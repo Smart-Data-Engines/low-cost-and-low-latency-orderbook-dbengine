@@ -66,7 +66,11 @@ WALWriter::WALWriter(std::string_view dir, size_t rotate_threshold_bytes)
     , rotate_threshold_(rotate_threshold_bytes)
     , dir_(dir)
     , file_index_(0)
+    , pending_sync_(0)
 {
+    // Pre-allocate write buffer (enough for largest possible record).
+    write_buf_.reserve(sizeof(WALRecord) + sizeof(DeltaUpdate) + MAX_LEVELS * sizeof(Level));
+
     // Ensure directory exists.
     std::filesystem::create_directories(dir_);
 
@@ -116,38 +120,29 @@ void WALWriter::open_current() {
 
 void WALWriter::write_record(const WALRecord& hdr, const void* payload,
                               size_t payload_len) {
-    // Write header.
-    const auto* hdr_bytes = reinterpret_cast<const uint8_t*>(&hdr);
-    size_t remaining = sizeof(WALRecord);
-    const uint8_t* ptr = hdr_bytes;
+    // Combine header + payload into a single write to minimize syscalls.
+    const size_t total = sizeof(WALRecord) + payload_len;
+    write_buf_.resize(total);
+    std::memcpy(write_buf_.data(), &hdr, sizeof(WALRecord));
+    if (payload_len > 0) {
+        std::memcpy(write_buf_.data() + sizeof(WALRecord), payload, payload_len);
+    }
+
+    size_t remaining = total;
+    const uint8_t* ptr = write_buf_.data();
     while (remaining > 0) {
         ssize_t n = ::write(fd_, ptr, remaining);
         if (n < 0) {
-            throw std::runtime_error(std::string("WALWriter: write header failed: ") +
+            throw std::runtime_error(std::string("WALWriter: write failed: ") +
                                      std::strerror(errno));
         }
         ptr += n;
         remaining -= static_cast<size_t>(n);
     }
 
-    // Write payload.
-    if (payload_len > 0) {
-        remaining = payload_len;
-        ptr = static_cast<const uint8_t*>(payload);
-        while (remaining > 0) {
-            ssize_t n = ::write(fd_, ptr, remaining);
-            if (n < 0) {
-                throw std::runtime_error(
-                    std::string("WALWriter: write payload failed: ") +
-                    std::strerror(errno));
-            }
-            ptr += n;
-            remaining -= static_cast<size_t>(n);
-        }
-    }
-
-    ::fsync(fd_);
-    written_ += sizeof(WALRecord) + payload_len;
+    // No fsync here — caller is responsible for calling sync() at group commit boundaries.
+    written_ += total;
+    ++pending_sync_;
 }
 
 void WALWriter::append(const DeltaUpdate& update, const Level* levels) {
@@ -155,21 +150,25 @@ void WALWriter::append(const DeltaUpdate& update, const Level* levels) {
     const size_t levels_bytes = update.n_levels * sizeof(Level);
     const size_t payload_len  = sizeof(DeltaUpdate) + levels_bytes;
 
-    std::vector<uint8_t> payload(payload_len);
-    std::memcpy(payload.data(), &update, sizeof(DeltaUpdate));
+    // Reuse pre-allocated buffer for payload (avoid heap alloc per record).
+    // We use a separate region of write_buf_ that write_record will overwrite anyway,
+    // so build payload in a local stack buffer for small payloads, or reuse write_buf_.
+    // Max payload: sizeof(DeltaUpdate) + 1024 * sizeof(Level) ≈ 200 + 24K ≈ 25K — fits on stack.
+    alignas(8) uint8_t payload[sizeof(DeltaUpdate) + MAX_LEVELS * sizeof(Level)];
+    std::memcpy(payload, &update, sizeof(DeltaUpdate));
     if (levels_bytes > 0) {
-        std::memcpy(payload.data() + sizeof(DeltaUpdate), levels, levels_bytes);
+        std::memcpy(payload + sizeof(DeltaUpdate), levels, levels_bytes);
     }
 
     WALRecord hdr{};
     hdr.sequence_number = update.sequence_number;
     hdr.timestamp_ns    = update.timestamp_ns;
-    hdr.checksum        = crc32c(payload.data(), payload_len);
+    hdr.checksum        = crc32c(payload, payload_len);
     hdr.payload_len     = static_cast<uint16_t>(payload_len);
     hdr.record_type     = WAL_RECORD_DELTA;
     hdr._pad            = 0;
 
-    write_record(hdr, payload.data(), payload_len);
+    write_record(hdr, payload, payload_len);
 
     // Auto-rotate if threshold exceeded.
     if (written_ >= rotate_threshold_) {
@@ -209,7 +208,12 @@ void WALWriter::rotate() {
 void WALWriter::flush() {
     if (fd_ >= 0) {
         ::fsync(fd_);
+        pending_sync_ = 0;
     }
+}
+
+void WALWriter::sync() {
+    flush();
 }
 
 // ── WALReplayer ───────────────────────────────────────────────────────────────

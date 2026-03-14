@@ -38,6 +38,16 @@ bench_engine
 test_*
 !tests/test_*.cpp
 
+# ── Python artifacts ──────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+_skbuild/
+.eggs/
+
 # ── IDE / editor ──────────────────────────────────────────────────────────────
 .vscode/
 .idea/

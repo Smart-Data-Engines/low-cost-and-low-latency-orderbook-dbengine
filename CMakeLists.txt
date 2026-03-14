@@ -5,6 +5,7 @@ project(orderbook-dbengine VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # ── Compiler warnings ──────────────────────────────────────────────────────────
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "12")
@@ -28,35 +29,40 @@ endif()
 # ── Dependencies via FetchContent ──────────────────────────────────────────────
 include(FetchContent)
 
-# Google Test
-FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG        v1.14.0
-)
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(googletest)
+# Test/benchmark deps are only needed when building tests
+option(OB_BUILD_TESTS "Build tests and benchmarks (requires gtest, benchmark, rapidcheck)" ON)
 
-# Google Benchmark
-FetchContent_Declare(
-    benchmark
-    GIT_REPOSITORY https://github.com/google/benchmark.git
-    GIT_TAG        v1.8.3
-)
-set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
-set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
-set(BENCHMARK_DOWNLOAD_DEPENDENCIES ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(benchmark)
+if(OB_BUILD_TESTS)
+    # Google Test
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG        v1.14.0
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
 
-# RapidCheck
-FetchContent_Declare(
-    rapidcheck
-    GIT_REPOSITORY https://github.com/emil-e/rapidcheck.git
-    GIT_TAG        master
-)
-set(RC_ENABLE_GTEST ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(rapidcheck)
+    # Google Benchmark
+    FetchContent_Declare(
+        benchmark
+        GIT_REPOSITORY https://github.com/google/benchmark.git
+        GIT_TAG        v1.8.3
+    )
+    set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+    set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(BENCHMARK_DOWNLOAD_DEPENDENCIES ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(benchmark)
+
+    # RapidCheck
+    FetchContent_Declare(
+        rapidcheck
+        GIT_REPOSITORY https://github.com/emil-e/rapidcheck.git
+        GIT_TAG        master
+    )
+    set(RC_ENABLE_GTEST ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(rapidcheck)
+endif()
 
 # ── Core library ───────────────────────────────────────────────────────────────
 add_library(orderbook_core INTERFACE)
@@ -182,9 +188,44 @@ if(OB_ENABLE_COVERAGE)
     endif()
 endif()
 
-# ── Tests ──────────────────────────────────────────────────────────────────────
-enable_testing()
-add_subdirectory(tests)
+# ── TCP Server library (testable components) ──────────────────────────────────
+add_library(orderbook_tcp_server_lib STATIC
+    src/tcp_server.cpp
+    src/command_parser.cpp
+    src/response_formatter.cpp
+    src/session.cpp
+)
+target_link_libraries(orderbook_tcp_server_lib PUBLIC orderbook_engine)
 
-# ── Benchmarks ─────────────────────────────────────────────────────────────────
-add_subdirectory(benchmarks)
+# ── TCP Server executable ─────────────────────────────────────────────────────
+add_executable(ob_tcp_server tools/ob_tcp_server.cpp)
+target_link_libraries(ob_tcp_server PRIVATE orderbook_tcp_server_lib)
+
+# ── CLI tool ───────────────────────────────────────────────────────────────────
+if(OB_BUILD_TESTS)
+    add_executable(ob_cli tools/ob_cli.cpp)
+    target_link_libraries(ob_cli PRIVATE orderbook_engine)
+endif()
+
+# ── Shared library for Python/FFI bindings ─────────────────────────────────────
+add_library(orderbook_shared SHARED src/c_api.cpp)
+target_link_libraries(orderbook_shared PUBLIC orderbook_engine)
+set_target_properties(orderbook_shared PROPERTIES
+    OUTPUT_NAME "orderbook_shared"
+    POSITION_INDEPENDENT_CODE ON
+)
+
+# Install shared lib into the Python package directory for scikit-build-core
+install(TARGETS orderbook_shared
+    LIBRARY DESTINATION orderbook_engine
+    RUNTIME DESTINATION orderbook_engine
+)
+
+# ── Tests ──────────────────────────────────────────────────────────────────────
+if(OB_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+
+    # ── Benchmarks ─────────────────────────────────────────────────────────────
+    add_subdirectory(benchmarks)
+endif()

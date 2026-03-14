@@ -55,5 +55,5 @@ ctest --test-dir build --output-on-failure
 
 1. Fork the repo and create a branch from `main`
 2. Make your changes — keep commits focused and atomic
-3. Ensure all 119 tests pass locally
+3. Ensure all 140 tests pass locally
 4. Open a PR with a clear description of what changed and why

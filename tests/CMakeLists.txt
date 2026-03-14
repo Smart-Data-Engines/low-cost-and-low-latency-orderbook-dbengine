@@ -176,3 +176,21 @@ endfunction()
 ob_add_engine_test(test_engine
     test_engine.cpp
 )
+
+# ── Helper to register a test executable that needs the TCP server library ────
+function(ob_add_tcp_test name)
+    add_executable(${name} ${ARGN})
+    target_link_libraries(${name}
+        PRIVATE
+            orderbook_tcp_server_lib
+            GTest::gtest_main
+            rapidcheck
+            rapidcheck_gtest
+    )
+    gtest_discover_tests(${name})
+endfunction()
+
+# ── TCP Server tests ──────────────────────────────────────────────────────────
+ob_add_tcp_test(test_tcp_server
+    test_tcp_server.cpp
+)

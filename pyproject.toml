@@ -1,0 +1,38 @@
+[build-system]
+requires = ["scikit-build-core>=0.8", "cmake>=3.20"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "orderbook-dbengine"
+version = "0.1.0"
+description = "Low-latency Level 2 orderbook database engine for HFT"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+authors = [
+    {name = "kmacewicz"},
+]
+keywords = ["orderbook", "hft", "database", "trading", "low-latency"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+
+[project.urls]
+Homepage = "https://github.com/kmacewicz/low-cost-and-low-latency-orderbook-dbengine"
+Repository = "https://github.com/kmacewicz/low-cost-and-low-latency-orderbook-dbengine"
+Documentation = "https://github.com/kmacewicz/low-cost-and-low-latency-orderbook-dbengine/tree/main/docs"
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+cmake.targets = ["orderbook_shared"]
+cmake.define = {"OB_BUILD_TESTS" = "OFF"}
+wheel.packages = ["python/orderbook_engine"]

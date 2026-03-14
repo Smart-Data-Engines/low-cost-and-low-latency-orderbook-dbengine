@@ -61,6 +61,7 @@ public:
     WALWriter& operator=(const WALWriter&) = delete;
 
     /// Append a DELTA record for the given update + levels.
+    /// Does NOT fsync — call sync() explicitly or rely on group commit.
     /// Automatically rotates if the threshold is exceeded after the write.
     void append(const DeltaUpdate& update, const Level* levels);
 
@@ -70,8 +71,14 @@ public:
     /// Force rotation: write ROTATE record, close current file, open next.
     void rotate();
 
-    /// fsync the current file.
+    /// fsync the current file (group commit boundary).
     void flush();
+
+    /// Sync the WAL to disk. Alias for flush() — explicit group commit point.
+    void sync();
+
+    /// Number of records written since last sync.
+    size_t pending_sync_count() const { return pending_sync_; }
 
 private:
     int         fd_;
@@ -79,11 +86,15 @@ private:
     size_t      rotate_threshold_;
     std::string dir_;
     uint32_t    file_index_;
+    size_t      pending_sync_{0};
+
+    // Pre-allocated write buffer to avoid per-record heap allocations.
+    std::vector<uint8_t> write_buf_;
 
     /// Open (or create) the WAL file for file_index_.
     void open_current();
 
-    /// Write a complete record (header + payload) and fsync.
+    /// Write a complete record (header + payload). Does NOT fsync.
     void write_record(const WALRecord& hdr, const void* payload, size_t payload_len);
 };
 

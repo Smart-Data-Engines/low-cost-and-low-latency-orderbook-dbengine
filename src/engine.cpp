@@ -55,6 +55,8 @@ void Engine::close() {
     // Final flush of all pending rows under the lock.
     {
         std::lock_guard<std::mutex> lock(mtx_);
+        // Group commit: sync any remaining WAL records.
+        wal_.sync();
         flush_pending();
     }
 
@@ -71,6 +73,7 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta, const Level* levels) {
     std::lock_guard<std::mutex> lock(mtx_);
 
     // 1. Write to WAL before any state mutation (Requirement 8.1).
+    //    No fsync here — group commit via flush_loop() or close().
     wal_.append(delta, levels);
 
     // 2. Apply to SoA buffer using seqlock writer protocol.
@@ -83,7 +86,7 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta, const Level* levels) {
         wal_.append_gap(delta.sequence_number, delta.timestamp_ns);
     }
 
-    // 4. Enqueue SnapshotRows for background columnar flush.
+    // 4. Enqueue SnapshotRows for background columnar flush + notify subscribers.
     for (uint16_t i = 0; i < delta.n_levels; ++i) {
         SnapshotRow row{};
         row.timestamp_ns    = delta.timestamp_ns;
@@ -93,19 +96,10 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta, const Level* levels) {
         row.price           = levels[i].price;
         row.quantity        = levels[i].qty;
         row.order_count     = levels[i].cnt;
-        pending_rows_.push_back({delta.symbol, delta.exchange, row});
-    }
 
-    // 5. Notify streaming subscribers synchronously (within 1 µs budget, Requirement 10.9).
-    for (uint16_t i = 0; i < delta.n_levels; ++i) {
-        SnapshotRow row{};
-        row.timestamp_ns    = delta.timestamp_ns;
-        row.sequence_number = delta.sequence_number;
-        row.side            = delta.side;
-        row.level_index     = i;
-        row.price           = levels[i].price;
-        row.quantity        = levels[i].qty;
-        row.order_count     = levels[i].cnt;
+        pending_rows_.push_back({delta.symbol, delta.exchange, row});
+
+        // 5. Notify streaming subscribers synchronously (within 1 µs budget, Requirement 10.9).
         query_engine_->notify_subscribers(delta.symbol, delta.exchange, row);
     }
 
@@ -174,6 +168,10 @@ void Engine::flush_loop() {
     while (!stop_flush_.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(interval);
         std::lock_guard<std::mutex> lock(mtx_);
+        // Group commit: sync WAL to disk periodically instead of per-record.
+        if (wal_.pending_sync_count() > 0) {
+            wal_.sync();
+        }
         flush_pending();
     }
 }
