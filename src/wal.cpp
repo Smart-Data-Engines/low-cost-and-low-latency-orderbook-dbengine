@@ -60,10 +60,12 @@ static std::string wal_filename(const std::string& dir, uint32_t index) {
 
 // ── WALWriter ─────────────────────────────────────────────────────────────────
 
-WALWriter::WALWriter(std::string_view dir, size_t rotate_threshold_bytes)
+WALWriter::WALWriter(std::string_view dir, size_t rotate_threshold_bytes,
+                     FsyncPolicy fsync_policy)
     : fd_(-1)
     , written_(0)
     , rotate_threshold_(rotate_threshold_bytes)
+    , fsync_policy_(fsync_policy)
     , dir_(dir)
     , file_index_(0)
     , pending_sync_(0)
@@ -141,8 +143,14 @@ void WALWriter::write_record(const WALRecord& hdr, const void* payload,
     }
 
     // No fsync here — caller is responsible for calling sync() at group commit boundaries.
+    // Exception: FsyncPolicy::EVERY fsyncs after every record.
     written_ += total;
     ++pending_sync_;
+
+    if (fsync_policy_ == FsyncPolicy::EVERY) {
+        ::fsync(fd_);
+        pending_sync_ = 0;
+    }
 }
 
 void WALWriter::append(const DeltaUpdate& update, const Level* levels) {
@@ -206,7 +214,7 @@ void WALWriter::rotate() {
 }
 
 void WALWriter::flush() {
-    if (fd_ >= 0) {
+    if (fd_ >= 0 && fsync_policy_ != FsyncPolicy::NONE) {
         ::fsync(fd_);
         pending_sync_ = 0;
     }
@@ -214,6 +222,25 @@ void WALWriter::flush() {
 
 void WALWriter::sync() {
     flush();
+}
+
+size_t WALWriter::truncate_before(uint32_t before_index) {
+    size_t removed = 0;
+    if (!std::filesystem::exists(dir_)) return 0;
+
+    for (auto& entry : std::filesystem::directory_iterator(dir_)) {
+        const std::string name = entry.path().filename().string();
+        if (name.size() == 14 &&
+            name.substr(0, 4) == "wal_" &&
+            name.substr(10) == ".bin") {
+            uint32_t idx = static_cast<uint32_t>(std::stoul(name.substr(4, 6)));
+            if (idx < before_index) {
+                std::filesystem::remove(entry.path());
+                ++removed;
+            }
+        }
+    }
+    return removed;
 }
 
 // ── WALReplayer ───────────────────────────────────────────────────────────────

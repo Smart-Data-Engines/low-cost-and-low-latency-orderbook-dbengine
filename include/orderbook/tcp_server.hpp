@@ -21,6 +21,14 @@ struct ServerConfig {
     int         max_sessions{64};
     int         worker_threads{4};
     size_t      max_line_length{8192};  // max command line bytes
+    bool        read_only{false};       // reject INSERT/FLUSH when true (replica mode)
+
+    // Replication (primary)
+    uint16_t replication_port{0};       // 0 = disabled
+
+    // Replication (replica)
+    std::string primary_host;
+    uint16_t    primary_port{0};        // 0 = disabled
 };
 
 // ── TcpServer ─────────────────────────────────────────────────────────────────
@@ -45,6 +53,7 @@ private:
     ServerConfig             config_;
     std::unique_ptr<Engine>  engine_;
     std::atomic<bool>        running_{false};
+    std::atomic<bool>        draining_{false};  // drain phase: reject new connections, finish in-flight
     int                      listen_fd_{-1};
     int                      epoll_fd_{-1};
 
@@ -55,10 +64,12 @@ private:
 // ── Free functions ────────────────────────────────────────────────────────────
 
 /// Execute a command against the engine. Returns the wire-protocol response string.
+/// When read_only is true, INSERT and FLUSH commands are rejected with an error.
 std::string execute_command(const Command& cmd,
                             Engine& engine,
                             Session& session,
-                            ServerStats& stats);
+                            ServerStats& stats,
+                            bool read_only = false);
 
 /// Parse CLI arguments into a ServerConfig. Applies defaults for missing args.
 ServerConfig parse_cli_args(int argc, char* argv[]);

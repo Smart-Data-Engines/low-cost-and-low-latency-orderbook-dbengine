@@ -15,6 +15,17 @@ inline constexpr uint8_t WAL_RECORD_SNAPSHOT = 2;
 inline constexpr uint8_t WAL_RECORD_GAP      = 3;
 inline constexpr uint8_t WAL_RECORD_ROTATE   = 4;
 
+// ── Fsync policy ──────────────────────────────────────────────────────────────
+// Controls when the WAL calls fsync:
+//   EVERY    — fsync after every record (max durability, lowest throughput)
+//   INTERVAL — fsync at group commit boundaries (default, ~100ms data loss window)
+//   NONE     — never fsync (max throughput, data loss on crash)
+enum class FsyncPolicy : uint8_t {
+    EVERY    = 0,
+    INTERVAL = 1,
+    NONE     = 2,
+};
+
 // ── WALRecord ─────────────────────────────────────────────────────────────────
 // Fixed-size header written before each payload.
 // The payload immediately follows this header in the file.
@@ -53,7 +64,8 @@ static_assert(sizeof(WALRecord) == 24, "WALRecord size mismatch");
 class WALWriter {
 public:
     explicit WALWriter(std::string_view dir,
-                       size_t rotate_threshold_bytes = 512ULL << 20);
+                       size_t rotate_threshold_bytes = 512ULL << 20,
+                       FsyncPolicy fsync_policy = FsyncPolicy::INTERVAL);
     ~WALWriter();
 
     // Non-copyable, non-movable (owns a file descriptor).
@@ -80,10 +92,25 @@ public:
     /// Number of records written since last sync.
     size_t pending_sync_count() const { return pending_sync_; }
 
+    /// Index of the WAL file currently being written to.
+    uint32_t current_file_index() const { return file_index_; }
+
+    /// Current byte offset within the active WAL file.
+    size_t current_offset() const { return written_; }
+
+    /// Directory where WAL files are stored.
+    const std::string& dir() const { return dir_; }
+
+    /// Remove WAL files with index strictly less than `before_index`.
+    /// Safe to call while the writer is active — only touches closed files.
+    /// Returns the number of files removed.
+    size_t truncate_before(uint32_t before_index);
+
 private:
     int         fd_;
     size_t      written_;
     size_t      rotate_threshold_;
+    FsyncPolicy fsync_policy_;
     std::string dir_;
     uint32_t    file_index_;
     size_t      pending_sync_{0};

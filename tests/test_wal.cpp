@@ -432,3 +432,66 @@ TEST(WAL, RotationThresholdTriggersNewFile) {
     });
     EXPECT_EQ(recovered, 3);
 }
+
+TEST(WAL, TruncateBeforeRemovesOldFiles) {
+    TempDir tmp("ut_truncate");
+
+    // Threshold of 150 bytes forces rotation after every 2nd record.
+    // Record size = 24 (header) + 88 (DeltaUpdate) + 20 (Level) = 132 bytes.
+    // After append: 132 bytes < 150 → no rotation.
+    // After 2nd append: 264 bytes >= 150 → rotation → new file.
+    const size_t threshold = 150;
+
+    {
+        ob::WALWriter writer(tmp.str(), threshold);
+        ob::Level lv = make_level(1000LL, 10ULL, 1U);
+
+        // Write 5 records to ensure the last file has at least one DELTA record.
+        // File 0: record1 (132) + record2 (264 >= 150 → rotate) + ROTATE
+        // File 1: record3 (132) + record4 (264 >= 150 → rotate) + ROTATE
+        // File 2: record5 (132) — current file, has data
+        writer.append(make_delta(1), &lv);
+        writer.append(make_delta(2), &lv);
+        writer.append(make_delta(3), &lv);
+        writer.append(make_delta(4), &lv);
+        writer.append(make_delta(5), &lv);
+
+        const size_t files_before = count_wal_files(tmp.path);
+        ASSERT_GE(files_before, 3) << "Need at least 3 WAL files for truncation test";
+
+        const uint32_t current = writer.current_file_index();
+        ASSERT_GT(current, 0) << "Current file index should be > 0 after rotations";
+
+        // Truncate all files before the current one.
+        size_t removed = writer.truncate_before(current);
+        EXPECT_GT(removed, 0);
+
+        const size_t files_after = count_wal_files(tmp.path);
+        EXPECT_EQ(files_after, files_before - removed);
+        EXPECT_GE(files_after, 1);
+    }
+
+    // Replay should recover record5 from the remaining current file.
+    int recovered = 0;
+    ob::WALReplayer replayer(tmp.str());
+    replayer.replay([&](const ob::WALRecord& hdr, const uint8_t* /*payload*/) {
+        if (hdr.record_type == ob::WAL_RECORD_DELTA) ++recovered;
+    });
+    EXPECT_GE(recovered, 1) << "At least the last record should be recoverable";
+}
+
+TEST(WAL, TruncateBeforeZeroRemovesNothing) {
+    TempDir tmp("ut_truncate_zero");
+
+    {
+        ob::WALWriter writer(tmp.str(), 150);
+        ob::Level lv = make_level();
+        writer.append(make_delta(1), &lv);
+        writer.append(make_delta(2), &lv);
+
+        const size_t files_before = count_wal_files(tmp.path);
+        size_t removed = writer.truncate_before(0);
+        EXPECT_EQ(removed, 0);
+        EXPECT_EQ(count_wal_files(tmp.path), files_before);
+    }
+}

@@ -691,3 +691,95 @@ TEST_F(ExecuteCommandTest, QuitReturnsEmpty) {
     std::string response = ob::execute_command(cmd, *engine_, session, stats_);
     EXPECT_TRUE(response.empty());
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Task 5.1 — Read-only mode unit tests
+// Validates: Requirements 3.1, 3.2
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class ReadOnlyCommandTest : public ExecuteCommandTest {};
+
+// Test: INSERT rejected in read-only mode
+TEST_F(ReadOnlyCommandTest, InsertRejected) {
+    ob::Session session(fd_server_);
+    ob::Command cmd{};
+    cmd.type = ob::CommandType::INSERT;
+    cmd.insert_args.symbol   = "BTC-USD";
+    cmd.insert_args.exchange = "BINANCE";
+    cmd.insert_args.side     = 0;
+    cmd.insert_args.price    = 6500000;
+    cmd.insert_args.qty      = 1500;
+    cmd.insert_args.count    = 1;
+
+    std::string response = ob::execute_command(cmd, *engine_, session, stats_, /*read_only=*/true);
+    EXPECT_EQ(response, "ERR read-only replica\n");
+    // Insert counter should NOT be incremented
+    EXPECT_EQ(session.inserts_executed(), 0u);
+    EXPECT_EQ(stats_.total_inserts.load(), 0u);
+}
+
+// Test: FLUSH rejected in read-only mode
+TEST_F(ReadOnlyCommandTest, FlushRejected) {
+    ob::Session session(fd_server_);
+    ob::Command cmd{};
+    cmd.type = ob::CommandType::FLUSH;
+
+    std::string response = ob::execute_command(cmd, *engine_, session, stats_, /*read_only=*/true);
+    EXPECT_EQ(response, "ERR read-only replica\n");
+}
+
+// Test: SELECT still works in read-only mode (Requirement 3.1)
+TEST_F(ReadOnlyCommandTest, SelectAllowed) {
+    ob::Session session(fd_server_);
+    ob::Command cmd{};
+    cmd.type = ob::CommandType::SELECT;
+    cmd.raw_sql = "SELECT * FROM 'BTC-USD'.'BINANCE' WHERE timestamp BETWEEN 0 AND 999";
+
+    std::string response = ob::execute_command(cmd, *engine_, session, stats_, /*read_only=*/true);
+    // Should NOT be rejected with read-only error — the query is allowed
+    EXPECT_EQ(response.find("read-only replica"), std::string::npos);
+}
+
+// Test: PING still works in read-only mode
+TEST_F(ReadOnlyCommandTest, PingAllowed) {
+    ob::Session session(fd_server_);
+    ob::Command cmd{};
+    cmd.type = ob::CommandType::PING;
+
+    std::string response = ob::execute_command(cmd, *engine_, session, stats_, /*read_only=*/true);
+    EXPECT_EQ(response, "PONG\n");
+}
+
+// Test: STATUS still works in read-only mode
+TEST_F(ReadOnlyCommandTest, StatusAllowed) {
+    ob::Session session(fd_server_);
+    ob::Command cmd{};
+    cmd.type = ob::CommandType::STATUS;
+
+    std::string response = ob::execute_command(cmd, *engine_, session, stats_, /*read_only=*/true);
+    ASSERT_GE(response.size(), 3u);
+    EXPECT_EQ(response.substr(0, 3), "OK\n");
+}
+
+// Test: --read-only CLI flag parsed correctly
+TEST(CliArgs, ReadOnlyFlag) {
+    char* argv[] = {
+        const_cast<char*>("ob_tcp_server"),
+        const_cast<char*>("--read-only"),
+        const_cast<char*>("--port"),
+        const_cast<char*>("8080")
+    };
+
+    ob::ServerConfig config = ob::parse_cli_args(4, argv);
+    EXPECT_TRUE(config.read_only);
+    EXPECT_EQ(config.port, 8080);
+}
+
+// Test: read_only defaults to false
+TEST(CliArgs, ReadOnlyDefaultFalse) {
+    char* argv[] = { const_cast<char*>("ob_tcp_server") };
+
+    ob::ServerConfig config = ob::parse_cli_args(1, argv);
+    EXPECT_FALSE(config.read_only);
+}

@@ -101,7 +101,7 @@ add_library(orderbook_query STATIC src/query_engine.cpp)
 target_link_libraries(orderbook_query PUBLIC orderbook_columnar orderbook_agg)
 
 # ── Engine facade compiled library ────────────────────────────────────────────
-add_library(orderbook_engine STATIC src/engine.cpp)
+add_library(orderbook_engine STATIC src/engine.cpp src/replication.cpp)
 target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal)
 
 # ── C API compiled library ────────────────────────────────────────────────────

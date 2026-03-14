@@ -21,7 +21,8 @@ namespace ob {
 std::string execute_command(const Command& cmd,
                             Engine& engine,
                             Session& session,
-                            ServerStats& stats) {
+                            ServerStats& stats,
+                            bool read_only) {
     switch (cmd.type) {
 
     case CommandType::SELECT: {
@@ -42,6 +43,7 @@ std::string execute_command(const Command& cmd,
     }
 
     case CommandType::INSERT: {
+        if (read_only) return format_error("read-only replica");
         try {
             const auto& a = cmd.insert_args;
 
@@ -74,6 +76,7 @@ std::string execute_command(const Command& cmd,
     }
 
     case CommandType::FLUSH: {
+        if (read_only) return format_error("read-only replica");
         try {
             // Flush pattern: close engine (flushes all data) then reopen.
             // NOTE: This is called on the TcpServer's engine, which is shared.
@@ -89,8 +92,26 @@ std::string execute_command(const Command& cmd,
     case CommandType::PING:
         return format_pong();
 
-    case CommandType::STATUS:
+    case CommandType::STATUS: {
+        auto es = engine.stats();
+        stats.engine_metrics.pending_rows   = es.pending_rows;
+        stats.engine_metrics.wal_file_index = es.wal_file_index;
+        stats.engine_metrics.segment_count  = es.segment_count;
+        stats.engine_metrics.symbol_count   = es.symbol_count;
+
+        // Copy replication metrics
+        stats.replicas.clear();
+        for (const auto& r : es.replicas) {
+            stats.replicas.push_back({r.address, r.confirmed_file, r.confirmed_offset, r.lag_bytes});
+        }
+        stats.is_replica            = es.is_replica;
+        stats.repl_confirmed_file   = es.repl_confirmed_file;
+        stats.repl_confirmed_offset = es.repl_confirmed_offset;
+        stats.repl_records_replayed = es.repl_records_replayed;
+        stats.repl_connected        = es.repl_connected;
+
         return format_status(stats);
+    }
 
     case CommandType::QUIT:
         return ""; // empty string signals session close
@@ -117,6 +138,14 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
             config.max_sessions = std::stoi(argv[++i]);
         } else if (arg == "--workers" && i + 1 < argc) {
             config.worker_threads = std::stoi(argv[++i]);
+        } else if (arg == "--read-only") {
+            config.read_only = true;
+        } else if (arg == "--replication-port" && i + 1 < argc) {
+            config.replication_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        } else if (arg == "--primary-host" && i + 1 < argc) {
+            config.primary_host = argv[++i];
+        } else if (arg == "--primary-port" && i + 1 < argc) {
+            config.primary_port = static_cast<uint16_t>(std::stoi(argv[++i]));
         }
     }
 
@@ -127,8 +156,18 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
 
 TcpServer::TcpServer(ServerConfig config)
     : config_(std::move(config))
-    , engine_(std::make_unique<Engine>(config_.data_dir))
-{}
+{
+    ReplicationConfig repl_config{};
+    repl_config.port = config_.replication_port;
+
+    ReplicationClientConfig repl_client_config{};
+    repl_client_config.primary_host = config_.primary_host;
+    repl_client_config.primary_port = config_.primary_port;
+    repl_client_config.state_file   = config_.data_dir + "/repl_state.txt";
+
+    engine_ = std::make_unique<Engine>(config_.data_dir, 100'000'000ULL, FsyncPolicy::INTERVAL,
+                                       repl_config, repl_client_config);
+}
 
 TcpServer::~TcpServer() {
     if (epoll_fd_ >= 0) ::close(epoll_fd_);
@@ -205,6 +244,20 @@ void TcpServer::run() {
             int fd = events[i].data.fd;
 
             if (fd == listen_fd_) {
+                // Draining: stop accepting new connections.
+                if (draining_.load(std::memory_order_relaxed)) {
+                    // Reject all pending connections.
+                    while (true) {
+                        int reject_fd = ::accept4(listen_fd_, nullptr, nullptr, SOCK_NONBLOCK);
+                        if (reject_fd < 0) break;
+                        const char* msg = "ERR server shutting down\n";
+                        auto wr = ::write(reject_fd, msg, std::strlen(msg));
+                        (void)wr;
+                        ::close(reject_fd);
+                    }
+                    continue;
+                }
+
                 // Accept new connection(s).
                 while (true) {
                     struct sockaddr_in client_addr{};
@@ -281,7 +334,7 @@ void TcpServer::run() {
                         }
 
                         Command cmd = parse_command(line);
-                        std::string response = execute_command(cmd, *engine_, *session, stats);
+                        std::string response = execute_command(cmd, *engine_, *session, stats, config_.read_only);
 
                         if (response.empty()) {
                             // QUIT — close session.
@@ -303,6 +356,12 @@ void TcpServer::run() {
                 next_event:;
             }
         }
+
+        // Drain phase: if draining and all sessions are closed, stop the loop.
+        if (draining_.load(std::memory_order_relaxed) &&
+            stats.active_sessions.load(std::memory_order_relaxed) <= 0) {
+            running_.store(false, std::memory_order_relaxed);
+        }
     }
 
     // Shutdown: close all sessions, close epoll, close listen socket.
@@ -312,6 +371,7 @@ void TcpServer::run() {
         ::close(epoll_fd_);
         epoll_fd_ = -1;
     }
+    // listen_fd_ may already be closed by shutdown() during drain.
     if (listen_fd_ >= 0) {
         ::close(listen_fd_);
         listen_fd_ = -1;
@@ -321,7 +381,16 @@ void TcpServer::run() {
 }
 
 void TcpServer::shutdown() {
-    running_.store(false, std::memory_order_relaxed);
+    // Initiate graceful drain: stop accepting new connections,
+    // let in-flight commands finish, then stop the epoll loop.
+    draining_.store(true, std::memory_order_relaxed);
+
+    // Close the listen socket so the OS rejects new TCP connections immediately.
+    if (listen_fd_ >= 0) {
+        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, listen_fd_, nullptr);
+        ::close(listen_fd_);
+        listen_fd_ = -1;
+    }
 }
 
 } // namespace ob

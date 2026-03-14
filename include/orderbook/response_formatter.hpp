@@ -16,6 +16,30 @@ struct ServerStats {
     std::atomic<uint64_t> total_queries{0};
     std::atomic<uint64_t> total_inserts{0};
     std::atomic<int>      active_sessions{0};
+
+    // Engine-level metrics (populated on STATUS request).
+    struct EngineMetrics {
+        size_t pending_rows{0};
+        size_t wal_file_index{0};
+        size_t segment_count{0};
+        size_t symbol_count{0};
+    };
+    EngineMetrics engine_metrics;
+
+    // Replication metrics (populated from Engine::Stats on STATUS request)
+    struct ReplicaMetrics {
+        std::string address;
+        uint32_t    confirmed_file;
+        size_t      confirmed_offset;
+        size_t      lag_bytes;
+    };
+    std::vector<ReplicaMetrics> replicas;
+
+    bool     is_replica{false};
+    uint32_t repl_confirmed_file{0};
+    size_t   repl_confirmed_offset{0};
+    uint64_t repl_records_replayed{0};
+    bool     repl_connected{false};
 };
 
 // ── Parsed response (for round-trip testing) ──────────────────────────────────

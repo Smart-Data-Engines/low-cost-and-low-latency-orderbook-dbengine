@@ -13,7 +13,7 @@ static constexpr std::string_view kQueryHeader =
     "timestamp_ns\tprice\tquantity\torder_count\tside\tlevel";
 
 static constexpr std::string_view kStatusHeader =
-    "sessions\tqueries\tinserts";
+    "sessions\tqueries\tinserts\tpending_rows\twal_file\tsegments\tsymbols";
 
 /// Split a string_view by a single-character delimiter.
 static std::vector<std::string_view> split(std::string_view sv, char delim) {
@@ -95,7 +95,50 @@ std::string format_status(const ServerStats& stats) {
     out += std::to_string(stats.total_queries.load(std::memory_order_relaxed));
     out += '\t';
     out += std::to_string(stats.total_inserts.load(std::memory_order_relaxed));
+    out += '\t';
+    out += std::to_string(stats.engine_metrics.pending_rows);
+    out += '\t';
+    out += std::to_string(stats.engine_metrics.wal_file_index);
+    out += '\t';
+    out += std::to_string(stats.engine_metrics.segment_count);
+    out += '\t';
+    out += std::to_string(stats.engine_metrics.symbol_count);
     out += '\n';
+
+    // Replication info (primary mode): per-replica lag
+    if (!stats.replicas.empty()) {
+        out += "replicas: ";
+        out += std::to_string(stats.replicas.size());
+        out += '\n';
+        for (size_t i = 0; i < stats.replicas.size(); ++i) {
+            const auto& r = stats.replicas[i];
+            out += "replica[";
+            out += std::to_string(i);
+            out += "]: ";
+            out += r.address;
+            out += " file=";
+            out += std::to_string(r.confirmed_file);
+            out += " offset=";
+            out += std::to_string(r.confirmed_offset);
+            out += " lag=";
+            out += std::to_string(r.lag_bytes);
+            out += '\n';
+        }
+    }
+
+    // Replication info (replica mode): local replay offset, connection status
+    if (stats.is_replica) {
+        out += "replication: connected=";
+        out += (stats.repl_connected ? "yes" : "no");
+        out += " file=";
+        out += std::to_string(stats.repl_confirmed_file);
+        out += " offset=";
+        out += std::to_string(stats.repl_confirmed_offset);
+        out += " replayed=";
+        out += std::to_string(stats.repl_records_replayed);
+        out += '\n';
+    }
+
     out += '\n'; // empty line terminator
     return out;
 }
