@@ -78,7 +78,20 @@ target_link_libraries(orderbook_soa PUBLIC orderbook_core)
 
 # ── WAL compiled library ───────────────────────────────────────────────────────
 add_library(orderbook_wal STATIC src/wal.cpp)
-target_link_libraries(orderbook_wal PUBLIC orderbook_core)
+target_link_libraries(orderbook_wal PUBLIC orderbook_core orderbook_epoch)
+
+# ── Epoch compiled library ─────────────────────────────────────────────────────
+add_library(orderbook_epoch STATIC src/epoch.cpp)
+target_link_libraries(orderbook_epoch PUBLIC orderbook_core)
+
+# ── Coordinator compiled library (etcd v3 REST client) ─────────────────────────
+find_package(CURL REQUIRED)
+add_library(orderbook_coordinator STATIC src/coordinator.cpp)
+target_link_libraries(orderbook_coordinator PUBLIC orderbook_epoch CURL::libcurl)
+
+# ── Failover compiled library (role transitions and monitoring) ────────────────
+add_library(orderbook_failover STATIC src/failover.cpp)
+target_link_libraries(orderbook_failover PUBLIC orderbook_coordinator orderbook_epoch)
 
 # ── Codec compiled library ─────────────────────────────────────────────────────
 add_library(orderbook_codec STATIC src/codec.cpp)
@@ -102,7 +115,7 @@ target_link_libraries(orderbook_query PUBLIC orderbook_columnar orderbook_agg)
 
 # ── Engine facade compiled library ────────────────────────────────────────────
 add_library(orderbook_engine STATIC src/engine.cpp src/replication.cpp)
-target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal)
+target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover)
 
 # ── C API compiled library ────────────────────────────────────────────────────
 add_library(orderbook_capi STATIC src/c_api.cpp)

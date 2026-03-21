@@ -46,6 +46,12 @@ struct ServerStats {
     size_t   snapshot_bytes_received{0};
     size_t   snapshot_bytes_total{0};
     bool     snapshot_active{false};  // primary: snapshot transfer in progress
+
+    // Failover state
+    uint8_t  node_role{0};            // NodeRole enum value
+    uint64_t current_epoch{0};
+    std::string primary_address;
+    int64_t  lease_ttl_remaining{0};
 };
 
 // ── Parsed response (for round-trip testing) ──────────────────────────────────

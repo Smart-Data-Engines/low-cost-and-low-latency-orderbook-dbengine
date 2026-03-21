@@ -14,6 +14,8 @@ enum class CommandType {
     FLUSH,
     PING,
     STATUS,
+    ROLE,
+    FAILOVER,
     QUIT,
     UNKNOWN
 };
@@ -35,6 +37,7 @@ struct Command {
     CommandType type;
     std::string raw_sql;        // for SELECT
     InsertArgs  insert_args;    // for INSERT
+    std::string target_node_id; // for FAILOVER
 };
 
 // ── Free functions ────────────────────────────────────────────────────────────

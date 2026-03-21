@@ -168,6 +168,7 @@ class _TcpBackend:
           - "PONG\n"     → single line
           - "OK\n\n"     → bare OK (double newline)
           - "OK\n...\n\n" → OK with body, terminated by empty line (\n\n)
+          - "PRIMARY ...\n" / "REPLICA ...\n" / "STANDALONE\n" → single line (ROLE response)
         """
         while True:
             decoded = self._buf.decode("utf-8", errors="replace")
@@ -182,6 +183,16 @@ class _TcpBackend:
 
             # PONG line
             if decoded.startswith("PONG"):
+                nl = decoded.find("\n")
+                if nl != -1:
+                    resp = decoded[:nl + 1]
+                    self._buf = self._buf[len(resp.encode("utf-8")):]
+                    return resp
+
+            # ROLE responses: single-line, terminated by \n
+            if (decoded.startswith("PRIMARY") or
+                decoded.startswith("REPLICA") or
+                decoded.startswith("STANDALONE")):
                 nl = decoded.find("\n")
                 if nl != -1:
                     resp = decoded[:nl + 1]
@@ -353,6 +364,199 @@ class _LocalBackend:
             self._engine = None
 
 
+# ── Node state for client pool ─────────────────────────────────────────────────
+
+@dataclass
+class _NodeState:
+    """Per-node tracking state for the client pool."""
+    host: str
+    port: int
+    role: str = "unknown"       # "primary", "replica", "standalone", "unknown"
+    epoch: int = 0
+    connected: bool = False
+    last_check: float = 0.0     # time.monotonic()
+
+
+class _ClientPool:
+    """
+    Multi-host connection pool with automatic primary discovery.
+
+    Connects to all hosts, issues ROLE commands to discover the primary,
+    and routes writes to the primary and reads to any available node.
+    """
+
+    def __init__(self, hosts: List[str], timeout: float = 10.0,
+                 health_check_interval: float = 2.0):
+        self._timeout = timeout
+        self._health_check_interval = health_check_interval
+        self._nodes: List[_NodeState] = []
+        self._connections: dict = {}  # "host:port" -> _TcpBackend
+        self._primary_key: Optional[str] = None
+        self._health_thread: Optional[object] = None
+        self._running = False
+
+        import threading
+        self._lock = threading.Lock()
+
+        # Parse hosts into _NodeState objects.
+        for h in hosts:
+            if ":" in h:
+                host, port_str = h.rsplit(":", 1)
+                port = int(port_str)
+            else:
+                host = h
+                port = 5555
+            self._nodes.append(_NodeState(host=host, port=port))
+
+        # Initial discovery.
+        self._connect_all()
+        self._discover_primary()
+
+        # Start health check thread.
+        self._running = True
+        self._health_thread = threading.Thread(
+            target=self._health_check_loop, daemon=True)
+        self._health_thread.start()
+
+    def _node_key(self, node: _NodeState) -> str:
+        return f"{node.host}:{node.port}"
+
+    def _connect_all(self):
+        """Connect to all nodes that aren't already connected."""
+        for node in self._nodes:
+            key = self._node_key(node)
+            if key in self._connections:
+                continue
+            try:
+                backend = _TcpBackend(node.host, node.port, self._timeout)
+                self._connections[key] = backend
+                node.connected = True
+            except Exception:
+                node.connected = False
+
+    def _discover_primary(self):
+        """Issue ROLE command to all connected nodes, find the primary."""
+        with self._lock:
+            for node in self._nodes:
+                key = self._node_key(node)
+                backend = self._connections.get(key)
+                if backend is None:
+                    node.connected = False
+                    continue
+                try:
+                    raw = backend.execute("ROLE")
+                    self._parse_role_response(node, raw)
+                    node.last_check = time.monotonic()
+                except Exception:
+                    node.connected = False
+                    node.role = "unknown"
+                    # Remove broken connection.
+                    self._connections.pop(key, None)
+
+            # Find primary.
+            self._primary_key = None
+            for node in self._nodes:
+                if node.role == "primary":
+                    self._primary_key = self._node_key(node)
+                    break
+
+    def _parse_role_response(self, node: _NodeState, raw: str):
+        """Parse ROLE command response and update node state."""
+        raw = raw.strip()
+        if raw.startswith("PRIMARY"):
+            node.role = "primary"
+            parts = raw.split()
+            if len(parts) >= 2:
+                try:
+                    node.epoch = int(parts[1])
+                except ValueError:
+                    pass
+        elif raw.startswith("REPLICA"):
+            node.role = "replica"
+            parts = raw.split()
+            if len(parts) >= 3:
+                try:
+                    node.epoch = int(parts[-1])
+                except ValueError:
+                    pass
+        elif raw.startswith("STANDALONE"):
+            node.role = "standalone"
+        else:
+            node.role = "unknown"
+
+    def execute_write(self, command: str) -> str:
+        """Route write to primary, retry on failover (re-discover + retry once)."""
+        with self._lock:
+            primary_key = self._primary_key
+
+        if primary_key is None:
+            self._discover_primary()
+            with self._lock:
+                primary_key = self._primary_key
+            if primary_key is None:
+                raise OrderbookError(-1, "No primary available")
+
+        backend = self._connections.get(primary_key)
+        if backend is None:
+            raise OrderbookError(-1, "Primary not connected")
+
+        try:
+            raw = backend.execute(command)
+            # Check for read-only error (stale primary).
+            if raw.startswith("ERR") and "read-only" in raw:
+                raise OrderbookError(-1, "read-only replica")
+            return raw
+        except (OrderbookError, OSError, socket.error):
+            # Retry once: re-discover primary and retry.
+            self._connect_all()
+            self._discover_primary()
+            with self._lock:
+                primary_key = self._primary_key
+            if primary_key is None:
+                raise OrderbookError(-1, "No primary available after re-discovery")
+            backend = self._connections.get(primary_key)
+            if backend is None:
+                raise OrderbookError(-1, "Primary not connected after re-discovery")
+            return backend.execute(command)
+
+    def execute_read(self, command: str) -> str:
+        """Route read to any available node, fallback on failure."""
+        # Try all nodes, starting with any connected one.
+        with self._lock:
+            node_keys = [self._node_key(n) for n in self._nodes if n.connected]
+
+        for key in node_keys:
+            backend = self._connections.get(key)
+            if backend is None:
+                continue
+            try:
+                return backend.execute(command)
+            except Exception:
+                # Try next node.
+                continue
+
+        raise OrderbookError(-1, "All hosts unreachable")
+
+    def _health_check_loop(self):
+        """Background thread: periodic ROLE checks on all nodes."""
+        while self._running:
+            time.sleep(self._health_check_interval)
+            if not self._running:
+                break
+            self._connect_all()
+            self._discover_primary()
+
+    def close(self):
+        """Stop health checks and close all connections."""
+        self._running = False
+        for key, backend in list(self._connections.items()):
+            try:
+                backend.close()
+            except Exception:
+                pass
+        self._connections.clear()
+
+
 # ── Unified Engine class ───────────────────────────────────────────────────────
 
 class OrderbookEngine:
@@ -371,11 +575,20 @@ class OrderbookEngine:
                  *,
                  host: Optional[str] = None,
                  port: int = 5555,
-                 timeout: float = 10.0):
+                 hosts: Optional[List[str]] = None,
+                 timeout: float = 10.0,
+                 health_check_interval: float = 2.0):
         self._seq = 0
         self._closed = False
+        self._pool: Optional[_ClientPool] = None
 
-        if host is not None:
+        if hosts is not None:
+            # Multi-host pool mode
+            self._mode = "pool"
+            self._pool = _ClientPool(hosts, timeout, health_check_interval)
+            self._tcp = None
+            self._local = None
+        elif host is not None:
             # TCP mode
             self._mode = "tcp"
             self._tcp = _TcpBackend(host, port, timeout)
@@ -386,7 +599,7 @@ class OrderbookEngine:
             self._local = _LocalBackend(data_dir)
             self._tcp = None
         else:
-            raise ValueError("Provide data_dir for local mode or host for TCP mode")
+            raise ValueError("Provide data_dir for local mode, host for TCP mode, or hosts for pool mode")
 
     @property
     def mode(self) -> str:
@@ -418,6 +631,8 @@ class OrderbookEngine:
             self._local.close()
         if self._tcp:
             self._tcp.close()
+        if self._pool:
+            self._pool.close()
 
     def insert(self,
                symbol: str,
@@ -457,6 +672,14 @@ class OrderbookEngine:
 
         if self._mode == "local":
             self._local.insert(symbol, exchange, side_int, prices, qtys, counts, seq, ts)
+        elif self._mode == "pool":
+            # Pool mode: route writes to primary.
+            for i in range(n):
+                cmd = f"INSERT {symbol} {exchange} {side_lower} {prices[i]} {qtys[i]} {counts[i]}"
+                raw = self._pool.execute_write(cmd)
+                is_err, msg, _, _ = _parse_tcp_response(raw)
+                if is_err:
+                    raise OrderbookError(-1, f"Pool INSERT failed: {msg}")
         else:
             # TCP: one INSERT per level
             for i in range(n):
@@ -474,6 +697,11 @@ class OrderbookEngine:
             raise OrderbookError(-1, "Engine is closed")
         if self._mode == "local":
             self._local.flush()
+        elif self._mode == "pool":
+            raw = self._pool.execute_write("FLUSH")
+            is_err, msg, _, _ = _parse_tcp_response(raw)
+            if is_err:
+                raise OrderbookError(-1, f"Pool FLUSH failed: {msg}")
         else:
             raw = self._tcp.execute("FLUSH")
             is_err, msg, _, _ = _parse_tcp_response(raw)
@@ -486,26 +714,31 @@ class OrderbookEngine:
             raise OrderbookError(-1, "Engine is closed")
         if self._mode == "local":
             return self._local.query(sql)
+
+        # TCP or pool mode — get raw response.
+        if self._mode == "pool":
+            raw = self._pool.execute_read(sql)
         else:
             raw = self._tcp.execute(sql)
-            is_err, msg, header, data_rows = _parse_tcp_response(raw)
-            if is_err:
-                raise OrderbookError(-1, f"TCP query error: {msg}")
-            # Parse TSV rows into OrderbookRow objects
-            # Header: timestamp_ns  price  quantity  order_count  side  level
-            rows: List[OrderbookRow] = []
-            for r in data_rows:
-                if len(r) < 6:
-                    continue
-                rows.append(OrderbookRow(
-                    timestamp_ns=int(r[0]),
-                    price=int(r[1]),
-                    quantity=int(r[2]),
-                    order_count=int(r[3]),
-                    side="bid" if r[4] == "0" else "ask",
-                    level=int(r[5]),
-                ))
-            return rows
+
+        is_err, msg, header, data_rows = _parse_tcp_response(raw)
+        if is_err:
+            raise OrderbookError(-1, f"query error: {msg}")
+        # Parse TSV rows into OrderbookRow objects
+        # Header: timestamp_ns  price  quantity  order_count  side  level
+        rows: List[OrderbookRow] = []
+        for r in data_rows:
+            if len(r) < 6:
+                continue
+            rows.append(OrderbookRow(
+                timestamp_ns=int(r[0]),
+                price=int(r[1]),
+                quantity=int(r[2]),
+                order_count=int(r[3]),
+                side="bid" if r[4] == "0" else "ask",
+                level=int(r[5]),
+            ))
+        return rows
 
     def query_all(self, symbol: str, exchange: str,
                   limit: Optional[int] = None) -> List[OrderbookRow]:
@@ -517,31 +750,37 @@ class OrderbookEngine:
         return self.query(sql)
 
     def ping(self) -> str:
-        """Send PING, expect PONG. Works in both modes."""
+        """Send PING, expect PONG. Works in all modes."""
         if self._closed:
             raise OrderbookError(-1, "Engine is closed")
         if self._mode == "local":
             return "PONG"
-        raw = self._tcp.execute("PING")
+        if self._mode == "pool":
+            raw = self._pool.execute_read("PING")
+        else:
+            raw = self._tcp.execute("PING")
         if raw.startswith("PONG"):
             return "PONG"
         raise OrderbookError(-1, f"Unexpected PING response: {raw}")
 
     def status(self) -> dict:
-        """Get server status. In TCP mode returns server stats, in local mode returns mode info."""
+        """Get server status. In TCP/pool mode returns server stats, in local mode returns mode info."""
         if self._closed:
             raise OrderbookError(-1, "Engine is closed")
         if self._mode == "local":
             return {"mode": "local"}
-        raw = self._tcp.execute("STATUS")
+        if self._mode == "pool":
+            raw = self._pool.execute_read("STATUS")
+        else:
+            raw = self._tcp.execute("STATUS")
         is_err, msg, header, data_rows = _parse_tcp_response(raw)
         if is_err:
-            raise OrderbookError(-1, f"TCP STATUS error: {msg}")
+            raise OrderbookError(-1, f"STATUS error: {msg}")
         if data_rows and len(data_rows[0]) >= 3:
             return {
-                "mode": "tcp",
+                "mode": self._mode,
                 "sessions": int(data_rows[0][0]),
                 "queries": int(data_rows[0][1]),
                 "inserts": int(data_rows[0][2]),
             }
-        return {"mode": "tcp"}
+        return {"mode": self._mode}

@@ -153,6 +153,30 @@ std::string format_status(const ServerStats& stats) {
         out += "snapshot: transfer_active\n";
     }
 
+    // Failover state
+    {
+        out += "role: ";
+        switch (stats.node_role) {
+        case 1:  out += "primary"; break;
+        case 2:  out += "replica"; break;
+        default: out += "standalone"; break;
+        }
+        out += '\n';
+        out += "epoch: ";
+        out += std::to_string(stats.current_epoch);
+        out += '\n';
+        if (!stats.primary_address.empty()) {
+            out += "primary_address: ";
+            out += stats.primary_address;
+            out += '\n';
+        }
+        if (stats.lease_ttl_remaining > 0) {
+            out += "lease_ttl_remaining: ";
+            out += std::to_string(stats.lease_ttl_remaining);
+            out += '\n';
+        }
+    }
+
     out += '\n'; // empty line terminator
     return out;
 }

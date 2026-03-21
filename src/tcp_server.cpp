@@ -118,8 +118,20 @@ std::string execute_command(const Command& cmd,
         stats.snapshot_bytes_total  = es.snapshot_bytes_total;
         stats.snapshot_active       = es.snapshot_active;
 
+        // Failover state
+        stats.node_role           = static_cast<uint8_t>(es.node_role);
+        stats.current_epoch       = es.current_epoch;
+        stats.primary_address     = es.primary_address;
+        stats.lease_ttl_remaining = es.lease_ttl_remaining;
+
         return format_status(stats);
     }
+
+    case CommandType::ROLE:
+        return engine.handle_role_command();
+
+    case CommandType::FAILOVER:
+        return engine.handle_failover_command(cmd.target_node_id);
 
     case CommandType::QUIT:
         return ""; // empty string signals session close
@@ -158,6 +170,26 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
             config.snapshot_chunk_size = static_cast<size_t>(std::stoul(argv[++i]));
         } else if (arg == "--snapshot-staging-dir" && i + 1 < argc) {
             config.snapshot_staging_dir = argv[++i];
+        } else if (arg == "--coordinator-endpoints" && i + 1 < argc) {
+            // Parse comma-separated list of endpoints.
+            std::string endpoints_str = argv[++i];
+            std::string ep;
+            for (char c : endpoints_str) {
+                if (c == ',') {
+                    if (!ep.empty()) config.coordinator_endpoints.push_back(ep);
+                    ep.clear();
+                } else {
+                    ep += c;
+                }
+            }
+            if (!ep.empty()) config.coordinator_endpoints.push_back(ep);
+        } else if (arg == "--coordinator-lease-ttl" && i + 1 < argc) {
+            config.coordinator_lease_ttl = std::stoll(argv[++i]);
+        } else if (arg == "--node-id" && i + 1 < argc) {
+            config.node_id = argv[++i];
+        } else if (arg == "--failover-enabled" && i + 1 < argc) {
+            std::string val = argv[++i];
+            config.failover_enabled = (val == "true" || val == "1" || val == "yes");
         }
     }
 
@@ -179,8 +211,17 @@ TcpServer::TcpServer(ServerConfig config)
     repl_client_config.snapshot_chunk_size = config_.snapshot_chunk_size;
     repl_client_config.snapshot_staging_dir = config_.snapshot_staging_dir;
 
+    FailoverConfig failover_config{};
+    if (!config_.coordinator_endpoints.empty()) {
+        failover_config.coordinator.endpoints = config_.coordinator_endpoints;
+        failover_config.coordinator.lease_ttl_seconds = config_.coordinator_lease_ttl;
+        failover_config.coordinator.node_id = config_.node_id;
+        failover_config.failover_enabled = config_.failover_enabled;
+        failover_config.replication_port = config_.replication_port;
+    }
+
     engine_ = std::make_unique<Engine>(config_.data_dir, 100'000'000ULL, FsyncPolicy::INTERVAL,
-                                       repl_config, repl_client_config);
+                                       repl_config, repl_client_config, failover_config);
 }
 
 TcpServer::~TcpServer() {

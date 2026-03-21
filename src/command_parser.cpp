@@ -114,7 +114,15 @@ Command parse_command(std::string_view line) {
     if (iequals(first, "FLUSH"))  { cmd.type = CommandType::FLUSH;  return cmd; }
     if (iequals(first, "PING"))   { cmd.type = CommandType::PING;   return cmd; }
     if (iequals(first, "STATUS")) { cmd.type = CommandType::STATUS; return cmd; }
+    if (iequals(first, "ROLE"))   { cmd.type = CommandType::ROLE;   return cmd; }
     if (iequals(first, "QUIT"))   { cmd.type = CommandType::QUIT;   return cmd; }
+
+    if (iequals(first, "FAILOVER")) {
+        if (tokens.size() < 2) return cmd; // need target_node_id
+        cmd.type = CommandType::FAILOVER;
+        cmd.target_node_id = std::string(tokens[1]);
+        return cmd;
+    }
 
     return cmd; // UNKNOWN
 }
@@ -147,6 +155,9 @@ std::string format_command(const Command& cmd) {
     case CommandType::FLUSH:  return "FLUSH\n";
     case CommandType::PING:   return "PING\n";
     case CommandType::STATUS: return "STATUS\n";
+    case CommandType::ROLE:   return "ROLE\n";
+    case CommandType::FAILOVER:
+        return "FAILOVER " + cmd.target_node_id + "\n";
     case CommandType::QUIT:   return "QUIT\n";
     case CommandType::UNKNOWN: return "";
     }

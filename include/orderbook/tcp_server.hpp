@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace ob {
 
@@ -33,6 +34,12 @@ struct ServerConfig {
     // Snapshot bootstrap
     size_t      snapshot_chunk_size{262144};  // --snapshot-chunk-size (default 256 KB)
     std::string snapshot_staging_dir;         // --snapshot-staging-dir
+
+    // Failover
+    std::vector<std::string> coordinator_endpoints;  // --coordinator-endpoints (comma-separated)
+    int64_t coordinator_lease_ttl{10};               // --coordinator-lease-ttl (seconds)
+    std::string node_id;                             // --node-id
+    bool failover_enabled{true};                     // --failover-enabled
 };
 
 // ── TcpServer ─────────────────────────────────────────────────────────────────

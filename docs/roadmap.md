@@ -55,17 +55,19 @@ Development plan towards production quality and High Availability.
 
 ### 9. Automatic failover
 - Replica with the highest confirmed WAL offset promotes itself to primary
-- Option A: External coordinator (etcd/consul) — simpler, proven
-- Option B: Built-in Raft — zero external deps, more work
-- Recommendation: start with option A
+- External coordinator (etcd v3 REST) with lease-based leadership
+- EpochManager, CoordinatorClient, FailoverManager with role transitions
+- Status: **DONE** — `EpochManager` (WAL epoch records, monotonic enforcement), `CoordinatorClient` (etcd v3 REST via libcurl, lease grant/refresh/revoke, CAS leadership), `FailoverManager` (monitor loop, promotion/demotion, graceful failover), Engine integration with `RoleTransitionHandler`
 
 ### 10. Client-side failover
 - Python bindings: `OrderbookEngine(hosts=["primary:5555", "replica1:5556"])`
 - Automatic switchover to new primary after failover
+- Status: **DONE** — `_ClientPool` with `_discover_primary()`, write routing with retry, read fallback, background health check loop, `ROLE` command support
 
 ### 11. Fencing / split-brain protection
 - WAL epoch counter: each new primary increments the epoch
 - Replicas reject writes from the old epoch
+- Status: **DONE** — Epoch in wire protocol (REPLICATE/WAL/HEARTBEAT), stale-epoch fencing, `ERR STALE_PRIMARY` on handshake, epoch persistence through WAL replay
 
 ## Phase 4 — Scalability and features
 
@@ -99,7 +101,7 @@ Development plan towards production quality and High Availability.
 | P1 | WAL streaming (#6) | L | Foundation for everything | ✅ Done |
 | P2 | Read replicas (#7) | M | First HA benefit | ✅ Done |
 | P2 | Replica lag (#8) | S | Operational necessity | ✅ Done |
-| P3 | Failover (#9-11) | XL | Full HA | |
+| P3 | Failover (#9-11) | XL | Full HA | ✅ Done |
 | P3 | Snapshot bootstrap (#13) | L | Replica catch-up | ✅ Done |
 | P4 | Sharding, TTL (#12-15) | XL | Scale | |
 

@@ -295,6 +295,7 @@ private:
     uint32_t confirmed_file_{0};
     size_t   confirmed_offset_{0};
     uint64_t records_replayed_{0};
+    uint64_t local_epoch_{0};
 
     // Snapshot bootstrap state
     std::atomic<bool> bootstrapping_{false};

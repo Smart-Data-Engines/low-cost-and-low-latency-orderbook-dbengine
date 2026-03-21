@@ -3,6 +3,8 @@
 #include "orderbook/aggregation.hpp"
 #include "orderbook/columnar_store.hpp"
 #include "orderbook/data_model.hpp"
+#include "orderbook/epoch.hpp"
+#include "orderbook/failover.hpp"
 #include "orderbook/query_engine.hpp"
 #include "orderbook/replication.hpp"
 #include "orderbook/soa_buffer.hpp"
@@ -26,13 +28,14 @@ namespace ob {
 ///   wal_ → agg_ → buffers_/live_ptrs_ → stores_ → combined_store_ → query_engine_
 ///
 /// Requirements: 7.3, 7.4, 7.5, 8.1, 8.3
-class Engine {
+class Engine : public RoleTransitionHandler {
 public:
     explicit Engine(std::string_view base_dir,
                     uint64_t flush_interval_ns = 100'000'000ULL,
                     FsyncPolicy fsync_policy = FsyncPolicy::INTERVAL,
                     ReplicationConfig repl_config = {},
-                    ReplicationClientConfig repl_client_config = {});
+                    ReplicationClientConfig repl_client_config = {},
+                    FailoverConfig failover_config = {});
 
     ~Engine();
 
@@ -99,6 +102,12 @@ public:
         size_t   snapshot_bytes_received{0};
         size_t   snapshot_bytes_total{0};
         bool     snapshot_active{false};  // primary: snapshot transfer in progress
+
+        // Failover state
+        NodeRole    node_role{NodeRole::STANDALONE};
+        uint64_t    current_epoch{0};
+        std::string primary_address;
+        int64_t     lease_ttl_remaining{0};
     };
 
     /// Collect current engine statistics (thread-safe, acquires mtx_).
@@ -118,6 +127,28 @@ public:
 
     /// Access the base data directory path.
     const std::string& base_dir() const { return base_dir_; }
+
+    // ── Failover / role management ────────────────────────────────────────────
+
+    /// RoleTransitionHandler overrides.
+    void promote_to_primary(const EpochValue& new_epoch) override;
+    void demote_to_replica(const std::string& new_primary_address) override;
+    std::pair<uint32_t, size_t> get_wal_position() const override;
+    EpochValue get_current_epoch() const override;
+    void truncate_and_rebootstrap(const EpochValue& new_epoch,
+                                  const std::string& primary_address) override;
+
+    /// Get current node role.
+    NodeRole node_role() const;
+
+    /// Get current epoch value.
+    uint64_t current_epoch() const;
+
+    /// Handle ROLE command — returns wire-protocol response.
+    std::string handle_role_command() const;
+
+    /// Handle FAILOVER command — returns wire-protocol response.
+    std::string handle_failover_command(const std::string& target_node_id);
 
 private:
     std::string base_dir_;
@@ -144,6 +175,12 @@ private:
     ReplicationClientConfig              repl_client_config_;
     std::unique_ptr<ReplicationManager>  repl_mgr_;
     std::unique_ptr<ReplicationClient>   repl_client_;
+
+    // Failover (optional, disabled when coordinator endpoints are empty)
+    FailoverConfig                       failover_config_;
+    std::unique_ptr<FailoverManager>     failover_mgr_;
+    std::atomic<NodeRole>                node_role_{NodeRole::STANDALONE};
+    std::atomic<uint64_t>                current_epoch_{0};
 
     // Background flush thread
     std::thread       flush_thread_;

@@ -285,7 +285,7 @@ TEST_F(ReplicationProtocolTest, HeartbeatSentAfterIdle) {
     // Wait for heartbeat (sent every 5 seconds). Use a generous timeout.
     // The epoll loop checks every 100ms and sends heartbeat after 5s idle.
     std::string line = recv_line(fd, 7000);
-    EXPECT_EQ(line, "HEARTBEAT") << "Should receive HEARTBEAT after idle period";
+    EXPECT_TRUE(line.rfind("HEARTBEAT", 0) == 0) << "Should receive HEARTBEAT after idle period";
 
     ::close(fd);
     mgr->stop();
@@ -615,7 +615,7 @@ TEST_F(ReplicationClientTest, ClientConnectsAndSendsHandshake) {
 
     // 5. Read the REPLICATE handshake.
     std::string handshake = recv_line(client_fd, 3000);
-    EXPECT_EQ(handshake, "REPLICATE 0 0")
+    EXPECT_TRUE(handshake.rfind("REPLICATE 0 0", 0) == 0)
         << "Client should send REPLICATE 0 0 handshake, got: " << handshake;
 
     // Cleanup.

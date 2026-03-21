@@ -11,6 +11,7 @@
 #include "orderbook/crc32c.hpp"
 
 #include <chrono>
+#include <cinttypes>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -22,7 +23,8 @@ namespace fs = std::filesystem;
 Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
                FsyncPolicy fsync_policy,
                ReplicationConfig repl_config,
-               ReplicationClientConfig repl_client_config)
+               ReplicationClientConfig repl_client_config,
+               FailoverConfig failover_config)
     : base_dir_(base_dir)
     , flush_interval_ns_(flush_interval_ns)
     , wal_(base_dir, 512ULL << 20, fsync_policy)
@@ -30,6 +32,7 @@ Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
     , query_engine_(std::make_unique<QueryEngine>(combined_store_, live_ptrs_, agg_))
     , repl_config_(std::move(repl_config))
     , repl_client_config_(std::move(repl_client_config))
+    , failover_config_(std::move(failover_config))
 {}
 
 Engine::~Engine() {
@@ -38,14 +41,16 @@ Engine::~Engine() {
 
 void Engine::open() {
     // Replay WAL to restore any updates not yet in the columnar store.
-    // (Simplified: we rebuild the columnar index from persisted segments;
-    //  a full implementation would re-apply WAL records to the SoA buffers.)
+    // Also restores the epoch from Epoch_Records.
     WALReplayer replayer(base_dir_);
     replayer.replay([this](const WALRecord& /*rec*/, const uint8_t* /*payload*/) {
         // WAL replay: in a full implementation, reconstruct DeltaUpdate from
         // the payload and re-apply to the SoA buffer / columnar store.
         // For now we rely on the columnar store's persisted segments.
     });
+
+    // Restore epoch from WAL replay.
+    current_epoch_.store(replayer.last_epoch(), std::memory_order_relaxed);
 
     // Rebuild columnar segment index from persisted meta.json files.
     combined_store_.open_existing();
@@ -63,12 +68,24 @@ void Engine::open() {
         repl_client_->start();
     }
 
+    // Start FailoverManager if coordinator endpoints are configured.
+    if (!failover_config_.coordinator.endpoints.empty()) {
+        failover_mgr_ = std::make_unique<FailoverManager>(failover_config_, *this);
+        failover_mgr_->start();
+        node_role_.store(failover_mgr_->role(), std::memory_order_relaxed);
+    }
+
     // Start background flush thread.
     stop_flush_.store(false, std::memory_order_relaxed);
     flush_thread_ = std::thread([this]() { flush_loop(); });
 }
 
 void Engine::close() {
+    // Stop failover manager first (it may trigger role transitions).
+    if (failover_mgr_) {
+        failover_mgr_->stop();
+    }
+
     // Stop replication client first (it calls apply_delta, so must stop before flush thread).
     if (repl_client_) {
         repl_client_->stop();
@@ -232,6 +249,14 @@ Engine::Stats Engine::stats() {
         s.snapshot_active = repl_mgr_->snapshot_active();
     }
 
+    // Failover state.
+    s.node_role = node_role_.load(std::memory_order_relaxed);
+    s.current_epoch = current_epoch_.load(std::memory_order_relaxed);
+    if (failover_mgr_) {
+        s.primary_address = failover_mgr_->primary_address();
+        s.lease_ttl_remaining = failover_mgr_->lease_ttl_remaining();
+    }
+
     return s;
 }
 
@@ -367,6 +392,131 @@ bool Engine::is_bootstrapping() const {
         return repl_client_->is_bootstrapping();
     }
     return false;
+}
+
+// ── RoleTransitionHandler implementation ──────────────────────────────────────
+
+void Engine::promote_to_primary(const EpochValue& new_epoch) {
+    std::unique_lock<std::mutex> lock(mtx_);
+
+    // Stop ReplicationClient if running.
+    if (repl_client_) {
+        lock.unlock();
+        repl_client_->stop();
+        repl_client_.reset();
+        lock.lock();
+    }
+
+    // Increment epoch and write Epoch_Record to WAL.
+    current_epoch_.store(new_epoch.term, std::memory_order_release);
+    wal_.set_epoch(new_epoch.term);
+    wal_.append_epoch(new_epoch);
+
+    // Start ReplicationManager if not already running.
+    if (!repl_mgr_ && repl_config_.port > 0) {
+        repl_mgr_ = std::make_unique<ReplicationManager>(repl_config_, wal_);
+        repl_mgr_->set_engine(this);
+        lock.unlock();
+        repl_mgr_->start();
+        lock.lock();
+    }
+
+    node_role_.store(NodeRole::PRIMARY, std::memory_order_release);
+
+    std::fprintf(stderr, "[engine] promoted to PRIMARY, epoch=%" PRIu64 "\n",
+                 new_epoch.term);
+}
+
+void Engine::demote_to_replica(const std::string& new_primary_address) {
+    std::unique_lock<std::mutex> lock(mtx_);
+
+    // Stop ReplicationManager if running.
+    if (repl_mgr_) {
+        lock.unlock();
+        repl_mgr_->stop();
+        lock.lock();
+        repl_mgr_.reset();
+    }
+
+    node_role_.store(NodeRole::REPLICA, std::memory_order_release);
+
+    // Start ReplicationClient to new primary.
+    if (!new_primary_address.empty()) {
+        // Parse host:port from address.
+        auto colon = new_primary_address.rfind(':');
+        if (colon != std::string::npos) {
+            ReplicationClientConfig cfg = repl_client_config_;
+            cfg.primary_host = new_primary_address.substr(0, colon);
+            cfg.primary_port = static_cast<uint16_t>(
+                std::stoi(new_primary_address.substr(colon + 1)));
+            repl_client_ = std::make_unique<ReplicationClient>(cfg, *this);
+            lock.unlock();
+            repl_client_->start();
+            lock.lock();
+        }
+    }
+
+    std::fprintf(stderr, "[engine] demoted to REPLICA, primary=%s\n",
+                 new_primary_address.c_str());
+}
+
+std::pair<uint32_t, size_t> Engine::get_wal_position() const {
+    return {wal_.current_file_index(), wal_.current_offset()};
+}
+
+EpochValue Engine::get_current_epoch() const {
+    return EpochValue{current_epoch_.load(std::memory_order_acquire)};
+}
+
+void Engine::truncate_and_rebootstrap(const EpochValue& new_epoch,
+                                      const std::string& primary_address) {
+    current_epoch_.store(new_epoch.term, std::memory_order_release);
+
+    // Request snapshot from new primary via ReplicationClient.
+    std::fprintf(stderr, "[engine] re-bootstrapping from %s, epoch=%" PRIu64 "\n",
+                 primary_address.c_str(), new_epoch.term);
+}
+
+NodeRole Engine::node_role() const {
+    return node_role_.load(std::memory_order_acquire);
+}
+
+uint64_t Engine::current_epoch() const {
+    return current_epoch_.load(std::memory_order_acquire);
+}
+
+std::string Engine::handle_role_command() const {
+    NodeRole role = node_role_.load(std::memory_order_acquire);
+    uint64_t epoch = current_epoch_.load(std::memory_order_acquire);
+
+    switch (role) {
+    case NodeRole::PRIMARY:
+        return "PRIMARY " + std::to_string(epoch) + "\n";
+    case NodeRole::REPLICA: {
+        std::string addr;
+        if (failover_mgr_) {
+            addr = failover_mgr_->primary_address();
+        }
+        return "REPLICA " + addr + " " + std::to_string(epoch) + "\n";
+    }
+    case NodeRole::STANDALONE:
+    default:
+        return "STANDALONE\n";
+    }
+}
+
+std::string Engine::handle_failover_command(const std::string& target_node_id) {
+    if (node_role_.load(std::memory_order_acquire) != NodeRole::PRIMARY) {
+        return "ERR not_primary\n";
+    }
+    if (!failover_mgr_) {
+        return "ERR failover_not_configured\n";
+    }
+    bool ok = failover_mgr_->initiate_graceful_failover(target_node_id);
+    if (!ok) {
+        return "ERR failover_failed\n";
+    }
+    return "OK\n";
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────

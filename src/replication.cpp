@@ -4,11 +4,12 @@
 // stream WAL records, handle ACKs, and send heartbeats.
 //
 // Wire protocol (text+binary hybrid, newline-delimited control messages):
-//   Handshake:  REPLICATE <file_index> <byte_offset>\n
-//   WAL record: WAL <file_index> <byte_offset> <total_len>\n<WALRecord(24)><payload>
+//   Handshake:  REPLICATE <file_index> <byte_offset> <epoch>\n
+//   WAL record: WAL <file_index> <byte_offset> <total_len> <epoch>\n<WALRecord(24)><payload>
 //   ACK:        ACK <file_index> <byte_offset>\n
-//   Heartbeat:  HEARTBEAT\n
+//   Heartbeat:  HEARTBEAT <epoch>\n
 //   Error:      ERR <message>\n
+//   Stale:      ERR STALE_PRIMARY\n
 //
 // Design notes:
 //   - broadcast() is non-blocking: it enqueues data into per-replica send buffers.
@@ -16,7 +17,7 @@
 //   - Line parsing uses BufferedReader (4 KB chunks) instead of byte-by-byte recv().
 //   - CRC32C uses the shared constexpr table from orderbook/crc32c.hpp.
 //
-// Requirements: 1.1, 1.2, 1.3, 1.4, 4.1, 4.2, 4.3, 4.4, 4.5, 6.2, 6.3
+// Requirements: 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 3.1, 3.2, 3.3, 3.4, 3.5, 4.1, 4.2, 4.3, 4.4, 4.5, 6.2, 6.3
 
 #include "orderbook/replication.hpp"
 #include "orderbook/crc32c.hpp"
@@ -25,6 +26,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -309,14 +311,15 @@ void ReplicationManager::broadcast(const WALRecord& hdr, const void* payload,
     // Non-blocking broadcast: enqueue the WAL message into each replica's send
     // buffer. The epoll thread will drain buffers via EPOLLOUT.
     //
-    // Format: WAL <file_index> <byte_offset> <total_len>\n<WALRecord(24)><payload>
+    // Format: WAL <file_index> <byte_offset> <total_len> <epoch>\n<WALRecord(24)><payload>
     const uint32_t file_index = wal_.current_file_index();
+    const uint64_t epoch = wal_.current_epoch();
     const size_t total_len = sizeof(WALRecord) + payload_len;
 
     // Build the text header line.
     char line[128];
-    int line_len = std::snprintf(line, sizeof(line), "WAL %u %zu %zu\n",
-                                  file_index, static_cast<size_t>(0), total_len);
+    int line_len = std::snprintf(line, sizeof(line), "WAL %u %zu %zu %" PRIu64 "\n",
+                                  file_index, static_cast<size_t>(0), total_len, epoch);
 
     // Build the complete message: text header + WALRecord bytes + payload bytes.
     std::vector<uint8_t> msg(static_cast<size_t>(line_len) + total_len);
@@ -457,12 +460,13 @@ void ReplicationManager::run_loop() {
         auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - last_heartbeat).count() >= 5) {
             last_heartbeat = now;
-            const char* hb = "HEARTBEAT\n";
-            const size_t hb_len = 10;
+            const uint64_t epoch = wal_.current_epoch();
+            char hb[64];
+            int hb_len = std::snprintf(hb, sizeof(hb), "HEARTBEAT %" PRIu64 "\n", epoch);
 
             std::lock_guard<std::mutex> lock(mtx_);
             for (auto it = replicas_.begin(); it != replicas_.end(); ) {
-                enqueue_send(*it, hb, hb_len);
+                enqueue_send(*it, hb, static_cast<size_t>(hb_len));
                 if (it->send_buf.size() > MAX_SEND_BUF_SIZE) {
                     remove_replica_locked(it->fd);
                     it = replicas_.erase(it);
@@ -559,11 +563,28 @@ void ReplicationManager::handle_replica_data(int fd) {
 
         std::string line(buf);
 
-        // Parse REPLICATE handshake: REPLICATE <file_index> <byte_offset>
+        // Parse REPLICATE handshake: REPLICATE <file_index> <byte_offset> <epoch>
         if (line.rfind("REPLICATE ", 0) == 0) {
             uint32_t from_file = 0;
             size_t from_offset = 0;
-            if (std::sscanf(line.c_str(), "REPLICATE %u %zu", &from_file, &from_offset) == 2) {
+            uint64_t replica_epoch = 0;
+            int parsed = std::sscanf(line.c_str(), "REPLICATE %u %zu %" SCNu64,
+                                     &from_file, &from_offset, &replica_epoch);
+            if (parsed >= 2) {
+                // Stale-primary check: if replica's epoch > our epoch, reject (Requirement 3.4).
+                if (parsed == 3 && replica_epoch > wal_.current_epoch()) {
+                    const char* err = "ERR STALE_PRIMARY\n";
+                    auto wr = ::write(replica_ptr->fd, err, std::strlen(err));
+                    (void)wr;
+                    remove_replica_locked(fd);
+                    for (auto it = replicas_.begin(); it != replicas_.end(); ++it) {
+                        if (it->fd == fd) {
+                            replicas_.erase(it);
+                            break;
+                        }
+                    }
+                    return;
+                }
                 replica_ptr->confirmed_file   = from_file;
                 replica_ptr->confirmed_offset = from_offset;
                 // Perform catchup from the requested position.
@@ -595,14 +616,15 @@ void ReplicationManager::handle_replica_data(int fd) {
 
 void ReplicationManager::send_to_replica(ReplicaInfo& replica, const WALRecord& hdr,
                                           const void* payload, size_t payload_len) {
-    // Format: WAL <file_index> <byte_offset> <total_len>\n<WALRecord(24)><payload>
+    // Format: WAL <file_index> <byte_offset> <total_len> <epoch>\n<WALRecord(24)><payload>
     const size_t total_len = sizeof(WALRecord) + payload_len;
+    const uint64_t epoch = wal_.current_epoch();
 
     char line[128];
-    int line_len = std::snprintf(line, sizeof(line), "WAL %u %zu %zu\n",
+    int line_len = std::snprintf(line, sizeof(line), "WAL %u %zu %zu %" PRIu64 "\n",
                                   replica.confirmed_file,
                                   replica.confirmed_offset,
-                                  total_len);
+                                  total_len, epoch);
 
     // Build complete message.
     std::vector<uint8_t> msg(static_cast<size_t>(line_len) + total_len);
@@ -947,12 +969,12 @@ void ReplicationClient::connect_to_primary() {
     // Initialize the buffered reader for this connection.
     reader_.set_fd(fd_);
 
-    // Send REPLICATE handshake (Requirement 4.2).
-    // Even fresh replicas start with REPLICATE 0 0. If the primary responds
+    // Send REPLICATE handshake (Requirement 4.2, 3.1).
+    // Even fresh replicas start with REPLICATE 0 0 0. If the primary responds
     // with ERR WAL_TRUNCATED, receive_and_replay() will trigger snapshot bootstrap.
     char handshake[128];
-    int len = std::snprintf(handshake, sizeof(handshake), "REPLICATE %u %zu\n",
-                            confirmed_file_, confirmed_offset_);
+    int len = std::snprintf(handshake, sizeof(handshake), "REPLICATE %u %zu %" PRIu64 "\n",
+                            confirmed_file_, confirmed_offset_, local_epoch_);
     if (!send_all(fd_, handshake, static_cast<size_t>(len))) {
         ::close(fd_);
         fd_ = -1;
@@ -982,14 +1004,29 @@ void ReplicationClient::receive_and_replay() {
             continue;
         }
 
-        // Parse WAL record: WAL <file_index> <byte_offset> <total_len>
+        // Parse WAL record: WAL <file_index> <byte_offset> <total_len> <epoch>
         if (std::strncmp(line_buf, "WAL ", 4) == 0) {
             uint32_t file_index = 0;
             size_t byte_offset = 0;
             size_t total_len = 0;
-            if (std::sscanf(line_buf, "WAL %u %zu %zu",
-                            &file_index, &byte_offset, &total_len) != 3) {
+            uint64_t msg_epoch = 0;
+            int parsed = std::sscanf(line_buf, "WAL %u %zu %zu %" SCNu64,
+                            &file_index, &byte_offset, &total_len, &msg_epoch);
+            if (parsed < 3) {
                 continue; // Malformed — skip.
+            }
+
+            // Stale-epoch check (Requirement 2.1, 2.2, 3.5).
+            if (parsed == 4 && msg_epoch < local_epoch_) {
+                // Stale primary — disconnect and log warning.
+                std::fprintf(stderr, "ReplicationClient: stale epoch %" PRIu64
+                             " < local %" PRIu64 ", disconnecting\n",
+                             msg_epoch, local_epoch_);
+                return;
+            }
+            // Epoch advancement: if received epoch > local, update (Requirement 2.4).
+            if (parsed == 4 && msg_epoch > local_epoch_) {
+                local_epoch_ = msg_epoch;
             }
 
             if (total_len < sizeof(WALRecord) || total_len > 1024 * 1024) {
@@ -1023,7 +1060,15 @@ void ReplicationClient::receive_and_replay() {
                 return;
             }
 
-            // Skip non-DELTA records (GAP, ROTATE, etc.) — only replay DELTA.
+            // Handle Epoch_Record: update local epoch (Requirement 2.4).
+            if (hdr.record_type == WAL_RECORD_EPOCH && payload_len == 8) {
+                EpochValue received_epoch = epoch_from_payload(payload);
+                if (received_epoch.term > local_epoch_) {
+                    local_epoch_ = received_epoch.term;
+                }
+            }
+
+            // Skip non-DELTA records (GAP, ROTATE, EPOCH, etc.) — only replay DELTA.
             if (hdr.record_type == WAL_RECORD_DELTA && payload_len >= sizeof(DeltaUpdate)) {
                 // Decode DeltaUpdate + Levels from payload.
                 DeltaUpdate delta{};
@@ -1049,8 +1094,23 @@ void ReplicationClient::receive_and_replay() {
             continue;
         }
 
-        // Handle HEARTBEAT: respond with current ACK (Requirement 4.5).
+        // Handle HEARTBEAT <epoch>: respond with current ACK (Requirement 4.5, 3.3, 3.5).
         if (std::strncmp(line_buf, "HEARTBEAT", 9) == 0) {
+            // Parse epoch from HEARTBEAT message.
+            uint64_t hb_epoch = 0;
+            if (std::sscanf(line_buf, "HEARTBEAT %" SCNu64, &hb_epoch) == 1) {
+                // Stale-epoch check (Requirement 3.5).
+                if (hb_epoch < local_epoch_) {
+                    std::fprintf(stderr, "ReplicationClient: stale heartbeat epoch %" PRIu64
+                                 " < local %" PRIu64 ", disconnecting\n",
+                                 hb_epoch, local_epoch_);
+                    return;
+                }
+                // Epoch advancement.
+                if (hb_epoch > local_epoch_) {
+                    local_epoch_ = hb_epoch;
+                }
+            }
             send_ack();
             continue;
         }

@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include "orderbook/data_model.hpp"
+#include "orderbook/epoch.hpp"
 
 namespace ob {
 
@@ -80,6 +81,15 @@ public:
     /// Write a GAP record (called by the engine when a sequence gap is detected).
     void append_gap(uint64_t sequence_number, uint64_t timestamp_ns);
 
+    /// Write an EPOCH record (WAL_RECORD_EPOCH, type=5) with the given epoch value.
+    void append_epoch(const EpochValue& epoch);
+
+    /// Set the current epoch tracked by this writer.
+    void set_epoch(uint64_t e) { current_epoch_ = e; }
+
+    /// Get the current epoch tracked by this writer.
+    uint64_t current_epoch() const { return current_epoch_; }
+
     /// Force rotation: write ROTATE record, close current file, open next.
     void rotate();
 
@@ -114,6 +124,7 @@ private:
     std::string dir_;
     uint32_t    file_index_;
     size_t      pending_sync_{0};
+    uint64_t    current_epoch_{0};
 
     // Pre-allocated write buffer to avoid per-record heap allocations.
     std::vector<uint8_t> write_buf_;
@@ -141,8 +152,12 @@ public:
     uint64_t replay(
         std::function<void(const WALRecord&, const uint8_t* payload)> cb);
 
+    /// Return the highest epoch found during the last replay (0 if none).
+    uint64_t last_epoch() const { return last_epoch_; }
+
 private:
     std::string dir_;
+    uint64_t    last_epoch_{0};
 };
 
 } // namespace ob

@@ -199,3 +199,63 @@ ob_add_tcp_test(test_tcp_server
 ob_add_engine_test(test_replication
     test_replication.cpp
 )
+
+# ── Epoch tests (ha-automatic-failover) ───────────────────────────────────────
+add_executable(test_epoch test_epoch.cpp)
+target_link_libraries(test_epoch
+    PRIVATE
+        orderbook_wal
+        orderbook_epoch
+        GTest::gtest_main
+        rapidcheck
+)
+gtest_discover_tests(test_epoch)
+
+# ── Wire protocol epoch tests (ha-automatic-failover) ─────────────────────────
+add_executable(test_wire_protocol_epoch test_wire_protocol_epoch.cpp)
+target_link_libraries(test_wire_protocol_epoch
+    PRIVATE
+        orderbook_epoch
+        GTest::gtest_main
+        rapidcheck
+)
+gtest_discover_tests(test_wire_protocol_epoch)
+
+# ── Failover election tests (ha-automatic-failover, Property 9) ───────────────
+add_executable(test_failover_election test_failover_election.cpp)
+target_link_libraries(test_failover_election
+    PRIVATE
+        orderbook_failover
+        GTest::gtest_main
+        rapidcheck
+)
+gtest_discover_tests(test_failover_election)
+
+# ── Failover roles tests (ha-automatic-failover, Properties 10, 15, 16) ──────
+add_executable(test_failover_roles test_failover_roles.cpp)
+target_link_libraries(test_failover_roles
+    PRIVATE
+        orderbook_engine
+        GTest::gtest_main
+        rapidcheck
+)
+gtest_discover_tests(test_failover_roles)
+
+# ── CLI failover tests (ha-automatic-failover, Property 11) ──────────────────
+add_executable(test_cli_failover test_cli_failover.cpp)
+target_link_libraries(test_cli_failover
+    PRIVATE
+        orderbook_tcp_server_lib
+        GTest::gtest_main
+        rapidcheck
+)
+gtest_discover_tests(test_cli_failover)
+
+# ── Failover integration tests (ha-automatic-failover) ────────────────────────
+add_executable(test_failover_integration test_failover_integration.cpp)
+target_link_libraries(test_failover_integration
+    PRIVATE
+        orderbook_engine
+        GTest::gtest_main
+)
+gtest_discover_tests(test_failover_integration)

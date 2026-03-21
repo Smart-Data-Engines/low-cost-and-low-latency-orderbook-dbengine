@@ -4,6 +4,7 @@
 
 #include "orderbook/wal.hpp"
 #include "orderbook/crc32c.hpp"
+#include "orderbook/epoch.hpp"
 
 #include <algorithm>
 #include <array>
@@ -169,6 +170,22 @@ void WALWriter::append_gap(uint64_t sequence_number, uint64_t timestamp_ns) {
     write_record(hdr, nullptr, 0);
 }
 
+void WALWriter::append_epoch(const EpochValue& epoch) {
+    uint8_t payload[8];
+    epoch_to_payload(epoch, payload);
+
+    WALRecord hdr{};
+    hdr.sequence_number = 0;
+    hdr.timestamp_ns    = 0;
+    hdr.checksum        = crc32c(payload, sizeof(payload));
+    hdr.payload_len     = 8;
+    hdr.record_type     = WAL_RECORD_EPOCH;
+    hdr._pad            = 0;
+
+    write_record(hdr, payload, sizeof(payload));
+    current_epoch_ = epoch.term;
+}
+
 void WALWriter::rotate() {
     // Write a ROTATE record to the current file.
     WALRecord hdr{};
@@ -225,6 +242,9 @@ WALReplayer::WALReplayer(std::string_view dir)
 uint64_t WALReplayer::replay(
     std::function<void(const WALRecord&, const uint8_t* payload)> cb)
 {
+    // Reset epoch tracking for this replay.
+    last_epoch_ = 0;
+
     // Collect all wal_*.bin files and sort them by index.
     std::vector<std::pair<uint32_t, std::string>> files;
 
@@ -281,6 +301,14 @@ uint64_t WALReplayer::replay(
             // ROTATE record signals end of this file's useful content.
             if (hdr.record_type == WAL_RECORD_ROTATE) {
                 break;
+            }
+
+            // Track highest epoch seen in WAL_RECORD_EPOCH records.
+            if (hdr.record_type == WAL_RECORD_EPOCH && hdr.payload_len == 8) {
+                const EpochValue ev = epoch_from_payload(payload.data());
+                if (ev.term > last_epoch_) {
+                    last_epoch_ = ev.term;
+                }
             }
 
             // Invoke callback.
