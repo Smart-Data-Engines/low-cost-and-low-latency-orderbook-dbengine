@@ -3,6 +3,7 @@
 // CRC32C is computed via a software lookup-table (portable, no hardware intrinsics).
 
 #include "orderbook/wal.hpp"
+#include "orderbook/crc32c.hpp"
 
 #include <algorithm>
 #include <array>
@@ -19,35 +20,7 @@
 
 namespace ob {
 
-// ── Portable CRC32C (software lookup table) ───────────────────────────────────
-// Polynomial: 0x1EDC6F41 (Castagnoli)
 namespace {
-
-static constexpr uint32_t CRC32C_POLY = 0x82F63B78u; // reflected form
-
-static uint32_t crc32c_table[256];
-static bool     crc32c_table_init = false;
-
-static void init_crc32c_table() {
-    for (uint32_t i = 0; i < 256; ++i) {
-        uint32_t crc = i;
-        for (int j = 0; j < 8; ++j) {
-            crc = (crc >> 1) ^ ((crc & 1u) ? CRC32C_POLY : 0u);
-        }
-        crc32c_table[i] = crc;
-    }
-    crc32c_table_init = true;
-}
-
-static uint32_t crc32c(const void* data, size_t len) {
-    if (!crc32c_table_init) init_crc32c_table();
-    const auto* p = static_cast<const uint8_t*>(data);
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; ++i) {
-        crc = (crc >> 8) ^ crc32c_table[(crc ^ p[i]) & 0xFFu];
-    }
-    return crc ^ 0xFFFFFFFFu;
-}
 
 // Build the WAL filename for a given index.
 static std::string wal_filename(const std::string& dir, uint32_t index) {
@@ -252,8 +225,6 @@ WALReplayer::WALReplayer(std::string_view dir)
 uint64_t WALReplayer::replay(
     std::function<void(const WALRecord&, const uint8_t* payload)> cb)
 {
-    if (!crc32c_table_init) init_crc32c_table();
-
     // Collect all wal_*.bin files and sort them by index.
     std::vector<std::pair<uint32_t, std::string>> files;
 

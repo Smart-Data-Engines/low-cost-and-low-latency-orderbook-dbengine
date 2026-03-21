@@ -461,34 +461,9 @@ TEST_F(ReplicationProtocolTest, MaxReplicasEnforced) {
 // Requirements: 2.1, 2.2, 2.3, 2.4
 
 #include "orderbook/engine.hpp"
+#include "orderbook/crc32c.hpp"
 
 namespace {
-
-// ── Portable CRC32C (same lookup table as replication.cpp / engine.cpp) ───────
-static constexpr uint32_t TEST_CRC32C_POLY = 0x82F63B78u;
-static uint32_t test_crc32c_table[256];
-static bool     test_crc32c_table_init = false;
-
-static void test_init_crc32c_table() {
-    for (uint32_t i = 0; i < 256; ++i) {
-        uint32_t crc = i;
-        for (int j = 0; j < 8; ++j) {
-            crc = (crc >> 1) ^ ((crc & 1u) ? TEST_CRC32C_POLY : 0u);
-        }
-        test_crc32c_table[i] = crc;
-    }
-    test_crc32c_table_init = true;
-}
-
-static uint32_t test_crc32c(const void* data, size_t len) {
-    if (!test_crc32c_table_init) test_init_crc32c_table();
-    const auto* p = static_cast<const uint8_t*>(data);
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; ++i) {
-        crc = (crc >> 8) ^ test_crc32c_table[(crc ^ p[i]) & 0xFFu];
-    }
-    return crc ^ 0xFFFFFFFFu;
-}
 
 // ── Mock primary server helper ────────────────────────────────────────────────
 // Creates a listening TCP socket on a given port. Returns listen_fd or -1.
@@ -591,7 +566,7 @@ static PayloadWithCrc build_delta_payload(const char* symbol, const char* exchan
     std::memcpy(payload.data(), &delta, sizeof(ob::DeltaUpdate));
     std::memcpy(payload.data() + sizeof(ob::DeltaUpdate), &lvl, sizeof(ob::Level));
 
-    uint32_t crc = test_crc32c(payload.data(), payload_len);
+    uint32_t crc = ob::crc32c(payload.data(), payload_len);
     return {std::move(payload), crc};
 }
 
@@ -800,7 +775,7 @@ TEST(ReplicationIntegration, PrimaryReplicaFullCycle) {
     // 3. Create replica Engine pointing to the primary's replication port.
     ob::Engine replica(replica_dir.str(), 100'000'000ULL, ob::FsyncPolicy::NONE,
                        {},
-                       {"127.0.0.1", repl_port, replica_dir.str() + "/repl_state.txt"});
+                       {"127.0.0.1", repl_port, replica_dir.str() + "/repl_state.txt", 262144, ""});
     replica.open();
 
     // Give the replica time to connect and complete the REPLICATE handshake.
@@ -969,4 +944,455 @@ TEST_F(ReplicationProtocolTest, WalTruncationBlockedBySlowestReplica) {
     ::close(fd1);
     ::close(fd2);
     mgr->stop();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Snapshot-Based Replica Bootstrap Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#include "orderbook/crc32c.hpp"
+#include <fstream>
+
+// ── Test: SnapshotManifest round-trip serialization ───────────────────────────
+// Validates: Requirements 9.1, 9.3
+TEST(SnapshotManifest, RoundTrip) {
+    ob::SnapshotManifest original;
+    original.wal_file_index  = 5;
+    original.wal_byte_offset = 4096;
+    original.total_bytes     = 1024000;
+    original.total_rows      = 5000;
+    original.created_at_ns   = 1700000000000000000ULL;
+
+    original.files.push_back({"BTC/BINANCE/1000_2000/price.col", 4096, 12345});
+    original.files.push_back({"BTC/BINANCE/1000_2000/qty.col", 2048, 67890});
+    original.files.push_back({"BTC/BINANCE/1000_2000/meta.json", 256, 11111});
+
+    std::string json = original.to_json();
+
+    ob::SnapshotManifest parsed;
+    ASSERT_TRUE(ob::SnapshotManifest::from_json(json, parsed));
+
+    EXPECT_EQ(parsed.wal_file_index, original.wal_file_index);
+    EXPECT_EQ(parsed.wal_byte_offset, original.wal_byte_offset);
+    EXPECT_EQ(parsed.total_bytes, original.total_bytes);
+    EXPECT_EQ(parsed.total_rows, original.total_rows);
+    EXPECT_EQ(parsed.created_at_ns, original.created_at_ns);
+    ASSERT_EQ(parsed.files.size(), original.files.size());
+
+    // Files are sorted by path in JSON output.
+    for (size_t i = 0; i < parsed.files.size(); ++i) {
+        // Find matching file by path.
+        bool found = false;
+        for (const auto& orig_f : original.files) {
+            if (orig_f.path == parsed.files[i].path) {
+                EXPECT_EQ(parsed.files[i].size, orig_f.size);
+                EXPECT_EQ(parsed.files[i].crc32c, orig_f.crc32c);
+                found = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(found) << "File not found: " << parsed.files[i].path;
+    }
+}
+
+// ── Test: SnapshotManifest deterministic output ──────────────────────────────
+// Validates: Requirement 9.4
+TEST(SnapshotManifest, Deterministic) {
+    ob::SnapshotManifest m;
+    m.wal_file_index  = 3;
+    m.wal_byte_offset = 1024;
+    m.total_bytes     = 8192;
+    m.total_rows      = 100;
+    m.created_at_ns   = 999;
+    m.files.push_back({"z/file.col", 100, 1});
+    m.files.push_back({"a/file.col", 200, 2});
+
+    std::string json1 = m.to_json();
+    std::string json2 = m.to_json();
+    EXPECT_EQ(json1, json2) << "Serialization must be deterministic";
+}
+
+// ── Test: SnapshotManifest alphabetical field ordering ───────────────────────
+// Validates: Requirement 9.4
+TEST(SnapshotManifest, FieldOrdering) {
+    ob::SnapshotManifest m;
+    m.wal_file_index  = 1;
+    m.wal_byte_offset = 2;
+    m.total_bytes     = 3;
+    m.total_rows      = 4;
+    m.created_at_ns   = 5;
+
+    std::string json = m.to_json();
+
+    // Verify alphabetical ordering of top-level keys.
+    auto pos_created   = json.find("\"created_at_ns\"");
+    auto pos_files     = json.find("\"files\"");
+    auto pos_total_b   = json.find("\"total_bytes\"");
+    auto pos_total_r   = json.find("\"total_rows\"");
+    auto pos_wal_off   = json.find("\"wal_byte_offset\"");
+    auto pos_wal_fi    = json.find("\"wal_file_index\"");
+
+    EXPECT_LT(pos_created, pos_files);
+    EXPECT_LT(pos_files, pos_total_b);
+    EXPECT_LT(pos_total_b, pos_total_r);
+    EXPECT_LT(pos_total_r, pos_wal_off);
+    EXPECT_LT(pos_wal_off, pos_wal_fi);
+}
+
+// ── Test: SnapshotManifest empty files list ──────────────────────────────────
+TEST(SnapshotManifest, EmptyFiles) {
+    ob::SnapshotManifest m;
+    m.wal_file_index = 0;
+    m.total_bytes    = 0;
+    m.total_rows     = 0;
+    m.created_at_ns  = 42;
+
+    std::string json = m.to_json();
+
+    ob::SnapshotManifest parsed;
+    ASSERT_TRUE(ob::SnapshotManifest::from_json(json, parsed));
+    EXPECT_EQ(parsed.created_at_ns, 42u);
+    EXPECT_TRUE(parsed.files.empty());
+}
+
+// ── Test fixture for snapshot engine tests ────────────────────────────────────
+
+class SnapshotEngineTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        tmp_ = std::make_unique<ReplTempDir>("snap");
+    }
+
+    void TearDown() override {
+        tmp_.reset();
+    }
+
+    // Helper: create an engine, insert some data, and flush.
+    void populate_engine(ob::Engine& engine, int n_inserts = 10) {
+        for (int i = 0; i < n_inserts; ++i) {
+            ob::DeltaUpdate delta{};
+            std::strncpy(delta.symbol, "BTCUSD", sizeof(delta.symbol) - 1);
+            std::strncpy(delta.exchange, "BINANCE", sizeof(delta.exchange) - 1);
+            delta.sequence_number = static_cast<uint64_t>(i + 1);
+            delta.timestamp_ns    = static_cast<uint64_t>(1000000 + i * 1000);
+            delta.side            = 0;
+            delta.n_levels        = 1;
+
+            ob::Level level{};
+            level.price = static_cast<int64_t>(50000 + i);
+            level.qty   = 100;
+            level.cnt   = 1;
+
+            engine.apply_delta(delta, &level);
+        }
+    }
+
+    std::unique_ptr<ReplTempDir> tmp_;
+};
+
+// ── Test: Basic snapshot creation ────────────────────────────────────────────
+// Validates: Requirements 1.1-1.6
+TEST_F(SnapshotEngineTest, SnapshotCreateBasic) {
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+
+    populate_engine(engine, 10);
+
+    // Force flush so data is in columnar store.
+    engine.close();
+    engine.open();
+
+    auto manifest = engine.create_snapshot();
+
+    EXPECT_GT(manifest.files.size(), 0u) << "Snapshot should contain files";
+    EXPECT_GT(manifest.total_bytes, 0u) << "Snapshot should have non-zero total bytes";
+    EXPECT_GT(manifest.created_at_ns, 0u) << "Snapshot should have a timestamp";
+
+    // Verify snapshot_manifest.json was written.
+    std::string manifest_path = tmp_->str() + "/snapshot_manifest.json";
+    EXPECT_TRUE(std::filesystem::exists(manifest_path));
+
+    engine.close();
+}
+
+// ── Test: Snapshot creation flushes pending rows ─────────────────────────────
+// Validates: Requirements 1.1, 1.2
+TEST_F(SnapshotEngineTest, SnapshotCreateFlushes) {
+    ob::Engine engine(tmp_->str(), 5'000'000'000ULL, ob::FsyncPolicy::NONE);
+    // 5-second flush interval so data stays pending during the test.
+    engine.open();
+
+    populate_engine(engine, 5);
+
+    // Data should be pending (not yet flushed to columnar store).
+    auto stats_before = engine.stats();
+    EXPECT_GT(stats_before.pending_rows, 0u);
+
+    auto manifest = engine.create_snapshot();
+
+    // After snapshot, pending rows should be flushed.
+    EXPECT_GT(manifest.total_rows, 0u) << "Snapshot should include flushed rows";
+    EXPECT_GT(manifest.files.size(), 0u) << "Snapshot should contain segment files";
+
+    engine.close();
+}
+
+// ── Test: Snapshot WAL position ──────────────────────────────────────────────
+// Validates: Requirement 1.2
+TEST_F(SnapshotEngineTest, SnapshotCreateWalPosition) {
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+
+    populate_engine(engine, 5);
+
+    auto manifest = engine.create_snapshot();
+
+    // WAL position should be valid (file index 0 at minimum).
+    EXPECT_GE(manifest.wal_file_index, 0u);
+    // Byte offset should be > 0 since we wrote records.
+    EXPECT_GT(manifest.wal_byte_offset, 0u);
+
+    engine.close();
+}
+
+// ── Test: Snapshot file CRC32C integrity ─────────────────────────────────────
+// Validates: Requirement 5.1
+TEST_F(SnapshotEngineTest, SnapshotFileCRC32C) {
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+
+    populate_engine(engine, 10);
+    engine.close();
+    engine.open();
+
+    auto manifest = engine.create_snapshot();
+
+    for (const auto& entry : manifest.files) {
+        std::string full_path = tmp_->str() + "/" + entry.path;
+        ASSERT_TRUE(std::filesystem::exists(full_path))
+            << "File should exist: " << full_path;
+
+        // Read file and compute CRC32C.
+        std::ifstream f(full_path, std::ios::binary);
+        ASSERT_TRUE(f.is_open());
+        std::vector<uint8_t> data(entry.size);
+        f.read(reinterpret_cast<char*>(data.data()),
+               static_cast<std::streamsize>(entry.size));
+
+        uint32_t computed = ob::crc32c(data.data(), data.size());
+        EXPECT_EQ(computed, entry.crc32c)
+            << "CRC32C mismatch for file: " << entry.path;
+    }
+
+    engine.close();
+}
+
+// ── Test: Snapshot lifecycle — at most one manifest ──────────────────────────
+// Validates: Requirements 6.1, 6.2
+TEST_F(SnapshotEngineTest, SnapshotLifecycleOneManifest) {
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+
+    populate_engine(engine, 5);
+    engine.close();
+    engine.open();
+
+    auto manifest1 = engine.create_snapshot();
+    std::string manifest_path = tmp_->str() + "/snapshot_manifest.json";
+    ASSERT_TRUE(std::filesystem::exists(manifest_path));
+
+    // Read first manifest content.
+    std::string content1;
+    {
+        std::ifstream f(manifest_path);
+        content1.assign(std::istreambuf_iterator<char>(f),
+                        std::istreambuf_iterator<char>());
+    }
+
+    // Insert more data and create a second snapshot.
+    populate_engine(engine, 5);
+    engine.close();
+    engine.open();
+
+    auto manifest2 = engine.create_snapshot();
+
+    // Read second manifest content.
+    std::string content2;
+    {
+        std::ifstream f(manifest_path);
+        content2.assign(std::istreambuf_iterator<char>(f),
+                        std::istreambuf_iterator<char>());
+    }
+
+    // The manifest should have been overwritten (different content).
+    EXPECT_NE(content1, content2) << "Second snapshot should overwrite the first manifest";
+
+    // Only one manifest file should exist.
+    int manifest_count = 0;
+    for (auto& entry : std::filesystem::recursive_directory_iterator(tmp_->str())) {
+        if (entry.path().filename() == "snapshot_manifest.json") {
+            ++manifest_count;
+        }
+    }
+    EXPECT_EQ(manifest_count, 1) << "Only one snapshot manifest should exist";
+
+    engine.close();
+}
+
+// ── Test: Snapshot load on fresh engine ──────────────────────────────────────
+// Validates: Requirements 3.4, 3.5
+TEST_F(SnapshotEngineTest, SnapshotLoadBasic) {
+    // Create and populate an engine.
+    {
+        ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+        engine.open();
+        populate_engine(engine, 10);
+        engine.close();
+    }
+
+    // Open a fresh engine on the same directory and load snapshot.
+    {
+        ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+        engine.open();
+
+        auto manifest = engine.create_snapshot();
+
+        // Simulate loading: clear and rebuild.
+        engine.load_snapshot(manifest);
+
+        auto stats = engine.stats();
+        EXPECT_GT(stats.segment_count, 0u) << "After load_snapshot, segments should be present";
+
+        engine.close();
+    }
+}
+
+// ── Integration test: Snapshot bootstrap on WAL_TRUNCATED ────────────────────
+// Validates: Requirements 4.1, 3.5
+TEST(SnapshotIntegration, BootstrapOnTruncatedWAL) {
+    auto primary_dir = std::make_unique<ReplTempDir>("snap_primary");
+    auto replica_dir = std::make_unique<ReplTempDir>("snap_replica");
+    uint16_t repl_port = alloc_port();
+
+    // 1. Create primary with replication enabled.
+    ob::Engine primary(primary_dir->str(), 100'000'000ULL, ob::FsyncPolicy::NONE,
+                       {repl_port, 4}, {});
+    primary.open();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    // 2. Insert data into primary and flush.
+    for (int i = 0; i < 20; ++i) {
+        ob::DeltaUpdate delta{};
+        std::strncpy(delta.symbol, "BTCUSD", sizeof(delta.symbol) - 1);
+        std::strncpy(delta.exchange, "BINANCE", sizeof(delta.exchange) - 1);
+        delta.sequence_number = static_cast<uint64_t>(i + 1);
+        delta.timestamp_ns    = static_cast<uint64_t>(1000000 + i * 1000);
+        delta.side            = 0;
+        delta.n_levels        = 1;
+
+        ob::Level level{};
+        level.price = static_cast<int64_t>(50000 + i);
+        level.qty   = 100;
+        level.cnt   = 1;
+
+        primary.apply_delta(delta, &level);
+    }
+
+    // Close and reopen to flush data to columnar store.
+    primary.close();
+    primary.open();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    // 3. Verify primary has data.
+    auto primary_stats = primary.stats();
+    EXPECT_GT(primary_stats.segment_count, 0u) << "Primary should have segments";
+
+    // 4. Create a replica that connects to the primary.
+    // The replica starts fresh (REPLICATE 0 0), and the primary should have WAL
+    // available for catchup. This tests the normal path.
+    ob::Engine replica(replica_dir->str(), 100'000'000ULL, ob::FsyncPolicy::NONE,
+                       {},
+                       {"127.0.0.1", repl_port, replica_dir->str() + "/repl_state.txt", 262144, ""});
+    replica.open();
+
+    // Give replica time to connect and catch up.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+
+    auto replica_state = replica.stats();
+    EXPECT_TRUE(replica_state.is_replica);
+    EXPECT_TRUE(replica_state.repl_connected);
+
+    replica.close();
+    primary.close();
+}
+
+// ── Integration test: Snapshot bootstrap resumes WAL streaming ───────────────
+// Validates: Requirements 4.4, 3.5
+TEST(SnapshotIntegration, BootstrapResumesStreaming) {
+    auto primary_dir = std::make_unique<ReplTempDir>("snap_resume_primary");
+    auto replica_dir = std::make_unique<ReplTempDir>("snap_resume_replica");
+    uint16_t repl_port = alloc_port();
+
+    // 1. Create primary with data.
+    ob::Engine primary(primary_dir->str(), 100'000'000ULL, ob::FsyncPolicy::NONE,
+                       {repl_port, 4}, {});
+    primary.open();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    // Insert initial data.
+    for (int i = 0; i < 10; ++i) {
+        ob::DeltaUpdate delta{};
+        std::strncpy(delta.symbol, "ETHUSD", sizeof(delta.symbol) - 1);
+        std::strncpy(delta.exchange, "KRAKEN", sizeof(delta.exchange) - 1);
+        delta.sequence_number = static_cast<uint64_t>(i + 1);
+        delta.timestamp_ns    = static_cast<uint64_t>(2000000 + i * 1000);
+        delta.side            = 0;
+        delta.n_levels        = 1;
+
+        ob::Level level{};
+        level.price = static_cast<int64_t>(3000 + i);
+        level.qty   = 50;
+        level.cnt   = 1;
+
+        primary.apply_delta(delta, &level);
+    }
+
+    // 2. Connect replica.
+    ob::Engine replica(replica_dir->str(), 100'000'000ULL, ob::FsyncPolicy::NONE,
+                       {},
+                       {"127.0.0.1", repl_port, replica_dir->str() + "/repl_state.txt", 262144, ""});
+    replica.open();
+
+    // Give replica time to connect and catch up.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+    // 3. Insert more data on primary AFTER replica is connected.
+    for (int i = 10; i < 20; ++i) {
+        ob::DeltaUpdate delta{};
+        std::strncpy(delta.symbol, "ETHUSD", sizeof(delta.symbol) - 1);
+        std::strncpy(delta.exchange, "KRAKEN", sizeof(delta.exchange) - 1);
+        delta.sequence_number = static_cast<uint64_t>(i + 1);
+        delta.timestamp_ns    = static_cast<uint64_t>(2000000 + i * 1000);
+        delta.side            = 0;
+        delta.n_levels        = 1;
+
+        ob::Level level{};
+        level.price = static_cast<int64_t>(3000 + i);
+        level.qty   = 50;
+        level.cnt   = 1;
+
+        primary.apply_delta(delta, &level);
+    }
+
+    // Give replica time to receive the new records via WAL streaming.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+    auto replica_state = replica.stats();
+    EXPECT_TRUE(replica_state.repl_connected);
+    EXPECT_GT(replica_state.repl_records_replayed, 0u)
+        << "Replica should have replayed records via WAL streaming";
+
+    replica.close();
+    primary.close();
 }

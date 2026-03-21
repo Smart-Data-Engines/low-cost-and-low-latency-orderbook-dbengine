@@ -10,9 +10,16 @@
 //   Heartbeat:  HEARTBEAT\n
 //   Error:      ERR <message>\n
 //
+// Design notes:
+//   - broadcast() is non-blocking: it enqueues data into per-replica send buffers.
+//     The epoll thread drains buffers via EPOLLOUT, keeping the hot path lock-free.
+//   - Line parsing uses BufferedReader (4 KB chunks) instead of byte-by-byte recv().
+//   - CRC32C uses the shared constexpr table from orderbook/crc32c.hpp.
+//
 // Requirements: 1.1, 1.2, 1.3, 1.4, 4.1, 4.2, 4.3, 4.4, 4.5, 6.2, 6.3
 
 #include "orderbook/replication.hpp"
+#include "orderbook/crc32c.hpp"
 #include "orderbook/engine.hpp"
 
 #include <algorithm>
@@ -20,6 +27,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -29,9 +38,12 @@
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace ob {
+
+namespace fs = std::filesystem;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -62,69 +74,139 @@ static bool send_all(int fd, const void* data, size_t len) {
     return true;
 }
 
-/// Read exactly `len` bytes from fd. Returns true on success, false on error/disconnect.
-static bool recv_all(int fd, void* data, size_t len) {
-    auto* ptr = static_cast<uint8_t*>(data);
-    size_t remaining = len;
-    while (remaining > 0) {
-        ssize_t n = ::recv(fd, ptr, remaining, 0);
-        if (n <= 0) return false;
-        ptr += n;
-        remaining -= static_cast<size_t>(n);
-    }
-    return true;
-}
-
-/// Read a newline-terminated line from fd into buf.
-/// Returns number of bytes read (excluding newline), 0 on EAGAIN, -1 on error/disconnect.
-static ssize_t read_line(int fd, char* buf, size_t buf_size) {
-    size_t pos = 0;
-    while (pos < buf_size - 1) {
-        ssize_t n = ::recv(fd, buf + pos, 1, 0);
-        if (n == 0) return -1; // disconnect
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return (pos > 0) ? static_cast<ssize_t>(pos) : 0;
-            }
-            return -1;
-        }
-        if (buf[pos] == '\n') {
-            buf[pos] = '\0';
-            return static_cast<ssize_t>(pos);
-        }
-        ++pos;
-    }
-    buf[pos] = '\0';
-    return static_cast<ssize_t>(pos);
-}
-
-// ── Portable CRC32C (software lookup table, same as wal.cpp) ──────────────────
-static constexpr uint32_t CRC32C_POLY = 0x82F63B78u;
-static uint32_t crc32c_table[256];
-static bool     crc32c_table_init = false;
-
-static void init_crc32c_table() {
-    for (uint32_t i = 0; i < 256; ++i) {
-        uint32_t crc = i;
-        for (int j = 0; j < 8; ++j) {
-            crc = (crc >> 1) ^ ((crc & 1u) ? CRC32C_POLY : 0u);
-        }
-        crc32c_table[i] = crc;
-    }
-    crc32c_table_init = true;
-}
-
-static uint32_t crc32c(const void* data, size_t len) {
-    if (!crc32c_table_init) init_crc32c_table();
-    const auto* p = static_cast<const uint8_t*>(data);
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; ++i) {
-        crc = (crc >> 8) ^ crc32c_table[(crc ^ p[i]) & 0xFFu];
-    }
-    return crc ^ 0xFFFFFFFFu;
-}
+/// Maximum per-replica send buffer size before we consider the replica too slow
+/// and disconnect it. 16 MB is generous for WAL streaming.
+static constexpr size_t MAX_SEND_BUF_SIZE = 16 * 1024 * 1024;
 
 } // anonymous namespace
+
+// ── SnapshotManifest serialization ────────────────────────────────────────────
+
+std::string SnapshotManifest::to_json() const {
+    // Deterministic alphabetical field ordering.
+    std::string out;
+    out.reserve(256 + files.size() * 128);
+
+    out += "{\"created_at_ns\":";
+    out += std::to_string(created_at_ns);
+
+    out += ",\"files\":[";
+    // Sort files by path for deterministic output.
+    auto sorted = files;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const SnapshotFileEntry& a, const SnapshotFileEntry& b) {
+                  return a.path < b.path;
+              });
+    for (size_t i = 0; i < sorted.size(); ++i) {
+        if (i > 0) out += ',';
+        out += "{\"crc32c\":";
+        out += std::to_string(sorted[i].crc32c);
+        out += ",\"path\":\"";
+        out += sorted[i].path;
+        out += "\",\"size\":";
+        out += std::to_string(sorted[i].size);
+        out += '}';
+    }
+    out += ']';
+
+    out += ",\"total_bytes\":";
+    out += std::to_string(total_bytes);
+    out += ",\"total_rows\":";
+    out += std::to_string(total_rows);
+    out += ",\"wal_byte_offset\":";
+    out += std::to_string(wal_byte_offset);
+    out += ",\"wal_file_index\":";
+    out += std::to_string(wal_file_index);
+    out += '}';
+
+    return out;
+}
+
+bool SnapshotManifest::from_json(std::string_view json, SnapshotManifest& out) {
+    out = {};
+
+    auto extract_uint64 = [&](const char* key) -> uint64_t {
+        std::string search = std::string("\"") + key + "\":";
+        auto pos = json.find(search);
+        if (pos == std::string_view::npos) return 0;
+        pos += search.size();
+        uint64_t val = 0;
+        while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') {
+            val = val * 10 + static_cast<uint64_t>(json[pos] - '0');
+            ++pos;
+        }
+        return val;
+    };
+
+    out.created_at_ns   = extract_uint64("created_at_ns");
+    out.total_bytes     = static_cast<size_t>(extract_uint64("total_bytes"));
+    out.total_rows      = static_cast<size_t>(extract_uint64("total_rows"));
+    out.wal_byte_offset = static_cast<size_t>(extract_uint64("wal_byte_offset"));
+    out.wal_file_index  = static_cast<uint32_t>(extract_uint64("wal_file_index"));
+
+    // Parse files array.
+    auto files_pos = json.find("\"files\":[");
+    if (files_pos == std::string_view::npos) return out.total_bytes > 0 || out.created_at_ns > 0;
+    files_pos += 9; // skip "files":[
+
+    while (files_pos < json.size()) {
+        // Find next object start.
+        auto obj_start = json.find('{', files_pos);
+        if (obj_start == std::string_view::npos) break;
+        auto obj_end = json.find('}', obj_start);
+        if (obj_end == std::string_view::npos) break;
+
+        auto obj = json.substr(obj_start, obj_end - obj_start + 1);
+
+        SnapshotFileEntry entry;
+
+        // Extract path.
+        auto path_pos = obj.find("\"path\":\"");
+        if (path_pos != std::string_view::npos) {
+            path_pos += 8;
+            auto path_end = obj.find('"', path_pos);
+            if (path_end != std::string_view::npos) {
+                entry.path = std::string(obj.substr(path_pos, path_end - path_pos));
+            }
+        }
+
+        // Extract size.
+        auto size_search = std::string("\"size\":");
+        auto size_pos = obj.find(size_search);
+        if (size_pos != std::string_view::npos) {
+            size_pos += size_search.size();
+            uint64_t val = 0;
+            while (size_pos < obj.size() && obj[size_pos] >= '0' && obj[size_pos] <= '9') {
+                val = val * 10 + static_cast<uint64_t>(obj[size_pos] - '0');
+                ++size_pos;
+            }
+            entry.size = static_cast<size_t>(val);
+        }
+
+        // Extract crc32c.
+        auto crc_search = std::string("\"crc32c\":");
+        auto crc_pos = obj.find(crc_search);
+        if (crc_pos != std::string_view::npos) {
+            crc_pos += crc_search.size();
+            uint64_t val = 0;
+            while (crc_pos < obj.size() && obj[crc_pos] >= '0' && obj[crc_pos] <= '9') {
+                val = val * 10 + static_cast<uint64_t>(obj[crc_pos] - '0');
+                ++crc_pos;
+            }
+            entry.crc32c = static_cast<uint32_t>(val);
+        }
+
+        out.files.push_back(std::move(entry));
+        files_pos = obj_end + 1;
+
+        // Check for end of array.
+        while (files_pos < json.size() && (json[files_pos] == ',' || json[files_pos] == ' '))
+            ++files_pos;
+        if (files_pos < json.size() && json[files_pos] == ']') break;
+    }
+
+    return true;
+}
 
 // ── ReplicationManager ────────────────────────────────────────────────────────
 
@@ -224,8 +306,10 @@ void ReplicationManager::stop() {
 
 void ReplicationManager::broadcast(const WALRecord& hdr, const void* payload,
                                     size_t payload_len) {
+    // Non-blocking broadcast: enqueue the WAL message into each replica's send
+    // buffer. The epoll thread will drain buffers via EPOLLOUT.
+    //
     // Format: WAL <file_index> <byte_offset> <total_len>\n<WALRecord(24)><payload>
-    // total_len = sizeof(WALRecord) + payload_len
     const uint32_t file_index = wal_.current_file_index();
     const size_t total_len = sizeof(WALRecord) + payload_len;
 
@@ -244,10 +328,11 @@ void ReplicationManager::broadcast(const WALRecord& hdr, const void* payload,
 
     std::lock_guard<std::mutex> lock(mtx_);
     for (auto it = replicas_.begin(); it != replicas_.end(); ) {
-        if (!send_all(it->fd, msg.data(), msg.size())) {
-            // Write failed — replica disconnected or too slow.
-            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, it->fd, nullptr);
-            ::close(it->fd);
+        enqueue_send(*it, msg.data(), msg.size());
+
+        // If the send buffer is too large, the replica is too slow — disconnect it.
+        if (it->send_buf.size() > MAX_SEND_BUF_SIZE) {
+            remove_replica_locked(it->fd);
             it = replicas_.erase(it);
         } else {
             ++it;
@@ -258,6 +343,63 @@ void ReplicationManager::broadcast(const WALRecord& hdr, const void* payload,
 std::vector<ReplicaInfo> ReplicationManager::replica_states() const {
     std::lock_guard<std::mutex> lock(mtx_);
     return replicas_;
+}
+
+bool ReplicationManager::snapshot_active() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    for (const auto& r : replicas_) {
+        if (r.snapshot_transfer.active) return true;
+    }
+    return false;
+}
+
+void ReplicationManager::enqueue_send(ReplicaInfo& replica, const void* data, size_t len) {
+    const bool was_empty = replica.send_buf.empty();
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    replica.send_buf.insert(replica.send_buf.end(), bytes, bytes + len);
+
+    // If the buffer was empty, we need to arm EPOLLOUT so the epoll thread
+    // will drain it. If it was already non-empty, EPOLLOUT is already armed.
+    if (was_empty && epoll_fd_ >= 0) {
+        struct epoll_event ev{};
+        ev.events  = EPOLLIN | EPOLLOUT | EPOLLET;
+        ev.data.fd = replica.fd;
+        ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, replica.fd, &ev);
+    }
+}
+
+bool ReplicationManager::drain_send_buffer(ReplicaInfo& replica) {
+    while (!replica.send_buf.empty()) {
+        ssize_t n = ::send(replica.fd, replica.send_buf.data(),
+                           replica.send_buf.size(), MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Socket buffer full — wait for next EPOLLOUT.
+                return true;
+            }
+            // Real error — replica is dead.
+            return false;
+        }
+        if (n == 0) return false;
+
+        // Erase sent bytes from the front.
+        replica.send_buf.erase(replica.send_buf.begin(),
+                               replica.send_buf.begin() + n);
+    }
+
+    // Buffer fully drained — disarm EPOLLOUT to avoid busy-spinning.
+    if (epoll_fd_ >= 0) {
+        struct epoll_event ev{};
+        ev.events  = EPOLLIN | EPOLLET;
+        ev.data.fd = replica.fd;
+        ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, replica.fd, &ev);
+    }
+    return true;
+}
+
+void ReplicationManager::remove_replica_locked(int fd) {
+    ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+    ::close(fd);
 }
 
 void ReplicationManager::run_loop() {
@@ -278,7 +420,35 @@ void ReplicationManager::run_loop() {
 
             if (fd == listen_fd_) {
                 accept_replica();
-            } else {
+                continue;
+            }
+
+            // Handle EPOLLOUT: drain send buffer and continue snapshot transfer.
+            if (events[i].events & EPOLLOUT) {
+                std::lock_guard<std::mutex> lock(mtx_);
+                for (auto it = replicas_.begin(); it != replicas_.end(); ++it) {
+                    if (it->fd == fd) {
+                        if (!drain_send_buffer(*it)) {
+                            remove_replica_locked(fd);
+                            replicas_.erase(it);
+                            break;
+                        }
+                        // If snapshot transfer is active and send buffer has room,
+                        // enqueue the next chunk.
+                        if (it->snapshot_transfer.active &&
+                            it->send_buf.size() < MAX_SEND_BUF_SIZE / 2) {
+                            if (!continue_snapshot_transfer(*it)) {
+                                remove_replica_locked(fd);
+                                replicas_.erase(it);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Handle EPOLLIN: read replica data (ACK, REPLICATE, etc.).
+            if (events[i].events & EPOLLIN) {
                 handle_replica_data(fd);
             }
         }
@@ -292,9 +462,9 @@ void ReplicationManager::run_loop() {
 
             std::lock_guard<std::mutex> lock(mtx_);
             for (auto it = replicas_.begin(); it != replicas_.end(); ) {
-                if (!send_all(it->fd, hb, hb_len)) {
-                    ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, it->fd, nullptr);
-                    ::close(it->fd);
+                enqueue_send(*it, hb, hb_len);
+                if (it->send_buf.size() > MAX_SEND_BUF_SIZE) {
+                    remove_replica_locked(it->fd);
                     it = replicas_.erase(it);
                 } else {
                     ++it;
@@ -350,6 +520,7 @@ void ReplicationManager::accept_replica() {
         info.address          = std::move(address);
         info.confirmed_file   = 0;
         info.confirmed_offset = 0;
+        info.reader.set_fd(client_fd);
 
         std::lock_guard<std::mutex> lock(mtx_);
         replicas_.push_back(std::move(info));
@@ -359,15 +530,25 @@ void ReplicationManager::accept_replica() {
 void ReplicationManager::handle_replica_data(int fd) {
     // Edge-triggered: read until EAGAIN.
     char buf[512];
+
+    // Find the replica's BufferedReader.
+    std::lock_guard<std::mutex> lock(mtx_);
+    ReplicaInfo* replica_ptr = nullptr;
+    for (auto& r : replicas_) {
+        if (r.fd == fd) {
+            replica_ptr = &r;
+            break;
+        }
+    }
+    if (!replica_ptr) return;
+
     while (true) {
-        ssize_t n = read_line(fd, buf, sizeof(buf));
+        ssize_t n = replica_ptr->reader.read_line(buf, sizeof(buf));
         if (n < 0) {
             // Disconnect — remove replica (Requirement 1.3).
-            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-            std::lock_guard<std::mutex> lock(mtx_);
+            remove_replica_locked(fd);
             for (auto it = replicas_.begin(); it != replicas_.end(); ++it) {
                 if (it->fd == fd) {
-                    ::close(fd);
                     replicas_.erase(it);
                     break;
                 }
@@ -383,17 +564,17 @@ void ReplicationManager::handle_replica_data(int fd) {
             uint32_t from_file = 0;
             size_t from_offset = 0;
             if (std::sscanf(line.c_str(), "REPLICATE %u %zu", &from_file, &from_offset) == 2) {
-                std::lock_guard<std::mutex> lock(mtx_);
-                for (auto& r : replicas_) {
-                    if (r.fd == fd) {
-                        r.confirmed_file   = from_file;
-                        r.confirmed_offset = from_offset;
-                        // Perform catchup from the requested position.
-                        handle_catchup(r, from_file, from_offset);
-                        break;
-                    }
-                }
+                replica_ptr->confirmed_file   = from_file;
+                replica_ptr->confirmed_offset = from_offset;
+                // Perform catchup from the requested position.
+                handle_catchup(*replica_ptr, from_file, from_offset);
             }
+            continue;
+        }
+
+        // Parse SNAPSHOT_REQUEST
+        if (line == "SNAPSHOT_REQUEST") {
+            handle_snapshot_request(*replica_ptr);
             continue;
         }
 
@@ -402,14 +583,8 @@ void ReplicationManager::handle_replica_data(int fd) {
             uint32_t ack_file = 0;
             size_t ack_offset = 0;
             if (std::sscanf(line.c_str(), "ACK %u %zu", &ack_file, &ack_offset) == 2) {
-                std::lock_guard<std::mutex> lock(mtx_);
-                for (auto& r : replicas_) {
-                    if (r.fd == fd) {
-                        r.confirmed_file   = ack_file;
-                        r.confirmed_offset = ack_offset;
-                        break;
-                    }
-                }
+                replica_ptr->confirmed_file   = ack_file;
+                replica_ptr->confirmed_offset = ack_offset;
             }
             continue;
         }
@@ -439,8 +614,7 @@ void ReplicationManager::send_to_replica(ReplicaInfo& replica, const WALRecord& 
 
     if (!send_all(replica.fd, msg.data(), msg.size())) {
         // Mark fd as -1; caller should clean up.
-        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, replica.fd, nullptr);
-        ::close(replica.fd);
+        remove_replica_locked(replica.fd);
         replica.fd = -1;
     }
 }
@@ -522,6 +696,141 @@ void ReplicationManager::handle_catchup(ReplicaInfo& replica, uint32_t from_file
     }
 }
 
+void ReplicationManager::handle_snapshot_request(ReplicaInfo& replica) {
+    if (!engine_) {
+        const char* err = "ERR SNAPSHOT_FAILED no_engine\n";
+        enqueue_send(replica, err, std::strlen(err));
+        return;
+    }
+
+    // Create snapshot (releases mtx_ internally for CRC computation).
+    // We must release our own mtx_ first since create_snapshot() acquires Engine::mtx_.
+    SnapshotManifest manifest;
+    {
+        // Temporarily release replication mtx_ to avoid deadlock with Engine::mtx_.
+        mtx_.unlock();
+        try {
+            manifest = engine_->create_snapshot();
+        } catch (const std::exception& e) {
+            mtx_.lock();
+            char err[256];
+            int len = std::snprintf(err, sizeof(err), "ERR SNAPSHOT_FAILED %s\n", e.what());
+            enqueue_send(replica, err, static_cast<size_t>(len));
+            return;
+        }
+        mtx_.lock();
+
+        // Re-find the replica (it may have been removed while we released the lock).
+        bool found = false;
+        for (auto& r : replicas_) {
+            if (r.fd == replica.fd) { found = true; break; }
+        }
+        if (!found) return;
+    }
+
+    // Initialize snapshot transfer state.
+    auto& st = replica.snapshot_transfer;
+    st.active            = true;
+    st.manifest          = std::move(manifest);
+    st.current_file_idx  = 0;
+    st.current_file_offset = 0;
+    st.current_file_fd   = -1;
+    st.header_sent       = false;
+    st.begin_sent        = false;
+    st.base_dir          = engine_->base_dir();
+    st.chunk_size        = 262144; // 256 KB
+
+    // Send SNAPSHOT_BEGIN.
+    char line[256];
+    int line_len = std::snprintf(line, sizeof(line),
+        "SNAPSHOT_BEGIN %zu %u %zu %zu\n",
+        st.manifest.total_bytes,
+        st.manifest.wal_file_index,
+        st.manifest.wal_byte_offset,
+        st.manifest.files.size());
+    enqueue_send(replica, line, static_cast<size_t>(line_len));
+    st.begin_sent = true;
+
+    // Start streaming the first chunk (the epoll loop will continue via EPOLLOUT).
+    continue_snapshot_transfer(replica);
+}
+
+bool ReplicationManager::continue_snapshot_transfer(ReplicaInfo& replica) {
+    auto& st = replica.snapshot_transfer;
+    if (!st.active) return true;
+
+    while (st.current_file_idx < st.manifest.files.size()) {
+        const auto& entry = st.manifest.files[st.current_file_idx];
+
+        // Send SNAPSHOT_FILE header once per file.
+        if (!st.header_sent) {
+            char line[512];
+            int line_len = std::snprintf(line, sizeof(line),
+                "SNAPSHOT_FILE %s %zu %u\n",
+                entry.path.c_str(), entry.size, entry.crc32c);
+            enqueue_send(replica, line, static_cast<size_t>(line_len));
+            st.header_sent = true;
+            st.current_file_offset = 0;
+
+            // Open the file.
+            std::string full_path = st.base_dir + "/" + entry.path;
+            st.current_file_fd = ::open(full_path.c_str(), O_RDONLY);
+            if (st.current_file_fd < 0) {
+                // File disappeared — abort transfer.
+                const char* err = "ERR SNAPSHOT_FAILED file_read_error\n";
+                enqueue_send(replica, err, std::strlen(err));
+                st.active = false;
+                return true;
+            }
+        }
+
+        // Read and enqueue chunks until file is done or send buffer is getting full.
+        while (st.current_file_offset < entry.size) {
+            if (replica.send_buf.size() >= MAX_SEND_BUF_SIZE / 2) {
+                // Back off — let EPOLLOUT drain the buffer first.
+                return true;
+            }
+
+            size_t remaining = entry.size - st.current_file_offset;
+            size_t to_read = std::min(remaining, st.chunk_size);
+
+            std::vector<uint8_t> chunk(to_read);
+            ssize_t n = ::pread(st.current_file_fd, chunk.data(), to_read,
+                                static_cast<off_t>(st.current_file_offset));
+            if (n <= 0) {
+                ::close(st.current_file_fd);
+                st.current_file_fd = -1;
+                const char* err = "ERR SNAPSHOT_FAILED file_read_error\n";
+                enqueue_send(replica, err, std::strlen(err));
+                st.active = false;
+                return true;
+            }
+
+            enqueue_send(replica, chunk.data(), static_cast<size_t>(n));
+            st.current_file_offset += static_cast<size_t>(n);
+        }
+
+        // File done — close and move to next.
+        if (st.current_file_fd >= 0) {
+            ::close(st.current_file_fd);
+            st.current_file_fd = -1;
+        }
+        st.current_file_idx++;
+        st.header_sent = false;
+    }
+
+    // All files sent — send SNAPSHOT_END.
+    std::string manifest_json = st.manifest.to_json();
+    uint32_t manifest_crc = ob::crc32c(manifest_json.data(), manifest_json.size());
+
+    char line[128];
+    int line_len = std::snprintf(line, sizeof(line), "SNAPSHOT_END %u\n", manifest_crc);
+    enqueue_send(replica, line, static_cast<size_t>(line_len));
+
+    st.active = false;
+    return true;
+}
+
 // ── ReplicationClient (Requirements: 2.1, 2.2, 2.3, 2.4, 4.2, 4.3, 4.4) ────
 
 ReplicationClient::ReplicationClient(ReplicationClientConfig config, Engine& engine)
@@ -567,7 +876,10 @@ void ReplicationClient::stop() {
 }
 
 ReplicationClient::State ReplicationClient::state() const {
-    return State{confirmed_file_, confirmed_offset_, (fd_ >= 0), records_replayed_};
+    return State{confirmed_file_, confirmed_offset_, (fd_ >= 0), records_replayed_,
+                 bootstrapping_.load(std::memory_order_acquire),
+                 snapshot_bytes_received_.load(std::memory_order_relaxed),
+                 snapshot_bytes_total_.load(std::memory_order_relaxed)};
 }
 
 void ReplicationClient::run_loop() {
@@ -632,7 +944,12 @@ void ReplicationClient::connect_to_primary() {
     tv.tv_usec = 0;
     ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    // Initialize the buffered reader for this connection.
+    reader_.set_fd(fd_);
+
     // Send REPLICATE handshake (Requirement 4.2).
+    // Even fresh replicas start with REPLICATE 0 0. If the primary responds
+    // with ERR WAL_TRUNCATED, receive_and_replay() will trigger snapshot bootstrap.
     char handshake[128];
     int len = std::snprintf(handshake, sizeof(handshake), "REPLICATE %u %zu\n",
                             confirmed_file_, confirmed_offset_);
@@ -654,8 +971,8 @@ void ReplicationClient::receive_and_replay() {
             save_state();
             last_save = now;
         }
-        // Read a text header line.
-        ssize_t n = read_line(fd_, line_buf, sizeof(line_buf));
+        // Read a text header line using the buffered reader.
+        ssize_t n = reader_.read_line(line_buf, sizeof(line_buf));
         if (n < 0) {
             // Disconnect or error.
             return;
@@ -683,7 +1000,7 @@ void ReplicationClient::receive_and_replay() {
 
             // Read exactly total_len binary bytes: WALRecord header + payload.
             std::vector<uint8_t> buf(total_len);
-            if (!recv_all(fd_, buf.data(), total_len)) {
+            if (!reader_.read_exact(buf.data(), total_len)) {
                 return; // Disconnect.
             }
 
@@ -700,7 +1017,7 @@ void ReplicationClient::receive_and_replay() {
                 return;
             }
 
-            const uint32_t computed_crc = crc32c(payload, payload_len);
+            const uint32_t computed_crc = ob::crc32c(payload, payload_len);
             if (computed_crc != hdr.checksum) {
                 // CRC32C mismatch — disconnect and log error (Requirement 2.3).
                 return;
@@ -709,7 +1026,6 @@ void ReplicationClient::receive_and_replay() {
             // Skip non-DELTA records (GAP, ROTATE, etc.) — only replay DELTA.
             if (hdr.record_type == WAL_RECORD_DELTA && payload_len >= sizeof(DeltaUpdate)) {
                 // Decode DeltaUpdate + Levels from payload.
-                // Payload format: DeltaUpdate struct followed by n_levels * Level.
                 DeltaUpdate delta{};
                 std::memcpy(&delta, payload, sizeof(DeltaUpdate));
 
@@ -741,7 +1057,13 @@ void ReplicationClient::receive_and_replay() {
 
         // Handle ERR: log and disconnect (Requirement 6.3).
         if (std::strncmp(line_buf, "ERR ", 4) == 0) {
-            // Error from primary — disconnect. The run_loop will handle reconnection.
+            // Check for WAL_TRUNCATED — trigger snapshot bootstrap.
+            if (std::strncmp(line_buf + 4, "WAL_TRUNCATED", 13) == 0) {
+                request_and_receive_snapshot();
+                // After snapshot, resume normal streaming from the snapshot's WAL position.
+                return;
+            }
+            // Other errors — disconnect. The run_loop will handle reconnection.
             return;
         }
 
@@ -792,6 +1114,218 @@ void ReplicationClient::load_state() {
     }
 
     std::fclose(f);
+}
+
+// ── Snapshot bootstrap (replica side) ─────────────────────────────────────────
+
+void ReplicationClient::request_and_receive_snapshot() {
+    bootstrapping_.store(true, std::memory_order_release);
+    snapshot_bytes_received_.store(0, std::memory_order_relaxed);
+    snapshot_bytes_total_.store(0, std::memory_order_relaxed);
+
+    // Determine staging directory.
+    std::string staging_dir = config_.snapshot_staging_dir;
+    if (staging_dir.empty()) {
+        staging_dir = engine_.base_dir() + "/snapshot_staging";
+    }
+
+    // Clean up any leftover staging directory from a previous interrupted transfer.
+    cleanup_staging(staging_dir);
+
+    // Send SNAPSHOT_REQUEST.
+    const char* req = "SNAPSHOT_REQUEST\n";
+    if (!send_all(fd_, req, std::strlen(req))) {
+        bootstrapping_.store(false, std::memory_order_release);
+        return;
+    }
+
+    // Read SNAPSHOT_BEGIN response.
+    char line_buf[512];
+    ssize_t n = reader_.read_line(line_buf, sizeof(line_buf));
+    if (n <= 0) {
+        bootstrapping_.store(false, std::memory_order_release);
+        return;
+    }
+
+    // Check for error.
+    if (std::strncmp(line_buf, "ERR ", 4) == 0) {
+        bootstrapping_.store(false, std::memory_order_release);
+        return;
+    }
+
+    size_t total_bytes = 0;
+    uint32_t snap_wal_fi = 0;
+    size_t snap_wal_off = 0;
+    size_t file_count = 0;
+
+    if (std::sscanf(line_buf, "SNAPSHOT_BEGIN %zu %u %zu %zu",
+                    &total_bytes, &snap_wal_fi, &snap_wal_off, &file_count) != 4) {
+        bootstrapping_.store(false, std::memory_order_release);
+        return;
+    }
+
+    snapshot_bytes_total_.store(total_bytes, std::memory_order_relaxed);
+
+    // Create staging directory.
+    fs::create_directories(staging_dir);
+
+    // Receive files.
+    SnapshotManifest manifest;
+    manifest.wal_file_index  = snap_wal_fi;
+    manifest.wal_byte_offset = snap_wal_off;
+    manifest.total_bytes     = total_bytes;
+
+    size_t bytes_received = 0;
+
+    for (size_t i = 0; i < file_count; ++i) {
+        // Read SNAPSHOT_FILE header.
+        n = reader_.read_line(line_buf, sizeof(line_buf));
+        if (n <= 0) {
+            cleanup_staging(staging_dir);
+            bootstrapping_.store(false, std::memory_order_release);
+            return;
+        }
+
+        char rel_path[256] = {};
+        size_t file_size = 0;
+        uint32_t file_crc = 0;
+
+        if (std::sscanf(line_buf, "SNAPSHOT_FILE %255s %zu %u",
+                        rel_path, &file_size, &file_crc) != 3) {
+            cleanup_staging(staging_dir);
+            bootstrapping_.store(false, std::memory_order_release);
+            return;
+        }
+
+        // Create parent directories in staging.
+        std::string staged_path = staging_dir + "/" + rel_path;
+        fs::create_directories(fs::path(staged_path).parent_path());
+
+        // Receive file data and write to staging.
+        {
+            std::FILE* out = std::fopen(staged_path.c_str(), "wb");
+            if (!out) {
+                cleanup_staging(staging_dir);
+                bootstrapping_.store(false, std::memory_order_release);
+                return;
+            }
+
+            uint32_t running_crc = 0xFFFFFFFFu;
+            size_t remaining = file_size;
+
+            while (remaining > 0) {
+                size_t chunk = std::min(remaining, static_cast<size_t>(262144));
+                std::vector<uint8_t> buf(chunk);
+
+                if (!reader_.read_exact(buf.data(), chunk)) {
+                    std::fclose(out);
+                    cleanup_staging(staging_dir);
+                    bootstrapping_.store(false, std::memory_order_release);
+                    return;
+                }
+
+                std::fwrite(buf.data(), 1, chunk, out);
+
+                // Update CRC32C incrementally.
+                for (size_t b = 0; b < chunk; ++b) {
+                    running_crc = (running_crc >> 8) ^
+                        detail::crc32c_table[(running_crc ^ buf[b]) & 0xFFu];
+                }
+
+                remaining -= chunk;
+                bytes_received += chunk;
+                snapshot_bytes_received_.store(bytes_received, std::memory_order_relaxed);
+            }
+
+            std::fclose(out);
+
+            // Verify CRC32C.
+            uint32_t computed_crc = running_crc ^ 0xFFFFFFFFu;
+            if (computed_crc != file_crc) {
+                // CRC mismatch — abort.
+                cleanup_staging(staging_dir);
+                bootstrapping_.store(false, std::memory_order_release);
+                return;
+            }
+        }
+
+        SnapshotFileEntry entry;
+        entry.path   = rel_path;
+        entry.size   = file_size;
+        entry.crc32c = file_crc;
+        manifest.files.push_back(std::move(entry));
+    }
+
+    // Read SNAPSHOT_END.
+    n = reader_.read_line(line_buf, sizeof(line_buf));
+    if (n <= 0) {
+        cleanup_staging(staging_dir);
+        bootstrapping_.store(false, std::memory_order_release);
+        return;
+    }
+
+    uint32_t manifest_crc = 0;
+    if (std::sscanf(line_buf, "SNAPSHOT_END %u", &manifest_crc) != 1) {
+        cleanup_staging(staging_dir);
+        bootstrapping_.store(false, std::memory_order_release);
+        return;
+    }
+
+    // Verify manifest CRC32C.
+    std::string manifest_json = manifest.to_json();
+    uint32_t computed_manifest_crc = ob::crc32c(manifest_json.data(), manifest_json.size());
+    if (computed_manifest_crc != manifest_crc) {
+        cleanup_staging(staging_dir);
+        bootstrapping_.store(false, std::memory_order_release);
+        return;
+    }
+
+    // Install the snapshot.
+    install_snapshot(staging_dir, manifest);
+
+    bootstrapping_.store(false, std::memory_order_release);
+}
+
+void ReplicationClient::install_snapshot(const std::string& staging_dir,
+                                          const SnapshotManifest& manifest) {
+    const std::string& data_dir = engine_.base_dir();
+
+    // Move staged files into the data directory.
+    // We move entire segment directories (parent of column files).
+    std::set<std::string> moved_dirs;
+    for (const auto& entry : manifest.files) {
+        std::string src = staging_dir + "/" + entry.path;
+        std::string dst = data_dir + "/" + entry.path;
+
+        // Ensure destination parent directory exists.
+        fs::create_directories(fs::path(dst).parent_path());
+
+        // Move (rename) the file.
+        std::error_code ec;
+        fs::rename(src, dst, ec);
+        if (ec) {
+            // Fallback: copy + remove (cross-device move).
+            fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
+            if (!ec) fs::remove(src, ec);
+        }
+    }
+
+    // Load the snapshot into the engine.
+    engine_.load_snapshot(manifest);
+
+    // Update confirmed WAL position.
+    confirmed_file_   = manifest.wal_file_index;
+    confirmed_offset_ = manifest.wal_byte_offset;
+    save_state();
+
+    // Clean up staging directory.
+    cleanup_staging(staging_dir);
+}
+
+void ReplicationClient::cleanup_staging(const std::string& staging_dir) {
+    std::error_code ec;
+    fs::remove_all(staging_dir, ec);
+    // Ignore errors — best effort cleanup.
 }
 
 } // namespace ob

@@ -26,6 +26,8 @@ std::string execute_command(const Command& cmd,
     switch (cmd.type) {
 
     case CommandType::SELECT: {
+        // Reject queries during snapshot bootstrap.
+        if (engine.is_bootstrapping()) return format_error("bootstrapping");
         std::vector<QueryResult> rows;
         try {
             std::string err = engine.execute(cmd.raw_sql, [&](const QueryResult& r) {
@@ -44,6 +46,7 @@ std::string execute_command(const Command& cmd,
 
     case CommandType::INSERT: {
         if (read_only) return format_error("read-only replica");
+        if (engine.is_bootstrapping()) return format_error("bootstrapping");
         try {
             const auto& a = cmd.insert_args;
 
@@ -77,6 +80,7 @@ std::string execute_command(const Command& cmd,
 
     case CommandType::FLUSH: {
         if (read_only) return format_error("read-only replica");
+        if (engine.is_bootstrapping()) return format_error("bootstrapping");
         try {
             // Flush pattern: close engine (flushes all data) then reopen.
             // NOTE: This is called on the TcpServer's engine, which is shared.
@@ -109,6 +113,10 @@ std::string execute_command(const Command& cmd,
         stats.repl_confirmed_offset = es.repl_confirmed_offset;
         stats.repl_records_replayed = es.repl_records_replayed;
         stats.repl_connected        = es.repl_connected;
+        stats.bootstrapping         = es.bootstrapping;
+        stats.snapshot_bytes_received = es.snapshot_bytes_received;
+        stats.snapshot_bytes_total  = es.snapshot_bytes_total;
+        stats.snapshot_active       = es.snapshot_active;
 
         return format_status(stats);
     }
@@ -146,6 +154,10 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
             config.primary_host = argv[++i];
         } else if (arg == "--primary-port" && i + 1 < argc) {
             config.primary_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        } else if (arg == "--snapshot-chunk-size" && i + 1 < argc) {
+            config.snapshot_chunk_size = static_cast<size_t>(std::stoul(argv[++i]));
+        } else if (arg == "--snapshot-staging-dir" && i + 1 < argc) {
+            config.snapshot_staging_dir = argv[++i];
         }
     }
 
@@ -164,6 +176,8 @@ TcpServer::TcpServer(ServerConfig config)
     repl_client_config.primary_host = config_.primary_host;
     repl_client_config.primary_port = config_.primary_port;
     repl_client_config.state_file   = config_.data_dir + "/repl_state.txt";
+    repl_client_config.snapshot_chunk_size = config_.snapshot_chunk_size;
+    repl_client_config.snapshot_staging_dir = config_.snapshot_staging_dir;
 
     engine_ = std::make_unique<Engine>(config_.data_dir, 100'000'000ULL, FsyncPolicy::INTERVAL,
                                        repl_config, repl_client_config);

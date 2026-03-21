@@ -38,15 +38,18 @@ Development plan towards production quality and High Availability.
 ### 6. WAL streaming replication
 - Primary sends WAL records to replica(s) via a dedicated TCP stream
 - Replica replays WAL and maintains its own SoA buffer + columnar store
-- Protocol: `REPLICATE <wal_offset> <payload_len> <payload>\n` / `ACK <wal_offset>\n`
+- Protocol: `REPLICATE <file_index> <byte_offset>\n` / `WAL <fi> <off> <len>\n<binary>` / `ACK <fi> <off>\n`
+- Status: **DONE** — `ReplicationManager` (epoll, non-blocking send buffers, EPOLLOUT drain), `ReplicationClient` (BufferedReader, CRC32C verify, exponential backoff reconnect), shared `crc32c.hpp` header
 
 ### 7. Read replicas
 - Replica accepts SELECT/aggregation, rejects INSERT/FLUSH
 - Client connects to replica for reads, to primary for writes
+- Status: **DONE** — `--read-only` flag in TcpServer rejects INSERT/FLUSH, replica Engine replays via `apply_delta()`
 
 ### 8. Replica lag monitoring
 - Primary tracks confirmed offset per replica
 - Exposed in `STATUS` and as a metric, alert when lag > threshold
+- Status: **DONE** — per-replica `lag_bytes` in `Engine::Stats`, exposed in STATUS response, WAL truncation respects slowest replica
 
 ## Phase 3 — High Availability
 
@@ -71,12 +74,18 @@ Development plan towards production quality and High Availability.
 
 ### 13. Snapshot-based replica bootstrap
 - Consistent snapshot (columnar store + WAL offset) instead of full WAL replay
+- Status: **DONE** — `Engine::create_snapshot()` (flush + CRC32C), `Engine::load_snapshot()`, `ReplicationManager` chunked transfer (SNAPSHOT_BEGIN/FILE/END), `ReplicationClient` auto-bootstrap on WAL_TRUNCATED, staging dir for crash safety, manifest CRC verification, bootstrapping state in STATUS
 
 ### 14. Wire protocol compression
 - Optional LZ4 frame compression on TCP for replication and large query results
 
 ### 15. TTL / data retention
 - Automatic deletion of segments older than N days
+
+### 16. Multi-master replication
+- Any node accepts writes, data propagated to all other nodes
+- Requires conflict resolution (sequence number vector clocks or CRDTs)
+- Prerequisite: automatic failover (#9-11) and snapshot bootstrap (#13) must be solid first
 
 ## Prioritization
 
@@ -87,10 +96,11 @@ Development plan towards production quality and High Availability.
 | P0 | Monitoring (#5) | M | Without this, blind ops | ✅ Done |
 | P1 | Graceful shutdown (#2) | S | Data loss on restart | ✅ Done |
 | P1 | Fsync policy (#1) | S | Configurability | ✅ Done |
-| P1 | WAL streaming (#6) | L | Foundation for everything | |
-| P2 | Read replicas (#7) | M | First HA benefit | |
-| P2 | Replica lag (#8) | S | Operational necessity | |
+| P1 | WAL streaming (#6) | L | Foundation for everything | ✅ Done |
+| P2 | Read replicas (#7) | M | First HA benefit | ✅ Done |
+| P2 | Replica lag (#8) | S | Operational necessity | ✅ Done |
 | P3 | Failover (#9-11) | XL | Full HA | |
+| P3 | Snapshot bootstrap (#13) | L | Replica catch-up | ✅ Done |
 | P4 | Sharding, TTL (#12-15) | XL | Scale | |
 
 S = few days, M = week, L = 2-3 weeks, XL = month+

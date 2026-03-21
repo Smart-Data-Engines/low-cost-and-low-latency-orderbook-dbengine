@@ -29,6 +29,10 @@ struct ServerConfig {
     // Replication (replica)
     std::string primary_host;
     uint16_t    primary_port{0};        // 0 = disabled
+
+    // Snapshot bootstrap
+    size_t      snapshot_chunk_size{262144};  // --snapshot-chunk-size (default 256 KB)
+    std::string snapshot_staging_dir;         // --snapshot-staging-dir
 };
 
 // ── TcpServer ─────────────────────────────────────────────────────────────────

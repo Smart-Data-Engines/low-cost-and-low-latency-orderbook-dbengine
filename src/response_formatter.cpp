@@ -139,6 +139,20 @@ std::string format_status(const ServerStats& stats) {
         out += '\n';
     }
 
+    // Snapshot bootstrap progress (replica)
+    if (stats.bootstrapping) {
+        out += "snapshot: bootstrapping bytes_received=";
+        out += std::to_string(stats.snapshot_bytes_received);
+        out += " bytes_total=";
+        out += std::to_string(stats.snapshot_bytes_total);
+        out += '\n';
+    }
+
+    // Snapshot transfer active (primary)
+    if (stats.snapshot_active) {
+        out += "snapshot: transfer_active\n";
+    }
+
     out += '\n'; // empty line terminator
     return out;
 }

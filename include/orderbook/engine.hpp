@@ -93,10 +93,31 @@ public:
         size_t   repl_confirmed_offset{0};
         uint64_t repl_records_replayed{0};
         bool     repl_connected{false};
+
+        // Snapshot bootstrap state
+        bool     bootstrapping{false};
+        size_t   snapshot_bytes_received{0};
+        size_t   snapshot_bytes_total{0};
+        bool     snapshot_active{false};  // primary: snapshot transfer in progress
     };
 
     /// Collect current engine statistics (thread-safe, acquires mtx_).
     Stats stats();
+
+    /// Create a consistent snapshot: flush pending rows, capture WAL position,
+    /// enumerate segment files with CRC32C checksums.
+    /// Returns the manifest. Writes snapshot_manifest.json to data dir.
+    SnapshotManifest create_snapshot();
+
+    /// Load a snapshot received from the primary: replace the columnar store
+    /// index with the snapshot's segments.
+    void load_snapshot(const SnapshotManifest& manifest);
+
+    /// Returns true if the replica is currently bootstrapping from a snapshot.
+    bool is_bootstrapping() const;
+
+    /// Access the base data directory path.
+    const std::string& base_dir() const { return base_dir_; }
 
 private:
     std::string base_dir_;

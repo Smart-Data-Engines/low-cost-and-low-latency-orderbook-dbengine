@@ -8,41 +8,16 @@
 // close(): stop flush thread + final flush + flush_segment + WAL flush.
 
 #include "orderbook/engine.hpp"
+#include "orderbook/crc32c.hpp"
 
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 
 namespace ob {
 
-// ── Portable CRC32C (software lookup table, same as wal.cpp) ──────────────────
-namespace {
-
-static constexpr uint32_t CRC32C_POLY = 0x82F63B78u;
-static uint32_t crc32c_table[256];
-static bool     crc32c_table_init = false;
-
-static void init_crc32c_table() {
-    for (uint32_t i = 0; i < 256; ++i) {
-        uint32_t crc = i;
-        for (int j = 0; j < 8; ++j) {
-            crc = (crc >> 1) ^ ((crc & 1u) ? CRC32C_POLY : 0u);
-        }
-        crc32c_table[i] = crc;
-    }
-    crc32c_table_init = true;
-}
-
-static uint32_t crc32c(const void* data, size_t len) {
-    if (!crc32c_table_init) init_crc32c_table();
-    const auto* p = static_cast<const uint8_t*>(data);
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; ++i) {
-        crc = (crc >> 8) ^ crc32c_table[(crc ^ p[i]) & 0xFFu];
-    }
-    return crc ^ 0xFFFFFFFFu;
-}
-
-} // anonymous namespace
+namespace fs = std::filesystem;
 
 Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
                FsyncPolicy fsync_policy,
@@ -78,6 +53,7 @@ void Engine::open() {
     // Start ReplicationManager if configured as primary (Requirement 7.4).
     if (repl_config_.port > 0) {
         repl_mgr_ = std::make_unique<ReplicationManager>(repl_config_, wal_);
+        repl_mgr_->set_engine(this);
         repl_mgr_->start();
     }
 
@@ -246,9 +222,151 @@ Engine::Stats Engine::stats() {
         s.repl_confirmed_offset  = st.confirmed_offset;
         s.repl_records_replayed  = st.records_replayed;
         s.repl_connected         = st.connected;
+        s.bootstrapping          = st.bootstrapping;
+        s.snapshot_bytes_received = st.snapshot_bytes_received;
+        s.snapshot_bytes_total   = st.snapshot_bytes_total;
+    }
+
+    // Snapshot transfer active on primary.
+    if (repl_mgr_) {
+        s.snapshot_active = repl_mgr_->snapshot_active();
     }
 
     return s;
+}
+
+// ── Snapshot operations ───────────────────────────────────────────────────────
+
+SnapshotManifest Engine::create_snapshot() {
+    SnapshotManifest manifest;
+
+    // Phase 1: flush + capture under lock (< 100ms).
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+
+        // Flush all pending rows to columnar stores.
+        wal_.sync();
+        flush_pending();
+
+        // Flush all per-symbol columnar store active segments.
+        for (auto& [key, store] : stores_) {
+            store->flush_segment();
+        }
+
+        // Capture WAL position atomically with the flush.
+        manifest.wal_file_index  = wal_.current_file_index();
+        manifest.wal_byte_offset = wal_.current_offset();
+    }
+
+    // Phase 2: enumerate files and compute CRC32C (lock-free, read-only).
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    manifest.created_at_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+
+    size_t total_bytes = 0;
+    size_t total_rows = 0;
+
+    // Walk the data directory for segment files.
+    if (fs::exists(base_dir_)) {
+        for (auto& entry : fs::recursive_directory_iterator(base_dir_)) {
+            if (!entry.is_regular_file()) continue;
+
+            const auto& path = entry.path();
+            const auto filename = path.filename().string();
+
+            // Only include columnar segment files and meta.json.
+            if (filename != "price.col" && filename != "qty.col" &&
+                filename != "ts.col" && filename != "cnt.col" &&
+                filename != "meta.json") {
+                continue;
+            }
+
+            // Skip WAL files and snapshot manifests.
+            if (filename.find("wal_") == 0 || filename == "snapshot_manifest.json") {
+                continue;
+            }
+
+            // Compute relative path from base_dir_.
+            auto rel = fs::relative(path, base_dir_).string();
+            auto file_size = static_cast<size_t>(entry.file_size());
+
+            // Compute CRC32C.
+            uint32_t crc = 0;
+            {
+                std::ifstream f(path.string(), std::ios::binary);
+                if (f.is_open()) {
+                    std::vector<uint8_t> buf(file_size);
+                    f.read(reinterpret_cast<char*>(buf.data()),
+                           static_cast<std::streamsize>(file_size));
+                    crc = ob::crc32c(buf.data(), file_size);
+                }
+            }
+
+            SnapshotFileEntry fe;
+            fe.path   = std::move(rel);
+            fe.size   = file_size;
+            fe.crc32c = crc;
+            manifest.files.push_back(std::move(fe));
+
+            total_bytes += file_size;
+
+            // Count rows from meta.json files.
+            if (filename == "meta.json") {
+                std::ifstream mf(path.string());
+                if (mf.is_open()) {
+                    std::string content((std::istreambuf_iterator<char>(mf)),
+                                         std::istreambuf_iterator<char>());
+                    // Extract row_count from meta.json.
+                    auto rc_pos = content.find("\"row_count\":");
+                    if (rc_pos != std::string::npos) {
+                        rc_pos += 12;
+                        uint64_t rc = 0;
+                        while (rc_pos < content.size() && content[rc_pos] >= '0' && content[rc_pos] <= '9') {
+                            rc = rc * 10 + static_cast<uint64_t>(content[rc_pos] - '0');
+                            ++rc_pos;
+                        }
+                        total_rows += static_cast<size_t>(rc);
+                    }
+                }
+            }
+        }
+    }
+
+    manifest.total_bytes = total_bytes;
+    manifest.total_rows  = total_rows;
+
+    // Write snapshot_manifest.json (at-most-one policy: overwrite previous).
+    {
+        std::string manifest_path = base_dir_ + "/snapshot_manifest.json";
+        std::ofstream f(manifest_path, std::ios::out | std::ios::trunc);
+        if (f.is_open()) {
+            f << manifest.to_json();
+            f.flush();
+        }
+    }
+
+    return manifest;
+}
+
+void Engine::load_snapshot(const SnapshotManifest& /*manifest*/) {
+    std::unique_lock<std::mutex> lock(mtx_);
+
+    // Clear all in-memory state.
+    stores_.clear();
+    buffers_.clear();
+    live_ptrs_.clear();
+    pending_rows_.clear();
+
+    // Rebuild columnar index from the new files on disk.
+    combined_store_.close();
+    combined_store_.open_existing();
+}
+
+bool Engine::is_bootstrapping() const {
+    if (repl_client_) {
+        return repl_client_->is_bootstrapping();
+    }
+    return false;
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
