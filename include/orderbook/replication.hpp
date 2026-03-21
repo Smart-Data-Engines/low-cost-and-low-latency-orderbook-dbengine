@@ -26,6 +26,7 @@ class Engine;
 struct ReplicationConfig {
     uint16_t port{0};           // 0 = disabled
     int      max_replicas{4};
+    bool     compress{false};   // --replication-compress
 };
 
 struct ReplicationClientConfig {
@@ -177,6 +178,7 @@ struct ReplicaInfo {
     std::string address;
     uint32_t    confirmed_file{0};
     size_t      confirmed_offset{0};
+    bool        compress{false};  // true after COMPRESS LZ4 directive sent
 
     // Per-replica send buffer for non-blocking broadcast (EPOLLOUT drain).
     std::vector<uint8_t> send_buf;
@@ -301,6 +303,9 @@ private:
     std::atomic<bool> bootstrapping_{false};
     std::atomic<size_t> snapshot_bytes_received_{0};
     std::atomic<size_t> snapshot_bytes_total_{0};
+
+    // Compression flag — set when primary sends COMPRESS LZ4 directive.
+    bool compress_{false};
 
     // Client-side buffered reader for efficient line parsing from primary.
     BufferedReader reader_;

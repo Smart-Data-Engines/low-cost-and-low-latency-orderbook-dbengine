@@ -105,6 +105,30 @@ target_link_libraries(orderbook_mmap PUBLIC orderbook_core)
 add_library(orderbook_columnar STATIC src/columnar_store.cpp)
 target_link_libraries(orderbook_columnar PUBLIC orderbook_codec orderbook_mmap)
 
+# ── LZ4 compression library ────────────────────────────────────────────────────
+find_package(PkgConfig)
+if(PkgConfig_FOUND)
+    pkg_check_modules(LZ4 IMPORTED_TARGET liblz4)
+endif()
+if(NOT LZ4_FOUND)
+    find_library(LZ4_LIBRARY NAMES lz4)
+    find_path(LZ4_INCLUDE_DIR NAMES lz4frame.h)
+    if(LZ4_LIBRARY AND LZ4_INCLUDE_DIR)
+        set(LZ4_FOUND TRUE)
+    else()
+        message(FATAL_ERROR "LZ4 library not found. Install liblz4-dev or equivalent.")
+    endif()
+endif()
+
+add_library(orderbook_compression STATIC src/compression.cpp)
+target_link_libraries(orderbook_compression PUBLIC orderbook_core)
+if(TARGET PkgConfig::LZ4)
+    target_link_libraries(orderbook_compression PUBLIC PkgConfig::LZ4)
+else()
+    target_link_libraries(orderbook_compression PUBLIC ${LZ4_LIBRARY})
+    target_include_directories(orderbook_compression PUBLIC ${LZ4_INCLUDE_DIR})
+endif()
+
 # ── Aggregation engine compiled library ────────────────────────────────────────
 add_library(orderbook_agg STATIC src/aggregation.cpp)
 target_link_libraries(orderbook_agg PUBLIC orderbook_soa)
@@ -115,7 +139,7 @@ target_link_libraries(orderbook_query PUBLIC orderbook_columnar orderbook_agg)
 
 # ── Engine facade compiled library ────────────────────────────────────────────
 add_library(orderbook_engine STATIC src/engine.cpp src/replication.cpp)
-target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover)
+target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression)
 
 # ── C API compiled library ────────────────────────────────────────────────────
 add_library(orderbook_capi STATIC src/c_api.cpp)

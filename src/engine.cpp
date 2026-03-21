@@ -24,7 +24,8 @@ Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
                FsyncPolicy fsync_policy,
                ReplicationConfig repl_config,
                ReplicationClientConfig repl_client_config,
-               FailoverConfig failover_config)
+               FailoverConfig failover_config,
+               TTLConfig ttl_config)
     : base_dir_(base_dir)
     , flush_interval_ns_(flush_interval_ns)
     , wal_(base_dir, 512ULL << 20, fsync_policy)
@@ -33,6 +34,7 @@ Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
     , repl_config_(std::move(repl_config))
     , repl_client_config_(std::move(repl_client_config))
     , failover_config_(std::move(failover_config))
+    , ttl_config_(ttl_config)
 {}
 
 Engine::~Engine() {
@@ -256,6 +258,11 @@ Engine::Stats Engine::stats() {
         s.primary_address = failover_mgr_->primary_address();
         s.lease_ttl_remaining = failover_mgr_->lease_ttl_remaining();
     }
+
+    // TTL / data retention metrics.
+    s.ttl_hours            = ttl_config_.ttl_hours;
+    s.ttl_segments_deleted = ttl_segments_deleted_.load(std::memory_order_relaxed);
+    s.ttl_bytes_reclaimed  = ttl_bytes_reclaimed_.load(std::memory_order_relaxed);
 
     return s;
 }
@@ -577,6 +584,21 @@ void Engine::flush_loop() {
         }
         if (safe_truncate > 0) {
             wal_.truncate_before(safe_truncate);
+        }
+
+        // TTL retention scan: delete expired segments periodically.
+        if (ttl_config_.ttl_hours > 0) {
+            auto now = std::chrono::steady_clock::now().time_since_epoch();
+            uint64_t now_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+            uint64_t scan_interval_ns = ttl_config_.scan_interval_seconds * 1'000'000'000ULL;
+            if (now_ns - last_ttl_scan_ns_ >= scan_interval_ns) {
+                uint64_t cutoff_ns = now_ns - ttl_config_.ttl_hours * 3600ULL * 1'000'000'000ULL;
+                auto [deleted, reclaimed] = combined_store_.delete_expired_segments(cutoff_ns);
+                ttl_segments_deleted_.fetch_add(deleted, std::memory_order_relaxed);
+                ttl_bytes_reclaimed_.fetch_add(reclaimed, std::memory_order_relaxed);
+                last_ttl_scan_ns_ = now_ns;
+            }
         }
     }
 }

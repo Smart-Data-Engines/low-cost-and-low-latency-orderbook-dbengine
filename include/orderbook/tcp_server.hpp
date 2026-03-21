@@ -26,6 +26,7 @@ struct ServerConfig {
 
     // Replication (primary)
     uint16_t replication_port{0};       // 0 = disabled
+    bool     replication_compress{false}; // --replication-compress
 
     // Replication (replica)
     std::string primary_host;
@@ -40,6 +41,10 @@ struct ServerConfig {
     int64_t coordinator_lease_ttl{10};               // --coordinator-lease-ttl (seconds)
     std::string node_id;                             // --node-id
     bool failover_enabled{true};                     // --failover-enabled
+
+    // TTL / data retention
+    uint64_t ttl_hours{0};                    // --ttl-hours (0 = disabled)
+    uint64_t ttl_scan_interval_seconds{300};  // --ttl-scan-interval-seconds
 };
 
 // ── TcpServer ─────────────────────────────────────────────────────────────────

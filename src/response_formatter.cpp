@@ -177,6 +177,27 @@ std::string format_status(const ServerStats& stats) {
         }
     }
 
+    // Compression metrics
+    if (stats.compress_bytes_in > 0 || stats.compress_bytes_out > 0) {
+        out += "compress_bytes_in: ";
+        out += std::to_string(stats.compress_bytes_in);
+        out += '\n';
+        out += "compress_bytes_out: ";
+        out += std::to_string(stats.compress_bytes_out);
+        out += '\n';
+    }
+
+    // TTL / data retention metrics
+    out += "ttl_hours: ";
+    out += std::to_string(stats.ttl_hours);
+    out += '\n';
+    out += "ttl_segments_deleted: ";
+    out += std::to_string(stats.ttl_segments_deleted);
+    out += '\n';
+    out += "ttl_bytes_reclaimed: ";
+    out += std::to_string(stats.ttl_bytes_reclaimed);
+    out += '\n';
+
     out += '\n'; // empty line terminator
     return out;
 }

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -378,6 +379,68 @@ void ColumnarStore::open_existing() {
               [](const SegmentMeta& a, const SegmentMeta& b) {
                   return a.start_ts_ns < b.start_ts_ns;
               });
+}
+
+// ── delete_expired_segments ───────────────────────────────────────────────────
+
+std::pair<size_t, size_t> ColumnarStore::delete_expired_segments(uint64_t cutoff_ns) {
+    if (cutoff_ns == 0) {
+        return {0, 0};
+    }
+
+    // Sort index by start_ts_ns (oldest first) for chronological deletion order.
+    std::sort(index_.begin(), index_.end(),
+              [](const SegmentMeta& a, const SegmentMeta& b) {
+                  return a.start_ts_ns < b.start_ts_ns;
+              });
+
+    size_t segments_deleted = 0;
+    size_t bytes_reclaimed = 0;
+
+    // Partition: expired segments have end_ts_ns < cutoff_ns.
+    // We iterate and collect indices to remove, then erase.
+    std::vector<SegmentMeta> remaining;
+    remaining.reserve(index_.size());
+
+    for (auto& meta : index_) {
+        if (meta.end_ts_ns < cutoff_ns) {
+            // Compute directory size before deletion.
+            size_t dir_bytes = 0;
+            std::error_code ec;
+            for (auto& entry : fs::recursive_directory_iterator(meta.dir_path, ec)) {
+                if (entry.is_regular_file(ec)) {
+                    dir_bytes += static_cast<size_t>(entry.file_size(ec));
+                }
+            }
+
+            // Attempt to remove the segment directory.
+            std::error_code rm_ec;
+            fs::remove_all(meta.dir_path, rm_ec);
+            if (rm_ec) {
+                std::fprintf(stderr,
+                    "[retention] ERROR: failed to delete segment %s: %s\n",
+                    meta.dir_path.c_str(), rm_ec.message().c_str());
+                // Keep the segment in the index since deletion failed.
+                remaining.push_back(std::move(meta));
+                continue;
+            }
+
+            ++segments_deleted;
+            bytes_reclaimed += dir_bytes;
+
+            // Log successful deletion: path, age (cutoff - end_ts), size
+            uint64_t age_ns = (cutoff_ns > meta.end_ts_ns) ? (cutoff_ns - meta.end_ts_ns) : 0;
+            double age_hours = static_cast<double>(age_ns) / 3.6e12;
+            std::fprintf(stderr,
+                "[retention] deleted segment %s age=%.1fh size=%zu bytes\n",
+                meta.dir_path.c_str(), age_hours, dir_bytes);
+        } else {
+            remaining.push_back(std::move(meta));
+        }
+    }
+
+    index_ = std::move(remaining);
+    return {segments_deleted, bytes_reclaimed};
 }
 
 // ── close ─────────────────────────────────────────────────────────────────────

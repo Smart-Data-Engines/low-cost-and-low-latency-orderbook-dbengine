@@ -124,6 +124,14 @@ Command parse_command(std::string_view line) {
         return cmd;
     }
 
+    if (iequals(first, "COMPRESS")) {
+        if (tokens.size() >= 2 && iequals(tokens[1], "LZ4")) {
+            cmd.type = CommandType::COMPRESS;
+            return cmd;
+        }
+        return cmd; // UNKNOWN
+    }
+
     return cmd; // UNKNOWN
 }
 
@@ -159,6 +167,7 @@ std::string format_command(const Command& cmd) {
     case CommandType::FAILOVER:
         return "FAILOVER " + cmd.target_node_id + "\n";
     case CommandType::QUIT:   return "QUIT\n";
+    case CommandType::COMPRESS: return "COMPRESS LZ4\n";
     case CommandType::UNKNOWN: return "";
     }
     return "";

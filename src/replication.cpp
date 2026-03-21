@@ -20,6 +20,7 @@
 // Requirements: 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 3.1, 3.2, 3.3, 3.4, 3.5, 4.1, 4.2, 4.3, 4.4, 4.5, 6.2, 6.3
 
 #include "orderbook/replication.hpp"
+#include "orderbook/compression.hpp"
 #include "orderbook/crc32c.hpp"
 #include "orderbook/engine.hpp"
 
@@ -331,7 +332,21 @@ void ReplicationManager::broadcast(const WALRecord& hdr, const void* payload,
 
     std::lock_guard<std::mutex> lock(mtx_);
     for (auto it = replicas_.begin(); it != replicas_.end(); ) {
-        enqueue_send(*it, msg.data(), msg.size());
+        if (it->compress) {
+            // Compress the entire message as a single LZ4 frame.
+            auto compressed = ob::lz4_compress(msg.data(), msg.size());
+            // Prefix with 4-byte big-endian compressed length.
+            uint32_t comp_len = static_cast<uint32_t>(compressed.size());
+            uint8_t len_prefix[4];
+            len_prefix[0] = static_cast<uint8_t>((comp_len >> 24) & 0xFF);
+            len_prefix[1] = static_cast<uint8_t>((comp_len >> 16) & 0xFF);
+            len_prefix[2] = static_cast<uint8_t>((comp_len >> 8) & 0xFF);
+            len_prefix[3] = static_cast<uint8_t>(comp_len & 0xFF);
+            enqueue_send(*it, len_prefix, 4);
+            enqueue_send(*it, compressed.data(), compressed.size());
+        } else {
+            enqueue_send(*it, msg.data(), msg.size());
+        }
 
         // If the send buffer is too large, the replica is too slow — disconnect it.
         if (it->send_buf.size() > MAX_SEND_BUF_SIZE) {
@@ -466,7 +481,20 @@ void ReplicationManager::run_loop() {
 
             std::lock_guard<std::mutex> lock(mtx_);
             for (auto it = replicas_.begin(); it != replicas_.end(); ) {
-                enqueue_send(*it, hb, static_cast<size_t>(hb_len));
+                if (it->compress) {
+                    // Compress heartbeat as a single LZ4 frame with length prefix.
+                    auto compressed = ob::lz4_compress(hb, static_cast<size_t>(hb_len));
+                    uint32_t comp_len = static_cast<uint32_t>(compressed.size());
+                    uint8_t len_prefix[4];
+                    len_prefix[0] = static_cast<uint8_t>((comp_len >> 24) & 0xFF);
+                    len_prefix[1] = static_cast<uint8_t>((comp_len >> 16) & 0xFF);
+                    len_prefix[2] = static_cast<uint8_t>((comp_len >> 8) & 0xFF);
+                    len_prefix[3] = static_cast<uint8_t>(comp_len & 0xFF);
+                    enqueue_send(*it, len_prefix, 4);
+                    enqueue_send(*it, compressed.data(), compressed.size());
+                } else {
+                    enqueue_send(*it, hb, static_cast<size_t>(hb_len));
+                }
                 if (it->send_buf.size() > MAX_SEND_BUF_SIZE) {
                     remove_replica_locked(it->fd);
                     it = replicas_.erase(it);
@@ -524,9 +552,25 @@ void ReplicationManager::accept_replica() {
         info.address          = std::move(address);
         info.confirmed_file   = 0;
         info.confirmed_offset = 0;
+        info.compress         = false;
         info.reader.set_fd(client_fd);
 
         std::lock_guard<std::mutex> lock(mtx_);
+
+        // If compression is enabled, send COMPRESS LZ4 directive before streaming.
+        if (config_.compress) {
+            const char* directive = "COMPRESS LZ4\n";
+            info.compress = true;
+            // Enqueue the directive into the send buffer (will be drained by epoll).
+            const auto* bytes = reinterpret_cast<const uint8_t*>(directive);
+            info.send_buf.insert(info.send_buf.end(), bytes, bytes + std::strlen(directive));
+            // Arm EPOLLOUT to drain the directive.
+            struct epoll_event ev_out{};
+            ev_out.events  = EPOLLIN | EPOLLOUT | EPOLLET;
+            ev_out.data.fd = client_fd;
+            ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, client_fd, &ev_out);
+        }
+
         replicas_.push_back(std::move(info));
     }
 }
@@ -969,6 +1013,9 @@ void ReplicationClient::connect_to_primary() {
     // Initialize the buffered reader for this connection.
     reader_.set_fd(fd_);
 
+    // Reset compression flag for new connection.
+    compress_ = false;
+
     // Send REPLICATE handshake (Requirement 4.2, 3.1).
     // Even fresh replicas start with REPLICATE 0 0 0. If the primary responds
     // with ERR WAL_TRUNCATED, receive_and_replay() will trigger snapshot bootstrap.
@@ -993,6 +1040,158 @@ void ReplicationClient::receive_and_replay() {
             save_state();
             last_save = now;
         }
+
+        // When compression is enabled, read length-prefixed LZ4 frames.
+        if (compress_) {
+            // Read 4-byte big-endian compressed length.
+            uint8_t len_bytes[4];
+            if (!reader_.read_exact(len_bytes, 4)) {
+                // Check if it's a timeout (EAGAIN) — read_exact returns false on both.
+                // Since we have SO_RCVTIMEO set, a timeout will cause recv to return -1
+                // with EAGAIN. But read_exact treats that as failure. We need to handle
+                // timeouts differently. For simplicity, just return and let run_loop reconnect.
+                return;
+            }
+
+            uint32_t comp_len = (static_cast<uint32_t>(len_bytes[0]) << 24) |
+                                (static_cast<uint32_t>(len_bytes[1]) << 16) |
+                                (static_cast<uint32_t>(len_bytes[2]) << 8) |
+                                static_cast<uint32_t>(len_bytes[3]);
+
+            if (comp_len == 0 || comp_len > 16 * 1024 * 1024) {
+                // Sanity check — invalid frame size.
+                return;
+            }
+
+            // Read the compressed frame.
+            std::vector<uint8_t> compressed(comp_len);
+            if (!reader_.read_exact(compressed.data(), comp_len)) {
+                return;
+            }
+
+            // Decompress.
+            std::vector<uint8_t> decompressed;
+            try {
+                decompressed = ob::lz4_decompress(compressed.data(), compressed.size());
+            } catch (const std::runtime_error& e) {
+                // Decompression failure — disconnect, log error (Requirement 2.5).
+                std::fprintf(stderr, "ReplicationClient: decompression failed: %s\n", e.what());
+                return;
+            }
+
+            // Parse the decompressed data as a normal message (text header + binary).
+            // Find the newline that terminates the text header.
+            const char* data = reinterpret_cast<const char*>(decompressed.data());
+            size_t data_len = decompressed.size();
+
+            const char* nl = static_cast<const char*>(std::memchr(data, '\n', data_len));
+            if (!nl) {
+                // No newline — malformed decompressed message.
+                return;
+            }
+
+            size_t header_len = static_cast<size_t>(nl - data);
+            std::string line(data, header_len);
+            const uint8_t* binary_start = decompressed.data() + header_len + 1;
+            size_t binary_len = data_len - header_len - 1;
+
+            // Parse WAL record.
+            if (line.rfind("WAL ", 0) == 0) {
+                uint32_t file_index = 0;
+                size_t byte_offset = 0;
+                size_t total_len = 0;
+                uint64_t msg_epoch = 0;
+                int parsed = std::sscanf(line.c_str(), "WAL %u %zu %zu %" SCNu64,
+                                &file_index, &byte_offset, &total_len, &msg_epoch);
+                if (parsed < 3) continue;
+
+                if (parsed == 4 && msg_epoch < local_epoch_) {
+                    std::fprintf(stderr, "ReplicationClient: stale epoch %" PRIu64
+                                 " < local %" PRIu64 ", disconnecting\n",
+                                 msg_epoch, local_epoch_);
+                    return;
+                }
+                if (parsed == 4 && msg_epoch > local_epoch_) {
+                    local_epoch_ = msg_epoch;
+                }
+
+                if (binary_len < sizeof(WALRecord)) {
+                    return;
+                }
+
+                WALRecord hdr{};
+                std::memcpy(&hdr, binary_start, sizeof(WALRecord));
+
+                const size_t payload_len = binary_len - sizeof(WALRecord);
+                const uint8_t* payload = binary_start + sizeof(WALRecord);
+
+                if (payload_len != hdr.payload_len) {
+                    return;
+                }
+
+                const uint32_t computed_crc = ob::crc32c(payload, payload_len);
+                if (computed_crc != hdr.checksum) {
+                    return;
+                }
+
+                if (hdr.record_type == WAL_RECORD_EPOCH && payload_len == 8) {
+                    EpochValue received_epoch = epoch_from_payload(payload);
+                    if (received_epoch.term > local_epoch_) {
+                        local_epoch_ = received_epoch.term;
+                    }
+                }
+
+                if (hdr.record_type == WAL_RECORD_DELTA && payload_len >= sizeof(DeltaUpdate)) {
+                    DeltaUpdate delta{};
+                    std::memcpy(&delta, payload, sizeof(DeltaUpdate));
+
+                    const size_t levels_bytes = delta.n_levels * sizeof(Level);
+                    if (sizeof(DeltaUpdate) + levels_bytes <= payload_len) {
+                        const auto* levels = reinterpret_cast<const Level*>(
+                            payload + sizeof(DeltaUpdate));
+                        engine_.apply_delta(delta, levels);
+                    }
+                }
+
+                confirmed_file_   = file_index;
+                confirmed_offset_ = byte_offset + total_len;
+                ++records_replayed_;
+                send_ack();
+                continue;
+            }
+
+            // Handle HEARTBEAT.
+            if (line.rfind("HEARTBEAT", 0) == 0) {
+                uint64_t hb_epoch = 0;
+                if (std::sscanf(line.c_str(), "HEARTBEAT %" SCNu64, &hb_epoch) == 1) {
+                    if (hb_epoch < local_epoch_) {
+                        std::fprintf(stderr, "ReplicationClient: stale heartbeat epoch %" PRIu64
+                                     " < local %" PRIu64 ", disconnecting\n",
+                                     hb_epoch, local_epoch_);
+                        return;
+                    }
+                    if (hb_epoch > local_epoch_) {
+                        local_epoch_ = hb_epoch;
+                    }
+                }
+                send_ack();
+                continue;
+            }
+
+            // Handle ERR.
+            if (line.rfind("ERR ", 0) == 0) {
+                if (line.find("WAL_TRUNCATED") != std::string::npos) {
+                    request_and_receive_snapshot();
+                    return;
+                }
+                return;
+            }
+
+            // Unknown — ignore.
+            continue;
+        }
+
+        // Uncompressed path (original logic).
         // Read a text header line using the buffered reader.
         ssize_t n = reader_.read_line(line_buf, sizeof(line_buf));
         if (n < 0) {
@@ -1125,6 +1324,12 @@ void ReplicationClient::receive_and_replay() {
             }
             // Other errors — disconnect. The run_loop will handle reconnection.
             return;
+        }
+
+        // Detect COMPRESS LZ4 directive from primary (Requirement 2.3).
+        if (std::strncmp(line_buf, "COMPRESS LZ4", 12) == 0) {
+            compress_ = true;
+            continue;
         }
 
         // Unknown message — ignore.

@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace ob {
@@ -69,6 +70,13 @@ public:
 
     /// Flush active segment and release resources.
     void close();
+
+    /// Delete segments whose end_ts_ns < cutoff_ns.
+    /// Returns {segments_deleted, bytes_reclaimed}.
+    /// Deletes in chronological order (oldest first).
+    /// Logs each deletion to stderr.
+    /// Skips segments that fail to delete (logs error, continues).
+    std::pair<size_t, size_t> delete_expired_segments(uint64_t cutoff_ns);
 
     /// Number of segments in the index (including active if flushed).
     size_t segment_count() const { return index_.size(); }

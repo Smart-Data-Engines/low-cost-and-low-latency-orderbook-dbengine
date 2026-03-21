@@ -122,13 +122,17 @@ def _parse_tcp_response(raw: str):
 class _TcpBackend:
     """Communicates with ob_tcp_server over a TCP socket."""
 
-    def __init__(self, host: str, port: int, timeout: float = 10.0):
+    def __init__(self, host: str, port: int, timeout: float = 10.0,
+                 compress: bool = False):
         self._host = host
         self._port = port
         self._sock: Optional[socket.socket] = None
         self._buf = b""
         self._timeout = timeout
+        self._compressed = False
         self._connect()
+        if compress:
+            self._negotiate_compression()
 
     def _connect(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -153,15 +157,38 @@ class _TcpBackend:
                 raise OrderbookError(-1, "Connection closed before banner")
             self._buf += chunk
 
+    def _negotiate_compression(self):
+        """Negotiate LZ4 compression with the server.
+
+        Sends COMPRESS LZ4 command and verifies the OK response.
+        Must be called before any other commands (right after connect).
+        """
+        self._send("COMPRESS LZ4")
+        resp = self._recv_response()
+        if not resp.startswith("OK COMPRESS LZ4"):
+            raise ConnectionError(
+                f"Server does not support LZ4 compression: {resp.strip()}")
+        self._compressed = True
+
     def _send(self, line: str):
-        """Send a command line (must end with \\n)."""
+        """Send a command line (must end with \\n).
+
+        When compression is active, the payload is LZ4-frame compressed.
+        """
         if not line.endswith("\n"):
             line += "\n"
-        self._sock.sendall(line.encode("utf-8"))
+        data = line.encode("utf-8")
+        if self._compressed:
+            import lz4.frame
+            data = lz4.frame.compress(data)
+        self._sock.sendall(data)
 
     def _recv_response(self) -> str:
         """
         Read a complete response from the server.
+
+        When compression is active, incoming data is accumulated until a
+        complete LZ4 frame is received, then decompressed before parsing.
 
         Response termination rules:
           - "ERR ...\n"  → single line ending with \n
@@ -170,6 +197,33 @@ class _TcpBackend:
           - "OK\n...\n\n" → OK with body, terminated by empty line (\n\n)
           - "PRIMARY ...\n" / "REPLICA ...\n" / "STANDALONE\n" → single line (ROLE response)
         """
+        if self._compressed:
+            return self._recv_compressed_response()
+        return self._recv_plain_response()
+
+    def _recv_compressed_response(self) -> str:
+        """Receive and decompress an LZ4-frame-compressed response."""
+        import lz4.frame
+
+        # Accumulate data until we can decompress a complete LZ4 frame.
+        while True:
+            try:
+                decompressed = lz4.frame.decompress(bytes(self._buf))
+                self._buf = b""
+                return decompressed.decode("utf-8", errors="replace")
+            except RuntimeError:
+                # Incomplete frame — need more data.
+                pass
+            try:
+                chunk = self._sock.recv(65536)
+            except socket.timeout:
+                raise OrderbookError(-1, "TCP recv timeout")
+            if not chunk:
+                raise OrderbookError(-1, "TCP connection closed by server")
+            self._buf += chunk
+
+    def _recv_plain_response(self) -> str:
+        """Receive an uncompressed response (original logic)."""
         while True:
             decoded = self._buf.decode("utf-8", errors="replace")
 
@@ -386,9 +440,11 @@ class _ClientPool:
     """
 
     def __init__(self, hosts: List[str], timeout: float = 10.0,
-                 health_check_interval: float = 2.0):
+                 health_check_interval: float = 2.0,
+                 compress: bool = False):
         self._timeout = timeout
         self._health_check_interval = health_check_interval
+        self._compress = compress
         self._nodes: List[_NodeState] = []
         self._connections: dict = {}  # "host:port" -> _TcpBackend
         self._primary_key: Optional[str] = None
@@ -428,7 +484,8 @@ class _ClientPool:
             if key in self._connections:
                 continue
             try:
-                backend = _TcpBackend(node.host, node.port, self._timeout)
+                backend = _TcpBackend(node.host, node.port, self._timeout,
+                                      compress=self._compress)
                 self._connections[key] = backend
                 node.connected = True
             except Exception:
@@ -577,7 +634,8 @@ class OrderbookEngine:
                  port: int = 5555,
                  hosts: Optional[List[str]] = None,
                  timeout: float = 10.0,
-                 health_check_interval: float = 2.0):
+                 health_check_interval: float = 2.0,
+                 compress: bool = False):
         self._seq = 0
         self._closed = False
         self._pool: Optional[_ClientPool] = None
@@ -585,13 +643,14 @@ class OrderbookEngine:
         if hosts is not None:
             # Multi-host pool mode
             self._mode = "pool"
-            self._pool = _ClientPool(hosts, timeout, health_check_interval)
+            self._pool = _ClientPool(hosts, timeout, health_check_interval,
+                                     compress=compress)
             self._tcp = None
             self._local = None
         elif host is not None:
             # TCP mode
             self._mode = "tcp"
-            self._tcp = _TcpBackend(host, port, timeout)
+            self._tcp = _TcpBackend(host, port, timeout, compress=compress)
             self._local = None
         elif data_dir is not None:
             # Local mode

@@ -25,7 +25,16 @@ std::string execute_command(const Command& cmd,
                             bool read_only) {
     switch (cmd.type) {
 
+    case CommandType::COMPRESS: {
+        if (session.commands_executed() > 0) {
+            return format_error("compress_must_be_first");
+        }
+        session.set_compressed(true);
+        return "OK COMPRESS LZ4\n";
+    }
+
     case CommandType::SELECT: {
+        session.increment_commands();
         // Reject queries during snapshot bootstrap.
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
         std::vector<QueryResult> rows;
@@ -45,6 +54,7 @@ std::string execute_command(const Command& cmd,
     }
 
     case CommandType::INSERT: {
+        session.increment_commands();
         if (read_only) return format_error("read-only replica");
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
         try {
@@ -79,6 +89,7 @@ std::string execute_command(const Command& cmd,
     }
 
     case CommandType::FLUSH: {
+        session.increment_commands();
         if (read_only) return format_error("read-only replica");
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
         try {
@@ -94,9 +105,11 @@ std::string execute_command(const Command& cmd,
     }
 
     case CommandType::PING:
+        session.increment_commands();
         return format_pong();
 
     case CommandType::STATUS: {
+        session.increment_commands();
         auto es = engine.stats();
         stats.engine_metrics.pending_rows   = es.pending_rows;
         stats.engine_metrics.wal_file_index = es.wal_file_index;
@@ -124,20 +137,33 @@ std::string execute_command(const Command& cmd,
         stats.primary_address     = es.primary_address;
         stats.lease_ttl_remaining = es.lease_ttl_remaining;
 
+        // Compression metrics from the requesting session
+        stats.compress_bytes_in  = session.compress_bytes_in();
+        stats.compress_bytes_out = session.compress_bytes_out();
+
+        // TTL / data retention metrics
+        stats.ttl_hours            = es.ttl_hours;
+        stats.ttl_segments_deleted = es.ttl_segments_deleted;
+        stats.ttl_bytes_reclaimed  = es.ttl_bytes_reclaimed;
+
         return format_status(stats);
     }
 
     case CommandType::ROLE:
+        session.increment_commands();
         return engine.handle_role_command();
 
     case CommandType::FAILOVER:
+        session.increment_commands();
         return engine.handle_failover_command(cmd.target_node_id);
 
     case CommandType::QUIT:
+        session.increment_commands();
         return ""; // empty string signals session close
 
     case CommandType::UNKNOWN:
     default:
+        session.increment_commands();
         return format_error("unknown command");
     }
 }
@@ -162,6 +188,8 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
             config.read_only = true;
         } else if (arg == "--replication-port" && i + 1 < argc) {
             config.replication_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        } else if (arg == "--replication-compress") {
+            config.replication_compress = true;
         } else if (arg == "--primary-host" && i + 1 < argc) {
             config.primary_host = argv[++i];
         } else if (arg == "--primary-port" && i + 1 < argc) {
@@ -190,6 +218,10 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
         } else if (arg == "--failover-enabled" && i + 1 < argc) {
             std::string val = argv[++i];
             config.failover_enabled = (val == "true" || val == "1" || val == "yes");
+        } else if (arg == "--ttl-hours" && i + 1 < argc) {
+            config.ttl_hours = std::stoull(argv[++i]);
+        } else if (arg == "--ttl-scan-interval-seconds" && i + 1 < argc) {
+            config.ttl_scan_interval_seconds = std::stoull(argv[++i]);
         }
     }
 
@@ -203,6 +235,7 @@ TcpServer::TcpServer(ServerConfig config)
 {
     ReplicationConfig repl_config{};
     repl_config.port = config_.replication_port;
+    repl_config.compress = config_.replication_compress;
 
     ReplicationClientConfig repl_client_config{};
     repl_client_config.primary_host = config_.primary_host;
@@ -221,7 +254,9 @@ TcpServer::TcpServer(ServerConfig config)
     }
 
     engine_ = std::make_unique<Engine>(config_.data_dir, 100'000'000ULL, FsyncPolicy::INTERVAL,
-                                       repl_config, repl_client_config, failover_config);
+                                       repl_config, repl_client_config, failover_config,
+                                       TTLConfig{config_.ttl_hours,
+                                                 config_.ttl_scan_interval_seconds});
 }
 
 TcpServer::~TcpServer() {

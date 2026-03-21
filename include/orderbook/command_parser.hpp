@@ -17,6 +17,7 @@ enum class CommandType {
     ROLE,
     FAILOVER,
     QUIT,
+    COMPRESS,
     UNKNOWN
 };
 

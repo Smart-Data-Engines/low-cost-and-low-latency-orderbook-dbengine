@@ -32,11 +32,27 @@ public:
     void increment_queries();
     void increment_inserts();
 
+    /// Compression state
+    void set_compressed(bool c);
+    bool is_compressed() const;
+
+    /// Compression metrics (per-session, aggregated for STATUS)
+    uint64_t compress_bytes_in() const;   // total pre-compression (raw) bytes
+    uint64_t compress_bytes_out() const;  // total post-compression (wire) bytes
+
+    /// Command counter (tracks total commands executed, used to enforce COMPRESS as first command)
+    uint64_t commands_executed() const;
+    void increment_commands();
+
 private:
     int         fd_;
     std::string read_buffer_;
     uint64_t    queries_{0};
     uint64_t    inserts_{0};
+    bool        compressed_{false};
+    uint64_t    command_count_{0};
+    uint64_t    compress_bytes_in_{0};   // raw bytes (before compression / after decompression)
+    uint64_t    compress_bytes_out_{0};  // wire bytes (after compression / before decompression)
 };
 
 // ── SessionManager ────────────────────────────────────────────────────────────

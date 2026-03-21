@@ -52,6 +52,15 @@ struct ServerStats {
     uint64_t current_epoch{0};
     std::string primary_address;
     int64_t  lease_ttl_remaining{0};
+
+    // Compression metrics
+    uint64_t compress_bytes_in{0};    // total pre-compression bytes
+    uint64_t compress_bytes_out{0};   // total post-compression bytes
+
+    // TTL / data retention metrics
+    uint64_t ttl_hours{0};              // configured TTL (0 = disabled)
+    uint64_t ttl_segments_deleted{0};   // cumulative segments deleted
+    uint64_t ttl_bytes_reclaimed{0};    // cumulative bytes reclaimed
 };
 
 // ── Parsed response (for round-trip testing) ──────────────────────────────────

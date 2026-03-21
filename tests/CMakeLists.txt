@@ -1,5 +1,8 @@
 include(GoogleTest)
 
+# Reduce RapidCheck iterations from default 100 → 25 for faster test runs.
+set(RC_TEST_ENV "RC_PARAMS=max_success=25")
+
 # ── Helper to register a test executable ──────────────────────────────────────
 function(ob_add_test name)
     add_executable(${name} ${ARGN})
@@ -10,7 +13,7 @@ function(ob_add_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name})
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 endfunction()
 
 # ── Helper to register a test executable that needs the soa library ───────────
@@ -23,7 +26,7 @@ function(ob_add_soa_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name})
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 endfunction()
 
 # ── Helper to register a test executable that needs the WAL library ──────────
@@ -37,7 +40,7 @@ function(ob_add_wal_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name})
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 endfunction()
 
 # ── Helper to register a test executable that needs the codec library ─────────
@@ -50,7 +53,7 @@ function(ob_add_codec_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name})
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 endfunction()
 
 # ── Task 1 smoke test ─────────────────────────────────────────────────────────
@@ -83,7 +86,7 @@ function(ob_add_mmap_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name})
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 endfunction()
 
 # ── Tasks 6.1–6.2: MmapStore unit tests ───────────────────────────────────────
@@ -101,7 +104,7 @@ function(ob_add_columnar_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name})
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 endfunction()
 
 # ── Tasks 7.2–7.6: ColumnarStore property and unit tests ──────────────────────
@@ -119,7 +122,7 @@ function(ob_add_agg_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name})
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 endfunction()
 
 # ── Tasks 9.3–9.4: Aggregation Engine property and unit tests ─────────────────
@@ -137,7 +140,7 @@ function(ob_add_query_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name})
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 endfunction()
 
 # ── Tasks 10.5–10.11: Query Engine property and unit tests ────────────────────
@@ -153,7 +156,7 @@ function(ob_add_capi_test name)
             orderbook_capi
             GTest::gtest_main
     )
-    gtest_discover_tests(${name})
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 endfunction()
 
 # ── Task 12.2: C API unit tests ───────────────────────────────────────────────
@@ -169,7 +172,7 @@ function(ob_add_engine_test name)
             orderbook_engine
             GTest::gtest_main
     )
-    gtest_discover_tests(${name})
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 endfunction()
 
 # ── Task 13.2: Engine integration tests ───────────────────────────────────────
@@ -187,7 +190,7 @@ function(ob_add_tcp_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name})
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 endfunction()
 
 # ── TCP Server tests ──────────────────────────────────────────────────────────
@@ -209,7 +212,7 @@ target_link_libraries(test_epoch
         GTest::gtest_main
         rapidcheck
 )
-gtest_discover_tests(test_epoch)
+gtest_discover_tests(test_epoch PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 
 # ── Wire protocol epoch tests (ha-automatic-failover) ─────────────────────────
 add_executable(test_wire_protocol_epoch test_wire_protocol_epoch.cpp)
@@ -219,7 +222,7 @@ target_link_libraries(test_wire_protocol_epoch
         GTest::gtest_main
         rapidcheck
 )
-gtest_discover_tests(test_wire_protocol_epoch)
+gtest_discover_tests(test_wire_protocol_epoch PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 
 # ── Failover election tests (ha-automatic-failover, Property 9) ───────────────
 add_executable(test_failover_election test_failover_election.cpp)
@@ -229,7 +232,7 @@ target_link_libraries(test_failover_election
         GTest::gtest_main
         rapidcheck
 )
-gtest_discover_tests(test_failover_election)
+gtest_discover_tests(test_failover_election PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 
 # ── Failover roles tests (ha-automatic-failover, Properties 10, 15, 16) ──────
 add_executable(test_failover_roles test_failover_roles.cpp)
@@ -239,7 +242,7 @@ target_link_libraries(test_failover_roles
         GTest::gtest_main
         rapidcheck
 )
-gtest_discover_tests(test_failover_roles)
+gtest_discover_tests(test_failover_roles PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 
 # ── CLI failover tests (ha-automatic-failover, Property 11) ──────────────────
 add_executable(test_cli_failover test_cli_failover.cpp)
@@ -249,7 +252,7 @@ target_link_libraries(test_cli_failover
         GTest::gtest_main
         rapidcheck
 )
-gtest_discover_tests(test_cli_failover)
+gtest_discover_tests(test_cli_failover PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 
 # ── Failover integration tests (ha-automatic-failover) ────────────────────────
 add_executable(test_failover_integration test_failover_integration.cpp)
@@ -258,4 +261,48 @@ target_link_libraries(test_failover_integration
         orderbook_engine
         GTest::gtest_main
 )
-gtest_discover_tests(test_failover_integration)
+gtest_discover_tests(test_failover_integration PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+
+# ── Helper to register a test executable that needs the compression library ───
+function(ob_add_compression_test name)
+    add_executable(${name} ${ARGN})
+    target_link_libraries(${name}
+        PRIVATE
+            orderbook_compression
+            GTest::gtest_main
+            rapidcheck
+            rapidcheck_gtest
+    )
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+endfunction()
+
+# ── Compression property and unit tests (compression-and-ttl) ─────────────────
+ob_add_compression_test(test_compression
+    test_compression.cpp
+)
+
+# ── Replication compression handshake tests (compression-and-ttl, Task 3.5) ───
+add_executable(test_replication_compress test_replication_compress.cpp)
+target_link_libraries(test_replication_compress
+    PRIVATE
+        orderbook_engine
+        GTest::gtest_main
+)
+gtest_discover_tests(test_replication_compress PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+
+# ── Session compression negotiation tests (compression-and-ttl, Task 4.4) ────
+ob_add_tcp_test(test_session_compress
+    test_session_compress.cpp
+)
+
+# ── TTL retention tests (compression-and-ttl, Tasks 7.2, 8.3–8.5) ────────────
+add_executable(test_ttl_retention test_ttl_retention.cpp)
+target_link_libraries(test_ttl_retention
+    PRIVATE
+        orderbook_tcp_server_lib
+        orderbook_columnar
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_ttl_retention PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")

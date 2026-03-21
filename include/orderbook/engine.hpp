@@ -22,6 +22,12 @@
 
 namespace ob {
 
+/// TTL / data retention configuration.
+struct TTLConfig {
+    uint64_t ttl_hours{0};                  // 0 = disabled
+    uint64_t scan_interval_seconds{300};    // default 5 minutes
+};
+
 /// Top-level facade that owns and coordinates all subsystems.
 ///
 /// Subsystem ownership order (construction/destruction):
@@ -35,7 +41,8 @@ public:
                     FsyncPolicy fsync_policy = FsyncPolicy::INTERVAL,
                     ReplicationConfig repl_config = {},
                     ReplicationClientConfig repl_client_config = {},
-                    FailoverConfig failover_config = {});
+                    FailoverConfig failover_config = {},
+                    TTLConfig ttl_config = {});
 
     ~Engine();
 
@@ -108,6 +115,15 @@ public:
         uint64_t    current_epoch{0};
         std::string primary_address;
         int64_t     lease_ttl_remaining{0};
+
+        // Compression metrics
+        uint64_t compress_bytes_in{0};   // total pre-compression bytes
+        uint64_t compress_bytes_out{0};  // total post-compression bytes
+
+        // TTL / data retention metrics
+        uint64_t ttl_hours{0};              // configured TTL (0 = disabled)
+        uint64_t ttl_segments_deleted{0};   // cumulative segments deleted
+        uint64_t ttl_bytes_reclaimed{0};    // cumulative bytes reclaimed
     };
 
     /// Collect current engine statistics (thread-safe, acquires mtx_).
@@ -181,6 +197,12 @@ private:
     std::unique_ptr<FailoverManager>     failover_mgr_;
     std::atomic<NodeRole>                node_role_{NodeRole::STANDALONE};
     std::atomic<uint64_t>                current_epoch_{0};
+
+    // TTL / data retention
+    TTLConfig ttl_config_;
+    std::atomic<uint64_t> ttl_segments_deleted_{0};
+    std::atomic<uint64_t> ttl_bytes_reclaimed_{0};
+    uint64_t last_ttl_scan_ns_{0};
 
     // Background flush thread
     std::thread       flush_thread_;
