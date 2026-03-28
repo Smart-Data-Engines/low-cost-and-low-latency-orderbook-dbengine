@@ -58,6 +58,10 @@ public:
     /// Close the engine: flush all dirty data + stop background thread.
     void close();
 
+    /// Incremental two-phase flush: drain pending rows (Phase A, under mutex)
+    /// then write segments to disk and merge index (Phase B, no mutex).
+    void flush_incremental();
+
     /// Apply a delta update: WAL → SoA buffer (gap detection) → enqueue for columnar flush.
     /// Returns OB_OK on success, error code on failure.
     ob_status_t apply_delta(const DeltaUpdate& delta, const Level* levels);
@@ -226,7 +230,8 @@ private:
     SoABuffer&     get_or_create_buffer(const std::string& symbol, const std::string& exchange);
     ColumnarStore& get_or_create_store(const std::string& symbol, const std::string& exchange);
     void flush_loop();
-    void flush_pending(); // must be called with mtx_ held
+    void flush_drain_pending();    // Phase A: drain pending_rows_ → per-symbol append (must hold mtx_)
+    void flush_write_and_merge();  // Phase B: flush segments to disk + merge index (no mutex)
 };
 
 } // namespace ob

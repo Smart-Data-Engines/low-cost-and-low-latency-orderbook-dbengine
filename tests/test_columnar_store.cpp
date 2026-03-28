@@ -463,3 +463,142 @@ TEST(ColumnarStore, CorruptedMetaJsonHandling) {
     // The corrupted segment should be skipped (row_count=0 → parse returns false)
     EXPECT_EQ(store2.segment_count(), 0u);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Task 1.5: test_flush_segment_returns_meta
+// Feature: incremental-flush
+// flush_segment() returns SegmentMeta with correct fields; returns std::nullopt
+// when no active segment.
+// Validates: Requirements 2.1
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(ColumnarStore, test_flush_segment_returns_meta) {
+    TempDir tmp("ut_flush_meta");
+    const uint64_t seg_dur = 1ULL << 60;
+    ob::ColumnarStore store(tmp.str(), seg_dur);
+
+    // --- No active segment → std::nullopt ---
+    {
+        auto result = store.flush_segment();
+        EXPECT_FALSE(result.has_value());
+    }
+
+    // --- Append rows with known symbol/exchange, flush, verify meta ---
+    store.set_symbol_exchange("BTCUSD", "BINANCE");
+
+    store.append(make_row(1000, 50000, 10, 2));
+    store.append(make_row(2000, 50100, 20, 3));
+    store.append(make_row(3000, 50200, 30, 4));
+
+    auto result = store.flush_segment();
+    ASSERT_TRUE(result.has_value());
+
+    const ob::SegmentMeta& meta = result.value();
+    EXPECT_EQ(meta.start_ts_ns, 0u);  // rounded down: 1000 / (1<<60) * (1<<60) = 0
+    EXPECT_EQ(meta.end_ts_ns, 3000u);
+    EXPECT_EQ(meta.row_count, 3u);
+    EXPECT_EQ(meta.symbol, "BTCUSD");
+    EXPECT_EQ(meta.exchange, "BINANCE");
+    EXPECT_FALSE(meta.dir_path.empty());
+    EXPECT_TRUE(fs::exists(meta.dir_path));
+
+    // --- After flush, no active segment → std::nullopt again ---
+    {
+        auto result2 = store.flush_segment();
+        EXPECT_FALSE(result2.has_value());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Task 1.6: test_merge_segments_empty
+// Feature: incremental-flush
+// merge_segments({}) does not change the index.
+// Validates: Requirements 2.4
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(ColumnarStore, test_merge_segments_empty) {
+    TempDir tmp("ut_merge_empty");
+    const uint64_t seg_dur = 1ULL << 60;
+    ob::ColumnarStore store(tmp.str(), seg_dur);
+
+    // Append and flush to create one segment in the index
+    store.set_symbol_exchange("ETHUSD", "KRAKEN");
+    store.append(make_row(500, 30000, 5, 1));
+    store.flush_segment();
+
+    ASSERT_EQ(store.segment_count(), 1u);
+    const auto idx_before = store.index();  // copy
+
+    // merge_segments with empty vector — index must not change
+    store.merge_segments({});
+
+    ASSERT_EQ(store.segment_count(), 1u);
+    const auto& idx_after = store.index();
+    EXPECT_EQ(idx_after[0].start_ts_ns, idx_before[0].start_ts_ns);
+    EXPECT_EQ(idx_after[0].end_ts_ns,   idx_before[0].end_ts_ns);
+    EXPECT_EQ(idx_after[0].row_count,   idx_before[0].row_count);
+    EXPECT_EQ(idx_after[0].symbol,      idx_before[0].symbol);
+    EXPECT_EQ(idx_after[0].exchange,    idx_before[0].exchange);
+    EXPECT_EQ(idx_after[0].dir_path,    idx_before[0].dir_path);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Property 2: Index sort invariant
+// Feature: incremental-flush, Property 2: Index sort invariant
+// For any sequence of flush_segment() and merge_segments(), index_ is always
+// sorted by start_ts_ns.
+// Validates: Requirements 2.2
+// ═══════════════════════════════════════════════════════════════════════════════
+RC_GTEST_PROP(ColumnarStoreProperty, prop_index_sorted_invariant, ()) {
+    TempDir tmp("prop_idx_sort");
+    const uint64_t seg_dur = 1000ULL;
+    ob::ColumnarStore store(tmp.str(), seg_dur);
+    store.set_symbol_exchange("SYM", "EXC");
+
+    // Generate segments via append + flush with monotonically increasing
+    // timestamps (the realistic scenario — market data arrives in time order).
+    const auto n_flush_rounds = *rc::gen::inRange<int>(1, 6);
+    uint64_t next_seg = 0;
+    for (int round = 0; round < n_flush_rounds; ++round) {
+        const auto seg_offset = *rc::gen::inRange<uint64_t>(0, 10);
+        uint64_t seg_base = next_seg + seg_offset;
+        next_seg = seg_base + 1;
+        const auto n_rows = *rc::gen::inRange<int>(1, 5);
+        for (int r = 0; r < n_rows; ++r) {
+            uint64_t ts = seg_base * seg_dur + static_cast<uint64_t>(r);
+            store.append(make_row(ts, 10000 + round * 100 + r));
+        }
+        store.flush_segment();
+
+        // Invariant: index must be sorted after each flush
+        const auto& idx = store.index();
+        for (size_t i = 1; i < idx.size(); ++i) {
+            RC_ASSERT(idx[i - 1].start_ts_ns <= idx[i].start_ts_ns);
+        }
+    }
+
+    // Now merge a random batch of external segments with arbitrary timestamps.
+    // merge_segments() must re-sort the index.
+    const auto n_merge = *rc::gen::inRange<int>(0, 5);
+    std::vector<ob::SegmentMeta> external;
+    for (int m = 0; m < n_merge; ++m) {
+        const auto ts = *rc::gen::inRange<uint64_t>(0, 100000);
+        ob::SegmentMeta seg{};
+        seg.start_ts_ns = ts;
+        seg.end_ts_ns   = ts + 100;
+        seg.row_count   = 1;
+        seg.first_price = 0;
+        seg.has_raw_qty = false;
+        seg.symbol      = "SYM";
+        seg.exchange    = "EXC";
+        seg.dir_path    = "/tmp/fake";
+        external.push_back(seg);
+    }
+    store.merge_segments(external);
+
+    // Invariant: index must still be sorted after merge
+    const auto& idx = store.index();
+    for (size_t i = 1; i < idx.size(); ++i) {
+        RC_ASSERT(idx[i - 1].start_ts_ns <= idx[i].start_ts_ns);
+    }
+}

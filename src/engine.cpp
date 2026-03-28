@@ -106,15 +106,18 @@ void Engine::close() {
         flush_thread_.join();
     }
 
-    // Final flush of all pending rows under the lock.
+    // Final flush of all pending rows under the lock (Phase A).
     {
         std::unique_lock<std::mutex> lock(mtx_);
         // Group commit: sync any remaining WAL records.
         wal_.sync();
-        flush_pending();
+        flush_drain_pending();
     }
 
-    // Flush each per-symbol columnar store.
+    // Phase B: flush segments to disk + merge (no mutex).
+    flush_write_and_merge();
+
+    // Flush each per-symbol columnar store again for any remaining active segments.
     for (auto& [key, store] : stores_) {
         store->flush_segment();
     }
@@ -278,7 +281,7 @@ SnapshotManifest Engine::create_snapshot() {
 
         // Flush all pending rows to columnar stores.
         wal_.sync();
-        flush_pending();
+        flush_drain_pending();
 
         // Flush all per-symbol columnar store active segments.
         for (auto& [key, store] : stores_) {
@@ -567,44 +570,56 @@ void Engine::flush_loop() {
     const auto interval = std::chrono::nanoseconds(flush_interval_ns_);
     while (!stop_flush_.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(interval);
-        std::unique_lock<std::mutex> lock(mtx_);
-        // Group commit: sync WAL to disk periodically instead of per-record.
-        if (wal_.pending_sync_count() > 0) {
-            wal_.sync();
-        }
-        flush_pending();
 
-        // WAL truncation: only truncate files that ALL replicas have confirmed
-        // past, so lagging replicas can still catch up (Requirement 6.3).
-        uint32_t safe_truncate = wal_.current_file_index();
-        if (repl_mgr_) {
-            for (const auto& r : repl_mgr_->replica_states()) {
-                safe_truncate = std::min(safe_truncate, r.confirmed_file);
+        // Phase A: drain pending rows under mutex.
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            if (wal_.pending_sync_count() > 0) {
+                wal_.sync();
             }
-        }
-        if (safe_truncate > 0) {
-            wal_.truncate_before(safe_truncate);
+            flush_drain_pending();
         }
 
-        // TTL retention scan: delete expired segments periodically.
-        if (ttl_config_.ttl_hours > 0) {
-            auto now = std::chrono::steady_clock::now().time_since_epoch();
-            uint64_t now_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
-            uint64_t scan_interval_ns = ttl_config_.scan_interval_seconds * 1'000'000'000ULL;
-            if (now_ns - last_ttl_scan_ns_ >= scan_interval_ns) {
-                uint64_t cutoff_ns = now_ns - ttl_config_.ttl_hours * 3600ULL * 1'000'000'000ULL;
-                auto [deleted, reclaimed] = combined_store_.delete_expired_segments(cutoff_ns);
-                ttl_segments_deleted_.fetch_add(deleted, std::memory_order_relaxed);
-                ttl_bytes_reclaimed_.fetch_add(reclaimed, std::memory_order_relaxed);
-                last_ttl_scan_ns_ = now_ns;
+        // Phase B: flush segments to disk + merge (no mutex).
+        flush_write_and_merge();
+
+        // WAL truncation and TTL scan under mutex.
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+
+            // WAL truncation: only truncate files that ALL replicas have confirmed
+            // past, so lagging replicas can still catch up (Requirement 6.3).
+            uint32_t safe_truncate = wal_.current_file_index();
+            if (repl_mgr_) {
+                for (const auto& r : repl_mgr_->replica_states()) {
+                    safe_truncate = std::min(safe_truncate, r.confirmed_file);
+                }
+            }
+            if (safe_truncate > 0) {
+                wal_.truncate_before(safe_truncate);
+            }
+
+            // TTL retention scan: delete expired segments periodically.
+            if (ttl_config_.ttl_hours > 0) {
+                auto now = std::chrono::steady_clock::now().time_since_epoch();
+                uint64_t now_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+                uint64_t scan_interval_ns = ttl_config_.scan_interval_seconds * 1'000'000'000ULL;
+                if (now_ns - last_ttl_scan_ns_ >= scan_interval_ns) {
+                    uint64_t cutoff_ns = now_ns - ttl_config_.ttl_hours * 3600ULL * 1'000'000'000ULL;
+                    auto [deleted, reclaimed] = combined_store_.delete_expired_segments(cutoff_ns);
+                    ttl_segments_deleted_.fetch_add(deleted, std::memory_order_relaxed);
+                    ttl_bytes_reclaimed_.fetch_add(reclaimed, std::memory_order_relaxed);
+                    last_ttl_scan_ns_ = now_ns;
+                }
             }
         }
     }
 }
 
-void Engine::flush_pending() {
-    // Drain pending_rows_ into per-symbol columnar stores.
+void Engine::flush_drain_pending() {
+    // Phase A: drain pending_rows_ into per-symbol columnar stores.
+    // Must be called with mtx_ held.
     for (const auto& pr : pending_rows_) {
         ColumnarStore& store = get_or_create_store(pr.symbol, pr.exchange);
         store.append(pr.row);
@@ -613,6 +628,34 @@ void Engine::flush_pending() {
 
     // Wake up any writers blocked on backpressure.
     pending_cv_.notify_all();
+}
+
+void Engine::flush_write_and_merge() {
+    // Phase B: flush segments to disk and merge into combined_store_.
+    // Runs WITHOUT mtx_ held (except for the brief merge at the end).
+    std::vector<SegmentMeta> new_segments;
+    for (auto& [key, store] : stores_) {
+        auto meta = store->flush_segment();
+        if (meta.has_value()) {
+            new_segments.push_back(std::move(meta.value()));
+        }
+    }
+
+    if (!new_segments.empty()) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        combined_store_.merge_segments(new_segments);
+    }
+}
+
+void Engine::flush_incremental() {
+    // Phase A: lock → WAL sync → drain pending rows → unlock
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+        wal_.sync();
+        flush_drain_pending();
+    }
+    // Phase B: flush segments to disk + merge (no mutex)
+    flush_write_and_merge();
 }
 
 } // namespace ob

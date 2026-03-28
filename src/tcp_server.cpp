@@ -88,16 +88,50 @@ std::string execute_command(const Command& cmd,
         return format_ok();
     }
 
+    case CommandType::MINSERT: {
+        session.increment_commands();
+        if (read_only) return format_error("read-only replica");
+        if (engine.is_bootstrapping()) return format_error("bootstrapping");
+        try {
+            const auto& a = cmd.minsert_args;
+
+            DeltaUpdate delta{};
+            std::strncpy(delta.symbol,   a.symbol.c_str(),   sizeof(delta.symbol)   - 1);
+            std::strncpy(delta.exchange, a.exchange.c_str(), sizeof(delta.exchange) - 1);
+            delta.sequence_number = 0;
+            delta.timestamp_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count());
+            delta.side     = a.side;
+            delta.n_levels = a.n_levels;
+
+            std::vector<Level> levels(a.n_levels);
+            for (uint16_t i = 0; i < a.n_levels; ++i) {
+                levels[i].price = a.levels[i].price;
+                levels[i].qty   = a.levels[i].qty;
+                levels[i].cnt   = a.levels[i].count;
+                levels[i]._pad  = 0;
+            }
+
+            ob_status_t status = engine.apply_delta(delta, levels.data());
+            if (status != OB_OK) {
+                return format_error("apply_delta failed with code " + std::to_string(status));
+            }
+        } catch (const std::exception& e) {
+            return format_error(e.what());
+        }
+        session.increment_inserts();
+        stats.total_inserts.fetch_add(1, std::memory_order_relaxed);
+        return format_ok();
+    }
+
     case CommandType::FLUSH: {
         session.increment_commands();
         if (read_only) return format_error("read-only replica");
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
         try {
-            // Flush pattern: close engine (flushes all data) then reopen.
-            // NOTE: This is called on the TcpServer's engine, which is shared.
-            // The caller must ensure thread-safety (Engine has internal mutex).
-            engine.close();
-            engine.open();
+            engine.flush_incremental();
         } catch (const std::exception& e) {
             return format_error(e.what());
         }
@@ -423,7 +457,10 @@ void TcpServer::run() {
                             goto next_event; // break out of both loops
                         }
 
-                        Command cmd = parse_command(line);
+                        // Multi-line blocks (containing \n) are MINSERT — use parse_minsert()
+                        Command cmd = (line.find('\n') != std::string::npos)
+                                          ? parse_minsert(line)
+                                          : parse_command(line);
                         std::string response = execute_command(cmd, *engine_, *session, stats, config_.read_only);
 
                         if (response.empty()) {

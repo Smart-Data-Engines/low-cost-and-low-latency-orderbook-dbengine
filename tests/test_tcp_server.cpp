@@ -100,11 +100,11 @@ static Gen<ob::Command> genCommand() {
             return cmd;
         }),
         // Simple commands
-        gen::just(ob::Command{ob::CommandType::FLUSH, {}, {}, {}}),
-        gen::just(ob::Command{ob::CommandType::PING, {}, {}, {}}),
-        gen::just(ob::Command{ob::CommandType::STATUS, {}, {}, {}}),
-        gen::just(ob::Command{ob::CommandType::ROLE, {}, {}, {}}),
-        gen::just(ob::Command{ob::CommandType::QUIT, {}, {}, {}})
+        gen::just(ob::Command{ob::CommandType::FLUSH, {}, {}, {}, {}}),
+        gen::just(ob::Command{ob::CommandType::PING, {}, {}, {}, {}}),
+        gen::just(ob::Command{ob::CommandType::STATUS, {}, {}, {}, {}}),
+        gen::just(ob::Command{ob::CommandType::ROLE, {}, {}, {}, {}}),
+        gen::just(ob::Command{ob::CommandType::QUIT, {}, {}, {}, {}})
     );
 }
 

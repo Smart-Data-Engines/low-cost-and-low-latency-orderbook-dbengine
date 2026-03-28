@@ -1,4 +1,5 @@
 #include "orderbook/command_parser.hpp"
+#include "orderbook/data_model.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -135,6 +136,98 @@ Command parse_command(std::string_view line) {
     return cmd; // UNKNOWN
 }
 
+// ── parse_minsert ─────────────────────────────────────────────────────────────
+
+/// Split a string_view into lines on '\n'.
+static std::vector<std::string_view> split_lines(std::string_view sv) {
+    std::vector<std::string_view> lines;
+    size_t pos = 0;
+    while (pos < sv.size()) {
+        size_t nl = sv.find('\n', pos);
+        if (nl == std::string_view::npos) {
+            auto tail = rtrim(sv.substr(pos));
+            if (!tail.empty()) lines.push_back(tail);
+            break;
+        }
+        auto segment = rtrim(sv.substr(pos, nl - pos));
+        if (!segment.empty()) lines.push_back(segment);
+        pos = nl + 1;
+    }
+    return lines;
+}
+
+Command parse_minsert(std::string_view block) {
+    Command cmd{};
+    cmd.type = CommandType::UNKNOWN;
+
+    auto lines = split_lines(block);
+    if (lines.empty()) return cmd;
+
+    // ── Parse header ──────────────────────────────────────────────────────
+    auto header_tokens = tokenize(lines[0]);
+    if (header_tokens.size() < 5) return cmd;
+    if (!iequals(header_tokens[0], "MINSERT")) return cmd;
+
+    MinsertArgs args{};
+    args.symbol   = std::string(header_tokens[1]);
+    args.exchange = std::string(header_tokens[2]);
+
+    // side
+    if (iequals(header_tokens[3], "bid")) {
+        args.side = 0;
+    } else if (iequals(header_tokens[3], "ask")) {
+        args.side = 1;
+    } else {
+        return cmd;
+    }
+
+    // n_levels
+    {
+        uint16_t nl_val = 0;
+        auto sv = header_tokens[4];
+        auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), nl_val);
+        if (ec != std::errc{} || ptr != sv.data() + sv.size()) return cmd;
+        if (nl_val == 0 || nl_val > MAX_LEVELS) return cmd;
+        args.n_levels = nl_val;
+    }
+
+    // ── Parse payload lines ───────────────────────────────────────────────
+    if (lines.size() < static_cast<size_t>(1 + args.n_levels)) return cmd;
+
+    args.levels.reserve(args.n_levels);
+    for (uint16_t i = 0; i < args.n_levels; ++i) {
+        auto toks = tokenize(lines[1 + i]);
+        if (toks.size() < 2) return cmd;
+
+        MinsertArgs::Level lvl{0, 0, 1};
+
+        // price (int64)
+        {
+            auto sv = toks[0];
+            auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), lvl.price);
+            if (ec != std::errc{} || ptr != sv.data() + sv.size()) return cmd;
+        }
+        // qty (uint64)
+        {
+            auto sv = toks[1];
+            auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), lvl.qty);
+            if (ec != std::errc{} || ptr != sv.data() + sv.size()) return cmd;
+        }
+        // optional count (uint32, default 1)
+        if (toks.size() >= 3) {
+            auto sv = toks[2];
+            auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), lvl.count);
+            if (ec != std::errc{} || ptr != sv.data() + sv.size()) return cmd;
+        }
+
+        args.levels.push_back(lvl);
+    }
+
+    cmd.type = CommandType::MINSERT;
+    cmd.minsert_args = std::move(args);
+    return cmd;
+}
+
 // ── format_command ────────────────────────────────────────────────────────────
 
 std::string format_command(const Command& cmd) {
@@ -157,6 +250,28 @@ std::string format_command(const Command& cmd) {
         out += ' ';
         out += std::to_string(a.count);
         out += '\n';
+        return out;
+    }
+
+    case CommandType::MINSERT: {
+        const auto& a = cmd.minsert_args;
+        std::string out = "MINSERT ";
+        out += a.symbol;
+        out += ' ';
+        out += a.exchange;
+        out += ' ';
+        out += (a.side == 0) ? "bid" : "ask";
+        out += ' ';
+        out += std::to_string(a.n_levels);
+        out += '\n';
+        for (const auto& lvl : a.levels) {
+            out += std::to_string(lvl.price);
+            out += ' ';
+            out += std::to_string(lvl.qty);
+            out += ' ';
+            out += std::to_string(lvl.count);
+            out += '\n';
+        }
         return out;
     }
 

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -58,7 +59,8 @@ public:
     }
 
     /// Flush the active segment: encode buffers, write column files, write meta.json.
-    void flush_segment();
+    /// Returns the SegmentMeta of the flushed segment, or std::nullopt if no active segment.
+    std::optional<SegmentMeta> flush_segment();
 
     /// Time-range scan; calls cb for each decoded row in [start_ns, end_ns].
     void scan(uint64_t start_ns, uint64_t end_ns,
@@ -83,6 +85,9 @@ public:
 
     /// Access the segment index (read-only).
     const std::vector<SegmentMeta>& index() const { return index_; }
+
+    /// Merge new segments into the index, maintaining sort order by start_ts_ns.
+    void merge_segments(const std::vector<SegmentMeta>& new_segments);
 
 private:
     std::string base_dir_;

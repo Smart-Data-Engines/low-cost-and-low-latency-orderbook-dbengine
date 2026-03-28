@@ -170,10 +170,10 @@ void ColumnarStore::append(const SnapshotRow& row) {
 
 // ── flush_segment ─────────────────────────────────────────────────────────────
 
-void ColumnarStore::flush_segment() {
+std::optional<SegmentMeta> ColumnarStore::flush_segment() {
     if (!has_active_segment_ || active_row_count_ == 0) {
         has_active_segment_ = false;
-        return;
+        return std::nullopt;
     }
 
     // Compute end timestamp
@@ -232,7 +232,7 @@ void ColumnarStore::flush_segment() {
     }
 
     // Build SegmentMeta
-    SegmentMeta meta;
+    SegmentMeta meta{};
     meta.start_ts_ns = active_segment_start_;
     meta.end_ts_ns   = end_ts;
     meta.row_count   = active_row_count_;
@@ -246,7 +246,7 @@ void ColumnarStore::flush_segment() {
     // Write meta.json
     write_meta_json(dir, meta);
 
-    // Add to index
+    // Add to index (backward compatibility)
     index_.push_back(meta);
 
     // Reset active segment state
@@ -257,6 +257,8 @@ void ColumnarStore::flush_segment() {
     qty_buf_.clear();
     ts_buf_.clear();
     cnt_buf_.clear();
+
+    return meta;
 }
 
 // ── scan ──────────────────────────────────────────────────────────────────────
@@ -375,6 +377,17 @@ void ColumnarStore::open_existing() {
     }
 
     // Sort by start_ts_ns
+    std::sort(index_.begin(), index_.end(),
+              [](const SegmentMeta& a, const SegmentMeta& b) {
+                  return a.start_ts_ns < b.start_ts_ns;
+              });
+}
+
+// ── merge_segments ────────────────────────────────────────────────────────────
+
+void ColumnarStore::merge_segments(const std::vector<SegmentMeta>& new_segments) {
+    if (new_segments.empty()) return;
+    index_.insert(index_.end(), new_segments.begin(), new_segments.end());
     std::sort(index_.begin(), index_.end(),
               [](const SegmentMeta& a, const SegmentMeta& b) {
                   return a.start_ts_ns < b.start_ts_ns;

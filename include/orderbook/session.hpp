@@ -53,6 +53,12 @@ private:
     uint64_t    command_count_{0};
     uint64_t    compress_bytes_in_{0};   // raw bytes (before compression / after decompression)
     uint64_t    compress_bytes_out_{0};  // wire bytes (after compression / before decompression)
+
+    // MINSERT multi-line buffering state
+    bool        minsert_pending_{false};
+    uint16_t    minsert_expected_{0};     // expected number of payload lines
+    std::string minsert_header_;          // saved header line
+    std::vector<std::string> minsert_lines_; // collected payload lines
 };
 
 // ── SessionManager ────────────────────────────────────────────────────────────

@@ -2,7 +2,9 @@
 #include "orderbook/compression.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <cstring>
 #include <stdexcept>
 #include <unistd.h>
@@ -20,18 +22,88 @@ std::vector<std::string> Session::feed(const char* data, size_t len) {
 
     if (!compressed_) {
         // Newline-delimited text mode
-        std::vector<std::string> lines;
+        std::vector<std::string> result;
         size_t pos = 0;
         while (true) {
             auto nl = read_buffer_.find('\n', pos);
             if (nl == std::string::npos) break;
-            lines.emplace_back(read_buffer_, pos, nl - pos);
+            std::string line(read_buffer_, pos, nl - pos);
             pos = nl + 1;
+
+            if (minsert_pending_) {
+                // Collecting payload lines for an in-progress MINSERT
+                minsert_lines_.push_back(std::move(line));
+                if (minsert_lines_.size() == static_cast<size_t>(minsert_expected_)) {
+                    // Assemble complete multi-line block
+                    std::string block = minsert_header_;
+                    for (const auto& pl : minsert_lines_) {
+                        block += '\n';
+                        block += pl;
+                    }
+                    result.push_back(std::move(block));
+                    // Reset MINSERT state
+                    minsert_pending_ = false;
+                    minsert_expected_ = 0;
+                    minsert_header_.clear();
+                    minsert_lines_.clear();
+                }
+            } else {
+                // Check if this line starts with MINSERT (case-insensitive)
+                bool is_minsert = false;
+                if (line.size() >= 7) {
+                    // Check prefix "MINSERT" case-insensitively
+                    is_minsert = true;
+                    const char* minsert_kw = "MINSERT";
+                    for (int i = 0; i < 7; ++i) {
+                        if (std::toupper(static_cast<unsigned char>(line[i])) != minsert_kw[i]) {
+                            is_minsert = false;
+                            break;
+                        }
+                    }
+                    // Must be followed by space or end of line
+                    if (is_minsert && line.size() > 7 && line[7] != ' ' && line[7] != '\t') {
+                        is_minsert = false;
+                    }
+                }
+
+                if (is_minsert) {
+                    // Parse n_levels from the header: tokenize, take token[4]
+                    // Tokenize: split on whitespace
+                    uint16_t n_levels = 0;
+                    size_t ti = 0;
+                    int token_idx = 0;
+                    while (ti < line.size() && token_idx < 5) {
+                        while (ti < line.size() && (line[ti] == ' ' || line[ti] == '\t')) ++ti;
+                        if (ti >= line.size()) break;
+                        size_t start = ti;
+                        while (ti < line.size() && line[ti] != ' ' && line[ti] != '\t') ++ti;
+                        if (token_idx == 4) {
+                            // Parse n_levels
+                            const char* begin = line.data() + start;
+                            const char* end = line.data() + ti;
+                            std::from_chars(begin, end, n_levels);
+                        }
+                        ++token_idx;
+                    }
+
+                    if (n_levels > 0) {
+                        minsert_pending_ = true;
+                        minsert_expected_ = n_levels;
+                        minsert_header_ = std::move(line);
+                        minsert_lines_.clear();
+                    } else {
+                        // n_levels=0 or parse failure — pass through as-is
+                        result.push_back(std::move(line));
+                    }
+                } else {
+                    result.push_back(std::move(line));
+                }
+            }
         }
         if (pos > 0) {
             read_buffer_.erase(0, pos);
         }
-        return lines;
+        return result;
     }
 
     // Compressed binary framing: [4-byte BE length][LZ4 frame]

@@ -21,7 +21,7 @@ struct ServerConfig {
     std::string data_dir{"/tmp/ob_data"};
     int         max_sessions{64};
     int         worker_threads{4};
-    size_t      max_line_length{8192};  // max command line bytes
+    size_t      max_line_length{262144}; // max command bytes (256KB, supports MINSERT with 1000 levels)
     bool        read_only{false};       // reject INSERT/FLUSH when true (replica mode)
 
     // Replication (primary)

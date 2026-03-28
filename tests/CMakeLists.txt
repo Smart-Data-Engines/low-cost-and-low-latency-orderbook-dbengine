@@ -295,6 +295,17 @@ ob_add_tcp_test(test_session_compress
     test_session_compress.cpp
 )
 
+# ── Incremental flush tests (incremental-flush, Tasks 6.1–7.3) ────────────────
+add_executable(test_incremental_flush test_incremental_flush.cpp)
+target_link_libraries(test_incremental_flush
+    PRIVATE
+        orderbook_engine
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_incremental_flush PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+
 # ── TTL retention tests (compression-and-ttl, Tasks 7.2, 8.3–8.5) ────────────
 add_executable(test_ttl_retention test_ttl_retention.cpp)
 target_link_libraries(test_ttl_retention
@@ -306,3 +317,14 @@ target_link_libraries(test_ttl_retention
         rapidcheck_gtest
 )
 gtest_discover_tests(test_ttl_retention PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+
+# ── Batch insert tests (batch-insert, Properties 1–5 + unit tests) ────────────
+add_executable(test_batch_insert test_batch_insert.cpp)
+target_link_libraries(test_batch_insert PRIVATE orderbook_tcp_server_lib GTest::gtest_main rapidcheck rapidcheck_gtest)
+gtest_discover_tests(test_batch_insert PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+
+# ── Stress tests (gated behind OB_STRESS_TESTS env var) ──────────────────────
+add_executable(test_stress test_stress.cpp)
+target_link_libraries(test_stress PRIVATE orderbook_engine GTest::gtest_main)
+# NOT registered with gtest_discover_tests — run manually:
+#   OB_STRESS_TESTS=1 ./build/tests/test_stress

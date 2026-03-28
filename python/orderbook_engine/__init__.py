@@ -492,7 +492,11 @@ class _ClientPool:
                 node.connected = False
 
     def _discover_primary(self):
-        """Issue ROLE command to all connected nodes, find the primary."""
+        """Issue ROLE command to all connected nodes, find the primary.
+
+        Standalone nodes (no coordinator) that are not read-only are treated
+        as primary for write routing purposes.
+        """
         with self._lock:
             for node in self._nodes:
                 key = self._node_key(node)
@@ -510,12 +514,17 @@ class _ClientPool:
                     # Remove broken connection.
                     self._connections.pop(key, None)
 
-            # Find primary.
+            # Find primary. Fall back to first standalone node (writable).
             self._primary_key = None
             for node in self._nodes:
                 if node.role == "primary":
                     self._primary_key = self._node_key(node)
                     break
+            if self._primary_key is None:
+                for node in self._nodes:
+                    if node.role == "standalone" and node.connected:
+                        self._primary_key = self._node_key(node)
+                        break
 
     def _parse_role_response(self, node: _NodeState, raw: str):
         """Parse ROLE command response and update node state."""
@@ -733,16 +742,35 @@ class OrderbookEngine:
             self._local.insert(symbol, exchange, side_int, prices, qtys, counts, seq, ts)
         elif self._mode == "pool":
             # Pool mode: route writes to primary.
-            for i in range(n):
-                cmd = f"INSERT {symbol} {exchange} {side_lower} {prices[i]} {qtys[i]} {counts[i]}"
+            if n > 1:
+                # MINSERT: single round-trip for multiple levels
+                header = f"MINSERT {symbol} {exchange} {side_lower} {n}"
+                payload_lines = [f"{prices[i]} {qtys[i]} {counts[i]}" for i in range(n)]
+                cmd = header + "\n" + "\n".join(payload_lines)
+                raw = self._pool.execute_write(cmd)
+                is_err, msg, _, _ = _parse_tcp_response(raw)
+                if is_err:
+                    raise OrderbookError(-1, f"Pool MINSERT failed: {msg}")
+            else:
+                cmd = f"INSERT {symbol} {exchange} {side_lower} {prices[0]} {qtys[0]} {counts[0]}"
                 raw = self._pool.execute_write(cmd)
                 is_err, msg, _, _ = _parse_tcp_response(raw)
                 if is_err:
                     raise OrderbookError(-1, f"Pool INSERT failed: {msg}")
         else:
-            # TCP: one INSERT per level
-            for i in range(n):
-                cmd = f"INSERT {symbol} {exchange} {side_lower} {prices[i]} {qtys[i]} {counts[i]}"
+            # TCP mode
+            if n > 1:
+                # MINSERT: single round-trip for multiple levels
+                header = f"MINSERT {symbol} {exchange} {side_lower} {n}"
+                payload_lines = [f"{prices[i]} {qtys[i]} {counts[i]}" for i in range(n)]
+                cmd = header + "\n" + "\n".join(payload_lines)
+                raw = self._tcp.execute(cmd)
+                is_err, msg, _, _ = _parse_tcp_response(raw)
+                if is_err:
+                    raise OrderbookError(-1, f"TCP MINSERT failed: {msg}")
+            else:
+                # INSERT: backward compat for single level
+                cmd = f"INSERT {symbol} {exchange} {side_lower} {prices[0]} {qtys[0]} {counts[0]}"
                 raw = self._tcp.execute(cmd)
                 is_err, msg, _, _ = _parse_tcp_response(raw)
                 if is_err:
