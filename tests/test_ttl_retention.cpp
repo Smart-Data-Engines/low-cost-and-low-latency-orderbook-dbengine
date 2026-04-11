@@ -101,7 +101,7 @@ TEST(TTLDeletion, TTLDeleteExpired) {
     EXPECT_EQ(store.segment_count(), 2u);
 
     // Verify remaining segments
-    const auto& idx = store.index();
+    const auto idx = store.index();
     EXPECT_EQ(idx[0].start_ts_ns, 300u);
     EXPECT_EQ(idx[1].start_ts_ns, 500u);
 
@@ -263,7 +263,7 @@ RC_GTEST_PROP(TTLProperty, ExpiredSegmentDeletionCorrectness, ()) {
     RC_ASSERT(deleted == static_cast<size_t>(seg_count) - expected_remaining.size());
 
     // Assert remaining segments match expected, sorted by start_ts_ns
-    const auto& idx = store.index();
+    const auto idx = store.index();
     for (size_t i = 0; i < expected_remaining.size(); ++i) {
         RC_ASSERT(idx[i].start_ts_ns == expected_remaining[i].start_ts);
         RC_ASSERT(idx[i].end_ts_ns == expected_remaining[i].end_ts);
@@ -308,7 +308,7 @@ RC_GTEST_PROP(TTLProperty, TTLZeroPreservesAllSegments, ()) {
     RC_ASSERT(store.segment_count() == original_count);
 
     // Index should be unchanged
-    const auto& idx = store.index();
+    const auto idx = store.index();
     for (size_t i = 0; i < original_count; ++i) {
         RC_ASSERT(idx[i].start_ts_ns == original_index[i].start_ts_ns);
         RC_ASSERT(idx[i].end_ts_ns == original_index[i].end_ts_ns);

@@ -416,7 +416,10 @@ TEST(StressTest, MinsertBatchThroughput) {
         }
     }
 
-    // Final flush
+    // Final flush — call twice with a small delay to catch any data drained
+    // by the background flush_loop that hasn't been written to segments yet.
+    eg.engine.flush_incremental();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
     eg.engine.flush_incremental();
 
     double elapsed_s = duration_cast<milliseconds>(steady_clock::now() - t0).count() / 1000.0;

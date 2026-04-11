@@ -1,108 +1,129 @@
 # Roadmap — orderbook-dbengine
 
-Development plan towards production quality and High Availability.
+Development plan towards production quality, High Availability, and HFT readiness.
 
-## Phase 1 — Production Hardening (HA foundation)
+## Phase 1 — Production Hardening ✅
 
 ### 1. Configurable fsync policy
-- Modes: `fsync_every` (full durability), `fsync_interval` (current ~100ms), `fsync_none` (max throughput)
-- User chooses the durability vs throughput tradeoff
-- Status: **DONE** — `FsyncPolicy` enum, propagated through `WALWriter` → `Engine` → `TcpServer`
+- Status: **DONE** — `FsyncPolicy` enum (EVERY, INTERVAL, NONE)
 
 ### 2. Graceful shutdown with drain
-- Reject new connections, finish in-flight commands
-- Flush pending rows, then shut down
-- Currently has `atomic<bool> running_` but no drain logic
-- Status: **DONE** — `draining_` state in `TcpServer`, rejects new connections during drain, waits for active sessions to finish
+- Status: **DONE** — `draining_` state, rejects new connections, waits for in-flight
 
-### 3. WAL truncation / compaction ← P0
-- WAL rotates at 512MB but old files are never removed
-- After data is confirmed in the columnar store, old WAL files can be safely deleted
-- Status: **DONE** — `WALWriter::truncate_before()` + auto-truncation in `Engine::flush_loop()`
+### 3. WAL truncation / compaction
+- Status: **DONE** — `WALWriter::truncate_before()` + auto-truncation in `flush_loop()`
 
-### 4. Backpressure on pending_rows_ ← P0
-- `std::vector<PendingRow>` grows without limit
-- Under high ingestion rate with slow flush → OOM
-- Bounded queue with backpressure (block writer when full)
-- Status: **DONE** — `MAX_PENDING_ROWS=1M` + `condition_variable` backpressure in `apply_delta()`
+### 4. Backpressure on pending_rows_
+- Status: **DONE** — `MAX_PENDING_ROWS=1M` + `condition_variable` backpressure
 
-### 5. Monitoring endpoint ← P0
-- `STATUS` returns basic stats but lacks:
-  - WAL size, pending rows count, segment count
-  - Memory usage, uptime
-- Critical for production operations
-- Status: **DONE** — `Engine::stats()` + extended `ServerStats` with `pending_rows`, `wal_file`, `segments`, `symbols`
+### 5. Monitoring endpoint
+- Status: **DONE** — `Engine::stats()` + extended `ServerStats` (replication, failover, compression, TTL metrics)
 
-## Phase 2 — Replication (HA foundation)
+## Phase 2 — Replication ✅
 
 ### 6. WAL streaming replication
-- Primary sends WAL records to replica(s) via a dedicated TCP stream
-- Replica replays WAL and maintains its own SoA buffer + columnar store
-- Protocol: `REPLICATE <file_index> <byte_offset>\n` / `WAL <fi> <off> <len>\n<binary>` / `ACK <fi> <off>\n`
-- Status: **DONE** — `ReplicationManager` (epoll, non-blocking send buffers, EPOLLOUT drain), `ReplicationClient` (BufferedReader, CRC32C verify, exponential backoff reconnect), shared `crc32c.hpp` header
+- Status: **DONE** — `ReplicationManager` + `ReplicationClient`, CRC32C verify, exponential backoff
 
 ### 7. Read replicas
-- Replica accepts SELECT/aggregation, rejects INSERT/FLUSH
-- Client connects to replica for reads, to primary for writes
-- Status: **DONE** — `--read-only` flag in TcpServer rejects INSERT/FLUSH, replica Engine replays via `apply_delta()`
+- Status: **DONE** — `--read-only` flag, replica replays via `apply_delta()`
 
 ### 8. Replica lag monitoring
-- Primary tracks confirmed offset per replica
-- Exposed in `STATUS` and as a metric, alert when lag > threshold
-- Status: **DONE** — per-replica `lag_bytes` in `Engine::Stats`, exposed in STATUS response, WAL truncation respects slowest replica
+- Status: **DONE** — per-replica `lag_bytes`, WAL truncation respects slowest replica
 
-## Phase 3 — High Availability
+## Phase 3 — High Availability ✅
 
 ### 9. Automatic failover
-- Replica with the highest confirmed WAL offset promotes itself to primary
-- External coordinator (etcd v3 REST) with lease-based leadership
-- EpochManager, CoordinatorClient, FailoverManager with role transitions
-- Status: **DONE** — `EpochManager` (WAL epoch records, monotonic enforcement), `CoordinatorClient` (etcd v3 REST via libcurl, lease grant/refresh/revoke, CAS leadership), `FailoverManager` (monitor loop, promotion/demotion, graceful failover), Engine integration with `RoleTransitionHandler`
+- Status: **DONE** — `EpochManager`, `CoordinatorClient` (etcd v3 REST), `FailoverManager`
 
 ### 10. Client-side failover
-- Python bindings: `OrderbookEngine(hosts=["primary:5555", "replica1:5556"])`
-- Automatic switchover to new primary after failover
-- Status: **DONE** — `_ClientPool` with `_discover_primary()`, write routing with retry, read fallback, background health check loop, `ROLE` command support
+- Status: **DONE** — `_ClientPool` with auto primary discovery, write routing, read fallback
 
 ### 11. Fencing / split-brain protection
-- WAL epoch counter: each new primary increments the epoch
-- Replicas reject writes from the old epoch
-- Status: **DONE** — Epoch in wire protocol (REPLICATE/WAL/HEARTBEAT), stale-epoch fencing, `ERR STALE_PRIMARY` on handshake, epoch persistence through WAL replay
+- Status: **DONE** — Epoch in wire protocol, stale-epoch fencing, `ERR STALE_PRIMARY`
 
-## Phase 4 — Scalability and features
+## Phase 4 — Performance & Features ✅
 
-### 12. Symbol-based sharding
-- Different symbols on different nodes, routing layer
+### 12. Snapshot-based replica bootstrap
+- Status: **DONE** — `create_snapshot()`, chunked transfer, auto-bootstrap on WAL_TRUNCATED
 
-### 13. Snapshot-based replica bootstrap
-- Consistent snapshot (columnar store + WAL offset) instead of full WAL replay
-- Status: **DONE** — `Engine::create_snapshot()` (flush + CRC32C), `Engine::load_snapshot()`, `ReplicationManager` chunked transfer (SNAPSHOT_BEGIN/FILE/END), `ReplicationClient` auto-bootstrap on WAL_TRUNCATED, staging dir for crash safety, manifest CRC verification, bootstrapping state in STATUS
+### 13. Wire protocol compression (LZ4)
+- Status: **DONE** — Replication stream + query session compression, `COMPRESS LZ4` handshake
 
-### 14. Wire protocol compression
-- Optional LZ4 frame compression on TCP for replication and large query results
+### 14. TTL / data retention
+- Status: **DONE** — `--ttl-hours`, `--ttl-scan-interval-seconds`, per-node retention
 
-### 15. TTL / data retention
-- Automatic deletion of segments older than N days
+### 15. Incremental flush (non-blocking)
+- Status: **DONE** — Two-phase flush (drain under mutex, write without), 82ms → 2ms
 
-### 16. Multi-master replication
+### 16. Batch INSERT (MINSERT wire protocol)
+- Status: **DONE** — `MINSERT` command, single `apply_delta()`, Python auto-batch, 85ms → 3ms
+
+### 17. Stress testing & load benchmarks
+- Status: **DONE** — C++ (5 scenarios) + Python TCP (2 scenarios), 777k levels/s sustained
+
+## Phase 5 — HFT Production Readiness
+
+### 18. Observability stack (Prometheus + structured logging)
+- Prometheus `/metrics` HTTP endpoint with counters/gauges/histograms
+- Structured JSON logging (replace fprintf(stderr) with structured logger)
+- Distributed tracing headers (optional, for multi-node debugging)
+- Effort: M | Impact: Critical for production ops
+
+### 19. Failover integration tests with real etcd
+- Docker-based test environment with etcd cluster
+- Test full failover cycle: primary crash → replica promotion → client reconnect
+- Test split-brain recovery with real network partitions
+- Gate behind `OB_INTEGRATION_TESTS` env var
+- Effort: M | Impact: Confidence in HA correctness
+
+### 20. C++ native client library
+- Zero-copy TCP client with connection pooling
+- Binary wire protocol option (avoid text parsing overhead on hot path)
+- Header-only or static library, no external dependencies
+- Effort: L | Impact: 10-100x lower latency than Python client
+
+### 21. io_uring transport layer
+- Replace epoll with io_uring for async I/O (Linux 5.1+)
+- Submission queue batching for multiple concurrent connections
+- Zero-copy receive with registered buffers
+- Effort: L | Impact: ~30-50% latency reduction on modern kernels
+
+### 22. Symbol-based sharding
+- Different symbols on different nodes, routing layer in client
+- Shard map stored in etcd, auto-rebalancing on node add/remove
+- Prerequisite: C++ client (#20) for efficient cross-shard routing
+- Effort: XL | Impact: Horizontal scalability
+
+### 23. Multi-master replication
 - Any node accepts writes, data propagated to all other nodes
-- Requires conflict resolution (sequence number vector clocks or CRDTs)
-- Prerequisite: automatic failover (#9-11) and snapshot bootstrap (#13) must be solid first
+- Conflict resolution via vector clocks or CRDTs
+- Prerequisite: sharding (#22) and solid failover (#9-11)
+- Effort: XL | Impact: Write scalability, geo-distribution
 
-## Prioritization
+## Recommended Order
 
-| Priority | Item | Effort | Impact | Status |
-|----------|------|--------|--------|--------|
-| P0 | WAL truncation (#3) | S | Without this, disk fills up | ✅ Done |
-| P0 | Backpressure (#4) | S | Without this, OOM in production | ✅ Done |
-| P0 | Monitoring (#5) | M | Without this, blind ops | ✅ Done |
-| P1 | Graceful shutdown (#2) | S | Data loss on restart | ✅ Done |
-| P1 | Fsync policy (#1) | S | Configurability | ✅ Done |
-| P1 | WAL streaming (#6) | L | Foundation for everything | ✅ Done |
-| P2 | Read replicas (#7) | M | First HA benefit | ✅ Done |
-| P2 | Replica lag (#8) | S | Operational necessity | ✅ Done |
-| P3 | Failover (#9-11) | XL | Full HA | ✅ Done |
-| P3 | Snapshot bootstrap (#13) | L | Replica catch-up | ✅ Done |
-| P4 | Sharding, TTL (#12-15) | XL | Scale | |
+| Priority | Item | Effort | Why next |
+|----------|------|--------|----------|
+| P1 | Observability (#18) | M | Can't run production without metrics/logging |
+| P1 | etcd integration tests (#19) | M | Validates HA before real deployment |
+| P2 | C++ client (#20) | L | Unlocks HFT hot path, prerequisite for sharding |
+| P2 | io_uring transport (#21) | L | Major latency win on modern Linux |
+| P3 | Symbol sharding (#22) | XL | Horizontal scale when single node isn't enough |
+| P4 | Multi-master (#23) | XL | Research-grade, only if geo-distribution needed |
 
 S = few days, M = week, L = 2-3 weeks, XL = month+
+
+## Performance Baselines (current)
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| PING latency (TCP) | ~60 µs avg | Python client, loopback |
+| Single INSERT (TCP) | ~0.3 ms | Python client |
+| MINSERT 1000 levels (TCP) | ~3 ms | Python client, single round-trip |
+| FLUSH (incremental) | ~2-3 ms | Non-blocking, two-phase |
+| Sustained INSERT throughput | 29k/s | Python TCP, 60s stress test |
+| Sustained MINSERT throughput | 777k levels/s | Python TCP, 60s stress test |
+| Native update latency | ~2.8 µs p50 | C++ benchmark |
+| Native ingestion | ~1.35M updates/s | C++ benchmark |
+| C++ tests | 281 | GTest + RapidCheck |
+| Python tests | 14 | unittest + Hypothesis |

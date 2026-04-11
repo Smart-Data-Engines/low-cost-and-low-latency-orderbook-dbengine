@@ -300,7 +300,7 @@ struct CoordinatorClient::Impl {
                          static_cast<long>(json_body.size()));
         curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_callback);
         curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &response);
-        curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 5L);
+        curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 2L);
 
         struct curl_slist* headers = nullptr;
         headers = curl_slist_append(headers, "Content-Type: application/json");

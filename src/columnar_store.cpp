@@ -1,5 +1,6 @@
 #include "orderbook/columnar_store.hpp"
 #include "orderbook/codec.hpp"
+#include "orderbook/logger.hpp"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -247,7 +248,10 @@ std::optional<SegmentMeta> ColumnarStore::flush_segment() {
     write_meta_json(dir, meta);
 
     // Add to index (backward compatibility)
-    index_.push_back(meta);
+    {
+        std::unique_lock<std::shared_mutex> lock(index_mtx_);
+        index_.push_back(meta);
+    }
 
     // Reset active segment state
     has_active_segment_ = false;
@@ -266,7 +270,15 @@ std::optional<SegmentMeta> ColumnarStore::flush_segment() {
 void ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
                           std::string_view symbol, std::string_view exchange,
                           std::function<void(const SnapshotRow&)> cb) const {
-    for (const auto& meta : index_) {
+    // Take a snapshot of the index under shared lock to avoid data race
+    // with merge_segments() which modifies index_ under exclusive lock.
+    std::vector<SegmentMeta> index_snapshot;
+    {
+        std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        index_snapshot = index_;
+    }
+
+    for (const auto& meta : index_snapshot) {
         // Filter by symbol/exchange
         if (meta.symbol != symbol || meta.exchange != exchange) continue;
 
@@ -360,6 +372,7 @@ void ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
 // ── open_existing ─────────────────────────────────────────────────────────────
 
 void ColumnarStore::open_existing() {
+    std::unique_lock<std::shared_mutex> lock(index_mtx_);
     index_.clear();
 
     if (!fs::exists(base_dir_)) return;
@@ -387,6 +400,7 @@ void ColumnarStore::open_existing() {
 
 void ColumnarStore::merge_segments(const std::vector<SegmentMeta>& new_segments) {
     if (new_segments.empty()) return;
+    std::unique_lock<std::shared_mutex> lock(index_mtx_);
     index_.insert(index_.end(), new_segments.begin(), new_segments.end());
     std::sort(index_.begin(), index_.end(),
               [](const SegmentMeta& a, const SegmentMeta& b) {
@@ -400,6 +414,8 @@ std::pair<size_t, size_t> ColumnarStore::delete_expired_segments(uint64_t cutoff
     if (cutoff_ns == 0) {
         return {0, 0};
     }
+
+    std::unique_lock<std::shared_mutex> lock(index_mtx_);
 
     // Sort index by start_ts_ns (oldest first) for chronological deletion order.
     std::sort(index_.begin(), index_.end(),
@@ -430,8 +446,7 @@ std::pair<size_t, size_t> ColumnarStore::delete_expired_segments(uint64_t cutoff
             std::error_code rm_ec;
             fs::remove_all(meta.dir_path, rm_ec);
             if (rm_ec) {
-                std::fprintf(stderr,
-                    "[retention] ERROR: failed to delete segment %s: %s\n",
+                OB_LOG_ERROR("retention", "failed to delete segment %s: %s",
                     meta.dir_path.c_str(), rm_ec.message().c_str());
                 // Keep the segment in the index since deletion failed.
                 remaining.push_back(std::move(meta));
@@ -444,8 +459,7 @@ std::pair<size_t, size_t> ColumnarStore::delete_expired_segments(uint64_t cutoff
             // Log successful deletion: path, age (cutoff - end_ts), size
             uint64_t age_ns = (cutoff_ns > meta.end_ts_ns) ? (cutoff_ns - meta.end_ts_ns) : 0;
             double age_hours = static_cast<double>(age_ns) / 3.6e12;
-            std::fprintf(stderr,
-                "[retention] deleted segment %s age=%.1fh size=%zu bytes\n",
+            OB_LOG_INFO("retention", "deleted segment %s age=%.1fh size=%zu bytes",
                 meta.dir_path.c_str(), age_hours, dir_bytes);
         } else {
             remaining.push_back(std::move(meta));

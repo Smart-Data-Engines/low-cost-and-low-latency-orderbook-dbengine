@@ -23,6 +23,7 @@
 #include "orderbook/compression.hpp"
 #include "orderbook/crc32c.hpp"
 #include "orderbook/engine.hpp"
+#include "orderbook/logger.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -1075,7 +1076,7 @@ void ReplicationClient::receive_and_replay() {
                 decompressed = ob::lz4_decompress(compressed.data(), compressed.size());
             } catch (const std::runtime_error& e) {
                 // Decompression failure — disconnect, log error (Requirement 2.5).
-                std::fprintf(stderr, "ReplicationClient: decompression failed: %s\n", e.what());
+                OB_LOG_ERROR("replication", "decompression failed: %s", e.what());
                 return;
             }
 
@@ -1106,8 +1107,8 @@ void ReplicationClient::receive_and_replay() {
                 if (parsed < 3) continue;
 
                 if (parsed == 4 && msg_epoch < local_epoch_) {
-                    std::fprintf(stderr, "ReplicationClient: stale epoch %" PRIu64
-                                 " < local %" PRIu64 ", disconnecting\n",
+                    OB_LOG_WARN("replication", "stale epoch %" PRIu64
+                                 " < local %" PRIu64 ", disconnecting",
                                  msg_epoch, local_epoch_);
                     return;
                 }
@@ -1165,8 +1166,8 @@ void ReplicationClient::receive_and_replay() {
                 uint64_t hb_epoch = 0;
                 if (std::sscanf(line.c_str(), "HEARTBEAT %" SCNu64, &hb_epoch) == 1) {
                     if (hb_epoch < local_epoch_) {
-                        std::fprintf(stderr, "ReplicationClient: stale heartbeat epoch %" PRIu64
-                                     " < local %" PRIu64 ", disconnecting\n",
+                        OB_LOG_WARN("replication", "stale heartbeat epoch %" PRIu64
+                                     " < local %" PRIu64 ", disconnecting",
                                      hb_epoch, local_epoch_);
                         return;
                     }
@@ -1218,8 +1219,8 @@ void ReplicationClient::receive_and_replay() {
             // Stale-epoch check (Requirement 2.1, 2.2, 3.5).
             if (parsed == 4 && msg_epoch < local_epoch_) {
                 // Stale primary — disconnect and log warning.
-                std::fprintf(stderr, "ReplicationClient: stale epoch %" PRIu64
-                             " < local %" PRIu64 ", disconnecting\n",
+                OB_LOG_WARN("replication", "stale epoch %" PRIu64
+                             " < local %" PRIu64 ", disconnecting",
                              msg_epoch, local_epoch_);
                 return;
             }
@@ -1300,8 +1301,8 @@ void ReplicationClient::receive_and_replay() {
             if (std::sscanf(line_buf, "HEARTBEAT %" SCNu64, &hb_epoch) == 1) {
                 // Stale-epoch check (Requirement 3.5).
                 if (hb_epoch < local_epoch_) {
-                    std::fprintf(stderr, "ReplicationClient: stale heartbeat epoch %" PRIu64
-                                 " < local %" PRIu64 ", disconnecting\n",
+                    OB_LOG_WARN("replication", "stale heartbeat epoch %" PRIu64
+                                 " < local %" PRIu64 ", disconnecting",
                                  hb_epoch, local_epoch_);
                     return;
                 }

@@ -654,7 +654,8 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb) {
     bool found_in_live = (live_buffers_.count(live_key) > 0);
     bool found_in_store = false;
     if (!found_in_live) {
-        for (const auto& seg : store_.index()) {
+        auto idx_snapshot = store_.index();
+        for (const auto& seg : idx_snapshot) {
             if (seg.symbol == ast.symbol && seg.exchange == ast.exchange) {
                 found_in_store = true;
                 break;

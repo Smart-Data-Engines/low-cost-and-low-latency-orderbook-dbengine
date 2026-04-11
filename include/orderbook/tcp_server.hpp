@@ -2,6 +2,8 @@
 
 #include "orderbook/command_parser.hpp"
 #include "orderbook/engine.hpp"
+#include "orderbook/metrics.hpp"
+#include "orderbook/metrics_server.hpp"
 #include "orderbook/response_formatter.hpp"
 #include "orderbook/session.hpp"
 
@@ -45,6 +47,10 @@ struct ServerConfig {
     // TTL / data retention
     uint64_t ttl_hours{0};                    // --ttl-hours (0 = disabled)
     uint64_t ttl_scan_interval_seconds{300};  // --ttl-scan-interval-seconds
+
+    // Observability
+    uint16_t    metrics_port{0};              // --metrics-port (0 = disabled)
+    std::string log_level{"INFO"};            // --log-level (ERROR|WARN|INFO|DEBUG)
 };
 
 // ── TcpServer ─────────────────────────────────────────────────────────────────
@@ -68,6 +74,7 @@ public:
 private:
     ServerConfig             config_;
     std::unique_ptr<Engine>  engine_;
+    std::unique_ptr<MetricsServer> metrics_server_;
     std::atomic<bool>        running_{false};
     std::atomic<bool>        draining_{false};  // drain phase: reject new connections, finish in-flight
     int                      listen_fd_{-1};
@@ -81,11 +88,13 @@ private:
 
 /// Execute a command against the engine. Returns the wire-protocol response string.
 /// When read_only is true, INSERT and FLUSH commands are rejected with an error.
+/// When registry is non-null, latency histograms and operation counters are updated.
 std::string execute_command(const Command& cmd,
                             Engine& engine,
                             Session& session,
                             ServerStats& stats,
-                            bool read_only = false);
+                            bool read_only = false,
+                            MetricsRegistry* registry = nullptr);
 
 /// Parse CLI arguments into a ServerConfig. Applies defaults for missing args.
 ServerConfig parse_cli_args(int argc, char* argv[]);

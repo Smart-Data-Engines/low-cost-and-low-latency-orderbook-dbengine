@@ -107,7 +107,7 @@ private:
     std::atomic<NodeRole>   role_{NodeRole::STANDALONE};
     mutable std::mutex      mtx_;
     EpochValue              epoch_;
-    int64_t                 lease_id_{0};
+    std::atomic<int64_t>    lease_id_{0};
     std::string             primary_address_;
     std::chrono::steady_clock::time_point last_lease_refresh_;
 

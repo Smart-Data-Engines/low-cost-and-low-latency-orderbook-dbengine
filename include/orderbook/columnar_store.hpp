@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -81,10 +82,17 @@ public:
     std::pair<size_t, size_t> delete_expired_segments(uint64_t cutoff_ns);
 
     /// Number of segments in the index (including active if flushed).
-    size_t segment_count() const { return index_.size(); }
+    size_t segment_count() const {
+        std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        return index_.size();
+    }
 
-    /// Access the segment index (read-only).
-    const std::vector<SegmentMeta>& index() const { return index_; }
+    /// Access the segment index (read-only snapshot).
+    /// NOTE: Returns a copy for thread safety. Use scan() for iteration.
+    std::vector<SegmentMeta> index() const {
+        std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        return index_;
+    }
 
     /// Merge new segments into the index, maintaining sort order by start_ts_ns.
     void merge_segments(const std::vector<SegmentMeta>& new_segments);
@@ -109,6 +117,9 @@ private:
 
     // Segment index (rebuilt from meta.json on open_existing)
     std::vector<SegmentMeta> index_;
+
+    // Protects index_ for concurrent scan() (shared) vs merge_segments()/open_existing() (exclusive)
+    mutable std::shared_mutex index_mtx_;
 
     // Helpers
     std::string segment_dir(const std::string& symbol, const std::string& exchange,

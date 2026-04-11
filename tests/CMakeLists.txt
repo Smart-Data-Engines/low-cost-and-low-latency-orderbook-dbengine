@@ -323,8 +323,67 @@ add_executable(test_batch_insert test_batch_insert.cpp)
 target_link_libraries(test_batch_insert PRIVATE orderbook_tcp_server_lib GTest::gtest_main rapidcheck rapidcheck_gtest)
 gtest_discover_tests(test_batch_insert PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 
+# ── MetricsRegistry property and unit tests (observability, Tasks 1.3–1.7) ────
+add_executable(test_metrics_registry test_metrics_registry.cpp)
+target_link_libraries(test_metrics_registry
+    PRIVATE
+        orderbook_metrics
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_metrics_registry PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+
+# ── MetricsServer property and integration tests (observability, Tasks 5.6–5.7) ─
+add_executable(test_metrics_server test_metrics_server.cpp)
+target_link_libraries(test_metrics_server
+    PRIVATE
+        orderbook_metrics_server
+        orderbook_tcp_server_lib
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_metrics_server PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+
+# ── StructuredLogger property and unit tests (observability, Tasks 3.3–3.7) ───
+add_executable(test_structured_logger test_structured_logger.cpp)
+target_link_libraries(test_structured_logger
+    PRIVATE
+        orderbook_logger
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_structured_logger PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+
 # ── Stress tests (gated behind OB_STRESS_TESTS env var) ──────────────────────
 add_executable(test_stress test_stress.cpp)
 target_link_libraries(test_stress PRIVATE orderbook_engine GTest::gtest_main)
 # NOT registered with gtest_discover_tests — run manually:
 #   OB_STRESS_TESTS=1 ./build/tests/test_stress
+
+# ── etcd integration tests (gated behind OB_ETCD_TESTS env var) ──────────────
+add_executable(test_etcd_integration test_etcd_integration.cpp)
+target_link_libraries(test_etcd_integration
+    PRIVATE
+        orderbook_engine
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+# NOT registered with gtest_discover_tests — run manually:
+#   OB_ETCD_TESTS=1 ./build/tests/test_etcd_integration
+set_target_properties(test_etcd_integration PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=25")
+
+# ── C++ native client tests (cpp-native-client, Properties 1–6 + unit tests) ─
+add_executable(test_client test_client.cpp)
+target_link_libraries(test_client
+    PRIVATE
+        orderbook_client
+        orderbook_tcp_server_lib
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_client PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")

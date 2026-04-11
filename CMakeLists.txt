@@ -91,7 +91,7 @@ target_link_libraries(orderbook_coordinator PUBLIC orderbook_epoch CURL::libcurl
 
 # ── Failover compiled library (role transitions and monitoring) ────────────────
 add_library(orderbook_failover STATIC src/failover.cpp)
-target_link_libraries(orderbook_failover PUBLIC orderbook_coordinator orderbook_epoch)
+target_link_libraries(orderbook_failover PUBLIC orderbook_coordinator orderbook_epoch orderbook_logger)
 
 # ── Codec compiled library ─────────────────────────────────────────────────────
 add_library(orderbook_codec STATIC src/codec.cpp)
@@ -103,7 +103,7 @@ target_link_libraries(orderbook_mmap PUBLIC orderbook_core)
 
 # ── Columnar store compiled library ────────────────────────────────────────────
 add_library(orderbook_columnar STATIC src/columnar_store.cpp)
-target_link_libraries(orderbook_columnar PUBLIC orderbook_codec orderbook_mmap)
+target_link_libraries(orderbook_columnar PUBLIC orderbook_codec orderbook_mmap orderbook_logger)
 
 # ── LZ4 compression library ────────────────────────────────────────────────────
 find_package(PkgConfig)
@@ -129,6 +129,18 @@ else()
     target_include_directories(orderbook_compression PUBLIC ${LZ4_INCLUDE_DIR})
 endif()
 
+# ── Metrics registry compiled library ──────────────────────────────────────────
+add_library(orderbook_metrics STATIC src/metrics.cpp)
+target_link_libraries(orderbook_metrics PUBLIC orderbook_core)
+
+# ── Structured logger compiled library ─────────────────────────────────────────
+add_library(orderbook_logger STATIC src/logger.cpp)
+target_link_libraries(orderbook_logger PUBLIC orderbook_core)
+
+# ── Metrics HTTP server compiled library ───────────────────────────────────────
+add_library(orderbook_metrics_server STATIC src/metrics_server.cpp)
+target_link_libraries(orderbook_metrics_server PUBLIC orderbook_metrics orderbook_logger)
+
 # ── Aggregation engine compiled library ────────────────────────────────────────
 add_library(orderbook_agg STATIC src/aggregation.cpp)
 target_link_libraries(orderbook_agg PUBLIC orderbook_soa)
@@ -139,7 +151,7 @@ target_link_libraries(orderbook_query PUBLIC orderbook_columnar orderbook_agg)
 
 # ── Engine facade compiled library ────────────────────────────────────────────
 add_library(orderbook_engine STATIC src/engine.cpp src/replication.cpp)
-target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression)
+target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression orderbook_metrics orderbook_logger)
 
 # ── C API compiled library ────────────────────────────────────────────────────
 add_library(orderbook_capi STATIC src/c_api.cpp)
@@ -232,7 +244,17 @@ add_library(orderbook_tcp_server_lib STATIC
     src/response_formatter.cpp
     src/session.cpp
 )
-target_link_libraries(orderbook_tcp_server_lib PUBLIC orderbook_engine)
+target_link_libraries(orderbook_tcp_server_lib PUBLIC orderbook_engine orderbook_logger orderbook_metrics_server)
+
+# ── Native C++ client library ──────────────────────────────────────────────────
+add_library(orderbook_client STATIC src/client.cpp)
+target_link_libraries(orderbook_client PUBLIC orderbook_core)
+
+option(OB_CLIENT_LZ4 "Enable optional LZ4 compression in orderbook_client" OFF)
+if(OB_CLIENT_LZ4)
+    target_compile_definitions(orderbook_client PUBLIC OB_CLIENT_LZ4)
+    target_link_libraries(orderbook_client PUBLIC orderbook_compression)
+endif()
 
 # ── TCP Server executable ─────────────────────────────────────────────────────
 add_executable(ob_tcp_server tools/ob_tcp_server.cpp)

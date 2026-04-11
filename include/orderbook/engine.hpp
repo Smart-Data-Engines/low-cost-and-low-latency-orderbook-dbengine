@@ -5,6 +5,7 @@
 #include "orderbook/data_model.hpp"
 #include "orderbook/epoch.hpp"
 #include "orderbook/failover.hpp"
+#include "orderbook/metrics.hpp"
 #include "orderbook/query_engine.hpp"
 #include "orderbook/replication.hpp"
 #include "orderbook/soa_buffer.hpp"
@@ -83,6 +84,9 @@ public:
 
     /// Access the query engine (for advanced use).
     QueryEngine& query_engine() { return *query_engine_; }
+
+    /// Access the metrics registry.
+    MetricsRegistry& registry() { return registry_; }
 
     /// Engine-level statistics for monitoring.
     struct Stats {
@@ -177,6 +181,7 @@ private:
     // Subsystems (order matters for construction/destruction)
     WALWriter         wal_;
     AggregationEngine agg_;
+    MetricsRegistry   registry_;
 
     // Per-symbol SoABuffers
     std::unordered_map<std::string, std::unique_ptr<SoABuffer>> buffers_;

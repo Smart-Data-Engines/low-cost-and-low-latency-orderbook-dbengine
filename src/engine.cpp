@@ -9,6 +9,7 @@
 
 #include "orderbook/engine.hpp"
 #include "orderbook/crc32c.hpp"
+#include "orderbook/logger.hpp"
 
 #include <chrono>
 #include <cinttypes>
@@ -189,6 +190,9 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta, const Level* levels) {
         // 5. Notify streaming subscribers synchronously (within 1 µs budget, Requirement 10.9).
         query_engine_->notify_subscribers(delta.symbol, delta.exchange, row);
     }
+
+    // Update gauge: pending rows after enqueue.
+    registry_.set_gauge("pending_rows", static_cast<int64_t>(pending_rows_.size()));
 
     return status;
 }
@@ -422,6 +426,9 @@ void Engine::promote_to_primary(const EpochValue& new_epoch) {
     wal_.set_epoch(new_epoch.term);
     wal_.append_epoch(new_epoch);
 
+    // Update gauge: current epoch after promotion.
+    registry_.set_gauge("current_epoch", static_cast<int64_t>(new_epoch.term));
+
     // Start ReplicationManager if not already running.
     if (!repl_mgr_ && repl_config_.port > 0) {
         repl_mgr_ = std::make_unique<ReplicationManager>(repl_config_, wal_);
@@ -433,8 +440,10 @@ void Engine::promote_to_primary(const EpochValue& new_epoch) {
 
     node_role_.store(NodeRole::PRIMARY, std::memory_order_release);
 
-    std::fprintf(stderr, "[engine] promoted to PRIMARY, epoch=%" PRIu64 "\n",
-                 new_epoch.term);
+    // Update metrics registry node role.
+    registry_.set_node_role("primary");
+
+    OB_LOG_INFO("engine", "promoted to PRIMARY, epoch=%" PRIu64, new_epoch.term);
 }
 
 void Engine::demote_to_replica(const std::string& new_primary_address) {
@@ -449,6 +458,11 @@ void Engine::demote_to_replica(const std::string& new_primary_address) {
     }
 
     node_role_.store(NodeRole::REPLICA, std::memory_order_release);
+
+    // Update metrics registry node role and epoch gauge.
+    registry_.set_node_role("replica");
+    registry_.set_gauge("current_epoch",
+                        static_cast<int64_t>(current_epoch_.load(std::memory_order_relaxed)));
 
     // Start ReplicationClient to new primary.
     if (!new_primary_address.empty()) {
@@ -466,8 +480,8 @@ void Engine::demote_to_replica(const std::string& new_primary_address) {
         }
     }
 
-    std::fprintf(stderr, "[engine] demoted to REPLICA, primary=%s\n",
-                 new_primary_address.c_str());
+    OB_LOG_INFO("engine", "demoted to REPLICA, primary=%s",
+                new_primary_address.c_str());
 }
 
 std::pair<uint32_t, size_t> Engine::get_wal_position() const {
@@ -483,8 +497,8 @@ void Engine::truncate_and_rebootstrap(const EpochValue& new_epoch,
     current_epoch_.store(new_epoch.term, std::memory_order_release);
 
     // Request snapshot from new primary via ReplicationClient.
-    std::fprintf(stderr, "[engine] re-bootstrapping from %s, epoch=%" PRIu64 "\n",
-                 primary_address.c_str(), new_epoch.term);
+    OB_LOG_INFO("engine", "re-bootstrapping from %s, epoch=%" PRIu64,
+                primary_address.c_str(), new_epoch.term);
 }
 
 NodeRole Engine::node_role() const {
@@ -550,6 +564,10 @@ SoABuffer& Engine::get_or_create_buffer(const std::string& symbol,
     live_ptrs_[key] = buf.get();
     auto& ref = *buf;
     buffers_[key] = std::move(buf);
+
+    // Update gauge: symbol count after adding new symbol.
+    registry_.set_gauge("symbol_count", static_cast<int64_t>(buffers_.size()));
+
     return ref;
 }
 
@@ -582,6 +600,10 @@ void Engine::flush_loop() {
 
         // Phase B: flush segments to disk + merge (no mutex).
         flush_write_and_merge();
+
+        // Update gauge: WAL file index.
+        registry_.set_gauge("wal_file_index",
+                            static_cast<int64_t>(wal_.current_file_index()));
 
         // WAL truncation and TTL scan under mutex.
         {
@@ -626,6 +648,9 @@ void Engine::flush_drain_pending() {
     }
     pending_rows_.clear();
 
+    // Update gauge: pending rows is now 0 after drain.
+    registry_.set_gauge("pending_rows", 0);
+
     // Wake up any writers blocked on backpressure.
     pending_cv_.notify_all();
 }
@@ -644,6 +669,10 @@ void Engine::flush_write_and_merge() {
     if (!new_segments.empty()) {
         std::unique_lock<std::mutex> lock(mtx_);
         combined_store_.merge_segments(new_segments);
+
+        // Update gauge: segment count after merge.
+        registry_.set_gauge("segment_count",
+                            static_cast<int64_t>(combined_store_.segment_count()));
     }
 }
 

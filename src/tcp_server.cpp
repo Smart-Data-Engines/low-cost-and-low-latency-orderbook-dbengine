@@ -1,8 +1,12 @@
 #include "orderbook/tcp_server.hpp"
+#include "orderbook/logger.hpp"
+#include "orderbook/metrics.hpp"
+#include "orderbook/metrics_server.hpp"
 
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -22,7 +26,8 @@ std::string execute_command(const Command& cmd,
                             Engine& engine,
                             Session& session,
                             ServerStats& stats,
-                            bool read_only) {
+                            bool read_only,
+                            MetricsRegistry* registry) {
     switch (cmd.type) {
 
     case CommandType::COMPRESS: {
@@ -37,6 +42,7 @@ std::string execute_command(const Command& cmd,
         session.increment_commands();
         // Reject queries during snapshot bootstrap.
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
+        auto t0_select = std::chrono::steady_clock::now();
         std::vector<QueryResult> rows;
         try {
             std::string err = engine.execute(cmd.raw_sql, [&](const QueryResult& r) {
@@ -48,6 +54,11 @@ std::string execute_command(const Command& cmd,
         } catch (const std::exception& e) {
             return format_error(e.what());
         }
+        if (registry) {
+            double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_select).count();
+            registry->observe_histogram("ob_query_latency_seconds", secs);
+            registry->increment_counter("ob_total_queries");
+        }
         session.increment_queries();
         stats.total_queries.fetch_add(1, std::memory_order_relaxed);
         return format_query_response(rows);
@@ -57,6 +68,7 @@ std::string execute_command(const Command& cmd,
         session.increment_commands();
         if (read_only) return format_error("read-only replica");
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
+        auto t0_insert = std::chrono::steady_clock::now();
         try {
             const auto& a = cmd.insert_args;
 
@@ -83,6 +95,11 @@ std::string execute_command(const Command& cmd,
         } catch (const std::exception& e) {
             return format_error(e.what());
         }
+        if (registry) {
+            double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_insert).count();
+            registry->observe_histogram("ob_insert_latency_seconds", secs);
+            registry->increment_counter("ob_total_inserts");
+        }
         session.increment_inserts();
         stats.total_inserts.fetch_add(1, std::memory_order_relaxed);
         return format_ok();
@@ -92,6 +109,7 @@ std::string execute_command(const Command& cmd,
         session.increment_commands();
         if (read_only) return format_error("read-only replica");
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
+        auto t0_minsert = std::chrono::steady_clock::now();
         try {
             const auto& a = cmd.minsert_args;
 
@@ -121,6 +139,11 @@ std::string execute_command(const Command& cmd,
         } catch (const std::exception& e) {
             return format_error(e.what());
         }
+        if (registry) {
+            double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_minsert).count();
+            registry->observe_histogram("ob_insert_latency_seconds", secs);
+            registry->increment_counter("ob_total_inserts");
+        }
         session.increment_inserts();
         stats.total_inserts.fetch_add(1, std::memory_order_relaxed);
         return format_ok();
@@ -130,10 +153,16 @@ std::string execute_command(const Command& cmd,
         session.increment_commands();
         if (read_only) return format_error("read-only replica");
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
+        auto t0_flush = std::chrono::steady_clock::now();
         try {
             engine.flush_incremental();
         } catch (const std::exception& e) {
             return format_error(e.what());
+        }
+        if (registry) {
+            double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_flush).count();
+            registry->observe_histogram("ob_flush_latency_seconds", secs);
+            registry->increment_counter("ob_total_flushes");
         }
         return format_ok();
     }
@@ -256,6 +285,18 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
             config.ttl_hours = std::stoull(argv[++i]);
         } else if (arg == "--ttl-scan-interval-seconds" && i + 1 < argc) {
             config.ttl_scan_interval_seconds = std::stoull(argv[++i]);
+        } else if (arg == "--metrics-port" && i + 1 < argc) {
+            config.metrics_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        } else if (arg == "--log-level" && i + 1 < argc) {
+            std::string level_str = argv[++i];
+            auto parsed = StructuredLogger::parse_level(level_str);
+            if (!parsed.has_value()) {
+                std::fprintf(stderr,
+                    "Error: invalid log level '%s'. Valid values: ERROR, WARN, INFO, DEBUG\n",
+                    level_str.c_str());
+                std::exit(1);
+            }
+            config.log_level = level_str;
         }
     }
 
@@ -301,6 +342,18 @@ TcpServer::~TcpServer() {
 void TcpServer::run() {
     // Open the engine (replay WAL, start flush thread).
     engine_->open();
+
+    // Set structured log level from config.
+    auto parsed_level = StructuredLogger::parse_level(config_.log_level);
+    if (parsed_level.has_value()) {
+        StructuredLogger::instance().set_level(*parsed_level);
+    }
+
+    // Start MetricsServer if configured.
+    if (config_.metrics_port > 0) {
+        metrics_server_ = std::make_unique<MetricsServer>(config_.metrics_port, engine_->registry());
+        metrics_server_->start();
+    }
 
     // 1. Create non-blocking TCP socket.
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -414,6 +467,7 @@ void TcpServer::run() {
                     }
 
                     stats.active_sessions.fetch_add(1, std::memory_order_relaxed);
+                    engine_->registry().increment_gauge("ob_active_sessions");
 
                     // Send welcome message.
                     Session* s = session_mgr.get_session(client_fd);
@@ -432,6 +486,7 @@ void TcpServer::run() {
                         ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
                         session_mgr.remove_session(fd);
                         stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
+                        engine_->registry().increment_gauge("ob_active_sessions", -1);
                         break;
                     }
                     if (n < 0) {
@@ -440,6 +495,7 @@ void TcpServer::run() {
                         ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
                         session_mgr.remove_session(fd);
                         stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
+                        engine_->registry().increment_gauge("ob_active_sessions", -1);
                         break;
                     }
 
@@ -454,6 +510,7 @@ void TcpServer::run() {
                             ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
                             session_mgr.remove_session(fd);
                             stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
+                            engine_->registry().increment_gauge("ob_active_sessions", -1);
                             goto next_event; // break out of both loops
                         }
 
@@ -461,13 +518,14 @@ void TcpServer::run() {
                         Command cmd = (line.find('\n') != std::string::npos)
                                           ? parse_minsert(line)
                                           : parse_command(line);
-                        std::string response = execute_command(cmd, *engine_, *session, stats, config_.read_only);
+                        std::string response = execute_command(cmd, *engine_, *session, stats, config_.read_only, &engine_->registry());
 
                         if (response.empty()) {
                             // QUIT — close session.
                             ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
                             session_mgr.remove_session(fd);
                             stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
+                            engine_->registry().increment_gauge("ob_active_sessions", -1);
                             goto next_event;
                         }
 
@@ -476,6 +534,7 @@ void TcpServer::run() {
                             ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
                             session_mgr.remove_session(fd);
                             stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
+                            engine_->registry().increment_gauge("ob_active_sessions", -1);
                             goto next_event;
                         }
                     }
@@ -508,6 +567,11 @@ void TcpServer::run() {
 }
 
 void TcpServer::shutdown() {
+    // Stop MetricsServer if running.
+    if (metrics_server_) {
+        metrics_server_->stop();
+    }
+
     // Initiate graceful drain: stop accepting new connections,
     // let in-flight commands finish, then stop the epoll loop.
     draining_.store(true, std::memory_order_relaxed);

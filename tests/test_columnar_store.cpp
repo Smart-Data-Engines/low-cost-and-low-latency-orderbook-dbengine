@@ -101,7 +101,7 @@ RC_GTEST_PROP(ColumnarStoreProperty, prop_segment_partitioning, ()) {
     RC_ASSERT(static_cast<int>(store.segment_count()) == n_segments);
 
     // Each segment's start_ts_ns and end_ts_ns must be within its window
-    const auto& idx = store.index();
+    const auto idx = store.index();
     for (int seg = 0; seg < n_segments; ++seg) {
         uint64_t expected_start = static_cast<uint64_t>(seg) * seg_dur;
         uint64_t expected_end   = expected_start + static_cast<uint64_t>(rows_per_seg - 1);
@@ -155,7 +155,7 @@ RC_GTEST_PROP(ColumnarStoreProperty, prop_segment_append_only, ()) {
 
     RC_ASSERT(store.segment_count() == 1u);
 
-    const auto& meta = store.index()[0];
+    const auto meta = store.index()[0];
     const std::string& dir = meta.dir_path;
 
     // All column files must exist and be non-empty
@@ -184,7 +184,7 @@ RC_GTEST_PROP(ColumnarStoreProperty, prop_segment_append_only, ()) {
     store2.flush_segment();
 
     RC_ASSERT(store2.segment_count() == 1u);
-    const auto& meta2 = store2.index()[0];
+    const auto meta2 = store2.index()[0];
     uintmax_t ts_size_2n = fs::file_size(meta2.dir_path + "/ts.col");
 
     // More rows → larger or equal file
@@ -346,7 +346,7 @@ TEST(ColumnarStore, SegmentRolloverAtTimeBoundary) {
 
     ASSERT_EQ(store.segment_count(), 2u);
 
-    const auto& idx = store.index();
+    const auto idx = store.index();
     EXPECT_EQ(idx[0].row_count, 3u);
     EXPECT_EQ(idx[0].start_ts_ns, 0u);
     EXPECT_EQ(idx[0].end_ts_ns, 200u);
@@ -533,7 +533,7 @@ TEST(ColumnarStore, test_merge_segments_empty) {
     store.merge_segments({});
 
     ASSERT_EQ(store.segment_count(), 1u);
-    const auto& idx_after = store.index();
+    const auto idx_after = store.index();
     EXPECT_EQ(idx_after[0].start_ts_ns, idx_before[0].start_ts_ns);
     EXPECT_EQ(idx_after[0].end_ts_ns,   idx_before[0].end_ts_ns);
     EXPECT_EQ(idx_after[0].row_count,   idx_before[0].row_count);
@@ -571,7 +571,7 @@ RC_GTEST_PROP(ColumnarStoreProperty, prop_index_sorted_invariant, ()) {
         store.flush_segment();
 
         // Invariant: index must be sorted after each flush
-        const auto& idx = store.index();
+        const auto idx = store.index();
         for (size_t i = 1; i < idx.size(); ++i) {
             RC_ASSERT(idx[i - 1].start_ts_ns <= idx[i].start_ts_ns);
         }
@@ -597,7 +597,7 @@ RC_GTEST_PROP(ColumnarStoreProperty, prop_index_sorted_invariant, ()) {
     store.merge_segments(external);
 
     // Invariant: index must still be sorted after merge
-    const auto& idx = store.index();
+    const auto idx = store.index();
     for (size_t i = 1; i < idx.size(); ++i) {
         RC_ASSERT(idx[i - 1].start_ts_ns <= idx[i].start_ts_ns);
     }

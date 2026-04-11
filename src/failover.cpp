@@ -1,4 +1,5 @@
 #include "orderbook/failover.hpp"
+#include "orderbook/logger.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -28,8 +29,7 @@ void FailoverManager::start() {
     // Create and connect the coordinator client.
     coordinator_ = std::make_unique<CoordinatorClient>(config_.coordinator);
     if (!coordinator_->connect()) {
-        std::fprintf(stderr, "[failover] WARNING: cannot connect to coordinator, "
-                     "operating in standalone mode\n");
+        OB_LOG_WARN("failover", "cannot connect to coordinator, operating in standalone mode");
         role_.store(NodeRole::STANDALONE);
         return;
     }
@@ -72,14 +72,41 @@ void FailoverManager::start() {
 // ── stop() ──────────────────────────────────────────────────────────────────
 
 void FailoverManager::stop() {
-    if (!running_.exchange(false)) return;
-
-    // If we are PRIMARY, revoke our lease so replicas can detect expiry quickly.
-    if (role_.load() == NodeRole::PRIMARY && coordinator_ && lease_id_ != 0) {
-        coordinator_->revoke_lease(lease_id_);
+    OB_LOG_INFO("failover", "stop() called on %s, running=%d role=%d lease=%ld",
+                config_.coordinator.node_id.c_str(),
+                running_.load(), static_cast<int>(role_.load()),
+                static_cast<long>(lease_id_.load(std::memory_order_acquire)));
+    if (!running_.exchange(false)) {
+        OB_LOG_INFO("failover", "stop() early return — was not running");
+        return;
     }
 
-    // Join the monitor thread.
+    // If we are PRIMARY, revoke our lease immediately using a separate
+    // coordinator connection. The monitor thread might be blocking on an
+    // HTTP call, so we can't wait for it before revoking.
+    int64_t lid = lease_id_.load(std::memory_order_acquire);
+    if (role_.load(std::memory_order_acquire) == NodeRole::PRIMARY && lid != 0) {
+        // Create a temporary coordinator client for the revoke call.
+        OB_LOG_INFO("failover", "revoking lease %ld via separate connection...",
+                    static_cast<long>(lid));
+        CoordinatorClient revoke_client(config_.coordinator);
+        if (revoke_client.connect()) {
+            OB_LOG_INFO("failover", "connected to coordinator for revoke");
+            bool revoked = revoke_client.revoke_lease(lid);
+            if (revoked) {
+                OB_LOG_INFO("failover", "lease revoked successfully, lease_id=%ld",
+                            static_cast<long>(lid));
+            } else {
+                OB_LOG_WARN("failover", "failed to revoke lease, lease_id=%ld",
+                            static_cast<long>(lid));
+            }
+            revoke_client.disconnect();
+        } else {
+            OB_LOG_WARN("failover", "could not connect to coordinator for revoke");
+        }
+    }
+
+    // Now join the monitor thread (it will exit within ~100ms + HTTP timeout).
     if (monitor_thread_.joinable()) {
         monitor_thread_.join();
     }
@@ -124,15 +151,15 @@ int64_t FailoverManager::lease_ttl_remaining() const {
 bool FailoverManager::initiate_graceful_failover(
         const std::string& /*target_node_id*/) {
     if (role_.load() != NodeRole::PRIMARY) return false;
-    if (!coordinator_ || lease_id_ == 0) return false;
+    if (!coordinator_ || lease_id_.load() == 0) return false;
 
     // Revoke our lease — replicas will detect the expiry and compete.
-    bool revoked = coordinator_->revoke_lease(lease_id_);
+    bool revoked = coordinator_->revoke_lease(lease_id_.load());
     if (!revoked) return false;
 
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        lease_id_ = 0;
+        lease_id_.store(0);
     }
 
     role_.store(NodeRole::REPLICA);
@@ -163,12 +190,15 @@ void FailoverManager::monitor_loop() {
             if (refresh_interval < 1) refresh_interval = 1;
 
             if (since_refresh.count() >= refresh_interval) {
-                if (coordinator_ && lease_id_ != 0) {
-                    bool ok = coordinator_->refresh_lease(lease_id_);
+                if (coordinator_ && lease_id_.load() != 0) {
+                    int64_t lid = lease_id_.load();
+                    bool ok = coordinator_->refresh_lease(lid);
                     if (ok) {
                         std::lock_guard<std::mutex> lk(mtx_);
                         last_lease_refresh_ = std::chrono::steady_clock::now();
                     } else {
+                        OB_LOG_WARN("failover", "refresh_lease failed for lease=%ld, demoting",
+                                    static_cast<long>(lid));
                         handle_primary_lease_lost();
                     }
                 }
@@ -187,6 +217,12 @@ void FailoverManager::monitor_loop() {
                         // Update known primary address.
                         std::lock_guard<std::mutex> lk(mtx_);
                         primary_address_ = state->leader_address;
+                    }
+                } else {
+                    // Could not read cluster state (key missing = leader gone).
+                    // Attempt promotion if failover is enabled.
+                    if (config_.failover_enabled) {
+                        handle_lease_expiry();
                     }
                 }
             }
@@ -211,38 +247,20 @@ void FailoverManager::handle_lease_expiry() {
 void FailoverManager::attempt_promotion() {
     if (!coordinator_) return;
 
-    // 1. Publish our WAL position for election comparison.
-    auto [wal_file, wal_offset] = handler_.get_wal_position();
-    coordinator_->publish_wal_position(wal_file, wal_offset);
-
-    // 2. Wait 500ms for other replicas to publish their positions.
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-    // 3. Get all published positions.
-    auto positions = coordinator_->get_published_positions();
-    if (positions.empty()) return;
-
-    // 4. Find the winner: highest WAL position, tie-break by lowest node_id.
-    std::sort(positions.begin(), positions.end(),
-              [](const PublishedPosition& a, const PublishedPosition& b) {
-                  if (a.wal_file_index != b.wal_file_index)
-                      return a.wal_file_index > b.wal_file_index;
-                  if (a.wal_byte_offset != b.wal_byte_offset)
-                      return a.wal_byte_offset > b.wal_byte_offset;
-                  return a.node_id < b.node_id;
-              });
-
-    const auto& winner = positions.front();
-    if (winner.node_id != config_.coordinator.node_id) {
-        // We are not the winner — remain replica.
-        return;
-    }
-
-    // 5. We are the winner — grant lease and try to acquire leadership.
+    // Grant a new lease and try to acquire leadership via CAS.
+    // If the leader key doesn't exist, CAS succeeds and we become primary.
+    // If it exists (another node promoted first), CAS fails and we stay replica.
     int64_t new_lease = coordinator_->grant_lease();
     if (new_lease == 0) return;
 
-    EpochValue current = handler_.get_current_epoch();
+    EpochValue local_epoch = handler_.get_current_epoch();
+    EpochValue fm_epoch;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        fm_epoch = epoch_;
+    }
+    // Use the higher of local engine epoch and the epoch we know from etcd.
+    EpochValue current = (fm_epoch.term > local_epoch.term) ? fm_epoch : local_epoch;
     EpochValue new_epoch = current.incremented();
 
     bool acquired = coordinator_->try_acquire_leadership(
@@ -253,30 +271,33 @@ void FailoverManager::attempt_promotion() {
     }
 
     // 6. Leadership acquired — update state and promote.
+    // Store lease_id_ with release semantics BEFORE role_ so that
+    // stop() sees the lease_id when it checks role_ == PRIMARY.
+    lease_id_.store(new_lease, std::memory_order_release);
+    OB_LOG_INFO("failover", "lease_id_ set to %ld", static_cast<long>(new_lease));
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        lease_id_ = new_lease;
         epoch_ = new_epoch;
         primary_address_ = config_.replication_address;
         last_lease_refresh_ = std::chrono::steady_clock::now();
     }
 
-    role_.store(NodeRole::PRIMARY);
+    role_.store(NodeRole::PRIMARY, std::memory_order_release);
     handler_.promote_to_primary(new_epoch);
 
-    std::fprintf(stderr, "[failover] promoted to PRIMARY, epoch=%lu\n",
-                 static_cast<unsigned long>(new_epoch.term));
+    OB_LOG_INFO("failover", "promoted to PRIMARY, epoch=%lu",
+                static_cast<unsigned long>(new_epoch.term));
 }
 
 // ── handle_primary_lease_lost() ─────────────────────────────────────────────
 
 void FailoverManager::handle_primary_lease_lost() {
-    std::fprintf(stderr, "[failover] lease lost, demoting to REPLICA\n");
+    OB_LOG_WARN("failover", "lease lost, demoting to REPLICA");
 
     role_.store(NodeRole::REPLICA);
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        lease_id_ = 0;
+        lease_id_.store(0);
     }
 
     // Discover the new primary from the coordinator.
