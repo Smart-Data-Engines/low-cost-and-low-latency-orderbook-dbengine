@@ -67,12 +67,18 @@ void Engine::open() {
 
     // Start ReplicationClient if configured as replica (Requirement 7.4).
     if (repl_client_config_.primary_port > 0) {
+        OB_LOG_INFO("engine", "starting ReplicationClient to %s:%u",
+                    repl_client_config_.primary_host.c_str(), repl_client_config_.primary_port);
         repl_client_ = std::make_unique<ReplicationClient>(repl_client_config_, *this);
         repl_client_->start();
+    } else {
+        OB_LOG_INFO("engine", "ReplicationClient not started (primary_port=0)");
     }
 
     // Start FailoverManager if coordinator endpoints are configured.
     if (!failover_config_.coordinator.endpoints.empty()) {
+        OB_LOG_INFO("engine", "starting FailoverManager, node_id=%s",
+                    failover_config_.coordinator.node_id.c_str());
         failover_mgr_ = std::make_unique<FailoverManager>(failover_config_, *this);
         failover_mgr_->start();
         node_role_.store(failover_mgr_->role(), std::memory_order_relaxed);

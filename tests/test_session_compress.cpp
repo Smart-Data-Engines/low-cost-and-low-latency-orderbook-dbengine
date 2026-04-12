@@ -104,7 +104,10 @@ TEST_F(SessionCompressTest, SessionCompressNegotiation) {
     ASSERT_EQ(cmd.type, ob::CommandType::COMPRESS);
 
     std::string response = ob::execute_command(cmd, *engine_, session, stats_);
-    EXPECT_EQ(response, "OK COMPRESS LZ4\n");
+    EXPECT_EQ(response, "OK COMPRESS LZ4\n\n");
+    // execute_command no longer sets compressed — the caller (epoll/io_uring loop) does it
+    // after sending the plain-text response. Simulate that here:
+    session.set_compressed(true);
     EXPECT_TRUE(session.is_compressed());
 }
 
@@ -211,7 +214,9 @@ TEST_F(SessionCompressTest, CompressMetricsStatus) {
     // Negotiate compression
     ob::Command compress_cmd = ob::parse_command("COMPRESS LZ4");
     std::string compress_resp = ob::execute_command(compress_cmd, *engine_, session, stats_);
-    EXPECT_EQ(compress_resp, "OK COMPRESS LZ4\n");
+    EXPECT_EQ(compress_resp, "OK COMPRESS LZ4\n\n");
+    // execute_command no longer sets compressed — simulate the epoll loop behavior:
+    session.set_compressed(true);
     EXPECT_TRUE(session.is_compressed());
 
     // Send a compressed command through feed() to generate metrics

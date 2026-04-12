@@ -49,6 +49,14 @@ MetricsRegistry::MetricsRegistry() {
     histograms_.push_back(make_histogram("ob_insert_latency_seconds", "Insert operation latency in seconds"));
     histograms_.push_back(make_histogram("ob_flush_latency_seconds",  "Flush operation latency in seconds"));
     histograms_.push_back(make_histogram("ob_query_latency_seconds",  "Query operation latency in seconds"));
+
+#ifdef OB_USE_IO_URING
+    // io_uring metrics
+    gauges_.push_back(make_gauge("ob_iouring_sq_utilization", "Submission Queue utilization percentage (0-100)"));
+    counters_.push_back(make_counter("ob_iouring_cq_overflows", "Number of Completion Queue overflows"));
+    counters_.push_back(make_counter("ob_iouring_sqe_submitted", "Total number of SQEs submitted"));
+    counters_.push_back(make_counter("ob_iouring_cqe_processed", "Total number of CQEs processed"));
+#endif
 }
 
 // ── Lookup helpers ────────────────────────────────────────────────────────────

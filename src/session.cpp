@@ -163,40 +163,28 @@ bool Session::send_response(std::string_view response) {
     compress_bytes_out_ += static_cast<uint64_t>(compressed.size());
 
     uint32_t frame_len = static_cast<uint32_t>(compressed.size());
-    uint8_t hdr[4];
-    hdr[0] = static_cast<uint8_t>((frame_len >> 24) & 0xFF);
-    hdr[1] = static_cast<uint8_t>((frame_len >> 16) & 0xFF);
-    hdr[2] = static_cast<uint8_t>((frame_len >> 8) & 0xFF);
-    hdr[3] = static_cast<uint8_t>(frame_len & 0xFF);
 
-    // Write header
-    {
-        const char* ptr = reinterpret_cast<const char*>(hdr);
-        size_t remaining = 4;
-        while (remaining > 0) {
-            ssize_t written = ::write(fd_, ptr, remaining);
-            if (written < 0) {
-                if (errno == EINTR) continue;
-                return false;
-            }
-            ptr += written;
-            remaining -= static_cast<size_t>(written);
-        }
-    }
+    // Build a single buffer: [4-byte BE header][compressed frame]
+    // Single write() avoids Nagle + delayed-ACK interaction (~40ms penalty).
+    std::string wire;
+    wire.reserve(4 + compressed.size());
+    wire.push_back(static_cast<char>((frame_len >> 24) & 0xFF));
+    wire.push_back(static_cast<char>((frame_len >> 16) & 0xFF));
+    wire.push_back(static_cast<char>((frame_len >> 8) & 0xFF));
+    wire.push_back(static_cast<char>(frame_len & 0xFF));
+    wire.append(reinterpret_cast<const char*>(compressed.data()),
+                compressed.size());
 
-    // Write compressed frame
-    {
-        const char* ptr = reinterpret_cast<const char*>(compressed.data());
-        size_t remaining = compressed.size();
-        while (remaining > 0) {
-            ssize_t written = ::write(fd_, ptr, remaining);
-            if (written < 0) {
-                if (errno == EINTR) continue;
-                return false;
-            }
-            ptr += written;
-            remaining -= static_cast<size_t>(written);
+    const char* ptr = wire.data();
+    size_t remaining = wire.size();
+    while (remaining > 0) {
+        ssize_t written = ::write(fd_, ptr, remaining);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            return false;
         }
+        ptr += written;
+        remaining -= static_cast<size_t>(written);
     }
 
     return true;

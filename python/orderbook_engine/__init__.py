@@ -173,15 +173,22 @@ class _TcpBackend:
     def _send(self, line: str):
         """Send a command line (must end with \\n).
 
-        When compression is active, the payload is LZ4-frame compressed.
+        When compression is active, the payload is LZ4-frame compressed
+        and prefixed with a 4-byte big-endian length header:
+          [4-byte BE frame_len][LZ4 compressed frame]
+        This matches the server's Session::feed() binary framing.
         """
         if not line.endswith("\n"):
             line += "\n"
         data = line.encode("utf-8")
         if self._compressed:
             import lz4.frame
-            data = lz4.frame.compress(data)
-        self._sock.sendall(data)
+            import struct
+            compressed = lz4.frame.compress(data)
+            header = struct.pack(">I", len(compressed))
+            self._sock.sendall(header + compressed)
+        else:
+            self._sock.sendall(data)
 
     def _recv_response(self) -> str:
         """
@@ -202,18 +209,16 @@ class _TcpBackend:
         return self._recv_plain_response()
 
     def _recv_compressed_response(self) -> str:
-        """Receive and decompress an LZ4-frame-compressed response."""
-        import lz4.frame
+        """Receive and decompress a length-prefixed LZ4 response.
 
-        # Accumulate data until we can decompress a complete LZ4 frame.
-        while True:
-            try:
-                decompressed = lz4.frame.decompress(bytes(self._buf))
-                self._buf = b""
-                return decompressed.decode("utf-8", errors="replace")
-            except RuntimeError:
-                # Incomplete frame — need more data.
-                pass
+        Server sends: [4-byte BE frame_len][LZ4 compressed frame]
+        This matches Session::send_response() binary framing.
+        """
+        import lz4.frame
+        import struct
+
+        # Read 4-byte length header
+        while len(self._buf) < 4:
             try:
                 chunk = self._sock.recv(65536)
             except socket.timeout:
@@ -221,6 +226,25 @@ class _TcpBackend:
             if not chunk:
                 raise OrderbookError(-1, "TCP connection closed by server")
             self._buf += chunk
+
+        frame_len = struct.unpack(">I", self._buf[:4])[0]
+        self._buf = self._buf[4:]
+
+        # Read the full compressed frame
+        while len(self._buf) < frame_len:
+            try:
+                chunk = self._sock.recv(65536)
+            except socket.timeout:
+                raise OrderbookError(-1, "TCP recv timeout")
+            if not chunk:
+                raise OrderbookError(-1, "TCP connection closed by server")
+            self._buf += chunk
+
+        compressed = bytes(self._buf[:frame_len])
+        self._buf = self._buf[frame_len:]
+
+        decompressed = lz4.frame.decompress(compressed)
+        return decompressed.decode("utf-8", errors="replace")
 
     def _recv_plain_response(self) -> str:
         """Receive an uncompressed response (original logic)."""

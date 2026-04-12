@@ -51,6 +51,11 @@ struct ServerConfig {
     // Observability
     uint16_t    metrics_port{0};              // --metrics-port (0 = disabled)
     std::string log_level{"INFO"};            // --log-level (ERROR|WARN|INFO|DEBUG)
+
+    // io_uring (used only when OB_USE_IO_URING is active)
+    uint32_t uring_ring_size{256};            // --ring-size
+    uint32_t uring_sqpoll_idle_ms{1000};      // --sqpoll-idle-ms
+    bool     uring_no_sqpoll{false};          // --no-sqpoll
 };
 
 // ── TcpServer ─────────────────────────────────────────────────────────────────

@@ -517,19 +517,8 @@ void ReplicationManager::accept_replica() {
                                    SOCK_NONBLOCK);
         if (client_fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            OB_LOG_WARN("repl_mgr", "accept4 failed: %s", std::strerror(errno));
             break;
-        }
-
-        // Check max replicas limit (Requirement 1.4).
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            if (static_cast<int>(replicas_.size()) >= config_.max_replicas) {
-                const char* msg = "ERR max_replicas_reached\n";
-                auto wr = ::write(client_fd, msg, std::strlen(msg));
-                (void)wr;
-                ::close(client_fd);
-                continue;
-            }
         }
 
         // Build address string for logging.
@@ -538,11 +527,28 @@ void ReplicationManager::accept_replica() {
         std::string address = std::string(addr_str) + ":" +
                               std::to_string(ntohs(client_addr.sin_port));
 
+        OB_LOG_INFO("repl_mgr", "new replica connection from %s, fd=%d", address.c_str(), client_fd);
+
+        // Check max replicas limit (Requirement 1.4).
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (static_cast<int>(replicas_.size()) >= config_.max_replicas) {
+                OB_LOG_WARN("repl_mgr", "max replicas reached (%d), rejecting fd=%d",
+                            config_.max_replicas, client_fd);
+                const char* msg = "ERR max_replicas_reached\n";
+                auto wr = ::write(client_fd, msg, std::strlen(msg));
+                (void)wr;
+                ::close(client_fd);
+                continue;
+            }
+        }
+
         // Add to epoll (edge-triggered for client data).
         struct epoll_event ev{};
         ev.events  = EPOLLIN | EPOLLET;
         ev.data.fd = client_fd;
         if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
+            OB_LOG_WARN("repl_mgr", "epoll_ctl ADD failed for fd=%d: %s", client_fd, std::strerror(errno));
             ::close(client_fd);
             continue;
         }
@@ -558,21 +564,16 @@ void ReplicationManager::accept_replica() {
 
         std::lock_guard<std::mutex> lock(mtx_);
 
-        // If compression is enabled, send COMPRESS LZ4 directive before streaming.
+        // NOTE: We only set the compress flag here. The actual COMPRESS LZ4 directive
+        // is sent AFTER catchup in handle_replica_data(), because catchup
+        // sends plain text and the replica must not switch to LZ4 mode yet.
         if (config_.compress) {
-            const char* directive = "COMPRESS LZ4\n";
             info.compress = true;
-            // Enqueue the directive into the send buffer (will be drained by epoll).
-            const auto* bytes = reinterpret_cast<const uint8_t*>(directive);
-            info.send_buf.insert(info.send_buf.end(), bytes, bytes + std::strlen(directive));
-            // Arm EPOLLOUT to drain the directive.
-            struct epoll_event ev_out{};
-            ev_out.events  = EPOLLIN | EPOLLOUT | EPOLLET;
-            ev_out.data.fd = client_fd;
-            ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, client_fd, &ev_out);
+            OB_LOG_INFO("repl_mgr", "compression enabled for replica fd=%d (will send COMPRESS LZ4 after catchup)", client_fd);
         }
 
         replicas_.push_back(std::move(info));
+        OB_LOG_INFO("repl_mgr", "replica added, total replicas=%zu", replicas_.size());
     }
 }
 
@@ -615,6 +616,8 @@ void ReplicationManager::handle_replica_data(int fd) {
             uint64_t replica_epoch = 0;
             int parsed = std::sscanf(line.c_str(), "REPLICATE %u %zu %" SCNu64,
                                      &from_file, &from_offset, &replica_epoch);
+            OB_LOG_INFO("repl_mgr", "received REPLICATE from fd=%d: file=%u offset=%zu epoch=%" PRIu64 " (parsed=%d)",
+                        fd, from_file, from_offset, replica_epoch, parsed);
             if (parsed >= 2) {
                 // Stale-primary check: if replica's epoch > our epoch, reject (Requirement 3.4).
                 if (parsed == 3 && replica_epoch > wal_.current_epoch()) {
@@ -632,8 +635,16 @@ void ReplicationManager::handle_replica_data(int fd) {
                 }
                 replica_ptr->confirmed_file   = from_file;
                 replica_ptr->confirmed_offset = from_offset;
-                // Perform catchup from the requested position.
+                // Perform catchup from the requested position (plain text).
                 handle_catchup(*replica_ptr, from_file, from_offset);
+
+                // After catchup, send COMPRESS LZ4 directive if compression is enabled.
+                // This must come AFTER catchup because catchup sends plain text.
+                if (replica_ptr->compress && replica_ptr->fd >= 0) {
+                    const char* directive = "COMPRESS LZ4\n";
+                    send_all(replica_ptr->fd, directive, std::strlen(directive));
+                    OB_LOG_INFO("replication", "sent COMPRESS LZ4 to replica fd=%d after catchup", fd);
+                }
             }
             continue;
         }
@@ -680,6 +691,7 @@ void ReplicationManager::send_to_replica(ReplicaInfo& replica, const WALRecord& 
     }
 
     if (!send_all(replica.fd, msg.data(), msg.size())) {
+        OB_LOG_WARN("repl_mgr", "send_to_replica failed for fd=%d, marking disconnected", replica.fd);
         // Mark fd as -1; caller should clean up.
         remove_replica_locked(replica.fd);
         replica.fd = -1;
@@ -688,22 +700,23 @@ void ReplicationManager::send_to_replica(ReplicaInfo& replica, const WALRecord& 
 
 void ReplicationManager::handle_catchup(ReplicaInfo& replica, uint32_t from_file,
                                          size_t from_offset) {
-    // Read historical WAL files starting from from_file and stream records to
-    // the replica. Uses WALReplayer-like logic: open file, read WALRecord
-    // headers + payloads, send each as a WAL message.
-
     const uint32_t current_file = wal_.current_file_index();
     const std::string& wal_dir = wal_.dir();
+
+    OB_LOG_INFO("repl_mgr", "catchup for fd=%d: from_file=%u, from_offset=%zu, current_file=%u, wal_dir=%s",
+                replica.fd, from_file, from_offset, current_file, wal_dir.c_str());
 
     // Stream records from from_file to current_file.
     for (uint32_t fi = from_file; fi <= current_file; ++fi) {
         std::string path = wal_filename(wal_dir, fi);
         int fd = ::open(path.c_str(), O_RDONLY);
         if (fd < 0) {
+            OB_LOG_WARN("repl_mgr", "catchup: cannot open WAL file %s: %s", path.c_str(), std::strerror(errno));
             // File doesn't exist — WAL has been truncated (Requirement 6.3).
             if (fi == from_file) {
                 const char* err = "ERR WAL_TRUNCATED\n";
                 send_all(replica.fd, err, std::strlen(err));
+                OB_LOG_INFO("repl_mgr", "sent ERR WAL_TRUNCATED to replica fd=%d", replica.fd);
                 return;
             }
             // Later files missing is unexpected but not fatal — stop catchup.
@@ -761,6 +774,7 @@ void ReplicationManager::handle_catchup(ReplicaInfo& replica, uint32_t from_file
         done_file:
         ::close(fd);
     }
+    OB_LOG_INFO("repl_mgr", "catchup complete for fd=%d", replica.fd);
 }
 
 void ReplicationManager::handle_snapshot_request(ReplicaInfo& replica) {
@@ -910,11 +924,21 @@ ReplicationClient::~ReplicationClient() {
 }
 
 void ReplicationClient::start() {
-    if (config_.primary_port == 0) return;
-    if (running_.load(std::memory_order_relaxed)) return;
+    if (config_.primary_port == 0) {
+        OB_LOG_INFO("repl_client", "not starting — primary_port=0");
+        return;
+    }
+    if (running_.load(std::memory_order_relaxed)) {
+        OB_LOG_WARN("repl_client", "already running, skipping start()");
+        return;
+    }
 
     // Load last confirmed offset from state file (Requirement 6.1, 6.2).
     load_state();
+
+    OB_LOG_INFO("repl_client", "starting replication client, primary=%s:%u, confirmed_file=%u, confirmed_offset=%lu",
+                config_.primary_host.c_str(), config_.primary_port,
+                confirmed_file_, static_cast<unsigned long>(confirmed_offset_));
 
     running_.store(true, std::memory_order_release);
     thread_ = std::thread([this]() { run_loop(); });
@@ -954,13 +978,21 @@ void ReplicationClient::run_loop() {
     int backoff_sec = 5;
     static constexpr int MAX_BACKOFF_SEC = 60;
 
+    OB_LOG_INFO("repl_client", "run_loop started, connecting to %s:%u",
+                config_.primary_host.c_str(), config_.primary_port);
+
     while (running_.load(std::memory_order_acquire)) {
         try {
             connect_to_primary();
+            OB_LOG_INFO("repl_client", "connected to primary %s:%u",
+                        config_.primary_host.c_str(), config_.primary_port);
             backoff_sec = 5; // Reset backoff on successful connect.
             receive_and_replay();
+            OB_LOG_INFO("repl_client", "receive_and_replay() returned, will reconnect");
+        } catch (const std::exception& ex) {
+            OB_LOG_WARN("repl_client", "connection/replay error: %s", ex.what());
         } catch (...) {
-            // Connection failed or receive error — will retry.
+            OB_LOG_WARN("repl_client", "unknown error in run_loop");
         }
 
         // Clean up socket on disconnect.
@@ -1028,9 +1060,12 @@ void ReplicationClient::connect_to_primary() {
         fd_ = -1;
         throw std::runtime_error("ReplicationClient: failed to send handshake");
     }
+    OB_LOG_INFO("repl_client", "handshake sent: %.*s", len - 1, handshake);
 }
 
 void ReplicationClient::receive_and_replay() {
+    OB_LOG_INFO("repl_client", "entering receive_and_replay loop, running=%d, compress=%d",
+                running_.load(std::memory_order_acquire), compress_);
     char line_buf[512];
     auto last_save = std::chrono::steady_clock::now();
 
@@ -1047,10 +1082,7 @@ void ReplicationClient::receive_and_replay() {
             // Read 4-byte big-endian compressed length.
             uint8_t len_bytes[4];
             if (!reader_.read_exact(len_bytes, 4)) {
-                // Check if it's a timeout (EAGAIN) — read_exact returns false on both.
-                // Since we have SO_RCVTIMEO set, a timeout will cause recv to return -1
-                // with EAGAIN. But read_exact treats that as failure. We need to handle
-                // timeouts differently. For simplicity, just return and let run_loop reconnect.
+                OB_LOG_WARN("repl_client", "compressed read_exact(4) failed (timeout or disconnect)");
                 return;
             }
 
@@ -1060,13 +1092,16 @@ void ReplicationClient::receive_and_replay() {
                                 static_cast<uint32_t>(len_bytes[3]);
 
             if (comp_len == 0 || comp_len > 16 * 1024 * 1024) {
-                // Sanity check — invalid frame size.
+                OB_LOG_WARN("repl_client", "invalid compressed frame size: %u", comp_len);
                 return;
             }
+
+            OB_LOG_INFO("repl_client", "reading compressed frame: %u bytes", comp_len);
 
             // Read the compressed frame.
             std::vector<uint8_t> compressed(comp_len);
             if (!reader_.read_exact(compressed.data(), comp_len)) {
+                OB_LOG_WARN("repl_client", "compressed read_exact(%u) failed", comp_len);
                 return;
             }
 
@@ -1194,15 +1229,21 @@ void ReplicationClient::receive_and_replay() {
 
         // Uncompressed path (original logic).
         // Read a text header line using the buffered reader.
+        OB_LOG_INFO("repl_client", "about to call read_line, running=%d",
+                    running_.load(std::memory_order_acquire));
         ssize_t n = reader_.read_line(line_buf, sizeof(line_buf));
         if (n < 0) {
             // Disconnect or error.
+            OB_LOG_WARN("repl_client", "read_line returned %zd (disconnect/error), errno=%d (%s)",
+                        n, errno, std::strerror(errno));
             return;
         }
         if (n == 0) {
             // Timeout (EAGAIN from SO_RCVTIMEO) — check running_ and continue.
             continue;
         }
+
+        OB_LOG_INFO("repl_client", "received line: %.*s", static_cast<int>(n), line_buf);
 
         // Parse WAL record: WAL <file_index> <byte_offset> <total_len> <epoch>
         if (std::strncmp(line_buf, "WAL ", 4) == 0) {

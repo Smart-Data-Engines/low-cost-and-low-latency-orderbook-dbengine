@@ -7,6 +7,9 @@
 //   SIGINT / SIGTERM → graceful shutdown
 
 #include "orderbook/tcp_server.hpp"
+#ifdef OB_USE_IO_URING
+#include "orderbook/io_uring_server.hpp"
+#endif
 
 #include <atomic>
 #include <csignal>
@@ -62,7 +65,11 @@ int main(int argc, char* argv[]) {
     std::printf("ob_tcp_server v0.1.0 listening on port %u, data-dir: %s\n",
                 static_cast<unsigned>(config.port), config.data_dir.c_str());
 
+#ifdef OB_USE_IO_URING
+    ob::IoUringServer server(std::move(config));
+#else
     ob::TcpServer server(std::move(config));
+#endif
 
     // Monitor thread: polls g_shutdown_requested and calls server.shutdown().
     std::thread monitor([&server]() {

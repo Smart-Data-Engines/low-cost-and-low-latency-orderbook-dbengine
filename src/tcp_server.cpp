@@ -34,8 +34,12 @@ std::string execute_command(const Command& cmd,
         if (session.commands_executed() > 0) {
             return format_error("compress_must_be_first");
         }
-        session.set_compressed(true);
-        return "OK COMPRESS LZ4\n";
+        // NOTE: Do NOT call session.set_compressed(true) here!
+        // The "OK COMPRESS LZ4\n\n" response must be sent as plain text.
+        // The caller (epoll/io_uring loop) enables compression AFTER
+        // sending this response.
+        // Double newline required — client uses \n\n as OK terminator.
+        return "OK COMPRESS LZ4\n\n";
     }
 
     case CommandType::SELECT: {
@@ -297,6 +301,12 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
                 std::exit(1);
             }
             config.log_level = level_str;
+        } else if (arg == "--sqpoll-idle-ms" && i + 1 < argc) {
+            config.uring_sqpoll_idle_ms = std::stoul(argv[++i]);
+        } else if (arg == "--ring-size" && i + 1 < argc) {
+            config.uring_ring_size = std::stoul(argv[++i]);
+        } else if (arg == "--no-sqpoll") {
+            config.uring_no_sqpoll = true;
         }
     }
 
@@ -326,6 +336,7 @@ TcpServer::TcpServer(ServerConfig config)
         failover_config.coordinator.node_id = config_.node_id;
         failover_config.failover_enabled = config_.failover_enabled;
         failover_config.replication_port = config_.replication_port;
+        failover_config.replication_address = "127.0.0.1:" + std::to_string(config_.replication_port);
     }
 
     engine_ = std::make_unique<Engine>(config_.data_dir, 100'000'000ULL, FsyncPolicy::INTERVAL,
@@ -536,6 +547,11 @@ void TcpServer::run() {
                             stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
                             engine_->registry().increment_gauge("ob_active_sessions", -1);
                             goto next_event;
+                        }
+
+                        // Enable compression AFTER sending the plain-text ack.
+                        if (cmd.type == CommandType::COMPRESS) {
+                            session->set_compressed(true);
                         }
                     }
                 }

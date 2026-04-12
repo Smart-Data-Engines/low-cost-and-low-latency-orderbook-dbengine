@@ -387,3 +387,18 @@ target_link_libraries(test_client
         rapidcheck_gtest
 )
 gtest_discover_tests(test_client PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+
+# ── io_uring property-based and unit tests (io-uring-transport, Task 9) ───────
+if(OB_USE_IO_URING)
+    add_executable(test_io_uring test_io_uring.cpp)
+    target_compile_definitions(test_io_uring PRIVATE OB_USE_IO_URING)
+    target_link_libraries(test_io_uring
+        PRIVATE
+            orderbook_iouring_server_lib
+            orderbook_tcp_server_lib
+            GTest::gtest_main
+            rapidcheck
+            rapidcheck_gtest
+    )
+    gtest_discover_tests(test_io_uring PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
+endif()
