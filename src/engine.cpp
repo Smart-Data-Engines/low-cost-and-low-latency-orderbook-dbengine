@@ -472,6 +472,57 @@ void Engine::demote_to_replica(const std::string& new_primary_address) {
 
     // Start ReplicationClient to new primary.
     if (!new_primary_address.empty()) {
+        // Stop existing ReplicationClient if running (may have been started
+        // from static --primary-host config or a previous demote).
+        if (repl_client_) {
+            lock.unlock();
+            repl_client_->stop();
+            lock.lock();
+            repl_client_.reset();
+        }
+
+        // Clear in-memory state to avoid data duplication during catchup.
+        // The ReplicationClient will replay WAL records from the primary,
+        // rebuilding the data from scratch. Without this, records that
+        // already exist locally would be duplicated.
+        OB_LOG_INFO("engine", "clearing local data before starting replication from %s",
+                    new_primary_address.c_str());
+        stores_.clear();
+        buffers_.clear();
+        live_ptrs_.clear();
+        pending_rows_.clear();
+
+        // Close and wipe columnar store to prevent stale data from appearing in queries.
+        combined_store_.close();
+
+        // Delete all columnar segment directories on disk.
+        // This is necessary because the node was previously PRIMARY with its own data,
+        // and the new primary may have different data. Catchup will rebuild everything.
+        {
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            for (auto& entry : fs::directory_iterator(base_dir_, ec)) {
+                if (entry.is_directory() && entry.path().filename().string() != "." &&
+                    entry.path().filename().string() != "..") {
+                    // Skip WAL files (wal_*.bin) — only delete columnar segment dirs
+                    auto name = entry.path().filename().string();
+                    if (name.find("wal_") != 0) {
+                        fs::remove_all(entry.path(), ec);
+                    }
+                }
+            }
+        }
+
+        // Reopen empty columnar store.
+        combined_store_.open_existing();
+
+        // Delete replication state file so catchup starts from position 0.
+        {
+            std::string state_path = base_dir_ + "/repl_state.txt";
+            std::error_code ec;
+            std::filesystem::remove(state_path, ec);
+        }
+
         // Parse host:port from address.
         auto colon = new_primary_address.rfind(':');
         if (colon != std::string::npos) {

@@ -89,7 +89,7 @@ static std::string recv_line(int fd, int timeout_ms = 3000) {
 
 } // anonymous namespace
 
-// ── ReplCompressHandshake: verify COMPRESS LZ4 is sent when config_.compress is true ──
+// ── ReplCompressHandshake: verify COMPRESS LZ4 is sent after catchup when config_.compress is true ──
 // Validates: Requirement 2.2
 TEST(ReplCompress, ReplCompressHandshake) {
     TempDir tmp("compress_hs");
@@ -108,10 +108,14 @@ TEST(ReplCompress, ReplCompressHandshake) {
     int fd = connect_to_localhost(port);
     ASSERT_GE(fd, 0) << "Should connect to replication port";
 
-    // The primary should send COMPRESS LZ4 as the first line.
+    // Send REPLICATE handshake — COMPRESS LZ4 is sent AFTER catchup.
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL);
+
+    // After catchup (empty WAL), the primary should send COMPRESS LZ4.
     std::string line = recv_line(fd, 3000);
     EXPECT_EQ(line, "COMPRESS LZ4")
-        << "Primary with compress=true should send COMPRESS LZ4 directive, got: " << line;
+        << "Primary with compress=true should send COMPRESS LZ4 after catchup, got: " << line;
 
     ::close(fd);
     mgr.stop();

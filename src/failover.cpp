@@ -53,11 +53,18 @@ void FailoverManager::start() {
             }
         } else {
             // Someone else is the leader — we are a replica.
+            // Call demote_to_replica() to start ReplicationClient with the
+            // primary address discovered from etcd. This is critical for HA:
+            // a node that restarts while another node is PRIMARY must
+            // automatically connect and start replicating.
             role_.store(NodeRole::REPLICA);
             {
                 std::lock_guard<std::mutex> lk(mtx_);
                 primary_address_ = state->leader_address;
             }
+            OB_LOG_INFO("failover", "starting as REPLICA, primary=%s (from etcd)",
+                        state->leader_address.c_str());
+            handler_.demote_to_replica(state->leader_address);
         }
     } else if (config_.failover_enabled) {
         // Could not read cluster state — try to become primary.
