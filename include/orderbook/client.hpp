@@ -22,6 +22,9 @@
 
 namespace ob {
 
+// Forward declaration for sharding support
+class ShardRouter;
+
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 /// Client configuration for a single TCP connection.
@@ -148,6 +151,10 @@ struct PoolConfig {
     double read_timeout_sec          = 10.0;
     double health_check_interval_sec = 2.0;
     bool   compress                  = false;
+
+    // Sharding (optional — when set, enables ShardRouter)
+    std::vector<std::string> coordinator_endpoints;  // etcd endpoints
+    std::string cluster_prefix{"/ob/"};
 };
 
 // ── OrderbookPool ─────────────────────────────────────────────────────────────
@@ -197,6 +204,9 @@ private:
     // Health-check thread
     std::thread       health_thread_;
     std::atomic<bool> running_{false};
+
+    // Sharding support
+    std::unique_ptr<ShardRouter> shard_router_;
 
     void connect_all();
     void discover_primary();

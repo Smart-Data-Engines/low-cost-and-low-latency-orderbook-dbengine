@@ -20,6 +20,9 @@ enum class CommandType {
     FAILOVER,
     QUIT,
     COMPRESS,
+    SHARD_MAP,
+    SHARD_INFO,
+    MIGRATE,
     UNKNOWN
 };
 
@@ -57,6 +60,8 @@ struct Command {
     InsertArgs  insert_args;    // for INSERT
     MinsertArgs minsert_args;   // for MINSERT
     std::string target_node_id; // for FAILOVER
+    std::string migrate_symbol;       // "symbol.exchange" for MIGRATE
+    std::string migrate_target_shard; // target shard_id for MIGRATE
 };
 
 // ── Free functions ────────────────────────────────────────────────────────────

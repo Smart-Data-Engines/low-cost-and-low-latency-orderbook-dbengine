@@ -238,6 +238,7 @@ gtest_discover_tests(test_failover_election PROPERTIES ENVIRONMENT "${RC_TEST_EN
 add_executable(test_failover_roles test_failover_roles.cpp)
 target_link_libraries(test_failover_roles
     PRIVATE
+        orderbook_tcp_server_lib
         orderbook_engine
         GTest::gtest_main
         rapidcheck
@@ -368,6 +369,9 @@ add_executable(test_etcd_integration test_etcd_integration.cpp)
 target_link_libraries(test_etcd_integration
     PRIVATE
         orderbook_engine
+        orderbook_shard_coordinator
+        orderbook_shard_map
+        orderbook_tcp_server_lib
         GTest::gtest_main
         rapidcheck
         rapidcheck_gtest
@@ -389,6 +393,44 @@ target_link_libraries(test_client
 gtest_discover_tests(test_client PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 
 # ── io_uring property-based and unit tests (io-uring-transport, Task 9) ───────
+# ── ShardMap & ConsistentHashRing property and unit tests (symbol-sharding) ───
+add_executable(test_shard_map test_shard_map.cpp)
+target_link_libraries(test_shard_map
+    PRIVATE
+        orderbook_shard_map
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_shard_map PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
+
+# ── ShardRouter property and unit tests (symbol-sharding, Task 14) ────────────
+add_executable(test_shard_router test_shard_router.cpp)
+target_link_libraries(test_shard_router
+    PRIVATE
+        orderbook_shard_router
+        orderbook_shard_map
+        orderbook_tcp_server_lib
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_shard_router PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
+
+# ── ShardCoordinator unit tests (symbol-sharding, Task 19) ────────────────────
+add_executable(test_shard_coordinator test_shard_coordinator.cpp)
+target_link_libraries(test_shard_coordinator
+    PRIVATE
+        orderbook_shard_coordinator
+        orderbook_shard_map
+        orderbook_tcp_server_lib
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_shard_coordinator PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
+
+# ── io_uring property-based and unit tests (io-uring-transport, Task 9) ───────
 if(OB_USE_IO_URING)
     add_executable(test_io_uring test_io_uring.cpp)
     target_compile_definitions(test_io_uring PRIVATE OB_USE_IO_URING)
@@ -402,3 +444,8 @@ if(OB_USE_IO_URING)
     )
     gtest_discover_tests(test_io_uring PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
 endif()
+
+# ── Integration test binary (Python test suite calls this) ────────────────────
+add_executable(ob_integration_test integration/ob_integration_test.cpp)
+target_link_libraries(ob_integration_test PRIVATE orderbook_client)
+# NOT registered with gtest_discover_tests — invoked by Python test_cpp_client.py

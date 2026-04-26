@@ -198,6 +198,40 @@ std::string format_status(const ServerStats& stats) {
     out += std::to_string(stats.ttl_bytes_reclaimed);
     out += '\n';
 
+    // Sharding metrics (only when shard_id is non-empty)
+    if (!stats.shard_id.empty()) {
+        out += "shard_id: ";
+        out += stats.shard_id;
+        out += '\n';
+        out += "shard_status: ";
+        out += stats.shard_status;
+        out += '\n';
+        out += "shard_symbols_count: ";
+        out += std::to_string(stats.shard_symbols_count);
+        out += '\n';
+        out += "shard_map_version: ";
+        out += std::to_string(stats.shard_map_version);
+        out += '\n';
+
+        // Migration metrics (when migration is in progress)
+        if (stats.migration_in_progress) {
+            out += "migration_in_progress: 1\n";
+            out += "migration_symbol: ";
+            out += stats.migration_symbol;
+            out += '\n';
+            out += "migration_target_shard: ";
+            out += stats.migration_target_shard;
+            out += '\n';
+            out += "migration_progress_pct: ";
+            out += std::to_string(stats.migration_progress_pct);
+            out += '\n';
+        }
+
+        out += "shard_routing_errors: ";
+        out += std::to_string(stats.shard_routing_errors);
+        out += '\n';
+    }
+
     out += '\n'; // empty line terminator
     return out;
 }

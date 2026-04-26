@@ -16,18 +16,27 @@ Usage (TCP):
 Both modes expose the same API: insert(), flush(), query(), close().
 """
 
+import base64
 import ctypes
 import ctypes.util
+import json
+import logging
 import os
 import socket
+import struct
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
+
+logger = logging.getLogger("orderbook_engine")
 
 __version__ = "0.2.0"
-__all__ = ["OrderbookEngine", "OrderbookRow", "OrderbookError"]
+__all__ = ["OrderbookEngine", "OrderbookRow", "OrderbookError",
+           "_murmurhash3_x86_32", "_ConsistentHashRing",
+           "_parse_shard_map_response", "_parse_shard_info_response",
+           "_parse_shard_error"]
 
 
 # ── Data types ─────────────────────────────────────────────────────────────────
@@ -143,13 +152,13 @@ class _TcpBackend:
         self._read_banner()
 
     def _read_banner(self):
-        """Read the welcome banner line from the server."""
+        """Read the welcome banner from the server (terminated by \\n\\n)."""
         while True:
             decoded = self._buf.decode("utf-8", errors="replace")
-            nl = decoded.find("\n")
-            if nl != -1:
-                # Consume the banner line
-                consumed = decoded[:nl + 1].encode("utf-8")
+            end = decoded.find("\n\n")
+            if end != -1:
+                # Consume the banner including the double newline
+                consumed = decoded[:end + 2].encode("utf-8")
                 self._buf = self._buf[len(consumed):]
                 return
             chunk = self._sock.recv(4096)
@@ -455,17 +464,171 @@ class _NodeState:
     last_check: float = 0.0     # time.monotonic()
 
 
+# ── MurmurHash3 (Python implementation) ────────────────────────────────────────
+
+def _murmurhash3_x86_32(data: bytes, seed: int = 0) -> int:
+    """MurmurHash3_x86_32 — pure Python implementation matching C++ version."""
+    c1 = 0xCC9E2D51
+    c2 = 0x1B873593
+    mask = 0xFFFFFFFF
+
+    h1 = seed & mask
+    length = len(data)
+    n_blocks = length // 4
+
+    for i in range(n_blocks):
+        k1 = int.from_bytes(data[i * 4:(i + 1) * 4], byteorder="little", signed=False)
+        k1 = (k1 * c1) & mask
+        k1 = ((k1 << 15) | (k1 >> 17)) & mask
+        k1 = (k1 * c2) & mask
+        h1 ^= k1
+        h1 = ((h1 << 13) | (h1 >> 19)) & mask
+        h1 = (h1 * 5 + 0xE6546B64) & mask
+
+    tail = data[n_blocks * 4:]
+    k1 = 0
+    tail_len = len(tail)
+    if tail_len >= 3:
+        k1 ^= tail[2] << 16
+    if tail_len >= 2:
+        k1 ^= tail[1] << 8
+    if tail_len >= 1:
+        k1 ^= tail[0]
+        k1 = (k1 * c1) & mask
+        k1 = ((k1 << 15) | (k1 >> 17)) & mask
+        k1 = (k1 * c2) & mask
+        h1 ^= k1
+
+    h1 ^= length
+    # fmix32
+    h1 ^= h1 >> 16
+    h1 = (h1 * 0x85EBCA6B) & mask
+    h1 ^= h1 >> 13
+    h1 = (h1 * 0xC2B2AE35) & mask
+    h1 ^= h1 >> 16
+
+    return h1
+
+
+class _ConsistentHashRing:
+    """Consistent hash ring with virtual nodes (Python implementation)."""
+
+    def __init__(self):
+        self._ring: Dict[int, str] = {}
+        self._sorted_keys: List[int] = []
+        self._shard_vnodes: Dict[str, List[int]] = {}
+
+    def add_shard(self, shard_id: str, vnodes: int = 150):
+        """Add a shard with virtual nodes to the ring."""
+        hashes = []
+        for i in range(vnodes):
+            vnode_key = f"{shard_id}#{i}"
+            h = _murmurhash3_x86_32(vnode_key.encode("utf-8"))
+            self._ring[h] = shard_id
+            hashes.append(h)
+        self._shard_vnodes[shard_id] = hashes
+        self._sorted_keys = sorted(self._ring.keys())
+
+    def remove_shard(self, shard_id: str):
+        """Remove a shard and its virtual nodes from the ring."""
+        hashes = self._shard_vnodes.pop(shard_id, [])
+        for h in hashes:
+            self._ring.pop(h, None)
+        self._sorted_keys = sorted(self._ring.keys())
+
+    def lookup(self, key: str) -> str:
+        """Find the shard responsible for a given key."""
+        if not self._sorted_keys:
+            return ""
+        h = _murmurhash3_x86_32(key.encode("utf-8"))
+        # Binary search for first hash >= h
+        lo, hi = 0, len(self._sorted_keys)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._sorted_keys[mid] < h:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo >= len(self._sorted_keys):
+            lo = 0  # wrap around
+        return self._ring[self._sorted_keys[lo]]
+
+    def shard_count(self) -> int:
+        return len(self._shard_vnodes)
+
+
+# ── Sharding response parsers ─────────────────────────────────────────────────
+
+def _parse_shard_map_response(raw: str) -> dict:
+    """Parse SHARD_MAP response: OK\\n<json>\\n\\n → dict."""
+    if raw.startswith("ERR "):
+        msg = raw[4:].rstrip("\n")
+        raise OrderbookError(-1, f"SHARD_MAP error: {msg}")
+    if raw.startswith("OK\n"):
+        body = raw[3:].rstrip("\n")
+        if body.strip():
+            return json.loads(body)
+    return {}
+
+
+def _parse_shard_info_response(raw: str) -> dict:
+    """Parse SHARD_INFO response: OK\\n<tsv>\\n\\n → dict."""
+    if raw.startswith("ERR "):
+        msg = raw[4:].rstrip("\n")
+        raise OrderbookError(-1, f"SHARD_INFO error: {msg}")
+    result = {}
+    if raw.startswith("OK\n"):
+        body = raw[3:]
+        for line in body.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t", 1)
+            if len(parts) == 2:
+                result[parts[0]] = parts[1]
+    return result
+
+
+def _parse_shard_error(raw: str):
+    """Parse sharding error responses.
+
+    Returns (error_type, detail) or (None, None) if not a shard error.
+    error_type: "NOT_OWNER", "SYMBOL_MIGRATED", or None
+    detail: symbol key or new address
+    """
+    if not raw.startswith("ERR "):
+        return None, None
+    msg = raw[4:].rstrip("\n")
+    if msg.startswith("NOT_OWNER "):
+        return "NOT_OWNER", msg[len("NOT_OWNER "):]
+    if msg.startswith("SYMBOL_MIGRATED "):
+        return "SYMBOL_MIGRATED", msg[len("SYMBOL_MIGRATED "):]
+    return None, None
+
+
 class _ClientPool:
     """
-    Multi-host connection pool with automatic primary discovery.
+    Multi-host connection pool with automatic primary discovery and shard routing.
 
     Connects to all hosts, issues ROLE commands to discover the primary,
     and routes writes to the primary and reads to any available node.
+
+    When coordinator_endpoints is provided, enables shard routing:
+      - Fetches ShardMap from etcd at initialization
+      - Routes INSERT/MINSERT per symbol to the correct shard
+      - Routes SELECT per symbol (single-shard) or fan-out (multi-symbol)
+      - Periodic ShardMap refresh in health-check thread
+      - Handles ERR SYMBOL_MIGRATED (refresh + retry 1x)
+
+    When coordinator_endpoints is not provided:
+      - Behavior unchanged (backward compatible primary/replica routing)
     """
 
     def __init__(self, hosts: List[str], timeout: float = 10.0,
                  health_check_interval: float = 2.0,
-                 compress: bool = False):
+                 compress: bool = False,
+                 coordinator_endpoints: Optional[List[str]] = None,
+                 cluster_prefix: str = "/ob/"):
         self._timeout = timeout
         self._health_check_interval = health_check_interval
         self._compress = compress
@@ -474,6 +637,13 @@ class _ClientPool:
         self._primary_key: Optional[str] = None
         self._health_thread: Optional[object] = None
         self._running = False
+
+        # Sharding fields
+        self._coordinator_endpoints = coordinator_endpoints
+        self._cluster_prefix = cluster_prefix
+        self._shard_map: Optional[dict] = None
+        self._shard_connections: dict = {}  # shard_id → _TcpBackend
+        self._hash_ring = _ConsistentHashRing()
 
         import threading
         self._lock = threading.Lock()
@@ -491,6 +661,10 @@ class _ClientPool:
         # Initial discovery.
         self._connect_all()
         self._discover_primary()
+
+        # Initialize sharding if coordinator endpoints provided.
+        if self._coordinator_endpoints:
+            self._init_sharding()
 
         # Start health check thread.
         self._running = True
@@ -635,6 +809,180 @@ class _ClientPool:
                 break
             self._connect_all()
             self._discover_primary()
+            # Refresh shard map if sharding enabled
+            if self._coordinator_endpoints:
+                try:
+                    new_map = self._fetch_shard_map()
+                    if new_map and new_map != self._shard_map:
+                        logger.debug("Health check: refreshing shard map")
+                        self._shard_map = new_map
+                        self._connect_shards()
+                        self._rebuild_hash_ring()
+                except Exception:
+                    logger.debug("Health check: shard map refresh failed, using cached")
+
+    # ── Sharding methods ───────────────────────────────────────────────────
+
+    def _init_sharding(self):
+        """Fetch ShardMap from etcd and establish connections to shards."""
+        logger.info("Shard mode enabled with %d coordinator endpoints",
+                     len(self._coordinator_endpoints))
+        self._shard_map = self._fetch_shard_map()
+        self._connect_shards()
+        self._rebuild_hash_ring()
+
+    def _fetch_shard_map(self) -> dict:
+        """Fetch ShardMap from etcd via HTTP GET to v3 REST API."""
+        import urllib.request
+        for endpoint in self._coordinator_endpoints:
+            try:
+                url = f"{endpoint}/v3/kv/range"
+                key_str = f"{self._cluster_prefix}shard_map"
+                key_b64 = base64.b64encode(key_str.encode()).decode()
+                body = json.dumps({"key": key_b64}).encode()
+                req = urllib.request.Request(
+                    url, data=body,
+                    headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read())
+                    if "kvs" in data and data["kvs"]:
+                        value = base64.b64decode(data["kvs"][0]["value"])
+                        shard_map = json.loads(value)
+                        version = shard_map.get("version", 0)
+                        shards = shard_map.get("shards", {})
+                        logger.info("Fetched shard map version=%d with %d shards",
+                                    version, len(shards))
+                        return shard_map
+            except Exception:
+                continue
+        return {}
+
+    def _connect_shards(self):
+        """Establish _TcpBackend connections to each shard from ShardMap."""
+        if not self._shard_map or "shards" not in self._shard_map:
+            return
+        shards = self._shard_map["shards"]
+        # Close connections to shards no longer in the map
+        for sid in list(self._shard_connections.keys()):
+            if sid not in shards:
+                try:
+                    self._shard_connections[sid].close()
+                except Exception:
+                    pass
+                del self._shard_connections[sid]
+        # Connect to new/updated shards
+        for shard_id, shard_info in shards.items():
+            if shard_id in self._shard_connections:
+                continue
+            address = shard_info.get("address", "")
+            if not address:
+                continue
+            try:
+                if ":" in address:
+                    host, port_str = address.rsplit(":", 1)
+                    port = int(port_str)
+                else:
+                    host = address
+                    port = 5555
+                backend = _TcpBackend(host, port, self._timeout,
+                                      compress=self._compress)
+                self._shard_connections[shard_id] = backend
+                logger.debug("Connected to shard %s at %s", shard_id, address)
+            except Exception:
+                logger.debug("Failed to connect to shard %s at %s",
+                             shard_id, address)
+
+    def _rebuild_hash_ring(self):
+        """Rebuild the consistent hash ring from the current shard map."""
+        self._hash_ring = _ConsistentHashRing()
+        if not self._shard_map or "shards" not in self._shard_map:
+            return
+        for shard_id, shard_info in self._shard_map["shards"].items():
+            vnodes = shard_info.get("vnodes", 150)
+            self._hash_ring.add_shard(shard_id, vnodes)
+
+    def _resolve_shard(self, symbol: str, exchange: str) -> str:
+        """Find shard_id for a symbol. Fallback: consistent hashing."""
+        key = f"{symbol}.{exchange}"
+        if self._shard_map and "assignments" in self._shard_map:
+            shard_id = self._shard_map["assignments"].get(key)
+            if shard_id:
+                logger.debug("Resolved %s.%s → shard %s (map lookup)",
+                             symbol, exchange, shard_id)
+                return shard_id
+        # Fallback: consistent hashing
+        shard_id = self._consistent_hash_lookup(key)
+        logger.debug("Resolved %s.%s → shard %s (consistent hash)",
+                     symbol, exchange, shard_id)
+        return shard_id
+
+    def _consistent_hash_lookup(self, key: str) -> str:
+        """MurmurHash3 consistent hash ring lookup."""
+        return self._hash_ring.lookup(key)
+
+    def execute_write_sharded(self, symbol: str, exchange: str,
+                               command: str) -> str:
+        """Route write to the correct shard based on symbol."""
+        shard_id = self._resolve_shard(symbol, exchange)
+        backend = self._shard_connections.get(shard_id)
+        if backend is None:
+            raise OrderbookError(-1, f"Shard {shard_id} not connected")
+        try:
+            raw = backend.execute(command)
+            err_type, detail = _parse_shard_error(raw)
+            if err_type == "SYMBOL_MIGRATED":
+                # Refresh shard map and retry 1x
+                logger.warning("Symbol migrated: %s.%s, refreshing shard map",
+                               symbol, exchange)
+                self._shard_map = self._fetch_shard_map()
+                self._connect_shards()
+                self._rebuild_hash_ring()
+                shard_id = self._resolve_shard(symbol, exchange)
+                backend = self._shard_connections.get(shard_id)
+                if backend is None:
+                    raise OrderbookError(
+                        -1, f"Shard {shard_id} not connected after refresh")
+                raw = backend.execute(command)
+            return raw
+        except (OSError, socket.error) as e:
+            logger.error("Shard %s unreachable for symbol %s.%s",
+                         shard_id, symbol, exchange)
+            raise OrderbookError(-1, f"Shard {shard_id} unreachable") from e
+
+    @property
+    def is_sharded(self) -> bool:
+        """True if sharding is enabled."""
+        return self._coordinator_endpoints is not None
+
+    def _route_query(self, sql: str) -> str:
+        """Route a query to the correct shard(s) based on symbol in SQL.
+
+        Extracts symbol from FROM clause (e.g. FROM 'AAPL'.'XNAS').
+        If symbol found → route to owning shard.
+        If not found → fan-out to all shards and return first non-empty result.
+        """
+        import re
+        # Try to extract symbol.exchange from SQL: FROM 'symbol'.'exchange'
+        match = re.search(r"FROM\s+'([^']+)'\s*\.\s*'([^']+)'", sql, re.IGNORECASE)
+        if match:
+            symbol, exchange = match.group(1), match.group(2)
+            shard_id = self._resolve_shard(symbol, exchange)
+            backend = self._shard_connections.get(shard_id)
+            if backend is not None:
+                try:
+                    return backend.execute(sql)
+                except (OSError, socket.error):
+                    pass
+        # Fan-out: query all shards, return first non-error response
+        for sid, backend in self._shard_connections.items():
+            try:
+                raw = backend.execute(sql)
+                if not raw.startswith("ERR "):
+                    return raw
+            except Exception:
+                continue
+        # Fallback to non-sharded read
+        return self.execute_read(sql)
 
     def close(self):
         """Stop health checks and close all connections."""
@@ -645,6 +993,13 @@ class _ClientPool:
             except Exception:
                 pass
         self._connections.clear()
+        # Close shard connections
+        for sid, backend in list(self._shard_connections.items()):
+            try:
+                backend.close()
+            except Exception:
+                pass
+        self._shard_connections.clear()
 
 
 # ── Unified Engine class ───────────────────────────────────────────────────────
@@ -668,7 +1023,9 @@ class OrderbookEngine:
                  hosts: Optional[List[str]] = None,
                  timeout: float = 10.0,
                  health_check_interval: float = 2.0,
-                 compress: bool = False):
+                 compress: bool = False,
+                 coordinator_endpoints: Optional[List[str]] = None,
+                 cluster_prefix: str = "/ob/"):
         self._seq = 0
         self._closed = False
         self._pool: Optional[_ClientPool] = None
@@ -677,7 +1034,9 @@ class OrderbookEngine:
             # Multi-host pool mode
             self._mode = "pool"
             self._pool = _ClientPool(hosts, timeout, health_check_interval,
-                                     compress=compress)
+                                     compress=compress,
+                                     coordinator_endpoints=coordinator_endpoints,
+                                     cluster_prefix=cluster_prefix)
             self._tcp = None
             self._local = None
         elif host is not None:
@@ -765,22 +1124,20 @@ class OrderbookEngine:
         if self._mode == "local":
             self._local.insert(symbol, exchange, side_int, prices, qtys, counts, seq, ts)
         elif self._mode == "pool":
-            # Pool mode: route writes to primary.
+            # Pool mode: route writes to primary or shard.
             if n > 1:
-                # MINSERT: single round-trip for multiple levels
                 header = f"MINSERT {symbol} {exchange} {side_lower} {n}"
                 payload_lines = [f"{prices[i]} {qtys[i]} {counts[i]}" for i in range(n)]
                 cmd = header + "\n" + "\n".join(payload_lines)
-                raw = self._pool.execute_write(cmd)
-                is_err, msg, _, _ = _parse_tcp_response(raw)
-                if is_err:
-                    raise OrderbookError(-1, f"Pool MINSERT failed: {msg}")
             else:
                 cmd = f"INSERT {symbol} {exchange} {side_lower} {prices[0]} {qtys[0]} {counts[0]}"
+            if self._pool.is_sharded:
+                raw = self._pool.execute_write_sharded(symbol, exchange, cmd)
+            else:
                 raw = self._pool.execute_write(cmd)
-                is_err, msg, _, _ = _parse_tcp_response(raw)
-                if is_err:
-                    raise OrderbookError(-1, f"Pool INSERT failed: {msg}")
+            is_err, msg, _, _ = _parse_tcp_response(raw)
+            if is_err:
+                raise OrderbookError(-1, f"Pool INSERT failed: {msg}")
         else:
             # TCP mode
             if n > 1:
@@ -828,7 +1185,11 @@ class OrderbookEngine:
 
         # TCP or pool mode — get raw response.
         if self._mode == "pool":
-            raw = self._pool.execute_read(sql)
+            # In sharded mode, try to extract symbol from SQL for routing
+            if self._pool.is_sharded:
+                raw = self._pool._route_query(sql)
+            else:
+                raw = self._pool.execute_read(sql)
         else:
             raw = self._tcp.execute(sql)
 

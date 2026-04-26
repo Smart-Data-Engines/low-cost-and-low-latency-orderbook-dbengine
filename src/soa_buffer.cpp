@@ -61,14 +61,28 @@ ob_status_t insert_level(SoASide& side, int64_t price, uint64_t qty,
 
     // ── Insert new level ───────────────────────────────────────────────────
     if (depth >= SoASide::MAX_LEVELS) {
-        return OB_ERR_FULL;
+        // Buffer at capacity — evict worst-priced level or discard if new price
+        // is worse than all existing levels.
+        //   Bid (descending): worst = prices[depth-1] (lowest price)
+        //   Ask (ascending):  worst = prices[depth-1] (highest price)
+        const int64_t worst = side.prices[depth - 1];
+        const bool new_is_worse = descending
+            ? (price <= worst)   // new bid price ≤ lowest existing bid
+            : (price >= worst);  // new ask price ≥ highest existing ask
+        if (new_is_worse) {
+            return OB_OK; // silently discard — not relevant for top of book
+        }
+        // Evict the worst level (last element) to make room.
+        side.depth = depth - 1;
+        // Fall through to the normal sorted-insert path below.
     }
 
     // Find insertion position to maintain sort order.
     // For descending (bid): insert before the first element that is < price.
     // For ascending  (ask): insert before the first element that is > price.
-    uint32_t insert_pos = depth;
-    for (uint32_t i = 0; i < depth; ++i) {
+    const uint32_t cur_depth = side.depth; // re-read after possible eviction
+    uint32_t insert_pos = cur_depth;
+    for (uint32_t i = 0; i < cur_depth; ++i) {
         bool should_insert_before = descending
             ? (price > side.prices[i])
             : (price < side.prices[i]);
@@ -79,7 +93,7 @@ ob_status_t insert_level(SoASide& side, int64_t price, uint64_t qty,
     }
 
     // Shift elements right to make room.
-    const uint32_t tail = depth - insert_pos;
+    const uint32_t tail = cur_depth - insert_pos;
     if (tail > 0) {
         std::memmove(&side.prices[insert_pos + 1],
                      &side.prices[insert_pos],
@@ -95,7 +109,7 @@ ob_status_t insert_level(SoASide& side, int64_t price, uint64_t qty,
     side.prices[insert_pos]       = price;
     side.quantities[insert_pos]   = qty;
     side.order_counts[insert_pos] = cnt;
-    side.depth = depth + 1;
+    side.depth = cur_depth + 1;
     return OB_OK;
 }
 

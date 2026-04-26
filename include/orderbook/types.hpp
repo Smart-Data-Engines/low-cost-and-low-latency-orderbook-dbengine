@@ -20,6 +20,7 @@ inline constexpr ob_status_t OB_ERR_MMAP_FAILED = -5;
 inline constexpr ob_status_t OB_ERR_OVERFLOW    = -6;
 inline constexpr ob_status_t OB_ERR_CHECKSUM    = -7;
 inline constexpr ob_status_t OB_ERR_FULL        = -8;
+inline constexpr ob_status_t OB_ERR_MIGRATED    = -9;
 inline constexpr ob_status_t OB_ERR_INTERNAL    = -99;
 
 // ── Exception ─────────────────────────────────────────────────────────────────

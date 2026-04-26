@@ -136,6 +136,16 @@ void Engine::close() {
 ob_status_t Engine::apply_delta(const DeltaUpdate& delta, const Level* levels) {
     std::unique_lock<std::mutex> lock(mtx_);
 
+    // Reject writes to migrated symbols (Requirement 6.6).
+    {
+        const std::string key = std::string(delta.symbol) + "." + delta.exchange;
+        if (migrated_symbols_.count(key)) {
+            OB_LOG_WARN("engine", "Rejecting write to migrated symbol: symbol_key=%s",
+                        key.c_str());
+            return OB_ERR_MIGRATED;
+        }
+    }
+
     // Backpressure: wait until pending queue has room.
     // This blocks the writer if the flush thread can't keep up.
     pending_cv_.wait(lock, [this]() {
@@ -277,6 +287,12 @@ Engine::Stats Engine::stats() {
     s.ttl_segments_deleted = ttl_segments_deleted_.load(std::memory_order_relaxed);
     s.ttl_bytes_reclaimed  = ttl_bytes_reclaimed_.load(std::memory_order_relaxed);
 
+    // Sharding metrics: populated when ShardCoordinator is available (Task 8).
+    // shard_id, shard_status, shard_symbols_count, shard_map_version,
+    // migration_in_progress, migration_symbol, migration_target_shard,
+    // migration_progress_pct, and shard_routing_errors are left at defaults
+    // until ShardCoordinator integration.
+
     return s;
 }
 
@@ -414,6 +430,81 @@ bool Engine::is_bootstrapping() const {
     return false;
 }
 
+// ── Symbol migration (sharding) ──────────────────────────────────────────────
+
+SnapshotManifest Engine::create_symbol_snapshot(const std::string& symbol_key) {
+    OB_LOG_INFO("engine", "Creating symbol snapshot: symbol_key=%s", symbol_key.c_str());
+
+    SnapshotManifest manifest;
+
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+
+        // Flush pending rows for this symbol to columnar stores.
+        wal_.sync();
+        flush_drain_pending();
+
+        // Flush the per-symbol columnar store segment if it exists.
+        auto it = stores_.find(symbol_key);
+        if (it != stores_.end()) {
+            it->second->flush_segment();
+        }
+
+        // Capture WAL position atomically with the flush.
+        manifest.wal_file_index  = wal_.current_file_index();
+        manifest.wal_byte_offset = wal_.current_offset();
+    }
+
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    manifest.created_at_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+
+    // Stub: in a full implementation, enumerate segment files for this symbol
+    // and populate manifest.files with per-symbol data.
+    // For now, return the manifest with WAL position but no files.
+
+    return manifest;
+}
+
+void Engine::load_symbol_snapshot(const std::string& symbol_key,
+                                  const SnapshotManifest& manifest) {
+    OB_LOG_INFO("engine", "Loading symbol snapshot: symbol_key=%s files=%zu",
+                symbol_key.c_str(), manifest.files.size());
+
+    // Stub: in a full implementation, load segments into per-symbol ColumnarStore
+    // and restore SoA buffer from the snapshot data.
+    // Requires ShardCoordinator (Task 8) for the full migration flow.
+    (void)symbol_key;
+    (void)manifest;
+}
+
+std::vector<uint8_t> Engine::get_symbol_wal_delta(const std::string& symbol_key,
+                                                   uint32_t from_file,
+                                                   size_t from_offset) {
+    OB_LOG_DEBUG("engine", "Getting WAL delta: symbol_key=%s from_file=%u from_offset=%zu",
+                 symbol_key.c_str(), from_file, from_offset);
+
+    // Stub: in a full implementation, filter WAL records for the given symbol
+    // from the specified position and return serialized delta bytes.
+    // Requires WAL reader with symbol filtering (Task 8 migration flow).
+    (void)symbol_key;
+    (void)from_file;
+    (void)from_offset;
+    return {};
+}
+
+bool Engine::is_symbol_migrated(const std::string& symbol_key) const {
+    // Note: caller should hold mtx_ or this should be called from a context
+    // where migrated_symbols_ is not being concurrently modified.
+    return migrated_symbols_.count(symbol_key) > 0;
+}
+
+void Engine::mark_symbol_migrated(const std::string& symbol_key) {
+    std::unique_lock<std::mutex> lock(mtx_);
+    migrated_symbols_.insert(symbol_key);
+    OB_LOG_INFO("engine", "Marking symbol as migrated: symbol_key=%s", symbol_key.c_str());
+}
+
 // ── RoleTransitionHandler implementation ──────────────────────────────────────
 
 void Engine::promote_to_primary(const EpochValue& new_epoch) {
@@ -446,6 +537,11 @@ void Engine::promote_to_primary(const EpochValue& new_epoch) {
 
     node_role_.store(NodeRole::PRIMARY, std::memory_order_release);
 
+    // Toggle dynamic read-only flag: PRIMARY accepts writes.
+    if (read_only_flag_) {
+        read_only_flag_->store(false, std::memory_order_release);
+    }
+
     // Update metrics registry node role.
     registry_.set_node_role("primary");
 
@@ -464,6 +560,11 @@ void Engine::demote_to_replica(const std::string& new_primary_address) {
     }
 
     node_role_.store(NodeRole::REPLICA, std::memory_order_release);
+
+    // Toggle dynamic read-only flag: REPLICA rejects writes.
+    if (read_only_flag_) {
+        read_only_flag_->store(true, std::memory_order_release);
+    }
 
     // Update metrics registry node role and epoch gauge.
     registry_.set_node_role("replica");
@@ -560,6 +661,10 @@ void Engine::truncate_and_rebootstrap(const EpochValue& new_epoch,
 
 NodeRole Engine::node_role() const {
     return node_role_.load(std::memory_order_acquire);
+}
+
+void Engine::set_read_only_flag(std::atomic<bool>* flag) {
+    read_only_flag_ = flag;
 }
 
 uint64_t Engine::current_epoch() const {

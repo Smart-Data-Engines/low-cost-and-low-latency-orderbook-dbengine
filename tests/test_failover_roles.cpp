@@ -148,3 +148,68 @@ TEST(FailoverRoles, StatusStandaloneDefaults) {
 }
 
 } // namespace
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Feature: replica-read-only-fix
+// Property 1: Bug Condition — Write Accepted After Demotion to Replica
+//
+// Bug condition C(X): command.type IN {INSERT, MINSERT, FLUSH}
+//                     AND node_role == REPLICA AND config_read_only == false
+// Expected behavior after fix: execute_command() returns ERR containing "read-only"
+//
+// On UNFIXED code this test MUST FAIL (returns OK instead of ERR).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#include "orderbook/command_parser.hpp"
+#include "orderbook/response_formatter.hpp"
+#include "orderbook/session.hpp"
+#include "orderbook/tcp_server.hpp"
+
+TEST(FailoverRoles, prop_write_rejected_after_demotion) {
+    rc::check("write commands rejected after demotion to REPLICA",
+              []() {
+        TempDir dir;
+        ob::Engine engine(dir.path);
+        engine.open();
+
+        // Promote to PRIMARY first (so we have a valid state to demote from)
+        ob::EpochValue epoch{1};
+        engine.promote_to_primary(epoch);
+        RC_ASSERT(engine.node_role() == ob::NodeRole::PRIMARY);
+
+        // Demote to REPLICA
+        engine.demote_to_replica("");
+        RC_ASSERT(engine.node_role() == ob::NodeRole::REPLICA);
+
+        // Create a write command — randomly choose INSERT or FLUSH
+        auto cmd_choice = *rc::gen::inRange(0, 2);
+        ob::Command cmd{};
+        if (cmd_choice == 0) {
+            cmd.type = ob::CommandType::INSERT;
+            cmd.insert_args.symbol = "TEST";
+            cmd.insert_args.exchange = "EX";
+            cmd.insert_args.side = 0;
+            cmd.insert_args.price = 100;
+            cmd.insert_args.qty = 10;
+            cmd.insert_args.count = 1;
+        } else {
+            cmd.type = ob::CommandType::FLUSH;
+        }
+
+        // Create session and stats for execute_command
+        ob::Session session(/*fd=*/-1);
+        ob::ServerStats stats;
+
+        // Call execute_command with read_only=false (simulating static config)
+        std::string response = ob::execute_command(
+            cmd, engine, session, stats,
+            /*read_only=*/false  // BUG: this is the static config flag, not dynamic
+        );
+
+        // Expected behavior after fix: response should contain ERR and "read-only"
+        RC_ASSERT(response.find("ERR") != std::string::npos);
+        RC_ASSERT(response.find("read-only") != std::string::npos);
+
+        engine.close();
+    });
+}

@@ -285,7 +285,7 @@ void IoUringServer::handle_accept(int client_fd) {
     engine_->registry().increment_gauge("ob_active_sessions");
 
     // Send welcome banner
-    static const char welcome[] = "OK ob_tcp_server v0.1.0\n";
+    static const char welcome[] = "OK ob_tcp_server v0.1.0\n\n";
     submit_write(client_fd, welcome, sizeof(welcome) - 1);
 
     // Submit read for incoming data
@@ -376,7 +376,7 @@ void IoUringServer::handle_read(int fd, int bytes_read) {
                           : parse_command(line);
 
         std::string response = execute_command(cmd, *engine_, *session, stats_,
-                                               config_.read_only, &engine_->registry());
+                                               read_only_.load(std::memory_order_acquire), &engine_->registry());
 
         if (response.empty()) {
             // QUIT — close session
@@ -445,6 +445,10 @@ void IoUringServer::handle_write(int fd, int bytes_written) {
 // ── run() — io_uring event loop ──────────────────────────────────────────────
 
 void IoUringServer::run() {
+    // Wire up the dynamic read-only flag so failover transitions toggle it.
+    read_only_.store(config_.read_only, std::memory_order_relaxed);
+    engine_->set_read_only_flag(&read_only_);
+
     // Open the engine (replay WAL, start flush thread).
     engine_->open();
 

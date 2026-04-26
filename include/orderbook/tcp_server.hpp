@@ -5,6 +5,7 @@
 #include "orderbook/metrics.hpp"
 #include "orderbook/metrics_server.hpp"
 #include "orderbook/response_formatter.hpp"
+#include "orderbook/shard_coordinator.hpp"
 #include "orderbook/session.hpp"
 
 #include <atomic>
@@ -52,6 +53,10 @@ struct ServerConfig {
     uint16_t    metrics_port{0};              // --metrics-port (0 = disabled)
     std::string log_level{"INFO"};            // --log-level (ERROR|WARN|INFO|DEBUG)
 
+    // Sharding
+    std::string shard_id;                     // --shard-id (empty = non-sharded)
+    uint32_t    shard_vnodes{150};            // --shard-vnodes
+
     // io_uring (used only when OB_USE_IO_URING is active)
     uint32_t uring_ring_size{256};            // --ring-size
     uint32_t uring_sqpoll_idle_ms{1000};      // --sqpoll-idle-ms
@@ -82,6 +87,7 @@ private:
     std::unique_ptr<MetricsServer> metrics_server_;
     std::atomic<bool>        running_{false};
     std::atomic<bool>        draining_{false};  // drain phase: reject new connections, finish in-flight
+    std::atomic<bool>        read_only_{false};  // dynamic read-only flag, toggled by failover
     int                      listen_fd_{-1};
     int                      epoll_fd_{-1};
 
@@ -94,12 +100,15 @@ private:
 /// Execute a command against the engine. Returns the wire-protocol response string.
 /// When read_only is true, INSERT and FLUSH commands are rejected with an error.
 /// When registry is non-null, latency histograms and operation counters are updated.
+/// When shard_coord is non-null, sharding commands (SHARD_MAP, SHARD_INFO, MIGRATE)
+/// are handled and INSERT/MINSERT ownership checks are enforced.
 std::string execute_command(const Command& cmd,
                             Engine& engine,
                             Session& session,
                             ServerStats& stats,
                             bool read_only = false,
-                            MetricsRegistry* registry = nullptr);
+                            MetricsRegistry* registry = nullptr,
+                            ShardCoordinator* shard_coord = nullptr);
 
 /// Parse CLI arguments into a ServerConfig. Applies defaults for missing args.
 ServerConfig parse_cli_args(int argc, char* argv[]);

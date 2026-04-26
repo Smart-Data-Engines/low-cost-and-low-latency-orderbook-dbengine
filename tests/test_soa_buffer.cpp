@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -364,22 +365,51 @@ TEST(SoABuffer, ExactlyMaxLevels) {
     EXPECT_EQ(out_bid.depth, ob::MAX_LEVELS);
 }
 
-TEST(SoABuffer, OverflowRejected) {
+TEST(SoABuffer, OverflowEviction) {
     auto buf = make_buffer();
     uint64_t seq = 1;
 
+    // Fill bid side to MAX_LEVELS with prices 1..1000 (stored descending: 1000, 999, ..., 1)
     for (uint32_t i = 0; i < ob::MAX_LEVELS; ++i) {
         ob::Level lv{static_cast<int64_t>(i + 1), 1ULL, 1U, 0U};
         ob::DeltaUpdate upd = make_update(ob::SIDE_BID, seq++, 1);
         bool gap = false;
         ob::apply_delta(*buf, upd, &lv, gap);
     }
+    ASSERT_EQ(buf->bid.depth, ob::MAX_LEVELS);
 
+    // Insert price=1001 (better than worst bid price=1) — should evict price=1
     ob::Level lv_extra{static_cast<int64_t>(ob::MAX_LEVELS + 1), 1ULL, 1U, 0U};
     ob::DeltaUpdate upd_extra = make_update(ob::SIDE_BID, seq, 1);
     bool gap = false;
     ob::ob_status_t st = ob::apply_delta(*buf, upd_extra, &lv_extra, gap);
-    EXPECT_EQ(st, ob::OB_ERR_FULL);
+    EXPECT_EQ(st, ob::OB_OK);
+    EXPECT_EQ(buf->bid.depth, ob::MAX_LEVELS);
+
+    // New price (1001) should be present
+    bool found_new = false;
+    for (uint32_t i = 0; i < buf->bid.depth; ++i) {
+        if (buf->bid.prices[i] == static_cast<int64_t>(ob::MAX_LEVELS + 1)) {
+            found_new = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found_new) << "New price 1001 not found after eviction";
+
+    // Worst price (1) should have been evicted
+    bool found_worst = false;
+    for (uint32_t i = 0; i < buf->bid.depth; ++i) {
+        if (buf->bid.prices[i] == 1) {
+            found_worst = true;
+            break;
+        }
+    }
+    EXPECT_FALSE(found_worst) << "Worst price 1 should have been evicted";
+
+    // Sort order maintained (bid descending)
+    for (uint32_t i = 1; i < buf->bid.depth; ++i) {
+        EXPECT_GE(buf->bid.prices[i - 1], buf->bid.prices[i]);
+    }
 }
 
 TEST(SoABuffer, GapDetectionNonConsecutive) {
@@ -412,4 +442,146 @@ TEST(SoABuffer, GapDetectionConsecutive) {
     ob::apply_delta(*buf, upd2, &lv2, gap2);
 
     EXPECT_FALSE(gap2);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Property: Bug Condition — Eviction on Overflow
+// Feature: wal-apply-delta-fix
+//
+// Bug condition C(X): qty > 0 AND price not in buffer AND depth >= MAX_LEVELS
+// Expected behavior after fix: apply_delta returns OB_OK, depth <= MAX_LEVELS,
+// side remains sorted, retained levels are the best MAX_LEVELS prices.
+//
+// On UNFIXED code this test MUST FAIL (OB_ERR_FULL instead of OB_OK).
+// ═══════════════════════════════════════════════════════════════════════════════
+RC_GTEST_PROP(SoABufferProperty, prop_eviction_on_overflow, ()) {
+    auto buf = make_buffer();
+    uint64_t seq = 1;
+
+    // Fill bid side to exactly MAX_LEVELS with prices 1..1000 (ascending insert,
+    // stored descending: 1000, 999, ..., 1).
+    for (uint32_t i = 0; i < ob::SoASide::MAX_LEVELS; ++i) {
+        ob::Level lv{static_cast<int64_t>(i + 1), 1ULL, 1U, 0U};
+        ob::DeltaUpdate upd = make_update(ob::SIDE_BID, seq++, 1);
+        bool gap = false;
+        ob::apply_delta(*buf, upd, &lv, gap);
+    }
+    RC_ASSERT(buf->bid.depth == ob::SoASide::MAX_LEVELS);
+
+    // Generate a random price that is BETTER than the worst bid (worst = prices[depth-1] = 1).
+    // For bids, "better" means higher price.
+    auto new_price = *rc::gen::inRange<int64_t>(2, 100000);
+    // Ensure it's not already in the buffer (prices 1..1000).
+    RC_PRE(new_price > static_cast<int64_t>(ob::SoASide::MAX_LEVELS));
+
+    ob::Level lv_new{new_price, 10ULL, 1U, 0U};
+    ob::DeltaUpdate upd_new = make_update(ob::SIDE_BID, seq++, 1);
+    bool gap = false;
+    ob::ob_status_t st = ob::apply_delta(*buf, upd_new, &lv_new, gap);
+
+    // Expected behavior after fix:
+    RC_ASSERT(st == ob::OB_OK);
+    RC_ASSERT(buf->bid.depth <= ob::SoASide::MAX_LEVELS);
+
+    // Sort invariant: bid prices descending
+    for (uint32_t i = 1; i < buf->bid.depth; ++i) {
+        RC_ASSERT(buf->bid.prices[i - 1] >= buf->bid.prices[i]);
+    }
+
+    // The new (better) price should be in the buffer
+    bool found_new = false;
+    for (uint32_t i = 0; i < buf->bid.depth; ++i) {
+        if (buf->bid.prices[i] == new_price) { found_new = true; break; }
+    }
+    RC_ASSERT(found_new);
+
+    // The worst price (1) should have been evicted
+    bool found_worst = false;
+    for (uint32_t i = 0; i < buf->bid.depth; ++i) {
+        if (buf->bid.prices[i] == 1) { found_worst = true; break; }
+    }
+    RC_ASSERT(!found_worst);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Property: Preservation — Sub-Capacity Insert Behavior Unchanged
+// Feature: wal-apply-delta-fix
+//
+// For any sequence of operations where depth stays below MAX_LEVELS:
+// - All apply_delta calls return OB_OK
+// - Depth equals the number of unique non-removed prices
+// - Bid prices are in descending order, ask prices in ascending order
+// - Seqlock version is even after each apply_delta call
+// - In-place updates don't change depth
+// - Removals (qty=0) decrement depth
+//
+// This test MUST PASS on both unfixed and fixed code.
+// ═══════════════════════════════════════════════════════════════════════════════
+RC_GTEST_PROP(SoABufferProperty, prop_sub_capacity_preservation, ()) {
+    auto buf = make_buffer();
+    uint64_t seq = 1;
+
+    // Generate a random number of unique prices (1..500, well below MAX_LEVELS)
+    const auto n_inserts = *rc::gen::inRange<uint16_t>(1, 501);
+
+    // Track which prices are currently in the buffer
+    std::set<int64_t> active_prices;
+
+    // Phase 1: Insert unique prices
+    for (uint16_t i = 0; i < n_inserts; ++i) {
+        int64_t price = static_cast<int64_t>((i + 1) * 100);
+        uint64_t qty = *rc::gen::inRange<uint64_t>(1, 1000);
+        uint32_t cnt = *rc::gen::inRange<uint32_t>(1, 100);
+
+        ob::Level lv{price, qty, cnt, 0U};
+        ob::DeltaUpdate upd = make_update(ob::SIDE_BID, seq++, 1);
+        bool gap = false;
+        ob::ob_status_t st = ob::apply_delta(*buf, upd, &lv, gap);
+        RC_ASSERT(st == ob::OB_OK);
+        active_prices.insert(price);
+    }
+
+    // Verify depth matches active prices
+    RC_ASSERT(static_cast<size_t>(buf->bid.depth) == active_prices.size());
+
+    // Verify sort order (bid descending)
+    for (uint32_t i = 1; i < buf->bid.depth; ++i) {
+        RC_ASSERT(buf->bid.prices[i - 1] >= buf->bid.prices[i]);
+    }
+
+    // Verify seqlock version is even
+    RC_ASSERT((buf->bid.version.load() & 1ULL) == 0ULL);
+
+    // Phase 2: Update some existing prices (should not change depth)
+    if (n_inserts > 1) {
+        uint32_t depth_before = buf->bid.depth;
+        int64_t update_price = static_cast<int64_t>(100);  // first inserted price
+        ob::Level lv_upd{update_price, 999ULL, 99U, 0U};
+        ob::DeltaUpdate upd = make_update(ob::SIDE_BID, seq++, 1);
+        bool gap = false;
+        ob::ob_status_t st = ob::apply_delta(*buf, upd, &lv_upd, gap);
+        RC_ASSERT(st == ob::OB_OK);
+        RC_ASSERT(buf->bid.depth == depth_before);  // depth unchanged
+    }
+
+    // Phase 3: Remove a price (should decrement depth)
+    if (n_inserts > 2) {
+        uint32_t depth_before = buf->bid.depth;
+        int64_t remove_price = static_cast<int64_t>(200);  // second inserted price
+        ob::Level lv_rm{remove_price, 0ULL, 0U, 0U};  // qty=0 → remove
+        ob::DeltaUpdate upd = make_update(ob::SIDE_BID, seq++, 1);
+        bool gap = false;
+        ob::ob_status_t st = ob::apply_delta(*buf, upd, &lv_rm, gap);
+        RC_ASSERT(st == ob::OB_OK);
+        RC_ASSERT(buf->bid.depth == depth_before - 1);
+        active_prices.erase(remove_price);
+    }
+
+    // Final verification: sort order still holds
+    for (uint32_t i = 1; i < buf->bid.depth; ++i) {
+        RC_ASSERT(buf->bid.prices[i - 1] >= buf->bid.prices[i]);
+    }
+
+    // Seqlock version still even
+    RC_ASSERT((buf->bid.version.load() & 1ULL) == 0ULL);
 }

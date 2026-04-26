@@ -64,6 +64,16 @@ if(OB_BUILD_TESTS)
     FetchContent_MakeAvailable(rapidcheck)
 endif()
 
+# nlohmann/json (header-only, used by shard_map serialization)
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+)
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+set(JSON_Install OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(nlohmann_json)
+
 # ── Core library ───────────────────────────────────────────────────────────────
 add_library(orderbook_core INTERFACE)
 target_include_directories(orderbook_core INTERFACE
@@ -136,6 +146,18 @@ target_link_libraries(orderbook_metrics PUBLIC orderbook_core)
 # ── Structured logger compiled library ─────────────────────────────────────────
 add_library(orderbook_logger STATIC src/logger.cpp)
 target_link_libraries(orderbook_logger PUBLIC orderbook_core)
+
+# ── Shard map compiled library ─────────────────────────────────────────────────
+add_library(orderbook_shard_map STATIC src/shard_map.cpp)
+target_link_libraries(orderbook_shard_map PUBLIC orderbook_core orderbook_logger nlohmann_json::nlohmann_json)
+
+# ── Shard router compiled library (client-side routing) ────────────────────────
+add_library(orderbook_shard_router STATIC src/shard_router.cpp)
+target_link_libraries(orderbook_shard_router PUBLIC orderbook_shard_map orderbook_coordinator orderbook_logger)
+
+# ── Shard coordinator compiled library ──────────────────────────────────────────
+add_library(orderbook_shard_coordinator STATIC src/shard_coordinator.cpp)
+target_link_libraries(orderbook_shard_coordinator PUBLIC orderbook_shard_map orderbook_coordinator orderbook_engine orderbook_logger)
 
 # ── Metrics HTTP server compiled library ───────────────────────────────────────
 add_library(orderbook_metrics_server STATIC src/metrics_server.cpp)
@@ -244,11 +266,11 @@ add_library(orderbook_tcp_server_lib STATIC
     src/response_formatter.cpp
     src/session.cpp
 )
-target_link_libraries(orderbook_tcp_server_lib PUBLIC orderbook_engine orderbook_logger orderbook_metrics_server)
+target_link_libraries(orderbook_tcp_server_lib PUBLIC orderbook_engine orderbook_logger orderbook_metrics_server orderbook_shard_coordinator)
 
 # ── Native C++ client library ──────────────────────────────────────────────────
 add_library(orderbook_client STATIC src/client.cpp)
-target_link_libraries(orderbook_client PUBLIC orderbook_core)
+target_link_libraries(orderbook_client PUBLIC orderbook_core orderbook_shard_router)
 
 option(OB_CLIENT_LZ4 "Enable optional LZ4 compression in orderbook_client" OFF)
 if(OB_CLIENT_LZ4)

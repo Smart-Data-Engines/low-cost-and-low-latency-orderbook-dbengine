@@ -19,6 +19,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace ob {
@@ -132,6 +133,21 @@ public:
         uint64_t ttl_hours{0};              // configured TTL (0 = disabled)
         uint64_t ttl_segments_deleted{0};   // cumulative segments deleted
         uint64_t ttl_bytes_reclaimed{0};    // cumulative bytes reclaimed
+
+        // Sharding metrics
+        std::string shard_id;                // empty = non-sharded
+        std::string shard_status;            // "active", "joining", "draining"
+        size_t      shard_symbols_count{0};
+        uint64_t    shard_map_version{0};
+
+        // Migration metrics
+        bool        migration_in_progress{false};
+        std::string migration_symbol;
+        std::string migration_target_shard;
+        uint8_t     migration_progress_pct{0};
+
+        // Routing errors
+        uint64_t    shard_routing_errors{0};
     };
 
     /// Collect current engine statistics (thread-safe, acquires mtx_).
@@ -148,6 +164,27 @@ public:
 
     /// Returns true if the replica is currently bootstrapping from a snapshot.
     bool is_bootstrapping() const;
+
+    // ── Symbol migration (sharding) ───────────────────────────────────────────
+
+    /// Create a snapshot containing only data for one symbol.
+    /// Used during symbol migration between shards.
+    SnapshotManifest create_symbol_snapshot(const std::string& symbol_key);
+
+    /// Load a symbol snapshot received from another shard.
+    void load_symbol_snapshot(const std::string& symbol_key,
+                              const SnapshotManifest& manifest);
+
+    /// Get WAL delta for a symbol from a given position.
+    std::vector<uint8_t> get_symbol_wal_delta(const std::string& symbol_key,
+                                               uint32_t from_file,
+                                               size_t from_offset);
+
+    /// Check if a symbol has been migrated (reject writes after switchover).
+    bool is_symbol_migrated(const std::string& symbol_key) const;
+
+    /// Mark a symbol as migrated (after atomic ShardMap update).
+    void mark_symbol_migrated(const std::string& symbol_key);
 
     /// Access the base data directory path.
     const std::string& base_dir() const { return base_dir_; }
@@ -173,6 +210,9 @@ public:
 
     /// Handle FAILOVER command — returns wire-protocol response.
     std::string handle_failover_command(const std::string& target_node_id);
+
+    /// Set external read-only flag pointer (toggled during role transitions).
+    void set_read_only_flag(std::atomic<bool>* flag);
 
 private:
     std::string base_dir_;
@@ -207,11 +247,17 @@ private:
     std::atomic<NodeRole>                node_role_{NodeRole::STANDALONE};
     std::atomic<uint64_t>                current_epoch_{0};
 
+    // External read-only flag (owned by TcpServer, toggled during role transitions)
+    std::atomic<bool>*                   read_only_flag_{nullptr};
+
     // TTL / data retention
     TTLConfig ttl_config_;
     std::atomic<uint64_t> ttl_segments_deleted_{0};
     std::atomic<uint64_t> ttl_bytes_reclaimed_{0};
     uint64_t last_ttl_scan_ns_{0};
+
+    // Sharding: symbols that have been migrated away from this shard
+    std::unordered_set<std::string> migrated_symbols_;
 
     // Background flush thread
     std::thread       flush_thread_;

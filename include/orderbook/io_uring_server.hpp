@@ -54,6 +54,7 @@ private:
     std::unique_ptr<MetricsServer> metrics_server_;
     std::atomic<bool>        running_{false};
     std::atomic<bool>        draining_{false};
+    std::atomic<bool>        read_only_{false};  // dynamic read-only flag, toggled by failover
 
     int listen_fd_{-1};
 

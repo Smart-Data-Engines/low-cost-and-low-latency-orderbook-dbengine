@@ -2,6 +2,7 @@
 #include "orderbook/logger.hpp"
 #include "orderbook/metrics.hpp"
 #include "orderbook/metrics_server.hpp"
+#include "orderbook/shard_coordinator.hpp"
 
 #include <cerrno>
 #include <chrono>
@@ -27,7 +28,8 @@ std::string execute_command(const Command& cmd,
                             Session& session,
                             ServerStats& stats,
                             bool read_only,
-                            MetricsRegistry* registry) {
+                            MetricsRegistry* registry,
+                            ShardCoordinator* shard_coord) {
     switch (cmd.type) {
 
     case CommandType::COMPRESS: {
@@ -70,8 +72,22 @@ std::string execute_command(const Command& cmd,
 
     case CommandType::INSERT: {
         session.increment_commands();
-        if (read_only) return format_error("read-only replica");
+        if (read_only || engine.node_role() == NodeRole::REPLICA) return format_error("read-only replica");
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
+        // Shard ownership check: reject writes for symbols not owned by this shard
+        if (shard_coord) {
+            const std::string symbol_key = cmd.insert_args.symbol + "." + cmd.insert_args.exchange;
+            if (engine.is_symbol_migrated(symbol_key)) {
+                shard_coord->increment_routing_errors();
+                OB_LOG_WARN("tcp_server", "Rejecting INSERT for migrated symbol=%s", symbol_key.c_str());
+                return format_error("SYMBOL_MIGRATED");
+            }
+            if (!shard_coord->owns_symbol(symbol_key)) {
+                shard_coord->increment_routing_errors();
+                OB_LOG_WARN("tcp_server", "Rejecting INSERT for non-owned symbol=%s", symbol_key.c_str());
+                return format_error("NOT_OWNER " + symbol_key);
+            }
+        }
         auto t0_insert = std::chrono::steady_clock::now();
         try {
             const auto& a = cmd.insert_args;
@@ -111,8 +127,22 @@ std::string execute_command(const Command& cmd,
 
     case CommandType::MINSERT: {
         session.increment_commands();
-        if (read_only) return format_error("read-only replica");
+        if (read_only || engine.node_role() == NodeRole::REPLICA) return format_error("read-only replica");
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
+        // Shard ownership check: reject writes for symbols not owned by this shard
+        if (shard_coord) {
+            const std::string symbol_key = cmd.minsert_args.symbol + "." + cmd.minsert_args.exchange;
+            if (engine.is_symbol_migrated(symbol_key)) {
+                shard_coord->increment_routing_errors();
+                OB_LOG_WARN("tcp_server", "Rejecting MINSERT for migrated symbol=%s", symbol_key.c_str());
+                return format_error("SYMBOL_MIGRATED");
+            }
+            if (!shard_coord->owns_symbol(symbol_key)) {
+                shard_coord->increment_routing_errors();
+                OB_LOG_WARN("tcp_server", "Rejecting MINSERT for non-owned symbol=%s", symbol_key.c_str());
+                return format_error("NOT_OWNER " + symbol_key);
+            }
+        }
         auto t0_minsert = std::chrono::steady_clock::now();
         try {
             const auto& a = cmd.minsert_args;
@@ -155,7 +185,7 @@ std::string execute_command(const Command& cmd,
 
     case CommandType::FLUSH: {
         session.increment_commands();
-        if (read_only) return format_error("read-only replica");
+        if (read_only || engine.node_role() == NodeRole::REPLICA) return format_error("read-only replica");
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
         auto t0_flush = std::chrono::steady_clock::now();
         try {
@@ -213,6 +243,17 @@ std::string execute_command(const Command& cmd,
         stats.ttl_segments_deleted = es.ttl_segments_deleted;
         stats.ttl_bytes_reclaimed  = es.ttl_bytes_reclaimed;
 
+        // Sharding metrics
+        stats.shard_id              = es.shard_id;
+        stats.shard_status          = es.shard_status;
+        stats.shard_symbols_count   = es.shard_symbols_count;
+        stats.shard_map_version     = es.shard_map_version;
+        stats.migration_in_progress = es.migration_in_progress;
+        stats.migration_symbol      = es.migration_symbol;
+        stats.migration_target_shard = es.migration_target_shard;
+        stats.migration_progress_pct = es.migration_progress_pct;
+        stats.shard_routing_errors  = es.shard_routing_errors;
+
         return format_status(stats);
     }
 
@@ -223,6 +264,30 @@ std::string execute_command(const Command& cmd,
     case CommandType::FAILOVER:
         session.increment_commands();
         return engine.handle_failover_command(cmd.target_node_id);
+
+    case CommandType::SHARD_MAP: {
+        session.increment_commands();
+        OB_LOG_DEBUG("tcp_server", "Handling SHARD_MAP command");
+        if (!shard_coord) return format_error("sharding not enabled");
+        return shard_coord->handle_shard_map_command();
+    }
+
+    case CommandType::SHARD_INFO: {
+        session.increment_commands();
+        OB_LOG_DEBUG("tcp_server", "Handling SHARD_INFO command");
+        if (!shard_coord) return format_error("sharding not enabled");
+        return shard_coord->handle_shard_info_command();
+    }
+
+    case CommandType::MIGRATE: {
+        session.increment_commands();
+        OB_LOG_INFO("tcp_server", "Handling MIGRATE command: symbol=%s target=%s",
+                    cmd.migrate_symbol.c_str(), cmd.migrate_target_shard.c_str());
+        if (!shard_coord) return format_error("sharding not enabled");
+        if (read_only) return format_error("read-only mode");
+        return shard_coord->handle_migrate_command(
+            cmd.migrate_symbol, cmd.migrate_target_shard);
+    }
 
     case CommandType::QUIT:
         session.increment_commands();
@@ -307,7 +372,24 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
             config.uring_ring_size = std::stoul(argv[++i]);
         } else if (arg == "--no-sqpoll") {
             config.uring_no_sqpoll = true;
+        } else if (arg == "--shard-id" && i + 1 < argc) {
+            config.shard_id = argv[++i];
+        } else if (arg == "--shard-vnodes" && i + 1 < argc) {
+            config.shard_vnodes = static_cast<uint32_t>(std::stoul(argv[++i]));
         }
+    }
+
+    // Validation: --shard-id requires --coordinator-endpoints
+    if (!config.shard_id.empty() && config.coordinator_endpoints.empty()) {
+        std::fprintf(stderr,
+            "Error: --shard-id requires --coordinator-endpoints to be specified. "
+            "Shard mode needs etcd for shard map coordination.\n");
+        std::exit(1);
+    }
+
+    if (!config.shard_id.empty()) {
+        OB_LOG_INFO("tcp_server", "Shard mode enabled: shard_id=%s vnodes=%u",
+                    config.shard_id.c_str(), config.shard_vnodes);
     }
 
     return config;
@@ -317,6 +399,7 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
 
 TcpServer::TcpServer(ServerConfig config)
     : config_(std::move(config))
+    , read_only_(config_.read_only)
 {
     ReplicationConfig repl_config{};
     repl_config.port = config_.replication_port;
@@ -351,6 +434,9 @@ TcpServer::~TcpServer() {
 }
 
 void TcpServer::run() {
+    // Wire up the dynamic read-only flag so failover transitions toggle it.
+    engine_->set_read_only_flag(&read_only_);
+
     // Open the engine (replay WAL, start flush thread).
     engine_->open();
 
@@ -364,6 +450,23 @@ void TcpServer::run() {
     if (config_.metrics_port > 0) {
         metrics_server_ = std::make_unique<MetricsServer>(config_.metrics_port, engine_->registry());
         metrics_server_->start();
+    }
+
+    // Initialize ShardCoordinator if shard mode is enabled.
+    std::unique_ptr<ShardCoordinator> shard_coord;
+    if (!config_.shard_id.empty()) {
+        OB_LOG_INFO("tcp_server", "Shard mode: shard_id=%s", config_.shard_id.c_str());
+
+        ShardCoordinatorConfig sc_config;
+        sc_config.shard_id = config_.shard_id;
+        sc_config.vnodes = config_.shard_vnodes;
+        sc_config.coordinator.endpoints = config_.coordinator_endpoints;
+        sc_config.coordinator.lease_ttl_seconds = config_.coordinator_lease_ttl;
+        sc_config.coordinator.node_id = config_.node_id;
+        sc_config.coordinator.cluster_prefix = "/ob/";
+
+        shard_coord = std::make_unique<ShardCoordinator>(sc_config, *engine_);
+        shard_coord->start();
     }
 
     // 1. Create non-blocking TCP socket.
@@ -483,7 +586,7 @@ void TcpServer::run() {
                     // Send welcome message.
                     Session* s = session_mgr.get_session(client_fd);
                     if (s) {
-                        s->send_response("OK ob_tcp_server v0.1.0\n");
+                        s->send_response("OK ob_tcp_server v0.1.0\n\n");
                     }
                 }
             } else {
@@ -529,7 +632,7 @@ void TcpServer::run() {
                         Command cmd = (line.find('\n') != std::string::npos)
                                           ? parse_minsert(line)
                                           : parse_command(line);
-                        std::string response = execute_command(cmd, *engine_, *session, stats, config_.read_only, &engine_->registry());
+                        std::string response = execute_command(cmd, *engine_, *session, stats, read_only_.load(std::memory_order_acquire), &engine_->registry(), shard_coord.get());
 
                         if (response.empty()) {
                             // QUIT — close session.
@@ -577,6 +680,12 @@ void TcpServer::run() {
     if (listen_fd_ >= 0) {
         ::close(listen_fd_);
         listen_fd_ = -1;
+    }
+
+    // Stop ShardCoordinator before closing engine.
+    if (shard_coord) {
+        shard_coord->stop();
+        shard_coord.reset();
     }
 
     engine_->close();

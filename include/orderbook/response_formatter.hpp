@@ -61,6 +61,21 @@ struct ServerStats {
     uint64_t ttl_hours{0};              // configured TTL (0 = disabled)
     uint64_t ttl_segments_deleted{0};   // cumulative segments deleted
     uint64_t ttl_bytes_reclaimed{0};    // cumulative bytes reclaimed
+
+    // Sharding metrics
+    std::string shard_id;                // empty = non-sharded
+    std::string shard_status;            // "active", "joining", "draining"
+    size_t      shard_symbols_count{0};
+    uint64_t    shard_map_version{0};
+
+    // Migration metrics
+    bool        migration_in_progress{false};
+    std::string migration_symbol;
+    std::string migration_target_shard;
+    uint8_t     migration_progress_pct{0};
+
+    // Routing errors
+    uint64_t    shard_routing_errors{0};
 };
 
 // ── Parsed response (for round-trip testing) ──────────────────────────────────

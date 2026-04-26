@@ -1,5 +1,6 @@
 #include "orderbook/command_parser.hpp"
 #include "orderbook/data_model.hpp"
+#include "orderbook/logger.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -131,6 +132,29 @@ Command parse_command(std::string_view line) {
             return cmd;
         }
         return cmd; // UNKNOWN
+    }
+
+    if (iequals(first, "SHARD_MAP")) {
+        cmd.type = CommandType::SHARD_MAP;
+        OB_LOG_DEBUG("cmd_parser", "Parsed command: SHARD_MAP");
+        return cmd;
+    }
+
+    if (iequals(first, "SHARD_INFO")) {
+        cmd.type = CommandType::SHARD_INFO;
+        OB_LOG_DEBUG("cmd_parser", "Parsed command: SHARD_INFO");
+        return cmd;
+    }
+
+    if (iequals(first, "MIGRATE")) {
+        // MIGRATE <symbol_key> <target_shard_id>
+        if (tokens.size() < 3) return cmd; // UNKNOWN — missing arguments
+        cmd.type = CommandType::MIGRATE;
+        cmd.migrate_symbol = std::string(tokens[1]);
+        cmd.migrate_target_shard = std::string(tokens[2]);
+        OB_LOG_DEBUG("cmd_parser", "Parsed command: MIGRATE symbol=%s target=%s",
+                     cmd.migrate_symbol.c_str(), cmd.migrate_target_shard.c_str());
+        return cmd;
     }
 
     return cmd; // UNKNOWN
@@ -283,6 +307,10 @@ std::string format_command(const Command& cmd) {
         return "FAILOVER " + cmd.target_node_id + "\n";
     case CommandType::QUIT:   return "QUIT\n";
     case CommandType::COMPRESS: return "COMPRESS LZ4\n";
+    case CommandType::SHARD_MAP:  return "SHARD_MAP\n";
+    case CommandType::SHARD_INFO: return "SHARD_INFO\n";
+    case CommandType::MIGRATE:
+        return "MIGRATE " + cmd.migrate_symbol + " " + cmd.migrate_target_shard + "\n";
     case CommandType::UNKNOWN: return "";
     }
     return "";

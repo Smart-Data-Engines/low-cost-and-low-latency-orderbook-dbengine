@@ -3,6 +3,8 @@
 //         pool routing, health-check, failover.
 
 #include "orderbook/client.hpp"
+#include "orderbook/shard_router.hpp"
+#include "orderbook/logger.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -599,6 +601,30 @@ Result<RoleInfo> OrderbookClient::role() {
 OrderbookPool::OrderbookPool(PoolConfig config)
     : config_(std::move(config))
 {
+    // Sharded mode: when coordinator_endpoints is non-empty, create ShardRouter
+    if (!config_.coordinator_endpoints.empty()) {
+        OB_LOG_INFO("pool", "Shard mode enabled with %zu coordinator endpoints",
+                    config_.coordinator_endpoints.size());
+
+        ShardRouterConfig sr_cfg;
+        sr_cfg.coordinator_endpoints  = config_.coordinator_endpoints;
+        sr_cfg.cluster_prefix         = config_.cluster_prefix;
+        sr_cfg.connect_timeout_sec    = config_.connect_timeout_sec;
+        sr_cfg.read_timeout_sec       = config_.read_timeout_sec;
+        sr_cfg.health_check_interval_sec = config_.health_check_interval_sec;
+        sr_cfg.compress               = config_.compress;
+
+        shard_router_ = std::make_unique<ShardRouter>(std::move(sr_cfg));
+        auto res = shard_router_->initialize();
+        if (!res) {
+            OB_LOG_WARN("pool", "ShardRouter initialization failed: %s",
+                        res.error_message().c_str());
+        }
+        // In sharded mode, we don't need the traditional host-based pool
+        return;
+    }
+
+    // Non-sharded mode: traditional host-based pool (backward compatible)
     // Parse host list and create a client for each host
     for (const auto& host_str : config_.hosts) {
         NodeState ns;
@@ -638,6 +664,13 @@ OrderbookPool::~OrderbookPool() {
 }
 
 void OrderbookPool::close() {
+    // Close shard router if in sharded mode
+    if (shard_router_) {
+        shard_router_->close();
+        shard_router_.reset();
+        return;
+    }
+
     // Signal health thread to stop
     bool was_running = running_.exchange(false, std::memory_order_acq_rel);
     if (was_running && health_thread_.joinable()) {
@@ -848,6 +881,9 @@ Result<void> OrderbookPool::insert(std::string_view symbol,
                                     std::string_view exchange,
                                     Side side, int64_t price,
                                     uint64_t qty, uint32_t count) {
+    if (shard_router_)
+        return shard_router_->insert(symbol, exchange, side, price, qty, count);
+
     return execute_write([&](OrderbookClient& c) {
         return c.insert(symbol, exchange, side, price, qty, count);
     });
@@ -857,12 +893,18 @@ Result<void> OrderbookPool::minsert(std::string_view symbol,
                                      std::string_view exchange,
                                      Side side, const Level* levels,
                                      size_t n_levels) {
+    if (shard_router_)
+        return shard_router_->minsert(symbol, exchange, side, levels, n_levels);
+
     return execute_write([&](OrderbookClient& c) {
         return c.minsert(symbol, exchange, side, levels, n_levels);
     });
 }
 
 Result<void> OrderbookPool::flush() {
+    if (shard_router_)
+        return shard_router_->flush();
+
     return execute_write([](OrderbookClient& c) {
         return c.flush();
     });
@@ -871,12 +913,18 @@ Result<void> OrderbookPool::flush() {
 // ── 7.3  Public methods — read routing ───────────────────────────────────────
 
 Result<QueryResult> OrderbookPool::query(std::string_view sql) {
+    if (shard_router_)
+        return shard_router_->query(sql);
+
     return execute_read([&](OrderbookClient& c) {
         return c.query(sql);
     });
 }
 
 Result<bool> OrderbookPool::ping() {
+    if (shard_router_)
+        return shard_router_->ping();
+
     return execute_read([](OrderbookClient& c) {
         return c.ping();
     });
