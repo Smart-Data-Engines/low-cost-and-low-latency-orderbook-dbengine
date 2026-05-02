@@ -50,6 +50,14 @@ MetricsRegistry::MetricsRegistry() {
     histograms_.push_back(make_histogram("ob_flush_latency_seconds",  "Flush operation latency in seconds"));
     histograms_.push_back(make_histogram("ob_query_latency_seconds",  "Query operation latency in seconds"));
 
+    // Multi-master metrics
+    gauges_.push_back(make_gauge("ob_mm_peers_connected",          "Number of connected multi-master peers"));
+    counters_.push_back(make_counter("ob_mm_conflicts_total",      "Total number of multi-master conflicts resolved"));
+    gauges_.push_back(make_gauge("ob_mm_replication_lag_bytes",    "Replication lag in bytes (max across peers)"));
+    counters_.push_back(make_counter("ob_mm_anti_entropy_runs_total",    "Total number of anti-entropy runs"));
+    counters_.push_back(make_counter("ob_mm_anti_entropy_repairs_total", "Total number of anti-entropy repairs"));
+    gauges_.push_back(make_gauge("ob_mm_hlc_drift_ns",             "Maximum HLC drift in nanoseconds"));
+
 #ifdef OB_USE_IO_URING
     // io_uring metrics
     gauges_.push_back(make_gauge("ob_iouring_sq_utilization", "Submission Queue utilization percentage (0-100)"));

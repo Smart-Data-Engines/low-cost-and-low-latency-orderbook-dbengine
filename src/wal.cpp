@@ -5,6 +5,8 @@
 #include "orderbook/wal.hpp"
 #include "orderbook/crc32c.hpp"
 #include "orderbook/epoch.hpp"
+#include "orderbook/hlc.hpp"
+#include "orderbook/logger.hpp"
 
 #include <algorithm>
 #include <array>
@@ -156,6 +158,80 @@ void WALWriter::append(const DeltaUpdate& update, const Level* levels) {
     if (written_ >= rotate_threshold_) {
         rotate();
     }
+}
+
+void WALWriter::write_record_v2(const WALRecordV2& hdr, const void* payload,
+                                 size_t payload_len) {
+    // Combine 38B header + payload into a single write to minimize syscalls.
+    const size_t total = sizeof(WALRecordV2) + payload_len;
+    write_buf_.resize(total);
+    std::memcpy(write_buf_.data(), &hdr, sizeof(WALRecordV2));
+    if (payload_len > 0) {
+        std::memcpy(write_buf_.data() + sizeof(WALRecordV2), payload, payload_len);
+    }
+
+    size_t remaining = total;
+    const uint8_t* ptr = write_buf_.data();
+    while (remaining > 0) {
+        ssize_t n = ::write(fd_, ptr, remaining);
+        if (n < 0) {
+            throw std::runtime_error(std::string("WALWriter: write failed: ") +
+                                     std::strerror(errno));
+        }
+        ptr += n;
+        remaining -= static_cast<size_t>(n);
+    }
+
+    written_ += total;
+    ++pending_sync_;
+
+    if (fsync_policy_ == FsyncPolicy::EVERY) {
+        ::fsync(fd_);
+        pending_sync_ = 0;
+    }
+}
+
+void WALWriter::append_with_origin(const DeltaUpdate& update, const Level* levels,
+                                    uint16_t origin_node_id, const HLCTimestamp& hlc) {
+    // Build payload: DeltaUpdate header + n_levels * sizeof(Level).
+    const size_t levels_bytes = update.n_levels * sizeof(Level);
+    const size_t payload_len  = sizeof(DeltaUpdate) + levels_bytes;
+
+    alignas(8) uint8_t payload[sizeof(DeltaUpdate) + MAX_LEVELS * sizeof(Level)];
+    std::memcpy(payload, &update, sizeof(DeltaUpdate));
+    if (levels_bytes > 0) {
+        std::memcpy(payload + sizeof(DeltaUpdate), levels, levels_bytes);
+    }
+
+    WALRecordV2 hdr{};
+    hdr.sequence_number = update.sequence_number;
+    hdr.timestamp_ns    = update.timestamp_ns;
+    hdr.checksum        = crc32c(payload, payload_len);
+    hdr.payload_len     = static_cast<uint16_t>(payload_len);
+    hdr.record_type     = WAL_RECORD_DELTA;
+    hdr.version         = 1;
+    hdr.origin_node_id  = origin_node_id;
+    hlc.serialize(hdr.hlc_data);
+
+    OB_LOG_DEBUG("wal", "append_with_origin: seq=%lu origin=%u hlc={%lu,%u,%u} payload=%u",
+                 static_cast<unsigned long>(update.sequence_number),
+                 static_cast<unsigned>(origin_node_id),
+                 static_cast<unsigned long>(hlc.physical_ns),
+                 static_cast<unsigned>(hlc.logical),
+                 static_cast<unsigned>(hlc.node_id),
+                 static_cast<unsigned>(payload_len));
+
+    write_record_v2(hdr, payload, payload_len);
+
+    // Auto-rotate if threshold exceeded.
+    if (written_ >= rotate_threshold_) {
+        rotate();
+    }
+}
+
+void WALWriter::set_origin_node_id(uint16_t node_id) {
+    origin_node_id_ = node_id;
+    OB_LOG_DEBUG("wal", "set_origin_node_id: %u", static_cast<unsigned>(node_id));
 }
 
 void WALWriter::append_gap(uint64_t sequence_number, uint64_t timestamp_ns) {
@@ -320,6 +396,131 @@ uint64_t WALReplayer::replay(
         }
 
         done_file:
+        ::close(fd);
+    }
+
+    return last_good_seq;
+}
+
+uint64_t WALReplayer::replay_v2(WALReplayCallbackV2 cb)
+{
+    // Reset epoch tracking for this replay.
+    last_epoch_ = 0;
+
+    // Collect all wal_*.bin files and sort them by index.
+    std::vector<std::pair<uint32_t, std::string>> files;
+
+    if (!std::filesystem::exists(dir_)) {
+        return 0;
+    }
+
+    for (auto& entry : std::filesystem::directory_iterator(dir_)) {
+        const std::string name = entry.path().filename().string();
+        if (name.size() == 14 &&
+            name.substr(0, 4) == "wal_" &&
+            name.substr(10) == ".bin") {
+            uint32_t idx = static_cast<uint32_t>(std::stoul(name.substr(4, 6)));
+            files.emplace_back(idx, entry.path().string());
+        }
+    }
+
+    std::sort(files.begin(), files.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    uint64_t last_good_seq = 0;
+
+    for (auto& [idx, path] : files) {
+        int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) continue;
+
+        while (true) {
+            // Read the base 24-byte header first.
+            WALRecord base_hdr{};
+            ssize_t n = ::read(fd, &base_hdr, sizeof(WALRecord));
+            if (n == 0) break; // EOF
+            if (n != static_cast<ssize_t>(sizeof(WALRecord))) break; // truncated
+
+            // Determine version from the _pad/version field.
+            const uint8_t version = base_hdr._pad;
+
+            uint16_t origin_node_id = 0;
+            HLCTimestamp hlc_ts{};
+
+            if (version == 1) {
+                // Read the additional 14 bytes (2B origin + 12B HLC).
+                uint8_t ext_buf[14]{};
+                ssize_t ext_n = ::read(fd, ext_buf, sizeof(ext_buf));
+                if (ext_n != static_cast<ssize_t>(sizeof(ext_buf))) {
+                    // Corrupted extended header — skip this record.
+                    OB_LOG_WARN("wal", "Corrupted extended WAL header at seq=%lu, skipping",
+                                static_cast<unsigned long>(base_hdr.sequence_number));
+                    // Try to skip the payload to continue reading.
+                    if (base_hdr.payload_len > 0) {
+                        ::lseek(fd, base_hdr.payload_len, SEEK_CUR);
+                    }
+                    continue;
+                }
+                std::memcpy(&origin_node_id, ext_buf, 2);
+                hlc_ts = HLCTimestamp::deserialize(ext_buf + 2);
+            }
+
+            OB_LOG_DEBUG("wal", "replay_v2: seq=%lu version=%u origin=%u",
+                         static_cast<unsigned long>(base_hdr.sequence_number),
+                         static_cast<unsigned>(version),
+                         static_cast<unsigned>(origin_node_id));
+
+            // Read payload.
+            std::vector<uint8_t> payload(base_hdr.payload_len);
+            if (base_hdr.payload_len > 0) {
+                size_t remaining = base_hdr.payload_len;
+                uint8_t* ptr = payload.data();
+                while (remaining > 0) {
+                    ssize_t r = ::read(fd, ptr, remaining);
+                    if (r <= 0) goto done_file_v2; // truncated or error
+                    ptr += r;
+                    remaining -= static_cast<size_t>(r);
+                }
+            }
+
+            // Verify CRC32C.
+            {
+                const uint32_t expected = crc32c(payload.data(), base_hdr.payload_len);
+                if (expected != base_hdr.checksum) {
+                    // Checksum mismatch — stop replay.
+                    ::close(fd);
+                    return last_good_seq;
+                }
+            }
+
+            // ROTATE record signals end of this file's useful content.
+            if (base_hdr.record_type == WAL_RECORD_ROTATE) {
+                break;
+            }
+
+            // Track highest epoch seen in WAL_RECORD_EPOCH records.
+            if (base_hdr.record_type == WAL_RECORD_EPOCH && base_hdr.payload_len == 8) {
+                const EpochValue ev = epoch_from_payload(payload.data());
+                if (ev.term > last_epoch_) {
+                    last_epoch_ = ev.term;
+                }
+            }
+
+            // Build context and invoke callback.
+            WALReplayContext ctx{};
+            ctx.header          = base_hdr;
+            ctx.origin_node_id  = origin_node_id;
+            ctx.hlc             = hlc_ts;
+            ctx.payload         = payload.empty() ? nullptr : payload.data();
+            ctx.payload_len     = base_hdr.payload_len;
+
+            cb(ctx);
+
+            if (base_hdr.sequence_number > 0) {
+                last_good_seq = base_hdr.sequence_number;
+            }
+        }
+
+        done_file_v2:
         ::close(fd);
     }
 

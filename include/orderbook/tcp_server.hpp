@@ -57,6 +57,13 @@ struct ServerConfig {
     std::string shard_id;                     // --shard-id (empty = non-sharded)
     uint32_t    shard_vnodes{150};            // --shard-vnodes
 
+    // Multi-master replication
+    bool        multi_master{false};                  // --multi-master
+    uint16_t    mm_node_id{0};                        // --mm-node-id
+    uint16_t    mm_replication_port{0};               // --mm-replication-port
+    uint32_t    anti_entropy_interval_sec{30};        // --anti-entropy-interval-seconds
+    size_t      mm_max_catchup_bytes{512ULL << 20};   // --mm-max-catchup-bytes (512MB)
+
     // io_uring (used only when OB_USE_IO_URING is active)
     uint32_t uring_ring_size{256};            // --ring-size
     uint32_t uring_sqpoll_idle_ms{1000};      // --sqpoll-idle-ms

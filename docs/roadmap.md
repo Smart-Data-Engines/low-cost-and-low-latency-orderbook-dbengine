@@ -61,40 +61,29 @@ Development plan towards production quality, High Availability, and HFT readines
 ### 17. Stress testing & load benchmarks
 - Status: **DONE** — C++ (5 scenarios) + Python TCP (2 scenarios), 777k levels/s sustained
 
-## Phase 5 — HFT Production Readiness
+## Phase 5 — HFT Production Readiness ✅
 
 ### 18. Observability stack (Prometheus + structured logging)
-- Prometheus `/metrics` HTTP endpoint with counters/gauges/histograms
-- Structured JSON logging (replace fprintf(stderr) with structured logger)
-- Distributed tracing headers (optional, for multi-node debugging)
-- Effort: M | Impact: Critical for production ops
+- Status: **DONE** — Prometheus `/metrics` HTTP endpoint (counters/gauges/histograms), `StructuredLogger` (JSON, log levels), `MetricsServer`, latency histograms
 
 ### 19. Failover integration tests with real etcd
-- Docker-based test environment with etcd cluster
-- Test full failover cycle: primary crash → replica promotion → client reconnect
-- Test split-brain recovery with real network partitions
-- Gate behind `OB_INTEGRATION_TESTS` env var
-- Effort: M | Impact: Confidence in HA correctness
+- Status: **DONE** — Docker-based etcd, 13 C++ tests, 4 Python tests, full failover cycle verified
 
 ### 20. C++ native client library
-- Zero-copy TCP client with connection pooling
-- Binary wire protocol option (avoid text parsing overhead on hot path)
-- Header-only or static library, no external dependencies
-- Effort: L | Impact: 10-100x lower latency than Python client
+- Status: **DONE** — `OrderbookClient` + `OrderbookPool`, zero-copy, pre-allocated buffers, ROLE discovery, failover
 
 ### 21. io_uring transport layer
-- Replace epoll with io_uring for async I/O (Linux 5.1+)
-- Submission queue batching for multiple concurrent connections
-- Zero-copy receive with registered buffers
-- Effort: L | Impact: ~30-50% latency reduction on modern kernels
+- Status: **DONE** — `IoUringServer` with SQPOLL, registered buffers, `OB_USE_IO_URING` compile flag. PING 24µs (vs 45µs epoll)
 
 ### 22. Symbol-based sharding
-- Different symbols on different nodes, routing layer in client
-- Shard map stored in etcd, auto-rebalancing on node add/remove
-- Prerequisite: C++ client (#20) for efficient cross-shard routing
-- Effort: XL | Impact: Horizontal scalability
+- Status: **DONE** — `ShardMap` + `ConsistentHashRing` (MurmurHash3, virtual nodes), `ShardCoordinator` (etcd registration, rebalancing, migration), `ShardRouter` (C++ client routing), Python `_ClientPool` sharding mode, wire protocol (SHARD_MAP, SHARD_INFO, MIGRATE), 10 property-based tests
 
-### 23. Multi-master replication
+### 23. Integration test suite
+- Status: **DONE** — pytest framework, `ClusterManager` (auto-boot etcd Docker + 2 nodes), 9 test categories (smoke, replication, failover, compression, stress, edge cases, metrics, pool, C++ client), colored console report, ~37 tests
+
+## Phase 6 — Write Scalability
+
+### 24. Multi-master replication
 - Any node accepts writes, data propagated to all other nodes
 - Conflict resolution via vector clocks or CRDTs
 - Prerequisite: sharding (#22) and solid failover (#9-11)
@@ -102,14 +91,11 @@ Development plan towards production quality, High Availability, and HFT readines
 
 ## Recommended Order
 
+All items through #23 are **DONE**. Remaining:
+
 | Priority | Item | Effort | Why next |
 |----------|------|--------|----------|
-| P1 | Observability (#18) | M | Can't run production without metrics/logging |
-| P1 | etcd integration tests (#19) | M | Validates HA before real deployment |
-| P2 | C++ client (#20) | L | Unlocks HFT hot path, prerequisite for sharding |
-| P2 | io_uring transport (#21) | L | Major latency win on modern Linux |
-| P3 | Symbol sharding (#22) | XL | Horizontal scale when single node isn't enough |
-| P4 | Multi-master (#23) | XL | Research-grade, only if geo-distribution needed |
+| P4 | Multi-master (#24) | XL | Write scalability, geo-distribution |
 
 S = few days, M = week, L = 2-3 weeks, XL = month+
 
@@ -117,13 +103,16 @@ S = few days, M = week, L = 2-3 weeks, XL = month+
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| PING latency (TCP) | ~60 µs avg | Python client, loopback |
+| PING latency (epoll) | ~45 µs avg | Python client, loopback |
+| PING latency (io_uring) | ~24 µs avg | Python client, loopback |
 | Single INSERT (TCP) | ~0.3 ms | Python client |
 | MINSERT 1000 levels (TCP) | ~3 ms | Python client, single round-trip |
 | FLUSH (incremental) | ~2-3 ms | Non-blocking, two-phase |
+| LZ4 INSERT (TCP) | ~1.6-2.9 ms | After Nagle fix |
 | Sustained INSERT throughput | 29k/s | Python TCP, 60s stress test |
 | Sustained MINSERT throughput | 777k levels/s | Python TCP, 60s stress test |
 | Native update latency | ~2.8 µs p50 | C++ benchmark |
 | Native ingestion | ~1.35M updates/s | C++ benchmark |
-| C++ tests | 281 | GTest + RapidCheck |
-| Python tests | 14 | unittest + Hypothesis |
+| Failover time | ~5-8s | etcd lease TTL dependent |
+| C++ tests | 400+ | GTest + RapidCheck |
+| Python tests | 37+ | pytest integration suite |

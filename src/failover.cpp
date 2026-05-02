@@ -131,6 +131,14 @@ NodeRole FailoverManager::role() const {
     return role_.load(std::memory_order_acquire);
 }
 
+void FailoverManager::set_role(NodeRole role) {
+    NodeRole old = role_.exchange(role, std::memory_order_acq_rel);
+    if (old != role) {
+        OB_LOG_INFO("failover", "Role changed externally: %d -> %d",
+                    static_cast<int>(old), static_cast<int>(role));
+    }
+}
+
 EpochValue FailoverManager::epoch() const {
     std::lock_guard<std::mutex> lk(mtx_);
     return epoch_;
@@ -187,6 +195,16 @@ bool FailoverManager::initiate_graceful_failover(
 void FailoverManager::monitor_loop() {
     while (running_.load(std::memory_order_acquire)) {
         NodeRole current = role_.load();
+
+        // Multi-master nodes do not participate in primary/replica election.
+        if (current == NodeRole::MULTI_MASTER) {
+            OB_LOG_DEBUG("failover", "Node role: MULTI_MASTER — skipping election");
+            // Sleep and continue — no lease management needed.
+            for (int i = 0; i < 10 && running_.load(std::memory_order_relaxed); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            continue;
+        }
 
         if (current == NodeRole::PRIMARY) {
             // Refresh lease every TTL/3 seconds.

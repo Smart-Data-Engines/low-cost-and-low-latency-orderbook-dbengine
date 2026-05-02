@@ -26,7 +26,8 @@ Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
                ReplicationConfig repl_config,
                ReplicationClientConfig repl_client_config,
                FailoverConfig failover_config,
-               TTLConfig ttl_config)
+               TTLConfig ttl_config,
+               MultiMasterConfig mm_config)
     : base_dir_(base_dir)
     , flush_interval_ns_(flush_interval_ns)
     , wal_(base_dir, 512ULL << 20, fsync_policy)
@@ -36,6 +37,7 @@ Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
     , repl_client_config_(std::move(repl_client_config))
     , failover_config_(std::move(failover_config))
     , ttl_config_(ttl_config)
+    , mm_config_(std::move(mm_config))
 {}
 
 Engine::~Engine() {
@@ -84,12 +86,35 @@ void Engine::open() {
         node_role_.store(failover_mgr_->role(), std::memory_order_relaxed);
     }
 
+    // Initialize multi-master replication if enabled.
+    if (mm_config_.enabled) {
+        OB_LOG_INFO("engine", "Multi-master mode enabled: node_id=%u replication_port=%u",
+                    mm_config_.node_id, mm_config_.replication_port);
+
+        hlc_ = std::make_unique<HybridLogicalClock>(mm_config_.node_id);
+        wal_.set_origin_node_id(mm_config_.node_id);
+        mm_mgr_ = std::make_unique<MultiMasterManager>(mm_config_, *this, wal_, *hlc_);
+        node_role_.store(NodeRole::MULTI_MASTER, std::memory_order_release);
+
+        // Tell FailoverManager to skip election logic for multi-master nodes.
+        if (failover_mgr_) {
+            failover_mgr_->set_role(NodeRole::MULTI_MASTER);
+        }
+
+        mm_mgr_->start();
+    }
+
     // Start background flush thread.
     stop_flush_.store(false, std::memory_order_relaxed);
     flush_thread_ = std::thread([this]() { flush_loop(); });
 }
 
 void Engine::close() {
+    // Stop multi-master manager first (it broadcasts, so must stop before WAL/flush).
+    if (mm_mgr_) {
+        mm_mgr_->stop();
+    }
+
     // Stop failover manager first (it may trigger role transitions).
     if (failover_mgr_) {
         failover_mgr_->stop();
@@ -213,6 +238,205 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta, const Level* levels) {
     return status;
 }
 
+ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta, const Level* levels) {
+    std::unique_lock<std::mutex> lock(mtx_);
+
+    // Reject writes to migrated symbols (Requirement 6.6).
+    {
+        const std::string key = std::string(delta.symbol) + "." + delta.exchange;
+        if (migrated_symbols_.count(key)) {
+            OB_LOG_WARN("engine", "Rejecting write to migrated symbol: symbol_key=%s",
+                        key.c_str());
+            return OB_ERR_MIGRATED;
+        }
+    }
+
+    // Backpressure: wait until pending queue has room.
+    pending_cv_.wait(lock, [this]() {
+        return pending_rows_.size() < MAX_PENDING_ROWS ||
+               stop_flush_.load(std::memory_order_relaxed);
+    });
+
+    // 1. Tick local HLC to get a timestamp for this write.
+    HLCTimestamp hlc_ts = hlc_->tick_local();
+
+    OB_LOG_DEBUG("engine", "apply_delta_mm: sym=%s exch=%s hlc={%lu,%u,%u}",
+                 delta.symbol, delta.exchange,
+                 static_cast<unsigned long>(hlc_ts.physical_ns),
+                 hlc_ts.logical, hlc_ts.node_id);
+
+    // 2. Write to WAL with origin and HLC (Requirement 2.1, 2.2).
+    wal_.append_with_origin(delta, levels, mm_config_.node_id, hlc_ts);
+
+    // 3. Update conflict resolver HLC for each level.
+    auto& resolver = const_cast<ConflictResolver&>(mm_mgr_->conflict_resolver());
+    for (uint16_t i = 0; i < delta.n_levels; ++i) {
+        ConflictKey ck{delta.symbol, delta.exchange, delta.side, levels[i].price};
+        resolver.update_hlc(ck, hlc_ts, mm_config_.node_id);
+    }
+
+    // 4. Apply to SoA buffer (same logic as apply_delta).
+    SoABuffer& buf = get_or_create_buffer(delta.symbol, delta.exchange);
+    bool gap_detected = false;
+    ob_status_t status = ob::apply_delta(buf, delta, levels, gap_detected);
+
+    if (gap_detected) {
+        wal_.append_gap(delta.sequence_number, delta.timestamp_ns);
+    }
+
+    // 5. Broadcast to peers.
+    if (mm_mgr_) {
+        const size_t levels_bytes = delta.n_levels * sizeof(Level);
+        const size_t payload_len  = sizeof(DeltaUpdate) + levels_bytes;
+
+        alignas(8) uint8_t payload[sizeof(DeltaUpdate) + MAX_LEVELS * sizeof(Level)];
+        std::memcpy(payload, &delta, sizeof(DeltaUpdate));
+        if (levels_bytes > 0) {
+            std::memcpy(payload + sizeof(DeltaUpdate), levels, levels_bytes);
+        }
+
+        WALRecordV2 hdr{};
+        hdr.sequence_number = delta.sequence_number;
+        hdr.timestamp_ns    = delta.timestamp_ns;
+        hdr.checksum        = crc32c(payload, payload_len);
+        hdr.payload_len     = static_cast<uint16_t>(payload_len);
+        hdr.record_type     = WAL_RECORD_DELTA;
+        hdr.version         = 1;
+        hdr.origin_node_id  = mm_config_.node_id;
+        hlc_ts.serialize(hdr.hlc_data);
+
+        mm_mgr_->broadcast_local(hdr, payload, payload_len);
+    }
+
+    // 6. Enqueue SnapshotRows for background columnar flush + notify subscribers.
+    for (uint16_t i = 0; i < delta.n_levels; ++i) {
+        SnapshotRow row{};
+        row.timestamp_ns    = delta.timestamp_ns;
+        row.sequence_number = delta.sequence_number;
+        row.side            = delta.side;
+        row.level_index     = i;
+        row.price           = levels[i].price;
+        row.quantity        = levels[i].qty;
+        row.order_count     = levels[i].cnt;
+
+        pending_rows_.push_back({delta.symbol, delta.exchange, row});
+        query_engine_->notify_subscribers(delta.symbol, delta.exchange, row);
+    }
+
+    registry_.set_gauge("pending_rows", static_cast<int64_t>(pending_rows_.size()));
+
+    return status;
+}
+
+ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta, const Level* levels,
+                                       uint16_t origin_node_id,
+                                       const HLCTimestamp& remote_hlc) {
+    // 1. Loop prevention: reject records from self.
+    if (origin_node_id == mm_config_.node_id) {
+        OB_LOG_DEBUG("engine", "Loop prevention: rejecting record from self origin=%u",
+                     origin_node_id);
+        return OB_OK;
+    }
+
+    std::unique_lock<std::mutex> lock(mtx_);
+
+    OB_LOG_DEBUG("engine", "apply_remote_delta: origin=%u sym=%s exch=%s remote_hlc={%lu,%u,%u}",
+                 origin_node_id, delta.symbol, delta.exchange,
+                 static_cast<unsigned long>(remote_hlc.physical_ns),
+                 remote_hlc.logical, remote_hlc.node_id);
+
+    // 2. Merge remote HLC into local clock.
+    hlc_->tick_receive(remote_hlc);
+
+    // Update HLC drift metric.
+    registry_.set_gauge("ob_mm_hlc_drift_ns", hlc_->max_drift_ns());
+
+    // 3. Per-level conflict resolution.
+    auto& resolver = const_cast<ConflictResolver&>(mm_mgr_->conflict_resolver());
+
+    // Build a list of levels that should be applied (not rejected by conflict resolution).
+    std::vector<uint16_t> winning_levels;
+    winning_levels.reserve(delta.n_levels);
+
+    for (uint16_t i = 0; i < delta.n_levels; ++i) {
+        ConflictKey ck{delta.symbol, delta.exchange, delta.side, levels[i].price};
+        ConflictResolution result = resolver.resolve(ck, remote_hlc, origin_node_id);
+
+        if (result == ConflictResolution::REJECT_REMOTE) {
+            OB_LOG_DEBUG("engine", "Conflict resolved: local_wins for %s/%s/%d/%ld",
+                         delta.symbol, delta.exchange, delta.side,
+                         static_cast<long>(levels[i].price));
+            registry_.increment_counter("ob_mm_conflicts_total");
+            continue;  // Skip this level — local is newer.
+        }
+
+        if (result == ConflictResolution::APPLY_REMOTE) {
+            OB_LOG_DEBUG("engine", "Conflict resolved: remote_wins for %s/%s/%d/%ld",
+                         delta.symbol, delta.exchange, delta.side,
+                         static_cast<long>(levels[i].price));
+            registry_.increment_counter("ob_mm_conflicts_total");
+        }
+
+        // NO_CONFLICT or APPLY_REMOTE → apply this level.
+        resolver.update_hlc(ck, remote_hlc, origin_node_id);
+        winning_levels.push_back(i);
+    }
+
+    // 4. Apply winning levels to SoA buffer.
+    if (!winning_levels.empty()) {
+        SoABuffer& buf = get_or_create_buffer(delta.symbol, delta.exchange);
+
+        // Build a filtered DeltaUpdate + Level array for winning levels only.
+        if (winning_levels.size() == static_cast<size_t>(delta.n_levels)) {
+            // All levels won — apply directly.
+            bool gap_detected = false;
+            ob::apply_delta(buf, delta, levels, gap_detected);
+            if (gap_detected) {
+                wal_.append_gap(delta.sequence_number, delta.timestamp_ns);
+            }
+        } else {
+            // Partial apply: build a new DeltaUpdate with only winning levels.
+            DeltaUpdate filtered = delta;
+            filtered.n_levels = static_cast<uint16_t>(winning_levels.size());
+
+            Level filtered_levels[MAX_LEVELS];
+            for (size_t j = 0; j < winning_levels.size(); ++j) {
+                filtered_levels[j] = levels[winning_levels[j]];
+            }
+
+            bool gap_detected = false;
+            ob::apply_delta(buf, filtered, filtered_levels, gap_detected);
+            if (gap_detected) {
+                wal_.append_gap(delta.sequence_number, delta.timestamp_ns);
+            }
+        }
+
+        // Enqueue for columnar flush.
+        for (uint16_t idx : winning_levels) {
+            SnapshotRow row{};
+            row.timestamp_ns    = delta.timestamp_ns;
+            row.sequence_number = delta.sequence_number;
+            row.side            = delta.side;
+            row.level_index     = idx;
+            row.price           = levels[idx].price;
+            row.quantity        = levels[idx].qty;
+            row.order_count     = levels[idx].cnt;
+
+            pending_rows_.push_back({delta.symbol, delta.exchange, row});
+            query_engine_->notify_subscribers(delta.symbol, delta.exchange, row);
+        }
+    }
+
+    // 5. Write to WAL with original origin (preserve WAL_Origin for anti-entropy).
+    wal_.append_with_origin(delta, levels, origin_node_id, remote_hlc);
+
+    // 6. Do NOT broadcast further (single-hop propagation in full-mesh).
+
+    registry_.set_gauge("pending_rows", static_cast<int64_t>(pending_rows_.size()));
+
+    return OB_OK;
+}
+
 std::string Engine::execute(std::string_view sql, RowCallback cb) {
     return query_engine_->execute(sql, std::move(cb));
 }
@@ -292,6 +516,32 @@ Engine::Stats Engine::stats() {
     // migration_in_progress, migration_symbol, migration_target_shard,
     // migration_progress_pct, and shard_routing_errors are left at defaults
     // until ShardCoordinator integration.
+
+    // Multi-master metrics.
+    if (mm_config_.enabled) {
+        s.mm_node_id = mm_config_.node_id;
+        if (mm_mgr_) {
+            s.mm_peer_count = mm_mgr_->peer_states().size();
+            s.mm_connected_peers = mm_mgr_->connected_peer_count();
+            s.mm_conflicts_total = mm_mgr_->conflict_resolver().total_conflicts();
+            s.mm_anti_entropy_runs = mm_mgr_->anti_entropy().total_runs();
+        }
+        if (hlc_) {
+            auto cur = hlc_->current();
+            s.mm_hlc_physical_ns = cur.physical_ns;
+            s.mm_hlc_logical = cur.logical;
+            s.mm_hlc_drift_ns = hlc_->max_drift_ns();
+        }
+        // Per-peer replication lag.
+        if (mm_mgr_) {
+            const size_t current_offset = wal_.current_offset();
+            for (const auto& peer : mm_mgr_->peer_states()) {
+                size_t lag = (current_offset > peer.confirmed_offset)
+                                 ? (current_offset - peer.confirmed_offset) : 0;
+                s.mm_replication_lag_per_peer.emplace_back(peer.node_id, lag);
+            }
+        }
+    }
 
     return s;
 }
@@ -684,6 +934,18 @@ std::string Engine::handle_role_command() const {
             addr = failover_mgr_->primary_address();
         }
         return "REPLICA " + addr + " " + std::to_string(epoch) + "\n";
+    }
+    case NodeRole::MULTI_MASTER: {
+        std::string hlc_str = "0.0.0";
+        size_t peer_count = 0;
+        if (hlc_) {
+            hlc_str = hlc_->current().to_string();
+        }
+        if (mm_mgr_) {
+            peer_count = mm_mgr_->connected_peer_count();
+        }
+        return "MULTI_MASTER " + std::to_string(mm_config_.node_id) + " " +
+               hlc_str + " " + std::to_string(peer_count) + "\n";
     }
     case NodeRole::STANDALONE:
     default:

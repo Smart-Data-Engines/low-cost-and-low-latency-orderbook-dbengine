@@ -88,7 +88,7 @@ target_link_libraries(orderbook_soa PUBLIC orderbook_core)
 
 # ── WAL compiled library ───────────────────────────────────────────────────────
 add_library(orderbook_wal STATIC src/wal.cpp)
-target_link_libraries(orderbook_wal PUBLIC orderbook_core orderbook_epoch)
+target_link_libraries(orderbook_wal PUBLIC orderbook_core orderbook_epoch orderbook_hlc)
 
 # ── Epoch compiled library ─────────────────────────────────────────────────────
 add_library(orderbook_epoch STATIC src/epoch.cpp)
@@ -147,6 +147,26 @@ target_link_libraries(orderbook_metrics PUBLIC orderbook_core)
 add_library(orderbook_logger STATIC src/logger.cpp)
 target_link_libraries(orderbook_logger PUBLIC orderbook_core)
 
+# ── HLC (Hybrid Logical Clock) compiled library ───────────────────────────────
+add_library(orderbook_hlc STATIC src/hlc.cpp)
+target_link_libraries(orderbook_hlc PUBLIC orderbook_core orderbook_logger)
+
+# ── Conflict resolver compiled library (multi-master LWW) ─────────────────────
+add_library(orderbook_conflict_resolver STATIC src/conflict_resolver.cpp)
+target_link_libraries(orderbook_conflict_resolver PUBLIC orderbook_hlc orderbook_core orderbook_logger)
+
+# ── Peer registry compiled library (multi-master peer discovery) ───────────────
+add_library(orderbook_peer_registry STATIC src/peer_registry.cpp)
+target_link_libraries(orderbook_peer_registry PUBLIC orderbook_hlc orderbook_coordinator orderbook_logger nlohmann_json::nlohmann_json)
+
+# ── Anti-entropy compiled library (multi-master gap detection and repair) ──────
+add_library(orderbook_anti_entropy STATIC src/anti_entropy.cpp)
+target_link_libraries(orderbook_anti_entropy PUBLIC orderbook_peer_registry orderbook_hlc orderbook_logger)
+
+# ── Multi-master manager compiled library (peer networking, WAL broadcast) ─────
+add_library(orderbook_multi_master STATIC src/multi_master.cpp)
+target_link_libraries(orderbook_multi_master PUBLIC orderbook_peer_registry orderbook_conflict_resolver orderbook_anti_entropy orderbook_hlc orderbook_compression orderbook_logger)
+
 # ── Shard map compiled library ─────────────────────────────────────────────────
 add_library(orderbook_shard_map STATIC src/shard_map.cpp)
 target_link_libraries(orderbook_shard_map PUBLIC orderbook_core orderbook_logger nlohmann_json::nlohmann_json)
@@ -173,7 +193,7 @@ target_link_libraries(orderbook_query PUBLIC orderbook_columnar orderbook_agg)
 
 # ── Engine facade compiled library ────────────────────────────────────────────
 add_library(orderbook_engine STATIC src/engine.cpp src/replication.cpp)
-target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression orderbook_metrics orderbook_logger)
+target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression orderbook_metrics orderbook_logger orderbook_multi_master)
 
 # ── C API compiled library ────────────────────────────────────────────────────
 add_library(orderbook_capi STATIC src/c_api.cpp)

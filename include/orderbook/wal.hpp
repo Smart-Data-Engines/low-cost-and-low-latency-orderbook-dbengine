@@ -7,6 +7,7 @@
 
 #include "orderbook/data_model.hpp"
 #include "orderbook/epoch.hpp"
+#include "orderbook/hlc.hpp"
 
 namespace ob {
 
@@ -49,6 +50,53 @@ struct WALRecord {
 
 static_assert(sizeof(WALRecord) == 24, "WALRecord size mismatch");
 
+// ── WALRecordV2 ───────────────────────────────────────────────────────────────
+// Extended WAL header (38 bytes) for multi-master replication.
+// Adds origin_node_id (WAL_Origin) and HLC timestamp to each record.
+//
+// Layout (38 bytes):
+//   sequence_number : uint64  (8B)  — sequence number
+//   timestamp_ns    : uint64  (8B)  — nanosecond timestamp (legacy, kept for compat)
+//   checksum        : uint32  (4B)  — CRC32C of payload
+//   payload_len     : uint16  (2B)  — payload length
+//   record_type     : uint8   (1B)  — DELTA=1, SNAPSHOT=2, GAP=3, ROTATE=4, EPOCH=5
+//   version         : uint8   (1B)  — 0=legacy (24B header), 1=extended (38B header)
+//   --- below only when version >= 1 ---
+//   origin_node_id  : uint16  (2B)  — WAL_Origin: node_id of the originating node
+//   hlc_data        : 12B           — HLCTimestamp (physical_ns + logical + node_id)
+//
+// Backward compatibility:
+//   - Old WALReplayer sees version=0, reads 24B header, ignores the rest
+//   - New WALReplayer sees version=0 → treats origin_node_id=0, hlc=zero
+//   - New WALReplayer sees version=1 → reads full 38B
+#pragma pack(push, 1)
+struct WALRecordV2 {
+    uint64_t sequence_number;
+    uint64_t timestamp_ns;
+    uint32_t checksum;        // CRC32C of payload
+    uint16_t payload_len;
+    uint8_t  record_type;
+    uint8_t  version;         // 0=legacy, 1=extended (with origin+HLC)
+    // Extended fields (version >= 1):
+    uint16_t origin_node_id;  // WAL_Origin
+    uint8_t  hlc_data[12];    // HLCTimestamp serialized (LE)
+};
+#pragma pack(pop)
+
+static_assert(sizeof(WALRecordV2) == 38, "WALRecordV2 size mismatch");
+
+// ── WALReplayContext ──────────────────────────────────────────────────────────
+// Extended replay callback context with origin and HLC information.
+struct WALReplayContext {
+    WALRecord       header;          // legacy header (24B)
+    uint16_t        origin_node_id;  // 0 if legacy record
+    HLCTimestamp    hlc;             // zero if legacy record
+    const uint8_t*  payload;
+    size_t          payload_len;
+};
+
+using WALReplayCallbackV2 = std::function<void(const WALReplayContext& ctx)>;
+
 // ── WALWriter ─────────────────────────────────────────────────────────────────
 // Append-only WAL writer.  Files are named wal_000000.bin, wal_000001.bin, …
 // in the given directory.
@@ -77,6 +125,17 @@ public:
     /// Does NOT fsync — call sync() explicitly or rely on group commit.
     /// Automatically rotates if the threshold is exceeded after the write.
     void append(const DeltaUpdate& update, const Level* levels);
+
+    /// Append a DELTA record with origin and HLC (multi-master mode).
+    /// Writes a WALRecordV2 header (38 bytes, version=1) + payload.
+    void append_with_origin(const DeltaUpdate& update, const Level* levels,
+                            uint16_t origin_node_id, const HLCTimestamp& hlc);
+
+    /// Set the local node_id for WAL_Origin (called once at startup).
+    void set_origin_node_id(uint16_t node_id);
+
+    /// Get the configured origin node_id.
+    uint16_t origin_node_id() const { return origin_node_id_; }
 
     /// Write a GAP record (called by the engine when a sequence gap is detected).
     void append_gap(uint64_t sequence_number, uint64_t timestamp_ns);
@@ -125,6 +184,7 @@ private:
     uint32_t    file_index_;
     size_t      pending_sync_{0};
     uint64_t    current_epoch_{0};
+    uint16_t    origin_node_id_{0};  // 0 = legacy mode (no multi-master)
 
     // Pre-allocated write buffer to avoid per-record heap allocations.
     std::vector<uint8_t> write_buf_;
@@ -134,6 +194,9 @@ private:
 
     /// Write a complete record (header + payload). Does NOT fsync.
     void write_record(const WALRecord& hdr, const void* payload, size_t payload_len);
+
+    /// Write a complete V2 record (38B header + payload). Does NOT fsync.
+    void write_record_v2(const WALRecordV2& hdr, const void* payload, size_t payload_len);
 };
 
 // ── WALReplayer ───────────────────────────────────────────────────────────────
@@ -151,6 +214,13 @@ public:
     /// Returns the last good sequence_number.
     uint64_t replay(
         std::function<void(const WALRecord&, const uint8_t* payload)> cb);
+
+    /// Replay with extended context (origin + HLC).
+    /// Reads the version field to determine header size (24B or 38B).
+    /// For legacy records (version=0): origin_node_id=0, hlc=zero.
+    /// For extended records (version=1): reads full 38B header.
+    /// Returns the last good sequence_number.
+    uint64_t replay_v2(WALReplayCallbackV2 cb);
 
     /// Return the highest epoch found during the last replay (0 if none).
     uint64_t last_epoch() const { return last_epoch_; }
