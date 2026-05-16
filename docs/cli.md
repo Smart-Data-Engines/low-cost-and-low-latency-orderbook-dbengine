@@ -139,3 +139,82 @@ ob> query SELECT * FROM 'BTC-USD'.'BINANCE' WHERE timestamp BETWEEN 0 AND 999999
 ob> status
 ob> quit
 ```
+
+## Multi-Master Replication
+
+Multi-master mode allows multiple nodes to accept writes simultaneously. All nodes in the cluster replicate data to each other via WAL streaming in a full-mesh topology. Conflicts (concurrent writes to the same price level) are resolved automatically using Last-Writer-Wins (LWW) based on Hybrid Logical Clock (HLC).
+
+### Parameters
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `--multi-master` | — | off | Enable multi-master mode |
+| `--mm-node-id <uint16>` | yes (in MM mode) | — | Unique node identifier in the cluster (1–65535) |
+| `--mm-replication-port <port>` | yes (in MM mode) | — | TCP port for inter-node WAL replication |
+| `--anti-entropy-interval-seconds <N>` | no | 30 | Interval for anti-entropy consistency checks |
+| `--mm-max-catchup-bytes <N>` | no | 536870912 (512MB) | Max catch-up buffer before switching to snapshot sync |
+
+Multi-master mode also requires:
+- `--coordinator-endpoints` — etcd endpoint(s) for peer discovery
+- `--replication-port` — standard replication port (used for catch-up)
+
+Multi-master mode is incompatible with:
+- `--read-only` — all MM nodes accept writes
+- `--primary-host` / `--primary-port` — single-primary replication
+
+### Example: 3-Node Multi-Master Cluster
+
+Start etcd (if not already running):
+
+```bash
+docker run -d --name etcd -p 2379:2379 \
+  quay.io/coreos/etcd:v3.5.17 \
+  /usr/local/bin/etcd \
+  --advertise-client-urls http://0.0.0.0:2379 \
+  --listen-client-urls http://0.0.0.0:2379
+```
+
+Start three multi-master nodes:
+
+```bash
+# Node 1
+./build/ob_tcp_server \
+  --port 5555 --data-dir /tmp/mm_node1 \
+  --coordinator-endpoints http://127.0.0.1:2379 \
+  --node-id mm_node_1 \
+  --multi-master --mm-node-id 1 \
+  --mm-replication-port 6001 \
+  --replication-port 6001
+
+# Node 2
+./build/ob_tcp_server \
+  --port 5556 --data-dir /tmp/mm_node2 \
+  --coordinator-endpoints http://127.0.0.1:2379 \
+  --node-id mm_node_2 \
+  --multi-master --mm-node-id 2 \
+  --mm-replication-port 6002 \
+  --replication-port 6002
+
+# Node 3
+./build/ob_tcp_server \
+  --port 5557 --data-dir /tmp/mm_node3 \
+  --coordinator-endpoints http://127.0.0.1:2379 \
+  --node-id mm_node_3 \
+  --multi-master --mm-node-id 3 \
+  --mm-replication-port 6003 \
+  --replication-port 6003
+```
+
+All three nodes accept writes. Data written to any node is automatically replicated to the others:
+
+```bash
+# Write to node 1
+echo "INSERT BTC-USD BINANCE bid 6500000 150 3" | nc localhost 5555
+
+# Read from node 2 (data is replicated)
+echo "SELECT * FROM 'BTC-USD'.'BINANCE' WHERE timestamp BETWEEN 0 AND 9999999999999999999" | nc localhost 5556
+
+# Check cluster status
+echo "MM_PEERS" | nc localhost 5555
+echo "MM_CONFLICTS" | nc localhost 5555
+```

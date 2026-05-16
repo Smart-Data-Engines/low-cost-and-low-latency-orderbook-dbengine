@@ -11,6 +11,7 @@ A purpose-built C++20 database engine for Level 2 orderbook data in high-frequen
 - **Aggregation engine** (VWAP, spread, mid-price, imbalance, etc.) with optional AVX2/AVX-512 SIMD
 - **SQL-like query language** with time-range filters, aggregations, and streaming subscriptions
 - **TCP server** — connect remotely via telnet/nc, like PostgreSQL or ClickHouse
+- **Multi-master replication** — write to any node, automatic conflict resolution via HLC + LWW
 - **C API** for FFI integration (Python, Rust, Go, etc.)
 - **Python bindings** — local (ctypes) or remote (TCP), same API
 
@@ -86,6 +87,38 @@ rows = engine.query_all("BTC-USD", "BINANCE")
 for row in rows:
     print(row.price, row.quantity, row.side)
 
+engine.close()
+```
+
+### Run a Multi-Master Cluster
+
+Start three nodes that all accept writes with automatic replication:
+
+```bash
+# Requires etcd running on localhost:2379
+# Node 1
+./build/ob_tcp_server --port 5555 --data-dir /tmp/mm1 \
+  --coordinator-endpoints http://127.0.0.1:2379 --node-id mm1 \
+  --multi-master --mm-node-id 1 --mm-replication-port 6001 --replication-port 6001
+
+# Node 2
+./build/ob_tcp_server --port 5556 --data-dir /tmp/mm2 \
+  --coordinator-endpoints http://127.0.0.1:2379 --node-id mm2 \
+  --multi-master --mm-node-id 2 --mm-replication-port 6002 --replication-port 6002
+
+# Node 3
+./build/ob_tcp_server --port 5557 --data-dir /tmp/mm3 \
+  --coordinator-endpoints http://127.0.0.1:2379 --node-id mm3 \
+  --multi-master --mm-node-id 3 --mm-replication-port 6003 --replication-port 6003
+```
+
+Write to any node — data replicates automatically:
+
+```python
+from orderbook_engine import OrderbookEngine
+
+engine = OrderbookEngine(hosts=["localhost:5555", "localhost:5556", "localhost:5557"])
+engine.insert("BTC-USD", "BINANCE", "bid", prices=[6_500_000], qtys=[150])
 engine.close()
 ```
 

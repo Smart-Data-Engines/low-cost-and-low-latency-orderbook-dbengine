@@ -85,7 +85,8 @@ ob::WALRecordV2 make_wal_record_v2(uint16_t origin_node_id,
 // **Validates: Requirements 4.3, 4.5**
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Assertion 1: if origin == local → handle_remote_record returns false (rejected)
+// Assertion 1: records from self are accepted (needed for catch-up reconstruction).
+// Loop prevention is at WAL write level, not at handle_remote_record level.
 RC_GTEST_PROP(MultiMasterLoopPrevention,
               prop_origin_equals_local_rejected, ()) {
     const auto local_node_id = *rc::gen::inRange<uint16_t>(1, 65535);
@@ -96,7 +97,7 @@ RC_GTEST_PROP(MultiMasterLoopPrevention,
     auto hdr = make_wal_record_v2(local_node_id);
 
     bool applied = mgr.handle_remote_record(local_node_id, hdr, nullptr, 0);
-    RC_ASSERT(!applied);
+    RC_ASSERT(applied);
 }
 
 // Assertion 2: if origin != local → record is accepted but NOT re-broadcast
@@ -317,7 +318,11 @@ TEST(MultiMasterUnit, LoopPreventionSameOriginRejected) {
 
     auto hdr = make_wal_record_v2(42);  // origin == local node_id
     bool applied = mgr.handle_remote_record(42, hdr, nullptr, 0);
-    EXPECT_FALSE(applied);
+    // Records from self are now accepted (needed for catch-up state reconstruction).
+    // Loop prevention is handled at the WAL write level (apply_remote_delta skips
+    // WAL write for records from self) and broadcast level (broadcast_local only
+    // sends locally-originated records).
+    EXPECT_TRUE(applied);
 }
 
 // ── Loop prevention unit test: different origin accepted ──────────────────────

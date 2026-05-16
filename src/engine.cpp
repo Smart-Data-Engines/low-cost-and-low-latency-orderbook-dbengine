@@ -96,6 +96,12 @@ void Engine::open() {
         mm_mgr_ = std::make_unique<MultiMasterManager>(mm_config_, *this, wal_, *hlc_);
         node_role_.store(NodeRole::MULTI_MASTER, std::memory_order_release);
 
+        // Multi-master nodes always accept writes — reset read-only flag
+        // that may have been set by FailoverManager's initial election.
+        if (read_only_flag_) {
+            read_only_flag_->store(false, std::memory_order_release);
+        }
+
         // Tell FailoverManager to skip election logic for multi-master nodes.
         if (failover_mgr_) {
             failover_mgr_->set_role(NodeRole::MULTI_MASTER);
@@ -331,12 +337,8 @@ ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta, const Level* levels
 ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta, const Level* levels,
                                        uint16_t origin_node_id,
                                        const HLCTimestamp& remote_hlc) {
-    // 1. Loop prevention: reject records from self.
-    if (origin_node_id == mm_config_.node_id) {
-        OB_LOG_DEBUG("engine", "Loop prevention: rejecting record from self origin=%u",
-                     origin_node_id);
-        return OB_OK;
-    }
+    // Determine if this record originated from self (for WAL write decision).
+    bool from_self = (origin_node_id == mm_config_.node_id);
 
     std::unique_lock<std::mutex> lock(mtx_);
 
@@ -428,7 +430,10 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta, const Level* le
     }
 
     // 5. Write to WAL with original origin (preserve WAL_Origin for anti-entropy).
-    wal_.append_with_origin(delta, levels, origin_node_id, remote_hlc);
+    // Skip WAL write for records that originated from self (they're already in our WAL).
+    if (!from_self) {
+        wal_.append_with_origin(delta, levels, origin_node_id, remote_hlc);
+    }
 
     // 6. Do NOT broadcast further (single-hop propagation in full-mesh).
 

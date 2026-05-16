@@ -2,6 +2,7 @@
 #include "orderbook/logger.hpp"
 
 #include <nlohmann/json.hpp>
+#include <curl/curl.h>
 
 #include <algorithm>
 #include <chrono>
@@ -379,6 +380,54 @@ bool PeerRegistry::register_self(const std::string& status) {
     self_info.wal_file_index  = 0;
     self_info.wal_byte_offset = 0;
 
+    // PUT PeerInfo JSON to etcd with lease.
+    std::string key = build_key();
+    std::string value = self_info.to_json();
+    std::string key_b64 = base64_encode(key);
+    std::string value_b64 = base64_encode(value);
+
+    std::string url = config_.endpoints[0] + "/v3/kv/put";
+    std::string body = "{\"key\":\"" + key_b64 +
+                       "\",\"value\":\"" + value_b64 +
+                       "\",\"lease\":\"" + std::to_string(lease_id_) + "\"}";
+
+    // Use a simple curl request to PUT.
+    CURL* curl = curl_easy_init();
+    if (curl) {
+        std::string response;
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+            +[](char* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
+                auto* resp = static_cast<std::string*>(userdata);
+                resp->append(ptr, size * nmemb);
+                return size * nmemb;
+            });
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+        CURLcode res = curl_easy_perform(curl);
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+
+        if (res != CURLE_OK) {
+            OB_LOG_WARN("peer_registry",
+                        "Failed to PUT PeerInfo to etcd for node %u: %s",
+                        local_node_id_, curl_easy_strerror(res));
+            return false;
+        }
+    }
+
+    // Store self in local peers map.
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        peers_[local_node_id_] = self_info;
+    }
+
     OB_LOG_INFO("peer_registry",
                 "Registered node %u at %s with lease %ld",
                 local_node_id_, replication_address_.c_str(),
@@ -436,6 +485,13 @@ std::optional<PeerInfo> PeerRegistry::get_peer(uint16_t node_id) const {
 void PeerRegistry::start_watch(TopologyChangeCallback cb) {
     change_cb_ = std::move(cb);
     running_.store(true, std::memory_order_release);
+
+    // Start watch thread that polls etcd for peer changes.
+    watch_thread_ = std::thread([this] { watch_loop(); });
+
+    // Start lease keep-alive thread.
+    lease_thread_ = std::thread([this] { lease_loop(); });
+
     OB_LOG_INFO("peer_registry", "Started watch for node %u", local_node_id_);
 }
 
@@ -470,10 +526,110 @@ int64_t PeerRegistry::lease_ttl_remaining() const {
 void PeerRegistry::watch_loop() {
     OB_LOG_DEBUG("peer_registry", "Watch loop started for node %u",
                  local_node_id_);
+
     while (running_.load(std::memory_order_acquire)) {
-        // In a full implementation this would use etcd watch API.
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        // Poll etcd for all peer keys under our prefix.
+        std::string prefix = build_prefix();
+        std::string range_end = prefix;
+        if (!range_end.empty()) {
+            range_end.back() = static_cast<char>(range_end.back() + 1);
+        }
+
+        std::string key_b64 = base64_encode(prefix);
+        std::string end_b64 = base64_encode(range_end);
+
+        std::string url = config_.endpoints[0] + "/v3/kv/range";
+        std::string body = "{\"key\":\"" + key_b64 +
+                           "\",\"range_end\":\"" + end_b64 + "\"}";
+
+        CURL* curl = curl_easy_init();
+        std::string response;
+        bool success = false;
+
+        if (curl) {
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+                +[](char* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
+                    auto* resp = static_cast<std::string*>(userdata);
+                    resp->append(ptr, size * nmemb);
+                    return size * nmemb;
+                });
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L);
+            struct curl_slist* headers = nullptr;
+            headers = curl_slist_append(headers, "Content-Type: application/json");
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+            CURLcode res = curl_easy_perform(curl);
+            curl_slist_free_all(headers);
+            curl_easy_cleanup(curl);
+
+            success = (res == CURLE_OK && !response.empty());
+        }
+
+        if (success) {
+            // Parse the range response to extract peer info.
+            // etcd v3 range response format:
+            // {"header":{...},"kvs":[{"key":"<b64>","value":"<b64>","..."},...],"count":"N"}
+            std::vector<PeerInfo> discovered_peers;
+
+            // Simple parsing: find all "value":"<base64>" entries.
+            size_t pos = 0;
+            while (true) {
+                pos = response.find("\"value\":\"", pos);
+                if (pos == std::string::npos) break;
+                pos += 9; // skip "value":"
+                size_t end = response.find('"', pos);
+                if (end == std::string::npos) break;
+
+                std::string value_b64 = response.substr(pos, end - pos);
+                std::string value_json = base64_decode(value_b64);
+
+                PeerInfo info;
+                if (PeerInfo::from_json(value_json, info)) {
+                    discovered_peers.push_back(info);
+                }
+                pos = end + 1;
+            }
+
+            // Update local peers map and notify callback if changed.
+            bool changed = false;
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                std::unordered_map<uint16_t, PeerInfo> new_peers;
+                for (auto& p : discovered_peers) {
+                    new_peers[p.node_id] = p;
+                }
+
+                if (new_peers != peers_) {
+                    peers_ = std::move(new_peers);
+                    changed = true;
+                }
+            }
+
+            if (changed && change_cb_) {
+                // Build peer list excluding self.
+                std::vector<PeerInfo> peer_list;
+                for (const auto& p : discovered_peers) {
+                    if (p.node_id != local_node_id_) {
+                        peer_list.push_back(p);
+                    }
+                }
+                OB_LOG_INFO("peer_registry",
+                            "Topology change detected: %zu peers (excluding self)",
+                            peer_list.size());
+                change_cb_(peer_list);
+            }
+        }
+
+        // Poll every 1 second.
+        for (int i = 0; i < 10 && running_.load(std::memory_order_acquire); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
     }
+
     OB_LOG_DEBUG("peer_registry", "Watch loop exited for node %u",
                  local_node_id_);
 }

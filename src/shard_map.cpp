@@ -183,6 +183,18 @@ std::string ShardNode::to_json() const {
     // Use nlohmann::json with sorted keys (std::map-backed object)
     nlohmann::json j;
     j["address"]  = address;
+
+    // mm_nodes (sorted by node_id for determinism)
+    nlohmann::json mm_arr = nlohmann::json::array();
+    for (const auto& mm : mm_nodes) {
+        nlohmann::json mj;
+        mj["address"]    = mm.address;
+        mj["mm_address"] = mm.mm_address;
+        mj["node_id"]    = mm.node_id;
+        mm_arr.push_back(std::move(mj));
+    }
+    j["mm_nodes"] = std::move(mm_arr);
+
     j["shard_id"] = shard_id;
     j["status"]   = shard_status_to_string(status);
     j["vnodes"]   = vnodes;
@@ -204,6 +216,26 @@ bool ShardNode::from_json(std::string_view json, ShardNode& out) {
         out.vnodes   = j.contains("vnodes") && j["vnodes"].is_number_unsigned()
                            ? j["vnodes"].get<uint32_t>()
                            : 150;
+
+        // Parse mm_nodes (optional)
+        out.mm_nodes.clear();
+        if (j.contains("mm_nodes") && j["mm_nodes"].is_array()) {
+            for (const auto& elem : j["mm_nodes"]) {
+                if (!elem.is_object()) continue;
+                MMNodeInfo mm;
+                mm.node_id    = elem.contains("node_id") && elem["node_id"].is_number_unsigned()
+                                    ? elem["node_id"].get<uint16_t>()
+                                    : 0;
+                mm.address    = elem.contains("address") && elem["address"].is_string()
+                                    ? elem["address"].get<std::string>()
+                                    : "";
+                mm.mm_address = elem.contains("mm_address") && elem["mm_address"].is_string()
+                                    ? elem["mm_address"].get<std::string>()
+                                    : "";
+                out.mm_nodes.push_back(std::move(mm));
+            }
+        }
+
         return true;
     } catch (...) {
         return false;
@@ -249,6 +281,18 @@ std::string ShardMap::to_json() const {
     for (const auto& [id, node] : shards) {
         nlohmann::json nj;
         nj["address"]  = node.address;
+
+        // mm_nodes
+        nlohmann::json mm_arr = nlohmann::json::array();
+        for (const auto& mm : node.mm_nodes) {
+            nlohmann::json mj;
+            mj["address"]    = mm.address;
+            mj["mm_address"] = mm.mm_address;
+            mj["node_id"]    = mm.node_id;
+            mm_arr.push_back(std::move(mj));
+        }
+        nj["mm_nodes"] = std::move(mm_arr);
+
         nj["shard_id"] = node.shard_id;
         nj["status"]   = shard_status_to_string(node.status);
         nj["vnodes"]   = node.vnodes;
@@ -354,6 +398,26 @@ bool ShardMap::from_json(std::string_view json, ShardMap& out, std::string& erro
         node.vnodes  = val.contains("vnodes") && val["vnodes"].is_number_unsigned()
                            ? val["vnodes"].get<uint32_t>()
                            : 150;
+
+        // Parse mm_nodes (optional)
+        node.mm_nodes.clear();
+        if (val.contains("mm_nodes") && val["mm_nodes"].is_array()) {
+            for (const auto& elem : val["mm_nodes"]) {
+                if (!elem.is_object()) continue;
+                MMNodeInfo mm;
+                mm.node_id    = elem.contains("node_id") && elem["node_id"].is_number_unsigned()
+                                    ? elem["node_id"].get<uint16_t>()
+                                    : 0;
+                mm.address    = elem.contains("address") && elem["address"].is_string()
+                                    ? elem["address"].get<std::string>()
+                                    : "";
+                mm.mm_address = elem.contains("mm_address") && elem["mm_address"].is_string()
+                                    ? elem["mm_address"].get<std::string>()
+                                    : "";
+                node.mm_nodes.push_back(std::move(mm));
+            }
+        }
+
         out.shards[key] = std::move(node);
     }
 

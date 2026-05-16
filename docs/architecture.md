@@ -81,3 +81,93 @@ The engine is composed of six subsystems, each responsible for a specific concer
 **Segment-based partitioning** — The columnar store splits data into time-bounded segments. Each segment is a directory containing column files (`price.col`, `qty.col`, `ts.col`, `cnt.col`) and a `meta.json` descriptor. This enables efficient time-range pruning.
 
 **Delta+zigzag compression** — Orderbook prices are highly correlated between consecutive levels. Delta encoding followed by zigzag encoding produces small integers that compress well with Simple8b bit-packing.
+
+
+## Multi-Master Replication
+
+Multi-master replication extends the engine to accept writes on multiple nodes simultaneously. Each node in a multi-master cluster holds a full copy of the data and can serve both reads and writes.
+
+### Core Concepts
+
+**Hybrid Logical Clock (HLC)** — Each write is stamped with a 12-byte HLC timestamp combining physical wall-clock time (uint64 nanoseconds), a logical counter (uint16), and the node ID (uint16). HLC preserves causal ordering without requiring synchronized clocks across nodes.
+
+**Last-Writer-Wins (LWW)** — Conflicts (concurrent writes to the same price level on different nodes) are resolved deterministically: the write with the higher HLC timestamp wins. For orderbook L2 data, this is semantically correct — the most recent price level update is always the most current.
+
+**Full-Mesh Topology** — For clusters up to 5 nodes, every node connects directly to every other node. WAL records are propagated in a single hop (no re-broadcast), eliminating cascading delays.
+
+**Anti-Entropy** — A background process periodically compares WAL positions across nodes and repairs any gaps. This guarantees eventual consistency even after network partitions or temporary failures.
+
+### Write Path (Multi-Master Mode)
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │           Client INSERT                  │
+                    └──────────────────┬──────────────────────┘
+                                       │
+                    ┌──────────────────▼──────────────────────┐
+                    │         HLC tick_local()                 │
+                    │  physical = max(wall_clock, last_hlc)    │
+                    │  logical = reset or increment            │
+                    └──────────────────┬──────────────────────┘
+                                       │
+              ┌────────────────────────▼────────────────────────┐
+              │  WAL append_with_origin(delta, origin, hlc)     │
+              │  (38-byte header: seq + ts + crc + origin + hlc)│
+              └────────────────────────┬────────────────────────┘
+                                       │
+              ┌────────────────────────▼────────────────────────┐
+              │  ConflictResolver.update_hlc(key, hlc, origin)  │
+              │  (track per-level HLC for future conflict check)│
+              └────────────────────────┬────────────────────────┘
+                                       │
+              ┌────────────────────────▼────────────────────────┐
+              │  Apply to SoA buffer (same as single-node)      │
+              └────────────────────────┬────────────────────────┘
+                                       │
+              ┌────────────────────────▼────────────────────────┐
+              │  MultiMasterManager.broadcast_local()            │
+              │  (send WAL record to all connected peers)        │
+              └────────────────────────┬────────────────────────┘
+                                       │
+                    ┌──────────────────▼──────────────────────┐
+                    │           Return OK to client            │
+                    └─────────────────────────────────────────┘
+```
+
+### Receive Path (Remote WAL Record)
+
+When a node receives a WAL record from a peer:
+
+1. **Loop prevention** — Check `origin_node_id`. If it matches the local node, discard (prevents infinite loops in full-mesh).
+2. **HLC merge** — Call `tick_receive(remote_hlc)` to advance the local clock.
+3. **Conflict resolution** — For each price level in the delta, compare `remote_hlc` with the locally tracked HLC for that key. Apply only levels where remote wins (LWW).
+4. **WAL append** — Write the record to local WAL preserving the original `origin_node_id`.
+5. **No re-broadcast** — The record is NOT forwarded to other peers (single-hop propagation).
+
+### Conflict Resolution Algorithm
+
+```
+resolve(key, remote_hlc, remote_origin):
+    local_state = level_states[key]
+    if not found → NO_CONFLICT (first write)
+    if remote_hlc > local_state.hlc → APPLY_REMOTE
+    if remote_hlc < local_state.hlc → REJECT_REMOTE
+    if equal physical + logical → tie-break by node_id (higher wins)
+```
+
+### Anti-Entropy Protocol
+
+Every `--anti-entropy-interval-seconds` (default 30s):
+
+1. Read peer WAL positions from etcd (Peer Registry)
+2. Compare with local WAL position
+3. For each detected gap: request missing records from the source peer
+4. If WAL is truncated (gap too large): trigger full snapshot repair
+
+### Per-Shard Multi-Master
+
+When combined with sharding, each shard operates as an independent multi-master cluster:
+
+- Peer Registry keys are namespaced: `<prefix>shards/<shard_id>/mm_peers/<node_id>`
+- Replication streams are isolated per shard
+- ShardRouter distributes writes across MM nodes in a shard using round-robin

@@ -285,7 +285,8 @@ TEST(WALv2, CorruptedExtendedHeader) {
         // Compute CRC for empty payload.
         hdr.checksum = ob::crc32c(nullptr, 0);
 
-        ::write(fd, &hdr, sizeof(ob::WALRecord));
+        auto written = ::write(fd, &hdr, sizeof(ob::WALRecord));
+        (void)written;
         // Do NOT write the 14 extended bytes — this simulates truncation.
         // The file ends here, so replay_v2 can't read the 14B extension.
 

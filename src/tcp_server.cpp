@@ -528,7 +528,13 @@ TcpServer::TcpServer(ServerConfig config)
                                            config_.replication_compress,
                                            config_.mm_max_catchup_bytes,
                                            config_.anti_entropy_interval_sec,
-                                           config_.shard_id
+                                           config_.shard_id,
+                                           CoordinatorConfig{
+                                               config_.coordinator_endpoints,
+                                               config_.coordinator_lease_ttl,
+                                               config_.node_id,
+                                               "/ob/"
+                                           }
                                        });
 }
 

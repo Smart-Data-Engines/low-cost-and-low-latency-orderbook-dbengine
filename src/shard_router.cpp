@@ -67,6 +67,16 @@ void ShardRouter::close() {
     }
     clients_.clear();
 
+    for (auto& [id, mm_vec] : mm_clients_) {
+        for (auto& client : mm_vec) {
+            if (client && client->connected()) {
+                client->disconnect();
+            }
+        }
+    }
+    mm_clients_.clear();
+    rr_counters_.clear();
+
     if (coordinator_) {
         coordinator_->disconnect();
     }
@@ -88,6 +98,21 @@ void ShardRouter::update_connections(const ShardMap& new_map) {
             }
             it = clients_.erase(it);
             ++removed;
+        } else {
+            ++it;
+        }
+    }
+
+    // Remove mm_clients for shards no longer in the map
+    for (auto it = mm_clients_.begin(); it != mm_clients_.end(); ) {
+        if (new_map.shards.find(it->first) == new_map.shards.end()) {
+            for (auto& client : it->second) {
+                if (client && client->connected()) {
+                    client->disconnect();
+                }
+            }
+            it = mm_clients_.erase(it);
+            rr_counters_.erase(it->first);
         } else {
             ++it;
         }
@@ -127,6 +152,65 @@ void ShardRouter::update_connections(const ShardMap& new_map) {
             OB_LOG_WARN("shard_router", "Failed to connect to shard=%s at %s",
                         shard_id.c_str(), node.address.c_str());
         }
+    }
+
+    // Update mm_clients for shards with mm_nodes
+    for (const auto& [shard_id, node] : new_map.shards) {
+        if (node.mm_nodes.empty()) {
+            // No mm_nodes — remove any existing mm_clients for this shard
+            mm_clients_.erase(shard_id);
+            continue;
+        }
+
+        // Rebuild mm_clients for this shard
+        auto& mm_vec = mm_clients_[shard_id];
+        // Disconnect existing
+        for (auto& client : mm_vec) {
+            if (client && client->connected()) {
+                client->disconnect();
+            }
+        }
+        mm_vec.clear();
+
+        // Initialize round-robin counter if not present
+        if (rr_counters_.find(shard_id) == rr_counters_.end()) {
+            rr_counters_[shard_id].store(0, std::memory_order_relaxed);
+        }
+
+        for (const auto& mm : node.mm_nodes) {
+            ClientConfig cc;
+            cc.connect_timeout_sec = config_.connect_timeout_sec;
+            cc.read_timeout_sec    = config_.read_timeout_sec;
+            cc.compress            = config_.compress;
+
+            auto colon = mm.address.rfind(':');
+            if (colon != std::string::npos) {
+                cc.host = mm.address.substr(0, colon);
+                try {
+                    cc.port = static_cast<uint16_t>(
+                        std::stoi(mm.address.substr(colon + 1)));
+                } catch (...) {
+                    cc.port = 9090;
+                }
+            } else {
+                cc.host = mm.address;
+                cc.port = 9090;
+            }
+
+            auto client = std::make_unique<OrderbookClient>(std::move(cc));
+            auto res = client->connect();
+            if (res) {
+                mm_vec.push_back(std::move(client));
+            } else {
+                OB_LOG_WARN("shard_router", "Failed to connect to mm node=%u in shard=%s at %s",
+                            mm.node_id, shard_id.c_str(), mm.address.c_str());
+                // Push nullptr to maintain index alignment
+                mm_vec.push_back(nullptr);
+            }
+        }
+
+        OB_LOG_INFO("shard_router", "Updated mm_clients for shard=%s: %zu nodes",
+                    shard_id.c_str(), mm_vec.size());
     }
 
     if (added > 0 || removed > 0) {
@@ -255,6 +339,57 @@ OrderbookClient* ShardRouter::get_client(const std::string& shard_id) {
     return nullptr;
 }
 
+// ── get_client_mm() — round-robin multi-master routing ───────────────────────
+
+OrderbookClient* ShardRouter::get_client_mm(const std::string& shard_id) {
+    auto it = mm_clients_.find(shard_id);
+    if (it == mm_clients_.end() || it->second.empty()) {
+        OB_LOG_DEBUG("shard_router", "No mm_clients for shard=%s, falling back to primary",
+                     shard_id.c_str());
+        return nullptr;
+    }
+
+    auto& clients_vec = it->second;
+    auto& counter = rr_counters_[shard_id];
+    uint64_t idx = counter.fetch_add(1, std::memory_order_relaxed);
+    size_t vec_size = clients_vec.size();
+
+    // Try round-robin, skip nullptr (failed connections)
+    for (size_t attempt = 0; attempt < vec_size; ++attempt) {
+        size_t pos = static_cast<size_t>((idx + attempt) % vec_size);
+        auto& client = clients_vec[pos];
+        if (client && client->connected()) {
+            OB_LOG_DEBUG("shard_router", "MM routing shard=%s -> node index=%zu",
+                         shard_id.c_str(), pos);
+            return client.get();
+        }
+    }
+
+    OB_LOG_WARN("shard_router", "All mm_clients unavailable for shard=%s",
+                shard_id.c_str());
+    return nullptr;
+}
+
+// ── rr_counter() — for testing ───────────────────────────────────────────────
+
+uint64_t ShardRouter::rr_counter(const std::string& shard_id) const {
+    auto it = rr_counters_.find(shard_id);
+    if (it != rr_counters_.end()) {
+        return it->second.load(std::memory_order_relaxed);
+    }
+    return 0;
+}
+
+// ── mm_client_count() — for testing ──────────────────────────────────────────
+
+size_t ShardRouter::mm_client_count(const std::string& shard_id) const {
+    auto it = mm_clients_.find(shard_id);
+    if (it != mm_clients_.end()) {
+        return it->second.size();
+    }
+    return 0;
+}
+
 // ── 11.6  execute_with_migration_retry() ─────────────────────────────────────
 
 template<typename F>
@@ -341,6 +476,28 @@ Result<void> ShardRouter::insert(std::string_view symbol,
                                   Side side, int64_t price, uint64_t qty,
                                   uint32_t count) {
     std::string key = build_symbol_key(symbol, exchange);
+
+    // Check if the shard has mm_nodes — use round-robin routing
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        std::string shard_id;
+        auto it = shard_map_.assignments.find(key);
+        if (it != shard_map_.assignments.end()) {
+            shard_id = it->second;
+        } else {
+            shard_id = hash_ring_.lookup(key);
+        }
+
+        auto shard_it = shard_map_.shards.find(shard_id);
+        if (shard_it != shard_map_.shards.end() && !shard_it->second.mm_nodes.empty()) {
+            OrderbookClient* mm_client = get_client_mm(shard_id);
+            if (mm_client) {
+                return mm_client->insert(symbol, exchange, side, price, qty, count);
+            }
+            // Fall through to normal routing if mm_client unavailable
+        }
+    }
+
     return execute_with_migration_retry(key,
         [&](OrderbookClient& c) {
             return c.insert(symbol, exchange, side, price, qty, count);
@@ -354,6 +511,28 @@ Result<void> ShardRouter::minsert(std::string_view symbol,
                                    Side side, const Level* levels,
                                    size_t n_levels) {
     std::string key = build_symbol_key(symbol, exchange);
+
+    // Check if the shard has mm_nodes — use round-robin routing
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        std::string shard_id;
+        auto it = shard_map_.assignments.find(key);
+        if (it != shard_map_.assignments.end()) {
+            shard_id = it->second;
+        } else {
+            shard_id = hash_ring_.lookup(key);
+        }
+
+        auto shard_it = shard_map_.shards.find(shard_id);
+        if (shard_it != shard_map_.shards.end() && !shard_it->second.mm_nodes.empty()) {
+            OrderbookClient* mm_client = get_client_mm(shard_id);
+            if (mm_client) {
+                return mm_client->minsert(symbol, exchange, side, levels, n_levels);
+            }
+            // Fall through to normal routing if mm_client unavailable
+        }
+    }
+
     return execute_with_migration_retry(key,
         [&](OrderbookClient& c) {
             return c.minsert(symbol, exchange, side, levels, n_levels);
