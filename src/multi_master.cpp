@@ -326,8 +326,13 @@ void MultiMasterManager::broadcast_local(const WALRecordV2& hdr,
         }
     }
 
-    OB_LOG_DEBUG("mm", "broadcast_local: seq=%lu to %zu peers",
+    OB_LOG_DEBUG("mm", "broadcast_local: seq=%lu to %zu peers (send_buf sizes: ",
                  static_cast<unsigned long>(hdr.sequence_number), peer_count);
+    for (auto& [nid, peer] : peers_) {
+        if (peer.connected) {
+            OB_LOG_DEBUG("mm", "  peer %u: send_buf=%zu bytes", nid, peer.send_buf.size());
+        }
+    }
 }
 
 // ── Handle remote record ──────────────────────────────────────────────────────
@@ -388,6 +393,11 @@ bool MultiMasterManager::handle_remote_record(uint16_t /*peer_node_id*/,
     // Loop prevention is handled by apply_remote_delta (skips WAL write for
     // records from self) and by broadcast_local (only broadcasts local writes).
     engine_.apply_remote_delta(delta, levels, origin, remote_hlc);
+
+    OB_LOG_DEBUG("mm", "handle_remote_record: APPLIED origin=%u seq=%lu symbol=%.*s n_levels=%u",
+                 origin, static_cast<unsigned long>(hdr.sequence_number),
+                 static_cast<int>(sizeof(delta.symbol)), delta.symbol,
+                 delta.n_levels);
 
     return true;
 }
@@ -1229,6 +1239,9 @@ void MultiMasterManager::start_catchup_to_peer(PeerConnection& peer) {
     const uint32_t local_file   = wal_.current_file_index();
     const size_t   local_offset = wal_.current_offset();
 
+    OB_LOG_INFO("mm", "Catch-up: peer %u position={file=%u, off=%zu}, local position={file=%u, off=%zu}",
+                peer.node_id, file_idx, offset, local_file, local_offset);
+
     // Helper lambda: build WAL file path for a given index.
     auto wal_path = [&](uint32_t idx) -> std::string {
         char buf[32];
@@ -1341,6 +1354,9 @@ void MultiMasterManager::start_catchup_to_peer(PeerConnection& peer) {
 
             // Only stream DELTA records to the peer (skip GAP, EPOCH, ROTATE).
             if (hdr.record_type != WAL_RECORD_DELTA) {
+                OB_LOG_DEBUG("mm", "Catch-up: skipping non-DELTA record type=%u seq=%lu in %s",
+                             hdr.record_type, static_cast<unsigned long>(hdr.sequence_number),
+                             path.c_str());
                 continue;
             }
 
@@ -1360,6 +1376,9 @@ void MultiMasterManager::start_catchup_to_peer(PeerConnection& peer) {
                 }
 
                 enqueue_frame(peer, frame_payload.data(), frame_payload.size());
+                OB_LOG_DEBUG("mm", "Catch-up: sent DELTA seq=%lu (%u bytes payload) to peer %u",
+                             static_cast<unsigned long>(hdr.sequence_number),
+                             hdr.payload_len, peer.node_id);
             }
 
             // Check backpressure after each record.
@@ -1381,8 +1400,9 @@ void MultiMasterManager::start_catchup_to_peer(PeerConnection& peer) {
 
     // Catch-up complete.
     peer.catching_up = false;
-    OB_LOG_INFO("mm", "Catch-up to peer %u complete (reached file=%u offset=%zu)",
-                peer.node_id, local_file, local_offset);
+    OB_LOG_INFO("mm", "Catch-up to peer %u complete (reached file=%u offset=%zu). "
+                "send_buf size=%zu bytes",
+                peer.node_id, local_file, local_offset, peer.send_buf.size());
 }
 
 // ── Backpressure check (task 11.1) ────────────────────────────────────────────

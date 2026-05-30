@@ -152,4 +152,68 @@ TEST(CliMultiMaster, DefaultsWhenNoMultiMasterArgs) {
     EXPECT_EQ(config.mm_max_catchup_bytes, 512ULL << 20);
 }
 
+// ── MM Port Isolation death tests (Properties 2 & 3) ─────────────────────────
+// Feature: mm-port-isolation, Property 2: CLI Port Conflict Detection
+// Validates: Requirements 3.3
+
+TEST(CliMultiMasterDeathTest, PortConflictSameMMAndReplicationPort) {
+    EXPECT_EXIT(
+        ([]{
+            std::vector<std::string> args = {
+                "ob_tcp_server",
+                "--multi-master",
+                "--mm-node-id", "1",
+                "--coordinator-endpoints", "http://localhost:2379",
+                "--mm-replication-port", "9100",
+                "--replication-port", "9100"
+            };
+            std::vector<char*> argv;
+            for (auto& s : args) argv.push_back(s.data());
+            ob::parse_cli_args(static_cast<int>(argv.size()), argv.data());
+        })(),
+        ::testing::ExitedWithCode(1),
+        ".*must be different ports.*"
+    );
+}
+
+// Feature: mm-port-isolation, Property 3: Orphaned MM Port Flag Detection
+// Validates: Requirements 3.4
+
+TEST(CliMultiMasterDeathTest, OrphanedMmReplicationPortWithoutMultiMaster) {
+    EXPECT_EXIT(
+        ([]{
+            std::vector<std::string> args = {
+                "ob_tcp_server",
+                "--mm-replication-port", "9100"
+            };
+            std::vector<char*> argv;
+            for (auto& s : args) argv.push_back(s.data());
+            ob::parse_cli_args(static_cast<int>(argv.size()), argv.data());
+        })(),
+        ::testing::ExitedWithCode(1),
+        ".*requires --multi-master.*"
+    );
+}
+
+// Unit test: --multi-master with --replication-port produces warning only (not fatal)
+// Validates: Requirements 3.2
+
+TEST(CliMultiMaster, ReplicationPortInMMModeParsesSuccessfully) {
+    std::vector<std::string> args = {
+        "ob_tcp_server",
+        "--multi-master",
+        "--mm-node-id", "1",
+        "--coordinator-endpoints", "http://localhost:2379",
+        "--mm-replication-port", "9100",
+        "--replication-port", "8080"
+    };
+
+    auto config = parse(args);
+
+    // Config parses successfully (warning only, not fatal)
+    EXPECT_TRUE(config.multi_master);
+    EXPECT_EQ(config.mm_replication_port, 9100);
+    EXPECT_EQ(config.replication_port, 8080);
+}
+
 } // namespace

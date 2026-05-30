@@ -60,34 +60,11 @@ void Engine::open() {
     // Rebuild columnar segment index from persisted meta.json files.
     combined_store_.open_existing();
 
-    // Start ReplicationManager if configured as primary (Requirement 7.4).
-    if (repl_config_.port > 0) {
-        repl_mgr_ = std::make_unique<ReplicationManager>(repl_config_, wal_);
-        repl_mgr_->set_engine(this);
-        repl_mgr_->start();
-    }
-
-    // Start ReplicationClient if configured as replica (Requirement 7.4).
-    if (repl_client_config_.primary_port > 0) {
-        OB_LOG_INFO("engine", "starting ReplicationClient to %s:%u",
-                    repl_client_config_.primary_host.c_str(), repl_client_config_.primary_port);
-        repl_client_ = std::make_unique<ReplicationClient>(repl_client_config_, *this);
-        repl_client_->start();
-    } else {
-        OB_LOG_INFO("engine", "ReplicationClient not started (primary_port=0)");
-    }
-
-    // Start FailoverManager if coordinator endpoints are configured.
-    if (!failover_config_.coordinator.endpoints.empty()) {
-        OB_LOG_INFO("engine", "starting FailoverManager, node_id=%s",
-                    failover_config_.coordinator.node_id.c_str());
-        failover_mgr_ = std::make_unique<FailoverManager>(failover_config_, *this);
-        failover_mgr_->start();
-        node_role_.store(failover_mgr_->role(), std::memory_order_relaxed);
-    }
-
-    // Initialize multi-master replication if enabled.
+    // Mutual exclusivity gate: MM mode and Replication mode are mutually exclusive.
+    // In MM mode, ONLY MultiMasterManager is created.
+    // In non-MM mode, ONLY ReplicationManager/ReplicationClient are created.
     if (mm_config_.enabled) {
+        // Multi-master mode: ONLY create MultiMasterManager
         OB_LOG_INFO("engine", "Multi-master mode enabled: node_id=%u replication_port=%u",
                     mm_config_.node_id, mm_config_.replication_port);
 
@@ -108,6 +85,35 @@ void Engine::open() {
         }
 
         mm_mgr_->start();
+
+        // NOTE: ReplicationManager is NOT created in MM mode.
+        // NOTE: ReplicationClient is NOT created in MM mode.
+    } else {
+        // Non-MM mode: create ReplicationManager if port configured (Requirement 7.4).
+        if (repl_config_.port > 0) {
+            repl_mgr_ = std::make_unique<ReplicationManager>(repl_config_, wal_);
+            repl_mgr_->set_engine(this);
+            repl_mgr_->start();
+        }
+
+        // Start ReplicationClient if configured as replica (Requirement 7.4).
+        if (repl_client_config_.primary_port > 0) {
+            OB_LOG_INFO("engine", "starting ReplicationClient to %s:%u",
+                        repl_client_config_.primary_host.c_str(), repl_client_config_.primary_port);
+            repl_client_ = std::make_unique<ReplicationClient>(repl_client_config_, *this);
+            repl_client_->start();
+        } else {
+            OB_LOG_INFO("engine", "ReplicationClient not started (primary_port=0)");
+        }
+    }
+
+    // FailoverManager is independent but only used in non-MM mode.
+    if (!failover_config_.coordinator.endpoints.empty() && !mm_config_.enabled) {
+        OB_LOG_INFO("engine", "starting FailoverManager, node_id=%s",
+                    failover_config_.coordinator.node_id.c_str());
+        failover_mgr_ = std::make_unique<FailoverManager>(failover_config_, *this);
+        failover_mgr_->start();
+        node_role_.store(failover_mgr_->role(), std::memory_order_relaxed);
     }
 
     // Start background flush thread.

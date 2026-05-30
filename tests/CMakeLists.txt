@@ -547,6 +547,18 @@ target_link_libraries(test_mm_networking
 )
 gtest_discover_tests(test_mm_networking PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
 
+# ── MM Port Isolation property-based tests (mm-port-isolation, Task 5.1) ──────
+add_executable(test_mm_port_isolation test_mm_port_isolation.cpp)
+target_link_libraries(test_mm_port_isolation
+    PRIVATE
+        orderbook_multi_master
+        orderbook_engine
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_mm_port_isolation PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
+
 # ── Integration test binary (Python test suite calls this) ────────────────────
 add_executable(ob_integration_test integration/ob_integration_test.cpp)
 target_link_libraries(ob_integration_test PRIVATE orderbook_client)

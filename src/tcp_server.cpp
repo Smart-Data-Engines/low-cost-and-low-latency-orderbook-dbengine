@@ -481,6 +481,27 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
         std::exit(1);
     }
 
+    // Validation: warn if --replication-port is specified in MM mode (it will be ignored)
+    if (config.multi_master && config.replication_port > 0) {
+        OB_LOG_WARN("cli",
+            "replication-port is ignored in multi-master mode");
+    }
+
+    // Validation: --mm-replication-port and --replication-port must be different ports
+    if (config.multi_master && config.replication_port > 0 &&
+        config.mm_replication_port == config.replication_port) {
+        std::fprintf(stderr,
+            "Error: --mm-replication-port and --replication-port must be different ports\n");
+        std::exit(1);
+    }
+
+    // Validation: --mm-replication-port requires --multi-master mode
+    if (!config.multi_master && config.mm_replication_port > 0) {
+        std::fprintf(stderr,
+            "Error: --mm-replication-port requires --multi-master mode\n");
+        std::exit(1);
+    }
+
     if (config.multi_master) {
         OB_LOG_INFO("cli", "Multi-master mode: node_id=%u replication_port=%u anti_entropy=%us",
                     config.mm_node_id, config.mm_replication_port,
@@ -497,8 +518,11 @@ TcpServer::TcpServer(ServerConfig config)
     , read_only_(config_.read_only)
 {
     ReplicationConfig repl_config{};
-    repl_config.port = config_.replication_port;
-    repl_config.compress = config_.replication_compress;
+    if (!config_.multi_master) {
+        repl_config.port = config_.replication_port;
+        repl_config.compress = config_.replication_compress;
+    }
+    // In MM mode, repl_config.port stays 0 → Engine won't create ReplicationManager
 
     ReplicationClientConfig repl_client_config{};
     repl_client_config.primary_host = config_.primary_host;
