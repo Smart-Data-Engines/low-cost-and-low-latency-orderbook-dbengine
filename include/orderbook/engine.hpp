@@ -5,7 +5,9 @@
 #include "orderbook/data_model.hpp"
 #include "orderbook/epoch.hpp"
 #include "orderbook/failover.hpp"
+#include "orderbook/hlc.hpp"
 #include "orderbook/metrics.hpp"
+#include "orderbook/multi_master.hpp"
 #include "orderbook/query_engine.hpp"
 #include "orderbook/replication.hpp"
 #include "orderbook/soa_buffer.hpp"
@@ -44,7 +46,8 @@ public:
                     ReplicationConfig repl_config = {},
                     ReplicationClientConfig repl_client_config = {},
                     FailoverConfig failover_config = {},
-                    TTLConfig ttl_config = {});
+                    TTLConfig ttl_config = {},
+                    MultiMasterConfig mm_config = {});
 
     ~Engine();
 
@@ -148,6 +151,17 @@ public:
 
         // Routing errors
         uint64_t    shard_routing_errors{0};
+
+        // Multi-master metrics
+        uint16_t    mm_node_id{0};
+        size_t      mm_peer_count{0};
+        size_t      mm_connected_peers{0};
+        uint64_t    mm_conflicts_total{0};
+        uint64_t    mm_anti_entropy_runs{0};
+        uint64_t    mm_hlc_physical_ns{0};
+        uint16_t    mm_hlc_logical{0};
+        int64_t     mm_hlc_drift_ns{0};
+        std::vector<std::pair<uint16_t, size_t>> mm_replication_lag_per_peer;
     };
 
     /// Collect current engine statistics (thread-safe, acquires mtx_).
@@ -214,6 +228,28 @@ public:
     /// Set external read-only flag pointer (toggled during role transitions).
     void set_read_only_flag(std::atomic<bool>* flag);
 
+    // ── Multi-master replication ──────────────────────────────────────────────
+
+    /// Apply a delta update in multi-master mode: HLC tick → WAL append with
+    /// origin → conflict resolver update → SoA buffer apply → broadcast → enqueue.
+    ob_status_t apply_delta_mm(const DeltaUpdate& delta, const Level* levels);
+
+    /// Apply a remote delta received from a peer node.  Performs loop prevention,
+    /// HLC merge, per-level conflict resolution, and WAL append with original origin.
+    /// Does NOT re-broadcast (single-hop propagation).
+    ob_status_t apply_remote_delta(const DeltaUpdate& delta, const Level* levels,
+                                   uint16_t origin_node_id,
+                                   const HLCTimestamp& remote_hlc);
+
+    /// Get the HLC clock (nullptr if multi-master is not enabled).
+    HybridLogicalClock* hlc() const { return hlc_.get(); }
+
+    /// Get the MultiMasterManager (nullptr if multi-master is not enabled).
+    MultiMasterManager* multi_master_manager() const { return mm_mgr_.get(); }
+
+    /// Check if this engine is running in multi-master mode.
+    bool is_multi_master() const { return mm_config_.enabled; }
+
 private:
     std::string base_dir_;
     uint64_t    flush_interval_ns_;
@@ -258,6 +294,11 @@ private:
 
     // Sharding: symbols that have been migrated away from this shard
     std::unordered_set<std::string> migrated_symbols_;
+
+    // Multi-master replication (optional, disabled when mm_config_.enabled == false)
+    MultiMasterConfig                    mm_config_;
+    std::unique_ptr<HybridLogicalClock>  hlc_;
+    std::unique_ptr<MultiMasterManager>  mm_mgr_;
 
     // Background flush thread
     std::thread       flush_thread_;

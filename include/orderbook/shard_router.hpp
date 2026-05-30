@@ -59,6 +59,10 @@ public:
     /// Get the TCP client for a given shard.  Returns nullptr if unknown.
     OrderbookClient* get_client(const std::string& shard_id);
 
+    /// Get a multi-master client for a given shard (round-robin).
+    /// Returns nullptr if no mm_nodes are configured for this shard.
+    OrderbookClient* get_client_mm(const std::string& shard_id);
+
     // ── Routed operations ─────────────────────────────────────────────
 
     Result<void> insert(std::string_view symbol, std::string_view exchange,
@@ -82,6 +86,12 @@ public:
     /// Force-refresh the ShardMap from etcd.
     Result<void> refresh_shard_map();
 
+    /// Get the round-robin counter for a shard (for testing).
+    uint64_t rr_counter(const std::string& shard_id) const;
+
+    /// Get the number of mm_clients for a shard (for testing).
+    size_t mm_client_count(const std::string& shard_id) const;
+
 private:
     ShardRouterConfig config_;
     std::unique_ptr<CoordinatorClient> coordinator_;
@@ -92,6 +102,12 @@ private:
 
     /// TCP connections per shard: shard_id → OrderbookClient
     std::unordered_map<std::string, std::unique_ptr<OrderbookClient>> clients_;
+
+    /// Multi-master clients per shard: shard_id → vector of OrderbookClient
+    std::unordered_map<std::string, std::vector<std::unique_ptr<OrderbookClient>>> mm_clients_;
+
+    /// Round-robin counters per shard (for multi-master routing)
+    mutable std::unordered_map<std::string, std::atomic<uint64_t>> rr_counters_;
 
     // Background watch thread
     std::thread watch_thread_;

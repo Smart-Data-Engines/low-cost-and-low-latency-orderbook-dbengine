@@ -30,6 +30,14 @@ enum class ShardStatus : uint8_t {
     DRAINING = 2,  // shard leaving cluster, migration in progress
 };
 
+// ── Multi-master node info (per shard) ────────────────────────────────────────
+
+struct MMNodeInfo {
+    uint16_t    node_id{0};                     // multi-master node identifier
+    std::string address;                        // "host:port" — client TCP address
+    std::string mm_address;                     // "host:port" — replication address
+};
+
 // ── Shard node descriptor ─────────────────────────────────────────────────────
 
 struct ShardNode {
@@ -37,6 +45,7 @@ struct ShardNode {
     std::string address;                        // "host:port" — client TCP address
     ShardStatus status{ShardStatus::ACTIVE};
     uint32_t    vnodes{150};                    // virtual node count in hash ring
+    std::vector<MMNodeInfo> mm_nodes;           // multi-master nodes in this shard
 
     /// Serialize to deterministic JSON (sorted keys).
     std::string to_json() const;

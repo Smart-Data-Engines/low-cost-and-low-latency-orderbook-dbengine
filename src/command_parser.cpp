@@ -157,6 +157,27 @@ Command parse_command(std::string_view line) {
         return cmd;
     }
 
+    if (iequals(first, "MM_PEERS")) {
+        cmd.type = CommandType::MM_PEERS;
+        OB_LOG_DEBUG("cmd_parser", "Parsed command: MM_PEERS");
+        return cmd;
+    }
+
+    if (iequals(first, "MM_CONFLICTS")) {
+        cmd.type = CommandType::MM_CONFLICTS;
+        if (tokens.size() >= 2) {
+            size_t limit_val = 0;
+            auto sv = tokens[1];
+            auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), limit_val);
+            if (ec == std::errc{} && ptr == sv.data() + sv.size()) {
+                cmd.mm_conflicts_limit = limit_val;
+            }
+            // else keep default 100
+        }
+        OB_LOG_DEBUG("cmd_parser", "Parsed command: MM_CONFLICTS limit=%zu", cmd.mm_conflicts_limit);
+        return cmd;
+    }
+
     return cmd; // UNKNOWN
 }
 
@@ -311,6 +332,12 @@ std::string format_command(const Command& cmd) {
     case CommandType::SHARD_INFO: return "SHARD_INFO\n";
     case CommandType::MIGRATE:
         return "MIGRATE " + cmd.migrate_symbol + " " + cmd.migrate_target_shard + "\n";
+    case CommandType::MM_PEERS:  return "MM_PEERS\n";
+    case CommandType::MM_CONFLICTS:
+        if (cmd.mm_conflicts_limit != 100) {
+            return "MM_CONFLICTS " + std::to_string(cmd.mm_conflicts_limit) + "\n";
+        }
+        return "MM_CONFLICTS\n";
     case CommandType::UNKNOWN: return "";
     }
     return "";

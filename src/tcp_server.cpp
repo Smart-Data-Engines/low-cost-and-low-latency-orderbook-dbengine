@@ -74,6 +74,11 @@ std::string execute_command(const Command& cmd,
         session.increment_commands();
         if (read_only || engine.node_role() == NodeRole::REPLICA) return format_error("read-only replica");
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
+        // Multi-master bootstrapping check
+        if (engine.is_multi_master() && engine.multi_master_manager() &&
+            engine.multi_master_manager()->is_bootstrapping()) {
+            return "ERR BOOTSTRAPPING\n";
+        }
         // Shard ownership check: reject writes for symbols not owned by this shard
         if (shard_coord) {
             const std::string symbol_key = cmd.insert_args.symbol + "." + cmd.insert_args.exchange;
@@ -108,7 +113,9 @@ std::string execute_command(const Command& cmd,
             level.qty   = a.qty;
             level.cnt   = a.count;
 
-            ob_status_t rc = engine.apply_delta(delta, &level);
+            ob_status_t rc = engine.is_multi_master()
+                ? engine.apply_delta_mm(delta, &level)
+                : engine.apply_delta(delta, &level);
             if (rc != OB_OK) {
                 return format_error("apply_delta failed with code " + std::to_string(rc));
             }
@@ -129,6 +136,11 @@ std::string execute_command(const Command& cmd,
         session.increment_commands();
         if (read_only || engine.node_role() == NodeRole::REPLICA) return format_error("read-only replica");
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
+        // Multi-master bootstrapping check
+        if (engine.is_multi_master() && engine.multi_master_manager() &&
+            engine.multi_master_manager()->is_bootstrapping()) {
+            return "ERR BOOTSTRAPPING\n";
+        }
         // Shard ownership check: reject writes for symbols not owned by this shard
         if (shard_coord) {
             const std::string symbol_key = cmd.minsert_args.symbol + "." + cmd.minsert_args.exchange;
@@ -166,7 +178,9 @@ std::string execute_command(const Command& cmd,
                 levels[i]._pad  = 0;
             }
 
-            ob_status_t status = engine.apply_delta(delta, levels.data());
+            ob_status_t status = engine.is_multi_master()
+                ? engine.apply_delta_mm(delta, levels.data())
+                : engine.apply_delta(delta, levels.data());
             if (status != OB_OK) {
                 return format_error("apply_delta failed with code " + std::to_string(status));
             }
@@ -254,6 +268,21 @@ std::string execute_command(const Command& cmd,
         stats.migration_progress_pct = es.migration_progress_pct;
         stats.shard_routing_errors  = es.shard_routing_errors;
 
+        // Multi-master metrics
+        stats.mm_node_role = static_cast<uint8_t>(es.node_role);
+        if (es.node_role == NodeRole::MULTI_MASTER) {
+            stats.mm_node_id           = es.mm_node_id;
+            stats.mm_peer_count        = es.mm_peer_count;
+            stats.mm_connected_peers   = es.mm_connected_peers;
+            stats.mm_conflicts_total   = es.mm_conflicts_total;
+            stats.mm_anti_entropy_runs = es.mm_anti_entropy_runs;
+            stats.mm_anti_entropy_repairs = 0; // populated from anti_entropy if available
+            stats.mm_hlc_physical_ns   = es.mm_hlc_physical_ns;
+            stats.mm_hlc_logical       = es.mm_hlc_logical;
+            stats.mm_hlc_drift_ns      = es.mm_hlc_drift_ns;
+            stats.mm_replication_lag_per_peer = es.mm_replication_lag_per_peer;
+        }
+
         return format_status(stats);
     }
 
@@ -287,6 +316,20 @@ std::string execute_command(const Command& cmd,
         if (read_only) return format_error("read-only mode");
         return shard_coord->handle_migrate_command(
             cmd.migrate_symbol, cmd.migrate_target_shard);
+    }
+
+    case CommandType::MM_PEERS: {
+        session.increment_commands();
+        OB_LOG_DEBUG("tcp_server", "Handling MM_PEERS command");
+        if (!engine.is_multi_master()) return format_error("not in multi-master mode");
+        return engine.multi_master_manager()->handle_mm_peers_command();
+    }
+
+    case CommandType::MM_CONFLICTS: {
+        session.increment_commands();
+        OB_LOG_DEBUG("tcp_server", "Handling MM_CONFLICTS command limit=%zu", cmd.mm_conflicts_limit);
+        if (!engine.is_multi_master()) return format_error("not in multi-master mode");
+        return engine.multi_master_manager()->handle_mm_conflicts_command(cmd.mm_conflicts_limit);
     }
 
     case CommandType::QUIT:
@@ -376,6 +419,16 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
             config.shard_id = argv[++i];
         } else if (arg == "--shard-vnodes" && i + 1 < argc) {
             config.shard_vnodes = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--multi-master") {
+            config.multi_master = true;
+        } else if (arg == "--mm-node-id" && i + 1 < argc) {
+            config.mm_node_id = static_cast<uint16_t>(std::stoi(argv[++i]));
+        } else if (arg == "--mm-replication-port" && i + 1 < argc) {
+            config.mm_replication_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        } else if (arg == "--anti-entropy-interval-seconds" && i + 1 < argc) {
+            config.anti_entropy_interval_sec = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--mm-max-catchup-bytes" && i + 1 < argc) {
+            config.mm_max_catchup_bytes = static_cast<size_t>(std::stoull(argv[++i]));
         }
     }
 
@@ -392,6 +445,69 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
                     config.shard_id.c_str(), config.shard_vnodes);
     }
 
+    // Validation: --multi-master requires --mm-node-id
+    if (config.multi_master && config.mm_node_id == 0) {
+        std::fprintf(stderr,
+            "Error: --multi-master requires --mm-node-id <uint16>\n");
+        std::exit(1);
+    }
+
+    // Validation: --multi-master requires --coordinator-endpoints
+    if (config.multi_master && config.coordinator_endpoints.empty()) {
+        std::fprintf(stderr,
+            "Error: --multi-master requires --coordinator-endpoints for peer discovery\n");
+        std::exit(1);
+    }
+
+    // Validation: --multi-master requires --mm-replication-port
+    if (config.multi_master && config.mm_replication_port == 0) {
+        std::fprintf(stderr,
+            "Error: --multi-master requires --mm-replication-port <port>\n");
+        std::exit(1);
+    }
+
+    // Validation: --multi-master is incompatible with --read-only
+    if (config.multi_master && config.read_only) {
+        std::fprintf(stderr,
+            "Error: --multi-master is incompatible with --read-only\n");
+        std::exit(1);
+    }
+
+    // Validation: --multi-master is incompatible with --primary-host/--primary-port
+    if (config.multi_master && (!config.primary_host.empty() || config.primary_port > 0)) {
+        std::fprintf(stderr,
+            "Error: --multi-master is incompatible with --primary-host/--primary-port "
+            "(single-primary replication)\n");
+        std::exit(1);
+    }
+
+    // Validation: warn if --replication-port is specified in MM mode (it will be ignored)
+    if (config.multi_master && config.replication_port > 0) {
+        OB_LOG_WARN("cli",
+            "replication-port is ignored in multi-master mode");
+    }
+
+    // Validation: --mm-replication-port and --replication-port must be different ports
+    if (config.multi_master && config.replication_port > 0 &&
+        config.mm_replication_port == config.replication_port) {
+        std::fprintf(stderr,
+            "Error: --mm-replication-port and --replication-port must be different ports\n");
+        std::exit(1);
+    }
+
+    // Validation: --mm-replication-port requires --multi-master mode
+    if (!config.multi_master && config.mm_replication_port > 0) {
+        std::fprintf(stderr,
+            "Error: --mm-replication-port requires --multi-master mode\n");
+        std::exit(1);
+    }
+
+    if (config.multi_master) {
+        OB_LOG_INFO("cli", "Multi-master mode: node_id=%u replication_port=%u anti_entropy=%us",
+                    config.mm_node_id, config.mm_replication_port,
+                    config.anti_entropy_interval_sec);
+    }
+
     return config;
 }
 
@@ -402,8 +518,11 @@ TcpServer::TcpServer(ServerConfig config)
     , read_only_(config_.read_only)
 {
     ReplicationConfig repl_config{};
-    repl_config.port = config_.replication_port;
-    repl_config.compress = config_.replication_compress;
+    if (!config_.multi_master) {
+        repl_config.port = config_.replication_port;
+        repl_config.compress = config_.replication_compress;
+    }
+    // In MM mode, repl_config.port stays 0 → Engine won't create ReplicationManager
 
     ReplicationClientConfig repl_client_config{};
     repl_client_config.primary_host = config_.primary_host;
@@ -425,7 +544,22 @@ TcpServer::TcpServer(ServerConfig config)
     engine_ = std::make_unique<Engine>(config_.data_dir, 100'000'000ULL, FsyncPolicy::INTERVAL,
                                        repl_config, repl_client_config, failover_config,
                                        TTLConfig{config_.ttl_hours,
-                                                 config_.ttl_scan_interval_seconds});
+                                                 config_.ttl_scan_interval_seconds},
+                                       MultiMasterConfig{
+                                           config_.mm_node_id,
+                                           config_.mm_replication_port,
+                                           config_.multi_master,
+                                           config_.replication_compress,
+                                           config_.mm_max_catchup_bytes,
+                                           config_.anti_entropy_interval_sec,
+                                           config_.shard_id,
+                                           CoordinatorConfig{
+                                               config_.coordinator_endpoints,
+                                               config_.coordinator_lease_ttl,
+                                               config_.node_id,
+                                               "/ob/"
+                                           }
+                                       });
 }
 
 TcpServer::~TcpServer() {

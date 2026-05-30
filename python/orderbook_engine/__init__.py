@@ -279,7 +279,8 @@ class _TcpBackend:
             # ROLE responses: single-line, terminated by \n
             if (decoded.startswith("PRIMARY") or
                 decoded.startswith("REPLICA") or
-                decoded.startswith("STANDALONE")):
+                decoded.startswith("STANDALONE") or
+                decoded.startswith("MULTI_MASTER")):
                 nl = decoded.find("\n")
                 if nl != -1:
                     resp = decoded[:nl + 1]
@@ -648,6 +649,11 @@ class _ClientPool:
         import threading
         self._lock = threading.Lock()
 
+        # Multi-master fields
+        self._multi_master_mode = False
+        self._mm_node_keys: List[str] = []
+        self._mm_rr_counter = 0
+
         # Parse hosts into _NodeState objects.
         for h in hosts:
             if ":" in h:
@@ -694,6 +700,8 @@ class _ClientPool:
 
         Standalone nodes (no coordinator) that are not read-only are treated
         as primary for write routing purposes.
+
+        Multi-master nodes: all nodes accept writes (round-robin routing).
         """
         with self._lock:
             for node in self._nodes:
@@ -711,6 +719,20 @@ class _ClientPool:
                     node.role = "unknown"
                     # Remove broken connection.
                     self._connections.pop(key, None)
+
+            # Check if we're in multi-master mode (any node reports MULTI_MASTER)
+            mm_nodes = [n for n in self._nodes
+                        if n.role == "multi_master" and n.connected]
+            if mm_nodes:
+                self._multi_master_mode = True
+                self._mm_node_keys = [self._node_key(n) for n in mm_nodes]
+                # In multi-master mode, set primary_key to first MM node
+                # (writes will be round-robin'd via execute_write)
+                self._primary_key = self._mm_node_keys[0]
+                return
+
+            self._multi_master_mode = False
+            self._mm_node_keys = []
 
             # Find primary. Fall back to first standalone node (writable).
             self._primary_key = None
@@ -735,6 +757,9 @@ class _ClientPool:
                     node.epoch = int(parts[1])
                 except ValueError:
                     pass
+        elif raw.startswith("MULTI_MASTER"):
+            node.role = "multi_master"
+            logger.info("Discovered multi-master node: %s:%d", node.host, node.port)
         elif raw.startswith("REPLICA"):
             node.role = "replica"
             parts = raw.split()
@@ -749,20 +774,35 @@ class _ClientPool:
             node.role = "unknown"
 
     def execute_write(self, command: str) -> str:
-        """Route write to primary, retry on failover (re-discover + retry once)."""
-        with self._lock:
-            primary_key = self._primary_key
+        """Route write to primary (or round-robin in multi-master mode).
 
-        if primary_key is None:
+        In multi-master mode, writes are distributed across all MM nodes
+        using round-robin. Retry on failover (re-discover + retry once).
+        """
+        with self._lock:
+            if self._multi_master_mode and self._mm_node_keys:
+                # Round-robin across multi-master nodes
+                idx = self._mm_rr_counter % len(self._mm_node_keys)
+                self._mm_rr_counter += 1
+                target_key = self._mm_node_keys[idx]
+            else:
+                target_key = self._primary_key
+
+        if target_key is None:
             self._discover_primary()
             with self._lock:
-                primary_key = self._primary_key
-            if primary_key is None:
+                if self._multi_master_mode and self._mm_node_keys:
+                    idx = self._mm_rr_counter % len(self._mm_node_keys)
+                    self._mm_rr_counter += 1
+                    target_key = self._mm_node_keys[idx]
+                else:
+                    target_key = self._primary_key
+            if target_key is None:
                 raise OrderbookError(-1, "No primary available")
 
-        backend = self._connections.get(primary_key)
+        backend = self._connections.get(target_key)
         if backend is None:
-            raise OrderbookError(-1, "Primary not connected")
+            raise OrderbookError(-1, "Target node not connected")
 
         try:
             raw = backend.execute(command)
@@ -771,16 +811,21 @@ class _ClientPool:
                 raise OrderbookError(-1, "read-only replica")
             return raw
         except (OrderbookError, OSError, socket.error):
-            # Retry once: re-discover primary and retry.
+            # Retry once: re-discover and retry.
             self._connect_all()
             self._discover_primary()
             with self._lock:
-                primary_key = self._primary_key
-            if primary_key is None:
+                if self._multi_master_mode and self._mm_node_keys:
+                    idx = self._mm_rr_counter % len(self._mm_node_keys)
+                    self._mm_rr_counter += 1
+                    target_key = self._mm_node_keys[idx]
+                else:
+                    target_key = self._primary_key
+            if target_key is None:
                 raise OrderbookError(-1, "No primary available after re-discovery")
-            backend = self._connections.get(primary_key)
+            backend = self._connections.get(target_key)
             if backend is None:
-                raise OrderbookError(-1, "Primary not connected after re-discovery")
+                raise OrderbookError(-1, "Target not connected after re-discovery")
             return backend.execute(command)
 
     def execute_read(self, command: str) -> str:
@@ -1000,6 +1045,100 @@ class _ClientPool:
             except Exception:
                 pass
         self._shard_connections.clear()
+
+
+# ── Multi-master response parsers ──────────────────────────────────────────────
+
+def _parse_status_multi_master(raw: str) -> Optional[dict]:
+    """Parse [multi_master] section from STATUS response.
+
+    The section looks like:
+      [multi_master]
+      node_id: 1
+      peer_count: 2
+      connected_peers: 2
+      mm_conflicts_total: 5
+      anti_entropy_runs: 10
+      hlc_physical_ns: 1700000000000000000
+      hlc_logical: 42
+      hlc_drift_ns: 1234
+
+    Returns a dict with parsed values, or None if section not found.
+    """
+    marker = "[multi_master]"
+    idx = raw.find(marker)
+    if idx == -1:
+        return None
+
+    result = {}
+    lines = raw[idx + len(marker):].split("\n")
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            break  # next section
+        if ":" in line:
+            key, _, value = line.partition(":")
+            key = key.strip()
+            value = value.strip()
+            # Try to parse as int
+            try:
+                result[key] = int(value)
+            except ValueError:
+                result[key] = value
+    return result if result else None
+
+
+def _parse_mm_peers_tsv(header: List[str], data_rows: List[List[str]]) -> List[dict]:
+    """Parse MM_PEERS TSV response into list of peer dicts.
+
+    Expected columns: node_id, address, status, hlc_timestamp, lag_bytes
+    """
+    peers = []
+    for row in data_rows:
+        peer = {}
+        for i, col in enumerate(header):
+            if i < len(row):
+                val = row[i]
+                # Try to parse numeric fields
+                if col in ("node_id", "lag_bytes"):
+                    try:
+                        peer[col] = int(val)
+                    except ValueError:
+                        peer[col] = val
+                else:
+                    peer[col] = val
+            else:
+                peer[col] = ""
+        peers.append(peer)
+    return peers
+
+
+def _parse_mm_conflicts_tsv(header: List[str], data_rows: List[List[str]]) -> List[dict]:
+    """Parse MM_CONFLICTS TSV response into list of conflict dicts.
+
+    Expected columns: timestamp, symbol, exchange, side, price,
+    local_hlc, remote_hlc, local_origin, remote_origin, result
+    """
+    conflicts = []
+    for row in data_rows:
+        entry = {}
+        for i, col in enumerate(header):
+            if i < len(row):
+                val = row[i]
+                # Try to parse numeric fields
+                if col in ("price", "local_origin", "remote_origin", "timestamp"):
+                    try:
+                        entry[col] = int(val)
+                    except ValueError:
+                        entry[col] = val
+                else:
+                    entry[col] = val
+            else:
+                entry[col] = ""
+        conflicts.append(entry)
+    return conflicts
 
 
 # ── Unified Engine class ───────────────────────────────────────────────────────
@@ -1236,7 +1375,12 @@ class OrderbookEngine:
         raise OrderbookError(-1, f"Unexpected PING response: {raw}")
 
     def status(self) -> dict:
-        """Get server status. In TCP/pool mode returns server stats, in local mode returns mode info."""
+        """Get server status. In TCP/pool mode returns server stats, in local mode returns mode info.
+
+        When connected to a multi-master node, the returned dict includes a
+        'multi_master' key with metrics: node_id, peer_count, connected_peers,
+        mm_conflicts_total, anti_entropy_runs, hlc_physical_ns, hlc_logical, hlc_drift_ns.
+        """
         if self._closed:
             raise OrderbookError(-1, "Engine is closed")
         if self._mode == "local":
@@ -1248,11 +1392,59 @@ class OrderbookEngine:
         is_err, msg, header, data_rows = _parse_tcp_response(raw)
         if is_err:
             raise OrderbookError(-1, f"STATUS error: {msg}")
+
+        result: dict = {"mode": self._mode}
+
         if data_rows and len(data_rows[0]) >= 3:
-            return {
-                "mode": self._mode,
-                "sessions": int(data_rows[0][0]),
-                "queries": int(data_rows[0][1]),
-                "inserts": int(data_rows[0][2]),
-            }
-        return {"mode": self._mode}
+            result["sessions"] = int(data_rows[0][0])
+            result["queries"] = int(data_rows[0][1])
+            result["inserts"] = int(data_rows[0][2])
+
+        # Parse [multi_master] section from raw response
+        mm_section = _parse_status_multi_master(raw)
+        if mm_section:
+            result["multi_master"] = mm_section
+
+        return result
+
+    def mm_peers(self) -> List[dict]:
+        """Query multi-master peer list.
+
+        Sends MM_PEERS command and parses the TSV response.
+        Returns a list of dicts with keys: node_id, address, status,
+        hlc_timestamp, lag_bytes.
+        """
+        if self._closed:
+            raise OrderbookError(-1, "Engine is closed")
+        if self._mode == "local":
+            return []
+        if self._mode == "pool":
+            raw = self._pool.execute_read("MM_PEERS")
+        else:
+            raw = self._tcp.execute("MM_PEERS")
+        is_err, msg, header, data_rows = _parse_tcp_response(raw)
+        if is_err:
+            raise OrderbookError(-1, f"MM_PEERS error: {msg}")
+        peers = _parse_mm_peers_tsv(header, data_rows)
+        logger.debug("MM peers: %s", peers)
+        return peers
+
+    def mm_conflicts(self, limit: int = 100) -> List[dict]:
+        """Query multi-master conflict log.
+
+        Sends MM_CONFLICTS <limit> command and parses the TSV response.
+        Returns a list of dicts with conflict entries.
+        """
+        if self._closed:
+            raise OrderbookError(-1, "Engine is closed")
+        if self._mode == "local":
+            return []
+        if self._mode == "pool":
+            raw = self._pool.execute_read(f"MM_CONFLICTS {limit}")
+        else:
+            raw = self._tcp.execute(f"MM_CONFLICTS {limit}")
+        is_err, msg, header, data_rows = _parse_tcp_response(raw)
+        if is_err:
+            raise OrderbookError(-1, f"MM_CONFLICTS error: {msg}")
+        conflicts = _parse_mm_conflicts_tsv(header, data_rows)
+        return conflicts

@@ -232,6 +232,45 @@ std::string format_status(const ServerStats& stats) {
         out += '\n';
     }
 
+    // Multi-master metrics (only when node_role == MULTI_MASTER, i.e. mm_node_role == 3)
+    if (stats.mm_node_role == 3) {
+        out += "[multi_master]\n";
+        out += "node_id: ";
+        out += std::to_string(stats.mm_node_id);
+        out += '\n';
+        out += "peer_count: ";
+        out += std::to_string(stats.mm_peer_count);
+        out += '\n';
+        out += "connected_peers: ";
+        out += std::to_string(stats.mm_connected_peers);
+        out += '\n';
+        out += "mm_conflicts_total: ";
+        out += std::to_string(stats.mm_conflicts_total);
+        out += '\n';
+        out += "anti_entropy_runs: ";
+        out += std::to_string(stats.mm_anti_entropy_runs);
+        out += '\n';
+        out += "anti_entropy_repairs: ";
+        out += std::to_string(stats.mm_anti_entropy_repairs);
+        out += '\n';
+        out += "hlc_physical_ns: ";
+        out += std::to_string(stats.mm_hlc_physical_ns);
+        out += '\n';
+        out += "hlc_logical: ";
+        out += std::to_string(stats.mm_hlc_logical);
+        out += '\n';
+        out += "hlc_drift_ns: ";
+        out += std::to_string(stats.mm_hlc_drift_ns);
+        out += '\n';
+        for (const auto& [peer_id, lag] : stats.mm_replication_lag_per_peer) {
+            out += "replication_lag_peer_";
+            out += std::to_string(peer_id);
+            out += ": ";
+            out += std::to_string(lag);
+            out += '\n';
+        }
+    }
+
     out += '\n'; // empty line terminator
     return out;
 }

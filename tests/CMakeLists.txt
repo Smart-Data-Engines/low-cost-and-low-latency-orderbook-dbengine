@@ -445,6 +445,120 @@ if(OB_USE_IO_URING)
     gtest_discover_tests(test_io_uring PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
 endif()
 
+# ── HLC property-based and unit tests (multi-master-replication, Tasks 1.4–1.10) ─
+add_executable(test_hlc test_hlc.cpp)
+target_link_libraries(test_hlc
+    PRIVATE
+        orderbook_hlc
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_hlc PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
+
+# ── ConflictResolver property-based and unit tests (multi-master-replication, Tasks 5.4–5.5) ─
+add_executable(test_conflict_resolver test_conflict_resolver.cpp)
+target_link_libraries(test_conflict_resolver
+    PRIVATE
+        orderbook_conflict_resolver
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_conflict_resolver PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
+
+# ── PeerRegistry property-based and unit tests (multi-master-replication, Tasks 7.4–7.6) ─
+add_executable(test_peer_registry test_peer_registry.cpp)
+target_link_libraries(test_peer_registry
+    PRIVATE
+        orderbook_peer_registry
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_peer_registry PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
+
+# ── WALRecordV2 property-based and unit tests (multi-master-replication, Tasks 3.4–3.5) ─
+add_executable(test_wal_v2 test_wal_v2.cpp)
+target_link_libraries(test_wal_v2
+    PRIVATE
+        orderbook_wal
+        orderbook_soa
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_wal_v2 PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
+
+# ── MultiMasterManager property-based and unit tests (multi-master-replication, Tasks 10.4–10.6) ─
+add_executable(test_multi_master test_multi_master.cpp)
+target_link_libraries(test_multi_master
+    PRIVATE
+        orderbook_multi_master
+        orderbook_engine
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_multi_master PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
+
+# ── Wire protocol multi-master tests (multi-master-replication, Tasks 13.5–13.6) ─
+add_executable(test_wire_protocol_mm test_wire_protocol_mm.cpp)
+target_link_libraries(test_wire_protocol_mm
+    PRIVATE
+        orderbook_tcp_server_lib
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_wire_protocol_mm PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
+
+# ── ShardRouter multi-master property and unit tests (multi-master-replication, Tasks 19.4–19.5) ─
+add_executable(test_shard_router_mm test_shard_router_mm.cpp)
+target_link_libraries(test_shard_router_mm
+    PRIVATE
+        orderbook_shard_router
+        orderbook_shard_map
+        orderbook_tcp_server_lib
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_shard_router_mm PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
+
+# ── CLI multi-master tests (multi-master-replication, Tasks 15.4–15.5) ─
+add_executable(test_cli_mm test_cli_mm.cpp)
+target_link_libraries(test_cli_mm
+    PRIVATE
+        orderbook_tcp_server_lib
+        GTest::gtest_main
+)
+gtest_discover_tests(test_cli_mm PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+
+# ── MM Replication Networking property-based tests (mm-replication-networking, Tasks 1.2–1.5) ─
+add_executable(test_mm_networking test_mm_networking.cpp)
+target_link_libraries(test_mm_networking
+    PRIVATE
+        orderbook_multi_master
+        orderbook_engine
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_mm_networking PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
+
+# ── MM Port Isolation property-based tests (mm-port-isolation, Task 5.1) ──────
+add_executable(test_mm_port_isolation test_mm_port_isolation.cpp)
+target_link_libraries(test_mm_port_isolation
+    PRIVATE
+        orderbook_multi_master
+        orderbook_engine
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_mm_port_isolation PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
+
 # ── Integration test binary (Python test suite calls this) ────────────────────
 add_executable(ob_integration_test integration/ob_integration_test.cpp)
 target_link_libraries(ob_integration_test PRIVATE orderbook_client)

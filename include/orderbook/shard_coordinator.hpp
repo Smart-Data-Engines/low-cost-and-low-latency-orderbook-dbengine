@@ -151,6 +151,9 @@ private:
 
     // Rollback migration
     void rollback_migration(const std::string& symbol_key);
+
+    // Propagate multi-master topology from etcd to ShardMap
+    void propagate_mm_topology();
 };
 
 } // namespace ob

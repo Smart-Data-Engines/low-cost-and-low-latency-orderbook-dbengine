@@ -23,6 +23,8 @@ enum class CommandType {
     SHARD_MAP,
     SHARD_INFO,
     MIGRATE,
+    MM_PEERS,
+    MM_CONFLICTS,
     UNKNOWN
 };
 
@@ -62,6 +64,7 @@ struct Command {
     std::string target_node_id; // for FAILOVER
     std::string migrate_symbol;       // "symbol.exchange" for MIGRATE
     std::string migrate_target_shard; // target shard_id for MIGRATE
+    size_t      mm_conflicts_limit{100}; // for MM_CONFLICTS
 };
 
 // ── Free functions ────────────────────────────────────────────────────────────

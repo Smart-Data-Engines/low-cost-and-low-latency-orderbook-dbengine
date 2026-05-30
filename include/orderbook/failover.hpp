@@ -25,9 +25,10 @@ class Engine;  // forward
 // ── Node role ────────────────────────────────────────────────────────────────
 
 enum class NodeRole : uint8_t {
-    STANDALONE = 0,
-    PRIMARY    = 1,
-    REPLICA    = 2,
+    STANDALONE   = 0,
+    PRIMARY      = 1,
+    REPLICA      = 2,
+    MULTI_MASTER = 3,
 };
 
 // ── Failover configuration ──────────────────────────────────────────────────
@@ -84,6 +85,9 @@ public:
 
     /// Get current node role.
     NodeRole role() const;
+
+    /// Set node role externally (used by Engine to set MULTI_MASTER).
+    void set_role(NodeRole role);
 
     /// Get current epoch.
     EpochValue epoch() const;

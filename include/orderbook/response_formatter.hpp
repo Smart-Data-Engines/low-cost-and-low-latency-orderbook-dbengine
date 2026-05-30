@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace ob {
@@ -76,6 +77,19 @@ struct ServerStats {
 
     // Routing errors
     uint64_t    shard_routing_errors{0};
+
+    // Multi-master metrics
+    uint8_t     mm_node_role{0};          // NodeRole enum value (3 = MULTI_MASTER)
+    uint16_t    mm_node_id{0};
+    size_t      mm_peer_count{0};
+    size_t      mm_connected_peers{0};
+    uint64_t    mm_conflicts_total{0};
+    uint64_t    mm_anti_entropy_runs{0};
+    uint64_t    mm_anti_entropy_repairs{0};
+    uint64_t    mm_hlc_physical_ns{0};
+    uint16_t    mm_hlc_logical{0};
+    int64_t     mm_hlc_drift_ns{0};
+    std::vector<std::pair<uint16_t, size_t>> mm_replication_lag_per_peer;
 };
 
 // ── Parsed response (for round-trip testing) ──────────────────────────────────
