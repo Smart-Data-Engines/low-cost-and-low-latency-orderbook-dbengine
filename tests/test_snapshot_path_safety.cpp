@@ -412,6 +412,70 @@ TEST(SnapshotPathSafetyE2E, AbsoluteSnapshotFileIsRejected) {
     engine.close();
 }
 
+// ── Atomic staging: a bad file never gets the final name ──────────────────────
+
+TEST(SnapshotPathSafetyE2E, CorruptFileLeavesNoStagedArtifact) {
+    // Content is written to a locally named temporary file and only renamed into
+    // place after the CRC checks out. A peer that sends a wrong CRC must leave
+    // neither the destination file nor the temporary behind.
+    SafetyTempDir tmp("e2e_crc");
+    ASSERT_FALSE(tmp.str().empty());
+
+    const uint16_t port = alloc_free_port();
+    ASSERT_NE(port, 0);
+    const int listen_fd = create_mock_primary(port);
+    ASSERT_GE(listen_fd, 0);
+
+    const std::string data_dir    = tmp.str() + "/data";
+    const std::string staging_dir = data_dir + "/snapshot_staging";
+    fs::create_directories(data_dir);
+
+    ob::Engine engine(data_dir, 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host         = "127.0.0.1";
+    cfg.primary_port         = port;
+    cfg.state_file           = data_dir + "/repl_state.txt";
+    cfg.snapshot_staging_dir = staging_dir;
+
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    const int peer_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(peer_fd, 0);
+    ASSERT_EQ(recv_line(peer_fd, 3000).rfind("REPLICATE", 0), 0u);
+    ASSERT_TRUE(send_str(peer_fd, "ERR WAL_TRUNCATED\n"));
+    ASSERT_EQ(recv_line(peer_fd, 5000), "SNAPSHOT_REQUEST");
+
+    // A legitimate relative path, but a CRC that does not match the payload.
+    ASSERT_TRUE(send_str(peer_fd, "SNAPSHOT_BEGIN 5 0 0 1\n"));
+    ASSERT_TRUE(send_str(peer_fd, "SNAPSHOT_FILE segment_0001/prices.col 5 12345\n"));
+    ASSERT_TRUE(send_str(peer_fd, "BADDD"));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    EXPECT_FALSE(fs::exists(staging_dir + "/segment_0001/prices.col"))
+        << "a file that failed its CRC must not carry the final name";
+
+    // And no temporary left over. cleanup_staging() removes the staging tree, so
+    // check for stragglers anywhere under the data directory.
+    int leftovers = 0;
+    if (fs::exists(data_dir)) {
+        for (const auto& e : fs::recursive_directory_iterator(data_dir)) {
+            if (e.path().filename().string().rfind(".incoming_", 0) == 0) {
+                ++leftovers;
+            }
+        }
+    }
+    EXPECT_EQ(leftovers, 0) << "temporary snapshot files were left behind";
+
+    client.stop();
+    ::close(peer_fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
 // ── File permissions ──────────────────────────────────────────────────────────
 
 TEST(SnapshotFilePermissions, ReplicationStateFileIsNotWorldAccessible) {
