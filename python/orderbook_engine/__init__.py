@@ -30,6 +30,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
+try:
+    import lz4.frame as _lz4_frame
+except ImportError:  # pragma: no cover - depends on the install extras
+    # Compression is an opt-in extra: `pip install "orderbook-dbengine[compression]"`.
+    # Imported here rather than inside _send()/_recv() so that the absence can be
+    # reported *before* the server is switched into compressed framing.
+    _lz4_frame = None
+
 logger = logging.getLogger("orderbook_engine")
 
 __version__ = "0.2.0"
@@ -171,7 +179,18 @@ class _TcpBackend:
 
         Sends COMPRESS LZ4 command and verifies the OK response.
         Must be called before any other commands (right after connect).
+
+        The lz4 check comes first on purpose. COMPRESS LZ4 switches the server's
+        framing for the rest of the session, so negotiating without being able to
+        compress would leave the connection permanently desynchronised: every
+        subsequent command would be sent as plain text into a socket the server is
+        now reading as length-prefixed frames.
         """
+        if _lz4_frame is None:
+            raise OrderbookError(
+                -1,
+                "compress=True requires the lz4 package: "
+                'pip install "orderbook-dbengine[compression]"')
         self._send("COMPRESS LZ4")
         resp = self._recv_response()
         if not resp.startswith("OK COMPRESS LZ4"):
@@ -191,9 +210,7 @@ class _TcpBackend:
             line += "\n"
         data = line.encode("utf-8")
         if self._compressed:
-            import lz4.frame
-            import struct
-            compressed = lz4.frame.compress(data)
+            compressed = _lz4_frame.compress(data)
             header = struct.pack(">I", len(compressed))
             self._sock.sendall(header + compressed)
         else:
@@ -223,8 +240,6 @@ class _TcpBackend:
         Server sends: [4-byte BE frame_len][LZ4 compressed frame]
         This matches Session::send_response() binary framing.
         """
-        import lz4.frame
-        import struct
 
         # Read 4-byte length header
         while len(self._buf) < 4:
@@ -252,7 +267,7 @@ class _TcpBackend:
         compressed = bytes(self._buf[:frame_len])
         self._buf = self._buf[frame_len:]
 
-        decompressed = lz4.frame.decompress(compressed)
+        decompressed = _lz4_frame.decompress(compressed)
         return decompressed.decode("utf-8", errors="replace")
 
     def _recv_plain_response(self) -> str:
@@ -1049,6 +1064,35 @@ class _ClientPool:
 
 # ── Multi-master response parsers ──────────────────────────────────────────────
 
+def _parse_status_fields(raw: str) -> dict:
+    """Collect the top-level `key: value` lines of a STATUS response.
+
+    Stops at the first `[section]` marker, so sectioned blocks such as
+    `[multi_master]` stay with their own parser and cannot shadow a top-level key.
+    Values that look like integers are converted; anything else (an address, a role
+    name) is kept as text.
+    """
+    result: dict = {}
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            break
+        if ":" not in line:
+            continue  # the OK line and the TSV counter row
+        key, _, value = line.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if not key or " " in key:
+            continue  # prose, not a field
+        try:
+            result[key] = int(value)
+        except ValueError:
+            result[key] = value
+    return result
+
+
 def _parse_status_multi_master(raw: str) -> Optional[dict]:
     """Parse [multi_master] section from STATUS response.
 
@@ -1399,6 +1443,12 @@ class OrderbookEngine:
             result["sessions"] = int(data_rows[0][0])
             result["queries"] = int(data_rows[0][1])
             result["inserts"] = int(data_rows[0][2])
+
+        # Every other `key: value` line the server sends. Previously only the three
+        # TSV counters above were kept, so replication lag, TTL reclamation, segment
+        # counts, shard state and flush integrity were all sent by the server and
+        # dropped here — invisible to any Python client, including the tests.
+        result.update(_parse_status_fields(raw))
 
         # Parse [multi_master] section from raw response
         mm_section = _parse_status_multi_master(raw)

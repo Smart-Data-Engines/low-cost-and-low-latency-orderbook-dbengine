@@ -347,3 +347,70 @@ TEST(MetricsRegistryUnit, SerializeFormat) {
     EXPECT_NE(output.find("ob_query_latency_seconds_sum{node_role=\"primary\"}"),
               std::string::npos);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Unregistered metric names must not be swallowed.
+//
+// Six of the engine's gauges were written as `segment_count`, `pending_rows` and
+// so on while being registered as `ob_segment_count`, `ob_pending_rows`. Every one
+// of those writes matched nothing and returned quietly, so /metrics served flat
+// zeros for as long as the metrics existed.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(MetricsRegistry, WriteToUnregisteredNameIsCounted) {
+    ob::MetricsRegistry registry;
+    ASSERT_EQ(registry.unknown_metric_writes(), 0u);
+
+    registry.set_gauge("segment_count", 7);            // missing ob_ prefix
+    registry.increment_counter("inserts_total", 3);    // never registered
+    registry.observe_histogram("query_latency", 0.01); // never registered
+
+    EXPECT_EQ(registry.unknown_metric_writes(), 3u)
+        << "a write to an unregistered name updated nothing and said nothing";
+
+    // The correctly named gauge must still be untouched by the bad write.
+    EXPECT_EQ(registry.gauge_value("ob_segment_count"), 0);
+}
+
+TEST(MetricsRegistry, CorrectlyNamedWritesAreNotReportedAsUnknown) {
+    ob::MetricsRegistry registry;
+
+    registry.set_gauge("ob_segment_count", 12);
+    registry.set_gauge("ob_pending_rows", 5);
+    registry.set_gauge("ob_segment_merge_refused", 0);
+    registry.increment_counter("ob_total_inserts", 2);
+    registry.observe_histogram("ob_query_latency_seconds", 0.002);
+
+    EXPECT_EQ(registry.unknown_metric_writes(), 0u);
+    EXPECT_EQ(registry.gauge_value("ob_segment_count"), 12);
+    EXPECT_EQ(registry.gauge_value("ob_pending_rows"), 5);
+}
+
+TEST(MetricsRegistry, EveryMetricTheEngineWritesIsRegistered) {
+    // Names the engine and multi-master layer write to. Kept as a list rather than
+    // scanning the sources, so adding a metric means adding it here too.
+    const char* gauges[] = {
+        "ob_pending_rows", "ob_segment_count", "ob_symbol_count", "ob_wal_file_index",
+        "ob_current_epoch", "ob_segment_merge_refused", "ob_active_sessions",
+        "ob_mm_peers_connected", "ob_mm_replication_lag_bytes", "ob_mm_hlc_drift_ns",
+    };
+    const char* counters[] = {
+        "ob_total_inserts", "ob_total_queries", "ob_total_flushes",
+        "ob_wal_records_written", "ob_repl_records_replayed", "ob_mm_conflicts_total",
+        "ob_mm_anti_entropy_runs_total", "ob_mm_anti_entropy_repairs_total",
+        "ob_mm_backpressure_snapshot_total",
+    };
+    const char* histograms[] = {
+        "ob_insert_latency_seconds", "ob_query_latency_seconds",
+        "ob_flush_latency_seconds",
+    };
+
+    ob::MetricsRegistry registry;
+    for (const char* name : gauges)     registry.set_gauge(name, 1);
+    for (const char* name : counters)   registry.increment_counter(name, 1);
+    for (const char* name : histograms) registry.observe_histogram(name, 0.001);
+
+    EXPECT_EQ(registry.unknown_metric_writes(), 0u)
+        << "at least one name written by the engine is not registered, so its value "
+           "is discarded and /metrics reports zero for it";
+}

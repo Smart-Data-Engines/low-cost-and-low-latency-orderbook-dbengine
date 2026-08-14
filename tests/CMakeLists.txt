@@ -321,6 +321,14 @@ target_link_libraries(test_incremental_flush
 )
 gtest_discover_tests(test_incremental_flush PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 
+add_executable(test_flush_race test_flush_race.cpp)
+target_link_libraries(test_flush_race
+    PRIVATE
+        orderbook_engine
+        GTest::gtest_main
+)
+gtest_discover_tests(test_flush_race)
+
 # ── TTL retention tests (compression-and-ttl, Tasks 7.2, 8.3–8.5) ────────────
 add_executable(test_ttl_retention test_ttl_retention.cpp)
 target_link_libraries(test_ttl_retention

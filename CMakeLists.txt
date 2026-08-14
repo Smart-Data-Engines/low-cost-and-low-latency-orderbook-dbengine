@@ -147,12 +147,14 @@ else()
 endif()
 
 # ── Metrics registry compiled library ──────────────────────────────────────────
-add_library(orderbook_metrics STATIC src/metrics.cpp)
-target_link_libraries(orderbook_metrics PUBLIC orderbook_core)
-
 # ── Structured logger compiled library ─────────────────────────────────────────
 add_library(orderbook_logger STATIC src/logger.cpp)
 target_link_libraries(orderbook_logger PUBLIC orderbook_core)
+
+add_library(orderbook_metrics STATIC src/metrics.cpp)
+# Needs the logger: a write to an unregistered metric name updates nothing, so it
+# has to be reported rather than swallowed.
+target_link_libraries(orderbook_metrics PUBLIC orderbook_core orderbook_logger)
 
 # ── HLC (Hybrid Logical Clock) compiled library ───────────────────────────────
 add_library(orderbook_hlc STATIC src/hlc.cpp)

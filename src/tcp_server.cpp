@@ -257,6 +257,9 @@ std::string execute_command(const Command& cmd,
         stats.ttl_segments_deleted = es.ttl_segments_deleted;
         stats.ttl_bytes_reclaimed  = es.ttl_bytes_reclaimed;
 
+        // Flush integrity
+        stats.segment_merge_refused = es.segment_merge_refused;
+
         // Sharding metrics
         stats.shard_id              = es.shard_id;
         stats.shard_status          = es.shard_status;

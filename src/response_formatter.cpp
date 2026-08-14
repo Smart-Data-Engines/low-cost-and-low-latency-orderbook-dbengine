@@ -198,6 +198,11 @@ std::string format_status(const ServerStats& stats) {
     out += std::to_string(stats.ttl_bytes_reclaimed);
     out += '\n';
 
+    // Flush integrity
+    out += "segment_merge_refused: ";
+    out += std::to_string(stats.segment_merge_refused);
+    out += '\n';
+
     // Sharding metrics (only when shard_id is non-empty)
     if (!stats.shard_id.empty()) {
         out += "shard_id: ";

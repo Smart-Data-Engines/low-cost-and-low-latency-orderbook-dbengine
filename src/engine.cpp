@@ -155,20 +155,23 @@ void Engine::close() {
         flush_thread_.join();
     }
 
-    // Final flush of all pending rows under the lock (Phase A).
+    // flush_mtx_ is taken after join(), never before: the flush thread holds it for
+    // the duration of a tick, so taking it first would make this thread wait on the
+    // very thread it is about to join.
     {
-        std::unique_lock<std::mutex> lock(mtx_);
-        // Group commit: sync any remaining WAL records.
-        wal_.sync();
-        flush_drain_pending();
-    }
+        std::lock_guard<std::mutex> flush_lock(flush_mtx_);
 
-    // Phase B: flush segments to disk + merge (no mutex).
-    flush_write_and_merge();
+        // Final flush of all pending rows under the lock (Phase A).
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            // Group commit: sync any remaining WAL records.
+            wal_.sync();
+            flush_drain_pending();
+        }
 
-    // Flush each per-symbol columnar store again for any remaining active segments.
-    for (auto& [key, store] : stores_) {
-        store->flush_segment();
+        // Phase B: segment I/O + merge. This closes every active segment, so the
+        // second flush_segment() loop that used to follow was dead code.
+        flush_write_and_merge();
     }
 
     // Flush WAL to disk.
@@ -250,7 +253,7 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta, const Level* levels) {
     }
 
     // Update gauge: pending rows after enqueue.
-    registry_.set_gauge("pending_rows", static_cast<int64_t>(pending_rows_.size()));
+    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
 
     return status;
 }
@@ -340,7 +343,7 @@ ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta, const Level* levels
         query_engine_->notify_subscribers(delta.symbol, delta.exchange, row);
     }
 
-    registry_.set_gauge("pending_rows", static_cast<int64_t>(pending_rows_.size()));
+    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
 
     return status;
 }
@@ -448,7 +451,7 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta, const Level* le
 
     // 6. Do NOT broadcast further (single-hop propagation in full-mesh).
 
-    registry_.set_gauge("pending_rows", static_cast<int64_t>(pending_rows_.size()));
+    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
 
     return OB_OK;
 }
@@ -527,6 +530,9 @@ Engine::Stats Engine::stats() {
     s.ttl_segments_deleted = ttl_segments_deleted_.load(std::memory_order_relaxed);
     s.ttl_bytes_reclaimed  = ttl_bytes_reclaimed_.load(std::memory_order_relaxed);
 
+    // Flush integrity.
+    s.segment_merge_refused = segment_merge_refused_.load(std::memory_order_relaxed);
+
     // Sharding metrics: populated when ShardCoordinator is available (Task 8).
     // shard_id, shard_status, shard_symbols_count, shard_map_version,
     // migration_in_progress, migration_symbol, migration_target_shard,
@@ -569,16 +575,31 @@ SnapshotManifest Engine::create_snapshot() {
 
     // Phase 1: flush + capture under lock (< 100ms).
     {
+        // flush_mtx_ before mtx_: this path writes segments, so it must not run
+        // alongside flush_loop() or a client FLUSH.
+        std::lock_guard<std::mutex> flush_lock(flush_mtx_);
         std::unique_lock<std::mutex> lock(mtx_);
 
         // Flush all pending rows to columnar stores.
         wal_.sync();
         flush_drain_pending();
 
-        // Flush all per-symbol columnar store active segments.
+        // Flush all per-symbol columnar store active segments. The returned metas
+        // must be merged, not dropped: SELECT reads combined_store_ only, so a
+        // snapshot that flushed rows without merging them made the rows it had just
+        // persisted disappear from every query until the next open_existing().
+        std::vector<SegmentMeta> flushed;
         for (auto& [key, store] : stores_) {
-            store->flush_segment();
+            for (auto& rolled : store->take_rolled_segments()) {
+                flushed.push_back(std::move(rolled));
+            }
+            auto meta = store->flush_segment();
+            if (meta.has_value()) {
+                flushed.push_back(std::move(meta.value()));
+            }
         }
+        segment_merge_refused_.fetch_add(combined_store_.merge_segments(flushed),
+                                         std::memory_order_relaxed);
 
         // Capture WAL position atomically with the flush.
         manifest.wal_file_index  = wal_.current_file_index();
@@ -681,6 +702,9 @@ SnapshotManifest Engine::create_snapshot() {
 }
 
 void Engine::load_snapshot(const SnapshotManifest& /*manifest*/) {
+    // flush_mtx_ first: clearing stores_ destroys the ColumnarStore objects that a
+    // concurrent Phase B may be iterating over.
+    std::lock_guard<std::mutex> flush_lock(flush_mtx_);
     std::unique_lock<std::mutex> lock(mtx_);
 
     // Clear all in-memory state.
@@ -709,16 +733,26 @@ SnapshotManifest Engine::create_symbol_snapshot(const std::string& symbol_key) {
     SnapshotManifest manifest;
 
     {
+        // flush_mtx_ before mtx_, same reason as create_snapshot().
+        std::lock_guard<std::mutex> flush_lock(flush_mtx_);
         std::unique_lock<std::mutex> lock(mtx_);
 
         // Flush pending rows for this symbol to columnar stores.
         wal_.sync();
         flush_drain_pending();
 
-        // Flush the per-symbol columnar store segment if it exists.
+        // Flush the per-symbol columnar store segment if it exists, merging the
+        // metas for the same reason as create_snapshot(): a dropped meta hides the
+        // rows it just wrote from every SELECT.
         auto it = stores_.find(symbol_key);
         if (it != stores_.end()) {
-            it->second->flush_segment();
+            std::vector<SegmentMeta> flushed = it->second->take_rolled_segments();
+            auto meta = it->second->flush_segment();
+            if (meta.has_value()) {
+                flushed.push_back(std::move(meta.value()));
+            }
+            segment_merge_refused_.fetch_add(combined_store_.merge_segments(flushed),
+                                         std::memory_order_relaxed);
         }
 
         // Capture WAL position atomically with the flush.
@@ -795,7 +829,7 @@ void Engine::promote_to_primary(const EpochValue& new_epoch) {
     wal_.append_epoch(new_epoch);
 
     // Update gauge: current epoch after promotion.
-    registry_.set_gauge("current_epoch", static_cast<int64_t>(new_epoch.term));
+    registry_.set_gauge("ob_current_epoch", static_cast<int64_t>(new_epoch.term));
 
     // Start ReplicationManager if not already running.
     if (!repl_mgr_ && repl_config_.port > 0) {
@@ -839,7 +873,7 @@ void Engine::demote_to_replica(const std::string& new_primary_address) {
 
     // Update metrics registry node role and epoch gauge.
     registry_.set_node_role("replica");
-    registry_.set_gauge("current_epoch",
+    registry_.set_gauge("ob_current_epoch",
                         static_cast<int64_t>(current_epoch_.load(std::memory_order_relaxed)));
 
     // Start ReplicationClient to new primary.
@@ -859,6 +893,17 @@ void Engine::demote_to_replica(const std::string& new_primary_address) {
         // already exist locally would be duplicated.
         OB_LOG_INFO("engine", "clearing local data before starting replication from %s",
                     new_primary_address.c_str());
+
+        // flush_mtx_ guards this block: clearing stores_ destroys the ColumnarStore
+        // objects a concurrent Phase B may be iterating. Taken here and not at the
+        // top of the function on purpose — repl_mgr_->stop() above joins a thread
+        // that can be inside create_snapshot() waiting for this very lock, so
+        // holding it across the stop would deadlock the demotion.
+        // Lock order is flush_mtx_ → mtx_, hence the release and reacquire.
+        lock.unlock();
+        std::unique_lock<std::mutex> flush_lock(flush_mtx_);
+        lock.lock();
+
         stores_.clear();
         buffers_.clear();
         live_ptrs_.clear();
@@ -887,6 +932,10 @@ void Engine::demote_to_replica(const std::string& new_primary_address) {
 
         // Reopen empty columnar store.
         combined_store_.open_existing();
+
+        // The store list is consistent again; release flush_mtx_ before starting the
+        // ReplicationClient so a catch-up flush does not wait on this function.
+        flush_lock.unlock();
 
         // Delete replication state file so catchup starts from position 0.
         {
@@ -1033,7 +1082,7 @@ SoABuffer& Engine::get_or_create_buffer(const std::string& symbol,
     buffers_[key] = std::move(buf);
 
     // Update gauge: symbol count after adding new symbol.
-    registry_.set_gauge("symbol_count", static_cast<int64_t>(buffers_.size()));
+    registry_.set_gauge("ob_symbol_count", static_cast<int64_t>(buffers_.size()));
 
     return ref;
 }
@@ -1071,6 +1120,9 @@ void Engine::flush_loop() {
             }
         }
 
+        // The whole tick is one flush, so a client FLUSH cannot interleave with it.
+        std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+
         // Phase A: drain pending rows under mutex.
         {
             std::unique_lock<std::mutex> lock(mtx_);
@@ -1080,11 +1132,11 @@ void Engine::flush_loop() {
             flush_drain_pending();
         }
 
-        // Phase B: flush segments to disk + merge (no mutex).
+        // Phase B: segment I/O + merge, outside mtx_ so writers are not blocked.
         flush_write_and_merge();
 
         // Update gauge: WAL file index.
-        registry_.set_gauge("wal_file_index",
+        registry_.set_gauge("ob_wal_file_index",
                             static_cast<int64_t>(wal_.current_file_index()));
 
         // WAL truncation and TTL scan under mutex.
@@ -1131,7 +1183,7 @@ void Engine::flush_drain_pending() {
     pending_rows_.clear();
 
     // Update gauge: pending rows is now 0 after drain.
-    registry_.set_gauge("pending_rows", 0);
+    registry_.set_gauge("ob_pending_rows", 0);
 
     // Wake up any writers blocked on backpressure.
     pending_cv_.notify_all();
@@ -1139,9 +1191,31 @@ void Engine::flush_drain_pending() {
 
 void Engine::flush_write_and_merge() {
     // Phase B: flush segments to disk and merge into combined_store_.
-    // Runs WITHOUT mtx_ held (except for the brief merge at the end).
+    // Caller holds flush_mtx_. Runs WITHOUT mtx_ (except the brief merge at the end)
+    // so that disk I/O does not block writers.
+
+    // Snapshot the store pointers under mtx_. stores_ is mutated by
+    // get_or_create_store(), load_snapshot() and the REPLICA transition; iterating
+    // it unlocked risked an invalidated iterator on insert and a use-after-free on
+    // clear(). The raw pointers stay valid because every mutator of stores_ holds
+    // flush_mtx_, which this caller holds too.
+    std::vector<ColumnarStore*> stores;
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+        stores.reserve(stores_.size());
+        for (auto& [key, store] : stores_) {
+            stores.push_back(store.get());
+        }
+    }
+
     std::vector<SegmentMeta> new_segments;
-    for (auto& [key, store] : stores_) {
+    for (ColumnarStore* store : stores) {
+        // Segments closed by a rollover inside append() come first: append() has no
+        // reference to the query index, so it parks their metas here. Left
+        // uncollected, those rows are on disk and invisible to SELECT.
+        for (auto& rolled : store->take_rolled_segments()) {
+            new_segments.push_back(std::move(rolled));
+        }
         auto meta = store->flush_segment();
         if (meta.has_value()) {
             new_segments.push_back(std::move(meta.value()));
@@ -1150,22 +1224,33 @@ void Engine::flush_write_and_merge() {
 
     if (!new_segments.empty()) {
         std::unique_lock<std::mutex> lock(mtx_);
-        combined_store_.merge_segments(new_segments);
+        const size_t refused = combined_store_.merge_segments(new_segments);
+        if (refused > 0) {
+            segment_merge_refused_.fetch_add(refused, std::memory_order_relaxed);
+            registry_.set_gauge("ob_segment_merge_refused",
+                                static_cast<int64_t>(
+                                    segment_merge_refused_.load(std::memory_order_relaxed)));
+        }
 
         // Update gauge: segment count after merge.
-        registry_.set_gauge("segment_count",
+        registry_.set_gauge("ob_segment_count",
                             static_cast<int64_t>(combined_store_.segment_count()));
     }
 }
 
 void Engine::flush_incremental() {
+    // One flush at a time, whichever thread asks. A client FLUSH arriving while
+    // flush_loop() was mid-tick used to produce two Phase B passes over the same
+    // active segment, and the segment ended up in the query index twice.
+    std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+
     // Phase A: lock → WAL sync → drain pending rows → unlock
     {
         std::unique_lock<std::mutex> lock(mtx_);
         wal_.sync();
         flush_drain_pending();
     }
-    // Phase B: flush segments to disk + merge (no mutex)
+    // Phase B: segment I/O + merge, outside mtx_ so writers are not blocked.
     flush_write_and_merge();
 }
 

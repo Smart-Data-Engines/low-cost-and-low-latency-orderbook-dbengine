@@ -26,6 +26,13 @@ classifiers = [
     "Topic :: Office/Business :: Financial :: Investment",
 ]
 
+# The client needs no third-party package for the plain protocol. LZ4 session
+# compression does, so it is an extra rather than a hard dependency: an install
+# that never sets compress=True should not pull a binary wheel it will not use.
+[project.optional-dependencies]
+compression = ["lz4>=4.0"]
+test = ["pytest>=7.0", "requests>=2.28", "lz4>=4.0"]
+
 [project.urls]
 Homepage = "https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine"
 Repository = "https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine"

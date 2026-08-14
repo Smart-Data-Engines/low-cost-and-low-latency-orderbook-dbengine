@@ -199,11 +199,32 @@ static void BM_TimeRangeQuery(benchmark::State& state) {
     engine.close();
     engine.open();
 
+    // The engine's SELECT grammar is FROM '<symbol>'.'<exchange>' with a
+    // BETWEEN range. The earlier query here used a symbol='...' WHERE clause the
+    // parser does not accept, so execute() returned an error string, the callback
+    // never ran and this benchmark timed the parser rejecting a query — 4 µs that
+    // was published as the scan latency for 100k rows.
     const std::string sql =
-        "SELECT timestamp_ns, price, quantity "
-        "FROM orderbook WHERE symbol='BTC-USD' AND exchange='BENCH' "
-        "AND timestamp_ns >= " + std::to_string(base_ts) +
-        " AND timestamp_ns <= " + std::to_string(base_ts + static_cast<uint64_t>(N) * 1'000ULL);
+        "SELECT * FROM 'BTC-USD'.'BENCH' WHERE timestamp BETWEEN " +
+        std::to_string(base_ts) + " AND " +
+        std::to_string(base_ts + static_cast<uint64_t>(N) * 1'000ULL);
+
+    // Fail loudly rather than report a fast empty scan.
+    {
+        int64_t probe = 0;
+        const std::string err =
+            engine.execute(sql, [&](const ob::QueryResult&) { ++probe; });
+        if (!err.empty()) {
+            state.SkipWithError(("query rejected: " + err).c_str());
+            engine.close();
+            return;
+        }
+        if (probe == 0) {
+            state.SkipWithError("query returned no rows: nothing would be measured");
+            engine.close();
+            return;
+        }
+    }
 
     int64_t row_count = 0;
     for (auto _ : state) {

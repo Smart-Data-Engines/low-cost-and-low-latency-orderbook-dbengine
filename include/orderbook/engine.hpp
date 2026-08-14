@@ -137,6 +137,10 @@ public:
         uint64_t ttl_segments_deleted{0};   // cumulative segments deleted
         uint64_t ttl_bytes_reclaimed{0};    // cumulative bytes reclaimed
 
+        // Flush integrity: segments refused as already indexed. Non-zero means two
+        // flush paths raced; rows would have been scanned twice.
+        uint64_t segment_merge_refused{0};
+
         // Sharding metrics
         std::string shard_id;                // empty = non-sharded
         std::string shard_status;            // "active", "joining", "draining"
@@ -290,6 +294,12 @@ private:
     TTLConfig ttl_config_;
     std::atomic<uint64_t> ttl_segments_deleted_{0};
     std::atomic<uint64_t> ttl_bytes_reclaimed_{0};
+
+    // Segments refused by merge_segments() because their directory was already in
+    // the index. Should stay at zero: any increment means two flush paths raced and
+    // the duplicate was caught by the index check rather than prevented by
+    // flush_mtx_. Worth alerting on, and it is what the concurrency test asserts.
+    std::atomic<uint64_t> segment_merge_refused_{0};
     uint64_t last_ttl_scan_ns_{0};
 
     // Sharding: symbols that have been migrated away from this shard
@@ -304,6 +314,17 @@ private:
     std::thread       flush_thread_;
     std::atomic<bool> stop_flush_{false};
     std::mutex        mtx_;
+
+    // Serialises every path that writes segments or mutates stores_.
+    //
+    // Separate from mtx_ on purpose: segment I/O must not block writers, so Phase B
+    // deliberately runs outside mtx_. But two flushers in Phase B at once each saw
+    // the same active segment, wrote the same directory and merged the same meta,
+    // so every row in it came back from SELECT twice. A concurrent stores_.clear()
+    // during a role transition freed stores mid-iteration on top of that.
+    //
+    // LOCK ORDER: flush_mtx_ → mtx_ → ColumnarStore::index_mtx_. Never the reverse.
+    std::mutex        flush_mtx_;
 
     // Shutdown signalling for the flush thread. Kept separate from pending_cv_
     // so that backpressure traffic cannot interfere with it, and so that close()
@@ -329,7 +350,7 @@ private:
     ColumnarStore& get_or_create_store(const std::string& symbol, const std::string& exchange);
     void flush_loop();
     void flush_drain_pending();    // Phase A: drain pending_rows_ → per-symbol append (must hold mtx_)
-    void flush_write_and_merge();  // Phase B: flush segments to disk + merge index (no mutex)
+    void flush_write_and_merge();  // Phase B: segment I/O + merge index (must hold flush_mtx_, not mtx_)
 };
 
 } // namespace ob
