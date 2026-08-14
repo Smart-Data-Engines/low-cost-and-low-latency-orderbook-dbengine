@@ -327,7 +327,6 @@ codebase. Each item is also a story we can sell as bespoke work.
 |----------|------|--------|---------|
 | **P0** | Restore integration test suite (#25) | M | The repo currently ships a test framework with no tests. Fix before anything else. |
 | **P0** | Fix graceful failover (#26) | M | `FAILOVER <node>` ignores the target and the outgoing primary re-takes the role ~40-50% of the time |
-| **P0** | Pin `rapidcheck` to a commit SHA (see `docs/github-security.md`) | S | `GIT_TAG master` means our build can break, or be compromised, without us changing a line |
 | **P1** | Deployment artifacts (#30) | M | Cheapest large jump in time-to-first-run |
 | **P1** | Reproducible comparative benchmarks (#35) | L | Makes the performance claim verifiable by a reader instead of asserted |
 | **P1** | Authentication and TLS (#27) | L | The single blocker to production adoption |
@@ -348,7 +347,6 @@ Things a reviewer will notice, listed here so they do not look like oversights:
 - **No authentication, no TLS.** Trusted-network deployment only (#27).
 - **Integration test files missing from the repo** (#25). The framework is present and the C++ suite
   is complete: 510 tests, all passing.
-- **`rapidcheck` is pinned to `master`**, a moving dependency in a public build.
 - **`FAILOVER <target_node_id>` does not honour the target** and the outgoing primary can immediately
   re-acquire the role it just released (#26). Reproducible: `EtcdTestFixture.GracefulFailover` fails
   40-50% of runs.

@@ -27,6 +27,10 @@ elseif(OB_ENABLE_AVX2)
 endif()
 
 # ── Dependencies via FetchContent ──────────────────────────────────────────────
+# Every dependency is pinned to a commit SHA, with the corresponding tag in a
+# trailing comment. Tags are mutable upstream; a SHA is not. When bumping a
+# dependency, resolve the new SHA with:
+#   git ls-remote https://github.com/<owner>/<repo>.git 'refs/tags/<tag>^{}'
 include(FetchContent)
 
 # Test/benchmark deps are only needed when building tests
@@ -37,7 +41,7 @@ if(OB_BUILD_TESTS)
     FetchContent_Declare(
         googletest
         GIT_REPOSITORY https://github.com/google/googletest.git
-        GIT_TAG        v1.14.0
+        GIT_TAG        f8d7d77c06936315286eb55f8de22cd23c188571  # v1.14.0
     )
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
     set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
@@ -47,7 +51,7 @@ if(OB_BUILD_TESTS)
     FetchContent_Declare(
         benchmark
         GIT_REPOSITORY https://github.com/google/benchmark.git
-        GIT_TAG        v1.8.3
+        GIT_TAG        344117638c8ff7e239044fd0fa7085839fc03021  # v1.8.3
     )
     set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
     set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
@@ -58,7 +62,10 @@ if(OB_BUILD_TESTS)
     FetchContent_Declare(
         rapidcheck
         GIT_REPOSITORY https://github.com/emil-e/rapidcheck.git
-        GIT_TAG        master
+        # Pinned to a commit: rapidcheck publishes no releases, and tracking
+        # master meant an upstream change could break or alter our build without
+        # a change on our side.
+        GIT_TAG        6e8dadfdafa3a74eabb52ead87f8787f72eccd0b  # master as of 2026-08-14
     )
     set(RC_ENABLE_GTEST ON CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(rapidcheck)
@@ -68,7 +75,7 @@ endif()
 FetchContent_Declare(
     nlohmann_json
     GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG        v3.11.3
+    GIT_TAG        9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03  # v3.11.3
 )
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 set(JSON_Install OFF CACHE BOOL "" FORCE)

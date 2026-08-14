@@ -120,8 +120,8 @@ Included in this repo:
 
 Rules that matter for workflow security:
 
-- **Pin third-party actions to a full commit SHA**, not a tag. A tag can be moved; a SHA cannot.
-  `actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0`
+- **Third-party actions are pinned to full commit SHAs** ✅, not tags. A tag can be moved; a SHA
+  cannot. Dependabot understands this form and keeps bumping both the SHA and the version comment.
 - **Least-privilege `permissions:`** — `permissions: contents: read` at workflow level, widened only
   where needed (CodeQL needs `security-events: write`).
 - **Never use `pull_request_target`** with a checkout of the PR head. That combination hands a fork's
@@ -172,10 +172,15 @@ own branch.
 The build fetches at configure time via `FetchContent`: googletest, google/benchmark, rapidcheck,
 nlohmann/json. Two problems:
 
-- **`rapidcheck` is pinned to `master`.** A moving target: an upstream change can break our build,
-  and in the worst case a compromised upstream lands in it. **Pin it to a commit SHA.**
-- The others are pinned to tags (`v1.14.0`, `v1.8.3`, `v3.11.3`), which is acceptable, but a tag is
-  still mutable upstream. SHAs are strictly better.
+All four are pinned to commit SHAs ✅, with the corresponding tag in a trailing comment. Tags are
+mutable upstream; a SHA is not. `rapidcheck` publishes no releases at all, so it was previously
+tracking `master` — an upstream change could have altered our build without any change on our side.
+
+When bumping a dependency, resolve the new SHA rather than writing a tag:
+
+```bash
+git ls-remote https://github.com/<owner>/<repo>.git 'refs/tags/<tag>^{}'
+```
 
 System libraries (`liblz4`, `libcurl`, `liburing`) and `etcd` come from the OS or an official release
 tarball and are covered by the normal update path. Document the versions we test against so a
@@ -219,6 +224,6 @@ handles (c), and 2FA with signed commits and tag protection handle (d).
 ⚙️ org-wide 2FA
 ⚙️ SSH/GPG signing key registered as a signing key (before requiring signatures)
 ⚙️ verify the CODEOWNERS handle resolves
-☐  pin rapidcheck to a commit SHA in CMakeLists.txt
-☐  pin third-party actions to commit SHAs
+✅ all FetchContent dependencies pinned to commit SHAs
+✅ third-party actions pinned to commit SHAs
 ```

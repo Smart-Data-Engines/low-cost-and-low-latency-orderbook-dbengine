@@ -22,7 +22,7 @@ jobs:
       packages: read
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Install system dependencies
         run: |
@@ -32,7 +32,7 @@ jobs:
             liblz4-dev libcurl4-openssl-dev liburing-dev
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@f3712979fa5f215279b101dd0a2e3bdfb4353324  # v3
         with:
           languages: c-cpp
           build-mode: manual
@@ -46,6 +46,6 @@ jobs:
           cmake --build build -j$(nproc)
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@f3712979fa5f215279b101dd0a2e3bdfb4353324  # v3
         with:
           category: /language:c-cpp
