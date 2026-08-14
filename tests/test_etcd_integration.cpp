@@ -559,6 +559,319 @@ TEST_F(EtcdTestFixture, FullFailoverCycle) {
     engine_b->close();
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Graceful failover, spec graceful-failover-fix (roadmap #26)
+//
+// The old GracefulFailover test above checked a single run, which a 50/50 race
+// passes half the time. These check the properties that were actually broken:
+// the role goes where the operator sent it, and the outgoing primary stays out.
+//
+// Which test guards which mechanism, established by disabling each one and
+// observing what turns red:
+//
+//   handover intent / deferral  -> TargetWinsOverOtherReplicas
+//   outgoing-primary cooldown   -> TargetGoneFallsBackToElection
+//
+// Note that HandsRoleToTarget does NOT catch a missing deferral: with only two
+// nodes the cooldown alone is enough to let the target win. That is why the
+// three-node test exists, and why it starts the extra replica BEFORE the target.
+// Two overlapping mechanisms can each look tested while neither actually is.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+/// One primary/replica pair wired to the test etcd, used by the handover tests.
+struct HandoverPair {
+    TempDir dir_a{"ho_a"};
+    TempDir dir_b{"ho_b"};
+    std::unique_ptr<ob::Engine> engine_a;
+    std::unique_ptr<ob::Engine> engine_b;
+    std::unique_ptr<ob::FailoverManager> fm_a;
+    std::unique_ptr<ob::FailoverManager> fm_b;
+
+    ~HandoverPair() {
+        if (fm_a) fm_a->stop();
+        if (fm_b) fm_b->stop();
+        if (engine_a) engine_a->close();
+        if (engine_b) engine_b->close();
+    }
+};
+
+ob::FailoverConfig make_failover_config(const std::string& node_id,
+                                        const std::string& address) {
+    ob::FailoverConfig fc{};
+    fc.coordinator.endpoints = {EtcdTestEnvironment::endpoint()};
+    fc.coordinator.lease_ttl_seconds = TEST_LEASE_TTL;
+    fc.coordinator.node_id = node_id;
+    fc.coordinator.cluster_prefix = ETCD_KEY_PREFIX;
+    fc.failover_enabled = true;
+    fc.replication_address = address;
+    // Short windows keep the tests quick; the ordering they verify does not
+    // depend on the absolute values.
+    fc.handover_grace_seconds = 3;
+    fc.handover_cooldown_seconds = 6;
+    return fc;
+}
+
+bool wait_for_role(const ob::FailoverManager& fm, ob::NodeRole want,
+                   std::chrono::seconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (fm.role() == want) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return fm.role() == want;
+}
+
+} // namespace
+
+TEST_F(EtcdTestFixture, GracefulFailoverHandsRoleToTarget) {
+    // Ten iterations. A race that the outgoing primary wins about half the time
+    // would show up here as a failure, not as a lucky pass.
+    constexpr int kIterations = 10;
+
+    for (int iter = 0; iter < kIterations; ++iter) {
+        clean_etcd_keys();
+
+        HandoverPair p;
+        p.engine_a = make_engine("node_A", p.dir_a.path);
+        p.engine_b = make_engine("node_B", p.dir_b.path);
+        p.engine_a->open();
+        p.engine_b->open();
+
+        p.fm_a = std::make_unique<ob::FailoverManager>(
+            make_failover_config("node_A", "127.0.0.1:19031"), *p.engine_a);
+        p.fm_a->start();
+        ASSERT_TRUE(wait_for_role(*p.fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)))
+            << "iteration " << iter << ": node_A should start as primary";
+        const uint64_t epoch_before = p.fm_a->epoch().term;
+
+        p.fm_b = std::make_unique<ob::FailoverManager>(
+            make_failover_config("node_B", "127.0.0.1:19032"), *p.engine_b);
+        p.fm_b->start();
+        ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)))
+            << "iteration " << iter << ": node_B should start as replica";
+
+        // The target must be known to the coordinator to be nameable.
+        {
+            auto pub = make_client("node_B");
+            ASSERT_TRUE(pub->connect());
+            ASSERT_TRUE(pub->publish_wal_position(0, 0));
+            pub->disconnect();
+        }
+
+        ASSERT_EQ(p.fm_a->initiate_graceful_failover("node_B"),
+                  ob::FailoverManager::HandoverResult::OK)
+            << "iteration " << iter;
+
+        EXPECT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::PRIMARY, std::chrono::seconds(8)))
+            << "iteration " << iter
+            << ": the named target must take over, but role is "
+            << static_cast<int>(p.fm_b->role());
+        EXPECT_EQ(p.fm_a->role(), ob::NodeRole::REPLICA)
+            << "iteration " << iter << ": the outgoing primary must stay a replica";
+        EXPECT_GT(p.fm_b->epoch().term, epoch_before)
+            << "iteration " << iter << ": epoch must advance on handover";
+    }
+}
+
+TEST_F(EtcdTestFixture, GracefulFailoverTargetWinsOverOtherReplicas) {
+    // Three nodes. This is the case that pins down the handover intent itself:
+    // with only two nodes the outgoing primary's cooldown is enough to let the
+    // target win, so the deferral logic is never exercised. Here a third replica
+    // is free to compete, and only the intent keeps it from taking a role the
+    // operator assigned to someone else.
+    TempDir dir_a("ho3_a");
+    TempDir dir_b("ho3_b");
+    TempDir dir_c("ho3_c");
+
+    auto engine_a = make_engine("node_A", dir_a.path);
+    auto engine_b = make_engine("node_B", dir_b.path);
+    auto engine_c = make_engine("node_C", dir_c.path);
+    engine_a->open();
+    engine_b->open();
+    engine_c->open();
+
+    auto cfg_a = make_failover_config("node_A", "127.0.0.1:19041");
+    ob::FailoverManager fm_a(cfg_a, *engine_a);
+    fm_a.start();
+    ASSERT_TRUE(wait_for_role(fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
+    const uint64_t epoch_before = fm_a.epoch().term;
+
+    // node_C is started BEFORE the handover target on purpose. Its monitor loop
+    // therefore reaches the empty leader key first, so without the intent it
+    // wins the race. That is what makes this test sensitive to the deferral
+    // logic rather than to startup order.
+    ob::FailoverManager fm_c(make_failover_config("node_C", "127.0.0.1:19043"), *engine_c);
+    fm_c.start();
+    ASSERT_TRUE(wait_for_role(fm_c, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
+
+    ob::FailoverManager fm_b(make_failover_config("node_B", "127.0.0.1:19042"), *engine_b);
+    fm_b.start();
+    ASSERT_TRUE(wait_for_role(fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
+
+    {
+        auto pub = make_client("node_B");
+        ASSERT_TRUE(pub->connect());
+        ASSERT_TRUE(pub->publish_wal_position(0, 0));
+        pub->disconnect();
+    }
+
+    ASSERT_EQ(fm_a.initiate_graceful_failover("node_B"),
+              ob::FailoverManager::HandoverResult::OK);
+
+    EXPECT_TRUE(wait_for_role(fm_b, ob::NodeRole::PRIMARY, std::chrono::seconds(8)))
+        << "the named target must take over even with another replica available";
+    EXPECT_NE(fm_c.role(), ob::NodeRole::PRIMARY)
+        << "node_C took a role that was handed to node_B";
+    EXPECT_EQ(fm_a.role(), ob::NodeRole::REPLICA);
+    EXPECT_GT(fm_b.epoch().term, epoch_before);
+
+    fm_a.stop();
+    fm_b.stop();
+    fm_c.stop();
+    engine_a->close();
+    engine_b->close();
+    engine_c->close();
+}
+
+TEST_F(EtcdTestFixture, GracefulFailoverOutgoingPrimaryDoesNotReacquire) {
+    HandoverPair p;
+    p.engine_a = make_engine("node_A", p.dir_a.path);
+    p.engine_b = make_engine("node_B", p.dir_b.path);
+    p.engine_a->open();
+    p.engine_b->open();
+
+    auto cfg_a = make_failover_config("node_A", "127.0.0.1:19033");
+    p.fm_a = std::make_unique<ob::FailoverManager>(cfg_a, *p.engine_a);
+    p.fm_a->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
+
+    p.fm_b = std::make_unique<ob::FailoverManager>(
+        make_failover_config("node_B", "127.0.0.1:19034"), *p.engine_b);
+    p.fm_b->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
+
+    {
+        auto pub = make_client("node_B");
+        ASSERT_TRUE(pub->connect());
+        ASSERT_TRUE(pub->publish_wal_position(0, 0));
+        pub->disconnect();
+    }
+
+    ASSERT_EQ(p.fm_a->initiate_graceful_failover("node_B"),
+              ob::FailoverManager::HandoverResult::OK);
+
+    // Watch node_A across the whole grace window plus a margin. This is the
+    // regression that matters: it used to reclaim the role about a second later.
+    const auto watch_until = std::chrono::steady_clock::now() +
+                             std::chrono::seconds(cfg_a.handover_grace_seconds + 2);
+    while (std::chrono::steady_clock::now() < watch_until) {
+        ASSERT_NE(p.fm_a->role(), ob::NodeRole::PRIMARY)
+            << "the outgoing primary reclaimed the role it just handed away";
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    EXPECT_EQ(p.fm_b->role(), ob::NodeRole::PRIMARY)
+        << "the target should hold the role by now";
+}
+
+TEST_F(EtcdTestFixture, GracefulFailoverUnknownTargetIsRejected) {
+    HandoverPair p;
+    p.engine_a = make_engine("node_A", p.dir_a.path);
+    p.engine_a->open();
+
+    p.fm_a = std::make_unique<ob::FailoverManager>(
+        make_failover_config("node_A", "127.0.0.1:19035"), *p.engine_a);
+    p.fm_a->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
+    const uint64_t epoch_before = p.fm_a->epoch().term;
+
+    EXPECT_EQ(p.fm_a->initiate_graceful_failover("node_that_does_not_exist"),
+              ob::FailoverManager::HandoverResult::UNKNOWN_TARGET);
+
+    // Naming ourselves is equally pointless and must not cost us the role.
+    EXPECT_EQ(p.fm_a->initiate_graceful_failover("node_A"),
+              ob::FailoverManager::HandoverResult::INVALID_TARGET);
+    EXPECT_EQ(p.fm_a->initiate_graceful_failover(""),
+              ob::FailoverManager::HandoverResult::INVALID_TARGET);
+
+    // A rejected handover is not a partial one: still primary, same epoch.
+    EXPECT_EQ(p.fm_a->role(), ob::NodeRole::PRIMARY);
+    EXPECT_EQ(p.fm_a->epoch().term, epoch_before);
+}
+
+TEST_F(EtcdTestFixture, GracefulFailoverTargetGoneFallsBackToElection) {
+    // Intent names a node that is not running. After the grace window the
+    // remaining replica must take over, so an unreachable target cannot leave
+    // the cluster without a primary.
+    HandoverPair p;
+    p.engine_a = make_engine("node_A", p.dir_a.path);
+    p.engine_b = make_engine("node_B", p.dir_b.path);
+    p.engine_a->open();
+    p.engine_b->open();
+
+    auto cfg_a = make_failover_config("node_A", "127.0.0.1:19037");
+    p.fm_a = std::make_unique<ob::FailoverManager>(cfg_a, *p.engine_a);
+    p.fm_a->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
+
+    p.fm_b = std::make_unique<ob::FailoverManager>(
+        make_failover_config("node_B", "127.0.0.1:19038"), *p.engine_b);
+    p.fm_b->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
+
+    // Register a third node that never runs, then hand the role to it.
+    {
+        auto ghost = make_client("node_ghost");
+        ASSERT_TRUE(ghost->connect());
+        ASSERT_TRUE(ghost->publish_wal_position(0, 0));
+        ghost->disconnect();
+    }
+
+    ASSERT_EQ(p.fm_a->initiate_graceful_failover("node_ghost"),
+              ob::FailoverManager::HandoverResult::OK);
+
+    // node_B defers while the intent is live, then wins the ordinary election.
+    EXPECT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::PRIMARY,
+                              std::chrono::seconds(cfg_a.handover_grace_seconds + 8)))
+        << "cluster left without a primary after the target failed to appear";
+}
+
+TEST_F(EtcdTestFixture, UngracefulFailoverStillImmediate) {
+    // No intent involved: a replica must promote as soon as the leader key is
+    // gone. Guards against the handover machinery slowing down real failover.
+    HandoverPair p;
+    p.engine_a = make_engine("node_A", p.dir_a.path);
+    p.engine_b = make_engine("node_B", p.dir_b.path);
+    p.engine_a->open();
+    p.engine_b->open();
+
+    p.fm_a = std::make_unique<ob::FailoverManager>(
+        make_failover_config("node_A", "127.0.0.1:19039"), *p.engine_a);
+    p.fm_a->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
+
+    p.fm_b = std::make_unique<ob::FailoverManager>(
+        make_failover_config("node_B", "127.0.0.1:19040"), *p.engine_b);
+    p.fm_b->start();
+    ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
+
+    // Simulate the primary vanishing: stop() revokes its lease.
+    const auto killed_at = std::chrono::steady_clock::now();
+    p.fm_a->stop();
+
+    ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::PRIMARY, std::chrono::seconds(10)))
+        << "replica did not take over after the primary went away";
+
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - killed_at);
+    EXPECT_LT(took.count(), 6000)
+        << "promotion took " << took.count()
+        << " ms; ungraceful failover must not wait out a handover grace window";
+}
+
 // ── Task 5.2: GracefulFailover ───────────────────────────────────────────────
 // Validates: Requirements 3.1, 3.2, 3.3, 3.4
 
@@ -610,9 +923,20 @@ TEST_F(EtcdTestFixture, GracefulFailover) {
     }
     ASSERT_EQ(fm_b.role(), ob::NodeRole::REPLICA);
 
+    // node_B must publish a WAL position before it can be named as a handover
+    // target: the target is validated against what the coordinator knows.
+    {
+        auto pub = make_client("node_B");
+        ASSERT_TRUE(pub->connect());
+        ASSERT_TRUE(pub->publish_wal_position(0, 0));
+        pub->disconnect();
+    }
+
     // Initiate graceful failover on A.
-    bool ok = fm_a.initiate_graceful_failover("node_B");
-    EXPECT_TRUE(ok) << "initiate_graceful_failover should succeed";
+    const auto handover = fm_a.initiate_graceful_failover("node_B");
+    EXPECT_EQ(handover, ob::FailoverManager::HandoverResult::OK)
+        << "initiate_graceful_failover should succeed, got "
+        << static_cast<int>(handover);
 
     // Verify leader key is deleted quickly (≤1s) — check via CoordinatorClient.
     auto client = make_client("observer");

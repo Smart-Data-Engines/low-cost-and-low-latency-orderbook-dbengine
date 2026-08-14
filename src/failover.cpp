@@ -9,6 +9,23 @@
 
 namespace ob {
 
+namespace {
+
+/// Wall-clock nanoseconds, for the handover deadline.
+///
+/// Deliberately wall clock rather than steady clock: the deadline is written to
+/// etcd and read by other nodes, so it has to mean something across processes.
+/// Clock skew only widens or narrows the preference window; promotion still goes
+/// through a CAS, so it cannot cause two primaries.
+uint64_t wall_clock_ns() {
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+}
+
+} // namespace
+
+
 // ── Construction / destruction ───────────────────────────────────────────────
 
 FailoverManager::FailoverManager(FailoverConfig config,
@@ -163,23 +180,101 @@ int64_t FailoverManager::lease_ttl_remaining() const {
 
 // ── initiate_graceful_failover() ────────────────────────────────────────────
 
-bool FailoverManager::initiate_graceful_failover(
-        const std::string& /*target_node_id*/) {
-    if (role_.load() != NodeRole::PRIMARY) return false;
-    if (!coordinator_ || lease_id_.load() == 0) return false;
-
-    // Revoke our lease — replicas will detect the expiry and compete.
-    bool revoked = coordinator_->revoke_lease(lease_id_.load());
-    if (!revoked) return false;
-
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        lease_id_.store(0);
+FailoverManager::HandoverResult FailoverManager::initiate_graceful_failover(
+        const std::string& target_node_id) {
+    if (role_.load() != NodeRole::PRIMARY) {
+        return HandoverResult::NOT_PRIMARY;
+    }
+    if (!coordinator_ || lease_id_.load() == 0) {
+        return HandoverResult::NOT_CONFIGURED;
     }
 
+    const std::string& self_id = config_.coordinator.node_id;
+
+    // 1. Validate the target before touching anything. Handing the role to a
+    //    node that does not exist would drop the cluster into an election for
+    //    no reason, and the operator would see OK for an operation that did the
+    //    opposite of what they asked.
+    if (target_node_id.empty() || target_node_id == self_id) {
+        OB_LOG_WARN("failover",
+                    "Graceful failover rejected: invalid target '%s' (self=%s)",
+                    target_node_id.c_str(), self_id.c_str());
+        return HandoverResult::INVALID_TARGET;
+    }
+
+    {
+        const auto positions = coordinator_->get_published_positions();
+        const bool known = std::any_of(
+            positions.begin(), positions.end(),
+            [&](const PublishedPosition& p) { return p.node_id == target_node_id; });
+        if (!known) {
+            OB_LOG_WARN("failover",
+                        "Graceful failover rejected: unknown target %s "
+                        "(%zu nodes known to coordinator)",
+                        target_node_id.c_str(), positions.size());
+            return HandoverResult::UNKNOWN_TARGET;
+        }
+    }
+
+    // 2. Announce the intent BEFORE revoking the lease. The other order would
+    //    leave a window where the leader key is gone and nothing says who should
+    //    take it, which is exactly the race this fix removes.
+    HandoverIntent intent;
+    intent.target_node_id = target_node_id;
+    intent.from_node_id   = self_id;
+    intent.deadline_ns    = wall_clock_ns() +
+        static_cast<uint64_t>(config_.handover_grace_seconds) * 1'000'000'000ULL;
+
+    if (!coordinator_->publish_handover_intent(intent)) {
+        OB_LOG_ERROR("failover",
+                     "Graceful failover aborted: cannot publish intent, "
+                     "staying primary (target=%s)",
+                     target_node_id.c_str());
+        return HandoverResult::COORDINATOR_ERROR;
+    }
+
+    OB_LOG_INFO("failover",
+                "Graceful failover: handing role to %s (grace=%lds cooldown=%lds)",
+                target_node_id.c_str(),
+                static_cast<long>(config_.handover_grace_seconds),
+                static_cast<long>(config_.handover_cooldown_seconds));
+
+    // 3. Block ourselves from standing for election BEFORE revoking, so our own
+    //    monitor_loop() cannot slip into attempt_promotion() between the
+    //    revocation and the block.
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        election_blocked_until_ = std::chrono::steady_clock::now() +
+            std::chrono::seconds(config_.handover_cooldown_seconds);
+    }
+
+    // 4. Revoke the lease; the leader key is held under it, so it disappears and
+    //    the target sees an empty leader with an intent naming it.
+    const int64_t lease = lease_id_.load();
+    if (!coordinator_->revoke_lease(lease)) {
+        // We are still primary as far as etcd is concerned. Undo the block and
+        // clear the intent so the cluster is not left in a half-handed-over
+        // state.
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            election_blocked_until_ = {};
+        }
+        coordinator_->clear_handover_intent();
+        OB_LOG_ERROR("failover",
+                     "Graceful failover aborted: lease revoke failed, "
+                     "staying primary (lease=%ld)", static_cast<long>(lease));
+        return HandoverResult::COORDINATOR_ERROR;
+    }
+
+    lease_id_.store(0);
     role_.store(NodeRole::REPLICA);
 
-    // Discover the new primary from the coordinator.
+    OB_LOG_INFO("failover",
+                "Graceful failover: lease %ld revoked, now REPLICA, waiting for %s",
+                static_cast<long>(lease), target_node_id.c_str());
+
+    // 5. If the target was quick, adopt it as our primary right away. Otherwise
+    //    monitor_loop() will pick it up on its next pass.
     auto state = coordinator_->get_cluster_state();
     if (state.has_value() && !state->leader_address.empty()) {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -187,6 +282,38 @@ bool FailoverManager::initiate_graceful_failover(
         handler_.demote_to_replica(state->leader_address);
     }
 
+    return HandoverResult::OK;
+}
+
+/// Whether this node should stand aside because a graceful handover named
+/// someone else.
+///
+/// Returns true only while an intent is live and points at another node. An
+/// absent, unparsable or expired intent means ordinary election, which is what
+/// keeps an unreachable target from deadlocking the cluster: the deadline passes
+/// and everyone competes again.
+bool FailoverManager::should_defer_to_handover_target() {
+    if (!coordinator_) return false;
+
+    const auto intent = coordinator_->get_handover_intent();
+    if (!intent.has_value()) return false;
+    if (!intent->is_active(wall_clock_ns())) {
+        OB_LOG_DEBUG("failover",
+                     "Handover intent for %s has expired, resuming normal election",
+                     intent->target_node_id.c_str());
+        return false;
+    }
+
+    if (intent->target_node_id == config_.coordinator.node_id) {
+        OB_LOG_INFO("failover",
+                    "Handover intent targets us (from=%s), promoting",
+                    intent->from_node_id.c_str());
+        return false;
+    }
+
+    OB_LOG_DEBUG("failover",
+                 "Deferring election: handover intent targets %s (from=%s)",
+                 intent->target_node_id.c_str(), intent->from_node_id.c_str());
     return true;
 }
 
@@ -232,23 +359,33 @@ void FailoverManager::monitor_loop() {
             // Poll cluster state every 2 seconds to detect leader changes.
             if (coordinator_) {
                 auto state = coordinator_->get_cluster_state();
+
+                // There is no leader when the key is absent, which
+                // get_cluster_state() reports as nullopt, and also when it is
+                // present with an empty node id. Both cases must go through the
+                // same path: the first is what a lease revocation produces, so
+                // handling the handover only in the second would leave the
+                // common case unprotected.
+                const bool leader_present =
+                    state.has_value() && !state->leader_node_id.empty();
+
                 if (state.has_value()) {
                     reconcile_epoch(*state);
+                }
 
-                    if (state->leader_node_id.empty()) {
-                        // Leader gone — attempt promotion.
-                        handle_lease_expiry();
-                    } else {
-                        // Update known primary address.
-                        std::lock_guard<std::mutex> lk(mtx_);
-                        primary_address_ = state->leader_address;
-                    }
-                } else {
-                    // Could not read cluster state (key missing = leader gone).
-                    // Attempt promotion if failover is enabled.
-                    if (config_.failover_enabled) {
+                if (leader_present) {
+                    // Update known primary address.
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    primary_address_ = state->leader_address;
+                } else if (config_.failover_enabled) {
+                    // Before competing, check whether this is a graceful
+                    // handover with a named successor: if so, only that node
+                    // should campaign, so the role goes where the operator sent
+                    // it rather than to whoever is quickest.
+                    if (!should_defer_to_handover_target()) {
                         handle_lease_expiry();
                     }
+                    // Otherwise: not our turn, re-check on the next pass.
                 }
             }
         }
@@ -271,6 +408,23 @@ void FailoverManager::handle_lease_expiry() {
 
 void FailoverManager::attempt_promotion() {
     if (!coordinator_) return;
+
+    // A node that has just handed the role away must not win the election it
+    // announced. Without this, the outgoing primary races the intended successor
+    // and wins roughly half the time, because it already has a warm connection
+    // to the coordinator.
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        const auto now = std::chrono::steady_clock::now();
+        if (now < election_blocked_until_) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                election_blocked_until_ - now);
+            OB_LOG_DEBUG("failover",
+                         "attempt_promotion skipped: handover cooldown, %ld ms remaining",
+                         static_cast<long>(remaining.count()));
+            return;
+        }
+    }
 
     // Grant a new lease and try to acquire leadership via CAS.
     // If the leader key doesn't exist, CAS succeeds and we become primary.
@@ -312,6 +466,12 @@ void FailoverManager::attempt_promotion() {
 
     OB_LOG_INFO("failover", "promoted to PRIMARY, epoch=%lu",
                 static_cast<unsigned long>(new_epoch.term));
+
+    // The handover, if there was one, is complete. Clearing is best-effort: the
+    // intent expires on its own, and every reader checks the deadline anyway.
+    if (coordinator_->clear_handover_intent()) {
+        OB_LOG_DEBUG("failover", "Handover intent cleared after promotion");
+    }
 }
 
 // ── handle_primary_lease_lost() ─────────────────────────────────────────────

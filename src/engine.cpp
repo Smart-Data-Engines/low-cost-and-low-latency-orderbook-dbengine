@@ -976,11 +976,33 @@ std::string Engine::handle_failover_command(const std::string& target_node_id) {
     if (!failover_mgr_) {
         return "ERR failover_not_configured\n";
     }
-    bool ok = failover_mgr_->initiate_graceful_failover(target_node_id);
-    if (!ok) {
-        return "ERR failover_failed\n";
+
+    using HandoverResult = FailoverManager::HandoverResult;
+    const HandoverResult result =
+        failover_mgr_->initiate_graceful_failover(target_node_id);
+
+    OB_LOG_INFO("engine", "FAILOVER command: target=%s result=%d",
+                target_node_id.c_str(), static_cast<int>(result));
+
+    // Distinct codes so an operator can tell a typo in a node id from a
+    // coordinator problem. Previously every failure was "failover_failed".
+    switch (result) {
+    case HandoverResult::OK:
+        // Note: OK means the handover was initiated, not that it finished.
+        // Confirmation is ROLE reporting PRIMARY on the target node.
+        return "OK\n";
+    case HandoverResult::NOT_PRIMARY:
+        return "ERR not_primary\n";
+    case HandoverResult::NOT_CONFIGURED:
+        return "ERR failover_not_configured\n";
+    case HandoverResult::INVALID_TARGET:
+        return "ERR invalid_target " + target_node_id + "\n";
+    case HandoverResult::UNKNOWN_TARGET:
+        return "ERR unknown_target " + target_node_id + "\n";
+    case HandoverResult::COORDINATOR_ERROR:
+        break;
     }
-    return "OK\n";
+    return "ERR failover_failed\n";
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────

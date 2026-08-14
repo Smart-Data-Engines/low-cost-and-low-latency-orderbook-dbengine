@@ -388,6 +388,10 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
             if (!ep.empty()) config.coordinator_endpoints.push_back(ep);
         } else if (arg == "--coordinator-lease-ttl" && i + 1 < argc) {
             config.coordinator_lease_ttl = std::stoll(argv[++i]);
+        } else if (arg == "--handover-grace-seconds" && i + 1 < argc) {
+            config.handover_grace_seconds = std::stoll(argv[++i]);
+        } else if (arg == "--handover-cooldown-seconds" && i + 1 < argc) {
+            config.handover_cooldown_seconds = std::stoll(argv[++i]);
         } else if (arg == "--node-id" && i + 1 < argc) {
             config.node_id = argv[++i];
         } else if (arg == "--failover-enabled" && i + 1 < argc) {
@@ -432,12 +436,36 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
         }
     }
 
+    // Validation: handover windows must be sane. A cooldown shorter than the
+    // grace window would let the outgoing primary win the race it announced,
+    // which is the bug this configuration exists to prevent.
+    if (config.handover_grace_seconds <= 0 || config.handover_cooldown_seconds <= 0) {
+        std::fprintf(stderr,
+                     "Error: --handover-grace-seconds and --handover-cooldown-seconds "
+                     "must be positive\n");
+        std::exit(1);
+    }
+    if (config.handover_cooldown_seconds < config.handover_grace_seconds) {
+        std::fprintf(stderr,
+                     "Error: --handover-cooldown-seconds (%ld) must be >= "
+                     "--handover-grace-seconds (%ld)\n",
+                     static_cast<long>(config.handover_cooldown_seconds),
+                     static_cast<long>(config.handover_grace_seconds));
+        std::exit(1);
+    }
+
     // Validation: --shard-id requires --coordinator-endpoints
     if (!config.shard_id.empty() && config.coordinator_endpoints.empty()) {
         std::fprintf(stderr,
             "Error: --shard-id requires --coordinator-endpoints to be specified. "
             "Shard mode needs etcd for shard map coordination.\n");
         std::exit(1);
+    }
+
+    if (!config.coordinator_endpoints.empty()) {
+        OB_LOG_INFO("tcp_server", "Handover: grace=%lds cooldown=%lds",
+                    static_cast<long>(config.handover_grace_seconds),
+                    static_cast<long>(config.handover_cooldown_seconds));
     }
 
     if (!config.shard_id.empty()) {
@@ -535,6 +563,8 @@ TcpServer::TcpServer(ServerConfig config)
     if (!config_.coordinator_endpoints.empty()) {
         failover_config.coordinator.endpoints = config_.coordinator_endpoints;
         failover_config.coordinator.lease_ttl_seconds = config_.coordinator_lease_ttl;
+        failover_config.handover_grace_seconds    = config_.handover_grace_seconds;
+        failover_config.handover_cooldown_seconds = config_.handover_cooldown_seconds;
         failover_config.coordinator.node_id = config_.node_id;
         failover_config.failover_enabled = config_.failover_enabled;
         failover_config.replication_port = config_.replication_port;
