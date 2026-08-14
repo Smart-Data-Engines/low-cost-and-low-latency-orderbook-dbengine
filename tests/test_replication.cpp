@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include "orderbook/replication.hpp"
 
+#include <set>
+
 TEST(ReplicationSmoke, ConfigDefaults) {
     ob::ReplicationConfig config;
     EXPECT_EQ(config.port, 0);
@@ -1092,6 +1094,47 @@ protected:
 
 // ── Test: Basic snapshot creation ────────────────────────────────────────────
 // Validates: Requirements 1.1-1.6
+TEST_F(SnapshotEngineTest, SnapshotIncludesEveryColumnFile) {
+    // The file walk used to match an allowlist of column names, so adding a
+    // column to the segment format silently left it out of every snapshot. A
+    // replica bootstrapped from such a snapshot receives segments its own reader
+    // then rejects as incomplete, which is a data-loss bug two components apart
+    // from the change that caused it.
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    populate_engine(engine, 10);
+    engine.close();
+    engine.open();
+
+    auto manifest = engine.create_snapshot();
+
+    // Gather the column files that actually exist on disk.
+    std::set<std::string> on_disk;
+    for (auto& entry : std::filesystem::recursive_directory_iterator(tmp_->str())) {
+        if (entry.is_regular_file() && entry.path().extension() == ".col") {
+            on_disk.insert(entry.path().filename().string());
+        }
+    }
+    ASSERT_FALSE(on_disk.empty()) << "sanity: the flush should have written columns";
+
+    std::set<std::string> in_manifest;
+    for (const auto& f : manifest.files) {
+        auto name = std::filesystem::path(f.path).filename().string();
+        if (std::filesystem::path(name).extension() == ".col") {
+            in_manifest.insert(name);
+        }
+    }
+
+    for (const auto& name : on_disk) {
+        EXPECT_TRUE(in_manifest.count(name) > 0)
+            << "column file " << name << " exists on disk but is missing from the "
+               "snapshot manifest; a replica restoring this snapshot would get an "
+               "incomplete segment";
+    }
+
+    engine.close();
+}
+
 TEST_F(SnapshotEngineTest, SnapshotCreateBasic) {
     ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
     engine.open();

@@ -601,10 +601,15 @@ SnapshotManifest Engine::create_snapshot() {
             const auto& path = entry.path();
             const auto filename = path.filename().string();
 
-            // Only include columnar segment files and meta.json.
-            if (filename != "price.col" && filename != "qty.col" &&
-                filename != "ts.col" && filename != "cnt.col" &&
-                filename != "meta.json") {
+            // Include every columnar file plus its metadata.
+            //
+            // Matched by extension rather than by an allowlist of names: the
+            // allowlist version silently dropped side.col, level.col and seq.col
+            // when they were added, which would have shipped replicas segments
+            // the reader then rejects as incomplete. One place to forget is
+            // better than two.
+            const bool is_column_file = path.extension() == ".col";
+            if (!is_column_file && filename != "meta.json") {
                 continue;
             }
 
