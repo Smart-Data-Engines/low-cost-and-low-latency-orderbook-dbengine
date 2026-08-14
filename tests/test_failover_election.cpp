@@ -7,10 +7,12 @@
 // replica with the lexicographically lowest node_id should win. This ordering
 // should be deterministic and total.
 
+#include "orderbook/coordinator.hpp"
 #include "orderbook/failover.hpp"
 
 #include <gtest/gtest.h>
 #include <rapidcheck.h>
+#include <rapidcheck/gtest.h>
 
 #include <algorithm>
 #include <random>
@@ -117,6 +119,95 @@ TEST(FailoverElection, HigherOffsetWins) {
     const auto* w = elect_winner(positions);
     ASSERT_NE(w, nullptr);
     EXPECT_EQ(w->node_id, "nodeB");
+}
+
+// ── HandoverIntent ────────────────────────────────────────────────────────────
+
+TEST(HandoverIntent, JsonRoundTrip) {
+    ob::HandoverIntent in;
+    in.target_node_id = "node_B";
+    in.from_node_id   = "node_A";
+    in.deadline_ns    = 1755164400000000000ULL;
+
+    ob::HandoverIntent out;
+    ASSERT_TRUE(ob::HandoverIntent::from_json(in.to_json(), out));
+    EXPECT_EQ(out.target_node_id, in.target_node_id);
+    EXPECT_EQ(out.from_node_id, in.from_node_id);
+    EXPECT_EQ(out.deadline_ns, in.deadline_ns);
+}
+
+TEST(HandoverIntent, RejectsMalformedJson) {
+    ob::HandoverIntent out;
+
+    // Not JSON at all.
+    EXPECT_FALSE(ob::HandoverIntent::from_json("", out));
+    EXPECT_FALSE(ob::HandoverIntent::from_json("not json", out));
+    EXPECT_FALSE(ob::HandoverIntent::from_json("{}", out));
+
+    // Missing target: the intent would say nothing.
+    EXPECT_FALSE(ob::HandoverIntent::from_json(
+        R"({"deadline_ns":1,"from_node_id":"node_A"})", out));
+
+    // Missing origin.
+    EXPECT_FALSE(ob::HandoverIntent::from_json(
+        R"({"deadline_ns":1,"target_node_id":"node_B"})", out));
+
+    // Missing deadline: the intent would never expire, which is exactly the
+    // deadlock the deadline exists to prevent.
+    EXPECT_FALSE(ob::HandoverIntent::from_json(
+        R"({"from_node_id":"node_A","target_node_id":"node_B"})", out));
+
+    // Deadline present but not a number.
+    EXPECT_FALSE(ob::HandoverIntent::from_json(
+        R"({"deadline_ns":"soon","from_node_id":"node_A","target_node_id":"node_B"})", out));
+}
+
+TEST(HandoverIntent, ExpiresAtDeadline) {
+    ob::HandoverIntent intent;
+    intent.target_node_id = "node_B";
+    intent.from_node_id   = "node_A";
+    intent.deadline_ns    = 1000;
+
+    EXPECT_TRUE(intent.is_active(999));
+    EXPECT_FALSE(intent.is_active(1000));   // deadline reached: no longer active
+    EXPECT_FALSE(intent.is_active(1001));
+}
+
+TEST(HandoverIntent, KeyPath) {
+    EXPECT_EQ(ob::coordinator_handover_key("/ob/"), "/ob/handover");
+    EXPECT_EQ(ob::coordinator_handover_key("/cluster1/"), "/cluster1/handover");
+}
+
+RC_GTEST_PROP(HandoverIntentProperty, prop_json_round_trip_preserves_fields,
+              (const std::string& raw_target, const std::string& raw_from,
+               uint64_t deadline)) {
+    // Node ids come from configuration and etcd keys, so restrict to the
+    // characters those actually allow.
+    auto clean = [](const std::string& in) {
+        std::string out;
+        for (char c : in) {
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '_' || c == '-') {
+                out.push_back(c);
+            }
+        }
+        return out;
+    };
+
+    ob::HandoverIntent in;
+    in.target_node_id = clean(raw_target);
+    in.from_node_id   = clean(raw_from);
+    in.deadline_ns    = deadline;
+
+    RC_PRE(!in.target_node_id.empty());
+    RC_PRE(!in.from_node_id.empty());
+    RC_PRE(in.deadline_ns > 0ULL);
+
+    ob::HandoverIntent out;
+    RC_ASSERT(ob::HandoverIntent::from_json(in.to_json(), out));
+    RC_ASSERT(out.target_node_id == in.target_node_id);
+    RC_ASSERT(out.from_node_id == in.from_node_id);
+    RC_ASSERT(out.deadline_ns == in.deadline_ns);
 }
 
 } // namespace
