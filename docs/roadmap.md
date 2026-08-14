@@ -13,6 +13,15 @@ rather than hiding it.
 
 Effort scale: S = few days, M = week, L = 2-3 weeks, XL = month+.
 
+**Item numbers are permanent identifiers.** A new item takes the next free number and is placed
+wherever it reads best, so numbering is not ascending down the page and is not meant to be. Renumbering
+to keep it tidy costs more than it buys: three passes over this file each damaged something. A `#47-48`
+range became `#48-48`, because a rewrite only touches the bound carrying a `#`. References drifted onto
+neighbouring items while still resolving to *an* item, which no existence check can see. Commit
+messages, specs and `CLAUDE.md` cite these numbers, and every renumbering invalidates those citations
+too. `scripts/check_roadmap.py` verifies what is verifiable: unique ids, resolving references, and
+ranges that ascend. Whether a reference points at the item it means is on the reader.
+
 ---
 
 ## Phase 1 — Production Hardening ✅
