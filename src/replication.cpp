@@ -49,9 +49,107 @@ namespace ob {
 
 namespace fs = std::filesystem;
 
+// ── Snapshot path validation ──────────────────────────────────────────────────
+
+bool is_safe_snapshot_path(std::string_view rel) {
+    if (rel.empty() || rel.size() > kMaxSnapshotPathLen) {
+        return false;
+    }
+
+    // Absolute paths would ignore the base directory entirely.
+    if (rel.front() == '/') {
+        return false;
+    }
+
+    // Walk components manually rather than through fs::path, so the rules are
+    // explicit and do not depend on platform path semantics.
+    size_t start = 0;
+    while (start <= rel.size()) {
+        size_t slash = rel.find('/', start);
+        std::string_view comp = (slash == std::string_view::npos)
+                                    ? rel.substr(start)
+                                    : rel.substr(start, slash - start);
+
+        // Rejects a trailing slash, a leading slash and any `a//b`.
+        if (comp.empty()) {
+            return false;
+        }
+        // `..` escapes the base directory; `.` is pointless and worth rejecting
+        // so that only one spelling of a path is ever accepted.
+        if (comp == ".." || comp == ".") {
+            return false;
+        }
+        for (char c : comp) {
+            const bool allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                 (c >= '0' && c <= '9') ||
+                                 c == '.' || c == '_' || c == '-';
+            if (!allowed) {
+                return false;
+            }
+        }
+
+        if (slash == std::string_view::npos) {
+            break;
+        }
+        start = slash + 1;
+    }
+
+    return true;
+}
+
+bool path_stays_within(const std::string& base, std::string_view rel) {
+    std::error_code ec;
+
+    // weakly_canonical resolves symlinks and `..` for the parts that exist,
+    // and lexically normalises the rest.
+    const fs::path canonical_base = fs::weakly_canonical(fs::path(base), ec);
+    if (ec) {
+        return false;
+    }
+    const fs::path canonical_target =
+        fs::weakly_canonical(fs::path(base) / fs::path(std::string(rel)), ec);
+    if (ec) {
+        return false;
+    }
+
+    // Compare component-wise so that /data/foo is not treated as being inside
+    // /data/foobar.
+    auto b = canonical_base.begin();
+    auto t = canonical_target.begin();
+    for (; b != canonical_base.end(); ++b, ++t) {
+        if (t == canonical_target.end() || *t != *b) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 namespace {
+
+/// Opens a file for writing with mode 0640, bypassing the process umask.
+///
+/// std::fopen creates files with 0666 & ~umask, so the resulting permissions
+/// depend on how the server was started. Under a systemd unit without an
+/// explicit UMask= that yields world-writable database files. Returns nullptr
+/// on failure, with errno set by open().
+static std::FILE* open_file_private(const std::string& path, const char* mode) {
+    int flags = O_WRONLY | O_CREAT;
+    flags |= (std::strchr(mode, 'a') != nullptr) ? O_APPEND : O_TRUNC;
+
+    const int fd = ::open(path.c_str(), flags, S_IRUSR | S_IWUSR | S_IRGRP);
+    if (fd < 0) {
+        return nullptr;
+    }
+    std::FILE* f = ::fdopen(fd, mode);
+    if (!f) {
+        const int saved = errno;
+        ::close(fd);
+        errno = saved;
+    }
+    return f;
+}
 
 /// Build WAL filename for a given index: wal_000000.bin
 static std::string wal_filename(const std::string& dir, uint32_t index) {
@@ -1389,7 +1487,7 @@ void ReplicationClient::send_ack() {
 void ReplicationClient::save_state() {
     if (config_.state_file.empty()) return;
 
-    std::FILE* f = std::fopen(config_.state_file.c_str(), "w");
+    std::FILE* f = open_file_private(config_.state_file, "w");
     if (!f) return;
 
     std::fprintf(f, "file_index=%u\nbyte_offset=%zu\n",
@@ -1504,13 +1602,28 @@ void ReplicationClient::request_and_receive_snapshot() {
             return;
         }
 
+        // The peer controls this path. Reject anything that could escape the
+        // staging directory before it reaches the filesystem.
+        if (!is_safe_snapshot_path(rel_path) ||
+            !path_stays_within(staging_dir, rel_path)) {
+            OB_LOG_ERROR("repl_client",
+                         "Rejecting snapshot: unsafe file path from peer: '%s'",
+                         rel_path);
+            cleanup_staging(staging_dir);
+            bootstrapping_.store(false, std::memory_order_release);
+            return;
+        }
+
         // Create parent directories in staging.
         std::string staged_path = staging_dir + "/" + rel_path;
         fs::create_directories(fs::path(staged_path).parent_path());
 
         // Receive file data and write to staging.
         {
-            std::FILE* out = std::fopen(staged_path.c_str(), "wb");
+            // Explicit 0640 rather than fopen's 0666 masked by whatever umask
+            // the process happens to run with. Database files are not world
+            // readable and never world writable.
+            std::FILE* out = open_file_private(staged_path, "wb");
             if (!out) {
                 cleanup_staging(staging_dir);
                 bootstrapping_.store(false, std::memory_order_release);
@@ -1601,6 +1714,18 @@ void ReplicationClient::install_snapshot(const std::string& staging_dir,
     // We move entire segment directories (parent of column files).
     std::set<std::string> moved_dirs;
     for (const auto& entry : manifest.files) {
+        // Defence in depth. request_and_receive_snapshot() already validates
+        // every path before writing to staging, but this is the call that
+        // overwrites files inside the live data directory, so it re-checks
+        // rather than trusting the manifest it was handed.
+        if (!is_safe_snapshot_path(entry.path) ||
+            !path_stays_within(data_dir, entry.path)) {
+            OB_LOG_ERROR("repl_client",
+                         "Refusing to install snapshot entry with unsafe path: '%s'",
+                         entry.path.c_str());
+            continue;
+        }
+
         std::string src = staging_dir + "/" + entry.path;
         std::string dst = data_dir + "/" + entry.path;
 
