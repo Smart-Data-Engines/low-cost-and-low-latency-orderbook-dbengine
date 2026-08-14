@@ -121,7 +121,10 @@ Learned the hard way. Check here before debugging.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
-below refer to that file. Things a newcomer should know because they look like working features and
+below refer to that file. **Those numbers are permanent ids — never renumber them.** A new item takes
+the next free number wherever it sits on the page; `scripts/check_roadmap.py` (run in CI) checks ids,
+references and ranges. The rule exists because three renumbering passes each broke something, and
+because commit messages and specs cite these numbers. Things a newcomer should know because they look like working features and
 are not:
 
 - **Aggregations are unreachable over the wire protocol.** `SPREAD`, `MID_PRICE`, `IMBALANCE` and
