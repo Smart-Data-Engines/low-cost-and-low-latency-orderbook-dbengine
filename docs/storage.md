@@ -43,22 +43,61 @@ Each record:
         qty.col            Simple8b packed uint64 quantities
         ts.col             Raw uint64 timestamps
         cnt.col            Raw uint32 order counts
+        side.col           Raw uint8, 0 = bid, 1 = ask
+        level.col          Raw uint16 level index within the side, 0 = best
+        seq.col            Delta+zigzag, then Simple8b packed sequence numbers
         meta.json          Segment metadata
 ```
+
+Every field of `SnapshotRow` has a column. That was not always true: format
+version 1 stored only the first four and zeroed `side`, `level_index` and
+`sequence_number` on read, so any row that passed a flush came back as a bid at
+level 0. If you add a field to `SnapshotRow`, add its column here too — a
+structure that is wider than its format loses data silently.
+
+`seq.col` uses both stages on purpose. Zigzag-delta turns a large absolute
+sequence into a small non-negative number and tolerates a decrease, which happens
+in multi-master mode when records from different nodes land in one segment.
+Simple8b then bit-packs those small values. Zigzag alone costs a full 8 bytes per
+row, because the codec returns one `uint64` per value regardless of magnitude.
+
+Measured on 100,000 rows with mixed sides, 20 levels and sequential sequence
+numbers:
+
+| Column | Bytes/row | Encoding |
+|--------|-----------|----------|
+| `ts.col` | 8.00 | raw |
+| `price.col` | 8.00 | zigzag-delta, not bit-packed |
+| `cnt.col` | 4.00 | raw |
+| `level.col` | 2.00 | raw |
+| `qty.col` | 1.11 | Simple8b |
+| `side.col` | 1.00 | raw |
+| `seq.col` | **0.27** | zigzag-delta + Simple8b |
+| total | 24.38 | against 48 bytes in memory |
+
+`ts.col` and `price.col` are the two remaining candidates for bit-packing: both
+carry values that compress well and both currently cost a full 8 bytes.
 
 ### meta.json
 
 ```json
 {
+  "format_version": 2,
   "symbol": "BTC-USD",
   "exchange": "BINANCE",
   "start_ts_ns": 1700000000000000000,
   "end_ts_ns":   1700000001000000000,
   "row_count": 5000,
-  "min_price": 6490000,
-  "max_price": 6510000
+  "first_price": 6490000,
+  "has_raw_qty": false
 }
 ```
+
+`format_version` is checked on read. A segment carrying any other version is
+**skipped with an error**, not read partially: a missing column would otherwise
+surface as zeroed fields, which is the failure mode this version exists to
+prevent. The same applies to a column file that is absent or shorter than
+`row_count`.
 
 ### Segment Rollover
 
