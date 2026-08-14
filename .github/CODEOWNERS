@@ -1,0 +1,13 @@
+# Every change needs the maintainer's review.
+# NOTE: verify this GitHub handle matches your account before relying on it —
+# an unknown handle in CODEOWNERS is silently ignored by GitHub.
+* @kmacewicz
+
+# Paths where a mistake is expensive: build, CI, security, wire protocol.
+/CMakeLists.txt        @kmacewicz
+/.github/              @kmacewicz
+/SECURITY.md           @kmacewicz
+/docs/github-security.md @kmacewicz
+/src/multi_master.cpp  @kmacewicz
+/src/wal.cpp           @kmacewicz
+/src/replication.cpp   @kmacewicz

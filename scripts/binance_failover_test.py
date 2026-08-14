@@ -6,7 +6,7 @@ This is the "ultimate" integration test: real market data + multi-master failove
 + visual verification via plot.
 
 Sequence:
-  1. Start 2-node MM cluster (etcd Docker + 2 ob_tcp_server --multi-master)
+  1. Start 2-node MM cluster (native etcd + 2 ob_tcp_server --multi-master)
   2. Connect to Binance WebSocket depth stream (btcusdt@depth)
   3. Phase A (~20s): stream data to both nodes alternately
   4. Phase B: KILL node 1 (SIGKILL)
@@ -25,7 +25,8 @@ Exit codes:
     0 — test passed (both nodes converged after failover)
     1 — test failed (nodes diverged or other error)
 
-Requirements: Docker, compiled ob_tcp_server, internet access, websockets, matplotlib
+Requirements: native etcd binary on PATH (or OB_ETCD_BINARY), compiled ob_tcp_server,
+internet access, websockets, matplotlib
 """
 
 from __future__ import annotations
@@ -50,7 +51,6 @@ from typing import Dict, List, Optional, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SERVER_BINARY = str(PROJECT_ROOT / "build" / "ob_tcp_server")
-ETCD_IMAGE = "quay.io/coreos/etcd:v3.5.9"
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@depth"
 SYMBOL = "BTCUSDT"
 EXCHANGE = "BINANCE"
@@ -186,8 +186,10 @@ class MMCluster:
     def __init__(self):
         self.etcd_client_port: int = 0
         self.etcd_peer_port: int = 0
-        self.etcd_container_id: str = ""
-        self._etcd_container_name: str = ""
+        self.etcd_binary: str = os.environ.get("OB_ETCD_BINARY") or "etcd"
+        self.etcd_data_dir: str = ""
+        self.etcd_process = None
+        self._etcd_log = None
         self.nodes: List[NodeInfo] = []
         self.temp_dirs: List[str] = []
 
@@ -253,8 +255,7 @@ class MMCluster:
             except Exception:
                 pass
         try:
-            subprocess.run(["docker", "rm", "-f", self._etcd_container_name],
-                           capture_output=True, timeout=10)
+            self._stop_etcd()
         except Exception:
             pass
         for d in self.temp_dirs:
@@ -265,29 +266,60 @@ class MMCluster:
     def _check_prerequisites(self):
         if not os.path.isfile(SERVER_BINARY):
             raise RuntimeError(f"Server binary not found: {SERVER_BINARY}\nBuild first.")
-        result = subprocess.run(["docker", "info"], capture_output=True, timeout=10)
-        if result.returncode != 0:
-            raise RuntimeError("Docker not available.")
+        resolved = shutil.which(self.etcd_binary)
+        if resolved is None:
+            raise RuntimeError(
+                f"etcd binary not found: '{self.etcd_binary}'. Install it natively "
+                "(see docs/cli.md) or set OB_ETCD_BINARY."
+            )
+        self.etcd_binary = resolved
 
     def _start_etcd(self):
+        """Start etcd as a native process. No containers anywhere in this harness."""
         self.etcd_client_port = self._find_free_port()
         self.etcd_peer_port = self._find_free_port()
-        self._etcd_container_name = f"ob-etcd-failover-live-{self.etcd_client_port}"
-        subprocess.run(["docker", "rm", "-f", self._etcd_container_name],
-                       capture_output=True, timeout=10)
+        self.etcd_data_dir = tempfile.mkdtemp(prefix="ob_etcd_live_")
+        self.temp_dirs.append(self.etcd_data_dir)
+        self._etcd_log = open(os.path.join(self.etcd_data_dir, "etcd.log"), "wb")
+
         cmd = [
-            "docker", "run", "-d", "--name", self._etcd_container_name, "--net=host",
-            ETCD_IMAGE, "etcd",
+            self.etcd_binary,
+            "--name", "ob-live-etcd",
+            "--data-dir", os.path.join(self.etcd_data_dir, "data"),
             "--advertise-client-urls", f"http://127.0.0.1:{self.etcd_client_port}",
-            "--listen-client-urls", f"http://0.0.0.0:{self.etcd_client_port}",
-            "--listen-peer-urls", f"http://0.0.0.0:{self.etcd_peer_port}",
+            "--listen-client-urls", f"http://127.0.0.1:{self.etcd_client_port}",
+            "--listen-peer-urls", f"http://127.0.0.1:{self.etcd_peer_port}",
             "--initial-advertise-peer-urls", f"http://127.0.0.1:{self.etcd_peer_port}",
-            "--initial-cluster", f"default=http://127.0.0.1:{self.etcd_peer_port}",
+            "--initial-cluster", f"ob-live-etcd=http://127.0.0.1:{self.etcd_peer_port}",
+            "--initial-cluster-state", "new",
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            raise RuntimeError(f"Failed to start etcd: {result.stderr}")
-        self.etcd_container_id = result.stdout.strip()
+        self.etcd_process = subprocess.Popen(
+            cmd, stdout=self._etcd_log, stderr=subprocess.STDOUT,
+        )
+        time.sleep(0.2)
+        if self.etcd_process.poll() is not None:
+            raise RuntimeError(
+                f"etcd exited immediately with code {self.etcd_process.returncode}; "
+                f"see {self.etcd_data_dir}/etcd.log"
+            )
+
+    def _stop_etcd(self):
+        proc = getattr(self, "etcd_process", None)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        self.etcd_process = None
+        log = getattr(self, "_etcd_log", None)
+        if log is not None:
+            try:
+                log.close()
+            except OSError:
+                pass
+            self._etcd_log = None
 
     def _wait_for_etcd(self, timeout: float = 30.0):
         url = f"http://127.0.0.1:{self.etcd_client_port}/v3/maintenance/status"
