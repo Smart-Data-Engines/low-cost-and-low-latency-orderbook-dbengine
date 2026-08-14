@@ -305,6 +305,12 @@ private:
     std::atomic<bool> stop_flush_{false};
     std::mutex        mtx_;
 
+    // Shutdown signalling for the flush thread. Kept separate from pending_cv_
+    // so that backpressure traffic cannot interfere with it, and so that close()
+    // does not have to wait out a full flush interval before join() returns.
+    std::mutex              flush_stop_mtx_;
+    std::condition_variable flush_stop_cv_;
+
     // Pending rows for columnar flush
     struct PendingRow {
         std::string symbol;
