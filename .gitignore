@@ -1,6 +1,7 @@
 # ── Build directories ──────────────────────────────────────────────────────────
 build/
 build_*/
+build-*/
 cmake-build-*/
 out/
 
@@ -28,18 +29,27 @@ coverage.profdata
 # ── Benchmark output ──────────────────────────────────────────────────────────
 results.json
 
+# ── Test run artifacts ────────────────────────────────────────────────────────
+# ReplicationClientConfig::state_file defaults to the relative path
+# "repl_state.txt", so any test that does not override it writes into the
+# current working directory.
+/repl_state.txt
+
 # ── Compiled objects / binaries ───────────────────────────────────────────────
 *.o
 *.a
 *.so
 *.dylib
 *.exe
-bench_engine
-test_*
-!tests/test_*.cpp
+# Only root-level binaries from in-source builds. Do NOT use a bare `test_*`
+# pattern here: it silently swallows tests/integration/test_*.py sources.
+/bench_engine
+/test_*
 
 # ── Python artifacts ──────────────────────────────────────────────────────────
 __pycache__/
+.hypothesis/
+.pytest_cache/
 *.pyc
 *.pyo
 *.egg-info/
