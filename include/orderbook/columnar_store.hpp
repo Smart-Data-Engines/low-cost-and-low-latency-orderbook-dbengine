@@ -16,7 +16,15 @@
 namespace ob {
 
 /// Metadata for a single columnar segment.
+/// Version of the on-disk segment layout.
+///
+/// Version 1 stored only ts/price/qty/cnt and silently zeroed side, level_index
+/// and sequence_number on read, which lost the order side of every row that made
+/// it past a flush. Version 2 stores all seven columns.
+inline constexpr uint32_t kColumnarFormatVersion = 2;
+
 struct SegmentMeta {
+    uint32_t format_version{kColumnarFormatVersion};
     uint64_t start_ts_ns;   ///< earliest timestamp in this segment
     uint64_t end_ts_ns;     ///< latest timestamp in this segment
     uint64_t row_count;     ///< number of rows stored
@@ -114,6 +122,13 @@ private:
     std::vector<uint64_t> qty_buf_;
     std::vector<uint64_t> ts_buf_;
     std::vector<uint32_t> cnt_buf_;
+    std::vector<uint8_t>  side_buf_;
+    std::vector<uint16_t> level_buf_;
+    // int64 rather than uint64 because encode_prices() takes int64. Sequence
+    // numbers never approach 2^63 in practice, and zigzag handles the sign, which
+    // matters in multi-master mode where sequences from different nodes can land
+    // in one segment out of order.
+    std::vector<int64_t>  seq_buf_;
 
     // Segment index (rebuilt from meta.json on open_existing)
     std::vector<SegmentMeta> index_;

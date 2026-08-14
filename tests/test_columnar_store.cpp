@@ -42,17 +42,30 @@ struct TempDir {
     std::string str() const { return path.string(); }
 };
 
+// side and level_index are parameters, not constants. They used to be hard-coded
+// to SIDE_BID and 0 here, which meant no test in this file ever changed them —
+// and the read path zeroed both without a single failure to show for it.
 static ob::SnapshotRow make_row(uint64_t ts_ns, int64_t price = 10000,
-                                 uint64_t qty = 100, uint32_t cnt = 1) {
+                                 uint64_t qty = 100, uint32_t cnt = 1,
+                                 uint8_t side = ob::SIDE_BID,
+                                 uint16_t level = 0) {
     ob::SnapshotRow row{};
     row.timestamp_ns    = ts_ns;
     row.sequence_number = ts_ns / 1000;
-    row.side            = ob::SIDE_BID;
-    row.level_index     = 0;
+    row.side            = side;
+    row.level_index     = level;
     row.price           = price;
     row.quantity        = qty;
     row.order_count     = cnt;
     return row;
+}
+
+/// Collect every row a store returns for the full time range.
+static std::vector<ob::SnapshotRow> scan_all(const ob::ColumnarStore& store) {
+    std::vector<ob::SnapshotRow> out;
+    store.scan(0, UINT64_MAX, "", "",
+               [&](const ob::SnapshotRow& r) { out.push_back(r); });
+    return out;
 }
 
 // Build a ColumnarStore with a known symbol/exchange by using a subdir approach.
@@ -600,5 +613,231 @@ RC_GTEST_PROP(ColumnarStoreProperty, prop_index_sorted_invariant, ()) {
     const auto idx = store.index();
     for (size_t i = 1; i < idx.size(); ++i) {
         RC_ASSERT(idx[i - 1].start_ts_ns <= idx[i].start_ts_ns);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Side, level_index and sequence_number survive a flush
+//
+// Spec: kiro-workspace/specs/columnar-side-level-seq. Format version 1 stored
+// only ts/price/qty/cnt and zeroed the other three fields on read, so every row
+// that passed a flush came back as a bid at level 0 with sequence 0. The whole
+// suite missed it because make_row() pinned side to SIDE_BID.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(ColumnarStoreFields, SideIsPreservedThroughFlush) {
+    TempDir tmp("side_pres");
+    ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+
+    store.append(make_row(1000, 100'000, 10, 1, ob::SIDE_BID, 0));
+    store.append(make_row(2000, 101'000, 20, 1, ob::SIDE_ASK, 0));
+    store.flush_segment();
+
+    const auto rows = scan_all(store);
+    ASSERT_EQ(rows.size(), 2u);
+
+    // Match by price, because scan order is not part of the contract.
+    const ob::SnapshotRow* bid = nullptr;
+    const ob::SnapshotRow* ask = nullptr;
+    for (const auto& r : rows) {
+        if (r.price == 100'000) bid = &r;
+        if (r.price == 101'000) ask = &r;
+    }
+    ASSERT_NE(bid, nullptr);
+    ASSERT_NE(ask, nullptr);
+
+    EXPECT_EQ(bid->side, ob::SIDE_BID);
+    EXPECT_EQ(ask->side, ob::SIDE_ASK)
+        << "the ask came back as side=" << static_cast<int>(ask->side)
+        << "; order side is being lost on the way through the segment";
+}
+
+TEST(ColumnarStoreFields, LevelIndexIsPreserved) {
+    TempDir tmp("level_pres");
+    ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+
+    constexpr uint16_t kDepth = 5;
+    for (uint16_t lvl = 0; lvl < kDepth; ++lvl) {
+        store.append(make_row(1000 + lvl, 100'000 - lvl * 100, 10, 1,
+                              ob::SIDE_BID, lvl));
+    }
+    store.flush_segment();
+
+    const auto rows = scan_all(store);
+    ASSERT_EQ(rows.size(), kDepth);
+
+    std::vector<uint16_t> levels;
+    for (const auto& r : rows) levels.push_back(r.level_index);
+    std::sort(levels.begin(), levels.end());
+
+    for (uint16_t lvl = 0; lvl < kDepth; ++lvl) {
+        EXPECT_EQ(levels[lvl], lvl) << "book depth is not preserved";
+    }
+}
+
+TEST(ColumnarStoreFields, SequenceNumberIsPreserved) {
+    TempDir tmp("seq_pres");
+    ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+
+    std::vector<uint64_t> expected;
+    for (int i = 0; i < 10; ++i) {
+        auto row = make_row(1000 + static_cast<uint64_t>(i));
+        row.sequence_number = 5'000'000'000ULL + static_cast<uint64_t>(i);
+        expected.push_back(row.sequence_number);
+        store.append(row);
+    }
+    store.flush_segment();
+
+    auto rows = scan_all(store);
+    ASSERT_EQ(rows.size(), expected.size());
+
+    std::vector<uint64_t> got;
+    for (const auto& r : rows) got.push_back(r.sequence_number);
+    std::sort(got.begin(), got.end());
+
+    EXPECT_EQ(got, expected)
+        << "sequence numbers are lost, so gaps in the update stream become undetectable";
+}
+
+TEST(ColumnarStoreFields, SequenceNumberHandlesNonMonotonic) {
+    // Multi-master writes from different nodes can land in one segment with a
+    // falling sequence. Simple8b cannot represent that, which is why the column
+    // uses the zigzag-delta codec.
+    TempDir tmp("seq_nonmono");
+    ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+
+    const std::vector<uint64_t> seqs = {900, 100, 500, 42, 10'000, 7};
+    for (size_t i = 0; i < seqs.size(); ++i) {
+        auto row = make_row(1000 + static_cast<uint64_t>(i));
+        row.sequence_number = seqs[i];
+        store.append(row);
+    }
+    store.flush_segment();
+
+    auto rows = scan_all(store);
+    ASSERT_EQ(rows.size(), seqs.size());
+
+    std::vector<uint64_t> got;
+    for (const auto& r : rows) got.push_back(r.sequence_number);
+    auto want = seqs;
+    std::sort(got.begin(), got.end());
+    std::sort(want.begin(), want.end());
+    EXPECT_EQ(got, want);
+}
+
+TEST(ColumnarStoreFields, SegmentWithUnknownFormatVersionIsRejected) {
+    // An older segment has no side/level/seq columns. Reading it anyway would
+    // hand back zeroed fields, which is exactly the defect being fixed, so the
+    // segment has to be skipped rather than partially trusted.
+    TempDir tmp("bad_version");
+    ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+    store.append(make_row(1000, 100'000, 10, 1, ob::SIDE_ASK, 3));
+    store.flush_segment();
+
+    ASSERT_EQ(scan_all(store).size(), 1u) << "sanity: the segment reads before tampering";
+
+    // Rewrite meta.json with a version this build does not know.
+    const auto dir = store.index().at(0).dir_path;
+    {
+        std::ifstream in(dir + "/meta.json");
+        std::string meta((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+        in.close();
+        const std::string from = "\"format_version\":2";
+        const auto pos = meta.find(from);
+        ASSERT_NE(pos, std::string::npos) << "meta.json is missing format_version";
+        meta.replace(pos, from.size(), "\"format_version\":99");
+        std::ofstream out(dir + "/meta.json", std::ios::trunc);
+        out << meta;
+    }
+
+    // Reopen so the tampered meta is what the index holds.
+    ob::ColumnarStore reopened(tmp.str(), 1'000'000'000ULL);
+    reopened.open_existing();
+    EXPECT_TRUE(scan_all(reopened).empty())
+        << "a segment with an unsupported format version must be skipped, not read";
+}
+
+TEST(ColumnarStoreFields, SegmentWithMissingColumnIsRejected) {
+    TempDir tmp("missing_col");
+    ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+    store.append(make_row(1000, 100'000, 10, 1, ob::SIDE_ASK, 2));
+    store.flush_segment();
+
+    const auto dir = store.index().at(0).dir_path;
+    std::error_code ec;
+    ASSERT_TRUE(fs::remove(dir + "/side.col", ec)) << "side.col should exist";
+
+    ob::ColumnarStore reopened(tmp.str(), 1'000'000'000ULL);
+    reopened.open_existing();
+    EXPECT_TRUE(scan_all(reopened).empty())
+        << "a segment missing a column must be skipped, not read with zeros";
+}
+
+TEST(ColumnarStoreFields, TruncatedColumnIsRejected) {
+    TempDir tmp("truncated_col");
+    ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+    for (int i = 0; i < 8; ++i) {
+        store.append(make_row(1000 + static_cast<uint64_t>(i), 100'000 + i, 10, 1,
+                              (i % 2 == 0) ? ob::SIDE_BID : ob::SIDE_ASK,
+                              static_cast<uint16_t>(i)));
+    }
+    store.flush_segment();
+
+    const auto dir = store.index().at(0).dir_path;
+    // Keep only the first two of eight entries.
+    fs::resize_file(dir + "/side.col", 2);
+
+    ob::ColumnarStore reopened(tmp.str(), 1'000'000'000ULL);
+    reopened.open_existing();
+    EXPECT_TRUE(scan_all(reopened).empty())
+        << "a truncated column must invalidate the segment; padding with zeros is "
+           "how the lost-side defect behaved";
+}
+
+RC_GTEST_PROP(ColumnarStoreFieldsProperty,
+              prop_round_trip_preserves_side_level_and_sequence,
+              ()) {
+    // The test that would have caught the original defect: the generator produces
+    // both sides on its own, so the fields cannot stay at their defaults.
+    const auto n = *rc::gen::inRange<int>(1, 40);
+
+    TempDir tmp("prop_fields");
+    ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+
+    struct Expected {
+        uint8_t  side;
+        uint16_t level;
+        uint64_t seq;
+        int64_t  price;
+    };
+    std::vector<Expected> expected;
+
+    for (int i = 0; i < n; ++i) {
+        const auto side  = static_cast<uint8_t>(*rc::gen::element(ob::SIDE_BID, ob::SIDE_ASK));
+        const auto level = static_cast<uint16_t>(*rc::gen::inRange<int>(0, 64));
+        const auto seq   = static_cast<uint64_t>(*rc::gen::inRange<int64_t>(0, 1'000'000));
+
+        auto row = make_row(1000 + static_cast<uint64_t>(i),
+                            /*price=*/100'000 + i, 10, 1, side, level);
+        row.sequence_number = seq;
+        store.append(row);
+        expected.push_back({side, level, seq, row.price});
+    }
+    store.flush_segment();
+
+    const auto rows = scan_all(store);
+    RC_ASSERT(rows.size() == expected.size());
+
+    // Price is unique per row here, so it identifies the row across the scan.
+    for (const auto& want : expected) {
+        const ob::SnapshotRow* got = nullptr;
+        for (const auto& r : rows) {
+            if (r.price == want.price) { got = &r; break; }
+        }
+        RC_ASSERT(got != nullptr);
+        RC_ASSERT(got->side == want.side);
+        RC_ASSERT(got->level_index == want.level);
+        RC_ASSERT(got->sequence_number == want.seq);
     }
 }
