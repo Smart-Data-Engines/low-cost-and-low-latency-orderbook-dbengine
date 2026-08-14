@@ -223,3 +223,56 @@ echo "SELECT * FROM 'BTC-USD'.'BINANCE' WHERE timestamp BETWEEN 0 AND 9999999999
 echo "MM_PEERS" | nc localhost 5555
 echo "MM_CONFLICTS" | nc localhost 5555
 ```
+
+## High Availability: graceful failover
+
+With `--coordinator-endpoints` set, one node holds the primary role under an etcd lease and the
+others follow as replicas. Before taking the primary down for maintenance, hand the role over
+deliberately rather than letting the cluster discover the outage:
+
+```bash
+echo "FAILOVER node_B" | nc localhost 5555
+```
+
+### What happens
+
+1. The primary validates that `node_B` is a node the coordinator knows about
+2. It publishes a **handover intent** naming `node_B`, with a deadline
+3. It blocks itself from standing for election for the cooldown period
+4. It revokes its lease, so the leader key disappears
+
+While the intent is live, only `node_B` campaigns for the leader key; the other replicas stand
+aside. This is what makes the role land where you sent it rather than with whichever replica polls
+first.
+
+If `node_B` never takes over, the intent expires at its deadline and the cluster falls back to an
+ordinary election, so an unreachable target cannot leave you without a primary.
+
+### Responses
+
+| Response | Meaning |
+|----------|---------|
+| `OK` | Handover **initiated**. Not the same as finished, see below |
+| `ERR not_primary` | This node is not the primary |
+| `ERR failover_not_configured` | No coordinator configured |
+| `ERR invalid_target <id>` | Target was empty, or named this node itself |
+| `ERR unknown_target <id>` | Target is not known to the coordinator, usually a typo in a node id |
+| `ERR failover_failed` | Coordinator error; the node kept its role and its lease |
+
+**`OK` means initiated, not completed.** Confirm the outcome by asking the target:
+
+```bash
+echo "ROLE" | nc localhost 5556     # expect: PRIMARY <epoch>
+```
+
+Anything other than `OK` leaves the node primary with its lease intact, so a rejected handover is
+never a partial one.
+
+### Parameters
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--handover-grace-seconds` | 5 | How long the named target gets before the cluster falls back to an ordinary election. Keep it below the lease TTL, so a handover completes faster than a failure is detected |
+| `--handover-cooldown-seconds` | 15 | How long the outgoing primary refrains from standing for election. Must be >= the grace window, otherwise it could win the race it just announced. Keep it above the lease TTL, so it does not return before the new primary settles |
+
+The server refuses to start if the cooldown is shorter than the grace window.
