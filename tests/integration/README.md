@@ -1,10 +1,17 @@
 # Integration Test Suite
 
-Automated integration tests for orderbook-dbengine. The framework manages the full cluster lifecycle (etcd Docker + 2 ob_tcp_server nodes), runs 9 test categories, and produces a colored console report.
+Automated integration tests for orderbook-dbengine. The framework manages the full cluster lifecycle (a native etcd process + 2 ob_tcp_server nodes), runs 9 test categories, and produces a colored console report.
 
 ## Prerequisites
 
-1. **Docker** — etcd runs as a Docker container. Verify: `docker info`
+1. **etcd, installed natively** — the harness starts it as a plain process. No containers: the
+   engine has no containerised deployment path, so its tests do not depend on one either.
+   ```bash
+   ETCD_VER=v3.5.17
+   curl -L https://github.com/etcd-io/etcd/releases/download/$ETCD_VER/etcd-$ETCD_VER-linux-amd64.tar.gz | tar xz
+   sudo install -m755 etcd-$ETCD_VER-linux-amd64/etcd etcd-$ETCD_VER-linux-amd64/etcdctl /usr/local/bin/
+   ```
+   Verify: `etcd --version`. A binary outside PATH can be pointed to with `OB_ETCD_BINARY`.
 2. **Compiled `ob_tcp_server`** — binary at `build/ob_tcp_server`. Build with:
    ```bash
    mkdir -p build && cd build && cmake .. && make -j$(nproc)

@@ -370,9 +370,9 @@ PYTHON_SCRIPT
 phase_mm_convergence() {
     section "Phase: MM Convergence Test"
 
-    # ── Step 1: Check Docker availability ──
-    if ! docker info > /dev/null 2>&1; then
-        record_skip "MM Convergence — Docker not available"
+    # ── Step 1: Check native etcd availability ──
+    if ! command -v "${OB_ETCD_BINARY:-etcd}" > /dev/null 2>&1; then
+        record_skip "MM Convergence — etcd binary not found (see docs/cli.md)"
         return
     fi
 
@@ -408,9 +408,9 @@ phase_mm_convergence() {
 phase_mm_failover() {
     section "Phase: MM Failover Test"
 
-    # Step 1: Check Docker availability
-    if ! docker info > /dev/null 2>&1; then
-        record_skip "MM Failover — Docker not available"
+    # Step 1: Check native etcd availability
+    if ! command -v "${OB_ETCD_BINARY:-etcd}" > /dev/null 2>&1; then
+        record_skip "MM Failover — etcd binary not found (see docs/cli.md)"
         return
     fi
 
@@ -442,9 +442,9 @@ phase_mm_failover() {
 phase_binance_live() {
     section "Phase: Binance Live Test"
 
-    # ── Step 1: Check Docker availability (needed for etcd) ──
-    if ! command -v docker &>/dev/null || ! docker info &>/dev/null 2>&1; then
-        record_skip "Binance Live — Docker not available (required for etcd)"
+    # ── Step 1: Check native etcd availability ──
+    if ! command -v "${OB_ETCD_BINARY:-etcd}" &>/dev/null; then
+        record_skip "Binance Live — etcd binary not found (see docs/cli.md)"
         return
     fi
 
@@ -492,9 +492,9 @@ phase_binance_live() {
 phase_binance_failover_sync() {
     section "Phase: Binance Failover Sync Test"
 
-    # ── Step 1: Check Docker availability ──
-    if ! command -v docker &>/dev/null || ! docker info &>/dev/null 2>&1; then
-        record_skip "Binance Failover Sync — Docker not available"
+    # ── Step 1: Check native etcd availability ──
+    if ! command -v "${OB_ETCD_BINARY:-etcd}" &>/dev/null; then
+        record_skip "Binance Failover Sync — etcd binary not found (see docs/cli.md)"
         return
     fi
 
@@ -508,7 +508,7 @@ phase_binance_failover_sync() {
     case $PYTEST_RC in
         0)
             if echo "$PYTEST_OUTPUT" | grep -qi "SKIPPED"; then
-                record_skip "Binance Failover Sync — skipped (no internet or Docker)"
+                record_skip "Binance Failover Sync — skipped (no internet or no etcd)"
             else
                 record_pass "Binance Failover Sync — nodes converged after failover"
             fi
