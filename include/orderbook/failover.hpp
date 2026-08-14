@@ -38,6 +38,18 @@ struct FailoverConfig {
     bool              failover_enabled{true};
     std::string       replication_address;  // host:port for replication
     uint16_t          replication_port{0};
+
+    /// How long the named successor gets to take over during a graceful
+    /// failover, before the cluster falls back to an ordinary election.
+    /// Shorter than the lease TTL, so a handover completes faster than a
+    /// failure would be detected.
+    int64_t handover_grace_seconds{5};
+
+    /// How long the outgoing primary refrains from standing for election after
+    /// giving up the role. Must be >= handover_grace_seconds, otherwise the
+    /// node could win the very race it announced. Longer than the lease TTL, so
+    /// it does not come back before the new primary has settled.
+    int64_t handover_cooldown_seconds{15};
 };
 
 // ── Callback interface for Engine to implement role transitions ──────────────
@@ -92,10 +104,29 @@ public:
     /// Get current epoch.
     EpochValue epoch() const;
 
-    /// Initiate graceful failover to a target node.
-    /// Only works if we are PRIMARY.  Revokes lease so replicas detect expiry.
-    /// Returns true if handover initiated successfully.
-    bool initiate_graceful_failover(const std::string& target_node_id);
+    /// Outcome of an attempted graceful failover.
+    ///
+    /// Distinguishing the causes matters to the operator: "unknown target"
+    /// usually means a typo in a node id, while "coordinator error" means the
+    /// node is still primary and the handover never started.
+    enum class HandoverResult {
+        OK,                 ///< intent published, lease revoked, role given up
+        NOT_PRIMARY,        ///< this node is not the primary
+        NOT_CONFIGURED,     ///< no coordinator, or no lease held
+        INVALID_TARGET,     ///< target empty, or naming this node itself
+        UNKNOWN_TARGET,     ///< target not known to the coordinator
+        COORDINATOR_ERROR,  ///< could not publish the intent; still primary
+    };
+
+    /// Hand the primary role to a named node.
+    ///
+    /// Publishes a handover intent, blocks itself from standing for election for
+    /// handover_cooldown_seconds, then revokes its lease so the target can take
+    /// over. Only works if we are PRIMARY.
+    ///
+    /// On anything other than OK the node keeps its role and its lease, so a
+    /// rejected handover is not a partial one.
+    HandoverResult initiate_graceful_failover(const std::string& target_node_id);
 
     /// Get the current primary address (from coordinator).
     std::string primary_address() const;
@@ -115,6 +146,11 @@ private:
     std::string             primary_address_;
     std::chrono::steady_clock::time_point last_lease_refresh_;
 
+    /// Until when this node declines to stand for election, after handing the
+    /// role away. steady_clock, because this measures elapsed time locally and
+    /// must not be affected by wall-clock adjustments.
+    std::chrono::steady_clock::time_point election_blocked_until_{};
+
     std::thread             monitor_thread_;
     std::atomic<bool>       running_{false};
 
@@ -122,6 +158,10 @@ private:
     void handle_lease_expiry();
     void attempt_promotion();
     void handle_primary_lease_lost();
+
+    /// True while a graceful handover intent names another node, so this node
+    /// should not compete for the leader key yet.
+    bool should_defer_to_handover_target();
     void reconcile_epoch(const ClusterState& state);
 };
 

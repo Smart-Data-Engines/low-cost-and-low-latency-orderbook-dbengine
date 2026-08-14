@@ -42,6 +42,8 @@ struct ServerConfig {
     // Failover
     std::vector<std::string> coordinator_endpoints;  // --coordinator-endpoints (comma-separated)
     int64_t coordinator_lease_ttl{10};               // --coordinator-lease-ttl (seconds)
+    int64_t handover_grace_seconds{5};               // --handover-grace-seconds
+    int64_t handover_cooldown_seconds{15};           // --handover-cooldown-seconds
     std::string node_id;                             // --node-id
     bool failover_enabled{true};                     // --failover-enabled
 
