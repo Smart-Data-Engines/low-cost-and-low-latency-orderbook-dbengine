@@ -146,6 +146,11 @@ void Engine::close() {
     stop_flush_.store(true, std::memory_order_relaxed);
     // Wake any writers blocked on backpressure so they can exit.
     pending_cv_.notify_all();
+    // Wake the flush thread itself, so join() does not wait out the interval.
+    {
+        std::lock_guard<std::mutex> lock(flush_stop_mtx_);
+        flush_stop_cv_.notify_all();
+    }
     if (flush_thread_.joinable()) {
         flush_thread_.join();
     }
@@ -1022,7 +1027,22 @@ ColumnarStore& Engine::get_or_create_store(const std::string& symbol,
 void Engine::flush_loop() {
     const auto interval = std::chrono::nanoseconds(flush_interval_ns_);
     while (!stop_flush_.load(std::memory_order_relaxed)) {
-        std::this_thread::sleep_for(interval);
+        // Interruptible wait. A plain sleep_for() here made close() block until
+        // the current interval elapsed, because join() cannot interrupt a
+        // sleeping thread: shutdown took up to flush_interval_ns_ for no reason,
+        // and tests that open and close an Engine per case paid it every time.
+        {
+            std::unique_lock<std::mutex> lock(flush_stop_mtx_);
+            const bool stop_requested = flush_stop_cv_.wait_for(
+                lock, interval,
+                [this]() { return stop_flush_.load(std::memory_order_relaxed); });
+            if (stop_requested) {
+                // close() performs the final drain, sync, segment flush and WAL
+                // flush itself, so leaving now loses nothing.
+                OB_LOG_DEBUG("engine", "flush_loop: stop requested, exiting");
+                break;
+            }
+        }
 
         // Phase A: drain pending rows under mutex.
         {

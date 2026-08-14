@@ -9,6 +9,7 @@
 #include <vector>
 #include <cstring>
 #include <cstdlib>
+#include <chrono>
 
 namespace fs = std::filesystem;
 
@@ -114,6 +115,58 @@ TEST(EngineIntegration, GracefulShutdownFlushesData) {
         EXPECT_TRUE(err.empty()) << "Query error: " << err;
         EXPECT_EQ(row_count, 5);
 
+        engine2.close();
+    }
+
+    fs::remove_all(dir);
+}
+
+// ── close() must not wait out the flush interval ──────────────────────────────
+// Regression guard. flush_loop() used a plain sleep_for(), which join() cannot
+// interrupt, so close() blocked for up to one flush interval. In production that
+// delayed every graceful shutdown; in tests that open an Engine per property
+// case it dominated the entire suite runtime (one test file went from 195s to
+// 1s when this was fixed).
+TEST(EngineIntegration, CloseDoesNotWaitForFlushInterval) {
+    std::string dir = make_temp_dir("engine_close_latency_");
+
+    // Ten second interval: if close() waits for it, this test takes ten seconds.
+    ob::Engine engine(dir, 10'000'000'000ULL);
+    engine.open();
+
+    ob::DeltaUpdate delta{};
+    std::strncpy(delta.symbol,   "BTC", sizeof(delta.symbol)   - 1);
+    std::strncpy(delta.exchange, "CB",  sizeof(delta.exchange) - 1);
+    delta.sequence_number = 1;
+    delta.timestamp_ns    = 1'000'000'000ULL;
+    delta.side            = ob::SIDE_BID;
+    delta.n_levels        = 1;
+    ob::Level level{10000, 100, 1, 0};
+    ASSERT_EQ(engine.apply_delta(delta, &level), ob::OB_OK);
+
+    const auto start = std::chrono::steady_clock::now();
+    engine.close();
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+
+    // Generous bound: the real cost is the final flush, measured in single-digit
+    // milliseconds. Anything approaching the interval means the wait regressed.
+    EXPECT_LT(elapsed_ms, 2000)
+        << "close() took " << elapsed_ms << " ms with a 10s flush interval, "
+           "which means it is waiting for the interval instead of signalling "
+           "the flush thread";
+
+    // And the data still has to be there.
+    {
+        ob::Engine engine2(dir);
+        engine2.open();
+        int row_count = 0;
+        std::string err = engine2.execute(
+            "SELECT * FROM 'BTC'.'CB' WHERE timestamp BETWEEN 0 AND 9999999999999999999",
+            [&](const ob::QueryResult&) { ++row_count; });
+        EXPECT_TRUE(err.empty()) << "Query error: " << err;
+        EXPECT_EQ(row_count, 1) << "close() must still flush pending rows";
         engine2.close();
     }
 
