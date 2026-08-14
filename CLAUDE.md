@@ -33,7 +33,7 @@ cmake --build build -j$(nproc)
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release -j$(nproc)
 
-# Tests — 510 of them, ~6 minutes
+# Tests — 544 of them, ~2.5 minutes
 ctest --test-dir build --output-on-failure -j1
 ```
 
@@ -107,22 +107,35 @@ Learned the hard way. Check here before debugging.
    disconnect the peer.
 8. **LZ4 and Nagle** — small compressed frames need `TCP_NODELAY`, or INSERT latency multiplies.
 9. **`FLUSH` is `flush_incremental()`**, not close+open. Getting this wrong costs 82ms instead of 2ms.
+10. **Lock order in `Engine` is `flush_mtx_` → `mtx_` → `ColumnarStore::index_mtx_`.** Never the
+    reverse. `flush_mtx_` serialises everything that writes segments or mutates `stores_`; `mtx_` is
+    released across segment I/O so writers are not blocked. Two unsynchronised flushes each wrote the
+    same segment and each merged its meta, so `SELECT` returned every row in it twice.
+    `demote_to_replica()` must not hold `flush_mtx_` across `repl_mgr_->stop()`: a replication thread
+    can be inside `create_snapshot()` waiting for it.
+11. **`ColumnarStore::flush_segment()` returns a `SegmentMeta` that must be merged.** `QueryEngine`
+    reads `combined_store_` only, never the live SoA buffer, so a dropped meta means rows sit on disk
+    invisible to every query until the next `open_existing()`. Same for the metas parked by an
+    `append()` rollover — collect them with `take_rolled_segments()`.
 
 ## Current state and open problems
 
-Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Three things
-a newcomer should know because they look like working features and are not:
+Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
+below refer to that file. Things a newcomer should know because they look like working features and
+are not:
 
-- **The integration test suite has no test files.** A `test_*` pattern in `.gitignore` silently
-  excluded every `tests/integration/test_*.py`. The framework (`conftest.py`, 691 lines) survived;
-  the ~37 tests did not. Roadmap #25.
-- **`FAILOVER <target_node_id>` ignores the target**, and the outgoing primary can immediately
-  re-acquire the role it just released. `EtcdTestFixture.GracefulFailover` fails 40-50% of runs.
-  Roadmap #26.
+- **Aggregations are unreachable over the wire protocol.** `SPREAD`, `MID_PRICE`, `IMBALANCE` and
+  `VWAP` return zeros to every network client: `format_query_response()` has one fixed row header and
+  never reads `QueryResult::agg_values`. The engine computes them correctly, so the C++ tests pass.
+  Roadmap #27.
 - **`AntiEntropyManager` is a scheduler with no reconciliation.** `detect_gaps()` always returns
-  empty, `repair_gap()` always returns false. Metrics report runs, so it looks alive. Roadmap #53.
+  empty, `repair_gap()` always returns false. Metrics report runs, so it looks alive. Roadmap #56.
+- **The integration test suite is being rebuilt.** A `test_*` pattern in `.gitignore` silently
+  excluded every `tests/integration/test_*.py`, so the ~37 original tests were never committed. The
+  framework survived and four categories are back (smoke, replication, compression, edge cases);
+  the rest are still missing. Roadmap #28.
 
-Also worth knowing: the wire protocol has no authentication or encryption (roadmap #27), and
+Also worth knowing: the wire protocol has no authentication or encryption (roadmap #30), and
 `rapidcheck` is pinned to `master` rather than a commit SHA.
 
 ## Before you call a change done
