@@ -203,6 +203,19 @@ ob_add_engine_test(test_replication
     test_replication.cpp
 )
 
+# ── Snapshot path validation (security) ───────────────────────────────────────
+# Needs rapidcheck on top of the engine library, which ob_add_engine_test does
+# not link.
+add_executable(test_snapshot_path_safety test_snapshot_path_safety.cpp)
+target_link_libraries(test_snapshot_path_safety
+    PRIVATE
+        orderbook_engine
+        GTest::gtest_main
+        rapidcheck
+        rapidcheck_gtest
+)
+gtest_discover_tests(test_snapshot_path_safety PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+
 # ── Epoch tests (ha-automatic-failover) ───────────────────────────────────────
 add_executable(test_epoch test_epoch.cpp)
 target_link_libraries(test_epoch

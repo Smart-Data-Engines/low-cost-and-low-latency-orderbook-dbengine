@@ -39,6 +39,38 @@ struct ReplicationClientConfig {
     std::string snapshot_staging_dir;            // --snapshot-staging-dir (default: <data_dir>/snapshot_staging)
 };
 
+// ── Snapshot path validation ──────────────────────────────────────────────────
+
+/// Checks whether `rel` is safe to append to a base directory.
+///
+/// Snapshot file names arrive from the network, from whichever peer we are
+/// bootstrapping against, and are used to build both the staging path and the
+/// final destination inside the data directory. Without validation a peer can
+/// send `../../../../home/user/.ssh/authorized_keys` and have the replica write
+/// a file of the peer's choosing anywhere the process can reach.
+///
+/// A path is accepted only when all of the following hold:
+///   - it is not empty and no longer than `kMaxSnapshotPathLen`
+///   - it is relative, not absolute
+///   - it contains no `..` component and no `.` component
+///   - it contains no empty component (rejects `a//b`) and does not end in `/`
+///   - every character is in [A-Za-z0-9._-] or is the `/` separator
+///
+/// The character allowlist is deliberately narrow: snapshot entries are segment
+/// directories and column files that we generate ourselves, so anything outside
+/// that set is either a bug or an attack.
+[[nodiscard]] bool is_safe_snapshot_path(std::string_view rel);
+
+/// Upper bound on a snapshot entry path, matching the receive buffer.
+inline constexpr size_t kMaxSnapshotPathLen = 255;
+
+/// Verifies that `base / rel` resolves to a location inside `base`.
+///
+/// Defence in depth behind is_safe_snapshot_path(): this one also catches the
+/// case where a component of `base` itself is a symlink pointing elsewhere.
+/// Returns false if the path escapes, or if the check cannot be performed.
+[[nodiscard]] bool path_stays_within(const std::string& base, std::string_view rel);
+
 // ── Snapshot manifest ─────────────────────────────────────────────────────────
 
 struct SnapshotFileEntry {
