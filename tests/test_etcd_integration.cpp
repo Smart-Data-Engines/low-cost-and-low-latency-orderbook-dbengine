@@ -1234,12 +1234,17 @@ TEST_F(EtcdTestFixture, EpochFencing) {
 // **Validates: Requirements 2.4, 3.4, 6.1**
 
 TEST_F(EtcdTestFixture, EpochMonotonicity) {
-    rc::check("Epoch is strictly monotonic across failover cycles",
-              [this]() {
-        // Generate number of failover cycles [1, 3] (kept small for speed).
-        int num_cycles = *rc::gen::inRange(1, 4);
-
-        // Clean keys before each RapidCheck iteration.
+    // Previously a rc::check property over rc::gen::inRange(1, 4), which has
+    // exactly three possible values. RapidCheck drew 25 samples from those three,
+    // so each case ran about eight times and every draw paid for a full failover
+    // cycle against a real etcd: 576-600 promotions and 166-171s for this single
+    // test. That put whole-binary runs past the timeouts used to invoke them,
+    // which looked like flakiness but was simply cost.
+    //
+    // Walking the three values directly gives identical coverage — every input
+    // the generator could produce — deterministically and roughly eight times
+    // faster.
+    for (int num_cycles : {1, 2, 3}) {
         clean_etcd_keys();
 
         TempDir dir_a("em_a");
@@ -1253,71 +1258,45 @@ TEST_F(EtcdTestFixture, EpochMonotonicity) {
         uint64_t prev_epoch = 0;
 
         for (int cycle = 0; cycle < num_cycles; ++cycle) {
-            // Determine which node is "primary starter" and which is "replica".
-            bool a_is_primary = (cycle % 2 == 0);
+            const bool a_is_primary = (cycle % 2 == 0);
             auto& engine_pri = a_is_primary ? engine_a : engine_b;
             auto& engine_rep = a_is_primary ? engine_b : engine_a;
-            const char* pri_id = a_is_primary ? "node_A" : "node_B";
-            const char* rep_id = a_is_primary ? "node_B" : "node_A";
+            const char* pri_id   = a_is_primary ? "node_A" : "node_B";
+            const char* rep_id   = a_is_primary ? "node_B" : "node_A";
             const char* pri_addr = a_is_primary ? "127.0.0.1:19051" : "127.0.0.1:19052";
             const char* rep_addr = a_is_primary ? "127.0.0.1:19052" : "127.0.0.1:19051";
 
-            ob::FailoverConfig fc_pri{};
-            fc_pri.coordinator.endpoints = {EtcdTestEnvironment::endpoint()};
-            fc_pri.coordinator.lease_ttl_seconds = TEST_LEASE_TTL;
-            fc_pri.coordinator.node_id = pri_id;
-            fc_pri.coordinator.cluster_prefix = ETCD_KEY_PREFIX;
-            fc_pri.failover_enabled = true;
-            fc_pri.replication_address = pri_addr;
-
-            ob::FailoverManager fm_pri(fc_pri, *engine_pri);
+            ob::FailoverManager fm_pri(make_failover_config(pri_id, pri_addr), *engine_pri);
             fm_pri.start();
+            ASSERT_TRUE(wait_for_role(fm_pri, ob::NodeRole::PRIMARY, std::chrono::seconds(8)))
+                << "cycles=" << num_cycles << " cycle=" << cycle
+                << ": primary did not come up";
 
-            // Wait for primary.
-            auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(8);
-            while (fm_pri.role() != ob::NodeRole::PRIMARY &&
-                   std::chrono::steady_clock::now() < dl) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-            RC_ASSERT(fm_pri.role() == ob::NodeRole::PRIMARY);
+            const uint64_t current_epoch = fm_pri.epoch().term;
+            ASSERT_GT(current_epoch, prev_epoch)
+                << "cycles=" << num_cycles << " cycle=" << cycle
+                << ": epoch must advance on promotion";
 
-            uint64_t current_epoch = fm_pri.epoch().term;
-            RC_ASSERT(current_epoch > prev_epoch);
-
-            // Start replica.
-            ob::FailoverConfig fc_rep{};
-            fc_rep.coordinator.endpoints = {EtcdTestEnvironment::endpoint()};
-            fc_rep.coordinator.lease_ttl_seconds = TEST_LEASE_TTL;
-            fc_rep.coordinator.node_id = rep_id;
-            fc_rep.coordinator.cluster_prefix = ETCD_KEY_PREFIX;
-            fc_rep.failover_enabled = true;
-            fc_rep.replication_address = rep_addr;
-
-            ob::FailoverManager fm_rep(fc_rep, *engine_rep);
+            ob::FailoverManager fm_rep(make_failover_config(rep_id, rep_addr), *engine_rep);
             fm_rep.start();
-
-            dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-            while (fm_rep.role() != ob::NodeRole::REPLICA &&
-                   std::chrono::steady_clock::now() < dl) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
+            ASSERT_TRUE(wait_for_role(fm_rep, ob::NodeRole::REPLICA, std::chrono::seconds(5)))
+                << "cycles=" << num_cycles << " cycle=" << cycle
+                << ": replica did not attach";
 
             prev_epoch = current_epoch;
 
-            // Stop primary — replica will promote in next cycle.
+            // Drop the primary; the replica must take over with a higher epoch.
             fm_pri.stop();
 
-            // Wait for replica to promote.
-            dl = std::chrono::steady_clock::now() +
-                 std::chrono::seconds(TEST_LEASE_TTL + 5);
-            while (fm_rep.role() != ob::NodeRole::PRIMARY &&
-                   std::chrono::steady_clock::now() < dl) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            }
-            RC_ASSERT(fm_rep.role() == ob::NodeRole::PRIMARY);
+            ASSERT_TRUE(wait_for_role(fm_rep, ob::NodeRole::PRIMARY,
+                                      std::chrono::seconds(TEST_LEASE_TTL + 5)))
+                << "cycles=" << num_cycles << " cycle=" << cycle
+                << ": replica did not promote after the primary went away";
 
-            uint64_t new_epoch = fm_rep.epoch().term;
-            RC_ASSERT(new_epoch > prev_epoch);
+            const uint64_t new_epoch = fm_rep.epoch().term;
+            ASSERT_GT(new_epoch, prev_epoch)
+                << "cycles=" << num_cycles << " cycle=" << cycle
+                << ": epoch must advance on failover";
             prev_epoch = new_epoch;
 
             fm_rep.stop();
@@ -1325,7 +1304,7 @@ TEST_F(EtcdTestFixture, EpochMonotonicity) {
 
         engine_a->close();
         engine_b->close();
-    });
+    }
 }
 
 // ── Task 5.7: Property 2 — CAS Atomicity ───────────────────────────────────
