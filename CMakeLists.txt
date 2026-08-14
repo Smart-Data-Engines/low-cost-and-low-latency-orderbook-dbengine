@@ -104,7 +104,7 @@ target_link_libraries(orderbook_epoch PUBLIC orderbook_core)
 # ── Coordinator compiled library (etcd v3 REST client) ─────────────────────────
 find_package(CURL REQUIRED)
 add_library(orderbook_coordinator STATIC src/coordinator.cpp)
-target_link_libraries(orderbook_coordinator PUBLIC orderbook_epoch CURL::libcurl)
+target_link_libraries(orderbook_coordinator PUBLIC orderbook_epoch orderbook_logger CURL::libcurl)
 
 # ── Failover compiled library (role transitions and monitoring) ────────────────
 add_library(orderbook_failover STATIC src/failover.cpp)

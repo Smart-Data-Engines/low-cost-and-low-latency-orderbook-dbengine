@@ -55,6 +55,39 @@ struct PublishedPosition {
     static bool from_json(std::string_view json, PublishedPosition& out);
 };
 
+// ── Handover intent: announced target of a graceful failover ─────────────────
+
+/// Announcement that the current primary is handing its role to a named node.
+///
+/// The outgoing primary cannot install the successor itself: the leader key is
+/// held under the successor's lease, and a lease belongs to its own session. So
+/// it publishes this intent, then revokes its lease and steps aside. Replicas
+/// read it while the leader key is empty: the named target campaigns
+/// immediately, everyone else waits until the deadline passes.
+///
+/// Stored without a lease, so that it survives the revocation that follows it.
+/// After `deadline_ns` it is ignored, so an unreachable target cannot deadlock
+/// the cluster, and a stale key does no harm.
+struct HandoverIntent {
+    std::string target_node_id;   // node that should take over
+    std::string from_node_id;     // node handing the role away
+    uint64_t    deadline_ns{0};   // wall clock; intent is void afterwards
+
+    /// Serialize to JSON string (deterministic alphabetical field ordering).
+    std::string to_json() const;
+
+    /// Parse from JSON string.  Returns true on success.
+    static bool from_json(std::string_view json, HandoverIntent& out);
+
+    /// Whether the intent still applies, against a wall-clock reading.
+    ///
+    /// Clocks differ between nodes, so this is a hint rather than a guarantee:
+    /// the worst case is a shorter or longer preference window. Promotion still
+    /// goes through a CAS on the leader key, so a skewed clock cannot produce
+    /// two primaries.
+    bool is_active(uint64_t now_ns) const;
+};
+
 // ── Callback for lease expiry / leader change events ─────────────────────────
 
 using LeaseEventCallback = std::function<void(const ClusterState&)>;
@@ -73,6 +106,9 @@ std::string coordinator_node_key(const std::string& prefix,
 
 /// Build the range-end for all node keys (prefix + "nodes" + '\x01').
 std::string coordinator_nodes_range_end(const std::string& prefix);
+
+/// Build the handover intent key path:  <prefix>handover
+std::string coordinator_handover_key(const std::string& prefix);
 
 // ── Base64 helpers (etcd v3 REST requires base64 keys/values) ────────────────
 
@@ -121,6 +157,22 @@ public:
 
     /// Read all published WAL positions.
     std::vector<PublishedPosition> get_published_positions();
+
+    /// Publish a graceful-failover handover intent.
+    ///
+    /// Written WITHOUT a lease on purpose: the outgoing primary revokes its
+    /// lease immediately afterwards, and a leased key would disappear with it.
+    /// Returns true on success.
+    bool publish_handover_intent(const HandoverIntent& intent);
+
+    /// Read the current handover intent.
+    /// Returns nullopt when the key is absent or its contents do not parse.
+    std::optional<HandoverIntent> get_handover_intent();
+
+    /// Delete the handover intent key.
+    /// Returns true when the key is gone afterwards, including when it was
+    /// never there.
+    bool clear_handover_intent();
 
     /// Start watching the leader key for changes.  Calls cb on change.
     void watch_leader(LeaseEventCallback cb);

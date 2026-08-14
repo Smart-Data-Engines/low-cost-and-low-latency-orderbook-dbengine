@@ -1,6 +1,7 @@
 // ── CoordinatorClient — etcd v3 REST integration ─────────────────────────────
 
 #include "orderbook/coordinator.hpp"
+#include "orderbook/logger.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -109,6 +110,10 @@ std::string coordinator_node_key(const std::string& prefix,
     return prefix + "nodes/" + node_id;
 }
 
+std::string coordinator_handover_key(const std::string& prefix) {
+    return prefix + "handover";
+}
+
 std::string coordinator_nodes_range_end(const std::string& prefix) {
     // Range end for all keys under <prefix>nodes/ — increment last byte.
     std::string key = prefix + "nodes/";
@@ -167,6 +172,70 @@ bool ClusterState::from_json(std::string_view json, ClusterState& out) {
     out.epoch.term      = extract_uint64("epoch");
 
     return !out.leader_node_id.empty();
+}
+
+// ── JSON serialization — HandoverIntent ──────────────────────────────────────
+
+std::string HandoverIntent::to_json() const {
+    // Deterministic alphabetical field ordering, as elsewhere in this file.
+    std::string out;
+    out.reserve(160);
+
+    out += "{\"deadline_ns\":";
+    out += std::to_string(deadline_ns);
+    out += ",\"from_node_id\":\"";
+    out += from_node_id;
+    out += "\",\"target_node_id\":\"";
+    out += target_node_id;
+    out += "\"}";
+
+    return out;
+}
+
+bool HandoverIntent::from_json(std::string_view json, HandoverIntent& out) {
+    out = {};
+
+    auto extract_string = [&](const char* key) -> std::string {
+        std::string search = std::string("\"") + key + "\":\"";
+        auto pos = json.find(search);
+        if (pos == std::string_view::npos) return {};
+        pos += search.size();
+        auto end = json.find('"', pos);
+        if (end == std::string_view::npos) return {};
+        return std::string(json.substr(pos, end - pos));
+    };
+
+    auto extract_uint64 = [&](const char* key, bool& found) -> uint64_t {
+        std::string search = std::string("\"") + key + "\":";
+        auto pos = json.find(search);
+        if (pos == std::string_view::npos) {
+            found = false;
+            return 0;
+        }
+        pos += search.size();
+        uint64_t val = 0;
+        size_t digits = 0;
+        while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') {
+            val = val * 10 + static_cast<uint64_t>(json[pos] - '0');
+            ++pos;
+            ++digits;
+        }
+        found = digits > 0;
+        return val;
+    };
+
+    bool deadline_found = false;
+    out.target_node_id = extract_string("target_node_id");
+    out.from_node_id   = extract_string("from_node_id");
+    out.deadline_ns    = extract_uint64("deadline_ns", deadline_found);
+
+    // All three fields are required. An intent without a target says nothing,
+    // and one without a deadline would never expire.
+    return !out.target_node_id.empty() && !out.from_node_id.empty() && deadline_found;
+}
+
+bool HandoverIntent::is_active(uint64_t now_ns) const {
+    return deadline_ns > now_ns;
 }
 
 // ── JSON serialization — PublishedPosition ───────────────────────────────────
@@ -484,6 +553,88 @@ bool CoordinatorClient::publish_wal_position(uint32_t file_index,
 
     std::string resp = impl_->http_post(url, body);
     return !resp.empty();
+}
+
+bool CoordinatorClient::publish_handover_intent(const HandoverIntent& intent) {
+    if (!impl_->connected) {
+        OB_LOG_WARN("coordinator",
+                    "Cannot publish handover intent: not connected to coordinator");
+        return false;
+    }
+
+    const std::string key_b64 =
+        base64_encode(coordinator_handover_key(config_.cluster_prefix));
+    const std::string value_b64 = base64_encode(intent.to_json());
+
+    // No lease field: this key must outlive the lease of the node writing it.
+    const std::string url  = impl_->active_endpoint + "/v3/kv/put";
+    const std::string body = "{\"key\":\"" + key_b64 +
+                             "\",\"value\":\"" + value_b64 + "\"}";
+
+    const std::string resp = impl_->http_post(url, body);
+    if (resp.empty()) {
+        OB_LOG_WARN("coordinator",
+                    "Failed to publish handover intent: target=%s from=%s",
+                    intent.target_node_id.c_str(), intent.from_node_id.c_str());
+        return false;
+    }
+
+    OB_LOG_INFO("coordinator",
+                "Published handover intent: target=%s from=%s deadline_ns=%lu",
+                intent.target_node_id.c_str(), intent.from_node_id.c_str(),
+                static_cast<unsigned long>(intent.deadline_ns));
+    return true;
+}
+
+std::optional<HandoverIntent> CoordinatorClient::get_handover_intent() {
+    if (!impl_->connected) return std::nullopt;
+
+    const std::string key_b64 =
+        base64_encode(coordinator_handover_key(config_.cluster_prefix));
+
+    const std::string url  = impl_->active_endpoint + "/v3/kv/range";
+    const std::string body = "{\"key\":\"" + key_b64 + "\"}";
+
+    const std::string resp = impl_->http_post(url, body);
+    if (resp.empty()) return std::nullopt;
+
+    // Absent key: etcd answers with a response carrying no kvs.
+    const std::string value_b64 = json_extract_string(resp, "value");
+    if (value_b64.empty()) return std::nullopt;
+
+    HandoverIntent intent;
+    if (!HandoverIntent::from_json(base64_decode(value_b64), intent)) {
+        OB_LOG_WARN("coordinator",
+                    "Handover intent key contains unparsable value, ignoring");
+        return std::nullopt;
+    }
+
+    OB_LOG_DEBUG("coordinator",
+                 "Handover intent read: target=%s from=%s deadline_ns=%lu",
+                 intent.target_node_id.c_str(), intent.from_node_id.c_str(),
+                 static_cast<unsigned long>(intent.deadline_ns));
+    return intent;
+}
+
+bool CoordinatorClient::clear_handover_intent() {
+    if (!impl_->connected) return false;
+
+    const std::string key_b64 =
+        base64_encode(coordinator_handover_key(config_.cluster_prefix));
+
+    const std::string url  = impl_->active_endpoint + "/v3/kv/deleterange";
+    const std::string body = "{\"key\":\"" + key_b64 + "\"}";
+
+    const std::string resp = impl_->http_post(url, body);
+    if (resp.empty()) {
+        OB_LOG_WARN("coordinator", "Failed to clear handover intent key");
+        return false;
+    }
+
+    // etcd reports deleted:"0" when the key was not there, which is the desired
+    // end state either way.
+    OB_LOG_DEBUG("coordinator", "Handover intent key cleared");
+    return true;
 }
 
 std::vector<PublishedPosition> CoordinatorClient::get_published_positions() {

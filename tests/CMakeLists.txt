@@ -244,6 +244,7 @@ target_link_libraries(test_failover_election
         orderbook_failover
         GTest::gtest_main
         rapidcheck
+        rapidcheck_gtest
 )
 gtest_discover_tests(test_failover_election PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 
