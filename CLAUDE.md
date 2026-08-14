@@ -1,0 +1,136 @@
+# orderbook-dbengine — working notes for AI assistants
+
+Context for anyone (human or AI) working on this repository. Read this before touching the code.
+
+## What this is
+
+A C++20 database engine specialised for Level 2 orderbook data in HFT environments. ~1.35M
+updates/sec and ~2.8µs p50 update latency on the reference machine, from WAL group commit, SoA
+buffers with seqlock concurrency, and columnar storage with delta+zigzag+Simple8b compression.
+
+**The engine runs natively on the host. There is no containerised deployment path and there will not
+be one** — a container layer between the engine and the hardware defeats the point of an engine
+tuned for specific hardware. This applies to the test harness too: etcd runs as a native process.
+
+## Non-negotiable rules
+
+1. **`ctest -j1`. Always sequential.** Network tests (replication, failover, multi-master) bind fixed
+   ports and fail under parallel execution. This is a correctness requirement, not a preference.
+2. **Benchmarks only mean anything in a Release build.** Debug is 3-4x slower; that is not a
+   regression. And never quote a number without stating the hardware it came from.
+3. **Every new function gets logging.** No exceptions. See "Logging" below.
+4. **Build must be warning-free.** `-Wall -Wextra -Werror` is on, so a warning is a build failure.
+5. **When debugging: add logs first, analyse second.** Guessing wastes time on this codebase.
+
+## Build and test
+
+```bash
+# Debug (development default)
+cmake -S . -B build
+cmake --build build -j$(nproc)
+
+# Release (benchmarks, production)
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release -j$(nproc)
+
+# Tests — 510 of them, ~6 minutes
+ctest --test-dir build --output-on-failure -j1
+```
+
+First configure pulls googletest, google/benchmark, rapidcheck and nlohmann/json via `FetchContent`,
+which needs network access and a few minutes.
+
+System dependencies: `liblz4-dev`, `libcurl4-openssl-dev`, `liburing-dev`.
+
+Tests that touch coordination need a native `etcd` on PATH (or `OB_ETCD_BINARY`). Installation
+instructions are in [tests/integration/README.md](tests/integration/README.md) and
+[docs/cli.md](docs/cli.md).
+
+Property tests use RapidCheck with `RC_PARAMS=max_success=100` for multi-master networking and `=25`
+elsewhere, set in `tests/CMakeLists.txt`.
+
+## Architecture
+
+`Engine` (`src/engine.cpp`) is a facade delegating to WAL, SoA buffer, columnar store, replication and
+multi-master. Full component map: [docs/architecture.md](docs/architecture.md). Wire protocol:
+[docs/cli.md](docs/cli.md).
+
+The largest and most intricate component is `MultiMasterManager` (`src/multi_master.cpp`, ~1000
+lines): a unified epoll io_loop handling accept, recv and send, plus reconnect with exponential
+backoff, catch-up streaming from a peer's WAL position, and backpressure that falls back to snapshot
+sync above 512MB.
+
+Peer discovery pipeline, worth memorising because breaking any link fails silently:
+`etcd → PeerRegistry::start_watch() → handle_topology_change() → connect_to_peer() → send_handshake()`
+
+## Coding conventions
+
+- C++20, namespace `ob::`, headers in `include/orderbook/`, sources in `src/`, tests in `tests/`
+- Code and comments in English
+- One test file per component; property-based tests where the invariant is worth stating
+- GCC quirk: `auto wr = ::write(...); (void)wr;` — not `(void)::write(...)`
+- Never name a local `rc`: it shadows the RapidCheck namespace and the resulting error is unreadable
+- Aggregate initialisation: list every field (`-Wmissing-field-initializers`)
+- Value-init `Type var{}` rather than `memset`
+- Storage is append-only; nothing deletes rows except TTL retention
+
+## Logging
+
+Default level is DEBUG. Do not economise on logs.
+
+| Level | Use for |
+|-------|---------|
+| `OB_LOG_INFO` | lifecycle: start/stop, connections, role transitions, handshake, catch-up |
+| `OB_LOG_DEBUG` | detail: parsing, processing, internal state |
+| `OB_LOG_WARN` | timeouts, retries, backpressure, unexpected states |
+| `OB_LOG_ERROR` | data loss, corruption, protocol errors |
+
+The component string must be specific (`"mm"`, `"engine"`, `"repl_client"`, `"failover"`,
+`"peer_registry"`, `"shard_router"`, `"tcp_server"`), and every line must carry context: fd, node_id,
+peer_id, epoch, addresses, sizes. Rule of thumb: if it can go wrong, it must be logged.
+
+## Known pitfalls
+
+Learned the hard way. Check here before debugging.
+
+1. **Port conflicts in tests** — always `ctest -j1`.
+2. **AF_INET vs AF_INET6** — `socket()` must match the `sockaddr` struct in use (we use AF_INET).
+3. **`read_only_flag_` in multi-master mode** — must be reset after `FailoverManager` initialisation,
+   or the node rejects writes it should accept.
+4. **`peer_registry_` wiring order** — init in the constructor, `register_self()` + `start_watch()` in
+   `start()`, `deregister()` in `stop()`. Miss one and peer discovery fails silently.
+5. **EPOLLOUT busy-loop** — arm EPOLLOUT only after `send()` returns EAGAIN, disarm when `send_buf`
+   empties. Otherwise epoll spins and burns a core.
+6. **`parse_frames` offsets** point into the buffer *before* erasure. Snapshot them if you need them
+   afterwards.
+7. **`WALRecordV2.payload_len`** must equal `frame_len - 38`. A mismatch means desync or corruption:
+   disconnect the peer.
+8. **LZ4 and Nagle** — small compressed frames need `TCP_NODELAY`, or INSERT latency multiplies.
+9. **`FLUSH` is `flush_incremental()`**, not close+open. Getting this wrong costs 82ms instead of 2ms.
+
+## Current state and open problems
+
+Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Three things
+a newcomer should know because they look like working features and are not:
+
+- **The integration test suite has no test files.** A `test_*` pattern in `.gitignore` silently
+  excluded every `tests/integration/test_*.py`. The framework (`conftest.py`, 691 lines) survived;
+  the ~37 tests did not. Roadmap #25.
+- **`FAILOVER <target_node_id>` ignores the target**, and the outgoing primary can immediately
+  re-acquire the role it just released. `EtcdTestFixture.GracefulFailover` fails 40-50% of runs.
+  Roadmap #26.
+- **`AntiEntropyManager` is a scheduler with no reconciliation.** `detect_gaps()` always returns
+  empty, `repair_gap()` always returns false. Metrics report runs, so it looks alive. Roadmap #53.
+
+Also worth knowing: the wire protocol has no authentication or encryption (roadmap #27), and
+`rapidcheck` is pinned to `master` rather than a commit SHA.
+
+## Before you call a change done
+
+1. Build clean, no warnings
+2. `ctest -j1` green
+3. New behaviour covered by a test; new server functionality also covered in `tests/integration/`
+4. Logging added
+5. Hot-path changes (WAL, SoA, columnar, codec, aggregation, query engine, engine facade): run
+   `bench_engine` in Release and compare against the previous run **on the same machine**
+6. Conventional commit message, in English
