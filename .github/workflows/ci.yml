@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: build-and-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            liblz4-dev libcurl4-openssl-dev liburing-dev
+
+      # etcd runs natively, like the engine itself. No containers in the test path.
+      - name: Install etcd
+        env:
+          ETCD_VER: v3.5.17
+        run: |
+          curl -fsSL "https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz" | tar xz
+          sudo install -m755 "etcd-${ETCD_VER}-linux-amd64/etcd" "etcd-${ETCD_VER}-linux-amd64/etcdctl" /usr/local/bin/
+          etcd --version
+
+      - name: Start etcd
+        run: |
+          etcd --name ci-etcd --data-dir /tmp/ci-etcd \
+            --advertise-client-urls http://127.0.0.1:2379 \
+            --listen-client-urls http://127.0.0.1:2379 \
+            > /tmp/ci-etcd.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:2379/version && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:2379/version
+
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      # -j1 is mandatory: network tests bind fixed ports and fail under parallel execution.
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j1
+
+  release-build:
+    name: release-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            liblz4-dev libcurl4-openssl-dev liburing-dev
+
+      - name: Configure (Release, no tests)
+        run: cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DOB_BUILD_TESTS=OFF
+
+      - name: Build server
+        run: cmake --build build-release -j$(nproc)
+
+      - name: Smoke check
+        run: |
+          ./build-release/ob_tcp_server --port 5599 --data-dir /tmp/ci-smoke &
+          SERVER_PID=$!
+          for i in $(seq 1 20); do
+            if printf 'PING\n' | timeout 2 nc -q1 127.0.0.1 5599 | grep -q PONG; then
+              echo "PONG received"
+              kill $SERVER_PID
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server did not answer PING"
+          kill $SERVER_PID || true
+          exit 1
