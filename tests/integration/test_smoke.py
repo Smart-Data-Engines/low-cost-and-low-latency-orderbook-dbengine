@@ -84,6 +84,28 @@ def test_query_returns_both_sides(primary_client: OrderbookEngine):
     assert len(sides) == 2, f"both sides should be stored, got sides={sides}"
 
 
+def test_repeated_flush_does_not_duplicate_rows(primary_client: OrderbookEngine):
+    """Flushing between reads must not multiply the rows.
+
+    This is the assertion that caught the flush race: a segment registered twice in
+    the query index returned every row in it twice. Count the rows — comparing
+    sets of prices would have passed on the duplicated data.
+    """
+    prices = [7_100_000, 7_099_000]
+    primary_client.insert("SMOKE-DUP", "BINANCE", "bid", prices, [10, 20])
+
+    for round_no in range(4):
+        primary_client.flush()
+        rows = primary_client.query_all("SMOKE-DUP", "BINANCE")
+        assert len(rows) == len(prices), (
+            f"round {round_no}: expected {len(prices)} rows, got {len(rows)}")
+
+    status = primary_client.status()
+    assert status.get("segment_merge_refused", 0) == 0, (
+        "the server refused a duplicate segment merge, so two flush paths raced: "
+        f"segment_merge_refused={status.get('segment_merge_refused')}")
+
+
 def test_status_reports_counters(primary_client: OrderbookEngine):
     """STATUS has to answer with counters, not just not fail."""
     primary_client.insert("SMOKE-STATUS", "BINANCE", "bid", [123_000], [7])

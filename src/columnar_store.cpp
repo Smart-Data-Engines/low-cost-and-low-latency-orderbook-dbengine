@@ -149,8 +149,18 @@ void ColumnarStore::append(const SnapshotRow& row) {
         level_buf_.clear();
         seq_buf_.clear();
     } else if (row.timestamp_ns >= active_segment_start_ + segment_duration_ns_) {
-        // Roll over to a new segment
-        flush_segment();
+        // Roll over to a new segment. The meta must be kept: this store has no
+        // reference to the index queries read, and discarding it left the segment
+        // on disk and invisible to every SELECT until the next open_existing().
+        auto rolled = flush_segment();
+        if (rolled.has_value()) {
+            OB_LOG_DEBUG("columnar",
+                         "Segment rolled over: dir=%s rows=%llu, meta queued for merge",
+                         rolled->dir_path.c_str(),
+                         static_cast<unsigned long long>(rolled->row_count));
+            std::unique_lock<std::shared_mutex> lock(index_mtx_);
+            rolled_segments_.push_back(std::move(rolled.value()));
+        }
         active_segment_start_ = seg_start;
         has_active_segment_   = true;
         active_row_count_     = 0;
@@ -544,14 +554,47 @@ void ColumnarStore::open_existing() {
 
 // ── merge_segments ────────────────────────────────────────────────────────────
 
-void ColumnarStore::merge_segments(const std::vector<SegmentMeta>& new_segments) {
-    if (new_segments.empty()) return;
+std::vector<SegmentMeta> ColumnarStore::take_rolled_segments() {
     std::unique_lock<std::shared_mutex> lock(index_mtx_);
-    index_.insert(index_.end(), new_segments.begin(), new_segments.end());
-    std::sort(index_.begin(), index_.end(),
-              [](const SegmentMeta& a, const SegmentMeta& b) {
-                  return a.start_ts_ns < b.start_ts_ns;
-              });
+    std::vector<SegmentMeta> taken;
+    taken.swap(rolled_segments_);
+    return taken;
+}
+
+size_t ColumnarStore::merge_segments(const std::vector<SegmentMeta>& new_segments) {
+    if (new_segments.empty()) return 0;
+    std::unique_lock<std::shared_mutex> lock(index_mtx_);
+
+    size_t refused = 0;
+    bool added = false;
+    for (const auto& meta : new_segments) {
+        // Defence in depth, not the fix. Serialising the flush paths is what stops
+        // the same segment being produced twice; this makes sure that if it ever
+        // happens again the log says so, instead of every client silently seeing
+        // each row in that segment twice.
+        const bool already_indexed =
+            std::any_of(index_.begin(), index_.end(),
+                        [&](const SegmentMeta& m) { return m.dir_path == meta.dir_path; });
+        if (already_indexed) {
+            OB_LOG_ERROR("columnar",
+                         "Refusing to merge a segment already in the index: dir=%s rows=%llu. "
+                         "Two flush paths raced; rows would be scanned twice",
+                         meta.dir_path.c_str(),
+                         static_cast<unsigned long long>(meta.row_count));
+            ++refused;
+            continue;
+        }
+        index_.push_back(meta);
+        added = true;
+    }
+
+    if (added) {
+        std::sort(index_.begin(), index_.end(),
+                  [](const SegmentMeta& a, const SegmentMeta& b) {
+                      return a.start_ts_ns < b.start_ts_ns;
+                  });
+    }
+    return refused;
 }
 
 // ── delete_expired_segments ───────────────────────────────────────────────────

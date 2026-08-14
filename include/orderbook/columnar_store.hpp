@@ -44,6 +44,14 @@ struct SegmentMeta {
 ///     ts.col     — raw uint64 nanosecond timestamps
 ///     cnt.col    — raw uint32 order counts
 ///     meta.json  — SegmentMeta as JSON
+///
+/// Thread safety: index_mtx_ guards the segment index and rolled_segments_, so
+/// scan() and merge_segments() are safe against each other. append() and
+/// flush_segment() are NOT: they touch the column buffers and the active-segment
+/// flags with no lock, deliberately, because append() sits on the drain hot path.
+/// Callers must serialise them — Engine does so with flush_mtx_. Two unsynchronised
+/// flush_segment() calls each write the same directory and each return a valid meta,
+/// which is how the same segment once landed in the query index twice.
 class ColumnarStore {
 public:
     explicit ColumnarStore(std::string_view base_dir,
@@ -70,6 +78,14 @@ public:
     /// Flush the active segment: encode buffers, write column files, write meta.json.
     /// Returns the SegmentMeta of the flushed segment, or std::nullopt if no active segment.
     std::optional<SegmentMeta> flush_segment();
+
+    /// Return and clear the metas of segments closed by a rollover inside append().
+    ///
+    /// append() cannot merge them itself: it has no reference to the index that
+    /// queries read. Whoever owns this store must collect them and merge them, or
+    /// those rows sit on disk invisible to every SELECT until the next
+    /// open_existing().
+    std::vector<SegmentMeta> take_rolled_segments();
 
     /// Time-range scan; calls cb for each decoded row in [start_ns, end_ns].
     void scan(uint64_t start_ns, uint64_t end_ns,
@@ -103,7 +119,12 @@ public:
     }
 
     /// Merge new segments into the index, maintaining sort order by start_ts_ns.
-    void merge_segments(const std::vector<SegmentMeta>& new_segments);
+    ///
+    /// Returns the number of segments refused because their directory was already
+    /// indexed. A non-zero return means two flush paths raced: the duplicate rows
+    /// were kept out of the index, but the race itself still needs fixing, so the
+    /// caller should surface the count rather than ignore it.
+    size_t merge_segments(const std::vector<SegmentMeta>& new_segments);
 
 private:
     std::string base_dir_;
@@ -129,6 +150,11 @@ private:
     // matters in multi-master mode where sequences from different nodes can land
     // in one segment out of order.
     std::vector<int64_t>  seq_buf_;
+
+    /// Segments closed by a rollover inside append(), waiting to be collected by
+    /// take_rolled_segments(). Guarded by index_mtx_ because it crosses the
+    /// append → flush boundary.
+    std::vector<SegmentMeta> rolled_segments_;
 
     // Segment index (rebuilt from meta.json on open_existing)
     std::vector<SegmentMeta> index_;

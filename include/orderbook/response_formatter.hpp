@@ -63,6 +63,10 @@ struct ServerStats {
     uint64_t ttl_segments_deleted{0};   // cumulative segments deleted
     uint64_t ttl_bytes_reclaimed{0};    // cumulative bytes reclaimed
 
+    // Flush integrity: segments refused because their directory was already in the
+    // index. Anything but 0 means two flush paths raced.
+    uint64_t segment_merge_refused{0};
+
     // Sharding metrics
     std::string shard_id;                // empty = non-sharded
     std::string shard_status;            // "active", "joining", "draining"
