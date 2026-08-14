@@ -164,15 +164,20 @@ Multi-master mode is incompatible with:
 
 ### Example: 3-Node Multi-Master Cluster
 
-Start etcd (if not already running):
+Start etcd (if not already running). Install it natively, the same way the engine itself runs.
+There is deliberately no container in this path:
 
 ```bash
-docker run -d --name etcd -p 2379:2379 \
-  quay.io/coreos/etcd:v3.5.17 \
-  /usr/local/bin/etcd \
-  --advertise-client-urls http://0.0.0.0:2379 \
-  --listen-client-urls http://0.0.0.0:2379
+ETCD_VER=v3.5.17
+curl -L https://github.com/etcd-io/etcd/releases/download/$ETCD_VER/etcd-$ETCD_VER-linux-amd64.tar.gz | tar xz
+sudo install -m755 etcd-$ETCD_VER-linux-amd64/etcd etcd-$ETCD_VER-linux-amd64/etcdctl /usr/local/bin/
+
+etcd --name node-etcd --data-dir /var/lib/ob-etcd \
+  --advertise-client-urls http://127.0.0.1:2379 \
+  --listen-client-urls http://127.0.0.1:2379
 ```
+
+On a permanent deployment, run etcd from a systemd unit and order `ob_tcp_server` after it.
 
 Start three multi-master nodes:
 
