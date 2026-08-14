@@ -1,6 +1,15 @@
 # orderbook-dbengine
 
+[![CI](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/workflows/ci.yml/badge.svg)](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/workflows/codeql.yml/badge.svg)](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/workflows/codeql.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
+
 A purpose-built C++20 database engine for Level 2 orderbook data in high-frequency trading environments. Designed for sub-microsecond update latency and millions of updates per second on a single core.
+
+Built by [Smart Data Engines](https://smartdataengines.com), who build custom database engines for specific hardware and workloads.
+
+> **Deployment notes:** the engine runs natively on the host; there is no containerised deployment path by design. The wire protocol has no authentication or transport encryption as of `v0.1.x`, so run it on a trusted network only. See [SECURITY.md](SECURITY.md).
 
 ## Features
 
@@ -125,8 +134,12 @@ engine.close()
 ### Run tests
 
 ```bash
-ctest --test-dir build --output-on-failure
+# -j1 is required: network tests bind fixed ports and fail under parallel execution.
+ctest --test-dir build --output-on-failure -j1
 ```
+
+510 tests (GTest + RapidCheck), roughly 6 minutes. Integration tests additionally need a native
+`etcd` binary — see [tests/integration/README.md](tests/integration/README.md).
 
 ### Run benchmarks
 
@@ -153,7 +166,7 @@ python python/benchmark.py --mode tcp --host 127.0.0.1 --port 5555
 ```
 include/orderbook/     C++ headers (public API)
 src/                   Implementation files
-tests/                 Unit + property-based tests (140 tests)
+tests/                 Unit + property-based tests (510 tests)
 benchmarks/            Google Benchmark suite
 tools/                 CLI tool (ob_cli) and TCP server (ob_tcp_server)
 python/                Python bindings and benchmark script
@@ -171,6 +184,8 @@ See the [docs/](docs/) directory:
 - [C API Reference](docs/c-api.md)
 - [Storage Format](docs/storage.md)
 - [Benchmarks](benchmarks/README.md)
+- [Roadmap](docs/roadmap.md)
+- [Repository security](docs/github-security.md)
 
 ## License
 
