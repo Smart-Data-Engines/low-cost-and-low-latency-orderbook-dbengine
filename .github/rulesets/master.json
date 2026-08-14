@@ -25,7 +25,8 @@
         "strict_required_status_checks_policy": true,
         "required_status_checks": [
           { "context": "build-and-test" },
-          { "context": "release-build" }
+          { "context": "release-build" },
+          { "context": "docs-integrity" }
         ]
       }
     }
