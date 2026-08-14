@@ -100,10 +100,14 @@ def test_repeated_flush_does_not_duplicate_rows(primary_client: OrderbookEngine)
         assert len(rows) == len(prices), (
             f"round {round_no}: expected {len(prices)} rows, got {len(rows)}")
 
+    # No default on the get: with one, this assertion passed while the field was
+    # missing from the client's STATUS parsing entirely, which is no assertion at all.
     status = primary_client.status()
-    assert status.get("segment_merge_refused", 0) == 0, (
+    assert "segment_merge_refused" in status, (
+        f"STATUS does not report segment_merge_refused; keys: {sorted(status)}")
+    assert status["segment_merge_refused"] == 0, (
         "the server refused a duplicate segment merge, so two flush paths raced: "
-        f"segment_merge_refused={status.get('segment_merge_refused')}")
+        f"segment_merge_refused={status['segment_merge_refused']}")
 
 
 def test_status_reports_counters(primary_client: OrderbookEngine):

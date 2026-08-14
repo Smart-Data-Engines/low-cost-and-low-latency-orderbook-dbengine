@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -78,7 +79,21 @@ public:
     // ── Direct histogram access (for testing) ─────────────────────────────────
     const HistogramData* histogram_data(std::string_view name) const;
 
+    /// How many writes were addressed to a metric name that is not registered.
+    ///
+    /// Such a write updates nothing. Six of the engine's gauges were dead this way
+    /// for as long as they existed — registered as `ob_segment_count` and friends,
+    /// written as `segment_count` — so `/metrics` served flat zeros while the engine
+    /// worked correctly. Anything other than 0 here is a wiring bug.
+    uint64_t unknown_metric_writes() const {
+        return unknown_metric_writes_.load(std::memory_order_relaxed);
+    }
+
 private:
+    /// Report a write to a name that is not registered. Logs once per distinct
+    /// name, because the caller may be on a path that runs ten times a second.
+    void report_unknown_metric(std::string_view kind, std::string_view name) const;
+
     // Pre-registered metrics (fixed at construction, no dynamic allocation).
     // unique_ptr because atomic members are non-movable.
     std::vector<std::unique_ptr<CounterEntry>>   counters_;
@@ -86,6 +101,10 @@ private:
     std::vector<std::unique_ptr<HistogramEntry>> histograms_;
     std::string                                  node_role_{"standalone"};
     mutable std::mutex                           serialize_mtx_;
+
+    mutable std::atomic<uint64_t>                unknown_metric_writes_{0};
+    mutable std::mutex                           unknown_names_mtx_;
+    mutable std::set<std::string>                unknown_names_reported_;
 
     // Lookup helpers — linear scan over small fixed-size vectors
     CounterEntry*         find_counter(std::string_view name);

@@ -253,7 +253,7 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta, const Level* levels) {
     }
 
     // Update gauge: pending rows after enqueue.
-    registry_.set_gauge("pending_rows", static_cast<int64_t>(pending_rows_.size()));
+    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
 
     return status;
 }
@@ -343,7 +343,7 @@ ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta, const Level* levels
         query_engine_->notify_subscribers(delta.symbol, delta.exchange, row);
     }
 
-    registry_.set_gauge("pending_rows", static_cast<int64_t>(pending_rows_.size()));
+    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
 
     return status;
 }
@@ -451,7 +451,7 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta, const Level* le
 
     // 6. Do NOT broadcast further (single-hop propagation in full-mesh).
 
-    registry_.set_gauge("pending_rows", static_cast<int64_t>(pending_rows_.size()));
+    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
 
     return OB_OK;
 }
@@ -829,7 +829,7 @@ void Engine::promote_to_primary(const EpochValue& new_epoch) {
     wal_.append_epoch(new_epoch);
 
     // Update gauge: current epoch after promotion.
-    registry_.set_gauge("current_epoch", static_cast<int64_t>(new_epoch.term));
+    registry_.set_gauge("ob_current_epoch", static_cast<int64_t>(new_epoch.term));
 
     // Start ReplicationManager if not already running.
     if (!repl_mgr_ && repl_config_.port > 0) {
@@ -873,7 +873,7 @@ void Engine::demote_to_replica(const std::string& new_primary_address) {
 
     // Update metrics registry node role and epoch gauge.
     registry_.set_node_role("replica");
-    registry_.set_gauge("current_epoch",
+    registry_.set_gauge("ob_current_epoch",
                         static_cast<int64_t>(current_epoch_.load(std::memory_order_relaxed)));
 
     // Start ReplicationClient to new primary.
@@ -1082,7 +1082,7 @@ SoABuffer& Engine::get_or_create_buffer(const std::string& symbol,
     buffers_[key] = std::move(buf);
 
     // Update gauge: symbol count after adding new symbol.
-    registry_.set_gauge("symbol_count", static_cast<int64_t>(buffers_.size()));
+    registry_.set_gauge("ob_symbol_count", static_cast<int64_t>(buffers_.size()));
 
     return ref;
 }
@@ -1136,7 +1136,7 @@ void Engine::flush_loop() {
         flush_write_and_merge();
 
         // Update gauge: WAL file index.
-        registry_.set_gauge("wal_file_index",
+        registry_.set_gauge("ob_wal_file_index",
                             static_cast<int64_t>(wal_.current_file_index()));
 
         // WAL truncation and TTL scan under mutex.
@@ -1183,7 +1183,7 @@ void Engine::flush_drain_pending() {
     pending_rows_.clear();
 
     // Update gauge: pending rows is now 0 after drain.
-    registry_.set_gauge("pending_rows", 0);
+    registry_.set_gauge("ob_pending_rows", 0);
 
     // Wake up any writers blocked on backpressure.
     pending_cv_.notify_all();
@@ -1227,13 +1227,13 @@ void Engine::flush_write_and_merge() {
         const size_t refused = combined_store_.merge_segments(new_segments);
         if (refused > 0) {
             segment_merge_refused_.fetch_add(refused, std::memory_order_relaxed);
-            registry_.set_gauge("segment_merge_refused",
+            registry_.set_gauge("ob_segment_merge_refused",
                                 static_cast<int64_t>(
                                     segment_merge_refused_.load(std::memory_order_relaxed)));
         }
 
         // Update gauge: segment count after merge.
-        registry_.set_gauge("segment_count",
+        registry_.set_gauge("ob_segment_count",
                             static_cast<int64_t>(combined_store_.segment_count()));
     }
 }

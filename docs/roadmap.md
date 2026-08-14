@@ -264,6 +264,15 @@ because the two mechanisms overlap there — which is why the three-node test ex
 - Shipped dashboard JSON and Prometheus alert rules (replica lag, failover events, backpressure,
   conflict rate, flush latency)
 - Effort: S | Impact: High value relative to cost; makes the metrics already being exported usable
+- **Prerequisite cleared.** Five of the gauges a dashboard would plot were dead: registered as
+  `ob_segment_count`, `ob_pending_rows`, `ob_symbol_count`, `ob_wal_file_index` and `ob_current_epoch`,
+  but written by the engine without the `ob_` prefix. `MetricsRegistry::set_gauge()` looks the name up
+  and returns quietly when it misses, so every one of those writes updated nothing and `/metrics`
+  served a flat zero while the engine worked correctly. `ob_mm_backpressure_snapshot_total` was
+  incremented but never registered at all. Names fixed, the missing counter registered, and an
+  unregistered write now logs `OB_LOG_ERROR` once per name and increments a counter that three unit
+  tests assert is zero. Found by the first integration test that checked a metric's *value* rather
+  than its presence
 
 ## Phase 8 — Verifiability
 

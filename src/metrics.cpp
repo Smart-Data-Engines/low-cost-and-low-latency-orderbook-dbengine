@@ -1,4 +1,5 @@
 #include "orderbook/metrics.hpp"
+#include "orderbook/logger.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -42,6 +43,8 @@ MetricsRegistry::MetricsRegistry() {
     gauges_.push_back(make_gauge("ob_pending_rows",    "Number of rows pending flush"));
     gauges_.push_back(make_gauge("ob_wal_file_index",  "Current WAL file index"));
     gauges_.push_back(make_gauge("ob_segment_count",   "Number of columnar segments"));
+    gauges_.push_back(make_gauge("ob_segment_merge_refused",
+                                 "Segments refused as already indexed (a flush race; should stay 0)"));
     gauges_.push_back(make_gauge("ob_symbol_count",    "Number of tracked symbols"));
     gauges_.push_back(make_gauge("ob_current_epoch",   "Current failover epoch"));
 
@@ -56,6 +59,8 @@ MetricsRegistry::MetricsRegistry() {
     gauges_.push_back(make_gauge("ob_mm_replication_lag_bytes",    "Replication lag in bytes (max across peers)"));
     counters_.push_back(make_counter("ob_mm_anti_entropy_runs_total",    "Total number of anti-entropy runs"));
     counters_.push_back(make_counter("ob_mm_anti_entropy_repairs_total", "Total number of anti-entropy repairs"));
+    counters_.push_back(make_counter("ob_mm_backpressure_snapshot_total",
+                                     "Times a peer fell back to snapshot sync under backpressure"));
     gauges_.push_back(make_gauge("ob_mm_hlc_drift_ns",             "Maximum HLC drift in nanoseconds"));
 
 #ifdef OB_USE_IO_URING
@@ -116,7 +121,9 @@ const HistogramEntry* MetricsRegistry::find_histogram(std::string_view name) con
 void MetricsRegistry::increment_counter(std::string_view name, uint64_t delta) {
     if (auto* c = find_counter(name)) {
         c->value.fetch_add(delta, std::memory_order_relaxed);
+        return;
     }
+    report_unknown_metric("counter", name);
 }
 
 uint64_t MetricsRegistry::counter_value(std::string_view name) const {
@@ -126,18 +133,39 @@ uint64_t MetricsRegistry::counter_value(std::string_view name) const {
     return 0;
 }
 
+void MetricsRegistry::report_unknown_metric(std::string_view kind,
+                                            std::string_view name) const {
+    unknown_metric_writes_.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(unknown_names_mtx_);
+        if (!unknown_names_reported_.insert(std::string(name)).second) {
+            return;  // already reported; callers can run ten times a second
+        }
+    }
+    OB_LOG_ERROR("metrics",
+                 "Write to unregistered %s '%.*s': the value is discarded and "
+                 "/metrics will report a flat zero. Check the name against the "
+                 "registrations in MetricsRegistry::MetricsRegistry()",
+                 std::string(kind).c_str(),
+                 static_cast<int>(name.size()), name.data());
+}
+
 // ── Gauge operations ──────────────────────────────────────────────────────────
 
 void MetricsRegistry::set_gauge(std::string_view name, int64_t value) {
     if (auto* g = find_gauge(name)) {
         g->value.store(value, std::memory_order_relaxed);
+        return;
     }
+    report_unknown_metric("gauge", name);
 }
 
 void MetricsRegistry::increment_gauge(std::string_view name, int64_t delta) {
     if (auto* g = find_gauge(name)) {
         g->value.fetch_add(delta, std::memory_order_relaxed);
+        return;
     }
+    report_unknown_metric("gauge", name);
 }
 
 int64_t MetricsRegistry::gauge_value(std::string_view name) const {
@@ -151,7 +179,10 @@ int64_t MetricsRegistry::gauge_value(std::string_view name) const {
 
 void MetricsRegistry::observe_histogram(std::string_view name, double seconds) {
     auto* h = find_histogram(name);
-    if (!h) return;
+    if (!h) {
+        report_unknown_metric("histogram", name);
+        return;
+    }
 
     auto& d = h->data;
 

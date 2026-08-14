@@ -1064,6 +1064,35 @@ class _ClientPool:
 
 # ── Multi-master response parsers ──────────────────────────────────────────────
 
+def _parse_status_fields(raw: str) -> dict:
+    """Collect the top-level `key: value` lines of a STATUS response.
+
+    Stops at the first `[section]` marker, so sectioned blocks such as
+    `[multi_master]` stay with their own parser and cannot shadow a top-level key.
+    Values that look like integers are converted; anything else (an address, a role
+    name) is kept as text.
+    """
+    result: dict = {}
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            break
+        if ":" not in line:
+            continue  # the OK line and the TSV counter row
+        key, _, value = line.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if not key or " " in key:
+            continue  # prose, not a field
+        try:
+            result[key] = int(value)
+        except ValueError:
+            result[key] = value
+    return result
+
+
 def _parse_status_multi_master(raw: str) -> Optional[dict]:
     """Parse [multi_master] section from STATUS response.
 
@@ -1414,6 +1443,12 @@ class OrderbookEngine:
             result["sessions"] = int(data_rows[0][0])
             result["queries"] = int(data_rows[0][1])
             result["inserts"] = int(data_rows[0][2])
+
+        # Every other `key: value` line the server sends. Previously only the three
+        # TSV counters above were kept, so replication lag, TTL reclamation, segment
+        # counts, shard state and flush integrity were all sent by the server and
+        # dropped here — invisible to any Python client, including the tests.
+        result.update(_parse_status_fields(raw))
 
         # Parse [multi_master] section from raw response
         mm_section = _parse_status_multi_master(raw)
