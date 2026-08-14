@@ -52,19 +52,28 @@ class NodeInfo:
 
 class ClusterManager:
     """Manage the full lifecycle of an integration-test cluster:
-    etcd Docker container + 2 ob_tcp_server nodes."""
+    a native etcd process + 2 ob_tcp_server nodes.
+
+    Everything runs directly on the host. The engine has no containerised
+    deployment path, so the test harness does not depend on one either.
+    """
 
     _PROJECT_ROOT = Path(__file__).resolve().parents[2]  # …/low-cost-and-low-latency-orderbook-dbengine
     _SERVER_BINARY = "build/ob_tcp_server"
-    _ETCD_IMAGE = "quay.io/coreos/etcd:v3.5.9"
 
-    def __init__(self, server_binary: Optional[str] = None):
+    def __init__(self, server_binary: Optional[str] = None,
+                 etcd_binary: Optional[str] = None):
         self.server_binary: str = server_binary or str(
             self._PROJECT_ROOT / self._SERVER_BINARY
         )
+        self.etcd_binary: str = (
+            etcd_binary or os.environ.get("OB_ETCD_BINARY") or "etcd"
+        )
         self.etcd_client_port: int = 0
         self.etcd_peer_port: int = 0
-        self.etcd_container_id: str = ""
+        self.etcd_data_dir: str = ""
+        self.etcd_process: Optional[subprocess.Popen] = None
+        self._etcd_log = None
         self.nodes: list[NodeInfo] = []
         self.temp_dirs: list[str] = []
         self._started = False
@@ -130,35 +139,56 @@ class ClusterManager:
     # ── etcd management ───────────────────────────────────────────
 
     def _start_etcd(self) -> None:
+        """Start etcd as a native process.
+
+        The engine is a native-deployment database and the test harness follows the
+        same rule: no containers anywhere in the loop. etcd must be on PATH, or its
+        location given via the OB_ETCD_BINARY environment variable.
+        """
         self.etcd_client_port = self.find_free_port()
         self.etcd_peer_port = self.find_free_port()
-        self._etcd_container_name = f"ob-etcd-test-{self.etcd_client_port}"
+        self.etcd_data_dir = tempfile.mkdtemp(prefix="ob_etcd_")
+        self.temp_dirs.append(self.etcd_data_dir)
 
-        # Remove any stale container with the same name (from a previous crashed run)
-        subprocess.run(
-            ["docker", "rm", "-f", self._etcd_container_name],
-            capture_output=True, timeout=10,
-        )
+        etcd_log_path = os.path.join(self.etcd_data_dir, "etcd.log")
+        self._etcd_log = open(etcd_log_path, "wb")
 
         cmd = [
-            "docker", "run", "-d",
-            "--name", self._etcd_container_name,
-            "--net=host",
-            self._ETCD_IMAGE,
-            "etcd",
+            self.etcd_binary,
+            "--name", "ob-test-etcd",
+            "--data-dir", os.path.join(self.etcd_data_dir, "data"),
             "--advertise-client-urls", f"http://127.0.0.1:{self.etcd_client_port}",
-            "--listen-client-urls", f"http://0.0.0.0:{self.etcd_client_port}",
-            "--listen-peer-urls", f"http://0.0.0.0:{self.etcd_peer_port}",
+            "--listen-client-urls", f"http://127.0.0.1:{self.etcd_client_port}",
+            "--listen-peer-urls", f"http://127.0.0.1:{self.etcd_peer_port}",
             "--initial-advertise-peer-urls", f"http://127.0.0.1:{self.etcd_peer_port}",
-            "--initial-cluster", f"default=http://127.0.0.1:{self.etcd_peer_port}",
+            "--initial-cluster", f"ob-test-etcd=http://127.0.0.1:{self.etcd_peer_port}",
+            "--initial-cluster-state", "new",
+            # Keep the store small: these are short-lived test clusters.
+            "--quota-backend-bytes", str(256 * 1024 * 1024),
         ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Failed to start etcd container: {result.stderr.strip()}"
+        try:
+            self.etcd_process = subprocess.Popen(
+                cmd, stdout=self._etcd_log, stderr=subprocess.STDOUT,
             )
-        self.etcd_container_id = result.stdout.strip()
+        except OSError as exc:
+            raise RuntimeError(
+                f"Failed to launch etcd binary '{self.etcd_binary}': {exc}"
+            ) from exc
+
+        # Fail fast if etcd died on startup (bad flags, port taken, corrupt data dir).
+        time.sleep(0.2)
+        if self.etcd_process.poll() is not None:
+            log_tail = ""
+            try:
+                with open(etcd_log_path, "r", errors="replace") as fh:
+                    log_tail = "".join(fh.readlines()[-15:])
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"etcd exited immediately with code {self.etcd_process.returncode}.\n"
+                f"Log tail:\n{log_tail}"
+            )
 
     def _wait_for_etcd(self, timeout: float = 30.0) -> None:
         url = f"http://127.0.0.1:{self.etcd_client_port}/v3/maintenance/status"
@@ -181,19 +211,22 @@ class ClusterManager:
         )
 
     def _stop_etcd(self) -> None:
-        # Remove by container ID
-        if self.etcd_container_id:
-            subprocess.run(
-                ["docker", "rm", "-f", self.etcd_container_id],
-                capture_output=True, timeout=15,
-            )
-            self.etcd_container_id = ""
-        # Also remove by name as safety net
-        if hasattr(self, '_etcd_container_name') and self._etcd_container_name:
-            subprocess.run(
-                ["docker", "rm", "-f", self._etcd_container_name],
-                capture_output=True, timeout=15,
-            )
+        proc = self.etcd_process
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        self.etcd_process = None
+
+        if self._etcd_log is not None:
+            try:
+                self._etcd_log.close()
+            except OSError:
+                pass
+            self._etcd_log = None
 
     # ── Node management ───────────────────────────────────────────
 
@@ -412,24 +445,27 @@ class ClusterManager:
             return sock.recv(4096).decode(errors="replace")
 
     def _check_prerequisites(self) -> None:
-        """Verify Docker and server binary are available."""
-        # Check server binary
+        """Verify the server binary and a native etcd binary are available."""
         if not os.path.isfile(self.server_binary):
             raise RuntimeError(
                 f"Server binary not found: {self.server_binary}\n"
                 "Please compile the project first (cmake --build build)."
             )
 
-        # Check Docker
-        result = subprocess.run(
-            ["docker", "info"],
-            capture_output=True, timeout=10,
-        )
-        if result.returncode != 0:
+        resolved = shutil.which(self.etcd_binary) if os.path.sep not in self.etcd_binary \
+            else (self.etcd_binary if os.access(self.etcd_binary, os.X_OK) else None)
+        if resolved is None:
             raise RuntimeError(
-                "Docker is not available. Please install and start Docker.\n"
-                f"stderr: {result.stderr.decode(errors='replace')}"
+                f"etcd binary not found: '{self.etcd_binary}'.\n"
+                "Install etcd natively (no container needed):\n"
+                "  ETCD_VER=v3.5.17\n"
+                "  curl -L https://github.com/etcd-io/etcd/releases/download/"
+                "$ETCD_VER/etcd-$ETCD_VER-linux-amd64.tar.gz | tar xz\n"
+                "  sudo install -m755 etcd-$ETCD_VER-linux-amd64/etcd"
+                " etcd-$ETCD_VER-linux-amd64/etcdctl /usr/local/bin/\n"
+                "Or point OB_ETCD_BINARY at an existing binary."
             )
+        self.etcd_binary = resolved
 
 
 # ---------------------------------------------------------------------------

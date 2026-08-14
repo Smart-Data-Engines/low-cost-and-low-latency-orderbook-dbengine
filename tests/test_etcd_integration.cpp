@@ -1,6 +1,9 @@
 // Feature: etcd-integration-tests
-// Integration tests for orderbook-dbengine failover with a real etcd v3 instance
-// running in Docker.
+// Integration tests for orderbook-dbengine failover against a real etcd v3
+// instance running as a native process on this host. No containers: the engine
+// has no containerised deployment path, and neither does its test harness.
+//
+// Requires the `etcd` binary on PATH, or OB_ETCD_BINARY pointing at one.
 //
 // Gated behind OB_ETCD_TESTS env var.  NOT registered with gtest_discover_tests.
 // Run manually:  OB_ETCD_TESTS=1 ./build/tests/test_etcd_integration
@@ -39,8 +42,6 @@ namespace fs = std::filesystem;
 constexpr int64_t     TEST_LEASE_TTL          = 5;        // seconds (production: 10)
 constexpr int         HEALTH_CHECK_TIMEOUT_S  = 10;       // health check timeout
 constexpr int         HEALTH_CHECK_INTERVAL_MS = 500;     // health check retry interval
-constexpr const char* DOCKER_IMAGE            = "quay.io/coreos/etcd:v3.5.17";
-constexpr const char* CONTAINER_NAME          = "ob_etcd_test";
 constexpr const char* ETCD_KEY_PREFIX         = "/ob/";
 constexpr int         MAX_PORT_RETRIES        = 3;
 
@@ -80,24 +81,22 @@ public:
             return;
         }
 
-        // 2. Check Docker availability.
-        int ret = std::system("docker info > /dev/null 2>&1");
-        if (ret != 0) {
-            std::fprintf(stderr,
-                "[etcd-test] docker info failed — skipping etcd tests\n");
-            available_ = false;
-            return;
-        }
-
-        // 3. Force-remove any leftover container from a previous run.
+        // 2. Locate the etcd binary (PATH, or OB_ETCD_BINARY override).
+        const char* bin_env = std::getenv("OB_ETCD_BINARY");
+        etcd_binary_ = (bin_env && *bin_env) ? bin_env : "etcd";
         {
-            char rm_cmd[128];
-            std::snprintf(rm_cmd, sizeof(rm_cmd),
-                "docker rm -f %s > /dev/null 2>&1", CONTAINER_NAME);
-            run_cmd(rm_cmd);
+            std::string probe = etcd_binary_ + " --version > /dev/null 2>&1";
+            if (std::system(probe.c_str()) != 0) {
+                std::fprintf(stderr,
+                    "[etcd-test] etcd binary '%s' not runnable — skipping etcd tests.\n"
+                    "[etcd-test] Install natively: see docs/cli.md\n",
+                    etcd_binary_.c_str());
+                available_ = false;
+                return;
+            }
         }
 
-        // 4. Try to start etcd on a random ephemeral port (retry up to 3 times).
+        // 3. Try to start etcd on a random ephemeral port (retry up to 3 times).
         std::random_device rd;
         std::mt19937 gen(rd());
         std::uniform_int_distribution<uint16_t> dist(49152, 65535);
@@ -105,32 +104,41 @@ public:
         bool started = false;
         for (int attempt = 0; attempt < MAX_PORT_RETRIES; ++attempt) {
             port_ = dist(gen);
+            const uint16_t peer_port = static_cast<uint16_t>(port_ == 65535 ? port_ - 1
+                                                                           : port_ + 1);
+            data_dir_ = "/tmp/ob_etcd_test_" + std::to_string(port_);
+            fs::remove_all(data_dir_);
 
-            char cmd[512];
+            // Launch detached, record the PID so TearDown can stop exactly this process.
+            char cmd[1024];
             std::snprintf(cmd, sizeof(cmd),
-                "docker run -d --name %s -p %u:2379 %s "
-                "/usr/local/bin/etcd "
-                "--advertise-client-urls http://0.0.0.0:2379 "
-                "--listen-client-urls http://0.0.0.0:2379 "
-                "> /dev/null 2>&1",
-                CONTAINER_NAME, static_cast<unsigned>(port_), DOCKER_IMAGE);
+                "%s --name ob-etcd-test --data-dir %s/data "
+                "--advertise-client-urls http://127.0.0.1:%u "
+                "--listen-client-urls http://127.0.0.1:%u "
+                "--listen-peer-urls http://127.0.0.1:%u "
+                "--initial-advertise-peer-urls http://127.0.0.1:%u "
+                "--initial-cluster ob-etcd-test=http://127.0.0.1:%u "
+                "--initial-cluster-state new "
+                "> %s/etcd.log 2>&1 & echo $! > %s/etcd.pid",
+                etcd_binary_.c_str(), data_dir_.c_str(),
+                static_cast<unsigned>(port_), static_cast<unsigned>(port_),
+                static_cast<unsigned>(peer_port), static_cast<unsigned>(peer_port),
+                static_cast<unsigned>(peer_port),
+                data_dir_.c_str(), data_dir_.c_str());
 
-            ret = std::system(cmd);
-            if (ret == 0) {
+            fs::create_directories(data_dir_);
+            run_cmd(cmd);
+
+            // 4. Health check: POST /v3/maintenance/status, retry every 500ms.
+            if (wait_for_health()) {
                 started = true;
                 break;
             }
 
-            // Port might be taken — remove failed container and retry.
             std::fprintf(stderr,
-                "[etcd-test] docker run failed on port %u (attempt %d/%d)\n",
+                "[etcd-test] etcd did not become healthy on port %u (attempt %d/%d)\n",
                 static_cast<unsigned>(port_), attempt + 1, MAX_PORT_RETRIES);
-            {
-                char rm_cmd[128];
-                std::snprintf(rm_cmd, sizeof(rm_cmd),
-                    "docker rm -f %s > /dev/null 2>&1", CONTAINER_NAME);
-                run_cmd(rm_cmd);
-            }
+            stop_etcd();
         }
 
         if (!started) {
@@ -141,37 +149,36 @@ public:
             return;
         }
 
-        // 5. Health check: POST /v3/maintenance/status, retry every 500ms, timeout 10s.
-        if (!wait_for_health()) {
-            std::fprintf(stderr,
-                "[etcd-test] etcd health check timed out after %ds\n",
-                HEALTH_CHECK_TIMEOUT_S);
-            // Cleanup the container even on failure.
-            char stop_cmd[128];
-            std::snprintf(stop_cmd, sizeof(stop_cmd),
-                "docker rm -f %s > /dev/null 2>&1", CONTAINER_NAME);
-            run_cmd(stop_cmd);
-            available_ = false;
-            return;
-        }
-
         available_ = true;
         std::fprintf(stderr,
-            "[etcd-test] etcd running on port %u\n",
-            static_cast<unsigned>(port_));
+            "[etcd-test] etcd running natively on port %u (pid file %s/etcd.pid)\n",
+            static_cast<unsigned>(port_), data_dir_.c_str());
     }
 
-    void TearDown() override {
-        // Always attempt to stop and remove the container.
-        char cmd[128];
+    void TearDown() override { stop_etcd(); }
+
+private:
+    /// Kill the etcd process recorded in the pid file and remove its data dir.
+    /// Safe to call when nothing was started.
+    void stop_etcd() {
+        if (data_dir_.empty()) return;
+
+        char cmd[512];
         std::snprintf(cmd, sizeof(cmd),
-            "docker stop %s > /dev/null 2>&1", CONTAINER_NAME);
+            "if [ -f %s/etcd.pid ]; then "
+            "kill \"$(cat %s/etcd.pid)\" > /dev/null 2>&1; "
+            "for _ in 1 2 3 4 5 6 7 8 9 10; do "
+            "kill -0 \"$(cat %s/etcd.pid)\" > /dev/null 2>&1 || break; sleep 0.5; done; "
+            "kill -9 \"$(cat %s/etcd.pid)\" > /dev/null 2>&1; fi",
+            data_dir_.c_str(), data_dir_.c_str(), data_dir_.c_str(), data_dir_.c_str());
         run_cmd(cmd);
 
-        std::snprintf(cmd, sizeof(cmd),
-            "docker rm -f %s > /dev/null 2>&1", CONTAINER_NAME);
-        run_cmd(cmd);
+        std::error_code ec;
+        fs::remove_all(data_dir_, ec);
+        data_dir_.clear();
     }
+
+public:
 
     static std::string endpoint() {
         return "http://127.0.0.1:" + std::to_string(port_);
@@ -183,6 +190,9 @@ public:
 private:
     static inline uint16_t port_{0};
     static inline bool     available_{false};
+
+    std::string etcd_binary_{"etcd"};   // resolved in SetUp (PATH or OB_ETCD_BINARY)
+    std::string data_dir_;              // holds etcd data, log and pid file
 
     /// Health check: curl POST to /v3/maintenance/status.
     /// Returns true if etcd responds with HTTP 200 within the timeout.
