@@ -104,8 +104,8 @@ Effort scale: S = few days, M = week, L = 2-3 weeks, XL = month+.
 ## Phase 7 — Correctness and Deployability
 
 **Why this phase is first.** Everything up to here is engine capability. What stands between this
-engine and a production deployment is not another feature. Two shipped features do not do what they
-claim (#25, #26), the wire protocol has no authentication, there is no configuration file, and there
+engine and a production deployment is not another feature. One shipped feature still does not do what
+it claims (#25), the wire protocol has no authentication, there is no configuration file, and there
 is no packaging. Someone who reads the code and likes it still cannot run it. Fix the broken
 promises first, then remove the deployment blockers.
 
@@ -118,32 +118,28 @@ promises first, then remove the deployment blockers.
   integration tests at all
 - Effort: M | Impact: Correctness confidence, credibility of a fresh clone
 
-### 26. Fix graceful failover: it ignores the target and races itself (P0 bug)
-Two defects in `FailoverManager::initiate_graceful_failover()` (`src/failover.cpp:166`):
+### 26. Graceful failover honours its target ✅
+- Status: **DONE** — `FAILOVER <target_node_id>` used to ignore the target entirely, and the
+  outgoing primary raced the intended successor and won roughly half the time.
 
-- **The target node is ignored.** The signature is
-  `initiate_graceful_failover(const std::string& /*target_node_id*/)` — the parameter is commented
-  out and never used. The implementation revokes its own lease and hopes some replica wins the
-  election. So `FAILOVER <target_node_id>` in the wire protocol does not hand the role to the node
-  the operator named.
-- **The outgoing primary immediately competes for the role again.** After revoking its lease it sets
-  its own role to `REPLICA`, and one second later its own `monitor_loop()` sees an empty
-  `leader_node_id` and promotes it straight back. Measured on
-  `EtcdTestFixture.GracefulFailover`: the test fails roughly 40-50% of runs, and the failing runs
-  show the same node logging `promoted to PRIMARY, epoch=2` right after handing the role away.
-  Verified as pre-existing, not introduced by the harness change.
+Fixed with two mechanisms that cover different cases:
+- **Handover intent** (`<prefix>handover` in etcd, written without a lease so it survives the
+  revocation that follows): while it is live, only the named target campaigns for the leader key and
+  the other replicas stand aside. After its deadline the cluster returns to an ordinary election, so
+  an unreachable target cannot deadlock it
+- **Election cooldown** on the outgoing primary, so it cannot reclaim the role it just released once
+  the intent expires
 
-Why it matters in production: an operator runs `FAILOVER node_B` before taking node A down for
-maintenance, gets `OK`, and node A stays primary. They then shut it down and get the unplanned
-failover they were trying to avoid.
+`initiate_graceful_failover()` now returns a result enum instead of a bool, and the wire protocol
+distinguishes `unknown_target` and `invalid_target` from a generic failure. The target is validated
+against the coordinator before anything is revoked, so a typo in a node id leaves the cluster
+untouched instead of dropping it into an election.
 
-Fix direction: honour `target_node_id` (write the successor into the coordinator, or have the target
-promote itself against a fenced epoch), and give the outgoing primary an election cooldown so it
-cannot re-acquire the role it just released. Needs a spec: the wire protocol contract and the
-epoch-fencing interaction both change.
-
-- Effort: M | Impact: **Graceful failover is the operation an operator reaches for during
-  maintenance. Today it silently does something else.**
+Six integration tests against a real etcd, including a ten-iteration handover loop and a three-node
+case. Mutation-verified: disabling the deferral turns the three-node test red, disabling the cooldown
+turns the fallback test red. Worth recording that the two-node test catches *neither* on its own,
+because the two mechanisms overlap there — which is why the three-node test exists. Spec:
+`kiro-workspace/specs/graceful-failover-fix/`
 
 ### 27. Authentication and TLS on the wire protocol
 - Token or mTLS authentication for client sessions, replication links and multi-master peers
@@ -326,7 +322,6 @@ codebase. Each item is also a story we can sell as bespoke work.
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
 | **P0** | Restore integration test suite (#25) | M | The repo currently ships a test framework with no tests. Fix before anything else. |
-| **P0** | Fix graceful failover (#26) | M | `FAILOVER <node>` ignores the target and the outgoing primary re-takes the role ~40-50% of the time |
 | **P1** | Deployment artifacts (#30) | M | Cheapest large jump in time-to-first-run |
 | **P1** | Reproducible comparative benchmarks (#35) | L | Makes the performance claim verifiable by a reader instead of asserted |
 | **P1** | Authentication and TLS (#27) | L | The single blocker to production adoption |
@@ -346,10 +341,7 @@ Things a reviewer will notice, listed here so they do not look like oversights:
 
 - **No authentication, no TLS.** Trusted-network deployment only (#27).
 - **Integration test files missing from the repo** (#25). The framework is present and the C++ suite
-  is complete: 510 tests, all passing.
-- **`FAILOVER <target_node_id>` does not honour the target** and the outgoing primary can immediately
-  re-acquire the role it just released (#26). Reproducible: `EtcdTestFixture.GracefulFailover` fails
-  40-50% of runs.
+  is complete: 531 tests, all passing.
 - **Anti-entropy is a scheduler with no reconciliation** (#53). The spec task is marked complete and
   the metrics report runs, but gap detection and repair are placeholders that return "nothing found"
   and "cannot repair". Reconnect catch-up is the only thing healing divergence today.
