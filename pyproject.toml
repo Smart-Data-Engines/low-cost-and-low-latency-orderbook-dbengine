@@ -33,6 +33,8 @@ Documentation = "https://github.com/Smart-Data-Engines/low-cost-and-low-latency-
 
 [tool.scikit-build]
 cmake.build-type = "Release"
-cmake.targets = ["orderbook_shared"]
+# build.targets, not cmake.targets: scikit-build-core >= 0.10 rejects the old
+# name outright, which made `pip install .` fail before it started compiling.
+build.targets = ["orderbook_shared"]
 cmake.define = {"OB_BUILD_TESTS" = "OFF"}
 wheel.packages = ["python/orderbook_engine"]
