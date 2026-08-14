@@ -30,6 +30,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <set>
@@ -148,6 +149,44 @@ static std::FILE* open_file_private(const std::string& path, const char* mode) {
         ::close(fd);
         errno = saved;
     }
+    return f;
+}
+
+/// Creates a uniquely named temporary file inside `dir` and returns it opened
+/// for writing, with the final path in `out_path`.
+///
+/// The name is generated locally by mkstemp(), so nothing derived from the
+/// network is used to open a file: a peer-supplied name only ever reaches
+/// rename(), after validation. mkstemp creates with 0600; we relax to 0640 to
+/// match the rest of the data directory, and never to anything group-writable.
+/// Returns nullptr on failure.
+static std::FILE* open_temp_file_private(const std::string& dir,
+                                         std::string& out_path) {
+    std::string tmpl = dir + "/.incoming_XXXXXX";
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+
+    const int fd = ::mkstemp(buf.data());
+    if (fd < 0) {
+        OB_LOG_ERROR("repl_client", "mkstemp failed in %s: %s",
+                     dir.c_str(), std::strerror(errno));
+        return nullptr;
+    }
+    if (::fchmod(fd, S_IRUSR | S_IWUSR | S_IRGRP) != 0) {
+        OB_LOG_WARN("repl_client", "fchmod on temp snapshot file failed: %s",
+                    std::strerror(errno));
+    }
+
+    std::FILE* f = ::fdopen(fd, "wb");
+    if (!f) {
+        const int saved = errno;
+        ::close(fd);
+        ::unlink(buf.data());
+        errno = saved;
+        return nullptr;
+    }
+
+    out_path.assign(buf.data());
     return f;
 }
 
@@ -1618,12 +1657,16 @@ void ReplicationClient::request_and_receive_snapshot() {
         std::string staged_path = staging_dir + "/" + rel_path;
         fs::create_directories(fs::path(staged_path).parent_path());
 
-        // Receive file data and write to staging.
+        // Receive file data into a temporary file whose name we generate, then
+        // rename it into place once the content is complete and its CRC checks
+        // out. Two reasons:
+        //   - a partially received or corrupt file never carries the final name,
+        //     so an interrupted transfer cannot be mistaken for a good segment
+        //   - nothing derived from the network reaches open(); the peer-supplied
+        //     name is only ever used by rename(), after validation
         {
-            // Explicit 0640 rather than fopen's 0666 masked by whatever umask
-            // the process happens to run with. Database files are not world
-            // readable and never world writable.
-            std::FILE* out = open_file_private(staged_path, "wb");
+            std::string temp_path;
+            std::FILE* out = open_temp_file_private(staging_dir, temp_path);
             if (!out) {
                 cleanup_staging(staging_dir);
                 bootstrapping_.store(false, std::memory_order_release);
@@ -1639,6 +1682,8 @@ void ReplicationClient::request_and_receive_snapshot() {
 
                 if (!reader_.read_exact(buf.data(), chunk)) {
                     std::fclose(out);
+                    std::error_code rm_ec;
+                    fs::remove(temp_path, rm_ec);
                     cleanup_staging(staging_dir);
                     bootstrapping_.store(false, std::memory_order_release);
                     return;
@@ -1662,7 +1707,28 @@ void ReplicationClient::request_and_receive_snapshot() {
             // Verify CRC32C.
             uint32_t computed_crc = running_crc ^ 0xFFFFFFFFu;
             if (computed_crc != file_crc) {
-                // CRC mismatch — abort.
+                OB_LOG_ERROR("repl_client",
+                             "Snapshot file CRC mismatch: path=%s expected=%u got=%u",
+                             rel_path, file_crc, computed_crc);
+                std::error_code rm_ec;
+                fs::remove(temp_path, rm_ec);
+                cleanup_staging(staging_dir);
+                bootstrapping_.store(false, std::memory_order_release);
+                return;
+            }
+
+            // Content is complete and verified: give it its final name.
+            // staged_path was validated above, and rename within one directory
+            // is atomic.
+            std::error_code mv_ec;
+            fs::rename(temp_path, staged_path, mv_ec);
+            if (mv_ec) {
+                OB_LOG_ERROR("repl_client",
+                             "Failed to move staged snapshot file into place: "
+                             "path=%s error=%s",
+                             rel_path, mv_ec.message().c_str());
+                std::error_code rm_ec;
+                fs::remove(temp_path, rm_ec);
                 cleanup_staging(staging_dir);
                 bootstrapping_.store(false, std::memory_order_release);
                 return;
