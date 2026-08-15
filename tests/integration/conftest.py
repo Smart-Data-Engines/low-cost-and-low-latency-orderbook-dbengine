@@ -45,6 +45,7 @@ class NodeInfo:
     data_dir: str                           # temporary data directory
     node_id: str                            # e.g. "node-0"
     read_only: bool = False                 # started with --read-only
+    mm_replication_port: int = 0            # multi-master peer port (0 = not MM)
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +232,83 @@ class ClusterManager:
 
     # ── Node management ───────────────────────────────────────────
 
-    def _start_node(self, node_index: int, read_only: bool = False) -> NodeInfo:
+    def start_multi_master(self, node_count: int = 3) -> None:
+        """Launch etcd plus `node_count` multi-master nodes.
+
+        A different topology, not a variation on the primary/replica one: every node
+        accepts writes, there is no election, and peers find each other through the
+        etcd topology watch rather than through a leader key. Sharing this with
+        start() would mean a method that means two things depending on a flag.
+
+        Nodes are started one at a time and each is only waited for on PING; peer
+        discovery is asynchronous, so a caller that needs a converged mesh should
+        wait for MM_PEERS to report the others.
+        """
+        self._check_prerequisites()
+        self._start_etcd()
+        self._wait_for_etcd(timeout=30)
+
+        for index in range(node_count):
+            node = self._start_node(index, multi_master_id=index + 1)
+            self.nodes.append(node)
+            self._wait_for_node(node, timeout=20)
+
+        self._started = True
+        atexit.register(self.shutdown)
+
+    def wait_for_mm_mesh(self, timeout: float = 30.0) -> None:
+        """Wait until every node sees all the others in MM_PEERS.
+
+        Without this, a test writing to node 0 and reading from node 2 can run before
+        the two have connected, and the failure looks like lost data rather than a
+        test that started too early.
+        """
+        expected_peers = len(self.nodes) - 1
+        deadline = time.monotonic() + timeout
+        counts: list[int] = []
+        errors: dict[str, str] = {}
+
+        while time.monotonic() < deadline:
+            counts = []
+            errors = {}
+            for node in self.nodes:
+                try:
+                    reply = self._send(node, "MM_PEERS")
+                    # One header line, then one line per peer.
+                    rows = [ln for ln in reply.strip().splitlines()[1:]
+                            if ln and not ln.startswith("OK")]
+                    counts.append(len(rows))
+                except Exception as exc:  # noqa: BLE001
+                    # Recorded, not swallowed: "saw [2, -1, 2]" says a node did not
+                    # answer and nothing about why, which is the difference between a
+                    # diagnosis and a shrug.
+                    counts.append(-1)
+                    alive = (node.process is None or node.process.poll() is None)
+                    errors[node.node_id] = f"{exc!r} (process alive: {alive})"
+            if all(c >= expected_peers for c in counts):
+                return
+            time.sleep(0.5)
+
+        detail = "; ".join(f"{k}: {v}" for k, v in errors.items()) or "no errors"
+        raise RuntimeError(
+            f"multi-master mesh did not converge in {timeout}s: each node should see "
+            f"{expected_peers} peers, saw {counts}. {detail}")
+
+    def _send(self, node: NodeInfo, command: str, timeout: float = 5.0) -> str:
+        """Send one command to a node over a fresh connection."""
+        with socket.create_connection(("127.0.0.1", node.tcp_port),
+                                      timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.recv(4096)  # banner
+            sock.sendall((command + "\n").encode())
+            time.sleep(0.3)
+            try:
+                return sock.recv(1 << 20).decode(errors="replace")
+            except socket.timeout:
+                return ""
+
+    def _start_node(self, node_index: int, read_only: bool = False,
+                    multi_master_id: Optional[int] = None) -> NodeInfo:
         tcp_port = self.find_free_port()
         replication_port = self.find_free_port()
         metrics_port = self.find_free_port()
@@ -252,6 +329,17 @@ class ClusterManager:
         ]
         if read_only:
             cmd.append("--read-only")
+        mm_replication_port = 0
+        if multi_master_id is not None:
+            # The server refuses --mm-replication-port equal to --replication-port:
+            # they are two different listeners, and colliding them would have one
+            # silently shadow the other.
+            mm_replication_port = self.find_free_port()
+            cmd += [
+                "--multi-master",
+                "--mm-node-id", str(multi_master_id),
+                "--mm-replication-port", str(mm_replication_port),
+            ]
 
         proc = subprocess.Popen(
             cmd,
@@ -268,6 +356,7 @@ class ClusterManager:
             data_dir=data_dir,
             node_id=node_id,
             read_only=read_only,
+            mm_replication_port=mm_replication_port,
         )
 
     def _wait_for_node(self, node: NodeInfo, timeout: float = 15.0) -> None:
@@ -371,6 +460,7 @@ class ClusterManager:
             data_dir=old.data_dir,
             node_id=old.node_id,
             read_only=old.read_only,
+            mm_replication_port=old.mm_replication_port,
         )
 
         etcd_url = f"http://127.0.0.1:{self.etcd_client_port}"
@@ -385,6 +475,16 @@ class ClusterManager:
         ]
         if new.read_only:
             cmd.append("--read-only")
+        if old.mm_replication_port:
+            # Without this, restarting a multi-master node brings it back as an
+            # ordinary primary/replica node: same ports, same data dir, silently a
+            # different topology. The test that noticed would look like a
+            # convergence bug.
+            cmd += [
+                "--multi-master",
+                "--mm-node-id", str(old.index + 1),
+                "--mm-replication-port", str(old.mm_replication_port),
+            ]
 
         new.process = subprocess.Popen(
             cmd,
@@ -479,7 +579,7 @@ _CATEGORIES = [
     # Added with the categories themselves. A marker missing from this list is not
     # an error: those tests fall into "uncategorized" in the report and quietly stop
     # being counted as coverage of anything.
-    "aggregations", "multi_master", "large_response",
+    "aggregations", "multi_master", "large_response", "binance",
 ]
 
 
@@ -763,6 +863,42 @@ def compressed_client(cluster: ClusterManager) -> Generator[OrderbookEngine, Non
     engine = OrderbookEngine(host="127.0.0.1", port=node.tcp_port, compress=True)
     yield engine
     engine.close()
+
+
+@pytest.fixture(scope="module")
+def mm_cluster(request) -> Generator[ClusterManager, None, None]:
+    """Three multi-master nodes, converged, on their own etcd.
+
+    A separate topology from the session cluster: every node accepts writes and there
+    is no primary. Module-scoped because bringing three nodes and a mesh up is worth
+    doing once, and because nothing else should have to share it.
+    """
+    cm = ClusterManager()
+    cm.start_multi_master(node_count=3)
+    cm.wait_for_mm_mesh(timeout=45)
+    if getattr(request.config, "_ob_cluster", None) is None:
+        request.config._ob_cluster = cm
+    yield cm
+    cm.shutdown()
+
+
+@pytest.fixture
+def healthy_mm_cluster(mm_cluster: ClusterManager) -> Generator[ClusterManager, None, None]:
+    """The multi-master cluster, with the mesh restored after each test.
+
+    Multi-master has no election, so a node that stays dead does not get replaced —
+    it simply leaves the next test with a two-node mesh and no explanation.
+    """
+    yield mm_cluster
+
+    for index, node in enumerate(mm_cluster.nodes):
+        if node.process is None or node.process.poll() is not None:
+            mm_cluster.restart_node(index)
+
+    # 90s rather than 45: a restarted node replays its WAL before it serves, and a
+    # module that has been streaming live market data leaves a WAL worth replaying.
+    # A tighter timeout here failed once with the node still coming up.
+    mm_cluster.wait_for_mm_mesh(timeout=90)
 
 
 @pytest.fixture(scope="module")

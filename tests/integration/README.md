@@ -76,7 +76,11 @@ tests/integration/
 | edge_cases | `@pytest.mark.edge_cases` | Nonexistent symbol, oversized line, malformed INSERT, read-only write |
 | metrics | `@pytest.mark.metrics` | Prometheus text exposition, STATUS fields on primary/replica |
 | pool | `@pytest.mark.pool` | Pool primary discovery, write routing, failover re-discovery |
-| cpp_client | `@pytest.mark.cpp_client` | C++ binary ping, insert/query, minsert (skipped if not compiled) |
+| cpp_client | `@pytest.mark.cpp_client` | C++ binary ping, insert/query, minsert, aggregates (skipped if not compiled) |
+| aggregations | `@pytest.mark.aggregations` | Aggregates over the wire: values, scale factors, NULL for empty, refusals |
+| large_response | `@pytest.mark.large_response` | Responses above the socket send buffer, slow readers, clients vanishing mid-response |
+| multi_master | `@pytest.mark.multi_master` | Three-node mesh: convergence, LWW, node loss and rejoin (own cluster) |
+| binance | `@pytest.mark.binance` | Live Binance depth feed — **opt-in**, see below |
 
 ## Adding New Tests
 
@@ -96,6 +100,8 @@ pytest auto-discovers `test_*.py` files — no registry or config changes requir
 |---|---|---|
 | `OB_INTEGRATION_TESTS` | Yes | Set to `1` to enable tests. Without it, all tests are skipped. |
 | `OB_INTEGRATION_FILTER` | No | Comma-separated category names (e.g. `smoke,replication`). Runs only matching categories. Empty = run all. |
+| `OB_BINANCE_TESTS` | No | Set to `1` to run the live Binance modules. Without it they hard-skip: a third-party exchange being unreachable must never fail this suite. |
+| `OB_STRESS_SECONDS` | No | Duration of the sustained-load window. Defaults to `5`; the documented long run is `30`. The duration used is printed in the report. |
 
 ## Console Report
 
@@ -106,6 +112,32 @@ After all tests finish, the framework prints a colored report to stdout:
 - **Yellow** (⚠) — skipped tests
 
 The report includes per-category sections, total passed/failed/skipped counts, execution time, and environment info (server version, ports, paths). Failover tests report measured failover time; stress tests report throughput (levels/sec) and error count.
+
+## Cluster fixtures
+
+Three cluster fixtures, because one shared cluster cannot serve every kind of test:
+
+| Fixture | Scope | For |
+|---|---|---|
+| `cluster` | session | Ordinary tests. Shared, so nothing here may kill a node or push half a million rows |
+| `heavy_cluster` | module | Load modules (`stress`, `large_response`). Half a million rows leave the replica replaying a backlog, and later modules then fail on timeouts that have nothing to do with them |
+| `failover_cluster` / `healthy_cluster` | module / function | Tests that kill nodes or move the primary. Restoring the shared cluster is not enough: lease TTLs and the election cooldown keep roles moving after any single check says they have settled |
+| `mm_cluster` / `healthy_mm_cluster` | module / function | Three-node multi-master mesh. A different topology, not a variation on primary/replica |
+
+`healthy_cluster` and `healthy_mm_cluster` restart dead nodes on teardown and refuse to finish unless
+the topology is back, because a half-restored cluster makes the next test's failure point at the wrong
+code.
+
+## Live Binance Tests
+
+`test_binance_live.py` and `test_binance_failover_sync.py` stream real BTC/USDT depth data through the
+engine. They are opt-in (`OB_BINANCE_TESTS=1`) and skip at module level with a reason naming the
+missing precondition: the opt-in itself, the `websockets` package, or reachability of
+`stream.binance.com:9443`.
+
+They exist because synthetic data cannot check what real data can: that live prices survive the round
+trip at the right scale, that both sides of a real book arrive, and that a node rejoining mid-feed ends
+up agreeing with the node that stayed up.
 
 ## C++ Client Tests
 

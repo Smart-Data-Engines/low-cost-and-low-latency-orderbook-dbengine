@@ -254,20 +254,25 @@ equivalent: ingestion −1.3%, `BM_UpdateLatency` +0.1%. Treat as no regression.
 
 Spec: `kiro-workspace/specs/aggregations-over-wire/`
 
-### 28. Restore the integration test suite (P0, in progress)
+### 28. Restore the integration test suite ✅
 - The framework survived (`tests/integration/conftest.py`, 691 lines), the tests did not
-- **Restored so far: 86 tests across 8 categories** — smoke, replication, compression, edge cases,
-  metrics, aggregations, pool, C++ client, stress, plus a new `large_response` category. Each one was
-  written to assert values rather than absence of errors, and between them they found four defects
+- **Restored: 108 passing tests across 12 modules** — smoke, replication, compression, edge cases,
+  metrics, aggregations, pool, C++ client, stress, large_response, multi-master (convergence and
+  failover), and the opt-in live Binance pair. Each one was written to assert values rather than
+  absence of errors, and between them they found six defects
   that 578 unit tests did not: the columnar format losing `side`, the flush race, aggregations
   returning zeros, and the write path in #59
 - **Failover category is back** (9 tests): graceful handover refusals, kill → promotion with the time
   published as `failover_time_sec`, acknowledged data surviving a kill, the promoted node accepting
   writes, and a pool client re-discovering the primary. One test is `xfail(strict=True)` because the
   behaviour it asserts is genuinely broken — see #60
-- **Still missing**:
-  `test_mm_convergence.py`, `test_mm_failover.py`, `test_binance_live.py`,
-  `test_binance_failover_sync.py` referenced by `scripts/run_regression.sh`
+- **Complete.** 108 passing, 2 skipped, 2 xfailed across 12 modules. The multi-master modules
+  (`test_mm_convergence.py`, 9 tests; `test_mm_failover.py`, 6) run on their own three-node mesh, and
+  the live Binance modules (`test_binance_live.py`, 5; `test_binance_failover_sync.py`, 2) are opt-in
+  behind `OB_BINANCE_TESTS=1` and hard-skip with a named reason when the exchange is unreachable or
+  `websockets` is missing — a third-party outage must never fail this suite. Both were verified against
+  the live feed, twice
+- The two xfails are `strict=True` and point at real defects the suite found: #60 and #61
 - Two fixtures exist to keep a shared session cluster usable: `heavy_cluster` (module-scoped) for load
   modules that would otherwise leave the replica replaying half a million rows into the next module's
   timeouts, and `healthy_cluster`, which restarts nodes and verifies a single primary after any test
@@ -580,14 +585,57 @@ becomes a lie.
 - Effort: S-M | Impact: An advertised HA operation currently cannot be performed on a real deployment
 
 
+### 61. Multi-master catch-up compares WAL offsets across independent WALs (P0)
+
+A node that rejoins a multi-master cluster catches up on the first outage and silently stops catching
+up on later ones. Measured on three nodes, killing and restarting the same node three times, writing
+one row before and one row during each outage:
+
+| Cycle | Rows on the restarted node | Expected |
+|-------|----------------------------|----------|
+| 0 | 2 | 2 |
+| 1 | 4 | 4 |
+| 2 | **5** | 6 |
+
+The row written during the third outage never arrives. No error is reported anywhere, on either node.
+
+The mechanism is in the handshake. `handle_handshake()` decides whether to stream:
+
+```
+Peer 3 is behind (peer: file=0 off=450, local: file=0 off=600) — starting catch-up
+```
+
+That comparison is between **byte offsets in two independent WALs**. In multi-master every node writes
+its own local records *and* the remote records it applies, in whatever order they arrive, so the same
+logical set of records produces different offsets on different nodes. After a couple of outages the
+rejoining node's offset can equal or exceed the peer's while it is still missing records the peer has,
+and the peer concludes there is nothing to send. Catch-up working at all on the first outage is
+coincidence, not design: the offsets happened to line up in the useful direction.
+
+Byte offsets cannot express "which records does this node not have". That needs per-record identity —
+`(origin_node_id, sequence_number)` is already carried in `WALRecordV2`, or the HLC — compared as a set
+rather than as a scalar position.
+
+There is no second line of defence: `AntiEntropyManager` (#57) is supposed to detect and repair exactly
+this, and `detect_gaps()` returns an empty list unconditionally. So the two defects compound —
+reconciliation is the mechanism that would have caught the flawed comparison, and it does nothing.
+
+`tests/integration/test_mm_failover.py::test_a_restarted_node_catches_up_on_what_it_missed` is marked
+`xfail(strict=True)`: it fails on the current server and will turn the suite red as soon as the fix
+lands, so the marker cannot outlive the defect.
+
+- Effort: M | Impact: Silent data loss on a rejoining node, in the topology the engine advertises for
+  write scalability
+
+
 ---
 
 ## Recommended order
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
+| **P0** | Multi-master catch-up loses records (#61) | M | A rejoining node silently misses records after a second outage, and anti-entropy that should catch it is a stub |
 | **P0** | Graceful failover unreachable (#60) | S | `FAILOVER <target>` always answers `ERR unknown_target` outside the C++ tests, because nothing publishes node positions |
-| **P0** | Finish the integration test suite (#28) | S | 86 tests across 9 categories are back; failover, multi-master and Binance modules are still missing, and `run_regression.sh --full` needs them |
 | **P1** | Deployment artifacts (#33) | M | Cheapest large jump in time-to-first-run |
 | **P1** | Reproducible comparative benchmarks (#39) | L | Makes the performance claim verifiable by a reader instead of asserted |
 | **P1** | Authentication and TLS (#30) | L | The single blocker to production adoption |
