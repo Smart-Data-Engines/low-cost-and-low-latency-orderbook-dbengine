@@ -261,7 +261,11 @@ Spec: `kiro-workspace/specs/aggregations-over-wire/`
   written to assert values rather than absence of errors, and between them they found four defects
   that 578 unit tests did not: the columnar format losing `side`, the flush race, aggregations
   returning zeros, and the write path in #59
-- **Still missing**: failover (destructive; `healthy_cluster` fixture is in place for it),
+- **Failover category is back** (9 tests): graceful handover refusals, kill → promotion with the time
+  published as `failover_time_sec`, acknowledged data surviving a kill, the promoted node accepting
+  writes, and a pool client re-discovering the primary. One test is `xfail(strict=True)` because the
+  behaviour it asserts is genuinely broken — see #60
+- **Still missing**:
   `test_mm_convergence.py`, `test_mm_failover.py`, `test_binance_live.py`,
   `test_binance_failover_sync.py` referenced by `scripts/run_regression.sh`
 - Two fixtures exist to keep a shared session cluster usable: `heavy_cluster` (module-scoped) for load
@@ -274,6 +278,11 @@ Spec: `kiro-workspace/specs/aggregations-over-wire/`
 ### 29. Graceful failover honours its target ✅
 - Status: **DONE** — `FAILOVER <target_node_id>` used to ignore the target entirely, and the
   outgoing primary raced the intended successor and won roughly half the time.
+
+**Caveat found later** (item #60): both mechanisms are verified by C++ tests against live etcd, and
+those tests publish node positions by hand. The server never publishes them, so `FAILOVER <target>`
+rejects every target with `ERR unknown_target` on a real cluster. The mechanisms below are correct; the
+command that triggers them cannot currently get past target validation.
 
 Fixed with two mechanisms that cover different cases:
 - **Handover intent** (`<prefix>handover` in etcd, written without a lease so it survives the
@@ -531,12 +540,53 @@ and a client vanishing mid-response with `SO_LINGER 0`) plus 6 unit tests on `Se
 confirmed red separately — EAGAIN as failure, no `EPOLLOUT` arming, no cap, no `MSG_NOSIGNAL`.
 Spec: `kiro-workspace/specs/large-response-write-path/`
 
+### 60. Graceful failover cannot work outside its own tests (P0)
+
+`FAILOVER <target_node_id>` validates the target by looking for it in
+`CoordinatorClient::get_published_positions()` (`src/failover.cpp:206`). Nothing in production ever
+publishes a position:
+
+```
+$ grep -rn "publish_wal_position" src/
+src/shard_coordinator.cpp:238:  (void)coordinator_->publish_wal_position(0, 0);  // verify connectivity
+src/coordinator.cpp:536:        bool CoordinatorClient::publish_wal_position(...)
+```
+
+One connectivity check with `(0, 0)` and the definition itself. Every other caller is in
+`tests/test_etcd_integration.cpp`, which publishes positions by hand before exercising the feature.
+
+So on a real two-node cluster, **every graceful handover answers `ERR unknown_target`** — measured
+against the integration cluster: `FAILOVER node-1` → `ERR unknown_target node-1`, with both nodes
+healthy and `node-1` holding the replica role. `docs/cli.md` documents that error as "usually a typo in
+a node id". In reality it means nobody publishes positions.
+
+The same absence affects `elect_winner()` (`src/failover.cpp:521`), which picks the most advanced
+replica from those positions. With no positions, election cannot prefer the node with the least data
+loss — and automatic failover demonstrably still works, so it is choosing by some other route. That
+needs establishing rather than assuming.
+
+Item #29 recorded this feature as fixed. What was fixed was real — the handover intent and the
+election cooldown, verified by C++ tests against live etcd — but those tests publish the positions the
+server never publishes, so the fix has never run in the configuration it ships in. Sixth instance of
+the same pattern in this repository: the layer works, the layer above never feeds it, and no test
+crosses the boundary.
+
+Scope: publish each node's WAL position periodically (the `FailoverManager` monitor loop already
+ticks), under a lease so a dead node stops being "known", then confirm both target validation and
+position-based election against a real cluster. `tests/integration/test_failover.py` already contains
+the test, marked `xfail(strict=True)` so it turns red the moment the defect is fixed and the marker
+becomes a lie.
+
+- Effort: S-M | Impact: An advertised HA operation currently cannot be performed on a real deployment
+
+
 ---
 
 ## Recommended order
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
+| **P0** | Graceful failover unreachable (#60) | S | `FAILOVER <target>` always answers `ERR unknown_target` outside the C++ tests, because nothing publishes node positions |
 | **P0** | Finish the integration test suite (#28) | S | 86 tests across 9 categories are back; failover, multi-master and Binance modules are still missing, and `run_regression.sh --full` needs them |
 | **P1** | Deployment artifacts (#33) | M | Cheapest large jump in time-to-first-run |
 | **P1** | Reproducible comparative benchmarks (#39) | L | Makes the performance claim verifiable by a reader instead of asserted |

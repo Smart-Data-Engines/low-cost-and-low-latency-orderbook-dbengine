@@ -765,19 +765,35 @@ def compressed_client(cluster: ClusterManager) -> Generator[OrderbookEngine, Non
     engine.close()
 
 
-@pytest.fixture
-def healthy_cluster(cluster: ClusterManager) -> Generator[ClusterManager, None, None]:
-    """A cluster that is verified healthy again once the test is done.
+@pytest.fixture(scope="module")
+def failover_cluster(request) -> Generator[ClusterManager, None, None]:
+    """A cluster of its own for tests that kill nodes or move the primary.
 
-    The `cluster` fixture is session-scoped and shared, so a test that kills a node
-    leaves every later test in the session running against a broken topology. That
-    turns one real failure into a page of unrelated ones. Any test that stops,
-    kills or hands over a node must take this fixture instead of `cluster`.
-
-    Teardown restarts whatever is not running and waits for exactly one primary. If
-    it cannot get there, it raises: a silent half-restored cluster is worse than a
-    loud failure, because the next test's red would point at the wrong code.
+    Restoring the shared cluster after each destructive test is not enough, and this
+    was measured rather than assumed: teardown saw one primary and one replica, and
+    minutes later ten unrelated tests failed with "No node with REPLICA role found".
+    Lease TTLs and the election cooldown keep the roles moving after any single check
+    says they have settled, so a topology test and a shared cluster cannot coexist.
     """
+    cm = ClusterManager()
+    cm.start()
+    if getattr(request.config, "_ob_cluster", None) is None:
+        request.config._ob_cluster = cm
+    yield cm
+    cm.shutdown()
+
+
+@pytest.fixture
+def healthy_cluster(failover_cluster: ClusterManager) -> Generator[ClusterManager, None, None]:
+    """The failover cluster, verified healthy again once each test is done.
+
+    Restoration still matters *within* the module: each failover test should start
+    from one primary and one replica rather than inheriting whatever the previous
+    one left. Teardown restarts whatever is not running and waits for exactly one
+    primary; if it cannot get there it raises, because a silently half-restored
+    cluster makes the next test's red point at the wrong code.
+    """
+    cluster = failover_cluster
     yield cluster
 
     for index, node in enumerate(cluster.nodes):
