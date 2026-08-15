@@ -1021,3 +1021,18 @@ TEST(SessionOutput, CloseAfterFlushIsRecorded) {
     ::close(fd_client);
     ::close(fd_server);
 }
+
+TEST(ResponseFormatterStatus, ReplicaCountIsReportedEvenWhenZero) {
+    // A monitoring consumer must be able to read zero. Emitting the field only when
+    // replicas exist makes "no replicas" indistinguishable from "field missing",
+    // which is the difference between a healthy standalone node and a broken parser.
+    ob::ServerStats stats;
+    stats.replicas.clear();
+
+    const std::string wire = ob::format_status(stats);
+
+    EXPECT_NE(wire.find("replicas: 0"), std::string::npos)
+        << "STATUS omitted the replica count for a node with no replicas:\n" << wire;
+    EXPECT_EQ(wire.find("replica["), std::string::npos)
+        << "per-replica detail lines should not appear when there are none";
+}

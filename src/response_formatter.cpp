@@ -136,11 +136,15 @@ std::string format_status(const ServerStats& stats) {
     out += std::to_string(stats.engine_metrics.symbol_count);
     out += '\n';
 
-    // Replication info (primary mode): per-replica lag
+    // Replication info (primary mode): per-replica lag.
+    //
+    // The count is unconditional. Emitting it only when replicas exist means a
+    // monitoring consumer cannot tell "zero replicas" from "field missing", which is
+    // the difference between a healthy standalone node and a parser that broke.
+    out += "replicas: ";
+    out += std::to_string(stats.replicas.size());
+    out += '\n';
     if (!stats.replicas.empty()) {
-        out += "replicas: ";
-        out += std::to_string(stats.replicas.size());
-        out += '\n';
         for (size_t i = 0; i < stats.replicas.size(); ++i) {
             const auto& r = stats.replicas[i];
             out += "replica[";
