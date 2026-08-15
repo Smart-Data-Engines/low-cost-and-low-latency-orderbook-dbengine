@@ -23,8 +23,27 @@ public:
     /// Append incoming bytes to read buffer. Returns complete lines (if any).
     std::vector<std::string> feed(const char* data, size_t len);
 
-    /// Send response string to client.
+    /// Queue a response and push as much of it to the socket as it accepts now.
+    ///
+    /// Returns false only on a real error: EPIPE, ECONNRESET, or the send buffer cap
+    /// being exceeded. A full socket buffer is NOT an error — the remainder stays
+    /// queued and the caller must arm EPOLLOUT. Reading EAGAIN as "the client is
+    /// gone" is what closed the session in the middle of every response larger than
+    /// the socket buffer, with no log line to say so.
     bool send_response(std::string_view response);
+
+    /// Push queued bytes towards the socket. Same contract as send_response().
+    bool flush_output();
+
+    /// True while bytes are still queued, so the caller must keep EPOLLOUT armed.
+    bool has_pending_output() const;
+
+    /// Bytes still queued. For logging and for the pending-bytes gauge.
+    size_t pending_output_bytes() const;
+
+    /// Close once the queue drains — QUIT arriving while a response is in flight.
+    void request_close_after_flush();
+    bool close_requested() const;
 
     /// Stats
     uint64_t queries_executed() const;
@@ -47,6 +66,18 @@ public:
 private:
     int         fd_;
     std::string read_buffer_;
+
+    /// Bytes accepted from execute_command() but not yet taken by the socket.
+    /// Holds already-framed bytes, so in compressed mode a partial write cannot
+    /// split an LZ4 frame: the next flush resumes exactly where it stopped.
+    std::string send_buf_;
+    bool        close_after_flush_{false};
+
+    /// A slow client asking for huge scans must not grow the server's memory without
+    /// bound; past this, the session is closed with a logged reason. 64 MB is about
+    /// 1.7 million rows of response, far beyond a sensible query without LIMIT, and
+    /// generous enough that merely reading slowly never reaches it.
+    static constexpr size_t kMaxSendBuffer = 64u * 1024u * 1024u;
     uint64_t    queries_{0};
     uint64_t    inserts_{0};
     bool        compressed_{false};
@@ -82,6 +113,12 @@ public:
 
     /// Number of active sessions.
     int active_count() const;
+
+    /// Bytes queued for sending across all sessions.
+    ///
+    /// The operator-facing view of a slow client: output piles up here long before a
+    /// session reaches its cap, so this is the signal that someone is not reading.
+    size_t total_pending_output_bytes() const;
 
 private:
     int max_sessions_;

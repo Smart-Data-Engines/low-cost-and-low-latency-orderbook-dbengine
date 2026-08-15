@@ -33,7 +33,7 @@ cmake --build build -j$(nproc)
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release -j$(nproc)
 
-# Tests — 578 of them, ~2.5 minutes
+# Tests — 584 of them, ~2.5 minutes
 ctest --test-dir build --output-on-failure -j1
 ```
 
@@ -113,11 +113,16 @@ Learned the hard way. Check here before debugging.
     same segment and each merged its meta, so `SELECT` returned every row in it twice.
     `demote_to_replica()` must not hold `flush_mtx_` across `repl_mgr_->stop()`: a replication thread
     can be inside `create_snapshot()` waiting for it.
-11. **An aggregate result is not a row.** `QueryResult::agg_values` needs `format_agg_response()`;
+11. **`EAGAIN` means "come back later", never "the client is gone".** `Session` queues response bytes
+    in `send_buf_` and the epoll loop arms `EPOLLOUT` after a partial write; treating a full socket
+    buffer as failure truncated every response above ~2 MB. Socket writes use
+    `::send(..., MSG_NOSIGNAL)`: with plain `::write()`, a client disconnecting mid-response raised
+    SIGPIPE and killed the whole process. Queued output is capped at 64 MB per session.
+12. **An aggregate result is not a row.** `QueryResult::agg_values` needs `format_agg_response()`;
     passing it to `format_query_response()` is what made every aggregate query answer a network client
     with a row of zeros. Each value carries its own `scale` (10⁶ for VWAP and MID_PRICE, 10⁹ for
     IMBALANCE) and an `empty` flag that must reach the wire as `NULL`, never `0`.
-12. **`ColumnarStore::flush_segment()` returns a `SegmentMeta` that must be merged.** `QueryEngine`
+13. **`ColumnarStore::flush_segment()` returns a `SegmentMeta` that must be merged.** `QueryEngine`
     reads `combined_store_` only, never the live SoA buffer, so a dropped meta means rows sit on disk
     invisible to every query until the next `open_existing()`. Same for the metas parked by an
     `append()` rollover — collect them with `take_rolled_segments()`.

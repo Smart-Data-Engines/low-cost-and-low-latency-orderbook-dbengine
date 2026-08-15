@@ -40,6 +40,8 @@ MetricsRegistry::MetricsRegistry() {
 
     // Gauges
     gauges_.push_back(make_gauge("ob_active_sessions", "Number of active TCP sessions"));
+    gauges_.push_back(make_gauge("ob_session_pending_bytes",
+                                 "Response bytes queued across sessions (a slow client shows up here)"));
     gauges_.push_back(make_gauge("ob_pending_rows",    "Number of rows pending flush"));
     gauges_.push_back(make_gauge("ob_wal_file_index",  "Current WAL file index"));
     gauges_.push_back(make_gauge("ob_segment_count",   "Number of columnar segments"));

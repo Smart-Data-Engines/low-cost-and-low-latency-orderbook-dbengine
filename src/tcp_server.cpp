@@ -688,7 +688,24 @@ void TcpServer::run() {
 
     // 7. Create SessionManager and ServerStats.
     SessionManager session_mgr(config_.max_sessions);
+
     ServerStats stats;
+    // One place that closes a session, so every close carries a reason in the log.
+    // This used to be five copies of the same four lines, none of them logging,
+    // which is why a session dying in the middle of a large response left no trace.
+    auto close_session = [&](int fd, const char* reason) {
+        size_t pending = 0;
+        if (Session* s = session_mgr.get_session(fd)) {
+            pending = s->pending_output_bytes();
+        }
+        OB_LOG_INFO("tcp_server",
+                    "Closing session: fd=%d reason=%s pending_bytes=%zu",
+                    fd, reason, pending);
+        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+        session_mgr.remove_session(fd);
+        stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
+        engine_->registry().increment_gauge("ob_active_sessions", -1);
+    };
 
     // Store pointers for use in accept_connection / handle_client_data.
     // We use a local lambda-based epoll loop so these are captured by reference.
@@ -706,6 +723,12 @@ void TcpServer::run() {
             break; // fatal epoll error
         }
 
+        // Once per loop iteration, not per event: the sum walks the session map, and
+        // there is nothing to learn from updating it several times per wake-up.
+        engine_->registry().set_gauge(
+            "ob_session_pending_bytes",
+            static_cast<int64_t>(session_mgr.total_pending_output_bytes()));
+
         for (int i = 0; i < nfds; ++i) {
             int fd = events[i].data.fd;
 
@@ -717,7 +740,7 @@ void TcpServer::run() {
                         int reject_fd = ::accept4(listen_fd_, nullptr, nullptr, SOCK_NONBLOCK);
                         if (reject_fd < 0) break;
                         const char* msg = "ERR server shutting down\n";
-                        auto wr = ::write(reject_fd, msg, std::strlen(msg));
+                        auto wr = ::send(reject_fd, msg, std::strlen(msg), MSG_NOSIGNAL);
                         (void)wr;
                         ::close(reject_fd);
                     }
@@ -740,7 +763,7 @@ void TcpServer::run() {
                     if (!session_mgr.add_session(client_fd)) {
                         // Server full — reject.
                         const char* msg = "ERR server full\n";
-                        auto wr = ::write(client_fd, msg, std::strlen(msg));
+                        auto wr = ::send(client_fd, msg, std::strlen(msg), MSG_NOSIGNAL);
                         (void)wr;
                         ::close(client_fd);
                         continue;
@@ -765,6 +788,28 @@ void TcpServer::run() {
                     }
                 }
             } else {
+                // Writable first: a session with queued output is waiting on this,
+                // and draining it may be the only thing that lets the client send
+                // its next command.
+                if (events[i].events & EPOLLOUT) {
+                    Session* session = session_mgr.get_session(fd);
+                    if (session) {
+                        if (!session->flush_output()) {
+                            close_session(fd, "flush failed");
+                            continue;
+                        }
+                        if (!session->has_pending_output()) {
+                            disarm_epollout(fd);
+                            if (session->close_requested()) {
+                                close_session(fd, "quit after flush");
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                if (!(events[i].events & EPOLLIN)) continue;
+
                 // Client data ready.
                 // Edge-triggered: read until EAGAIN.
                 char buf[4096];
@@ -772,19 +817,13 @@ void TcpServer::run() {
                     ssize_t n = ::read(fd, buf, sizeof(buf));
                     if (n == 0) {
                         // Client disconnected.
-                        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-                        session_mgr.remove_session(fd);
-                        stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
-                        engine_->registry().increment_gauge("ob_active_sessions", -1);
+                        close_session(fd, "peer closed or read error");
                         break;
                     }
                     if (n < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                         // Read error — disconnect.
-                        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-                        session_mgr.remove_session(fd);
-                        stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
-                        engine_->registry().increment_gauge("ob_active_sessions", -1);
+                        close_session(fd, "peer closed or read error");
                         break;
                     }
 
@@ -796,10 +835,7 @@ void TcpServer::run() {
                         // Check line length.
                         if (line.size() > config_.max_line_length) {
                             session->send_response(format_error("line too long"));
-                            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-                            session_mgr.remove_session(fd);
-                            stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
-                            engine_->registry().increment_gauge("ob_active_sessions", -1);
+                            close_session(fd, "line too long");
                             goto next_event; // break out of both loops
                         }
 
@@ -810,21 +846,31 @@ void TcpServer::run() {
                         std::string response = execute_command(cmd, *engine_, *session, stats, read_only_.load(std::memory_order_acquire), &engine_->registry(), shard_coord.get());
 
                         if (response.empty()) {
-                            // QUIT — close session.
-                            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-                            session_mgr.remove_session(fd);
-                            stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
-                            engine_->registry().increment_gauge("ob_active_sessions", -1);
+                            // QUIT. If a previous response is still draining, let it
+                            // finish first: closing now would truncate data the
+                            // client already asked for and is still reading.
+                            if (session->has_pending_output()) {
+                                session->request_close_after_flush();
+                                arm_epollout(fd);
+                                goto next_event;
+                            }
+                            close_session(fd, "quit");
                             goto next_event;
                         }
 
                         if (!session->send_response(response)) {
-                            // Write failed (client gone).
-                            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-                            session_mgr.remove_session(fd);
-                            stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
-                            engine_->registry().increment_gauge("ob_active_sessions", -1);
+                            // A real error: EPIPE, ECONNRESET or the buffer cap. A
+                            // full socket buffer is not one of these — it leaves
+                            // bytes queued and is handled just below.
+                            close_session(fd, "send failed");
                             goto next_event;
+                        }
+
+                        if (session->has_pending_output()) {
+                            // The socket took part of the response. The rest goes out
+                            // on EPOLLOUT; closing here is what truncated every
+                            // response larger than the socket buffer.
+                            arm_epollout(fd);
                         }
 
                         // Enable compression AFTER sending the plain-text ack.
@@ -864,6 +910,33 @@ void TcpServer::run() {
     }
 
     engine_->close();
+}
+
+void TcpServer::arm_epollout(int fd) {
+    if (epoll_fd_ < 0 || fd < 0) return;
+
+    struct epoll_event ev{};
+    ev.events  = EPOLLIN | EPOLLOUT | EPOLLET;
+    ev.data.fd = fd;
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0) {
+        OB_LOG_WARN("tcp_server", "arm_epollout failed: fd=%d errno=%s",
+                    fd, std::strerror(errno));
+    }
+}
+
+void TcpServer::disarm_epollout(int fd) {
+    if (epoll_fd_ < 0 || fd < 0) return;
+
+    // Back to read-only interest. Leaving EPOLLOUT armed on an edge-triggered fd
+    // makes epoll_wait return immediately whenever the socket is writable, which is
+    // almost always, and the loop spins on a core for nothing.
+    struct epoll_event ev{};
+    ev.events  = EPOLLIN | EPOLLET;
+    ev.data.fd = fd;
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0) {
+        OB_LOG_WARN("tcp_server", "disarm_epollout failed: fd=%d errno=%s",
+                    fd, std::strerror(errno));
+    }
 }
 
 void TcpServer::shutdown() {

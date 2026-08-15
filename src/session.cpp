@@ -1,5 +1,6 @@
 #include "orderbook/session.hpp"
 #include "orderbook/compression.hpp"
+#include "orderbook/logger.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -7,6 +8,7 @@
 #include <charconv>
 #include <cstring>
 #include <stdexcept>
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace ob {
@@ -140,55 +142,86 @@ std::vector<std::string> Session::feed(const char* data, size_t len) {
 }
 
 bool Session::send_response(std::string_view response) {
-    if (!compressed_) {
-        const char* ptr = response.data();
-        size_t remaining = response.size();
-        while (remaining > 0) {
-            ssize_t written = ::write(fd_, ptr, remaining);
-            if (written < 0) {
-                if (errno == EINTR) continue;
-                return false;
-            }
-            ptr += written;
-            remaining -= static_cast<size_t>(written);
-        }
-        return true;
-    }
+    if (compressed_) {
+        // Compressed mode: [4-byte BE length][LZ4 frame]. Framed before queueing, so
+        // a partial write can never split a frame.
+        auto compressed = lz4_compress(response.data(), response.size());
 
-    // Compressed mode: [4-byte BE length][LZ4 frame]
-    auto compressed = lz4_compress(response.data(), response.size());
+        // Compression metrics: raw bytes in, wire bytes out.
+        compress_bytes_in_  += static_cast<uint64_t>(response.size());
+        compress_bytes_out_ += static_cast<uint64_t>(compressed.size());
 
-    // Track compression metrics: raw bytes in, wire bytes out
-    compress_bytes_in_  += static_cast<uint64_t>(response.size());
-    compress_bytes_out_ += static_cast<uint64_t>(compressed.size());
-
-    uint32_t frame_len = static_cast<uint32_t>(compressed.size());
-
-    // Build a single buffer: [4-byte BE header][compressed frame]
-    // Single write() avoids Nagle + delayed-ACK interaction (~40ms penalty).
-    std::string wire;
-    wire.reserve(4 + compressed.size());
-    wire.push_back(static_cast<char>((frame_len >> 24) & 0xFF));
-    wire.push_back(static_cast<char>((frame_len >> 16) & 0xFF));
-    wire.push_back(static_cast<char>((frame_len >> 8) & 0xFF));
-    wire.push_back(static_cast<char>(frame_len & 0xFF));
-    wire.append(reinterpret_cast<const char*>(compressed.data()),
-                compressed.size());
-
-    const char* ptr = wire.data();
-    size_t remaining = wire.size();
-    while (remaining > 0) {
-        ssize_t written = ::write(fd_, ptr, remaining);
-        if (written < 0) {
-            if (errno == EINTR) continue;
+        uint32_t frame_len = static_cast<uint32_t>(compressed.size());
+        if (send_buf_.size() + 4 + compressed.size() > kMaxSendBuffer) {
+            OB_LOG_ERROR("session",
+                         "Send buffer cap exceeded: fd=%d pending=%zu adding=%zu cap=%zu",
+                         fd_, send_buf_.size(), 4 + compressed.size(), kMaxSendBuffer);
             return false;
         }
-        ptr += written;
-        remaining -= static_cast<size_t>(written);
+        send_buf_.push_back(static_cast<char>((frame_len >> 24) & 0xFF));
+        send_buf_.push_back(static_cast<char>((frame_len >> 16) & 0xFF));
+        send_buf_.push_back(static_cast<char>((frame_len >> 8) & 0xFF));
+        send_buf_.push_back(static_cast<char>(frame_len & 0xFF));
+        send_buf_.append(reinterpret_cast<const char*>(compressed.data()),
+                         compressed.size());
+    } else {
+        if (send_buf_.size() + response.size() > kMaxSendBuffer) {
+            OB_LOG_ERROR("session",
+                         "Send buffer cap exceeded: fd=%d pending=%zu adding=%zu cap=%zu",
+                         fd_, send_buf_.size(), response.size(), kMaxSendBuffer);
+            return false;
+        }
+        send_buf_.append(response.data(), response.size());
     }
 
+    return flush_output();
+}
+
+bool Session::flush_output() {
+    size_t sent_total = 0;
+
+    while (sent_total < send_buf_.size()) {
+        // send() with MSG_NOSIGNAL, not write(): a client that disconnects while we
+        // are writing raises SIGPIPE, whose default action kills the whole server
+        // process — every other session with it. Every other socket writer in this
+        // repository already does this; this one did not.
+        ssize_t written = ::send(fd_, send_buf_.data() + sent_total,
+                                 send_buf_.size() - sent_total, MSG_NOSIGNAL);
+        if (written > 0) {
+            sent_total += static_cast<size_t>(written);
+            continue;
+        }
+
+        if (written < 0) {
+            const int err = errno;
+            if (err == EINTR) continue;
+            if (err == EAGAIN || err == EWOULDBLOCK) {
+                // The socket buffer is full. Not an error: the caller arms EPOLLOUT
+                // and the rest goes out when the client drains it.
+                break;
+            }
+            if (sent_total > 0) send_buf_.erase(0, sent_total);
+            OB_LOG_WARN("session",
+                        "Send failed: fd=%d errno=%s pending=%zu",
+                        fd_, std::strerror(err), send_buf_.size());
+            return false;
+        }
+
+        // written == 0: nothing accepted, treat like EAGAIN rather than spinning.
+        break;
+    }
+
+    if (sent_total > 0) send_buf_.erase(0, sent_total);
     return true;
 }
+
+bool Session::has_pending_output() const { return !send_buf_.empty(); }
+
+size_t Session::pending_output_bytes() const { return send_buf_.size(); }
+
+void Session::request_close_after_flush() { close_after_flush_ = true; }
+
+bool Session::close_requested() const { return close_after_flush_; }
 
 uint64_t Session::queries_executed() const { return queries_; }
 uint64_t Session::inserts_executed() const { return inserts_; }
@@ -241,6 +274,15 @@ void SessionManager::close_all() {
 int SessionManager::active_count() const {
     std::lock_guard<std::mutex> lock(mtx_);
     return static_cast<int>(sessions_.size());
+}
+
+size_t SessionManager::total_pending_output_bytes() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    size_t total = 0;
+    for (const auto& entry : sessions_) {
+        if (entry.second) total += entry.second->pending_output_bytes();
+    }
+    return total;
 }
 
 } // namespace ob

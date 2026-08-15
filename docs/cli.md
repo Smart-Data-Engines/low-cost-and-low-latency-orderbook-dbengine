@@ -145,6 +145,26 @@ Show the help message.
 
 Shut down the engine (flushes all data) and exit.
 
+## Large responses and slow clients
+
+A response is queued per session and written as the socket accepts it, so a result set larger than the
+kernel's send buffer is delivered across several event-loop turns rather than in one write. Two
+consequences worth knowing:
+
+- **A slow client is not disconnected.** Reading a 100 000-row result a few kilobytes at a time works;
+  the server keeps the remainder queued and sends it as the client drains. Before this was buffered,
+  any response above roughly 2 MB closed the connection mid-stream, with nothing in the log.
+- **Queued output is capped at 64 MB per session** (about 1.7 million rows of response). A client that
+  stops reading entirely while asking for more hits that cap and has its session closed, with the
+  reason logged. This bounds server memory: without a cap, one client that never reads would grow the
+  process without limit.
+
+`ob_session_pending_bytes` in `/metrics` reports the bytes queued across all sessions. It is the
+signal that a client is not keeping up, and it should sit at zero in a healthy system.
+
+Use `LIMIT` when you do not need the whole scan — it is cheaper on both sides than transferring rows
+you will discard.
+
 ## Typical Session
 
 ```
