@@ -148,6 +148,10 @@ ob_add_query_test(test_query_engine
     test_query_engine.cpp
 )
 
+ob_add_query_test(test_query_agg_execution
+    test_query_agg_execution.cpp
+)
+
 # ── Helper to register a test executable that needs the C API library ─────────
 function(ob_add_capi_test name)
     add_executable(${name} ${ARGN})

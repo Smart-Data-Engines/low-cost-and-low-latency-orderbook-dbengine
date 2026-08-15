@@ -17,7 +17,9 @@ Built by [Smart Data Engines](https://smartdataengines.com), who build custom da
 - **Write-Ahead Log (WAL)** with CRC32C checksums and crash recovery
 - **Columnar storage** with delta+zigzag price compression and Simple8b volume packing
 - **MMAP persistence** with segment-based time partitioning
-- **Aggregation engine** (VWAP, spread, mid-price, imbalance, etc.) with optional AVX2/AVX-512 SIMD
+- **Aggregation engine** (VWAP, spread, mid-price, imbalance, etc.) with optional AVX2/AVX-512 SIMD,
+  reachable over the wire protocol: every result carries its scale factor and distinguishes an empty
+  aggregate from a zero
 - **SQL-like query language** with time-range filters, aggregations, and streaming subscriptions
 - **TCP server** — connect remotely via telnet/nc, like PostgreSQL or ClickHouse
 - **Multi-master replication** — write to any node, automatic conflict resolution via HLC + LWW

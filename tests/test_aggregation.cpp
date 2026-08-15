@@ -545,3 +545,69 @@ TEST(AggEngine, N1000Boundary) {
     auto r_cum = eng.cumulative_volume(side, 1000);
     EXPECT_EQ(r_cum.value, 1000);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Every result reports the factor it was scaled by (aggregations-over-wire).
+//
+// The scale used to live only in a header comment, so a client receiving the number
+// had to know that mid-price is multiplied by 10^6. It is now returned by the same
+// function that does the multiplying, which is the only way the two cannot drift.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(AggEngineScale, PriceScaledFunctionsReportTenToTheSix) {
+    ob::SoASide bid{}, ask{};
+    bid.prices[0] = 9900;  bid.quantities[0] = 10; bid.depth = 1;
+    ask.prices[0] = 10100; ask.quantities[0] = 10; ask.depth = 1;
+    ob::AggregationEngine eng;
+
+    EXPECT_EQ(eng.vwap(bid, 1).scale, ob::kAggScalePrice);
+    EXPECT_EQ(eng.mid_price(bid, ask).scale, ob::kAggScalePrice);
+    EXPECT_EQ(ob::kAggScalePrice, 1'000'000);
+}
+
+TEST(AggEngineScale, ImbalanceReportsTenToTheNine) {
+    ob::SoASide bid{}, ask{};
+    bid.prices[0] = 9900;  bid.quantities[0] = 60; bid.depth = 1;
+    ask.prices[0] = 10100; ask.quantities[0] = 40; ask.depth = 1;
+    ob::AggregationEngine eng;
+
+    auto r = eng.imbalance(bid, ask, 1);
+    EXPECT_EQ(r.scale, ob::kAggScaleRatio);
+    EXPECT_EQ(ob::kAggScaleRatio, 1'000'000'000);
+    // (60 - 40) * 10^9 / 100 = 200000000, i.e. 0.2 once divided by the scale.
+    EXPECT_EQ(r.value, 200'000'000LL);
+    EXPECT_EQ(static_cast<double>(r.value) / static_cast<double>(r.scale), 0.2);
+}
+
+TEST(AggEngineScale, UnscaledFunctionsReportOne) {
+    ob::SoASide bid{}, ask{};
+    bid.prices[0] = 9900;  bid.quantities[0] = 10; bid.depth = 1;
+    ask.prices[0] = 10100; ask.quantities[0] = 10; ask.depth = 1;
+    ob::AggregationEngine eng;
+
+    EXPECT_EQ(eng.sum_qty(bid, 1).scale,            ob::kAggScaleRaw);
+    EXPECT_EQ(eng.avg_price(bid, 1).scale,          ob::kAggScaleRaw);
+    EXPECT_EQ(eng.min_price(bid, 1).scale,          ob::kAggScaleRaw);
+    EXPECT_EQ(eng.max_price(bid, 1).scale,          ob::kAggScaleRaw);
+    EXPECT_EQ(eng.spread(bid, ask).scale,           ob::kAggScaleRaw);
+    EXPECT_EQ(eng.depth_at_price(bid, 9900).scale,  ob::kAggScaleRaw);
+    EXPECT_EQ(eng.depth_within_range(bid, 0, 99999).scale, ob::kAggScaleRaw);
+    EXPECT_EQ(eng.cumulative_volume(bid, 1).scale,  ob::kAggScaleRaw);
+}
+
+TEST(AggEngineScale, EmptyResultsStillReportTheirScale) {
+    // An empty result carries no value, but a client formatting it still needs to
+    // know the units the aggregate would have used.
+    ob::SoASide empty_side{};
+    ob::SoASide ask{};
+    ask.prices[0] = 10100; ask.quantities[0] = 10; ask.depth = 1;
+    ob::AggregationEngine eng;
+
+    auto mid = eng.mid_price(empty_side, ask);
+    ASSERT_TRUE(mid.empty);
+    EXPECT_EQ(mid.scale, ob::kAggScalePrice);
+
+    auto vwap = eng.vwap(empty_side, 1);
+    ASSERT_TRUE(vwap.empty);
+    EXPECT_EQ(vwap.scale, ob::kAggScalePrice);
+}

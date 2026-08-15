@@ -109,7 +109,24 @@ struct ParsedResponse {
 
 /// Format a successful query result as TSV with headers.
 /// Returns "OK\n<header>\n<row1>\n...<rowN>\n\n"
+///
+/// Row scans only. An aggregate result does not fit this shape — it has no price,
+/// quantity or level — and passing one here is what made every aggregate query
+/// answer a network client with a row of zeros. Use format_agg_response().
 std::string format_query_response(const std::vector<QueryResult>& rows);
+
+/// Format aggregate results as TSV: one row per aggregate, three columns.
+///
+///     OK
+///     name	value	scale
+///     SPREAD(*)	1000	1
+///     MID_PRICE(*)	100500000000	1000000
+///
+/// The value column carries NULL when there was nothing to aggregate, which is not
+/// the same as zero: a spread with no ask side is absent, not tight. The scale
+/// column is what the value is multiplied by, so a client divides by it instead of
+/// hardcoding that mid-price happens to be scaled by a million.
+std::string format_agg_response(const std::vector<AggValue>& values);
 
 /// Format an error response.
 /// Returns "ERR <message>\n"

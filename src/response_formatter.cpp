@@ -12,6 +12,8 @@ namespace ob {
 static constexpr std::string_view kQueryHeader =
     "timestamp_ns\tprice\tquantity\torder_count\tside\tlevel";
 
+static constexpr std::string_view kAggHeader = "name\tvalue\tscale";
+
 static constexpr std::string_view kStatusHeader =
     "sessions\tqueries\tinserts\tpending_rows\twal_file\tsegments\tsymbols";
 
@@ -57,6 +59,35 @@ std::string format_query_response(const std::vector<QueryResult>& rows) {
     }
 
     out += '\n'; // empty line terminator
+    return out;
+}
+
+// ── format_agg_response ───────────────────────────────────────────────────────
+
+std::string format_agg_response(const std::vector<AggValue>& values) {
+    std::string out;
+    out.reserve(64 + values.size() * 48);
+
+    out += "OK\n";
+    out += kAggHeader;
+    out += '\n';
+
+    for (const auto& v : values) {
+        out += v.name;
+        out += '\t';
+        // NULL rather than 0: a client that reads 0 here believes a number the
+        // engine never computed. One that chokes on NULL at least knows.
+        if (v.empty) {
+            out += "NULL";
+        } else {
+            out += std::to_string(v.value);
+        }
+        out += '\t';
+        out += std::to_string(v.scale);
+        out += '\n';
+    }
+
+    out += '\n'; // empty line terminator, same contract as a row response
     return out;
 }
 

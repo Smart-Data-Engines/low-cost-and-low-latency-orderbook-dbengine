@@ -67,6 +67,14 @@ std::string execute_command(const Command& cmd,
         }
         session.increment_queries();
         stats.total_queries.fetch_add(1, std::memory_order_relaxed);
+
+        // An aggregate query calls the callback exactly once, with agg_values set
+        // and the row fields left at zero. Formatting that as a data row is what
+        // made SPREAD, MID_PRICE, IMBALANCE and VWAP return zeros to every network
+        // client while the engine computed them correctly.
+        if (!rows.empty() && !rows.front().agg_values.empty()) {
+            return format_agg_response(rows.front().agg_values);
+        }
         return format_query_response(rows);
     }
 

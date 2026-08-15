@@ -90,13 +90,34 @@ rows = engine.query(
 
 Convenience method to query all rows for a symbol/exchange pair.
 
-#### engine.ping() → str
+#### engine.query_agg(symbol, exchange, *exprs) → Dict[str, AggValue]
 
-Returns `"PONG"`. Useful for connection health checks in TCP mode.
+Run aggregate expressions against the live orderbook. TCP and pool mode only.
+
+```python
+aggs = engine.query_agg("BTC-USD", "BINANCE", "SPREAD(*)", "MID_PRICE(*)", "IMBALANCE(10)")
+
+aggs["MID_PRICE(*)"].real       # 100500.0  — already divided by the scale
+aggs["MID_PRICE(*)"].value      # 100500000000  — raw, scaled by 10^6
+aggs["MID_PRICE(*)"].scale      # 1000000
+aggs["SPREAD(*)"].is_empty      # False
+```
+
+No timestamp range is sent: aggregates are computed over the current book, and the server rejects a
+timestamp or price filter rather than accepting one and ignoring it.
+
+`query()` raises `OrderbookError` if the query turns out to return aggregates, because the row parser
+would silently discard all three columns and hand back an empty list.
 
 #### engine.status() → dict
 
-Returns server statistics. In TCP mode: `{"mode": "tcp", "sessions": 1, "queries": 5, "inserts": 100}`.
+Returns server statistics, parsed from every `key: value` field the server sends: `sessions`,
+`queries`, `inserts`, `role`, `epoch`, `replicas`, `primary_address`, `lease_ttl_remaining`, the
+`ttl_*` counters and `segment_merge_refused`.
+
+#### engine.ping() → str
+
+Returns `"PONG"`. Useful for connection health checks in TCP mode.
 
 #### engine.close()
 
@@ -117,6 +138,25 @@ class OrderbookRow:
     @property
     def price_float(self) -> float: ...
 ```
+
+### AggValue
+
+```python
+@dataclass
+class AggValue:
+    name: str
+    value: Optional[int]   # None when the server reported NULL
+    scale: int
+
+    @property
+    def real(self) -> Optional[float]: ...   # value / scale
+    @property
+    def is_empty(self) -> bool: ...          # value is None
+```
+
+`value` is scaled by the server: × 10⁶ for `VWAP` and `MID_PRICE`, × 10⁹ for `IMBALANCE`, raw for
+everything else. Prefer `real` unless you want the integer. `value` is `None` when there was nothing
+to aggregate — a spread on a one-sided book is absent, not zero.
 
 ### OrderbookError
 

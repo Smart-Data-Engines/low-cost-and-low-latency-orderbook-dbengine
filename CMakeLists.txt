@@ -198,7 +198,8 @@ target_link_libraries(orderbook_agg PUBLIC orderbook_soa)
 
 # ── Query engine compiled library ─────────────────────────────────────────────
 add_library(orderbook_query STATIC src/query_engine.cpp)
-target_link_libraries(orderbook_query PUBLIC orderbook_columnar orderbook_agg)
+# Needs the logger: rejected queries must say so, not fail in silence.
+target_link_libraries(orderbook_query PUBLIC orderbook_columnar orderbook_agg orderbook_logger)
 
 # ── Engine facade compiled library ────────────────────────────────────────────
 add_library(orderbook_engine STATIC src/engine.cpp src/replication.cpp)

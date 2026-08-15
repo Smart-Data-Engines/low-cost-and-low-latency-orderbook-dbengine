@@ -19,6 +19,21 @@ namespace ob {
 // ── QueryResult ───────────────────────────────────────────────────────────────
 // A single row returned by a query execution.
 
+/// One aggregate result on its way to a client: what was asked for, what came out,
+/// whether there was anything to aggregate, and in what units.
+///
+/// `empty` and `scale` are not decoration. Without `empty`, a spread computed on a
+/// book with no ask side is indistinguishable from a spread of zero. Without
+/// `scale`, a client reads MID_PRICE a million times too large, because vwap and
+/// mid_price are scaled by 10^6 and imbalance by 10^9. Both used to be dropped
+/// here, and the whole vector used to be dropped again by the response formatter.
+struct AggValue {
+    std::string name;   ///< the expression exactly as written, e.g. "MID_PRICE(*)"
+    int64_t     value;
+    bool        empty;
+    int64_t     scale;
+};
+
 struct QueryResult {
     uint64_t timestamp_ns;
     uint64_t sequence_number;
@@ -27,8 +42,8 @@ struct QueryResult {
     uint32_t order_count;
     uint8_t  side;    // 0=bid, 1=ask
     uint16_t level;
-    // For aggregation results: name -> value pairs
-    std::vector<std::pair<std::string, int64_t>> agg_values;
+    // Populated for aggregation queries only; empty for a row scan.
+    std::vector<AggValue> agg_values;
 };
 
 // ── QueryType ─────────────────────────────────────────────────────────────────

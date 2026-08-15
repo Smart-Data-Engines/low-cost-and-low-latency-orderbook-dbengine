@@ -63,6 +63,24 @@ struct QueryResult {
     std::vector<QueryRow> rows;
 };
 
+/// One aggregate result, as reported by the server.
+///
+/// `value` is scaled: the server multiplies VWAP and MID_PRICE by 10^6 and
+/// IMBALANCE by 10^9, so divide by `scale` before treating it as a price or a
+/// ratio. `empty` marks an aggregate with nothing to aggregate — a spread on a book
+/// with no ask side is absent, not zero.
+struct AggEntry {
+    std::string name;    ///< the expression as sent, e.g. "MID_PRICE(*)"
+    int64_t     value{0};
+    bool        empty{false};
+    int64_t     scale{1};
+
+    /// value in natural units; meaningless when `empty` is true.
+    double real() const {
+        return static_cast<double>(value) / static_cast<double>(scale);
+    }
+};
+
 /// Node role in the cluster.
 enum class NodeRole : uint8_t {
     STANDALONE = 0,
@@ -108,6 +126,14 @@ public:
     Result<void>        flush();
     Result<QueryResult> query(std::string_view sql);
 
+    /// Run an aggregate query (SELECT SPREAD(*), MID_PRICE(*) FROM ...).
+    ///
+    /// Aggregates use their own response shape, so query() cannot return them and
+    /// says so rather than misparsing the columns. Aggregates are computed over the
+    /// live book: the server rejects a timestamp or price filter instead of
+    /// accepting one and ignoring it.
+    Result<std::vector<AggEntry>> query_agg(std::string_view sql);
+
     // ── Diagnostics ──────────────────────────────────────────────────
     Result<bool>     ping();
     Result<RoleInfo> role();
@@ -123,6 +149,7 @@ public:
     // ── Response parsing (public for property-based testing) ─────────
     Result<void>        parse_ok_response(std::string_view resp);
     Result<QueryResult> parse_query_response(std::string_view resp);
+    Result<std::vector<AggEntry>> parse_agg_response(std::string_view resp);
     RoleInfo            parse_role_response(std::string_view resp);
 
     /// Access to the send buffer (for testing).
