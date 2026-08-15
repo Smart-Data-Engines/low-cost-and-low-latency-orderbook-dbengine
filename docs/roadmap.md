@@ -113,9 +113,9 @@ ranges that ascend. Whether a reference points at the item it means is on the re
 ## Phase 7 — Correctness and Deployability
 
 **Why this phase is first.** Everything up to here is engine capability. What stands between this
-engine and a production deployment is not another feature. One shipped feature still does not do what
-it claims (#27), the wire protocol has no authentication, there is no configuration file, and there
-is no packaging. Someone who reads the code and likes it still cannot run it. Fix the broken
+engine and a production deployment is not another feature. A shipped feature still does not do what it
+claims (#56, anti-entropy reconciles nothing), the wire protocol has no authentication, there is no
+configuration file, and there is no packaging. Someone who reads the code and likes it still cannot run it. Fix the broken
 promises first, then remove the deployment blockers.
 
 ### 25. Columnar segments lost the order side ✅
@@ -186,22 +186,73 @@ separately; 544 tests passing; the integration suite six consecutive clean runs 
 failed 1 in 6; `BM_UpdateLatency` p50 unchanged within noise (the lock is taken once per flush, not
 per row). Spec: `kiro-workspace/specs/flush-race-duplicate-segments/`
 
-### 27. Aggregations are unreachable over the wire protocol (P0)
-- `SPREAD(*)`, `MID_PRICE(*)`, `IMBALANCE(n)` and `VWAP(...)` all return zeros over TCP.
-  `QueryResult` carries results in `agg_values` (a name/value list), but
-  `format_query_response()` in `src/response_formatter.cpp` has a single fixed row header and never
-  reads that field. The engine computes them correctly — `test_query_engine.cpp` proves it — they are
-  simply not representable in the wire protocol
-- So no network client can use them: not the Python client, not the C++ client, not `nc`. Only code
-  linking the engine directly. The README advertises all four
-- Same shape as items #25 and #26: the lower layer works and is tested, the layer above drops the
-  result, and no test crosses the boundary between them
-- Needs a protocol decision, which is why it is not a quick fix: a separate response type, or a
-  header derived from the projection. Whatever is chosen has to keep existing row queries working
-- While here: the parser accepted `SPREAD(price)` and returned zeros instead of a syntax error, and
-  `VWAP(10)` is rejected while `IMBALANCE(10)` is accepted. Aggregate argument forms are inconsistent
-  and absent from `docs/query-language.md`
-- Effort: M | Impact: **Makes an advertised feature usable at all**
+### 27. Aggregations are unreachable over the wire protocol ✅
+
+Every aggregate query answered `OK` plus a single row of zeros. `format_query_response()` had one
+fixed row header and never read `QueryResult::agg_values` — one write site in the whole repository,
+zero read sites. The engine computed the values correctly the entire time; nothing carried them to a
+client. Not the Python client, not the C++ client, not `nc`; only code linking the engine directly.
+The README advertised all four functions.
+
+Worse than an error, because `OK` plus a number invites belief. For an orderbook store it meant
+spread 0 and imbalance 0 — two values that read as a signal in a trading system.
+
+Writing a test that runs an aggregate through `execute()` — which nothing had ever done — turned up
+four more defects in the same feature:
+
+- **`empty` was dropped**, so a spread on a book with only one side was indistinguishable from a
+  spread of zero. It is now `NULL` on the wire, never `0`.
+- **Scales were tribal knowledge.** `VWAP` and `MID_PRICE` are multiplied by 10⁶, `IMBALANCE` by 10⁹,
+  the rest not at all, and this lived only in header comments. A client reading mid-price as a raw
+  price is wrong by a million. The factor is now returned by the function that applies it
+  (`AggResult::scale`) and travels in the response.
+- **The argument was decoration, and it lied.** The dispatcher calls `sum_qty()` for `SUM` and
+  `avg_price()` for `AVG` regardless of the argument, so `SUM(price)` returned a sum of quantities
+  labelled `SUM(price)`, and `AVG(quantity)`/`MIN(quantity)` returned price statistics. Arguments are
+  now validated against what each function actually aggregates.
+- **`DEPTH_RANGE` could only ever answer `NULL`.** The parser rebuilds the expression text with `", "`
+  between arguments, so the second bound always arrived as `" 101000"`; `std::from_chars` refuses a
+  leading space, `parse_i64()` turned that failure into `0`, and `[lo, 0]` is an empty range.
+  `test_aggregation.cpp` tests `depth_within_range()` directly, so it stayed green.
+
+Aggregates read the live SoA book, so a timestamp or price filter cannot be honoured. Both used to be
+accepted and ignored; both are now refused by name (`AGG_TIME_FILTER`, `AGG_PRICE_FILTER`), as is
+mixing aggregates with plain columns (`AGG_WITH_COLUMNS`).
+
+Response shape — one row per aggregate, self-describing:
+
+```
+OK
+name	value	scale
+SPREAD(*)	1000	1
+MID_PRICE(*)	100500000000	1000000
+IMBALANCE(10)	250000000	1000000000
+```
+
+Python gets `query_agg()` returning `AggValue` with a `real` property that applies the scale; C++ gets
+`query_agg()` returning `AggEntry`; each parser refuses the other shape by naming the right method
+instead of misparsing columns. The CLI renders an aggregate table with the value in natural units.
+
+**Why 547 tests missed it.** Coverage came in two halves that never met: 14 tests for
+`AggregationEngine`'s maths on hand-built `SoASide` inputs, and one parser test that calls `parse()`
+rather than `execute()`. No test crossed from a query string to the bytes on the wire. The earlier
+claim here that "the engine computes them correctly — `test_query_engine.cpp` proves it" was
+overstated: what was proven was the arithmetic and the grammar, not the execution path.
+
+Verified: 27 new tests (execution, arguments, formatter, C++ client, plus 11 integration tests over
+the raw protocol and the Python client), all values hand-computed in the tests; 578 C++ tests and 55
+integration tests green; four mutations confirmed red separately.
+
+Performance: `BM_VwapLatency` measured 2645 → 1616 ns, and that is **not** a speedup this change
+produced — do not quote it. The accumulation loop is byte-identical in both binaries (same 15
+instructions, same registers, no SIMD in either). `AggResult` crossing 16 bytes moved the return to a
+hidden pointer, which lengthened the prologue by two pushes and moved the loop from `0x41530`
+(mod 32 = 16, spanning two 32-byte fetch boundaries) to `0x41600` (mod 64 = 0, spanning one). On this
+CPU, with the loop stream detector disabled, that front-end difference is worth the ~2.5 cycles per
+level observed. Control benchmarks the change cannot touch confirm the two build environments are
+equivalent: ingestion −1.3%, `BM_UpdateLatency` +0.1%. Treat as no regression.
+
+Spec: `kiro-workspace/specs/aggregations-over-wire/`
 
 ### 28. Restore the integration test suite (P0)
 - The framework survived (`tests/integration/conftest.py`, 691 lines), the tests did not

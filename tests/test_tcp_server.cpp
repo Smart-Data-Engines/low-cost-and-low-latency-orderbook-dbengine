@@ -784,3 +784,83 @@ TEST(CliArgs, ReadOnlyDefaultFalse) {
     ob::ServerConfig config = ob::parse_cli_args(1, argv);
     EXPECT_FALSE(config.read_only);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Aggregate responses (aggregations-over-wire)
+//
+// format_query_response() has one fixed row header and never read agg_values, so
+// every aggregate query answered a network client with OK and a row of zeros. These
+// tests cover the shape that replaced it, including the two things the row format
+// had no room for: an empty result and a scale factor.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(ResponseFormatterAgg, SingleAggregateCarriesValueAndScale) {
+    std::vector<ob::AggValue> values = {
+        {"SPREAD(*)", 1000, false, 1},
+    };
+
+    std::string wire = ob::format_agg_response(values);
+    ob::ParsedResponse parsed = ob::parse_response(wire);
+
+    ASSERT_FALSE(parsed.is_error) << wire;
+    ASSERT_EQ(parsed.header_columns.size(), 3u);
+    EXPECT_EQ(parsed.header_columns[0], "name");
+    EXPECT_EQ(parsed.header_columns[1], "value");
+    EXPECT_EQ(parsed.header_columns[2], "scale");
+
+    ASSERT_EQ(parsed.rows.size(), 1u);
+    ASSERT_EQ(parsed.rows[0].size(), 3u);
+    EXPECT_EQ(parsed.rows[0][0], "SPREAD(*)");
+    EXPECT_EQ(parsed.rows[0][1], "1000");
+    EXPECT_EQ(parsed.rows[0][2], "1");
+}
+
+TEST(ResponseFormatterAgg, SeveralAggregatesKeepTheirOrder) {
+    std::vector<ob::AggValue> values = {
+        {"SPREAD(*)",    1000,            false, 1},
+        {"MID_PRICE(*)", 100500000000LL,  false, 1000000},
+        {"IMBALANCE(10)", 200000000LL,    false, 1000000000},
+    };
+
+    ob::ParsedResponse parsed = ob::parse_response(ob::format_agg_response(values));
+
+    ASSERT_EQ(parsed.rows.size(), 3u);
+    EXPECT_EQ(parsed.rows[0][0], "SPREAD(*)");
+    EXPECT_EQ(parsed.rows[1][0], "MID_PRICE(*)");
+    EXPECT_EQ(parsed.rows[2][0], "IMBALANCE(10)");
+    // The scale is the whole point: 100500000000 with scale 1000000 is 100500.
+    EXPECT_EQ(parsed.rows[1][1], "100500000000");
+    EXPECT_EQ(parsed.rows[1][2], "1000000");
+}
+
+TEST(ResponseFormatterAgg, EmptyResultIsNullNotZero) {
+    std::vector<ob::AggValue> values = {
+        {"SPREAD(*)", 0, true, 1},
+    };
+
+    ob::ParsedResponse parsed = ob::parse_response(ob::format_agg_response(values));
+
+    ASSERT_EQ(parsed.rows.size(), 1u);
+    EXPECT_EQ(parsed.rows[0][1], "NULL")
+        << "a spread with no ask side is absent, not zero, and a trading client "
+           "cannot tell those apart if it is serialised as 0";
+    EXPECT_EQ(parsed.rows[0][2], "1") << "the scale is still meaningful for a NULL";
+}
+
+TEST(ResponseFormatterAgg, ResponseFollowsTheSameFramingAsARowResponse) {
+    std::vector<ob::AggValue> values = {{"SPREAD(*)", 1000, false, 1}};
+    std::string wire = ob::format_agg_response(values);
+
+    EXPECT_EQ(wire.rfind("OK\n", 0), 0u) << "must start with OK";
+    EXPECT_GE(wire.size(), 2u);
+    EXPECT_EQ(wire.substr(wire.size() - 2), "\n\n")
+        << "must end with the blank-line terminator every client waits for";
+}
+
+TEST(ResponseFormatterAgg, NoAggregatesStillProducesAWellFormedResponse) {
+    std::string wire = ob::format_agg_response({});
+
+    ob::ParsedResponse parsed = ob::parse_response(wire);
+    EXPECT_FALSE(parsed.is_error);
+    EXPECT_TRUE(parsed.rows.empty());
+}

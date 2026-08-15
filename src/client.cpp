@@ -291,10 +291,17 @@ Result<QueryResult> OrderbookClient::parse_query_response(std::string_view resp)
     if (resp.empty())
         return Result<QueryResult>::ok(QueryResult{});
 
-    // Skip header line
+    // Read the header before dropping it: an aggregate response has its own
+    // columns, and parsing those positionally as a row used to fail with the
+    // baffling "bad timestamp_ns" instead of naming the actual problem.
     auto header_end = resp.find('\n');
     if (header_end == std::string_view::npos)
         return Result<QueryResult>::err(OB_ERR_PARSE, "missing header");
+    std::string_view header = resp.substr(0, header_end);
+    if (header == "name\tvalue\tscale")
+        return Result<QueryResult>::err(
+            OB_ERR_PARSE,
+            "response holds aggregates, not rows; use query_agg()");
     resp.remove_prefix(header_end + 1);
 
     // Parse data rows
@@ -565,6 +572,91 @@ Result<QueryResult> OrderbookClient::query(std::string_view sql) {
     if (!rr) return Result<QueryResult>::err(rr.error_code(), rr.error_message());
 
     return parse_query_response(rr.value());
+}
+
+Result<std::vector<AggEntry>> OrderbookClient::parse_agg_response(std::string_view resp) {
+    using Res = Result<std::vector<AggEntry>>;
+
+    if (resp.starts_with("ERR ")) {
+        auto msg = resp.substr(4);
+        if (!msg.empty() && msg.back() == '\n')
+            msg.remove_suffix(1);
+        return Res::err(OB_ERR_INTERNAL, std::string(msg));
+    }
+    if (!resp.starts_with("OK\n"))
+        return Res::err(OB_ERR_PARSE, "unexpected response");
+
+    resp.remove_prefix(3);
+    if (resp.size() >= 2 && resp.substr(resp.size() - 2) == "\n\n")
+        resp.remove_suffix(2);
+    if (resp.empty())
+        return Res::ok({});
+
+    auto header_end = resp.find('\n');
+    if (header_end == std::string_view::npos)
+        return Res::err(OB_ERR_PARSE, "missing header");
+    std::string_view header = resp.substr(0, header_end);
+    if (header != "name\tvalue\tscale")
+        return Res::err(OB_ERR_PARSE,
+                        "response holds rows, not aggregates; use query()");
+    resp.remove_prefix(header_end + 1);
+
+    std::vector<AggEntry> entries;
+    while (!resp.empty()) {
+        auto line_end = resp.find('\n');
+        std::string_view line = (line_end == std::string_view::npos)
+                                    ? resp : resp.substr(0, line_end);
+        if (!line.empty()) {
+            auto tab1 = line.find('\t');
+            auto tab2 = line.rfind('\t');
+            if (tab1 == std::string_view::npos || tab1 == tab2)
+                return Res::err(OB_ERR_PARSE, "malformed aggregate row");
+
+            AggEntry entry{};
+            entry.name = std::string(line.substr(0, tab1));
+
+            std::string_view value_field = line.substr(tab1 + 1, tab2 - tab1 - 1);
+            if (value_field == "NULL") {
+                // Deliberately not 0: the server had nothing to aggregate, and a
+                // zero here would be indistinguishable from a real measurement.
+                entry.empty = true;
+                entry.value = 0;
+            } else {
+                auto [vp, vec] = std::from_chars(value_field.data(),
+                                                 value_field.data() + value_field.size(),
+                                                 entry.value);
+                (void)vp;
+                if (vec != std::errc{})
+                    return Res::err(OB_ERR_PARSE, "bad aggregate value");
+            }
+
+            std::string_view scale_field = line.substr(tab2 + 1);
+            auto [sp, sec] = std::from_chars(scale_field.data(),
+                                             scale_field.data() + scale_field.size(),
+                                             entry.scale);
+            (void)sp;
+            if (sec != std::errc{} || entry.scale == 0)
+                return Res::err(OB_ERR_PARSE, "bad aggregate scale");
+
+            entries.push_back(std::move(entry));
+        }
+        if (line_end == std::string_view::npos) break;
+        resp.remove_prefix(line_end + 1);
+    }
+
+    return Res::ok(std::move(entries));
+}
+
+Result<std::vector<AggEntry>> OrderbookClient::query_agg(std::string_view sql) {
+    using Res = Result<std::vector<AggEntry>>;
+    size_t len = format_query(sql);
+    auto sr = send_all(len);
+    if (!sr) return Res::err(sr.error_code(), sr.error_message());
+
+    auto rr = recv_response();
+    if (!rr) return Res::err(rr.error_code(), rr.error_message());
+
+    return parse_agg_response(rr.value());
 }
 
 Result<bool> OrderbookClient::ping() {

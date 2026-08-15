@@ -309,20 +309,14 @@ void cmd_generate(ob::Engine& engine, std::istringstream& args) {
 
 void cmd_query(ob::Engine& engine, const std::string& sql) {
     auto t0 = std::chrono::steady_clock::now();
-    int rows = 0;
 
-    std::cout << "  ts_ns               | side | level | price        | qty          | orders\n";
-    std::cout << "  ────────────────────┼──────┼───────┼──────────────┼──────────────┼────────\n";
-
+    // Results are collected before anything is printed, so the table header can
+    // match what actually came back. Printing the orderbook header first meant an
+    // aggregate query was rendered as one row of zeros under price/qty/level
+    // columns, and a failed query printed an empty table.
+    std::vector<ob::QueryResult> results;
     std::string err = engine.execute(sql, [&](const ob::QueryResult& r) {
-        std::printf("  %-20lu | %-4s | %5u | %12ld | %12lu | %6u\n",
-                    r.timestamp_ns,
-                    r.side == 0 ? "bid" : "ask",
-                    r.level,
-                    r.price,
-                    r.quantity,
-                    r.order_count);
-        ++rows;
+        results.push_back(r);
     });
 
     auto t1 = std::chrono::steady_clock::now();
@@ -330,8 +324,44 @@ void cmd_query(ob::Engine& engine, const std::string& sql) {
 
     if (!err.empty()) {
         std::cerr << "  ERROR: " << err << "\n";
+        ++g_queries;
+        return;
     }
-    std::cout << "  ── " << rows << " row(s) in " << ms << " ms\n";
+
+    // Aggregate response: one value per requested expression, with its scale.
+    if (!results.empty() && !results.front().agg_values.empty()) {
+        const auto& values = results.front().agg_values;
+        std::cout << "  aggregate            | value                |      scale | in units\n";
+        std::cout << "  ─────────────────────┼──────────────────────┼────────────┼──────────────\n";
+        for (const auto& v : values) {
+            if (v.empty) {
+                // NULL, not 0: there was nothing to aggregate. A zero here would
+                // read as a real measurement.
+                std::printf("  %-20s | %20s | %10ld | %s\n",
+                            v.name.c_str(), "NULL", v.scale, "-");
+            } else {
+                std::printf("  %-20s | %20ld | %10ld | %.6g\n",
+                            v.name.c_str(), v.value, v.scale,
+                            static_cast<double>(v.value) / static_cast<double>(v.scale));
+            }
+        }
+        std::cout << "  ── " << values.size() << " aggregate(s) in " << ms << " ms\n";
+        ++g_queries;
+        return;
+    }
+
+    std::cout << "  ts_ns               | side | level | price        | qty          | orders\n";
+    std::cout << "  ────────────────────┼──────┼───────┼──────────────┼──────────────┼────────\n";
+    for (const auto& r : results) {
+        std::printf("  %-20lu | %-4s | %5u | %12ld | %12lu | %6u\n",
+                    r.timestamp_ns,
+                    r.side == 0 ? "bid" : "ask",
+                    r.level,
+                    r.price,
+                    r.quantity,
+                    r.order_count);
+    }
+    std::cout << "  ── " << results.size() << " row(s) in " << ms << " ms\n";
     ++g_queries;
 }
 

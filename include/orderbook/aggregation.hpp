@@ -11,9 +11,18 @@ namespace ob {
 // Imbalance returns value scaled by 10^9.
 
 struct AggResult {
-    int64_t value;  // primary result
-    bool    empty;  // true when input set was empty
+    int64_t value;      // primary result, expressed in units of 1/scale
+    bool    empty;      // true when input set was empty
+    int64_t scale{1};   // value is scaled by this factor: 10^6 for vwap and
+                        // mid_price, 10^9 for imbalance, 1 for everything else
 };
+
+/// Scale factors, named so that a call site reads as documentation and a client
+/// receiving the value knows what to divide by. The function that multiplies is the
+/// function that reports the factor, so the two cannot drift apart.
+inline constexpr int64_t kAggScaleRaw    = 1;
+inline constexpr int64_t kAggScalePrice  = 1'000'000;      // vwap, mid_price
+inline constexpr int64_t kAggScaleRatio  = 1'000'000'000;  // imbalance
 
 class AggregationEngine {
 public:

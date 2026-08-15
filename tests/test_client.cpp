@@ -350,3 +350,101 @@ TEST(ClientUnit, MoveOnlySemantics) {
     static_assert(std::is_move_assignable_v<ob::OrderbookClient>,
                   "OrderbookClient must be move-assignable");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Aggregate responses (aggregations-over-wire)
+//
+// The row parser skips the header and reads columns positionally, so an aggregate
+// response used to fail with "bad timestamp_ns" — a message that says nothing about
+// the real problem. Now each shape is parsed by the function that understands it,
+// and each refuses the other by name.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(ClientUnit, ParseAggResponseValueAndScale) {
+    std::string wire =
+        "OK\n"
+        "name\tvalue\tscale\n"
+        "SPREAD(*)\t1000\t1\n"
+        "MID_PRICE(*)\t100500000000\t1000000\n"
+        "\n";
+
+    ob::OrderbookClient client;
+    auto result = client.parse_agg_response(wire);
+    ASSERT_TRUE(result.has_value()) << result.error_message();
+
+    const auto& entries = result.value();
+    ASSERT_EQ(entries.size(), 2u);
+
+    EXPECT_EQ(entries[0].name, "SPREAD(*)");
+    EXPECT_EQ(entries[0].value, 1000);
+    EXPECT_EQ(entries[0].scale, 1);
+    EXPECT_FALSE(entries[0].empty);
+
+    EXPECT_EQ(entries[1].name, "MID_PRICE(*)");
+    EXPECT_EQ(entries[1].value, 100500000000LL);
+    EXPECT_EQ(entries[1].scale, 1000000);
+    EXPECT_DOUBLE_EQ(entries[1].real(), 100500.0);
+}
+
+TEST(ClientUnit, ParseAggResponseNullIsEmptyNotZero) {
+    std::string wire =
+        "OK\n"
+        "name\tvalue\tscale\n"
+        "SPREAD(*)\tNULL\t1\n"
+        "\n";
+
+    ob::OrderbookClient client;
+    auto result = client.parse_agg_response(wire);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result.value().size(), 1u);
+    EXPECT_TRUE(result.value()[0].empty)
+        << "NULL means there was nothing to aggregate, which a caller must be able "
+           "to distinguish from a genuine zero";
+}
+
+TEST(ClientUnit, RowParserRefusesAnAggregateResponseByName) {
+    std::string wire =
+        "OK\n"
+        "name\tvalue\tscale\n"
+        "SPREAD(*)\t1000\t1\n"
+        "\n";
+
+    ob::OrderbookClient client;
+    auto result = client.parse_query_response(wire);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error_message().find("query_agg"), std::string::npos)
+        << "the error should name the method to use, got: " << result.error_message();
+}
+
+TEST(ClientUnit, AggParserRefusesARowResponseByName) {
+    std::string wire =
+        "OK\n"
+        "timestamp_ns\tprice\tquantity\torder_count\tside\tlevel\n"
+        "1700000000000000000\t100000\t50\t1\t0\t0\n"
+        "\n";
+
+    ob::OrderbookClient client;
+    auto result = client.parse_agg_response(wire);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error_message().find("query()"), std::string::npos)
+        << result.error_message();
+}
+
+TEST(ClientUnit, ParseAggResponseRejectsAZeroScale) {
+    // A zero scale would make real() divide by zero, so it is a protocol error.
+    std::string wire =
+        "OK\n"
+        "name\tvalue\tscale\n"
+        "SPREAD(*)\t1000\t0\n"
+        "\n";
+
+    ob::OrderbookClient client;
+    EXPECT_FALSE(client.parse_agg_response(wire).has_value());
+}
+
+TEST(ClientUnit, ParseAggResponseErrorIsPropagated) {
+    ob::OrderbookClient client;
+    auto result = client.parse_agg_response("ERR AGG_TIME_FILTER not supported\n");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error_message().find("AGG_TIME_FILTER"), std::string::npos);
+}

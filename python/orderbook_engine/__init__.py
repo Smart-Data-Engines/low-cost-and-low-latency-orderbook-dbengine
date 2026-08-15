@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - depends on the install extras
 logger = logging.getLogger("orderbook_engine")
 
 __version__ = "0.2.0"
-__all__ = ["OrderbookEngine", "OrderbookRow", "OrderbookError",
+__all__ = ["OrderbookEngine", "OrderbookRow", "OrderbookError", "AggValue",
            "_murmurhash3_x86_32", "_ConsistentHashRing",
            "_parse_shard_map_response", "_parse_shard_info_response",
            "_parse_shard_error"]
@@ -69,6 +69,33 @@ class OrderbookRow:
                 f"side={self.side}, level={self.level}, "
                 f"price={self.price}, qty={self.quantity}, "
                 f"orders={self.order_count})")
+
+
+@dataclass
+class AggValue:
+    """One aggregate result as the server reported it.
+
+    `value` is scaled: the server multiplies VWAP and MID_PRICE by 10^6 and
+    IMBALANCE by 10^9. Use `real` rather than `value` unless you specifically want
+    the raw integer — reading `value` as a price is how a mid-price ends up a
+    million times too large.
+
+    `value` is None when the server said NULL, meaning there was nothing to
+    aggregate. That is not the same as zero: a spread with no ask side is absent,
+    not tight.
+    """
+    name: str
+    value: Optional[int]
+    scale: int
+
+    @property
+    def real(self) -> Optional[float]:
+        """The value in natural units, or None when the aggregate was empty."""
+        return None if self.value is None else self.value / self.scale
+
+    @property
+    def is_empty(self) -> bool:
+        return self.value is None
 
 
 class OrderbookError(Exception):
@@ -1064,6 +1091,27 @@ class _ClientPool:
 
 # ── Multi-master response parsers ──────────────────────────────────────────────
 
+# The header the server uses for an aggregate response. A row response has
+# timestamp_ns/price/... instead, and the two must never be parsed as one another.
+_AGG_HEADER = ["name", "value", "scale"]
+
+
+def _is_agg_response(header: List[str]) -> bool:
+    return header[:3] == _AGG_HEADER
+
+
+def _parse_agg_rows(data_rows: List[List[str]]) -> Dict[str, "AggValue"]:
+    """Turn the three-column aggregate TSV into name -> AggValue."""
+    out: Dict[str, AggValue] = {}
+    for r in data_rows:
+        if len(r) < 3:
+            continue
+        name, raw_value, raw_scale = r[0], r[1], r[2]
+        value = None if raw_value == "NULL" else int(raw_value)
+        out[name] = AggValue(name=name, value=value, scale=int(raw_scale))
+    return out
+
+
 def _parse_status_fields(raw: str) -> dict:
     """Collect the top-level `key: value` lines of a STATUS response.
 
@@ -1379,6 +1427,13 @@ class OrderbookEngine:
         is_err, msg, header, data_rows = _parse_tcp_response(raw)
         if is_err:
             raise OrderbookError(-1, f"query error: {msg}")
+        # An aggregate response has three columns, so the row loop below would skip
+        # every one of them and hand back an empty list — a silent wrong answer.
+        if _is_agg_response(header):
+            raise OrderbookError(
+                -1,
+                "this query returned aggregates, not rows; use query_agg() "
+                f"(columns: {header})")
         # Parse TSV rows into OrderbookRow objects
         # Header: timestamp_ns  price  quantity  order_count  side  level
         rows: List[OrderbookRow] = []
@@ -1403,6 +1458,38 @@ class OrderbookEngine:
         if limit is not None:
             sql += f" LIMIT {limit}"
         return self.query(sql)
+
+    def query_agg(self, symbol: str, exchange: str,
+                  *exprs: str) -> Dict[str, "AggValue"]:
+        """Run aggregate expressions against the live book.
+
+        Example:
+            aggs = engine.query_agg("BTC-USD", "BINANCE", "SPREAD(*)", "MID_PRICE(*)")
+            aggs["MID_PRICE(*)"].real   # 100500.0, already divided by the scale
+
+        Aggregates are computed over the current book, so no timestamp range is sent:
+        the server rejects one, rather than accepting it and ignoring it.
+        """
+        if self._closed:
+            raise OrderbookError(-1, "Engine is closed")
+        if not exprs:
+            raise OrderbookError(-1, "query_agg needs at least one expression")
+        if self._mode == "local":
+            raise OrderbookError(-1, "query_agg is TCP/pool mode only")
+
+        sql = f"SELECT {', '.join(exprs)} FROM '{symbol}'.'{exchange}'"
+        if self._mode == "pool":
+            raw = self._pool.execute_read(sql)
+        else:
+            raw = self._tcp.execute(sql)
+
+        is_err, msg, header, data_rows = _parse_tcp_response(raw)
+        if is_err:
+            raise OrderbookError(-1, f"query_agg error: {msg}")
+        if not _is_agg_response(header):
+            raise OrderbookError(
+                -1, f"expected an aggregate response, got columns {header}")
+        return _parse_agg_rows(data_rows)
 
     def ping(self) -> str:
         """Send PING, expect PONG. Works in all modes."""

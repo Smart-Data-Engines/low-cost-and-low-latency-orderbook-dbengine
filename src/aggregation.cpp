@@ -197,52 +197,52 @@ static std::pair<__int128, int64_t> dispatch_vwap_parts(const SoASide& side, uin
 
 AggResult AggregationEngine::sum_qty(const SoASide& side, uint32_t n_levels) const {
     uint32_t n = effective_n(side, n_levels);
-    if (n == 0) return {0, true};
-    return {dispatch_sum_qty(side, n), false};
+    if (n == 0) return {0, true, kAggScaleRaw};
+    return {dispatch_sum_qty(side, n), false, kAggScaleRaw};
 }
 
 AggResult AggregationEngine::avg_price(const SoASide& side, uint32_t n_levels) const {
     uint32_t n = effective_n(side, n_levels);
-    if (n == 0) return {0, true};
+    if (n == 0) return {0, true, kAggScaleRaw};
     int64_t sum = 0;
     for (uint32_t i = 0; i < n; ++i) sum += side.prices[i];
-    return {sum / static_cast<int64_t>(n), false};
+    return {sum / static_cast<int64_t>(n), false, kAggScaleRaw};
 }
 
 AggResult AggregationEngine::min_price(const SoASide& side, uint32_t n_levels) const {
     uint32_t n = effective_n(side, n_levels);
-    if (n == 0) return {0, true};
-    return {dispatch_min_price(side, n), false};
+    if (n == 0) return {0, true, kAggScaleRaw};
+    return {dispatch_min_price(side, n), false, kAggScaleRaw};
 }
 
 AggResult AggregationEngine::max_price(const SoASide& side, uint32_t n_levels) const {
     uint32_t n = effective_n(side, n_levels);
-    if (n == 0) return {0, true};
-    return {dispatch_max_price(side, n), false};
+    if (n == 0) return {0, true, kAggScaleRaw};
+    return {dispatch_max_price(side, n), false, kAggScaleRaw};
 }
 
 AggResult AggregationEngine::vwap(const SoASide& side, uint32_t n_levels) const {
     uint32_t n = effective_n(side, n_levels);
-    if (n == 0) return {0, true};
+    if (n == 0) return {0, true, kAggScalePrice};
     auto [num, denom] = dispatch_vwap_parts(side, n);
-    if (denom == 0) return {0, true};
+    if (denom == 0) return {0, true, kAggScalePrice};
     // Scale by 10^6
     int64_t result = static_cast<int64_t>((num * 1'000'000LL) / denom);
-    return {result, false};
+    return {result, false, kAggScalePrice};
 }
 
 AggResult AggregationEngine::spread(const SoASide& bid, const SoASide& ask) const {
-    if (bid.depth == 0 || ask.depth == 0) return {0, true};
-    return {ask.prices[0] - bid.prices[0], false};
+    if (bid.depth == 0 || ask.depth == 0) return {0, true, kAggScaleRaw};
+    return {ask.prices[0] - bid.prices[0], false, kAggScaleRaw};
 }
 
 AggResult AggregationEngine::mid_price(const SoASide& bid, const SoASide& ask) const {
-    if (bid.depth == 0 || ask.depth == 0) return {0, true};
+    if (bid.depth == 0 || ask.depth == 0) return {0, true, kAggScalePrice};
     // (ask + bid) / 2 scaled by 10^6
     int64_t sum = ask.prices[0] + bid.prices[0];
     // Multiply by 10^6 first to preserve precision, then divide by 2
     int64_t result = (sum * 1'000'000LL) / 2LL;
-    return {result, false};
+    return {result, false, kAggScalePrice};
 }
 
 AggResult AggregationEngine::imbalance(const SoASide& bid, const SoASide& ask,
@@ -257,21 +257,21 @@ AggResult AggregationEngine::imbalance(const SoASide& bid, const SoASide& ask,
     for (uint32_t i = 0; i < na; ++i) ask_vol += static_cast<int64_t>(ask.quantities[i]);
 
     int64_t total = bid_vol + ask_vol;
-    if (total == 0) return {0, true};
+    if (total == 0) return {0, true, kAggScaleRatio};
 
     // (bid_vol - ask_vol) * 10^9 / (bid_vol + ask_vol)
     __int128 num = static_cast<__int128>(bid_vol - ask_vol) * 1'000'000'000LL;
     int64_t result = static_cast<int64_t>(num / total);
-    return {result, false};
+    return {result, false, kAggScaleRatio};
 }
 
 AggResult AggregationEngine::depth_at_price(const SoASide& side, int64_t price) const {
     for (uint32_t i = 0; i < side.depth; ++i) {
         if (side.prices[i] == price) {
-            return {static_cast<int64_t>(side.quantities[i]), false};
+            return {static_cast<int64_t>(side.quantities[i]), false, kAggScaleRaw};
         }
     }
-    return {0, false};
+    return {0, false, kAggScaleRaw};
 }
 
 AggResult AggregationEngine::depth_within_range(const SoASide& side,
@@ -284,15 +284,15 @@ AggResult AggregationEngine::depth_within_range(const SoASide& side,
             found = true;
         }
     }
-    return {sum, !found};
+    return {sum, !found, kAggScaleRaw};
 }
 
 AggResult AggregationEngine::cumulative_volume(const SoASide& side, uint32_t n_levels) const {
     uint32_t n = effective_n(side, n_levels);
-    if (n == 0) return {0, true};
+    if (n == 0) return {0, true, kAggScaleRaw};
     int64_t sum = 0;
     for (uint32_t i = 0; i < n; ++i) sum += static_cast<int64_t>(side.quantities[i]);
-    return {sum, false};
+    return {sum, false, kAggScaleRaw};
 }
 
 } // namespace ob

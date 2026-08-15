@@ -110,6 +110,22 @@ ob> query SELECT * FROM 'BTC-USD'.'BINANCE' WHERE timestamp BETWEEN 0 AND 999999
   ── 2 row(s) in 0.11 ms
 ```
 
+Aggregates render as their own table, with the value in natural units in the last column, so the
+scale factor does not have to be applied by eye:
+
+```
+ob> query SELECT SPREAD(*), MID_PRICE(*), IMBALANCE(10) FROM 'BTC-USD'.'BINANCE'
+  aggregate            | value                |      scale | in units
+  ─────────────────────┼──────────────────────┼────────────┼──────────────
+  SPREAD(*)            |                 1000 |          1 | 1000
+  MID_PRICE(*)         |         100500000000 |    1000000 | 100500
+  IMBALANCE(10)        |            250000000 | 1000000000 | 0.25
+  ── 3 aggregate(s) in 0.12 ms
+```
+
+An empty aggregate prints `NULL`, not `0`. Aggregates read the live book, so they need no `WHERE`
+clause and reject one.
+
 See [Query Language](query-language.md) for full SQL syntax.
 
 ### status

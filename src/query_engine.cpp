@@ -1,5 +1,6 @@
 // Feature: orderbook-dbengine — Query Engine parser and skeleton execution
 #include "orderbook/query_engine.hpp"
+#include "orderbook/logger.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -637,6 +638,21 @@ static int64_t parse_i64(const std::string& s) {
     return (ec == std::errc{}) ? v : 0;
 }
 
+/// Parse an integer argument, reporting failure instead of substituting zero.
+///
+/// Leading whitespace is skipped because the parser reconstructs the expression
+/// text with ", " between arguments, so DEPTH_RANGE's second bound always arrives
+/// as " 101000". std::from_chars refuses that, parse_i64() turned the failure into
+/// 0, and the range [lo, 0] is always empty — which is why DEPTH_RANGE could only
+/// ever answer NULL.
+static bool parse_i64_strict(const std::string& s, int64_t& out) {
+    size_t begin = s.find_first_not_of(" \t");
+    if (begin == std::string::npos) return false;
+    size_t end = s.find_last_not_of(" \t") + 1;
+    auto [ptr, ec] = std::from_chars(s.data() + begin, s.data() + end, out);
+    return ec == std::errc{} && ptr == s.data() + end;
+}
+
 } // anonymous namespace
 
 std::string QueryEngine::execute(std::string_view sql, RowCallback cb) {
@@ -692,6 +708,66 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb) {
                 return "OB_ERR_PARSE: undefined aggregation function '" +
                        fname + "' at position " + std::to_string(i);
             }
+
+            // The column argument has to name what the function actually
+            // aggregates. The dispatcher below calls sum_qty() for SUM and
+            // avg_price() for AVG regardless of the argument, so SUM(price)
+            // returned a quantity labelled SUM(price) and AVG(quantity) returned a
+            // price. An argument that would be ignored is an error, not decoration.
+            const std::string farg = agg_func_arg(expr);
+            if (fname == "SUM") {
+                if (farg != "*" && farg != "quantity") {
+                    OB_LOG_WARN("query", "Rejecting %s: SUM aggregates quantity", expr.c_str());
+                    return "AGG_BAD_ARGUMENT: SUM aggregates quantity; write SUM(quantity) "
+                           "or SUM(*), not '" + expr + "'";
+                }
+            } else if (fname == "AVG" || fname == "MIN" || fname == "MAX" ||
+                       fname == "VWAP") {
+                if (farg != "*" && farg != "price") {
+                    OB_LOG_WARN("query", "Rejecting %s: %s aggregates price",
+                                expr.c_str(), fname.c_str());
+                    return "AGG_BAD_ARGUMENT: " + fname + " aggregates price; write " +
+                           fname + "(price) or " + fname + "(*), not '" + expr + "'";
+                }
+            } else if (fname == "SPREAD" || fname == "MID_PRICE") {
+                if (farg != "*") {
+                    OB_LOG_WARN("query", "Rejecting %s: %s takes no argument",
+                                expr.c_str(), fname.c_str());
+                    return "AGG_BAD_ARGUMENT: " + fname + " reads both sides of the book and "
+                           "takes no argument; write " + fname + "(*), not '" + expr + "'";
+                }
+            }
+        }
+    }
+
+    // ── Reject what the aggregation path would silently ignore ───────────────
+    //
+    // Aggregates are computed over the live SoA book, so a row filter has nothing
+    // to act on. Accepting one and ignoring it is the same defect as dropping the
+    // results themselves: the client is told OK and gets an answer to a different
+    // question than the one it asked.
+    if (has_agg) {
+        for (const auto& expr : ast.select_exprs) {
+            if (is_agg_expr(expr)) continue;
+            OB_LOG_WARN("query",
+                        "Rejecting mixed aggregate/column SELECT: symbol=%s exchange=%s column=%s",
+                        ast.symbol.c_str(), ast.exchange.c_str(), expr.c_str());
+            return "AGG_WITH_COLUMNS: aggregate and plain columns cannot be mixed: '" +
+                   expr + "'";
+        }
+        if (ast.ts_start_ns.has_value() || ast.ts_end_ns.has_value()) {
+            OB_LOG_WARN("query",
+                        "Rejecting aggregate with timestamp filter: symbol=%s exchange=%s",
+                        ast.symbol.c_str(), ast.exchange.c_str());
+            return "AGG_TIME_FILTER: aggregates are computed over the live book; "
+                   "a timestamp filter is not supported";
+        }
+        if (ast.price_lo.has_value() || ast.price_hi.has_value()) {
+            OB_LOG_WARN("query",
+                        "Rejecting aggregate with price filter: symbol=%s exchange=%s",
+                        ast.symbol.c_str(), ast.exchange.c_str());
+            return "AGG_PRICE_FILTER: aggregates are computed over the whole live book; "
+                   "a price filter is not supported (use DEPTH_RANGE(lo, hi))";
         }
     }
 
@@ -777,12 +853,17 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb) {
                 int64_t price = parse_i64(farg);
                 res = agg_.depth_at_price(snap_bid, price);
             } else if (fname == "DEPTH_RANGE") {
-                // farg = "lo, hi"
+                // farg = "lo, hi" — the space is inserted by the parser, not the client.
                 auto comma = farg.find(',');
                 int64_t lo = 0, hi = 0;
-                if (comma != std::string::npos) {
-                    lo = parse_i64(farg.substr(0, comma));
-                    hi = parse_i64(farg.substr(comma + 1));
+                if (comma == std::string::npos ||
+                    !parse_i64_strict(farg.substr(0, comma), lo) ||
+                    !parse_i64_strict(farg.substr(comma + 1), hi)) {
+                    OB_LOG_WARN("query",
+                                "Rejecting DEPTH_RANGE with unparseable bounds: arg='%s'",
+                                farg.c_str());
+                    return "AGG_BAD_ARGUMENT: DEPTH_RANGE needs two integer bounds, got '" +
+                           farg + "'";
                 }
                 res = agg_.depth_within_range(snap_bid, lo, hi);
             } else if (fname == "CUMULATIVE_VOLUME") {
@@ -791,8 +872,15 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb) {
                 res = agg_.cumulative_volume(snap_bid, n);
             }
 
-            qr.agg_values.emplace_back(expr, res.value);
+            // All four fields travel. value alone was what shipped, which is how a
+            // scaled result and an empty one both arrived at clients as a bare
+            // integer they had no way to interpret.
+            qr.agg_values.push_back(AggValue{expr, res.value, res.empty, res.scale});
         }
+
+        OB_LOG_DEBUG("query",
+                     "Aggregate query: symbol=%s exchange=%s count=%zu",
+                     ast.symbol.c_str(), ast.exchange.c_str(), qr.agg_values.size());
 
         cb(qr);
         return {};

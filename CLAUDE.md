@@ -33,7 +33,7 @@ cmake --build build -j$(nproc)
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release -j$(nproc)
 
-# Tests — 544 of them, ~2.5 minutes
+# Tests — 578 of them, ~2.5 minutes
 ctest --test-dir build --output-on-failure -j1
 ```
 
@@ -113,7 +113,11 @@ Learned the hard way. Check here before debugging.
     same segment and each merged its meta, so `SELECT` returned every row in it twice.
     `demote_to_replica()` must not hold `flush_mtx_` across `repl_mgr_->stop()`: a replication thread
     can be inside `create_snapshot()` waiting for it.
-11. **`ColumnarStore::flush_segment()` returns a `SegmentMeta` that must be merged.** `QueryEngine`
+11. **An aggregate result is not a row.** `QueryResult::agg_values` needs `format_agg_response()`;
+    passing it to `format_query_response()` is what made every aggregate query answer a network client
+    with a row of zeros. Each value carries its own `scale` (10⁶ for VWAP and MID_PRICE, 10⁹ for
+    IMBALANCE) and an `empty` flag that must reach the wire as `NULL`, never `0`.
+12. **`ColumnarStore::flush_segment()` returns a `SegmentMeta` that must be merged.** `QueryEngine`
     reads `combined_store_` only, never the live SoA buffer, so a dropped meta means rows sit on disk
     invisible to every query until the next `open_existing()`. Same for the metas parked by an
     `append()` rollover — collect them with `take_rolled_segments()`.
@@ -127,10 +131,6 @@ references and ranges. The rule exists because three renumbering passes each bro
 because commit messages and specs cite these numbers. Things a newcomer should know because they look like working features and
 are not:
 
-- **Aggregations are unreachable over the wire protocol.** `SPREAD`, `MID_PRICE`, `IMBALANCE` and
-  `VWAP` return zeros to every network client: `format_query_response()` has one fixed row header and
-  never reads `QueryResult::agg_values`. The engine computes them correctly, so the C++ tests pass.
-  Roadmap #27.
 - **`AntiEntropyManager` is a scheduler with no reconciliation.** `detect_gaps()` always returns
   empty, `repair_gap()` always returns false. Metrics report runs, so it looks alive. Roadmap #56.
 - **The integration test suite is being rebuilt.** A `test_*` pattern in `.gitignore` silently
