@@ -62,6 +62,12 @@ int main(int argc, char* argv[]) {
     sigaction(SIGINT,  &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
+    // Ignore SIGPIPE. Writing to a socket whose peer has gone raises it, and the
+    // default action is to kill the process — one disconnecting client would take
+    // the server and every other session down with it. Individual writes use
+    // MSG_NOSIGNAL, so this is the net for any path that forgets to.
+    signal(SIGPIPE, SIG_IGN);
+
     std::printf("ob_tcp_server v0.1.0 listening on port %u, data-dir: %s\n",
                 static_cast<unsigned>(config.port), config.data_dir.c_str());
 

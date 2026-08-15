@@ -17,6 +17,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.request
@@ -475,6 +476,10 @@ class ClusterManager:
 _CATEGORIES = [
     "smoke", "replication", "failover", "compression",
     "stress", "edge_cases", "metrics", "pool", "cpp_client",
+    # Added with the categories themselves. A marker missing from this list is not
+    # an error: those tests fall into "uncategorized" in the report and quietly stop
+    # being counted as coverage of anything.
+    "aggregations", "multi_master", "large_response",
 ]
 
 
@@ -485,10 +490,7 @@ _CATEGORIES = [
 class IntegrationReportPlugin:
     """Pytest plugin that generates a colored console report after all tests."""
 
-    CATEGORIES = [
-        "smoke", "replication", "failover", "compression",
-        "stress", "edge_cases", "metrics", "pool", "cpp_client",
-    ]
+    CATEGORIES = _CATEGORIES
 
     # ANSI color codes
     _GREEN = "\033[32m"
@@ -612,6 +614,13 @@ class IntegrationReportPlugin:
                 color = G if errs == 0 else R
                 print(f"    Stress errors: {color}{errs}{RST}")
 
+            # Anything a test chose to publish beyond the three keys above. Without
+            # this, a new metric is collected and then dropped, which looks exactly
+            # like a metric that stayed at zero.
+            known = {"failover_time_sec", "stress_throughput", "stress_errors"}
+            for key in sorted(k for k in custom if k not in known):
+                print(f"    {key}: {custom[key]}")
+
         print(f"\n{G}{'=' * 70}{RST}")
         print()
 
@@ -619,26 +628,25 @@ class IntegrationReportPlugin:
 
     @staticmethod
     def _collect_custom_metrics() -> dict:
-        """Try to import custom_metrics from test_failover and test_stress modules."""
+        """Read custom_metrics from whichever test modules were loaded.
+
+        Reads sys.modules rather than importing. The previous version tried four
+        import paths wrapped in bare `except Exception: pass`, and every one of them
+        failed for reasons nobody could see — so a stress run published its
+        throughput and the report printed nothing at all. Whatever pytest called the
+        module, it is already in sys.modules; importing it again cannot be more
+        reliable than looking it up.
+        """
         merged: dict = {}
-        try:
-            from tests.integration.test_failover import custom_metrics as fm
-            merged.update(fm)
-        except Exception:
-            try:
-                from test_failover import custom_metrics as fm2
-                merged.update(fm2)
-            except Exception:
-                pass
-        try:
-            from tests.integration.test_stress import custom_metrics as sm
-            merged.update(sm)
-        except Exception:
-            try:
-                from test_stress import custom_metrics as sm2
-                merged.update(sm2)
-            except Exception:
-                pass
+        for name, module in list(sys.modules.items()):
+            if module is None:
+                continue
+            base = name.rsplit(".", 1)[-1]
+            if not base.startswith("test_"):
+                continue
+            metrics = getattr(module, "custom_metrics", None)
+            if isinstance(metrics, dict):
+                merged.update(metrics)
         return merged
 
 
@@ -683,12 +691,51 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture(scope="session")
-def cluster() -> Generator[ClusterManager, None, None]:
+def cluster(request) -> Generator[ClusterManager, None, None]:
     """Start the integration-test cluster (etcd + 2 nodes), yield, shutdown."""
     cm = ClusterManager()
     cm.start()
+    # The report reads this at session finish. It used to look for
+    # session.config._ob_cluster, which nothing ever set, and then fall back to
+    # item.funcargs — already cleared by teardown — so the environment section always
+    # printed "(cluster info not available)".
+    request.config._ob_cluster = cm
     yield cm
     cm.shutdown()
+
+
+@pytest.fixture(scope="module")
+def heavy_cluster(request) -> Generator[ClusterManager, None, None]:
+    """A cluster of its own, for modules that push hundreds of thousands of rows.
+
+    The session-scoped `cluster` is shared by every module, and load tests poison it
+    for whatever runs next: half a million rows leave the replica replaying a backlog,
+    and later tests fail on ROLE and replication-position timeouts that have nothing
+    to do with the code they are testing. Diagnosing that costs far more than the two
+    seconds it takes to start a second cluster.
+
+    Module-scoped rather than per-test: the point is to contain the load, not to pay
+    for a cluster per assertion.
+    """
+    cm = ClusterManager()
+    cm.start()
+    # Only if the session cluster has not registered itself: when both exist, the
+    # shared one describes the run better. Registering nothing at all is how the
+    # report ends up saying "(cluster info not available)" for a run that had a
+    # perfectly good cluster.
+    if getattr(request.config, "_ob_cluster", None) is None:
+        request.config._ob_cluster = cm
+    yield cm
+    cm.shutdown()
+
+
+@pytest.fixture
+def heavy_client(heavy_cluster: ClusterManager) -> Generator[OrderbookEngine, None, None]:
+    """TCP connection to the PRIMARY of the isolated heavy cluster."""
+    node = heavy_cluster.primary()
+    engine = OrderbookEngine(host="127.0.0.1", port=node.tcp_port, timeout=60.0)
+    yield engine
+    engine.close()
 
 
 @pytest.fixture
@@ -716,6 +763,36 @@ def compressed_client(cluster: ClusterManager) -> Generator[OrderbookEngine, Non
     engine = OrderbookEngine(host="127.0.0.1", port=node.tcp_port, compress=True)
     yield engine
     engine.close()
+
+
+@pytest.fixture
+def healthy_cluster(cluster: ClusterManager) -> Generator[ClusterManager, None, None]:
+    """A cluster that is verified healthy again once the test is done.
+
+    The `cluster` fixture is session-scoped and shared, so a test that kills a node
+    leaves every later test in the session running against a broken topology. That
+    turns one real failure into a page of unrelated ones. Any test that stops,
+    kills or hands over a node must take this fixture instead of `cluster`.
+
+    Teardown restarts whatever is not running and waits for exactly one primary. If
+    it cannot get there, it raises: a silent half-restored cluster is worse than a
+    loud failure, because the next test's red would point at the wrong code.
+    """
+    yield cluster
+
+    for index, node in enumerate(cluster.nodes):
+        if node.process is None or node.process.poll() is not None:
+            cluster.restart_node(index)
+
+    cluster._wait_for_election(timeout=30.0)
+
+    roles = [cluster._query_role(n).strip().upper() for n in cluster.nodes]
+    primaries = [r for r in roles if "PRIMARY" in r and "REPLICA" not in r]
+    if len(primaries) != 1:
+        raise RuntimeError(
+            f"cluster not restored after the test: expected exactly one primary, "
+            f"roles={roles}"
+        )
 
 
 @pytest.fixture

@@ -102,6 +102,13 @@ private:
 
     void accept_connection();
     void handle_client_data(int fd);
+
+    /// Arm EPOLLOUT for a session with queued output, and disarm once it drains.
+    ///
+    /// Armed only after a partial write. Leaving EPOLLOUT armed permanently on an
+    /// edge-triggered fd spins the loop and burns a core.
+    void arm_epollout(int fd);
+    void disarm_epollout(int fd);
 };
 
 // ── Free functions ────────────────────────────────────────────────────────────

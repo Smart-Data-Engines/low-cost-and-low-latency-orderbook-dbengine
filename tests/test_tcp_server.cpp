@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -863,4 +864,160 @@ TEST(ResponseFormatterAgg, NoAggregatesStillProducesAWellFormedResponse) {
     ob::ParsedResponse parsed = ob::parse_response(wire);
     EXPECT_FALSE(parsed.is_error);
     EXPECT_TRUE(parsed.rows.empty());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Session output buffering (large-response-write-path)
+//
+// Client sockets are non-blocking, so a response bigger than the socket send buffer
+// makes write() return EAGAIN. The old send_response() treated that as a failure and
+// the server closed the session — truncating every response above a couple of
+// megabytes, with nothing in the log. EAGAIN has to mean "come back later".
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+/// A non-blocking socketpair with a deliberately tiny send buffer, so EAGAIN is
+/// reached with a small payload instead of megabytes.
+std::pair<int, int> make_tiny_nonblocking_socketpair() {
+    int fds[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        ADD_FAILURE() << "socketpair() failed";
+        return {-1, -1};
+    }
+    int small = 4096;
+    ::setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+    ::setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+    int flags = ::fcntl(fds[0], F_GETFL, 0);
+    ::fcntl(fds[0], F_SETFL, flags | O_NONBLOCK);
+    return {fds[0], fds[1]};
+}
+
+} // namespace
+
+TEST(SessionOutput, FullSocketBufferIsNotAnError) {
+    auto [fd_server, fd_client] = make_tiny_nonblocking_socketpair();
+    ASSERT_GE(fd_server, 0);
+    ob::Session session(fd_server);
+
+    // Far more than the 4KB buffers configured above.
+    const std::string big(512 * 1024, 'x');
+
+    EXPECT_TRUE(session.send_response(big))
+        << "a full socket buffer was reported as a failure, which is what closed "
+           "the session mid-response";
+    EXPECT_TRUE(session.has_pending_output())
+        << "the unsent remainder must stay queued for EPOLLOUT";
+    EXPECT_GT(session.pending_output_bytes(), 0u);
+
+    ::close(fd_client);
+    ::close(fd_server);
+}
+
+TEST(SessionOutput, PendingOutputDrainsAsTheReaderConsumes) {
+    auto [fd_server, fd_client] = make_tiny_nonblocking_socketpair();
+    ASSERT_GE(fd_server, 0);
+    ob::Session session(fd_server);
+
+    const std::string big(256 * 1024, 'y');
+    ASSERT_TRUE(session.send_response(big));
+    ASSERT_TRUE(session.has_pending_output());
+
+    // Drain from the other end, flushing after each read, exactly as the epoll loop
+    // does when EPOLLOUT fires.
+    std::vector<char> buf(8192);
+    size_t received = 0;
+    for (int guard = 0; guard < 10000 && received < big.size(); ++guard) {
+        ssize_t n = ::read(fd_client, buf.data(), buf.size());
+        if (n > 0) {
+            received += static_cast<size_t>(n);
+            ASSERT_TRUE(session.flush_output());
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            ASSERT_TRUE(session.flush_output());
+            continue;
+        }
+        break;
+    }
+
+    EXPECT_EQ(received, big.size()) << "not everything arrived";
+    EXPECT_FALSE(session.has_pending_output()) << "queue should be empty now";
+
+    ::close(fd_client);
+    ::close(fd_server);
+}
+
+TEST(SessionOutput, SmallResponseLeavesNothingQueued) {
+    auto [fd_server, fd_client] = make_tiny_nonblocking_socketpair();
+    ASSERT_GE(fd_server, 0);
+    ob::Session session(fd_server);
+
+    EXPECT_TRUE(session.send_response("PONG\n"));
+    EXPECT_FALSE(session.has_pending_output())
+        << "a five-byte response must not need EPOLLOUT";
+    EXPECT_EQ(session.pending_output_bytes(), 0u);
+
+    ::close(fd_client);
+    ::close(fd_server);
+}
+
+TEST(SessionOutput, BufferCapIsEnforced) {
+    auto [fd_server, fd_client] = make_tiny_nonblocking_socketpair();
+    ASSERT_GE(fd_server, 0);
+    ob::Session session(fd_server);
+
+    // Nobody reads, so everything past the socket buffer accumulates. Past the cap
+    // the session must be refused rather than growing the server's memory for a
+    // client that is not consuming.
+    const std::string chunk(8 * 1024 * 1024, 'z');
+    bool refused = false;
+    for (int i = 0; i < 16; ++i) {
+        if (!session.send_response(chunk)) {
+            refused = true;
+            break;
+        }
+    }
+
+    EXPECT_TRUE(refused)
+        << "queued output grew past the cap without being refused; a client that "
+           "never reads would take the server's memory with it";
+
+    ::close(fd_client);
+    ::close(fd_server);
+}
+
+TEST(SessionOutput, WriteToAClosedPeerIsAnError) {
+    auto [fd_server, fd_client] = make_tiny_nonblocking_socketpair();
+    ASSERT_GE(fd_server, 0);
+    ob::Session session(fd_server);
+    ::close(fd_client);
+
+    // EPIPE is a genuine failure and must still be reported as one — the fix must
+    // not turn every write error into "come back later".
+    bool failed = false;
+    for (int i = 0; i < 200; ++i) {
+        if (!session.send_response(std::string(64 * 1024, 'q'))) {
+            failed = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(failed) << "writing to a closed peer was reported as success";
+
+    ::close(fd_server);
+}
+
+TEST(SessionOutput, CloseAfterFlushIsRecorded) {
+    auto [fd_server, fd_client] = make_tiny_nonblocking_socketpair();
+    ASSERT_GE(fd_server, 0);
+    ob::Session session(fd_server);
+
+    EXPECT_FALSE(session.close_requested());
+    session.request_close_after_flush();
+    EXPECT_TRUE(session.close_requested())
+        << "QUIT arriving while a response drains must be remembered, not acted on "
+           "immediately";
+
+    ::close(fd_client);
+    ::close(fd_server);
 }

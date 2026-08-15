@@ -194,6 +194,26 @@ void ColumnarStore::append(const SnapshotRow& row) {
     }
 }
 
+
+namespace {
+
+/// Total order for the segment index.
+///
+/// Ordering by start_ts_ns alone is a partial order: two segments can share a start
+/// timestamp, and std::sort is not stable, so their relative position was whatever
+/// the implementation happened to produce. Scan output order then varied between
+/// runs on identical data, and a TTL property test comparing surviving segments
+/// element-wise failed roughly one run in three with `304 == 303` — two segments
+/// with the same start, tie-broken differently on each side of the comparison.
+/// dir_path is unique per segment, so this is a total order.
+bool segment_order_less(const SegmentMeta& a, const SegmentMeta& b) {
+    if (a.start_ts_ns != b.start_ts_ns) return a.start_ts_ns < b.start_ts_ns;
+    if (a.end_ts_ns != b.end_ts_ns) return a.end_ts_ns < b.end_ts_ns;
+    return a.dir_path < b.dir_path;
+}
+
+} // anonymous namespace
+
 // ── flush_segment ─────────────────────────────────────────────────────────────
 
 std::optional<SegmentMeta> ColumnarStore::flush_segment() {
@@ -546,10 +566,7 @@ void ColumnarStore::open_existing() {
     }
 
     // Sort by start_ts_ns
-    std::sort(index_.begin(), index_.end(),
-              [](const SegmentMeta& a, const SegmentMeta& b) {
-                  return a.start_ts_ns < b.start_ts_ns;
-              });
+    std::sort(index_.begin(), index_.end(), segment_order_less);
 }
 
 // ── merge_segments ────────────────────────────────────────────────────────────
@@ -589,10 +606,7 @@ size_t ColumnarStore::merge_segments(const std::vector<SegmentMeta>& new_segment
     }
 
     if (added) {
-        std::sort(index_.begin(), index_.end(),
-                  [](const SegmentMeta& a, const SegmentMeta& b) {
-                      return a.start_ts_ns < b.start_ts_ns;
-                  });
+        std::sort(index_.begin(), index_.end(), segment_order_less);
     }
     return refused;
 }
@@ -607,10 +621,7 @@ std::pair<size_t, size_t> ColumnarStore::delete_expired_segments(uint64_t cutoff
     std::unique_lock<std::shared_mutex> lock(index_mtx_);
 
     // Sort index by start_ts_ns (oldest first) for chronological deletion order.
-    std::sort(index_.begin(), index_.end(),
-              [](const SegmentMeta& a, const SegmentMeta& b) {
-                  return a.start_ts_ns < b.start_ts_ns;
-              });
+    std::sort(index_.begin(), index_.end(), segment_order_less);
 
     size_t segments_deleted = 0;
     size_t bytes_reclaimed = 0;

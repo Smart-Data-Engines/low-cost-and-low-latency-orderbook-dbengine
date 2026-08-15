@@ -254,13 +254,21 @@ equivalent: ingestion −1.3%, `BM_UpdateLatency` +0.1%. Treat as no regression.
 
 Spec: `kiro-workspace/specs/aggregations-over-wire/`
 
-### 28. Restore the integration test suite (P0)
+### 28. Restore the integration test suite (P0, in progress)
 - The framework survived (`tests/integration/conftest.py`, 691 lines), the tests did not
-- 9 categories to restore: smoke, replication, failover, compression, stress, edge cases, metrics,
-  pool, C++ client; plus `test_mm_convergence.py`, `test_mm_failover.py`, `test_binance_live.py`,
+- **Restored so far: 86 tests across 8 categories** — smoke, replication, compression, edge cases,
+  metrics, aggregations, pool, C++ client, stress, plus a new `large_response` category. Each one was
+  written to assert values rather than absence of errors, and between them they found four defects
+  that 578 unit tests did not: the columnar format losing `side`, the flush race, aggregations
+  returning zeros, and the write path in #59
+- **Still missing**: failover (destructive; `healthy_cluster` fixture is in place for it),
+  `test_mm_convergence.py`, `test_mm_failover.py`, `test_binance_live.py`,
   `test_binance_failover_sync.py` referenced by `scripts/run_regression.sh`
-- Until this is done, `scripts/run_regression.sh --full` cannot pass and a fresh clone cannot run
-  integration tests at all
+- Two fixtures exist to keep a shared session cluster usable: `heavy_cluster` (module-scoped) for load
+  modules that would otherwise leave the replica replaying half a million rows into the next module's
+  timeouts, and `healthy_cluster`, which restarts nodes and verifies a single primary after any test
+  that kills one
+- Until the rest is done, `scripts/run_regression.sh --full` cannot pass
 - Effort: M | Impact: Correctness confidence, credibility of a fresh clone
 
 ### 29. Graceful failover honours its target ✅
@@ -483,14 +491,53 @@ codebase. Each item is also a story we can sell as bespoke work.
 - OpenTelemetry spans across client, primary, replica and peers; trace a write end to end
 - Effort: M | Impact: Debuggability in a real deployment
 
+### 59. Responses larger than the socket buffer killed the session, and SIGPIPE killed the server ✅
+
+Two defects on the same code path, both found by the first integration test that read a large result
+set under load.
+
+**A response above the socket send buffer was truncated.** Measured on a fresh server, one symbol,
+reading immediately: 20 000 rows fine, 50 000 fine, 100 000 (~3.9 MB) closed the connection mid-stream.
+Client sockets are non-blocking, and `Session::send_response()` looped on `::write()` treating anything
+other than `EINTR` as failure — so a full kernel send buffer returned `EAGAIN`, the loop gave up, and
+`tcp_server.cpp` read that as "client gone" and removed the session. There was **no log line at all**:
+the last entry after such a disconnect was the server's startup message.
+
+Ironically the correct pattern was already in the repository, in
+`MultiMasterManager::flush_send_buffer()` — queue, arm `EPOLLOUT` on `EAGAIN`, disarm when drained —
+and documented as pitfall 5. The TCP server did not use it.
+
+**SIGPIPE killed the whole process.** `grep -rn SIGPIPE src/ tools/ include/` returned nothing, and
+`Session` wrote with `::write()`, so a client disconnecting mid-response raised SIGPIPE whose default
+action terminated the server — every other client's session with it. The unit test for this exited with
+code 141 (128 + 13) before the fix. Every other socket writer in the repo already used
+`::send(..., MSG_NOSIGNAL)`: metrics server, replication, multi-master, the C++ client. Only this one
+did not, and buffering responses across event-loop turns widens the window, so both had to be fixed
+together.
+
+Now: a per-session send buffer with `EPOLLOUT` arming, `MSG_NOSIGNAL` on every write plus
+`signal(SIGPIPE, SIG_IGN)` as a net, a 64 MB cap per session so a client that never reads cannot grow
+the server without bound, one `close_session(fd, reason)` that logs instead of five silent copies, and
+`ob_session_pending_bytes` in `/metrics` so an operator sees a slow client before it disappears.
+
+**Why 578 tests missed it.** The largest response any test ever asked for was 1000 rows, about 40 KB —
+three orders of magnitude below the threshold. `test_tcp_server.cpp` exercises
+`format_query_response()` as a function, with no socket involved, so kernel buffers do not exist there.
+This was not a forgotten case: no test had ever sent a response bigger than a socket buffer, and that
+is the only condition under which either defect appears.
+
+Verified: 8 integration tests (including a deliberately slow reader that fills the buffer every run,
+and a client vanishing mid-response with `SO_LINGER 0`) plus 6 unit tests on `Session`; four mutations
+confirmed red separately — EAGAIN as failure, no `EPOLLOUT` arming, no cap, no `MSG_NOSIGNAL`.
+Spec: `kiro-workspace/specs/large-response-write-path/`
+
 ---
 
 ## Recommended order
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **P0** | Aggregations unreachable over TCP (#27) | M | An advertised feature returns zeros to every network client |
-| **P0** | Restore integration test suite (#28) | M | The repo currently ships a test framework with no tests. Fix before anything else. |
+| **P0** | Finish the integration test suite (#28) | S | 86 tests across 9 categories are back; failover, multi-master and Binance modules are still missing, and `run_regression.sh --full` needs them |
 | **P1** | Deployment artifacts (#33) | M | Cheapest large jump in time-to-first-run |
 | **P1** | Reproducible comparative benchmarks (#39) | L | Makes the performance claim verifiable by a reader instead of asserted |
 | **P1** | Authentication and TLS (#30) | L | The single blocker to production adoption |

@@ -251,9 +251,14 @@ RC_GTEST_PROP(TTLProperty, ExpiredSegmentDeletionCorrectness, ()) {
             expected_remaining.push_back(sp);
         }
     }
+    // Same total order the store uses. Comparing element-wise against a sort keyed
+    // on start_ts alone made this test fail about one run in three: two segments can
+    // share a start timestamp, std::sort is not stable, and each side broke the tie
+    // its own way — reported as `304 == 303`.
     std::sort(expected_remaining.begin(), expected_remaining.end(),
               [](const SegSpec& a, const SegSpec& b) {
-                  return a.start_ts < b.start_ts;
+                  if (a.start_ts != b.start_ts) return a.start_ts < b.start_ts;
+                  return a.end_ts < b.end_ts;
               });
 
     auto [deleted, reclaimed] = store.delete_expired_segments(cutoff);

@@ -392,6 +392,7 @@ TEST(MetricsRegistry, EveryMetricTheEngineWritesIsRegistered) {
     const char* gauges[] = {
         "ob_pending_rows", "ob_segment_count", "ob_symbol_count", "ob_wal_file_index",
         "ob_current_epoch", "ob_segment_merge_refused", "ob_active_sessions",
+        "ob_session_pending_bytes",
         "ob_mm_peers_connected", "ob_mm_replication_lag_bytes", "ob_mm_hlc_drift_ns",
     };
     const char* counters[] = {

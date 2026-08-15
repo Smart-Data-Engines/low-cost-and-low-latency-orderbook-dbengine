@@ -156,11 +156,98 @@ static int run_minsert(const std::string& host, uint16_t port) {
     return 0;
 }
 
+// ── Test: query_agg ──────────────────────────────────────────────────────────
+// Exercises the aggregate response over a real socket: values, scale factors, and
+// the row API refusing a shape it cannot represent. The unit tests for this parser
+// feed it hand-written strings; only this one proves the server and the client
+// agree on the bytes.
+
+static int run_query_agg(const std::string& host, uint16_t port) {
+    ob::ClientConfig cfg;
+    cfg.host = host;
+    cfg.port = port;
+
+    ob::OrderbookClient client(cfg);
+    auto conn = client.connect();
+    if (!conn) {
+        print_result("query_agg", "fail", "connect failed: " + conn.error_message());
+        return 1;
+    }
+
+    // Aggregates read the live book, so no flush is needed — and that is part of
+    // what this checks.
+    auto bid = client.insert("CPP-AGG", "TEST-EX", ob::Side::BID, 100000, 50, 1);
+    auto ask = client.insert("CPP-AGG", "TEST-EX", ob::Side::ASK, 101000, 30, 1);
+    if (!bid || !ask) {
+        print_result("query_agg", "fail", "insert failed");
+        return 1;
+    }
+
+    const std::string sql =
+        "SELECT SPREAD(*), MID_PRICE(*) FROM 'CPP-AGG'.'TEST-EX'";
+
+    auto agg = client.query_agg(sql);
+    if (!agg) {
+        print_result("query_agg", "fail",
+                     "query_agg failed: " + agg.error_message());
+        return 1;
+    }
+
+    const auto& entries = agg.value();
+    if (entries.size() != 2) {
+        print_result("query_agg", "fail",
+                     "expected 2 aggregates, got " + std::to_string(entries.size()));
+        return 1;
+    }
+
+    // spread = 101000 - 100000, raw units.
+    if (entries[0].name != "SPREAD(*)" || entries[0].value != 1000 ||
+        entries[0].scale != 1 || entries[0].empty) {
+        print_result("query_agg", "fail",
+                     "spread wrong: name=" + entries[0].name +
+                     " value=" + std::to_string(entries[0].value) +
+                     " scale=" + std::to_string(entries[0].scale));
+        return 1;
+    }
+
+    // mid price = 100500, scaled by 10^6.
+    if (entries[1].name != "MID_PRICE(*)" || entries[1].scale != 1000000 ||
+        entries[1].value != 100500LL * 1000000LL) {
+        print_result("query_agg", "fail",
+                     "mid price wrong: value=" + std::to_string(entries[1].value) +
+                     " scale=" + std::to_string(entries[1].scale));
+        return 1;
+    }
+    if (entries[1].real() < 100499.9 || entries[1].real() > 100500.1) {
+        print_result("query_agg", "fail", "real() did not apply the scale");
+        return 1;
+    }
+
+    // The row API must refuse this response by name rather than misparse it.
+    auto as_rows = client.query(sql);
+    if (as_rows) {
+        print_result("query_agg", "fail",
+                     "query() accepted an aggregate response and returned rows");
+        return 1;
+    }
+    if (as_rows.error_message().find("query_agg") == std::string::npos) {
+        print_result("query_agg", "fail",
+                     "query() refused it without naming query_agg: " +
+                     as_rows.error_message());
+        return 1;
+    }
+
+    print_result("query_agg", "pass",
+                 "spread=1000 mid=100500 scale=1000000");
+    return 0;
+}
+
 // ── CLI argument parsing ─────────────────────────────────────────────────────
 
 static void usage(const char* prog) {
     std::cerr << "Usage: " << prog
-              << " --host <host> --port <port> --test <ping|insert_query|minsert>\n";
+              << " --host <host> --port <port>"
+              << " --test <ping|insert_query|minsert|query_agg>\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -189,6 +276,7 @@ int main(int argc, char* argv[]) {
     if (test_name == "ping")         return run_ping(host, port);
     if (test_name == "insert_query") return run_insert_query(host, port);
     if (test_name == "minsert")      return run_minsert(host, port);
+    if (test_name == "query_agg")    return run_query_agg(host, port);
 
     std::cerr << "Unknown test: " << test_name << "\n";
     usage(argv[0]);
