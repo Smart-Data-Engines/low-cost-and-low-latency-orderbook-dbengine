@@ -998,6 +998,12 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
                               ? static_cast<const void*>(data + MM_WALRECORD_V2_SIZE)
                               : nullptr;
 
+    // Remember what we last heard from this peer. PeerConnection::last_hlc is
+    // reported by MM_PEERS, and before this it was written nowhere in the codebase:
+    // one read site, zero write sites, so the hlc_timestamp column showed 0.0.0 for
+    // every peer no matter how much data had flowed.
+    peer.last_hlc = HLCTimestamp::deserialize(hdr.hlc_data);
+
     // Dispatch to handle_remote_record.
     handle_remote_record(peer.node_id, hdr, payload_ptr, expected_payload_len);
 }
@@ -1066,6 +1072,25 @@ void MultiMasterManager::process_handshake(PeerConnection& peer,
     peer.confirmed_file = msg.wal_file_index;
     peer.confirmed_offset = msg.wal_byte_offset;
     peer.handshake_done = true;
+
+    // An accepted connection carries no address: the socket's source port is
+    // ephemeral, not the port the peer listens on, so MM_PEERS showed a blank
+    // address for every inbound peer — half the mesh in a three-node cluster. The
+    // registry knows the advertised address, and the handshake has just told us
+    // which node this is.
+    if (peer.address.empty() && peer_registry_) {
+        for (const auto& known : peer_registry_->get_peers()) {
+            if (known.node_id == peer.node_id) {
+                peer.address = known.address;
+                break;
+            }
+        }
+        if (peer.address.empty()) {
+            OB_LOG_WARN("mm",
+                        "Peer %u completed handshake but is not in the registry, "
+                        "so its address stays unknown", peer.node_id);
+        }
+    }
 
     OB_LOG_INFO("mm", "Handshake complete with peer %u: %s",
                 peer.node_id, msg.to_string().c_str());
@@ -1451,6 +1476,23 @@ void MultiMasterManager::handle_topology_change(
         }
         for (uint16_t nid : to_remove) {
             disconnect_peer(nid);
+        }
+    }
+
+    // Fill in addresses we could not know earlier. A peer that dialled us arrives
+    // over an accepted socket whose source port is ephemeral, so the connection has
+    // no usable address until the registry tells us what the node advertises. This
+    // is the moment it does.
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        for (auto& [nid, conn] : peers_) {
+            if (!conn.address.empty()) continue;
+            auto it = new_map.find(conn.node_id);
+            if (it != new_map.end() && !it->second.address.empty()) {
+                conn.address = it->second.address;
+                OB_LOG_DEBUG("mm", "Learned address for inbound peer %u: %s",
+                             conn.node_id, conn.address.c_str());
+            }
         }
     }
 
