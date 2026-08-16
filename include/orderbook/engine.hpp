@@ -349,6 +349,22 @@ private:
     SoABuffer&     get_or_create_buffer(const std::string& symbol, const std::string& exchange);
     ColumnarStore& get_or_create_store(const std::string& symbol, const std::string& exchange);
     void flush_loop();
+
+    /// Apply a DELTA record read back from the WAL during open().
+    ///
+    /// Does two things from apply_delta(): the SoA update and the pending-row enqueue.
+    /// Deliberately not: writing to the WAL (the record is already there, and writing
+    /// it again would grow the log on every restart), broadcasting to replicas or
+    /// peers (each node replays its own WAL, so re-sending duplicates on the other
+    /// side), notifying subscribers (nothing is subscribed before open() returns), or
+    /// waiting on backpressure (nobody is competing for the buffer yet).
+    void apply_delta_replayed(const DeltaUpdate& delta, const Level* levels);
+
+    /// Replay the WAL tail into memory. Returns records applied.
+    ///
+    /// Requires combined_store_.open_existing() to have run: rows already covered by
+    /// a segment are skipped by timestamp, which needs the segment index.
+    uint64_t replay_wal_tail();
     void flush_drain_pending();    // Phase A: drain pending_rows_ → per-symbol append (must hold mtx_)
     void flush_write_and_merge();  // Phase B: segment I/O + merge index (must hold flush_mtx_, not mtx_)
 };

@@ -125,7 +125,21 @@ Learned the hard way. Check here before debugging.
 13. **`ColumnarStore::flush_segment()` returns a `SegmentMeta` that must be merged.** `QueryEngine`
     reads `combined_store_` only, never the live SoA buffer, so a dropped meta means rows sit on disk
     invisible to every query until the next `open_existing()`. Same for the metas parked by an
-    `append()` rollover — collect them with `take_rolled_segments()`.
+    `append()` rollover — collect them with `take_rolled_segments()`. The same asymmetry bites WAL
+    recovery from the other side: replaying records into the SoA buffer recovers nothing a `SELECT`
+    can see, so `open()` flushes immediately after a non-empty replay.
+14. **A test that ends in `close()` does not test crash recovery.** `close()` drains and flushes, so
+    the rows come back from the columnar store and replay is never the thing under test. This is why
+    585 passing tests missed `Engine::open()` replaying into a callback that discarded every record —
+    acknowledged writes were lost on every crash, always (roadmap #62). Abandon the engine instead:
+    `Engine::release()` in C++, a real `SIGKILL` in Python, plus an assertion that no segment existed
+    at the moment of the kill.
+15. **The checkpoint goes after the flush, never before.** A `CHECKPOINT` record claiming more than
+    is durable turns a crash into data loss; claiming less costs a replay that gets skipped anyway.
+    For the crash window between writing the segment files and appending the checkpoint,
+    `replay_wal_tail()` skips records at or below the highest `end_ts_ns` already on disk — without
+    that, replay rewrites a durable segment from a WAL tail that may hold fewer rows than the segment
+    does, because truncation only follows the replica-confirmed position.
 
 ## Current state and open problems
 

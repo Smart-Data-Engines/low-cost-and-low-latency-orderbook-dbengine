@@ -45,20 +45,32 @@ Engine::~Engine() {
 }
 
 void Engine::open() {
-    // Replay WAL to restore any updates not yet in the columnar store.
-    // Also restores the epoch from Epoch_Records.
-    WALReplayer replayer(base_dir_);
-    replayer.replay([this](const WALRecord& /*rec*/, const uint8_t* /*payload*/) {
-        // WAL replay: in a full implementation, reconstruct DeltaUpdate from
-        // the payload and re-apply to the SoA buffer / columnar store.
-        // For now we rely on the columnar store's persisted segments.
-    });
+    // Rebuild the columnar segment index first: the replay below needs it to tell
+    // which records are already durable.
+    combined_store_.open_existing();
+
+    // Replay the WAL tail — the records written after the last flush. Until this
+    // existed, the replay callback was empty and every write acknowledged but not yet
+    // flushed was lost on a crash, despite being in a fsynced WAL.
+    const uint64_t replayed = replay_wal_tail();
+
+    // Persist what was recovered before serving anything. Two reasons, and the first
+    // is not optional: SELECT reads the columnar store and never the live SoA buffer,
+    // so rows recovered into memory alone would be invisible to every query. The
+    // second is that this flush appends a checkpoint, so the next open() has nothing
+    // left to replay.
+    if (replayed > 0) {
+        OB_LOG_INFO("engine", "Persisting %llu recovered records before serving",
+                    static_cast<unsigned long long>(replayed));
+        flush_incremental();
+    }
 
     // Restore epoch from WAL replay.
-    current_epoch_.store(replayer.last_epoch(), std::memory_order_relaxed);
-
-    // Rebuild columnar segment index from persisted meta.json files.
-    combined_store_.open_existing();
+    {
+        WALReplayer epoch_replayer(base_dir_);
+        epoch_replayer.replay([](const WALRecord&, const uint8_t*) {});
+        current_epoch_.store(epoch_replayer.last_epoch(), std::memory_order_relaxed);
+    }
 
     // Mutual exclusivity gate: MM mode and Replication mode are mutually exclusive.
     // In MM mode, ONLY MultiMasterManager is created.
@@ -1235,7 +1247,102 @@ void Engine::flush_write_and_merge() {
         // Update gauge: segment count after merge.
         registry_.set_gauge("ob_segment_count",
                             static_cast<int64_t>(combined_store_.segment_count()));
+
+        // Record that everything written before now is durable in segments, so the
+        // next open() does not replay it. Appended AFTER the segments are on disk,
+        // never before: a checkpoint that claims more than is durable turns a crash
+        // into data loss, while one that claims less only costs a replay that the
+        // timestamp guard in replay_wal_tail() filters.
+        wal_.append_checkpoint(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()));
     }
+}
+
+void Engine::apply_delta_replayed(const DeltaUpdate& delta, const Level* levels) {
+    // Caller holds mtx_.
+    SoABuffer& buf = get_or_create_buffer(delta.symbol, delta.exchange);
+    bool gap_detected = false;
+    (void)ob::apply_delta(buf, delta, levels, gap_detected);
+
+    for (uint16_t i = 0; i < delta.n_levels; ++i) {
+        SnapshotRow row{};
+        row.timestamp_ns    = delta.timestamp_ns;
+        row.sequence_number = delta.sequence_number;
+        row.side            = delta.side;
+        row.level_index     = i;
+        row.price           = levels[i].price;
+        row.quantity        = levels[i].qty;
+        row.order_count     = levels[i].cnt;
+
+        pending_rows_.push_back({delta.symbol, delta.exchange, row});
+    }
+}
+
+uint64_t Engine::replay_wal_tail() {
+    // Highest end timestamp already stored per symbol, so a record that a segment
+    // already covers can be skipped. This closes the window between writing segments
+    // and appending the checkpoint: a crash in there replays records that are already
+    // durable, and duplicated rows are as wrong as lost ones.
+    std::unordered_map<std::string, uint64_t> flushed_up_to;
+    for (const auto& meta : combined_store_.index()) {
+        const std::string key = meta.symbol + "." + meta.exchange;
+        auto it = flushed_up_to.find(key);
+        if (it == flushed_up_to.end() || meta.end_ts_ns > it->second) {
+            flushed_up_to[key] = meta.end_ts_ns;
+        }
+    }
+
+    uint64_t applied = 0;
+    uint64_t skipped = 0;
+    uint64_t records = 0;
+
+    WALReplayer replayer(base_dir_);
+    replayer.replay_after_checkpoint([&](const WALReplayContext& ctx) {
+        ++records;
+        if (ctx.header.record_type != WAL_RECORD_DELTA) return;
+        if (ctx.payload_len < sizeof(DeltaUpdate)) {
+            OB_LOG_WARN("engine", "WAL replay: DELTA payload too short (%zu < %zu), skipping",
+                        ctx.payload_len, sizeof(DeltaUpdate));
+            return;
+        }
+
+        DeltaUpdate delta{};
+        std::memcpy(&delta, ctx.payload, sizeof(DeltaUpdate));
+
+        const size_t levels_bytes = static_cast<size_t>(delta.n_levels) * sizeof(Level);
+        if (sizeof(DeltaUpdate) + levels_bytes > ctx.payload_len) {
+            OB_LOG_WARN("engine",
+                        "WAL replay: payload holds %zu bytes but %u levels need %zu, skipping",
+                        ctx.payload_len, delta.n_levels, sizeof(DeltaUpdate) + levels_bytes);
+            return;
+        }
+
+        const std::string key = std::string(delta.symbol) + "." + delta.exchange;
+        auto it = flushed_up_to.find(key);
+        if (it != flushed_up_to.end() && delta.timestamp_ns <= it->second) {
+            ++skipped;
+            return;
+        }
+
+        const auto* levels = reinterpret_cast<const Level*>(
+            ctx.payload + sizeof(DeltaUpdate));
+
+        std::unique_lock<std::mutex> lock(mtx_);
+        apply_delta_replayed(delta, levels);
+        ++applied;
+    });
+
+    // skipped should be zero on a clean checkpoint; anything else means the crash
+    // landed between writing segments and recording that fact.
+    OB_LOG_INFO("engine",
+                "WAL replay: records=%llu applied=%llu skipped_already_flushed=%llu",
+                static_cast<unsigned long long>(records),
+                static_cast<unsigned long long>(applied),
+                static_cast<unsigned long long>(skipped));
+
+    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
+    return applied;
 }
 
 void Engine::flush_incremental() {

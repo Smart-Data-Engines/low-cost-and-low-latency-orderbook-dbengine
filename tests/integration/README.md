@@ -16,10 +16,13 @@ Automated integration tests for orderbook-dbengine. The framework manages the fu
    ```bash
    mkdir -p build && cd build && cmake .. && make -j$(nproc)
    ```
-3. **Python with `orderbook_engine`** — install from project root:
+3. **Python with `orderbook_engine` and the test extras** — install from project root:
    ```bash
-   pip install -e .
+   pip install -e ".[test]"
    ```
+   The extras matter: without `lz4` the compression module errors out at fixture setup, and without
+   `pytest-timeout` the `timeout = 120` in `pytest.ini` is silently ignored. On a PEP 668 system
+   (Debian/Ubuntu ≥ 23), do this inside a virtualenv.
 
 ## Running Tests
 

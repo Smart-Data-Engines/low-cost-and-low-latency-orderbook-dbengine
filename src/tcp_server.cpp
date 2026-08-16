@@ -414,6 +414,8 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
             config.ttl_scan_interval_seconds = std::stoull(argv[++i]);
         } else if (arg == "--metrics-port" && i + 1 < argc) {
             config.metrics_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        } else if (arg == "--flush-interval-ms" && i + 1 < argc) {
+            config.flush_interval_ms = std::stoull(argv[++i]);
         } else if (arg == "--log-level" && i + 1 < argc) {
             std::string level_str = argv[++i];
             auto parsed = StructuredLogger::parse_level(level_str);
@@ -582,7 +584,9 @@ TcpServer::TcpServer(ServerConfig config)
         failover_config.replication_address = "127.0.0.1:" + std::to_string(config_.replication_port);
     }
 
-    engine_ = std::make_unique<Engine>(config_.data_dir, 100'000'000ULL, FsyncPolicy::INTERVAL,
+    engine_ = std::make_unique<Engine>(config_.data_dir,
+                                      config_.flush_interval_ms * 1'000'000ULL,
+                                      FsyncPolicy::INTERVAL,
                                        repl_config, repl_client_config, failover_config,
                                        TTLConfig{config_.ttl_hours,
                                                  config_.ttl_scan_interval_seconds},

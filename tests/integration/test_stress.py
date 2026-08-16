@@ -100,6 +100,16 @@ def test_concurrent_writer_and_readers(heavy_cluster, heavy_client: OrderbookEng
     counts_seen: list[int] = []
     lock = threading.Lock()
 
+    # Seed the symbol before any reader connects. Without this the readers start ahead
+    # of the writer's first flush and their first query legitimately answers NOT_FOUND —
+    # measured: all three readers erroring with zero successful reads behind them, which
+    # reads like a concurrency defect and is a race in the test. After the seed, a
+    # NOT_FOUND is a real failure, because storage is append-only.
+    heavy_client.insert(symbol, "BINANCE", "bid",
+                        [3_000_000 + i for i in range(10)], [5] * 10)
+    heavy_client.flush()
+    seeded = 10
+
     def reader() -> None:
         client = OrderbookEngine(host="127.0.0.1", port=heavy_cluster.primary().tcp_port)
         try:
@@ -119,7 +129,9 @@ def test_concurrent_writer_and_readers(heavy_cluster, heavy_client: OrderbookEng
     for thread in readers:
         thread.start()
 
-    written = 0
+    # The seeded rows count as written, or the duplication check below fires on rows
+    # that really were written.
+    written = seeded
     deadline = time.monotonic() + STRESS_SECONDS
     try:
         while time.monotonic() < deadline:

@@ -27,6 +27,13 @@ struct ServerConfig {
     size_t      max_line_length{262144}; // max command bytes (256KB, supports MINSERT with 1000 levels)
     bool        read_only{false};       // reject INSERT/FLUSH when true (replica mode)
 
+    /// Background flush interval. Shorter means less unflushed data at any moment and
+    /// more segment writes; longer means the opposite. Configurable because it decides
+    /// how much sits in the WAL rather than in a segment, which is exactly what crash
+    /// recovery has to deal with — and because a test of that recovery needs to be
+    /// able to widen the window instead of racing a hardcoded 100 ms.
+    uint64_t    flush_interval_ms{100};   // --flush-interval-ms
+
     // Replication (primary)
     uint16_t replication_port{0};       // 0 = disabled
     bool     replication_compress{false}; // --replication-compress

@@ -579,7 +579,7 @@ _CATEGORIES = [
     # Added with the categories themselves. A marker missing from this list is not
     # an error: those tests fall into "uncategorized" in the report and quietly stop
     # being counted as coverage of anything.
-    "aggregations", "multi_master", "large_response", "binance",
+    "aggregations", "multi_master", "large_response", "binance", "crash_recovery",
 ]
 
 
