@@ -11,6 +11,7 @@
 #include "orderbook/query_engine.hpp"
 #include "orderbook/replication.hpp"
 #include "orderbook/soa_buffer.hpp"
+#include "orderbook/sequence_tracker.hpp"
 #include "orderbook/wal.hpp"
 
 #include <atomic>
@@ -307,6 +308,9 @@ private:
 
     // Multi-master replication (optional, disabled when mm_config_.enabled == false)
     MultiMasterConfig                    mm_config_;
+
+    /// Per-symbol sequence counters and per-origin high-water marks. Guarded by mtx_.
+    SequenceTracker                      seq_tracker_;
     std::unique_ptr<HybridLogicalClock>  hlc_;
     std::unique_ptr<MultiMasterManager>  mm_mgr_;
 
@@ -347,6 +351,14 @@ private:
 
     // Helpers
     SoABuffer&     get_or_create_buffer(const std::string& symbol, const std::string& exchange);
+
+    /// Stamp `delta` with a sequence number and record a GAP if its origin's stream skipped.
+    ///
+    /// Called under mtx_ immediately before the WAL append, so the numbers a symbol receives
+    /// are in WAL order. A delta arriving with a non-zero number keeps it: that number was
+    /// minted by whoever originated the record, and renumbering it here would make catch-up
+    /// compare numbers from different nodes.
+    void stamp_sequence(DeltaUpdate& delta, uint16_t origin);
     ColumnarStore& get_or_create_store(const std::string& symbol, const std::string& exchange);
     void flush_loop();
 

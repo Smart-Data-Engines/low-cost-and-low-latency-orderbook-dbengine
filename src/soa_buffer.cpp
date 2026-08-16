@@ -127,6 +127,11 @@ ob_status_t remove_level(SoASide& side, int64_t price)
 //
 // Gap detection: if buf.sequence_number != 0 and
 //   update.sequence_number != buf.sequence_number + 1, gap_detected is set.
+//
+// Engine no longer reads that flag. One counter per buffer cannot tell a gap from two
+// origins interleaving, which in multi-master would report every interleave as a hole, so
+// the engine decides gaps per origin in SequenceTracker. The flag stays for the C API,
+// whose caller supplies its own sequence numbers and owns a single stream.
 ob_status_t apply_delta(SoABuffer& buf, const DeltaUpdate& update,
                         const Level* levels, bool& gap_detected)
 {

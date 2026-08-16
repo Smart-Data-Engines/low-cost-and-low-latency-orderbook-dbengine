@@ -49,6 +49,21 @@ void Engine::open() {
     // which records are already durable.
     combined_store_.open_existing();
 
+    // Restore the sequence counters from what is already durable in segments, before the
+    // replay below adds what is durable only in the WAL. Both only ever raise, so the order
+    // between them does not matter; skipping either hands out a number twice.
+    {
+        size_t raised = 0;
+        for (const auto& meta : combined_store_.index()) {
+            if (meta.max_sequence_number == 0) continue;   // written before numbers existed
+            seq_tracker_.raise_local(meta.symbol + "." + meta.exchange,
+                                     meta.max_sequence_number);
+            ++raised;
+        }
+        OB_LOG_INFO("engine", "Sequence counters restored from segments: segments=%zu symbols=%zu",
+                    raised, seq_tracker_.symbol_count());
+    }
+
     // Replay the WAL tail — the records written after the last flush. Until this
     // existed, the replay callback was empty and every write acknowledged but not yet
     // flushed was lost on a crash, despite being in a fsynced WAL.
@@ -190,7 +205,31 @@ void Engine::close() {
     wal_.flush();
 }
 
-ob_status_t Engine::apply_delta(const DeltaUpdate& delta, const Level* levels) {
+void Engine::stamp_sequence(DeltaUpdate& delta, uint16_t origin) {
+    // Caller holds mtx_.
+    const std::string key = std::string(delta.symbol) + "." + delta.exchange;
+    const SequenceTracker::Decision d = seq_tracker_.observe(key, origin,
+                                                             delta.sequence_number);
+    delta.sequence_number = d.sequence_number;
+
+    if (d.gap) {
+        // First time this engine has ever written one of these: the record type is as old as
+        // the WAL format, but nothing assigned sequence numbers, so the check that produces it
+        // could never fire.
+        OB_LOG_WARN("engine", "Sequence gap: symbol=%s.%s origin=%u expected=%llu got=%llu",
+                    delta.symbol, delta.exchange, static_cast<unsigned>(origin),
+                    static_cast<unsigned long long>(d.expected),
+                    static_cast<unsigned long long>(d.sequence_number));
+        registry_.increment_counter("ob_sequence_gaps_detected");
+        wal_.append_gap(delta.sequence_number, delta.timestamp_ns);
+    }
+}
+
+ob_status_t Engine::apply_delta(const DeltaUpdate& delta_in, const Level* levels) {
+    // Local copy, because the sequence number is stamped below and the public signature
+    // takes a const reference — a caller's DeltaUpdate is not ours to modify.
+    DeltaUpdate delta = delta_in;
+
     std::unique_lock<std::mutex> lock(mtx_);
 
     // Reject writes to migrated symbols (Requirement 6.6).
@@ -210,8 +249,11 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta, const Level* levels) {
                stop_flush_.load(std::memory_order_relaxed);
     });
 
-    // 1. Write to WAL before any state mutation (Requirement 8.1).
-    //    No fsync here — group commit via flush_loop() or close().
+    // 1. Assign the sequence number, then write to WAL before any state mutation
+    //    (Requirement 8.1). No fsync here — group commit via flush_loop() or close().
+    //    Origin 0 outside multi-master; a record streamed from a primary arrives here with
+    //    the primary's number already set and keeps it.
+    stamp_sequence(delta, mm_config_.node_id);
     wal_.append(delta, levels);
 
     // 1b. Broadcast to replicas if replication is enabled (Requirement 1.2).
@@ -239,13 +281,8 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta, const Level* levels) {
 
     // 2. Apply to SoA buffer using seqlock writer protocol.
     SoABuffer& buf = get_or_create_buffer(delta.symbol, delta.exchange);
-    bool gap_detected = false;
+    bool gap_detected = false;   // unused: gaps are decided per origin in stamp_sequence()
     ob_status_t status = ob::apply_delta(buf, delta, levels, gap_detected);
-
-    // 3. Record gap event in WAL if sequence number was non-consecutive (Requirement 1.5).
-    if (gap_detected) {
-        wal_.append_gap(delta.sequence_number, delta.timestamp_ns);
-    }
 
     // 4. Enqueue SnapshotRows for background columnar flush + notify subscribers.
     for (uint16_t i = 0; i < delta.n_levels; ++i) {
@@ -270,7 +307,9 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta, const Level* levels) {
     return status;
 }
 
-ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta, const Level* levels) {
+ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta_in, const Level* levels) {
+    DeltaUpdate delta = delta_in;   // see apply_delta() for why this is copied
+
     std::unique_lock<std::mutex> lock(mtx_);
 
     // Reject writes to migrated symbols (Requirement 6.6).
@@ -297,7 +336,10 @@ ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta, const Level* levels
                  static_cast<unsigned long>(hlc_ts.physical_ns),
                  hlc_ts.logical, hlc_ts.node_id);
 
-    // 2. Write to WAL with origin and HLC (Requirement 2.1, 2.2).
+    // 2. Assign the sequence number for this node's stream, then write to WAL with origin
+    //    and HLC (Requirement 2.1, 2.2). Each node numbers only its own stream, which is
+    //    what makes (origin, sequence) comparable across a cluster.
+    stamp_sequence(delta, mm_config_.node_id);
     wal_.append_with_origin(delta, levels, mm_config_.node_id, hlc_ts);
 
     // 3. Update conflict resolver HLC for each level.
@@ -309,12 +351,8 @@ ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta, const Level* levels
 
     // 4. Apply to SoA buffer (same logic as apply_delta).
     SoABuffer& buf = get_or_create_buffer(delta.symbol, delta.exchange);
-    bool gap_detected = false;
+    bool gap_detected = false;   // unused: gaps are decided per origin in stamp_sequence()
     ob_status_t status = ob::apply_delta(buf, delta, levels, gap_detected);
-
-    if (gap_detected) {
-        wal_.append_gap(delta.sequence_number, delta.timestamp_ns);
-    }
 
     // 5. Broadcast to peers.
     if (mm_mgr_) {
@@ -360,13 +398,29 @@ ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta, const Level* levels
     return status;
 }
 
-ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta, const Level* levels,
+ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level* levels,
                                        uint16_t origin_node_id,
                                        const HLCTimestamp& remote_hlc) {
+    // Only MultiMasterManager calls this, and it exists only in multi-master mode — but this
+    // is a public method on a library type, and hlc_ / mm_mgr_ below are null without it.
+    // Answering an error beats taking the process down.
+    if (!hlc_ || !mm_mgr_) {
+        OB_LOG_ERROR("engine",
+                     "apply_remote_delta called with multi-master disabled: origin=%u sym=%s.%s",
+                     static_cast<unsigned>(origin_node_id), delta_in.symbol, delta_in.exchange);
+        return OB_ERR_INVALID_ARG;
+    }
+
+    DeltaUpdate delta = delta_in;   // see apply_delta() for why this is copied
+
     // Determine if this record originated from self (for WAL write decision).
     bool from_self = (origin_node_id == mm_config_.node_id);
 
     std::unique_lock<std::mutex> lock(mtx_);
+
+    // The peer's number stays the peer's number: stamp_sequence() only assigns when the
+    // record carries 0, which happens if the peer predates sequence numbering.
+    stamp_sequence(delta, origin_node_id);
 
     OB_LOG_DEBUG("engine", "apply_remote_delta: origin=%u sym=%s exch=%s remote_hlc={%lu,%u,%u}",
                  origin_node_id, delta.symbol, delta.exchange,
@@ -1261,6 +1315,14 @@ void Engine::flush_write_and_merge() {
 
 void Engine::apply_delta_replayed(const DeltaUpdate& delta, const Level* levels) {
     // Caller holds mtx_.
+    //
+    // No number is assigned here: this record was written once already and carries its
+    // number. seed() restores the counters from it without reporting a gap — the gap, if
+    // there was one, was recorded when the records were first written, and re-reporting it
+    // would append a second GAP for the same hole on every restart.
+    seq_tracker_.seed(std::string(delta.symbol) + "." + delta.exchange,
+                      /*origin=*/mm_config_.node_id, delta.sequence_number);
+
     SoABuffer& buf = get_or_create_buffer(delta.symbol, delta.exchange);
     bool gap_detected = false;
     (void)ob::apply_delta(buf, delta, levels, gap_detected);

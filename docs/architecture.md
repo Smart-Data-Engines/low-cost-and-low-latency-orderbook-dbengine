@@ -76,6 +76,43 @@ The engine is composed of six subsystems, each responsible for a specific concer
 3. Flush each columnar segment's metadata.
 4. Flush the WAL to disk.
 
+### Sequence numbers and who assigns them
+
+A sequence number belongs to the **origin** that produced an update, not to the node storing it. A
+node numbers only the writes it accepted from a client, per `(symbol, exchange)`, and never renumbers
+anything that arrived from elsewhere: a replica renumbering its primary's stream, or a multi-master
+node renumbering a peer's, would make catch-up compare numbers minted by different nodes.
+
+`0` in `DeltaUpdate::sequence_number` means "unassigned". `Engine::stamp_sequence()` fills it in from
+the counter for that symbol; a non-zero number passes through untouched, which is how the replica path
+keeps the primary's numbering while sharing `apply_delta()` with client writes. The caller's struct is
+never modified — the engine works on a copy.
+
+The state lives in `SequenceTracker` (`src/sequence_tracker.cpp`): a local counter plus the last number
+seen from each origin, per symbol. Gap detection is per origin, because a single counter cannot tell a
+gap from two origins interleaving — in multi-master every interleave would look like a hole. A number
+that is not exactly one past the previous one **for that origin** appends a `GAP` record, increments
+`ob_sequence_gaps_detected` and logs the symbol, origin and expected number. The first record from an
+origin is never a gap.
+
+Counters are restored at startup from two places, both of which only ever raise them: the highest
+number in each segment (`SegmentMeta::max_sequence_number`, published in `meta.json`) and every record
+replayed from the WAL tail. Replay *seeds* the tracker rather than assigning, so a gap recorded when
+the records were first written is not reported again on every restart. A `meta.json` without the field
+was written before numbers existed, and 0 is then the truth about that data rather than a fallback.
+
+Until August 2026 none of this happened: `tcp_server.cpp` set the field to 0 with a comment saying the
+engine assigned it, and the engine copied the zero into the WAL header and the stored row. So every
+production write carried 0, the `sequence_number` column in every segment was zeros, and the gap check
+in `soa_buffer.cpp` — which requires a non-zero previous number — could never fire, leaving `GAP` a
+record type that had a unit test and had never been produced by a running server. That flag is still
+returned for the C API, whose caller supplies its own numbers and owns a single stream; the engine
+ignores it.
+
+Not exposed on the wire: `format_query_response()` sends six columns and the sequence number is not
+among them, so a client cannot see it. Adding a column means changing both clients, the header line and
+the docs, which is roadmap #65.
+
 ### What the WAL guarantees after a crash
 
 With `FsyncPolicy::EVERY` (the default), a write that has been acknowledged is in a fsynced WAL

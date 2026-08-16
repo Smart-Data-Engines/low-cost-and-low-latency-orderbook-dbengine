@@ -56,6 +56,7 @@ void ColumnarStore::write_meta_json(const std::string& dir,
       << ",\"row_count\":"   << meta.row_count
       << ",\"first_price\":" << meta.first_price
       << ",\"has_raw_qty\":"  << (meta.has_raw_qty ? "true" : "false")
+      << ",\"max_sequence_number\":" << meta.max_sequence_number
       << ",\"symbol\":\""    << meta.symbol   << "\""
       << ",\"exchange\":\""  << meta.exchange << "\""
       << "}";
@@ -116,6 +117,9 @@ bool ColumnarStore::parse_meta_json(const std::string& path,
     out.row_count    = extract_uint64("row_count");
     out.first_price  = extract_uint64("first_price");
     out.has_raw_qty  = extract_bool("has_raw_qty");
+    // Missing in segments written before sequence numbers were assigned; 0 is then correct,
+    // not a fallback.
+    out.max_sequence_number = extract_uint64("max_sequence_number");
     out.symbol       = extract_string("symbol");
     out.exchange     = extract_string("exchange");
 
@@ -329,6 +333,14 @@ std::optional<SegmentMeta> ColumnarStore::flush_segment() {
     // first_price: store the zigzag-encoded first price as the anchor
     meta.first_price = encoded_prices.empty() ? 0 : encoded_prices[0];
     meta.has_raw_qty = active_has_raw_qty_ || qty_result.has_fallback;
+    // Highest, not last: rows are appended in arrival order and a batch can hold numbers
+    // from several origins, so the last one is not necessarily the largest.
+    meta.max_sequence_number = 0;
+    for (int64_t seq : seq_buf_) {
+        if (seq > 0 && static_cast<uint64_t>(seq) > meta.max_sequence_number) {
+            meta.max_sequence_number = static_cast<uint64_t>(seq);
+        }
+    }
     meta.symbol      = symbol_;
     meta.exchange    = exchange_;
     meta.dir_path    = dir;
