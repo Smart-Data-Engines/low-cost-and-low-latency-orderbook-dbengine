@@ -246,6 +246,21 @@ void WALWriter::append_gap(uint64_t sequence_number, uint64_t timestamp_ns) {
     write_record(hdr, nullptr, 0);
 }
 
+void WALWriter::append_checkpoint(uint64_t timestamp_ns) {
+    WALRecord hdr{};
+    hdr.sequence_number = 0;
+    hdr.timestamp_ns    = timestamp_ns;
+    hdr.checksum        = crc32c(nullptr, 0); // empty payload
+    hdr.payload_len     = 0;
+    hdr.record_type     = WAL_RECORD_CHECKPOINT;
+    hdr._pad            = 0;
+
+    write_record(hdr, nullptr, 0);
+
+    OB_LOG_DEBUG("wal", "Checkpoint appended: file=%u offset=%zu",
+                 current_file_index(), current_offset());
+}
+
 void WALWriter::append_epoch(const EpochValue& epoch) {
     uint8_t payload[8];
     epoch_to_payload(epoch, payload);
@@ -400,6 +415,40 @@ uint64_t WALReplayer::replay(
     }
 
     return last_good_seq;
+}
+
+uint64_t WALReplayer::replay_after_checkpoint(WALReplayCallbackV2 cb)
+{
+    // Pass 1: find the ordinal of the last CHECKPOINT record. Reusing replay_v2 here
+    // rather than writing a second parser is deliberate: two parsers for one format
+    // eventually disagree, and this one only needs record types and ordering.
+    uint64_t ordinal = 0;
+    uint64_t last_checkpoint_ordinal = 0;   // 0 = no checkpoint found
+    replay_v2([&](const WALReplayContext& ctx) {
+        ++ordinal;
+        if (ctx.header.record_type == WAL_RECORD_CHECKPOINT) {
+            last_checkpoint_ordinal = ordinal;
+        }
+    });
+
+    // Pass 2: forward everything after that ordinal.
+    uint64_t seen = 0;
+    uint64_t forwarded = 0;
+    uint64_t last_seq = replay_v2([&](const WALReplayContext& ctx) {
+        ++seen;
+        if (seen <= last_checkpoint_ordinal) return;
+        ++forwarded;
+        cb(ctx);
+    });
+
+    OB_LOG_INFO("wal",
+                "Replay after checkpoint: records=%llu last_checkpoint_ordinal=%llu "
+                "forwarded=%llu",
+                static_cast<unsigned long long>(seen),
+                static_cast<unsigned long long>(last_checkpoint_ordinal),
+                static_cast<unsigned long long>(forwarded));
+
+    return last_seq;
 }
 
 uint64_t WALReplayer::replay_v2(WALReplayCallbackV2 cb)

@@ -35,6 +35,7 @@ static void print_usage(const char* prog) {
         "Options:\n"
         "  --port <PORT>          TCP port to listen on (default: 9090)\n"
         "  --data-dir <DIR>       Data directory for the engine (default: /tmp/ob_data)\n"
+        "  --flush-interval-ms <N> Background flush interval in ms (default: 100)\n"
         "  --max-sessions <N>     Maximum concurrent client sessions (default: 64)\n"
         "  --workers <N>          Number of worker threads (default: 4)\n"
         "  --help                 Show this help message and exit\n",

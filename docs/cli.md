@@ -176,6 +176,33 @@ ob> status
 ob> quit
 ```
 
+## Durability and crash recovery
+
+An acknowledged `INSERT` or `MINSERT` is in a fsynced WAL record before the reply is sent, and it
+survives a process kill or a power cut: on the next start, `Engine::open()` replays every WAL record
+written after the last checkpoint, applies it, and flushes it into a segment so queries can see it.
+The startup log states what happened, and it is worth reading after an unclean stop:
+
+```
+{"component":"wal","msg":"Replay after checkpoint: records=15 last_checkpoint_ordinal=11 forwarded=4"}
+{"component":"engine","msg":"WAL replay: records=4 applied=4 skipped_already_flushed=0"}
+```
+
+`skipped_already_flushed` counts records whose rows a segment already holds. It is normally 0, and
+non-zero after a crash that landed between writing the segment files and recording that fact.
+
+`FLUSH` and a clean shutdown both end in a checkpoint, so a restart after either replays nothing.
+
+### Parameters
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--flush-interval-ms <N>` | 100 | How often the background thread moves pending rows into columnar segments. Lower means less to replay after a crash and more segment churn; higher means the opposite. A long interval is also how the recovery tests keep rows in the WAL instead of racing the flush |
+
+Durability of the WAL write itself is set at build/config level by `FsyncPolicy` (`EVERY`, `INTERVAL`,
+`NEVER`). With anything other than `EVERY`, an acknowledged write can be lost on a power cut — the
+replay described above cannot recover a record that never reached the platter.
+
 ## Multi-Master Replication
 
 Multi-master mode allows multiple nodes to accept writes simultaneously. All nodes in the cluster replicate data to each other via WAL streaming in a full-mesh topology. Conflicts (concurrent writes to the same price level) are resolved automatically using Last-Writer-Wins (LWW) based on Hybrid Logical Clock (HLC).

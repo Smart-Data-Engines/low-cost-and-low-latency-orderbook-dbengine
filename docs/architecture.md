@@ -59,9 +59,15 @@ The engine is composed of six subsystems, each responsible for a specific concer
 
 ### Startup (open)
 
-1. Replay WAL records to recover any updates not yet persisted to the columnar store.
-2. Scan the columnar store directory and rebuild the segment index from `meta.json` files.
-3. Start the background flush thread.
+1. Scan the columnar store directory and rebuild the segment index from `meta.json` files. This
+   happens **first**, because recovery needs to know what is already durable.
+2. Replay the WAL records written after the last `CHECKPOINT` record and apply them to the SoA
+   buffer and the pending-row queue. A record whose timestamp is at or below the highest `end_ts_ns`
+   of an existing segment for its symbol is skipped: those rows are already durable.
+3. If anything was replayed, flush it into a segment immediately. `QueryEngine` reads segments, not
+   the live SoA buffer, so a recovered row that stays in memory is invisible to every `SELECT`.
+4. Read the epoch record, if any, and restore the fencing epoch.
+5. Start the background flush thread.
 
 ### Shutdown (close)
 
@@ -69,6 +75,28 @@ The engine is composed of six subsystems, each responsible for a specific concer
 2. Flush all pending rows to the columnar store.
 3. Flush each columnar segment's metadata.
 4. Flush the WAL to disk.
+
+### What the WAL guarantees after a crash
+
+With `FsyncPolicy::EVERY` (the default), a write that has been acknowledged is in a fsynced WAL
+record before the acknowledgement leaves the server, and it comes back after a `SIGKILL`, a power
+cut, or any other end that skips `close()`. That is the whole point of the log, and until August
+2026 it did not hold: `Engine::open()` called replay with a callback that did nothing, so every
+acknowledged write not yet flushed to a segment was lost. Nothing in 585 tests noticed, because
+every one of them ended in `close()`, which drains and flushes.
+
+A `CHECKPOINT` record (type 6, empty payload) marks how far the log has been made redundant by the
+columnar store. It is appended **after** the segment files are written and their metadata merged,
+never before: a checkpoint that claims more than is durable turns a crash into data loss, while one
+that claims less costs a replay that is skipped anyway.
+
+The remaining window is a crash between writing the segment files and appending the checkpoint. The
+records are then replayed even though their rows are durable, which is what the timestamp comparison
+in step 2 above exists to catch — without it, replay rewrites an existing segment with whatever the
+WAL tail still holds, and since the WAL is truncated only up to the replica-confirmed position, that
+tail can hold fewer rows than the segment does.
+
+`FLUSH` and a clean `close()` both end in a checkpoint, so a restart after either replays nothing.
 
 ## Key Design Decisions
 

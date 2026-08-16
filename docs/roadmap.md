@@ -28,6 +28,9 @@ ranges that ascend. Whether a reference points at the item it means is on the re
 
 ### 1. Configurable fsync policy
 - Status: **DONE** — `FsyncPolicy` enum (EVERY, INTERVAL, NONE)
+- Worth knowing: for four months this bought nothing. Records were fsynced faithfully and then never
+  read back, because replay applied an empty callback (#62). A durability knob is only as good as the
+  recovery path behind it.
 
 ### 2. Graceful shutdown with drain
 - Status: **DONE** — `draining_` state, rejects new connections, waits for in-flight
@@ -627,6 +630,56 @@ lands, so the marker cannot outlive the defect.
 - Effort: M | Impact: Silent data loss on a rejoining node, in the topology the engine advertises for
   write scalability
 
+### 62. The WAL was written, fsynced, and never read back ✅
+
+Found while investigating #61, by asking a question no test had asked: what does a node hold after a
+crash?
+
+**Measured before the fix.** Five `INSERT`s to a fresh server, each acknowledged, sent in one write so
+the 100 ms background flush could not intervene. No `*.col` file existed at the moment of the kill and
+the WAL held 680 bytes. `kill -9`, restart, `SELECT`: **0 of 5 rows**. Not a corner case, not a race —
+the ordinary path, every time, for as long as the engine had existed.
+
+The cause was three lines in `Engine::open()`: `WALReplayer::replay()` was called with a callback that
+counted records and discarded them. So `FsyncPolicy::EVERY` flushed each record to the platter, and
+recovery threw all of them away. The WAL worked perfectly as a replication source and not at all as a
+recovery log, which is why the failure was invisible in a repository whose replication tests all pass.
+
+**Why 585 tests missed it.** Every one of them ended in `close()`, which drains the pending rows and
+flushes segments, so the data came back from the columnar store and the replay path was never the thing
+under test. No test had ever killed a process. That is the whole explanation, and it is the reason the
+new tests do not call `close()`: `Engine::release()` in C++, a real `SIGKILL` in Python.
+
+**The fix.** A `CHECKPOINT` record (type 6) appended after — never before — a flush has written its
+segment files and merged their metadata; `WALReplayer::replay_after_checkpoint()` forwarding only the
+records past the last checkpoint, in two passes over the same parser rather than a second one written
+for the tail; `Engine::apply_delta_replayed()` applying them without re-appending to the WAL,
+re-broadcasting to peers, or waking subscribers; and an immediate flush afterwards, because
+`QueryEngine` reads segments and a recovered row left in the SoA buffer is invisible to every `SELECT`
+(pitfall 13, met again from the other side).
+
+**The window a checkpoint cannot describe**, and the part worth reading twice: a crash between writing
+the segment files and appending the checkpoint. Those records are then replayed although their rows are
+durable. Skipping them by timestamp looks like belt-and-braces until you measure what happens without
+it — the re-flush lands on the same segment path (`<active_segment_start>_<end_ts>`, and the start stays
+0), so `ColumnarStore` refuses the merge as a duplicate, **but the refusal comes after the files were
+rewritten in place**. Since the WAL is truncated only up to the replica-confirmed position, its tail can
+hold fewer rows than the segment it is overwriting. Measured with the guard removed: 8 durable rows
+became **6**. The guard prevents data loss, not duplicate scans.
+
+That same collision is why the first two attempts at this mutation came back green: a backstop lower in
+the stack was hiding the defect, so the mutation looked covered while no test had touched the changed
+line. Recorded as a pitfall, because it invalidates mutation testing generally.
+
+Verified: 7 unit tests, 5 integration tests that actually `SIGKILL` a server (including two crashes in a
+row, and writes made after a recovery surviving the next crash), three mutations red — empty replay,
+checkpoint before the flush, timestamp guard removed. Ingestion and update latency unchanged: one 24-byte
+record per flush, ten flushes a second.
+Spec: `kiro-workspace/specs/wal-replay-recovery/`
+
+- Also added: `--flush-interval-ms` on `ob_tcp_server`. The recovery tests need rows to stay in the WAL,
+  and hardcoding 100 ms made the test race the server instead of measuring it.
+
 
 ---
 
@@ -655,8 +708,9 @@ lands, so the marker cannot outlive the defect.
 Things a reviewer will notice, listed here so they do not look like oversights:
 
 - **No authentication, no TLS.** Trusted-network deployment only (#30).
-- **Integration test files missing from the repo** (#28). The framework is present and the C++ suite
-  is complete: 531 tests, all passing.
+- **Neither suite kills a process except in one module.** Until #62 that was every module, and it hid
+  total loss of acknowledged writes on crash. `tests/integration/test_crash_recovery.py` is the only
+  place a server is `SIGKILL`ed; fault injection more broadly is still #54.
 - **Anti-entropy is a scheduler with no reconciliation** (#57). The spec task is marked complete and
   the metrics report runs, but gap detection and repair are placeholders that return "nothing found"
   and "cannot repair". Reconnect catch-up is the only thing healing divergence today.

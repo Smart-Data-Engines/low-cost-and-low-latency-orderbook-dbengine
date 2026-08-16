@@ -16,6 +16,11 @@ inline constexpr uint8_t WAL_RECORD_DELTA    = 1;
 inline constexpr uint8_t WAL_RECORD_SNAPSHOT = 2;
 inline constexpr uint8_t WAL_RECORD_GAP      = 3;
 inline constexpr uint8_t WAL_RECORD_ROTATE   = 4;
+// EPOCH = 5, see append_epoch().
+/// Everything before this record is durable in columnar segments, so replay may skip
+/// it. Written after a successful flush, never before: a checkpoint claiming more than
+/// is durable turns a crash into data loss.
+inline constexpr uint8_t WAL_RECORD_CHECKPOINT = 6;
 
 // ── Fsync policy ──────────────────────────────────────────────────────────────
 // Controls when the WAL calls fsync:
@@ -140,6 +145,12 @@ public:
     /// Write a GAP record (called by the engine when a sequence gap is detected).
     void append_gap(uint64_t sequence_number, uint64_t timestamp_ns);
 
+    /// Write a CHECKPOINT record: everything before it is durable in segments.
+    ///
+    /// Called after a flush has written and merged its segments, so the record's
+    /// presence is evidence that the rows preceding it no longer need replaying.
+    void append_checkpoint(uint64_t timestamp_ns);
+
     /// Write an EPOCH record (WAL_RECORD_EPOCH, type=5) with the given epoch value.
     void append_epoch(const EpochValue& epoch);
 
@@ -221,6 +232,18 @@ public:
     /// For extended records (version=1): reads full 38B header.
     /// Returns the last good sequence_number.
     uint64_t replay_v2(WALReplayCallbackV2 cb);
+
+    /// Replay only the records written after the last CHECKPOINT record.
+    ///
+    /// Two passes rather than buffering the tail in memory: the first finds the last
+    /// checkpoint, the second invokes cb for the records after it. The tail can be
+    /// arbitrarily large if flushing fell behind, and open() is not on a latency
+    /// path, so bounded memory is worth more than one pass.
+    ///
+    /// With no checkpoint in the log, every record is replayed — which is correct for
+    /// a log written before checkpoints existed, and for one whose first flush has
+    /// not happened yet.
+    uint64_t replay_after_checkpoint(WALReplayCallbackV2 cb);
 
     /// Return the highest epoch found during the last replay (0 if none).
     uint64_t last_epoch() const { return last_epoch_; }
