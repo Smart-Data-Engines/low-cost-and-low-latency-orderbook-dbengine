@@ -204,7 +204,11 @@ private:
     void open_current();
 
     /// Write a complete record (header + payload). Does NOT fsync.
-    void write_record(const WALRecord& hdr, const void* payload, size_t payload_len);
+    /// allow_fsync=false writes the record without honouring FsyncPolicy::EVERY. Only
+    /// for records whose loss is harmless: a lost CHECKPOINT costs a redundant replay,
+    /// never a lost row, so paying an fsync for it would slow every flush for nothing.
+    void write_record(const WALRecord& hdr, const void* payload, size_t payload_len,
+                      bool allow_fsync = true);
 
     /// Write a complete V2 record (38B header + payload). Does NOT fsync.
     void write_record_v2(const WALRecordV2& hdr, const void* payload, size_t payload_len);

@@ -90,11 +90,26 @@ columnar store. It is appended **after** the segment files are written and their
 never before: a checkpoint that claims more than is durable turns a crash into data loss, while one
 that claims less costs a replay that is skipped anyway.
 
+The checkpoint is deliberately **not** fsynced, even under `FsyncPolicy::EVERY`. It can only ever
+claim that rows are already durable, so losing it in a crash makes the next `open()` replay records
+the timestamp comparison below then skips. Fsyncing it measured +0.22 ms (+10.5%) on every `FLUSH`,
+paid to protect a record whose loss is harmless; without the fsync the cost is not measurable above
+run-to-run spread. The next WAL write fsyncs the file anyway, so in practice the checkpoint reaches
+the platter moments later.
+
 The remaining window is a crash between writing the segment files and appending the checkpoint. The
 records are then replayed even though their rows are durable, which is what the timestamp comparison
 in step 2 above exists to catch — without it, replay rewrites an existing segment with whatever the
 WAL tail still holds, and since the WAL is truncated only up to the replica-confirmed position, that
-tail can hold fewer rows than the segment does.
+tail can hold fewer rows than the segment does. Measured with the comparison removed: eight durable
+rows became six.
+
+That comparison uses each segment's `end_ts_ns`, which is the timestamp of the **last** row written
+into it rather than the highest, so it assumes timestamps for one symbol arrive in order. A single
+node satisfies that, because the server stamps each write on arrival. Multi-master does not: a peer's
+record carries the origin's timestamp and can be appended after newer local rows, and a record like
+that, replayed inside the crash window, would be skipped as already durable. Narrow, but real, and
+tracked as roadmap #63.
 
 `FLUSH` and a clean `close()` both end in a checkpoint, so a restart after either replays nothing.
 

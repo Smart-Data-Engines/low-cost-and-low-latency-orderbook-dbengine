@@ -104,7 +104,8 @@ ranges that ascend. Whether a reference points at the item it means is on the re
 - Status: **DONE** — `ShardMap` + `ConsistentHashRing` (MurmurHash3, virtual nodes), `ShardCoordinator` (etcd registration, rebalancing, migration), `ShardRouter` (C++ client routing), Python `_ClientPool` sharding mode, wire protocol (SHARD_MAP, SHARD_INFO, MIGRATE), 10 property-based tests
 
 ### 23. Integration test suite
-- Status: **PARTIAL** — framework is DONE (`ClusterManager` auto-boots etcd plus two nodes, fixtures, colored console report, marker-based categories), but **the test files themselves are missing from the repository**. A `test_*` pattern in `.gitignore` silently excluded every `tests/integration/test_*.py`, so the ~37 tests across 9 categories were never committed. The `.gitignore` is fixed; the test files have to be recovered or rewritten. See item #28.
+- Status: **DONE** — the framework, and since #28 the tests too. Kept here for the history: the
+  framework was DONE (`ClusterManager` auto-boots etcd plus two nodes, fixtures, colored console report, marker-based categories), but **the test files themselves are missing from the repository**. A `test_*` pattern in `.gitignore` silently excluded every `tests/integration/test_*.py`, so the ~37 tests across 9 categories were never committed. The `.gitignore` is fixed and the suite was rewritten from scratch — see #28.
 
 ## Phase 6 — Write Scalability ✅
 
@@ -269,7 +270,8 @@ Spec: `kiro-workspace/specs/aggregations-over-wire/`
   published as `failover_time_sec`, acknowledged data surviving a kill, the promoted node accepting
   writes, and a pool client re-discovering the primary. One test is `xfail(strict=True)` because the
   behaviour it asserts is genuinely broken — see #60
-- **Complete.** 108 passing, 2 skipped, 2 xfailed across 12 modules. The multi-master modules
+- **Complete.** 108 passing, 2 skipped, 2 xfailed across 12 modules; 113 across 13 since #62 added the
+  crash-recovery module, the only one that kills a server. The multi-master modules
   (`test_mm_convergence.py`, 9 tests; `test_mm_failover.py`, 6) run on their own three-node mesh, and
   the live Binance modules (`test_binance_live.py`, 5; `test_binance_failover_sync.py`, 2) are opt-in
   behind `OB_BINANCE_TESTS=1` and hard-skip with a named reason when the exchange is unreachable or
@@ -671,14 +673,54 @@ That same collision is why the first two attempts at this mutation came back gre
 the stack was hiding the defect, so the mutation looked covered while no test had touched the changed
 line. Recorded as a pitfall, because it invalidates mutation testing generally.
 
+**Performance.** Ingestion and update latency are untouched, as expected — nothing was added to the
+per-update path. Machine B, three interleaved rounds: ingestion median 2543 → 2552 ns/op (+0.4%),
+update p50 6033 → 6003 ns (-0.5%), both far inside a ±30% run-to-run spread.
+
+The flush path is where the cost landed, and the first version of it was real: fsyncing the checkpoint
+under `FsyncPolicy::EVERY` cost **+0.22 ms (+10.5%)** on `FLUSH` (median 2.04 → 2.26 ms, 150 samples per
+arm, interleaved). The checkpoint does not need to be durable — it only ever claims that rows already
+are, so losing it costs a replay the timestamp guard then skips. Written without fsync, the difference
+falls below the noise floor (median 2.18 → 2.04 ms, i.e. the wrong sign). Worth stating plainly: the
+first measurement of this was garbage. `FLUSH` answers `OK\n\n`, the harness read one line per command,
+so it drifted a line per iteration and reported 0.03 ms for a flush the roadmap documents at 2-3 ms —
+pitfall 35 again, one layer up.
+
 Verified: 7 unit tests, 5 integration tests that actually `SIGKILL` a server (including two crashes in a
 row, and writes made after a recovery surviving the next crash), three mutations red — empty replay,
-checkpoint before the flush, timestamp guard removed. Ingestion and update latency unchanged: one 24-byte
-record per flush, ten flushes a second.
+checkpoint before the flush, timestamp guard removed.
 Spec: `kiro-workspace/specs/wal-replay-recovery/`
 
 - Also added: `--flush-interval-ms` on `ob_tcp_server`. The recovery tests need rows to stay in the WAL,
   and hardcoding 100 ms made the test race the server instead of measuring it.
+
+### 63. The replay guard assumes timestamps for a symbol arrive in order
+
+Found while writing #62, by asking what the guard assumes rather than what it does.
+
+`replay_wal_tail()` skips a record when its timestamp is at or below the highest `end_ts_ns` among the
+segments for that symbol. `SegmentMeta::end_ts_ns` is the timestamp of the **last** row written into
+the segment, not the highest one in it, so the comparison is exact only while timestamps for a symbol
+increase monotonically.
+
+A single node satisfies that: `ob_tcp_server` stamps every write on arrival. Multi-master does not. A
+peer's record carries the origin's timestamp and is appended to the local WAL after whatever arrived
+locally in the meantime, so the tail can hold a record with a timestamp below an existing segment's
+`end_ts_ns`. Replayed inside the crash window between writing segments and appending the checkpoint,
+that record would be skipped as already durable when it is not — one lost row on a rejoining node.
+
+The intersection is narrow (multi-master, plus a crash in a window of microseconds, plus an
+out-of-order timestamp for the same symbol), which is why #62 shipped with it rather than waiting.
+Two ways out, and the second is the honest one:
+- Record `max(ts)` alongside `end_ts_ns` in `SegmentMeta`, and compare against that. Cheap, but it
+  only shrinks the assumption instead of removing it: a segment can still be missing rows whose
+  timestamps fall inside its range.
+- Have the checkpoint carry the WAL position (file index + offset) it certifies, so replay starts from
+  a position rather than inferring one from timestamps. The timestamp comparison then narrows to the
+  crash window alone, where a row-level identity check on the replayed rows can settle it exactly.
+
+- Effort: M | Impact: One lost row per occurrence on a multi-master node, in a window that only opens
+  on an unclean stop. Correctness of a guard that currently rests on an unstated assumption
 
 
 ---
@@ -780,5 +822,5 @@ absolute thresholds for a designated benchmark host.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 510 | all passing, ~381s with `ctest -j1` on machine B |
-| Python integration | ~37 | **missing from repo** (#28) |
+| C++ (GTest + RapidCheck) | 592 | all passing, ~159s with `ctest -j1` on machine B |
+| Python integration | 113 | passing, plus 2 skipped and 2 `xfail(strict=True)` for #60 and #61; ~3.7 min |
