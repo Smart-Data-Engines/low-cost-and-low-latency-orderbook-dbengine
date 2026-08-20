@@ -12,6 +12,7 @@
 #include "orderbook/replication.hpp"
 #include "orderbook/soa_buffer.hpp"
 #include "orderbook/sequence_tracker.hpp"
+#include "orderbook/version_vector.hpp"
 #include "orderbook/wal.hpp"
 
 #include <atomic>
@@ -246,6 +247,18 @@ public:
                                    uint16_t origin_node_id,
                                    const HLCTimestamp& remote_hlc);
 
+    /// What this node holds, per (symbol, origin), for a peer's catch-up decision.
+    ///
+    /// Served from a cache refreshed at flush time, and deliberately not from the tracker:
+    /// MultiMasterManager calls this from its io_loop while holding its own mutex, and the
+    /// write path takes the engine mutex before MM's. Reaching into the tracker here would
+    /// close that cycle — measured as a node that stopped answering writes entirely.
+    ///
+    /// A stale cache understates what we hold, so a peer sends more than it needs to and the
+    /// duplicates are dropped on arrival. The staleness window is one flush interval.
+    std::vector<SequenceTracker::VectorEntry> export_version_vector(std::size_t limit,
+                                                                    bool& truncated) const;
+
     /// Get the HLC clock (nullptr if multi-master is not enabled).
     HybridLogicalClock* hlc() const { return hlc_.get(); }
 
@@ -311,6 +324,18 @@ private:
 
     /// Per-symbol sequence counters and per-origin high-water marks. Guarded by mtx_.
     SequenceTracker                      seq_tracker_;
+    /// Fingerprint of the frontiers as last written to the WAL, so an unchanged vector is not
+    /// rewritten ten times a second.
+    uint64_t                             vector_fingerprint_written_{0};
+
+    /// Snapshot of the vector for MM to read without touching mtx_. Its own small mutex,
+    /// because the point is to be reachable from the MM io_loop under MM's lock.
+    mutable std::mutex                   vector_cache_mtx_;
+    std::vector<SequenceTracker::VectorEntry> vector_cache_;
+    bool                                 vector_cache_truncated_{false};
+
+    /// Refresh the snapshot above from the tracker. Caller must hold mtx_.
+    void refresh_version_vector_cache();
     std::unique_ptr<HybridLogicalClock>  hlc_;
     std::unique_ptr<MultiMasterManager>  mm_mgr_;
 
@@ -359,6 +384,17 @@ private:
     /// minted by whoever originated the record, and renumbering it here would make catch-up
     /// compare numbers from different nodes.
     void stamp_sequence(DeltaUpdate& delta, uint16_t origin, const std::string& key);
+
+    /// Cap on what gets written down. Above it the node relearns by over-asking, which costs
+    /// traffic and duplicate drops, never data.
+    static constexpr std::size_t kMaxPersistedVectorEntries = 4096;
+
+    /// Write the version vector to the WAL if any frontier moved since it was last written.
+    /// **Caller must hold mtx_** — it is called from inside the flush's merge block.
+    void persist_version_vector_if_changed();
+
+    /// Restore the version vector from the last one recorded in the WAL.
+    void restore_version_vector();
     ColumnarStore& get_or_create_store(const std::string& symbol, const std::string& exchange);
     void flush_loop();
 

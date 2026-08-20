@@ -21,6 +21,10 @@ inline constexpr uint8_t WAL_RECORD_ROTATE   = 4;
 /// it. Written after a successful flush, never before: a checkpoint claiming more than
 /// is durable turns a crash into data loss.
 inline constexpr uint8_t WAL_RECORD_CHECKPOINT = 6;
+/// A node's version vector: what it holds per (symbol, origin). Written to the WAL so a
+/// restarted node knows it, and sent to peers in the same envelope so a node running the
+/// older protocol skips it as an unknown type instead of disconnecting.
+inline constexpr uint8_t WAL_RECORD_VERSION_VECTOR = 7;
 
 // ── Fsync policy ──────────────────────────────────────────────────────────────
 // Controls when the WAL calls fsync:
@@ -150,6 +154,13 @@ public:
     /// Called after a flush has written and merged its segments, so the record's
     /// presence is evidence that the rows preceding it no longer need replaying.
     void append_checkpoint(uint64_t timestamp_ns);
+
+    /// Append this node's serialised version vector: what it holds, per (symbol, origin).
+    ///
+    /// Not fsynced, for the same reason as the checkpoint: losing it means the node restores
+    /// a lower frontier, asks a peer for more than it needs and drops the duplicates. Losing
+    /// it cannot cost data.
+    void append_version_vector(const uint8_t* payload, size_t payload_len);
 
     /// Write an EPOCH record (WAL_RECORD_EPOCH, type=5) with the given epoch value.
     void append_epoch(const EpochValue& epoch);

@@ -33,7 +33,7 @@ cmake --build build -j$(nproc)
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release -j$(nproc)
 
-# Tests — 615 of them, ~2.5 minutes
+# Tests — 638 of them, ~2.5 minutes
 ctest --test-dir build --output-on-failure -j1
 ```
 
@@ -146,7 +146,28 @@ Learned the hard way. Check here before debugging.
     path (`replication.cpp`) shares `apply_delta()` with client writes and must keep the
     primary's numbering. Gap detection is per origin in `SequenceTracker` — one counter per
     buffer reports every multi-master interleave as a hole.
-17. **The checkpoint goes after the flush, never before.** A `CHECKPOINT` record claiming more than
+17. **A "how far did I get" cursor must live in the sender's space, not the receiver's.**
+    Multi-master catch-up compared the peer's WAL byte offset with the local one and streamed from
+    that offset in the *local* log. Every node writes its own records plus copies of foreign ones, so
+    the same data yields different offsets: 846 at the peer against 870 locally read as "behind by 24
+    bytes" and shipped one empty checkpoint while the missing rows sat earlier (roadmap #61). A
+    sequence number minted by an origin means the same thing on every node that received it.
+18. **"Highest seen" is not "I have everything up to".** A peer can receive live record 7 before
+    catch-up delivers 6, and a maximum would report 6 as delivered. The state is a contiguous
+    frontier: a record above it is applied, but the frontier stays put.
+19. **Over-delivery is not free, and Last-Writer-Wins does not make it so.** Storage is append-only,
+    so re-applying a record appends its rows again: four outage cycles stored 25 rows where 9 were
+    written. LWW does refuse the repeat, but its HLC state is in memory and does not survive a
+    restart, and the columnar store's duplicate-path refusal only hides it while the re-flushed
+    segment covers the same timestamp range. Dedup belongs on the sequence number, before the WAL
+    append (`SequenceTracker::has_seen`).
+20. **`std::mutex` is not recursive, so a helper that locks cannot be called from a section that
+    already holds that lock.** `persist_version_vector_if_changed()` took `mtx_` and was called from
+    inside the flush block that held it: the flush thread deadlocked against itself and every client
+    write queued behind it. The symptom looked like an ABBA cycle between the engine and
+    multi-master. `sudo gdb -p <pid> -batch -ex "thread apply all bt"` settled it in two minutes;
+    without sudo, `ptrace_scope` blocks the attach.
+21. **The checkpoint goes after the flush, never before.** A `CHECKPOINT` record claiming more than
     is durable turns a crash into data loss; claiming less costs a replay that gets skipped anyway.
     For the crash window between writing the segment files and appending the checkpoint,
     `replay_wal_tail()` skips records at or below the highest `end_ts_ns` already on disk — without

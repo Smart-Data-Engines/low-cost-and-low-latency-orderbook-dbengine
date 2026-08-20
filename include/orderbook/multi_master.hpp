@@ -22,6 +22,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include "orderbook/version_vector.hpp"
+
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -30,7 +32,10 @@ namespace ob {
 
 // ── Protocol constants ────────────────────────────────────────────────────────
 
-inline constexpr uint16_t MM_PROTOCOL_VERSION   = 1;
+inline constexpr uint16_t MM_PROTOCOL_VERSION   = 2;   // 2 = exchanges version vectors
+inline constexpr size_t   MM_MAX_VV_ENTRIES     = 4096; // ~172 kB on the wire
+inline constexpr uint64_t MM_VV_GRACE_MS        = 2000; // wait for a peer's vector before
+                                                        // assuming it holds nothing
 inline constexpr size_t   MM_FRAME_HEADER_SIZE  = 4;            // uint32 LE length
 inline constexpr size_t   MM_HANDSHAKE_SIZE     = 17;           // HandshakeMessage wire size
 inline constexpr size_t   MM_MAX_FRAME_PAYLOAD  = 64ULL << 20;  // 64 MB
@@ -130,8 +135,19 @@ struct PeerConnection {
     bool         connected{false};
     bool         handshake_done{false};  // handshake completed
     bool         compress{false};    // LZ4 negotiated
+    // Reported by the peer in its handshake, kept for the MM_PEERS view only. Catch-up must
+    // not use them: they are positions in the peer's own WAL, and #61 was the consequence of
+    // comparing them with ours.
     uint32_t     confirmed_file{0};
     size_t       confirmed_offset{0};
+
+    /// What the peer says it holds. Until it arrives, the peer is assumed to hold nothing.
+    PeerVector   peer_vector;
+    /// Monotonic milliseconds after which a silent peer is treated as holding nothing.
+    uint64_t     vector_deadline_ms{0};
+    /// Set once catch-up has been started for this connection, so a late vector does not
+    /// start a second stream.
+    bool         catchup_started{false};
     HLCTimestamp last_hlc;           // last HLC received from this peer
 
     // Send buffer (non-blocking)
@@ -270,6 +286,14 @@ private:
     // Handshake send (task 7.1)
     /// Send our handshake message to a peer (called after connect or accept).
     void send_handshake(PeerConnection& peer);
+    /// Send this node's version vector as a WAL_RECORD_VERSION_VECTOR frame.
+    ///
+    /// Same envelope as a WAL record on purpose: a node running protocol 1 skips an unknown
+    /// record type instead of disconnecting, so a mixed-version cluster degrades to
+    /// "send everything" rather than to a broken connection.
+    void send_version_vector(PeerConnection& peer);
+    /// Start catch-up for peers whose vector never arrived within MM_VV_GRACE_MS.
+    void start_overdue_catchups();
 
     // Reconnect logic (task 10.1)
     /// Mark peer as disconnected, close fd, log INFO. Schedules reconnect.
