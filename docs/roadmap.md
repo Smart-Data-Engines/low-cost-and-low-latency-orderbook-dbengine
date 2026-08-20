@@ -768,9 +768,48 @@ rather than a getter), 3 integration tests that read `meta.json` from a real ser
 four mutations red — assigning over a supplied number, one high-water mark for all origins, no restore
 from `meta.json`, and replay assigning instead of seeding. 615 C++ tests green, 142 s.
 
-- Status: **in progress** — code and tests are done on `feat/wal-sequence-numbers`; the A/B benchmark is
-  outstanding and matters here, because unlike #62 this change does touch the per-write path
+**Performance, and what the control benchmark actually caught.** Eight interleaved rounds on machine B
+(order reversed each round, pinned with `taskset`), compared **pairwise** — the ratio within a round,
+because slow thermal drift moves both arms together and cancels in a ratio. Medians: ingestion +3.0%
+(7 of 8 rounds positive), update p50 +1.0% (signs random). Then the control: `BM_VwapLatency`, a read
+path this change cannot touch, came out **-40.6% in 8 of 8 rounds**. `objdump` on both binaries puts
+the benchmark function at the same address (`0xc02f`, mod 32 = 15) with the same 21 instructions,
+differing only in the call offsets to `_M_dispose`. So that is binary layout, the pitfall `bench-guard`
+documents at ±37% on this very benchmark — which means a few-percent signal from the engine benchmark
+on this machine is not evidence of anything.
+
+So the cost was measured directly instead, on the mechanism: `SequenceTracker::observe()` is
+**54.4 ns** per call (one string-keyed lookup plus one origin-keyed lookup) and building a
+`"SYMBOL.EXCHANGE"` key is **27.0 ns** (allocation plus concatenation). Net against master is
+**~27 ns per write, about 1% of a 2883 ns ingestion op**, because the change also removed one of the
+two key builds per write: `apply_delta()` built it once for the migrated-symbol check and again in
+`stamp_sequence()`, and now builds it once and passes it down.
+
+- Status: **DONE**
 - Spec: `kiro-workspace/specs/wal-sequence-numbers/`
+
+### 66. The write path builds the same key string three times
+
+Measured while benchmarking #64, and worth its own item because the numbers are known and the fix is
+not free.
+
+Every write builds `"SYMBOL.EXCHANGE"` and looks it up more than once: `apply_delta()` builds it for
+the migrated-symbol check (and after #64 passes that one down), `get_or_create_buffer()` takes
+`std::string` parameters by value and concatenates again — two temporaries plus the result — and
+`SequenceTracker` keeps its own map keyed by the same string. Measured on machine B: 27.0 ns per key
+construction, 54.4 ns for the tracker's `observe()`.
+
+Unifying per-symbol state into a single map — buffer, sequence counter and origin high-water marks
+under one key — would leave one lookup and no extra allocations per write, and would very likely come
+out *ahead* of master rather than level with it. This was the original shape in #64's design and was
+deliberately deferred: it changes shared `Engine` internals (7 uses of `buffers_`, 4 of `live_ptrs_`,
+plus the flush, snapshot and TTL paths), so it deserves its own change with its own measurement rather
+than riding along with a correctness fix.
+
+Note for whoever does it: on machine B the engine benchmarks cannot resolve a few percent (see #64), so
+the verification has to be a direct measurement of the mechanism, not a `bench_engine` A/B.
+
+- Effort: S | Impact: Removes three allocations and one hash lookup from the hottest path in the engine
 
 ### 65. The sequence number is not visible to a client
 

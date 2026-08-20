@@ -205,9 +205,9 @@ void Engine::close() {
     wal_.flush();
 }
 
-void Engine::stamp_sequence(DeltaUpdate& delta, uint16_t origin) {
-    // Caller holds mtx_.
-    const std::string key = std::string(delta.symbol) + "." + delta.exchange;
+void Engine::stamp_sequence(DeltaUpdate& delta, uint16_t origin, const std::string& key) {
+    // Caller holds mtx_, and passes the "SYMBOL.EXCHANGE" key it already built. Building it
+    // again here would add a heap allocation to every write for nothing.
     const SequenceTracker::Decision d = seq_tracker_.observe(key, origin,
                                                              delta.sequence_number);
     delta.sequence_number = d.sequence_number;
@@ -232,14 +232,15 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta_in, const Level* levels
 
     std::unique_lock<std::mutex> lock(mtx_);
 
+    // Built once and reused by the migrated-symbol check and stamp_sequence() below. One
+    // string per write, not two.
+    const std::string symbol_key = std::string(delta.symbol) + "." + delta.exchange;
+
     // Reject writes to migrated symbols (Requirement 6.6).
-    {
-        const std::string key = std::string(delta.symbol) + "." + delta.exchange;
-        if (migrated_symbols_.count(key)) {
-            OB_LOG_WARN("engine", "Rejecting write to migrated symbol: symbol_key=%s",
-                        key.c_str());
-            return OB_ERR_MIGRATED;
-        }
+    if (migrated_symbols_.count(symbol_key)) {
+        OB_LOG_WARN("engine", "Rejecting write to migrated symbol: symbol_key=%s",
+                    symbol_key.c_str());
+        return OB_ERR_MIGRATED;
     }
 
     // Backpressure: wait until pending queue has room.
@@ -253,7 +254,7 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta_in, const Level* levels
     //    (Requirement 8.1). No fsync here — group commit via flush_loop() or close().
     //    Origin 0 outside multi-master; a record streamed from a primary arrives here with
     //    the primary's number already set and keeps it.
-    stamp_sequence(delta, mm_config_.node_id);
+    stamp_sequence(delta, mm_config_.node_id, symbol_key);
     wal_.append(delta, levels);
 
     // 1b. Broadcast to replicas if replication is enabled (Requirement 1.2).
@@ -312,14 +313,14 @@ ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta_in, const Level* lev
 
     std::unique_lock<std::mutex> lock(mtx_);
 
+    // One key string per write; see apply_delta().
+    const std::string symbol_key = std::string(delta.symbol) + "." + delta.exchange;
+
     // Reject writes to migrated symbols (Requirement 6.6).
-    {
-        const std::string key = std::string(delta.symbol) + "." + delta.exchange;
-        if (migrated_symbols_.count(key)) {
-            OB_LOG_WARN("engine", "Rejecting write to migrated symbol: symbol_key=%s",
-                        key.c_str());
-            return OB_ERR_MIGRATED;
-        }
+    if (migrated_symbols_.count(symbol_key)) {
+        OB_LOG_WARN("engine", "Rejecting write to migrated symbol: symbol_key=%s",
+                    symbol_key.c_str());
+        return OB_ERR_MIGRATED;
     }
 
     // Backpressure: wait until pending queue has room.
@@ -339,7 +340,7 @@ ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta_in, const Level* lev
     // 2. Assign the sequence number for this node's stream, then write to WAL with origin
     //    and HLC (Requirement 2.1, 2.2). Each node numbers only its own stream, which is
     //    what makes (origin, sequence) comparable across a cluster.
-    stamp_sequence(delta, mm_config_.node_id);
+    stamp_sequence(delta, mm_config_.node_id, symbol_key);
     wal_.append_with_origin(delta, levels, mm_config_.node_id, hlc_ts);
 
     // 3. Update conflict resolver HLC for each level.
@@ -420,7 +421,8 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
 
     // The peer's number stays the peer's number: stamp_sequence() only assigns when the
     // record carries 0, which happens if the peer predates sequence numbering.
-    stamp_sequence(delta, origin_node_id);
+    stamp_sequence(delta, origin_node_id,
+                   std::string(delta.symbol) + "." + delta.exchange);
 
     OB_LOG_DEBUG("engine", "apply_remote_delta: origin=%u sym=%s exch=%s remote_hlc={%lu,%u,%u}",
                  origin_node_id, delta.symbol, delta.exchange,

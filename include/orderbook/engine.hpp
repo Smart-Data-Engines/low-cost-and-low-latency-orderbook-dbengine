@@ -358,7 +358,7 @@ private:
     /// are in WAL order. A delta arriving with a non-zero number keeps it: that number was
     /// minted by whoever originated the record, and renumbering it here would make catch-up
     /// compare numbers from different nodes.
-    void stamp_sequence(DeltaUpdate& delta, uint16_t origin);
+    void stamp_sequence(DeltaUpdate& delta, uint16_t origin, const std::string& key);
     ColumnarStore& get_or_create_store(const std::string& symbol, const std::string& exchange);
     void flush_loop();
 
