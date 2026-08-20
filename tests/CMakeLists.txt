@@ -46,6 +46,10 @@ ob_add_sequence_test(test_sequence_tracker
     test_sequence_tracker.cpp
 )
 
+ob_add_sequence_test(test_version_vector
+    test_version_vector.cpp
+)
+
 # ── Helper to register a test executable that needs the WAL library ──────────
 function(ob_add_wal_test name)
     add_executable(${name} ${ARGN})
@@ -207,6 +211,10 @@ ob_add_engine_test(test_wal_recovery
 
 ob_add_engine_test(test_sequence_numbers
     test_sequence_numbers.cpp
+)
+
+ob_add_engine_test(test_mm_dedup
+    test_mm_dedup.cpp
 )
 
 # ── Helper to register a test executable that needs the TCP server library ────

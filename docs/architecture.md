@@ -113,6 +113,48 @@ Not exposed on the wire: `format_query_response()` sends six columns and the seq
 among them, so a client cannot see it. Adding a column means changing both clients, the header line and
 the docs, which is roadmap #65.
 
+### How a node catches up after an outage
+
+A node that reconnects states **what it holds** and the peer sends the complement. It states it as a
+*version vector*: for each `(symbol, exchange, origin)`, the highest sequence number below which
+nothing is missing. Sequence numbers are minted per origin (see above), so they mean the same thing on
+every node that received them, and a hole in them is arithmetic.
+
+The entry is a **frontier, not a maximum**. A reconnecting peer can receive live record 7 before
+catch-up delivers 6, and a maximum would report 6 as delivered and never ask for it again. A record
+above the frontier is applied — data is data — but the frontier stays where it is, so the next
+exchange asks for that range again.
+
+One principle decides every edge case: **when unsure, ask for too much.** A missing entry, a peer that
+sent no vector, and a peer that could not fit its vector on the wire all mean the same thing to a
+sender: send everything retained. Over-delivery costs bandwidth; under-delivery is silent data loss.
+
+That principle only holds because the receiver drops what it already applied, by sequence number,
+before the WAL append. Two other mechanisms look like they would do it and do not: Last-Writer-Wins
+refuses a record whose HLC is not newer, but its state is in memory and does not survive a restart;
+and `ColumnarStore` refuses to merge a segment path already in the index, which hides a duplicate only
+while the re-flushed segment happens to cover the same timestamp range. Measured without the sequence
+check: four outage cycles storing 25 rows where 9 were written.
+
+The vector travels in a `WALRecordV2` envelope with `record_type = WAL_RECORD_VERSION_VECTOR`, which is
+also how it is written to the WAL so a restarted node knows what it holds. Reusing the record envelope
+means a node on the older protocol skips it as an unknown type instead of disconnecting; it then sends
+no vector of its own, and after a two-second grace window it is treated as holding nothing.
+
+What this replaced: catch-up used to compare the peer's WAL byte offset with the local one and stream
+from that offset in the *local* log. Every node writes its own records plus copies of foreign ones, so
+the same data yields different offsets — the two numbers had no common scale. Measured: a node
+reporting offset 846 against a local 870 was judged "behind by 24 bytes" and sent one empty checkpoint
+record, while the rows it had missed sat earlier in the log (roadmap #61).
+
+Two limits worth knowing. A node that joined an origin's stream in the middle — it saw sequence 5000
+before it ever saw 1 — keeps a frontier of 0 for that origin, because "everything up to here" cannot
+be claimed without having followed the stream from its start. It therefore keeps receiving
+redeliveries, and after a restart it can re-apply records whose numbers sit above its frontier, since
+only frontiers are persisted. Establishing a base for such a node is what snapshot bootstrap is for,
+and it is roadmap #67. The second limit is size: above 4096 entries the vector is not sent and not
+written down, and the node falls back to asking for everything.
+
 ### What the WAL guarantees after a crash
 
 With `FsyncPolicy::EVERY` (the default), a write that has been acknowledged is in a fsynced WAL

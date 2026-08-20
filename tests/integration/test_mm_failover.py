@@ -100,24 +100,19 @@ def test_a_dead_peer_is_reported_as_disconnected(healthy_mm_cluster):
         f"was killed")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="roadmap #61: catch-up decides what to send by comparing byte offsets in "
-           "two independent WALs. In multi-master each node writes its own records "
-           "and the remote ones it applies, so the same set of records yields "
-           "different offsets, and after an earlier outage the rejoining node can "
-           "look 'not behind' while still missing records. Measured: cycle 0 and 1 "
-           "recover, cycle 2 loses a row. Passes in isolation because a single "
-           "outage happens to line the offsets up favourably; the two tests above "
-           "have each already restarted this node. strict=True so the marker cannot "
-           "outlive the fix.")
 def test_a_restarted_node_catches_up_on_what_it_missed(healthy_mm_cluster):
-    """Rows written during an outage must reach the node that was away.
+    """Rows written during an outage must reach the node that was away — twice over.
 
-    This asserts the outcome, not the route: whether the data arrives through
-    catch-up streaming from a peer's WAL position or through re-broadcast is an
-    implementation detail, and the node's own data directory cannot be the source
-    because it was not running when these rows were written.
+    This asserts the outcome, not the route: whether the data arrives through catch-up
+    streaming or through re-broadcast is an implementation detail, and the node's own data
+    directory cannot be the source because it was not running when these rows were written.
+
+    Two outages, not one, because roadmap #61 survived a one-outage test for months. The
+    first reconnect happened to line the two nodes' byte offsets up favourably; the second
+    concluded "behind by 24 bytes", shipped one empty checkpoint record, and dropped
+    everything written during the outage. Row counts are exact, because the first fix
+    attempt traded the loss for duplicates — over-delivery is only harmless if the receiver
+    drops what it already has.
     """
     cluster = healthy_mm_cluster
     victim = cluster.nodes[2]
@@ -127,20 +122,25 @@ def test_a_restarted_node_catches_up_on_what_it_missed(healthy_mm_cluster):
     assert wait_for_prices(victim, "MMF-CATCHUP", [700_000]) == [700_000], (
         "the cluster was not converged before the test began")
 
-    cluster.kill_node(victim.index)
-    time.sleep(1.5)
+    expected = [700_000]
+    for cycle, prices in enumerate(([701_000, 702_000], [703_000, 704_000])):
+        cluster.kill_node(victim.index)
+        time.sleep(1.5)
 
-    # Written while the third node is not running.
-    write(writer, "MMF-CATCHUP", [701_000, 702_000], [2, 3])
-    time.sleep(1.0)
+        # Written while the third node is not running.
+        write(writer, "MMF-CATCHUP", prices, [2, 3])
+        expected.extend(prices)
+        time.sleep(1.0)
 
-    cluster.restart_node(victim.index)
+        cluster.restart_node(victim.index)
 
-    got = wait_for_prices(victim, "MMF-CATCHUP", [700_000, 701_000, 702_000],
-                          timeout=45)
-    assert got == [700_000, 701_000, 702_000], (
-        f"the restarted node holds {got}; rows written during its outage did not "
-        f"reach it")
+        got = wait_for_prices(victim, "MMF-CATCHUP", expected, timeout=45)
+        assert got == expected, (
+            f"outage {cycle}: the restarted node holds {got}, expected {expected} — rows "
+            f"written during its outage did not reach it")
+        assert len(got) == len(set(got)), (
+            f"outage {cycle}: the node holds duplicate rows ({got}), so catch-up is "
+            f"redelivering records the node already had and applying them twice")
 
 
 def test_the_mesh_reconverges_after_a_restart(healthy_mm_cluster):

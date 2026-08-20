@@ -114,18 +114,33 @@ TEST(SequenceTracker, TheFirstRecordFromAnOriginIsNotAGap) {
     EXPECT_EQ(t.high_water("LATE.EX", 7), 5000u);
 }
 
-TEST(SequenceTracker, ALateOutOfOrderRecordDoesNotDragTheHighWaterBack) {
+TEST(SequenceTracker, ARedeliveredRecordIsNotAGap) {
     ob::SequenceTracker t;
 
     t.observe("OOO.EX", 1, 1);
     t.observe("OOO.EX", 1, 2);
     t.observe("OOO.EX", 1, 3);
 
-    EXPECT_TRUE(t.observe("OOO.EX", 1, 2).gap) << "a repeat of 2 is not what was expected";
+    // Catch-up redelivers on purpose whenever it cannot prove the peer already has a record
+    // (#61's design principle: over-deliver rather than lose). Reporting those as gaps would
+    // put a GAP record in the WAL for every redelivered row and make the metric noise.
+    EXPECT_FALSE(t.observe("OOO.EX", 1, 2).gap)
+        << "a record at or below the frontier is a duplicate, not a hole";
     EXPECT_EQ(t.high_water("OOO.EX", 1), 3u)
-        << "the high-water mark went backwards, so every following record would be reported "
-           "as a gap for as long as the stream continues";
+        << "the maximum went backwards, so the next record would look like a gap";
+    EXPECT_EQ(t.frontier("OOO.EX", 1), 3u) << "a duplicate cannot move the frontier either";
     EXPECT_FALSE(t.observe("OOO.EX", 1, 4).gap);
+}
+
+TEST(SequenceTracker, TheRecordThatFillsAHoleIsNotItselfAGap) {
+    ob::SequenceTracker t;
+
+    t.observe("FILL.EX", 1, 1);
+    EXPECT_TRUE(t.observe("FILL.EX", 1, 3).gap) << "2 is missing, so this is a gap";
+    EXPECT_FALSE(t.observe("FILL.EX", 1, 2).gap)
+        << "2 is exactly what was missing; measuring gaps against the maximum instead of the "
+           "frontier would report the repair as a new hole";
+    EXPECT_EQ(t.frontier("FILL.EX", 1), 3u);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -160,19 +175,71 @@ TEST(SequenceTracker, RaiseLocalOnAnUnseenSymbolIsTheSameAsStartingThere) {
            "push it anywhere else either";
 }
 
-TEST(SequenceTracker, SeedRestoresStateWithoutReportingGaps) {
+TEST(SequenceTracker, SeedLeavesAConservativeFrontierAcrossAHoleInTheTail) {
     ob::SequenceTracker t;
 
-    // Replay of a WAL tail whose records already have numbers, including a hole that was
-    // recorded as a GAP when it first happened.
+    // Replay of a WAL tail with a hole. The hole may be real, or records 2-3 may be sitting
+    // in a segment where replay cannot see them — the tail only reaches back to the last
+    // checkpoint. The tracker cannot tell the difference, so it takes the conservative side:
+    // the frontier stops below the hole, the next catch-up asks for that range again, and a
+    // redelivery costs bandwidth. Claiming the records instead would be #61: a node stating
+    // it holds what it never received.
     t.seed("S.EX", 1, 1);
     t.seed("S.EX", 1, 4);
 
     EXPECT_EQ(t.high_water("S.EX", 1), 4u);
     EXPECT_EQ(t.peek_next_local("S.EX"), 5u);
-    EXPECT_FALSE(t.observe("S.EX", 1, 5).gap)
-        << "the record following a replayed tail was reported as a gap, so every restart "
-           "would invent one";
+    EXPECT_EQ(t.frontier("S.EX", 1), 1u)
+        << "the frontier crossed a hole it has no evidence for";
+    EXPECT_TRUE(t.observe("S.EX", 1, 5).gap)
+        << "a received record five past a frontier of one is a hole, and saying so is what "
+           "makes the range get requested again";
+}
+
+TEST(SequenceTracker, ANumberThisNodeAssignedIsNeverAGap) {
+    ob::SequenceTracker t;
+
+    // A remote hole holds the frontier down for that origin. The node's own writes must not
+    // be dragged into it: they are minted in order in the same critical section, so a GAP
+    // record per local insert would be noise. Origin 0 is the local one here.
+    t.observe("L.EX", 7, 1);
+    t.observe("L.EX", 7, 9);          // remote hole: frontier for origin 7 stays at 1
+    ASSERT_EQ(t.frontier("L.EX", 7), 1u);
+
+    for (int i = 0; i < 3; ++i) {
+        auto d = t.observe("L.EX", 0, 0);     // 0 = unassigned, so the tracker mints it
+        EXPECT_TRUE(d.assigned);
+        EXPECT_FALSE(d.gap) << "local write " << d.sequence_number << " was called a gap";
+    }
+}
+
+TEST(SequenceTracker, DeclareFrontierIsHowARestartedNodeStopsAccusingItself) {
+    ob::SequenceTracker t;
+
+    // What Engine::open() does: the counter comes back from the segments, and the node
+    // declares that its own records up to it are held — sound only for the local origin,
+    // which cannot be missing a record it minted and applied itself.
+    t.raise_local("D.EX", 40);
+    t.declare_frontier("D.EX", /*origin=*/0, 40);
+
+    EXPECT_EQ(t.frontier("D.EX", 0), 40u);
+    auto d = t.observe("D.EX", 0, 0);
+    EXPECT_EQ(d.sequence_number, 41u);
+    EXPECT_FALSE(d.gap);
+}
+
+TEST(SequenceTracker, DeclareFrontierDrainsWhatWasHeldAboveIt) {
+    ob::SequenceTracker t;
+
+    t.seed("DR.EX", 5, 10);
+    t.seed("DR.EX", 5, 11);
+    ASSERT_EQ(t.frontier("DR.EX", 5), 0u) << "nothing contiguous from 1 yet";
+
+    t.declare_frontier("DR.EX", 5, 9);
+    EXPECT_EQ(t.frontier("DR.EX", 5), 11u)
+        << "declaring up to 9 must absorb the 10 and 11 already held, or the frontier would "
+           "understate what is provably there";
+    EXPECT_EQ(t.above_frontier_size("DR.EX", 5), 0u);
 }
 
 TEST(SequenceTracker, SeedIgnoresRecordsFromBeforeNumbersExisted) {
@@ -183,4 +250,99 @@ TEST(SequenceTracker, SeedIgnoresRecordsFromBeforeNumbersExisted) {
     EXPECT_EQ(t.high_water("OLD.EX", 0), 0u)
         << "a zero is the absence of a number, not the number zero, and must not become an "
            "origin's high-water mark — the next real record would look like a gap";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Contiguous frontier (#61): "the highest number I saw" is not "everything up to here"
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(SequenceTracker, TheFrontierOnlyMovesThroughContiguousRecords) {
+    ob::SequenceTracker t;
+
+    t.observe("F.EX", 1, 1);
+    EXPECT_EQ(t.frontier("F.EX", 1), 1u);
+
+    // A live record arriving before catch-up delivers the one behind it. A maximum would
+    // call 2 delivered here, and 2 would never be asked for again — which is #61.
+    t.observe("F.EX", 1, 3);
+    EXPECT_EQ(t.frontier("F.EX", 1), 1u)
+        << "the frontier moved past a hole, so the missing record would never be requested";
+    EXPECT_EQ(t.high_water("F.EX", 1), 3u) << "the maximum is still tracked, for gap detection";
+
+    t.observe("F.EX", 1, 2);
+    EXPECT_EQ(t.frontier("F.EX", 1), 3u)
+        << "filling the hole must drain what was already held above the frontier, not just "
+           "advance by one";
+}
+
+TEST(SequenceTracker, AFrontierIsPerOriginAndPerSymbol) {
+    ob::SequenceTracker t;
+
+    t.observe("A.EX", 1, 1);
+    t.observe("A.EX", 2, 1);
+    t.observe("B.EX", 1, 1);
+    t.observe("A.EX", 1, 2);
+
+    EXPECT_EQ(t.frontier("A.EX", 1), 2u);
+    EXPECT_EQ(t.frontier("A.EX", 2), 1u);
+    EXPECT_EQ(t.frontier("B.EX", 1), 1u);
+    EXPECT_EQ(t.frontier("B.EX", 2), 0u) << "nothing was ever seen here, so nothing is held";
+}
+
+TEST(SequenceTracker, AnUnboundedHoleDoesNotGrowMemoryWithoutLimit) {
+    ob::SequenceTracker t;
+
+    // A peer that has been away for a long time can deliver a very long run above the
+    // frontier. Holding all of it is an optimisation, not a correctness requirement, so it
+    // is capped — and the frontier stays put, which only means asking for too much later.
+    for (uint64_t seq = 2; seq <= 6000; ++seq) t.observe("CAP.EX", 1, seq);
+
+    EXPECT_EQ(t.frontier("CAP.EX", 1), 0u) << "record 1 never arrived, so nothing is contiguous";
+    EXPECT_LE(t.above_frontier_size("CAP.EX", 1), 4096u)
+        << "the held set grew past its cap, so a long outage would grow memory unbounded";
+}
+
+TEST(SequenceTracker, SeedRestoresTheFrontierTooNotJustTheMaximum) {
+    ob::SequenceTracker t;
+
+    // Replay of a WAL tail after a restart: this is where the frontier has to come back
+    // from, because segments carry no origin and cannot answer "what do I have from whom".
+    t.seed("S.EX", 1, 1);
+    t.seed("S.EX", 1, 2);
+    t.seed("S.EX", 1, 4);
+
+    EXPECT_EQ(t.frontier("S.EX", 1), 2u)
+        << "the frontier came back as the maximum, so the hole at 3 would be treated as "
+           "delivered and never requested again";
+    EXPECT_EQ(t.high_water("S.EX", 1), 4u);
+}
+
+TEST(SequenceTracker, AFrontierStartsAtZeroMeaningNothingHeld) {
+    ob::SequenceTracker t;
+    EXPECT_EQ(t.frontier("NEW.EX", 7), 0u)
+        << "0 has to mean 'I have nothing from this origin', because that is what a peer "
+           "sends when it has never heard of it, and the answer must be 'send everything'";
+}
+
+TEST(SequenceTracker, HasSeenIsWhatMakesRedeliveryIdempotent) {
+    ob::SequenceTracker t;
+
+    t.observe("H.EX", 1, 1);
+    t.observe("H.EX", 1, 2);
+    t.observe("H.EX", 1, 5);        // out of order, held above the frontier
+
+    EXPECT_TRUE(t.has_seen("H.EX", 1, 1));
+    EXPECT_TRUE(t.has_seen("H.EX", 1, 2)) << "below the frontier";
+    EXPECT_FALSE(t.has_seen("H.EX", 1, 3)) << "the hole must read as not seen, or it is lost";
+    EXPECT_TRUE(t.has_seen("H.EX", 1, 5)) << "held above the frontier still counts as applied";
+    EXPECT_FALSE(t.has_seen("H.EX", 1, 6));
+    EXPECT_FALSE(t.has_seen("H.EX", 2, 1)) << "a different origin's numbering is unrelated";
+    EXPECT_FALSE(t.has_seen("OTHER.EX", 1, 1));
+}
+
+TEST(SequenceTracker, HasSeenSaysNoForAnUnassignedNumber) {
+    ob::SequenceTracker t;
+    EXPECT_FALSE(t.has_seen("H.EX", 1, 0))
+        << "0 means nobody assigned one, so it cannot have been seen; answering yes would "
+           "silently drop writes from an older node";
 }

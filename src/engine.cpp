@@ -56,13 +56,22 @@ void Engine::open() {
         size_t raised = 0;
         for (const auto& meta : combined_store_.index()) {
             if (meta.max_sequence_number == 0) continue;   // written before numbers existed
-            seq_tracker_.raise_local(meta.symbol + "." + meta.exchange,
-                                     meta.max_sequence_number);
+            const std::string key = meta.symbol + "." + meta.exchange;
+            seq_tracker_.raise_local(key, meta.max_sequence_number);
+            // Everything this node minted up to that number is held: it assigned and applied
+            // those records itself. Without saying so, a hole in a remote origin's stream
+            // would hold the frontier down and every local write after a restart would be
+            // reported as a gap.
+            seq_tracker_.declare_frontier(key, mm_config_.node_id, meta.max_sequence_number);
             ++raised;
         }
         OB_LOG_INFO("engine", "Sequence counters restored from segments: segments=%zu symbols=%zu",
                     raised, seq_tracker_.symbol_count());
     }
+
+    // What this node holds, from the last vector it wrote down. Before the tail replay, so
+    // the tail can only raise it.
+    restore_version_vector();
 
     // Replay the WAL tail — the records written after the last flush. Until this
     // existed, the replay callback was empty and every write acknowledged but not yet
@@ -203,6 +212,92 @@ void Engine::close() {
 
     // Flush WAL to disk.
     wal_.flush();
+}
+
+std::vector<SequenceTracker::VectorEntry> Engine::export_version_vector(std::size_t limit,
+                                                                       bool& truncated) const {
+    std::lock_guard<std::mutex> lock(vector_cache_mtx_);
+    truncated = vector_cache_truncated_ || vector_cache_.size() > limit;
+    if (truncated) {
+        OB_LOG_DEBUG("engine", "Version vector not exportable: cached=%zu limit=%zu",
+                     vector_cache_.size(), limit);
+        return {};
+    }
+    return vector_cache_;
+}
+
+void Engine::refresh_version_vector_cache() {
+    // Caller holds mtx_.
+    bool truncated = false;
+    auto entries = seq_tracker_.export_vector(kMaxPersistedVectorEntries, truncated);
+    {
+        std::lock_guard<std::mutex> lock(vector_cache_mtx_);
+        vector_cache_           = std::move(entries);
+        vector_cache_truncated_ = truncated;
+    }
+}
+
+void Engine::persist_version_vector_if_changed() {
+    // Caller holds mtx_ — this runs from flush_write_and_merge() inside the block that merges
+    // segments and appends the checkpoint. Taking mtx_ here instead deadlocked the flush
+    // thread against itself: std::mutex is not recursive, and the stack showed the flush
+    // thread waiting on a mutex it already held while every client write queued behind it.
+    const uint64_t fp = seq_tracker_.fingerprint();
+    if (fp == vector_fingerprint_written_) return;      // nothing moved
+
+    bool truncated = false;
+    auto entries = seq_tracker_.export_vector(kMaxPersistedVectorEntries, truncated);
+    refresh_version_vector_cache();
+
+    if (truncated) {
+        // Too many entries to write down. A node with that many symbols will relearn by
+        // over-asking after a restart, which costs traffic and drops duplicates.
+        OB_LOG_WARN("engine",
+                    "Version vector too large to persist (limit=%zu) — a restart will ask "
+                    "peers for more than it needs", kMaxPersistedVectorEntries);
+        vector_fingerprint_written_ = fp;
+        return;
+    }
+
+    const auto payload = serialize_version_vector(entries, /*truncated=*/false);
+    wal_.append_version_vector(payload.data(), payload.size());
+    vector_fingerprint_written_ = fp;
+
+    OB_LOG_DEBUG("engine", "Persisted version vector: entries=%zu bytes=%zu",
+                 entries.size(), payload.size());
+}
+
+void Engine::restore_version_vector() {
+    // Caller holds nothing: this runs from open() before the flush thread exists.
+    // A full pass, like the epoch restore: the vector is written next to a checkpoint, so
+    // replay_after_checkpoint() would usually skip it. Keep the last one seen.
+    std::vector<uint8_t> last;
+    WALReplayer replayer(base_dir_);
+    replayer.replay_v2([&last](const WALReplayContext& ctx) {
+        if (ctx.header.record_type != WAL_RECORD_VERSION_VECTOR) return;
+        last.assign(ctx.payload, ctx.payload + ctx.payload_len);
+    });
+
+    if (last.empty()) {
+        OB_LOG_INFO("engine", "No version vector in the WAL — this node will ask peers for "
+                              "everything they have");
+        return;
+    }
+
+    PeerVector own;
+    if (!own.deserialize(last.data(), last.size()) || own.truncated()) {
+        OB_LOG_WARN("engine", "Persisted version vector unusable — asking peers for everything");
+        return;
+    }
+
+    std::vector<SequenceTracker::VectorEntry> entries = own.entries();
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+        seq_tracker_.import_own_vector(entries);
+        vector_fingerprint_written_ = seq_tracker_.fingerprint();
+        refresh_version_vector_cache();   // safe: refresh does not touch mtx_
+    }
+    OB_LOG_INFO("engine", "Restored version vector from WAL: entries=%zu", entries.size());
 }
 
 void Engine::stamp_sequence(DeltaUpdate& delta, uint16_t origin, const std::string& key) {
@@ -419,10 +514,26 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
 
     std::unique_lock<std::mutex> lock(mtx_);
 
+    const std::string symbol_key = std::string(delta.symbol) + "." + delta.exchange;
+
+    // Drop what we already applied, before the WAL append and before any state changes.
+    // Catch-up over-delivers on purpose — it would rather send a record twice than lose it —
+    // and storage is append-only, so applying a duplicate appends its rows a second time.
+    // Measured without this check: four outage cycles turned 9 written rows into 25 stored
+    // ones, trading #61's data loss for #26's duplicates.
+    if (delta.sequence_number != 0 &&
+        seq_tracker_.has_seen(symbol_key, origin_node_id, delta.sequence_number)) {
+        OB_LOG_DEBUG("engine",
+                     "Dropping duplicate remote record: sym=%s origin=%u seq=%llu",
+                     symbol_key.c_str(), static_cast<unsigned>(origin_node_id),
+                     static_cast<unsigned long long>(delta.sequence_number));
+        registry_.increment_counter("ob_mm_duplicates_dropped");
+        return OB_OK;
+    }
+
     // The peer's number stays the peer's number: stamp_sequence() only assigns when the
     // record carries 0, which happens if the peer predates sequence numbering.
-    stamp_sequence(delta, origin_node_id,
-                   std::string(delta.symbol) + "." + delta.exchange);
+    stamp_sequence(delta, origin_node_id, symbol_key);
 
     OB_LOG_DEBUG("engine", "apply_remote_delta: origin=%u sym=%s exch=%s remote_hlc={%lu,%u,%u}",
                  origin_node_id, delta.symbol, delta.exchange,
@@ -1312,6 +1423,11 @@ void Engine::flush_write_and_merge() {
         wal_.append_checkpoint(static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count()));
+
+        // And what this node holds, so a restart does not have to relearn it. Written next to
+        // the checkpoint because that is where the WAL tail is cut: a vector after the last
+        // checkpoint is one the next replay would find anyway.
+        persist_version_vector_if_changed();
     }
 }
 

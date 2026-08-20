@@ -94,7 +94,7 @@ add_library(orderbook_soa STATIC src/soa_buffer.cpp)
 target_link_libraries(orderbook_soa PUBLIC orderbook_core)
 
 # ── Sequence tracker compiled library ─────────────────────────────────────────
-add_library(orderbook_sequence STATIC src/sequence_tracker.cpp)
+add_library(orderbook_sequence STATIC src/sequence_tracker.cpp src/version_vector.cpp)
 target_link_libraries(orderbook_sequence PUBLIC orderbook_core orderbook_logger)
 
 # ── WAL compiled library ───────────────────────────────────────────────────────

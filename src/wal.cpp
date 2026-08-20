@@ -246,6 +246,21 @@ void WALWriter::append_gap(uint64_t sequence_number, uint64_t timestamp_ns) {
     write_record(hdr, nullptr, 0);
 }
 
+void WALWriter::append_version_vector(const uint8_t* payload, size_t payload_len) {
+    WALRecord hdr{};
+    hdr.sequence_number = 0;
+    hdr.timestamp_ns    = 0;
+    hdr.checksum        = crc32c(payload, payload_len);
+    hdr.payload_len     = static_cast<uint16_t>(payload_len);
+    hdr.record_type     = WAL_RECORD_VERSION_VECTOR;
+    hdr._pad            = 0;
+
+    write_record(hdr, payload, payload_len, /*allow_fsync=*/false);
+
+    OB_LOG_DEBUG("wal", "Version vector appended (not fsynced): bytes=%zu file=%u offset=%zu",
+                 payload_len, current_file_index(), current_offset());
+}
+
 void WALWriter::append_checkpoint(uint64_t timestamp_ns) {
     WALRecord hdr{};
     hdr.sequence_number = 0;

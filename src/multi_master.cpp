@@ -6,6 +6,8 @@
 // Requirements: 4.1–4.8, 9.1–9.6
 
 #include "orderbook/multi_master.hpp"
+
+#include "orderbook/crc32c.hpp"
 #include "orderbook/engine.hpp"
 #include "orderbook/logger.hpp"
 
@@ -134,6 +136,14 @@ void encode_frame(const void* payload, size_t len, std::vector<uint8_t>& out) {
         const auto* pl = static_cast<const uint8_t*>(payload);
         out.insert(out.end(), pl, pl + len);
     }
+}
+
+/// Monotonic milliseconds. Used for the version-vector grace window; steady_clock because a
+/// wall-clock step must not shorten or extend it.
+static uint64_t now_ms() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
 int parse_frames(std::vector<uint8_t>& recv_buf,
@@ -656,6 +666,14 @@ void MultiMasterManager::io_loop() {
                 }
             }
         }
+
+        // epoll_wait above returns at least every 500 ms, so this runs regularly without a
+        // timer of its own: a peer that completed the handshake and never sent a version
+        // vector (protocol 1, or a version it could not state) must still get its catch-up.
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            start_overdue_catchups();
+        }
     }
 
     OB_LOG_DEBUG("mm", "io_loop exited");
@@ -998,6 +1016,24 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
                               ? static_cast<const void*>(data + MM_WALRECORD_V2_SIZE)
                               : nullptr;
 
+    if (hdr.record_type == WAL_RECORD_VERSION_VECTOR) {
+        // The peer told us what it holds. This is what replaced the byte-offset comparison
+        // that #61 was built on.
+        if (peer.peer_vector.deserialize(static_cast<const uint8_t*>(payload_ptr),
+                                         expected_payload_len)) {
+            OB_LOG_INFO("mm", "Peer %u version vector: entries=%zu truncated=%d",
+                        peer.node_id, peer.peer_vector.entry_count(),
+                        peer.peer_vector.truncated() ? 1 : 0);
+        } else {
+            OB_LOG_WARN("mm", "Peer %u sent an unusable version vector — sending everything",
+                        peer.node_id);
+        }
+        if (!peer.catchup_started) {
+            start_catchup_to_peer(peer);
+        }
+        return;
+    }
+
     // Remember what we last heard from this peer. PeerConnection::last_hlc is
     // reported by MM_PEERS, and before this it was written nowhere in the codebase:
     // one read site, zero write sites, so the hlc_timestamp column showed 0.0.0 for
@@ -1095,16 +1131,65 @@ void MultiMasterManager::process_handshake(PeerConnection& peer,
     OB_LOG_INFO("mm", "Handshake complete with peer %u: %s",
                 peer.node_id, msg.to_string().c_str());
 
-    // Check if peer is behind our WAL position — if so, start catch-up.
-    uint32_t local_file = wal_.current_file_index();
-    size_t local_offset = wal_.current_offset();
+    // No catch-up decision here any more. This is where #61 lived: the peer's WAL position
+    // was compared with ours, and two independent logs have no common scale — every node
+    // writes its own records plus copies of foreign ones, so the same data yields different
+    // offsets. Measured consequence: a node reporting offset 846 against a local 870 was
+    // judged "behind by 24 bytes" and sent one empty checkpoint record, while the rows it had
+    // missed sat earlier in the log.
+    //
+    // Instead we tell the peer what we hold, and wait for it to tell us the same. Catch-up
+    // starts when its vector arrives, or when MM_VV_GRACE_MS passes and we assume it holds
+    // nothing.
+    send_version_vector(peer);
+    peer.vector_deadline_ms = now_ms() + MM_VV_GRACE_MS;
+    peer.catchup_started    = false;
 
-    if (msg.wal_file_index < local_file ||
-        (msg.wal_file_index == local_file && msg.wal_byte_offset < local_offset)) {
-        OB_LOG_INFO("mm", "Peer %u is behind (peer: file=%u off=%lu, local: file=%u off=%zu) — starting catch-up",
-                    peer.node_id, msg.wal_file_index,
-                    static_cast<unsigned long>(msg.wal_byte_offset),
-                    local_file, local_offset);
+    if (msg.protocol_version < 2) {
+        OB_LOG_WARN("mm",
+                    "Peer %u speaks protocol %u, which does not send a version vector — it "
+                    "will receive everything retained in our WAL",
+                    peer.node_id, msg.protocol_version);
+    }
+}
+
+void MultiMasterManager::send_version_vector(PeerConnection& peer) {
+    bool truncated = false;
+    const auto entries = engine_.export_version_vector(MM_MAX_VV_ENTRIES, truncated);
+    const auto payload = serialize_version_vector(entries, truncated);
+
+    WALRecordV2 hdr{};
+    hdr.sequence_number = 0;
+    hdr.timestamp_ns    = 0;
+    hdr.checksum        = crc32c(payload.data(), payload.size());
+    hdr.payload_len     = static_cast<uint16_t>(payload.size());
+    hdr.record_type     = WAL_RECORD_VERSION_VECTOR;
+    hdr.version         = 1;
+    hdr.origin_node_id  = config_.node_id;
+    std::memset(hdr.hlc_data, 0, sizeof(hdr.hlc_data));
+
+    std::vector<uint8_t> frame;
+    frame.reserve(MM_WALRECORD_V2_SIZE + payload.size());
+    const auto* hdr_bytes = reinterpret_cast<const uint8_t*>(&hdr);
+    frame.insert(frame.end(), hdr_bytes, hdr_bytes + MM_WALRECORD_V2_SIZE);
+    frame.insert(frame.end(), payload.begin(), payload.end());
+
+    enqueue_frame(peer, frame.data(), frame.size());
+    OB_LOG_INFO("mm", "Sent version vector to peer %u: entries=%zu truncated=%d bytes=%zu",
+                peer.node_id, entries.size(), truncated ? 1 : 0, frame.size());
+}
+
+void MultiMasterManager::start_overdue_catchups() {
+    const uint64_t now = now_ms();
+    for (auto& [node_id, peer] : peers_) {
+        if (!peer.connected || !peer.handshake_done) continue;
+        if (peer.catchup_started || peer.catching_up) continue;
+        if (peer.vector_deadline_ms == 0 || now < peer.vector_deadline_ms) continue;
+
+        OB_LOG_WARN("mm",
+                    "Peer %u sent no version vector within %llu ms — treating it as holding "
+                    "nothing and sending everything retained",
+                    peer.node_id, static_cast<unsigned long long>(MM_VV_GRACE_MS));
         start_catchup_to_peer(peer);
     }
 }
@@ -1252,182 +1337,115 @@ void MultiMasterManager::reconnect_loop() {
 // ── Catch-up streaming (task 8.1) ─────────────────────────────────────────────
 
 void MultiMasterManager::start_catchup_to_peer(PeerConnection& peer) {
-    OB_LOG_INFO("mm", "Starting catch-up to peer %u from file=%u offset=%zu",
-                peer.node_id, peer.confirmed_file, peer.confirmed_offset);
-
-    peer.catching_up = true;
+    peer.catching_up    = true;
+    peer.catchup_started = true;
     peer.needs_snapshot = false;
 
-    uint32_t file_idx = peer.confirmed_file;
-    size_t   offset   = peer.confirmed_offset;
+    const PeerVector& pv = peer.peer_vector;
+    OB_LOG_INFO("mm",
+                "Starting catch-up to peer %u: vector entries=%zu received=%d truncated=%d",
+                peer.node_id, pv.entry_count(), pv.received() ? 1 : 0,
+                pv.truncated() ? 1 : 0);
 
-    const uint32_t local_file   = wal_.current_file_index();
-    const size_t   local_offset = wal_.current_offset();
+    // Read the whole retained WAL through the same parser everything else uses, and decide
+    // per record. Two things this deliberately does not do:
+    //
+    //   - it does not seek to a byte offset derived from the peer's position. That was #61:
+    //     the offsets belong to different logs, and a seek into the middle of a record reads
+    //     a header out of payload bytes.
+    //   - it does not restrict itself to records this node originated. If the peer is missing
+    //     records from a third origin that is currently unreachable, we have them and it does
+    //     not, so we send them. That is what makes this a version vector rather than a
+    //     per-link cursor.
+    uint64_t scanned = 0, sent = 0, skipped_have = 0, skipped_type = 0;
+    size_t bytes_sent = 0, bytes_scanned = 0;
 
-    OB_LOG_INFO("mm", "Catch-up: peer %u position={file=%u, off=%zu}, local position={file=%u, off=%zu}",
-                peer.node_id, file_idx, offset, local_file, local_offset);
+    WALReplayer replayer(wal_.dir());
+    replayer.replay_v2([&](const WALReplayContext& ctx) {
+        ++scanned;
+        bytes_scanned += MM_WALRECORD_V2_SIZE + ctx.payload_len;
 
-    // Helper lambda: build WAL file path for a given index.
-    auto wal_path = [&](uint32_t idx) -> std::string {
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "wal_%06u.bin", idx);
-        return wal_.dir() + "/" + buf;
-    };
+        if (peer.needs_snapshot) return;                       // backpressure already gave up
 
-    // Stream WAL records from peer's confirmed position to current position.
-    while (file_idx < local_file ||
-           (file_idx == local_file && offset < local_offset)) {
-
-        std::string path = wal_path(file_idx);
-        int fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) {
-            // WAL file doesn't exist (rotated away) → trigger snapshot sync.
-            OB_LOG_WARN("mm", "Catch-up: WAL file %s not found (rotated?) — needs snapshot for peer %u",
-                        path.c_str(), peer.node_id);
+        // This scan runs on the io_loop thread, which also carries live traffic to every other
+        // peer. Measured on machine B: 94 MB/s, so a 1 GB WAL would stall the loop for about
+        // ten seconds. A catch-up that has to read more than the send-buffer ceiling is a
+        // snapshot, not a catch-up.
+        if (bytes_scanned > config_.max_catchup_bytes) {
+            OB_LOG_WARN("mm",
+                        "Catch-up scan for peer %u exceeded %zu bytes — falling back to "
+                        "snapshot sync instead of holding the io_loop",
+                        peer.node_id, config_.max_catchup_bytes);
             peer.needs_snapshot = true;
-            peer.catching_up = false;
+            peer.send_buf.clear();
+            return;
+        }
+        if (ctx.header.record_type != WAL_RECORD_DELTA) {       // GAP, EPOCH, CHECKPOINT, vector
+            ++skipped_type;
+            return;
+        }
+        if (ctx.payload_len < sizeof(DeltaUpdate)) {
+            ++skipped_type;
             return;
         }
 
-        // Seek to the starting offset within this file.
-        if (offset > 0) {
-            if (::lseek(fd, static_cast<off_t>(offset), SEEK_SET) < 0) {
-                OB_LOG_WARN("mm", "Catch-up: lseek failed on %s offset=%zu — needs snapshot for peer %u",
-                            path.c_str(), offset, peer.node_id);
-                ::close(fd);
-                peer.needs_snapshot = true;
-                peer.catching_up = false;
-                return;
-            }
+        DeltaUpdate delta{};
+        std::memcpy(&delta, ctx.payload, sizeof(DeltaUpdate));
+        const std::string key = std::string(delta.symbol) + "." + delta.exchange;
+
+        // 0 for anything the peer never mentioned, which reads as "it holds nothing here".
+        const uint64_t peer_frontier = pv.wants_everything()
+                                       ? 0
+                                       : pv.frontier_for(key, ctx.origin_node_id);
+        if (ctx.header.sequence_number <= peer_frontier) {
+            ++skipped_have;
+            return;
         }
 
-        // Determine the end position for this file.
-        size_t end_offset = (file_idx == local_file) ? local_offset : SIZE_MAX;
+        // Rebuild the V2 header for the wire: the replay context carries the legacy header
+        // plus the origin and HLC that the V2 envelope needs.
+        WALRecordV2 hdr{};
+        hdr.sequence_number = ctx.header.sequence_number;
+        hdr.timestamp_ns    = ctx.header.timestamp_ns;
+        hdr.checksum        = ctx.header.checksum;
+        hdr.payload_len     = static_cast<uint16_t>(ctx.payload_len);
+        hdr.record_type     = WAL_RECORD_DELTA;
+        hdr.version         = 1;
+        hdr.origin_node_id  = ctx.origin_node_id;
+        ctx.hlc.serialize(hdr.hlc_data);
 
-        // Read records sequentially from this WAL file.
-        // WAL files contain mixed V1 (24B header) and V2 (38B header) records.
-        while (true) {
-            // Check current position.
-            off_t cur_pos = ::lseek(fd, 0, SEEK_CUR);
-            if (cur_pos < 0) break;
+        std::vector<uint8_t> frame;
+        frame.reserve(MM_WALRECORD_V2_SIZE + ctx.payload_len);
+        const auto* hdr_bytes = reinterpret_cast<const uint8_t*>(&hdr);
+        frame.insert(frame.end(), hdr_bytes, hdr_bytes + MM_WALRECORD_V2_SIZE);
+        frame.insert(frame.end(), ctx.payload, ctx.payload + ctx.payload_len);
 
-            // If we're in the current file and reached the local offset, done with this file.
-            if (file_idx == local_file &&
-                static_cast<size_t>(cur_pos) >= end_offset) {
-                break;
-            }
+        enqueue_frame(peer, frame.data(), frame.size());
+        ++sent;
+        bytes_sent += frame.size();
 
-            // Read the first 24 bytes (common to V1 and V2).
-            WALRecord v1_hdr{};
-            ssize_t n = ::read(fd, &v1_hdr, sizeof(WALRecord));
-            if (n == 0) {
-                // EOF — move to next file.
-                break;
-            }
-            if (n != static_cast<ssize_t>(sizeof(WALRecord))) {
-                // Truncated header — end of valid data.
-                OB_LOG_DEBUG("mm", "Catch-up: truncated WAL header in %s — ending file",
-                             path.c_str());
-                break;
-            }
+        OB_LOG_DEBUG("mm",
+                     "Catch-up: sent %s origin=%u seq=%lu (peer had %lu) to peer %u",
+                     key.c_str(), ctx.origin_node_id,
+                     static_cast<unsigned long>(ctx.header.sequence_number),
+                     static_cast<unsigned long>(peer_frontier), peer.node_id);
 
-            // Check version field (_pad in V1, version in V2).
-            // In V1: _pad is always 0 and version concept doesn't exist.
-            // In V2: version=1 means extended header.
-            uint8_t version = v1_hdr._pad;  // _pad field is at the same offset as version
+        check_backpressure(peer);
+    });
 
-            WALRecordV2 hdr{};
-            hdr.sequence_number = v1_hdr.sequence_number;
-            hdr.timestamp_ns = v1_hdr.timestamp_ns;
-            hdr.checksum = v1_hdr.checksum;
-            hdr.payload_len = v1_hdr.payload_len;
-            hdr.record_type = v1_hdr.record_type;
-            hdr.version = version;
-            hdr.origin_node_id = 0;
-            std::memset(hdr.hlc_data, 0, 12);
+    // These numbers are the whole point of the log line: a catch-up that sends nothing looks
+    // identical to one that had nothing to send, and #61 lived in exactly that ambiguity.
+    OB_LOG_INFO("mm",
+                "Catch-up to peer %u finished: scanned=%llu (%zu bytes) sent=%llu "
+                "skipped_peer_has=%llu skipped_type=%llu bytes_sent=%zu snapshot_needed=%d",
+                peer.node_id,
+                static_cast<unsigned long long>(scanned), bytes_scanned,
+                static_cast<unsigned long long>(sent),
+                static_cast<unsigned long long>(skipped_have),
+                static_cast<unsigned long long>(skipped_type),
+                bytes_sent, peer.needs_snapshot ? 1 : 0);
 
-            if (version >= 1) {
-                // Read the remaining 14 bytes of V2 header.
-                uint8_t ext[14];
-                ssize_t ext_n = ::read(fd, ext, 14);
-                if (ext_n != 14) {
-                    OB_LOG_DEBUG("mm", "Catch-up: truncated V2 extension in %s — ending file",
-                                 path.c_str());
-                    break;
-                }
-                std::memcpy(&hdr.origin_node_id, ext, 2);
-                std::memcpy(hdr.hlc_data, ext + 2, 12);
-            }
-
-            // Read payload.
-            std::vector<uint8_t> payload(hdr.payload_len);
-            if (hdr.payload_len > 0) {
-                size_t remaining = hdr.payload_len;
-                uint8_t* ptr = payload.data();
-                while (remaining > 0) {
-                    ssize_t r = ::read(fd, ptr, remaining);
-                    if (r <= 0) {
-                        // Truncated payload — end of valid data.
-                        OB_LOG_DEBUG("mm", "Catch-up: truncated WAL payload in %s — ending file",
-                                     path.c_str());
-                        goto done_file;
-                    }
-                    ptr += r;
-                    remaining -= static_cast<size_t>(r);
-                }
-            }
-
-            // Only stream DELTA records to the peer (skip GAP, EPOCH, ROTATE).
-            if (hdr.record_type != WAL_RECORD_DELTA) {
-                OB_LOG_DEBUG("mm", "Catch-up: skipping non-DELTA record type=%u seq=%lu in %s",
-                             hdr.record_type, static_cast<unsigned long>(hdr.sequence_number),
-                             path.c_str());
-                continue;
-            }
-
-            {
-                // Build frame payload: WALRecordV2 header (38B) + payload.
-                // Always send as V2 format to the peer.
-                std::vector<uint8_t> frame_payload;
-                frame_payload.reserve(MM_WALRECORD_V2_SIZE + hdr.payload_len);
-
-                const auto* hdr_bytes = reinterpret_cast<const uint8_t*>(&hdr);
-                frame_payload.insert(frame_payload.end(), hdr_bytes,
-                                     hdr_bytes + MM_WALRECORD_V2_SIZE);
-                if (hdr.payload_len > 0) {
-                    frame_payload.insert(frame_payload.end(),
-                                         payload.data(),
-                                         payload.data() + hdr.payload_len);
-                }
-
-                enqueue_frame(peer, frame_payload.data(), frame_payload.size());
-                OB_LOG_DEBUG("mm", "Catch-up: sent DELTA seq=%lu (%u bytes payload) to peer %u",
-                             static_cast<unsigned long>(hdr.sequence_number),
-                             hdr.payload_len, peer.node_id);
-            }
-
-            // Check backpressure after each record.
-            check_backpressure(peer);
-            if (peer.needs_snapshot) {
-                // Backpressure triggered — abort catch-up.
-                ::close(fd);
-                return;  // catching_up already set to false by check_backpressure
-            }
-        }
-
-    done_file:
-        ::close(fd);
-
-        // Move to the next WAL file.
-        file_idx++;
-        offset = 0;  // Start from beginning of next file.
-    }
-
-    // Catch-up complete.
     peer.catching_up = false;
-    OB_LOG_INFO("mm", "Catch-up to peer %u complete (reached file=%u offset=%zu). "
-                "send_buf size=%zu bytes",
-                peer.node_id, local_file, local_offset, peer.send_buf.size());
 }
 
 // ── Backpressure check (task 11.1) ────────────────────────────────────────────

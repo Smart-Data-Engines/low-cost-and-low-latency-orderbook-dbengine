@@ -493,6 +493,10 @@ codebase. Each item is also a story we can sell as bespoke work.
 - Effort: M | Impact: Required before anyone runs this longer than one release
 
 ### 57. Complete the anti-entropy implementation
+- Since #61 the mechanism it needs exists: reconciliation is a periodic version-vector exchange, and
+  the repair path is the same filtered stream catch-up uses. `GapInfo` still describes gaps as WAL file
+  and byte offsets, which is the model #61 disproved, so it has to be reshaped to
+  `(symbol, origin, from_seq, to_seq)`. The snapshot-repair stub belongs with #67.
 - `AntiEntropyManager` runs, logs and reports metrics, but its three working methods are
   placeholders: `detect_gaps()` always returns an empty list, `repair_gap()` returns false, and
   `trigger_snapshot_repair()` does nothing. The scheduler around them is real; the reconciliation
@@ -590,47 +594,94 @@ becomes a lie.
 - Effort: S-M | Impact: An advertised HA operation currently cannot be performed on a real deployment
 
 
-### 61. Multi-master catch-up compares WAL offsets across independent WALs (P0)
+### 61. Multi-master catch-up compared WAL offsets across independent WALs ✅
 
-A node that rejoins a multi-master cluster catches up on the first outage and silently stops catching
-up on later ones. Measured on three nodes, killing and restarting the same node three times, writing
-one row before and one row during each outage:
-
-| Cycle | Rows on the restarted node | Expected |
-|-------|----------------------------|----------|
-| 0 | 2 | 2 |
-| 1 | 4 | 4 |
-| 2 | **5** | 6 |
-
-The row written during the third outage never arrives. No error is reported anywhere, on either node.
-
-The mechanism is in the handshake. `handle_handshake()` decides whether to stream:
+A node that rejoined after an outage caught up once and then silently stopped. Reproduced with a
+purpose-built three-node harness that logs to files, because the integration fixture keeps node stdout
+in a pipe and the catch-up decision is invisible there:
 
 ```
-Peer 3 is behind (peer: file=0 off=450, local: file=0 off=600) — starting catch-up
+cycle 0: node2 has 3/3 — OK
+cycle 1: node2 has 3/5 — LOSES [720000, 721000]
+  writer has: [700000, 710000, 711000, 720000, 721000]
 ```
 
-That comparison is between **byte offsets in two independent WALs**. In multi-master every node writes
-its own local records *and* the remote records it applies, in whatever order they arrive, so the same
-logical set of records produces different offsets on different nodes. After a couple of outages the
-rejoining node's offset can equal or exceed the peer's while it is still missing records the peer has,
-and the peer concludes there is nothing to send. Catch-up working at all on the first outage is
-coincidence, not design: the offsets happened to line up in the useful direction.
+The logs gave the mechanism rather than the symptom:
 
-Byte offsets cannot express "which records does this node not have". That needs per-record identity —
-`(origin_node_id, sequence_number)` is already carried in `WALRecordV2`, or the HLC — compared as a set
-rather than as a scalar position.
+```
+cycle 0: Peer 3 is behind (peer: file=0 off=174, local: file=0 off=522) — starting catch-up
+cycle 1: Peer 3 is behind (peer: file=0 off=846, local: file=0 off=870) — starting catch-up
+```
 
-There is no second line of defence: `AntiEntropyManager` (#57) is supposed to detect and repair exactly
-this, and `detect_gaps()` returns an empty list unconditionally. So the two defects compound —
-reconciliation is the mechanism that would have caught the flawed comparison, and it does nothing.
+In cycle 0 the stream started at byte 174 of the *local* WAL and happened to land on a record boundary,
+so everything arrived by luck. In cycle 1 the peer reported 846 against a local 870, so the node
+concluded "behind by 24 bytes" and shipped the last 24 — exactly one empty `CHECKPOINT` record from
+#62 — while the rows written during the outage sat earlier in the log. The two offsets have no common
+scale: every node writes its own records plus copies of foreign ones. #62 made the drift faster by
+adding checkpoints, and `AntiEntropyManager` (#57), the only second line of defence, is a stub.
 
-`tests/integration/test_mm_failover.py::test_a_restarted_node_catches_up_on_what_it_missed` is marked
-`xfail(strict=True)`: it fails on the current server and will turn the suite red as soon as the fix
-lands, so the marker cannot outlive the defect.
+**The fix** replaces the position comparison with a version vector: for each
+`(symbol, exchange, origin)`, the highest sequence number below which nothing is missing. Sequence
+numbers exist since #64 and are dense within an origin's stream, so a hole is arithmetic — which is why
+this could not be fixed before #64 landed. Details in [architecture.md](architecture.md); the parts
+that took measuring:
 
-- Effort: M | Impact: Silent data loss on a rejoining node, in the topology the engine advertises for
-  write scalability
+- **The entry is a frontier, not a maximum.** A peer can receive live record 7 before catch-up delivers
+  6, and a maximum would report 6 as delivered. Records above the frontier are applied but do not move
+  it.
+- **Over-delivery is not free, which the design assumed it was.** Streaming everything a peer might
+  lack turned #61's data loss into #26's duplicate rows: four outage cycles stored 25 rows where 9 were
+  written. Storage is append-only, and the two mechanisms that look like they would prevent this do
+  not — Last-Writer-Wins keeps its HLC state in memory and loses it on restart, and the columnar
+  store's refusal to merge a duplicate segment path only hides a duplicate while the re-flushed segment
+  covers the same timestamp range. The receiver now drops a record it has already applied, by sequence
+  number, before the WAL append.
+- **The vector has to survive a restart**, or every restart triggers a redelivery the node cannot
+  recognise. It is written to the WAL as record type 7 next to the checkpoint, only when a frontier
+  moved, and without fsync — losing it means restoring a lower frontier, which asks for too much.
+- **Reusing the `WALRecordV2` envelope** for the vector means a node on protocol 1 skips it as an
+  unknown record type instead of disconnecting, and after a two-second grace window it is treated as
+  holding nothing.
+
+**Found on the way:** serving the vector from the tracker under the engine mutex deadlocked the flush
+thread against itself — `persist_version_vector_if_changed()` runs inside the block that already holds
+`mtx_`, and `std::mutex` is not recursive. The thread stacks showed the flush thread waiting on a mutex
+it held while every client write queued behind it. `sudo gdb -p <pid> -batch -ex "thread apply all bt"`
+is how that was found in two minutes instead of by guessing; ptrace_scope blocks it without sudo.
+
+Verified: 4 outage cycles with exact row counts (no losses, no duplicates), the integration test
+extended to two outages because one passed for months while the defect was live, 5 dedup tests, 12
+tracker tests for the frontier, 7 serialisation tests. Four mutations red — frontier as a maximum,
+catch-up filter off by one, no receive-side dedup, vector not restored at startup. The dedup mutation
+took three attempts to catch: LWW masked it, then the segment-path refusal masked it, which is
+pitfall 37 twice in one afternoon.
+
+`test_a_restarted_node_catches_up_on_what_it_missed` lost its `xfail(strict=True)` marker: it went
+XPASS the moment the fix landed, which is what strict was for.
+
+- Spec: `kiro-workspace/specs/mm-version-vector-catchup/`
+
+### 67. A node that joins an origin's stream mid-way never establishes a frontier
+
+Found while writing #61's dedup tests, and worth its own item because the fix is a different mechanism.
+
+The frontier means "I have everything from this origin up to here", so it can only leave zero if the
+node followed the stream from its first record. A node that joins a cluster later, or whose peer no
+longer retains the early records, sees sequence 5000 before it ever sees 1 — and cannot honestly claim
+1-4999. Consequences, both bounded: it exports no entry for that origin, so peers keep sending it
+records it already has; and because only frontiers are persisted, a restart loses the held set above
+the frontier, so those redeliveries are applied again and duplicate rows.
+
+The mechanism that fits is the one already in the codebase for this: snapshot bootstrap. A snapshot
+carries the sender's state, so the receiver may legitimately declare frontiers from it — which is also
+what `AntiEntropyManager::trigger_snapshot_repair()` is a stub for today (#57).
+
+Not urgent: every node in a cluster that grew together follows its peers' streams from the start, and
+the duplicate window is bounded by the 4096-entry held set. It matters when a node is added to a
+running cluster.
+
+- Effort: M | Impact: A late-joining node keeps receiving redeliveries and can store duplicate rows
+  after a restart
 
 ### 62. The WAL was written, fsynced, and never read back ✅
 
