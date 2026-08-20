@@ -145,3 +145,20 @@ up agreeing with the node that stayed up.
 ## C++ Client Tests
 
 The `test_cpp_client.py` module runs the `ob_integration_test` binary (built by CMake with `-DOB_BUILD_TESTS=ON`). If the binary is not found in `build/tests/`, all C++ tests are automatically skipped with an informational message — no error is raised.
+
+
+## When the suite says rows are missing but not why
+
+`scripts/mm_harness.py` runs three multi-master nodes with each node's log on disk, kills one in a
+loop, and checks exact row counts after every restart. The fixtures here keep node stdout in a pipe,
+which is fine until the thing you need is the line where the engine decided what to send — that is how
+roadmap #61 stayed hidden while a single-outage test passed.
+
+```bash
+MMH_CYCLES=4 python3 scripts/mm_harness.py     # logs under /tmp/ob_mm_harness
+```
+
+It repeats the outage on purpose: #61 recovered on the first reconnect by luck and lost rows from the
+second one on. It also counts duplicates, because the first attempt at fixing that defect replaced
+missing rows with duplicated ones, and a check that only looks for absent values calls that a pass.
+On a hang it dumps thread stacks with `sudo gdb`, which has twice named a lock problem in seconds.

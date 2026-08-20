@@ -976,5 +976,5 @@ absolute thresholds for a designated benchmark host.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 615 | all passing, ~142s with `ctest -j1` on machine B (592 on master, 23 more with #64) |
-| Python integration | 113 | passing, plus 2 skipped and 2 `xfail(strict=True)` for #60 and #61; ~3.7 min |
+| C++ (GTest + RapidCheck) | 640 | all passing, ~149s with `ctest -j1` on machine B |
+| Python integration | 117 | passing, plus 2 skipped and 1 `xfail(strict=True)` for #60; ~3 min |
