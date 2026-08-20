@@ -93,6 +93,10 @@ target_compile_features(orderbook_core INTERFACE cxx_std_20)
 add_library(orderbook_soa STATIC src/soa_buffer.cpp)
 target_link_libraries(orderbook_soa PUBLIC orderbook_core)
 
+# ── Sequence tracker compiled library ─────────────────────────────────────────
+add_library(orderbook_sequence STATIC src/sequence_tracker.cpp)
+target_link_libraries(orderbook_sequence PUBLIC orderbook_core orderbook_logger)
+
 # ── WAL compiled library ───────────────────────────────────────────────────────
 add_library(orderbook_wal STATIC src/wal.cpp)
 target_link_libraries(orderbook_wal PUBLIC orderbook_core orderbook_epoch orderbook_hlc)
@@ -203,7 +207,7 @@ target_link_libraries(orderbook_query PUBLIC orderbook_columnar orderbook_agg or
 
 # ── Engine facade compiled library ────────────────────────────────────────────
 add_library(orderbook_engine STATIC src/engine.cpp src/replication.cpp)
-target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression orderbook_metrics orderbook_logger orderbook_multi_master)
+target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression orderbook_metrics orderbook_logger orderbook_multi_master orderbook_sequence)
 
 # ── C API compiled library ────────────────────────────────────────────────────
 add_library(orderbook_capi STATIC src/c_api.cpp)

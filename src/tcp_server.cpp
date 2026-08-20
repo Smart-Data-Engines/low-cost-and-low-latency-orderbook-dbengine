@@ -108,7 +108,10 @@ std::string execute_command(const Command& cmd,
             DeltaUpdate delta{};
             std::strncpy(delta.symbol,   a.symbol.c_str(),   sizeof(delta.symbol)   - 1);
             std::strncpy(delta.exchange, a.exchange.c_str(), sizeof(delta.exchange) - 1);
-            delta.sequence_number = 0; // server-assigned; engine handles sequencing
+            // 0 means "unassigned": Engine::stamp_sequence() gives this write the next
+            // number for its symbol. The comment here used to claim the engine handled
+            // sequencing while nothing did, so every stored row carried a zero.
+            delta.sequence_number = 0;
             delta.timestamp_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::system_clock::now().time_since_epoch())
@@ -170,7 +173,7 @@ std::string execute_command(const Command& cmd,
             DeltaUpdate delta{};
             std::strncpy(delta.symbol,   a.symbol.c_str(),   sizeof(delta.symbol)   - 1);
             std::strncpy(delta.exchange, a.exchange.c_str(), sizeof(delta.exchange) - 1);
-            delta.sequence_number = 0;
+            delta.sequence_number = 0;   // unassigned; the engine numbers it (see INSERT above)
             delta.timestamp_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::system_clock::now().time_since_epoch())

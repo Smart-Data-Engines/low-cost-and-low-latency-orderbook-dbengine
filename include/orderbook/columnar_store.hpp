@@ -30,6 +30,11 @@ struct SegmentMeta {
     uint64_t row_count;     ///< number of rows stored
     uint64_t first_price;   ///< absolute price anchor for delta decoding (zigzag-encoded)
     bool     has_raw_qty;   ///< true if any qty used raw uint64 fallback
+    uint64_t max_sequence_number{0};  ///< highest sequence number in this segment; 0 in
+                                      ///< segments written before numbers were assigned,
+                                      ///< which is the truth about that data. Read at
+                                      ///< startup so the next number cannot repeat one
+                                      ///< already durable.
     std::string symbol;     ///< symbol this segment belongs to
     std::string exchange;   ///< exchange this segment belongs to
     std::string dir_path;   ///< full path to the segment directory

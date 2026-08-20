@@ -722,6 +722,109 @@ Two ways out, and the second is the honest one:
 - Effort: M | Impact: One lost row per occurrence on a multi-master node, in a window that only opens
   on an unclean stop. Correctness of a guard that currently rests on an unstated assumption
 
+### 64. Nobody assigned the sequence numbers, so three mechanisms were switched off by a zero
+
+Found while working out what #61 needs in order to be fixable at all.
+
+`src/tcp_server.cpp` set `delta.sequence_number = 0` with the comment
+`// server-assigned; engine handles sequencing`. The engine assigned nothing: it copied the value into
+the WAL header and the stored row. Every write that ever came in over the network carried **0**, and the
+comment was worse than no comment, because it told the reader the layer below handled it.
+
+What that silently disabled:
+
+- **Gap detection never fired.** `apply_delta()` in `src/soa_buffer.cpp` tests
+  `prev_seq != 0 && update.sequence_number != prev_seq + 1`, and `prev_seq` is whatever the last write
+  stored, which was always 0.
+- **`append_gap()` was dead code.** The `GAP` record is as old as the WAL format, has a unit test, and
+  had never been produced by a running server.
+- **The `sequence_number` column in every segment was zeros**, so it was space in the format rather than
+  data — the same shape of defect as #25, where segments silently dropped the order side.
+- **#61 had nothing to be fixed on.** A `(origin_node_id, sequence_number)` version vector needs a
+  sequence number to exist.
+
+The interesting part is that the missing assignment was a *symptom*. A single counter per SoA buffer
+cannot express per-origin sequencing: in multi-master, records from two origins land in the same field,
+so every interleave would be reported as a gap. That is why the mechanism was switched off by a zero
+rather than merely forgotten, and why the fix is not "fill the field in".
+
+**The fix.** `SequenceTracker` (`src/sequence_tracker.cpp`) holds, per symbol, a local counter and the
+last number seen from each origin. `Engine::stamp_sequence()` assigns when the number is 0 and passes a
+non-zero one through untouched — the discriminator has to be the value, not the caller, because the
+replica path shares `apply_delta()` with client writes and must keep the primary's numbering. Gaps are
+decided per origin, append a `GAP`, increment `ob_sequence_gaps_detected` and log symbol, origin and the
+expected number. Counters are restored at startup from `SegmentMeta::max_sequence_number` (new field in
+`meta.json`; absent means 0, which is the truth about older data) and from the WAL tail replayed by #62,
+both of which only raise. Replay seeds the tracker instead of assigning, so a gap recorded once is not
+re-reported on every restart.
+
+**Found on the way:** `Engine::apply_remote_delta()` dereferenced `hlc_` and `mm_mgr_` with no null
+check, so calling it on a node without multi-master dumped core. Unreachable through the server — only
+`MultiMasterManager` calls it — but it is a public method on a library type, and a test that called it
+found out the hard way. It now answers `OB_ERR_INVALID_ARG`.
+
+Verified: 14 unit tests on the tracker, 9 on the engine (numbers in the WAL read back through a replayer
+rather than a getter), 3 integration tests that read `meta.json` from a real server's data directory,
+four mutations red — assigning over a supplied number, one high-water mark for all origins, no restore
+from `meta.json`, and replay assigning instead of seeding. 615 C++ tests green, 142 s.
+
+**Performance, and what the control benchmark actually caught.** Eight interleaved rounds on machine B
+(order reversed each round, pinned with `taskset`), compared **pairwise** — the ratio within a round,
+because slow thermal drift moves both arms together and cancels in a ratio. Medians: ingestion +3.0%
+(7 of 8 rounds positive), update p50 +1.0% (signs random). Then the control: `BM_VwapLatency`, a read
+path this change cannot touch, came out **-40.6% in 8 of 8 rounds**. `objdump` on both binaries puts
+the benchmark function at the same address (`0xc02f`, mod 32 = 15) with the same 21 instructions,
+differing only in the call offsets to `_M_dispose`. So that is binary layout, the pitfall `bench-guard`
+documents at ±37% on this very benchmark — which means a few-percent signal from the engine benchmark
+on this machine is not evidence of anything.
+
+So the cost was measured directly instead, on the mechanism: `SequenceTracker::observe()` is
+**54.4 ns** per call (one string-keyed lookup plus one origin-keyed lookup) and building a
+`"SYMBOL.EXCHANGE"` key is **27.0 ns** (allocation plus concatenation). Net against master is
+**~27 ns per write, about 1% of a 2883 ns ingestion op**, because the change also removed one of the
+two key builds per write: `apply_delta()` built it once for the migrated-symbol check and again in
+`stamp_sequence()`, and now builds it once and passes it down.
+
+- Status: **DONE**
+- Spec: `kiro-workspace/specs/wal-sequence-numbers/`
+
+### 66. The write path builds the same key string three times
+
+Measured while benchmarking #64, and worth its own item because the numbers are known and the fix is
+not free.
+
+Every write builds `"SYMBOL.EXCHANGE"` and looks it up more than once: `apply_delta()` builds it for
+the migrated-symbol check (and after #64 passes that one down), `get_or_create_buffer()` takes
+`std::string` parameters by value and concatenates again — two temporaries plus the result — and
+`SequenceTracker` keeps its own map keyed by the same string. Measured on machine B: 27.0 ns per key
+construction, 54.4 ns for the tracker's `observe()`.
+
+Unifying per-symbol state into a single map — buffer, sequence counter and origin high-water marks
+under one key — would leave one lookup and no extra allocations per write, and would very likely come
+out *ahead* of master rather than level with it. This was the original shape in #64's design and was
+deliberately deferred: it changes shared `Engine` internals (7 uses of `buffers_`, 4 of `live_ptrs_`,
+plus the flush, snapshot and TTL paths), so it deserves its own change with its own measurement rather
+than riding along with a correctness fix.
+
+Note for whoever does it: on machine B the engine benchmarks cannot resolve a few percent (see #64), so
+the verification has to be a direct measurement of the mechanism, not a `bench_engine` A/B.
+
+- Effort: S | Impact: Removes three allocations and one hash lookup from the hottest path in the engine
+
+### 65. The sequence number is not visible to a client
+
+`format_query_response()` sends six columns — timestamp, price, quantity, order_count, side, level — and
+the sequence number is not one of them, although `QueryEngine` fills it into `QueryResult`. After #64
+these numbers are real and per-origin, so exposing them would let a client detect for itself that rows
+it received have a hole in them.
+
+Not free: it means a seventh column in the row format, `kQueryHeader`, the Python client's row parsing,
+the C++ client, `docs/cli.md`, and the tests that assert response shape. Worth doing deliberately rather
+than as a side effect of #64.
+
+- Effort: S | Impact: A client can verify the completeness of what it received instead of trusting the
+  server
+
 
 ---
 
@@ -822,5 +925,5 @@ absolute thresholds for a designated benchmark host.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 592 | all passing, ~159s with `ctest -j1` on machine B |
+| C++ (GTest + RapidCheck) | 615 | all passing, ~142s with `ctest -j1` on machine B (592 on master, 23 more with #64) |
 | Python integration | 113 | passing, plus 2 skipped and 2 `xfail(strict=True)` for #60 and #61; ~3.7 min |

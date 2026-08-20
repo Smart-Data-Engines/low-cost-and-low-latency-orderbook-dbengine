@@ -33,7 +33,7 @@ cmake --build build -j$(nproc)
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release -j$(nproc)
 
-# Tests — 584 of them, ~2.5 minutes
+# Tests — 615 of them, ~2.5 minutes
 ctest --test-dir build --output-on-failure -j1
 ```
 
@@ -134,7 +134,19 @@ Learned the hard way. Check here before debugging.
     acknowledged writes were lost on every crash, always (roadmap #62). Abandon the engine instead:
     `Engine::release()` in C++, a real `SIGKILL` in Python, plus an assertion that no segment existed
     at the moment of the kill.
-15. **The checkpoint goes after the flush, never before.** A `CHECKPOINT` record claiming more than
+15. **A field nobody fills in disables the mechanism that reads it, and looks like a working
+    feature while doing so.** `tcp_server.cpp` set `sequence_number = 0` and said the engine
+    assigned it; the engine copied the zero through. Gap detection tests
+    `prev_seq != 0 && seq != prev_seq + 1`, so it never fired; `append_gap()` was dead code with
+    a passing unit test; the `sequence_number` column in every segment was zeros (roadmap #64).
+    The sentinel that was meant to mean "no history yet" ended up meaning "never check".
+16. **Sequence numbers belong to the origin, not to the node holding the record.** `0` means
+    unassigned and `Engine::stamp_sequence()` fills it in; a non-zero number passes through
+    untouched. The discriminator has to be the value rather than the caller, because the replica
+    path (`replication.cpp`) shares `apply_delta()` with client writes and must keep the
+    primary's numbering. Gap detection is per origin in `SequenceTracker` — one counter per
+    buffer reports every multi-master interleave as a hole.
+17. **The checkpoint goes after the flush, never before.** A `CHECKPOINT` record claiming more than
     is durable turns a crash into data loss; claiming less costs a replay that gets skipped anyway.
     For the crash window between writing the segment files and appending the checkpoint,
     `replay_wal_tail()` skips records at or below the highest `end_ts_ns` already on disk — without

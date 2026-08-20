@@ -29,6 +29,23 @@ function(ob_add_soa_test name)
     gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
 endfunction()
 
+# ── Helper to register a test executable that needs the sequence tracker ─────
+function(ob_add_sequence_test name)
+    add_executable(${name} ${ARGN})
+    target_link_libraries(${name}
+        PRIVATE
+            orderbook_sequence
+            GTest::gtest_main
+            rapidcheck
+            rapidcheck_gtest
+    )
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+endfunction()
+
+ob_add_sequence_test(test_sequence_tracker
+    test_sequence_tracker.cpp
+)
+
 # ── Helper to register a test executable that needs the WAL library ──────────
 function(ob_add_wal_test name)
     add_executable(${name} ${ARGN})
@@ -186,6 +203,10 @@ ob_add_engine_test(test_engine
 
 ob_add_engine_test(test_wal_recovery
     test_wal_recovery.cpp
+)
+
+ob_add_engine_test(test_sequence_numbers
+    test_sequence_numbers.cpp
 )
 
 # ── Helper to register a test executable that needs the TCP server library ────
