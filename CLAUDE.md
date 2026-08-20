@@ -33,7 +33,7 @@ cmake --build build -j$(nproc)
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release -j$(nproc)
 
-# Tests — 638 of them, ~2.5 minutes
+# Tests — 640 of them, ~2.5 minutes
 ctest --test-dir build --output-on-failure -j1
 ```
 
