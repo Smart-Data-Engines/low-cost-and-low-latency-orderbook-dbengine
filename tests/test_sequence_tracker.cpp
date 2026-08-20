@@ -346,3 +346,33 @@ TEST(SequenceTracker, HasSeenSaysNoForAnUnassignedNumber) {
         << "0 means nobody assigned one, so it cannot have been seen; answering yes would "
            "silently drop writes from an older node";
 }
+
+TEST(SequenceTracker, OriginsWithNothingHeldDoNotCountTowardsTheVectorLimit) {
+    ob::SequenceTracker t;
+
+    // 50 origins seen mid-stream, so every frontier is 0 and none of them is exportable, plus
+    // two that are. Counting all the pairs before filtering would call this vector 52 entries
+    // long and refuse to state a position that fits in two.
+    for (uint16_t origin = 1; origin <= 50; ++origin) {
+        t.observe("Z.EX", origin, 5000);          // no contiguity from 1: frontier stays 0
+    }
+    t.declare_frontier("A.EX", 1, 10);
+    t.declare_frontier("B.EX", 1, 20);
+
+    bool truncated = true;
+    const auto entries = t.export_vector(/*limit=*/4, truncated);
+    EXPECT_FALSE(truncated) << "a vector of two entries was refused as too large";
+    EXPECT_EQ(entries.size(), 2u);
+}
+
+TEST(SequenceTracker, AVectorOverTheLimitIsRefusedWholeNotInPart) {
+    ob::SequenceTracker t;
+    for (int i = 0; i < 10; ++i) t.declare_frontier("S" + std::to_string(i) + ".EX", 1, 5);
+
+    bool truncated = false;
+    const auto entries = t.export_vector(/*limit=*/4, truncated);
+    EXPECT_TRUE(truncated);
+    EXPECT_TRUE(entries.empty())
+        << "a partial vector looks complete to the receiver, so the entries left out would "
+           "never be asked for";
+}

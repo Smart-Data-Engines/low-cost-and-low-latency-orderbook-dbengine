@@ -206,23 +206,26 @@ std::vector<SequenceTracker::VectorEntry> SequenceTracker::export_vector(std::si
     truncated = false;
     std::vector<VectorEntry> out;
 
-    std::size_t needed = 0;
-    for (const auto& [key, st] : symbols_) needed += st.origins.size();
-    if (needed > limit) {
-        // Say "I cannot state what I have" rather than state part of it: a partial vector
-        // would look complete to the sender, and the entries left out would never be asked
-        // for. An empty vector means "send everything", which costs bandwidth, not data.
-        truncated = true;
-        OB_LOG_WARN("sequence",
-                    "Version vector too large to send: entries=%zu limit=%zu — asking for "
-                    "everything instead", needed, limit);
-        return out;
-    }
-
-    out.reserve(needed);
+    // One pass, and it counts only what would actually go on the wire. A separate counting
+    // pass over every (symbol, origin) pair overstated the size, because an origin whose
+    // frontier is still 0 is skipped below — a node tracking many origins it has no
+    // contiguous history for would have declared itself too large to state its position while
+    // the real vector fit comfortably.
     for (const auto& [key, st] : symbols_) {
         for (const auto& [origin, ost] : st.origins) {
             if (ost.frontier == 0) continue;   // nothing held; the default already says so
+
+            if (out.size() >= limit) {
+                // Say "I cannot state what I have" rather than state part of it: a partial
+                // vector looks complete to the sender, and the entries left out would never
+                // be asked for. An empty vector means "send everything" — bandwidth, not data.
+                truncated = true;
+                out.clear();
+                OB_LOG_WARN("sequence",
+                            "Version vector exceeds %zu entries — asking for everything instead",
+                            limit);
+                return out;
+            }
             out.push_back(VectorEntry{key, origin, ost.frontier});
         }
     }
