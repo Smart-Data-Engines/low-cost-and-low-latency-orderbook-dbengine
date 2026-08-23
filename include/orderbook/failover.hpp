@@ -152,9 +152,21 @@ private:
     std::chrono::steady_clock::time_point election_blocked_until_{};
 
     std::thread             monitor_thread_;
+    std::chrono::steady_clock::time_point last_position_publish_{};
+    /// The primary address this node has told the engine to follow, so a leader change is
+    /// adopted once and an unchanged leader does not restart replication every second.
+    std::string             adopted_primary_address_;
     std::atomic<bool>       running_{false};
 
     void monitor_loop();
+
+    /// Publish this node's WAL position to the coordinator, at most once per second.
+    ///
+    /// Nothing did this before: `publish_wal_position()` was called from tests and from one
+    /// connectivity check, so `get_published_positions()` was always empty on a real cluster and
+    /// `FAILOVER <target>` answered ERR unknown_target every time (roadmap #60). The positions are
+    /// also what `elect_winner()` was written to compare, though nothing calls that yet.
+    void publish_position_if_due();
     void handle_lease_expiry();
     void attempt_promotion();
     void handle_primary_lease_lost();

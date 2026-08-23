@@ -64,15 +64,6 @@ def wait_for_role(port: int, expected: str, timeout: float = 30.0) -> float:
 
 # ── Graceful handover ─────────────────────────────────────────────────────────
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="roadmap #60: FAILOVER <target> validates the target against "
-           "get_published_positions(), and no production code path ever publishes a "
-           "position — publish_wal_position() is called only from tests and from one "
-           "connectivity check in shard_coordinator.cpp. So every graceful handover "
-           "on a real cluster answers ERR unknown_target. strict=True on purpose: "
-           "when the fix lands, this test starts passing and the suite fails until "
-           "the marker is removed.")
 def test_handover_lands_on_the_named_target(healthy_cluster):
     """The role must go to the node named in the command, not to whoever polls first."""
     primary = healthy_cluster.primary()
@@ -89,6 +80,20 @@ def test_handover_lands_on_the_named_target(healthy_cluster):
     assert "PRIMARY" not in role_of(primary.tcp_port), (
         "the outgoing primary reacquired the role it handed over — this is the race "
         "roadmap #29 fixed, and it used to happen about half the time")
+
+    # It must also stop *saying* it is primary. Until #60 the handover moved the failover
+    # manager's own role and left the engine untouched unless the target had already promoted in
+    # that same instant — which it never had, because it first has to notice the empty leader key.
+    # So the outgoing node kept answering ROLE with PRIMARY, and a client discovering the primary
+    # by asking would keep writing to the node that had just given the role away.
+    outgoing_role = role_of(primary.tcp_port)
+    assert "REPLICA" in outgoing_role, (
+        f"the outgoing primary reports {outgoing_role!r} after handing the role over")
+
+    # And refuse writes, which is the consequence that costs data rather than confusion.
+    refused = send_command(primary.tcp_port, "INSERT HANDOVER EX bid 100000 1 1")
+    assert refused.startswith("ERR"), (
+        f"the outgoing primary still accepts writes: {refused!r}")
 
 
 def test_handover_to_an_unknown_node_is_refused(healthy_cluster):
