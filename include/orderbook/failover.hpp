@@ -50,6 +50,16 @@ struct FailoverConfig {
     /// node could win the very race it announced. Longer than the lease TTL, so
     /// it does not come back before the new primary has settled.
     int64_t handover_cooldown_seconds{15};
+
+    /// How long a candidate defers to a replica that published a further WAL position, before
+    /// promoting anyway (--election-deference-ms).
+    ///
+    /// Bounded on purpose. Positions are written to etcd without a lease, so a node that died
+    /// leaves its position behind for ever; deferring to it without a deadline would leave the
+    /// cluster with no primary at all, which is worse than the defect this preference fixes. The
+    /// default clears the 2-second cluster-state poll, so a live better candidate has time to take
+    /// the role before this window runs out.
+    int64_t election_deference_ms{3000};
 };
 
 // ── Callback interface for Engine to implement role transitions ──────────────
@@ -104,6 +114,10 @@ public:
     /// Get current epoch.
     EpochValue epoch() const;
 
+    /// How many times this node stood down for a replica with a further WAL position. Zero means
+    /// there was never a better-placed candidate, not that the preference is switched off.
+    uint64_t deferrals() const { return deferrals_.load(std::memory_order_relaxed); }
+
     /// Outcome of an attempted graceful failover.
     ///
     /// Distinguishing the causes matters to the operator: "unknown target"
@@ -156,9 +170,19 @@ private:
     /// The primary address this node has told the engine to follow, so a leader change is
     /// adopted once and an unchanged leader does not restart replication every second.
     std::string             adopted_primary_address_;
+    /// When this node started deferring to a better-placed replica; zero when it is not deferring.
+    std::chrono::steady_clock::time_point deferring_since_{};
+    std::atomic<uint64_t>   deferrals_{0};
     std::atomic<bool>       running_{false};
 
     void monitor_loop();
+
+    /// Should this node take the role now, or is a better-placed replica expected to?
+    ///
+    /// Returns true when the published positions name this node as the most advanced, when there
+    /// are no positions at all (the pre-#70 behaviour: a CAS race), or when the deference window
+    /// has expired. Returns false while deferring.
+    bool should_promote_now();
 
     /// Publish this node's WAL position to the coordinator, at most once per second.
     ///
@@ -183,5 +207,25 @@ private:
 /// highest WAL position (file_index, byte_offset), tie-break by lowest node_id.
 /// Returns nullptr if positions is empty.
 const PublishedPosition* elect_winner(const std::vector<PublishedPosition>& positions);
+
+// ── Election decision ─────────────────────────────────────────────────────────
+
+/// What a candidate should do about promotion right now.
+enum class ElectionDecision {
+    PromoteNow,          ///< nobody better is published, or we are the best
+    Defer,               ///< a further position exists and the window has not run out
+    PromoteAfterWindow,  ///< a further position exists but its owner never promoted
+};
+
+/// Decide, from the published positions alone, whether this node should take the role.
+///
+/// Pure on purpose: the cases worth testing — we are best, someone else is, the window expiring,
+/// nothing published at all — then need no etcd, no cluster and no clock. The caller owns the
+/// bookkeeping (when deferral started, logging, metrics), which is the part that needs a running
+/// node and is not where the mistakes live.
+ElectionDecision decide_election(const std::vector<PublishedPosition>& positions,
+                                 const std::string& self_node_id,
+                                 std::chrono::milliseconds deferred_for,
+                                 std::chrono::milliseconds window);
 
 } // namespace ob

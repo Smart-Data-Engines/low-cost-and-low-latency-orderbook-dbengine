@@ -498,6 +498,8 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
             config.handover_grace_seconds = cursor.value_as<int64_t>();
         } else if (arg == "--handover-cooldown-seconds") {
             config.handover_cooldown_seconds = cursor.value_as<int64_t>();
+        } else if (arg == "--election-deference-ms") {
+            config.election_deference_ms = cursor.value_as<int64_t>();
         } else if (arg == "--node-id") {
             config.node_id = std::string{cursor.value()};
         } else if (arg == "--failover-enabled") {
@@ -678,6 +680,7 @@ TcpServer::TcpServer(ServerConfig config)
         failover_config.coordinator.endpoints = config_.coordinator_endpoints;
         failover_config.coordinator.lease_ttl_seconds = config_.coordinator_lease_ttl;
         failover_config.handover_grace_seconds    = config_.handover_grace_seconds;
+        failover_config.election_deference_ms      = config_.election_deference_ms;
         failover_config.handover_cooldown_seconds = config_.handover_cooldown_seconds;
         failover_config.coordinator.node_id = config_.node_id;
         failover_config.failover_enabled = config_.failover_enabled;

@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <random>
 #include <string>
+#include <chrono>
 #include <vector>
 
 namespace {
@@ -211,3 +212,111 @@ RC_GTEST_PROP(HandoverIntentProperty, prop_json_round_trip_preserves_fields,
 }
 
 } // namespace
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// decide_election: whether to take the role now, or wait for a better-placed replica
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// elect_winner() above has had tests since it was written, and had no callers in src/ until #70:
+// promotion was a create-only CAS race, so the role went to whoever polled first rather than to the
+// replica that lost the least. These cover the decision that finally uses it — including the one
+// that stops the preference from becoming an outage.
+
+namespace {
+
+ob::PublishedPosition at(const std::string& node, uint32_t file, size_t offset) {
+    ob::PublishedPosition p;
+    p.node_id         = node;
+    p.wal_file_index  = file;
+    p.wal_byte_offset = offset;
+    return p;
+}
+
+constexpr auto kWindow = std::chrono::milliseconds(3000);
+constexpr auto kZero   = std::chrono::milliseconds(0);
+
+}  // namespace
+
+TEST(DecideElection, PromotesImmediatelyWhenNothingIsPublished) {
+    EXPECT_EQ(ob::decide_election({}, "node-0", kZero, kWindow),
+              ob::ElectionDecision::PromoteNow)
+        << "with no positions this has to behave as it did before #70: race for the key. A cluster "
+           "whose nodes predate position publishing must still elect";
+}
+
+TEST(DecideElection, PromotesImmediatelyWhenWeAreTheMostAdvanced) {
+    const std::vector<ob::PublishedPosition> positions{
+        at("node-0", 3, 900), at("node-1", 3, 100)};
+
+    EXPECT_EQ(ob::decide_election(positions, "node-0", kZero, kWindow),
+              ob::ElectionDecision::PromoteNow)
+        << "nobody holds more of the log than we do, so there is nothing to wait for";
+}
+
+TEST(DecideElection, DefersToAReplicaThatHoldsMore) {
+    const std::vector<ob::PublishedPosition> positions{
+        at("node-0", 3, 100), at("node-1", 3, 900)};
+
+    EXPECT_EQ(ob::decide_election(positions, "node-0", kZero, kWindow),
+              ob::ElectionDecision::Defer)
+        << "node-1 lost less, so it should have the role — this is the whole point of the item";
+}
+
+TEST(DecideElection, AFurtherFileBeatsAFurtherOffset) {
+    const std::vector<ob::PublishedPosition> positions{
+        at("node-0", 4, 0), at("node-1", 3, 999999)};
+
+    EXPECT_EQ(ob::decide_election(positions, "node-0", kZero, kWindow),
+              ob::ElectionDecision::PromoteNow)
+        << "a later WAL file is further along than a large offset in an earlier one";
+}
+
+TEST(DecideElection, PromotesAfterTheWindowWhenTheBetterNodeNeverDoes) {
+    // The case that keeps this preference from becoming an outage. Positions are written to etcd
+    // without a lease, so a node that died leaves its position behind for ever: deferring to it
+    // without a deadline would leave the cluster with no primary at all, which is worse than the
+    // defect being fixed.
+    const std::vector<ob::PublishedPosition> positions{
+        at("node-0", 3, 100), at("node-1", 9, 900)};
+
+    EXPECT_EQ(ob::decide_election(positions, "node-0", std::chrono::milliseconds(2999), kWindow),
+              ob::ElectionDecision::Defer);
+    EXPECT_EQ(ob::decide_election(positions, "node-0", kWindow, kWindow),
+              ob::ElectionDecision::PromoteAfterWindow)
+        << "a dead node's stale position must not block promotion for ever";
+}
+
+TEST(DecideElection, TwoCandidatesReadingTheSamePositionsDoNotBothDefer) {
+    // Equal positions: elect_winner breaks the tie on the lower node id, deterministically, so
+    // exactly one of the two sees itself as the winner. Both deferring to each other would be the
+    // same outage in a different shape.
+    const std::vector<ob::PublishedPosition> positions{
+        at("node-0", 3, 500), at("node-1", 3, 500)};
+
+    const auto for_zero = ob::decide_election(positions, "node-0", kZero, kWindow);
+    const auto for_one  = ob::decide_election(positions, "node-1", kZero, kWindow);
+
+    EXPECT_EQ(for_zero, ob::ElectionDecision::PromoteNow);
+    EXPECT_EQ(for_one, ob::ElectionDecision::Defer);
+    EXPECT_NE(for_zero, for_one) << "if both sides read the same list, exactly one may promote";
+}
+
+TEST(DecideElection, ANodeMissingFromTheListStillDefersOnlyForTheWindow) {
+    // Right after a start, before the first publish, our own position is not in etcd yet. Deferring
+    // is right — someone else is demonstrably ahead — but only until the window runs out.
+    const std::vector<ob::PublishedPosition> positions{at("node-1", 5, 10)};
+
+    EXPECT_EQ(ob::decide_election(positions, "node-0", kZero, kWindow),
+              ob::ElectionDecision::Defer);
+    EXPECT_EQ(ob::decide_election(positions, "node-0", std::chrono::milliseconds(3001), kWindow),
+              ob::ElectionDecision::PromoteAfterWindow);
+}
+
+TEST(DecideElection, AZeroWindowMeansNeverDefer) {
+    const std::vector<ob::PublishedPosition> positions{
+        at("node-0", 1, 0), at("node-1", 9, 900)};
+
+    EXPECT_EQ(ob::decide_election(positions, "node-0", kZero, std::chrono::milliseconds(0)),
+              ob::ElectionDecision::PromoteAfterWindow)
+        << "--election-deference-ms=0 has to switch the preference off rather than deadlock it";
+}

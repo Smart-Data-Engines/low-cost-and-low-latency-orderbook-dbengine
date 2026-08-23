@@ -51,6 +51,9 @@ struct ServerConfig {
     int64_t coordinator_lease_ttl{10};               // --coordinator-lease-ttl (seconds)
     int64_t handover_grace_seconds{5};               // --handover-grace-seconds
     int64_t handover_cooldown_seconds{15};           // --handover-cooldown-seconds
+    /// --election-deference-ms: how long a candidate waits for a replica that published a further
+    /// WAL position before promoting anyway. 0 switches the preference off.
+    int64_t election_deference_ms{3000};
     std::string node_id;                             // --node-id
     bool failover_enabled{true};                     // --failover-enabled
 

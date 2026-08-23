@@ -268,6 +268,12 @@ FailoverManager::HandoverResult FailoverManager::initiate_graceful_failover(
 
     lease_id_.store(0);
     role_.store(NodeRole::REPLICA);
+    {
+        // A fresh election starts with a fresh window, or the next one inherits a deferral clock
+        // from this handover and promotes sooner than it should.
+        std::lock_guard<std::mutex> lk(mtx_);
+        deferring_since_ = {};
+    }
 
     OB_LOG_INFO("failover",
                 "Graceful failover: lease %ld revoked, now REPLICA, waiting for %s",
@@ -449,6 +455,91 @@ void FailoverManager::handle_lease_expiry() {
 
 // ── attempt_promotion() ─────────────────────────────────────────────────────
 
+ElectionDecision decide_election(const std::vector<PublishedPosition>& positions,
+                                 const std::string& self_node_id,
+                                 std::chrono::milliseconds deferred_for,
+                                 std::chrono::milliseconds window) {
+    if (positions.empty()) {
+        // Nothing published: behave as before #70 and race for the key. Also the path for a cluster
+        // whose nodes predate position publishing.
+        return ElectionDecision::PromoteNow;
+    }
+
+    const PublishedPosition* best = elect_winner(positions);
+    if (!best || best->node_id == self_node_id) {
+        // We are the most advanced, or the comparison could not name anyone. Nobody to wait for.
+        return ElectionDecision::PromoteNow;
+    }
+
+    // Someone published a further position. Wait for them — but not for ever: positions are written
+    // without a lease, so a node that died leaves its position behind, and deferring to a dead node
+    // indefinitely would leave the cluster with no primary at all.
+    if (deferred_for < window) return ElectionDecision::Defer;
+    return ElectionDecision::PromoteAfterWindow;
+}
+
+bool FailoverManager::should_promote_now() {
+    if (!coordinator_) return true;
+
+    const auto positions = coordinator_->get_published_positions();
+    const auto now = std::chrono::steady_clock::now();
+
+    std::chrono::milliseconds deferred_for{0};
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (deferring_since_ != std::chrono::steady_clock::time_point{}) {
+            deferred_for = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - deferring_since_);
+        }
+    }
+
+    const auto decision = decide_election(
+        positions, config_.coordinator.node_id, deferred_for,
+        std::chrono::milliseconds(config_.election_deference_ms));
+
+    switch (decision) {
+    case ElectionDecision::PromoteNow: {
+        std::lock_guard<std::mutex> lk(mtx_);
+        deferring_since_ = {};
+        return true;
+    }
+    case ElectionDecision::Defer: {
+        bool first = false;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (deferring_since_ == std::chrono::steady_clock::time_point{}) {
+                deferring_since_ = now;
+                first = true;
+            }
+        }
+        if (first) {
+            const PublishedPosition* best = elect_winner(positions);
+            deferrals_.fetch_add(1, std::memory_order_relaxed);
+            OB_LOG_INFO("failover",
+                        "Deferring election to %s (file=%u offset=%zu), window=%lldms — it holds "
+                        "more of the log than we do",
+                        best ? best->node_id.c_str() : "?",
+                        best ? best->wal_file_index : 0u,
+                        best ? best->wal_byte_offset : size_t{0},
+                        static_cast<long long>(config_.election_deference_ms));
+        }
+        return false;
+    }
+    case ElectionDecision::PromoteAfterWindow: {
+        const PublishedPosition* best = elect_winner(positions);
+        OB_LOG_WARN("failover",
+                    "Deference window expired after %lldms and %s never promoted — its position may "
+                    "be stale, since positions carry no lease. Promoting anyway",
+                    static_cast<long long>(deferred_for.count()),
+                    best ? best->node_id.c_str() : "?");
+        std::lock_guard<std::mutex> lk(mtx_);
+        deferring_since_ = {};
+        return true;
+    }
+    }
+    return true;
+}
+
 void FailoverManager::attempt_promotion() {
     if (!coordinator_) return;
 
@@ -468,6 +559,11 @@ void FailoverManager::attempt_promotion() {
             return;
         }
     }
+
+    // Prefer the replica that lost the least. Until #70 this was a pure CAS race, so the role went
+    // to whoever polled first — elect_winner() existed, with unit tests, and had no callers.
+    // Checked before granting a lease: no point taking one out only to stand down.
+    if (!should_promote_now()) return;
 
     // Grant a new lease and try to acquire leadership via CAS.
     // If the leader key doesn't exist, CAS succeeds and we become primary.

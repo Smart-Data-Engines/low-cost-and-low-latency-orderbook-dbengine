@@ -673,6 +673,55 @@ first. Published positions now exist for it to compare, but nothing compares the
 - Effort: S | Impact: Graceful handover works, an outgoing primary stops advertising a role it gave
   away, and a replica follows the current leader instead of a remembered one
 
+### 73. A node that loses the startup race is inert for the rest of its life (P0)
+
+Found while proving #70 on a real cluster: the deference log lines never appeared, and the reason was
+not the new code. Two nodes started **simultaneously**, the way any `systemd`, Ansible or start-all
+script starts them. One won the leader key. The other sat at `STANDALONE` for 54 seconds and did not
+log a single election attempt. Then `kill -9` on the primary, and **no promotion in 40 seconds** — the
+cluster simply had no primary any more.
+
+The state machine has a dead state. `FailoverManager::start()` assigns `REPLICA` when it reads a leader
+from etcd and calls `attempt_promotion()` when it does not — but `attempt_promotion()` returns on a lost
+CAS **without touching the role**, so the loser stays `STANDALONE`. And `monitor_loop()` branches on
+`PRIMARY` and on `REPLICA`, so `STANDALONE` matches neither: no lease refresh, no leader poll, no
+campaign, no replication client. Forever.
+
+Why no test caught it: the integration fixture starts nodes **one at a time and waits**, so the loser
+always reads an existing leader and takes the `REPLICA` path. Simultaneous start — the realistic case —
+was never exercised. The consequences compound: an inert node also never replicates, so it holds no data
+to promote *with*, and the operator's instinctive fix (restart it) is the only thing that works.
+
+Fix: `monitor_loop()` must have no dead state — a `STANDALONE` node with a reachable coordinator and
+failover enabled either campaigns (no leader) or becomes a replica (leader present) — and a lost CAS
+must re-read the state and demote to replica of the winner. Regression test: start the cluster
+simultaneously, then kill the primary.
+
+- Effort: S | Impact: Automatic failover does not work on a cluster whose nodes were started together,
+  which is every real deployment. This is the failure mode HA exists to prevent
+
+### 72. Deference cannot tell a further replica from a dead one
+
+`decide_election()` (#70) defers to whoever published the furthest position, and cannot ask whether that
+node is still alive, because `PublishedPosition` carries neither a timestamp nor a lease. The bounded
+window keeps that safe but blunt: in a two-node cluster the survivor always waits the full window for the
+node that just died, which is where the +3 s of failover time measured in #70 goes.
+
+Two ways to make it precise, and the choice matters:
+
+1. **Timestamp in `PublishedPosition`** — cheap, but compares wall clocks across machines, so it trades a
+   liveness question for an NTP assumption.
+2. **Write the position keys under a per-node etcd lease** — a dead node's position disappears on its own,
+   which is exactly what a lease is for, and needs no clock agreement. Costs each node its own lease plus
+   a refresh in the monitor loop.
+
+Recommendation: (2). Then deference applies only to peers that are both further ahead **and** currently
+alive, the window shrinks to a backstop for a live-but-wedged node, and the common two-node failover pays
+nothing.
+
+- Effort: M | Impact: Removes the failover time #70 added in the common case, and makes "prefer the most
+  advanced replica" mean the most advanced *live* replica
+
 ### 71. The coordinator client shared one libcurl handle across threads ✅
 
 Found by chasing a flaky test after #60, rather than by re-running it until it passed.
@@ -707,7 +756,7 @@ which node is primary.
 - Effort: S | Impact: Removes a data race from lease management and leader election, and with it the
   intermittent handover failure it caused
 
-### 70. The election policy has no callers
+### 70. The election policy has no callers ✅
 
 `elect_winner()` in `src/failover.cpp` picks the most advanced replica from the published positions —
 higher WAL file index, then higher byte offset, then lower node id as a tiebreak. It has unit tests in
@@ -724,8 +773,41 @@ candidate reads the positions, and defers if another live replica is further ahe
 edge cases — the most advanced replica being down, positions being stale, and two candidates deferring
 to each other — which is why this is its own item rather than a rider on #60.
 
-- Effort: M | Impact: Failover currently prefers speed over data. With this, a promotion picks the node
-  that lost the least, which is the whole point of publishing positions
+Wired in as `decide_election()`, a pure function over the published positions, called from
+`attempt_promotion()` after the cooldown check and **before** `grant_lease()` — deferring must not
+consume a lease it is about to abandon.
+
+The edge case that shaped the design is the one the entry above predicted: **positions carry no lease**.
+A dead node's position stays in etcd, so naive "step aside if someone is further" hands the cluster a
+livelock — the survivor waits for a node that will never come back. So deference is bounded: defer while
+another node is further ahead, and after `--election-deference-ms` promote anyway, logging that the
+position we deferred to may be stale. Two candidates reading the same list never both defer, because at
+most one of them is not the best.
+
+Proven on a real two-node cluster, not just in unit tests (`scripts/`-style probe, staggered start so the
+loser is a genuine REPLICA):
+
+```
+role before:  ['PRIMARY 1', 'REPLICA 127.0.0.1:50435 0']
+kill -9 primary
+16:04:09 Deferring election to node-0 (file=0 offset=260), window=3000ms — it holds more of the log than we do
+16:04:12 Deference window expired after 3028ms and node-0 never promoted — promoting anyway
+node1 promoted after 9.4s
+```
+
+The honest cost: **failover went from ~6.5 s to 9.4 s** whenever the node that died was the furthest
+ahead — which in a two-node cluster is the common case, and there the wait buys nothing, since there is
+no second replica to prefer. That is why the flag exists and why `0` restores the old race. The win
+appears with two or more replicas at different positions, where the promotion now goes to the one that
+lost the least.
+
+Mutation-tested rather than assumed: disabling the window bound fails 2 tests, failing to recognise
+ourselves in the list fails 3, and comparing byte offsets while ignoring the file index fails 1.
+Removing the empty-list shortcut fails nothing — correctly, since `elect_winner({})` is null and the
+next branch reaches the same decision, so that early return is documentation, not logic.
+
+- Effort: M | Impact: A promotion now picks the node that lost the least instead of the quickest one,
+  which is the whole point of publishing positions. Follow-ups it exposed: #72 and #73
 
 ### 61. Multi-master catch-up compared WAL offsets across independent WALs ✅
 
