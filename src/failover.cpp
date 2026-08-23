@@ -46,8 +46,20 @@ void FailoverManager::start() {
     // Create and connect the coordinator client.
     coordinator_ = std::make_unique<CoordinatorClient>(config_.coordinator);
     if (!coordinator_->connect()) {
-        OB_LOG_WARN("failover", "cannot connect to coordinator, operating in standalone mode");
         role_.store(NodeRole::STANDALONE);
+        if (config_.coordinator.endpoints.empty()) {
+            // Genuinely single-node: nothing to poll, so do not start a thread that would retry a
+            // connection to nowhere once a second.
+            OB_LOG_INFO("failover", "no coordinator endpoints configured, running standalone");
+            return;
+        }
+        // Endpoints were configured, so this is an outage, not a deployment choice. Start the
+        // monitor thread anyway and let it retry: returning here is what left a node that booted
+        // during an etcd restart permanently outside its own cluster (#73).
+        OB_LOG_WARN("failover", "cannot reach the coordinator at startup — starting STANDALONE and "
+                                "retrying, this node will join once it answers");
+        running_.store(true);
+        monitor_thread_ = std::thread([this] { monitor_loop(); });
         return;
     }
 
@@ -437,6 +449,31 @@ void FailoverManager::monitor_loop() {
                     // Otherwise: not our turn, re-check on the next pass.
                 }
             }
+        } else if (current == NodeRole::STANDALONE) {
+            // No dead states. Before #73 this role matched neither branch above, so a node that
+            // lost the startup CAS, or booted while the coordinator was briefly unreachable, sat
+            // here for the rest of its life: no lease, no leader poll, no campaign, no replication
+            // — and no takeover when the primary died.
+            ++standalone_polls_;
+            if (coordinator_ && !coordinator_->is_connected()) {
+                if (coordinator_->connect()) {
+                    OB_LOG_INFO("failover", "coordinator reachable again after %llu attempts, "
+                                            "rejoining the cluster",
+                                static_cast<unsigned long long>(standalone_polls_));
+                } else if (standalone_polls_ % 30 == 1) {
+                    // Once per 30 s, not once per second: an unreachable coordinator is a
+                    // condition, not an event.
+                    OB_LOG_WARN("failover", "coordinator still unreachable after %llu attempts, "
+                                            "this node holds no cluster role",
+                                static_cast<unsigned long long>(standalone_polls_));
+                }
+            }
+            if (coordinator_ && coordinator_->is_connected() && !adopt_leader_if_present() &&
+                config_.failover_enabled) {
+                OB_LOG_INFO("failover", "no leader published and no role held — standing for "
+                                        "election");
+                attempt_promotion();
+            }
         }
 
         // Sleep 1 second between iterations.
@@ -444,6 +481,31 @@ void FailoverManager::monitor_loop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
+}
+
+// ── adopt_leader_if_present() ───────────────────────────────────────────────
+
+bool FailoverManager::adopt_leader_if_present() {
+    if (!coordinator_) return false;
+
+    auto state = coordinator_->get_cluster_state();
+    const bool leader_present = state.has_value() && !state->leader_node_id.empty();
+    if (!leader_present) return false;
+    if (state->leader_node_id == config_.coordinator.node_id) {
+        // The key names us. Whoever calls this is mid-transition; leave the role alone.
+        return false;
+    }
+
+    reconcile_epoch(*state);
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        primary_address_ = state->leader_address;
+    }
+    role_.store(NodeRole::REPLICA, std::memory_order_release);
+    OB_LOG_INFO("failover", "following %s at %s — this node is a REPLICA",
+                state->leader_node_id.c_str(), state->leader_address.c_str());
+    handler_.demote_to_replica(state->leader_address);
+    return true;
 }
 
 // ── handle_lease_expiry() ───────────────────────────────────────────────────
@@ -585,6 +647,14 @@ void FailoverManager::attempt_promotion() {
         new_lease, new_epoch, config_.replication_address);
     if (!acquired) {
         coordinator_->revoke_lease(new_lease);
+        // Losing the CAS means someone else is primary — so follow them. Returning here without
+        // touching the role is what left a node stuck at STANDALONE for the rest of its life (#73).
+        OB_LOG_INFO("failover", "lost the leadership CAS on node %s — following the winner",
+                    config_.coordinator.node_id.c_str());
+        if (!adopt_leader_if_present()) {
+            OB_LOG_WARN("failover", "lost the CAS but no leader is published yet — will retry on "
+                                    "the next pass rather than idle at STANDALONE");
+        }
         return;
     }
 

@@ -673,7 +673,7 @@ first. Published positions now exist for it to compare, but nothing compares the
 - Effort: S | Impact: Graceful handover works, an outgoing primary stops advertising a role it gave
   away, and a replica follows the current leader instead of a remembered one
 
-### 73. A node that loses the startup race is inert for the rest of its life (P0)
+### 73. A node that loses the startup race is inert for the rest of its life (P0) ✅
 
 Found while proving #70 on a real cluster: the deference log lines never appeared, and the reason was
 not the new code. Two nodes started **simultaneously**, the way any `systemd`, Ansible or start-all
@@ -697,8 +697,47 @@ failover enabled either campaigns (no leader) or becomes a replica (leader prese
 must re-read the state and demote to replica of the winner. Regression test: start the cluster
 simultaneously, then kill the primary.
 
-- Effort: S | Impact: Automatic failover does not work on a cluster whose nodes were started together,
-  which is every real deployment. This is the failure mode HA exists to prevent
+The state machine now has no dead ends. `adopt_leader_if_present()` follows whoever holds the leader
+key, and it is called from the places that used to leave a node without a role: the lost CAS in
+`attempt_promotion()` and a new `STANDALONE` branch in `monitor_loop()`. A startup that cannot reach a
+configured coordinator starts the monitor thread and retries instead of returning, logging once per
+thirty attempts because an unreachable coordinator is a condition, not an event. Single-node mode is
+untouched: with no `--coordinator-endpoints` there is no thread and no retry log, since that is a
+deployment choice rather than an outage.
+
+Measured on both scenarios, before and after:
+
+```
+A: two nodes started simultaneously
+   before: ['PRIMARY 1', 'STANDALONE']  → kill -9 primary → no promotion in 40s
+   after:  ['REPLICA …', 'PRIMARY 1']   → kill -9 primary → promoted in 6.8s
+
+B: a node booted while nothing listened on the coordinator port
+   before: STANDALONE, and still STANDALONE after etcd came up — for ever
+   after:  STANDALONE, then joined 0.3s after etcd answered
+```
+
+Three regression tests in `tests/integration/test_failover_dead_state.py`, which brings its own etcd
+because the whole point is the *order* of startup. All three were run against the pre-fix binary and
+all three failed, which is the only reason to believe they test anything:
+
+```
+AssertionError: a node holds no cluster role and will never campaign again: ['STANDALONE', 'PRIMARY 1']
+AssertionError: node-0 never promoted within 45.0s; roles now ['STANDALONE', '<unreachable: ConnectionRefusedError>']
+AssertionError: the node never joined after etcd came up; role is STANDALONE
+```
+
+Two things worth keeping from how this was found. The retry loop exposed a leak the one-shot code hid:
+`connect()` called `curl_easy_init()` unconditionally and overwrote `impl_->curl_handle` without
+freeing it — invisible when you connect once, a leak per second when you retry. And the fixture had
+already documented the bug as a reason to avoid it: "This avoids a race condition where both nodes
+start simultaneously and one fails to transition from STANDALONE." The defect was known and worked
+around in the harness rather than fixed in the engine. **A workaround in the test harness is a bug
+report nobody filed.**
+
+- Effort: S | Impact: Automatic failover now works on a cluster whose nodes were started together,
+  which is every real deployment, and on a node that boots while etcd is restarting. This was the
+  failure mode HA exists to prevent
 
 ### 72. Deference cannot tell a further replica from a dead one
 
@@ -1097,7 +1136,7 @@ Two ways out, and the second is the honest one:
 - Effort: M | Impact: One lost row per occurrence on a multi-master node, in a window that only opens
   on an unclean stop. Correctness of a guard that currently rests on an unstated assumption
 
-### 64. Nobody assigned the sequence numbers, so three mechanisms were switched off by a zero
+### 64. Nobody assigned the sequence numbers, so three mechanisms were switched off by a zero ✅
 
 Found while working out what #61 needs in order to be fixable at all.
 

@@ -139,8 +139,15 @@ class Node:
                 self.proc.kill()
 
 
-def start_etcd() -> tuple[subprocess.Popen, str]:
-    client_port, peer_port = free_port(), free_port()
+def start_etcd(client_port: int | None = None) -> tuple[subprocess.Popen, str]:
+    """Start etcd and return (process, client_url).
+
+    ``client_port`` lets a caller reserve the port before etcd exists, which is how you test a node
+    that boots while its coordinator is still down.
+    """
+    peer_port = free_port()
+    if client_port is None:
+        client_port = free_port()
     url = f"http://127.0.0.1:{client_port}"
     log = open(os.path.join(ROOT, "etcd.log"), "wb")
     proc = subprocess.Popen([
