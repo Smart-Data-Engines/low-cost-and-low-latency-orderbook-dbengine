@@ -84,6 +84,10 @@ gh api -X PUT repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengi
 JSON
 ```
 
+The list above is the live state: `analyze (c-cpp)` was added to the `master` ruleset on
+23 August 2026, so all four checks are required now. The command under "Verify afterwards" prints
+what is actually enforced, which is the only answer worth trusting.
+
 ### Why `analyze (c-cpp)` is on that list
 
 It was deliberately left off for a while, for a reason that has since gone away: `parse_cli_args()`
@@ -108,13 +112,18 @@ steps in one commit (#23 did). If that happens again and the queue must move, th
 Verify afterwards:
 
 ```bash
+# rule types on master
 gh api repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/rulesets/20841774 \
   --jq '.rules[].type'
+# and, more usefully, the checks a PR actually has to pass
+gh api repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/rulesets/20841774 \
+  --jq '.rules[] | select(.type=="required_status_checks")
+         | .parameters.required_status_checks[].context'
 ```
 
-### Tags ⚙️
+### Tags ✅
 
-Add a second ruleset with `target: tag` and condition `refs/tags/v*`, enforcing `deletion` and
+A second ruleset named `release tags` targets `refs/tags/v*` and enforces `deletion` and
 `non_fast_forward`. Releases are what people download; a silently rewritten tag is a supply-chain
 problem.
 
