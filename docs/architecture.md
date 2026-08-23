@@ -155,6 +155,27 @@ only frontiers are persisted. Establishing a base for such a node is what snapsh
 and it is roadmap #67. The second limit is size: above 4096 entries the vector is not sent and not
 written down, and the node falls back to asking for everything.
 
+### Anti-entropy: what reconciliation is for, and what it is not
+
+A background pass every `--anti-entropy-interval-seconds` tells every connected peer what this node
+holds. Receiving a vector already makes a node stream what the sender lacks, so reconciliation needs
+no protocol of its own: sending the vector is the repair. The pass reports the difference in both
+directions as `(symbol, origin, sequence range)`, and counts a repair only when a gap it was behind on
+has disappeared by the following pass — a count of requests sent would measure diligence rather than
+convergence.
+
+It is worth being precise about what this adds, because most divergence in this architecture is
+already handled elsewhere. A broken connection triggers reconnect, handshake, and catch-up. A healthy
+connection delivers in order, and an `iptables DROP` does not reset it — TCP retransmits the backlog
+once traffic is allowed again, so a partitioned node reconverges without reconciliation doing
+anything. What is left for anti-entropy is divergence that outlives a healthy connection: a record the
+receiver dropped rather than lost (above the held-set cap in `SequenceTracker`, or refused), a peer
+whose vector was missing or stale when catch-up ran, and a backlog the sender discarded under
+backpressure.
+
+`ob_mm_anti_entropy_runs_total` and `ob_mm_reconcile_gaps_detected` are reported separately on
+purpose: a zero in the second one means "checked, nothing to repair" only if the first one is moving.
+
 ### What the WAL guarantees after a crash
 
 With `FsyncPolicy::EVERY` (the default), a write that has been acknowledged is in a fsynced WAL

@@ -33,7 +33,7 @@ cmake --build build -j$(nproc)
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release -j$(nproc)
 
-# Tests — 643 of them, ~2.5 minutes
+# Tests — 656 of them, ~2.5 minutes
 ctest --test-dir build --output-on-failure -j1
 ```
 
@@ -181,7 +181,13 @@ Learned the hard way. Check here before debugging.
     `ob_mm_anti_entropy_runs_total` sat at zero because the scheduler was never constructed, and
     the roadmap read that as "runs fine, only reconciliation is missing" for months. Where a
     counter can be zero for two reasons, report the second one separately.
-24. **The checkpoint goes after the flush, never before.** A `CHECKPOINT` record claiming more than
+24. **An `iptables DROP` does not reset a TCP connection, so a partition test proves nothing
+    about any repair mechanism.** "Cut the node off, write elsewhere, restore the link" looks like
+    a test of anti-entropy and is actually a test of retransmission: the frames sit in the
+    sender's buffer and arrive when the rule goes away. A mutation disabling reconciliation
+    entirely still passed that scenario. For such a test to decide anything, the divergence has to
+    be one TCP cannot undo — a record the sender discarded, or one the receiver refused.
+25. **The checkpoint goes after the flush, never before.** A `CHECKPOINT` record claiming more than
     is durable turns a crash into data loss; claiming less costs a replay that gets skipped anyway.
     For the crash window between writing the segment files and appending the checkpoint,
     `replay_wal_tail()` skips records at or below the highest `end_ts_ns` already on disk — without

@@ -72,4 +72,28 @@ private:
     bool received_{false};
 };
 
+/// One (symbol, origin) pair where two nodes disagree about what they hold.
+struct VectorGap {
+    uint16_t    peer_node_id{0};
+    std::string key;            ///< "SYMBOL.EXCHANGE"
+    uint16_t    origin{0};
+    uint64_t    from_seq{0};    ///< first sequence number the lagging side is missing
+    uint64_t    to_seq{0};      ///< last sequence number the other side holds
+};
+
+/// Both directions of a comparison: what we lack, and what the peer lacks.
+struct VectorDiff {
+    std::vector<VectorGap> we_lack;
+    std::vector<VectorGap> peer_lacks;
+};
+
+/// Compare our frontiers against a peer's.
+///
+/// A missing entry means "holds nothing here" on whichever side it is missing from, never
+/// "holds everything" — the same asymmetry the catch-up filter relies on. Getting that backwards
+/// is how a reconciliation pass would conclude there is nothing to repair while a peer sits on
+/// data nobody else has.
+VectorDiff compare_vectors(const std::vector<SequenceTracker::VectorEntry>& ours,
+                           const PeerVector& theirs, uint16_t peer_node_id);
+
 }  // namespace ob

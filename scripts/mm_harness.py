@@ -17,8 +17,16 @@ Row counts are exact on purpose. The first attempt at fixing #61 replaced the mi
 duplicated ones — storage is append-only — and a check that only looks for absent prices calls
 that a pass.
 
-Usage:
-    MMH_CYCLES=4 python3 scripts/mm_harness.py
+Two scenarios:
+
+    MMH_CYCLES=4 python3 scripts/mm_harness.py            # outage: kill a node, restart it
+    MMH_MODE=partition python3 scripts/mm_harness.py      # partition: block the link, keep the
+                                                          # node running, let reconciliation fix it
+
+The partition mode is what proves anti-entropy (roadmap #57) rather than catch-up: the node stays
+up, so nothing reconnects and no handshake happens. Only the periodic vector exchange can close the
+difference. It needs `sudo iptables`, which is why it is a local tool and not part of the pytest
+suite.
 
 Needs a built build/ob_tcp_server and a native etcd on PATH (or ETCD env var).
 """
@@ -37,6 +45,7 @@ SERVER = os.environ.get("OB_SERVER_BINARY", os.path.join(REPO, "build", "ob_tcp_
 ETCD = os.environ.get("ETCD", shutil.which("etcd") or "/usr/local/bin/etcd")
 ROOT = os.environ.get("MMH_ROOT", "/tmp/ob_mm_harness")
 SYMBOL = "MMH-CATCHUP"
+MESH_PORTS: set[int] = set()   # every node's multi-master port, filled in as nodes start
 
 
 def free_port() -> int:
@@ -85,6 +94,7 @@ class Node:
         if not reuse_ports or self.ports == (0, 0, 0, 0):
             self.ports = (free_port(), free_port(), free_port(), free_port())
         tcp, metrics, repl, mm = self.ports
+        MESH_PORTS.add(mm)
         log = open(os.path.join(ROOT, f"node{self.index}.log"), "ab")
         self.proc = subprocess.Popen([
             SERVER, "--port", str(tcp), "--data-dir", self.dir,
@@ -92,6 +102,12 @@ class Node:
             "--coordinator-endpoints", self.etcd_url, "--node-id", f"node-{self.index}",
             "--multi-master", "--mm-node-id", str(self.index + 1),
             "--mm-replication-port", str(mm), "--log-level", "DEBUG",
+            # Short enough that a reconciliation pass happens inside a test rather than in half
+            # a minute; the production default is 30 s.
+            "--anti-entropy-interval-seconds", os.environ.get("MMH_AE_INTERVAL", "3"),
+            # A small catch-up ceiling on purpose: the partition scenario needs backpressure to
+            # discard a peer's backlog, which is the one divergence TCP cannot undo by itself.
+            "--mm-max-catchup-bytes", os.environ.get("MMH_MAX_CATCHUP", "8192"),
         ], stdout=log, stderr=subprocess.STDOUT)
 
         deadline = time.time() + 25
@@ -159,6 +175,182 @@ def dump_stacks(nodes: list[Node]) -> None:
                 print(f"  could not dump stacks for node{node.index}: {exc!r}")
 
 
+def victim_ports(pid: int, mm_port: int) -> list[int]:
+    """Every TCP port the victim uses for multi-master, listening and ephemeral.
+
+    Blocking only the listening port does not partition a full mesh: each node also *dials* its
+    peers, and those connections carry an ephemeral local port that no port-based rule on the
+    listening side touches. Measured the hard way — the first version of this scenario reported a
+    partition while every write still arrived.
+
+    On loopback every address is 127.0.0.1, so the peers cannot be told apart by address; the
+    victim's own socket list is what makes the cut precise.
+    """
+    ports = {mm_port}
+    out = subprocess.run(["ss", "-tnpH", "state", "established"],
+                         capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        if f"pid={pid}," not in line:
+            continue
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        local, remote = fields[2], fields[3]
+        try:
+            local_port, remote_port = int(local.rsplit(":", 1)[1]), int(remote.rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        # Only the multi-master mesh: leave the client port and the metrics port alone, or the
+        # harness would cut the connection it uses to ask questions.
+        if remote_port in MESH_PORTS or local_port == mm_port:
+            ports.add(local_port)
+    return sorted(ports)
+
+
+def block_link(ports: list[int]) -> None:
+    """Drop traffic on the victim's mesh sockets, both directions.
+
+    A partition, not a pause: `kill -STOP` would leave the sender filling socket buffers and the
+    records would arrive on resume, which proves nothing about reconciliation.
+    """
+    for port in ports:
+        for chain, flag in (("INPUT", "--dport"), ("INPUT", "--sport"),
+                            ("OUTPUT", "--dport"), ("OUTPUT", "--sport")):
+            subprocess.run(["sudo", "iptables", "-I", chain, "-p", "tcp", flag, str(port),
+                            "-j", "DROP"], check=True, capture_output=True)
+
+
+def unblock_link(ports: list[int]) -> None:
+    for port in ports:
+        for chain, flag in (("INPUT", "--dport"), ("INPUT", "--sport"),
+                            ("OUTPUT", "--dport"), ("OUTPUT", "--sport")):
+            subprocess.run(["sudo", "iptables", "-D", chain, "-p", "tcp", flag, str(port),
+                            "-j", "DROP"], check=False, capture_output=True)
+
+
+def status_value(port: int, field: str) -> int:
+    reply = command(port, "STATUS\n", settle=0.5)
+    for line in reply.splitlines():
+        if line.strip().startswith(f"{field}:"):
+            raw = line.split(":", 1)[1].strip()
+            return int(raw) if raw.isdigit() else 0
+    return 0
+
+
+def line_after(line: str, since: str) -> bool:
+    """Is this JSON log line's timestamp at or after `since` (an ISO time-of-day)?"""
+    marker = '"ts":"'
+    at = line.find(marker)
+    if at < 0:
+        return False
+    return line[at + len(marker) + 11:at + len(marker) + 19] >= since
+
+
+def run_partition(nodes: list[Node], writer: Node, victim: Node) -> int:
+    """Isolate the victim, write enough to make the sender discard its backlog, then let
+    reconciliation close the difference.
+
+    Blocking the link alone proves nothing: an iptables DROP does not reset the connection, so TCP
+    retransmits everything once the rule is gone and the rows arrive with no help from anti-entropy
+    at all. That version of this scenario reported success while a mutation that disabled
+    reconciliation entirely still passed it.
+
+    What cannot be undone by retransmission is backpressure: once the queued frames exceed
+    max_catchup_bytes, MultiMasterManager clears the send buffer and sets needs_snapshot, which
+    nothing acts on. Those records are then permanently absent from the peer, the connection is
+    healthy, and no reconnect will ever happen — so the periodic vector exchange is the only thing
+    left that can repair it. Hence the deliberately small ceiling and the write volume below.
+    """
+    expected = [700_000]
+    mm_port = victim.ports[3]
+    ports = victim_ports(victim.proc.pid, mm_port)
+    block_started = time.strftime("%H:%M:%S")
+    print(f"isolating node{victim.index} on mesh ports {ports}")
+    block_link(ports)
+    try:
+        time.sleep(3)
+        writes = int(os.environ.get("MMH_PARTITION_WRITES", "150"))
+        with socket.create_connection(("127.0.0.1", writer.tcp), timeout=20) as sock:
+            sock.settimeout(20)
+            sock.recv(4096)
+            payload = "".join(f"INSERT {SYMBOL} EX bid {730_000 + i} 2 1\n" for i in range(writes))
+            sock.sendall(payload.encode())
+            time.sleep(2)
+            try:
+                sock.recv(1 << 20)
+            except socket.timeout:
+                pass
+        expected.extend(730_000 + i for i in range(writes))
+        time.sleep(3)
+
+        during = prices(victim.tcp)
+        held_before_writes = len(expected) - writes
+        print(f"during the partition node{victim.index} holds {len(during)} rows "
+              f"(expected {held_before_writes} — the writes cannot reach it)")
+        if len(during) != held_before_writes:
+            print("  WARNING: the partition did not hold, so this run proves nothing about "
+                  "reconciliation")
+    finally:
+        unblock_link(ports)
+        print("link restored; the node was never restarted")
+
+    runs_before = status_value(victim.tcp, "anti_entropy_runs")
+    deadline = time.time() + 120
+    got: list[int] = []
+    while time.time() < deadline:
+        got = prices(victim.tcp)
+        if sorted(got) == sorted(expected):
+            break
+        time.sleep(2)
+
+    runs_after = status_value(victim.tcp, "anti_entropy_runs")
+
+    # Attribute the repair instead of assuming it. Two mechanisms could have done this: a
+    # reconnect, whose handshake exchanges vectors, or the periodic reconciliation pass. An
+    # iptables DROP does not reset the connection — TCP just retransmits — so a clean run shows
+    # no handshake at all, and then only anti-entropy can have closed the gap. If a handshake
+    # does appear, this run proves catch-up, not reconciliation, and says so.
+    handshakes = 0
+    log_path = os.path.join(ROOT, f"node{victim.index}.log")
+    if os.path.isfile(log_path):
+        with open(log_path, errors="replace") as fh:
+            for line in fh:
+                if "Handshake complete" in line and line_after(line, block_started):
+                    handshakes += 1
+
+    # Evidence that the gap was real: the writer discarded a backlog for this peer, so the
+    # records were gone from the wire rather than waiting in a retransmission queue.
+    discards = 0
+    writer_log = os.path.join(ROOT, f"node{writer.index}.log")
+    if os.path.isfile(writer_log):
+        with open(writer_log, errors="replace") as fh:
+            for line in fh:
+                if "Backpressure" in line and line_after(line, block_started):
+                    discards += 1
+
+    ok = sorted(got) == sorted(expected) and len(got) == len(set(got))
+    print(f"after reconciliation node{victim.index} holds {len(got)} rows, "
+          f"{len(set(got))} distinct, expected {len(expected)}; "
+          f"anti_entropy runs {runs_before} -> {runs_after}")
+    print(f"  evidence: backpressure discards on the writer = {discards}, "
+          f"handshakes on the victim after the block = {handshakes}")
+    if discards == 0:
+        print("  WARNING: nothing was discarded, so TCP retransmission alone could explain this "
+              "run — it proves nothing about reconciliation")
+    elif handshakes:
+        print("  NOTE: a handshake happened, so reconnect-driven catch-up may have done the work")
+    else:
+        print("  attributed to reconciliation: the backlog was discarded, no reconnect happened, "
+              "and the rows arrived anyway")
+    if ok and discards == 0:
+        print("RESULT: RECONVERGED, but by TCP retransmission — an iptables DROP does not reset "
+              "the connection, so this says nothing about anti-entropy. A conclusive run needs a "
+              "bounded send buffer (roadmap #69) so the backlog is actually discarded.")
+    else:
+        print("RESULT:", "OK" if ok else "STILL DIVERGED")
+    return 0 if ok else 1
+
+
 def main() -> int:
     if not os.path.isfile(SERVER):
         print(f"server binary not built: {SERVER}")
@@ -183,6 +375,10 @@ def main() -> int:
         print("after the first write:", [prices(n.tcp) for n in nodes])
 
         victim, writer = nodes[2], nodes[0]
+
+        if os.environ.get("MMH_MODE") == "partition":
+            failures += run_partition(nodes, writer, victim)
+            return 1 if failures else 0
         for cycle in range(cycles):
             victim.kill()
             time.sleep(2)

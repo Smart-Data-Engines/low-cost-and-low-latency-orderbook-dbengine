@@ -274,6 +274,9 @@ void MultiMasterManager::start() {
         AntiEntropyConfig ae_config{};
         ae_config.interval_seconds = config_.anti_entropy_interval_sec;
         anti_entropy_ = std::make_unique<AntiEntropyManager>(ae_config, engine_, *peer_registry_);
+        // The work itself, injected rather than reached for: this object owns the manager, so a
+        // reference back would be a cycle, and a function makes a pass testable with a fake.
+        anti_entropy_->set_reconciler([this] { return reconcile_with_peers(); });
         anti_entropy_->start();
         OB_LOG_INFO("mm", "Anti-entropy scheduler started: interval=%us",
                     config_.anti_entropy_interval_sec);
@@ -1193,6 +1196,40 @@ void MultiMasterManager::send_version_vector(PeerConnection& peer) {
     enqueue_frame(peer, frame.data(), frame.size());
     OB_LOG_INFO("mm", "Sent version vector to peer %u: entries=%zu truncated=%d bytes=%zu",
                 peer.node_id, entries.size(), truncated ? 1 : 0, frame.size());
+}
+
+ReconcileReport MultiMasterManager::reconcile_with_peers() {
+    ReconcileReport report{};
+
+    // The vector snapshot comes from the engine's cache, so this does not touch the engine mutex
+    // while holding MM's — the cycle that deadlocked the flush thread once already.
+    bool truncated = false;
+    const auto ours = engine_.export_version_vector(MM_MAX_VV_ENTRIES, truncated);
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    for (auto& [node_id, peer] : peers_) {
+        if (!peer.connected || !peer.handshake_done) continue;
+        ++report.peers_contacted;
+
+        // What the two sides disagree about, as far as we know from the peer's last vector. This
+        // is reporting, not the repair: the repair is the send below.
+        const VectorDiff diff = compare_vectors(ours, peer.peer_vector, peer.node_id);
+        report.we_lack.insert(report.we_lack.end(), diff.we_lack.begin(), diff.we_lack.end());
+        report.peer_lacks.insert(report.peer_lacks.end(),
+                                 diff.peer_lacks.begin(), diff.peer_lacks.end());
+
+        // Send ours again and let the peer's returning vector re-run our filter, so both
+        // directions get closed by one exchange.
+        send_version_vector(peer);
+        peer.catchup_started    = false;
+        peer.vector_deadline_ms = now_ms() + MM_VV_GRACE_MS;
+        ++report.vectors_sent;
+    }
+
+    OB_LOG_DEBUG("mm", "Reconcile pass: peers=%zu vectors_sent=%zu we_lack=%zu peer_lacks=%zu",
+                 report.peers_contacted, report.vectors_sent,
+                 report.we_lack.size(), report.peer_lacks.size());
+    return report;
 }
 
 void MultiMasterManager::start_overdue_catchups() {
