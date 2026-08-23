@@ -1270,6 +1270,20 @@ consecutive numbers with no hole. The module's docstring used to say "a client c
 numbers, so asserting on `SELECT` output would prove nothing"; it now says the opposite, and the
 tests do the asserting.
 
+**What the column costs.** Measured directly on the formatter rather than through `bench_engine`,
+which cannot resolve this size of change on this machine: formatting 1000 rows, best of five
+interleaved rounds, on the i3-7100U development machine. Seven columns cost **+41 ns per row (+23%)**
+over six — one more `std::to_string` of a `uint64` and one more tab. A 1000-row response therefore
+spends about 40 µs more in formatting. The upper end of the range is quoted on purpose: understating
+a cost is the same mistake as overstating a speed.
+
+The measurement needed two attempts, and the reason is worth more than the number. The first version
+kept the six-column control in the **same translation unit** as `main`, where it could be inlined,
+while the real function lives in `response_formatter.cpp` and cannot be. Moving the control into its
+own translation unit — the same shape as the thing it is compared against — changed the *control* by
+28 ns, which is most of the effect being measured. A control that is not built like the subject
+measures the harness.
+
 - Effort: S | Impact: A client can verify the completeness of what it received instead of trusting the
   server
 

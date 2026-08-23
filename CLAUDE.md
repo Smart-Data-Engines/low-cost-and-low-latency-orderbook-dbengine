@@ -232,6 +232,12 @@ Learned the hard way. Check here before debugging.
     unconditionally and stored the result over the previous handle. Called once at startup it looked
     fine; called once a second while a coordinator was down it leaked a handle per attempt. Before
     turning a one-shot call into a retried one, read it as if it runs a thousand times.
+33. **A control that is not built like the subject measures the harness.** Timing the seventh column
+    of a query response against a six-column copy looked simple until the copy was moved out of
+    `main`'s translation unit, where it had been inlinable while the real formatter — in
+    `response_formatter.cpp` — was not. That move changed the *control* by 28 ns, most of the 41 ns
+    effect under test. Build the control the way the subject is built: same translation unit shape,
+    same linkage, same optimisation opportunities.
 
 ## Current state and open problems
 
