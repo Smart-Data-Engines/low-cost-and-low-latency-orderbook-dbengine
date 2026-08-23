@@ -936,7 +936,20 @@ def healthy_cluster(failover_cluster: ClusterManager) -> Generator[ClusterManage
         if node.process is None or node.process.poll() is not None:
             cluster.restart_node(index)
 
-    cluster._wait_for_election(timeout=30.0)
+    # The timeout has to clear the handover cooldown, not just an election. A node that has just
+    # handed the role away refuses to stand for election for --handover-cooldown-seconds (15 by
+    # default), so a 30-second budget was only barely enough and the suite flickered once graceful
+    # handover started working for real (roadmap #60): before that, these tests were no-ops that
+    # answered ERR unknown_target and never moved a role at all.
+    try:
+        cluster._wait_for_election(timeout=45.0)
+    except Exception:
+        # One restart of everything, then insist. A silently half-restored cluster makes the next
+        # module's red point at the wrong code — which is exactly what happened: a smoke test
+        # failed with "No node with PRIMARY role found" because a failover test left no primary.
+        for index in range(len(cluster.nodes)):
+            cluster.restart_node(index)
+        cluster._wait_for_election(timeout=45.0)
 
     roles = [cluster._query_role(n).strip().upper() for n in cluster.nodes]
     primaries = [r for r in roles if "PRIMARY" in r and "REPLICA" not in r]

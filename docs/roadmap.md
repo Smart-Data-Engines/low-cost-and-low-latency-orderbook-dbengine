@@ -559,6 +559,20 @@ in order. What is left for anti-entropy is divergence that persists while the co
 - a backlog the sender discarded under backpressure, which nothing repairs today and which becomes
   the conclusive test for this item once #69 caps the live send buffer
 
+**A regression this introduced, and the fix.** As first shipped, a vector arriving started a full scan
+of the retained WAL — so a timer that sends a vector to every peer meant every node re-read its whole
+log, per peer, per interval, on the io_loop thread that also carries live traffic. Measured in the
+harness: `scanned=543 (9662010 bytes) sent=0`, over and over. At the 94 MB/s that scan runs at, a 1 GB
+WAL would spend most of every interval reading itself to find nothing.
+
+Receiving a vector now compares it first and scans only if the peer is actually missing a range. In a
+four-cycle harness run that skipped 18 scans and left only scans that sent records. The comparison is
+safe because every route to a peer missing data leaves evidence in it or forces a reconnect: a
+disconnected peer returns through the handshake, a backlog dropped for not draining closes the
+connection (#69), and a record the receiver refused leaves its own frontier behind. The code says so,
+because a future change that can drop a record while both sides stay connected has to remove the
+shortcut with it.
+
 Verified: 6 unit tests on the pass (both directions, closure measured across passes, a persisting gap
 not counted, the same symbol from two peers as two facts, and a run with no reconciler saying so), 7
 on `compare_vectors` (including a key only the peer holds, and silence read as "holds nothing"), and
@@ -658,6 +672,40 @@ first. Published positions now exist for it to compare, but nothing compares the
 
 - Effort: S | Impact: Graceful handover works, an outgoing primary stops advertising a role it gave
   away, and a replica follows the current leader instead of a remembered one
+
+### 71. The coordinator client shared one libcurl handle across threads ✅
+
+Found by chasing a flaky test after #60, rather than by re-running it until it passed.
+
+`CoordinatorClient::Impl` held a single `CURL* curl_handle` and there was no mutex anywhere in
+`src/coordinator.cpp`. A libcurl easy handle must not be used from two threads at once, and this one
+was: the failover monitor thread refreshes the lease and polls cluster state, while a session thread
+running `FAILOVER` sets a handover intent and revokes a lease — on the same handle.
+
+The window was narrow until #60 started publishing WAL positions every second. Then graceful handover
+began failing intermittently:
+
+```
+AssertionError: handover refused: 'ERR failover_failed'
+```
+
+`failover_failed` is `COORDINATOR_ERROR`, which in that path means `revoke_lease()` returned false —
+a request corrupted mid-flight by the concurrent publish. One run in three, and the cascade after it
+(a cluster with no primary) also broke a smoke test two modules later with "No node with PRIMARY role
+found".
+
+Every request on the shared handle is now serialised. The watch loop is unaffected: it already creates
+its own handle. Verified by repetition, since the symptom was intermittent: three consecutive runs of
+the failover module and two of the failover-plus-smoke combination that had been failing, all green.
+
+Worth noting what the flakiness was *not*: it was not test ordering, though it looked like it. The
+control — the same combination on `master` — passed, which pointed at the change rather than the
+tests, and the actual message (`failover_failed`, not `not_primary`) pointed at the coordinator rather
+than at the role. Re-running until green would have hidden a data race in the component that decides
+which node is primary.
+
+- Effort: S | Impact: Removes a data race from lease management and leader election, and with it the
+  intermittent handover failure it caused
 
 ### 70. The election policy has no callers
 
