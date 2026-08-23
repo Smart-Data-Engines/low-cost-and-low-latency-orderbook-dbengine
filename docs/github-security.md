@@ -73,7 +73,9 @@ gh api -X PUT repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengi
         "strict_required_status_checks_policy": true,
         "required_status_checks": [
           { "context": "build-and-test" },
-          { "context": "release-build" }
+          { "context": "release-build" },
+          { "context": "docs-integrity" },
+          { "context": "analyze (c-cpp)" }
         ]
       }
     }
@@ -81,6 +83,27 @@ gh api -X PUT repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengi
 }
 JSON
 ```
+
+### Why `analyze (c-cpp)` is on that list
+
+It was deliberately left off for a while, for a reason that has since gone away: `parse_cli_args()`
+consumed flag values with `argv[++i]` inside a `for` loop, which CodeQL reports as
+`cpp/loop-variable-changed` 29 times over. Every PR that touched the file opened a review thread, and
+with `required_review_thread_resolution` on, every one of those PRs needed a manual resolution. Making
+the analysis required on top of that would have meant a merge blocked by a finding nobody intended to
+act on.
+
+Roadmap #36 removed that class — an `ArgCursor` owns the index now — so the analysis is clean, and the
+last three PRs went through without a CodeQL thread. Requiring it costs about 3.5 minutes per PR and
+buys the guarantee that a real finding cannot be merged past by habit.
+
+The risk is worth stating, because it has already happened once: a CodeQL **infrastructure** failure
+blocks merges just as firmly as a real finding. In August 2026 Dependabot split a `codeql-action` bump
+into two PRs, one for `init` and one for `analyze`, and each failed on its own with
+`Loaded a configuration file for version '4.37.7', but running version '3.37.7'` — the two steps have
+to move together. With the analysis required, that state blocks the queue until someone bumps both
+steps in one commit (#23 did). If that happens again and the queue must move, the escape hatch is
+`gh pr merge --admin`, and using it should be noted on the PR.
 
 Verify afterwards:
 
