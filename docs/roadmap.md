@@ -1033,28 +1033,34 @@ two key builds per write: `apply_delta()` built it once for the migrated-symbol 
 - Status: **DONE**
 - Spec: `kiro-workspace/specs/wal-sequence-numbers/`
 
-### 66. The write path builds the same key string three times
+### 66. The write path built the same key string four times ✅
 
-Measured while benchmarking #64, and worth its own item because the numbers are known and the fix is
-not free.
+Measured while benchmarking #64, fixed now that the numbers were known.
 
-Every write builds `"SYMBOL.EXCHANGE"` and looks it up more than once: `apply_delta()` builds it for
-the migrated-symbol check (and after #64 passes that one down), `get_or_create_buffer()` takes
-`std::string` parameters by value and concatenates again — two temporaries plus the result — and
-`SequenceTracker` keeps its own map keyed by the same string. Measured on machine B: 27.0 ns per key
-construction, 54.4 ns for the tracker's `observe()`.
+Every write builds `"SYMBOL.EXCHANGE"`: once for the migrated-symbol check, once more inside
+`get_or_create_buffer()`, which took its arguments as `std::string` **by value** — so calling it with
+the `char` arrays from `DeltaUpdate` created two temporaries and then concatenated them, three
+allocations of their own. Four in total on the hottest path in the engine.
 
-Unifying per-symbol state into a single map — buffer, sequence counter and origin high-water marks
-under one key — would leave one lookup and no extra allocations per write, and would very likely come
-out *ahead* of master rather than level with it. This was the original shape in #64's design and was
-deliberately deferred: it changes shared `Engine` internals (7 uses of `buffers_`, 4 of `live_ptrs_`,
-plus the flush, snapshot and TTL paths), so it deserves its own change with its own measurement rather
-than riding along with a correctness fix.
+The write path already has that key in hand: it needs it for the migrated-symbol check and, since
+#64, for the sequence tracker. So `get_or_create_buffer()` now takes the prebuilt key plus the two
+`char` pointers it needs when it actually creates a buffer, and every hot call site passes what it
+already built. The old two-argument overload stays for callers that do not have a key.
 
-Note for whoever does it: on machine B the engine benchmarks cannot resolve a few percent (see #64), so
-the verification has to be a direct measurement of the mechanism, not a `bench_engine` A/B.
+Measured on machine B, the exact pattern the engine used against the same lookup with a key in hand:
 
-- Effort: S | Impact: Removes three allocations and one hash lookup from the hottest path in the engine
+| | ns per write |
+|---|---|
+| build the key, then look up | 53.6 |
+| look up with the key already built | 8.8 |
+
+**44.8 ns saved per write**, about 1.6% of a 2883 ns ingestion op. Measured on the pattern rather than
+with `bench_engine`, for the reason #64 established: a few percent is below what the engine benchmark
+can resolve on this machine, and the control benchmark proved it by moving 40% on an unrelated read
+path.
+
+- Effort: S | Impact: Three allocations off every write, on the path the engine's headline number
+  measures
 
 ### 65. The sequence number is not visible to a client
 
