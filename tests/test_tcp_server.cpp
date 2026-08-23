@@ -290,20 +290,22 @@ RC_GTEST_PROP(ResponseFormatter, RoundTrip, ()) {
         ob::ParsedResponse parsed = ob::parse_response(wire);
 
         RC_ASSERT(!parsed.is_error);
-        // Header should have 6 columns
-        RC_ASSERT(parsed.header_columns.size() == 6u);
+        // Header should have 7 columns: sequence_number was appended by #65
+        RC_ASSERT(parsed.header_columns.size() == 7u);
+        RC_ASSERT(parsed.header_columns[6] == "sequence_number");
         // Row count should match
         RC_ASSERT(parsed.rows.size() == rows.size());
 
         // Verify each row's values match
         for (size_t i = 0; i < rows.size(); ++i) {
-            RC_ASSERT(parsed.rows[i].size() == size_t(6));
+            RC_ASSERT(parsed.rows[i].size() == size_t(7));
             RC_ASSERT(parsed.rows[i][0] == std::to_string(rows[i].timestamp_ns));
             RC_ASSERT(parsed.rows[i][1] == std::to_string(rows[i].price));
             RC_ASSERT(parsed.rows[i][2] == std::to_string(rows[i].quantity));
             RC_ASSERT(parsed.rows[i][3] == std::to_string(rows[i].order_count));
             RC_ASSERT(parsed.rows[i][4] == std::to_string(rows[i].side));
             RC_ASSERT(parsed.rows[i][5] == std::to_string(rows[i].level));
+            RC_ASSERT(parsed.rows[i][6] == std::to_string(rows[i].sequence_number));
         }
     }
 }

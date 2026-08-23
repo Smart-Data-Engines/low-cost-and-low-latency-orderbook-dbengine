@@ -159,6 +159,7 @@ Subscriptions are used programmatically via the C API (`ob_subscribe`) or Python
 | `order_count` | uint32 | Number of orders at this level |
 | `side` | uint8 | 0 = bid, 1 = ask |
 | `level` | uint16 | 0-based level index (0 = best) |
+| `sequence_number` | uint64 | Per-origin sequence number of the update that produced the row; last column, and 0 when unknown |
 
 ## Error Handling
 

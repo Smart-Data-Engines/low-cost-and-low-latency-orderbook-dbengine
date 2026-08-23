@@ -9,8 +9,11 @@ namespace ob {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// sequence_number goes last on purpose: a client that reads columns by index keeps working, and
+// one that reads by name finds the new field. 0 means "unassigned" — rows written before #64
+// carry no number, and there is no way to invent one for them after the fact.
 static constexpr std::string_view kQueryHeader =
-    "timestamp_ns\tprice\tquantity\torder_count\tside\tlevel";
+    "timestamp_ns\tprice\tquantity\torder_count\tside\tlevel\tsequence_number";
 
 static constexpr std::string_view kAggHeader = "name\tvalue\tscale";
 
@@ -55,6 +58,8 @@ std::string format_query_response(const std::vector<QueryResult>& rows) {
         out += std::to_string(r.side);
         out += '\t';
         out += std::to_string(r.level);
+        out += '\t';
+        out += std::to_string(r.sequence_number);
         out += '\n';
     }
 

@@ -103,11 +103,16 @@ query <SQL>
 
 ```
 ob> query SELECT * FROM 'BTC-USD'.'BINANCE' WHERE timestamp BETWEEN 0 AND 9999999999999999999
-  ts_ns               | side | level | price        | qty          | orders
-  ────────────────────┼──────┼───────┼──────────────┼──────────────┼────────
-  1773478813946338657  | bid  |     0 |      6500000 |          150 |      3
-  1773478813948808615  | bid  |     0 |      6499000 |          200 |      5
+  ts_ns               | side | level | price        | qty          | orders |      seq
+  ────────────────────┼──────┼───────┼──────────────┼──────────────┼────────┼─────────
+  1773478813946338657  | bid  |     0 |      6500000 |          150 |      3 |        1
+  1773478813948808615  | bid  |     0 |      6499000 |          200 |      5 |        2
   ── 2 row(s) in 0.11 ms
+
+`seq` is the per-origin sequence number of the update that produced the row, and the wire protocol
+carries it as the seventh column of a `SELECT` response. Consecutive numbers for one symbol mean
+nothing is missing between them; a hole means a row did not arrive. `0` means the number is unknown —
+the row was stored before sequencing existed, or the server predates the column and sent six fields.
 ```
 
 Aggregates render as their own table, with the value in natural units in the last column, so the

@@ -231,13 +231,14 @@ extern "C" void ob_result_free(ob_result_t* result) {
     delete result;
 }
 
-extern "C" ob_status_t ob_result_next(ob_result_t* result,
+extern "C" ob_status_t ob_result_next_seq(ob_result_t* result,
                                        uint64_t*    out_timestamp_ns,
                                        int64_t*     out_price,
                                        uint64_t*    out_quantity,
                                        uint32_t*    out_order_count,
                                        uint8_t*     out_side,
-                                       uint16_t*    out_level)
+                                       uint16_t*    out_level,
+                                       uint64_t*    out_sequence_number)
 {
     if (!result) return OB_C_ERR_INVALID_ARG;
     if (result->pos >= result->rows.size()) return OB_C_ERR_NOT_FOUND;
@@ -249,7 +250,22 @@ extern "C" ob_status_t ob_result_next(ob_result_t* result,
     if (out_order_count)  *out_order_count  = r.order_count;
     if (out_side)         *out_side         = r.side;
     if (out_level)        *out_level        = r.level;
+    if (out_sequence_number) *out_sequence_number = r.sequence_number;
     return OB_C_OK;
+}
+
+extern "C" ob_status_t ob_result_next(ob_result_t* result,
+                                       uint64_t*    out_timestamp_ns,
+                                       int64_t*     out_price,
+                                       uint64_t*    out_quantity,
+                                       uint32_t*    out_order_count,
+                                       uint8_t*     out_side,
+                                       uint16_t*    out_level)
+{
+    // Delegating keeps one implementation of the cursor. The sequence number is dropped rather
+    // than silently zeroed into a caller's struct: this signature has no field for it.
+    return ob_result_next_seq(result, out_timestamp_ns, out_price, out_quantity,
+                              out_order_count, out_side, out_level, nullptr);
 }
 
 // ── Subscriptions ─────────────────────────────────────────────────────────────

@@ -68,8 +68,8 @@ FLUSH
 OK
 SELECT * FROM 'BTC-USD'.'BINANCE' WHERE timestamp BETWEEN 0 AND 9999999999999999999
 OK
-timestamp_ns	price	quantity	order_count	side	level
-1700000000000	6500000	150	3	0	0
+timestamp_ns	price	quantity	order_count	side	level	sequence_number
+1700000000000	6500000	150	3	0	0	1
 
 QUIT
 ```

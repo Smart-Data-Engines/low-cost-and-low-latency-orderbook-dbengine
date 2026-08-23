@@ -1231,7 +1231,7 @@ path.
 - Effort: S | Impact: Three allocations off every write, on the path the engine's headline number
   measures
 
-### 65. The sequence number is not visible to a client
+### 65. The sequence number is not visible to a client ✅
 
 `format_query_response()` sends six columns — timestamp, price, quantity, order_count, side, level — and
 the sequence number is not one of them, although `QueryEngine` fills it into `QueryResult`. After #64
@@ -1242,6 +1242,34 @@ Not free: it means a seventh column in the row format, `kQueryHeader`, the Pytho
 the C++ client, `docs/cli.md`, and the tests that assert response shape. Worth doing deliberately rather
 than as a side effect of #64.
 
+`sequence_number` is now the **seventh and last** column of a `SELECT` response. Last on purpose: a
+client that reads columns by index keeps working unchanged, and one that reads by name finds the new
+field. The same value reaches the three other readers the engine ships — the C++ client
+(`QueryRow::sequence_number`), the Python client (`OrderbookRow.sequence_number`) and the interactive
+CLI, which grew a `seq` column so the number is not visible on the wire and invisible in our own tool.
+
+Compatibility went both ways and both are tested. A new client against a six-column server reads 0 —
+"unknown" — instead of failing or shifting a field. A truncated or non-numeric seventh column is still
+a parse error, because handing back half a number would let a caller believe it knows where it is in
+the stream.
+
+The C API needed a decision rather than an edit: `ob_result_next()` is a C entry point somebody may
+have compiled against, so the extra out-parameter went into a new `ob_result_next_seq()` and the old
+function delegates to it. The Python binding uses the new one when the loaded library exports it and
+falls back otherwise, so an in-process query reports the same numbers a TCP query does. Without that
+the field would have been a silent 0 in pool mode — the exact class of defect #64 was.
+
+What 0 means is now written down in four places, because it means two different things and neither is
+"the first row": the row predates sequencing, or the server predates the column.
+
+Verified beyond "it compiles": the formatter round-trip property now covers the seventh column, three
+new client unit tests cover the new/old/garbage cases, and three integration tests read the numbers
+off a live server — that the header names the column last, that the highest number a client sees
+equals `max_sequence_number` in `meta.json` for the same symbol, and that ten writes produce ten
+consecutive numbers with no hole. The module's docstring used to say "a client cannot see these
+numbers, so asserting on `SELECT` output would prove nothing"; it now says the opposite, and the
+tests do the asserting.
+
 - Effort: S | Impact: A client can verify the completeness of what it received instead of trusting the
   server
 
@@ -1250,10 +1278,13 @@ than as a side effect of #64.
 
 ## Recommended order
 
+No P0 is open. The four that were — #60, #61, #62, #64 — are closed, and so is #73, which was found
+while proving #70 on a real cluster rather than by reading the code.
+
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **P0** | Multi-master catch-up loses records (#61) | M | A rejoining node silently misses records after a second outage, and anti-entropy that should catch it is a stub |
-| **P0** | Graceful failover unreachable (#60) | S | `FAILOVER <target>` always answers `ERR unknown_target` outside the C++ tests, because nothing publishes node positions |
+| **P1** | Position freshness on election (#72) | M | Deference cannot tell a further replica from a dead one, so every two-node failover pays the full window for nothing |
+| **P1** | A node joining mid-stream never establishes a frontier (#67) | M | It can catch up but cannot prove it has everything, which is the guarantee the version vector exists to give |
 | **P1** | Deployment artifacts (#33) | M | Cheapest large jump in time-to-first-run |
 | **P1** | Reproducible comparative benchmarks (#39) | L | Makes the performance claim verifiable by a reader instead of asserted |
 | **P1** | Authentication and TLS (#30) | L | The single blocker to production adoption |
