@@ -33,7 +33,7 @@ cmake --build build -j$(nproc)
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release -j$(nproc)
 
-# Tests — 658 of them, ~2.5 minutes
+# Tests — 673 of them, ~2.5 minutes
 ctest --test-dir build --output-on-failure -j1
 ```
 
@@ -199,7 +199,12 @@ Learned the hard way. Check here before debugging.
     the peer buffer contributed 0.2 MB, because the kernel socket buffer absorbs the first few
     megabytes. Measure the thing (`ob_mm_peer_send_buf_bytes`), not a proxy that moves for a dozen
     other reasons.
-27. **The checkpoint goes after the flush, never before.** A `CHECKPOINT` record claiming more than
+27. **A parser that ignores what it does not understand hides operator mistakes.**
+    `parse_cli_args()` accepted `--prot 5599` and `--port` with no value by silently skipping
+    both, and cast `--port 99999` down to 34463. It also had no tests, which is how that survived
+    (roadmap #36). Unknown flag, missing value, non-numeric value and out-of-range value are all
+    errors now. If a config parser can be wrong in silence, it will be.
+28. **The checkpoint goes after the flush, never before.** A `CHECKPOINT` record claiming more than
     is durable turns a crash into data loss; claiming less costs a replay that gets skipped anyway.
     For the crash window between writing the segment files and appending the checkpoint,
     `replay_wal_tail()` skips records at or below the highest `end_ts_ns` already on disk — without

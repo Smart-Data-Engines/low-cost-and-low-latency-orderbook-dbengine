@@ -239,6 +239,10 @@ function(ob_add_tcp_test name)
 endfunction()
 
 # ── TCP Server tests ──────────────────────────────────────────────────────────
+ob_add_tcp_test(test_cli_args
+    test_cli_args.cpp
+)
+
 ob_add_tcp_test(test_tcp_server
     test_tcp_server.cpp
 )

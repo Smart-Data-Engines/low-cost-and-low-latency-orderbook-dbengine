@@ -203,6 +203,30 @@ Durability of the WAL write itself is set at build/config level by `FsyncPolicy`
 `NEVER`). With anything other than `EVERY`, an acknowledged write can be lost on a power cut — the
 replay described above cannot recover a record that never reached the platter.
 
+## Argument handling
+
+The server refuses a command line it does not fully understand, rather than starting with defaults:
+
+```
+$ ob_tcp_server --prot 5599
+Error: unknown argument '--prot'
+
+$ ob_tcp_server --port
+Error: --port requires a value
+
+$ ob_tcp_server --port abc
+Error: --port expects a non-negative integer, got 'abc'
+
+$ ob_tcp_server --port 99999
+Error: --port expects a value in range, got '99999'
+```
+
+All four used to be accepted in some form. A typo in a flag name was ignored along with its value, a
+flag with no value fell through, a non-numeric value threw an uncaught `std::invalid_argument` from
+`stoi`, and an out-of-range port was cast into range — `99999` became `34463`, so the server listened
+on a port nobody had named. If you have scripts passing flags this binary does not know, they will now
+fail instead of starting a server with a configuration you did not intend.
+
 ## Multi-Master Replication
 
 Multi-master mode allows multiple nodes to accept writes simultaneously. All nodes in the cluster replicate data to each other via WAL streaming in a full-mesh topology. Conflicts (concurrent writes to the same price level) are resolved automatically using Last-Writer-Wins (LWW) based on Hybrid Logical Clock (HLC).

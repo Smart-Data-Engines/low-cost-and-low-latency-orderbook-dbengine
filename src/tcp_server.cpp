@@ -10,6 +10,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <charconv>
+#include <limits>
+#include <type_traits>
+#include <string_view>
 #include <string>
 #include <vector>
 
@@ -357,100 +361,189 @@ std::string execute_command(const Command& cmd,
     }
 }
 
+// ── ArgCursor ─────────────────────────────────────────────────────────────────
+//
+// A cursor over argv, so consuming a flag's value does not mean modifying the loop variable.
+// The old parser did `argv[++i]` inside `for (int i = 1; i < argc; ++i)` 29 times, which is 29
+// instances of cpp/loop-variable-changed and a review thread on every PR that added a flag
+// (roadmap #36). It also hid three real defects, all measured before this rewrite:
+//
+//   ob_tcp_server --port abc      → terminate called after throwing std::invalid_argument, core
+//                                   dumped: stoi threw and nothing caught it
+//   ob_tcp_server --port          → started anyway, on the default port. The guard was
+//                                   `arg == "--port" && i + 1 < argc`, so a flag with no value
+//                                   simply fell through
+//   ob_tcp_server --prot 5599     → started anyway, on the default port, ignoring both the typo
+//                                   and its value, because there was no unknown-argument branch
+//
+// All three are now errors with a message naming the flag. That is stricter than before: an
+// invocation carrying an unknown flag used to start a server and now refuses to. A correct
+// invocation behaves exactly as it did.
+
+namespace {
+
+class ArgCursor {
+public:
+    ArgCursor(int argc, char* argv[]) : argc_(argc), argv_(argv) {}
+
+    /// Advance to the next argument. False when there are none left.
+    bool next() { return ++index_ < argc_; }
+
+    /// The argument the cursor is on.
+    std::string_view arg() const { return argv_[index_]; }
+
+    /// The value belonging to the current flag. Missing values are fatal, not ignored.
+    std::string_view value() {
+        if (index_ + 1 >= argc_) {
+            std::fprintf(stderr, "Error: %s requires a value\n", argv_[index_]);
+            std::exit(1);
+        }
+        return argv_[++index_];
+    }
+
+    /// The value parsed as a number, with the flag named in the error rather than a stoi throw.
+    template <typename T>
+    T value_as() {
+        const char* flag = argv_[index_];
+        const std::string_view text = value();
+
+        if constexpr (std::is_signed_v<T>) {
+            long long parsed = 0;
+            const auto result = std::from_chars(text.data(), text.data() + text.size(), parsed);
+            if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) {
+                fail(flag, text, "an integer");
+            }
+            if (parsed < static_cast<long long>(std::numeric_limits<T>::min()) ||
+                parsed > static_cast<long long>(std::numeric_limits<T>::max())) {
+                fail(flag, text, "a value in range");
+            }
+            return static_cast<T>(parsed);
+        } else {
+            unsigned long long parsed = 0;
+            const auto result = std::from_chars(text.data(), text.data() + text.size(), parsed);
+            if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) {
+                fail(flag, text, "a non-negative integer");
+            }
+            if (parsed > static_cast<unsigned long long>(std::numeric_limits<T>::max())) {
+                fail(flag, text, "a value in range");
+            }
+            return static_cast<T>(parsed);
+        }
+    }
+
+private:
+    [[noreturn]] static void fail(const char* flag, std::string_view text, const char* expected) {
+        std::fprintf(stderr, "Error: %s expects %s, got '%.*s'\n", flag, expected,
+                     static_cast<int>(text.size()), text.data());
+        std::exit(1);
+    }
+
+    int    argc_;
+    char** argv_;
+    int    index_{0};
+};
+
+}  // namespace
+
 // ── parse_cli_args ────────────────────────────────────────────────────────────
 
 ServerConfig parse_cli_args(int argc, char* argv[]) {
     ServerConfig config;
 
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
+    ArgCursor cursor(argc, argv);
+    while (cursor.next()) {
+        const std::string arg{cursor.arg()};
 
-        if (arg == "--port" && i + 1 < argc) {
-            config.port = static_cast<uint16_t>(std::stoi(argv[++i]));
-        } else if (arg == "--data-dir" && i + 1 < argc) {
-            config.data_dir = argv[++i];
-        } else if (arg == "--max-sessions" && i + 1 < argc) {
-            config.max_sessions = std::stoi(argv[++i]);
-        } else if (arg == "--workers" && i + 1 < argc) {
-            config.worker_threads = std::stoi(argv[++i]);
+        if (arg == "--port") {
+            config.port = cursor.value_as<uint16_t>();
+        } else if (arg == "--data-dir") {
+            config.data_dir = std::string{cursor.value()};
+        } else if (arg == "--max-sessions") {
+            config.max_sessions = cursor.value_as<int>();
+        } else if (arg == "--workers") {
+            config.worker_threads = cursor.value_as<int>();
         } else if (arg == "--read-only") {
             config.read_only = true;
-        } else if (arg == "--replication-port" && i + 1 < argc) {
-            config.replication_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        } else if (arg == "--replication-port") {
+            config.replication_port = cursor.value_as<uint16_t>();
         } else if (arg == "--replication-compress") {
             config.replication_compress = true;
-        } else if (arg == "--primary-host" && i + 1 < argc) {
-            config.primary_host = argv[++i];
-        } else if (arg == "--primary-port" && i + 1 < argc) {
-            config.primary_port = static_cast<uint16_t>(std::stoi(argv[++i]));
-        } else if (arg == "--snapshot-chunk-size" && i + 1 < argc) {
-            config.snapshot_chunk_size = static_cast<size_t>(std::stoul(argv[++i]));
-        } else if (arg == "--snapshot-staging-dir" && i + 1 < argc) {
-            config.snapshot_staging_dir = argv[++i];
-        } else if (arg == "--coordinator-endpoints" && i + 1 < argc) {
-            // Parse comma-separated list of endpoints.
-            std::string endpoints_str = argv[++i];
+        } else if (arg == "--primary-host") {
+            config.primary_host = std::string{cursor.value()};
+        } else if (arg == "--primary-port") {
+            config.primary_port = cursor.value_as<uint16_t>();
+        } else if (arg == "--snapshot-chunk-size") {
+            config.snapshot_chunk_size = cursor.value_as<size_t>();
+        } else if (arg == "--snapshot-staging-dir") {
+            config.snapshot_staging_dir = std::string{cursor.value()};
+        } else if (arg == "--coordinator-endpoints") {
+            // Comma-separated list; empty entries are skipped rather than stored.
+            const std::string endpoints{cursor.value()};
             std::string ep;
-            for (char c : endpoints_str) {
+            for (char c : endpoints) {
                 if (c == ',') {
                     if (!ep.empty()) config.coordinator_endpoints.push_back(ep);
                     ep.clear();
                 } else {
-                    ep += c;
+                    ep.push_back(c);
                 }
             }
             if (!ep.empty()) config.coordinator_endpoints.push_back(ep);
-        } else if (arg == "--coordinator-lease-ttl" && i + 1 < argc) {
-            config.coordinator_lease_ttl = std::stoll(argv[++i]);
-        } else if (arg == "--handover-grace-seconds" && i + 1 < argc) {
-            config.handover_grace_seconds = std::stoll(argv[++i]);
-        } else if (arg == "--handover-cooldown-seconds" && i + 1 < argc) {
-            config.handover_cooldown_seconds = std::stoll(argv[++i]);
-        } else if (arg == "--node-id" && i + 1 < argc) {
-            config.node_id = argv[++i];
-        } else if (arg == "--failover-enabled" && i + 1 < argc) {
-            std::string val = argv[++i];
+        } else if (arg == "--coordinator-lease-ttl") {
+            config.coordinator_lease_ttl = cursor.value_as<int64_t>();
+        } else if (arg == "--handover-grace-seconds") {
+            config.handover_grace_seconds = cursor.value_as<int64_t>();
+        } else if (arg == "--handover-cooldown-seconds") {
+            config.handover_cooldown_seconds = cursor.value_as<int64_t>();
+        } else if (arg == "--node-id") {
+            config.node_id = std::string{cursor.value()};
+        } else if (arg == "--failover-enabled") {
+            const std::string val{cursor.value()};
             config.failover_enabled = (val == "true" || val == "1" || val == "yes");
-        } else if (arg == "--ttl-hours" && i + 1 < argc) {
-            config.ttl_hours = std::stoull(argv[++i]);
-        } else if (arg == "--ttl-scan-interval-seconds" && i + 1 < argc) {
-            config.ttl_scan_interval_seconds = std::stoull(argv[++i]);
-        } else if (arg == "--metrics-port" && i + 1 < argc) {
-            config.metrics_port = static_cast<uint16_t>(std::stoi(argv[++i]));
-        } else if (arg == "--flush-interval-ms" && i + 1 < argc) {
-            config.flush_interval_ms = std::stoull(argv[++i]);
-        } else if (arg == "--log-level" && i + 1 < argc) {
-            std::string level_str = argv[++i];
-            auto parsed = StructuredLogger::parse_level(level_str);
-            if (!parsed.has_value()) {
+        } else if (arg == "--ttl-hours") {
+            config.ttl_hours = cursor.value_as<uint64_t>();
+        } else if (arg == "--ttl-scan-interval-seconds") {
+            config.ttl_scan_interval_seconds = cursor.value_as<uint64_t>();
+        } else if (arg == "--metrics-port") {
+            config.metrics_port = cursor.value_as<uint16_t>();
+        } else if (arg == "--flush-interval-ms") {
+            config.flush_interval_ms = cursor.value_as<uint64_t>();
+        } else if (arg == "--log-level") {
+            const std::string level{cursor.value()};
+            if (!StructuredLogger::parse_level(level).has_value()) {
                 std::fprintf(stderr,
                     "Error: invalid log level '%s'. Valid values: ERROR, WARN, INFO, DEBUG\n",
-                    level_str.c_str());
+                    level.c_str());
                 std::exit(1);
             }
-            config.log_level = level_str;
-        } else if (arg == "--sqpoll-idle-ms" && i + 1 < argc) {
-            config.uring_sqpoll_idle_ms = std::stoul(argv[++i]);
-        } else if (arg == "--ring-size" && i + 1 < argc) {
-            config.uring_ring_size = std::stoul(argv[++i]);
+            config.log_level = level;
+        } else if (arg == "--sqpoll-idle-ms") {
+            config.uring_sqpoll_idle_ms = cursor.value_as<uint32_t>();
+        } else if (arg == "--ring-size") {
+            config.uring_ring_size = cursor.value_as<uint32_t>();
         } else if (arg == "--no-sqpoll") {
             config.uring_no_sqpoll = true;
-        } else if (arg == "--shard-id" && i + 1 < argc) {
-            config.shard_id = argv[++i];
-        } else if (arg == "--shard-vnodes" && i + 1 < argc) {
-            config.shard_vnodes = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--shard-id") {
+            config.shard_id = std::string{cursor.value()};
+        } else if (arg == "--shard-vnodes") {
+            config.shard_vnodes = cursor.value_as<uint32_t>();
         } else if (arg == "--multi-master") {
             config.multi_master = true;
-        } else if (arg == "--mm-node-id" && i + 1 < argc) {
-            config.mm_node_id = static_cast<uint16_t>(std::stoi(argv[++i]));
-        } else if (arg == "--mm-replication-port" && i + 1 < argc) {
-            config.mm_replication_port = static_cast<uint16_t>(std::stoi(argv[++i]));
-        } else if (arg == "--anti-entropy-interval-seconds" && i + 1 < argc) {
-            config.anti_entropy_interval_sec = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--mm-max-peer-send-buffer" && i + 1 < argc) {
-            config.mm_max_peer_send_buf_bytes = std::stoull(argv[++i]);
-        } else if (arg == "--mm-max-catchup-bytes" && i + 1 < argc) {
-            config.mm_max_catchup_bytes = static_cast<size_t>(std::stoull(argv[++i]));
+        } else if (arg == "--mm-node-id") {
+            config.mm_node_id = cursor.value_as<uint16_t>();
+        } else if (arg == "--mm-replication-port") {
+            config.mm_replication_port = cursor.value_as<uint16_t>();
+        } else if (arg == "--anti-entropy-interval-seconds") {
+            config.anti_entropy_interval_sec = cursor.value_as<uint32_t>();
+        } else if (arg == "--mm-max-peer-send-buffer") {
+            config.mm_max_peer_send_buf_bytes = cursor.value_as<size_t>();
+        } else if (arg == "--mm-max-catchup-bytes") {
+            config.mm_max_catchup_bytes = cursor.value_as<size_t>();
+        } else {
+            // Previously ignored in silence, which meant a typo started a server on the default
+            // port: `--prot 5599` was accepted, and so was `--port` with no value at all.
+            std::fprintf(stderr, "Error: unknown argument '%s'\n", arg.c_str());
+            std::exit(1);
         }
     }
 
