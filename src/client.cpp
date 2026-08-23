@@ -318,7 +318,8 @@ Result<QueryResult> OrderbookClient::parse_query_response(std::string_view resp)
             continue;
         }
 
-        // Parse TSV columns: timestamp_ns \t price \t quantity \t order_count \t side \t level
+        // Parse TSV columns: timestamp_ns, price, quantity, order_count, side, level, and
+        // sequence_number when the server is new enough to send it.
         QueryRow row{};
         const char* p   = line.data();
         const char* end = p + line.size();
@@ -357,6 +358,18 @@ Result<QueryResult> OrderbookClient::parse_query_response(std::string_view resp)
         auto [p6, ec6] = std::from_chars(p, end, row.level);
         if (ec6 != std::errc{})
             return Result<QueryResult>::err(OB_ERR_PARSE, "bad level");
+        p = p6;
+
+        // sequence_number, appended by #65. A server that predates it ends the row here, and the
+        // field stays 0 — the same "unknown" a pre-#64 row means. A truncated number is still an
+        // error: silently reading half of one would be worse than refusing the row.
+        if (p < end && *p == '\t') {
+            ++p;
+            auto [p7, ec7] = std::from_chars(p, end, row.sequence_number);
+            if (ec7 != std::errc{})
+                return Result<QueryResult>::err(OB_ERR_PARSE, "bad sequence_number");
+            p = p7;
+        }
 
         qr.rows.push_back(row);
 

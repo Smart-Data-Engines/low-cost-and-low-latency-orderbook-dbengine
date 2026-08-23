@@ -134,6 +134,7 @@ class OrderbookRow:
     order_count: int
     side: str            # "bid" or "ask"
     level: int
+    sequence_number: int = 0   # per-origin sequence of the update; 0 = unknown
 
     @property
     def price_float(self) -> float: ...

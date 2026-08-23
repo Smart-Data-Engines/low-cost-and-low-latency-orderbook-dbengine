@@ -56,6 +56,13 @@ struct QueryRow {
     uint32_t order_count;
     uint8_t  side;       // 0=bid, 1=ask
     uint16_t level;
+    /// Per-origin sequence number of the update that produced this row.
+    ///
+    /// 0 means unknown, and two different things produce it: a row stored before sequence numbers
+    /// were assigned at all, and a server older than this column, which sends six fields. Gaps in
+    /// this sequence for one symbol are what let a reader check for itself that it received
+    /// everything, instead of trusting the server that it did.
+    uint64_t sequence_number{0};
 };
 
 /// Result of a SELECT query.

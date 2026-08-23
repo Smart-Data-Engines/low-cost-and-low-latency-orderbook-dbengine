@@ -254,9 +254,6 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   knowing. Roadmap #72 has the fix and the reasoning for it.
 - **A node that joins an origin's stream mid-way never establishes a contiguous frontier.** It can
   catch up, but it cannot prove it has everything. Roadmap #67.
-- **A client cannot see the sequence number of a row it read.** `SELECT` returns six columns and the
-  number is not one of them, so the ordering the engine maintains is invisible to the reader.
-  Roadmap #65.
 - `rapidcheck` is pinned to `master` rather than a commit SHA, unlike every other dependency.
 
 ## Before you call a change done

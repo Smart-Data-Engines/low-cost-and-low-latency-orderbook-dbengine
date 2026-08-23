@@ -88,6 +88,29 @@ ob_status_t ob_result_next(
 
 Advance to the next row. Returns `OB_C_OK` while rows remain, `OB_C_ERR_NOT_FOUND` when exhausted. Any output pointer may be `NULL` to skip that field.
 
+### ob_result_next_seq
+
+```c
+ob_status_t ob_result_next_seq(
+    ob_result_t* result,
+    uint64_t*    out_timestamp_ns,     // may be NULL
+    int64_t*     out_price,            // may be NULL
+    uint64_t*    out_quantity,         // may be NULL
+    uint32_t*    out_order_count,      // may be NULL
+    uint8_t*     out_side,             // may be NULL
+    uint16_t*    out_level,            // may be NULL
+    uint64_t*    out_sequence_number   // may be NULL
+);
+```
+
+The same cursor with one more field: the per-origin sequence number of the update that produced the
+row, or `0` when the row predates sequence numbering. Gaps in this sequence for one symbol are what
+let a reader verify for itself that it received everything.
+
+It is a separate function rather than an extra parameter on `ob_result_next()` because that one is a C
+entry point callers may already have compiled against. Both advance the same cursor — call one or the
+other, not both.
+
 ### ob_result_free
 
 ```c

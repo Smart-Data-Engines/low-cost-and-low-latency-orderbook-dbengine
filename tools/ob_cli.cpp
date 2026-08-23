@@ -350,16 +350,19 @@ void cmd_query(ob::Engine& engine, const std::string& sql) {
         return;
     }
 
-    std::cout << "  ts_ns               | side | level | price        | qty          | orders\n";
-    std::cout << "  ────────────────────┼──────┼───────┼──────────────┼──────────────┼────────\n";
+    // seq last, like the wire format: a number the reader can check for holes, and a 0 that says
+    // the row predates sequence numbering rather than that it is the first one.
+    std::cout << "  ts_ns               | side | level | price        | qty          | orders |      seq\n";
+    std::cout << "  ────────────────────┼──────┼───────┼──────────────┼──────────────┼────────┼─────────\n";
     for (const auto& r : results) {
-        std::printf("  %-20lu | %-4s | %5u | %12ld | %12lu | %6u\n",
+        std::printf("  %-20lu | %-4s | %5u | %12ld | %12lu | %6u | %8lu\n",
                     r.timestamp_ns,
                     r.side == 0 ? "bid" : "ask",
                     r.level,
                     r.price,
                     r.quantity,
-                    r.order_count);
+                    r.order_count,
+                    r.sequence_number);
     }
     std::cout << "  ── " << results.size() << " row(s) in " << ms << " ms\n";
     ++g_queries;

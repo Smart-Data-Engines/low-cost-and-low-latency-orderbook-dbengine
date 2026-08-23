@@ -129,17 +129,20 @@ RC_GTEST_PROP(ClientProperty, prop_tsv_query_response_roundtrip, ()) {
         rows[i].order_count  = *rc::gen::inRange<uint32_t>(1, 100'001);
         rows[i].side         = *rc::gen::inRange<uint8_t>(0, 2);
         rows[i].level        = *rc::gen::inRange<uint16_t>(0, 1000);
+        rows[i].sequence_number = *rc::gen::inRange<uint64_t>(0, 1'000'000'001);
     }
 
     // Format as TSV wire protocol
-    std::string wire = "OK\ntimestamp_ns\tprice\tquantity\torder_count\tside\tlevel\n";
+    std::string wire =
+        "OK\ntimestamp_ns\tprice\tquantity\torder_count\tside\tlevel\tsequence_number\n";
     for (const auto& row : rows) {
         wire += std::to_string(row.timestamp_ns) + "\t";
         wire += std::to_string(row.price) + "\t";
         wire += std::to_string(row.quantity) + "\t";
         wire += std::to_string(row.order_count) + "\t";
         wire += std::to_string(row.side) + "\t";
-        wire += std::to_string(row.level) + "\n";
+        wire += std::to_string(row.level) + "\t";
+        wire += std::to_string(row.sequence_number) + "\n";
     }
     wire += "\n";  // double newline terminator
 
@@ -157,6 +160,7 @@ RC_GTEST_PROP(ClientProperty, prop_tsv_query_response_roundtrip, ()) {
         RC_ASSERT(parsed[i].order_count == rows[i].order_count);
         RC_ASSERT(parsed[i].side == rows[i].side);
         RC_ASSERT(parsed[i].level == rows[i].level);
+        RC_ASSERT(parsed[i].sequence_number == rows[i].sequence_number);
     }
 }
 
@@ -414,6 +418,57 @@ TEST(ClientUnit, RowParserRefusesAnAggregateResponseByName) {
     ASSERT_FALSE(result.has_value());
     EXPECT_NE(result.error_message().find("query_agg"), std::string::npos)
         << "the error should name the method to use, got: " << result.error_message();
+}
+
+TEST(ClientUnit, ParseQueryResponseReadsTheSequenceNumber) {
+    std::string wire =
+        "OK\n"
+        "timestamp_ns\tprice\tquantity\torder_count\tside\tlevel\tsequence_number\n"
+        "1700000000000000000\t100000\t50\t1\t0\t0\t4242\n"
+        "\n";
+
+    ob::OrderbookClient client;
+    auto result = client.parse_query_response(wire);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result.value().rows.size(), 1u);
+    EXPECT_EQ(result.value().rows[0].sequence_number, 4242u);
+    // The columns before it must not shift.
+    EXPECT_EQ(result.value().rows[0].level, 0u);
+    EXPECT_EQ(result.value().rows[0].price, 100000);
+}
+
+TEST(ClientUnit, ParseQueryResponseAcceptsASixColumnServer) {
+    // A server older than the sequence-number column. The row still parses and the number reads as
+    // 0 — unknown — rather than failing the query or shifting a field.
+    std::string wire =
+        "OK\n"
+        "timestamp_ns\tprice\tquantity\torder_count\tside\tlevel\n"
+        "1700000000000000000\t100000\t50\t1\t1\t3\n"
+        "\n";
+
+    ob::OrderbookClient client;
+    auto result = client.parse_query_response(wire);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result.value().rows.size(), 1u);
+    EXPECT_EQ(result.value().rows[0].sequence_number, 0u);
+    EXPECT_EQ(result.value().rows[0].level, 3u);
+    EXPECT_EQ(result.value().rows[0].side, 1u);
+}
+
+TEST(ClientUnit, ParseQueryResponseRefusesAGarbageSequenceNumber) {
+    // Reading half a number would be worse than refusing the row: the caller would think it knows
+    // where it is in the stream.
+    std::string wire =
+        "OK\n"
+        "timestamp_ns\tprice\tquantity\torder_count\tside\tlevel\tsequence_number\n"
+        "1700000000000000000\t100000\t50\t1\t0\t0\tnot-a-number\n"
+        "\n";
+
+    ob::OrderbookClient client;
+    auto result = client.parse_query_response(wire);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error_message().find("sequence_number"), std::string::npos)
+        << result.error_message();
 }
 
 TEST(ClientUnit, AggParserRefusesARowResponseByName) {

@@ -58,6 +58,10 @@ class OrderbookRow:
     order_count: int
     side: str       # "bid" or "ask"
     level: int
+    # Per-origin sequence number of the update that produced this row. 0 means unknown: either the
+    # row predates sequence numbering, or the server predates the column and sent six fields.
+    # Defaulted so that positional construction against the old field order still works.
+    sequence_number: int = 0
 
     @property
     def price_float(self) -> float:
@@ -68,7 +72,7 @@ class OrderbookRow:
         return (f"OrderbookRow(ts={self.timestamp_ns}, "
                 f"side={self.side}, level={self.level}, "
                 f"price={self.price}, qty={self.quantity}, "
-                f"orders={self.order_count})")
+                f"orders={self.order_count}, seq={self.sequence_number})")
 
 
 @dataclass
@@ -420,6 +424,18 @@ def _load_lib():
         ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint16),
     ]
     lib.ob_result_next.restype = ctypes.c_int
+    # ob_result_next_seq() arrived with the sequence-number column. Bind it only if the loaded
+    # library has it: a shared object built before that has the six-field cursor and nothing else,
+    # and refusing to load at all would be a worse answer than reporting an unknown sequence.
+    if hasattr(lib, "ob_result_next_seq"):
+        lib.ob_result_next_seq.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint16),
+            ctypes.POINTER(ctypes.c_uint64),
+        ]
+        lib.ob_result_next_seq.restype = ctypes.c_int
     return lib
 
 
@@ -468,16 +484,28 @@ class _LocalBackend:
         cnt = ctypes.c_uint32()
         sd  = ctypes.c_uint8()
         lvl = ctypes.c_uint16()
+        seq = ctypes.c_uint64()
+        # Same cursor either way. Without the seven-field entry point the sequence number is
+        # unknown rather than zero-by-accident, which is what a caller reading this field needs to
+        # be able to tell apart from a real 0.
+        next_seq = getattr(self._lib, "ob_result_next_seq", None)
         while True:
-            rc = self._lib.ob_result_next(
-                result, ctypes.byref(ts), ctypes.byref(pr), ctypes.byref(qty),
-                ctypes.byref(cnt), ctypes.byref(sd), ctypes.byref(lvl))
+            if next_seq is not None:
+                rc = next_seq(
+                    result, ctypes.byref(ts), ctypes.byref(pr), ctypes.byref(qty),
+                    ctypes.byref(cnt), ctypes.byref(sd), ctypes.byref(lvl),
+                    ctypes.byref(seq))
+            else:
+                seq.value = 0
+                rc = self._lib.ob_result_next(
+                    result, ctypes.byref(ts), ctypes.byref(pr), ctypes.byref(qty),
+                    ctypes.byref(cnt), ctypes.byref(sd), ctypes.byref(lvl))
             if rc != OB_OK:
                 break
             rows.append(OrderbookRow(
                 timestamp_ns=ts.value, price=pr.value, quantity=qty.value,
                 order_count=cnt.value, side="bid" if sd.value == 0 else "ask",
-                level=lvl.value,
+                level=lvl.value, sequence_number=seq.value,
             ))
         self._lib.ob_result_free(result)
         return rows
@@ -1435,7 +1463,9 @@ class OrderbookEngine:
                 "this query returned aggregates, not rows; use query_agg() "
                 f"(columns: {header})")
         # Parse TSV rows into OrderbookRow objects
-        # Header: timestamp_ns  price  quantity  order_count  side  level
+        # Header: timestamp_ns  price  quantity  order_count  side  level  sequence_number
+        # The seventh column arrived after the first six, so it is read when present rather than
+        # required: this client still talks to a server that sends six.
         rows: List[OrderbookRow] = []
         for r in data_rows:
             if len(r) < 6:
@@ -1447,6 +1477,7 @@ class OrderbookEngine:
                 order_count=int(r[3]),
                 side="bid" if r[4] == "0" else "ask",
                 level=int(r[5]),
+                sequence_number=int(r[6]) if len(r) > 6 else 0,
             ))
         return rows
 

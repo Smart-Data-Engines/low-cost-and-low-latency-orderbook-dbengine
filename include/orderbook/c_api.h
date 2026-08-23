@@ -65,6 +65,21 @@ ob_status_t ob_result_next(ob_result_t* result,
                             uint8_t*     out_side,
                             uint16_t*    out_level);
 
+/* Same cursor, one more field: the per-origin sequence number of the update that produced the row.
+   0 means unknown — a row stored before sequence numbers existed has none.
+
+   This is a separate function rather than an extra parameter on ob_result_next() because that one
+   is a C entry point somebody may already have compiled against. Both advance the same cursor; call
+   one or the other, not both. */
+ob_status_t ob_result_next_seq(ob_result_t* result,
+                            uint64_t*    out_timestamp_ns,
+                            int64_t*     out_price,
+                            uint64_t*    out_quantity,
+                            uint32_t*    out_order_count,
+                            uint8_t*     out_side,
+                            uint16_t*    out_level,
+                            uint64_t*    out_sequence_number);
+
 // ── Subscriptions ─────────────────────────────────────────────────────────────
 uint64_t ob_subscribe(ob_engine_t* engine,
                       const char*  sql,
