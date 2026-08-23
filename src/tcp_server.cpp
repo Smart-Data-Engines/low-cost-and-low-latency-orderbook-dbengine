@@ -14,6 +14,7 @@
 #include <limits>
 #include <type_traits>
 #include <string_view>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -384,27 +385,30 @@ namespace {
 
 class ArgCursor {
 public:
-    ArgCursor(int argc, char* argv[]) : argc_(argc), argv_(argv) {}
+    /// A span rather than (int, char*[]): the cursor then carries its own bounds, and the bounds
+    /// are what every check below is against. main()'s signature is fixed, so the conversion
+    /// happens once, at the call site.
+    explicit ArgCursor(std::span<char* const> args) : args_(args) {}
 
     /// Advance to the next argument. False when there are none left.
-    bool next() { return ++index_ < argc_; }
+    bool next() { return ++index_ < args_.size(); }
 
     /// The argument the cursor is on.
-    std::string_view arg() const { return argv_[index_]; }
+    std::string_view arg() const { return args_[index_]; }
 
     /// The value belonging to the current flag. Missing values are fatal, not ignored.
     std::string_view value() {
-        if (index_ + 1 >= argc_) {
-            std::fprintf(stderr, "Error: %s requires a value\n", argv_[index_]);
+        if (index_ + 1 >= args_.size()) {
+            std::fprintf(stderr, "Error: %s requires a value\n", args_[index_]);
             std::exit(1);
         }
-        return argv_[++index_];
+        return args_[++index_];
     }
 
     /// The value parsed as a number, with the flag named in the error rather than a stoi throw.
     template <typename T>
     T value_as() {
-        const char* flag = argv_[index_];
+        const char* flag = args_[index_];
         const std::string_view text = value();
 
         if constexpr (std::is_signed_v<T>) {
@@ -438,9 +442,8 @@ private:
         std::exit(1);
     }
 
-    int    argc_;
-    char** argv_;
-    int    index_{0};
+    std::span<char* const> args_;
+    std::size_t            index_{0};
 };
 
 }  // namespace
@@ -450,7 +453,7 @@ private:
 ServerConfig parse_cli_args(int argc, char* argv[]) {
     ServerConfig config;
 
-    ArgCursor cursor(argc, argv);
+    ArgCursor cursor(std::span<char* const>(argv, static_cast<std::size_t>(argc)));
     while (cursor.next()) {
         const std::string arg{cursor.arg()};
 
