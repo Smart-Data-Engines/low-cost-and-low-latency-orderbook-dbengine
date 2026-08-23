@@ -174,6 +174,10 @@ private:
     std::chrono::steady_clock::time_point deferring_since_{};
     std::atomic<uint64_t>   deferrals_{0};
     std::atomic<bool>       running_{false};
+    /// How many times the monitor loop has looked at a STANDALONE role. Touched only from the
+    /// monitor thread, so it needs no lock; it exists to keep the retry log from repeating every
+    /// second while a coordinator stays unreachable.
+    uint64_t                standalone_polls_{0};
 
     void monitor_loop();
 
@@ -183,6 +187,18 @@ private:
     /// are no positions at all (the pre-#70 behaviour: a CAS race), or when the deference window
     /// has expired. Returns false while deferring.
     bool should_promote_now();
+
+    /// Follow whoever holds the leader key, if anyone does. Returns true when this node is now a
+    /// REPLICA of a live leader.
+    ///
+    /// Must be called without `mtx_` held: it calls `reconcile_epoch()` and the role-transition
+    /// handler, both of which take locks of their own.
+    ///
+    /// Exists because losing a race is not a role. `attempt_promotion()` used to return on a lost
+    /// CAS without touching `role_`, which left a node at STANDALONE — a state `monitor_loop()`
+    /// had no branch for, so the node never campaigned, never replicated, and never took over
+    /// (roadmap #73).
+    bool adopt_leader_if_present();
 
     /// Publish this node's WAL position to the coordinator, at most once per second.
     ///

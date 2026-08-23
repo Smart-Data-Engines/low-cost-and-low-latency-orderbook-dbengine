@@ -409,9 +409,14 @@ CoordinatorClient::~CoordinatorClient() {
 bool CoordinatorClient::connect() {
     if (impl_->connected) return true;
 
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    impl_->curl_handle = curl_easy_init();
-    if (!impl_->curl_handle) return false;
+    // Reuse the handle across attempts. connect() is now retried once a second while a node waits
+    // for an unreachable coordinator (#73), and re-initialising here would overwrite — and leak —
+    // the previous handle on every failed attempt.
+    if (!impl_->curl_handle) {
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+        impl_->curl_handle = curl_easy_init();
+        if (!impl_->curl_handle) return false;
+    }
 
     // Try each endpoint in order — first one that responds to /v3/maintenance/status wins.
     for (const auto& ep : config_.endpoints) {

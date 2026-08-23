@@ -218,6 +218,20 @@ Learned the hard way. Check here before debugging.
     `replay_wal_tail()` skips records at or below the highest `end_ts_ns` already on disk — without
     that, replay rewrites a durable segment from a WAL tail that may hold fewer rows than the segment
     does, because truncation only follows the replica-confirmed position.
+30. **A state machine with a branch missing is a state machine with a trap.** `monitor_loop()`
+    handled `PRIMARY` and `REPLICA`; a node at `STANDALONE` matched neither and sat there for the rest
+    of its life — no lease, no leader poll, no campaign, no replication. Losing a race is not a role:
+    every path that declines to promote must say what the node *is* instead. Enumerate the roles and
+    check each one has an active branch, rather than trusting that the interesting ones do.
+31. **A workaround in the test harness is a bug report nobody filed.** The integration fixture started
+    nodes sequentially and its docstring said why: "This avoids a race condition where both nodes start
+    simultaneously and one fails to transition from STANDALONE." The defect was known, described
+    precisely, and worked around in the harness for months. When a fixture explains that it avoids a
+    scenario, that scenario is a filed bug — go read the engine, not around it.
+32. **A retry loop exposes leaks that one-shot code hides.** `connect()` called `curl_easy_init()`
+    unconditionally and stored the result over the previous handle. Called once at startup it looked
+    fine; called once a second while a coordinator was down it leaked a handle per attempt. Before
+    turning a one-shot call into a retried one, read it as if it runs a thousand times.
 
 ## Current state and open problems
 
@@ -225,18 +239,25 @@ Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/road
 below refer to that file. **Those numbers are permanent ids — never renumber them.** A new item takes
 the next free number wherever it sits on the page; `scripts/check_roadmap.py` (run in CI) checks ids,
 references and ranges. The rule exists because three renumbering passes each broke something, and
-because commit messages and specs cite these numbers. Things a newcomer should know because they look like working features and
-are not:
+because commit messages and specs cite these numbers.
 
-- **`AntiEntropyManager` is a scheduler with no reconciliation.** `detect_gaps()` always returns
-  empty, `repair_gap()` always returns false. Metrics report runs, so it looks alive. Roadmap #56.
-- **The integration test suite is being rebuilt.** A `test_*` pattern in `.gitignore` silently
-  excluded every `tests/integration/test_*.py`, so the ~37 original tests were never committed. The
-  framework survived and four categories are back (smoke, replication, compression, edge cases);
-  the rest are still missing. Roadmap #28.
+**Where the suites stand:** 681 C++ tests (`ctest -j1`, ~170 s) and 124 integration tests plus 2
+opt-in skips (`pytest tests/integration/`, ~3.8 min), all green, and **no `xfail` left** — the two
+that marked known defects are gone because both defects are fixed.
 
-Also worth knowing: the wire protocol has no authentication or encryption (roadmap #30), and
-`rapidcheck` is pinned to `master` rather than a commit SHA.
+Things a newcomer should know, because they are real limits rather than bugs to file again:
+
+- **The wire protocol has no authentication or encryption.** Roadmap #30. Do not expose a node
+  outside a trusted network.
+- **Deference on election cannot tell a further replica from a dead one.** Positions carry no lease
+  and no timestamp, so a candidate waits out a bounded window (`--election-deference-ms`) instead of
+  knowing. Roadmap #72 has the fix and the reasoning for it.
+- **A node that joins an origin's stream mid-way never establishes a contiguous frontier.** It can
+  catch up, but it cannot prove it has everything. Roadmap #67.
+- **A client cannot see the sequence number of a row it read.** `SELECT` returns six columns and the
+  number is not one of them, so the ordering the engine maintains is invisible to the reader.
+  Roadmap #65.
+- `rapidcheck` is pinned to `master` rather than a commit SHA, unlike every other dependency.
 
 ## Before you call a change done
 
