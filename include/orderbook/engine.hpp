@@ -164,6 +164,10 @@ public:
         size_t      mm_connected_peers{0};
         uint64_t    mm_conflicts_total{0};
         uint64_t    mm_anti_entropy_runs{0};
+        /// Repairs the scheduler actually completed. Reported alongside the run count so a
+        /// reader can tell "ran and found nothing" from "never ran" — tcp_server.cpp used to
+        /// hardcode this to 0 with a comment saying it was unavailable.
+        uint64_t    mm_anti_entropy_repairs{0};
         uint64_t    mm_hlc_physical_ns{0};
         uint16_t    mm_hlc_logical{0};
         int64_t     mm_hlc_drift_ns{0};

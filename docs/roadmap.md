@@ -493,6 +493,9 @@ codebase. Each item is also a story we can sell as bespoke work.
 - Effort: M | Impact: Required before anyone runs this longer than one release
 
 ### 57. Complete the anti-entropy implementation
+- Correction to what this item used to claim: the scheduler did **not** work. It was never
+  constructed, so `ob_mm_anti_entropy_runs_total` sat at zero and read like "checked, nothing to
+  repair". Fixed in #68, which also stopped `STATUS` from killing multi-master nodes.
 - Since #61 the mechanism it needs exists: reconciliation is a periodic version-vector exchange, and
   the repair path is the same filtered stream catch-up uses. `GapInfo` still describes gaps as WAL file
   and byte offsets, which is the model #61 disproved, so it has to be reshaped to
@@ -660,6 +663,62 @@ pitfall 37 twice in one afternoon.
 XPASS the moment the fix landed, which is what strict was for.
 
 - Spec: `kiro-workspace/specs/mm-version-vector-catchup/`
+
+### 68. STATUS killed every multi-master node (P0) ✅
+
+Found while starting #57, by reading the class that item is about rather than the item.
+
+`Engine::stats()` in multi-master mode did this:
+
+```cpp
+s.mm_anti_entropy_runs = mm_mgr_->anti_entropy().total_runs();
+```
+
+`MultiMasterManager::anti_entropy()` is `return *anti_entropy_;`, and **nothing in the repository ever
+constructed `anti_entropy_`** — `grep -rn "make_unique<AntiEntropyManager>" src/` returned nothing. So
+the first caller to ask a multi-master node for its statistics dereferenced a null `unique_ptr`.
+
+Measured, on a live node started by `scripts/mm_harness.py`:
+
+```
+node came up, port 57139
+1) STATUS ...
+   reply:
+   process alive? NO, exit=-11
+```
+
+And with no server and no etcd at all, straight through the library API: `Engine::stats()` on an
+MM-enabled engine dumped core. That is `STATUS` from an operator, and every `/metrics` scrape a
+monitoring system makes, taking down the node — on the feature this engine advertises for write
+scalability.
+
+**Why 640 unit and 117 integration tests missed it.** The multi-master modules exercise `INSERT`,
+`SELECT`, `ROLE` and `MM_PEERS` but never `STATUS`. The metrics module runs `STATUS` and `/metrics`,
+but against the plain `cluster` fixture with multi-master off. Both paths were covered; their
+*crossing* was not. Same family as #25 (a field no test varied) and #64 (a field nobody filled), and
+the reason it stayed invisible is the same: nothing was missing from the list of things to test, only
+from the list of combinations.
+
+**The fix** is two separate corrections, because two separate mistakes had to meet:
+
+- `MultiMasterManager::start()` now constructs the manager and starts it, when a peer registry exists.
+  This is #57's scheduler, which the roadmap described as working: it had never run once.
+- `anti_entropy()` returns a **pointer**, not a reference. The component is optional — a node without
+  coordinator endpoints has no registry and no scheduler — and handing out a reference to something
+  optional is what made the bad call look correct. `stop()` had checked the pointer since the
+  beginning; the accessor did not.
+- `Engine::stats()` fills the counters only when the manager exists, and now also reports
+  `mm_anti_entropy_repairs`, which `tcp_server.cpp` had been hardcoding to 0 with a comment saying it
+  was unavailable. Zero has to mean "no scheduler" and not "ran and found nothing" — the same
+  ambiguity that let #57 look finished.
+
+Verified: 3 unit tests (`stats()` on an MM engine, repeated scrapes, and the no-registry case
+answering instead of crashing) and 3 integration tests with their own etcd — `STATUS` leaves the node
+alive, `/metrics` leaves the node alive, and the scheduler records a run within twenty seconds at a
+one-second interval. Mutation red: drop the pointer check in `stats()` and the process dumps core
+again.
+
+- Spec: `kiro-workspace/specs/mm-status-crash/`
 
 ### 67. A node that joins an origin's stream mid-way never establishes a frontier
 
@@ -976,5 +1035,5 @@ absolute thresholds for a designated benchmark host.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 640 | all passing, ~149s with `ctest -j1` on machine B |
-| Python integration | 117 | passing, plus 2 skipped and 1 `xfail(strict=True)` for #60; ~3 min |
+| C++ (GTest + RapidCheck) | 643 | all passing, ~149s with `ctest -j1` on machine B |
+| Python integration | 120 | passing, plus 2 skipped and 1 `xfail(strict=True)` for #60; ~3.4 min |

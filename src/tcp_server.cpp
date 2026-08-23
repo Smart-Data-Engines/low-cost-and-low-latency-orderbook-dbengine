@@ -290,7 +290,7 @@ std::string execute_command(const Command& cmd,
             stats.mm_connected_peers   = es.mm_connected_peers;
             stats.mm_conflicts_total   = es.mm_conflicts_total;
             stats.mm_anti_entropy_runs = es.mm_anti_entropy_runs;
-            stats.mm_anti_entropy_repairs = 0; // populated from anti_entropy if available
+            stats.mm_anti_entropy_repairs = es.mm_anti_entropy_repairs;
             stats.mm_hlc_physical_ns   = es.mm_hlc_physical_ns;
             stats.mm_hlc_logical       = es.mm_hlc_logical;
             stats.mm_hlc_drift_ns      = es.mm_hlc_drift_ns;

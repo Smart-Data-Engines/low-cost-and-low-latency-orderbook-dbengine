@@ -217,6 +217,10 @@ ob_add_engine_test(test_mm_dedup
     test_mm_dedup.cpp
 )
 
+ob_add_engine_test(test_mm_stats
+    test_mm_stats.cpp
+)
+
 # ── Helper to register a test executable that needs the TCP server library ────
 function(ob_add_tcp_test name)
     add_executable(${name} ${ARGN})

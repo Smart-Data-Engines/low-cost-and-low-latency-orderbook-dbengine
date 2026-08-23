@@ -725,7 +725,13 @@ Engine::Stats Engine::stats() {
             s.mm_peer_count = mm_mgr_->peer_states().size();
             s.mm_connected_peers = mm_mgr_->connected_peer_count();
             s.mm_conflicts_total = mm_mgr_->conflict_resolver().total_conflicts();
-            s.mm_anti_entropy_runs = mm_mgr_->anti_entropy().total_runs();
+            // Only when the manager exists. Zero here means "no scheduler", which is not the
+            // same statement as "it ran and found nothing" — the distinction that made this
+            // crash invisible in the first place.
+            if (auto* ae = mm_mgr_->anti_entropy()) {
+                s.mm_anti_entropy_runs    = ae->total_runs();
+                s.mm_anti_entropy_repairs = ae->total_repairs();
+            }
         }
         if (hlc_) {
             auto cur = hlc_->current();

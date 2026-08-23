@@ -33,7 +33,7 @@ cmake --build build -j$(nproc)
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release -j$(nproc)
 
-# Tests — 640 of them, ~2.5 minutes
+# Tests — 643 of them, ~2.5 minutes
 ctest --test-dir build --output-on-failure -j1
 ```
 
@@ -167,7 +167,21 @@ Learned the hard way. Check here before debugging.
     write queued behind it. The symptom looked like an ABBA cycle between the engine and
     multi-master. `sudo gdb -p <pid> -batch -ex "thread apply all bt"` settled it in two minutes;
     without sudo, `ptrace_scope` blocks the attach.
-21. **The checkpoint goes after the flush, never before.** A `CHECKPOINT` record claiming more than
+21. **Two covered paths are not a covered crossing.** `Engine::stats()` dereferenced a null
+    `unique_ptr` on every multi-master node, so `STATUS` and every `/metrics` scrape killed the
+    process (roadmap #68). The multi-master tests never send `STATUS`; the metrics tests never
+    enable multi-master. 640 unit and 117 integration tests missed it by one combination, and
+    nothing was missing from the list of things to test — only from the list of pairs.
+22. **Never hand out a reference to an optional component.** `anti_entropy()` was
+    `return *anti_entropy_;` while `stop()` checked the same pointer for null, and nothing
+    constructed it. A pointer return makes the caller face the question; a reference makes the
+    bad call look correct. If a member can legitimately be absent, its accessor must say so in
+    its type.
+23. **A metric that reports zero must distinguish "nothing happened" from "nobody ran".**
+    `ob_mm_anti_entropy_runs_total` sat at zero because the scheduler was never constructed, and
+    the roadmap read that as "runs fine, only reconciliation is missing" for months. Where a
+    counter can be zero for two reasons, report the second one separately.
+24. **The checkpoint goes after the flush, never before.** A `CHECKPOINT` record claiming more than
     is durable turns a crash into data loss; claiming less costs a replay that gets skipped anyway.
     For the crash window between writing the segment files and appending the checkpoint,
     `replay_wal_tail()` skips records at or below the highest `end_ts_ns` already on disk — without
