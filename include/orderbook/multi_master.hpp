@@ -34,6 +34,10 @@ namespace ob {
 
 inline constexpr uint16_t MM_PROTOCOL_VERSION   = 2;   // 2 = exchanges version vectors
 inline constexpr size_t   MM_MAX_VV_ENTRIES     = 4096; // ~172 kB on the wire
+/// How much queued output one peer may hold before it is dropped. Same ceiling as a client
+/// session gets since #59, and for the same reason: a peer that stops reading otherwise grows
+/// the writer without bound — measured at ~113 MB/s per unreachable peer.
+inline constexpr size_t   MM_MAX_PEER_SEND_BUF  = 64ULL << 20;
 inline constexpr uint64_t MM_VV_GRACE_MS        = 2000; // wait for a peer's vector before
                                                         // assuming it holds nothing
 inline constexpr size_t   MM_FRAME_HEADER_SIZE  = 4;            // uint32 LE length
@@ -122,6 +126,9 @@ struct MultiMasterConfig {
     bool        compress{false};                  // --replication-compress
     size_t      max_catchup_bytes{512ULL << 20};  // --mm-max-catchup-bytes (512MB)
     uint32_t    anti_entropy_interval_sec{30};    // --anti-entropy-interval-seconds
+    /// Queued output one peer may hold before the connection is dropped
+    /// (--mm-max-peer-send-buffer). Same ceiling a client session gets since #59.
+    size_t      max_peer_send_buf_bytes{MM_MAX_PEER_SEND_BUF};
     std::string shard_id;                         // optional, if sharding active
     CoordinatorConfig coordinator_config;         // etcd endpoints for peer discovery
 };
@@ -298,6 +305,15 @@ private:
     // Handshake send (task 7.1)
     /// Send our handshake message to a peer (called after connect or accept).
     void send_handshake(PeerConnection& peer);
+    /// Drop a peer whose queued output passed the ceiling.
+    ///
+    /// Disconnecting, not clearing: try_drain_send_buf() erases the sent prefix after a partial
+    /// write, so the buffer can begin in the middle of a frame. Clearing it then leaves the peer
+    /// waiting for the rest of a frame that will never arrive and reading everything after it as
+    /// that frame's tail. A closed connection is the only honest answer, and the reconnect path
+    /// already knows how to catch up afterwards.
+    bool drop_peer_if_send_buf_too_large(PeerConnection& peer);
+
     /// Send this node's version vector as a WAL_RECORD_VERSION_VECTOR frame.
     ///
     /// Same envelope as a WAL record on purpose: a node running protocol 1 skips an unknown

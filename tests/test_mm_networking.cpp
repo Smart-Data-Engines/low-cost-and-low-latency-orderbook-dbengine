@@ -535,3 +535,60 @@ RC_GTEST_PROP(CatchUpOrderingInvariant,
         RC_ASSERT(parsed_seq_numbers[i] > parsed_seq_numbers[i - 1]);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// What abandoning a partially sent frame does to the receiver (roadmap #69)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(MmFramingDesync, AbandoningAPartialFrameSwallowsEverythingAfterIt) {
+    // The sender's side of this: try_drain_send_buf() erases the sent prefix after a partial
+    // write, so peer.send_buf can begin mid-frame. check_backpressure() used to clear it and keep
+    // the socket open, which is what this test shows the receiver making of that.
+    std::vector<uint8_t> wire;
+    const std::string first  = "FIRST-FRAME";
+    const std::string second = std::string(64, 'B');   // the one that gets cut in half
+    const std::string third  = "THIRD-FRAME";
+
+    ob::encode_frame(first.data(), first.size(), wire);
+
+    std::vector<uint8_t> second_frame;
+    ob::encode_frame(second.data(), second.size(), second_frame);
+    // Half of it reaches the peer; the rest is what the sender threw away.
+    wire.insert(wire.end(), second_frame.begin(),
+                second_frame.begin() + static_cast<std::ptrdiff_t>(second_frame.size() / 2));
+
+    ob::encode_frame(third.data(), third.size(), wire);
+
+    std::vector<std::pair<size_t, size_t>> frames;
+    const int rcode = ob::parse_frames(wire, frames);
+
+    EXPECT_EQ(rcode, 0) << "nothing here is an oversized length, so the parser reports no error — "
+                           "the corruption is silent";
+    ASSERT_EQ(frames.size(), 1u)
+        << "only the first frame is delivered: the truncated second one is still waiting for bytes "
+           "that will never come, and the third frame's bytes are being counted as its tail";
+    EXPECT_EQ(frames[0].second, first.size());
+}
+
+TEST(MmFramingDesync, TheFollowingFrameIsConsumedAsTheAbandonedOnesTail) {
+    // Sharper version: make the abandoned frame's declared length large enough to swallow the
+    // frames that follow, which is exactly how a peer starts applying nonsense or disconnecting on
+    // a length it invented.
+    std::vector<uint8_t> wire;
+    const std::string big(4096, 'X');
+
+    std::vector<uint8_t> big_frame;
+    ob::encode_frame(big.data(), big.size(), big_frame);
+    wire.insert(wire.end(), big_frame.begin(), big_frame.begin() + 40);   // header + 36 bytes
+
+    const std::string later = "LATER";
+    for (int i = 0; i < 5; ++i) ob::encode_frame(later.data(), later.size(), wire);
+
+    std::vector<std::pair<size_t, size_t>> frames;
+    EXPECT_EQ(ob::parse_frames(wire, frames), 0);
+    EXPECT_TRUE(frames.empty())
+        << "five perfectly good frames arrived and none was delivered, because the parser is still "
+           "counting bytes towards a frame the sender abandoned. This is why the fix drops the "
+           "connection instead of clearing the buffer";
+    EXPECT_GT(wire.size(), 0u) << "and the bytes stay queued, so the desync persists";
+}

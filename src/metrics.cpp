@@ -63,6 +63,10 @@ MetricsRegistry::MetricsRegistry() {
     counters_.push_back(make_counter("ob_mm_anti_entropy_repairs_total", "Total number of anti-entropy repairs"));
     gauges_.push_back(make_gauge("ob_mm_reconcile_gaps_detected",
                                  "Symbol/origin pairs where this node and a peer disagree, both directions"));
+    gauges_.push_back(make_gauge("ob_mm_peer_send_buf_bytes",
+                                 "Queued output for the most recently written peer, in bytes"));
+    counters_.push_back(make_counter("ob_mm_peer_dropped_slow_total",
+                                     "Peers dropped for not draining their queued output"));
     gauges_.push_back(make_gauge("ob_mm_reconcile_we_lack",
                                  "Of those, the pairs where this node is the one behind"));
     counters_.push_back(make_counter("ob_mm_backpressure_snapshot_total",

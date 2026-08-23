@@ -857,6 +857,38 @@ void MultiMasterManager::enqueue_frame(PeerConnection& peer,
 
     // Attempt to drain immediately.
     try_drain_send_buf(peer);
+
+    // And refuse to hold an unbounded backlog for a peer that is not reading. Before this check
+    // existed, one unreachable peer grew the writer at about 113 MB/s at the rate this engine
+    // advertises, with nothing to stop it: check_backpressure() only ever ran inside the catch-up
+    // loop.
+    drop_peer_if_send_buf_too_large(peer);
+}
+
+bool MultiMasterManager::drop_peer_if_send_buf_too_large(PeerConnection& peer) {
+    engine_.registry().set_gauge("ob_mm_peer_send_buf_bytes",
+                                 static_cast<int64_t>(peer.send_buf.size()));
+    if (peer.send_buf.size() <= config_.max_peer_send_buf_bytes) return false;
+
+    OB_LOG_WARN("mm",
+                "Peer %u is not draining: send_buf=%zu > %zu — dropping the connection so it "
+                "reconnects and catches up",
+                peer.node_id, peer.send_buf.size(), config_.max_peer_send_buf_bytes);
+    engine_.registry().increment_counter("ob_mm_peer_dropped_slow_total");
+
+    // Deliberately not send_buf.clear() while keeping the socket: after a partial write the buffer
+    // can start mid-frame, and abandoning half a frame desynchronises the peer's parser.
+    if (peer.fd >= 0) {
+        ::close(peer.fd);
+        peer.fd = -1;
+    }
+    peer.connected      = false;
+    peer.handshake_done = false;
+    peer.catching_up    = false;
+    peer.needs_snapshot = true;
+    peer.send_buf.clear();          // safe now: nobody is reading this socket any more
+    peer.recv_buf.clear();
+    return true;
 }
 
 bool MultiMasterManager::try_drain_send_buf(PeerConnection& peer) {
@@ -1505,12 +1537,26 @@ void MultiMasterManager::start_catchup_to_peer(PeerConnection& peer) {
 
 void MultiMasterManager::check_backpressure(PeerConnection& peer) {
     if (peer.send_buf.size() > config_.max_catchup_bytes) {
-        OB_LOG_WARN("mm", "Backpressure: peer %u send_buf=%zu > max_catchup_bytes=%zu — needs snapshot",
+        OB_LOG_WARN("mm",
+                    "Backpressure: peer %u send_buf=%zu > max_catchup_bytes=%zu — dropping the "
+                    "connection instead of abandoning a partial frame",
                     peer.node_id, peer.send_buf.size(), config_.max_catchup_bytes);
-        peer.send_buf.clear();
-        peer.needs_snapshot = true;
-        peer.catching_up = false;
         engine_.registry().increment_counter("ob_mm_backpressure_snapshot_total");
+
+        // This used to clear the buffer and keep the socket. After a partial write the buffer can
+        // begin mid-frame, so that left the peer waiting for the rest of a frame nobody would send
+        // and reading the next frames as its tail. Closing the connection is the only answer that
+        // does not lie about the state of the stream.
+        if (peer.fd >= 0) {
+            ::close(peer.fd);
+            peer.fd = -1;
+        }
+        peer.connected      = false;
+        peer.handshake_done = false;
+        peer.send_buf.clear();
+        peer.recv_buf.clear();
+        peer.needs_snapshot = true;
+        peer.catching_up    = false;
     }
 }
 

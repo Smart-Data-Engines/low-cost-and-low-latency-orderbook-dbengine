@@ -108,6 +108,7 @@ class Node:
             # A small catch-up ceiling on purpose: the partition scenario needs backpressure to
             # discard a peer's backlog, which is the one divergence TCP cannot undo by itself.
             "--mm-max-catchup-bytes", os.environ.get("MMH_MAX_CATCHUP", "8192"),
+            "--mm-max-peer-send-buffer", os.environ.get("MMH_MAX_SEND_BUF", "262144"),
         ], stdout=log, stderr=subprocess.STDOUT)
 
         deadline = time.time() + 25
@@ -235,6 +236,101 @@ def status_value(port: int, field: str) -> int:
             raw = line.split(":", 1)[1].strip()
             return int(raw) if raw.isdigit() else 0
     return 0
+
+
+def rss_mb(pid: int) -> float:
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return 0.0
+
+
+def count_drops(writer: "Node", since: str) -> int:
+    """How many times the writer dropped a peer for not draining, since `since`."""
+    path = os.path.join(ROOT, f"node{writer.index}.log")
+    if not os.path.isfile(path):
+        return 0
+    n = 0
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if "is not draining" in line and line_after(line, since):
+                n += 1
+    return n
+
+
+def run_slow_peer(nodes: list[Node], writer: Node, victim: Node) -> int:
+    """Stop a peer from reading and keep writing: is the writer's queued output bounded?
+
+    Before roadmap #69 nothing capped `peer.send_buf` on the live path — `check_backpressure()` ran
+    only inside the catch-up loop — so a peer that stopped reading grew the writer with no limit. The
+    ceiling is `--mm-max-peer-send-buffer`, and on overflow the connection is dropped rather than the
+    buffer cleared: after a partial write the buffer can begin mid-frame, and abandoning half a frame
+    desynchronises the peer's parser.
+
+    SIGSTOP rather than iptables, deliberately. A DROP rule leaves the kernel buffers to fill at
+    whatever rate autotuning picks, and the ceiling then trips somewhere between 240k and never — one
+    run tripped, another did not at 320k levels. A stopped process reliably stops reading, so the
+    buffers fill in order and the trip point is repeatable at about 160k levels with a 256 KB ceiling.
+
+    RSS is not the assertion here. A control run with the same writes and no stopped peer grows by
+    about the same amount: that growth is the writer's own pending rows and columnar buffers, and the
+    peer buffer contributes a fraction of a megabyte before the kernel buffers saturate.
+    """
+    block_started = time.strftime("%H:%M:%S")
+    base_rss = rss_mb(writer.proc.pid)
+    print(f"stopping node{victim.index} so it cannot read; writer RSS {base_rss:.1f} MB")
+    victim.proc.send_signal(signal.SIGSTOP)
+
+    drops = 0
+    try:
+        with socket.create_connection(("127.0.0.1", writer.tcp), timeout=60) as sock:
+            sock.settimeout(60)
+            sock.recv(4096)
+            for batch in range(10):
+                block = ""
+                for k in range(40):
+                    start = 900_000 + batch * 40_000 + k * 1000
+                    block += "MINSERT SLOWPEER EX bid 1000\n" + "".join(
+                        f"{start + i} 7 1\n" for i in range(1000))
+                sock.sendall(block.encode())
+                time.sleep(1.0)
+                try:
+                    sock.recv(1 << 20)      # drain replies so the session buffer stays small
+                except socket.timeout:
+                    pass
+                drops = count_drops(writer, block_started)
+                print(f"  after {(batch + 1) * 40}k levels: peer dropped {drops} time(s), "
+                      f"writer RSS {rss_mb(writer.proc.pid):.1f} MB", flush=True)
+                if drops:
+                    break
+    finally:
+        victim.proc.send_signal(signal.SIGCONT)
+        print(f"node{victim.index} resumed")
+
+    # The rows still have to arrive, by reconnect and catch-up.
+    deadline = time.time() + 120
+    rows, target = 0, 0
+    while time.time() < deadline:
+        rows = len(prices(victim.tcp, "SLOWPEER"))
+        target = len(prices(writer.tcp, "SLOWPEER"))
+        if target and rows >= target:
+            break
+        time.sleep(3)
+
+    print(f"peer dropped for not draining: {drops} time(s)")
+    print(f"victim holds {rows} of the writer's {target} SLOWPEER rows after resuming")
+    ok = drops > 0 and target > 0 and rows >= target
+    if drops == 0:
+        print("RESULT: NO DROP OBSERVED — the ceiling never tripped, so this proves nothing")
+    elif rows < target:
+        print("RESULT: DROPPED BUT DID NOT RECOVER — the peer never caught up after reconnecting")
+    else:
+        print("RESULT: OK")
+    return 0 if ok else 1
 
 
 def line_after(line: str, since: str) -> bool:
@@ -376,8 +472,12 @@ def main() -> int:
 
         victim, writer = nodes[2], nodes[0]
 
-        if os.environ.get("MMH_MODE") == "partition":
+        mode = os.environ.get("MMH_MODE")
+        if mode == "partition":
             failures += run_partition(nodes, writer, victim)
+            return 1 if failures else 0
+        if mode == "slowpeer":
+            failures += run_slow_peer(nodes, writer, victim)
             return 1 if failures else 0
         for cycle in range(cycles):
             victim.kill()

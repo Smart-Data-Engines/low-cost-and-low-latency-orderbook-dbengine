@@ -741,42 +741,58 @@ again.
 
 - Spec: `kiro-workspace/specs/mm-status-crash/`
 
-### 69. An unreachable peer grows the sender's memory without bound
+### 69. Queued output for a peer had no ceiling, and discarding it corrupted the stream ✅
 
-Found while trying to make a partition test prove something about anti-entropy (#57).
+Found while trying to make a partition test prove something about anti-entropy (#57), and the first
+version of this entry got the measurement wrong — corrected below, because the wrong number was
+already committed.
+
+**Two defects, one code path.**
 
 `MultiMasterManager::enqueue_frame()` appends every broadcast frame to `peer.send_buf` and tries to
-drain it. Nothing caps that buffer on the live path: `check_backpressure()`, which clears it and sets
-`needs_snapshot` above `max_catchup_bytes`, is called from exactly one place — the catch-up loop. A
-peer that stops reading, whether partitioned, paused or merely slow, makes the writer grow.
+drain it. Nothing capped that buffer on the live path: `check_backpressure()`, the only thing that
+looked at its size, was called from exactly one place — the catch-up loop. A peer that stops reading,
+whether partitioned, paused or slow, grows the writer with no limit.
 
-Measured on machine B, one of three nodes isolated with iptables while the writer took `MINSERT`
-batches:
+Worse, what `check_backpressure()` did about it was `send_buf.clear()` while keeping the socket open.
+`try_drain_send_buf()` erases the sent prefix after a partial write, so the buffer can begin in the
+middle of a frame — clearing it leaves the peer waiting for the rest of a frame nobody will send and
+reading everything after it as that frame's tail. That is not freeing memory, it is silently
+corrupting the peer's framing until some invented length exceeds `MM_MAX_FRAME_PAYLOAD`.
 
-```
-peer cut off; sender RSS at start: 13.8 MB
-  after  20k levels: 17.8 MB (+4.0)
-  after  60k levels: 23.2 MB (+9.4)
-  after 120k levels: 31.5 MB (+17.8)
-after the link was restored: 31.5 MB
-```
+**What was measured, and what was not.** With a 256 KB ceiling and one of three nodes isolated by
+iptables, the buffer crossed it and the peer was dropped after about 240k levels written — so the
+growth is real. But the first version of this entry claimed "+17.8 MB per 120k levels, about
+113 MB/s per unreachable peer", and that number was wrong: a control run with the same writes and
+**no** partition grew by +17.4 MB against +17.7 MB with one. The RSS was the writer's own pending
+rows and columnar buffers, which grow with any write; the peer buffer contributed about 0.2 MB,
+because the kernel socket buffer absorbs the first few megabytes. The unbounded case was not measured
+to saturation — the writer stalls before that — so the magnitude here is code-verified, not
+benchmarked, and the entry says so rather than repeating a proxy measurement as if it were the thing.
 
-Linear, about 2.9 MB per 20k levels, and it does not come back after the buffer drains — the
-allocator keeps the pages. At the sustained rate this engine advertises (777k levels/s) that is
-roughly 113 MB/s per unreachable peer: a peer down for a minute costs the writer several gigabytes.
+**The fix.** `--mm-max-peer-send-buffer` (default 64 MB, the ceiling a client session has had since
+#59) checked on the live path, and on overflow the connection is **dropped** rather than the buffer
+cleared: a closed socket is the only answer that does not lie about the state of the stream, and the
+existing reconnect path then catches the peer up. `check_backpressure()` on the catch-up path now does
+the same thing for the same reason. `ob_mm_peer_send_buf_bytes` and `ob_mm_peer_dropped_slow_total`
+make a peer that is not draining visible before it disappears, the way `ob_session_pending_bytes` does
+for clients.
 
-This is the same defect #59 fixed for client sessions, which got a 64 MB cap per session for exactly
-this reason. The multi-master peer path never got one.
+**Verification, split by what is actually verifiable.** The framing half is deterministic and now has
+tests: feed `parse_frames()` a stream where one frame is cut in half and five good frames follow, and
+**none of the five is delivered** — the parser keeps counting bytes towards the frame the sender
+abandoned, reports no error, and stays desynced. That is the receiver's view of `send_buf.clear()`, and
+it is the reason the fix drops the connection instead.
 
-The fix is the same shape: cap the buffer, and on overflow stop growing rather than stopping the
-writer — discard the backlog, mark the peer for snapshot, and let reconciliation (#57) bring it back.
-That combination also makes a partition test conclusive about anti-entropy, which today it cannot be:
-an iptables DROP does not reset the connection, so TCP retransmits the backlog and the node
-reconverges with no help from reconciliation at all. A mutation that disabled reconciliation entirely
-still passed that scenario.
+The ceiling's end-to-end trip is not deterministic and the entry says so rather than pretending. With a
+256 KB ceiling it tripped after about 160k levels written to a peer stopped with `SIGSTOP`, and in
+another run with the same shape it had not tripped by 320k, because the kernel socket buffers absorb a
+few megabytes first and their size autotunes. `MMH_MODE=slowpeer` in `scripts/mm_harness.py` runs that
+scenario and reports what it observed, including "the ceiling never tripped, so this proves nothing"
+when it did not — a diagnostic, not a verdict. What the code guarantees is the bound; what the harness
+can show is that the bound is reachable.
 
-- Effort: S | Impact: One unreachable peer can exhaust the writer's memory, and it is the same
-  failure mode as a client that stops reading — already fixed once, on the other path
+- Spec: `kiro-workspace/specs/mm-send-buffer-cap/`
 
 ### 67. A node that joins an origin's stream mid-way never establishes a frontier
 
@@ -1093,5 +1109,5 @@ absolute thresholds for a designated benchmark host.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 656 | all passing, ~150s with `ctest -j1` on machine B |
+| C++ (GTest + RapidCheck) | 658 | all passing, ~150s with `ctest -j1` on machine B |
 | Python integration | 120 | passing, plus 2 skipped and 1 `xfail(strict=True)` for #60; ~3.4 min |
