@@ -266,6 +266,22 @@ void MultiMasterManager::start() {
     }
 
     // Start unified I/O thread and reconnect thread.
+    // Anti-entropy: construct it here, which until now nobody did anywhere. The pointer was
+    // declared, stop() checked it, and anti_entropy() handed out a reference to it regardless —
+    // so the first caller of Engine::stats() on a multi-master node took the process down with
+    // it (roadmap #68). The scheduler the roadmap described as working had never run.
+    if (peer_registry_) {
+        AntiEntropyConfig ae_config{};
+        ae_config.interval_seconds = config_.anti_entropy_interval_sec;
+        anti_entropy_ = std::make_unique<AntiEntropyManager>(ae_config, engine_, *peer_registry_);
+        anti_entropy_->start();
+        OB_LOG_INFO("mm", "Anti-entropy scheduler started: interval=%us",
+                    config_.anti_entropy_interval_sec);
+    } else {
+        OB_LOG_INFO("mm", "Anti-entropy scheduler not started: no peer registry (no "
+                          "coordinator endpoints configured)");
+    }
+
     io_thread_ = std::thread([this] { io_loop(); });
     reconnect_thread_ = std::thread([this] { reconnect_loop(); });
 

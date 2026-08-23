@@ -203,8 +203,13 @@ public:
     /// Get conflict resolver (for MM_CONFLICTS command).
     const ConflictResolver& conflict_resolver() const { return *conflict_resolver_; }
 
-    /// Get anti-entropy manager.
-    AntiEntropyManager& anti_entropy() { return *anti_entropy_; }
+    /// Get the anti-entropy manager, or nullptr when there is none.
+    ///
+    /// A pointer, not a reference: this component is optional — it needs a peer registry, so a
+    /// node without coordinator endpoints has none — and handing out a reference to something
+    /// optional is what let Engine::stats() dereference a null unique_ptr and kill every
+    /// multi-master node that was asked for STATUS (roadmap #68).
+    AntiEntropyManager* anti_entropy() { return anti_entropy_.get(); }
 
     /// Check if this manager is in bootstrap state.
     bool is_bootstrapping() const { return bootstrapping_.load(std::memory_order_acquire); }
