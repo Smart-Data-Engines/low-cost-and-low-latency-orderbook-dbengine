@@ -447,6 +447,8 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
             config.mm_replication_port = static_cast<uint16_t>(std::stoi(argv[++i]));
         } else if (arg == "--anti-entropy-interval-seconds" && i + 1 < argc) {
             config.anti_entropy_interval_sec = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--mm-max-peer-send-buffer" && i + 1 < argc) {
+            config.mm_max_peer_send_buf_bytes = std::stoull(argv[++i]);
         } else if (arg == "--mm-max-catchup-bytes" && i + 1 < argc) {
             config.mm_max_catchup_bytes = static_cast<size_t>(std::stoull(argv[++i]));
         }
@@ -593,15 +595,21 @@ TcpServer::TcpServer(ServerConfig config)
                                        repl_config, repl_client_config, failover_config,
                                        TTLConfig{config_.ttl_hours,
                                                  config_.ttl_scan_interval_seconds},
+                                       // Designated initialisers: this was positional, and adding
+                                       // a field in the middle of MultiMasterConfig silently
+                                       // shifted every argument after it.
                                        MultiMasterConfig{
-                                           config_.mm_node_id,
-                                           config_.mm_replication_port,
-                                           config_.multi_master,
-                                           config_.replication_compress,
-                                           config_.mm_max_catchup_bytes,
-                                           config_.anti_entropy_interval_sec,
-                                           config_.shard_id,
-                                           CoordinatorConfig{
+                                           .node_id = config_.mm_node_id,
+                                           .replication_port = config_.mm_replication_port,
+                                           .enabled = config_.multi_master,
+                                           .compress = config_.replication_compress,
+                                           .max_catchup_bytes = config_.mm_max_catchup_bytes,
+                                           .anti_entropy_interval_sec =
+                                               config_.anti_entropy_interval_sec,
+                                           .max_peer_send_buf_bytes =
+                                               config_.mm_max_peer_send_buf_bytes,
+                                           .shard_id = config_.shard_id,
+                                           .coordinator_config = CoordinatorConfig{
                                                config_.coordinator_endpoints,
                                                config_.coordinator_lease_ttl,
                                                config_.node_id,

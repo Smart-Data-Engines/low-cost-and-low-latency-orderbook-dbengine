@@ -215,7 +215,8 @@ Multi-master mode allows multiple nodes to accept writes simultaneously. All nod
 | `--mm-node-id <uint16>` | yes (in MM mode) | — | Unique node identifier in the cluster (1–65535) |
 | `--mm-replication-port <port>` | yes (in MM mode) | — | TCP port for inter-node WAL replication |
 | `--anti-entropy-interval-seconds <N>` | no | 30 | Interval for anti-entropy consistency checks |
-| `--mm-max-catchup-bytes <N>` | no | 536870912 (512MB) | Max catch-up buffer before switching to snapshot sync |
+| `--mm-max-catchup-bytes <N>` | no | 536870912 (512MB) | Max catch-up buffer before the peer is dropped and re-synced |
+| `--mm-max-peer-send-buffer <N>` | no | 67108864 (64MB) | Queued output one peer may hold before its connection is dropped. A peer that stops reading — partitioned, paused or merely slow — otherwise grows the writer without bound: measured at about 113 MB/s per unreachable peer before this ceiling existed. Same ceiling a client session gets |
 
 Multi-master mode also requires:
 - `--coordinator-endpoints` — etcd endpoint(s) for peer discovery

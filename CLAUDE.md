@@ -33,7 +33,7 @@ cmake --build build -j$(nproc)
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release -j$(nproc)
 
-# Tests — 656 of them, ~2.5 minutes
+# Tests — 658 of them, ~2.5 minutes
 ctest --test-dir build --output-on-failure -j1
 ```
 
@@ -187,7 +187,19 @@ Learned the hard way. Check here before debugging.
     sender's buffer and arrive when the rule goes away. A mutation disabling reconciliation
     entirely still passed that scenario. For such a test to decide anything, the divergence has to
     be one TCP cannot undo — a record the sender discarded, or one the receiver refused.
-25. **The checkpoint goes after the flush, never before.** A `CHECKPOINT` record claiming more than
+25. **Clearing a partially-sent buffer corrupts the peer's framing.** `try_drain_send_buf()`
+    erases the sent prefix after a partial write, so `peer.send_buf` can begin mid-frame.
+    `check_backpressure()` used to `clear()` it and keep the socket, which left the peer waiting
+    for the rest of a frame nobody would send and reading the next frames as its tail. Dropping
+    the connection is the only answer that does not lie about the stream; reconnect and catch-up
+    then repair it (roadmap #69).
+26. **RSS is not a measurement of the thing you changed.** A partitioned peer looked like it grew
+    the writer by 17.8 MB per 120k levels — until a control run with the same writes and no
+    partition grew by 17.4 MB. The growth was the writer's own pending rows and columnar buffers;
+    the peer buffer contributed 0.2 MB, because the kernel socket buffer absorbs the first few
+    megabytes. Measure the thing (`ob_mm_peer_send_buf_bytes`), not a proxy that moves for a dozen
+    other reasons.
+27. **The checkpoint goes after the flush, never before.** A `CHECKPOINT` record claiming more than
     is durable turns a crash into data loss; claiming less costs a replay that gets skipped anyway.
     For the crash window between writing the segment files and appending the checkpoint,
     `replay_wal_tail()` skips records at or below the highest `end_ts_ns` already on disk — without
