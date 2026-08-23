@@ -95,6 +95,12 @@ def test_handover_lands_on_the_named_target(healthy_cluster):
     assert refused.startswith("ERR"), (
         f"the outgoing primary still accepts writes: {refused!r}")
 
+    # Leave the cluster settled. This test moves a role for real since #60, and the next test
+    # resolves "the primary" by asking: handing over and walking away made the next one send its
+    # command to a node mid-transition and get ERR not_primary instead of what it was checking.
+    wait_for_role(target.tcp_port, "PRIMARY", timeout=30)
+    wait_for_role(primary.tcp_port, "REPLICA", timeout=30)
+
 
 def test_handover_to_an_unknown_node_is_refused(healthy_cluster):
     primary = healthy_cluster.primary()

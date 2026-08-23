@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -340,6 +341,13 @@ static bool json_extract_succeeded(std::string_view json) {
 
 struct CoordinatorClient::Impl {
     CURL*               curl_handle{nullptr};
+    /// Serialises every request on curl_handle. A libcurl easy handle must not be used from two
+    /// threads at once, and this one was: the monitor thread refreshes the lease and polls cluster
+    /// state while a session thread runs FAILOVER, which sets an intent and revokes a lease. The
+    /// window was small until WAL positions started being published every second (roadmap #60),
+    /// and then graceful handover began failing intermittently with ERR failover_failed —
+    /// COORDINATOR_ERROR from a revoke_lease() whose request had been corrupted mid-flight.
+    std::mutex          http_mtx;
     bool                connected{false};
     std::string         active_endpoint;
     std::thread         watch_thread;
@@ -357,6 +365,7 @@ struct CoordinatorClient::Impl {
 
     /// POST JSON to an etcd endpoint.  Returns response body or empty on error.
     std::string http_post(const std::string& url, const std::string& json_body) {
+        std::lock_guard<std::mutex> lock(http_mtx);
         if (!curl_handle) return {};
 
         std::string response;

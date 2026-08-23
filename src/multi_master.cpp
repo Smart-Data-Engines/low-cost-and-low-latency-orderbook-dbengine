@@ -1079,9 +1079,34 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
             OB_LOG_WARN("mm", "Peer %u sent an unusable version vector — sending everything",
                         peer.node_id);
         }
-        if (!peer.catchup_started) {
-            start_catchup_to_peer(peer);
+        // Only scan the WAL if this peer is actually missing something. Reconciliation (#57)
+        // sends a vector to every peer on a timer, and a vector arriving used to start a full
+        // scan of the retained WAL — measured in the harness as `scanned=543 (9662010 bytes)
+        // sent=0`, repeated per peer per interval, on the io_loop thread that also carries live
+        // traffic. A 1 GB WAL at the 94 MB/s this scan runs at would spend most of every interval
+        // reading itself to discover there was nothing to send.
+        //
+        // Skipping is safe because every route by which a peer can be missing data leaves
+        // evidence in the comparison or forces a reconnect: a peer that was disconnected comes
+        // back through the handshake, a backlog dropped for not draining now closes the
+        // connection (#69), and a record the receiver refused leaves its own frontier behind, so
+        // peer_lacks is not empty. If a future change can drop a record while both sides stay
+        // connected and both frontiers keep moving, this shortcut has to go with it.
+        bool truncated = false;
+        const auto ours = engine_.export_version_vector(MM_MAX_VV_ENTRIES, truncated);
+        const VectorDiff diff = compare_vectors(ours, peer.peer_vector, peer.node_id);
+
+        if (!peer.peer_vector.wants_everything() && diff.peer_lacks.empty()) {
+            peer.catchup_started = true;
+            OB_LOG_DEBUG("mm",
+                         "Peer %u holds everything we do (%zu entries compared) — no scan",
+                         peer.node_id, ours.size());
+            return;
         }
+
+        OB_LOG_INFO("mm", "Peer %u is missing %zu (symbol, origin) ranges — scanning",
+                    peer.node_id, diff.peer_lacks.size());
+        start_catchup_to_peer(peer);
         return;
     }
 
