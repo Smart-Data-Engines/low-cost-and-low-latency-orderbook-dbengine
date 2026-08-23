@@ -61,6 +61,10 @@ MetricsRegistry::MetricsRegistry() {
     gauges_.push_back(make_gauge("ob_mm_replication_lag_bytes",    "Replication lag in bytes (max across peers)"));
     counters_.push_back(make_counter("ob_mm_anti_entropy_runs_total",    "Total number of anti-entropy runs"));
     counters_.push_back(make_counter("ob_mm_anti_entropy_repairs_total", "Total number of anti-entropy repairs"));
+    gauges_.push_back(make_gauge("ob_mm_reconcile_gaps_detected",
+                                 "Symbol/origin pairs where this node and a peer disagree, both directions"));
+    gauges_.push_back(make_gauge("ob_mm_reconcile_we_lack",
+                                 "Of those, the pairs where this node is the one behind"));
     counters_.push_back(make_counter("ob_mm_backpressure_snapshot_total",
                                      "Times a peer fell back to snapshot sync under backpressure"));
     gauges_.push_back(make_gauge("ob_mm_hlc_drift_ns",             "Maximum HLC drift in nanoseconds"));

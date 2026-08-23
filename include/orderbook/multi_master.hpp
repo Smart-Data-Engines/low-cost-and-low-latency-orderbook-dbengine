@@ -203,6 +203,13 @@ public:
     /// Get conflict resolver (for MM_CONFLICTS command).
     const ConflictResolver& conflict_resolver() const { return *conflict_resolver_; }
 
+    /// One reconciliation pass: tell every connected peer what we hold, and report the
+    /// difference in both directions.
+    ///
+    /// Sending our vector *is* the repair: a peer receiving it streams what we lack, because
+    /// that is the same path catch-up takes. Nothing here needs a protocol of its own.
+    ReconcileReport reconcile_with_peers();
+
     /// Get the anti-entropy manager, or nullptr when there is none.
     ///
     /// A pointer, not a reference: this component is optional — it needs a peer registry, so a

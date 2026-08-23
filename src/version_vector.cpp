@@ -98,4 +98,46 @@ uint64_t PeerVector::frontier_for(const std::string& key, uint16_t origin) const
     return it == entries_.end() ? 0 : it->second;
 }
 
+VectorDiff compare_vectors(const std::vector<SequenceTracker::VectorEntry>& ours,
+                           const PeerVector& theirs, uint16_t peer_node_id) {
+    VectorDiff diff{};
+
+    // A peer that could not state its position, or has not stated it yet, is treated as holding
+    // nothing: everything we have is something it lacks. Over-stating what it needs costs
+    // bandwidth; under-stating it loses data.
+    const bool peer_unknown = theirs.wants_everything();
+
+    for (const auto& e : ours) {
+        const uint64_t theirs_frontier = peer_unknown ? 0 : theirs.frontier_for(e.key, e.origin);
+        if (theirs_frontier < e.frontier) {
+            diff.peer_lacks.push_back(VectorGap{peer_node_id, e.key, e.origin,
+                                                theirs_frontier + 1, e.frontier});
+        }
+    }
+
+    if (peer_unknown) {
+        // Nothing to learn about our own gaps from a peer that said nothing. Reporting them as
+        // zero would be a claim; leaving them out is the truth.
+        return diff;
+    }
+
+    // The other direction needs the peer's entries, including keys we have never heard of: a
+    // symbol only it holds is exactly the gap worth finding.
+    for (const auto& e : theirs.entries()) {
+        uint64_t ours_frontier = 0;
+        for (const auto& o : ours) {
+            if (o.origin == e.origin && o.key == e.key) {
+                ours_frontier = o.frontier;
+                break;
+            }
+        }
+        if (ours_frontier < e.frontier) {
+            diff.we_lack.push_back(VectorGap{peer_node_id, e.key, e.origin,
+                                             ours_frontier + 1, e.frontier});
+        }
+    }
+
+    return diff;
+}
+
 }  // namespace ob

@@ -492,26 +492,47 @@ codebase. Each item is also a story we can sell as bespoke work.
 - Protocol version negotiation matrix, mixed-version cluster tests, documented upgrade path
 - Effort: M | Impact: Required before anyone runs this longer than one release
 
-### 57. Complete the anti-entropy implementation
-- Correction to what this item used to claim: the scheduler did **not** work. It was never
-  constructed, so `ob_mm_anti_entropy_runs_total` sat at zero and read like "checked, nothing to
-  repair". Fixed in #68, which also stopped `STATUS` from killing multi-master nodes.
-- Since #61 the mechanism it needs exists: reconciliation is a periodic version-vector exchange, and
-  the repair path is the same filtered stream catch-up uses. `GapInfo` still describes gaps as WAL file
-  and byte offsets, which is the model #61 disproved, so it has to be reshaped to
-  `(symbol, origin, from_seq, to_seq)`. The snapshot-repair stub belongs with #67.
-- `AntiEntropyManager` runs, logs and reports metrics, but its three working methods are
-  placeholders: `detect_gaps()` always returns an empty list, `repair_gap()` returns false, and
-  `trigger_snapshot_repair()` does nothing. The scheduler around them is real; the reconciliation
-  is not
-- `detect_gaps()` needs the Engine wiring flagged as `TODO(task-12)` in `src/anti_entropy.cpp`:
-  compare local `wal().current_file_index()` / `current_offset()` against each peer's published
-  position from `PeerRegistry`
-- `repair_gap()` should issue a catch-up request over the existing `MultiMasterManager` path;
-  `trigger_snapshot_repair()` should reuse the snapshot bootstrap machinery from item #12
-- Until then, divergence is only healed by the reconnect catch-up path. Two peers that drift while
-  staying connected stay drifted
-- Effort: M | Impact: Closes the one component in the architecture that does not do what its name says
+### 57. Anti-entropy reconciles for real, and here is what that covers ✅
+
+The class was a scheduler with two stubs: `detect_gaps()` returned an empty list unconditionally,
+`repair_gap()` returned false, and `GapInfo` described a gap as a WAL file index and byte offset —
+the model #61 measured as data loss. It was worse than that: the scheduler was never constructed
+either, and asking a multi-master node for statistics dereferenced it (#68).
+
+**Now** a pass is one thing: tell every connected peer what we hold. Receiving a vector already makes
+a node stream what the peer lacks (#61), so reconciliation needs no protocol of its own — sending the
+vector *is* the repair. `compare_vectors()` reports the difference in both directions in terms of
+`(symbol, origin, sequence range)`, and the work is injected into `AntiEntropyManager` as a function
+rather than reached for through a back-reference to `MultiMasterManager`, which owns it. That is what
+makes a pass testable with no cluster, no etcd and no ports — and why this class had no tests before.
+
+**A repair counts when the gap is gone, not when a vector was sent.** A pass remembers what it was
+behind on and the next pass counts what disappeared. A metric that counted requests would measure
+diligence; `ob_mm_anti_entropy_repairs_total` now measures closure, and
+`ob_mm_reconcile_gaps_detected` alongside the run counter keeps "checked, nothing to repair" distinct
+from "never ran" — the ambiguity that let this item look finished for months.
+
+**What it actually covers, measured rather than claimed.** The obvious test — partition a node, write
+elsewhere, restore the link — reconverges without any help from reconciliation, and a mutation that
+disabled the pass entirely still passed it. An `iptables DROP` does not reset the connection, so TCP
+retransmits the backlog once the rule is gone. In this architecture, most divergence is already
+handled: a broken connection triggers reconnect, handshake and catch-up; a live connection delivers
+in order. What is left for anti-entropy is divergence that persists while the connection is healthy:
+
+- a record the receiver dropped rather than lost in transit — above the 4096-entry held set in
+  `SequenceTracker`, or refused for another reason
+- a peer whose vector was missing or stale when catch-up ran, so the filter had nothing to work from
+- a backlog the sender discarded under backpressure, which nothing repairs today and which becomes
+  the conclusive test for this item once #69 caps the live send buffer
+
+Verified: 6 unit tests on the pass (both directions, closure measured across passes, a persisting gap
+not counted, the same symbol from two peers as two facts, and a run with no reconciler saying so), 7
+on `compare_vectors` (including a key only the peer holds, and silence read as "holds nothing"), and
+three mutations red — closure counted on dispatch, a silent peer read as holding everything, and a
+missing reconciler reported as a clean pass. The fourth mutation, disabling the pass, is green against
+the partition scenario for the reason above; that gap closes with #69.
+
+- Spec: `kiro-workspace/specs/mm-version-vector-catchup/` (section 6a)
 
 ### 58. Distributed tracing
 - OpenTelemetry spans across client, primary, replica and peers; trace a write end to end
@@ -719,6 +740,43 @@ one-second interval. Mutation red: drop the pointer check in `stats()` and the p
 again.
 
 - Spec: `kiro-workspace/specs/mm-status-crash/`
+
+### 69. An unreachable peer grows the sender's memory without bound
+
+Found while trying to make a partition test prove something about anti-entropy (#57).
+
+`MultiMasterManager::enqueue_frame()` appends every broadcast frame to `peer.send_buf` and tries to
+drain it. Nothing caps that buffer on the live path: `check_backpressure()`, which clears it and sets
+`needs_snapshot` above `max_catchup_bytes`, is called from exactly one place — the catch-up loop. A
+peer that stops reading, whether partitioned, paused or merely slow, makes the writer grow.
+
+Measured on machine B, one of three nodes isolated with iptables while the writer took `MINSERT`
+batches:
+
+```
+peer cut off; sender RSS at start: 13.8 MB
+  after  20k levels: 17.8 MB (+4.0)
+  after  60k levels: 23.2 MB (+9.4)
+  after 120k levels: 31.5 MB (+17.8)
+after the link was restored: 31.5 MB
+```
+
+Linear, about 2.9 MB per 20k levels, and it does not come back after the buffer drains — the
+allocator keeps the pages. At the sustained rate this engine advertises (777k levels/s) that is
+roughly 113 MB/s per unreachable peer: a peer down for a minute costs the writer several gigabytes.
+
+This is the same defect #59 fixed for client sessions, which got a 64 MB cap per session for exactly
+this reason. The multi-master peer path never got one.
+
+The fix is the same shape: cap the buffer, and on overflow stop growing rather than stopping the
+writer — discard the backlog, mark the peer for snapshot, and let reconciliation (#57) bring it back.
+That combination also makes a partition test conclusive about anti-entropy, which today it cannot be:
+an iptables DROP does not reset the connection, so TCP retransmits the backlog and the node
+reconverges with no help from reconciliation at all. A mutation that disabled reconciliation entirely
+still passed that scenario.
+
+- Effort: S | Impact: One unreachable peer can exhaust the writer's memory, and it is the same
+  failure mode as a client that stops reading — already fixed once, on the other path
 
 ### 67. A node that joins an origin's stream mid-way never establishes a frontier
 
@@ -1035,5 +1093,5 @@ absolute thresholds for a designated benchmark host.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 643 | all passing, ~149s with `ctest -j1` on machine B |
+| C++ (GTest + RapidCheck) | 656 | all passing, ~150s with `ctest -j1` on machine B |
 | Python integration | 120 | passing, plus 2 skipped and 1 `xfail(strict=True)` for #60; ~3.4 min |

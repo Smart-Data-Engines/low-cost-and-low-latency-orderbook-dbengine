@@ -97,3 +97,112 @@ TEST(VersionVector, AKeyAtTheWireLimitSurvivesTheRoundTrip) {
     ASSERT_TRUE(pv.deserialize(payload.data(), payload.size()));
     EXPECT_EQ(pv.frontier_for(key, 3), 11u) << "the longest possible key was clipped";
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// compare_vectors: the arithmetic a reconciliation pass runs on
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+ob::PeerVector make_peer_vector(const std::vector<ob::SequenceTracker::VectorEntry>& entries,
+                                bool truncated = false) {
+    const auto payload = ob::serialize_version_vector(entries, truncated);
+    ob::PeerVector pv;
+    pv.deserialize(payload.data(), payload.size());
+    return pv;
+}
+
+}  // namespace
+
+TEST(CompareVectors, FindsWhatEachSideIsMissing) {
+    const std::vector<ob::SequenceTracker::VectorEntry> ours{
+        {"A.EX", 1, 10},   // we are ahead
+        {"B.EX", 1, 5},    // we are behind
+    };
+    const auto theirs = make_peer_vector({{"A.EX", 1, 4}, {"B.EX", 1, 9}});
+
+    const auto diff = ob::compare_vectors(ours, theirs, /*peer=*/7);
+
+    ASSERT_EQ(diff.peer_lacks.size(), 1u);
+    EXPECT_EQ(diff.peer_lacks[0].key, "A.EX");
+    EXPECT_EQ(diff.peer_lacks[0].from_seq, 5u) << "the first record the peer is missing";
+    EXPECT_EQ(diff.peer_lacks[0].to_seq, 10u);
+    EXPECT_EQ(diff.peer_lacks[0].peer_node_id, 7u);
+
+    ASSERT_EQ(diff.we_lack.size(), 1u);
+    EXPECT_EQ(diff.we_lack[0].key, "B.EX");
+    EXPECT_EQ(diff.we_lack[0].from_seq, 6u);
+    EXPECT_EQ(diff.we_lack[0].to_seq, 9u);
+}
+
+TEST(CompareVectors, EqualFrontiersAreNotAGap) {
+    const std::vector<ob::SequenceTracker::VectorEntry> ours{{"A.EX", 1, 10}};
+    const auto theirs = make_peer_vector({{"A.EX", 1, 10}});
+
+    const auto diff = ob::compare_vectors(ours, theirs, 7);
+    EXPECT_TRUE(diff.we_lack.empty());
+    EXPECT_TRUE(diff.peer_lacks.empty());
+}
+
+TEST(CompareVectors, AKeyOnlyTheyHoldIsSomethingWeLack) {
+    // The case that matters most for anti-entropy: a symbol whose records only reached the peer.
+    // Iterating our own entries alone would never see it, and the difference would be invisible
+    // for as long as nobody wrote to that symbol here.
+    const std::vector<ob::SequenceTracker::VectorEntry> ours{{"A.EX", 1, 3}};
+    const auto theirs = make_peer_vector({{"A.EX", 1, 3}, {"ONLY-THEIRS.EX", 2, 8}});
+
+    const auto diff = ob::compare_vectors(ours, theirs, 7);
+
+    ASSERT_EQ(diff.we_lack.size(), 1u);
+    EXPECT_EQ(diff.we_lack[0].key, "ONLY-THEIRS.EX");
+    EXPECT_EQ(diff.we_lack[0].origin, 2u);
+    EXPECT_EQ(diff.we_lack[0].from_seq, 1u) << "we hold nothing there, so we lack from 1";
+    EXPECT_EQ(diff.we_lack[0].to_seq, 8u);
+}
+
+TEST(CompareVectors, AKeyOnlyWeHoldIsSomethingTheyLack) {
+    const std::vector<ob::SequenceTracker::VectorEntry> ours{{"ONLY-OURS.EX", 1, 4}};
+    const auto theirs = make_peer_vector({});
+
+    const auto diff = ob::compare_vectors(ours, theirs, 7);
+    ASSERT_EQ(diff.peer_lacks.size(), 1u);
+    EXPECT_EQ(diff.peer_lacks[0].from_seq, 1u);
+    EXPECT_EQ(diff.peer_lacks[0].to_seq, 4u);
+    EXPECT_TRUE(diff.we_lack.empty());
+}
+
+TEST(CompareVectors, TheSameSymbolFromDifferentOriginsIsComparedSeparately) {
+    const std::vector<ob::SequenceTracker::VectorEntry> ours{{"A.EX", 1, 9}, {"A.EX", 2, 1}};
+    const auto theirs = make_peer_vector({{"A.EX", 1, 2}, {"A.EX", 2, 6}});
+
+    const auto diff = ob::compare_vectors(ours, theirs, 7);
+
+    ASSERT_EQ(diff.peer_lacks.size(), 1u);
+    EXPECT_EQ(diff.peer_lacks[0].origin, 1u) << "we are ahead on origin 1";
+    ASSERT_EQ(diff.we_lack.size(), 1u);
+    EXPECT_EQ(diff.we_lack[0].origin, 2u) << "and behind on origin 2, in the same symbol";
+}
+
+TEST(CompareVectors, APeerThatSaidNothingIsTreatedAsHoldingNothing) {
+    const std::vector<ob::SequenceTracker::VectorEntry> ours{{"A.EX", 1, 10}};
+    ob::PeerVector silent;   // never received
+
+    const auto diff = ob::compare_vectors(ours, silent, 7);
+
+    ASSERT_EQ(diff.peer_lacks.size(), 1u);
+    EXPECT_EQ(diff.peer_lacks[0].from_seq, 1u) << "send it everything";
+    EXPECT_TRUE(diff.we_lack.empty())
+        << "a silent peer says nothing about our own gaps, and inventing zeros for them would be "
+           "a claim rather than an observation";
+}
+
+TEST(CompareVectors, ATruncatedVectorIsTreatedTheSameAsSilence) {
+    const std::vector<ob::SequenceTracker::VectorEntry> ours{{"A.EX", 1, 10}};
+    const auto theirs = make_peer_vector({{"A.EX", 1, 99}}, /*truncated=*/true);
+
+    const auto diff = ob::compare_vectors(ours, theirs, 7);
+    ASSERT_EQ(diff.peer_lacks.size(), 1u);
+    EXPECT_EQ(diff.peer_lacks[0].from_seq, 1u);
+    EXPECT_TRUE(diff.we_lack.empty())
+        << "a vector the peer could not state must not be read as data about what it holds";
+}

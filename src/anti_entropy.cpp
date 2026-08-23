@@ -17,9 +17,8 @@ AntiEntropyManager::AntiEntropyManager(AntiEntropyConfig config,
                                        Engine& engine,
                                        PeerRegistry& registry)
     : config_(config), engine_(engine), registry_(registry) {
-    OB_LOG_DEBUG("anti_entropy",
-                 "AntiEntropyManager created: interval=%u max_repair_bytes=%zu",
-                 config_.interval_seconds, config_.max_repair_bytes);
+    OB_LOG_DEBUG("anti_entropy", "AntiEntropyManager created: interval=%us",
+                 config_.interval_seconds);
 }
 
 AntiEntropyManager::~AntiEntropyManager() {
@@ -105,25 +104,38 @@ void AntiEntropyManager::loop() {
 
 // ── execute_run ───────────────────────────────────────────────────────────────
 
+void AntiEntropyManager::set_reconciler(ReconcileFn fn) {
+    std::lock_guard<std::mutex> lock(reconciler_mtx_);
+    reconciler_ = std::move(fn);
+    OB_LOG_INFO("anti_entropy", "Reconciler installed");
+}
+
 AntiEntropyResult AntiEntropyManager::execute_run() {
     const uint64_t run_id = total_runs_.load(std::memory_order_relaxed) + 1;
     const auto now_ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
-            .count());
+            std::chrono::steady_clock::now().time_since_epoch()).count());
 
     AntiEntropyResult result{};
-    result.run_id = run_id;
+    result.run_id       = run_id;
     result.timestamp_ns = now_ns;
 
-    // Fetch current peer list from registry.
-    auto peers = registry_.get_peers();
-    result.peers_checked = peers.size();
+    ReconcileFn fn;
+    {
+        std::lock_guard<std::mutex> lock(reconciler_mtx_);
+        fn = reconciler_;
+    }
 
-    if (peers.empty()) {
-        OB_LOG_DEBUG("anti_entropy", "Run #%lu: no peers to check",
-                     static_cast<unsigned long>(run_id));
+    if (!fn) {
+        // No work is possible, and that is a different statement from "nothing to repair". The
+        // previous version of this class returned an empty gap list unconditionally and let the
+        // run counter tick, which read as a clean bill of health for months.
+        result.reconciler_missing = true;
+        OB_LOG_WARN("anti_entropy",
+                    "Run #%llu: no reconciler installed, so nothing was checked",
+                    static_cast<unsigned long long>(run_id));
         total_runs_.fetch_add(1, std::memory_order_relaxed);
+        engine_.registry().increment_counter("ob_mm_anti_entropy_runs_total");
         {
             std::lock_guard<std::mutex> lock(result_mtx_);
             last_result_ = result;
@@ -131,136 +143,61 @@ AntiEntropyResult AntiEntropyManager::execute_run() {
         return result;
     }
 
-    // Detect gaps between local WAL and peer positions.
-    auto gaps = detect_gaps(peers);
-    result.gaps_detected = gaps.size();
+    const ReconcileReport report = fn();
+    result.peers_checked = report.peers_contacted;
+    result.vectors_sent  = report.vectors_sent;
+    result.gaps_detected = report.we_lack.size() + report.peer_lacks.size();
+    result.we_lack       = report.we_lack.size();
 
-    // Attempt to repair each gap.
-    size_t bytes_transferred = 0;
-    for (const auto& gap : gaps) {
-        if (bytes_transferred >= config_.max_repair_bytes) {
-            OB_LOG_WARN("anti_entropy",
-                        "Run #%lu: max_repair_bytes reached (%zu), "
-                        "deferring remaining gaps",
-                        static_cast<unsigned long>(run_id),
-                        config_.max_repair_bytes);
-            break;
-        }
-
-        // If the gap spans different WAL files, the WAL may have been
-        // truncated — fall back to snapshot repair.
-        if (gap.from_file != gap.to_file) {
-            OB_LOG_WARN("anti_entropy",
-                        "WAL truncated for peer %u, triggering snapshot repair",
-                        static_cast<unsigned>(gap.peer_node_id));
-            if (trigger_snapshot_repair(gap.peer_node_id)) {
-                result.snapshot_triggered = true;
-                result.gaps_repaired++;
-                total_repairs_.fetch_add(1, std::memory_order_relaxed);
-            }
-        } else {
-            if (repair_gap(gap)) {
-                result.gaps_repaired++;
-                total_repairs_.fetch_add(1, std::memory_order_relaxed);
-                // Estimate bytes transferred from gap size.
-                if (gap.to_offset > gap.from_offset) {
-                    bytes_transferred += (gap.to_offset - gap.from_offset);
-                }
-            }
-        }
+    // Closure, measured against the previous pass. A gap we were behind on and are not behind on
+    // any more was repaired; one that is still there was not, however many vectors we sent.
+    std::set<std::string> now_we_lack;
+    for (const auto& gap : report.we_lack) {
+        now_we_lack.insert(gap.key + "|" + std::to_string(gap.origin) + "|" +
+                           std::to_string(gap.peer_node_id));
     }
-
-    result.bytes_transferred = bytes_transferred;
-
-    OB_LOG_INFO("anti_entropy",
-                "Run #%lu: checked %zu peers, %zu gaps detected, %zu repaired",
-                static_cast<unsigned long>(run_id),
-                result.peers_checked,
-                result.gaps_detected,
-                result.gaps_repaired);
+    for (const auto& previous : previous_we_lack_) {
+        if (now_we_lack.count(previous) == 0) ++result.gaps_closed;
+    }
+    previous_we_lack_ = std::move(now_we_lack);
 
     total_runs_.fetch_add(1, std::memory_order_relaxed);
+    total_repairs_.fetch_add(result.gaps_closed, std::memory_order_relaxed);
 
-    // Update Prometheus metrics.
     engine_.registry().increment_counter("ob_mm_anti_entropy_runs_total");
-    if (result.gaps_repaired > 0) {
+    if (result.gaps_closed > 0) {
         engine_.registry().increment_counter("ob_mm_anti_entropy_repairs_total",
-                                             result.gaps_repaired);
+                                             static_cast<int64_t>(result.gaps_closed));
+    }
+    engine_.registry().set_gauge("ob_mm_reconcile_gaps_detected",
+                                 static_cast<int64_t>(result.gaps_detected));
+    engine_.registry().set_gauge("ob_mm_reconcile_we_lack",
+                                 static_cast<int64_t>(result.we_lack));
+
+    OB_LOG_INFO("anti_entropy",
+                "Run #%llu: peers=%zu vectors_sent=%zu gaps=%zu (we_lack=%zu) closed_since_last=%zu",
+                static_cast<unsigned long long>(run_id), result.peers_checked,
+                result.vectors_sent, result.gaps_detected, result.we_lack, result.gaps_closed);
+
+    // The individual gaps at DEBUG: an operator chasing divergence wants the symbol and the
+    // range, not just a count.
+    for (const auto& gap : report.we_lack) {
+        OB_LOG_DEBUG("anti_entropy", "Behind peer %u on %s origin=%u: missing %llu..%llu",
+                     gap.peer_node_id, gap.key.c_str(), gap.origin,
+                     static_cast<unsigned long long>(gap.from_seq),
+                     static_cast<unsigned long long>(gap.to_seq));
+    }
+    for (const auto& gap : report.peer_lacks) {
+        OB_LOG_DEBUG("anti_entropy", "Peer %u behind us on %s origin=%u: missing %llu..%llu",
+                     gap.peer_node_id, gap.key.c_str(), gap.origin,
+                     static_cast<unsigned long long>(gap.from_seq),
+                     static_cast<unsigned long long>(gap.to_seq));
     }
 
     {
         std::lock_guard<std::mutex> lock(result_mtx_);
         last_result_ = result;
     }
-
     return result;
 }
-
-// ── detect_gaps ───────────────────────────────────────────────────────────────
-
-std::vector<GapInfo>
-AntiEntropyManager::detect_gaps(const std::vector<PeerInfo>& peers) {
-    std::vector<GapInfo> gaps;
-
-    // Placeholder: In the full implementation, we would compare the local
-    // WAL position (from Engine) with each peer's published position.
-    // For now, we log and return an empty list — the actual WAL position
-    // comparison requires Engine integration (task 12).
-
-    for (const auto& peer : peers) {
-        OB_LOG_DEBUG("anti_entropy",
-                     "Checking peer %u: wal_file=%u wal_offset=%zu",
-                     static_cast<unsigned>(peer.node_id),
-                     peer.wal_file_index,
-                     peer.wal_byte_offset);
-
-        // TODO(task-12): Compare with engine_.wal().current_file_index()
-        // and engine_.wal().current_offset() to detect actual gaps.
-        // For now, no gaps are detected until Engine integration is complete.
-    }
-
-    return gaps;
-}
-
-// ── repair_gap ────────────────────────────────────────────────────────────────
-
-bool AntiEntropyManager::repair_gap(const GapInfo& gap) {
-    // Placeholder: In the full implementation, this would send a CATCHUP
-    // request to the peer and replay the missing WAL records.
-    // Full networking integration comes with MultiMasterManager.
-
-    OB_LOG_WARN("anti_entropy",
-                "Gap detected: peer=%u from={%u,%zu} to={%u,%zu}",
-                static_cast<unsigned>(gap.peer_node_id),
-                gap.from_file, gap.from_offset,
-                gap.to_file, gap.to_offset);
-
-    OB_LOG_INFO("anti_entropy",
-                "Repair gap for peer %u: placeholder — "
-                "full networking in MultiMasterManager",
-                static_cast<unsigned>(gap.peer_node_id));
-
-    // Return false since we cannot actually repair yet.
-    return false;
-}
-
-// ── trigger_snapshot_repair ───────────────────────────────────────────────────
-
-bool AntiEntropyManager::trigger_snapshot_repair(uint16_t peer_node_id) {
-    // Placeholder: In the full implementation, this would initiate a full
-    // snapshot transfer from the peer when WAL-based repair is not possible.
-
-    OB_LOG_WARN("anti_entropy",
-                "WAL truncated for peer %u, triggering snapshot repair",
-                static_cast<unsigned>(peer_node_id));
-
-    OB_LOG_INFO("anti_entropy",
-                "Snapshot repair for peer %u: placeholder — "
-                "full networking in MultiMasterManager",
-                static_cast<unsigned>(peer_node_id));
-
-    // Return false since we cannot actually perform snapshot repair yet.
-    return false;
-}
-
 } // namespace ob

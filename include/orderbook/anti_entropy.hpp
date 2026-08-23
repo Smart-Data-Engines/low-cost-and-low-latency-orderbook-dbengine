@@ -1,21 +1,33 @@
 #pragma once
 
-// ── AntiEntropyManager — periodic gap detection and repair ───────────────────
+// ── AntiEntropyManager — reconciliation on a timer ───────────────────────────
 //
-// Ensures eventual consistency between multi-master nodes by periodically
-// comparing local WAL position with peer-published positions from etcd.
-// Detected gaps are repaired via WAL catch-up or, when WAL is truncated,
-// via full snapshot synchronization.
+// Eventual consistency between multi-master nodes, by periodically exchanging version vectors
+// with every connected peer. Receiving a peer's vector already makes a node stream what that
+// peer lacks (see MultiMasterManager::start_catchup_to_peer), so reconciliation needs no
+// protocol of its own: sending our vector is the repair.
 //
-// Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6
+// What this replaced: comparing the local WAL position with peer positions published in etcd,
+// and describing gaps as WAL file indices and byte offsets. Two independent WALs have no common
+// scale — that model is what roadmap #61 measured as data loss — and detect_gaps() returned an
+// empty list unconditionally while the metrics reported runs, which read as "checked, nothing to
+// repair". The scheduler was never even constructed (#68).
+//
+// The work is injected as a function rather than a reference to MultiMasterManager, which owns
+// this object: a reference back would be a cycle, and a function makes a run testable with no
+// cluster, no etcd and no ports.
 
 #include "orderbook/hlc.hpp"
 #include "orderbook/peer_registry.hpp"
+#include "orderbook/version_vector.hpp"
+
+#include <functional>
 
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -28,7 +40,6 @@ class Engine;  // forward — full integration comes in task 12
 
 struct AntiEntropyConfig {
     uint32_t interval_seconds{30};              // --anti-entropy-interval-seconds
-    size_t   max_repair_bytes{64ULL << 20};     // max bytes to repair per run (64MB)
 };
 
 // ── Result of a single anti-entropy run ───────────────────────────────────────
@@ -37,21 +48,27 @@ struct AntiEntropyResult {
     uint64_t run_id{0};
     uint64_t timestamp_ns{0};
     size_t   peers_checked{0};
-    size_t   gaps_detected{0};
-    size_t   gaps_repaired{0};
-    size_t   bytes_transferred{0};
-    bool     snapshot_triggered{false};
+    size_t   gaps_detected{0};   ///< pairs where the two sides disagree, both directions
+    size_t   we_lack{0};         ///< of those, the ones where this node is behind
+    size_t   gaps_closed{0};     ///< gaps this node was behind on last run and is not now
+    size_t   vectors_sent{0};
+    bool     reconciler_missing{false};  ///< no work was possible, which is not "nothing to do"
 };
 
-// ── Gap information ───────────────────────────────────────────────────────────
+// ── What one reconciliation pass found and did ────────────────────────────────
+//
+// Gaps are (symbol, origin, sequence range), not WAL offsets: a sequence number minted by an
+// origin means the same thing on every node that received it, and a byte offset does not.
 
-struct GapInfo {
-    uint16_t peer_node_id{0};
-    uint32_t from_file{0};
-    size_t   from_offset{0};
-    uint32_t to_file{0};
-    size_t   to_offset{0};
+struct ReconcileReport {
+    size_t peers_contacted{0};
+    size_t vectors_sent{0};
+    std::vector<VectorGap> we_lack;
+    std::vector<VectorGap> peer_lacks;
 };
+
+/// Performs one reconciliation pass and reports what it saw. Supplied by MultiMasterManager.
+using ReconcileFn = std::function<ReconcileReport()>;
 
 // ── AntiEntropyManager ────────────────────────────────────────────────────────
 
@@ -82,6 +99,9 @@ public:
     /// Get the result of the last run.
     AntiEntropyResult last_result() const;
 
+    /// Install the function that performs a pass. Without it, a run does nothing and says so.
+    void set_reconciler(ReconcileFn fn);
+
 private:
     AntiEntropyConfig config_;
     Engine& engine_;
@@ -106,15 +126,14 @@ private:
     /// Execute a single anti-entropy run.
     AntiEntropyResult execute_run();
 
-    /// Compare local WAL position with peer-published positions.
-    /// Returns a GapInfo for each peer that is ahead of the local node.
-    std::vector<GapInfo> detect_gaps(const std::vector<PeerInfo>& peers);
+    /// Gaps this node was behind on during the previous run, as "key|origin" keys.
+    ///
+    /// Closure is measured, not assumed: a repair counts when the difference is gone on the next
+    /// pass, not when a request was sent. A metric that counts requests measures diligence.
+    std::set<std::string> previous_we_lack_;
 
-    /// Request missing WAL records from a peer (placeholder — full networking in MultiMasterManager).
-    bool repair_gap(const GapInfo& gap);
-
-    /// Trigger full snapshot synchronization when WAL repair is not possible.
-    bool trigger_snapshot_repair(uint16_t peer_node_id);
+    mutable std::mutex reconciler_mtx_;
+    ReconcileFn reconciler_;
 };
 
 } // namespace ob
