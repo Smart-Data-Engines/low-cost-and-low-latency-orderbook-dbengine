@@ -367,19 +367,53 @@ because the two mechanisms overlap there — which is why the three-node test ex
 are worth nothing without evidence in CI. Every item in this phase produces something a stranger can
 run and check themselves.
 
-### 36. Refactor the argument parser to stop mutating the loop counter
-- `parse_args()` in `src/tcp_server.cpp` consumes flag values with `argv[++i]` inside
-  `for (int i = 1; i < argc; ++i)`. That is 27 instances of `cpp/loop-variable-changed`, and a classic
-  source of off-by-one bugs when a flag is added or reordered
-- Individual lines cannot be fixed in isolation: advancing past a flag's value requires modifying `i`,
-  so it takes restructuring the loop. A small helper that takes the flag name and returns its value,
-  advancing an explicit index, removes the whole class at once
-- Practical consequence beyond tidiness: `required_review_thread_resolution` is enabled on `master`,
-  so CodeQL opens a review thread on any PR that touches one of these lines, and every such PR needs a
-  manual resolution before it can merge. This came up while merging the graceful failover fix, whose
-  only offence was adding two flags in the file's established style
-- Effort: S | Impact: Closes 27 static-analysis findings and removes friction from every future PR
-  that adds a CLI flag
+### 36. The argument parser mutated its loop counter, and hid three defects behind it ✅
+
+`parse_args()` consumed every flag's value with `argv[++i]` inside `for (int i = 1; i < argc; ++i)` —
+29 instances of `cpp/loop-variable-changed`, and a CodeQL review thread on every PR that touched the
+file. Three PRs in a row paid that toll before this was worth doing.
+
+The static-analysis finding turned out to be the least of it. Measured on the built binary before the
+rewrite:
+
+```
+ob_tcp_server --port abc     → terminate called after throwing std::invalid_argument
+                                 what(): stoi
+                               core dumped
+ob_tcp_server --port         → server started, on the default port
+ob_tcp_server --prot 5599    → server started, on the default port
+```
+
+A non-numeric value crashed with a C++ exception message rather than an error. A flag with no value
+was **silently ignored**, because the guard read `arg == "--port" && i + 1 < argc` and a missing value
+simply fell through. And there was no unknown-argument branch at all, so a typo in a flag name — and
+the value after it — vanished, leaving an operator with a server on a port they did not ask for.
+
+Now: an `ArgCursor` owns the index, so consuming a value is not a mutation of a loop variable; values
+are parsed with `std::from_chars` and range-checked against the destination type; and every one of the
+three cases above is an error naming the flag:
+
+```
+Error: --port expects a non-negative integer, got 'abc'
+Error: --port requires a value
+Error: unknown argument '--prot'
+Error: --port expects a value in range, got '99999'
+```
+
+The range check matters on its own: `--port 99999` used to be `static_cast<uint16_t>` of 99999, which
+is 34463. The server listened on a port nobody named.
+
+**This is stricter than before**, deliberately: an invocation carrying an unknown flag used to start a
+server and now refuses to. A correct invocation behaves exactly as it did.
+
+`parse_cli_args()` also had no tests, which is how all of this survived. It has 15 now — six on parsing
+(including the endpoint list dropping empty entries, and booleans not swallowing the next argument) and
+nine death tests, one per refusal. Two of those pin down validations that already existed and had never
+been exercised: multi-master without `--mm-node-id`, and multi-master without `--coordinator-endpoints`.
+The second was found by writing the happy-path test without endpoints and watching it take the whole
+test binary down.
+
+- Spec: none; the roadmap entry was the spec
 
 ### 37. CI hardening
 - Sanitizer jobs: ASan + UBSan on the full test suite, TSan on the concurrency-heavy subset
@@ -1109,5 +1143,5 @@ absolute thresholds for a designated benchmark host.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 658 | all passing, ~150s with `ctest -j1` on machine B |
+| C++ (GTest + RapidCheck) | 673 | all passing, ~152s with `ctest -j1` on machine B |
 | Python integration | 120 | passing, plus 2 skipped and 1 `xfail(strict=True)` for #60; ~3.4 min |
