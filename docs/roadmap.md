@@ -612,45 +612,72 @@ and a client vanishing mid-response with `SO_LINGER 0`) plus 6 unit tests on `Se
 confirmed red separately — EAGAIN as failure, no `EPOLLOUT` arming, no cap, no `MSG_NOSIGNAL`.
 Spec: `kiro-workspace/specs/large-response-write-path/`
 
-### 60. Graceful failover cannot work outside its own tests (P0)
+### 60. Graceful failover could not work outside its own tests, and two more links were missing ✅
 
-`FAILOVER <target_node_id>` validates the target by looking for it in
-`CoordinatorClient::get_published_positions()` (`src/failover.cpp:206`). Nothing in production ever
-publishes a position:
+`FAILOVER <target_node_id>` validated the target against
+`CoordinatorClient::get_published_positions()`, and nothing in production ever published a position:
+`publish_wal_position()` had one caller in `src/`, a connectivity check writing `(0, 0)`, and the rest
+were in `tests/test_etcd_integration.cpp`, which publishes positions by hand before exercising the
+feature. So every graceful handover on a real cluster answered `ERR unknown_target`.
+
+`FailoverManager` already had everything it needed — `RoleTransitionHandler::get_wal_position()` exists
+and `Engine` implements it — so the fix is a publish in the monitor loop, at most once a second, for
+both roles. `FAILOVER <target>` works from the first run:
 
 ```
-$ grep -rn "publish_wal_position" src/
-src/shard_coordinator.cpp:238:  (void)coordinator_->publish_wal_position(0, 0);  // verify connectivity
-src/coordinator.cpp:536:        bool CoordinatorClient::publish_wal_position(...)
+{"component":"failover","msg":"Graceful failover: handing role to node-1 (grace=5s cooldown=15s)"}
 ```
 
-One connectivity check with `(0, 0)` and the definition itself. Every other caller is in
-`tests/test_etcd_integration.cpp`, which publishes positions by hand before exercising the feature.
+**And then the integration module fell over**, which is where this item earns its length. Two more
+links in the same chain had never run, because the first link never worked:
 
-So on a real two-node cluster, **every graceful handover answers `ERR unknown_target`** — measured
-against the integration cluster: `FAILOVER node-1` → `ERR unknown_target node-1`, with both nodes
-healthy and `node-1` holding the replica role. `docs/cli.md` documents that error as "usually a typo in
-a node id". In reality it means nobody publishes positions.
+- **The outgoing primary kept saying it was primary.** The handover moved `FailoverManager`'s own role
+  and called `handler_.demote_to_replica()` **only if** the coordinator already showed a new leader at
+  that instant — which it never does, because the target first has to notice the empty leader key. The
+  comment said "monitor_loop() will pick it up on its next pass"; the replica branch of that loop only
+  recorded the address. So the node that had just given the role away answered `ROLE` with `PRIMARY`
+  and kept accepting writes. Measured: `{'node-0': 'PRIMARY 1', 'node-1': 'PRIMARY 2'}` for the full
+  30-second convergence window, while the node's own `FailoverManager` said `role=2` (REPLICA).
+- **A replica never followed a new primary.** The same branch recorded `primary_address_` and told the
+  engine nothing, so a `ReplicationClient` stayed pointed at whoever was leader when it started. After
+  a handover the demoted node followed nobody; after a promotion elsewhere, a surviving replica kept
+  talking to the node that had lost the role. Uncovered by the tests because a two-node cluster has no
+  third node to observe it.
 
-The same absence affects `elect_winner()` (`src/failover.cpp:521`), which picks the most advanced
-replica from those positions. With no positions, election cannot prefer the node with the least data
-loss — and automatic failover demonstrably still works, so it is choosing by some other route. That
-needs establishing rather than assuming.
+Both are now in the monitor loop: the handover demotes the engine immediately (the lease is gone, so
+the role is gone whatever the target does yet — an empty address is safe, `demote_to_replica()` only
+starts a client when it can parse `host:port`), and the replica branch adopts a leader address when it
+changes, once per change rather than once per poll.
 
-Item #29 recorded this feature as fixed. What was fixed was real — the handover intent and the
-election cooldown, verified by C++ tests against live etcd — but those tests publish the positions the
-server never publishes, so the fix has never run in the configuration it ships in. Sixth instance of
-the same pattern in this repository: the layer works, the layer above never feeds it, and no test
-crosses the boundary.
+`test_handover_lands_on_the_named_target` lost its `xfail(strict=True)` and gained the two assertions
+this uncovered: the outgoing node must report `REPLICA`, and it must refuse writes.
 
-Scope: publish each node's WAL position periodically (the `FailoverManager` monitor loop already
-ticks), under a lease so a dead node stops being "known", then confirm both target validation and
-position-based election against a real cluster. `tests/integration/test_failover.py` already contains
-the test, marked `xfail(strict=True)` so it turns red the moment the defect is fixed and the marker
-becomes a lie.
+Worth recording separately: `elect_winner()`, the "most advanced replica wins" policy, has **no callers
+in `src/`** — election is a create-only CAS race on the leader key, so the winner is whoever gets there
+first. Published positions now exist for it to compare, but nothing compares them. That is #70.
 
-- Effort: S-M | Impact: An advertised HA operation currently cannot be performed on a real deployment
+- Effort: S | Impact: Graceful handover works, an outgoing primary stops advertising a role it gave
+  away, and a replica follows the current leader instead of a remembered one
 
+### 70. The election policy has no callers
+
+`elect_winner()` in `src/failover.cpp` picks the most advanced replica from the published positions —
+higher WAL file index, then higher byte offset, then lower node id as a tiebreak. It has unit tests in
+`tests/test_failover_election.cpp`. It has **no callers in `src/`**: `grep -rn elect_winner src/` finds
+the definition and nothing else.
+
+What actually happens on failover is `attempt_promotion()`, whose comment says it plainly: "Grant a new
+lease and try to acquire leadership via CAS. If the leader key doesn't exist, CAS succeeds and we become
+primary. If it exists (another node promoted first), CAS fails and we stay replica." The role goes to
+whoever wins the race, not to the replica with the least missing data.
+
+Since #60 the positions the policy needs are actually published, so wiring it in is now possible: a
+candidate reads the positions, and defers if another live replica is further ahead. The care is in the
+edge cases — the most advanced replica being down, positions being stale, and two candidates deferring
+to each other — which is why this is its own item rather than a rider on #60.
+
+- Effort: M | Impact: Failover currently prefers speed over data. With this, a promotion picks the node
+  that lost the least, which is the whole point of publishing positions
 
 ### 61. Multi-master catch-up compared WAL offsets across independent WALs ✅
 
@@ -1144,4 +1171,4 @@ absolute thresholds for a designated benchmark host.
 | Suite | Count | Status |
 |-------|-------|--------|
 | C++ (GTest + RapidCheck) | 673 | all passing, ~152s with `ctest -j1` on machine B |
-| Python integration | 120 | passing, plus 2 skipped and 1 `xfail(strict=True)` for #60; ~3.4 min |
+| Python integration | 121 | passing, plus 2 skipped. **No xfails left**: #60's and #61's markers both fell with their fixes |

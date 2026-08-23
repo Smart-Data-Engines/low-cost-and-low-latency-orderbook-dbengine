@@ -275,12 +275,25 @@ FailoverManager::HandoverResult FailoverManager::initiate_graceful_failover(
 
     // 5. If the target was quick, adopt it as our primary right away. Otherwise
     //    monitor_loop() will pick it up on its next pass.
+    // The lease is gone, so this node is not primary any more whatever the target does next. Tell
+    // the engine now: it owns the ROLE answer and the read-only flag, and this call used to happen
+    // only if the target had already promoted by this instant — which it has not, because it first
+    // has to notice the empty leader key. So a node that had just handed the role away kept
+    // answering ROLE with PRIMARY and kept accepting writes. The empty-address case is handled:
+    // Engine::demote_to_replica() only starts a replication client when it can parse host:port.
     auto state = coordinator_->get_cluster_state();
-    if (state.has_value() && !state->leader_address.empty()) {
+    const std::string new_primary =
+        (state.has_value() && !state->leader_address.empty()) ? state->leader_address
+                                                             : std::string{};
+    {
         std::lock_guard<std::mutex> lk(mtx_);
-        primary_address_ = state->leader_address;
-        handler_.demote_to_replica(state->leader_address);
+        primary_address_          = new_primary;
+        adopted_primary_address_  = new_primary;
     }
+    handler_.demote_to_replica(new_primary);
+
+    OB_LOG_INFO("failover", "Graceful failover: demoted locally, primary=%s",
+                new_primary.empty() ? "(not elected yet)" : new_primary.c_str());
 
     return HandoverResult::OK;
 }
@@ -319,9 +332,39 @@ bool FailoverManager::should_defer_to_handover_target() {
 
 // ── monitor_loop() ──────────────────────────────────────────────────────────
 
+void FailoverManager::publish_position_if_due() {
+    if (!coordinator_) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (last_position_publish_ != std::chrono::steady_clock::time_point{} &&
+            now - last_position_publish_ < std::chrono::seconds(1)) {
+            return;
+        }
+        last_position_publish_ = now;
+    }
+
+    const auto [file_index, byte_offset] = handler_.get_wal_position();
+    if (!coordinator_->publish_wal_position(file_index, byte_offset)) {
+        OB_LOG_WARN("failover", "publish_wal_position failed: file=%u offset=%zu",
+                    file_index, byte_offset);
+        return;
+    }
+    OB_LOG_DEBUG("failover", "Published WAL position: file=%u offset=%zu",
+                 file_index, byte_offset);
+}
+
 void FailoverManager::monitor_loop() {
     while (running_.load(std::memory_order_acquire)) {
         NodeRole current = role_.load();
+
+        // Both roles publish: a handover target is a replica, and FAILOVER <target> validates the
+        // name against the published positions. Before this call existed, that list was empty on
+        // every real cluster and every graceful handover was refused (#60).
+        if (current != NodeRole::MULTI_MASTER) {
+            publish_position_if_due();
+        }
 
         // Multi-master nodes do not participate in primary/replica election.
         if (current == NodeRole::MULTI_MASTER) {
