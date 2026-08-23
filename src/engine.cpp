@@ -376,7 +376,7 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta_in, const Level* levels
     }
 
     // 2. Apply to SoA buffer using seqlock writer protocol.
-    SoABuffer& buf = get_or_create_buffer(delta.symbol, delta.exchange);
+    SoABuffer& buf = get_or_create_buffer(symbol_key, delta.symbol, delta.exchange);
     bool gap_detected = false;   // unused: gaps are decided per origin in stamp_sequence()
     ob_status_t status = ob::apply_delta(buf, delta, levels, gap_detected);
 
@@ -446,7 +446,7 @@ ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta_in, const Level* lev
     }
 
     // 4. Apply to SoA buffer (same logic as apply_delta).
-    SoABuffer& buf = get_or_create_buffer(delta.symbol, delta.exchange);
+    SoABuffer& buf = get_or_create_buffer(symbol_key, delta.symbol, delta.exchange);
     bool gap_detected = false;   // unused: gaps are decided per origin in stamp_sequence()
     ob_status_t status = ob::apply_delta(buf, delta, levels, gap_detected);
 
@@ -579,7 +579,7 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
 
     // 4. Apply winning levels to SoA buffer.
     if (!winning_levels.empty()) {
-        SoABuffer& buf = get_or_create_buffer(delta.symbol, delta.exchange);
+        SoABuffer& buf = get_or_create_buffer(symbol_key, delta.symbol, delta.exchange);
 
         // Build a filtered DeltaUpdate + Level array for winning levels only.
         if (winning_levels.size() == static_cast<size_t>(delta.n_levels)) {
@@ -1248,7 +1248,11 @@ std::string Engine::handle_failover_command(const std::string& target_node_id) {
 
 SoABuffer& Engine::get_or_create_buffer(const std::string& symbol,
                                          const std::string& exchange) {
-    const std::string key = symbol + "." + exchange;
+    return get_or_create_buffer(symbol + "." + exchange, symbol.c_str(), exchange.c_str());
+}
+
+SoABuffer& Engine::get_or_create_buffer(const std::string& key, const char* symbol,
+                                        const char* exchange) {
     auto it = buffers_.find(key);
     if (it != buffers_.end()) return *it->second;
 
@@ -1259,8 +1263,8 @@ SoABuffer& Engine::get_or_create_buffer(const std::string& symbol,
     buf->ask.version.store(0, std::memory_order_relaxed);
     buf->sequence_number.store(0, std::memory_order_relaxed);
     buf->last_timestamp_ns = 0;
-    std::strncpy(buf->symbol,   symbol.c_str(),   sizeof(buf->symbol)   - 1);
-    std::strncpy(buf->exchange, exchange.c_str(), sizeof(buf->exchange) - 1);
+    std::strncpy(buf->symbol,   symbol,   sizeof(buf->symbol)   - 1);
+    std::strncpy(buf->exchange, exchange, sizeof(buf->exchange) - 1);
 
     live_ptrs_[key] = buf.get();
     auto& ref = *buf;
@@ -1444,10 +1448,10 @@ void Engine::apply_delta_replayed(const DeltaUpdate& delta, const Level* levels)
     // number. seed() restores the counters from it without reporting a gap — the gap, if
     // there was one, was recorded when the records were first written, and re-reporting it
     // would append a second GAP for the same hole on every restart.
-    seq_tracker_.seed(std::string(delta.symbol) + "." + delta.exchange,
-                      /*origin=*/mm_config_.node_id, delta.sequence_number);
+    const std::string symbol_key = std::string(delta.symbol) + "." + delta.exchange;
+    seq_tracker_.seed(symbol_key, /*origin=*/mm_config_.node_id, delta.sequence_number);
 
-    SoABuffer& buf = get_or_create_buffer(delta.symbol, delta.exchange);
+    SoABuffer& buf = get_or_create_buffer(symbol_key, delta.symbol, delta.exchange);
     bool gap_detected = false;
     (void)ob::apply_delta(buf, delta, levels, gap_detected);
 

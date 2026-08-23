@@ -379,6 +379,16 @@ private:
     std::condition_variable pending_cv_;  // signalled when pending_rows_ is drained
 
     // Helpers
+    /// Buffer for a symbol whose "SYMBOL.EXCHANGE" key the caller already built.
+    ///
+    /// The write path has that key in hand — it needs it for the migrated-symbol check and for the
+    /// sequence tracker — and the two-argument overload below rebuilt it from scratch: two
+    /// std::string temporaries from the char arrays plus the concatenation, three allocations per
+    /// write on the hottest path in the engine (roadmap #66).
+    SoABuffer&     get_or_create_buffer(const std::string& key, const char* symbol,
+                                        const char* exchange);
+
+    /// Convenience for callers that do not have the key yet.
     SoABuffer&     get_or_create_buffer(const std::string& symbol, const std::string& exchange);
 
     /// Stamp `delta` with a sequence number and record a GAP if its origin's stream skipped.
