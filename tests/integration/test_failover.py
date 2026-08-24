@@ -12,11 +12,18 @@ Two things are being checked, and they are different:
   the race back roughly half the time.
 - **An unplanned loss** (SIGKILL) must promote the survivor, keep the data that was
   acknowledged, and accept writes again.
+- **A lease the coordinator has forgotten** must take the role away from whoever held it. That is
+  the whole purpose of writing the leader key under a lease, and until #74 it did not work: a
+  keepalive for a lease etcd no longer knew answered 200, so the holder never found out.
 """
 from __future__ import annotations
 
+import base64
+import json
 import socket
 import time
+import urllib.error
+import urllib.request
 
 import pytest
 
@@ -60,6 +67,44 @@ def wait_for_role(port: int, expected: str, timeout: float = 30.0) -> float:
     raise AssertionError(
         f"node on port {port} did not report {expected} within {timeout}s; "
         f"last ROLE was {last!r}")
+
+
+def etcd_post(port: int, path: str, payload: dict) -> tuple[int, str]:
+    """POST to etcd's HTTP gateway. Returns (status, body) and does not raise on 4xx."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}", data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, resp.read().decode()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode()
+
+
+def revoke_every_lease(etcd_port: int) -> list[int]:
+    """Drop every lease in etcd, which deletes the keys written under them.
+
+    This is what a network partition longer than the TTL does to a primary, without having to build
+    the partition: the leader key disappears while the process holding the role stays up and healthy.
+    """
+    _, body = etcd_post(etcd_port, "/v3/lease/leases", {})
+    ids = [int(entry["ID"]) for entry in json.loads(body).get("leases", [])]
+    for lease_id in ids:
+        etcd_post(etcd_port, "/v3/lease/revoke", {"ID": lease_id})
+    return ids
+
+
+def epoch_of(role_response: str) -> int:
+    """ROLE answers `PRIMARY <epoch>` for a primary; 0 when there is no epoch to read."""
+    parts = role_response.split()
+    if len(parts) >= 2 and parts[0] == "PRIMARY" and parts[1].isdigit():
+        return int(parts[1])
+    return 0
+
+
+def primaries_among(cluster) -> list[str]:
+    roles = [role_of(n.tcp_port) for n in cluster.nodes]
+    return [r for r in roles if "PRIMARY" in r and "REPLICA" not in r]
 
 
 # ── Graceful handover ─────────────────────────────────────────────────────────
@@ -251,3 +296,65 @@ def test_a_dead_node_is_reported_as_unreachable_not_as_a_replica(healthy_cluster
     assert replicas == 0, (
         f"the new primary reports {replicas} replicas while the only other node is "
         f"dead")
+
+
+# ── Lease fencing ─────────────────────────────────────────────────────────────
+
+
+def test_a_primary_whose_lease_etcd_forgot_stops_holding_the_role(healthy_cluster):
+    """The leader key is written under a lease so that losing the lease loses the role.
+
+    Revoking every lease in etcd is a partition longer than the TTL, without building a partition:
+    the leader key disappears while the process that held the role stays up and healthy. Before #74
+    the holder never found out — a keepalive for a forgotten lease answers HTTP 200 with the ID
+    echoed back and no TTL, and the code only checked that the response was non-empty. The result was
+    two nodes reporting PRIMARY at different epochs, indefinitely, both accepting writes.
+    """
+    primary = healthy_cluster.primary()
+    epoch_before = epoch_of(role_of(primary.tcp_port))
+    assert epoch_before > 0, "the primary did not report an epoch to compare against"
+
+    assert revoke_every_lease(healthy_cluster.etcd_client_port), "there was no lease to revoke"
+
+    # Sample often enough to catch a second primary while it exists, rather than only its aftermath.
+    deadline = time.monotonic() + 30
+    worst = 0
+    while time.monotonic() < deadline:
+        worst = max(worst, len(primaries_among(healthy_cluster)))
+        if worst > 1:
+            break
+        time.sleep(0.5)
+    assert worst <= 1, (
+        f"{worst} nodes held the PRIMARY role at once: the lease fenced nothing, and both accept "
+        f"writes, so their data diverges")
+
+    # And the old holder must have reacted: either it stepped down, or it stood for election again
+    # and won a *later* epoch. Still sitting on the old epoch means it never noticed.
+    role_after = role_of(primary.tcp_port)
+    if "PRIMARY" in role_after and "REPLICA" not in role_after:
+        assert epoch_of(role_after) > epoch_before, (
+            f"the old primary still claims epoch {epoch_of(role_after)} after its lease was "
+            f"revoked, so it never learned it had lost the role")
+
+
+def test_the_cluster_still_has_a_primary_after_a_lease_scare(healthy_cluster):
+    """Fencing has to be recoverable, not just safe.
+
+    Taking the role away is only half of it: something must take it back, or a transient coordinator
+    problem would leave the cluster read-only until an operator noticed.
+
+    Unlike the test above, this one is **not** a regression test for #74 — it passes against the
+    pre-fix binary too, because the fixture restarts nodes between tests and a restarting node reads
+    its role from etcd anyway. It guards recoverability, and only that.
+    """
+    revoke_every_lease(healthy_cluster.etcd_client_port)
+
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        if len(primaries_among(healthy_cluster)) == 1:
+            break
+        time.sleep(0.5)
+
+    roles = [role_of(n.tcp_port) for n in healthy_cluster.nodes]
+    primaries = [r for r in roles if "PRIMARY" in r and "REPLICA" not in r]
+    assert len(primaries) == 1, f"no single primary came back; roles={roles}"

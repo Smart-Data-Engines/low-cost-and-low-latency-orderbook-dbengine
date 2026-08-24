@@ -385,9 +385,23 @@ struct CoordinatorClient::Impl {
         curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
 
         CURLcode res = curl_easy_perform(curl_handle);
+        long status = 0;
+        curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &status);
         curl_slist_free_all(headers);
 
         if (res != CURLE_OK) return {};
+
+        // etcd answers a rejected write with 4xx and a JSON error body — a `put` under a lease it
+        // no longer knows returns 404 with {"error":"etcdserver: requested lease not found"}.
+        // Handing that body back made every caller that tests `!resp.empty()` read a refusal as a
+        // success, which is how a node came to believe it had published a position that was never
+        // stored (#74).
+        if (status >= 400) {
+            OB_LOG_WARN("coordinator", "HTTP %ld from %s: %s",
+                        status, url.c_str(),
+                        response.empty() ? "(no body)" : response.c_str());
+            return {};
+        }
         return response;
     }
 };
@@ -472,7 +486,27 @@ bool CoordinatorClient::refresh_lease(int64_t lease_id) {
     std::string body = "{\"ID\":" + std::to_string(lease_id) + "}";
 
     std::string resp = impl_->http_post(url, body);
-    return !resp.empty();
+    if (resp.empty()) return false;
+
+    // A keepalive for a lease etcd has forgotten answers **200** with the same envelope as a live
+    // one and the ID echoed back — the only difference is that TTL is absent:
+    //
+    //   live:    {"result":{"header":{...},"ID":"5639...","TTL":"30"}}
+    //   expired: {"result":{"header":{...},"ID":"5639..."}}
+    //
+    // So `!resp.empty()` meant this function could never fail, and the lease fenced nothing: a
+    // primary partitioned from etcd for longer than the TTL kept answering PRIMARY and accepting
+    // writes while a replica took the leader key it had lost (#74).
+    const int64_t ttl = json_extract_int64(resp, "TTL");
+    if (ttl <= 0) {
+        OB_LOG_WARN("coordinator",
+                    "lease %ld is gone: keepalive returned no TTL, so etcd does not know it any "
+                    "more", static_cast<long>(lease_id));
+        return false;
+    }
+    OB_LOG_DEBUG("coordinator", "lease %ld refreshed, ttl=%lds",
+                 static_cast<long>(lease_id), static_cast<long>(ttl));
+    return true;
 }
 
 bool CoordinatorClient::revoke_lease(int64_t lease_id) {

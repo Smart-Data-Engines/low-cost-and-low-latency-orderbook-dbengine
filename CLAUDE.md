@@ -238,6 +238,16 @@ Learned the hard way. Check here before debugging.
     `response_formatter.cpp` — was not. That move changed the *control* by 28 ns, most of the 41 ns
     effect under test. Build the control the way the subject is built: same translation unit shape,
     same linkage, same optimisation opportunities.
+34. **An HTTP 200 is not a success — find the field that proves it.** etcd answers a keepalive for a
+    lease it has forgotten with **200**, the same envelope as a live one, and the lease id echoed
+    back; the only difference is that `TTL` is missing. `refresh_lease()` tested `!resp.empty()`, so
+    it could not fail, and the lease fenced nothing. When a call's answer decides whether this node
+    still owns a role, parse the field that carries the answer, and make the failing case a log line.
+35. **Ask the server what it answers; do not infer it from the client code.** Both halves of #74 came
+    out of ten lines of Python against a scratch etcd: keepalive on a revoked lease returns 200
+    without `TTL`, and `put` under an unknown lease returns **404** with a JSON error body that
+    `http_post()` handed back as though it were a result. Neither is visible by reading our own code,
+    and neither is documented where you would look.
 
 ## Current state and open problems
 

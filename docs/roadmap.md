@@ -673,6 +673,58 @@ first. Published positions now exist for it to compare, but nothing compares the
 - Effort: S | Impact: Graceful handover works, an outgoing primary stops advertising a role it gave
   away, and a replica follows the current leader instead of a remembered one
 
+### 74. A keepalive for a forgotten lease answers 200, so the lease fenced nothing (P0) ✅
+
+Found while working out whether a position key could be trusted for #72, by asking etcd what it
+actually answers instead of assuming.
+
+`refresh_lease()` ended with `return !resp.empty();`. Measured against etcd 3.5.17:
+
+```
+live lease, keepalive:
+  {"result":{"header":{...},"ID":"563970515281197573","TTL":"30"}}
+revoked lease, keepalive:
+  {"result":{"header":{...},"ID":"563970515281197573"}}          ← same shape, HTTP 200, no TTL
+```
+
+So the function **could not fail**, and the lease fenced nothing. The leader key is written under the
+lease precisely so that losing the lease loses the role, which made this the failure the whole
+mechanism exists to prevent:
+
+1. A primary loses contact with etcd. After the TTL the lease expires and **the leader key is
+   deleted**.
+2. A replica sees no leader, campaigns, wins the CAS under its own lease, and is primary.
+3. Contact returns. The old primary's keepalive answers 200 with no TTL, it concludes all is well,
+   and keeps answering `PRIMARY` — and `INSERT` refuses writes only for `NodeRole::REPLICA`, so it
+   **keeps accepting them**.
+
+Reproduced without building a partition, by revoking every lease in etcd — which is what a partition
+longer than the TTL does to the leader key, minus the networking:
+
+```
+before the fix:  ['PRIMARY 1', 'PRIMARY 2']  for the full 24 s window, old primary logged nothing
+after the fix:   ['PRIMARY 2', 'REPLICA …']  — "keepalive returned no TTL", demoted, re-elected
+```
+
+Three changes, in increasing order of how much they generalise:
+
+1. `refresh_lease()` reads `TTL` from the keepalive response and fails when it is absent or `<= 0`.
+2. `Impl::http_post()` reads `CURLINFO_RESPONSE_CODE` and returns nothing for `>= 400`, logging the
+   code, URL and body. This fixes a class rather than a case: a `put` under an unknown lease answers
+   **404** with `{"error":"etcdserver: requested lease not found"}`, and every caller that tested
+   `!resp.empty()` read that refusal as a success.
+3. The `PRIMARY` branch of `monitor_loop()` now reads cluster state each pass, reconciles the epoch,
+   and steps down the moment the leader key names someone else — an independent guard, because a live
+   lease is not proof that the key still belongs to us. It demotes on the first sighting: a spurious
+   demotion costs seconds of unavailability, two primaries cost divergent data.
+
+The regression test (`test_a_primary_whose_lease_etcd_forgot_stops_holding_the_role`) samples the
+roles twice a second and fails on the first moment two nodes claim the role. It fails against the
+pre-fix binary with `2 nodes held the PRIMARY role at once`.
+
+- Effort: S | Impact: Closes a split-brain path in the component whose only job is to prevent split
+  brain, and stops three other call sites from reading an HTTP 404 as a success
+
 ### 73. A node that loses the startup race is inert for the rest of its life (P0) ✅
 
 Found while proving #70 on a real cluster: the deference log lines never appeared, and the reason was
