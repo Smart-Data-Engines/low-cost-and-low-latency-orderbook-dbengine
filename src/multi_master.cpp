@@ -456,7 +456,28 @@ size_t MultiMasterManager::connected_peer_count() const {
 
 void MultiMasterManager::start_bootstrap() {
     bootstrapping_.store(true, std::memory_order_release);
-    OB_LOG_INFO("mm", "Bootstrap started for node %u", config_.node_id);
+    OB_LOG_INFO("mm",
+                "Bootstrap started for node %u — writes are refused with ERR BOOTSTRAPPING until "
+                "finish_bootstrap() is called",
+                config_.node_id);
+}
+
+void MultiMasterManager::finish_bootstrap(bool succeeded) {
+    const bool was = bootstrapping_.exchange(false, std::memory_order_acq_rel);
+    if (!was) {
+        OB_LOG_DEBUG("mm", "finish_bootstrap() with no bootstrap in progress on node %u",
+                     config_.node_id);
+        return;
+    }
+    if (succeeded) {
+        OB_LOG_INFO("mm", "Bootstrap finished for node %u — accepting writes", config_.node_id);
+    } else {
+        OB_LOG_ERROR("mm",
+                     "Bootstrap FAILED for node %u — accepting writes anyway rather than refusing "
+                     "them for ever. This node may be missing data its peers hold; reads can be "
+                     "incomplete until anti-entropy catches up",
+                     config_.node_id);
+    }
 }
 
 // ── Diagnostic commands ───────────────────────────────────────────────────────
@@ -1645,11 +1666,18 @@ void MultiMasterManager::handle_topology_change(
 }
 
 void MultiMasterManager::bootstrap_from_peer(const PeerConnection& source) {
-    OB_LOG_INFO("mm",
-                "Bootstrap progress: phase=%s bytes=%zu/%zu (%.1f%%) elapsed=%.1fs",
-                "snapshot", size_t(0), size_t(0), 0.0, 0.0);
-    // Full implementation in task 12 — snapshot transfer + WAL catch-up.
-    (void)source;
+    // Not implemented, and it says so rather than logging a progress line of zeros. A multi-master
+    // node currently starts empty and relies on catch-up from a peer's retained WAL, which is
+    // enough for a cluster that grew together and not enough for a node added to a running one —
+    // that is roadmap #76, with #67 waiting behind it.
+    //
+    // Whatever happens, the bootstrap state gets an exit: refusing writes for ever is a worse
+    // answer than admitting the transfer did not happen.
+    OB_LOG_ERROR("mm",
+                 "bootstrap_from_peer(%u) is not implemented: no snapshot was transferred, so this "
+                 "node holds only what catch-up can reach in its peers' retained WAL",
+                 source.node_id);
+    finish_bootstrap(/*succeeded=*/false);
 }
 
 } // namespace ob

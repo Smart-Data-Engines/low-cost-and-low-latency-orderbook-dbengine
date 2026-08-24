@@ -728,8 +728,35 @@ needs, and what `AntiEntropyManager::trigger_snapshot_repair()` is a stub for), 
 meanwhile about a progress log that reports progress it never makes. A feature that looks implemented
 is worse than an absent one, especially in a repository read as a portfolio.
 
-- Effort: L for the implementation, S to remove the decoration | Impact: Prevents a self-inflicted
-  outage the first time bootstrap is wired up, and unblocks #67
+**The dead end is closed; the transfer is still missing.** `finish_bootstrap(bool succeeded)` now
+pairs with `start_bootstrap()`, and a failure leaves the state rather than sitting in it: a node that
+cannot bootstrap says so loudly and becomes usable, because refusing writes for ever is the worse
+answer. `bootstrap_from_peer()` logs that it is not implemented instead of a progress line of zeros,
+and clears the flag. Four unit tests cover entering, leaving, leaving after a failure, and leaving
+without entering.
+
+What remains is the snapshot transfer itself, and it needs a decision rather than an implementation,
+because the obvious shortcut is not available: **`ReplicationManager` is deliberately not created in
+multi-master mode** (`src/engine.cpp`: "NOTE: ReplicationManager is NOT created in MM mode"), so an MM
+node serves no `SNAPSHOT_REQUEST` and a joining node has nobody to ask.
+
+Two ways, and they differ in architecture rather than in effort:
+
+1. **Extend the multi-master protocol** with snapshot request/file/chunk messages, mirroring what
+   `replication.cpp` already does for primary→replica: sender-side streaming state per peer,
+   receiver-side staging, CRC check and rename-into-place. Self-contained, no new listener, and it
+   duplicates a protocol that already exists once.
+2. **Run the replication server on multi-master nodes too**, and let a joining node act as a replica
+   for the length of the bootstrap before switching to peering. Far less new code, and it reuses a
+   tested path — at the cost of every MM node speaking two protocols on two ports, with overlapping
+   responsibilities.
+
+Either way the manifest should carry the sender's version vector, so the receiver may legitimately
+declare frontiers from it — which is the remaining half of #67.
+
+- Effort: S (done: the dead end) + L (the transfer) | Impact: The first caller of `start_bootstrap()`
+  no longer bricks its node. Adding a node to a running cluster still misses data older than its
+  peers' WAL retention
 
 ### 75. A restart forgot every out-of-order record it was holding ✅
 
