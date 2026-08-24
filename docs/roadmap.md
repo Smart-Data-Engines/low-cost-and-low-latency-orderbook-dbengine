@@ -673,6 +673,103 @@ first. Published positions now exist for it to compare, but nothing compares the
 - Effort: S | Impact: Graceful handover works, an outgoing primary stops advertising a role it gave
   away, and a replica follows the current leader instead of a remembered one
 
+### 77. Two metrics were written by name and never registered ✅
+
+Found by reading a test's own log output instead of only its verdict. Every run of the dedup tests
+printed:
+
+```
+ERROR metrics Write to unregistered counter 'ob_mm_duplicates_dropped': the value is discarded and
+/metrics will report a flat zero.
+```
+
+The registry already said exactly what was wrong, on every run, for as long as receive-side dedup had
+existed. A sweep for the class found a second one, `ob_sequence_gaps_detected` — so **both** numbers
+that say whether multi-master deduplication is working were invisible on the dashboard, and both were
+added together with the mechanisms they measure, which is precisely when nobody is watching a graph
+yet.
+
+Both registered, and `scripts/check_metrics.py` now runs in the `docs-integrity` job: it extracts every
+string literal handed to `increment_counter()`, `add_to_counter()`, `set_gauge()` or
+`observe_histogram()` in `src/` and `tools/`, and fails if one is missing from the registrations in
+`src/metrics.cpp`. Verified by deleting a registration and watching it exit 1 with the file and metric
+named.
+
+What the script cannot prove, and no script can: that a registered metric is ever written, or that a
+name is spelled the way a dashboard expects.
+
+- Effort: S | Impact: The two counters that describe deduplication report real numbers, and a check in
+  CI stops the class from coming back
+
+### 76. Multi-master bootstrap is a stub, and its flag has no way out
+
+Found while looking for the snapshot mechanism #67 says to build on. It is not there.
+
+`MultiMasterManager::bootstrap_from_peer()` logs one progress line with every number set to zero and
+returns:
+
+```cpp
+OB_LOG_INFO("mm", "Bootstrap progress: phase=%s bytes=%zu/%zu (%.1f%%) elapsed=%.1fs",
+            "snapshot", size_t(0), size_t(0), 0.0, 0.0);
+// Full implementation in task 12 — snapshot transfer + WAL catch-up.
+```
+
+It has **no callers**. `start_bootstrap()` has none either outside `tests/test_multi_master.cpp`. And
+`bootstrapping_` is set to `true` in one place and **never set back to false anywhere in the tree**.
+
+So a multi-master node never bootstraps: it starts empty and relies on catch-up from a peer's retained
+WAL. That is survivable and is roughly what #67 describes. The trap is the flag: `INSERT`, `MINSERT`
+and `DELETE` all answer `ERR BOOTSTRAPPING` while `is_bootstrapping()` is true, so **the day someone
+wires `start_bootstrap()` into a real path, that node stops accepting writes for the rest of its
+life** — the same shape as #73, waiting in a state machine with an entrance and no exit.
+
+Two things to decide, and they are separate: whether to implement snapshot bootstrap (it is what #67
+needs, and what `AntiEntropyManager::trigger_snapshot_repair()` is a stub for), and what to do
+meanwhile about a progress log that reports progress it never makes. A feature that looks implemented
+is worse than an absent one, especially in a repository read as a portfolio.
+
+- Effort: L for the implementation, S to remove the decoration | Impact: Prevents a self-inflicted
+  outage the first time bootstrap is wired up, and unblocks #67
+
+### 75. A restart forgot every out-of-order record it was holding ✅
+
+The second consequence listed under #67, split out because the fix is a different mechanism and does
+not need snapshot bootstrap.
+
+`SequenceTracker` keeps, per (symbol, origin), a frontier — "everything up to here" — and a set of
+numbers seen above it that cannot be merged yet because something below is missing. Only frontiers
+were persisted. So a node holding 5 with 1-4 missing wrote down nothing, and after a restart it had
+never seen 5. Catch-up over-delivers **on purpose** (#61 made that safe by dropping duplicates on
+arrival), so the next redelivery was applied a second time into append-only storage: one duplicate row
+per held record, on every restart.
+
+Held numbers are now persisted as **inclusive ranges** in their own WAL record (`WAL_RECORD_HELD_SEQUENCES`,
+type 8), written next to the version vector. Ranges because that is the shape the data has — catch-up
+delivers runs, so four thousand held numbers above one gap is a single sixteen-byte range. A separate
+record type rather than an extra section in the version vector, because the vector is also what peers
+read, and catch-up forwards `WAL_RECORD_DELTA` and nothing else: **this changes no protocol**.
+
+`SequenceTracker::fingerprint()` had to learn about the held set too. It summed frontiers only, and the
+whole point of this state is that it changes while the frontier stands still — without that, a node
+receiving nothing but out-of-order records would have written down none of them.
+
+The regression test needed two attempts, and the second attempt is the interesting one. The first
+version passed with the persistence **disabled**, because the re-flushed segment landed on the same
+directory name and `ColumnarStore` refused the duplicate merge — #62's backstop, masking the very
+thing under test. The file already warned about exactly this in the test above it, and I walked into it
+anyway. With a later-timestamped record added so the segment path differs, the test reads 2 rows with
+the fix and **3 without it**.
+
+Truncation is bounded and honest: the WAL payload length is 16-bit, so at most 3000 ranges are written
+per persist, and exceeding that logs a warning. A held set written in part still prevents every
+duplicate it covers.
+
+What this does **not** fix, and stays with #67: a late joiner still exports no vector entry for an
+origin whose stream it joined mid-way, so peers keep sending it records it already has. That needs a
+legitimately established base, which needs snapshot bootstrap — see #76.
+
+- Effort: M | Impact: A restart no longer turns catch-up's deliberate over-delivery into duplicate rows
+
 ### 74. A keepalive for a forgotten lease answers 200, so the lease fenced nothing (P0) ✅
 
 Found while working out whether a position key could be trusted for #72, by asking etcd what it
@@ -1137,8 +1234,15 @@ Not urgent: every node in a cluster that grew together follows its peers' stream
 the duplicate window is bounded by the 4096-entry held set. It matters when a node is added to a
 running cluster.
 
-- Effort: M | Impact: A late-joining node keeps receiving redeliveries and can store duplicate rows
-  after a restart
+**Half of this is closed.** The duplicate-rows-after-a-restart consequence was a separate mechanism —
+the held set simply was not persisted — and is fixed under #75. What remains is the frontier itself: a
+node that joined mid-stream still cannot claim contiguity, so it exports no entry for that origin and
+peers keep sending it records it already has. That still needs a base established by snapshot
+bootstrap, and **#76** records that multi-master bootstrap does not exist yet: `bootstrap_from_peer()`
+is a stub with no callers.
+
+- Effort: M | Impact: A late-joining node keeps receiving redeliveries. It no longer stores duplicate
+  rows after a restart — that half went with #75
 
 ### 62. The WAL was written, fsynced, and never read back ✅
 

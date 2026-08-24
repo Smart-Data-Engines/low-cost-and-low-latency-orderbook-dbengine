@@ -261,6 +261,21 @@ void WALWriter::append_version_vector(const uint8_t* payload, size_t payload_len
                  payload_len, current_file_index(), current_offset());
 }
 
+void WALWriter::append_held_sequences(const uint8_t* payload, size_t payload_len) {
+    WALRecord hdr{};
+    hdr.sequence_number = 0;
+    hdr.timestamp_ns    = 0;
+    hdr.checksum        = crc32c(payload, payload_len);
+    hdr.payload_len     = static_cast<uint16_t>(payload_len);
+    hdr.record_type     = WAL_RECORD_HELD_SEQUENCES;
+    hdr._pad            = 0;
+
+    write_record(hdr, payload, payload_len, /*allow_fsync=*/false);
+
+    OB_LOG_DEBUG("wal", "Held sequences appended (not fsynced): bytes=%zu file=%u offset=%zu",
+                 payload_len, current_file_index(), current_offset());
+}
+
 void WALWriter::append_checkpoint(uint64_t timestamp_ns) {
     WALRecord hdr{};
     hdr.sequence_number = 0;

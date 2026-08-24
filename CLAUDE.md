@@ -248,6 +248,15 @@ Learned the hard way. Check here before debugging.
     without `TTL`, and `put` under an unknown lease returns **404** with a JSON error body that
     `http_post()` handed back as though it were a result. Neither is visible by reading our own code,
     and neither is documented where you would look.
+36. **Read the log a passing test prints.** Every run of the dedup tests printed `Write to
+    unregistered counter 'ob_mm_duplicates_dropped'` — the registry saying, on every run, that the
+    metric was discarded and `/metrics` would report a flat zero. Nothing failed, so nobody read it. A
+    sweep found a second one. `scripts/check_metrics.py` now fails CI for the class.
+37. **A mutation that survives means the test is measuring something else.** Persisting the held
+    sequence set was verified by a test that passed with the persistence disabled: the re-flushed
+    segment landed on the same directory path, `ColumnarStore` refused the merge as a duplicate, and
+    the row count came out right for a reason unrelated to dedup. The neighbouring test warned about
+    exactly this. Always disable the fix and watch the test fail before believing it.
 
 ## Current state and open problems
 

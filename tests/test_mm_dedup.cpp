@@ -115,6 +115,54 @@ TEST(MultiMasterDedup, TheSameRemoteRecordTwiceStoresOneRow) {
     engine.close();
 }
 
+TEST(MultiMasterDedup, ARecordHeldAboveTheFrontierIsStillRefusedAfterARestart) {
+    // The gap is the point. A record that arrives out of order sits above the frontier: the node
+    // has seen 5 but not 1-4, so it cannot claim contiguity and the frontier stays at 0. Only
+    // frontiers were persisted, so a restart forgot the held set, and the next redelivery — which
+    // catch-up performs deliberately — was applied a second time into append-only storage.
+    TempDir tmp("mm_dedup_restart_");
+    const auto mm = mm_config(1);
+
+    ob::Level level{};
+    level.price = 300'000;
+    level.qty   = 7;
+    level.cnt   = 1;
+    level._pad  = 0;
+
+    auto delta = remote_delta("HELD", /*seq=*/5, 1'000'000'000ULL);
+    const auto hlc = hlc_for(delta, /*origin=*/2);
+
+    {
+        ob::Engine engine(tmp.path, kNoAutoFlush, ob::FsyncPolicy::EVERY, {}, {}, {}, {}, mm);
+        engine.open();
+        ASSERT_EQ(engine.apply_remote_delta(delta, &level, 2, hlc), ob::OB_OK);
+        ASSERT_EQ(engine.above_frontier_size("HELD.EX", 2), 1u)
+            << "seq 5 with nothing below it should be held above the frontier, not merged into it";
+        engine.flush_incremental();
+        engine.close();
+    }
+
+    ob::Engine engine(tmp.path, kNoAutoFlush, ob::FsyncPolicy::EVERY, {}, {}, {}, {}, mm);
+    engine.open();
+    EXPECT_EQ(engine.apply_remote_delta(delta, &level, 2, hlc), ob::OB_OK);
+
+    // A genuinely new record with a later timestamp, for the reason the test above this one
+    // records: without it the re-flushed segment lands on the same directory name and
+    // ColumnarStore refuses the merge, so the duplicate never reaches storage and the row count
+    // stays right for a reason that has nothing to do with dedup. That backstop masked this test
+    // until the segment was made to differ — verified by disabling the persistence and watching
+    // the test still pass.
+    auto later = remote_delta("HELD", /*seq=*/9, 9'000'000'000ULL);
+    ob::Level other = level;
+    other.price = 300'100;
+    ASSERT_EQ(engine.apply_remote_delta(later, &other, 2, hlc_for(later, 2)), ob::OB_OK);
+    engine.flush_incremental();
+
+    EXPECT_EQ(row_count(engine, "HELD"), 2)
+        << "the redelivered record was applied again after the restart, so its row is stored twice";
+    engine.close();
+}
+
 TEST(MultiMasterDedup, DifferentSequenceNumbersFromOneOriginAreBothStored) {
     TempDir tmp("mm_dedup_two_");
     ob::Engine engine(tmp.path, kNoAutoFlush, ob::FsyncPolicy::EVERY, {}, {}, {}, {},

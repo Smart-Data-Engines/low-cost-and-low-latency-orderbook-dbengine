@@ -260,6 +260,12 @@ public:
     ///
     /// A stale cache understates what we hold, so a peer sends more than it needs to and the
     /// duplicates are dropped on arrival. The staleness window is one flush interval.
+    /// How many sequence numbers from `origin` are held above the frontier for this symbol key.
+    ///
+    /// A test seam, and a diagnostic: a non-zero count means this node has seen records it cannot
+    /// yet claim contiguity for, which is exactly the state a restart used to lose (#75).
+    std::size_t above_frontier_size(const std::string& key, uint16_t origin);
+
     std::vector<SequenceTracker::VectorEntry> export_version_vector(std::size_t limit,
                                                                     bool& truncated) const;
 
@@ -402,6 +408,9 @@ private:
     /// Cap on what gets written down. Above it the node relearns by over-asking, which costs
     /// traffic and duplicate drops, never data.
     static constexpr std::size_t kMaxPersistedVectorEntries = 4096;
+    /// Held ranges written down per persist. The WAL payload length is 16-bit, so this is a hard
+    /// ceiling rather than a preference: 3000 ranges is ~48 KB of payload plus entry headers.
+    static constexpr std::size_t kMaxPersistedHeldRanges = 3000;
 
     /// Write the version vector to the WAL if any frontier moved since it was last written.
     /// **Caller must hold mtx_** — it is called from inside the flush's merge block.
@@ -409,6 +418,13 @@ private:
 
     /// Restore the version vector from the last one recorded in the WAL.
     void restore_version_vector();
+
+    /// Restore the numbers held above the frontiers from the last HELD_SEQUENCES record.
+    ///
+    /// Separate from the vector restore, and called even when there is no usable vector: held
+    /// numbers are independently useful, and importing them can only raise what this node claims
+    /// to have seen.
+    void restore_held_sequences();
     ColumnarStore& get_or_create_store(const std::string& symbol, const std::string& exchange);
     void flush_loop();
 
