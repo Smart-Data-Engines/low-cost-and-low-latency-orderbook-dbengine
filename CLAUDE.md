@@ -257,6 +257,22 @@ Learned the hard way. Check here before debugging.
     segment landed on the same directory path, `ColumnarStore` refused the merge as a duplicate, and
     the row count came out right for a reason unrelated to dedup. The neighbouring test warned about
     exactly this. Always disable the fix and watch the test fail before believing it.
+38. **Prefer a fact you recorded to an inference from data you kept for another purpose.**
+    Recovery decided "is this record already stored?" by comparing its timestamp against a segment's
+    `end_ts_ns` — a field kept for time-range pruning, which is the *last* row's timestamp, not the
+    highest. That made the guard exact only while a symbol's timestamps increase, which one node
+    guarantees and multi-master does not. Segments now record the WAL position their rows came from,
+    and the question is answered by comparison rather than inference (#63).
+39. **A number written by another node is not a number about you.** Snapshot transfer and shard
+    migration ship whole segment directories, `meta.json` included, so a received segment carries the
+    sender's WAL position. Trusting it would skip records this node never stored. Any position,
+    offset or counter that can arrive from elsewhere needs to say whose it is — `wal_identity` here,
+    kept outside every segment directory so it cannot travel with one.
+40. **A test whose setup the system cannot produce will fight the correct fix.** The crash-window test
+    built its state by re-appending copies of durable records, putting them at WAL positions above the
+    segment holding them — impossible in the engine, where a record is written before the row it
+    produces is stored. When the guard became a position comparison, that test failed and the code was
+    right. Build the state the mechanism actually leaves behind.
 
 ## Current state and open problems
 

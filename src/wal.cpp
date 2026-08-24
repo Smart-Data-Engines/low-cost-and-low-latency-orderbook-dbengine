@@ -517,6 +517,11 @@ uint64_t WALReplayer::replay_v2(WALReplayCallbackV2 cb)
         if (fd < 0) continue;
 
         while (true) {
+            // Where this record starts, before anything is read from it. Recovery compares this
+            // against the position a segment recorded for the same symbol (#63), so it has to be
+            // the offset of the header rather than of the payload.
+            const off_t record_start = ::lseek(fd, 0, SEEK_CUR);
+
             // Read the base 24-byte header first.
             WALRecord base_hdr{};
             ssize_t n = ::read(fd, &base_hdr, sizeof(WALRecord));
@@ -595,6 +600,8 @@ uint64_t WALReplayer::replay_v2(WALReplayCallbackV2 cb)
             ctx.hlc             = hlc_ts;
             ctx.payload         = payload.empty() ? nullptr : payload.data();
             ctx.payload_len     = base_hdr.payload_len;
+            ctx.wal_file_index  = idx;
+            ctx.wal_byte_offset = record_start < 0 ? 0 : static_cast<uint64_t>(record_start);
 
             cb(ctx);
 

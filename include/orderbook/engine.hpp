@@ -417,6 +417,13 @@ private:
     void persist_version_vector_if_changed();
 
     /// Restore the version vector from the last one recorded in the WAL.
+    /// Identity of this data directory's WAL, so a position recorded in a segment can be told
+    /// apart from one that arrived with a snapshot. Read from `<base_dir>/wal_identity`, generated
+    /// on first open. Deliberately outside every segment directory: a snapshot ships segment
+    /// directories, and an identity that travelled with them would defeat its own purpose.
+    void load_or_create_wal_identity();
+    uint64_t wal_identity_{0};
+
     void restore_version_vector();
 
     /// Restore the numbers held above the frontiers from the last HELD_SEQUENCES record.
