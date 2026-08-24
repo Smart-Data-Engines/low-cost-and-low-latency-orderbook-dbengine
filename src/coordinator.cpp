@@ -582,7 +582,8 @@ std::optional<ClusterState> CoordinatorClient::get_cluster_state() {
 // ── WAL position publish / read ──────────────────────────────────────────────
 
 bool CoordinatorClient::publish_wal_position(uint32_t file_index,
-                                             size_t byte_offset) {
+                                             size_t byte_offset,
+                                             int64_t lease_id) {
     if (!impl_->connected) return false;
 
     std::string node_key = coordinator_node_key(config_.cluster_prefix,
@@ -597,8 +598,15 @@ bool CoordinatorClient::publish_wal_position(uint32_t file_index,
 
     std::string url = impl_->active_endpoint + "/v3/kv/put";
     std::string body = "{\"key\":\"" + key_b64 +
-                       "\",\"value\":\"" + value_b64 + "\"}";
+                       "\",\"value\":\"" + value_b64 + "\"";
+    if (lease_id != 0) {
+        body += ",\"lease\":" + std::to_string(lease_id);
+    }
+    body += "}";
 
+    // A put under a lease etcd does not know answers 404, which http_post() now reports as a
+    // failure rather than handing back the error body (#74). That matters here: a caller that
+    // believed it had published a position nobody can read would be invisible to itself.
     std::string resp = impl_->http_post(url, body);
     return !resp.empty();
 }

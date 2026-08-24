@@ -147,6 +147,21 @@ void FailoverManager::stop() {
         monitor_thread_.join();
     }
 
+    // Drop the position lease too, so a node that was stopped on purpose stops being a target for
+    // another node's election deference immediately rather than after the TTL. The thread is joined
+    // by now, so the client is ours to use.
+    const int64_t plid = position_lease_id_.exchange(0, std::memory_order_acq_rel);
+    if (plid != 0 && coordinator_) {
+        if (coordinator_->revoke_lease(plid)) {
+            OB_LOG_INFO("failover", "position lease %ld revoked on shutdown",
+                        static_cast<long>(plid));
+        } else {
+            OB_LOG_WARN("failover",
+                        "could not revoke position lease %ld — this node's position stays visible "
+                        "for up to the lease TTL", static_cast<long>(plid));
+        }
+    }
+
     // Disconnect from coordinator.
     if (coordinator_) {
         coordinator_->stop_watch();
@@ -363,14 +378,47 @@ void FailoverManager::publish_position_if_due() {
         last_position_publish_ = now;
     }
 
+    const int64_t lease = ensure_position_lease();
     const auto [file_index, byte_offset] = handler_.get_wal_position();
-    if (!coordinator_->publish_wal_position(file_index, byte_offset)) {
-        OB_LOG_WARN("failover", "publish_wal_position failed: file=%u offset=%zu",
-                    file_index, byte_offset);
+    if (!coordinator_->publish_wal_position(file_index, byte_offset, lease)) {
+        OB_LOG_WARN("failover", "publish_wal_position failed: file=%u offset=%zu lease=%ld",
+                    file_index, byte_offset, static_cast<long>(lease));
         return;
     }
-    OB_LOG_DEBUG("failover", "Published WAL position: file=%u offset=%zu",
-                 file_index, byte_offset);
+    OB_LOG_DEBUG("failover", "Published WAL position: file=%u offset=%zu lease=%ld",
+                 file_index, byte_offset, static_cast<long>(lease));
+}
+
+// ── ensure_position_lease() ─────────────────────────────────────────────────
+
+int64_t FailoverManager::ensure_position_lease() {
+    if (!coordinator_) return 0;
+
+    int64_t lease = position_lease_id_.load(std::memory_order_acquire);
+    if (lease != 0) {
+        if (coordinator_->refresh_lease(lease)) return lease;
+        // etcd does not know this lease any more: it restarted, or this process was stalled past
+        // the TTL. Publishing under a dead lease writes a key that is deleted the moment it lands,
+        // so take a new lease rather than retrying the old one for ever.
+        OB_LOG_WARN("failover",
+                    "position lease %ld is gone, taking a new one so this node stays visible to "
+                    "an election", static_cast<long>(lease));
+        position_lease_id_.store(0, std::memory_order_release);
+    }
+
+    lease = coordinator_->grant_lease();
+    if (lease == 0) {
+        OB_LOG_WARN("failover",
+                    "could not grant a lease for the published position — publishing without one, "
+                    "so this position will outlive this node and other nodes may defer to it after "
+                    "it dies");
+        return 0;
+    }
+    position_lease_id_.store(lease, std::memory_order_release);
+    OB_LOG_INFO("failover", "position lease %ld granted, ttl=%lds",
+                static_cast<long>(lease),
+                static_cast<long>(config_.coordinator.lease_ttl_seconds));
+    return lease;
 }
 
 void FailoverManager::monitor_loop() {

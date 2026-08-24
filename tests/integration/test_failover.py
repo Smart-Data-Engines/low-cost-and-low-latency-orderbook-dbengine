@@ -94,6 +94,24 @@ def revoke_every_lease(etcd_port: int) -> list[int]:
     return ids
 
 
+def published_positions(etcd_port: int) -> dict[str, dict]:
+    """The WAL positions an election actually reads, taken straight out of etcd.
+
+    Keyed by node id. Since #72 these keys are written under a per-node lease, so a node that dies
+    stops appearing here on its own — which is what lets a candidate tell a replica that is further
+    ahead from one that is merely dead.
+    """
+    start = base64.b64encode(b"/ob/nodes/").decode()
+    end = base64.b64encode(b"/ob/nodes0").decode()   # one past the prefix
+    _, body = etcd_post(etcd_port, "/v3/kv/range", {"key": start, "range_end": end})
+    out: dict[str, dict] = {}
+    for kv in json.loads(body).get("kvs", []):
+        key = base64.b64decode(kv["key"]).decode()
+        value = json.loads(base64.b64decode(kv["value"]).decode())
+        out[key.rsplit("/", 1)[-1]] = value
+    return out
+
+
 def epoch_of(role_response: str) -> int:
     """ROLE answers `PRIMARY <epoch>` for a primary; 0 when there is no epoch to read."""
     parts = role_response.split()
@@ -358,3 +376,58 @@ def test_the_cluster_still_has_a_primary_after_a_lease_scare(healthy_cluster):
     roles = [role_of(n.tcp_port) for n in healthy_cluster.nodes]
     primaries = [r for r in roles if "PRIMARY" in r and "REPLICA" not in r]
     assert len(primaries) == 1, f"no single primary came back; roles={roles}"
+
+
+# ── Position freshness (#72) ──────────────────────────────────────────────────
+
+
+def test_a_killed_node_stops_publishing_a_position(healthy_cluster):
+    """A dead node's WAL position has to disappear by itself.
+
+    Election deference reads these positions to find the replica that lost the least. Until #72 they
+    were written without a lease, so a dead node left its position behind for ever and a candidate
+    could only wait out a fixed window before promoting anyway — paying that window on every
+    two-node failover, where there is no second replica to prefer.
+    """
+    primary = healthy_cluster.primary()
+    before = published_positions(healthy_cluster.etcd_client_port)
+    assert primary.node_id in before, (
+        f"the primary published no position at all; keys present: {sorted(before)}")
+
+    healthy_cluster.kill_node(primary.index)
+
+    # The lease TTL is 10 s by default, so give it that plus room for a loaded machine.
+    deadline = time.monotonic() + 30
+    gone = False
+    while time.monotonic() < deadline:
+        if primary.node_id not in published_positions(healthy_cluster.etcd_client_port):
+            gone = True
+            break
+        time.sleep(0.5)
+
+    assert gone, (
+        f"{primary.node_id} was killed but its position is still in etcd, so every election from "
+        f"now on will defer to a node that cannot answer")
+
+
+def test_the_survivor_does_not_wait_for_a_dead_nodes_position(healthy_cluster):
+    """The point of the lease, stated as an invariant rather than as a stopwatch.
+
+    By the time the survivor holds the role, the dead node's position must already be gone — that is
+    what makes the promotion immediate instead of deferred. Asserting this rather than a wall-clock
+    threshold keeps the test honest on a loaded machine.
+    """
+    primary = healthy_cluster.primary()
+    survivor = healthy_cluster.replica()
+
+    start = time.monotonic()
+    healthy_cluster.kill_node(primary.index)
+    elapsed = wait_for_role(survivor.tcp_port, "PRIMARY", timeout=40)
+    custom_metrics["failover_time_sec"] = elapsed
+    custom_metrics["failover_kind"] = "kill (position lease)"
+
+    positions = published_positions(healthy_cluster.etcd_client_port)
+    assert primary.node_id not in positions, (
+        f"the survivor was promoted while {primary.node_id}'s position was still published, which "
+        f"means it either deferred to a corpse and timed out, or ignored the positions entirely "
+        f"(elapsed {elapsed:.1f}s, keys {sorted(positions)})")

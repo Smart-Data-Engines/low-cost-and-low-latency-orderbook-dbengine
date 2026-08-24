@@ -791,7 +791,7 @@ report nobody filed.**
   which is every real deployment, and on a node that boots while etcd is restarting. This was the
   failure mode HA exists to prevent
 
-### 72. Deference cannot tell a further replica from a dead one
+### 72. Deference cannot tell a further replica from a dead one ✅
 
 `decide_election()` (#70) defers to whoever published the furthest position, and cannot ask whether that
 node is still alive, because `PublishedPosition` carries neither a timestamp nor a lease. The bounded
@@ -809,6 +809,48 @@ Two ways to make it precise, and the choice matters:
 Recommendation: (2). Then deference applies only to peers that are both further ahead **and** currently
 alive, the window shrinks to a backstop for a live-but-wedged node, and the common two-node failover pays
 nothing.
+
+Option (2) it is. Position keys are written under a **per-node lease**, so a node that stops
+refreshing stops being visible to an election — the liveness question is answered by the mechanism
+that exists for liveness, and no clock is compared to any other clock.
+
+The lease TTL is the same as the leader lease's, and that is a choice rather than convenience: when a
+process dies, **both** leases stop being refreshed at the same instant, so the position key expires at
+about the moment the leader key does. The survivor starts its election and the corpse is already gone
+from the list. The safety asymmetry says not to go shorter — a position key that lives slightly too
+long costs a little failover time, while one that vanishes too early (a live node that missed a
+refresh under load) costs **data**, because we would stop deferring to a replica that really does hold
+more log. Refresh rides along with the position publish, once a second.
+
+`decide_election()` is unchanged. It gets better input, not new logic, which is the best available
+outcome for a change like this. `--election-deference-ms` stops being the main protection and becomes
+the residual one: it now catches a node that is alive, refreshing its lease, and still not promoting —
+stuck in I/O, looping, stopped in a debugger. The default stays at 3000 and is expected not to fire.
+
+`stop()` revokes the position lease, so a node stopped on purpose leaves the list at once rather than
+after the TTL.
+
+Measured on a two-node cluster, `--coordinator-lease-ttl 5`, `kill -9` on the primary:
+
+```
+                 dead node's position    "Deferring election"   promotion
+before (#70):    never expires           1                      8.5 s
+after  (#72):    gone at +4.9 s          0                      5.6 s
+```
+
+So the three seconds #70 charged for a corpse are gone, and the win #70 was built for — preferring the
+replica that lost the least — now applies only to replicas that are actually there.
+
+This item had a prerequisite that was not visible when it was filed: **#74**. Publishing under a lease
+is only sound if the code can tell that a lease has died, and `refresh_lease()` could not fail at all.
+The re-grant path in `ensure_position_lease()` would have been unreachable, and a node whose lease
+etcd had forgotten would have gone on publishing keys that were deleted on arrival — invisible to
+itself, and invisible to every election.
+
+Three regression tests, all of which fail against the pre-change binary: the dead node's position
+disappears; the survivor holds the role only once that position is gone (an invariant rather than a
+stopwatch, so a loaded machine cannot make it lie); and a node stopped with `SIGTERM` leaves the list
+within four seconds, well inside the TTL, so expiry cannot be what removed it.
 
 - Effort: M | Impact: Removes the failover time #70 added in the common case, and makes "prefer the most
   advanced replica" mean the most advanced *live* replica
