@@ -35,6 +35,30 @@ inline constexpr uint16_t VV_TRUNCATED = 0xFFFF;
 std::vector<uint8_t> serialize_version_vector(const std::vector<SequenceTracker::VectorEntry>& entries,
                                              bool truncated);
 
+// ── Held sequence numbers ────────────────────────────────────────────────────
+//
+// The frontier says "everything up to here"; these are the numbers above it that arrived out of
+// order. They live in their own WAL record rather than in the version vector, for one reason: the
+// vector is also what peers read, and this is only ever read by the node that wrote it. Catch-up
+// forwards `WAL_RECORD_DELTA` and nothing else, so a new record type changes no protocol.
+
+/// Fixed part of one held entry: char[32] key + uint16 origin + uint16 range_count.
+inline constexpr size_t HS_ENTRY_HEADER_SIZE = 36;
+/// One inclusive range: uint64 first + uint64 last.
+inline constexpr size_t HS_RANGE_SIZE = 16;
+/// Payload header: uint16 entry_count.
+inline constexpr size_t HS_HEADER_SIZE = 2;
+
+/// Serialise held ranges for the WAL. Returns an empty payload when there is nothing to write.
+std::vector<uint8_t> serialize_held_ranges(
+        const std::vector<SequenceTracker::HeldRanges>& entries);
+
+/// Parse a held-ranges payload. False on a malformed or truncated buffer, in which case `out` is
+/// left empty — losing this state costs duplicate rows after a restart, never wrong data, so
+/// refusing the whole payload is the safe answer to a byte that does not parse.
+bool deserialize_held_ranges(const uint8_t* data, size_t len,
+                            std::vector<SequenceTracker::HeldRanges>& out);
+
 /// A peer's vector, ready to be asked "does it have this record?".
 class PeerVector {
 public:

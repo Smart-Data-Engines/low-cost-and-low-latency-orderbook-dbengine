@@ -8,6 +8,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstring>
+
 TEST(VersionVector, RoundTripsEntries) {
     std::vector<ob::SequenceTracker::VectorEntry> entries{
         {"BTC-USD.BINANCE", 1, 42},
@@ -205,4 +207,110 @@ TEST(CompareVectors, ATruncatedVectorIsTreatedTheSameAsSilence) {
     EXPECT_EQ(diff.peer_lacks[0].from_seq, 1u);
     EXPECT_TRUE(diff.we_lack.empty())
         << "a vector the peer could not state must not be read as data about what it holds";
+}
+
+// ── Held sequence ranges (#75) ────────────────────────────────────────────────
+//
+// The frontier describes a node that followed every origin's stream from its first record.
+// Everything that arrived out of order sits above it, and that set is what a restart used to
+// forget — turning catch-up's deliberate over-delivery back into duplicate rows.
+
+TEST(HeldRanges, RoundTripsThroughTheWireFormat) {
+    std::vector<ob::SequenceTracker::HeldRanges> in;
+    in.push_back({"BTC-USD.BINANCE", 2, {{5, 9}, {20, 20}, {100, 4099}}});
+    in.push_back({"ETH-USD.KRAKEN", 7, {{1, 1}}});
+
+    const auto payload = ob::serialize_held_ranges(in);
+    ASSERT_FALSE(payload.empty());
+
+    std::vector<ob::SequenceTracker::HeldRanges> out;
+    ASSERT_TRUE(ob::deserialize_held_ranges(payload.data(), payload.size(), out));
+    ASSERT_EQ(out.size(), in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        EXPECT_EQ(out[i].key, in[i].key);
+        EXPECT_EQ(out[i].origin, in[i].origin);
+        EXPECT_EQ(out[i].ranges, in[i].ranges);
+    }
+}
+
+TEST(HeldRanges, AnEmptySetSerialisesToNothingAtAll) {
+    // Not an empty record: nothing held means nothing to write, and a zero-entry payload would
+    // cost a WAL record per flush for no information.
+    EXPECT_TRUE(ob::serialize_held_ranges({}).empty());
+}
+
+TEST(HeldRanges, ATruncatedPayloadIsRefusedRatherThanPartlyBelieved) {
+    std::vector<ob::SequenceTracker::HeldRanges> in;
+    in.push_back({"BTC-USD.BINANCE", 2, {{5, 9}, {20, 30}}});
+    const auto payload = ob::serialize_held_ranges(in);
+
+    std::vector<ob::SequenceTracker::HeldRanges> out;
+    // Every prefix short of the whole thing must be refused. Believing half of it would mean
+    // claiming to have seen numbers this node never did, which loses records instead of
+    // duplicating them — the expensive direction.
+    for (size_t len = 0; len < payload.size(); ++len) {
+        out.assign(1, {});   // make sure the function clears it
+        EXPECT_FALSE(ob::deserialize_held_ranges(payload.data(), len, out))
+            << "accepted a payload truncated to " << len << " of " << payload.size() << " bytes";
+        EXPECT_TRUE(out.empty()) << "left entries behind after refusing a payload";
+    }
+}
+
+TEST(HeldRanges, ABackwardsRangeIsRefused) {
+    // 36-byte entry header with one range whose end precedes its start.
+    std::vector<uint8_t> payload(ob::HS_HEADER_SIZE + ob::HS_ENTRY_HEADER_SIZE + ob::HS_RANGE_SIZE, 0);
+    const uint16_t one = 1;
+    std::memcpy(payload.data(), &one, sizeof(one));
+    std::memcpy(payload.data() + ob::HS_HEADER_SIZE, "SYM.EX", 6);
+    std::memcpy(payload.data() + ob::HS_HEADER_SIZE + 34, &one, sizeof(one));  // range_count
+    const uint64_t first = 90, last = 10;
+    std::memcpy(payload.data() + ob::HS_HEADER_SIZE + ob::HS_ENTRY_HEADER_SIZE, &first, sizeof(first));
+    std::memcpy(payload.data() + ob::HS_HEADER_SIZE + ob::HS_ENTRY_HEADER_SIZE + 8, &last, sizeof(last));
+
+    std::vector<ob::SequenceTracker::HeldRanges> out;
+    EXPECT_FALSE(ob::deserialize_held_ranges(payload.data(), payload.size(), out));
+}
+
+TEST(HeldRanges, ExportCollapsesConsecutiveNumbersIntoOneRange) {
+    ob::SequenceTracker tracker;
+    // A run above a gap: 5..8 and 20, with 1-4 never seen, so the frontier stays at 0.
+    for (uint64_t seq : {5ULL, 6ULL, 7ULL, 8ULL, 20ULL}) {
+        tracker.observe("SYM.EX", 3, seq);
+    }
+    ASSERT_EQ(tracker.frontier("SYM.EX", 3), 0u);
+
+    bool truncated = false;
+    const auto held = tracker.export_held(100, truncated);
+    ASSERT_FALSE(truncated);
+    ASSERT_EQ(held.size(), 1u);
+    EXPECT_EQ(held[0].origin, 3);
+    ASSERT_EQ(held[0].ranges.size(), 2u) << "a run of four should be one range, not four";
+    const std::pair<uint64_t, uint64_t> run{5, 8};
+    const std::pair<uint64_t, uint64_t> single{20, 20};
+    EXPECT_EQ(held[0].ranges[0], run);
+    EXPECT_EQ(held[0].ranges[1], single);
+}
+
+TEST(HeldRanges, ImportRestoresWhatHasBeenSeenWithoutMovingTheFrontier) {
+    ob::SequenceTracker tracker;
+    tracker.import_held({{"SYM.EX", 3, {{5, 8}}}});
+
+    EXPECT_TRUE(tracker.has_seen("SYM.EX", 3, 5));
+    EXPECT_TRUE(tracker.has_seen("SYM.EX", 3, 8));
+    EXPECT_FALSE(tracker.has_seen("SYM.EX", 3, 4)) << "importing held numbers must not claim the gap";
+    EXPECT_EQ(tracker.frontier("SYM.EX", 3), 0u);
+}
+
+TEST(HeldRanges, ExportTruncatesAndSaysSoRatherThanDroppingSilently) {
+    ob::SequenceTracker tracker;
+    // Every other number, so each one is its own range and the budget is reached quickly.
+    for (uint64_t seq = 10; seq < 10 + 20 * 2; seq += 2) {
+        tracker.observe("SYM.EX", 4, seq);
+    }
+
+    bool truncated = false;
+    const auto held = tracker.export_held(5, truncated);
+    EXPECT_TRUE(truncated);
+    ASSERT_EQ(held.size(), 1u);
+    EXPECT_EQ(held[0].ranges.size(), 5u);
 }

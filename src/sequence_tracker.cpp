@@ -196,9 +196,79 @@ uint64_t SequenceTracker::fingerprint() const {
     for (const auto& [key, st] : symbols_) {
         for (const auto& [origin, ost] : st.origins) {
             fp += ost.frontier * 1000003ULL + origin;
+            // The held set is persisted too, and it changes while the frontier stands still —
+            // that is its whole purpose. Without mixing it in, a node that received nothing but
+            // out-of-order records would never write any of them down.
+            if (!ost.above_frontier.empty()) {
+                fp += ost.above_frontier.size() * 31ULL +
+                      *ost.above_frontier.begin() * 7ULL +
+                      *ost.above_frontier.rbegin() * 13ULL;
+            }
         }
     }
     return fp;
+}
+
+std::vector<SequenceTracker::HeldRanges> SequenceTracker::export_held(std::size_t max_ranges,
+                                                                     bool& truncated) const {
+    truncated = false;
+    std::vector<HeldRanges> out;
+    std::size_t budget = max_ranges;
+
+    for (const auto& [key, st] : symbols_) {
+        for (const auto& [origin, ost] : st.origins) {
+            if (ost.above_frontier.empty()) continue;
+
+            HeldRanges entry;
+            entry.key    = key;
+            entry.origin = origin;
+
+            // Collapse consecutive numbers into one range as we go: the set is ordered, so this
+            // is a single pass and no intermediate list of numbers is built.
+            uint64_t first = 0, last = 0;
+            bool open_range = false;
+            for (uint64_t seq : ost.above_frontier) {
+                if (open_range && seq == last + 1) {
+                    last = seq;
+                    continue;
+                }
+                if (open_range) entry.ranges.emplace_back(first, last);
+                first = last = seq;
+                open_range = true;
+            }
+            if (open_range) entry.ranges.emplace_back(first, last);
+
+            if (entry.ranges.size() > budget) {
+                // Keep what fits rather than dropping the entry: a partial held set is still
+                // fewer duplicates than none.
+                entry.ranges.resize(budget);
+                truncated = true;
+            }
+            budget -= entry.ranges.size();
+            if (!entry.ranges.empty()) out.push_back(std::move(entry));
+            if (budget == 0) {
+                // Anything not visited yet is dropped, and the caller must be told.
+                truncated = truncated || out.size() < symbols_.size();
+                return out;
+            }
+        }
+    }
+    return out;
+}
+
+void SequenceTracker::import_held(const std::vector<HeldRanges>& held) {
+    for (const auto& entry : held) {
+        auto& st  = symbols_[entry.key];
+        auto& ost = st.origins[entry.origin];
+        for (const auto& [first, last] : entry.ranges) {
+            for (uint64_t seq = first; seq <= last; ++seq) {
+                // note_seen() also advances the frontier when a range turns out to close a hole,
+                // which is correct: if the gap below was filled in a previous run and recorded in
+                // the frontier, these numbers now sit right above it.
+                note_seen(ost, seq);
+            }
+        }
+    }
 }
 
 std::vector<SequenceTracker::VectorEntry> SequenceTracker::export_vector(std::size_t limit,

@@ -72,6 +72,7 @@ void Engine::open() {
     // What this node holds, from the last vector it wrote down. Before the tail replay, so
     // the tail can only raise it.
     restore_version_vector();
+    restore_held_sequences();
 
     // Replay the WAL tail — the records written after the last flush. Until this
     // existed, the replay callback was empty and every write acknowledged but not yet
@@ -214,6 +215,11 @@ void Engine::close() {
     wal_.flush();
 }
 
+std::size_t Engine::above_frontier_size(const std::string& key, uint16_t origin) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return seq_tracker_.above_frontier_size(key, origin);
+}
+
 std::vector<SequenceTracker::VectorEntry> Engine::export_version_vector(std::size_t limit,
                                                                        bool& truncated) const {
     std::lock_guard<std::mutex> lock(vector_cache_mtx_);
@@ -261,10 +267,63 @@ void Engine::persist_version_vector_if_changed() {
 
     const auto payload = serialize_version_vector(entries, /*truncated=*/false);
     wal_.append_version_vector(payload.data(), payload.size());
+
+    // The held set goes with it. The frontier alone describes a node that followed every origin's
+    // stream from its first record; anything that arrived out of order lives above the frontier,
+    // and forgetting it across a restart turns catch-up's deliberate over-delivery back into
+    // duplicate rows (#75).
+    bool held_truncated = false;
+    const auto held = seq_tracker_.export_held(kMaxPersistedHeldRanges, held_truncated);
+    if (held_truncated) {
+        OB_LOG_WARN("engine",
+                    "Held sequence set too large to persist in full (limit=%zu ranges) — a "
+                    "restart may store duplicates for the numbers left out",
+                    kMaxPersistedHeldRanges);
+    }
+    if (!held.empty()) {
+        const auto held_payload = serialize_held_ranges(held);
+        wal_.append_held_sequences(held_payload.data(), held_payload.size());
+        OB_LOG_DEBUG("engine", "Persisted held sequences: entries=%zu bytes=%zu",
+                     held.size(), held_payload.size());
+    }
     vector_fingerprint_written_ = fp;
 
     OB_LOG_DEBUG("engine", "Persisted version vector: entries=%zu bytes=%zu",
                  entries.size(), payload.size());
+}
+
+void Engine::restore_held_sequences() {
+    std::vector<uint8_t> last;
+    WALReplayer replayer(base_dir_);
+    replayer.replay_v2([&last](const WALReplayContext& ctx) {
+        if (ctx.header.record_type != WAL_RECORD_HELD_SEQUENCES) return;
+        last.assign(ctx.payload, ctx.payload + ctx.payload_len);
+    });
+
+    if (last.empty()) return;   // nothing was held when this node last wrote its state down
+
+    std::vector<SequenceTracker::HeldRanges> held;
+    if (!deserialize_held_ranges(last.data(), last.size(), held)) {
+        OB_LOG_WARN("engine",
+                    "Held sequence record unusable — a redelivered out-of-order record may be "
+                    "stored twice");
+        return;
+    }
+
+    std::size_t numbers = 0;
+    for (const auto& entry : held) {
+        for (const auto& [first, last_seq] : entry.ranges) numbers += last_seq - first + 1;
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+        seq_tracker_.import_held(held);
+        vector_fingerprint_written_ = seq_tracker_.fingerprint();
+    }
+    OB_LOG_INFO("engine",
+                "Restored held sequences from WAL: entries=%zu numbers=%zu — these are the "
+                "out-of-order records a redelivery must not apply again",
+                held.size(), numbers);
 }
 
 void Engine::restore_version_vector() {

@@ -2,6 +2,7 @@
 
 #include "orderbook/logger.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace ob {
@@ -33,6 +34,79 @@ std::vector<uint8_t> serialize_version_vector(
         off += sizeof(e.frontier);
     }
     return out;
+}
+
+std::vector<uint8_t> serialize_held_ranges(
+        const std::vector<SequenceTracker::HeldRanges>& entries) {
+    if (entries.empty()) return {};
+
+    size_t total = HS_HEADER_SIZE;
+    for (const auto& e : entries) {
+        total += HS_ENTRY_HEADER_SIZE + e.ranges.size() * HS_RANGE_SIZE;
+    }
+
+    std::vector<uint8_t> out(total, 0);
+    const uint16_t count = static_cast<uint16_t>(entries.size());
+    std::memcpy(out.data(), &count, sizeof(count));
+
+    size_t off = HS_HEADER_SIZE;
+    for (const auto& e : entries) {
+        std::memcpy(out.data() + off, e.key.data(), std::min<size_t>(e.key.size(), 31));
+        off += 32;
+        std::memcpy(out.data() + off, &e.origin, sizeof(e.origin));
+        off += sizeof(e.origin);
+        const uint16_t range_count = static_cast<uint16_t>(e.ranges.size());
+        std::memcpy(out.data() + off, &range_count, sizeof(range_count));
+        off += sizeof(range_count);
+        for (const auto& [first, last] : e.ranges) {
+            std::memcpy(out.data() + off, &first, sizeof(first));
+            off += sizeof(first);
+            std::memcpy(out.data() + off, &last, sizeof(last));
+            off += sizeof(last);
+        }
+    }
+    return out;
+}
+
+bool deserialize_held_ranges(const uint8_t* data, size_t len,
+                            std::vector<SequenceTracker::HeldRanges>& out) {
+    out.clear();
+    if (!data || len < HS_HEADER_SIZE) return false;
+
+    uint16_t count = 0;
+    std::memcpy(&count, data, sizeof(count));
+
+    size_t off = HS_HEADER_SIZE;
+    out.reserve(count);
+    for (uint16_t i = 0; i < count; ++i) {
+        if (off + HS_ENTRY_HEADER_SIZE > len) { out.clear(); return false; }
+
+        SequenceTracker::HeldRanges entry;
+        const char* key_bytes = reinterpret_cast<const char*>(data + off);
+        // The key was written into a fixed 32-byte field and zero-padded, so stop at the first
+        // NUL rather than trusting the whole field to be text.
+        entry.key.assign(key_bytes, std::find(key_bytes, key_bytes + 32, '\0'));
+        off += 32;
+        std::memcpy(&entry.origin, data + off, sizeof(entry.origin));
+        off += sizeof(entry.origin);
+        uint16_t range_count = 0;
+        std::memcpy(&range_count, data + off, sizeof(range_count));
+        off += sizeof(range_count);
+
+        if (off + static_cast<size_t>(range_count) * HS_RANGE_SIZE > len) { out.clear(); return false; }
+        entry.ranges.reserve(range_count);
+        for (uint16_t r = 0; r < range_count; ++r) {
+            uint64_t first = 0, last = 0;
+            std::memcpy(&first, data + off, sizeof(first));
+            off += sizeof(first);
+            std::memcpy(&last, data + off, sizeof(last));
+            off += sizeof(last);
+            if (last < first) { out.clear(); return false; }   // not a range
+            entry.ranges.emplace_back(first, last);
+        }
+        out.push_back(std::move(entry));
+    }
+    return true;
 }
 
 bool PeerVector::deserialize(const uint8_t* data, size_t len) {

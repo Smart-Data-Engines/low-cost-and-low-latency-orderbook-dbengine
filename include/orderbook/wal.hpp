@@ -25,6 +25,11 @@ inline constexpr uint8_t WAL_RECORD_CHECKPOINT = 6;
 /// restarted node knows it, and sent to peers in the same envelope so a node running the
 /// older protocol skips it as an unknown type instead of disconnecting.
 inline constexpr uint8_t WAL_RECORD_VERSION_VECTOR = 7;
+/// Sequence numbers held above the frontiers, as ranges. Written next to the version vector and
+/// read only by the node that wrote it: without it, a restart forgets every out-of-order record it
+/// was holding, and the next redelivery — which catch-up performs on purpose — is applied a second
+/// time into append-only storage. Catch-up forwards only DELTA records, so peers never see this.
+inline constexpr uint8_t WAL_RECORD_HELD_SEQUENCES = 8;
 
 // ── Fsync policy ──────────────────────────────────────────────────────────────
 // Controls when the WAL calls fsync:
@@ -161,6 +166,10 @@ public:
     /// a lower frontier, asks a peer for more than it needs and drops the duplicates. Losing
     /// it cannot cost data.
     void append_version_vector(const uint8_t* payload, size_t payload_len);
+
+    /// Write a HELD_SEQUENCES record (type 8). Not fsynced, for the same reason as the vector:
+    /// losing it costs redeliveries and duplicate drops, never data.
+    void append_held_sequences(const uint8_t* payload, size_t payload_len);
 
     /// Write an EPOCH record (WAL_RECORD_EPOCH, type=5) with the given epoch value.
     void append_epoch(const EpochValue& epoch);

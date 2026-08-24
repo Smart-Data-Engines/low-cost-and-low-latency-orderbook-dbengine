@@ -126,6 +126,30 @@ public:
     /// them only means the frontier stays put and the next catch-up asks for more.
     static constexpr std::size_t kMaxAboveFrontier = 4096;
 
+    /// One (symbol, origin) pair's held-but-not-contiguous numbers, as inclusive ranges.
+    ///
+    /// Ranges rather than individual numbers because that is the shape the data has: catch-up
+    /// delivers runs, so a held set of four thousand numbers above one gap is a single range.
+    struct HeldRanges {
+        std::string key;
+        uint16_t    origin{0};
+        /// Inclusive [first, last] pairs, ascending and non-adjacent.
+        std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    };
+
+    /// Everything held above the frontiers, for persistence.
+    ///
+    /// `max_ranges` bounds the total across all entries, because the WAL record that carries this
+    /// has a 16-bit length. When it is hit, `truncated` is set and the entries that fit are still
+    /// returned: every range that survives prevents a duplicate row after a restart, and the ones
+    /// dropped only cost the duplicates they would have prevented.
+    std::vector<HeldRanges> export_held(std::size_t max_ranges, bool& truncated) const;
+
+    /// Restore held numbers from a previous run. Only raises: a number already known stays known,
+    /// and a frontier is never moved by this, because these numbers are precisely the ones the
+    /// frontier cannot cover.
+    void import_held(const std::vector<HeldRanges>& held);
+
     /// Number of symbols with any state. Logged at startup.
     std::size_t symbol_count() const { return symbols_.size(); }
 
