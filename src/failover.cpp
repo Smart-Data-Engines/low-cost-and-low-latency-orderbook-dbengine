@@ -402,6 +402,32 @@ void FailoverManager::monitor_loop() {
             int64_t refresh_interval = config_.coordinator.lease_ttl_seconds / 3;
             if (refresh_interval < 1) refresh_interval = 1;
 
+            // A lease that is alive is not proof that the role still belongs to us: the key can be
+            // gone while the lease lives, and before #74 a keepalive could not fail at all, so this
+            // is the second and independent guard. Demote on the first sighting of a leader key that
+            // is not ours — a spurious demotion costs seconds of unavailability, two primaries cost
+            // divergent data.
+            if (coordinator_) {
+                auto state = coordinator_->get_cluster_state();
+                if (state.has_value()) {
+                    reconcile_epoch(*state);
+                    const std::string& holder = state->leader_node_id;
+                    if (holder != config_.coordinator.node_id) {
+                        OB_LOG_WARN("failover",
+                                    "we hold the PRIMARY role but the leader key says '%s' — "
+                                    "stepping down",
+                                    holder.empty() ? "(absent)" : holder.c_str());
+                        handle_primary_lease_lost();
+                        // Sleep and re-evaluate as whatever we are now.
+                        for (int i = 0; i < 10 && running_.load(std::memory_order_relaxed); ++i) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+                        continue;
+                    }
+                }
+                // A failed read is not evidence of anything: leave the role alone.
+            }
+
             if (since_refresh.count() >= refresh_interval) {
                 if (coordinator_ && lease_id_.load() != 0) {
                     int64_t lid = lease_id_.load();
