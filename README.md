@@ -162,6 +162,8 @@ python python/benchmark.py --mode tcp --host 127.0.0.1 --port 5555
 | `OB_ENABLE_AVX2` | OFF | Enable AVX2 SIMD for aggregation |
 | `OB_ENABLE_AVX512` | OFF | Enable AVX-512 SIMD for aggregation |
 | `OB_ENABLE_COVERAGE` | OFF | Enable gcov/llvm-cov instrumentation |
+| `OB_ENABLE_ASAN` | OFF | AddressSanitizer + UndefinedBehaviorSanitizer. Build in a separate tree |
+| `OB_ENABLE_TSAN` | OFF | ThreadSanitizer. Cannot be combined with `OB_ENABLE_ASAN` |
 
 ## Project Structure
 

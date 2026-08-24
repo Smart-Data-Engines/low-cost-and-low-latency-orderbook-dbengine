@@ -15,6 +15,7 @@
 
 #include "orderbook/logger.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -28,7 +29,10 @@ namespace ob {
 // 12 bytes: physical_ns (8) + logical (2) + node_id (2)
 // Comparison order: physical_ns → logical → node_id
 
-#pragma pack(push, 1)
+/// Bytes an HLCTimestamp occupies on the wire. Not `sizeof(HLCTimestamp)`: the struct is laid out
+/// for the CPU and written to the wire field by field, which are two different jobs.
+inline constexpr size_t HLC_WIRE_SIZE = 12;
+
 struct HLCTimestamp {
     uint64_t physical_ns{0};   // physical time in nanoseconds (wall clock)
     uint16_t logical{0};       // logical counter (incremented when physical is equal)
@@ -101,9 +105,21 @@ struct HLCTimestamp {
     /// Returns true if all fields are zero (default-constructed).
     bool is_zero() const { return physical_ns == 0 && logical == 0 && node_id == 0; }
 };
-#pragma pack(pop)
 
-static_assert(sizeof(HLCTimestamp) == 12, "HLCTimestamp must be exactly 12 bytes");
+// The struct used to be `#pragma pack(1)` so that its size matched the wire form. That made every
+// in-memory use of it misaligned — an HLCTimestamp inside a `std::vector<ConflictEntry>` puts
+// `physical_ns` on a 4-byte boundary, and binding a `const uint64_t&` to it is undefined behaviour.
+// UBSan reported exactly that, and it is not theoretical: unaligned 8-byte access is a fault on
+// some targets and a silently slower path on others, in an engine written for specific hardware.
+//
+// Packing was never needed. `serialize()` and `deserialize()` copy field by field at fixed offsets,
+// so the wire layout does not depend on the struct layout at all. What matters is asserted below:
+// the field order and offsets the wire form is built from. `sizeof` is now 16 and nothing reads it.
+static_assert(offsetof(HLCTimestamp, physical_ns) == 0, "wire layout: physical_ns first");
+static_assert(offsetof(HLCTimestamp, logical) == 8,     "wire layout: logical at offset 8");
+static_assert(offsetof(HLCTimestamp, node_id) == 10,    "wire layout: node_id at offset 10");
+static_assert(alignof(HLCTimestamp) == alignof(uint64_t),
+              "HLCTimestamp must be naturally aligned: it is compared and copied in hot paths");
 
 // ── HybridLogicalClock ────────────────────────────────────────────────────────
 // Thread-safe HLC implementation.

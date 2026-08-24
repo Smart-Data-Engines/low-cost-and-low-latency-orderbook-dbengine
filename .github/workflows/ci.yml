@@ -117,3 +117,57 @@ jobs:
           echo "server did not answer PING"
           kill $SERVER_PID || true
           exit 1
+
+  # Sanitizers run on the C++ unit suite, not on the integration suite: the value is in the
+  # concurrency and memory paths, and pulling etcd plus a live cluster under instrumentation would
+  # multiply the runtime without adding coverage of anything the unit tests do not reach.
+  #
+  # Both were clean when introduced, and each found a real defect on the way in: UBSan a misaligned
+  # reference binding caused by packing HLCTimestamp (roadmap #37), TSan a shutdown that closed the
+  # epoll descriptor while the io thread was still inside epoll_wait().
+  sanitizers:
+    name: sanitizers (${{ matrix.sanitizer }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [asan, tsan]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            liblz4-dev libcurl4-openssl-dev liburing-dev
+
+      # ThreadSanitizer refuses to start when the kernel hands out more ASLR entropy than its
+      # shadow mapping allows: "FATAL: ThreadSanitizer: unexpected memory mapping". Ubuntu 24.04
+      # defaults to 32 bits; 28 is what TSan can live with. Harmless for the ASan job, so it is not
+      # conditional.
+      - name: Lower ASLR entropy for ThreadSanitizer
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: |
+          if [ "${{ matrix.sanitizer }}" = "asan" ]; then
+            cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug -DOB_ENABLE_ASAN=ON
+          else
+            cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug -DOB_ENABLE_TSAN=ON
+          fi
+
+      - name: Build
+        run: cmake --build build-san -j$(nproc)
+
+      # -j1 for the same reason as the ordinary suite: the networking tests bind ports.
+      - name: Run tests
+        env:
+          # detect_leaks is on: a leak in a long-lived server process is a defect, not noise.
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=0
+          UBSAN_OPTIONS: print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=0:second_deadlock_stack=1
+        run: ctest --test-dir build-san --output-on-failure -j1
