@@ -89,9 +89,35 @@ carry values that compress well and both currently cost a full 8 bytes.
   "end_ts_ns":   1700000001000000000,
   "row_count": 5000,
   "first_price": 6490000,
-  "has_raw_qty": false
+  "has_raw_qty": false,
+  "max_sequence_number": 41207,
+  "wal_identity": 5089339406814280536,
+  "wal_file_index": 0,
+  "wal_byte_offset": 136
 }
 ```
+
+`max_sequence_number` is the highest sequence number in the segment — the highest, not
+the last, because a batch can hold numbers from several origins. It is read at startup so
+the next number handed out cannot repeat one already durable. `0` means the segment was
+written before numbers were assigned, which is the truth about that data.
+
+The last three fields answer one question during crash recovery: *is this record from the
+WAL already stored?* Every row here came from a record at or before `wal_file_index` /
+`wal_byte_offset`, because a flush drains all pending rows first and only then writes
+segments. Recovery therefore compares positions instead of guessing from timestamps —
+`end_ts_ns` is the *last* row's timestamp rather than the highest, so a timestamp
+comparison is exact only while a symbol's timestamps increase, which one node guarantees
+and multi-master does not.
+
+`wal_identity` says which WAL those numbers belong to. A snapshot transfer and a shard
+migration ship whole segment directories, `meta.json` included, so a received segment
+carries the *sender's* position — meaningless on the receiver and dangerous if believed,
+since skipping by a foreign position would drop records this node never stored. Recovery
+trusts the position only when the identity matches the one in `<data_dir>/wal_identity`,
+which is generated on first open and deliberately lives outside every segment directory so
+that it cannot travel with one. All three are `0` in segments written before this existed;
+recovery falls back to the timestamp comparison for those and says so in the log.
 
 `format_version` is checked on read. A segment carrying any other version is
 **skipped with an error**, not read partially: a missing column would otherwise

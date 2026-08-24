@@ -57,6 +57,9 @@ void ColumnarStore::write_meta_json(const std::string& dir,
       << ",\"first_price\":" << meta.first_price
       << ",\"has_raw_qty\":"  << (meta.has_raw_qty ? "true" : "false")
       << ",\"max_sequence_number\":" << meta.max_sequence_number
+      << ",\"wal_identity\":"        << meta.wal_identity
+      << ",\"wal_file_index\":"      << meta.wal_file_index
+      << ",\"wal_byte_offset\":"     << meta.wal_byte_offset
       << ",\"symbol\":\""    << meta.symbol   << "\""
       << ",\"exchange\":\""  << meta.exchange << "\""
       << "}";
@@ -120,6 +123,10 @@ bool ColumnarStore::parse_meta_json(const std::string& path,
     // Missing in segments written before sequence numbers were assigned; 0 is then correct,
     // not a fallback.
     out.max_sequence_number = extract_uint64("max_sequence_number");
+    // Absent in older segments, and 0 then means "unknown", not "position zero".
+    out.wal_identity    = extract_uint64("wal_identity");
+    out.wal_file_index  = static_cast<uint32_t>(extract_uint64("wal_file_index"));
+    out.wal_byte_offset = extract_uint64("wal_byte_offset");
     out.symbol       = extract_string("symbol");
     out.exchange     = extract_string("exchange");
 
@@ -344,6 +351,9 @@ std::optional<SegmentMeta> ColumnarStore::flush_segment() {
     meta.symbol      = symbol_;
     meta.exchange    = exchange_;
     meta.dir_path    = dir;
+    meta.wal_identity    = wal_identity_;
+    meta.wal_file_index  = wal_file_index_;
+    meta.wal_byte_offset = wal_byte_offset_;
 
     // Write meta.json
     write_meta_json(dir, meta);

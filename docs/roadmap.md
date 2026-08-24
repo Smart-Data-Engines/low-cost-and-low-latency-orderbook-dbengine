@@ -1306,7 +1306,7 @@ Spec: `kiro-workspace/specs/wal-replay-recovery/`
 - Also added: `--flush-interval-ms` on `ob_tcp_server`. The recovery tests need rows to stay in the WAL,
   and hardcoding 100 ms made the test race the server instead of measuring it.
 
-### 63. The replay guard assumes timestamps for a symbol arrive in order
+### 63. The replay guard assumes timestamps for a symbol arrive in order ✅
 
 Found while writing #62, by asking what the guard assumes rather than what it does.
 
@@ -1331,8 +1331,42 @@ Two ways out, and the second is the honest one:
   a position rather than inferring one from timestamps. The timestamp comparison then narrows to the
   crash window alone, where a row-level identity check on the replayed rows can settle it exactly.
 
-- Effort: M | Impact: One lost row per occurrence on a multi-master node, in a window that only opens
-  on an unclean stop. Correctness of a guard that currently rests on an unstated assumption
+**Fixed by making the answer a fact.** Every segment now records the WAL position its rows came from
+(`wal_file_index`, `wal_byte_offset` in `meta.json`), and recovery compares positions instead of
+timestamps. The invariant that makes it exact: a record reaches the WAL *before* it reaches
+`pending_rows_`, and a flush drains all pending rows before writing any segment — so every row in a
+segment came from a record at or before the position taken at that drain. Per symbol, which matters:
+a crash that left one symbol's segment written and another's not is described correctly, because each
+segment carries its own position.
+
+The third option, neither of the two the entry proposed: `wal_identity`. A snapshot transfer and a
+shard migration ship whole segment directories, `meta.json` included, so a received segment carries
+the **sender's** position — and skipping by a foreign position would drop records this node never
+stored, which is the expensive direction. Segments therefore record which WAL the position belongs to,
+recovery trusts it only on a match, and the identity file lives at `<data_dir>/wal_identity`,
+deliberately outside every segment directory so that it cannot travel with one. Missing identity or
+position means "written before this existed": recovery falls back to the timestamp comparison for that
+symbol and logs a warning naming what it did.
+
+Three tests, each with the fix disabled to prove it is measuring something:
+
+```
+out-of-order timestamp inside a segment's range   fix: 4 rows   timestamp guard: 3 rows (the lost row)
+position from another node's WAL                  fix: 4 rows   identity check off: 3 rows
+crash window (segments written, no checkpoint)    fix: 8 rows   — passes either way, by design
+```
+
+The crash-window test needed rewriting rather than re-running, and the reason is worth keeping. It
+used to build its state by **re-appending copies** of durable records after the last checkpoint, which
+puts them at positions *above* the segment that holds them — a state the engine cannot produce, since
+a record reaches the WAL before the row it produces reaches a segment. It now cuts the log at the last
+checkpoint instead, which is exactly what a crash between writing segment files and recording that
+fact leaves behind. A test whose construction the mechanism cannot reach will contradict the correct
+fix, and did.
+
+- Effort: M | Impact: Recovery no longer rests on an assumption that multi-master breaks. The guard is
+  a position comparison, exact per symbol, and a position from another node's log cannot be mistaken
+  for one of ours
 
 ### 64. Nobody assigned the sequence numbers, so three mechanisms were switched off by a zero ✅
 

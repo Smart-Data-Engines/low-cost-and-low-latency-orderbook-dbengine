@@ -35,6 +35,24 @@ struct SegmentMeta {
                                       ///< which is the truth about that data. Read at
                                       ///< startup so the next number cannot repeat one
                                       ///< already durable.
+    /// WAL position whose records are all durable in this segment, for this symbol.
+    ///
+    /// Every row here came from a record at or before this position, because a flush drains all
+    /// pending rows first and only then writes segments. That makes the pair below an exact,
+    /// per-symbol answer to "is this replayed record already stored?" — which timestamps cannot
+    /// give in multi-master, where a peer's record carries the origin's clock and can sit below a
+    /// segment's `end_ts_ns` for the same symbol (#63).
+    ///
+    /// Both zero in segments written before this was recorded, which is the truth about that data:
+    /// replay falls back to the timestamp comparison for those.
+    /// Identity of the WAL the position below refers to. A snapshot and a shard migration ship
+    /// whole segment directories, `meta.json` included, so the position in a received segment is
+    /// the *sender's* — meaningless here, and dangerous if believed, because skipping by a foreign
+    /// position would drop records this node never stored. Recovery trusts the position only when
+    /// this matches the local WAL's identity; 0 means "written before identities existed".
+    uint64_t wal_identity{0};
+    uint32_t wal_file_index{0};
+    uint64_t wal_byte_offset{0};
     std::string symbol;     ///< symbol this segment belongs to
     std::string exchange;   ///< exchange this segment belongs to
     std::string dir_path;   ///< full path to the segment directory
@@ -78,6 +96,18 @@ public:
     void set_symbol_exchange(std::string_view symbol, std::string_view exchange) {
         symbol_   = std::string(symbol);
         exchange_ = std::string(exchange);
+    }
+
+    /// Record the WAL position whose records are covered by the rows appended from here on.
+    ///
+    /// Called at the start of a drain, when everything the engine is about to append came from a
+    /// record at or before this position. Every segment closed afterwards — by `flush_segment()` or
+    /// by a rollover inside `append()` — is stamped with it, which is what lets replay decide by
+    /// position instead of by timestamp (#63).
+    void set_wal_position(uint64_t wal_identity, uint32_t file_index, uint64_t byte_offset) {
+        wal_identity_    = wal_identity;
+        wal_file_index_  = file_index;
+        wal_byte_offset_ = byte_offset;
     }
 
     /// Flush the active segment: encode buffers, write column files, write meta.json.
@@ -136,6 +166,9 @@ private:
     uint64_t    segment_duration_ns_;
 
     // Active segment state
+    uint64_t    wal_identity_{0};
+    uint32_t    wal_file_index_{0};
+    uint64_t    wal_byte_offset_{0};
     std::string symbol_;
     std::string exchange_;
     uint64_t    active_segment_start_{0};

@@ -16,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <random>
 
 namespace ob {
 
@@ -68,6 +69,9 @@ void Engine::open() {
         OB_LOG_INFO("engine", "Sequence counters restored from segments: segments=%zu symbols=%zu",
                     raised, seq_tracker_.symbol_count());
     }
+
+    // Which WAL these segments' positions refer to. Before the replay, which needs it.
+    load_or_create_wal_identity();
 
     // What this node holds, from the last vector it wrote down. Before the tail replay, so
     // the tail can only raise it.
@@ -324,6 +328,43 @@ void Engine::restore_held_sequences() {
                 "Restored held sequences from WAL: entries=%zu numbers=%zu — these are the "
                 "out-of-order records a redelivery must not apply again",
                 held.size(), numbers);
+}
+
+void Engine::load_or_create_wal_identity() {
+    const std::string path = base_dir_ + "/wal_identity";
+
+    std::ifstream in(path);
+    if (in.is_open()) {
+        uint64_t value = 0;
+        in >> value;
+        if (value != 0) {
+            wal_identity_ = value;
+            OB_LOG_INFO("engine", "WAL identity %llu",
+                        static_cast<unsigned long long>(wal_identity_));
+            return;
+        }
+        OB_LOG_WARN("engine", "wal_identity file present but unusable — generating a new one, so "
+                              "positions recorded by the previous run are ignored");
+    }
+
+    // Random rather than derived from the path or the clock: two data directories restored from the
+    // same backup must not agree, or one would trust the other's positions.
+    std::random_device rd;
+    uint64_t value = (static_cast<uint64_t>(rd()) << 32) ^ rd();
+    if (value == 0) value = 1;   // 0 means "unknown" everywhere else
+    wal_identity_ = value;
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out.is_open()) {
+        OB_LOG_WARN("engine",
+                    "cannot write %s — recovery will fall back to comparing timestamps, which is "
+                    "exact only while a symbol's timestamps increase", path.c_str());
+        return;
+    }
+    out << wal_identity_;
+    out.flush();
+    OB_LOG_INFO("engine", "WAL identity %llu generated",
+                static_cast<unsigned long long>(wal_identity_));
 }
 
 void Engine::restore_version_vector() {
@@ -1424,8 +1465,18 @@ void Engine::flush_loop() {
 void Engine::flush_drain_pending() {
     // Phase A: drain pending_rows_ into per-symbol columnar stores.
     // Must be called with mtx_ held.
+    //
+    // The WAL position is read once, here, and stamped into every store this drain touches. It is
+    // exact: `wal_.sync()` has just run and every row about to be appended came from a record at or
+    // before this point, so a segment closed from these rows covers that symbol's WAL up to here.
+    // That is the fact replay needs, and the reason it no longer has to guess from timestamps
+    // (#63).
+    const uint32_t wal_file   = wal_.current_file_index();
+    const uint64_t wal_offset = static_cast<uint64_t>(wal_.current_offset());
+
     for (const auto& pr : pending_rows_) {
         ColumnarStore& store = get_or_create_store(pr.symbol, pr.exchange);
+        store.set_wal_position(wal_identity_, wal_file, wal_offset);
         store.append(pr.row);
     }
     pending_rows_.clear();
@@ -1529,21 +1580,51 @@ void Engine::apply_delta_replayed(const DeltaUpdate& delta, const Level* levels)
 }
 
 uint64_t Engine::replay_wal_tail() {
-    // Highest end timestamp already stored per symbol, so a record that a segment
-    // already covers can be skipped. This closes the window between writing segments
-    // and appending the checkpoint: a crash in there replays records that are already
-    // durable, and duplicated rows are as wrong as lost ones.
-    std::unordered_map<std::string, uint64_t> flushed_up_to;
+    // What each symbol already has on disk, so a record a segment covers is not applied twice.
+    // This closes the window between writing segments and appending the checkpoint: a crash in
+    // there replays records that are already durable, and duplicated rows are as wrong as lost
+    // ones.
+    //
+    // Two answers, and the first one is a fact. Every segment records the WAL position its rows
+    // came from, so "this record is already stored" is a position comparison — and a per-symbol
+    // one, which is sound even when a crash left one symbol's segment written and another's not.
+    // The timestamp comparison is the fallback for segments written before positions were
+    // recorded; it is exact only while timestamps for a symbol increase, which a single node
+    // guarantees and multi-master does not, because a peer's record carries the origin's clock
+    // (#63).
+    struct DurableUpTo {
+        uint32_t wal_file_index{0};
+        uint64_t wal_byte_offset{0};
+        bool     has_position{false};
+        uint64_t end_ts_ns{0};
+    };
+    std::unordered_map<std::string, DurableUpTo> durable;
     for (const auto& meta : combined_store_.index()) {
         const std::string key = meta.symbol + "." + meta.exchange;
-        auto it = flushed_up_to.find(key);
-        if (it == flushed_up_to.end() || meta.end_ts_ns > it->second) {
-            flushed_up_to[key] = meta.end_ts_ns;
+        auto& d = durable[key];
+        if (meta.end_ts_ns > d.end_ts_ns) d.end_ts_ns = meta.end_ts_ns;
+        // Trust a position only if it was written against this WAL. A snapshot or a shard
+        // migration ships whole segment directories, so a received segment carries the sender's
+        // position — believing it would skip records this node never stored. A zero position means
+        // the segment predates this record-keeping, not offset zero.
+        const bool has_pos = meta.wal_identity != 0 && meta.wal_identity == wal_identity_ &&
+                             (meta.wal_file_index != 0 || meta.wal_byte_offset != 0);
+        if (has_pos) {
+            const bool later = !d.has_position ||
+                               meta.wal_file_index > d.wal_file_index ||
+                               (meta.wal_file_index == d.wal_file_index &&
+                                meta.wal_byte_offset > d.wal_byte_offset);
+            if (later) {
+                d.wal_file_index  = meta.wal_file_index;
+                d.wal_byte_offset = meta.wal_byte_offset;
+                d.has_position    = true;
+            }
         }
     }
 
     uint64_t applied = 0;
     uint64_t skipped = 0;
+    uint64_t skipped_by_timestamp = 0;
     uint64_t records = 0;
 
     WALReplayer replayer(base_dir_);
@@ -1568,10 +1649,24 @@ uint64_t Engine::replay_wal_tail() {
         }
 
         const std::string key = std::string(delta.symbol) + "." + delta.exchange;
-        auto it = flushed_up_to.find(key);
-        if (it != flushed_up_to.end() && delta.timestamp_ns <= it->second) {
-            ++skipped;
-            return;
+        auto it = durable.find(key);
+        if (it != durable.end()) {
+            const auto& d = it->second;
+            if (d.has_position) {
+                const bool already_stored =
+                    ctx.wal_file_index < d.wal_file_index ||
+                    (ctx.wal_file_index == d.wal_file_index &&
+                     ctx.wal_byte_offset < d.wal_byte_offset);
+                if (already_stored) {
+                    ++skipped;
+                    return;
+                }
+            } else if (delta.timestamp_ns <= d.end_ts_ns) {
+                // Legacy segment with no recorded position. Same behaviour as before, and the same
+                // assumption: it holds on a single node and can misfire in multi-master.
+                ++skipped_by_timestamp;
+                return;
+            }
         }
 
         const auto* levels = reinterpret_cast<const Level*>(
@@ -1585,10 +1680,19 @@ uint64_t Engine::replay_wal_tail() {
     // skipped should be zero on a clean checkpoint; anything else means the crash
     // landed between writing segments and recording that fact.
     OB_LOG_INFO("engine",
-                "WAL replay: records=%llu applied=%llu skipped_already_flushed=%llu",
+                "WAL replay: records=%llu applied=%llu skipped_by_position=%llu "
+                "skipped_by_timestamp=%llu",
                 static_cast<unsigned long long>(records),
                 static_cast<unsigned long long>(applied),
-                static_cast<unsigned long long>(skipped));
+                static_cast<unsigned long long>(skipped),
+                static_cast<unsigned long long>(skipped_by_timestamp));
+    if (skipped_by_timestamp > 0) {
+        OB_LOG_WARN("engine",
+                    "%llu records were skipped by timestamp because their symbol's segments carry "
+                    "no WAL position — pre-#63 data, where an out-of-order timestamp can hide a "
+                    "record that was never stored",
+                    static_cast<unsigned long long>(skipped_by_timestamp));
+    }
 
     registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
     return applied;

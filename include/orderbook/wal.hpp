@@ -107,6 +107,12 @@ struct WALReplayContext {
     HLCTimestamp    hlc;             // zero if legacy record
     const uint8_t*  payload;
     size_t          payload_len;
+    /// Where this record starts: the WAL file it came from and its byte offset in that file.
+    ///
+    /// Recovery compares this against the position a segment recorded for the same symbol, which
+    /// answers "is this already stored?" as a fact rather than inferring it from timestamps (#63).
+    uint32_t        wal_file_index{0};
+    uint64_t        wal_byte_offset{0};
 };
 
 using WALReplayCallbackV2 = std::function<void(const WALReplayContext& ctx)>;
