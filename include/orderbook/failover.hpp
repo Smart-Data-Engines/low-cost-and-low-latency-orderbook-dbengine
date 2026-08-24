@@ -174,6 +174,10 @@ private:
     std::chrono::steady_clock::time_point deferring_since_{};
     std::atomic<uint64_t>   deferrals_{0};
     std::atomic<bool>       running_{false};
+    /// Lease that keeps this node's published WAL position alive. Separate from the leadership
+    /// lease on purpose: a position says "this node is here and holds this much log", which is true
+    /// of a replica as much as of a primary, and must not disappear when a role changes hands.
+    std::atomic<int64_t>    position_lease_id_{0};
     /// How many times the monitor loop has looked at a STANDALONE role. Touched only from the
     /// monitor thread, so it needs no lock; it exists to keep the retry log from repeating every
     /// second while a coordinator stays unreachable.
@@ -207,6 +211,16 @@ private:
     /// `FAILOVER <target>` answered ERR unknown_target every time (roadmap #60). The positions are
     /// also what `elect_winner()` was written to compare, though nothing calls that yet.
     void publish_position_if_due();
+
+    /// Grant, or keep alive, the lease that keeps this node's published position present.
+    ///
+    /// Returns the lease id, or 0 when no lease could be had — in which case the caller publishes
+    /// without one and the position outlives the node, which is what happened before #72.
+    ///
+    /// The re-grant path only works because #74 made `refresh_lease()` capable of failing: before
+    /// that, a keepalive for a lease etcd had forgotten answered 200 and this function would have
+    /// gone on publishing under a lease that no longer existed.
+    int64_t ensure_position_lease();
     void handle_lease_expiry();
     void attempt_promotion();
     void handle_primary_lease_lost();

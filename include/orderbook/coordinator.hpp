@@ -153,7 +153,13 @@ public:
     std::optional<ClusterState> get_cluster_state();
 
     /// Publish this node's WAL position for election comparison.
-    bool publish_wal_position(uint32_t file_index, size_t byte_offset);
+    /// Publish this node's WAL position.
+    ///
+    /// `lease_id` ties the key to a lease, so the position disappears on its own when this node
+    /// stops refreshing it. That is what makes "is that replica further ahead, or merely dead?"
+    /// answerable without comparing wall clocks across machines (#72). Passing 0 publishes a key
+    /// that outlives the node, which is the behaviour this parameter replaced.
+    bool publish_wal_position(uint32_t file_index, size_t byte_offset, int64_t lease_id = 0);
 
     /// Read all published WAL positions.
     std::vector<PublishedPosition> get_published_positions();

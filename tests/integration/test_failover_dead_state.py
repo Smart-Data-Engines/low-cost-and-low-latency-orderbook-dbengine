@@ -16,6 +16,8 @@ starts one: everything at once, and sometimes before the coordinator answers.
 """
 from __future__ import annotations
 
+import base64
+import json
 import os
 import shutil
 import signal
@@ -23,6 +25,8 @@ import socket
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.request
 
 import pytest
 
@@ -54,6 +58,26 @@ def command(port: int, text: str, settle: float = 0.4) -> str:
             return s.recv(1 << 16).decode(errors="replace")
         except socket.timeout:
             return ""
+
+
+def etcd_positions(etcd_port: int) -> list[str]:
+    """Node ids that currently have a WAL position published in etcd.
+
+    A local copy on purpose: every module in this suite stands on its own, and `test_failover.py`
+    has its own for the shared-cluster tests.
+    """
+    payload = {"key": base64.b64encode(b"/ob/nodes/").decode(),
+               "range_end": base64.b64encode(b"/ob/nodes0").decode()}
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{etcd_port}/v3/kv/range", data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = resp.read().decode()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode()
+    return sorted(base64.b64decode(kv["key"]).decode().rsplit("/", 1)[-1]
+                  for kv in json.loads(body).get("kvs", []))
 
 
 def role_of(port: int) -> str:
@@ -240,3 +264,45 @@ def test_a_node_that_boots_before_its_coordinator_still_joins_the_cluster(simult
     log = cluster.node_log(0)
     assert "cannot reach the coordinator at startup" in log, (
         "the retry path should say why it is standing by")
+
+
+def test_a_node_stopped_on_purpose_stops_being_a_deference_target_at_once(simultaneous_cluster):
+    """A clean shutdown should not leave an election waiting on the lease TTL.
+
+    Position keys expire on their own since #72, which covers a node that died. A node that was
+    stopped deliberately can do better than expire: it revokes the lease on the way out, so the
+    remaining node sees a shorter list immediately rather than in ten seconds.
+    """
+    cluster = simultaneous_cluster
+    url = cluster.start_etcd()
+    cluster.spawn(0, url)
+    cluster.spawn(1, url)
+    cluster.wait_until_listening(0)
+    cluster.wait_until_listening(1)
+
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if {"node-0", "node-1"} <= set(etcd_positions(cluster.etcd_port)):
+            break
+        time.sleep(0.5)
+    assert {"node-0", "node-1"} <= set(etcd_positions(cluster.etcd_port)), (
+        f"both nodes should publish a position; etcd has {etcd_positions(cluster.etcd_port)}")
+
+    # SIGTERM, not SIGKILL: the difference between the two is the whole point here.
+    cluster.procs[1].terminate()
+    cluster.procs[1].wait(timeout=15)
+
+    # Well inside the lease TTL, so expiry cannot be what removed it.
+    gone_within = None
+    start = time.time()
+    while time.time() - start < 4:
+        if "node-1" not in etcd_positions(cluster.etcd_port):
+            gone_within = time.time() - start
+            break
+        time.sleep(0.2)
+
+    assert gone_within is not None, (
+        "a node stopped with SIGTERM left its position behind, so the survivor would wait out the "
+        "lease TTL before it could stop deferring")
+    assert "position lease" in cluster.node_log(1), (
+        "the shutdown path should say what it did with the position lease")
