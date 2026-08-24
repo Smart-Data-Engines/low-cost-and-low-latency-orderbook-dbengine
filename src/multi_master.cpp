@@ -25,6 +25,7 @@
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -212,6 +213,30 @@ void MultiMasterManager::start() {
         throw std::runtime_error("epoll_create1 failed");
     }
 
+    // A descriptor whose only job is to end epoll_wait() on demand. Registered below, written by
+    // stop(). Without it, shutdown waits out the 500 ms epoll timeout and stop() has to interfere
+    // with descriptors the io thread is still using.
+    wakeup_fd_ = ::eventfd(0, EFD_NONBLOCK);
+    if (wakeup_fd_ < 0) {
+        OB_LOG_ERROR("mm", "eventfd failed: %s", std::strerror(errno));
+        ::close(epoll_fd_);
+        epoll_fd_ = -1;
+        throw std::runtime_error("eventfd failed");
+    }
+    {
+        struct epoll_event ev{};
+        ev.events  = EPOLLIN;
+        ev.data.fd = wakeup_fd_;
+        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wakeup_fd_, &ev) < 0) {
+            OB_LOG_ERROR("mm", "epoll_ctl(wakeup) failed: %s", std::strerror(errno));
+            ::close(wakeup_fd_);
+            ::close(epoll_fd_);
+            wakeup_fd_ = -1;
+            epoll_fd_  = -1;
+            throw std::runtime_error("epoll_ctl(wakeup) failed");
+        }
+    }
+
     // Bind listen socket.
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) {
@@ -303,21 +328,37 @@ void MultiMasterManager::stop() {
         peer_registry_->deregister_self();
     }
 
-    // Close listen socket to unblock accept.
+    // Wake the io thread, then join it, and only then close anything it might be holding.
+    //
+    // The order matters and the previous one was wrong: closing listen_fd_ and epoll_fd_ here was
+    // described as unblocking the threads, but closing an epoll descriptor does not wake a thread
+    // inside epoll_wait() on Linux — so shutdown waited out the 500 ms timeout anyway, while the io
+    // loop could call epoll_wait() on a descriptor number the kernel had already reassigned.
+    // ThreadSanitizer reported it as a data race on file descriptor 4 between stop() and io_loop().
+    if (wakeup_fd_ >= 0) {
+        const uint64_t one = 1;
+        const ssize_t wr = ::write(wakeup_fd_, &one, sizeof(one));
+        (void)wr;   // a full eventfd counter still means the loop will wake
+    }
+
+    // Join threads. Both check running_, and the io thread is now woken at once rather than in up
+    // to half a second.
+    if (io_thread_.joinable()) io_thread_.join();
+    if (reconnect_thread_.joinable()) reconnect_thread_.join();
+
+    // Nobody is reading these any more.
     if (listen_fd_ >= 0) {
         ::close(listen_fd_);
         listen_fd_ = -1;
     }
-
-    // Close epoll to unblock threads.
+    if (wakeup_fd_ >= 0) {
+        ::close(wakeup_fd_);
+        wakeup_fd_ = -1;
+    }
     if (epoll_fd_ >= 0) {
         ::close(epoll_fd_);
         epoll_fd_ = -1;
     }
-
-    // Join threads.
-    if (io_thread_.joinable()) io_thread_.join();
-    if (reconnect_thread_.joinable()) reconnect_thread_.join();
 
     // Disconnect all peers.
     {
@@ -542,6 +583,15 @@ void MultiMasterManager::io_loop() {
         for (int i = 0; i < nfds; ++i) {
             int ev_fd = events[i].data.fd;
             uint32_t ev_events = events[i].events;
+
+            if (ev_fd == wakeup_fd_) {
+                // Drain it and re-check running_ at the top of the loop. Nothing else to do: the
+                // event carries no information beyond "look again".
+                uint64_t drained = 0;
+                const ssize_t rd = ::read(wakeup_fd_, &drained, sizeof(drained));
+                (void)rd;
+                continue;
+            }
 
             if (ev_fd == listen_fd_) {
                 // ── Accept new connections (level-triggered EPOLLIN) ──────────

@@ -415,12 +415,57 @@ test binary down.
 
 - Spec: none; the roadmap entry was the spec
 
-### 37. CI hardening
-- Sanitizer jobs: ASan + UBSan on the full test suite, TSan on the concurrency-heavy subset
-  (SoA seqlock, multi-master io_loop, group commit)
-- Coverage report with a badge; `OB_ENABLE_COVERAGE` already exists
-- Matrix build: GCC and Clang, Debug and Release
-- Effort: S | Impact: A sanitizer-clean concurrent C++ codebase is a strong quality signal
+### 37. CI hardening — sanitizers ✅ (coverage and the compiler matrix are still open)
+
+**Sanitizers are in CI and both are clean**, and each found a real defect on the way in — which is the
+whole argument for the job, so it is worth recording what they were.
+
+**UBSan: undefined behaviour in every in-memory use of a timestamp.** `HLCTimestamp` was
+`#pragma pack(1)` so that its size would match its 12-byte wire form. That put `physical_ns` on a
+4-byte boundary whenever the struct was embedded in another — inside a `std::vector<ConflictEntry>`,
+for instance — and binding a `const uint64_t&` to it, as `EXPECT_EQ` does, is undefined behaviour:
+
+```
+runtime error: reference binding to misaligned address 0x516000005adc for type
+'const long unsigned int', which requires 8 byte alignment
+```
+
+Not theoretical for an engine written for specific hardware: an unaligned 8-byte access faults on some
+targets and takes a slower path on others. The packing was never needed — `serialize()` and
+`deserialize()` copy field by field at fixed offsets, so the wire layout never depended on the struct
+layout. The struct is naturally aligned now, `sizeof` is 16, the wire form is still 12, and three
+`offsetof` assertions state what the wire form actually requires.
+
+**TSan: shutdown closed descriptors the io thread was still using.** `MultiMasterManager::stop()`
+closed `listen_fd_` and `epoll_fd_` under a comment saying it did so "to unblock threads", and only
+then joined them. Closing an epoll descriptor does **not** wake a thread inside `epoll_wait()` on
+Linux, so shutdown waited out the 500 ms timeout anyway — while the loop could call `epoll_wait()` on
+a descriptor number the kernel had already handed to something else:
+
+```
+WARNING: ThreadSanitizer: data race
+  Write of size 8 by main thread:   close ... MultiMasterManager::stop() multi_master.cpp:314
+  Previous read of size 8 by T1:    epoll_wait ... MultiMasterManager::io_loop() multi_master.cpp:536
+  Location is file descriptor 4 created by main thread at epoll_create1
+```
+
+Now an `eventfd` registered in the epoll set is written by `stop()`, the threads are joined, and only
+then is anything closed. One fix, and all twelve failing tests went green — they were the same race
+seen from twelve places. Shutdown also stopped waiting: the multi-master stats module went from
+carrying a half-second teardown per node to finishing in 1.7 s overall.
+
+Both jobs run the C++ unit suite, not the integration suite: the value is in the concurrency and
+memory paths, and instrumenting a live etcd cluster would multiply the runtime without reaching
+anything new. `detect_leaks=1` is on, because a leak in a long-lived server process is a defect.
+ThreadSanitizer needs `vm.mmap_rnd_bits=28` on Ubuntu 24.04 or it refuses to start at all —
+documented in the workflow next to the sysctl, since the failure mode ("unexpected memory mapping")
+does not name its cause.
+
+Still open under this item: the coverage report with a badge (`OB_ENABLE_COVERAGE` already exists),
+and the GCC/Clang × Debug/Release matrix.
+
+- Effort: S | Impact: 697 tests clean under ASan+UBSan and under TSan, checked on every push. Two
+  defects found by turning them on, one of them undefined behaviour on the hot path's data type
 
 ### 38. Fuzzing
 - libFuzzer harnesses for `command_parser`, the multi-master frame parser, and WAL record

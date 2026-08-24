@@ -268,6 +268,14 @@ private:
     // Networking
     int listen_fd_{-1};
     int epoll_fd_{-1};
+    /// eventfd registered in the epoll set, written by stop() to wake io_loop() at once.
+    ///
+    /// stop() used to close epoll_fd_ "to unblock threads", which does not unblock a thread sitting
+    /// in epoll_wait() — Linux does not wake it on close — so shutdown actually waited for the
+    /// 500 ms timeout, and meanwhile the loop could call epoll_wait() on a descriptor number the
+    /// kernel had already handed to something else. ThreadSanitizer reported it as a race on
+    /// file descriptor 4 between stop() and io_loop().
+    int wakeup_fd_{-1};
     std::thread io_thread_;
     std::thread reconnect_thread_;
     std::atomic<bool> running_{false};

@@ -214,6 +214,42 @@ add_library(orderbook_capi STATIC src/c_api.cpp)
 target_link_libraries(orderbook_capi PUBLIC orderbook_query orderbook_wal)
 
 # ── Coverage ──────────────────────────────────────────────────────────────────
+# ── Sanitizers ────────────────────────────────────────────────────────────────
+#
+# Two separate options because ASan and TSan cannot be linked into the same binary. ASan is paired
+# with UBSan, which composes with it and costs almost nothing extra.
+#
+# Both keep -O1 and frame pointers: -O0 hides optimisation-dependent bugs and makes the suite slow
+# enough that nobody runs it, while -O2 loses the stack detail that makes a report actionable.
+option(OB_ENABLE_ASAN "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(OB_ENABLE_TSAN "Build with ThreadSanitizer" OFF)
+
+if(OB_ENABLE_ASAN AND OB_ENABLE_TSAN)
+    message(FATAL_ERROR "OB_ENABLE_ASAN and OB_ENABLE_TSAN cannot be enabled together: the two "
+                        "runtimes cannot coexist in one binary. Build them as separate trees.")
+endif()
+
+if(OB_ENABLE_ASAN OR OB_ENABLE_TSAN)
+    # GCC 13 reports -Wmaybe-uninitialized inside <bits/std_function.h> when instrumentation
+    # changes what it can see through std::function, on code that is fine — a diagnostic about a
+    # system header, not about ours. -Werror turns it into a build failure, so it is disabled for
+    # sanitizer trees only. The ordinary build keeps every warning fatal.
+    add_compile_options(-Wno-maybe-uninitialized)
+endif()
+
+if(OB_ENABLE_ASAN)
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer
+                        -fno-sanitize-recover=undefined -g -O1)
+    add_link_options(-fsanitize=address,undefined)
+    message(STATUS "AddressSanitizer + UndefinedBehaviorSanitizer enabled")
+endif()
+
+if(OB_ENABLE_TSAN)
+    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g -O1)
+    add_link_options(-fsanitize=thread)
+    message(STATUS "ThreadSanitizer enabled")
+endif()
+
 option(OB_ENABLE_COVERAGE "Enable gcov/llvm-cov code coverage instrumentation" OFF)
 
 if(OB_ENABLE_COVERAGE)

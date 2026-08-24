@@ -273,6 +273,16 @@ Learned the hard way. Check here before debugging.
     segment holding them — impossible in the engine, where a record is written before the row it
     produces is stored. When the guard became a position comparison, that test failed and the code was
     right. Build the state the mechanism actually leaves behind.
+41. **Closing a descriptor does not wake a thread blocked on it.** `stop()` closed the epoll
+    descriptor "to unblock threads"; Linux does not wake `epoll_wait()` on close, so shutdown really
+    waited out the 500 ms timeout while the loop could call `epoll_wait()` on a number the kernel had
+    already reassigned. Wake the loop through something it is watching — an `eventfd` in the epoll
+    set — join the thread, and only then close what it was using.
+42. **Packing a struct for the wire makes every in-memory use of it misaligned.** `HLCTimestamp` was
+    `#pragma pack(1)` to match its 12-byte wire form, which put a `uint64_t` on a 4-byte boundary
+    inside any struct holding it; binding a reference to that field is undefined behaviour, and UBSan
+    said so. Serialisation was already field-by-field at fixed offsets, so the packing bought nothing.
+    Keep the CPU layout natural and let the serialiser own the wire layout.
 
 ## Current state and open problems
 
