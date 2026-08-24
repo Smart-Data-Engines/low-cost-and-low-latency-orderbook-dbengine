@@ -228,8 +228,20 @@ public:
     /// Check if this manager is in bootstrap state.
     bool is_bootstrapping() const { return bootstrapping_.load(std::memory_order_acquire); }
 
-    /// Initiate bootstrap from a peer.
+    /// Enter the bootstrap state: this node holds no data yet and must not serve as though it did.
+    ///
+    /// Always paired with `finish_bootstrap()`. A flag that gates writes and has no way out is a
+    /// self-inflicted outage waiting for its first caller — `INSERT`, `MINSERT` and `DELETE` all
+    /// answer `ERR BOOTSTRAPPING` while this is set, and before #76 nothing anywhere cleared it
+    /// (roadmap #73 is the same shape, found in the failover state machine).
     void start_bootstrap();
+
+    /// Leave the bootstrap state, whether the transfer succeeded or failed.
+    ///
+    /// `succeeded == false` is not a reason to stay in bootstrap: a node that cannot bootstrap has
+    /// to say so and become usable or be restarted, not sit silently refusing writes for ever. The
+    /// caller decides what to do about the failure; this only guarantees the state has an exit.
+    void finish_bootstrap(bool succeeded);
 
     /// Handle MM_PEERS command — return TSV response.
     std::string handle_mm_peers_command() const;

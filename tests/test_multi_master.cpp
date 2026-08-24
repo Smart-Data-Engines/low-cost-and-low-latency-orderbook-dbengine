@@ -301,6 +301,40 @@ TEST(MultiMasterUnit, StartBootstrapSetsFlag) {
     EXPECT_TRUE(mgr.is_bootstrapping());
 }
 
+TEST(MultiMasterUnit, BootstrapStateHasAnExit) {
+    // The flag gates writes: INSERT, MINSERT and DELETE all answer ERR BOOTSTRAPPING while it is
+    // set, and until #76 nothing in the tree cleared it. A state with an entrance and no exit is a
+    // self-inflicted outage waiting for its first caller — the same shape as #73 in the failover
+    // state machine.
+    TestContext ctx(1, 0);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+
+    mgr.start_bootstrap();
+    ASSERT_TRUE(mgr.is_bootstrapping());
+
+    mgr.finish_bootstrap(/*succeeded=*/true);
+    EXPECT_FALSE(mgr.is_bootstrapping());
+}
+
+TEST(MultiMasterUnit, AFailedBootstrapStillLeavesTheState) {
+    // Failing is not a reason to keep refusing writes for ever. The node says what happened and
+    // becomes usable; an operator can then decide to restart it.
+    TestContext ctx(1, 0);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+
+    mgr.start_bootstrap();
+    mgr.finish_bootstrap(/*succeeded=*/false);
+    EXPECT_FALSE(mgr.is_bootstrapping());
+}
+
+TEST(MultiMasterUnit, FinishingWithoutStartingIsHarmless) {
+    TestContext ctx(1, 0);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+
+    mgr.finish_bootstrap(/*succeeded=*/true);
+    EXPECT_FALSE(mgr.is_bootstrapping());
+}
+
 // ── connected_peer_count initially zero ───────────────────────────────────────
 
 TEST(MultiMasterUnit, ConnectedPeerCountInitiallyZero) {
