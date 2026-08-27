@@ -569,15 +569,30 @@ codebase. Each item is also a story we can sell as bespoke work.
   clock skew (HLC correctness under skew is untested), etcd unavailability
 - Effort: L | Impact: The failure modes that lose data in production
 
-### 55. Multi-node cluster tests in CI
+### 55. Multi-node cluster tests in CI ✅
 - Three native nodes plus etcd started by a script, multi-master convergence and failover verified
   on every PR
-- **Partly there, as a side effect of #80.** The `sanitizers-integration (tsan)` job is the first CI
-  job that runs the pytest suite at all: it installs etcd, builds the server under ThreadSanitizer
-  and runs the multi-master modules against a real three-node cluster. So convergence *is* verified
-  on every PR, on instrumented binaries. What is still missing is the plain (uninstrumented) run of
-  the whole suite, and the modules that kill nodes — failover included, which is the half most worth
-  having and the half whose fixtures wait on timeouts that instrumentation makes unreliable.
+
+Two jobs, added in two steps and for two different reasons.
+
+**`sanitizers-integration (tsan)`** came first, as a side effect of #80: it installs etcd, builds the
+server under ThreadSanitizer and runs the multi-master modules against a real three-node cluster,
+failing on any sanitizer report. It was the first CI job to run the pytest suite at all. Its scope is
+deliberately narrow — the modules that kill nodes are outside it, because their fixtures wait on
+timings that instrumentation makes unreliable.
+
+**`integration-tests`** is the rest: the whole suite against a plain build, and therefore the half
+that gates what the narrow job cannot — failover, crash recovery under `SIGKILL`, and the
+position-lease invariant that #72 and #74 turned on. Kept as its own job rather than appended to
+`build-and-test`, because that job is the C++ suite and a failure here means something different.
+
+Both are required in the ruleset. The cost is stated plainly in `docs/github-security.md` next to
+CodeQL's, because it is the same cost: **an infrastructure failure blocks merges exactly as
+effectively as a real finding**, and here the infrastructure is etcd plus a live cluster. The
+failover module is also the one place in the suite with a wall-clock dependency — it flaked once
+locally when a benchmark was saturating a core in parallel — so if it turns out to flake on shared
+runners, the fix is a measured timeout, not deletion.
+
 - Effort: M | Impact: Prevents regressions that unit tests structurally cannot catch
 
 ### 56. Rolling upgrade support
