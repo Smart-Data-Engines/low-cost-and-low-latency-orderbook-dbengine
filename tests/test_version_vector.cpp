@@ -314,3 +314,70 @@ TEST(HeldRanges, ExportTruncatesAndSaysSoRatherThanDroppingSilently) {
     ASSERT_EQ(held.size(), 1u);
     EXPECT_EQ(held[0].ranges.size(), 5u);
 }
+
+// ── #78: a payload larger than the header can describe ────────────────────────
+//
+// `payload_len` is a uint16_t in both the WAL record header and the multi-master frame header,
+// and the writers cast a size_t into it. A version vector of 4096 entries — the documented
+// maximum — is 172 kB, so the cast wrapped and produced a header claiming 40962 bytes for a
+// 172034-byte payload. In the WAL that makes every later record unreadable, because replay takes
+// the header at its word and lands in the middle of this payload. On the wire the peer compares
+// `payload_len` against the frame it received, disagrees, and disconnects — again on every
+// reconnect. Both were reachable with roughly 400 symbols across 4 origins.
+
+TEST(VersionVectorLimits, AVectorTooLargeForAHeaderBecomesTheSendEverythingMarker) {
+    std::vector<ob::SequenceTracker::VectorEntry> entries;
+    for (int i = 0; i < 1600; ++i) {       // 1600 * 42 + 2 = 67202 bytes
+        entries.push_back({"SYM" + std::to_string(i) + ".EX", 1, 100});
+    }
+    ASSERT_GT(ob::VV_HEADER_SIZE + entries.size() * ob::VV_ENTRY_SIZE, ob::WAL_MAX_PAYLOAD_LEN);
+
+    const auto payload = ob::serialize_version_vector(entries, /*truncated=*/false);
+
+    ASSERT_EQ(payload.size(), ob::VV_HEADER_SIZE)
+        << "a payload a header cannot describe must not be produced at all";
+    uint16_t marker = 0;
+    std::memcpy(&marker, payload.data(), sizeof(marker));
+    EXPECT_EQ(marker, ob::VV_TRUNCATED)
+        << "the receiver has to be told to send everything, not handed a short read";
+}
+
+TEST(VersionVectorLimits, AVectorThatStillFitsIsUnaffected) {
+    std::vector<ob::SequenceTracker::VectorEntry> entries;
+    for (int i = 0; i < 1500; ++i) {       // 1500 * 42 + 2 = 63002 bytes
+        entries.push_back({"SYM" + std::to_string(i) + ".EX", 1, 100});
+    }
+    const auto payload = ob::serialize_version_vector(entries, /*truncated=*/false);
+    ASSERT_LE(payload.size(), ob::WAL_MAX_PAYLOAD_LEN);
+    EXPECT_EQ(payload.size(), ob::VV_HEADER_SIZE + entries.size() * ob::VV_ENTRY_SIZE);
+
+    ob::PeerVector pv;
+    ASSERT_TRUE(pv.deserialize(payload.data(), payload.size()));
+    EXPECT_EQ(pv.entry_count(), 1500u);
+    EXPECT_FALSE(pv.truncated());
+}
+
+TEST(VersionVectorLimits, HeldRangesAreTrimmedToFitRatherThanRefused) {
+    // Unlike the vector, a partial held set is sound: every range that survives prevents a
+    // duplicate row, and the ones dropped cost only the duplicates they would have prevented.
+    std::vector<ob::SequenceTracker::HeldRanges> entries;
+    for (int i = 0; i < 2000; ++i) {
+        entries.push_back({"SYM" + std::to_string(i) + ".EX", 1, {{10, 12}, {20, 22}}});
+    }
+    const auto payload = ob::serialize_held_ranges(entries);
+
+    ASSERT_FALSE(payload.empty()) << "trimming, not refusing";
+    ASSERT_LE(payload.size(), ob::WAL_MAX_PAYLOAD_LEN);
+
+    std::vector<ob::SequenceTracker::HeldRanges> parsed;
+    ASSERT_TRUE(ob::deserialize_held_ranges(payload.data(), payload.size(), parsed));
+    EXPECT_GT(parsed.size(), 0u);
+    EXPECT_LT(parsed.size(), entries.size()) << "some entries must have been dropped";
+    // And what survived is intact — a trimmed payload that parses into damaged entries would be
+    // worse than none.
+    for (const auto& e : parsed) {
+        ASSERT_EQ(e.ranges.size(), 2u);
+        EXPECT_EQ(e.ranges[0].first, 10u);
+        EXPECT_EQ(e.ranges[1].second, 22u);
+    }
+}

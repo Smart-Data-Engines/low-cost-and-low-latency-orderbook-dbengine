@@ -16,6 +16,7 @@
 // skips it as an unknown record type instead of disconnecting.
 
 #include "orderbook/sequence_tracker.hpp"
+#include "orderbook/wal.hpp"
 
 #include <cstdint>
 #include <string>

@@ -11,7 +11,22 @@ std::vector<uint8_t> serialize_version_vector(
         const std::vector<SequenceTracker::VectorEntry>& entries, bool truncated) {
     std::vector<uint8_t> out;
 
-    if (truncated || entries.size() >= VV_TRUNCATED) {
+    // The byte bound, not the entry count, is what actually limits this: both the WAL record
+    // header and the multi-master frame header carry the length in a uint16_t, so a payload above
+    // 65535 bytes produces a header that understates it. In the WAL that makes every later record
+    // unreadable; on the wire the peer sees payload_len disagree with the frame and disconnects,
+    // on every reconnect, for ever. 4096 entries is 172 kB, so MM_MAX_VV_ENTRIES alone never
+    // brought this anywhere near safe (#78).
+    const size_t would_be = VV_HEADER_SIZE + entries.size() * VV_ENTRY_SIZE;
+    const bool too_large_for_a_header = would_be > WAL_MAX_PAYLOAD_LEN;
+    if (too_large_for_a_header) {
+        OB_LOG_WARN("version_vector",
+                    "Vector of %zu entries needs %zu bytes, over the %zu a record header can "
+                    "describe — sending the \"send everything\" marker instead",
+                    entries.size(), would_be, WAL_MAX_PAYLOAD_LEN);
+    }
+
+    if (truncated || too_large_for_a_header || entries.size() >= VV_TRUNCATED) {
         out.resize(VV_HEADER_SIZE);
         const uint16_t marker = VV_TRUNCATED;
         std::memcpy(out.data(), &marker, sizeof(marker));
@@ -40,17 +55,33 @@ std::vector<uint8_t> serialize_held_ranges(
         const std::vector<SequenceTracker::HeldRanges>& entries) {
     if (entries.empty()) return {};
 
+    // Fit inside what a record header can describe (#78). Unlike the version vector, a partial
+    // held set is sound: every range that survives prevents a duplicate row, and the ones left
+    // out cost only the duplicates they would have prevented. So this drops whole entries from
+    // the tail rather than refusing the payload.
     size_t total = HS_HEADER_SIZE;
+    size_t fitting = 0;
     for (const auto& e : entries) {
-        total += HS_ENTRY_HEADER_SIZE + e.ranges.size() * HS_RANGE_SIZE;
+        const size_t entry_bytes = HS_ENTRY_HEADER_SIZE + e.ranges.size() * HS_RANGE_SIZE;
+        if (total + entry_bytes > WAL_MAX_PAYLOAD_LEN) break;
+        total += entry_bytes;
+        ++fitting;
     }
+    if (fitting < entries.size()) {
+        OB_LOG_WARN("version_vector",
+                    "Held ranges do not fit a record header: keeping %zu of %zu entries "
+                    "(%zu bytes, limit %zu)",
+                    fitting, entries.size(), total, WAL_MAX_PAYLOAD_LEN);
+    }
+    if (fitting == 0) return {};
 
     std::vector<uint8_t> out(total, 0);
-    const uint16_t count = static_cast<uint16_t>(entries.size());
+    const uint16_t count = static_cast<uint16_t>(fitting);
     std::memcpy(out.data(), &count, sizeof(count));
 
     size_t off = HS_HEADER_SIZE;
-    for (const auto& e : entries) {
+    for (size_t idx = 0; idx < fitting; ++idx) {
+        const auto& e = entries[idx];
         std::memcpy(out.data() + off, e.key.data(), std::min<size_t>(e.key.size(), 31));
         off += 32;
         std::memcpy(out.data() + off, &e.origin, sizeof(e.origin));
