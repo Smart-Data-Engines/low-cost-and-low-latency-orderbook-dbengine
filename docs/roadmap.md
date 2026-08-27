@@ -1529,9 +1529,13 @@ around each multiple of eight and a sampled test misses all of them — at every
 on buffers up to 1 MB, and across uneven splits of the running form. It also pins three published
 CRC32C check values, because two implementations agreeing proves consistency, not correctness.
 
-Knock-on: #79's stall shrinks by the same factor — 16-18 ms for 2.37 MB becomes a few milliseconds,
-and the extrapolated seven seconds per gigabyte becomes well under one. Whether that closes #79 or
-merely defers it is a question for a measurement on a real store, not an assumption here.
+Knock-on, and it is **smaller than it looks** — which is why it was measured rather than asserted.
+Snapshot creation went from 16.0-18.0 ms to **8.3-10.3 ms** for the same 2.37 MB across 184 files:
+1.9×, not 20×. So the checksum was about half of that path and the other half is elsewhere. At
+287 MB/s for 184 files that is roughly 45 µs per file, which is what an `fs::file_size`, an
+`ifstream` open, a `std::vector` sized to the whole file, and a read cost when repeated per file.
+**#79 stays open, and what it should fix has changed**: the dominant cost is now per-file syscalls
+and allocation, not arithmetic.
 
 - Effort: S | Impact: +17.6% ingestion throughput measured; every WAL record, every replication frame
   and every snapshot file checksummed 15-25× faster
@@ -1549,16 +1553,29 @@ Measured in a Release build on the development machine (i3-7100U), 100 000 rows 
 | Rows | Symbols | Files | Bytes | Time | Rate |
 |------|---------|-------|-------|------|------|
 | 100 000 | 20 | 184 | 2.37 MB | 16.0–18.0 ms | 132–148 MB/s |
+| the same, after #81 | 20 | 184 | 2.37 MB | **8.3–10.3 ms** | 230–287 MB/s |
 
-Three rounds, 16.0 / 16.1 / 18.0 ms. The rate is the CRC pass; the flush is a small constant next to
-it. At that rate a 1 GB store stalls the io thread for about **7 seconds** — long enough for peers to
-see the node as unresponsive and for live writes to queue behind it. At the few megabytes a test
-cluster holds it is invisible, which is exactly why it needed measuring rather than assuming.
+Three rounds each. The first assumption was that this path *was* the CRC pass, and #81 tested that by
+making the CRC twenty times faster: the path got **1.9× faster**, not twenty. So the checksum was
+about half of it, and the other half is per-file work — at 287 MB/s across 184 files that is roughly
+45 µs per file, which is what an `fs::file_size`, an `ifstream` open, a `std::vector` sized to the
+whole file and a read cost when repeated once per file.
 
-The fix has a shape already: do the flush-and-checksum on a short-lived worker thread and hand the
-manifest back to the io loop through the `wakeup_fd_` eventfd that `stop()` already uses. It is not
-folded into #76 on purpose — it adds cross-thread state and shutdown ordering to a feature whose
-first version should be reviewable, and the class of bug it invites is the one TSan found in #37.
+That changes what this item should fix, and in a useful direction, because two candidates are now
+independent:
+
+1. **Stop paying per file.** One reused buffer read in fixed-size chunks instead of a vector sized to
+   each file, and `open`/`read`/`close` instead of an `ifstream` per entry. Contained, measurable, and
+   it helps every caller of `create_snapshot()`, including shard migration.
+2. **Get it off the io thread.** The flush-and-checksum on a short-lived worker, handing the manifest
+   back through the `wakeup_fd_` eventfd that `stop()` already uses. This is the one that bounds the
+   worst case rather than shrinking it, and it adds the cross-thread state whose bug class TSan
+   found twice (#37, #80) — so it wants doing carefully, not quickly.
+
+At 8.3 ms for 2.37 MB a 1 GB store still stalls the io thread for about **3.5 seconds**, which is
+long enough for peers to see the node as unresponsive and for live writes to queue behind it. At the
+few megabytes a test cluster holds it stays invisible, which is why it needed measuring rather than
+assuming — twice now.
 
 - Effort: M | Impact: A snapshot of a large store makes the node look dead to its peers for seconds
 
