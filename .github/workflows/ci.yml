@@ -219,6 +219,71 @@ jobs:
           kill $SERVER_PID || true
           exit 1
 
+  # Clang, because the README and CLAUDE.md both claim GCC >= 12 / Clang >= 15 and nothing had ever
+  # checked the second half of that sentence.
+  #
+  # One job rather than a GCC/Clang x Debug/Release matrix: build-and-test already covers GCC Debug
+  # with the full suite and release-build covers GCC Release, so a matrix would spend most of its
+  # time re-running what is already required. The missing combination was Clang, and this covers
+  # both configurations of it.
+  clang-build:
+    name: clang-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config clang \
+            liblz4-dev libcurl4-openssl-dev liburing-dev
+          clang++ --version
+
+      # etcd for the handful of C++ tests that talk to a coordinator.
+      - name: Install etcd
+        env:
+          ETCD_VER: v3.5.17
+        run: |
+          curl -fsSL "https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz" | tar xz
+          sudo install -m755 "etcd-${ETCD_VER}-linux-amd64/etcd" "etcd-${ETCD_VER}-linux-amd64/etcdctl" /usr/local/bin/
+
+      - name: Start etcd
+        run: |
+          etcd --name ci-etcd --data-dir /tmp/ci-etcd \
+            --advertise-client-urls http://127.0.0.1:2379 \
+            --listen-client-urls http://127.0.0.1:2379 \
+            > /tmp/ci-etcd.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:2379/version && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:2379/version
+
+      - name: Configure and build with clang (Debug)
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          cmake -S . -B build-clang -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build-clang -j$(nproc)
+
+      # -j1 for the same reason as everywhere else: the networking tests bind fixed ports.
+      - name: Test (clang, Debug)
+        run: ctest --test-dir build-clang --output-on-failure -j1
+
+      # Release too, because -O2/-O3 turns on diagnostics that -O0 does not reach — the class of
+      # warning that only appears once the optimiser can see through a function.
+      - name: Configure and build with clang (Release)
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          cmake -S . -B build-clang-release -DCMAKE_BUILD_TYPE=Release -DOB_BUILD_TESTS=OFF
+          cmake --build build-clang-release -j$(nproc)
+
   # Sanitizers on the C++ unit suite. Both were clean when introduced, and each found a real defect
   # on the way in: UBSan a misaligned reference binding caused by packing HLCTimestamp (roadmap
   # #37), TSan a shutdown that closed the epoll descriptor while the io thread was still inside

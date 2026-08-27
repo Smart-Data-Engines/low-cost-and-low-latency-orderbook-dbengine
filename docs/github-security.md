@@ -84,8 +84,12 @@ gh api -X PUT repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengi
 JSON
 ```
 
-The list above is **nine** checks as of 27 August 2026, not the four the JSON block shows — see
+The list above is **ten** checks as of 27 August 2026, not the four the JSON block shows — see
 §1.1, which is about how it came to be wrong.
+
+The tenth is `clang-build`, added with roadmap #37. It carries no infrastructure of its own beyond a
+compiler, so it is the cheapest of these to keep green — and it earned its place on the first run by
+finding two variables that are computed and never read, which GCC does not warn about.
 
 The ninth is `integration-tests`, added with roadmap #55: the whole pytest suite against a plain
 build, which is the only check that exercises failover, crash recovery under `SIGKILL` and the
@@ -427,6 +431,8 @@ handles (c), and 2FA with signed commits and tag protection handle (d).
    pytest suite, and the one that caught the lock-order inversion
 ✅ ruleset: integration-tests required — added with #55, the whole suite against a plain build, so
    failover and crash recovery are gated rather than only run locally
+✅ ruleset: clang-build required — added with #37, because the README claimed Clang support that
+   nothing checked
 ✅ .github/rulesets/master.json matches the live ruleset again, see §1.1
 ✅ the 30 vendored CodeQL alerts dismissed with a reason — paths-ignore does not work here, see §1
 ⚙️ triage the two own-code CodeQL alerts recorded in §1; the other thirteen are note-level tidiness
