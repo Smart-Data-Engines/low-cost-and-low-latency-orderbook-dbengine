@@ -86,12 +86,9 @@ std::string execute_command(const Command& cmd,
     case CommandType::INSERT: {
         session.increment_commands();
         if (read_only || engine.node_role() == NodeRole::REPLICA) return format_error("read-only replica");
+        // Covers the multi-master bootstrap too, which used to need its own block here and
+        // answered with a second spelling of the same error.
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
-        // Multi-master bootstrapping check
-        if (engine.is_multi_master() && engine.multi_master_manager() &&
-            engine.multi_master_manager()->is_bootstrapping()) {
-            return "ERR BOOTSTRAPPING\n";
-        }
         // Shard ownership check: reject writes for symbols not owned by this shard
         if (shard_coord) {
             const std::string symbol_key = cmd.insert_args.symbol + "." + cmd.insert_args.exchange;
@@ -151,12 +148,9 @@ std::string execute_command(const Command& cmd,
     case CommandType::MINSERT: {
         session.increment_commands();
         if (read_only || engine.node_role() == NodeRole::REPLICA) return format_error("read-only replica");
+        // Covers the multi-master bootstrap too, which used to need its own block here and
+        // answered with a second spelling of the same error.
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
-        // Multi-master bootstrapping check
-        if (engine.is_multi_master() && engine.multi_master_manager() &&
-            engine.multi_master_manager()->is_bootstrapping()) {
-            return "ERR BOOTSTRAPPING\n";
-        }
         // Shard ownership check: reject writes for symbols not owned by this shard
         if (shard_coord) {
             const std::string symbol_key = cmd.minsert_args.symbol + "." + cmd.minsert_args.exchange;

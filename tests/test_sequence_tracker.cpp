@@ -376,3 +376,50 @@ TEST(SequenceTracker, AVectorOverTheLimitIsRefusedWholeNotInPart) {
         << "a partial vector looks complete to the receiver, so the entries left out would "
            "never be asked for";
 }
+
+// ── reset() ───────────────────────────────────────────────────────────────────
+//
+// The one caller entitled to this is a snapshot install, which replaces the node's contents
+// wholesale. What matters is that nothing survives: a frontier that outlives the contents it
+// described claims records that are no longer on disk.
+
+TEST(SequenceTracker, ResetForgetsFrontiersHeldNumbersAndLocalCounters) {
+    ob::SequenceTracker t;
+    t.observe("A.EX", 1, 1);
+    t.observe("A.EX", 1, 2);
+    t.observe("A.EX", 1, 9);          // held above the frontier
+    t.observe("A.EX", 0, 0);          // mints a local number, moving next_local
+
+    ASSERT_EQ(t.frontier("A.EX", 1), 2u);
+    ASSERT_TRUE(t.has_seen("A.EX", 1, 9));
+    ASSERT_GT(t.peek_next_local("A.EX"), 1u);
+
+    t.reset();
+
+    EXPECT_EQ(t.symbol_count(), 0u);
+    EXPECT_EQ(t.frontier("A.EX", 1), 0u);
+    EXPECT_FALSE(t.has_seen("A.EX", 1, 9));
+    EXPECT_FALSE(t.has_seen("A.EX", 1, 1));
+    EXPECT_EQ(t.peek_next_local("A.EX"), 1u);
+
+    bool truncated = false;
+    EXPECT_TRUE(t.export_vector(4096, truncated).empty());
+    EXPECT_FALSE(truncated);
+}
+
+TEST(SequenceTracker, ImportAfterResetDoesNotResurrectTheOldFrontier) {
+    // The reason reset() exists. import_own_vector() only ever raises, so adopting a snapshot
+    // whose frontier is *lower* than ours would keep ours — and ours describes contents that
+    // load_snapshot() just discarded.
+    ob::SequenceTracker t;
+    for (uint64_t s = 1; s <= 100; ++s) t.observe("A.EX", 1, s);
+    ASSERT_EQ(t.frontier("A.EX", 1), 100u);
+
+    t.reset();
+    t.import_own_vector({{"A.EX", 1, 10}});
+
+    EXPECT_EQ(t.frontier("A.EX", 1), 10u)
+        << "the adopted frontier must replace ours, not lose to it";
+    EXPECT_FALSE(t.has_seen("A.EX", 1, 50))
+        << "50 was in the discarded contents; claiming it is a hole that never gets filled";
+}

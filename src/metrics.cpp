@@ -77,6 +77,25 @@ MetricsRegistry::MetricsRegistry() {
                                  "Of those, the pairs where this node is the one behind"));
     counters_.push_back(make_counter("ob_mm_backpressure_snapshot_total",
                                      "Times a peer fell back to snapshot sync under backpressure"));
+    // Snapshot bootstrap over the multi-master protocol (#76).
+    counters_.push_back(make_counter("ob_mm_snapshot_requested_total",
+                                     "Snapshots this node asked a peer for"));
+    counters_.push_back(make_counter("ob_mm_snapshot_sent_total",
+                                     "Snapshots streamed to a peer in full"));
+    counters_.push_back(make_counter("ob_mm_snapshot_received_total",
+                                     "Snapshots received, verified and installed"));
+    counters_.push_back(make_counter("ob_mm_snapshot_refused_total",
+                                     "Snapshot requests refused because one was already in flight"));
+    counters_.push_back(make_counter("ob_mm_snapshot_failed_total",
+                                     "Snapshot transfers abandoned, in either direction"));
+    counters_.push_back(make_counter("ob_mm_snapshot_bytes_sent_total",
+                                     "Bytes of snapshot chunk payload sent"));
+    counters_.push_back(make_counter("ob_mm_snapshot_bytes_received_total",
+                                     "Bytes of snapshot chunk payload received"));
+    counters_.push_back(make_counter("ob_mm_records_dropped_bootstrapping_total",
+                                     "Remote records dropped, unrecorded, while installing a snapshot"));
+    gauges_.push_back(make_gauge("ob_mm_snapshot_create_ms",
+                                 "Milliseconds the last snapshot creation took"));
     gauges_.push_back(make_gauge("ob_mm_hlc_drift_ns",             "Maximum HLC drift in nanoseconds"));
 
 #ifdef OB_USE_IO_URING

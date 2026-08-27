@@ -15,6 +15,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <filesystem>
@@ -387,4 +388,132 @@ TEST(SequenceNumbers, AGapRecordInTheWalDoesNotDisturbRecovery) {
     EXPECT_EQ(count_type(wal_record_types(tmp.path), ob::WAL_RECORD_GAP), 1)
         << "replay re-reported a gap that was already recorded when it happened, so every "
            "restart would add another GAP record for the same hole";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Snapshot sequence state (#67 / #76)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(SnapshotSequenceState, CapturedVectorNeverClaimsMoreThanTheFilesHold) {
+    // The invariant behind exporting inside the flush's critical section. A frontier the snapshot
+    // files do not cover is a hole the receiver would declare itself past.
+    TempDir tmp("snap_seq_");
+    ob::Engine engine(tmp.path, kNoAutoFlush, ob::FsyncPolicy::EVERY);
+    engine.open();
+
+    ob::Level level{};
+    level.price = 100'000;
+    level.qty   = 5;
+    for (int i = 0; i < 5; ++i) {
+        auto d = make_delta("BTC", "USDT", 1'000 + static_cast<uint64_t>(i));
+        engine.apply_delta(d, &level);
+    }
+
+    const auto snap = engine.create_snapshot_with_sequence_state();
+
+    ASSERT_FALSE(snap.vector.empty())
+        << "a node with rows must be able to state what it holds, or a receiver can declare "
+           "no frontier at all";
+    EXPECT_FALSE(snap.vector_truncated);
+
+    uint64_t declared = 0;
+    for (const auto& e : snap.vector) {
+        if (e.key == "BTC.USDT") declared = e.frontier;
+    }
+    ASSERT_EQ(declared, 5u) << "five local writes were numbered 1..5";
+
+    // And the numbers are actually in the files the manifest lists: the highest sequence number
+    // in the columnar segments must be at least the declared frontier.
+    engine.close();
+    const auto seqs = wal_sequences(tmp.path, "BTC");
+    ASSERT_FALSE(seqs.empty());
+    EXPECT_GE(*std::max_element(seqs.begin(), seqs.end()), declared);
+}
+
+TEST(SnapshotSequenceState, AdoptingReplacesOurStateRatherThanMergingWithIt) {
+    TempDir tmp("snap_adopt_");
+    ob::Engine engine(tmp.path, kNoAutoFlush, ob::FsyncPolicy::EVERY);
+    engine.open();
+
+    ob::Level level{};
+    level.price = 100'000;
+    level.qty   = 5;
+    for (int i = 0; i < 20; ++i) {
+        auto d = make_delta("BTC", "USDT", 2'000 + static_cast<uint64_t>(i));
+        engine.apply_delta(d, &level);
+    }
+    // Read the tracker, not export_version_vector(): that one serves a cache refreshed on flush,
+    // and with the auto-flush interval set to an hour the cache is still empty here.
+    const auto before = engine.create_snapshot_with_sequence_state();
+    ASSERT_EQ(before.vector.size(), 1u);
+    ASSERT_EQ(before.vector[0].frontier, 20u);
+
+    // A sender's state: a *lower* frontier for the symbol we have, and one origin we never saw.
+    std::vector<ob::SequenceTracker::VectorEntry> adopted = {
+        {"BTC.USDT", 0, 4},
+        {"ETH.USDT", 7, 900},
+    };
+    std::vector<ob::SequenceTracker::HeldRanges> held = {
+        {"ETH.USDT", 7, {{905, 907}}},
+    };
+
+    engine.adopt_snapshot_sequence_state(adopted, held);
+
+    bool truncated = false;
+    const auto after = engine.export_version_vector(4096, truncated);
+    ASSERT_FALSE(truncated);
+
+    // Exactly the adopted entries, no more: 20 local writes left a frontier of 20 for BTC, and
+    // keeping it would claim sixteen rows the snapshot never carried.
+    ASSERT_EQ(after.size(), 2u);
+    for (const auto& e : after) {
+        if (e.key == "BTC.USDT") {
+            EXPECT_EQ(e.frontier, 4u);
+        } else if (e.key == "ETH.USDT") {
+            EXPECT_EQ(e.frontier, 900u);
+        } else {
+            ADD_FAILURE() << "unexpected entry after adopting: " << e.key;
+        }
+    }
+
+    engine.close();
+}
+
+TEST(SnapshotSequenceState, AdoptedHeldNumbersSurviveAsSeen) {
+    TempDir tmp("snap_held_");
+    ob::Engine engine(tmp.path, kNoAutoFlush, ob::FsyncPolicy::EVERY);
+    engine.open();
+
+    engine.adopt_snapshot_sequence_state({{"ETH.USDT", 7, 100}},
+                                        {{"ETH.USDT", 7, {{105, 107}}}});
+
+    // The held set is what keeps the boundary exact: the sender holds 105-107 above its frontier
+    // of 100, so a redelivery of 106 must be recognised rather than appended a second time.
+    EXPECT_EQ(engine.above_frontier_size("ETH.USDT", 7), 3u);
+    engine.close();
+}
+
+TEST(SnapshotSequenceState, AdoptedFrontierForOurOwnOriginMovesTheLocalCounter) {
+    // A node whose data directory was wiped keeps its node id. If a peer still holds records this
+    // node minted before the wipe, minting from 1 again hands out numbers the cluster has seen —
+    // and every peer drops the new records as duplicates of rows this node no longer has.
+    TempDir tmp("snap_local_");
+    // No multi-master: a plain engine stamps its own writes with origin 0, which is the origin
+    // the adopted entry below names.
+    ob::Engine engine(tmp.path, kNoAutoFlush, ob::FsyncPolicy::EVERY);
+    engine.open();
+
+    engine.adopt_snapshot_sequence_state({{"BTC.USDT", 0, 5'000}}, {});
+
+    ob::Level level{};
+    level.price = 100'000;
+    level.qty   = 5;
+    auto d = make_delta("BTC", "USDT", 9'000);
+    engine.apply_delta(d, &level);
+    engine.close();
+
+    const auto seqs = wal_sequences(tmp.path, "BTC");
+    ASSERT_FALSE(seqs.empty());
+    EXPECT_GT(seqs.back(), 5'000u)
+        << "the next minted number must clear the adopted frontier, not restart at 1";
 }

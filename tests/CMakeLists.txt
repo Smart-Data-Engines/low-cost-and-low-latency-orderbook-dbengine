@@ -217,6 +217,10 @@ ob_add_engine_test(test_mm_dedup
     test_mm_dedup.cpp
 )
 
+ob_add_engine_test(test_mm_snapshot
+    test_mm_snapshot.cpp
+)
+
 ob_add_engine_test(test_mm_stats
     test_mm_stats.cpp
 )

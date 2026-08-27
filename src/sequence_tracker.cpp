@@ -189,6 +189,12 @@ void SequenceTracker::import_own_vector(const std::vector<VectorEntry>& entries)
                 entries.size(), symbols_.size());
 }
 
+void SequenceTracker::reset() {
+    const std::size_t had = symbols_.size();
+    symbols_.clear();
+    OB_LOG_INFO("sequence", "Reset: dropped state for %zu symbols", had);
+}
+
 uint64_t SequenceTracker::fingerprint() const {
     // Order-independent on purpose: unordered_map iteration order is not stable, and this
     // only has to answer "did anything move".
