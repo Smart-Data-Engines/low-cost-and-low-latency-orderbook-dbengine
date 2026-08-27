@@ -131,10 +131,14 @@ jobs:
           path: build/_deps
           key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
 
-      - name: Build the server
+      # ob_integration_test as well as the server: test_cpp_client.py skips itself when that binary
+      # is absent, and the first run of this job skipped seven tests for exactly that reason while
+      # reporting green on the rest. A test that skips itself because the harness did not build it
+      # is the same failure mode as a check that runs and gates nothing.
+      - name: Build the server and the C++ client harness
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-          cmake --build build -j$(nproc) --target ob_tcp_server
+          cmake --build build -j$(nproc) --target ob_tcp_server ob_integration_test
 
       - name: Install Python package and test extras
         run: |
@@ -147,7 +151,34 @@ jobs:
       - name: Run the integration suite
         env:
           OB_INTEGRATION_TESTS: "1"
-        run: PYTHONPATH=$PWD/python .venv/bin/python -m pytest tests/integration/ -q
+        run: |
+          PYTHONPATH=$PWD/python .venv/bin/python -m pytest tests/integration/ -q \
+            --junitxml=integration-report.xml
+
+      # A skip is a test that did not run, and the only ones this job accepts are the two Binance
+      # tests that need a live feed. Anything else — a binary the build step forgot, a fixture that
+      # gave up, a marker added without thinking — would otherwise pass as green.
+      - name: No test may skip except the two opt-in Binance ones
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          tree = ET.parse("integration-report.xml")
+          skipped = [
+              (case.get("classname", ""), case.get("name", ""),
+               (case.find("skipped").get("message") or "").splitlines()[0][:160])
+              for case in tree.iter("testcase")
+              if case.find("skipped") is not None
+          ]
+          for classname, name, why in skipped:
+              print(f"skipped: {classname}::{name} — {why}")
+          allowed = [s for s in skipped if "binance" in s[0].lower()]
+          if len(skipped) != len(allowed):
+              print(f"\n{len(skipped) - len(allowed)} unexpected skip(s); only the Binance "
+                    f"tests may skip in this job")
+              sys.exit(1)
+          print(f"\n{len(skipped)} skipped, all of them Binance opt-ins")
+          PY
 
   release-build:
     name: release-build
