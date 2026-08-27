@@ -37,6 +37,15 @@ jobs:
           languages: c-cpp
           build-mode: manual
           queries: security-and-quality
+          # Half of the open alerts in this repository were in build/_deps - nlohmann/json's headers,
+          # pulled in by FetchContent and then analysed as though we wrote them. Fifteen findings we
+          # will never act on, sitting in the same list as the ones we should, which is how a real
+          # finding goes unread. Excluded by path rather than dismissed one at a time, because the
+          # next dependency bump would bring them back.
+          config: |
+            paths-ignore:
+              - build/**
+              - tests/**
 
       # Tests are excluded from the scan to keep analysis time down; the point is
       # to analyse shipped code.

@@ -66,6 +66,17 @@ The commits themselves are the source of truth.
   granting yourself a bypass defeats them.
 - `required_status_checks` contexts must have reported to GitHub at least once before they can be
   enforced, so let `ci.yml` run before applying.
+- **A required context is an exact string, and a matrix job is not named what the file calls it.** The
+  job id is `sanitizers`; the contexts are `sanitizers (asan)` and `sanitizers (tsan)`. Requiring
+  `sanitizers` would create a check that never reports — which is not an error but a permanent block,
+  since nothing fails and the pull request simply waits. Read the names off a real run:
+  `gh pr checks <number>`.
+- **This file drifting from the live ruleset is the failure mode to fear**, because `PUT` sends the
+  whole thing: a context missing here is a protection removed there, silently, by a command whose
+  purpose was to add one. It happened - `analyze (c-cpp)` was live and absent from this file for days.
+  `check_contexts.py` now runs in `docs-integrity` and compares this file against the workflows in
+  both directions, so a job nobody requires and a requirement nobody produces both fail the PR that
+  introduced them. It cannot see the live ruleset; after editing, apply and then verify.
 - `required_signatures` is intentionally absent from `master.json`. Add it only after registering an
   SSH or GPG **signing** key on your GitHub account and confirming a commit shows as Verified.
   Enabling it first locks you out of your own branch.
