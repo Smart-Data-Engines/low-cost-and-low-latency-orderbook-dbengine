@@ -284,6 +284,34 @@ Learned the hard way. Check here before debugging.
     said so. Serialisation was already field-by-field at fixed offsets, so the packing bought nothing.
     Keep the CPU layout natural and let the serialiser own the wire layout.
 
+43. **An index into a list means nothing unless both sides order the list the same way.** A snapshot
+    chunk names its file by index into the manifest, and `SnapshotManifest::to_json()` sorts entries
+    by path for deterministic output — so index 0 on the sender was a different file from index 0 on
+    the receiver, and the first chunk was refused for exceeding a size that belonged to another file.
+    Serialisation that normalises order turns an index into a different identifier on the other side.
+    The first end-to-end test caught it on its first run, which is the argument for writing that test
+    before believing the feature.
+44. **A width in a header is a limit on every producer, whether or not they check it.**
+    `payload_len` is a `uint16_t`, and two WAL appenders cast a `size_t` into it. `write_record()`
+    writes the bytes it is handed, so a payload over 65535 produced a record claiming to be shorter
+    than it is — and replay then read the middle of that payload as the next header, making the WAL
+    tail unreadable from there. Same field on the wire, different symptom: the peer compares it with
+    the frame, disagrees, and disconnects for ever. Reachable at 1561 (symbol, origin) pairs (#78).
+45. **A guard duplicated for defence in depth cannot be mutation-tested on its own.** Disabling the
+    `SNAPSHOT_END` completeness check left the test passing, because the install pre-flight caught the
+    same thing. That is not a useless test and not a useless guard — it means the *test* has to assert
+    the invariant, not the branch. It now checks that an incomplete transfer leaves no `.col` file in
+    the data directory at all, and disabling both guards together fails it.
+46. **An in-memory "am I empty" check says nothing about the directory.** `holds_no_data()` reads the
+    sequence tracker and the store index, so a half-installed snapshot — files renamed into place,
+    nothing loaded — reads as "clean". Any assertion about what an aborted operation left behind has
+    to look at the filesystem.
+47. **A blocking socket turns `try_drain_send_buf()` into a deadlock in a single-threaded test.** Real
+    peer sockets are non-blocking, so EAGAIN arms EPOLLOUT and the call returns; a `socketpair()`
+    without `O_NONBLOCK` blocks inside `send()` waiting for a reader that only runs after the call
+    returns. While diagnosing it: `sent == 0` fell through both branches of that loop and spun
+    silently — now treated as "come back later".
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

@@ -746,7 +746,7 @@ name is spelled the way a dashboard expects.
 - Effort: S | Impact: The two counters that describe deduplication report real numbers, and a check in
   CI stops the class from coming back
 
-### 76. Multi-master bootstrap is a stub, and its flag has no way out
+### 76. Multi-master bootstrap is a stub, and its flag has no way out ✅
 
 Found while looking for the snapshot mechanism #67 says to build on. It is not there.
 
@@ -763,10 +763,13 @@ It has **no callers**. `start_bootstrap()` has none either outside `tests/test_m
 `bootstrapping_` is set to `true` in one place and **never set back to false anywhere in the tree**.
 
 So a multi-master node never bootstraps: it starts empty and relies on catch-up from a peer's retained
-WAL. That is survivable and is roughly what #67 describes. The trap is the flag: `INSERT`, `MINSERT`
-and `DELETE` all answer `ERR BOOTSTRAPPING` while `is_bootstrapping()` is true, so **the day someone
+WAL. That is survivable and is roughly what #67 describes. The trap is the flag: `INSERT` and
+`MINSERT` answer `ERR BOOTSTRAPPING` while `is_bootstrapping()` is true, so **the day someone
 wires `start_bootstrap()` into a real path, that node stops accepting writes for the rest of its
 life** — the same shape as #73, waiting in a state machine with an entrance and no exit.
+*(This paragraph named `DELETE` as a third command until #76 was implemented and the guards were
+audited: there is no `DELETE` in the client protocol. The two that exist were the two that mattered,
+and — see below — they were also the only two that checked the multi-master flag at all.)*
 
 Two things to decide, and they are separate: whether to implement snapshot bootstrap (it is what #67
 needs, and what `AntiEntropyManager::trigger_snapshot_repair()` is a stub for), and what to do
@@ -785,19 +788,94 @@ because the obvious shortcut is not available: **`ReplicationManager` is deliber
 multi-master mode** (`src/engine.cpp`: "NOTE: ReplicationManager is NOT created in MM mode"), so an MM
 node serves no `SNAPSHOT_REQUEST` and a joining node has nobody to ask.
 
-Two ways, and they differ in architecture rather than in effort:
+**Closed by extending the multi-master protocol**, and the deciding argument was correctness rather
+than effort. The other option on the table was to run the replication server on MM nodes too and let
+a joiner act as a replica for the length of the bootstrap — far less new code, reusing a tested path.
+It was rejected because an MM node's WAL holds records from several origins, each numbered by the
+origin that minted it, while the primary→replica receive path applies records **without sequence
+dedup and without LWW conflict resolution** — a replica has one source and needs neither. Serving
+that protocol from an MM node puts two protocols with different correctness rules over one WAL,
+where a single misconfiguration duplicates rows. Two listeners on every node was the smaller half of
+the objection.
 
-1. **Extend the multi-master protocol** with snapshot request/file/chunk messages, mirroring what
-   `replication.cpp` already does for primary→replica: sender-side streaming state per peer,
-   receiver-side staging, CRC check and rename-into-place. Self-contained, no new listener, and it
-   duplicates a protocol that already exists once.
-2. **Run the replication server on multi-master nodes too**, and let a joining node act as a replica
-   for the length of the bootstrap before switching to peering. Far less new code, and it reuses a
-   tested path — at the cost of every MM node speaking two protocols on two ports, with overlapping
-   responsibilities.
+The extension turned out cheaper than this entry assumed, because **no new framing was needed**.
+Frames after the handshake are untagged: each carries a `WALRecordV2` header whose `record_type` is
+the only discriminator, `handle_frame()` branches on it, and an unknown value falls through to
+`handle_remote_record()`, which skips it and stays connected. That is the door the version vector
+(type 7) went through, and five snapshot messages went through it too — so a node running the older
+build stays in the mesh. The numbers live in a reserved range from 200 up, documented next to the
+`WAL_RECORD_*` constants, so adding a ninth WAL record type can never collide with a wire message.
 
-Either way the manifest should carry the sender's version vector, so the receiver may legitimately
-declare frontiers from it — which is the remaining half of #67.
+What the transfer does:
+
+- `SNAPSHOT_REQUEST` → the sender creates a snapshot **and captures its version vector and held set
+  in the same critical section as the flush** (`create_snapshot_with_sequence_state()`). That
+  boundary is the whole correctness argument and is one line wide: a vector exported afterwards can
+  claim a number that landed after the flush and is therefore in no snapshot file, so the receiver
+  would declare a frontier over a hole; exported before, it claims less than the files hold, and a
+  redelivery of the difference appends those rows a second time. The held set closes what remains
+  exactly — the numbers above the frontier that the sender does hold are listed, so a redelivery of
+  any of them meets `has_seen()`.
+- `SNAPSHOT_BEGIN` announces the metadata blob; the blob itself (manifest ++ vector ++ held) is
+  streamed through the same chunk mechanism as the files, because a manifest for a few thousand
+  segments passes 64 kB on its own and a frame cannot carry more (#78). Metadata carried in one
+  frame would have imposed a store-size limit on the very case bootstrap exists for.
+- `SNAPSHOT_CHUNK` frames are pushed only while the peer's send buffer is below a low watermark, and
+  resume from the `EPOLLOUT` branch as the socket drains. So live deltas enqueued between chunks go
+  out promptly, and the buffer never reaches the size that drops the peer for not draining (#69).
+- `SNAPSHOT_END` carries nothing. Every byte is already covered by a per-file CRC from the manifest
+  and by the metadata CRC from BEGIN; a third checksum could only fail where one of those already
+  has.
+- `SNAPSHOT_ABORT` carries a bounded, sanitised reason, so a peer cannot make us log an arbitrary
+  amount of text or break a log line.
+
+The receiver stages to a scratch directory, validates **every** path in the manifest before writing
+a byte and refuses the whole snapshot if one is unsafe, checks each file's CRC as it completes, and
+installs only after a pre-flight pass confirms every staged file exists at its manifest size. Then
+`load_snapshot()`, then `adopt_snapshot_sequence_state()` — which **resets** the tracker before
+importing, because `import_own_vector()` only raises, so a frontier from the discarded contents
+would otherwise survive the discard and claim rows that are no longer on disk.
+
+Three things this fixed that were not on the list when it started:
+
+- **The file index meant different things on the two sides.** A chunk names its file by index into
+  the manifest, and `to_json()` sorts entries by path for deterministic output — so index 0 on the
+  sender was a different file from index 0 on the receiver, and the first chunk was rejected for
+  exceeding a size belonging to another file. The sender now adopts the order it is about to
+  transmit. Found by the first end-to-end test, on its first run.
+- **`Engine::is_bootstrapping()` did not know about multi-master.** It consulted `repl_client_`,
+  which does not exist in MM mode, so `SELECT` and `FLUSH` passed straight through an MM bootstrap
+  while `INSERT` and `MINSERT` were stopped by their own duplicated check. `FLUSH` is the one that
+  mattered: it writes segments into the directory an install is about to rename files into. One
+  condition now covers all five commands, and the duplicated blocks — and the second spelling of
+  the same error — are gone.
+- **A record applied during bootstrap is worse than a record dropped.** `load_snapshot()` discards
+  the in-memory buffers, so a delta applied mid-transfer can vanish while its number stays in the
+  tracker: a frontier claiming a row that does not exist, which no later catch-up fills because
+  nobody knows it is missing. Remote deltas are now refused **without being recorded as seen**, so
+  the next vector exchange brings them back.
+
+Triggered from a real path, which is what this entry was really about: after the handshake and the
+peer's vector, a node that **holds nothing at all** asks that peer for a snapshot. Deliberately
+stricter than "we are behind" — installing a snapshot discards local contents, and a node that wipes
+its own rows because a peer looked further ahead is a worse failure than any amount of redundant
+traffic. Repairing a node that *does* hold data stays with #57, where `trigger_snapshot_repair()`
+already waits and where "discard and accept" has an owner.
+
+Verified: 20 unit tests in `tests/test_mm_snapshot.cpp` (codecs, every refusal, a whole transfer
+driven through a socketpair, and who may ask), plus an integration test that adds a fourth node to a
+running three-node mesh — a case the harness could not express before, which is a large part of why
+#67 went untested for so long. Six of the seven fixes were confirmed by disabling them and watching
+the test fail. The seventh is recorded honestly below.
+
+**One guard is redundant by design, and the first attempt to test it was measuring something else.**
+`SNAPSHOT_END` checks that every file arrived, and `install_snapshot_files()` checks the same thing
+again from the staging directory. Disabling only the first left the test passing — install caught it
+— which is pitfall 37 exactly. The test now asserts the invariant rather than the branch: after an
+incomplete transfer, **no `.col` file may appear in the data directory at all**. Disabling both
+guards together fails it. Worth stating plainly: a half-installed snapshot leaves in-memory state
+empty while the directory already holds another node's segments, so `holds_no_data()` — the first
+thing the test asserted — reads "clean" for a directory that is anything but.
 
 - Effort: S (done: the dead end) + L (the transfer) | Impact: The first caller of `start_bootstrap()`
   no longer bricks its node. Adding a node to a running cluster still misses data older than its
@@ -1287,7 +1365,144 @@ can show is that the bound is reachable.
 
 - Spec: `kiro-workspace/specs/mm-send-buffer-cap/`
 
-### 67. A node that joins an origin's stream mid-way never establishes a frontier
+### 80. The integration suite had never been run under a sanitizer, and it reports a deadlock
+
+Found by pointing the existing pytest suite at a TSan build of `ob_tcp_server` — thirteen seconds of
+`test_mm_convergence.py`, nine tests, three nodes. The CI sanitizer job (#37) runs `ctest` only, and
+unit tests never start a server process with real clients, real peers and a signal-driven shutdown.
+So this whole class was outside the reach of a job that exists to find exactly it.
+
+**A lock-order inversion, reported on all three nodes.** TSan names
+`execute_command()` (`tcp_server.cpp:954`) on one side and an internal thread on the other:
+
+```
+Cycle in lock order graph: M0 => M1 => M0
+  Mutex M1 acquired here while holding mutex M0 in main thread:   TcpServer::run()
+  Mutex M0 acquired here while holding mutex M1 in thread T5
+```
+
+The two mutexes are not named in the stacks — the intervening frames are inlined at `-O1` — but the
+two code paths that acquire them in opposite orders are unambiguous:
+
+- **Client write:** `Engine::apply_delta_mm()` takes `Engine::mtx_` and, still holding it, calls
+  `MultiMasterManager::broadcast_local()`, which takes `MM::mtx_`.
+- **Received delta:** `io_loop()` holds `MM::mtx_` across the whole peer-fd branch — including
+  `process_recv_buf() → handle_frame() → handle_remote_record()` — and calls
+  `Engine::apply_remote_delta()`, which takes `Engine::mtx_`.
+
+So `Engine::mtx_ → MM::mtx_` on one thread and `MM::mtx_ → Engine::mtx_` on the other. Both are
+ordinary operations on **every** multi-master node: one accepts a client write while the other
+applies a peer's record. The window is microseconds, which is why the suite has never hung — a
+cluster under sustained bidirectional load is a different matter.
+
+Note what did *not* find it. `reconcile_with_peers()` carries a comment about this exact cycle
+("does not touch the engine mutex while holding MM's — the cycle that deadlocked the flush thread
+once already"), so the hazard was known in one place and not audited elsewhere. Pitfall 20 in
+`CLAUDE.md` describes the same shape from the previous occurrence.
+
+**Seventeen data races, all on the shutdown path.** `TcpServer::shutdown()` runs on the
+signal-handling thread and reads members that `main` and `run()` are still writing:
+`src/tcp_server.cpp:1062` (9 reports), `src/metrics_server.cpp:62` (3), `src/tcp_server.cpp:1009`
+(2), plus three on the `metrics_server_` unique_ptr itself. Lower severity — the process is
+exiting — but a crash while shutting down is a crash, and it makes CI flaky for reasons nobody can
+reproduce locally.
+
+Repeatable now: `OB_SERVER_BINARY` lets the whole suite run against any build.
+
+```bash
+sudo sysctl -w vm.mmap_rnd_bits=28
+cmake --build build-tsan -j$(nproc) --target ob_tcp_server
+PYTHONPATH=$PWD/python OB_INTEGRATION_TESTS=1 \
+  OB_SERVER_BINARY=$PWD/build-tsan/ob_tcp_server \
+  TSAN_OPTIONS="detect_deadlocks=1 second_deadlock_stack=1 halt_on_error=0 log_path=/tmp/tsan" \
+  pytest tests/integration/ -q
+```
+
+Every site matters, not just the one TSan happened to name. On the io-loop side the calls into the
+engine under `MM::mtx_` are `apply_remote_delta()`, `holds_no_data()` and — added by #76 —
+`create_snapshot_with_sequence_state()`, which takes `Engine::flush_mtx_` **before** `Engine::mtx_`
+and so widens the cycle by one mutex. `export_version_vector()` is deliberately not one of them: it
+reads a cache under its own mutex, which is what that comment in `reconcile_with_peers()` is about.
+
+Three pieces of work, in this order: fix the inversion (the write path must not hold `Engine::mtx_`
+across a call into multi-master, or the io loop must not hold `MM::mtx_` across a call into the
+engine — the first is the smaller change and matches what `reconcile_with_peers()` already does);
+fix the shutdown races; then add a CI job that runs the integration suite against a sanitizer build,
+because a finding this size behind a door nobody opened is an argument for opening it every time.
+
+- Effort: M | Impact: A multi-master node under bidirectional load can deadlock, taking client
+  writes and peer replication down together. P0 by consequence, unproven in the wild
+
+### 79. Creating a snapshot blocks the multi-master io thread, and the measurement says how much
+
+Filed because #76 measured its own cost instead of estimating it, and the number does not scale.
+
+`create_snapshot_with_sequence_state()` runs on whichever thread asked for it, and for multi-master
+that is `io_loop()` — the thread that also carries live deltas, catch-up and peer handshakes. The
+work is a flush plus a CRC32C pass over every columnar file, so it grows with the store.
+
+Measured in a Release build on the development machine (i3-7100U), 100 000 rows across 20 symbols:
+
+| Rows | Symbols | Files | Bytes | Time | Rate |
+|------|---------|-------|-------|------|------|
+| 100 000 | 20 | 184 | 2.37 MB | 16.0–18.0 ms | 132–148 MB/s |
+
+Three rounds, 16.0 / 16.1 / 18.0 ms. The rate is the CRC pass; the flush is a small constant next to
+it. At that rate a 1 GB store stalls the io thread for about **7 seconds** — long enough for peers to
+see the node as unresponsive and for live writes to queue behind it. At the few megabytes a test
+cluster holds it is invisible, which is exactly why it needed measuring rather than assuming.
+
+The fix has a shape already: do the flush-and-checksum on a short-lived worker thread and hand the
+manifest back to the io loop through the `wakeup_fd_` eventfd that `stop()` already uses. It is not
+folded into #76 on purpose — it adds cross-thread state and shutdown ordering to a feature whose
+first version should be reviewable, and the class of bug it invites is the one TSan found in #37.
+
+- Effort: M | Impact: A snapshot of a large store makes the node look dead to its peers for seconds
+
+### 78. A payload larger than 65535 bytes produces a record header that understates it ✅
+
+Found while sizing the snapshot chunk for #76, by reading the field the chunk would have to fit in.
+It is not about snapshots at all.
+
+`payload_len` is a `uint16_t` in both `WALRecord` and `WALRecordV2`, and two writers cast a `size_t`
+into it without checking:
+
+```cpp
+hdr.payload_len = static_cast<uint16_t>(payload_len);   // append_version_vector, append_held_sequences
+```
+
+`write_record()` then writes the payload it was handed and the header the caller built. So a payload
+above 65535 bytes produces a record whose header claims to be shorter than it is — and every replay
+after that record reads the middle of this payload as the next header. **The WAL tail becomes
+unreadable from that point**, which for a record written on every flush means crash recovery
+silently stops there.
+
+The same field is checked on the wire, with a different consequence. `handle_frame()` disconnects a
+peer whose `payload_len` disagrees with the frame it arrived in, so an oversized version vector
+drops the connection — on every reconnect, for ever.
+
+Reachable at ordinary scale, not at an extreme: a version vector is `2 + 42n` bytes, so it passes
+65535 at **1561 (symbol, origin) pairs** — 400 symbols across four origins. `MM_MAX_VV_ENTRIES` says
+4096 is fine, and 4096 entries is 172 kB, which wraps to a header claiming 40962.
+
+Fixed at the serialisers, which is the one place both paths share:
+
+- A version vector that would not fit becomes the "send everything" marker instead. Partial is not
+  an option here: the receiver has no way to know entries were left out, so it would never ask for
+  them.
+- Held ranges are trimmed to fit, entry by entry, with a warning naming what was dropped. Partial
+  *is* sound here — every range that survives prevents a duplicate row, and the ones dropped cost
+  only the duplicates they would have prevented, which is the trade #75 already accepts.
+- Both WAL appenders refuse an oversized payload outright as a backstop, at ERROR. Losing a version
+  vector costs duplicates; losing the WAL tail costs rows.
+
+`MAX_LEVELS = 1000` keeps DELTA records well under the limit, so the exposure was exactly the two
+unbounded payloads.
+
+- Effort: S | Impact: A cluster above ~1560 (symbol, origin) pairs could not form, and each node
+  corrupted its own WAL tail on the first flush
+
+### 67. A node that joins an origin's stream mid-way never establishes a frontier ✅
 
 Found while writing #61's dedup tests, and worth its own item because the fix is a different mechanism.
 
@@ -1306,15 +1521,29 @@ Not urgent: every node in a cluster that grew together follows its peers' stream
 the duplicate window is bounded by the 4096-entry held set. It matters when a node is added to a
 running cluster.
 
-**Half of this is closed.** The duplicate-rows-after-a-restart consequence was a separate mechanism —
-the held set simply was not persisted — and is fixed under #75. What remains is the frontier itself: a
-node that joined mid-stream still cannot claim contiguity, so it exports no entry for that origin and
-peers keep sending it records it already has. That still needs a base established by snapshot
-bootstrap, and **#76** records that multi-master bootstrap does not exist yet: `bootstrap_from_peer()`
-is a stub with no callers.
+**Closed in two halves, by two different mechanisms.** The duplicate-rows-after-a-restart
+consequence was never about frontiers at all — the held set simply was not persisted — and went with
+#75. The frontier itself is closed by #76: a snapshot carries the sender's version vector and held
+set, captured in the same critical section as the flush that produced its files, and the receiver
+resets its tracker and adopts them. A node that starts empty now ends up stating exactly what the
+sender stated, which is a claim it is entitled to make because its contents *are* the sender's
+contents.
 
-- Effort: M | Impact: A late-joining node keeps receiving redeliveries. It no longer stores duplicate
-  rows after a restart — that half went with #75
+Two details worth keeping, because both are ways to get this wrong while looking right:
+
+- **A frontier for the node's own origin has to move the local counter with it.** A node whose data
+  directory was wiped keeps its node id, so a peer can still hold records it minted before the wipe.
+  Minting from 1 again hands out numbers the cluster has already seen, and every peer drops the new
+  records as duplicates — of rows this node no longer has. `adopt_snapshot_sequence_state()` raises
+  the counter past any adopted frontier for its own origin.
+- **A sender that cannot state what it holds must refuse to be a bootstrap source.** If the version
+  vector does not fit a frame, the receiver would install the files and then declare no frontier at
+  all — so every peer resends the whole snapshot's worth of records into append-only storage. The
+  sender refuses with a reason rather than sending a "send everything" marker, and the receiver
+  refuses such a marker too, in case an older sender ever produces one.
+
+- Effort: M | Impact: A node added to a running cluster can now prove what it holds, so peers stop
+  resending it records it already has
 
 ### 62. The WAL was written, fsynced, and never read back ✅
 
@@ -1625,9 +1854,18 @@ Things a reviewer will notice, listed here so they do not look like oversights:
 - **Neither suite kills a process except in one module.** Until #62 that was every module, and it hid
   total loss of acknowledged writes on crash. `tests/integration/test_crash_recovery.py` is the only
   place a server is `SIGKILL`ed; fault injection more broadly is still #54.
-- **Anti-entropy is a scheduler with no reconciliation** (#57). The spec task is marked complete and
-  the metrics report runs, but gap detection and repair are placeholders that return "nothing found"
-  and "cannot repair". Reconnect catch-up is the only thing healing divergence today.
+- **Anti-entropy reconciles, but only what a peer still retains** (#57). Gap detection and repair are
+  real; what neither covers is a gap whose records have left every peer's WAL. That needs a snapshot,
+  and `trigger_snapshot_repair()` is still a stub — the transfer it would use now exists (#76), so
+  what remains is the decision to discard a node's contents, which is a decision with an owner.
+  *(This bullet used to say anti-entropy was a scheduler with two placeholders. That was true until
+  #57 closed and stale afterwards.)*
+- **Snapshot bootstrap does not resume, does not compress, and creates the snapshot on the io
+  thread** (#76). An interrupted transfer starts again from zero; columnar files are already
+  compressed, so a second pass would buy little; and the flush-and-checksum happens on the thread
+  that also carries live multi-master traffic. The third is the one with a measured cost — 16-18 ms
+  for a 2.37 MB store, so roughly 7 s for 1 GB — and it has its own item, #79, rather than being a
+  hidden part of #76.
 - **Benchmark baselines were recorded on one developer machine** with no hardware description. The
   table below fixes that going forward. Any published number needs its hardware next to it.
 - **The README advertises streaming subscriptions** that are not verified to exist in the current

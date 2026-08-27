@@ -147,13 +147,82 @@ the same data yields different offsets — the two numbers had no common scale. 
 reporting offset 846 against a local 870 was judged "behind by 24 bytes" and sent one empty checkpoint
 record, while the rows it had missed sat earlier in the log (roadmap #61).
 
-Two limits worth knowing. A node that joined an origin's stream in the middle — it saw sequence 5000
-before it ever saw 1 — keeps a frontier of 0 for that origin, because "everything up to here" cannot
-be claimed without having followed the stream from its start. It therefore keeps receiving
-redeliveries, and after a restart it can re-apply records whose numbers sit above its frontier, since
-only frontiers are persisted. Establishing a base for such a node is what snapshot bootstrap is for,
-and it is roadmap #67. The second limit is size: above 4096 entries the vector is not sent and not
-written down, and the node falls back to asking for everything.
+One limit worth knowing, and it is about size. The vector travels in a record header whose
+`payload_len` is a `uint16_t`, so a vector above 65535 bytes — 1561 entries at 42 bytes each — cannot
+be described by the header that carries it. It is not sent and not written down; the node falls back
+to asking for everything, which costs bandwidth and never costs data.
+
+A node that joined an origin's stream in the middle used to be the other limit: it saw sequence 5000
+before it ever saw 1, so it could not claim "everything up to here" for that origin and kept
+receiving redeliveries for ever. That is what snapshot bootstrap is for, and it now exists — see
+below.
+
+### Snapshot bootstrap: how a node that holds nothing gets a base
+
+A frontier can only leave zero if the node followed an origin's stream from its first record. A node
+added to a running cluster never did, so no amount of catch-up lets it state what it holds. A
+snapshot solves this by carrying the sender's own frontiers alongside its files: the receiver's
+contents *become* the sender's contents, so the sender's claims become claims the receiver is
+entitled to make.
+
+The transfer rides the multi-master frame envelope, tagged by `record_type` in the reserved wire-only
+range from 200 up, the same way the version vector rides `record_type = 7`. A node that does not know
+these types skips them and stays connected.
+
+```
+joiner                                            peer
+  │  handshake + version vector  ───────────────►  │
+  │  ◄──────────────  handshake + version vector   │
+  │                                                │
+  │  SNAPSHOT_REQUEST  ──────────────────────────► │   (only if the joiner holds nothing at all)
+  │  ◄──────────  SNAPSHOT_BEGIN (lengths + CRC)   │   flush + checksum, vector captured with it
+  │  ◄──────────  SNAPSHOT_CHUNK × n  (metadata)   │   manifest ++ version vector ++ held set
+  │  ◄──────────  SNAPSHOT_CHUNK × n  (file data)  │   pushed as the socket drains
+  │  ◄──────────  SNAPSHOT_END                     │
+  │                                                │
+  │  stage → verify → install → adopt frontiers    │
+```
+
+Four properties are worth stating, because each is a way to get this wrong:
+
+**The vector is captured in the same critical section as the flush.** Exported a line later, it could
+claim a number that landed after the flush and is therefore in no snapshot file — and the receiver
+would declare a frontier over a hole. Exported before, it claims less than the files hold, and a
+redelivery of the difference appends those rows a second time into append-only storage. The held set
+closes what remains exactly: the numbers above the frontier that the sender does hold are listed, so
+a redelivery of any of them is recognised.
+
+**The metadata is streamed, not carried in one frame.** A manifest for a few thousand segments passes
+65535 bytes on its own, and so does a version vector of 1561 entries. Metadata in a single frame
+would have put a store-size limit on the one case bootstrap exists for.
+
+**Chunks are pushed only while the peer's send buffer has room**, and resume from the `EPOLLOUT`
+branch of the io loop as the socket drains. So live deltas enqueued between chunks go out promptly,
+and the buffer never reaches the size at which a peer is dropped for not draining.
+
+**Installation is all or nothing.** Files are staged to a scratch directory; every path in the
+manifest is validated before a byte is written and one unsafe path refuses the whole snapshot; each
+file's CRC32C is checked as it completes; and a pre-flight pass confirms every staged file exists at
+its manifest size before the first rename. An abandoned transfer leaves the data directory exactly as
+it was — and leaves the node **usable**, because refusing writes for ever is a worse answer than
+admitting the bootstrap failed.
+
+Two things the joiner must not do while a snapshot is in flight. It must not serve reads or accept
+writes, including `FLUSH`, which would write segments into the directory an install is about to
+rename files into. And it must not *record* the remote deltas that keep arriving: applying one is
+harmless — the install discards it — but remembering its number leaves a frontier claiming a row that
+no longer exists, which no later catch-up will fill because nobody knows it is missing. Such records
+are dropped unmarked, so the next vector exchange brings them back.
+
+The gate on asking is deliberately strict: a node requests a snapshot only when it holds **nothing at
+all**, not merely when it is behind. Installing one discards local contents, and a node that wipes
+its own rows because a peer looked further ahead is a worse failure than any amount of redundant
+traffic. Repairing a node that does hold data is anti-entropy's job.
+
+One cost is known and measured rather than estimated: creating the snapshot — a flush plus a CRC32C
+pass over every columnar file — runs on the io thread. 2.37 MB across 184 files took 16–18 ms in a
+Release build on the development machine, so a gigabyte would stall that thread for roughly seven
+seconds. Roadmap #79 moves it to a worker thread.
 
 ### Anti-entropy: what reconciliation is for, and what it is not
 
