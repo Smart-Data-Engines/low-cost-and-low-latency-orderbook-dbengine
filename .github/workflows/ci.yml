@@ -172,7 +172,9 @@ jobs:
           ]
           for classname, name, why in skipped:
               print(f"skipped: {classname}::{name} — {why}")
-          allowed = [s for s in skipped if "binance" in s[0].lower()]
+          # Matched on classname *and* name: a module skipped at collection time — which is how
+          # the Binance ones skip, on a marker — lands in the report with an empty classname.
+          allowed = [s for s in skipped if "binance" in (s[0] + " " + s[1]).lower()]
           if len(skipped) != len(allowed):
               print(f"\n{len(skipped) - len(allowed)} unexpected skip(s); only the Binance "
                     f"tests may skip in this job")
