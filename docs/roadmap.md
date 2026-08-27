@@ -1540,7 +1540,7 @@ and allocation, not arithmetic.
 - Effort: S | Impact: +17.6% ingestion throughput measured; every WAL record, every replication frame
   and every snapshot file checksummed 15-25× faster
 
-### 79. Creating a snapshot blocks the multi-master io thread, and the measurement says how much
+### 79. Creating a snapshot blocks the multi-master io thread, and the measurement says how much (mostly closed)
 
 Filed because #76 measured its own cost instead of estimating it, and the number does not scale.
 
@@ -1572,12 +1572,61 @@ independent:
    worst case rather than shrinking it, and it adds the cross-thread state whose bug class TSan
    found twice (#37, #80) — so it wants doing carefully, not quickly.
 
-At 8.3 ms for 2.37 MB a 1 GB store still stalls the io thread for about **3.5 seconds**, which is
-long enough for peers to see the node as unresponsive and for live writes to queue behind it. At the
-few megabytes a test cluster holds it stays invisible, which is why it needed measuring rather than
-assuming — twice now.
+**Candidate 1 turned out to be two things, and only one of them was the time.**
 
-- Effort: M | Impact: A snapshot of a large store makes the node look dead to its peers for seconds
+Replacing the per-file `std::vector` and `ifstream` with one reused buffer and `open`/`read`/`close`
+moved the clock **not at all**: 8.2-10.2 ms against 8.3-10.3 ms. That is the third hypothesis about
+this path to be wrong — the first said the checksum (half of it, #81), the second said the
+allocation (none of it). The change stayed anyway, for two reasons that are not speed: a
+hundred-megabyte segment no longer causes a hundred-megabyte transient allocation on the io thread,
+and a failed open or a short read is now an ERROR line instead of a manifest entry silently
+describing a file with `crc32c = 0`.
+
+So the path got profiled properly instead of guessed at again. Each column below is a full
+directory walk **plus** the named operation, three rounds:
+
+| walk | + `file_size()` | + `fs::relative()` | + prefix strip | read + CRC of 2.37 MB |
+|------|-----------------|--------------------|----------------|-----------------------|
+| 1.03 ms | 1.50 ms | **4.85 ms** | 1.01 ms | 3.01 ms |
+| 0.98 ms | 1.78 ms | **7.63 ms** | 1.58 ms | 3.49 ms |
+| 1.06 ms | 1.58 ms | **4.97 ms** | 1.02 ms | 3.00 ms |
+
+`fs::relative()` is **~21 µs per call**, about 3.9 ms across 184 files — roughly half of everything
+the snapshot cost. libstdc++ implements it through `weakly_canonical()`, which resolves every path
+component against the filesystem, for both arguments, on every call. Producing the same string by
+stripping the base-directory prefix measures inside the noise of the bare walk.
+
+It is sound to strip: `path` comes from `recursive_directory_iterator(base_dir_)`, so it always
+begins with `base_dir_`. Checked rather than assumed, with `fs::relative()` as the fallback if it
+ever does not.
+
+**Where this leaves the item.** Snapshot creation on the same store:
+
+| | Time (3 rounds) | Rate |
+|---|---|---|
+| Originally | 16.0 / 16.1 / 18.0 ms | 132-148 MB/s |
+| After #81 (hardware CRC32C) | 8.3 / 8.3 / 10.3 ms | 230-287 MB/s |
+| After the prefix strip | 6.4 / 4.3 / 4.1 ms | 372-577 MB/s |
+
+**~4× on a warm store**, and the first round after writing the store is consistently the slow one
+(6.4-7.1 ms) because the files are not in the page cache yet. What is left is 1 ms of directory walk
+and 3 ms of reading and checksumming 2.37 MB, which is close to the floor for "read every file and
+check it".
+
+That puts a gigabyte at roughly **1.7 seconds** rather than 7, on the io thread. Better, and still
+not nothing — so candidate 2 stays open on its own merits:
+
+- **Get it off the io thread.** The flush-and-checksum on a short-lived worker, handing the manifest
+  back through the `wakeup_fd_` eventfd that `stop()` already uses. This bounds the worst case
+  instead of shrinking it, and it adds the cross-thread state whose bug class ThreadSanitizer has
+  now found twice (#37, #80) — so it wants doing carefully, not quickly.
+
+The repeatable seam is `MMSnapshotMeasurement.DISABLED_SnapshotCreationCost`, which now prints the
+breakdown as well as the total, because three wrong guesses in a row is an argument for keeping the
+instrument rather than the conclusion.
+
+- Effort: S remaining | Impact: A snapshot of a large store no longer stalls the io thread for many
+  seconds; it still stalls it for one or two
 
 ### 78. A payload larger than 65535 bytes produces a record header that understates it ✅
 

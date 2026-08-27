@@ -348,6 +348,14 @@ Learned the hard way. Check here before debugging.
     input per iteration, feed the result forward, and keep an `asm volatile` barrier in the loop. A
     smaller error in the same direction would have looked like a result.
 
+53. **A convenience function in `<filesystem>` can touch the filesystem once per path component.**
+    `fs::relative(path, base)` costs **~21 µs per call** in libstdc++, because it goes through
+    `weakly_canonical()`, which resolves every component of both arguments against the disk. Called
+    once per file while building a snapshot manifest that was about half of the whole operation —
+    3.9 ms of 8.2 ms across 184 files. Stripping the base prefix produces the same string inside the
+    noise of the bare directory walk. Three hypotheses about where that time went were wrong before
+    this one was measured, which is the real lesson: profile the loop, do not reason about it (#79).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
