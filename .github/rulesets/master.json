@@ -2,12 +2,25 @@
   "name": "master",
   "target": "branch",
   "enforcement": "active",
-  "conditions": { "ref_name": { "include": ["refs/heads/master"], "exclude": [] } },
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "refs/heads/master"
+      ],
+      "exclude": []
+    }
+  },
   "bypass_actors": [],
   "rules": [
-    { "type": "deletion" },
-    { "type": "non_fast_forward" },
-    { "type": "required_linear_history" },
+    {
+      "type": "deletion"
+    },
+    {
+      "type": "non_fast_forward"
+    },
+    {
+      "type": "required_linear_history"
+    },
     {
       "type": "pull_request",
       "parameters": {
@@ -16,7 +29,10 @@
         "require_code_owner_review": false,
         "require_last_push_approval": false,
         "required_review_thread_resolution": true,
-        "allowed_merge_methods": ["squash", "rebase"]
+        "allowed_merge_methods": [
+          "squash",
+          "rebase"
+        ]
       }
     },
     {
@@ -24,9 +40,24 @@
       "parameters": {
         "strict_required_status_checks_policy": true,
         "required_status_checks": [
-          { "context": "build-and-test" },
-          { "context": "release-build" },
-          { "context": "docs-integrity" }
+          {
+            "context": "build-and-test"
+          },
+          {
+            "context": "release-build"
+          },
+          {
+            "context": "docs-integrity"
+          },
+          {
+            "context": "analyze (c-cpp)"
+          },
+          {
+            "context": "sanitizers (asan)"
+          },
+          {
+            "context": "sanitizers (tsan)"
+          }
         ]
       }
     }

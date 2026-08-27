@@ -29,6 +29,15 @@ jobs:
       - name: Check every metric written by name is registered
         run: python3 scripts/check_metrics.py
 
+      - name: The ruleset still gates what the workflows produce
+        # A warning in docs/github-security.md until this step, and the warning was already being
+        # ignored: sanitizers (asan) and sanitizers (tsan) ran on every PR and gated nothing, and
+        # .github/rulesets/master.json had lost analyze (c-cpp) relative to the live ruleset. Both
+        # states look like green.
+        run: |
+          python3 -m pip install -q pyyaml
+          python3 .github/rulesets/check_contexts.py
+
   build-and-test:
     name: build-and-test
     runs-on: ubuntu-24.04

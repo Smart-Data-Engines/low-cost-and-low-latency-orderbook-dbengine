@@ -84,11 +84,40 @@ gh api -X PUT repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengi
 JSON
 ```
 
-The list above is the live state: `analyze (c-cpp)` was added to the `master` ruleset on
-23 August 2026, so all four checks are required now. The command under "Verify afterwards" prints
-what is actually enforced, which is the only answer worth trusting.
+The list above is **six** checks as of 27 August 2026, not the four the JSON block shows — see
+§1.1, which is about how it came to be wrong. The command under "Verify afterwards" prints what is
+actually enforced, which is the only answer worth trusting.
 
-### Why `analyze (c-cpp)` is on that list
+### 1.1 Two ways this configuration drifted, and the check that now stops it
+
+Both were found by applying this document's checklist to a second repository. That is the useful part
+of doing it twice: the second application is what tells you whether the first one happened.
+
+**`sanitizers (asan)` and `sanitizers (tsan)` ran on every pull request and gated nothing.** They
+arrived with roadmap item #40 and were never added to the ruleset. For the whole time they existed, a
+PR could go red under AddressSanitizer and merge anyway. This is the more dangerous of the two failure
+modes precisely because the job *runs*: it appears on the PR page, and a reader reasonably assumes a
+visible check is a gate. They are required now.
+
+**`.github/rulesets/master.json` did not match the live ruleset.** `analyze (c-cpp)` was added to the
+live one in August 2026 and never written back into the file. That turned "rulesets as code" into a
+loaded gun rather than documentation: applying the file with `PUT`, exactly as its own README
+instructs, would have silently dropped the CodeQL requirement. The file is now correct and matches.
+
+Neither of these is the sort of thing a person reliably notices, so it is checked mechanically now.
+`.github/rulesets/check_contexts.py` derives the contexts the workflows will actually report — job id
+or `name:`, with matrix values appended the way GitHub appends them — and compares that set against
+`master.json` in **both** directions:
+
+- a context required by the ruleset that no job produces (a permanent block: the PR waits forever)
+- a context produced by a job that the ruleset does not require (the drift above, which looks green)
+
+It runs in the `docs-integrity` job, so it is one of the required checks itself. What it cannot see is
+the **live** ruleset, which needs a token that job does not have and should not; after editing
+`master.json`, re-apply it with the command in `.github/rulesets/README.md` and verify with the `gh api`
+call below.
+
+### 1.2 Why `analyze (c-cpp)` is on that list
 
 It was deliberately left off for a while, for a reason that has since gone away: `parse_cli_args()`
 consumed flag values with `argv[++i]` inside a `for` loop, which CodeQL reports as
@@ -289,7 +318,7 @@ handles (c), and 2FA with signed commits and tag protection handle (d).
 ✅ CODEOWNERS
 ✅ pull_request_template.md
 ✅ branch ruleset on master: PR required, no force push, no deletion, no bypass actors
-✅ ruleset: required_status_checks — build-and-test, release-build, docs-integrity, analyze (c-cpp)
+✅ ruleset: required_status_checks — six contexts, strict
 ✅ ruleset: required_linear_history, review thread resolution
 ✅ tag ruleset on refs/tags/v*
 ✅ secret scanning + push protection
@@ -299,6 +328,9 @@ handles (c), and 2FA with signed commits and tag protection handle (d).
 ✅ Actions: fork PR approval required for all external contributors
 ✅ Actions: SHA pinning required at the repository level
 ✅ CODEOWNERS handle verified against /codeowners/errors — it was wrong, see §5.1
+✅ check_contexts.py in docs-integrity — the ruleset and the workflows cannot drift apart silently
+✅ ruleset: sanitizers (asan) and sanitizers (tsan) required — they ran and gated nothing, see §1.1
+✅ .github/rulesets/master.json matches the live ruleset again, see §1.1
 ✅ all FetchContent dependencies pinned to commit SHAs
 ✅ third-party actions pinned to commit SHAs
 ⚙️ org-wide 2FA on Smart-Data-Engines
