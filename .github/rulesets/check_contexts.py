@@ -44,11 +44,13 @@ RULESET = Path(".github/rulesets/master.json")
 # Contexts required by the ruleset that no workflow in this repository produces, with the reason. Each
 # entry is a deliberate exception and has to stay short: an allowlist that grows is this check being
 # switched off one line at a time.
-NOT_FROM_A_WORKFLOW: dict[str, str] = {
-    # Empty, and that is the correct state today: every context this repository requires is produced
-    # by a job in .github/workflows/. An entry here is a deliberate exception for a check posted by a
-    # GitHub integration rather than by us, and the list has to stay short - an allowlist that grows is
-    # this check being switched off one line at a time.
+NOT_FROM_A_WORKFLOW = {
+    # Posted by GitHub's code scanning integration, not by our `analyze` job. Ours goes green when the
+    # *job* succeeds; this one fails when the pull request **introduces a new alert**. Requiring only
+    # ours would require that the scan ran, not that it found nothing. Pre-existing alerts do not fail
+    # it, which is what makes it adoptable here: it is a ratchet on the count rather than a demand that
+    # the backlog be cleared first.
+    "CodeQL": "posted by the code scanning integration",
 }
 
 _MATRIX_REF = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}")

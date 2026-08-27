@@ -84,8 +84,34 @@ gh api -X PUT repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengi
 JSON
 ```
 
-The list above is **six** checks as of 27 August 2026, not the four the JSON block shows — see
-§1.1, which is about how it came to be wrong. The command under "Verify afterwards" prints what is
+The list above is **seven** checks as of 27 August 2026, not the four the JSON block shows — see
+§1.1, which is about how it came to be wrong. The seventh is `CodeQL`, and it is not a second analysis
+job: `analyze (c-cpp)` is ours and goes green when the *job* succeeds, while `CodeQL` is posted by the
+code scanning integration and fails when a pull request **introduces a new alert**. Pre-existing alerts
+do not fail it, which is what makes it adoptable without clearing the backlog first — it is a ratchet
+on the count rather than a demand.
+
+That backlog is worth naming, because a security document that lists a scanner and not its output is
+half a document. On 27 August 2026 there were **30 open alerts**, and half of them were in
+`build/_deps` — nlohmann/json's headers, pulled in by `FetchContent` and then analysed as though we
+wrote them. Fifteen findings nobody will ever act on, in the same list as the ones we should, which is
+exactly how a real finding goes unread. `codeql.yml` now excludes `build/**` by path rather than
+dismissing them one at a time, since the next dependency bump would bring them back.
+
+Of the fifteen in our own code, thirteen are `note`-level tidiness from the quality suite. The two
+worth a person's attention were both read and are recorded here rather than left in a web UI:
+
+- **`cpp/path-injection`, high, `src/wal.cpp:88`** — `::open()` on a path built from `dir_`, which
+  CodeQL traces back to `argv`. Real dataflow, but the source is the operator: somebody who can set the
+  WAL directory can already write where their own permissions allow. Not reachable from the network and
+  not reachable from a client connection. Triage as such, with the reason recorded on the alert.
+- **`cpp/stack-address-escape`, warning, `src/engine.cpp:1272`** — `set_read_only_flag()` stores a raw
+  `std::atomic<bool>*`. False as stated: both callers pass `&read_only_`, a *member* of `TcpServer` /
+  `IoUringServer`, so no stack address escapes. What it does surface is real and unguarded, though:
+  `Engine` holds a raw pointer into a server object's storage, nothing sets it back to `nullptr` in
+  either destructor, and an `Engine` outliving its server would read freed memory. Today the lifetimes
+  are nested in `main()`, so it is latent rather than live — which is precisely the kind of thing that
+  should be a roadmap item instead of a comment nobody wrote. The command under "Verify afterwards" prints what is
 actually enforced, which is the only answer worth trusting.
 
 ### 1.1 Two ways this configuration drifted, and the check that now stops it
@@ -335,7 +361,7 @@ handles (c), and 2FA with signed commits and tag protection handle (d).
 ✅ CODEOWNERS
 ✅ pull_request_template.md
 ✅ branch ruleset on master: PR required, no force push, no deletion, no bypass actors
-✅ ruleset: required_status_checks — six contexts, strict
+✅ ruleset: required_status_checks — seven contexts, strict (incl. CodeQL, the findings gate)
 ✅ ruleset: required_linear_history, review thread resolution
 ✅ tag ruleset on refs/tags/v*
 ✅ secret scanning + push protection
@@ -348,6 +374,8 @@ handles (c), and 2FA with signed commits and tag protection handle (d).
 ✅ check_contexts.py in docs-integrity — the ruleset and the workflows cannot drift apart silently
 ✅ ruleset: sanitizers (asan) and sanitizers (tsan) required — they ran and gated nothing, see §1.1
 ✅ .github/rulesets/master.json matches the live ruleset again, see §1.1
+✅ codeql.yml excludes build/** — half the open alerts were vendored headers, see §1
+⚙️ triage the two own-code CodeQL alerts recorded in §1; the other thirteen are note-level
 ✅ all FetchContent dependencies pinned to commit SHAs
 ✅ third-party actions pinned to commit SHAs
 ✅ organisation defaults for new repositories: scanning, push protection, Dependabot, dep graph
