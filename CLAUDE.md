@@ -356,6 +356,30 @@ Learned the hard way. Check here before debugging.
     noise of the bare directory walk. Three hypotheses about where that time went were wrong before
     this one was measured, which is the real lesson: profile the loop, do not reason about it (#79).
 
+54. **A test that asserts an ordering between two independent timers asserts a coincidence.**
+    `test_the_survivor_does_not_wait_for_a_dead_nodes_position` required a killed node's position key
+    to be gone *by the time* the survivor was promoted. The leader lease and the position lease share
+    a TTL and have independent refresh phases, so which expires first depends on which was refreshed
+    more recently before the kill. It passed for weeks on one machine and failed at 10.2 s on a
+    slower one, with the mechanism working exactly as designed. Assert the property the mechanism
+    provides — the key *does* disappear within TTL plus a margin — not the race you happened to win.
+55. **A slow runner is a fuzzer for orderings.** Two failover tests failed the first time the suite
+    ran in CI, and only one was the test's fault: the other reproduced a real window in which two
+    nodes both hold the role and both accept writes, because a revoked lease is noticed on the
+    holder's next refresh (`lease_ttl/3`) while a candidate can win the vacated key immediately
+    (#82). It needs the unlucky poll order, which an idle laptop rarely produces. When a test fails
+    only under load, decide which of the two is wrong before touching either.
+56. **`xfail(strict=True)` is wrong for a defect whose reproduction is probabilistic.** The repo's
+    habit is strict markers, and it is a good habit: a strict xfail that starts passing is a signal.
+    But #82's window fails on a loaded runner and passes on an idle one, so strict would turn the
+    idle case into a false failure. Non-strict is the honest statement there — and it is the only
+    place in this suite where it is.
+57. **A test that skips itself because the harness did not build its binary reports green.**
+    `test_cpp_client.py` skips when `ob_integration_test` is absent, and the first version of the
+    integration CI job built only `ob_tcp_server` — seven tests quietly did not run. Same failure
+    mode as a check that runs and gates nothing. The job now fails if anything skips except the two
+    opt-in Binance tests.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
