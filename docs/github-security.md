@@ -92,14 +92,47 @@ do not fail it, which is what makes it adoptable without clearing the backlog fi
 on the count rather than a demand.
 
 That backlog is worth naming, because a security document that lists a scanner and not its output is
-half a document. On 27 August 2026 there were **30 open alerts**, and half of them were in
-`build/_deps` — nlohmann/json's headers, pulled in by `FetchContent` and then analysed as though we
-wrote them. Fifteen findings nobody will ever act on, in the same list as the ones we should, which is
-exactly how a real finding goes unread. `codeql.yml` now excludes `build/**` by path rather than
-dismissing them one at a time, since the next dependency bump would bring them back.
+half a document. On 27 August 2026 there were **45 open alerts**: 30 in `build/_deps` — nlohmann/json's
+headers, pulled in by `FetchContent` and then analysed as though we wrote them — and 15 in `src/`.
+Exactly **one** of the 45 carries a security severity. The other 44 are the quality suite's, and none of
+them had been acted on.
 
-Of the fifteen in our own code, thirteen are `note`-level tidiness from the quality suite. The two
-worth a person's attention were both read and are recorded here rather than left in a web UI:
+An earlier revision of this section said 30 open alerts, half of them vendored. Both numbers were wrong
+and the reason is worth recording, because it is the same shape as the `PATCH`-returns-200 trap in §2:
+**`GET /code-scanning/alerts` paginates at 30 by default.** The query returned exactly 30 rows, which
+looked like a total. Use `per_page=100` and `--paginate`, and be suspicious of any count that equals a
+page size.
+
+The 30 vendored findings are now **dismissed** as `won't fix`, each with the reason on the alert. That
+is the mechanism that works here, and the first attempt was a mechanism that does not: `paths-ignore`
+was added to `codeql.yml` to exclude `build/**` and had **no effect**. It only applies to interpreted
+languages; for a compiled one CodeQL analyses whatever the build compiles, and nlohmann/json is
+header-only, so its headers are extracted through our own translation units. The analysis after that
+change reported the same 45 results, which is how this is known rather than assumed. The config was
+removed rather than left in place — configuration that looks load-bearing and is not is worse than
+none, because the next reader takes it for a filter that works.
+
+Two smaller things learned in the same hour, both about believing a command that says nothing:
+
+- The dismissal comment is capped at **280 characters**. A longer one is rejected with
+  `Invalid request`, and the first bulk run dismissed **0 of 30** while reporting nothing, because the
+  loop had `2>/dev/null` on it. Suppressing stderr on a bulk write is how thirty failures become
+  silence.
+- The engine repository's own count above was quoted in a commit message before it was checked twice.
+  The commit is in the history; the number in this document is the corrected one.
+
+**The query suite is an open question, deliberately not decided here.** Dropping
+`security-and-quality` for the default suite would remove 44 of the 45 alerts in one line and keep the
+only one with a security severity — and this repository has `-Wall -Wextra -Werror`, ASan, UBSan and
+TSan on every push, plus 684 unit and 127 integration tests, so the quality suite's marginal value is
+small. Against that: it is the suite that produced `cpp/stack-address-escape`, which is how the latent
+lifetime coupling below was noticed. Changing it is a tuning decision that deserves its own pull
+request and its own observation window, not a line slipped into a security fix.
+
+Of the 15 in our own code, 13 are `note`-level tidiness from the quality suite — unused locals in
+`client.cpp` and `query_engine.cpp`, two empty `if`s, a long `switch`. They are a chore, not a security
+backlog, and they are named here so that "45 alerts" does not read as 45 problems. The two worth a
+person's attention were both read, and are recorded here rather than left in a web UI:
 
 - **`cpp/path-injection`, high, `src/wal.cpp:88`** — `::open()` on a path built from `dir_`, which
   CodeQL traces back to `argv`. Real dataflow, but the source is the operator: somebody who can set the
@@ -374,8 +407,9 @@ handles (c), and 2FA with signed commits and tag protection handle (d).
 ✅ check_contexts.py in docs-integrity — the ruleset and the workflows cannot drift apart silently
 ✅ ruleset: sanitizers (asan) and sanitizers (tsan) required — they ran and gated nothing, see §1.1
 ✅ .github/rulesets/master.json matches the live ruleset again, see §1.1
-✅ codeql.yml excludes build/** — half the open alerts were vendored headers, see §1
-⚙️ triage the two own-code CodeQL alerts recorded in §1; the other thirteen are note-level
+✅ the 30 vendored CodeQL alerts dismissed with a reason — paths-ignore does not work here, see §1
+⚙️ triage the two own-code CodeQL alerts recorded in §1; the other thirteen are note-level tidiness
+⚙️ decide the query suite: security-and-quality keeps 44 unactioned alerts, see §1
 ✅ all FetchContent dependencies pinned to commit SHAs
 ✅ third-party actions pinned to commit SHAs
 ✅ organisation defaults for new repositories: scanning, push protection, Dependabot, dep graph

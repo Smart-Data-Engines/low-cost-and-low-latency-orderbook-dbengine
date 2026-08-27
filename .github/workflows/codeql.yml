@@ -37,15 +37,18 @@ jobs:
           languages: c-cpp
           build-mode: manual
           queries: security-and-quality
-          # Half of the open alerts in this repository were in build/_deps - nlohmann/json's headers,
-          # pulled in by FetchContent and then analysed as though we wrote them. Fifteen findings we
-          # will never act on, sitting in the same list as the ones we should, which is how a real
-          # finding goes unread. Excluded by path rather than dismissed one at a time, because the
-          # next dependency bump would bring them back.
-          config: |
-            paths-ignore:
-              - build/**
-              - tests/**
+          # No `paths-ignore` here, and its absence is deliberate rather than an omission: it was
+          # added in the previous commit to exclude build/_deps and it did not work. `paths` and
+          # `paths-ignore` only apply to interpreted languages; for a compiled one CodeQL analyses
+          # what the build compiles, and nlohmann/json is header-only, so its headers are extracted
+          # through our own translation units. The analysis after that change still reported 45
+          # results - the same 45 - which is how this is known rather than assumed. The config was
+          # removed instead of left in place, because configuration that looks load-bearing and is
+          # not is worse than none: the next person reads it as a filter that works.
+          #
+          # The 30 vendored findings are dismissed as `won't fix` with a reason on each alert, which
+          # is the mechanism that does work here. See docs/github-security.md for the count and the
+          # open question about the query suite.
 
       # Tests are excluded from the scan to keep analysis time down; the point is
       # to analyse shipped code.
