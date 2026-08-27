@@ -84,9 +84,18 @@ gh api -X PUT repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengi
 JSON
 ```
 
-The list above is **seven** checks as of 27 August 2026, not the four the JSON block shows — see
-§1.1, which is about how it came to be wrong. The seventh is `CodeQL`, and it is not a second analysis
-job: `analyze (c-cpp)` is ours and goes green when the *job* succeeds, while `CodeQL` is posted by the
+The list above is **eight** checks as of 27 August 2026, not the four the JSON block shows — see
+§1.1, which is about how it came to be wrong. The eighth is `sanitizers-integration (tsan)`, added
+with roadmap #80 and required for the same reason the other two sanitizer contexts are: it found a
+lock-order inversion on its first run, and a check that finds that class and gates nothing is the
+more dangerous kind of green. Its known cost is the same as CodeQL's — **an infrastructure failure
+blocks merges exactly as effectively as a real finding**, and here the infrastructure is etcd, a
+three-node cluster and a TSan build. The escape hatch is the documented one:
+`gh pr merge --admin` with a note on the pull request saying why. The modules that kill nodes are
+deliberately outside that job, because their fixtures wait on timeouts that instrumentation makes
+unreliable and a flaky required check teaches people to ignore checks.
+
+The seventh is `CodeQL`, and it is not a second analysis job: `analyze (c-cpp)` is ours and goes green when the *job* succeeds, while `CodeQL` is posted by the
 code scanning integration and fails when a pull request **introduces a new alert**. Pre-existing alerts
 do not fail it, which is what makes it adoptable without clearing the backlog first — it is a ratchet
 on the count rather than a demand.
@@ -406,6 +415,8 @@ handles (c), and 2FA with signed commits and tag protection handle (d).
 ✅ CODEOWNERS handle verified against /codeowners/errors — it was wrong, see §5.1
 ✅ check_contexts.py in docs-integrity — the ruleset and the workflows cannot drift apart silently
 ✅ ruleset: sanitizers (asan) and sanitizers (tsan) required — they ran and gated nothing, see §1.1
+✅ ruleset: sanitizers-integration (tsan) required — added with #80, the first CI job to run the
+   pytest suite, and the one that caught the lock-order inversion
 ✅ .github/rulesets/master.json matches the live ruleset again, see §1.1
 ✅ the 30 vendored CodeQL alerts dismissed with a reason — paths-ignore does not work here, see §1
 ⚙️ triage the two own-code CodeQL alerts recorded in §1; the other thirteen are note-level tidiness
