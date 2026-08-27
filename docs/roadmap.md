@@ -415,7 +415,7 @@ test binary down.
 
 - Spec: none; the roadmap entry was the spec
 
-### 37. CI hardening — sanitizers ✅ (coverage and the compiler matrix are still open)
+### 37. CI hardening — sanitizers and the compiler matrix ✅ (coverage is still open)
 
 **Sanitizers are in CI and both are clean**, and each found a real defect on the way in — which is the
 whole argument for the job, so it is worth recording what they were.
@@ -461,8 +461,37 @@ ThreadSanitizer needs `vm.mmap_rnd_bits=28` on Ubuntu 24.04 or it refuses to sta
 documented in the workflow next to the sysctl, since the failure mode ("unexpected memory mapping")
 does not name its cause.
 
-Still open under this item: the coverage report with a badge (`OB_ENABLE_COVERAGE` already exists),
-and the GCC/Clang × Debug/Release matrix.
+**The compiler half is closed, and it found two things.** `README.md` and `CLAUDE.md` both claim
+GCC ≥ 12 / Clang ≥ 15, and nothing had ever checked the second half of that sentence. It was nearly
+true: the whole tree built with Clang 18 after two fixes, and all 735 tests passed.
+
+What Clang caught that GCC does not, both `-Wunused-but-set-variable` and both the same shape — a
+value computed and never read:
+
+- `base64_decode()` counted trailing `=` characters into a `padding` variable that nothing used,
+  under a comment saying the padding was stripped. It was not; the loop checks those two characters
+  as it reads them, which is correct, so the variable and the comment were both fiction.
+- `handle_catchup_request()` kept a `file_offset` counter, advanced by every record streamed and read
+  by nothing. The primary does not need one — it streams sequentially, and where the replica has got
+  to comes back in the replica's ACKs, which is the only account of it worth trusting. A counter
+  nobody reads is the mirror image of pitfall 15, where a field nobody wrote disabled the mechanism
+  that read it.
+
+One job rather than a GCC/Clang × Debug/Release matrix: `build-and-test` already covers GCC Debug
+with the full suite and `release-build` covers GCC Release, so a matrix would spend most of its time
+re-running what is already required. The missing combination was Clang, and `clang-build` covers both
+its configurations — Debug with the full `ctest`, and Release, because `-O2` turns on diagnostics that
+`-O0` never reaches.
+
+Also fixed on the way in, before it could bite: `-Wno-maybe-uninitialized` was added unconditionally
+to sanitizer trees. That flag does not exist in Clang, where an unknown `-Wno-*` is itself a
+diagnostic — which `-Werror` would turn into the build failure the line exists to prevent. It is
+guarded on `CMAKE_CXX_COMPILER_ID STREQUAL "GNU"` now.
+
+**Still open under this item:** the coverage report (`OB_ENABLE_COVERAGE` already exists). The
+*badge* is a separate question and not a technical one — every option means sending coverage data
+from a public repository to a third-party service and holding an account there, which is a decision
+with an owner.
 
 - Effort: S | Impact: 697 tests clean under ASan+UBSan and under TSan, checked on every push. Two
   defects found by turning them on, one of them undefined behaviour on the hot path's data type

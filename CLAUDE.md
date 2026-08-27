@@ -380,6 +380,15 @@ Learned the hard way. Check here before debugging.
     mode as a check that runs and gates nothing. The job now fails if anything skips except the two
     opt-in Binance tests.
 
+58. **A value computed and never read is the mirror image of a field nobody writes, and one
+    compiler sees it while the other does not.** Clang's `-Wunused-but-set-variable` found two on its
+    first build of this tree, neither of which GCC reports: `base64_decode()` counted padding
+    characters into a variable nothing used, under a comment claiming the padding was stripped; and
+    `handle_catchup_request()` advanced a `file_offset` counter that nothing read. Both were harmless,
+    and both were a mechanism that looks present and is not — which is pitfall 15 from the other
+    side. Build with the other compiler occasionally; the README promised Clang support for months
+    before anything checked it (#37).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

@@ -872,7 +872,11 @@ void ReplicationManager::handle_catchup(ReplicaInfo& replica, uint32_t from_file
         }
 
         // Read records and stream them.
-        size_t file_offset = (fi == from_file) ? from_offset : 0;
+        //
+        // There used to be a `file_offset` counter here, advanced by every record and read by
+        // nothing. The primary does not need one: it streams sequentially, and where the replica
+        // has got to comes back in the replica's ACKs, which is the only account of it that can be
+        // trusted anyway. Clang reports it (-Wunused-but-set-variable); GCC does not.
         while (true) {
             WALRecord hdr{};
             ssize_t n = ::read(fd, &hdr, sizeof(WALRecord));
@@ -905,7 +909,6 @@ void ReplicationManager::handle_catchup(ReplicaInfo& replica, uint32_t from_file
                 return;
             }
 
-            file_offset += sizeof(WALRecord) + hdr.payload_len;
         }
 
         done_file:

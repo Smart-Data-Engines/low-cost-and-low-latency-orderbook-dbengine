@@ -71,12 +71,12 @@ std::string base64_decode(const std::string& input) {
     std::string out;
     if (input.empty()) return out;
 
-    // Strip trailing '=' for length calculation.
-    size_t len = input.size();
-    size_t padding = 0;
-    if (len >= 1 && input[len - 1] == '=') ++padding;
-    if (len >= 2 && input[len - 2] == '=') ++padding;
-
+    // Padding is handled inside the loop, by checking the two characters that can be '=' as they
+    // are read. This used to count them up front into a `padding` variable that nothing then used,
+    // under a comment claiming the padding was stripped — it was not. Clang says so
+    // (-Wunused-but-set-variable); GCC does not, which is why it survived until the compiler
+    // matrix went in.
+    const size_t len = input.size();
     out.reserve((len / 4) * 3);
 
     for (size_t i = 0; i + 3 < len; i += 4) {

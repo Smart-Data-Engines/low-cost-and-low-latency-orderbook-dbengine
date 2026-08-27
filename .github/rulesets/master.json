@@ -50,6 +50,9 @@
             "context": "release-build"
           },
           {
+            "context": "clang-build"
+          },
+          {
             "context": "docs-integrity"
           },
           {

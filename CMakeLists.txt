@@ -229,11 +229,14 @@ if(OB_ENABLE_ASAN AND OB_ENABLE_TSAN)
                         "runtimes cannot coexist in one binary. Build them as separate trees.")
 endif()
 
-if(OB_ENABLE_ASAN OR OB_ENABLE_TSAN)
+if((OB_ENABLE_ASAN OR OB_ENABLE_TSAN) AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     # GCC 13 reports -Wmaybe-uninitialized inside <bits/std_function.h> when instrumentation
     # changes what it can see through std::function, on code that is fine — a diagnostic about a
     # system header, not about ours. -Werror turns it into a build failure, so it is disabled for
     # sanitizer trees only. The ordinary build keeps every warning fatal.
+    #
+    # GCC only: clang has no -Wmaybe-uninitialized, and an unknown -Wno-* is itself a diagnostic
+    # there, which -Werror turns into the failure this line exists to prevent.
     add_compile_options(-Wno-maybe-uninitialized)
 endif()
 
