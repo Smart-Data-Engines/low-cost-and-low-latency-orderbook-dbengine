@@ -1,13 +1,20 @@
 # Every change needs the maintainer's review.
-# NOTE: verify this GitHub handle matches your account before relying on it —
-# an unknown handle in CODEOWNERS is silently ignored by GitHub.
-* @kmacewicz
+#
+# The handle below is verified rather than assumed. GitHub *silently ignores* an owner who does not
+# exist or lacks write access: the file keeps looking like protection and provides none. This file
+# named @kmacewicz for months - a real GitHub user, but not a collaborator here and not a member of
+# the organisation - and every one of its lines was inert. Check with:
+#
+#   gh api repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/codeowners/errors
+#
+# An empty `errors` array is the only acceptable answer. Re-run it after adding or removing anyone.
+* @krzysztof-smartdataengines
 
 # Paths where a mistake is expensive: build, CI, security, wire protocol.
-/CMakeLists.txt        @kmacewicz
-/.github/              @kmacewicz
-/SECURITY.md           @kmacewicz
-/docs/github-security.md @kmacewicz
-/src/multi_master.cpp  @kmacewicz
-/src/wal.cpp           @kmacewicz
-/src/replication.cpp   @kmacewicz
+/CMakeLists.txt        @krzysztof-smartdataengines
+/.github/              @krzysztof-smartdataengines
+/SECURITY.md           @krzysztof-smartdataengines
+/docs/github-security.md @krzysztof-smartdataengines
+/src/multi_master.cpp  @krzysztof-smartdataengines
+/src/wal.cpp           @krzysztof-smartdataengines
+/src/replication.cpp   @krzysztof-smartdataengines

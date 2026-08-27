@@ -19,12 +19,12 @@ A ruleset named `master` is active on `refs/heads/master` with no bypass actors,
 
 That covers accidental history destruction. The important gap is below.
 
-### What is missing ⚙️
+### The rule that was missing, and now is not ✅
 
-**A required status check.** Today a PR can be merged while CI is failing, or before CI has even
-run. This is the single most valuable rule in the whole document: it is what makes "the tests pass on
-master" a fact rather than a habit. Add `required_status_checks` with the `build-and-test` context
-from `ci.yml`, and `strict: true` so a stale branch has to be updated before merging.
+**A required status check.** Before 23 August 2026 a PR could be merged while CI was failing, or
+before CI had even run. This is the single most valuable rule in the whole document: it is what makes
+"the tests pass on master" a fact rather than a habit. It is now `required_status_checks` with four
+contexts and `strict: true`, so a stale branch has to be updated before merging.
 
 The check context only becomes selectable after `ci.yml` has run at least once, so push the workflow
 first, then add the rule.
@@ -127,17 +127,29 @@ A second ruleset named `release tags` targets `refs/tags/v*` and enforces `delet
 `non_fast_forward`. Releases are what people download; a silently rewritten tag is a supply-chain
 problem.
 
-## 2. Turn on GitHub's scanning ⚙️
+## 2. GitHub's scanning
 
-Settings → Code security and analysis:
+| Feature | State | Why |
+|---------|-------|-----|
+| **Secret scanning** | ✅ enabled | Catches a leaked key the moment it is pushed. Free for public repos. |
+| **Push protection** | ✅ enabled | Blocks the push instead of reporting it afterwards. |
+| **Dependabot alerts** | ✅ enabled | Vulnerability alerts for dependencies. |
+| **Dependabot security updates** | ✅ enabled | Opens the bump PR, rather than only saying one is needed. |
+| **Private vulnerability reporting** | ✅ enabled | Lets researchers report privately instead of opening a public issue — which `SECURITY.md` invites, so until now that invitation had nowhere to land. |
+| **Code scanning (CodeQL)** | ✅ `codeql.yml` | Static analysis, required on `master` since 23 August 2026. |
+| **Non-provider secret patterns** | ⚙️ organisation | See below. |
+| **Secret scanning validity checks** | ⚙️ organisation | See below. |
 
-| Feature | Why |
-|---------|-----|
-| **Secret scanning** | Catches a leaked key the moment it is pushed. Free for public repos. |
-| **Push protection** | Blocks the push instead of reporting it afterwards. Turn this on. |
-| **Dependabot alerts** + **security updates** | Vulnerability alerts for dependencies. |
-| **Private vulnerability reporting** | Lets researchers report privately instead of opening a public issue. |
-| **Code scanning (CodeQL)** | Static analysis. Configured in `codeql.yml` ✅ |
+The first five sat in this document as ⚙️ for weeks and were **enabled on 27 August 2026**. Worth
+recording plainly rather than quietly ticking: a checklist item marked "to do" in a security document
+is indistinguishable from one that is done, once enough time passes that nobody re-reads the marker.
+The state above was read back from the API, not assumed from a successful call.
+
+The last two are worth a paragraph because of *how* they fail. `PATCH /repos/{owner}/{repo}` accepts
+`secret_scanning_non_provider_patterns` and `secret_scanning_validity_checks` with HTTP 200 and leaves
+both `disabled`; the response body reports the old value. They are organisation-level Secret Protection
+features rather than repository ones. The lesson generalises past these two settings: **a 200 from that
+endpoint is not evidence that a setting changed.** Read the value back.
 
 A leaked secret must be **rotated, not deleted**. Removing a commit does not un-leak it: GitHub keeps
 unreachable objects reachable via the API for a while, and forks keep copies indefinitely.
@@ -160,8 +172,14 @@ Rules that matter for workflow security:
   code your write token. `pull_request` is the safe trigger.
 - **Do not interpolate untrusted input into `run:`** — a PR title or branch name containing `$(...)`
   becomes shell injection. Pass values through `env:` instead.
-- ⚙️ Settings → Actions → General: default workflow permissions **read-only**, and **require approval
-  for all outside collaborators** before workflows run on their PRs.
+- **The repository now requires SHA pinning** ✅ (`sha_pinning_required: true` on
+  `/actions/permissions`), so an unpinned action is refused rather than merely discouraged. The cost is
+  worth stating: a workflow that unpins one does not fail a test, it fails to start — which reads as
+  infrastructure trouble rather than as policy.
+- **Default workflow permissions are read-only** ✅ and workflows cannot approve pull requests ✅.
+- **Fork pull requests need approval before workflows run** ✅ — set to `all_external_contributors`,
+  not GitHub's default of first-time contributors only. A second PR from the same account should not
+  be exempt from review because the first one was benign.
 
 ## 4. Secrets ⚙️
 
@@ -179,8 +197,33 @@ Rules that matter for workflow security:
 - Grant the minimum role: `write` for contributors, `admin` only where genuinely needed.
 - Review third-party OAuth apps and installed GitHub Apps periodically. Every app with write access
   is another path into the repo.
-- `.github/CODEOWNERS` ✅ makes changes to sensitive paths require the maintainer's review. Note that
-  an unknown handle in CODEOWNERS is silently ignored by GitHub, so verify it resolves.
+- `.github/CODEOWNERS` ✅ makes changes to sensitive paths require the maintainer's review.
+
+### 5.1 Verify the CODEOWNERS handle, because a wrong one is invisible
+
+This is not a hypothetical, it is what this repository shipped. `CODEOWNERS` named `@kmacewicz` — a
+real GitHub user, but not a collaborator here and not a member of the organisation — and GitHub
+**silently ignores** an owner without write access. All eight lines were inert for months while the
+file, and the checklist at the end of this document, both read as though the paths were covered. The
+correct handle is `@krzysztof-smartdataengines`, and it was fixed on 27 August 2026.
+
+The check takes one call, and the fully-qualified ref matters: the bare endpoint and `?ref=master`
+both answer 404 on some repositories, which reads as "broken" rather than "no data".
+
+```bash
+gh api repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/codeowners/errors \
+  --jq '.errors | length'
+# or, if that 404s:
+gh api 'repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/codeowners/errors?ref=refs/heads/master' \
+  --jq '.errors'
+```
+
+An empty `errors` array is the only acceptable answer. Re-run it after adding or removing anyone.
+
+Note that `require_code_owner_review` is `false` and `required_approving_review_count` is `0` while
+there is one maintainer — a review you grant yourself is theatre. `CODEOWNERS` is therefore
+documentation of what is load-bearing today, and becomes enforcement the day a second person has write
+access; turn both on together at that point.
 
 ## 6. Signed commits ✅ / ⚙️
 
@@ -246,16 +289,19 @@ handles (c), and 2FA with signed commits and tag protection handle (d).
 ✅ CODEOWNERS
 ✅ pull_request_template.md
 ✅ branch ruleset on master: PR required, no force push, no deletion, no bypass actors
-⚙️ ruleset: add required_status_checks (build-and-test) — the important gap
-⚙️ ruleset: add required_signatures, required_linear_history, review thread resolution
-⚙️ tag ruleset on v*
-⚙️ secret scanning + push protection
-⚙️ Dependabot alerts + security updates
-⚙️ private vulnerability reporting
-⚙️ Actions: read-only default token, approval required for outside collaborators
-⚙️ org-wide 2FA
-⚙️ SSH/GPG signing key registered as a signing key (before requiring signatures)
-⚙️ verify the CODEOWNERS handle resolves
+✅ ruleset: required_status_checks — build-and-test, release-build, docs-integrity, analyze (c-cpp)
+✅ ruleset: required_linear_history, review thread resolution
+✅ tag ruleset on refs/tags/v*
+✅ secret scanning + push protection
+✅ Dependabot alerts + security updates
+✅ private vulnerability reporting
+✅ Actions: read-only default token, cannot approve PRs
+✅ Actions: fork PR approval required for all external contributors
+✅ Actions: SHA pinning required at the repository level
+✅ CODEOWNERS handle verified against /codeowners/errors — it was wrong, see §5.1
 ✅ all FetchContent dependencies pinned to commit SHAs
 ✅ third-party actions pinned to commit SHAs
+⚙️ org-wide 2FA on Smart-Data-Engines
+⚙️ SSH/GPG signing key registered as a *signing* key, then required_signatures in the ruleset
+⚙️ non-provider secret patterns + validity checks (organisation-level Secret Protection)
 ```
