@@ -572,6 +572,12 @@ codebase. Each item is also a story we can sell as bespoke work.
 ### 55. Multi-node cluster tests in CI
 - Three native nodes plus etcd started by a script, multi-master convergence and failover verified
   on every PR
+- **Partly there, as a side effect of #80.** The `sanitizers-integration (tsan)` job is the first CI
+  job that runs the pytest suite at all: it installs etcd, builds the server under ThreadSanitizer
+  and runs the multi-master modules against a real three-node cluster. So convergence *is* verified
+  on every PR, on instrumented binaries. What is still missing is the plain (uninstrumented) run of
+  the whole suite, and the modules that kill nodes — failover included, which is the half most worth
+  having and the half whose fixtures wait on timeouts that instrumentation makes unreliable.
 - Effort: M | Impact: Prevents regressions that unit tests structurally cannot catch
 
 ### 56. Rolling upgrade support
