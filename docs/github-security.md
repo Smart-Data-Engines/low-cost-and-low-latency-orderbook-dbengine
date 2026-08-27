@@ -221,8 +221,16 @@ Rules that matter for workflow security:
 
 ## 5. Repository access ⚙️
 
-- **Enforce 2FA** on the `Smart-Data-Engines` organisation (Settings → Authentication security).
-  Hardware key or TOTP app, not SMS.
+- **Enforce 2FA** on the `Smart-Data-Engines` organisation ⚙️ (Settings → Authentication security).
+  Hardware key or TOTP app, not SMS. Not reachable from the API: `PATCH /orgs/{org}` accepts
+  `two_factor_requirement_enabled` with a 200 and leaves it `false` — the same trap as the two
+  secret-scanning flags in §2.
+- **New repositories in the organisation start protected** ✅. Every `*_enabled_for_new_repositories`
+  flag was `false`, so a new repository began life with no secret scanning, no push protection and no
+  Dependabot, and needed somebody to remember this document. Now enabled at the organisation level:
+  secret scanning, push protection, Dependabot alerts, Dependabot security updates, dependency graph.
+  Advanced Security is deliberately left off, since enabling it for new repositories is a billing
+  decision rather than a hygiene one.
 - Grant the minimum role: `write` for contributors, `admin` only where genuinely needed.
 - Review third-party OAuth apps and installed GitHub Apps periodically. Every app with write access
   is another path into the repo.
@@ -286,6 +294,15 @@ When bumping a dependency, resolve the new SHA rather than writing a tag:
 git ls-remote https://github.com/<owner>/<repo>.git 'refs/tags/<tag>^{}'
 ```
 
+The `^{}` is not optional, and the reason belongs here because the SDK repository pinned three actions
+without it and found out from Dependabot. For an **annotated** tag, `refs/tags/<tag>` answers with the
+tag *object*, and the commit is one dereference further. A lightweight tag's ref is already the commit,
+so both forms of the command agree — which is what makes the mistake easy to make and hard to notice.
+The symptom is diagnostic: **Dependabot opens a PR bumping a version to itself**, `v4.37.9` →
+`v4.37.9`, changing only the SHA. Nothing is insecure, since a tag object's SHA is content-addressed
+too and names one fixed commit, but the pin is not the object the trailing comment claims.
+`github/codeql-action` uses annotated tags; `actions/*` use lightweight ones.
+
 System libraries (`liblz4`, `libcurl`, `liburing`) and `etcd` come from the OS or an official release
 tarball and are covered by the normal update path. Document the versions we test against so a
 reviewer can reproduce our build.
@@ -333,7 +350,8 @@ handles (c), and 2FA with signed commits and tag protection handle (d).
 ✅ .github/rulesets/master.json matches the live ruleset again, see §1.1
 ✅ all FetchContent dependencies pinned to commit SHAs
 ✅ third-party actions pinned to commit SHAs
-⚙️ org-wide 2FA on Smart-Data-Engines
+✅ organisation defaults for new repositories: scanning, push protection, Dependabot, dep graph
+⚙️ org-wide 2FA on Smart-Data-Engines — UI only, the API reports success and changes nothing
 ⚙️ SSH/GPG signing key registered as a *signing* key, then required_signatures in the ruleset
 ⚙️ non-provider secret patterns + validity checks (organisation-level Secret Protection)
 ```
