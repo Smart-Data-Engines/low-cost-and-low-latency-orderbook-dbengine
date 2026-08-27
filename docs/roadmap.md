@@ -569,15 +569,30 @@ codebase. Each item is also a story we can sell as bespoke work.
   clock skew (HLC correctness under skew is untested), etcd unavailability
 - Effort: L | Impact: The failure modes that lose data in production
 
-### 55. Multi-node cluster tests in CI
+### 55. Multi-node cluster tests in CI ✅
 - Three native nodes plus etcd started by a script, multi-master convergence and failover verified
   on every PR
-- **Partly there, as a side effect of #80.** The `sanitizers-integration (tsan)` job is the first CI
-  job that runs the pytest suite at all: it installs etcd, builds the server under ThreadSanitizer
-  and runs the multi-master modules against a real three-node cluster. So convergence *is* verified
-  on every PR, on instrumented binaries. What is still missing is the plain (uninstrumented) run of
-  the whole suite, and the modules that kill nodes — failover included, which is the half most worth
-  having and the half whose fixtures wait on timeouts that instrumentation makes unreliable.
+
+Two jobs, added in two steps and for two different reasons.
+
+**`sanitizers-integration (tsan)`** came first, as a side effect of #80: it installs etcd, builds the
+server under ThreadSanitizer and runs the multi-master modules against a real three-node cluster,
+failing on any sanitizer report. It was the first CI job to run the pytest suite at all. Its scope is
+deliberately narrow — the modules that kill nodes are outside it, because their fixtures wait on
+timings that instrumentation makes unreliable.
+
+**`integration-tests`** is the rest: the whole suite against a plain build, and therefore the half
+that gates what the narrow job cannot — failover, crash recovery under `SIGKILL`, and the
+position-lease invariant that #72 and #74 turned on. Kept as its own job rather than appended to
+`build-and-test`, because that job is the C++ suite and a failure here means something different.
+
+Both are required in the ruleset. The cost is stated plainly in `docs/github-security.md` next to
+CodeQL's, because it is the same cost: **an infrastructure failure blocks merges exactly as
+effectively as a real finding**, and here the infrastructure is etcd plus a live cluster. The
+failover module is also the one place in the suite with a wall-clock dependency — it flaked once
+locally when a benchmark was saturating a core in parallel — so if it turns out to flake on shared
+runners, the fix is a measured timeout, not deletion.
+
 - Effort: M | Impact: Prevents regressions that unit tests structurally cannot catch
 
 ### 56. Rolling upgrade support
@@ -1472,6 +1487,58 @@ ignore checks.
 
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
+
+### 82. A revoked lease is noticed on the next refresh, and a candidate can win the key before then
+
+Found by the `integration-tests` job on its **first run** (#55). The suite has always passed on the
+development machine; on a shared two-vCPU runner two failover tests failed, and only one of them was
+a test defect.
+
+The real one: `test_a_primary_whose_lease_etcd_forgot_stops_holding_the_role` reported **two nodes
+holding PRIMARY at once**. That is not #74 coming back — #74 was about the holder never finding out
+at all, and it does find out now. This is the window before it does.
+
+Revoking the lease deletes the leader key **immediately**. The holder learns on its next refresh,
+which runs every `lease_ttl_seconds / 3` — about 3.3 s at the default TTL of 10. A candidate polling
+the leader key sees it vacant and can win it inside that window. So for up to ~3.3 s two nodes
+believe they are primary, and **both accept writes**, because the write path checks the local role
+rather than asking the coordinator per write. Writes landing on the one about to step down are in its
+WAL and in nobody else's.
+
+Bounded, and not the same class as #74's indefinite split brain — but it is real divergence, and it
+only shows up when the two polls land in the unlucky order, which a loaded machine makes likely and
+an idle one makes rare. That is why it went unseen: it needs a slow runner and it needs looking.
+
+The fix is a lease that enforces itself locally rather than one that is checked when convenient.
+Two halves, and they are independent:
+
+1. **Self-fencing on the holder.** Stop accepting writes when the time since the last *successful*
+   refresh exceeds a fraction of the TTL, rather than only when a refresh actively fails. A holder
+   that cannot reach etcd is in the same position as one whose lease was revoked, and today neither
+   stops until a call returns.
+2. **A candidate waits out the remainder.** After observing a vacant leader key, wait long enough
+   that the previous holder must have noticed — the TTL, less what is already known to have elapsed.
+   This costs failover latency, which is the trade to state explicitly rather than assume: the same
+   trade #70 made with `--election-deference-ms` and #72 then bought back.
+
+Recorded as a test rather than as a paragraph:
+`test_no_two_nodes_hold_the_role_at_the_same_instant`, marked `xfail(strict=False)` on purpose. Not
+strict, because whether it reproduces depends on which poll lands first — it fails on a loaded runner
+and passes on an idle laptop, and a strict marker would turn the idle case into a false failure. The
+non-strict marker is the honest statement of a defect whose reproduction is probabilistic.
+
+**The other failure was the test's fault, and worth recording next to it.**
+`test_the_survivor_does_not_wait_for_a_dead_nodes_position` asserted that a killed node's published
+position had already left etcd *by the time* the survivor was promoted. That is not an invariant: the
+leader lease and the position lease share a TTL and have independent refresh phases, so which expires
+first depends on which was refreshed more recently before the kill. It failed at 10.2 s with the
+position still present — the mechanism working exactly as designed. It now asserts what #72 actually
+guarantees, which is also the stronger regression guard: the position **does** disappear within the
+TTL plus a margin, because it is written under a lease nobody is refreshing. Before #72 the key had
+no lease and stayed there for ever.
+
+- Effort: M | Impact: Up to ~3.3 s during which two nodes accept writes after a lease is lost.
+  Bounded divergence, not indefinite
 
 ### 81. CRC32C was a byte-at-a-time table lookup on a CPU that has a CRC32C instruction ✅
 

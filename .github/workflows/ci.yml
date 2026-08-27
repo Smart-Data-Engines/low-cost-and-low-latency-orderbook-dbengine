@@ -90,6 +90,98 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure -j1
 
+
+  # The whole pytest suite against a plain build, on every pull request.
+  #
+  # The other half of #55, and the half that matters most: the sanitizer variant of this job runs
+  # only the multi-master modules, because instrumentation makes the fixtures that kill nodes wait
+  # on timings they cannot rely on. Uninstrumented, those modules are exactly the ones worth
+  # gating — failover, crash recovery, and the position-lease invariant that #72 and #74 turned on.
+  #
+  # Kept separate from build-and-test rather than appended to it: that job is the C++ suite and
+  # should stay readable as such, and a failure here means something different from a failure
+  # there.
+  integration-tests:
+    name: integration-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            liblz4-dev libcurl4-openssl-dev liburing-dev
+
+      # etcd runs natively, like the engine itself. No containers in the test path.
+      - name: Install etcd
+        env:
+          ETCD_VER: v3.5.17
+        run: |
+          curl -fsSL "https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz" | tar xz
+          sudo install -m755 "etcd-${ETCD_VER}-linux-amd64/etcd" "etcd-${ETCD_VER}-linux-amd64/etcdctl" /usr/local/bin/
+          etcd --version
+
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
+        with:
+          path: build/_deps
+          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      # ob_integration_test as well as the server: test_cpp_client.py skips itself when that binary
+      # is absent, and the first run of this job skipped seven tests for exactly that reason while
+      # reporting green on the rest. A test that skips itself because the harness did not build it
+      # is the same failure mode as a check that runs and gates nothing.
+      - name: Build the server and the C++ client harness
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build -j$(nproc) --target ob_tcp_server ob_integration_test
+
+      - name: Install Python package and test extras
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q --upgrade pip
+          .venv/bin/pip install -q -e ".[test]"
+
+      # The harness starts its own etcd per cluster, so nothing is started here. Binance tests are
+      # opt-in and stay skipped without OB_BINANCE_TESTS.
+      - name: Run the integration suite
+        env:
+          OB_INTEGRATION_TESTS: "1"
+        run: |
+          PYTHONPATH=$PWD/python .venv/bin/python -m pytest tests/integration/ -q \
+            --junitxml=integration-report.xml
+
+      # A skip is a test that did not run, and the only ones this job accepts are the two Binance
+      # tests that need a live feed. Anything else — a binary the build step forgot, a fixture that
+      # gave up, a marker added without thinking — would otherwise pass as green.
+      - name: No test may skip except the two opt-in Binance ones
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          tree = ET.parse("integration-report.xml")
+          skipped = [
+              (case.get("classname", ""), case.get("name", ""),
+               (case.find("skipped").get("message") or "").splitlines()[0][:160])
+              for case in tree.iter("testcase")
+              if case.find("skipped") is not None
+          ]
+          for classname, name, why in skipped:
+              print(f"skipped: {classname}::{name} — {why}")
+          # Matched on classname *and* name: a module skipped at collection time — which is how
+          # the Binance ones skip, on a marker — lands in the report with an empty classname.
+          allowed = [s for s in skipped if "binance" in (s[0] + " " + s[1]).lower()]
+          if len(skipped) != len(allowed):
+              print(f"\n{len(skipped) - len(allowed)} unexpected skip(s); only the Binance "
+                    f"tests may skip in this job")
+              sys.exit(1)
+          print(f"\n{len(skipped)} skipped, all of them Binance opt-ins")
+          PY
+
   release-build:
     name: release-build
     runs-on: ubuntu-24.04

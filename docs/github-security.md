@@ -84,8 +84,16 @@ gh api -X PUT repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengi
 JSON
 ```
 
-The list above is **eight** checks as of 27 August 2026, not the four the JSON block shows — see
-§1.1, which is about how it came to be wrong. The eighth is `sanitizers-integration (tsan)`, added
+The list above is **nine** checks as of 27 August 2026, not the four the JSON block shows — see
+§1.1, which is about how it came to be wrong.
+
+The ninth is `integration-tests`, added with roadmap #55: the whole pytest suite against a plain
+build, which is the only check that exercises failover, crash recovery under `SIGKILL` and the
+position-lease invariant. It carries the same cost as the two below and one of its own — the failover
+module has a wall-clock dependency, and it flaked once locally when a benchmark was saturating a core
+in parallel. If it flakes on shared runners the answer is a measured timeout, not removing the check.
+
+The eighth is `sanitizers-integration (tsan)`, added
 with roadmap #80 and required for the same reason the other two sanitizer contexts are: it found a
 lock-order inversion on its first run, and a check that finds that class and gates nothing is the
 more dangerous kind of green. Its known cost is the same as CodeQL's — **an infrastructure failure
@@ -417,6 +425,8 @@ handles (c), and 2FA with signed commits and tag protection handle (d).
 ✅ ruleset: sanitizers (asan) and sanitizers (tsan) required — they ran and gated nothing, see §1.1
 ✅ ruleset: sanitizers-integration (tsan) required — added with #80, the first CI job to run the
    pytest suite, and the one that caught the lock-order inversion
+✅ ruleset: integration-tests required — added with #55, the whole suite against a plain build, so
+   failover and crash recovery are gated rather than only run locally
 ✅ .github/rulesets/master.json matches the live ruleset again, see §1.1
 ✅ the 30 vendored CodeQL alerts dismissed with a reason — paths-ignore does not work here, see §1
 ⚙️ triage the two own-code CodeQL alerts recorded in §1; the other thirteen are note-level tidiness
