@@ -46,6 +46,11 @@ Engine::~Engine() {
 }
 
 void Engine::open() {
+    // Which CRC32C runs is worth one line: it is a factor of twenty on the write path, and there
+    // is no other way to tell from outside whether this binary found the instruction.
+    OB_LOG_INFO("engine", "CRC32C implementation: %s",
+                crc32c_has_hardware() ? "SSE4.2 instruction" : "lookup table");
+
     // Rebuild the columnar segment index first: the replay below needs it to tell
     // which records are already durable.
     combined_store_.open_existing();
