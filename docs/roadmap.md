@@ -1365,7 +1365,7 @@ can show is that the bound is reachable.
 
 - Spec: `kiro-workspace/specs/mm-send-buffer-cap/`
 
-### 80. The integration suite had never been run under a sanitizer, and it reports a deadlock
+### 80. The integration suite had never been run under a sanitizer, and it reported a deadlock ✅
 
 Found by pointing the existing pytest suite at a TSan build of `ob_tcp_server` — thirteen seconds of
 `test_mm_convergence.py`, nine tests, three nodes. The CI sanitizer job (#37) runs `ctest` only, and
@@ -1407,7 +1407,7 @@ signal-handling thread and reads members that `main` and `run()` are still writi
 exiting — but a crash while shutting down is a crash, and it makes CI flaky for reasons nobody can
 reproduce locally.
 
-Repeatable now: `OB_SERVER_BINARY` lets the whole suite run against any build.
+Repeatable, and now run in CI. `OB_SERVER_BINARY` lets the whole suite run against any build:
 
 ```bash
 sudo sysctl -w vm.mmap_rnd_bits=28
@@ -1424,14 +1424,41 @@ engine under `MM::mtx_` are `apply_remote_delta()`, `holds_no_data()` and — ad
 and so widens the cycle by one mutex. `export_version_vector()` is deliberately not one of them: it
 reads a cache under its own mutex, which is what that comment in `reconcile_with_peers()` is about.
 
-Three pieces of work, in this order: fix the inversion (the write path must not hold `Engine::mtx_`
-across a call into multi-master, or the io loop must not hold `MM::mtx_` across a call into the
-engine — the first is the smaller change and matches what `reconcile_with_peers()` already does);
-fix the shutdown races; then add a CI job that runs the integration suite against a sanitizer build,
-because a finding this size behind a door nobody opened is an argument for opening it every time.
+**Fixed by removing one direction of the cycle entirely.** Of the two orders, `Engine::mtx_ →
+MM::mtx_` was the smaller side — three call sites, all of which can gather what they need without
+the lock — so it is gone, and `MM::mtx_ → Engine::mtx_` is now the only order in the tree:
 
-- Effort: M | Impact: A multi-master node under bidirectional load can deadlock, taking client
-  writes and peer replication down together. P0 by consequence, unproven in the wild
+- `apply_delta_mm()` broadcasts **after** releasing `mtx_`, as the last step rather than the
+  fifth. The cost is that two concurrent writers can reach the wire in an order that differs from
+  their WAL order; nothing on the receiving side reads arrival order as meaning anything, because
+  catch-up already over-delivers out of order on purpose, records above the frontier are held
+  rather than rejected, and conflicts are resolved by HLC.
+- `stats()` asks multi-master for peer state **before** taking `mtx_` and copies it in afterwards.
+  This was the second way in, and the more embarrassing one: `STATUS` and every `/metrics` scrape
+  came through it.
+- `open()` and `close()` call `mm_mgr_->start()`/`stop()` without holding `mtx_`, so they were
+  never part of it. Checked rather than assumed.
+
+The shutdown races went the same way as #41, and for the same reason: **the thread that owns a
+descriptor is the thread that closes it.** `TcpServer::shutdown()` now only raises `draining_`; the
+epoll loop sees it within its 100 ms wait and closes the listen socket and the metrics server
+itself. `MetricsServer::stop()` joins its thread before closing anything, having previously closed
+`listen_fd_` "to unblock epoll_wait" — which does not unblock it, and left a descriptor number the
+loop was still comparing against events and the kernel was free to reassign.
+
+Measured before and after, on the same command: **3 lock-order inversions and 17 data races → zero**,
+with `test_mm_convergence.py`, `test_mm_stats.py`, `test_mm_snapshot_bootstrap.py` and
+`test_metrics.py` all clean under TSan.
+
+And the door is now open in CI: a `sanitizers-integration (tsan)` job builds the server under TSan
+and runs the multi-master modules against it with the deadlock detector on, failing on **any** report
+— TSan runs with `halt_on_error=0` so that one finding does not hide the next, which means pytest can
+pass while the logs are full. The modules that kill nodes are left out for now: their fixtures wait
+on timeouts that instrumentation makes unreliable, and a flaky required check teaches people to
+ignore checks.
+
+- Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
+  writes and peer replication down together. P0 by consequence, never observed in the wild
 
 ### 79. Creating a snapshot blocks the multi-master io thread, and the measurement says how much
 

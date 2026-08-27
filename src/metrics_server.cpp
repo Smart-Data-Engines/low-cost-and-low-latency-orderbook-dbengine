@@ -57,16 +57,23 @@ void MetricsServer::stop() {
 
     running_.store(false, std::memory_order_release);
 
-    // Close listen fd to unblock epoll_wait
-    if (listen_fd_ >= 0) {
-        ::close(listen_fd_);
-        listen_fd_ = -1;
-    }
-
+    // Join first, then close. This used to close listen_fd_ here "to unblock epoll_wait", which
+    // does not unblock it — closing a descriptor does not wake a thread waiting on it — while
+    // the loop was still reading that same field and comparing it against event descriptors.
+    // ThreadSanitizer reported the race on this line during the integration suite (#80), and the
+    // dangerous half is not the read: a descriptor number closed here can be reassigned before
+    // the loop's next epoll_wait, so the loop would be watching whatever took its place.
+    //
+    // Nothing is needed to wake it. epoll_wait has a 200 ms timeout and the loop re-checks
+    // running_ every iteration, so the join costs at most that.
     if (thread_.joinable()) {
         thread_.join();
     }
 
+    if (listen_fd_ >= 0) {
+        ::close(listen_fd_);
+        listen_fd_ = -1;
+    }
     if (epoll_fd_ >= 0) {
         ::close(epoll_fd_);
         epoll_fd_ = -1;

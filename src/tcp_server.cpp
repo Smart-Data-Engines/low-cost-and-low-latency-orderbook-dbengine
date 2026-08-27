@@ -823,6 +823,11 @@ void TcpServer::run() {
 
     running_.store(true, std::memory_order_relaxed);
 
+    // Whether this loop has already reacted to a shutdown request. See the note in shutdown():
+    // the descriptors and the metrics server belong to this thread, and only this thread closes
+    // them.
+    bool drain_started = false;
+
     // 8. Epoll loop.
     while (running_.load(std::memory_order_relaxed)) {
         int nfds = ::epoll_wait(epoll_fd_, events, MAX_EVENTS, 100 /*ms timeout*/);
@@ -991,6 +996,29 @@ void TcpServer::run() {
             }
         }
 
+        // React to a shutdown request here, on the thread that owns these descriptors, rather
+        // than inside shutdown() on the thread that requested it (#80).
+        //
+        // At the *end* of the iteration, not the start: the events just processed can include one
+        // for listen_fd_, and closing it first would leave `fd == listen_fd_` comparing against
+        // -1, so that event would fall through to the session path carrying a descriptor this
+        // loop had already closed. The wait above has a 100 ms timeout, so nothing is needed to
+        // wake it, and during that window new connections are still accepted and answered with
+        // "server shutting down" — a better answer than a refused connection.
+        if (!drain_started && draining_.load(std::memory_order_acquire)) {
+            drain_started = true;
+            OB_LOG_INFO("tcp_server", "Drain requested: closing the listen socket, fd=%d",
+                        listen_fd_);
+            if (metrics_server_) {
+                metrics_server_->stop();
+            }
+            if (listen_fd_ >= 0) {
+                ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, listen_fd_, nullptr);
+                ::close(listen_fd_);
+                listen_fd_ = -1;
+            }
+        }
+
         // Drain phase: if draining and all sessions are closed, stop the loop.
         if (draining_.load(std::memory_order_relaxed) &&
             stats.active_sessions.load(std::memory_order_relaxed) <= 0) {
@@ -1009,6 +1037,12 @@ void TcpServer::run() {
     if (listen_fd_ >= 0) {
         ::close(listen_fd_);
         listen_fd_ = -1;
+    }
+
+    // A fatal epoll error leaves the loop without ever seeing draining_, so the metrics server
+    // would still be serving after run() returned. stop() is idempotent.
+    if (metrics_server_) {
+        metrics_server_->stop();
     }
 
     // Stop ShardCoordinator before closing engine.
@@ -1048,21 +1082,20 @@ void TcpServer::disarm_epollout(int fd) {
 }
 
 void TcpServer::shutdown() {
-    // Stop MetricsServer if running.
-    if (metrics_server_) {
-        metrics_server_->stop();
-    }
-
-    // Initiate graceful drain: stop accepting new connections,
-    // let in-flight commands finish, then stop the epoll loop.
-    draining_.store(true, std::memory_order_relaxed);
-
-    // Close the listen socket so the OS rejects new TCP connections immediately.
-    if (listen_fd_ >= 0) {
-        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, listen_fd_, nullptr);
-        ::close(listen_fd_);
-        listen_fd_ = -1;
-    }
+    // Request only. This runs on the thread watching for SIGINT/SIGTERM, while run() is inside
+    // its epoll loop on another — so everything this used to do here was a race, and
+    // ThreadSanitizer said so seventeen times in one run of the integration suite (#80):
+    //
+    //   - `metrics_server_` was read here while main was still constructing it,
+    //   - `listen_fd_` was read, closed and set to -1 here while run() was reading and closing
+    //     the same field, which is a double close and, worse, an `epoll_ctl` on a descriptor
+    //     number the kernel may already have handed to something else.
+    //
+    // The rule is the one pitfall 41 came from: the thread that owns a descriptor is the thread
+    // that closes it. This one raises a flag; run() sees it within its 100 ms wait and does the
+    // work itself.
+    draining_.store(true, std::memory_order_release);
+    OB_LOG_INFO("tcp_server", "Shutdown requested — the epoll loop will drain and close");
 }
 
 } // namespace ob

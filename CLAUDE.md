@@ -312,6 +312,28 @@ Learned the hard way. Check here before debugging.
     returns. While diagnosing it: `sent == 0` fell through both branches of that loop and spun
     silently — now treated as "come back later".
 
+48. **Two mutexes taken in two orders by two threads is a deadlock, and the only reliable way to
+    find it is to run the real thing under ThreadSanitizer.** The client write path held
+    `Engine::mtx_` across `broadcast_local()`, which takes `MultiMasterManager::mtx_`; the io loop
+    held `MM::mtx_` across `apply_remote_delta()`, which takes `Engine::mtx_`. Both are ordinary
+    operations on every multi-master node. Thirteen seconds of the integration suite against a TSan
+    build reported the cycle on all three nodes; the unit suite under the same sanitizer had been
+    green for weeks, because no unit test starts a server with real clients and real peers. Fix the
+    smaller side: `stats()` and `apply_delta_mm()` now gather what they need without the lock, so
+    `MM::mtx_ → Engine::mtx_` is the only order left (#80).
+49. **"Close the descriptor to unblock the loop" is wrong every time it is written.** It was wrong
+    in `MultiMasterManager::stop()` (pitfall 41) and it was wrong twice more:
+    `TcpServer::shutdown()` closed `listen_fd_` from the signal thread while `run()` was reading and
+    closing the same field, and `MetricsServer::stop()` closed its listen socket before joining its
+    own thread. Both loops already had timeouts and already re-checked their flags, so both needed
+    nothing but the flag. The rule: the thread that owns a descriptor closes it; every other thread
+    raises a flag.
+50. **A comment explaining why something is not tested is a hypothesis, and it can be wrong.** The
+    sanitizer job carried a note saying the integration suite under instrumentation would "multiply
+    the runtime without adding coverage of anything the unit tests do not reach". It found a
+    lock-order inversion and seventeen data races in thirteen seconds. When a comment justifies a gap
+    in coverage, it deserves the same scepticism as a claim in code.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
