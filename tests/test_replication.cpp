@@ -1439,3 +1439,37 @@ TEST(SnapshotIntegration, BootstrapResumesStreaming) {
     replica.close();
     primary.close();
 }
+
+// ── Running CRC32C ────────────────────────────────────────────────────────────
+//
+// The streaming form exists because a snapshot file arrives in chunks and checksumming it means
+// either buffering the whole file or folding as it goes. Two callers now fold as they go, so the
+// property worth pinning is that folding in pieces cannot differ from one call over the whole.
+
+TEST(Crc32cRunning, FoldingInPiecesMatchesOneCall) {
+    std::vector<uint8_t> data(4096);
+    for (size_t i = 0; i < data.size(); ++i) {
+        data[i] = static_cast<uint8_t>((i * 31u + 7u) & 0xFFu);
+    }
+    const uint32_t whole = ob::crc32c(data.data(), data.size());
+
+    // Deliberately uneven splits: an implementation that only worked on aligned or equal chunks
+    // would pass a two-halves test and fail here.
+    for (size_t first : {size_t(0), size_t(1), size_t(7), size_t(64), size_t(4095), size_t(4096)}) {
+        uint32_t crc = ob::crc32c_init;
+        crc = ob::crc32c_update(crc, data.data(), first);
+        crc = ob::crc32c_update(crc, data.data() + first, data.size() - first);
+        EXPECT_EQ(ob::crc32c_finish(crc), whole) << "split at " << first;
+    }
+
+    // Three pieces, and an empty update in the middle, which a chunked reader produces at EOF.
+    uint32_t crc = ob::crc32c_init;
+    crc = ob::crc32c_update(crc, data.data(), 100);
+    crc = ob::crc32c_update(crc, data.data() + 100, 0);
+    crc = ob::crc32c_update(crc, data.data() + 100, data.size() - 100);
+    EXPECT_EQ(ob::crc32c_finish(crc), whole);
+}
+
+TEST(Crc32cRunning, EmptyInputMatchesTheOneShotForm) {
+    EXPECT_EQ(ob::crc32c_finish(ob::crc32c_init), ob::crc32c(nullptr, 0));
+}

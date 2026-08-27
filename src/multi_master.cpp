@@ -346,6 +346,12 @@ void MultiMasterManager::stop() {
     if (io_thread_.joinable()) io_thread_.join();
     if (reconnect_thread_.joinable()) reconnect_thread_.join();
 
+    // Only now that the io thread is gone is it safe to touch the transfer state it owns. An
+    // in-flight snapshot holds an open descriptor and a staging directory; a shutdown mid-transfer
+    // must leave neither, and must not leave the node believing it is still bootstrapping.
+    if (snapshot_send_.active) finish_snapshot_send(false, "shutting_down");
+    if (snapshot_recv_.active) abort_bootstrap("shutting_down");
+
     // Nobody is reading these any more.
     if (listen_fd_ >= 0) {
         ::close(listen_fd_);
@@ -413,6 +419,20 @@ bool MultiMasterManager::handle_remote_record(uint16_t /*peer_node_id*/,
                                               size_t payload_len) {
     // Extract origin from the WAL record header.
     uint16_t origin = hdr.origin_node_id;
+
+    // Nothing may be applied while a snapshot is being installed, and — just as important —
+    // nothing may be *recorded as seen*. load_snapshot() discards the in-memory buffers, so a
+    // delta applied now can vanish while its number stays in the tracker: a frontier claiming a
+    // row that does not exist, which no later catch-up will ever fill. Left unmarked, the record
+    // comes back on the next vector exchange, because our frontier will not cover it.
+    if (bootstrapping_.load(std::memory_order_acquire)) {
+        OB_LOG_DEBUG("mm",
+                     "Dropping record from origin=%u seq=%lu: bootstrapping, so it would be "
+                     "discarded by the install and remembered anyway",
+                     origin, static_cast<unsigned long>(hdr.sequence_number));
+        engine_.registry().increment_counter("ob_mm_records_dropped_bootstrapping_total");
+        return false;
+    }
 
     // Only process DELTA records — skip GAP, ROTATE, EPOCH, etc.
     if (hdr.record_type != WAL_RECORD_DELTA) {
@@ -700,6 +720,7 @@ void MultiMasterManager::io_loop() {
                         peer_ptr->connected = false;
                         peer_ptr->recv_buf.clear();
                         peer_ptr->send_buf.clear();
+                        on_peer_disconnected(*peer_ptr);
 
                         uint16_t node_to_reconnect = peer_ptr->node_id;
                         if (node_to_reconnect != 0) {
@@ -730,9 +751,13 @@ void MultiMasterManager::io_loop() {
                     }
                 }
 
-                // Handle EPOLLOUT — drain send buffer.
+                // Handle EPOLLOUT — drain send buffer, then push more of any snapshot.
                 if ((ev_events & EPOLLOUT) && peer_ptr && peer_ptr->connected) {
                     try_drain_send_buf(*peer_ptr);
+                    // This is what keeps a snapshot from being enqueued all at once: chunks are
+                    // added only as the socket makes room, so live deltas queued between them go
+                    // out promptly and the buffer never reaches the size that drops the peer.
+                    if (peer_ptr->connected) advance_snapshot_send(*peer_ptr);
                 }
 
                 // Handle errors/hangup.
@@ -745,6 +770,7 @@ void MultiMasterManager::io_loop() {
                         peer_ptr->connected = false;
                         peer_ptr->recv_buf.clear();
                         peer_ptr->send_buf.clear();
+                        on_peer_disconnected(*peer_ptr);
 
                         if (peer_ptr->node_id != 0) {
                             uint32_t delay_ms = peer_ptr->backoff.next_delay_ms();
@@ -959,6 +985,7 @@ bool MultiMasterManager::drop_peer_if_send_buf_too_large(PeerConnection& peer) {
     peer.needs_snapshot = true;
     peer.send_buf.clear();          // safe now: nobody is reading this socket any more
     peer.recv_buf.clear();
+    on_peer_disconnected(peer);
     return true;
 }
 
@@ -984,6 +1011,17 @@ bool MultiMasterManager::try_drain_send_buf(PeerConnection& peer) {
             }
             // Partial write — loop to try sending more.
             continue;
+        }
+
+        if (sent == 0) {
+            // Neither progress nor an error. A stream socket should not answer a non-empty send()
+            // this way, and before this branch existed the loop simply spun on it — a wedged io
+            // thread with no log line to say why. Treat it as "come back later", which is the
+            // only interpretation that cannot lose the buffer.
+            OB_LOG_WARN("mm", "Peer %u: send() returned 0 for %zu pending bytes — waiting for "
+                              "EPOLLOUT", peer.node_id, peer.send_buf.size());
+            arm_epollout(peer);
+            return true;
         }
 
         if (sent < 0) {
@@ -1138,6 +1176,37 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
                               ? static_cast<const void*>(data + MM_WALRECORD_V2_SIZE)
                               : nullptr;
 
+    // Snapshot bootstrap (#76). Wire-only record types, dispatched before the WAL types so a
+    // chunk is never mistaken for something to replay.
+    switch (hdr.record_type) {
+        case MM_MSG_SNAPSHOT_REQUEST:
+            handle_snapshot_request(peer);
+            return;
+        case MM_MSG_SNAPSHOT_BEGIN:
+            handle_snapshot_begin(peer, static_cast<const uint8_t*>(payload_ptr),
+                                  expected_payload_len);
+            return;
+        case MM_MSG_SNAPSHOT_CHUNK:
+            handle_snapshot_chunk(peer, static_cast<const uint8_t*>(payload_ptr),
+                                  expected_payload_len);
+            return;
+        case MM_MSG_SNAPSHOT_END:
+            handle_snapshot_end(peer, static_cast<const uint8_t*>(payload_ptr),
+                                expected_payload_len);
+            return;
+        case MM_MSG_SNAPSHOT_ABORT: {
+            const std::string reason = decode_snapshot_abort(
+                static_cast<const uint8_t*>(payload_ptr), expected_payload_len);
+            OB_LOG_WARN("mm", "Peer %u aborted the snapshot: %s", peer.node_id, reason.c_str());
+            if (snapshot_recv_.active && snapshot_recv_.source_node_id == peer.node_id) {
+                abort_bootstrap("peer_aborted");
+            }
+            return;
+        }
+        default:
+            break;
+    }
+
     if (hdr.record_type == WAL_RECORD_VERSION_VECTOR) {
         // The peer told us what it holds. This is what replaced the byte-offset comparison
         // that #61 was built on.
@@ -1163,6 +1232,17 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
         // connection (#69), and a record the receiver refused leaves its own frontier behind, so
         // peer_lacks is not empty. If a future change can drop a record while both sides stay
         // connected and both frontiers keep moving, this shortcut has to go with it.
+        // A node that holds nothing cannot be caught up honestly: it will see sequence 5000
+        // before it ever sees 1, so it can never claim contiguity for a foreign origin and its
+        // peers keep resending records it already has (#67). A snapshot carries the sender's own
+        // frontiers, which is a base it may legitimately declare. Gated inside
+        // request_snapshot_from() on holding nothing at all, because the install discards
+        // whatever is here.
+        if (!peer.peer_vector.wants_everything() && peer.peer_vector.entry_count() > 0 &&
+            request_snapshot_from(peer)) {
+            return;
+        }
+
         bool truncated = false;
         const auto ours = engine_.export_version_vector(MM_MAX_VV_ENTRIES, truncated);
         const VectorDiff diff = compare_vectors(ours, peer.peer_vector, peer.node_id);
@@ -1713,21 +1793,6 @@ void MultiMasterManager::handle_topology_change(
     for (const auto& [nid, info] : new_map) {
         connect_to_peer(info);
     }
-}
-
-void MultiMasterManager::bootstrap_from_peer(const PeerConnection& source) {
-    // Not implemented, and it says so rather than logging a progress line of zeros. A multi-master
-    // node currently starts empty and relies on catch-up from a peer's retained WAL, which is
-    // enough for a cluster that grew together and not enough for a node added to a running one —
-    // that is roadmap #76, with #67 waiting behind it.
-    //
-    // Whatever happens, the bootstrap state gets an exit: refusing writes for ever is a worse
-    // answer than admitting the transfer did not happen.
-    OB_LOG_ERROR("mm",
-                 "bootstrap_from_peer(%u) is not implemented: no snapshot was transferred, so this "
-                 "node holds only what catch-up can reach in its peers' retained WAL",
-                 source.node_id);
-    finish_bootstrap(/*succeeded=*/false);
 }
 
 } // namespace ob

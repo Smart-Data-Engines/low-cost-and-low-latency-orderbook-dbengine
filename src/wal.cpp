@@ -247,6 +247,19 @@ void WALWriter::append_gap(uint64_t sequence_number, uint64_t timestamp_ns) {
 }
 
 void WALWriter::append_version_vector(const uint8_t* payload, size_t payload_len) {
+    // Backstop for #78. The header describes the length in a uint16_t, and write_record()
+    // writes whatever it is handed, so a payload above the limit would produce a record
+    // claiming to be shorter than it is — and every replay after it would read the middle
+    // of this payload as the next header. The serialisers bound themselves; this refuses
+    // outright, because losing the version vector costs duplicates and losing the WAL tail
+    // costs rows.
+    if (payload_len > WAL_MAX_PAYLOAD_LEN) {
+        OB_LOG_ERROR("wal",
+                     "Refusing to append version vector: %zu bytes exceeds the %zu a record "
+                     "header can describe",
+                     payload_len, WAL_MAX_PAYLOAD_LEN);
+        return;
+    }
     WALRecord hdr{};
     hdr.sequence_number = 0;
     hdr.timestamp_ns    = 0;
@@ -262,6 +275,19 @@ void WALWriter::append_version_vector(const uint8_t* payload, size_t payload_len
 }
 
 void WALWriter::append_held_sequences(const uint8_t* payload, size_t payload_len) {
+    // Backstop for #78. The header describes the length in a uint16_t, and write_record()
+    // writes whatever it is handed, so a payload above the limit would produce a record
+    // claiming to be shorter than it is — and every replay after it would read the middle
+    // of this payload as the next header. The serialisers bound themselves; this refuses
+    // outright, because losing the held sequences costs duplicates and losing the WAL tail
+    // costs rows.
+    if (payload_len > WAL_MAX_PAYLOAD_LEN) {
+        OB_LOG_ERROR("wal",
+                     "Refusing to append held sequences: %zu bytes exceeds the %zu a record "
+                     "header can describe",
+                     payload_len, WAL_MAX_PAYLOAD_LEN);
+        return;
+    }
     WALRecord hdr{};
     hdr.sequence_number = 0;
     hdr.timestamp_ns    = 0;

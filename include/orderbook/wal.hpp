@@ -31,6 +31,22 @@ inline constexpr uint8_t WAL_RECORD_VERSION_VECTOR = 7;
 /// time into append-only storage. Catch-up forwards only DELTA records, so peers never see this.
 inline constexpr uint8_t WAL_RECORD_HELD_SEQUENCES = 8;
 
+/// Reserved: 200 and above are wire-only message types, never written to a WAL file.
+///
+/// The multi-master snapshot protocol (MM_MSG_SNAPSHOT_* in multi_master.hpp) borrows this
+/// field to tag its frames, because frames after the handshake carry a WALRecordV2 header and
+/// nothing else identifies them. A new WAL record type takes the next free number from 9 up and
+/// must stay below 200, or a node would read a snapshot chunk as a record to replay.
+inline constexpr uint8_t WAL_RECORD_WIRE_ONLY_BASE = 200;
+
+/// Largest payload a record header can describe: `payload_len` is a `uint16_t`.
+///
+/// Not a style detail. `write_record()` writes the payload it was given and the header the caller
+/// built, so a caller that casts a larger size down produces a record whose header understates
+/// its own length — and every replay after it reads the middle of that payload as the next
+/// header. Anything that assembles a record has to check against this, not assume it.
+inline constexpr size_t WAL_MAX_PAYLOAD_LEN = 65535;
+
 // ── Fsync policy ──────────────────────────────────────────────────────────────
 // Controls when the WAL calls fsync:
 //   EVERY    — fsync after every record (max durability, lowest throughput)

@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include "orderbook/version_vector.hpp"
 
 #include <thread>
@@ -44,6 +45,61 @@ inline constexpr size_t   MM_FRAME_HEADER_SIZE  = 4;            // uint32 LE len
 inline constexpr size_t   MM_HANDSHAKE_SIZE     = 17;           // HandshakeMessage wire size
 inline constexpr size_t   MM_MAX_FRAME_PAYLOAD  = 64ULL << 20;  // 64 MB
 inline constexpr size_t   MM_WALRECORD_V2_SIZE  = 38;           // WALRecordV2 header size
+
+// ── Snapshot bootstrap (#76) ──────────────────────────────────────────────────
+//
+// Frames after the handshake are untagged: each is a WALRecordV2 header plus payload, and the
+// type is read from `record_type`. handle_frame() branches on it and an unknown value falls
+// through to handle_remote_record(), which skips it and stays connected — which is how the
+// version vector (record type 7) was added without a protocol version bump, and how these are
+// added now.
+//
+// The numbers sit in a reserved range far above the WAL's own record types (1-8, and growing) so
+// that adding a ninth WAL record type can never collide with a wire-only message. See the
+// reservation note next to the WAL_RECORD_* constants in wal.hpp.
+inline constexpr uint8_t MM_MSG_SNAPSHOT_REQUEST = 200;
+inline constexpr uint8_t MM_MSG_SNAPSHOT_BEGIN   = 201;
+inline constexpr uint8_t MM_MSG_SNAPSHOT_CHUNK   = 202;
+inline constexpr uint8_t MM_MSG_SNAPSHOT_END     = 203;
+inline constexpr uint8_t MM_MSG_SNAPSHOT_ABORT   = 204;
+
+/// Bytes of file content per chunk frame.
+///
+/// Bounded above by the frame header, not by taste: `WALRecordV2::payload_len` is a uint16_t and
+/// the receiver disconnects a peer whose `payload_len` disagrees with the frame it arrived in, so
+/// no frame may carry more than 65535 bytes of payload (#78). 32 kB leaves room for the chunk
+/// header and keeps a live delta enqueued between two chunks from waiting on a long write.
+inline constexpr size_t MM_SNAPSHOT_CHUNK_BYTES = 32ULL << 10;
+
+/// Reserved `file_index` naming the metadata blob rather than a file from the manifest.
+///
+/// The manifest, the version vector and the held set are streamed through the same chunk
+/// mechanism as the files. That is not economy of message types: the manifest for a store with a
+/// few thousand segments passes 64 kB on its own, and a version vector of 1500 entries is 63 kB,
+/// so metadata carried in one frame would have imposed a store-size limit on bootstrap — the very
+/// case bootstrap exists for. Streaming it reuses the offset discipline and the checksum.
+inline constexpr uint16_t MM_SNAPSHOT_META_INDEX = 0xFFFF;
+
+/// Upper bound on the metadata blob, which is assembled in memory. Roughly a hundred thousand
+/// files' worth of manifest; a peer claiming more is refused rather than trusted.
+inline constexpr size_t MM_SNAPSHOT_MAX_META_BYTES = 8ULL << 20;
+
+/// SNAPSHOT_BEGIN payload: three uint32 lengths and a uint32 CRC32C of the metadata blob.
+inline constexpr size_t MM_SNAPSHOT_BEGIN_SIZE = 16;
+
+/// Stop pushing chunks while the peer's send buffer holds at least this much.
+///
+/// Far below MM_MAX_PEER_SEND_BUF, because exceeding *that* drops the connection
+/// (drop_peer_if_send_buf_too_large): a snapshot that kills the peer with its own size would be
+/// a funny way to fail. The gap is also what keeps live traffic moving — chunks resume from the
+/// EPOLLOUT branch as the socket drains.
+inline constexpr size_t MM_SNAPSHOT_LOW_WATERMARK = 4ULL << 20;
+
+/// Upper bound on an abort reason, so a peer cannot make us log an arbitrary amount of text.
+inline constexpr size_t MM_SNAPSHOT_ABORT_REASON_MAX = 128;
+
+/// Fixed part of a chunk payload: uint16 file_index + uint64 byte_offset.
+inline constexpr size_t MM_SNAPSHOT_CHUNK_HEADER_SIZE = 10;
 
 // ── HandshakeMessage ──────────────────────────────────────────────────────────
 //
@@ -129,6 +185,8 @@ struct MultiMasterConfig {
     /// Queued output one peer may hold before the connection is dropped
     /// (--mm-max-peer-send-buffer). Same ceiling a client session gets since #59.
     size_t      max_peer_send_buf_bytes{MM_MAX_PEER_SEND_BUF};
+    /// Stop adding snapshot chunks while a peer's send buffer still holds this much.
+    size_t      snapshot_low_watermark_bytes{MM_SNAPSHOT_LOW_WATERMARK};
     std::string shard_id;                         // optional, if sharding active
     CoordinatorConfig coordinator_config;         // etcd endpoints for peer discovery
 };
@@ -171,6 +229,83 @@ struct PeerConnection {
     bool catching_up{false};
     bool needs_snapshot{false};
 };
+
+// ── Snapshot transfer state ───────────────────────────────────────────────────
+
+/// What BEGIN announces: the shape of the metadata blob that the next chunks carry.
+struct SnapshotBegin {
+    uint32_t manifest_len{0};
+    uint32_t vector_len{0};
+    uint32_t held_len{0};
+    uint32_t meta_crc{0};
+
+    size_t total() const {
+        return static_cast<size_t>(manifest_len) + vector_len + held_len;
+    }
+};
+
+
+/// Sending side: one at a time per node, streamed as the peer's socket drains.
+struct MMSnapshotSend {
+    bool             active{false};
+    uint16_t         target_node_id{0};
+    SnapshotManifest manifest;
+    std::vector<uint8_t> meta;         // manifest ++ vector ++ held, sent before the files
+    size_t           meta_offset{0};
+    size_t           file_idx{0};
+    size_t           file_offset{0};
+    int              fd{-1};
+    uint64_t         bytes_sent{0};
+    std::chrono::steady_clock::time_point started_at{};
+};
+
+/// Receiving side: staged to a scratch directory, installed only once every byte has checked out.
+struct MMSnapshotRecv {
+    /// Metadata arrives first, through the same chunk mechanism as the files.
+    enum class Phase { META, FILES };
+
+    bool             active{false};
+    Phase            phase{Phase::META};
+    uint16_t         source_node_id{0};
+    SnapshotBegin    announced{};
+    std::vector<uint8_t> meta;         // assembled manifest ++ vector ++ held
+    SnapshotManifest manifest;
+    std::vector<SequenceTracker::VectorEntry> vector;
+    std::vector<SequenceTracker::HeldRanges>  held;
+    std::string      staging_dir;
+    size_t           file_idx{0};      // the file the next chunk must belong to
+    size_t           file_offset{0};   // the offset the next chunk must start at
+    int              fd{-1};
+    uint32_t         running_crc{0};
+    uint64_t         bytes_received{0};
+    std::chrono::steady_clock::time_point started_at{};
+};
+
+// ── Snapshot payload codecs ───────────────────────────────────────────────────
+//
+// Free functions rather than private methods, so the wire format can be tested without a peer,
+// a socket or an engine. Every decoder returns false on a payload that is short, inconsistent or
+// out of range, and leaves its output untouched.
+
+std::vector<uint8_t> encode_snapshot_begin(const SnapshotBegin& begin);
+
+/// False on a payload of the wrong length, or one announcing more metadata than we will hold.
+bool decode_snapshot_begin(const uint8_t* data, size_t len, SnapshotBegin& out);
+
+std::vector<uint8_t> encode_snapshot_chunk(uint16_t file_index, uint64_t byte_offset,
+                                           const uint8_t* bytes, size_t n);
+
+bool decode_snapshot_chunk(const uint8_t* data, size_t len,
+                           uint16_t& file_index, uint64_t& byte_offset,
+                           const uint8_t*& bytes, size_t& n);
+
+/// END carries nothing. Every byte is already covered by a per-file CRC from the manifest and by
+/// the metadata CRC from BEGIN; a third checksum could only fail where one of those already has.
+std::vector<uint8_t> encode_snapshot_end();
+bool decode_snapshot_end(const uint8_t* data, size_t len);
+
+std::vector<uint8_t> encode_snapshot_abort(std::string_view reason);
+std::string          decode_snapshot_abort(const uint8_t* data, size_t len);
 
 // ── MultiMasterManager ────────────────────────────────────────────────────────
 
@@ -228,6 +363,45 @@ public:
     /// Check if this manager is in bootstrap state.
     bool is_bootstrapping() const { return bootstrapping_.load(std::memory_order_acquire); }
 
+    // ── Snapshot bootstrap protocol (#76) ─────────────────────────────────────
+    //
+    // Public because every interesting case here is a refusal — an unsafe path in a manifest, a
+    // chunk at the wrong offset, a checksum that does not match — and a refusal reached only
+    // through a live socket is a refusal nobody tests. `PeerConnection` is already public for
+    // the same reason.
+
+    /// A peer asked us for a snapshot. Creates one and starts streaming, or aborts with a reason.
+    void handle_snapshot_request(PeerConnection& peer);
+
+    /// A peer is about to send us one. Validates the manifest whole, then opens staging.
+    void handle_snapshot_begin(PeerConnection& peer, const uint8_t* payload, size_t len);
+
+    /// One chunk of one file. Must be the expected file at the expected offset.
+    void handle_snapshot_chunk(PeerConnection& peer, const uint8_t* payload, size_t len);
+
+    /// Every file has arrived. Verifies, installs, adopts the sequence state.
+    void handle_snapshot_end(PeerConnection& peer, const uint8_t* payload, size_t len);
+
+    /// Give up on the inbound snapshot: staging removed, data directory untouched, flag cleared.
+    void abort_bootstrap(const char* reason);
+
+    /// Ask a peer for a snapshot. Refuses unless this node holds nothing at all.
+    bool request_snapshot_from(PeerConnection& peer);
+
+    /// Push chunks while the peer's send buffer has room.
+    ///
+    /// Called after BEGIN and from the EPOLLOUT branch of `io_loop()`, which is what keeps a
+    /// snapshot from being enqueued in one piece ahead of live traffic.
+    void advance_snapshot_send(PeerConnection& peer);
+
+    /// Cancel whatever transfer this peer was part of. Called from every disconnect path.
+    void on_peer_disconnected(PeerConnection& peer);
+
+    /// Test seams. Read without the lock, so only meaningful from a test that drives the
+    /// protocol handlers directly; production code asks `is_bootstrapping()`, which is atomic.
+    bool snapshot_send_active() const { return snapshot_send_.active; }
+    bool snapshot_recv_active() const { return snapshot_recv_.active; }
+
     /// Enter the bootstrap state: this node holds no data yet and must not serve as though it did.
     ///
     /// Always paired with `finish_bootstrap()`. A flag that gates writes and has no way out is a
@@ -281,6 +455,21 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> bootstrapping_{false};
 
+    // ── Snapshot transfer (#76) ───────────────────────────────────────────────
+    // One outbound and one inbound at a time. Guarded by mtx_ like the rest of the peer state:
+    // every touch happens on the io_loop thread or under the lock a diagnostic command takes.
+    MMSnapshotSend snapshot_send_;
+    MMSnapshotRecv snapshot_recv_;
+
+    /// End the outbound transfer, successfully or not: closes the file, clears the state.
+    void finish_snapshot_send(bool succeeded, const char* reason);
+
+    /// Send an abort frame and log it. Does not touch inbound state.
+    void send_snapshot_abort(PeerConnection& peer, const char* reason);
+
+    /// Move the staged files into the data directory. Returns false if any rename failed.
+    bool install_snapshot_files();
+
     // Internal methods
     void io_loop();
     void connect_to_peer(const PeerInfo& peer);
@@ -291,7 +480,6 @@ private:
     void handle_catchup_request(PeerConnection& peer, uint32_t from_file,
                                 size_t from_offset);
     void handle_topology_change(const std::vector<PeerInfo>& new_peers);
-    void bootstrap_from_peer(const PeerConnection& source);
 
     // Frame-based send methods (task 5.1)
     /// Encode payload into a Frame and append to peer.send_buf, then try to drain.

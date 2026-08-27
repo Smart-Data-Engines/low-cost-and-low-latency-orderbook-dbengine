@@ -182,12 +182,53 @@ public:
     /// Returns the manifest. Writes snapshot_manifest.json to data dir.
     SnapshotManifest create_snapshot();
 
+    /// A snapshot plus what the sender holds, captured together.
+    struct SnapshotWithSequenceState {
+        SnapshotManifest                          manifest;
+        std::vector<SequenceTracker::VectorEntry> vector;
+        std::vector<SequenceTracker::HeldRanges>  held;
+        bool vector_truncated{false};
+        bool held_truncated{false};
+        /// How long the capture took. Measured rather than assumed: this runs on the caller's
+        /// thread, and for multi-master that thread is `io_loop()`.
+        double create_ms{0.0};
+    };
+
+    /// The same snapshot, with the sequence state a receiver needs to declare frontiers from it.
+    ///
+    /// Both halves come out of the *same* critical section as the flush, and that is the whole
+    /// point of a separate method. A vector exported afterwards can claim a number that landed
+    /// after the flush and is therefore in no snapshot file — the receiver would then declare a
+    /// frontier over a hole. Exported before, it claims less than the files hold, and a redelivery
+    /// of the difference appends the rows a second time. The held set closes the remaining gap
+    /// exactly: the numbers above the frontier that we do hold are listed, so a redelivery of any
+    /// of them meets `has_seen()`.
+    SnapshotWithSequenceState create_snapshot_with_sequence_state();
+
+    /// Replace this node's sequence state with a snapshot sender's.
+    ///
+    /// Only legitimate straight after `load_snapshot()`, because it resets: our contents are now
+    /// the sender's contents, so our frontiers must be the sender's frontiers and nothing else.
+    void adopt_snapshot_sequence_state(const std::vector<SequenceTracker::VectorEntry>& vector,
+                                       const std::vector<SequenceTracker::HeldRanges>& held);
+
     /// Load a snapshot received from the primary: replace the columnar store
     /// index with the snapshot's segments.
     void load_snapshot(const SnapshotManifest& manifest);
 
     /// Returns true if the replica is currently bootstrapping from a snapshot.
     bool is_bootstrapping() const;
+
+    /// True when this node holds nothing at all: no sequence state, no stored segment, no
+    /// pending row.
+    ///
+    /// The gate on requesting a multi-master snapshot, and deliberately stricter than "we are
+    /// behind": installing a snapshot *discards* local contents, so a node with data of its own
+    /// must never ask for one automatically. Reads the tracker rather than
+    /// `export_version_vector()`, whose cache is a flush interval stale — long enough for a node
+    /// that has just accepted writes to look empty.
+    /// Not const: `mtx_` is not mutable, the same reason `above_frontier_size()` is not const.
+    bool holds_no_data();
 
     // ── Symbol migration (sharding) ───────────────────────────────────────────
 

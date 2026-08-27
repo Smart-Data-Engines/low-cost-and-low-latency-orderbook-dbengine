@@ -177,7 +177,7 @@ add_library(orderbook_anti_entropy STATIC src/anti_entropy.cpp)
 target_link_libraries(orderbook_anti_entropy PUBLIC orderbook_peer_registry orderbook_hlc orderbook_logger)
 
 # ── Multi-master manager compiled library (peer networking, WAL broadcast) ─────
-add_library(orderbook_multi_master STATIC src/multi_master.cpp)
+add_library(orderbook_multi_master STATIC src/multi_master.cpp src/mm_snapshot.cpp)
 target_link_libraries(orderbook_multi_master PUBLIC orderbook_peer_registry orderbook_conflict_resolver orderbook_anti_entropy orderbook_hlc orderbook_compression orderbook_logger)
 
 # ── Shard map compiled library ─────────────────────────────────────────────────

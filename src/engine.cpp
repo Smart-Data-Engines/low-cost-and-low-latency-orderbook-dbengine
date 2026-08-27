@@ -856,7 +856,14 @@ Engine::Stats Engine::stats() {
 // ── Snapshot operations ───────────────────────────────────────────────────────
 
 SnapshotManifest Engine::create_snapshot() {
-    SnapshotManifest manifest;
+    return create_snapshot_with_sequence_state().manifest;
+}
+
+Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() {
+    const auto t_start = std::chrono::steady_clock::now();
+
+    SnapshotWithSequenceState out;
+    SnapshotManifest& manifest = out.manifest;
 
     // Phase 1: flush + capture under lock (< 100ms).
     {
@@ -889,6 +896,11 @@ SnapshotManifest Engine::create_snapshot() {
         // Capture WAL position atomically with the flush.
         manifest.wal_file_index  = wal_.current_file_index();
         manifest.wal_byte_offset = wal_.current_offset();
+
+        // And the sequence state, in the same critical section. See the header for why the
+        // boundary has to be exactly here and not a line later.
+        out.vector = seq_tracker_.export_vector(kMaxPersistedVectorEntries, out.vector_truncated);
+        out.held   = seq_tracker_.export_held(kMaxPersistedHeldRanges, out.held_truncated);
     }
 
     // Phase 2: enumerate files and compute CRC32C (lock-free, read-only).
@@ -983,7 +995,48 @@ SnapshotManifest Engine::create_snapshot() {
         }
     }
 
-    return manifest;
+    out.create_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t_start).count();
+    OB_LOG_INFO("engine",
+                "Snapshot created: files=%zu bytes=%zu rows=%zu wal=%u:%zu vector=%zu%s "
+                "held=%zu%s in %.1f ms",
+                manifest.files.size(), manifest.total_bytes, manifest.total_rows,
+                manifest.wal_file_index, manifest.wal_byte_offset,
+                out.vector.size(), out.vector_truncated ? " (truncated)" : "",
+                out.held.size(), out.held_truncated ? " (truncated)" : "",
+                out.create_ms);
+
+    return out;
+}
+
+void Engine::adopt_snapshot_sequence_state(
+        const std::vector<SequenceTracker::VectorEntry>& vector,
+        const std::vector<SequenceTracker::HeldRanges>& held) {
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    seq_tracker_.reset();
+    seq_tracker_.import_own_vector(vector);
+    seq_tracker_.import_held(held);
+
+    // A frontier for *our own* origin has to move the local counter with it. A node whose data
+    // directory was wiped keeps its node id, so a peer can still hold records this node minted
+    // before the wipe: minting from 1 again would hand out numbers the cluster has already seen,
+    // and every peer would drop the new records as duplicates of rows this node no longer holds.
+    const uint16_t self = mm_config_.node_id;
+    for (const auto& e : vector) {
+        if (e.origin == self) {
+            seq_tracker_.raise_local(e.key, e.frontier);
+        }
+    }
+
+    // Write it down before returning. Until the vector is in the WAL, a restart before the next
+    // flush would come back with the frontiers of the contents that were just discarded.
+    persist_version_vector_if_changed();
+    refresh_version_vector_cache();
+
+    OB_LOG_INFO("engine",
+                "Adopted snapshot sequence state: entries=%zu held_entries=%zu symbols=%zu",
+                vector.size(), held.size(), seq_tracker_.symbol_count());
 }
 
 void Engine::load_snapshot(const SnapshotManifest& /*manifest*/) {
@@ -1003,9 +1056,30 @@ void Engine::load_snapshot(const SnapshotManifest& /*manifest*/) {
     combined_store_.open_existing();
 }
 
+bool Engine::holds_no_data() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    const bool empty = seq_tracker_.symbol_count() == 0 &&
+                       pending_rows_.empty() &&
+                       stores_.empty() &&
+                       combined_store_.segment_count() == 0;
+    OB_LOG_DEBUG("engine",
+                 "holds_no_data=%d (symbols=%zu pending=%zu stores=%zu segments=%zu)",
+                 empty ? 1 : 0, seq_tracker_.symbol_count(), pending_rows_.size(),
+                 stores_.size(), combined_store_.segment_count());
+    return empty;
+}
+
 bool Engine::is_bootstrapping() const {
     if (repl_client_) {
         return repl_client_->is_bootstrapping();
+    }
+    // And the multi-master path, which this used to miss entirely. ReplicationClient does not
+    // exist in MM mode, so every caller of this — SELECT, FLUSH, and the write commands through
+    // their own duplicated check — read "not bootstrapping" while an MM bootstrap was under way.
+    // FLUSH is the one that mattered: it writes segments into the directory an install is about
+    // to rename files into.
+    if (mm_mgr_) {
+        return mm_mgr_->is_bootstrapping();
     }
     return false;
 }

@@ -65,8 +65,13 @@ class ClusterManager:
 
     def __init__(self, server_binary: Optional[str] = None,
                  etcd_binary: Optional[str] = None):
-        self.server_binary: str = server_binary or str(
-            self._PROJECT_ROOT / self._SERVER_BINARY
+        # OB_SERVER_BINARY lets the whole suite run against a different build — a sanitizer
+        # tree, most usefully. A lock-order inversion or a data race in the io loop only shows up
+        # when real clients and real peers are driving it, which no unit test arranges.
+        self.server_binary: str = (
+            server_binary
+            or os.environ.get("OB_SERVER_BINARY")
+            or str(self._PROJECT_ROOT / self._SERVER_BINARY)
         )
         self.etcd_binary: str = (
             etcd_binary or os.environ.get("OB_ETCD_BINARY") or "etcd"
@@ -255,6 +260,21 @@ class ClusterManager:
 
         self._started = True
         atexit.register(self.shutdown)
+
+    def add_multi_master_node(self, timeout: float = 20.0) -> NodeInfo:
+        """Add one fresh multi-master node to a cluster that is already running.
+
+        The harness could not express this before, and that is why roadmap #67 went
+        untested for as long as it did: every fixture starts all nodes at once, so no
+        test ever had a node joining a cluster with data already in it — the only
+        situation in which a node cannot establish a contiguous frontier by following
+        its peers' streams.
+        """
+        index = len(self.nodes)
+        node = self._start_node(index, multi_master_id=index + 1)
+        self.nodes.append(node)
+        self._wait_for_node(node, timeout=timeout)
+        return node
 
     def wait_for_mm_mesh(self, timeout: float = 30.0) -> None:
         """Wait until every node sees all the others in MM_PEERS.

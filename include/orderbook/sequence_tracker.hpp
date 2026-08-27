@@ -150,6 +150,14 @@ public:
     /// frontier cannot cover.
     void import_held(const std::vector<HeldRanges>& held);
 
+    /// Forget everything: every frontier, every held number and every local counter.
+    ///
+    /// For the one caller that is entitled to it — installing a snapshot, which replaces this
+    /// node's contents wholesale. `import_own_vector()` only ever raises a frontier, so without
+    /// this a frontier from the discarded contents would survive the discard and claim records
+    /// that are no longer on disk.
+    void reset();
+
     /// Number of symbols with any state. Logged at startup.
     std::size_t symbol_count() const { return symbols_.size(); }
 

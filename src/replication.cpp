@@ -1673,7 +1673,7 @@ void ReplicationClient::request_and_receive_snapshot() {
                 return;
             }
 
-            uint32_t running_crc = 0xFFFFFFFFu;
+            uint32_t running_crc = crc32c_init;
             size_t remaining = file_size;
 
             while (remaining > 0) {
@@ -1691,11 +1691,7 @@ void ReplicationClient::request_and_receive_snapshot() {
 
                 std::fwrite(buf.data(), 1, chunk, out);
 
-                // Update CRC32C incrementally.
-                for (size_t b = 0; b < chunk; ++b) {
-                    running_crc = (running_crc >> 8) ^
-                        detail::crc32c_table[(running_crc ^ buf[b]) & 0xFFu];
-                }
+                running_crc = crc32c_update(running_crc, buf.data(), chunk);
 
                 remaining -= chunk;
                 bytes_received += chunk;
@@ -1705,7 +1701,7 @@ void ReplicationClient::request_and_receive_snapshot() {
             std::fclose(out);
 
             // Verify CRC32C.
-            uint32_t computed_crc = running_crc ^ 0xFFFFFFFFu;
+            uint32_t computed_crc = crc32c_finish(running_crc);
             if (computed_crc != file_crc) {
                 OB_LOG_ERROR("repl_client",
                              "Snapshot file CRC mismatch: path=%s expected=%u got=%u",
