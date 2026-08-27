@@ -550,7 +550,39 @@ ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta_in, const Level* lev
     bool gap_detected = false;   // unused: gaps are decided per origin in stamp_sequence()
     ob_status_t status = ob::apply_delta(buf, delta, levels, gap_detected);
 
-    // 5. Broadcast to peers.
+    // 5. Enqueue SnapshotRows for background columnar flush + notify subscribers.
+    for (uint16_t i = 0; i < delta.n_levels; ++i) {
+        SnapshotRow row{};
+        row.timestamp_ns    = delta.timestamp_ns;
+        row.sequence_number = delta.sequence_number;
+        row.side            = delta.side;
+        row.level_index     = i;
+        row.price           = levels[i].price;
+        row.quantity        = levels[i].qty;
+        row.order_count     = levels[i].cnt;
+
+        pending_rows_.push_back({delta.symbol, delta.exchange, row});
+        query_engine_->notify_subscribers(delta.symbol, delta.exchange, row);
+    }
+
+    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
+
+    // 6. Broadcast to peers — with mtx_ released.
+    //
+    // This is the last step, and the unlock is the point of it rather than tidiness.
+    // `broadcast_local()` takes MultiMasterManager's mutex, and the io loop holds that mutex
+    // across the whole peer-fd branch — including `apply_remote_delta()`, which takes this one.
+    // Holding mtx_ here made the two orders opposite: a client write going Engine → MM against a
+    // received delta going MM → Engine. ThreadSanitizer reports that cycle within seconds of a
+    // three-node cluster doing both, which is what every multi-master node does (#80).
+    //
+    // The cost of moving it out is that two concurrent writers can now reach the wire in an order
+    // that differs from their WAL order. That is already the normal case for a receiver: catch-up
+    // over-delivers and delivers out of order on purpose, records above the frontier are held
+    // rather than rejected, and conflicts are resolved by HLC rather than by arrival. Nothing on
+    // the receiving side reads arrival order as meaning anything.
+    lock.unlock();
+
     if (mm_mgr_) {
         const size_t levels_bytes = delta.n_levels * sizeof(Level);
         const size_t payload_len  = sizeof(DeltaUpdate) + levels_bytes;
@@ -573,23 +605,6 @@ ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta_in, const Level* lev
 
         mm_mgr_->broadcast_local(hdr, payload, payload_len);
     }
-
-    // 6. Enqueue SnapshotRows for background columnar flush + notify subscribers.
-    for (uint16_t i = 0; i < delta.n_levels; ++i) {
-        SnapshotRow row{};
-        row.timestamp_ns    = delta.timestamp_ns;
-        row.sequence_number = delta.sequence_number;
-        row.side            = delta.side;
-        row.level_index     = i;
-        row.price           = levels[i].price;
-        row.quantity        = levels[i].qty;
-        row.order_count     = levels[i].cnt;
-
-        pending_rows_.push_back({delta.symbol, delta.exchange, row});
-        query_engine_->notify_subscribers(delta.symbol, delta.exchange, row);
-    }
-
-    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
 
     return status;
 }
@@ -756,6 +771,29 @@ void Engine::unsubscribe(uint64_t id) {
 }
 
 Engine::Stats Engine::stats() {
+    // Ask multi-master first, before taking mtx_.
+    //
+    // `peer_states()` and `connected_peer_count()` take MultiMasterManager's mutex, and the io
+    // loop holds that one across `apply_remote_delta()`, which takes this one — the cycle #80 is
+    // about. STATUS and every /metrics scrape come through here, so this was the second way into
+    // it after the write path. Collected into locals, then copied in below.
+    std::vector<PeerConnection> mm_peers;
+    size_t   mm_connected  = 0;
+    uint64_t mm_conflicts  = 0;
+    uint64_t mm_ae_runs    = 0;
+    uint64_t mm_ae_repairs = 0;
+    bool     mm_ae_present = false;
+    if (mm_config_.enabled && mm_mgr_) {
+        mm_peers      = mm_mgr_->peer_states();
+        mm_connected  = mm_mgr_->connected_peer_count();
+        mm_conflicts  = mm_mgr_->conflict_resolver().total_conflicts();
+        if (auto* ae = mm_mgr_->anti_entropy()) {
+            mm_ae_present = true;
+            mm_ae_runs    = ae->total_runs();
+            mm_ae_repairs = ae->total_repairs();
+        }
+    }
+
     std::unique_lock<std::mutex> lock(mtx_);
     Stats s{};
     s.pending_rows      = pending_rows_.size();
@@ -822,15 +860,15 @@ Engine::Stats Engine::stats() {
     if (mm_config_.enabled) {
         s.mm_node_id = mm_config_.node_id;
         if (mm_mgr_) {
-            s.mm_peer_count = mm_mgr_->peer_states().size();
-            s.mm_connected_peers = mm_mgr_->connected_peer_count();
-            s.mm_conflicts_total = mm_mgr_->conflict_resolver().total_conflicts();
-            // Only when the manager exists. Zero here means "no scheduler", which is not the
-            // same statement as "it ran and found nothing" — the distinction that made this
-            // crash invisible in the first place.
-            if (auto* ae = mm_mgr_->anti_entropy()) {
-                s.mm_anti_entropy_runs    = ae->total_runs();
-                s.mm_anti_entropy_repairs = ae->total_repairs();
+            s.mm_peer_count      = mm_peers.size();
+            s.mm_connected_peers = mm_connected;
+            s.mm_conflicts_total = mm_conflicts;
+            // Only when the scheduler exists. Zero here would otherwise mean "no scheduler",
+            // which is not the same statement as "it ran and found nothing" — the distinction
+            // that made an earlier crash invisible.
+            if (mm_ae_present) {
+                s.mm_anti_entropy_runs    = mm_ae_runs;
+                s.mm_anti_entropy_repairs = mm_ae_repairs;
             }
         }
         if (hlc_) {
@@ -839,14 +877,12 @@ Engine::Stats Engine::stats() {
             s.mm_hlc_logical = cur.logical;
             s.mm_hlc_drift_ns = hlc_->max_drift_ns();
         }
-        // Per-peer replication lag.
-        if (mm_mgr_) {
-            const size_t current_offset = wal_.current_offset();
-            for (const auto& peer : mm_mgr_->peer_states()) {
-                size_t lag = (current_offset > peer.confirmed_offset)
-                                 ? (current_offset - peer.confirmed_offset) : 0;
-                s.mm_replication_lag_per_peer.emplace_back(peer.node_id, lag);
-            }
+        // Per-peer replication lag, against the WAL offset as of this call.
+        const size_t current_offset = wal_.current_offset();
+        for (const auto& peer : mm_peers) {
+            size_t lag = (current_offset > peer.confirmed_offset)
+                             ? (current_offset - peer.confirmed_offset) : 0;
+            s.mm_replication_lag_per_peer.emplace_back(peer.node_id, lag);
         }
     }
 

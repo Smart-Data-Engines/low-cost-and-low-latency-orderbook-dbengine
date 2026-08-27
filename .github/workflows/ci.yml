@@ -127,13 +127,18 @@ jobs:
           kill $SERVER_PID || true
           exit 1
 
-  # Sanitizers run on the C++ unit suite, not on the integration suite: the value is in the
-  # concurrency and memory paths, and pulling etcd plus a live cluster under instrumentation would
-  # multiply the runtime without adding coverage of anything the unit tests do not reach.
+  # Sanitizers on the C++ unit suite. Both were clean when introduced, and each found a real defect
+  # on the way in: UBSan a misaligned reference binding caused by packing HLCTimestamp (roadmap
+  # #37), TSan a shutdown that closed the epoll descriptor while the io thread was still inside
+  # epoll_wait().
   #
-  # Both were clean when introduced, and each found a real defect on the way in: UBSan a misaligned
-  # reference binding caused by packing HLCTimestamp (roadmap #37), TSan a shutdown that closed the
-  # epoll descriptor while the io thread was still inside epoll_wait().
+  # This used to carry a note explaining that running the integration suite under a sanitizer would
+  # "multiply the runtime without adding coverage of anything the unit tests do not reach". That
+  # turned out to be wrong, and expensively so: thirteen seconds of test_mm_convergence.py against a
+  # TSan build reported a lock-order inversion on all three nodes and seventeen data races on the
+  # shutdown path (#80). Unit tests never start a server process with real clients, real peers and a
+  # signal-driven shutdown, so that whole class was outside the reach of a job that exists to find
+  # it. Hence the second job below.
   sanitizers:
     name: sanitizers (${{ matrix.sanitizer }})
     runs-on: ubuntu-24.04
@@ -180,3 +185,79 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1
           TSAN_OPTIONS: halt_on_error=0:second_deadlock_stack=1
         run: ctest --test-dir build-san --output-on-failure -j1
+
+  # The integration suite under ThreadSanitizer, with the deadlock detector on.
+  #
+  # A separate job rather than a matrix entry on the one above, because it needs etcd, Python and a
+  # live cluster, and because what it looks for is different: lock order and cross-thread access in
+  # a running server, not memory errors in a unit test. Any report at all fails the job — TSan runs
+  # with halt_on_error=0 so that one finding does not hide the next, which means pytest can pass
+  # while the logs are full.
+  #
+  # Scope is the multi-master modules: they are the ones that drive both lock orders at once (a
+  # client write going Engine -> MM against a received delta going MM -> Engine). The modules that
+  # kill nodes are left out for now — their fixtures wait on timeouts that instrumentation makes
+  # unreliable, and a flaky required check teaches people to ignore checks.
+  sanitizers-integration:
+    name: sanitizers-integration (tsan)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            liblz4-dev libcurl4-openssl-dev liburing-dev
+
+      - name: Install etcd
+        run: |
+          ETCD_VER=v3.5.17
+          curl -sSL https://github.com/etcd-io/etcd/releases/download/$ETCD_VER/etcd-$ETCD_VER-linux-amd64.tar.gz | tar xz
+          sudo install -m755 etcd-$ETCD_VER-linux-amd64/etcd etcd-$ETCD_VER-linux-amd64/etcdctl /usr/local/bin/
+          etcd --version
+
+      # Same reason as the job above: TSan refuses to start under Ubuntu 24.04's default ASLR
+      # entropy.
+      - name: Lower ASLR entropy for ThreadSanitizer
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Configure and build the server under TSan
+        run: |
+          cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DOB_ENABLE_TSAN=ON -DOB_BUILD_TESTS=OFF
+          cmake --build build-tsan -j$(nproc) --target ob_tcp_server
+
+      - name: Install Python package and test extras
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q --upgrade pip
+          .venv/bin/pip install -q -e ".[test]"
+
+      - name: Run the multi-master modules against the TSan server
+        env:
+          OB_INTEGRATION_TESTS: "1"
+          OB_SERVER_BINARY: ${{ github.workspace }}/build-tsan/ob_tcp_server
+          TSAN_OPTIONS: detect_deadlocks=1:second_deadlock_stack=1:halt_on_error=0:log_path=${{ github.workspace }}/tsan-report
+        run: |
+          PYTHONPATH=$PWD/python .venv/bin/python -m pytest -q \
+            tests/integration/test_mm_convergence.py \
+            tests/integration/test_mm_stats.py \
+            tests/integration/test_mm_snapshot_bootstrap.py
+
+      - name: Fail on any ThreadSanitizer report
+        run: |
+          shopt -s nullglob
+          reports=(tsan-report.*)
+          if [ ${#reports[@]} -eq 0 ]; then
+            echo "No ThreadSanitizer reports."
+            exit 0
+          fi
+          echo "ThreadSanitizer wrote ${#reports[@]} report file(s):"
+          for f in "${reports[@]}"; do
+            echo "──────── $f ────────"
+            cat "$f"
+          done
+          exit 1

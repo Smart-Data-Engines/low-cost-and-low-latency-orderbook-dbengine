@@ -59,6 +59,9 @@
             "context": "sanitizers (tsan)"
           },
           {
+            "context": "sanitizers-integration (tsan)"
+          },
+          {
             "context": "CodeQL"
           }
         ]
