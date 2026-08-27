@@ -1473,6 +1473,69 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 81. CRC32C was a byte-at-a-time table lookup on a CPU that has a CRC32C instruction ✅
+
+Found while sizing #79. Creating a snapshot ran at 148 MB/s, which for a flush plus a checksum pass
+looked like the checksum, so the checksum got measured on its own: **295 MB/s, flat, at every size**.
+That is a table walk one byte per iteration, and SSE4.2 has had a `crc32` instruction implementing
+this exact reflected polynomial since 2008.
+
+Measured on the development machine (i3-7100U, Release, `-O2`), buffer mutated on every iteration so
+neither the call nor the loop can be hoisted:
+
+| Payload | Table | Instruction | Speedup |
+|---------|-------|-------------|---------|
+| 112 B — a one-level `INSERT` | 361.7 ns | 23.8 ns | **15.2×** |
+| 328 B — ten levels | 1094 ns | 45.0 ns | 24.3× |
+| 24 088 B — `MINSERT` with 1000 levels | 81.7 µs | 3.78 µs | 21.6× |
+| 4 MB — a columnar segment file | 14.23 ms | 0.70 ms | 20.4× |
+
+The first attempt at this measurement reported **82 TB/s** and a 3.2× "speedup", because the input
+was loop-invariant and the function pure, so the compiler hoisted both. Worth recording next to the
+result: the numbers were absurd enough to notice, and a smaller error in the same direction would not
+have been.
+
+End to end, with the control built by changing one line in the same header so that the subject and
+the control differ in nothing else (pitfall 33):
+
+| `bench_engine` (5 repetitions, Release) | Table | Instruction |
+|---|---|---|
+| `BM_IngestionThroughput` | 2843 ns/op, 392.4k updates/s, cv 0.97% | **2455 ns/op, 461.7k updates/s**, cv 0.89% |
+
+**+17.6% ingestion throughput**, from two tight and non-overlapping distributions. The 388 ns per
+operation is the right order for the 338 ns the mechanism costs at this payload size; the remaining
+50 ns is not accounted for line by line and was not chased, so it is reported as unexplained rather
+than attributed. For scale: #66 was worth celebrating at 44.8 ns per write.
+
+`BM_UpdateLatency` is not quoted, and that is deliberate. Its `manual_time` column moved the *wrong*
+way by 3.7 µs while its CPU-time column moved the right way by 1.5 µs. This is the instrument the
+roadmap already discredited on this machine — `BM_VwapLatency` once reported −40.6% in 8 of 8 rounds
+for an identical function at the same address — so it is reported as unusable rather than quietly
+dropped.
+
+How it is chosen: `__attribute__((target("sse4.2")))` on the hardware fold, so the default build
+keeps its baseline and no global `-msse4.2` is needed, plus `__builtin_cpu_supports("sse4.2")`
+resolved once at static initialisation. No build-time assumption about the CPU, unlike
+`OB_ENABLE_AVX2`, because there is nothing to opt into: the fallback is the old code, and a CPU
+without the instruction gets exactly what it got before. `Engine::open()` logs which one ran, since
+a factor of twenty on the write path deserves a line and is not otherwise visible from outside.
+
+The property that matters more than the speed is that **you cannot tell which one ran**. These
+checksums go into WAL record headers, snapshot manifests and every replication frame, so a build that
+computed them differently would reject its own files and disconnect its own peers.
+`tests/test_crc32c.cpp` compares the two at every length from 0 to 300 — every length, because the
+hardware fold does eight bytes at a time and then finishes byte-wise, so the interesting cases sit
+around each multiple of eight and a sampled test misses all of them — at every alignment from 0 to 15,
+on buffers up to 1 MB, and across uneven splits of the running form. It also pins three published
+CRC32C check values, because two implementations agreeing proves consistency, not correctness.
+
+Knock-on: #79's stall shrinks by the same factor — 16-18 ms for 2.37 MB becomes a few milliseconds,
+and the extrapolated seven seconds per gigabyte becomes well under one. Whether that closes #79 or
+merely defers it is a question for a measurement on a real store, not an assumption here.
+
+- Effort: S | Impact: +17.6% ingestion throughput measured; every WAL record, every replication frame
+  and every snapshot file checksummed 15-25× faster
+
 ### 79. Creating a snapshot blocks the multi-master io thread, and the measurement says how much
 
 Filed because #76 measured its own cost instead of estimating it, and the number does not scale.
@@ -1941,11 +2004,17 @@ verified. Do not use this machine for published figures.
 
 | Metric | Value | Machine-A threshold | Ratio |
 |--------|-------|---------------------|-------|
-| `BM_IngestionThroughput` | 387k updates/s | ≥ 1.0M/s | 3.5x slower |
+| `BM_IngestionThroughput` | **462k updates/s** (387k before #81) | ≥ 1.0M/s | 2.2x slower |
 | `BM_UpdateLatency` p50 | 10.6 µs | ≤ 5 µs | 3.9x slower |
 | `BM_UpdateLatency` p99 | 10.8 µs | — | — |
 | `BM_VwapLatency` | 1577 ns (1000 levels) | ≤ 1000 ns | 1.6x slower |
 | `BM_TimeRangeQuery` (10k / 100k rows) | 0.549 ms / 3.40 ms | ≤ 5 ms | inside |
+
+The ingestion figure moved for a reason worth stating rather than quietly restating: CRC32C now uses
+the SSE4.2 instruction instead of a byte-at-a-time table, which is worth 388 ns per operation on this
+machine (#81). Two runs of five repetitions, cv under 1% on both, with the control built by changing
+one line in the same header. The machine-A thresholds in this table were recorded with the table
+version, so the ratios against them are now flattering by that much until machine A is re-measured.
 
 The `BM_TimeRangeQuery` figures above replace an earlier `0.004 ms / 0.004 ms`, which was not a
 measurement of anything. The benchmark issued `SELECT ... FROM orderbook WHERE symbol='...'`, a syntax

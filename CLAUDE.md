@@ -334,6 +334,20 @@ Learned the hard way. Check here before debugging.
     lock-order inversion and seventeen data races in thirteen seconds. When a comment justifies a gap
     in coverage, it deserves the same scepticism as a claim in code.
 
+51. **A checksum can be a hot-path cost, and a flat MB/s figure is the tell.** CRC32C ran at 295 MB/s
+    at every size, because it was a table walk one byte per iteration on a CPU with a `crc32`
+    instruction for exactly this polynomial. 361 ns per 112-byte WAL record; the instruction does it in
+    24. Measured end to end: +17.6% ingestion throughput (#81). Two things made it safe to swap:
+    runtime detection with the old code as the fallback, so no build-time assumption about the CPU,
+    and a test that compares both paths at every length from 0 to 300 and every alignment — because
+    these checksums are written into WAL headers and replication frames, so a build that computed them
+    differently would reject its own files.
+52. **A benchmark whose input never changes measures nothing, and the number will be absurd enough to
+    notice only if you are lucky.** The first CRC32C measurement reported 82 TB/s and a 3.2× speedup:
+    the buffer was loop-invariant and the function pure, so the compiler hoisted both. Mutate the
+    input per iteration, feed the result forward, and keep an `asm volatile` barrier in the loop. A
+    smaller error in the same direction would have looked like a result.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

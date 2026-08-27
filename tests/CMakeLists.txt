@@ -78,6 +78,10 @@ function(ob_add_codec_test name)
 endfunction()
 
 # ── Task 1 smoke test ─────────────────────────────────────────────────────────
+ob_add_test(test_crc32c
+    test_crc32c.cpp
+)
+
 ob_add_test(test_types_and_data_model
     test_types_and_data_model.cpp
 )
