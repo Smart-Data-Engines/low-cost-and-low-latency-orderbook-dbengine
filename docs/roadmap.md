@@ -512,9 +512,16 @@ and getting data into their existing Python stack without a copy.
 - Effort: L | Impact: This is what people build on top of orderbook data anyway
 
 ### 45. Streaming subscriptions
-- `SUBSCRIBE 'SYM'.'EXCH'` pushing updates to the client; the README already advertises streaming
-  subscriptions, so either implement or correct the claim
+- `SUBSCRIBE 'SYM'.'EXCH'` pushing updates to the client
 - Backpressure policy per subscriber, slow-consumer disconnect
+- **The claim has been corrected in the meantime, because it was the half that was free.** The
+  README listed "streaming subscriptions" among the features, and a reader takes a feature list on a
+  wire-protocol project as describing the wire protocol. What exists: the query language parses
+  `SUBSCRIBE`, `Engine::subscribe()` and `ob_subscribe()` deliver rows to a callback, and
+  `notify_subscribers()` is called on every write — so an **embedded** consumer really does stream.
+  What does not exist: any way to ask for it over TCP. `CommandType` has no `SUBSCRIBE`, and
+  `QueryEngine::execute()` says so outright ("SUBSCRIBE via execute() is not supported"). A network
+  client polls. The README now says exactly that.
 - Effort: M | Impact: Real-time consumers stop polling
 
 ### 46. Apache Arrow output
