@@ -453,6 +453,11 @@ private:
     /// ceiling rather than a preference: 3000 ranges is ~48 KB of payload plus entry headers.
     static constexpr std::size_t kMaxPersistedHeldRanges = 3000;
 
+    /// Read size when checksumming snapshot files. One buffer, reused for every file, rather
+    /// than an allocation the size of each file — which for a large segment meant a large
+    /// transient allocation on whichever thread asked for the snapshot (#79).
+    static constexpr std::size_t kSnapshotReadChunk = 256u * 1024u;
+
     /// Write the version vector to the WAL if any frontier moved since it was last written.
     /// **Caller must hold mtx_** — it is called from inside the flush's merge block.
     void persist_version_vector_if_changed();

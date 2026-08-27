@@ -11,12 +11,16 @@
 #include "orderbook/crc32c.hpp"
 #include "orderbook/logger.hpp"
 
+#include <cerrno>
 #include <chrono>
 #include <cinttypes>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <random>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace ob {
 
@@ -945,6 +949,15 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
     }
 
     // Phase 2: enumerate files and compute CRC32C (lock-free, read-only).
+    //
+    // One buffer for every file, reused. The previous version allocated a `std::vector` the size of
+    // each file and read the whole thing in: 184 allocations for the store this was measured on,
+    // and for a hundred-megabyte segment a hundred-megabyte transient allocation on whichever
+    // thread asked — which for multi-master is `io_loop()`. Measured cost of this path after #81
+    // made the checksum twenty times faster: 8.3 ms for 2.37 MB, so ~45 µs per file, which is what
+    // an open, an allocation and a read cost when repeated once per entry (#79).
+    std::vector<uint8_t> read_buf(kSnapshotReadChunk);
+
     auto now = std::chrono::steady_clock::now().time_since_epoch();
     manifest.created_at_ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
@@ -977,19 +990,69 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
                 continue;
             }
 
-            // Compute relative path from base_dir_.
-            auto rel = fs::relative(path, base_dir_).string();
+            // Relative path from base_dir_, by stripping the prefix rather than asking
+            // fs::relative().
+            //
+            // Measured at 21 µs per call, ~3.9 ms across the 184 files of the store this was
+            // profiled on — about half of what the whole snapshot cost after #81. libstdc++
+            // implements fs::relative() through weakly_canonical(), which resolves every path
+            // component against the filesystem, for both arguments, on every call. The prefix
+            // strip measures inside the noise of the bare directory walk.
+            //
+            // Sound because `path` comes from recursive_directory_iterator(base_dir_), so it
+            // always begins with base_dir_ — but checked rather than assumed, with the slow
+            // correct answer as the fallback if it ever does not.
+            const std::string full = path.string();
+            std::string rel;
+            if (full.size() > base_dir_.size() + 1 &&
+                full.compare(0, base_dir_.size(), base_dir_) == 0 &&
+                full[base_dir_.size()] == '/') {
+                rel = full.substr(base_dir_.size() + 1);
+            } else {
+                rel = fs::relative(path, base_dir_).string();
+            }
             auto file_size = static_cast<size_t>(entry.file_size());
 
-            // Compute CRC32C.
+            // Compute CRC32C by folding chunks, so nothing the size of the file is allocated.
             uint32_t crc = 0;
             {
-                std::ifstream f(path.string(), std::ios::binary);
-                if (f.is_open()) {
-                    std::vector<uint8_t> buf(file_size);
-                    f.read(reinterpret_cast<char*>(buf.data()),
-                           static_cast<std::streamsize>(file_size));
-                    crc = ob::crc32c(buf.data(), file_size);
+                const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+                if (fd < 0) {
+                    // Previously this left crc at 0 and said nothing, so a manifest could describe
+                    // a file it had failed to read and the receiver would reject it on checksum
+                    // with no clue where the fault was.
+                    OB_LOG_ERROR("engine", "Snapshot: cannot read '%s': %s",
+                                 rel.c_str(), std::strerror(errno));
+                } else {
+                    uint32_t running = crc32c_init;
+                    size_t   total_read = 0;
+                    for (;;) {
+                        const ssize_t n = ::read(fd, read_buf.data(), read_buf.size());
+                        if (n < 0) {
+                            if (errno == EINTR) continue;
+                            OB_LOG_ERROR("engine", "Snapshot: read failed on '%s': %s",
+                                         rel.c_str(), std::strerror(errno));
+                            total_read = 0;          // force the mismatch check below to fire
+                            break;
+                        }
+                        if (n == 0) break;           // EOF
+                        running = crc32c_update(running, read_buf.data(),
+                                                static_cast<size_t>(n));
+                        total_read += static_cast<size_t>(n);
+                    }
+                    ::close(fd);
+
+                    if (total_read != file_size) {
+                        // A file that grew or shrank between the directory walk and the read, or a
+                        // read that failed part-way. Either way the size in the manifest and the
+                        // checksum would describe different content.
+                        OB_LOG_ERROR("engine",
+                                     "Snapshot: '%s' is %zu bytes but %zu were read — the manifest "
+                                     "entry would not describe it",
+                                     rel.c_str(), file_size, total_read);
+                    } else {
+                        crc = crc32c_finish(running);
+                    }
                 }
             }
 

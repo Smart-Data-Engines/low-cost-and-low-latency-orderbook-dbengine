@@ -27,6 +27,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <fcntl.h>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -35,6 +36,9 @@
 #include <vector>
 
 namespace fs = std::filesystem;
+
+/// Kept so the compiler cannot drop the work being timed.
+volatile size_t benchmarkish_sink = 0;
 
 namespace {
 
@@ -774,6 +778,82 @@ TEST(MMSnapshotMeasurement, DISABLED_SnapshotCreationCost) {
                     snap.manifest.total_rows, snap.vector.size(), snap.held.size(), ms,
                     ms > 0 ? (static_cast<double>(snap.manifest.total_bytes) / 1e6) / (ms / 1e3)
                            : 0.0);
+    }
+
+    // A breakdown, because two guesses at where the time goes have already been wrong. The first
+    // said the checksum (it was about half, #81); the second said the per-file allocation and
+    // ifstream (it was neither — replacing them moved nothing). These are the remaining
+    // candidates, timed against the same directory the snapshot walks.
+    const std::string& dir = node.engine->base_dir();
+    for (int round = 0; round < 3; ++round) {
+        size_t entries = 0, counted = 0, bytes = 0;
+
+        auto t0 = std::chrono::steady_clock::now();
+        for (auto& e : std::filesystem::recursive_directory_iterator(dir)) {
+            ++entries;
+            (void)e.is_regular_file();
+        }
+        auto t1 = std::chrono::steady_clock::now();
+
+        // The walk again, statting for the size only.
+        for (auto& e : std::filesystem::recursive_directory_iterator(dir)) {
+            if (!e.is_regular_file()) continue;
+            const auto& path = e.path();
+            if (path.extension() != ".col" && path.filename() != "meta.json") continue;
+            ++counted;
+            bytes += static_cast<size_t>(e.file_size());
+        }
+        auto t1b = std::chrono::steady_clock::now();
+
+        // And again, this time also making each path relative to the base directory — which is
+        // where the time turned out to be.
+        for (auto& e : std::filesystem::recursive_directory_iterator(dir)) {
+            if (!e.is_regular_file()) continue;
+            const auto& path = e.path();
+            if (path.extension() != ".col" && path.filename() != "meta.json") continue;
+            auto rel = std::filesystem::relative(path, dir).string();
+            benchmarkish_sink += rel.size();
+        }
+        auto t1c = std::chrono::steady_clock::now();
+
+        // The cheap way to get the same string: strip the base prefix. No filesystem access.
+        for (auto& e : std::filesystem::recursive_directory_iterator(dir)) {
+            if (!e.is_regular_file()) continue;
+            const auto& path = e.path();
+            if (path.extension() != ".col" && path.filename() != "meta.json") continue;
+            const std::string full = path.string();
+            std::string rel = (full.size() > dir.size() + 1) ? full.substr(dir.size() + 1) : full;
+            benchmarkish_sink += rel.size();
+        }
+        auto t2 = std::chrono::steady_clock::now();
+
+        // And reading every one of those files, folding the checksum as the snapshot does.
+        std::vector<uint8_t> buf(256u * 1024u);
+        for (auto& e : std::filesystem::recursive_directory_iterator(dir)) {
+            if (!e.is_regular_file()) continue;
+            const auto& path = e.path();
+            if (path.extension() != ".col" && path.filename() != "meta.json") continue;
+            const int fd = ::open(path.c_str(), O_RDONLY);
+            if (fd < 0) continue;
+            uint32_t crc = ob::crc32c_init;
+            for (;;) {
+                const ssize_t n = ::read(fd, buf.data(), buf.size());
+                if (n <= 0) break;
+                crc = ob::crc32c_update(crc, buf.data(), static_cast<size_t>(n));
+            }
+            ::close(fd);
+            benchmarkish_sink += ob::crc32c_finish(crc);
+        }
+        auto t3 = std::chrono::steady_clock::now();
+
+        const auto msec = [](auto a, auto b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        std::printf("breakdown %d: walk %.2f ms | +file_size %.2f ms | +fs::relative %.2f ms | "
+                    "+prefix-strip %.2f ms | read+crc of %zu bytes %.2f ms  (%zu entries, "
+                    "%zu matched)\n",
+                    round, msec(t0, t1), msec(t1, t1b), msec(t1b, t1c), msec(t1c, t2),
+                    bytes, msec(t2, t3), entries, counted);
     }
     SUCCEED();
 }
