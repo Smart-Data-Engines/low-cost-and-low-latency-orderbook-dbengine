@@ -555,8 +555,11 @@ bool CoordinatorClient::try_acquire_leadership(int64_t lease_id,
 
 // ── Cluster state read ───────────────────────────────────────────────────────
 
-std::optional<ClusterState> CoordinatorClient::get_cluster_state() {
-    if (!impl_->connected) return std::nullopt;
+CoordinatorClient::LeaderRead CoordinatorClient::read_leader(ClusterState& out) {
+    if (!impl_->connected) {
+        OB_LOG_DEBUG("coordinator", "read_leader: not connected — Unavailable");
+        return LeaderRead::Unavailable;
+    }
 
     std::string leader_key = coordinator_leader_key(config_.cluster_prefix);
     std::string key_b64 = base64_encode(leader_key);
@@ -564,18 +567,47 @@ std::optional<ClusterState> CoordinatorClient::get_cluster_state() {
     std::string url = impl_->active_endpoint + "/v3/kv/range";
     std::string body = "{\"key\":\"" + key_b64 + "\"}";
 
-    std::string resp = impl_->http_post(url, body);
-    if (resp.empty()) return std::nullopt;
+    return interpret_leader_response(impl_->http_post(url, body), out);
+}
 
-    // Extract the value from the first kv in the response.
-    // etcd response: {"kvs":[{"key":"...","value":"<base64>", ...}]}
+CoordinatorClient::LeaderRead CoordinatorClient::interpret_leader_response(
+        const std::string& resp, ClusterState& out) {
+    if (resp.empty()) {
+        // http_post() returns an empty string for a transport failure and for any status >= 400,
+        // so this is "no information" rather than "no leader".
+        OB_LOG_DEBUG("coordinator", "read_leader: empty response — Unavailable");
+        return LeaderRead::Unavailable;
+    }
+
+    // etcd answers a range over a missing key with a body that has no `kvs` array at all, so an
+    // absent value here is the key being absent — the one case that used to be indistinguishable
+    // from the two above.
     std::string value_b64 = json_extract_string(resp, "value");
-    if (value_b64.empty()) return std::nullopt;
+    if (value_b64.empty()) {
+        OB_LOG_DEBUG("coordinator", "read_leader: no kvs in a successful range — Absent");
+        return LeaderRead::Absent;
+    }
 
     std::string value_json = base64_decode(value_b64);
     ClusterState state;
-    if (!ClusterState::from_json(value_json, state)) return std::nullopt;
+    if (!ClusterState::from_json(value_json, state)) {
+        // A key that exists but whose body will not parse is not an absent key. Reporting it as
+        // Absent would let a candidate claim a role somebody else holds.
+        OB_LOG_WARN("coordinator",
+                    "read_leader: leader key present but unparseable (%zu bytes) — Unavailable",
+                    value_json.size());
+        return LeaderRead::Unavailable;
+    }
 
+    out = std::move(state);
+    return LeaderRead::Present;
+}
+
+std::optional<ClusterState> CoordinatorClient::get_cluster_state() {
+    // Kept for the callers that do not need the distinction. Everything that is not Present
+    // collapses back to nullopt, exactly as before.
+    ClusterState state;
+    if (read_leader(state) != LeaderRead::Present) return std::nullopt;
     return state;
 }
 

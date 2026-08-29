@@ -334,52 +334,99 @@ def test_a_primary_whose_lease_etcd_forgot_stops_holding_the_role(healthy_cluste
 
     assert revoke_every_lease(healthy_cluster.etcd_client_port), "there was no lease to revoke"
 
-    # What #74 restored is that the holder *finds out*. Asserted as "within a bounded time exactly
-    # one node holds the role", because that is what the design guarantees and what the pre-fix
-    # binary fails: before #74 the old holder never noticed at all, so two primaries persisted
-    # indefinitely and no amount of waiting resolved it.
+    # What #74 restored is that the holder *finds out*, and the only robust way to assert that is to
+    # watch for the holder's claim to change. "Exactly one primary" cannot do it: that is true
+    # before the transition as well as after, so a poll loop waiting for it declares success while
+    # nothing has happened — which is exactly how the first version of this assertion passed against
+    # a node that had not noticed anything yet.
     #
-    # This deliberately does **not** assert that two primaries never coexist for an instant. They
-    # can, and a shared CI runner reproduced it: revoking the lease deletes the leader key at once,
-    # a candidate can win the empty key on its next poll, and the old holder only learns on its next
-    # refresh — up to lease_ttl/3, about 3.3 seconds at the default TTL of 10. That window is
-    # roadmap #82, and it has its own test below.
-    deadline = time.monotonic() + 30
-    counts: list[int] = []
+    # Either the old holder stops claiming PRIMARY, or it stands again and wins a *later* epoch.
+    # Sitting on the same epoch means it never learned.
+    deadline = time.monotonic() + 40
+    role_after = ""
     while time.monotonic() < deadline:
-        counts.append(len(primaries_among(healthy_cluster)))
-        if counts[-1] == 1 and len(counts) >= 3 and counts[-2] == 1 and counts[-3] == 1:
-            break            # settled: three consecutive samples with a single holder
+        role_after = role_of(primary.tcp_port)
+        still_claiming_the_same = ("PRIMARY" in role_after and "REPLICA" not in role_after
+                                   and epoch_of(role_after) <= epoch_before)
+        if not still_claiming_the_same:
+            break
         time.sleep(0.5)
 
-    settled = primaries_among(healthy_cluster)
-    assert len(settled) == 1, (
-        f"after 30s, {len(settled)} nodes hold the PRIMARY role ({settled}): the lease fenced "
-        f"nothing, so the holder never learned it had lost the role")
+    assert not ("PRIMARY" in role_after and "REPLICA" not in role_after
+                and epoch_of(role_after) <= epoch_before), (
+        f"the old primary still answers {role_after!r} after its lease was revoked, so it never "
+        f"learned it had lost the role")
 
-    # And the old holder must have reacted: either it stepped down, or it stood for election again
-    # and won a *later* epoch. Still sitting on the old epoch means it never noticed.
-    role_after = role_of(primary.tcp_port)
-    if "PRIMARY" in role_after and "REPLICA" not in role_after:
-        assert epoch_of(role_after) > epoch_before, (
-            f"the old primary still claims epoch {epoch_of(role_after)} after its lease was "
-            f"revoked, so it never learned it had lost the role")
+    # And the cluster comes back to exactly one holder. Since #82 this takes longer than it used to:
+    # the holder steps down within a second of the key vanishing, and then a candidate waits out the
+    # lease TTL before claiming it, so there is a deliberate stretch with no primary at all.
+    deadline = time.monotonic() + 40
+    holders: list[str] = []
+    while time.monotonic() < deadline:
+        holders = primaries_among(healthy_cluster)
+        if len(holders) == 1:
+            break
+        time.sleep(0.5)
+    assert len(holders) == 1, f"expected one primary once the dust settled, saw {holders}"
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="roadmap #82: after a lease is revoked, the old primary keeps the role — and keeps "
-           "accepting writes — until its next refresh notices, up to lease_ttl/3. A candidate can "
-           "win the vacated key inside that window. Whether this reproduces depends on which poll "
-           "lands first, so the marker is non-strict on purpose: it fails on a loaded runner and "
-           "passes on an idle laptop, and both outcomes are information.")
+def test_a_primary_that_lost_its_lease_refuses_writes(healthy_cluster):
+    """The larger half of #82: the demotion has to reach the Engine, not just the FailoverManager.
+
+    `handle_primary_lease_lost()` used to call `demote_to_replica()` **only** when it could read a
+    leader key carrying a non-empty address. After a revoke there is no key and therefore no
+    address, so in the one case that matters the Engine was never told: `node_role_` stayed PRIMARY,
+    `read_only_flag_` stayed unset, `ROLE` kept answering "PRIMARY <epoch>", and the node kept
+    accepting writes — until it happened to stand for election again, and indefinitely if it never
+    did.
+
+    So the assertion is about writes, not about roles. A role is what a node says; a refused write is
+    what protects the data.
+    """
+    primary = healthy_cluster.primary()
+
+    client = OrderbookEngine(host="127.0.0.1", port=primary.tcp_port, timeout=20)
+    try:
+        # It accepts writes now, so the refusal below cannot be blamed on anything else.
+        client.insert("LEASEGONE", "TEST", "bid", [100_000], [5],
+                      timestamp_ns=1_700_000_000_000_000_001)
+
+        assert revoke_every_lease(healthy_cluster.etcd_client_port), "there was no lease to revoke"
+
+        deadline = time.monotonic() + 30
+        last_error = ""
+        refused = False
+        while time.monotonic() < deadline:
+            try:
+                client.insert("LEASEGONE", "TEST", "bid", [100_001], [5],
+                              timestamp_ns=1_700_000_000_000_000_002)
+            except Exception as exc:  # noqa: BLE001 — the message is the evidence
+                last_error = repr(exc)
+                refused = True
+                break
+            time.sleep(0.5)
+
+        assert refused, (
+            "the node went on accepting writes after its lease was revoked, so it never learned it "
+            "had lost the role — and any write it accepted is in its WAL and in nobody else's")
+        assert "read-only" in last_error.lower() or "replica" in last_error.lower(), (
+            f"writes stopped, but not for the reason this test is about: {last_error}")
+    finally:
+        client.close()
+
+
 def test_no_two_nodes_hold_the_role_at_the_same_instant(healthy_cluster):
-    """The window #74 left behind, recorded as a test rather than as a paragraph.
+    """The window #74 left behind, closed by #82.
 
     Not a duplicate of the test above. That one asks whether the holder ever finds out, which is
     what #74 fixed. This one asks whether there is any instant at which two nodes both believe they
     are primary — because both accept writes while they believe it, and the writes that land on the
     one about to step down are not in the other's log.
+
+    Was `xfail(strict=False)` between the day CI reproduced it and the day #82 landed. Two changes
+    closed it: the holder now steps down on a *confirmed* absent leader key, which it could not
+    distinguish from an unreadable one before, and a candidate waits out the holder's step-down
+    bound before claiming the vacated key.
     """
     assert revoke_every_lease(healthy_cluster.etcd_client_port), "there was no lease to revoke"
 
@@ -408,15 +455,26 @@ def test_the_cluster_still_has_a_primary_after_a_lease_scare(healthy_cluster):
     """
     revoke_every_lease(healthy_cluster.etcd_client_port)
 
-    deadline = time.monotonic() + 45
+    # Confirmed twice, a second apart, because a single sighting is not recovery. Right after the
+    # revoke the old holder is still answering PRIMARY for the moment it takes to notice, so a loop
+    # that breaks on the first sighting of one primary and then re-reads can catch the gap between
+    # the step-down and the new election — which is exactly what it did once #82 made the step-down
+    # prompt. What this test guards is that a primary comes *back*, so it has to see one that stays.
+    deadline = time.monotonic() + 60
+    roles: list[str] = []
     while time.monotonic() < deadline:
-        if len(primaries_among(healthy_cluster)) == 1:
-            break
+        roles = [role_of(n.tcp_port) for n in healthy_cluster.nodes]
+        primaries = [r for r in roles if "PRIMARY" in r and "REPLICA" not in r]
+        if len(primaries) == 1:
+            time.sleep(1.0)
+            roles = [role_of(n.tcp_port) for n in healthy_cluster.nodes]
+            primaries = [r for r in roles if "PRIMARY" in r and "REPLICA" not in r]
+            if len(primaries) == 1:
+                break
         time.sleep(0.5)
 
-    roles = [role_of(n.tcp_port) for n in healthy_cluster.nodes]
     primaries = [r for r in roles if "PRIMARY" in r and "REPLICA" not in r]
-    assert len(primaries) == 1, f"no single primary came back; roles={roles}"
+    assert len(primaries) == 1, f"no single primary came back and stayed; roles={roles}"
 
 
 # ── Position freshness (#72) ──────────────────────────────────────────────────

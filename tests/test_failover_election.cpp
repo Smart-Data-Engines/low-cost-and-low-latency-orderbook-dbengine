@@ -18,6 +18,7 @@
 #include <random>
 #include <string>
 #include <chrono>
+#include <optional>
 #include <vector>
 
 namespace {
@@ -319,4 +320,47 @@ TEST(DecideElection, AZeroWindowMeansNeverDefer) {
     EXPECT_EQ(ob::decide_election(positions, "node-0", kZero, std::chrono::milliseconds(0)),
               ob::ElectionDecision::PromoteAfterWindow)
         << "--election-deference-ms=0 has to switch the preference off rather than deadlock it";
+}
+
+// ── The election wait after the leader key goes absent (#82) ──────────────────
+//
+// A revoked or expired lease deletes the leader key immediately, while the previous holder learns on
+// its next poll. A candidate that claims the vacated key at once can therefore coexist with a node
+// that still believes it is primary — and both accept writes while both believe it. CI reproduced
+// exactly that on a shared runner.
+//
+// The wait is the fix, and this is the decision it turns on, tested as a function of time rather
+// than through a cluster.
+
+TEST(ElectionWait, NoAbsenceObservedMeansNoCampaign) {
+    // The case that matters most, and the one that used to be indistinguishable from an absent key:
+    // a read that failed records nothing, so nothing has elapsed.
+    const auto now = std::chrono::steady_clock::now();
+    EXPECT_FALSE(ob::election_wait_elapsed(std::nullopt, now, 10'000));
+    EXPECT_FALSE(ob::election_wait_elapsed(std::nullopt, now, 0))
+        << "not even with the wait switched off: there is nothing to have waited for";
+}
+
+TEST(ElectionWait, TheWindowIsMeasuredFromTheFirstSighting) {
+    const auto seen = std::chrono::steady_clock::now();
+
+    EXPECT_FALSE(ob::election_wait_elapsed(seen, seen, 10'000));
+    EXPECT_FALSE(ob::election_wait_elapsed(seen, seen + std::chrono::milliseconds(9'999), 10'000));
+    EXPECT_TRUE(ob::election_wait_elapsed(seen, seen + std::chrono::milliseconds(10'000), 10'000))
+        << "the boundary is inclusive: waiting exactly the window is waiting the window";
+    EXPECT_TRUE(ob::election_wait_elapsed(seen, seen + std::chrono::seconds(30), 10'000));
+}
+
+TEST(ElectionWait, AZeroWindowIsNoWait) {
+    // Reachable only from a caller that asks for it — the configuration reads 0 as "derive from the
+    // lease TTL" and rejects a negative value at startup.
+    const auto seen = std::chrono::steady_clock::now();
+    EXPECT_TRUE(ob::election_wait_elapsed(seen, seen, 0));
+}
+
+TEST(ElectionWait, ClockGoingBackwardsDoesNotGrantAnEarlyCampaign) {
+    // steady_clock should not go backwards, but the arithmetic is on a duration that could be
+    // negative if it ever did, and "negative elapsed" must not compare as "waited long enough".
+    const auto seen = std::chrono::steady_clock::now();
+    EXPECT_FALSE(ob::election_wait_elapsed(seen, seen - std::chrono::seconds(5), 10'000));
 }

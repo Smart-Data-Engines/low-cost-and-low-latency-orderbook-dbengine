@@ -282,6 +282,53 @@ tracked as roadmap #63.
 
 `FLUSH` and a clean `close()` both end in a checkpoint, so a restart after either replays nothing.
 
+### Who holds the role, and how a node stops holding it
+
+The leader key in etcd is written under a lease, so losing the lease loses the role. Three things
+make that more than a slogan, and each of them was a defect first.
+
+**A lease that is alive is not proof that the role is yours.** The key can be gone while the lease
+lives. So a primary re-reads the leader key every second and steps down if it does not name itself —
+independently of whether its lease refresh succeeded. (Before that guard, a keepalive for a lease
+etcd had forgotten answered HTTP 200 with the id echoed back and no `TTL` field, and the code tested
+only that the response was non-empty, so the refresh could not fail at all.)
+
+**A read has three possible answers, not two.** `Present`, `Absent`, `Unavailable`. The distinction
+is load-bearing in both directions: a primary must step down on a key that is confirmed gone, and
+must *not* step down because a read failed; a replica must campaign when there is confirmed no
+leader, and must not campaign because it could not find out. Both used to see the same
+`std::nullopt`.
+
+**A holder that cannot confirm ownership for a whole lease TTL steps down anyway.** Whatever the
+reason — unreachable coordinator, a stalled poll — the lease has had time to expire, so continuing
+to answer `PRIMARY` is a claim without support. A healthy node confirms every second, ten times more
+often than the threshold.
+
+And on the other side of the handover, a candidate does **not** take a vacated key immediately:
+
+```
+leader key vanishes (lease expired or revoked)
+  │
+  ├─ holder notices within ~1 s and demotes: read-only, ROLE stops saying PRIMARY
+  │
+  └─ candidate waits --election-lease-wait-ms (default: the lease TTL) before its CAS
+```
+
+The wait exists because the two events above are not ordered by anything. A revoke deletes the key
+at once while the holder learns on its next poll, so a candidate that claims immediately can coexist
+with a node that still believes it is primary — and both accept writes while both believe it. The
+wait costs failover latency, measured at 10.2 s → 20.1 s on the development machine, and that trade
+was made deliberately: the alternative that costs no latency makes a primary read-only during a
+brief etcd hiccup instead.
+
+A cold start does not wait. No leader has existed to wait for, which the node reads from the epoch —
+persisted, so a node that was ever part of this cluster comes back knowing one.
+
+Demotion is unconditional. It used to depend on being able to read the *new* primary's address,
+which after a revoke does not exist yet — so the Engine was never told, and a node kept accepting
+writes while the failover component privately considered it a replica. Not knowing where to point the
+replication client is a reason to start no client, not a reason to keep the role.
+
 ## Key Design Decisions
 
 **Append-only storage** — No in-place updates or deletes. This simplifies crash recovery and enables lock-free reads. Orderbook data is naturally time-series: you rarely need to modify historical snapshots.

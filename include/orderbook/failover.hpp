@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <optional>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -54,12 +55,30 @@ struct FailoverConfig {
     /// How long a candidate defers to a replica that published a further WAL position, before
     /// promoting anyway (--election-deference-ms).
     ///
-    /// Bounded on purpose. Positions are written to etcd without a lease, so a node that died
-    /// leaves its position behind for ever; deferring to it without a deadline would leave the
-    /// cluster with no primary at all, which is worse than the defect this preference fixes. The
-    /// default clears the 2-second cluster-state poll, so a live better candidate has time to take
-    /// the role before this window runs out.
+    /// Bounded on purpose. Deferring without a deadline would leave the cluster with no primary at
+    /// all if the node it waits for never comes back, which is worse than the defect this preference
+    /// fixes. The default clears the 2-second cluster-state poll, so a live better candidate has
+    /// time to take the role before this window runs out.
+    ///
+    /// The original reason for the bound was that positions were written without a lease, so a dead
+    /// node left its position behind for ever. #72 gave them per-node leases, so a dead node drops
+    /// off the list on its own and this window is now a backstop rather than the main defence.
     int64_t election_deference_ms{3000};
+
+    /// How long a candidate waits, after first seeing the leader key absent, before campaigning.
+    /// `0` means "derive it from `lease_ttl_seconds`", which is the intended use — two numbers that
+    /// have to agree should not both be written down.
+    ///
+    /// This is what closes the window in #82. The previous holder steps down no later than
+    /// `lease_ttl` after it last confirmed ownership, and a candidate cannot know when that was, so
+    /// it assumes the worst: that the confirmation happened just before the key vanished. Waiting a
+    /// full TTL from *observing* the absence covers that.
+    ///
+    /// The cost is failover latency, and it is paid every time rather than only in the unlucky
+    /// case — roughly `lease_ttl` on top of what failover took before. Setting this to a smaller
+    /// value narrows the safety margin in exact proportion; setting it to a value below the
+    /// primary's own step-down bound reopens the window.
+    int64_t election_lease_wait_ms{0};
 };
 
 // ── Callback interface for Engine to implement role transitions ──────────────
@@ -160,6 +179,36 @@ private:
     std::string             primary_address_;
     std::chrono::steady_clock::time_point last_lease_refresh_;
 
+    /// When this node last *confirmed* that the leader key names it.
+    ///
+    /// Not the same thing as the last successful lease refresh: a live lease does not prove the role
+    /// still belongs to us, which is what #74 was about. This is the only moment at which ownership
+    /// is established rather than assumed, and the clock rule in monitor_loop() measures from it.
+    std::chrono::steady_clock::time_point last_ownership_confirmed_;
+
+    /// When this node first saw the leader key absent, or the epoch of nothing if it is present.
+    ///
+    /// A candidate waits `election_lease_wait_ms` from here before campaigning, so that the previous
+    /// holder has certainly stepped down (#82). An `Unavailable` read neither sets nor clears it: it
+    /// says nothing about the key.
+    std::optional<std::chrono::steady_clock::time_point> leader_absent_since_;
+
+    /// Record that the leader key was seen absent. Idempotent: only the first sighting counts, so
+    /// the wait is measured from when the key went away rather than from the latest poll.
+    void note_leader_absent();
+
+    /// Record that the leader key is present, cancelling any wait in progress.
+    void note_leader_present();
+
+    /// Whether the wait since the first sighting of an absent key has elapsed.
+    ///
+    /// False when no absence has been recorded at all, which is what stops a node from campaigning
+    /// on the strength of a read that failed.
+    bool leader_absence_settled() const;
+
+    /// The configured wait, or the value derived from the lease TTL when it is 0.
+    int64_t lease_wait_ms() const;
+
     /// Until when this node declines to stand for election, after handing the
     /// role away. steady_clock, because this measures elapsed time locally and
     /// must not be affected by wall-clock adjustments.
@@ -253,6 +302,20 @@ enum class ElectionDecision {
 /// nothing published at all — then need no etcd, no cluster and no clock. The caller owns the
 /// bookkeeping (when deferral started, logging, metrics), which is the part that needs a running
 /// node and is not where the mistakes live.
+/// Whether a candidate has waited long enough since the leader key first went absent (#82).
+///
+/// Pure for the same reason `decide_election()` is: the cases worth testing — never saw it absent,
+/// saw it a moment ago, waited exactly the window, waited longer, a wait of zero — need no etcd and
+/// no cluster. The caller owns the bookkeeping of *when* absence was first seen, which is where a
+/// running node is required and is not where the mistakes live.
+///
+/// `absent_since` empty means no absence has been observed, and the answer is false. That is what
+/// stops a node from campaigning on the strength of a read that failed: "I could not find out" must
+/// not be recorded as "the key is gone".
+bool election_wait_elapsed(std::optional<std::chrono::steady_clock::time_point> absent_since,
+                           std::chrono::steady_clock::time_point now,
+                           int64_t wait_ms);
+
 ElectionDecision decide_election(const std::vector<PublishedPosition>& positions,
                                  const std::string& self_node_id,
                                  std::chrono::milliseconds deferred_for,
