@@ -1544,6 +1544,29 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 84. MM_PEERS counted inbound connections that had not said who they were ✅
+
+Found by the `integration-tests` job, which failed with `node-2 sees 3 peers` in a three-node
+cluster. The third row was `0  (no address)  disconnected`.
+
+An accepted connection is stored in `peers_` under a temporary key with `node_id = 0` until its
+handshake identifies it. `handle_mm_peers_command()` printed every entry, so a connection
+mid-handshake appeared as a peer — one an operator reads as a peer that has fallen over, and one that
+anything comparing the row count against the cluster size reads as a node too many. Both readings are
+wrong, and the second is what made it an intermittent test failure rather than a permanent one: the
+row exists only for as long as a handshake is in flight.
+
+Un-identified connections are skipped now, and their count goes to the log at DEBUG. Not to the wire:
+these rows are parsed — by the integration harness among others — so a trailing summary line would be
+counted as a peer by anything splitting on newlines. Dropping something silently is the failure this
+whole class is about, hence the log line.
+
+`MM_PEERS` is a command an operator has to trust, which is the argument #23 makes about a metric that
+reads zero for two different reasons, and the one behind the `hlc_timestamp` column that showed
+`0.0.0` for every peer because nothing ever wrote `last_hlc`.
+
+- Effort: S | Impact: A diagnostic command reported a peer that did not exist, intermittently
+
 ### 83. The sanitizers and the coverage build instrumented a sixth of the tree
 
 Found while measuring coverage for the other half of #37. `gcovr` reported **59.0% of 2387 lines**,
@@ -1618,6 +1641,7 @@ tool and the engine's hottest data structure are incompatible.
 - Effort: S | Impact: Two CI jobs and a coverage number that all looked like they covered the tree
   and covered a sixth of it. Turning the instrumentation on properly found undefined behaviour on
   the compression path and in the clock, one of it reachable from a peer
+
 
 ### 82. A revoked lease is noticed on the next refresh, and a candidate can win the key before then ✅
 

@@ -549,12 +549,33 @@ std::string MultiMasterManager::handle_mm_peers_command() const {
     std::ostringstream oss;
     oss << "node_id\taddress\tstatus\thlc_timestamp\tlag_bytes\n";
 
+    // An accepted connection lands in peers_ under a temporary key with node_id 0 and no address,
+    // and stays there until its handshake says who it is. Those are not peers, and listing them made
+    // MM_PEERS answer "0, (no address), disconnected" — which an operator reads as a peer that has
+    // fallen over, and which anything comparing the row count against the cluster size reads as one
+    // node too many. Both readings are wrong: it is an inbound connection mid-handshake.
+    //
+    // Skipped rather than reported differently, because these rows are parsed — by the integration
+    // harness among others — so a trailing summary line would be counted as a peer by anything
+    // splitting on newlines. The count goes to the log, so nothing is hidden by being dropped.
+    size_t unidentified = 0;
     for (const auto& [nid, peer] : peers_) {
+        if (peer.node_id == 0) {
+            ++unidentified;
+            continue;
+        }
         oss << peer.node_id << '\t'
             << peer.address << '\t'
             << (peer.connected ? "connected" : "disconnected") << '\t'
             << peer.last_hlc.to_string() << '\t'
             << peer.send_buf.size() << '\n';
+    }
+
+    if (unidentified > 0) {
+        OB_LOG_DEBUG("mm",
+                     "MM_PEERS: %zu inbound connection(s) have not completed a handshake and are "
+                     "not listed as peers",
+                     unidentified);
     }
 
     return oss.str();

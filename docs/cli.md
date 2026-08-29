@@ -317,6 +317,13 @@ echo "MM_PEERS" | nc localhost 5555
 echo "MM_CONFLICTS" | nc localhost 5555
 ```
 
+`MM_PEERS` answers a header line and then one line per peer: `node_id`, `address`, `status`,
+`hlc_timestamp`, `lag_bytes`. It lists **peers**, meaning connections whose handshake has said who
+they are — an inbound connection that has not got that far is not listed, because it used to appear
+as `0  (no address)  disconnected`, which reads as a peer that has fallen over and counts as one node
+too many. The number of such connections is logged at DEBUG rather than put on the wire, since these
+rows are parsed.
+
 ## High Availability: graceful failover
 
 With `--coordinator-endpoints` set, one node holds the primary role under an etcd lease and the
