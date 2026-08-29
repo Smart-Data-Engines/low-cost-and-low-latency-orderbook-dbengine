@@ -53,6 +53,9 @@
             "context": "clang-build"
           },
           {
+            "context": "coverage"
+          },
+          {
             "context": "docs-integrity"
           },
           {

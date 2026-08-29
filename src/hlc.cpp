@@ -1,6 +1,7 @@
 #include "orderbook/hlc.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <charconv>
 #include <cstdlib>
 #include <ctime>
@@ -227,9 +228,20 @@ HLCTimestamp HybridLogicalClock::tick_receive(const HLCTimestamp& remote) {
 
     last_ = HLCTimestamp{new_physical, new_logical, node_id_};
 
-    // Track drift
-    int64_t drift = static_cast<int64_t>(new_physical) - static_cast<int64_t>(now);
-    if (drift < 0) drift = -drift;
+    // Track drift, in unsigned arithmetic and then clamped.
+    //
+    // `static_cast<int64_t>(new_physical) - static_cast<int64_t>(now)` overflows when the physical
+    // component is large, and `new_physical` comes from a **peer's** timestamp on the wire — so a
+    // node sending a nonsense value caused undefined behaviour on every node that received it, not
+    // just a wrong number. UBSan reported it as
+    // "-7914833802811814732 - 1788012145016597349 cannot be represented in type 'long int'".
+    // `-drift` on INT64_MIN was the second undefined step in the same three lines.
+    //
+    // Unsigned difference cannot overflow and needs no sign test; the clamp keeps the result
+    // representable, and a drift at INT64_MAX is as good as any other way of saying "absurd".
+    const uint64_t drift_unsigned = (new_physical > now) ? (new_physical - now) : (now - new_physical);
+    const int64_t drift = static_cast<int64_t>(
+        std::min<uint64_t>(drift_unsigned, static_cast<uint64_t>(INT64_MAX)));
     if (drift > max_drift_ns_) {
         max_drift_ns_ = drift;
     }

@@ -284,6 +284,104 @@ jobs:
           cmake -S . -B build-clang-release -DCMAKE_BUILD_TYPE=Release -DOB_BUILD_TESTS=OFF
           cmake --build build-clang-release -j$(nproc)
 
+  # Line coverage over the engine's own sources, reported and not (yet) gated.
+  #
+  # Required, but not on a percentage — not yet. A floor needs a measured baseline, and until #83
+  # there was none to have: `OB_ENABLE_COVERAGE` instrumented six of thirty-four source files, so the
+  # 59% it reported described a sixth of the tree. This job exists to produce the first honest number.
+  #
+  # What it does gate is worth gating on its own: the tree builds with coverage, the suite passes
+  # under it, and the instrumentation still reaches the libraries — the last of which failed silently
+  # for as long as the option existed. The percentage floor goes in once a run has printed a number
+  # to set it from.
+  #
+  # No third-party service. Every coverage badge on offer means sending reports from a public
+  # repository to somebody else's account, which is a decision with an owner rather than a task, so
+  # the number lands in the job summary and stays here.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            liblz4-dev libcurl4-openssl-dev liburing-dev
+          python3 -m pip install --quiet gcovr
+
+      # etcd for the C++ tests that talk to a coordinator; without it their lines read as uncovered
+      # and the number understates the suite rather than describing it.
+      - name: Install etcd
+        env:
+          ETCD_VER: v3.5.17
+        run: |
+          curl -fsSL "https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz" | tar xz
+          sudo install -m755 "etcd-${ETCD_VER}-linux-amd64/etcd" "etcd-${ETCD_VER}-linux-amd64/etcdctl" /usr/local/bin/
+
+      - name: Configure and build with coverage
+        run: |
+          cmake -S . -B build-cov -DCMAKE_BUILD_TYPE=Debug -DOB_ENABLE_COVERAGE=ON
+          cmake --build build-cov -j$(nproc)
+
+      # A quick check that the instrumentation actually reached the libraries, because that is the
+      # defect this job was born out of and it failed silently for as long as it existed (#83).
+      - name: The instrumentation must reach the libraries
+        run: |
+          for target in orderbook_engine orderbook_multi_master orderbook_failover; do
+            flags="build-cov/CMakeFiles/${target}.dir/flags.make"
+            if ! grep -q -- "--coverage" "$flags"; then
+              echo "::error::${target} is not instrumented; coverage would describe part of the tree"
+              exit 1
+            fi
+            echo "${target}: instrumented"
+          done
+
+      - name: Run the suite
+        run: ctest --test-dir build-cov --output-on-failure -j1
+
+      - name: Report coverage
+        run: |
+          gcovr --root . \
+                --filter 'src/' --filter 'include/orderbook/' \
+                --exclude 'tests/' --exclude 'build.*' \
+                --txt-metric line --print-summary \
+                --txt coverage.txt --json-summary coverage.json
+          {
+            echo '### Line coverage'
+            echo
+            echo '```'
+            python3 -c "
+          import json
+          d = json.load(open('coverage.json'))
+          print(f\"lines     {d['line_percent']:.1f}%  ({d['line_covered']}/{d['line_total']})\")
+          print(f\"functions {d['function_percent']:.1f}%  ({d['function_covered']}/{d['function_total']})\")
+          print(f\"branches  {d['branch_percent']:.1f}%  ({d['branch_covered']}/{d['branch_total']})\")
+          "
+            echo '```'
+            echo
+            echo '<details><summary>Per file</summary>'
+            echo
+            echo '```'
+            cat coverage.txt
+            echo '```'
+            echo
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: coverage
+          path: |
+            coverage.txt
+            coverage.json
+
   # Sanitizers on the C++ unit suite. Both were clean when introduced, and each found a real defect
   # on the way in: UBSan a misaligned reference binding caused by packing HLCTimestamp (roadmap
   # #37), TSan a shutdown that closed the epoll descriptor while the io thread was still inside

@@ -412,6 +412,14 @@ Learned the hard way. Check here before debugging.
     and then re-reads state to assert on it, the gap between the two reads is a race the fix can
     widen.
 
+62. **`add_compile_options()` only affects targets created after the call, and CMake will not tell
+    you.** `OB_ENABLE_ASAN`, `OB_ENABLE_TSAN` and `OB_ENABLE_COVERAGE` sat below all twenty-eight
+    `add_library()` calls, so they instrumented `ob_tcp_server` and the tests and nothing else. Two
+    required CI jobs and a coverage number all looked like they covered the tree and covered a sixth
+    of it. What gave it away was a coverage report naming 6 of 34 source files — a number of the wrong
+    order of magnitude — not the sanitizers, which kept passing. The proof is one grep of
+    `flags.make`; do that after touching any global flag (#83).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -420,11 +428,16 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 744 C++ tests (`ctest -j1`, ~2 min) and 135 integration tests plus 2
-opt-in skips (`pytest tests/integration/`, ~6 min), all green, and **no `xfail` left** — every marker
-that recorded a known defect went with the defect. Both suites run in CI on every pull request, the
-multi-master modules a second time under ThreadSanitizer, and the tree also builds and tests under
-Clang.
+**Where the suites stand:** 744 C++ tests (`ctest -j1`, ~2 min) and 136 integration tests plus 2
+opt-in skips (`pytest tests/integration/`, ~7.5 min), all green, and **no `xfail` left** — every
+marker that recorded a known defect went with the defect. Both suites run in CI on every pull
+request, the multi-master modules a second time under ThreadSanitizer, and the tree also builds and
+tests under Clang.
+
+Read the sanitizer claims with #83 in mind: until it landed, `OB_ENABLE_ASAN`, `OB_ENABLE_TSAN` and
+`OB_ENABLE_COVERAGE` instrumented the test binaries and the server but **none of the static
+libraries**, because `add_compile_options()` only affects targets declared after it and those blocks
+sat below all of them.
 
 Things a newcomer should know, because they are real limits rather than bugs to file again:
 
