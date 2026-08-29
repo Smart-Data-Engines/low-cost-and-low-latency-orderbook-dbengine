@@ -82,6 +82,15 @@ ob_add_test(test_crc32c
     test_crc32c.cpp
 )
 
+# ── What a read of the leader key means (#82): three answers, not one ────────
+add_executable(test_coordinator_leader_read test_coordinator_leader_read.cpp)
+target_link_libraries(test_coordinator_leader_read
+    PRIVATE
+        orderbook_coordinator
+        GTest::gtest_main
+)
+gtest_discover_tests(test_coordinator_leader_read PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+
 ob_add_test(test_types_and_data_model
     test_types_and_data_model.cpp
 )

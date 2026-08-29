@@ -494,6 +494,8 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
             config.handover_cooldown_seconds = cursor.value_as<int64_t>();
         } else if (arg == "--election-deference-ms") {
             config.election_deference_ms = cursor.value_as<int64_t>();
+        } else if (arg == "--election-lease-wait-ms") {
+            config.election_lease_wait_ms = cursor.value_as<int64_t>();
         } else if (arg == "--node-id") {
             config.node_id = std::string{cursor.value()};
         } else if (arg == "--failover-enabled") {
@@ -553,6 +555,16 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
         std::fprintf(stderr,
                      "Error: --handover-grace-seconds and --handover-cooldown-seconds "
                      "must be positive\n");
+        std::exit(1);
+    }
+    // A negative wait would read as "no wait" in election_wait_elapsed() and quietly reopen the
+    // window #82 closed. Rejected rather than clamped: a parser that fixes up what it does not
+    // understand is how --prot 5599 used to start a server on the default port (#36).
+    if (config.election_lease_wait_ms < 0) {
+        std::fprintf(stderr,
+                     "Error: --election-lease-wait-ms (%ld) cannot be negative. Use 0 to derive "
+                     "it from the lease TTL, which is the intended setting\n",
+                     static_cast<long>(config.election_lease_wait_ms));
         std::exit(1);
     }
     if (config.handover_cooldown_seconds < config.handover_grace_seconds) {
@@ -675,6 +687,7 @@ TcpServer::TcpServer(ServerConfig config)
         failover_config.coordinator.lease_ttl_seconds = config_.coordinator_lease_ttl;
         failover_config.handover_grace_seconds    = config_.handover_grace_seconds;
         failover_config.election_deference_ms      = config_.election_deference_ms;
+        failover_config.election_lease_wait_ms     = config_.election_lease_wait_ms;
         failover_config.handover_cooldown_seconds = config_.handover_cooldown_seconds;
         failover_config.coordinator.node_id = config_.node_id;
         failover_config.failover_enabled = config_.failover_enabled;

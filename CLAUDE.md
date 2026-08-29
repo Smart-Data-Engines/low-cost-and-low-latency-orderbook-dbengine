@@ -33,7 +33,7 @@ cmake --build build -j$(nproc)
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release -j$(nproc)
 
-# Tests — 673 of them, ~2.7 minutes
+# Tests — 744 of them, ~2 minutes
 ctest --test-dir build --output-on-failure -j1
 ```
 
@@ -389,6 +389,29 @@ Learned the hard way. Check here before debugging.
     side. Build with the other compiler occasionally; the README promised Clang support for months
     before anything checked it (#37).
 
+59. **An answer that means four different things cannot be acted on.** `get_cluster_state()`
+    returned `std::nullopt` for not-connected, an empty HTTP response, a key that genuinely was not
+    there, and a body that would not parse. A primary reading that as "the leader key is gone" would
+    step down on every transient etcd error, so it read it as "no information" — and therefore could
+    not react to the key actually disappearing. Same conflation on the replica side made an
+    unreachable coordinator look exactly like a vacant key, so replicas campaigned because a read
+    failed. `read_leader()` answers `Present` / `Absent` / `Unavailable` and both branches can now
+    say what they mean (#82). Same shape as pitfall 23 and #34: find the field that carries the
+    answer, or add one.
+60. **A demotion that depends on knowing the successor does not happen when there is no successor.**
+    `handle_primary_lease_lost()` told the Engine to demote **only** if it could read a leader key
+    with a non-empty address. After a revoke there is no key, so in the one case that matters the
+    Engine was never told: it kept `node_role_ == PRIMARY`, `read_only_flag_` unset, and went on
+    accepting writes indefinitely, while the FailoverManager privately believed it was a replica.
+    Not knowing where to point the replication client is a reason to start no client; it is not a
+    reason to keep claiming a role. Pitfall 28 in the path pitfall 28 was written about.
+61. **"Exactly one primary" is true before a transition as well as after it.** A test that polls for
+    it and breaks on the first sighting declares success while nothing has happened — which is how a
+    rewritten assertion passed against a node that had not yet noticed it lost the role. Watch for
+    the thing that *changes*: the holder's claim, or the epoch. And when a test breaks on a condition
+    and then re-reads state to assert on it, the gap between the two reads is a race the fix can
+    widen.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -397,20 +420,27 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 681 C++ tests (`ctest -j1`, ~170 s) and 124 integration tests plus 2
-opt-in skips (`pytest tests/integration/`, ~3.8 min), all green, and **no `xfail` left** — the two
-that marked known defects are gone because both defects are fixed.
+**Where the suites stand:** 744 C++ tests (`ctest -j1`, ~2 min) and 135 integration tests plus 2
+opt-in skips (`pytest tests/integration/`, ~6 min), all green, and **no `xfail` left** — every marker
+that recorded a known defect went with the defect. Both suites run in CI on every pull request, the
+multi-master modules a second time under ThreadSanitizer, and the tree also builds and tests under
+Clang.
 
 Things a newcomer should know, because they are real limits rather than bugs to file again:
 
 - **The wire protocol has no authentication or encryption.** Roadmap #30. Do not expose a node
   outside a trusted network.
-- **Deference on election cannot tell a further replica from a dead one.** Positions carry no lease
-  and no timestamp, so a candidate waits out a bounded window (`--election-deference-ms`) instead of
-  knowing. Roadmap #72 has the fix and the reasoning for it.
-- **A node that joins an origin's stream mid-way never establishes a contiguous frontier.** It can
-  catch up, but it cannot prove it has everything. Roadmap #67.
+- **Failover takes about twice as long as it used to, on purpose.** Since #82 a candidate waits one
+  lease TTL after the leader key goes absent, so the previous holder has certainly stepped down.
+  Measured: 10.2 s → 20.1 s after a `kill -9`. The alternative that costs no latency makes a primary
+  read-only during a brief etcd hiccup, so the cost was moved to latency deliberately;
+  `--election-lease-wait-ms` is the knob.
 - `rapidcheck` is pinned to `master` rather than a commit SHA, unlike every other dependency.
+
+*Two entries used to sit here and no longer describe the code.* "Deference on election cannot tell a
+further replica from a dead one" was true until #72 gave published positions per-node leases. "A node
+that joins an origin's stream mid-way never establishes a contiguous frontier" was true until #76
+made snapshot bootstrap real and #67 closed on it.
 
 ## Before you call a change done
 

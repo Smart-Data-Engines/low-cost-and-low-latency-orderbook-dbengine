@@ -152,6 +152,34 @@ public:
     /// Read current cluster state from etcd.
     std::optional<ClusterState> get_cluster_state();
 
+    /// What a read of the leader key found. Three answers, because `get_cluster_state()` collapses
+    /// them into one and two callers need the difference.
+    ///
+    /// `std::nullopt` from `get_cluster_state()` means any of: not connected, an empty HTTP
+    /// response, a key that genuinely is not there, or a body that would not parse. A primary that
+    /// treated that as "the leader key is gone" would step down on every transient etcd error; one
+    /// that treats it as "no information" — which is what the code does — cannot react to the key
+    /// actually disappearing. That is the window roadmap #82 is about, and the missing distinction
+    /// is its cause.
+    enum class LeaderRead {
+        Present,      ///< the read succeeded and the key is there; `out` is filled in
+        Absent,       ///< the read succeeded and the key is not there: nobody holds the role
+        Unavailable,  ///< no information: unreachable, empty response, or unparseable body
+    };
+
+    /// Read the leader key, saying which of the three it was.
+    LeaderRead read_leader(ClusterState& out);
+
+    /// Decide what a range response over the leader key means.
+    ///
+    /// Separated from the socket so all five cases can be tested without an etcd — the whole point
+    /// of this change is that those five stop being one, and a test that needs a live coordinator
+    /// to say so would be opt-in and would never run. Same reason `decide_election()` is a pure
+    /// function.
+    ///
+    /// `resp` is what `http_post()` returned: empty for a transport failure or any status >= 400.
+    static LeaderRead interpret_leader_response(const std::string& resp, ClusterState& out);
+
     /// Publish this node's WAL position for election comparison.
     /// Publish this node's WAL position.
     ///

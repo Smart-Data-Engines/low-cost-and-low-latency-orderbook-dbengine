@@ -54,6 +54,11 @@ struct ServerConfig {
     /// --election-deference-ms: how long a candidate waits for a replica that published a further
     /// WAL position before promoting anyway. 0 switches the preference off.
     int64_t election_deference_ms{3000};
+    /// --election-lease-wait-ms: how long a candidate waits after first seeing the leader key
+    /// absent, so the previous holder has certainly stepped down (#82). 0 derives it from the
+    /// lease TTL, which is the intended setting; a smaller explicit value narrows the safety
+    /// margin in proportion.
+    int64_t election_lease_wait_ms{0};
     std::string node_id;                             // --node-id
     bool failover_enabled{true};                     // --failover-enabled
 

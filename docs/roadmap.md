@@ -1517,7 +1517,7 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
-### 82. A revoked lease is noticed on the next refresh, and a candidate can win the key before then
+### 82. A revoked lease is noticed on the next refresh, and a candidate can win the key before then ✅
 
 Found by the `integration-tests` job on its **first run** (#55). The suite has always passed on the
 development machine; on a shared two-vCPU runner two failover tests failed, and only one of them was
@@ -1566,8 +1566,79 @@ guarantees, which is also the stronger regression guard: the position **does** d
 TTL plus a margin, because it is written under a lease nobody is refreshing. Before #72 the key had
 no lease and stayed there for ever.
 
-- Effort: M | Impact: Up to ~3.3 s during which two nodes accept writes after a lease is lost.
-  Bounded divergence, not indefinite
+**The window was the smaller half. Fixing it turned up the larger one.**
+
+`handle_primary_lease_lost()` called `handler_.demote_to_replica()` **only when it could read a
+leader key carrying a non-empty address**:
+
+```cpp
+auto state = coordinator_->get_cluster_state();
+if (state.has_value() && !state->leader_address.empty()) {
+    primary_address_ = state->leader_address;
+    handler_.demote_to_replica(state->leader_address);   // ← the only call
+}
+```
+
+In the case that matters there is no key: a revoked or expired lease deletes it, so there is no
+address, so the Engine was **never told**. `FailoverManager::role_` went to `REPLICA` while
+`Engine::node_role_` stayed `PRIMARY`, `read_only_flag_` stayed unset, `ROLE` kept answering
+`PRIMARY <epoch>` — and the node went on accepting writes until it happened to stand for election
+again, **indefinitely if it never did**. Not a 3.3-second window: an open-ended one.
+
+That is pitfall 28 — "when a role moves, every component that answers questions about it has to be
+told" — in the very path pitfall 28 was written about. Not knowing where to point the replication
+client is a reason to start no client; it is not a reason to keep claiming a role. The demotion is
+unconditional now, and the address is optional.
+
+**What actually shipped**, in the order it was found:
+
+1. **The coordinator says what it does not know.** `read_leader()` answers `Present` / `Absent` /
+   `Unavailable`. `get_cluster_state()`'s `std::nullopt` meant not-connected *or* empty-response *or*
+   key-absent *or* unparseable-body, so a primary could not act on a vacant key without also
+   stepping down on every transient etcd error — which is why it acted on neither.
+2. **The holder steps down on a confirmed-absent key**, within its one-second poll instead of within
+   `lease_ttl/3`. And on a clock rule: no confirmation for a whole TTL means stepping down, because
+   whatever the reason the lease has had time to expire. It never fires on a healthy node, which
+   confirms every second.
+3. **The demotion reaches the Engine unconditionally** — the larger half above.
+4. **A candidate waits out the holder's step-down bound** (`--election-lease-wait-ms`, deriving from
+   the lease TTL) before claiming a vacated key. A cold start does not wait: no leader has existed to
+   wait for, read from the epoch, which is persisted. The residual hole is a brand-new node that has
+   never seen this cluster's epoch and reconnects during the vacancy — narrower than what this
+   closes, and named rather than left to be found.
+5. **A replica no longer campaigns on a read that failed.** Same conflation, opposite direction: an
+   unreachable coordinator used to look exactly like a vacant key.
+
+**Measured cost, which is the trade that was chosen deliberately:**
+
+| | before | after |
+|---|---|---|
+| Failover after `kill -9` | 10.2 s | **20.1 s** |
+| Two nodes accepting writes after a revoke | open-ended | 0 |
+| Old holder still answering `PRIMARY` after a revoke | until it re-promoted, or for ever | ≤ ~1 s |
+
+Failover roughly doubles, every time and not only in the unlucky case. That was the decision: the
+alternatives either leave the window open or make a primary read-only during a brief etcd hiccup,
+which trades a latency cost for an availability one.
+
+**Four tests, and three of them had to be rewritten first**, because they asserted transient states
+that this change re-timed:
+
+- `test_a_primary_that_lost_its_lease_refuses_writes` is the new one and the one that matters: it
+  asserts a *refused write* rather than a reported role, because a role is what a node says and a
+  refused write is what protects the data. Verified by mutation — restoring the `if
+  (!new_primary.empty())` makes it fail.
+- `test_no_two_nodes_hold_the_role_at_the_same_instant` was `xfail(strict=False)` from the day CI
+  reproduced it; it is an ordinary test now.
+- `..._stops_holding_the_role` used to wait for "exactly one primary", which is true before the
+  transition as well as after — so its loop declared success while nothing had happened. It watches
+  for the holder's claim to *change* now.
+- `..._after_a_lease_scare` broke on the first sighting of one primary and then re-read, which
+  straddles the gap between a prompt step-down and the next election. It confirms twice, a second
+  apart.
+
+- Effort: M | Impact: A node whose lease was revoked kept accepting writes indefinitely. Closed at
+  the cost of doubling failover latency
 
 ### 81. CRC32C was a byte-at-a-time table lookup on a CPU that has a CRC32C instruction ✅
 
@@ -2156,7 +2227,7 @@ Baselines are hardware-specific. **Never quote a number without the machine it c
 | LZ4 INSERT (TCP) | ~1.6-2.9 ms | After Nagle fix |
 | Sustained INSERT throughput | 29k/s | Python TCP, 60s stress test |
 | Sustained MINSERT throughput | 777k levels/s | Python TCP, 60s stress test |
-| Failover time | ~5-8 s | etcd lease TTL dependent |
+| Failover time | ~5-8 s | etcd lease TTL dependent. **Measured at 20.1 s since #82**, which added a deliberate wait of one lease TTL before a candidate claims a vacated key. The figure here predates that and predates the machine-B table below |
 
 ### Machine B — Intel Core i3-7100U @ 2.40GHz, 2C/4T, August 2026
 
