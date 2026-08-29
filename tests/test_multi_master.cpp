@@ -9,6 +9,12 @@
 #include <string>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <thread>
+#include <chrono>
 #include "orderbook/multi_master.hpp"
 #include "orderbook/conflict_resolver.hpp"
 #include "orderbook/hlc.hpp"
@@ -214,6 +220,75 @@ TEST(MultiMasterUnit, DisconnectPeerRemovesFromStates) {
     // After disconnect of non-existent peer, still empty.
     // (disconnect_peer is private, but we verify the invariant)
     EXPECT_EQ(mgr.connected_peer_count(), 0u);
+}
+
+// ── MM_PEERS lists peers, not connections mid-handshake ──────────────────────
+//
+// An accepted connection sits in peers_ under a temporary key with node_id 0 until its handshake
+// says who it is. Listing those made MM_PEERS answer "0  (no address)  disconnected", which reads as
+// a peer that has fallen over and counts as one node too many — and because the row exists only
+// while a handshake is in flight, it turned up as an intermittent integration failure rather than a
+// permanent one (#84).
+//
+// Driven through the real accept path rather than by reaching into peers_: the placeholder is
+// confirmed present through peer_states(), which reports every entry, and then MM_PEERS is asked. So
+// the test distinguishes "the connection is there and correctly not listed" from "nothing happened",
+// which is the distinction a weaker version of this test would miss.
+
+TEST(MultiMasterUnit, MmPeersDoesNotListAConnectionThatHasNotIdentifiedItself) {
+    TestContext ctx(1, 47821);
+    ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
+    mgr.start();
+
+    int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(sock, 0);
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(47821);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    bool connected = false;
+    for (int attempt = 0; attempt < 50 && !connected; ++attempt) {
+        if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+            connected = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    ASSERT_TRUE(connected) << "could not connect to the multi-master listener";
+
+    // Deliberately send no handshake. Wait until the manager has accepted the connection, which
+    // peer_states() shows because it reports every entry including the un-identified ones.
+    bool accepted = false;
+    for (int attempt = 0; attempt < 50 && !accepted; ++attempt) {
+        for (const auto& p : mgr.peer_states()) {
+            if (p.node_id == 0) accepted = true;
+        }
+        if (accepted) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    ASSERT_TRUE(accepted) << "the connection was never accepted, so this test proves nothing";
+
+    const std::string reply = mgr.handle_mm_peers_command();
+
+    // One header line and no data rows: the connection exists and is not a peer.
+    std::vector<std::string> lines;
+    size_t start = 0;
+    while (start < reply.size()) {
+        const size_t nl = reply.find('\n', start);
+        if (nl == std::string::npos) break;
+        lines.push_back(reply.substr(start, nl - start));
+        start = nl + 1;
+    }
+    ASSERT_FALSE(lines.empty());
+    EXPECT_NE(lines[0].find("node_id"), std::string::npos) << "first line should be the header";
+    EXPECT_EQ(lines.size(), 1u)
+        << "MM_PEERS listed " << (lines.size() - 1) << " peer row(s) for a connection that has not "
+        << "completed a handshake; the reply was:\n" << reply;
+
+    ::close(sock);
+    mgr.stop();
 }
 
 // ── handle_mm_peers_command() → correct TSV format ────────────────────────────
