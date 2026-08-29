@@ -275,6 +275,16 @@ Rules that matter for workflow security:
 
 - **Third-party actions are pinned to full commit SHAs** ✅, not tags. A tag can be moved; a SHA
   cannot. Dependabot understands this form and keeps bumping both the SHA and the version comment.
+  Resolve a SHA by hand with `git ls-remote ... 'refs/tags/vX.Y.Z^{}'` — without `^{}` an
+  **annotated** tag hands back the tag object rather than the commit, which for a lightweight tag is
+  the same value and so goes unnoticed until it is not.
+- **`github/codeql-action*` is grouped in `dependabot.yml`** ✅. Its `init` and `analyze` steps have
+  to move together — mixing versions fails with "Loaded a configuration file for version X, but
+  running version Y" — so a split bump gives two pull requests that each fail on their own, and with
+  `analyze (c-cpp)` and `CodeQL` both required that blocks every merge until both land. This happened
+  here in August 2026; the lesson was written into the SDK repository's config and **this** file, the
+  one where it happened, was left without the grouping. It then happened again the same month, pull
+  requests #50 and #51. Fixed where it occurs, not only where it was noticed.
 - **Least-privilege `permissions:`** — `permissions: contents: read` at workflow level, widened only
   where needed (CodeQL needs `security-events: write`).
 - **Never use `pull_request_target`** with a checkout of the PR head. That combination hands a fork's
