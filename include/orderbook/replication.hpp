@@ -324,12 +324,43 @@ private:
     Engine&                 engine_;
     std::thread             thread_;
     std::atomic<bool>       running_{false};
-    int                     fd_{-1};
 
-    uint32_t confirmed_file_{0};
-    size_t   confirmed_offset_{0};
-    uint64_t records_replayed_{0};
-    uint64_t local_epoch_{0};
+    /// The socket to the primary. Atomic because two threads read it and one writes it: the receive
+    /// thread owns its lifecycle, while `stop()` and `state()` are called from elsewhere.
+    ///
+    /// ThreadSanitizer reported the write in `run_loop()` against the read in `stop()` as soon as
+    /// this library was actually instrumented (#83). A torn `int` is the smaller half of it — the
+    /// larger is that `stop()` read the descriptor and then called `shutdown()` on it, so the
+    /// receive thread could close and the kernel reassign the number in between. That is the third
+    /// appearance of the same shape in this codebase (pitfalls 41 and 49).
+    std::atomic<int>        fd_{-1};
+
+    /// Serialises "close the socket and forget it" against "shut the socket down to wake the read".
+    ///
+    /// `shutdown()` is the right call in `stop()` and cannot be replaced by a flag: unlike
+    /// `close()`, it genuinely wakes a blocked `recv()`. What it needs is for the descriptor not to
+    /// be closed underneath it, which one mutex on the lifecycle gives — on the connect and shutdown
+    /// paths only, never on the receive path.
+    mutable std::mutex      fd_mtx_;
+
+    /// Where replay has got to, and how much of it there has been.
+    ///
+    /// Atomic because `state()` reads them for `STATUS` and `/metrics` while the receive thread
+    /// advances them — which ThreadSanitizer reported as three data races per run once this library
+    /// was instrumented (#83). The consequence was mild, since these are diagnostics rather than
+    /// decisions, but "mild" was not established anywhere: an unsynchronised `size_t` is a torn read
+    /// by the language's rules whatever the hardware does, and the three were reported as a triple
+    /// nobody had made consistent.
+    ///
+    /// `snapshot_bytes_received_` below was already atomic for exactly this reason. These four were
+    /// missed.
+    ///
+    /// Relaxed ordering throughout: the receive thread is the only writer, and a reader wants a
+    /// recent value rather than a synchronised one.
+    std::atomic<uint32_t> confirmed_file_{0};
+    std::atomic<size_t>   confirmed_offset_{0};
+    std::atomic<uint64_t> records_replayed_{0};
+    std::atomic<uint64_t> local_epoch_{0};
 
     // Snapshot bootstrap state
     std::atomic<bool> bootstrapping_{false};
@@ -345,6 +376,9 @@ private:
     void run_loop();
     void connect_to_primary();
     void receive_and_replay();
+
+    /// Close the socket and forget it, once, under fd_mtx_.
+    void close_socket();
     void send_ack();
     void save_state();
     void load_state();

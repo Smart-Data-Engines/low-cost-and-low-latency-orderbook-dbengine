@@ -81,6 +81,78 @@ set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 set(JSON_Install OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(nlohmann_json)
 
+# ── Instrumented builds: sanitizers and coverage ──────────────────────────────
+#
+# Placed here, and the placement is the point. `add_compile_options()` only affects targets created
+# *after* the call, and every one of this project's libraries is created below. These blocks used to
+# sit further down the file, past all of them — so `OB_ENABLE_ASAN`, `OB_ENABLE_TSAN` and
+# `OB_ENABLE_COVERAGE` instrumented `ob_tcp_server` and the test executables and **none of the
+# twenty-eight static libraries where the engine actually lives**.
+#
+# The evidence was one grep: in the ASan tree, `orderbook_engine.dir/flags.make` carried no
+# `-fsanitize` and `ob_tcp_server.dir/flags.make` did. Coverage said 59% of 2387 lines, when the
+# tree has an order of magnitude more than that — 6 of 34 source files were being measured. A
+# sanitizer job and a coverage number that both look like they cover the tree and cover a sixth of
+# it are the same failure mode as a required check that gates nothing.
+#
+# After FetchContent on purpose, so googletest, benchmark, rapidcheck and nlohmann/json stay
+# uninstrumented: they are not what these builds are asking about, and UBSan findings inside a
+# dependency would fail our build with -fno-sanitize-recover.
+
+# ── Sanitizers ────────────────────────────────────────────────────────────────
+#
+# Two separate options because ASan and TSan cannot be linked into the same binary. ASan is paired
+# with UBSan, which composes with it and costs almost nothing extra.
+#
+# Both keep -O1 and frame pointers: -O0 hides optimisation-dependent bugs and makes the suite slow
+# enough that nobody runs it, while -O2 loses the stack detail that makes a report actionable.
+option(OB_ENABLE_ASAN "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(OB_ENABLE_TSAN "Build with ThreadSanitizer" OFF)
+
+if(OB_ENABLE_ASAN AND OB_ENABLE_TSAN)
+    message(FATAL_ERROR "OB_ENABLE_ASAN and OB_ENABLE_TSAN cannot be enabled together: the two "
+                        "runtimes cannot coexist in one binary. Build them as separate trees.")
+endif()
+
+if((OB_ENABLE_ASAN OR OB_ENABLE_TSAN) AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # GCC 13 reports -Wmaybe-uninitialized inside <bits/std_function.h> when instrumentation
+    # changes what it can see through std::function, on code that is fine — a diagnostic about a
+    # system header, not about ours. -Werror turns it into a build failure, so it is disabled for
+    # sanitizer trees only. The ordinary build keeps every warning fatal.
+    #
+    # GCC only: clang has no -Wmaybe-uninitialized, and an unknown -Wno-* is itself a diagnostic
+    # there, which -Werror turns into the failure this line exists to prevent.
+    add_compile_options(-Wno-maybe-uninitialized)
+endif()
+
+if(OB_ENABLE_ASAN)
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer
+                        -fno-sanitize-recover=undefined -g -O1)
+    add_link_options(-fsanitize=address,undefined)
+    message(STATUS "AddressSanitizer + UndefinedBehaviorSanitizer enabled")
+endif()
+
+if(OB_ENABLE_TSAN)
+    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g -O1)
+    add_link_options(-fsanitize=thread)
+    message(STATUS "ThreadSanitizer enabled")
+endif()
+
+option(OB_ENABLE_COVERAGE "Enable gcov/llvm-cov code coverage instrumentation" OFF)
+
+if(OB_ENABLE_COVERAGE)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+        add_compile_options(--coverage -O0 -g)
+        add_link_options(--coverage)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        add_compile_options(-fprofile-instr-generate -fcoverage-mapping -O0 -g)
+        add_link_options(-fprofile-instr-generate)
+    else()
+        message(WARNING "Coverage not supported for compiler: ${CMAKE_CXX_COMPILER_ID}")
+    endif()
+    message(STATUS "Coverage instrumentation enabled")
+endif()
+
 # ── Core library ───────────────────────────────────────────────────────────────
 add_library(orderbook_core INTERFACE)
 target_include_directories(orderbook_core INTERFACE
@@ -91,6 +163,25 @@ target_compile_features(orderbook_core INTERFACE cxx_std_20)
 
 # ── SoA buffer compiled library ────────────────────────────────────────────────
 add_library(orderbook_soa STATIC src/soa_buffer.cpp)
+
+# The one translation unit ThreadSanitizer cannot compile.
+#
+# The SoA buffer's seqlock is built on `std::atomic_thread_fence`, and GCC refuses outright:
+# "'atomic_thread_fence' is not supported with '-fsanitize=thread' [-Werror=tsan]". TSan models
+# happens-before through atomic operations, not through standalone fences, so it cannot reason about
+# a seqlock even if it compiled one.
+#
+# So this file is excluded rather than the option abandoned. What that costs is real and worth stating:
+# **races inside the seqlock itself are outside TSan's reach**, and reports about the data it guards,
+# raised from instrumented callers, need reading against the seqlock's design rather than taken at
+# face value.
+#
+# Discovered when #83 moved the instrumentation above the libraries. Until then this file was not
+# instrumented either — along with the other twenty-seven — so the build succeeded by accident and
+# nobody learned that TSan and this data structure are incompatible.
+if(OB_ENABLE_TSAN)
+    target_compile_options(orderbook_soa PRIVATE -fno-sanitize=thread -Wno-tsan)
+endif()
 target_link_libraries(orderbook_soa PUBLIC orderbook_core)
 
 # ── Sequence tracker compiled library ─────────────────────────────────────────
@@ -214,58 +305,7 @@ add_library(orderbook_capi STATIC src/c_api.cpp)
 target_link_libraries(orderbook_capi PUBLIC orderbook_query orderbook_wal)
 
 # ── Coverage ──────────────────────────────────────────────────────────────────
-# ── Sanitizers ────────────────────────────────────────────────────────────────
-#
-# Two separate options because ASan and TSan cannot be linked into the same binary. ASan is paired
-# with UBSan, which composes with it and costs almost nothing extra.
-#
-# Both keep -O1 and frame pointers: -O0 hides optimisation-dependent bugs and makes the suite slow
-# enough that nobody runs it, while -O2 loses the stack detail that makes a report actionable.
-option(OB_ENABLE_ASAN "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
-option(OB_ENABLE_TSAN "Build with ThreadSanitizer" OFF)
-
-if(OB_ENABLE_ASAN AND OB_ENABLE_TSAN)
-    message(FATAL_ERROR "OB_ENABLE_ASAN and OB_ENABLE_TSAN cannot be enabled together: the two "
-                        "runtimes cannot coexist in one binary. Build them as separate trees.")
-endif()
-
-if((OB_ENABLE_ASAN OR OB_ENABLE_TSAN) AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    # GCC 13 reports -Wmaybe-uninitialized inside <bits/std_function.h> when instrumentation
-    # changes what it can see through std::function, on code that is fine — a diagnostic about a
-    # system header, not about ours. -Werror turns it into a build failure, so it is disabled for
-    # sanitizer trees only. The ordinary build keeps every warning fatal.
-    #
-    # GCC only: clang has no -Wmaybe-uninitialized, and an unknown -Wno-* is itself a diagnostic
-    # there, which -Werror turns into the failure this line exists to prevent.
-    add_compile_options(-Wno-maybe-uninitialized)
-endif()
-
-if(OB_ENABLE_ASAN)
-    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer
-                        -fno-sanitize-recover=undefined -g -O1)
-    add_link_options(-fsanitize=address,undefined)
-    message(STATUS "AddressSanitizer + UndefinedBehaviorSanitizer enabled")
-endif()
-
-if(OB_ENABLE_TSAN)
-    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g -O1)
-    add_link_options(-fsanitize=thread)
-    message(STATUS "ThreadSanitizer enabled")
-endif()
-
-option(OB_ENABLE_COVERAGE "Enable gcov/llvm-cov code coverage instrumentation" OFF)
-
 if(OB_ENABLE_COVERAGE)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
-        add_compile_options(--coverage -O0 -g)
-        add_link_options(--coverage)
-    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        add_compile_options(-fprofile-instr-generate -fcoverage-mapping -O0 -g)
-        add_link_options(-fprofile-instr-generate)
-    else()
-        message(WARNING "Coverage not supported for compiler: ${CMAKE_CXX_COMPILER_ID}")
-    endif()
-
     # Find lcov/genhtml (gcov path) or llvm-profdata/llvm-cov (clang path)
     find_program(LCOV_EXECUTABLE    lcov)
     find_program(GENHTML_EXECUTABLE genhtml)

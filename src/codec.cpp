@@ -19,14 +19,26 @@ static inline int64_t zigzag_decode(uint64_t v) noexcept {
 
 // ── Delta + Zigzag price codec ────────────────────────────────────────────────
 
+// The deltas are computed in unsigned arithmetic and reinterpreted, not subtracted as int64_t.
+//
+// `prices[i] - prev` on two int64_t is undefined when it overflows, and a property test over the
+// full int64 range finds that in a handful of cases — UBSan reported
+// "-5398869315210128419 - 3959960346406320104 cannot be represented in type 'long int'". Unsigned
+// subtraction wraps by definition, and in C++20 the conversion back to a signed type is modular
+// rather than implementation-defined, so this is exact for **every** int64 input rather than for the
+// range real prices happen to occupy. Which also makes the codec's round trip total: with wrapping
+// both ways, decode inverts encode even for values that overflow.
+//
+// It went unnoticed because the sanitizer builds did not instrument this library at all (#83).
 std::vector<uint64_t> encode_prices(std::span<const int64_t> prices) {
     std::vector<uint64_t> out;
     out.reserve(prices.size());
-    int64_t prev = 0;
+    uint64_t prev = 0;
     for (size_t i = 0; i < prices.size(); ++i) {
-        int64_t delta = (i == 0) ? prices[0] : (prices[i] - prev);
+        const uint64_t cur = static_cast<uint64_t>(prices[i]);
+        const int64_t delta = static_cast<int64_t>(cur - prev);
         out.push_back(zigzag_encode(delta));
-        prev = prices[i];
+        prev = cur;
     }
     return out;
 }
@@ -34,11 +46,11 @@ std::vector<uint64_t> encode_prices(std::span<const int64_t> prices) {
 std::vector<int64_t> decode_prices(std::span<const uint64_t> encoded) {
     std::vector<int64_t> out;
     out.reserve(encoded.size());
-    int64_t prev = 0;
+    uint64_t prev = 0;
     for (size_t i = 0; i < encoded.size(); ++i) {
-        int64_t delta = zigzag_decode(encoded[i]);
-        int64_t price = (i == 0) ? delta : (prev + delta);
-        out.push_back(price);
+        const uint64_t delta = static_cast<uint64_t>(zigzag_decode(encoded[i]));
+        const uint64_t price = prev + delta;      // wraps, matching encode_prices() exactly
+        out.push_back(static_cast<int64_t>(price));
         prev = price;
     }
     return out;

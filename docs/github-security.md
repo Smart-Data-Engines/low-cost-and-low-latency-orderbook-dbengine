@@ -84,8 +84,14 @@ gh api -X PUT repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengi
 JSON
 ```
 
-The list above is **ten** checks as of 27 August 2026, not the four the JSON block shows — see
+The list above is **eleven** checks as of 28 August 2026, not the four the JSON block shows — see
 §1.1, which is about how it came to be wrong.
+
+The eleventh is `coverage`, added with roadmap #37. It gates three things and deliberately not a
+percentage: that the tree builds with coverage instrumentation, that the suite passes under it, and
+that the instrumentation **reaches the libraries** — which it did not for as long as the option
+existed (#83), while the number it printed looked like a number. No third-party service is involved;
+the figure lands in the job summary and the per-file report as an artifact.
 
 The tenth is `clang-build`, added with roadmap #37. It carries no infrastructure of its own beyond a
 compiler, so it is the cheapest of these to keep green — and it earned its place on the first run by
@@ -443,6 +449,8 @@ handles (c), and 2FA with signed commits and tag protection handle (d).
    failover and crash recovery are gated rather than only run locally
 ✅ ruleset: clang-build required — added with #37, because the README claimed Clang support that
    nothing checked
+✅ ruleset: coverage required — added with #37; gates the instrumentation reaching the libraries, not
+   a percentage, until a measured baseline exists
 ✅ .github/rulesets/master.json matches the live ruleset again, see §1.1
 ✅ the 30 vendored CodeQL alerts dismissed with a reason — paths-ignore does not work here, see §1
 ⚙️ triage the two own-code CodeQL alerts recorded in §1; the other thirteen are note-level tidiness

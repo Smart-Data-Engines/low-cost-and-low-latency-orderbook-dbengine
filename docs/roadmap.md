@@ -415,7 +415,7 @@ test binary down.
 
 - Spec: none; the roadmap entry was the spec
 
-### 37. CI hardening — sanitizers and the compiler matrix ✅ (coverage is still open)
+### 37. CI hardening — sanitizers, the compiler matrix and coverage ✅
 
 **Sanitizers are in CI and both are clean**, and each found a real defect on the way in — which is the
 whole argument for the job, so it is worth recording what they were.
@@ -488,13 +488,40 @@ to sanitizer trees. That flag does not exist in Clang, where an unknown `-Wno-*`
 diagnostic — which `-Werror` would turn into the build failure the line exists to prevent. It is
 guarded on `CMAKE_CXX_COMPILER_ID STREQUAL "GNU"` now.
 
-**Still open under this item:** the coverage report (`OB_ENABLE_COVERAGE` already exists). The
-*badge* is a separate question and not a technical one — every option means sending coverage data
-from a public repository to a third-party service and holding an account there, which is a decision
-with an owner.
+**The coverage half is closed too, without a badge.** A `coverage` job builds with
+`OB_ENABLE_COVERAGE`, runs the suite, and prints line, function and branch coverage into the job
+summary with a per-file breakdown attached as an artifact. Nothing leaves the repository: every badge
+on offer means sending reports from a public repository to a third-party service and holding an
+account there, which is a decision with an owner rather than a task, and it was decided against for
+now.
 
-- Effort: S | Impact: 697 tests clean under ASan+UBSan and under TSan, checked on every push. Two
-  defects found by turning them on, one of them undefined behaviour on the hot path's data type
+**The first honest number**, and it is instructive next to the one it replaced:
+
+| | lines | functions | branches | source files measured |
+|---|---|---|---|---|
+| Before #83 | 59.0% of **2387** | 66.5% | 36.2% | **6** of 34 |
+| After | **61.0% of 11352** | 72.5% | 33.4% | **33** of 34 |
+
+The percentage barely moved while the denominator grew almost fivefold. That is the shape of the
+defect: the old figure was not measuring less of the tree, it was measuring an unrepresentative sixth
+of it and landing on a plausible number anyway.
+
+Gated at a **58% line floor** — three points of slack, so ordinary churn does not trip it and a real
+drop does. Branches are deliberately not gated: 33% is too far from anything to be a useful ratchet,
+and a floor nobody can raise is a floor nobody respects. The job also gates three things that are not
+percentages — the tree builds with coverage, the suite passes under it, and the instrumentation still
+reaches the libraries, which is the part that failed silently for as long as the option existed.
+
+**Correction, from #83.** The line below said "697 tests clean under ASan+UBSan and under TSan", and
+this entry said so from the day the jobs went in. It was true of the test binaries and the server and
+**not of the twenty-eight static libraries** — `add_compile_options()` only affects targets created
+after the call, and these blocks sat past every one of them. UBSan needs instrumentation to see
+anything, so undefined behaviour in library code was not being checked at all. #83 has the evidence,
+the fix and what survives of the original claim.
+
+- Effort: S | Impact: 697 tests clean under ASan+UBSan and under TSan, checked on every push — with
+  the qualification above until #83 made it true of the whole tree. Two defects found by turning them
+  on, one of them undefined behaviour on the hot path's data type
 
 ### 38. Fuzzing
 - libFuzzer harnesses for `command_parser`, the multi-master frame parser, and WAL record
@@ -1516,6 +1543,81 @@ ignore checks.
 
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
+
+### 83. The sanitizers and the coverage build instrumented a sixth of the tree
+
+Found while measuring coverage for the other half of #37. `gcovr` reported **59.0% of 2387 lines**,
+which for a tree of this size is the wrong order of magnitude — and the per-file report named **6 of
+34** source files. Everything else was missing, not at 0%.
+
+`add_compile_options()` affects only targets created **after** the call. Every library in this
+project is created between lines 85 and 213 of `CMakeLists.txt`; the `OB_ENABLE_ASAN`,
+`OB_ENABLE_TSAN` and `OB_ENABLE_COVERAGE` blocks sat at 232-258, past all of them. So the
+instrumentation reached `ob_tcp_server` and the test executables and **none of the twenty-eight
+static libraries where the engine lives**.
+
+One grep is the whole proof:
+
+```
+build-asan/CMakeFiles/orderbook_multi_master.dir/flags.make   -fsanitize: 0
+build-asan/CMakeFiles/orderbook_engine.dir/flags.make         -fsanitize: 0
+build-asan/CMakeFiles/ob_tcp_server.dir/flags.make            -fsanitize: 1
+```
+
+**What this means for what has been claimed.** #37 and #80 both reported suites "clean under
+ASan+UBSan and TSan", and this repository has said so in a commit message, a pull request and its own
+notes. That claim covered the test binaries and the server, not the libraries. UBSan needs
+instrumentation to see anything, so undefined behaviour in library code was never checked. ASan still
+catches heap errors through its allocator interposition, so that part held. The TSan findings in #80
+were real — a lock-order inversion and races it sees through pthread interceptors regardless — but
+races entirely inside uninstrumented library code were invisible to it.
+
+Corrected rather than quietly restated, because the number of times this repository has been bitten
+by a mechanism that looks present and is not is the reason it keeps a pitfall list.
+
+The fix is placement: the three blocks now sit **after** FetchContent, so googletest, benchmark,
+rapidcheck and nlohmann/json stay uninstrumented — they are not what these builds are asking about,
+and a UBSan finding inside a dependency would fail the build under `-fno-sanitize-recover` — and
+**before** the first `add_library`, so every target of ours is covered. Verified the same way it was
+disproved: by grepping `flags.make`.
+
+**And the first fully-instrumented run found two pieces of undefined behaviour, both in libraries
+that had never been instrumented.** Two of 744 tests failed, which is the proof that this was not a
+tidying exercise:
+
+- **`encode_prices()` subtracted two `int64_t`** to form each delta. UBSan:
+  `-5398869315210128419 - 3959960346406320104 cannot be represented in type 'long int'`. Real prices
+  live nowhere near the ends of the range, but the property test generates the whole of it — and it
+  was right to: signed overflow is undefined, and the round trip was therefore not total. The deltas
+  are computed in unsigned arithmetic and reinterpreted now, which wraps by definition and, in C++20,
+  converts back modularly rather than implementation-definedly. `decode_prices()` wraps to match, so
+  the codec now inverts itself for **every** `int64_t` input rather than for the range prices happen
+  to occupy.
+- **`HybridLogicalClock::merge_remote()` computed drift as
+  `int64_t(new_physical) - int64_t(now)`**, and then negated it if negative. Two undefined steps in
+  three lines: the subtraction overflows for a large physical component, and `-INT64_MIN` is
+  undefined on its own. This one is reachable **from the network** — `new_physical` derives from a
+  peer's timestamp on the wire, so a node sending a nonsense value caused undefined behaviour on
+  every node that received it, not merely a wrong drift figure. Unsigned difference, then clamped to
+  `INT64_MAX`.
+
+Neither was found by the sanitizer job that had been required on every pull request for a day,
+because neither library was compiled with the sanitizer.
+
+**And one library cannot be compiled with TSan at all**, which is the other thing the accident was
+hiding. `orderbook_soa` builds the SoA buffer's seqlock on `std::atomic_thread_fence`, and GCC
+refuses: *"'atomic_thread_fence' is not supported with '-fsanitize=thread' [-Werror=tsan]"*. TSan
+models happens-before through atomic operations rather than standalone fences, so it could not reason
+about a seqlock even if it compiled one. That translation unit is excluded from TSan explicitly now,
+with the cost stated where the exclusion is: **races inside the seqlock are outside TSan's reach**, and
+reports about the data it guards, raised from instrumented callers, have to be read against the
+seqlock's design rather than taken at face value. Before #83 the file was not instrumented either —
+along with the other twenty-seven — so the build succeeded by accident and nobody learned that the
+tool and the engine's hottest data structure are incompatible.
+
+- Effort: S | Impact: Two CI jobs and a coverage number that all looked like they covered the tree
+  and covered a sixth of it. Turning the instrumentation on properly found undefined behaviour on
+  the compression path and in the clock, one of it reachable from a peer
 
 ### 82. A revoked lease is noticed on the next refresh, and a candidate can win the key before then ✅
 

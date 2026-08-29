@@ -1076,9 +1076,13 @@ void ReplicationClient::start() {
     // Load last confirmed offset from state file (Requirement 6.1, 6.2).
     load_state();
 
-    OB_LOG_INFO("repl_client", "starting replication client, primary=%s:%u, confirmed_file=%u, confirmed_offset=%lu",
+    const uint32_t cf = confirmed_file_.load(std::memory_order_relaxed);
+    const size_t   co = confirmed_offset_.load(std::memory_order_relaxed);
+    OB_LOG_INFO("repl_client",
+                "starting replication client, primary=%s:%u, confirmed_file=%u, "
+                "confirmed_offset=%lu",
                 config_.primary_host.c_str(), config_.primary_port,
-                confirmed_file_, static_cast<unsigned long>(confirmed_offset_));
+                cf, static_cast<unsigned long>(co));
 
     running_.store(true, std::memory_order_release);
     thread_ = std::thread([this]() { run_loop(); });
@@ -1090,24 +1094,42 @@ void ReplicationClient::stop() {
     running_.store(false, std::memory_order_release);
 
     // Shutdown the socket to unblock any blocking recv() in the receive thread.
-    if (fd_ >= 0) {
-        ::shutdown(fd_, SHUT_RDWR);
+    //
+    // Under fd_mtx_, and that is not decoration: reading the descriptor and then calling shutdown()
+    // on it leaves a window in which the receive thread closes it and the kernel hands the number to
+    // something else — so the call would land on an unrelated socket. shutdown() itself is the right
+    // tool here and cannot be replaced by a flag, because unlike close() it actually wakes a blocked
+    // recv().
+    {
+        std::lock_guard<std::mutex> lk(fd_mtx_);
+        const int fd = fd_.load(std::memory_order_acquire);
+        if (fd >= 0) {
+            ::shutdown(fd, SHUT_RDWR);
+        }
     }
 
     if (thread_.joinable()) {
         thread_.join();
     }
 
-    if (fd_ >= 0) {
-        ::close(fd_);
-        fd_ = -1;
-    }
+    close_socket();
 
     save_state();
 }
 
+void ReplicationClient::close_socket() {
+    std::lock_guard<std::mutex> lk(fd_mtx_);
+    const int fd = fd_.exchange(-1, std::memory_order_acq_rel);
+    if (fd >= 0) {
+        ::close(fd);
+    }
+}
+
 ReplicationClient::State ReplicationClient::state() const {
-    return State{confirmed_file_, confirmed_offset_, (fd_ >= 0), records_replayed_,
+    return State{confirmed_file_.load(std::memory_order_relaxed),
+                 confirmed_offset_.load(std::memory_order_relaxed),
+                 (fd_.load(std::memory_order_acquire) >= 0),
+                 records_replayed_.load(std::memory_order_relaxed),
                  bootstrapping_.load(std::memory_order_acquire),
                  snapshot_bytes_received_.load(std::memory_order_relaxed),
                  snapshot_bytes_total_.load(std::memory_order_relaxed)};
@@ -1135,11 +1157,9 @@ void ReplicationClient::run_loop() {
             OB_LOG_WARN("repl_client", "unknown error in run_loop");
         }
 
-        // Clean up socket on disconnect.
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
-        }
+        // Clean up socket on disconnect. Through close_socket() so it cannot race stop()'s
+        // shutdown() on the same descriptor.
+        close_socket();
 
         // Wait before reconnecting, checking running_ periodically.
         for (int i = 0; i < backoff_sec * 10 && running_.load(std::memory_order_acquire); ++i) {
@@ -1164,15 +1184,13 @@ void ReplicationClient::connect_to_primary() {
     addr.sin_port   = htons(config_.primary_port);
 
     if (::inet_pton(AF_INET, config_.primary_host.c_str(), &addr.sin_addr) <= 0) {
-        ::close(fd_);
-        fd_ = -1;
+        close_socket();
         throw std::runtime_error("ReplicationClient: invalid primary_host: " +
                                  config_.primary_host);
     }
 
     if (::connect(fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd_);
-        fd_ = -1;
+        close_socket();
         throw std::runtime_error(std::string("ReplicationClient: connect() failed: ") +
                                  std::strerror(errno));
     }
@@ -1194,10 +1212,11 @@ void ReplicationClient::connect_to_primary() {
     // with ERR WAL_TRUNCATED, receive_and_replay() will trigger snapshot bootstrap.
     char handshake[128];
     int len = std::snprintf(handshake, sizeof(handshake), "REPLICATE %u %zu %" PRIu64 "\n",
-                            confirmed_file_, confirmed_offset_, local_epoch_);
+                            confirmed_file_.load(std::memory_order_relaxed),
+                            confirmed_offset_.load(std::memory_order_relaxed),
+                            local_epoch_.load(std::memory_order_relaxed));
     if (!send_all(fd_, handshake, static_cast<size_t>(len))) {
-        ::close(fd_);
-        fd_ = -1;
+        close_socket();
         throw std::runtime_error("ReplicationClient: failed to send handshake");
     }
     OB_LOG_INFO("repl_client", "handshake sent: %.*s", len - 1, handshake);
@@ -1281,14 +1300,14 @@ void ReplicationClient::receive_and_replay() {
                                 &file_index, &byte_offset, &total_len, &msg_epoch);
                 if (parsed < 3) continue;
 
-                if (parsed == 4 && msg_epoch < local_epoch_) {
+                if (parsed == 4 && msg_epoch < local_epoch_.load(std::memory_order_relaxed)) {
                     OB_LOG_WARN("replication", "stale epoch %" PRIu64
                                  " < local %" PRIu64 ", disconnecting",
-                                 msg_epoch, local_epoch_);
+                                 msg_epoch, local_epoch_.load(std::memory_order_relaxed));
                     return;
                 }
-                if (parsed == 4 && msg_epoch > local_epoch_) {
-                    local_epoch_ = msg_epoch;
+                if (parsed == 4 && msg_epoch > local_epoch_.load(std::memory_order_relaxed)) {
+                    local_epoch_.store(msg_epoch, std::memory_order_relaxed);
                 }
 
                 if (binary_len < sizeof(WALRecord)) {
@@ -1312,8 +1331,8 @@ void ReplicationClient::receive_and_replay() {
 
                 if (hdr.record_type == WAL_RECORD_EPOCH && payload_len == 8) {
                     EpochValue received_epoch = epoch_from_payload(payload);
-                    if (received_epoch.term > local_epoch_) {
-                        local_epoch_ = received_epoch.term;
+                    if (received_epoch.term > local_epoch_.load(std::memory_order_relaxed)) {
+                        local_epoch_.store(received_epoch.term, std::memory_order_relaxed);
                     }
                 }
 
@@ -1329,9 +1348,9 @@ void ReplicationClient::receive_and_replay() {
                     }
                 }
 
-                confirmed_file_   = file_index;
-                confirmed_offset_ = byte_offset + total_len;
-                ++records_replayed_;
+                confirmed_file_.store(file_index, std::memory_order_relaxed);
+                confirmed_offset_.store(byte_offset + total_len, std::memory_order_relaxed);
+                records_replayed_.fetch_add(1, std::memory_order_relaxed);
                 send_ack();
                 continue;
             }
@@ -1340,14 +1359,14 @@ void ReplicationClient::receive_and_replay() {
             if (line.rfind("HEARTBEAT", 0) == 0) {
                 uint64_t hb_epoch = 0;
                 if (std::sscanf(line.c_str(), "HEARTBEAT %" SCNu64, &hb_epoch) == 1) {
-                    if (hb_epoch < local_epoch_) {
+                    if (hb_epoch < local_epoch_.load(std::memory_order_relaxed)) {
                         OB_LOG_WARN("replication", "stale heartbeat epoch %" PRIu64
                                      " < local %" PRIu64 ", disconnecting",
-                                     hb_epoch, local_epoch_);
+                                     hb_epoch, local_epoch_.load(std::memory_order_relaxed));
                         return;
                     }
-                    if (hb_epoch > local_epoch_) {
-                        local_epoch_ = hb_epoch;
+                    if (hb_epoch > local_epoch_.load(std::memory_order_relaxed)) {
+                        local_epoch_.store(hb_epoch, std::memory_order_relaxed);
                     }
                 }
                 send_ack();
@@ -1398,16 +1417,16 @@ void ReplicationClient::receive_and_replay() {
             }
 
             // Stale-epoch check (Requirement 2.1, 2.2, 3.5).
-            if (parsed == 4 && msg_epoch < local_epoch_) {
+            if (parsed == 4 && msg_epoch < local_epoch_.load(std::memory_order_relaxed)) {
                 // Stale primary — disconnect and log warning.
                 OB_LOG_WARN("replication", "stale epoch %" PRIu64
                              " < local %" PRIu64 ", disconnecting",
-                             msg_epoch, local_epoch_);
+                             msg_epoch, local_epoch_.load(std::memory_order_relaxed));
                 return;
             }
             // Epoch advancement: if received epoch > local, update (Requirement 2.4).
-            if (parsed == 4 && msg_epoch > local_epoch_) {
-                local_epoch_ = msg_epoch;
+            if (parsed == 4 && msg_epoch > local_epoch_.load(std::memory_order_relaxed)) {
+                local_epoch_.store(msg_epoch, std::memory_order_relaxed);
             }
 
             if (total_len < sizeof(WALRecord) || total_len > 1024 * 1024) {
@@ -1444,8 +1463,8 @@ void ReplicationClient::receive_and_replay() {
             // Handle Epoch_Record: update local epoch (Requirement 2.4).
             if (hdr.record_type == WAL_RECORD_EPOCH && payload_len == 8) {
                 EpochValue received_epoch = epoch_from_payload(payload);
-                if (received_epoch.term > local_epoch_) {
-                    local_epoch_ = received_epoch.term;
+                if (received_epoch.term > local_epoch_.load(std::memory_order_relaxed)) {
+                    local_epoch_.store(received_epoch.term, std::memory_order_relaxed);
                 }
             }
 
@@ -1466,9 +1485,9 @@ void ReplicationClient::receive_and_replay() {
             }
 
             // Update confirmed position.
-            confirmed_file_   = file_index;
-            confirmed_offset_ = byte_offset + total_len;
-            ++records_replayed_;
+            confirmed_file_.store(file_index, std::memory_order_relaxed);
+            confirmed_offset_.store(byte_offset + total_len, std::memory_order_relaxed);
+            records_replayed_.fetch_add(1, std::memory_order_relaxed);
 
             // Send ACK (Requirement 2.4).
             send_ack();
@@ -1481,15 +1500,15 @@ void ReplicationClient::receive_and_replay() {
             uint64_t hb_epoch = 0;
             if (std::sscanf(line_buf, "HEARTBEAT %" SCNu64, &hb_epoch) == 1) {
                 // Stale-epoch check (Requirement 3.5).
-                if (hb_epoch < local_epoch_) {
+                if (hb_epoch < local_epoch_.load(std::memory_order_relaxed)) {
                     OB_LOG_WARN("replication", "stale heartbeat epoch %" PRIu64
                                  " < local %" PRIu64 ", disconnecting",
-                                 hb_epoch, local_epoch_);
+                                 hb_epoch, local_epoch_.load(std::memory_order_relaxed));
                     return;
                 }
                 // Epoch advancement.
-                if (hb_epoch > local_epoch_) {
-                    local_epoch_ = hb_epoch;
+                if (hb_epoch > local_epoch_.load(std::memory_order_relaxed)) {
+                    local_epoch_.store(hb_epoch, std::memory_order_relaxed);
                 }
             }
             send_ack();
@@ -1522,7 +1541,8 @@ void ReplicationClient::send_ack() {
     // Format: ACK <file_index> <byte_offset>\n (Requirement 4.4).
     char ack[128];
     int len = std::snprintf(ack, sizeof(ack), "ACK %u %zu\n",
-                            confirmed_file_, confirmed_offset_);
+                            confirmed_file_.load(std::memory_order_relaxed),
+                            confirmed_offset_.load(std::memory_order_relaxed));
     send_all(fd_, ack, static_cast<size_t>(len));
 }
 
@@ -1533,7 +1553,8 @@ void ReplicationClient::save_state() {
     if (!f) return;
 
     std::fprintf(f, "file_index=%u\nbyte_offset=%zu\n",
-                 confirmed_file_, confirmed_offset_);
+                 confirmed_file_.load(std::memory_order_relaxed),
+                 confirmed_offset_.load(std::memory_order_relaxed));
     std::fclose(f);
 }
 
@@ -1543,8 +1564,8 @@ void ReplicationClient::load_state() {
     std::FILE* f = std::fopen(config_.state_file.c_str(), "r");
     if (!f) {
         // No state file — start from beginning.
-        confirmed_file_   = 0;
-        confirmed_offset_ = 0;
+        confirmed_file_.store(0, std::memory_order_relaxed);
+        confirmed_offset_.store(0, std::memory_order_relaxed);
         return;
     }
 
@@ -1554,9 +1575,9 @@ void ReplicationClient::load_state() {
 
     while (std::fgets(line, sizeof(line), f)) {
         if (std::sscanf(line, "file_index=%u", &file_index) == 1) {
-            confirmed_file_ = file_index;
+            confirmed_file_.store(file_index, std::memory_order_relaxed);
         } else if (std::sscanf(line, "byte_offset=%zu", &byte_offset) == 1) {
-            confirmed_offset_ = byte_offset;
+            confirmed_offset_.store(byte_offset, std::memory_order_relaxed);
         }
     }
 
@@ -1811,8 +1832,8 @@ void ReplicationClient::install_snapshot(const std::string& staging_dir,
     engine_.load_snapshot(manifest);
 
     // Update confirmed WAL position.
-    confirmed_file_   = manifest.wal_file_index;
-    confirmed_offset_ = manifest.wal_byte_offset;
+    confirmed_file_.store(manifest.wal_file_index, std::memory_order_relaxed);
+    confirmed_offset_.store(manifest.wal_byte_offset, std::memory_order_relaxed);
     save_state();
 
     // Clean up staging directory.
