@@ -346,9 +346,19 @@ jobs:
 
       - name: Report coverage
         run: |
+          # negative_hits.warn: gcov emits negative execution counts for a few of wal.cpp's lines,
+          # and gcovr treats an unparseable count as fatal by default. They come from tests that
+          # abandon a process on purpose — crash recovery is tested by killing the engine rather than
+          # closing it — which leaves a partially written .gcda. Warn and carry on: the alternative is
+          # no coverage number at all, and the lines affected are the ones a deliberately killed
+          # process was executing.
+          #
+          # It did not appear locally before this change, for the reason this change is about:
+          # wal.cpp was not instrumented.
           gcovr --root . \
                 --filter 'src/' --filter 'include/orderbook/' \
                 --exclude 'tests/' --exclude 'build.*' \
+                --gcov-ignore-parse-errors=negative_hits.warn \
                 --txt-metric line --print-summary \
                 --txt coverage.txt --json-summary coverage.json
           {

@@ -1090,24 +1090,40 @@ void ReplicationClient::stop() {
     running_.store(false, std::memory_order_release);
 
     // Shutdown the socket to unblock any blocking recv() in the receive thread.
-    if (fd_ >= 0) {
-        ::shutdown(fd_, SHUT_RDWR);
+    //
+    // Under fd_mtx_, and that is not decoration: reading the descriptor and then calling shutdown()
+    // on it leaves a window in which the receive thread closes it and the kernel hands the number to
+    // something else — so the call would land on an unrelated socket. shutdown() itself is the right
+    // tool here and cannot be replaced by a flag, because unlike close() it actually wakes a blocked
+    // recv().
+    {
+        std::lock_guard<std::mutex> lk(fd_mtx_);
+        const int fd = fd_.load(std::memory_order_acquire);
+        if (fd >= 0) {
+            ::shutdown(fd, SHUT_RDWR);
+        }
     }
 
     if (thread_.joinable()) {
         thread_.join();
     }
 
-    if (fd_ >= 0) {
-        ::close(fd_);
-        fd_ = -1;
-    }
+    close_socket();
 
     save_state();
 }
 
+void ReplicationClient::close_socket() {
+    std::lock_guard<std::mutex> lk(fd_mtx_);
+    const int fd = fd_.exchange(-1, std::memory_order_acq_rel);
+    if (fd >= 0) {
+        ::close(fd);
+    }
+}
+
 ReplicationClient::State ReplicationClient::state() const {
-    return State{confirmed_file_, confirmed_offset_, (fd_ >= 0), records_replayed_,
+    return State{confirmed_file_, confirmed_offset_,
+                 (fd_.load(std::memory_order_acquire) >= 0), records_replayed_,
                  bootstrapping_.load(std::memory_order_acquire),
                  snapshot_bytes_received_.load(std::memory_order_relaxed),
                  snapshot_bytes_total_.load(std::memory_order_relaxed)};
@@ -1135,11 +1151,9 @@ void ReplicationClient::run_loop() {
             OB_LOG_WARN("repl_client", "unknown error in run_loop");
         }
 
-        // Clean up socket on disconnect.
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
-        }
+        // Clean up socket on disconnect. Through close_socket() so it cannot race stop()'s
+        // shutdown() on the same descriptor.
+        close_socket();
 
         // Wait before reconnecting, checking running_ periodically.
         for (int i = 0; i < backoff_sec * 10 && running_.load(std::memory_order_acquire); ++i) {
@@ -1164,15 +1178,13 @@ void ReplicationClient::connect_to_primary() {
     addr.sin_port   = htons(config_.primary_port);
 
     if (::inet_pton(AF_INET, config_.primary_host.c_str(), &addr.sin_addr) <= 0) {
-        ::close(fd_);
-        fd_ = -1;
+        close_socket();
         throw std::runtime_error("ReplicationClient: invalid primary_host: " +
                                  config_.primary_host);
     }
 
     if (::connect(fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd_);
-        fd_ = -1;
+        close_socket();
         throw std::runtime_error(std::string("ReplicationClient: connect() failed: ") +
                                  std::strerror(errno));
     }
@@ -1196,8 +1208,7 @@ void ReplicationClient::connect_to_primary() {
     int len = std::snprintf(handshake, sizeof(handshake), "REPLICATE %u %zu %" PRIu64 "\n",
                             confirmed_file_, confirmed_offset_, local_epoch_);
     if (!send_all(fd_, handshake, static_cast<size_t>(len))) {
-        ::close(fd_);
-        fd_ = -1;
+        close_socket();
         throw std::runtime_error("ReplicationClient: failed to send handshake");
     }
     OB_LOG_INFO("repl_client", "handshake sent: %.*s", len - 1, handshake);
