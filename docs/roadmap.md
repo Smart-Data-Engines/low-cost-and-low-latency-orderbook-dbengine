@@ -1567,7 +1567,7 @@ reads zero for two different reasons, and the one behind the `hlc_timestamp` col
 
 - Effort: S | Impact: A diagnostic command reported a peer that did not exist, intermittently
 
-### 83. The sanitizers and the coverage build instrumented a sixth of the tree
+### 83. The sanitizers and the coverage build instrumented a sixth of the tree ✅
 
 Found while measuring coverage for the other half of #37. `gcovr` reported **59.0% of 2387 lines**,
 which for a tree of this size is the wrong order of magnitude — and the per-file report named **6 of
