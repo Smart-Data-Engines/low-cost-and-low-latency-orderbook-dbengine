@@ -343,10 +343,24 @@ private:
     /// paths only, never on the receive path.
     mutable std::mutex      fd_mtx_;
 
-    uint32_t confirmed_file_{0};
-    size_t   confirmed_offset_{0};
-    uint64_t records_replayed_{0};
-    uint64_t local_epoch_{0};
+    /// Where replay has got to, and how much of it there has been.
+    ///
+    /// Atomic because `state()` reads them for `STATUS` and `/metrics` while the receive thread
+    /// advances them — which ThreadSanitizer reported as three data races per run once this library
+    /// was instrumented (#83). The consequence was mild, since these are diagnostics rather than
+    /// decisions, but "mild" was not established anywhere: an unsynchronised `size_t` is a torn read
+    /// by the language's rules whatever the hardware does, and the three were reported as a triple
+    /// nobody had made consistent.
+    ///
+    /// `snapshot_bytes_received_` below was already atomic for exactly this reason. These four were
+    /// missed.
+    ///
+    /// Relaxed ordering throughout: the receive thread is the only writer, and a reader wants a
+    /// recent value rather than a synchronised one.
+    std::atomic<uint32_t> confirmed_file_{0};
+    std::atomic<size_t>   confirmed_offset_{0};
+    std::atomic<uint64_t> records_replayed_{0};
+    std::atomic<uint64_t> local_epoch_{0};
 
     // Snapshot bootstrap state
     std::atomic<bool> bootstrapping_{false};
