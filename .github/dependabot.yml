@@ -8,6 +8,18 @@ updates:
       prefix: "chore"
     labels:
       - dependencies
+    groups:
+      # codeql-action's `init` and `analyze` steps have to move together: running init from one
+      # version and analyze from another fails with "Loaded a configuration file for version X, but
+      # running version Y". Split across two pull requests, each one fails on its own — and with
+      # `analyze (c-cpp)` and `CodeQL` both required, that blocks every merge until both land.
+      #
+      # This happened here in August 2026, the lesson was written into the SDK repository's
+      # dependabot.yml, and this file — the one where it happened — never got the grouping. It then
+      # happened again: #50 and #51, init and analyze, two pull requests, same day.
+      codeql:
+        patterns:
+          - "github/codeql-action*"
 
   - package-ecosystem: pip
     directory: /
