@@ -495,12 +495,22 @@ on offer means sending reports from a public repository to a third-party service
 account there, which is a decision with an owner rather than a task, and it was decided against for
 now.
 
-It is required, and deliberately **not** on a percentage — yet. A floor needs a measured baseline and
-until #83 there was none to have: the option instrumented six of thirty-four source files, so the
-59% it reported described a sixth of the tree. What the job does gate is worth gating on its own —
-the tree builds with coverage, the suite passes under it, and the instrumentation still reaches the
-libraries, which is the part that failed silently for as long as the option existed. The percentage
-floor goes in once a run has printed a number to set it from.
+**The first honest number**, and it is instructive next to the one it replaced:
+
+| | lines | functions | branches | source files measured |
+|---|---|---|---|---|
+| Before #83 | 59.0% of **2387** | 66.5% | 36.2% | **6** of 34 |
+| After | **61.0% of 11352** | 72.5% | 33.4% | **33** of 34 |
+
+The percentage barely moved while the denominator grew almost fivefold. That is the shape of the
+defect: the old figure was not measuring less of the tree, it was measuring an unrepresentative sixth
+of it and landing on a plausible number anyway.
+
+Gated at a **58% line floor** — three points of slack, so ordinary churn does not trip it and a real
+drop does. Branches are deliberately not gated: 33% is too far from anything to be a useful ratchet,
+and a floor nobody can raise is a floor nobody respects. The job also gates three things that are not
+percentages — the tree builds with coverage, the suite passes under it, and the instrumentation still
+reaches the libraries, which is the part that failed silently for as long as the option existed.
 
 **Correction, from #83.** The line below said "697 tests clean under ASan+UBSan and under TSan", and
 this entry said so from the day the jobs went in. It was true of the test binaries and the server and

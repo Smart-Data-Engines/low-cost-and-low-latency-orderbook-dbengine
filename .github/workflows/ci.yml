@@ -286,14 +286,19 @@ jobs:
 
   # Line coverage over the engine's own sources, reported and not (yet) gated.
   #
-  # Required, but not on a percentage — not yet. A floor needs a measured baseline, and until #83
-  # there was none to have: `OB_ENABLE_COVERAGE` instrumented six of thirty-four source files, so the
-  # 59% it reported described a sixth of the tree. This job exists to produce the first honest number.
+  # Required, and gated on a floor taken from a measurement rather than from taste.
   #
-  # What it does gate is worth gating on its own: the tree builds with coverage, the suite passes
-  # under it, and the instrumentation still reaches the libraries — the last of which failed silently
-  # for as long as the option existed. The percentage floor goes in once a run has printed a number
-  # to set it from.
+  # The first honest run reported **61.0% of 11352 lines** (functions 72.5%, branches 33.4%) across
+  # 33 source files. Before #83 the same option reported "59.0% of 2387 lines" over 6 files — nearly
+  # the same percentage of an unrepresentative sixth, which is what made it worth nothing.
+  #
+  # The floor is 58%: three points of slack, so ordinary churn does not trip it and a real drop does.
+  # Branches are not gated — 33% is too far from anything to be a useful ratchet yet, and a floor
+  # nobody can raise is a floor nobody respects.
+  #
+  # It also gates three things that are not percentages: the tree builds with coverage, the suite
+  # passes under it, and the instrumentation still reaches the libraries. The last of those failed
+  # silently for as long as the option existed.
   #
   # No third-party service. Every coverage badge on offer means sending reports from a public
   # repository to somebody else's account, which is a decision with an owner rather than a task, so
@@ -382,6 +387,19 @@ jobs:
             echo
             echo '</details>'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Line coverage must not fall below the floor
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          FLOOR = 58.0
+          d = json.load(open("coverage.json"))
+          pct = d["line_percent"]
+          print(f"line coverage {pct:.1f}% (floor {FLOOR}%), {d['line_covered']}/{d['line_total']} lines")
+          if pct < FLOOR:
+              print(f"::error::line coverage {pct:.1f}% is below the {FLOOR}% floor")
+              sys.exit(1)
+          PY
 
       - name: Upload the report
         if: always()
