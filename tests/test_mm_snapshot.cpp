@@ -942,9 +942,12 @@ TEST(MMSnapshotPreparation, TearingDownWithASnapshotInFlightIsClean) {
 TEST(MMSnapshotPreparation, ConcurrentCreationNeverLeavesAHalfWrittenManifest) {
     Node node(1);
     for (int sym = 0; sym < 30; ++sym) {
-        char name[8];
-        std::snprintf(name, sizeof(name), "SYM%02d", sym);
-        node.write_rows(name, 2, 25'000'000 + static_cast<uint64_t>(sym) * 1000);
+        // std::to_string rather than snprintf into a fixed buffer: at -O1 and above GCC cannot
+        // narrow the loop variable and reports "%02d may write up to 11 bytes into a region of
+        // size 5" as an error. A Debug build at -O0 does not run that analysis at all, so the
+        // sanitizer job — which builds Debug *plus* -O1 — was the first thing to see it.
+        const std::string sym_name = "SYM" + std::to_string(sym);
+        node.write_rows(sym_name.c_str(), 2, 25'000'000 + static_cast<uint64_t>(sym) * 1000);
     }
 
     const std::string manifest_path = node.tmp.path + "/snapshot_manifest.json";
