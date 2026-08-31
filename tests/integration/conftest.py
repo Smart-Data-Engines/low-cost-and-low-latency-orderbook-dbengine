@@ -545,12 +545,35 @@ class ClusterManager:
                 continue
         raise RuntimeError("No node with REPLICA role found")
 
+    # Every port number this process has handed out, so it is never handed out twice.
+    _ports_handed_out: set = set()
+
     @staticmethod
     def find_free_port() -> int:
-        """Bind to port 0 and return the OS-assigned port."""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            return s.getsockname()[1]
+        """Bind to port 0 and return the OS-assigned port, never the same one twice.
+
+        Binding to port 0 tells you a port that was free *at that instant*. The socket is closed
+        before the caller can use it, so two calls in quick succession can return the same number,
+        and the second node to start dies with `bind() failed on port N: Address already in use`.
+        A single cluster fixture calls this six or more times back to back.
+
+        On a development machine the nodes bind fast enough to hide it. A loaded CI runner widens
+        the gap, which is how it appeared with 134 tests passing around it — the same shape as
+        pitfall 55 in CLAUDE.md, and the engine was right: it refused to bind and said exactly why.
+
+        This does not defend against something outside this process taking the port in between,
+        which is unfixable with this API. It does close the collision the suite was causing itself.
+        """
+        for _ in range(200):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            if port not in ClusterManager._ports_handed_out:
+                ClusterManager._ports_handed_out.add(port)
+                return port
+        raise RuntimeError(
+            "200 attempts and every port the OS offered had already been handed out in this "
+            "process — something is leaking ports or the ephemeral range is exhausted")
 
     # ── Internal ──────────────────────────────────────────────────
 
