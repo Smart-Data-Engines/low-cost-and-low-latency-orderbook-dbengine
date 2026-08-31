@@ -2355,24 +2355,29 @@ measures the harness.
 
 ## Recommended order
 
-No P0 is open. The four that were — #60, #61, #62, #64 — are closed, and so is #73, which was found
-while proving #70 on a real cluster rather than by reading the code.
+No P0 is open, and none of the correctness work is. Every P0 that has been raised — #60, #61, #62,
+#64, #68, #73, #74 — is closed, and two of those were found by running a real cluster rather than by
+reading the code (#73 while proving #70, #82's true cause while proving #82's smaller half).
+
+**What that changes about this table.** Every remaining item is a capability or a proof, not a
+defect. The ordering below is therefore about who we want to be able to say yes to, and the first
+three rows are one answer: a reader can build the engine and read its tests, but cannot deploy it,
+cannot verify its numbers, and cannot put it on a network they do not fully control.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **P1** | Position freshness on election (#72) | M | Deference cannot tell a further replica from a dead one, so every two-node failover pays the full window for nothing |
-| **P1** | A node joining mid-stream never establishes a frontier (#67) | M | It can catch up but cannot prove it has everything, which is the guarantee the version vector exists to give |
-| **P1** | Deployment artifacts (#33) | M | Cheapest large jump in time-to-first-run |
-| **P1** | Reproducible comparative benchmarks (#39) | L | Makes the performance claim verifiable by a reader instead of asserted |
+| **P1** | Deployment artifacts (#33) | M | Cheapest large jump in time-to-first-run; today a first run means reading CMake |
+| **P1** | Reproducible comparative benchmarks (#39) | L | Makes the performance claim verifiable by a reader instead of asserted, and the claim is the reason the repo exists |
 | **P1** | Authentication and TLS (#30) | L | The single blocker to production adoption |
-| **P2** | Argument parser refactor (#36) | S | Closes 27 static-analysis findings; without it every PR adding a CLI flag needs a manual review-thread resolution |
-| **P2** | CI hardening with sanitizers (#37) | S | Strong quality signal, low cost, catches real concurrency bugs |
-| **P2** | Configuration file (#32) | S | Ops ergonomics |
+| **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
+| **P2** | Configuration file (#32) | S | Ops ergonomics; past twenty flags, flags alone are unreasonable |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
 | **P2** | Release engineering + PyPI wheels (#42) | S | `pip install` is the shortest path to a first user |
+| **P2** | Streaming subscriptions on the wire (#45) | M | The embedded half works; the network half is the one a reader assumes from the feature list |
 | **P3** | Time-bucketed aggregation (#44) | L | The most-requested analytical capability for this data |
 | **P3** | Arrow output (#46) | M | Near-zero integration cost for analytics teams |
 | **P3** | Backup and restore (#34) | M | Table stakes for a database |
+| **P3** | Fuzzing (#38) | M | Finds the class of bug property tests miss, in the three places that read untrusted bytes |
 | **P4** | Chaos testing (#54) | L | Do this once there are users whose data can be lost |
 | **P4** | Performance frontier (#49-50) | varies | Proves the bespoke-engine claim; pick one and write it up |
 
@@ -2381,25 +2386,34 @@ while proving #70 on a real cluster rather than by reading the code.
 Things a reviewer will notice, listed here so they do not look like oversights:
 
 - **No authentication, no TLS.** Trusted-network deployment only (#30).
-- **Neither suite kills a process except in one module.** Until #62 that was every module, and it hid
-  total loss of acknowledged writes on crash. `tests/integration/test_crash_recovery.py` is the only
-  place a server is `SIGKILL`ed; fault injection more broadly is still #54.
+- **Process death is exercised in three modules, and nowhere else.** Until #62 no module killed
+  anything, and that hid total loss of acknowledged writes on crash. Today `test_crash_recovery.py`,
+  `test_failover.py` and `test_failover_dead_state.py` `SIGKILL` a server; the last of those also
+  covers `SIGTERM` deliberately, because the difference between the two is the defect it was written
+  for. What none of them do is fail a disk, drop a packet or stall a thread — fault injection more
+  broadly is still #54.
 - **Anti-entropy reconciles, but only what a peer still retains** (#57). Gap detection and repair are
   real; what neither covers is a gap whose records have left every peer's WAL. That needs a snapshot,
-  and `trigger_snapshot_repair()` is still a stub — the transfer it would use now exists (#76), so
-  what remains is the decision to discard a node's contents, which is a decision with an owner.
-  *(This bullet used to say anti-entropy was a scheduler with two placeholders. That was true until
-  #57 closed and stale afterwards.)*
-- **Snapshot bootstrap does not resume, does not compress, and creates the snapshot on the io
-  thread** (#76). An interrupted transfer starts again from zero; columnar files are already
-  compressed, so a second pass would buy little; and the flush-and-checksum happens on the thread
-  that also carries live multi-master traffic. The third is the one with a measured cost — 16-18 ms
-  for a 2.37 MB store, so roughly 7 s for 1 GB — and it has its own item, #79, rather than being a
-  hidden part of #76.
+  and the reconciler has no path to one: `AntiEntropyManager` is a scheduler around a pluggable
+  `ReconcileFn`, and the multi-master reconciler it drives never requests a snapshot. The transfer it
+  would use exists (#76, #79), so what remains is the decision to discard a node's contents, which is
+  a decision with an owner.
+  *(This bullet has been wrong twice: it once said anti-entropy was a scheduler with two
+  placeholders, true until #57; then it named `trigger_snapshot_repair()`, a function that no longer
+  exists. The gap it describes is real, which is why the wrong names went unnoticed.)*
+- **Snapshot bootstrap does not resume and does not compress** (#76). An interrupted transfer starts
+  again from zero, and columnar files are already compressed, so a second pass would buy little.
+  The third item that used to be on this list — creation running on the io thread — closed with #79:
+  the loop now pays 0.060-0.146 ms to hand the work to a worker, and that figure does not grow with
+  the store, where creation does. One request at a time, so a second peer arriving mid-creation is
+  told `busy` rather than queued.
 - **Benchmark baselines were recorded on one developer machine** with no hardware description. The
   table below fixes that going forward. Any published number needs its hardware next to it.
-- **The README advertises streaming subscriptions** that are not verified to exist in the current
-  wire protocol (#45): implement it or correct the claim.
+- **Streaming subscriptions work embedded and not over TCP** (#45). `Engine::subscribe()` and
+  `ob_subscribe()` really do push rows to a callback, and `notify_subscribers()` runs on every write,
+  but `CommandType` has no `SUBSCRIBE`, so a network client polls. The README used to list the
+  feature without that distinction and now states it; the claim was the half that was free to fix,
+  the wire protocol is still open.
 - **Aggregation SIMD is opt-in and off by default** (`OB_ENABLE_AVX2=OFF`), so default builds do not
   show the SIMD numbers.
 
