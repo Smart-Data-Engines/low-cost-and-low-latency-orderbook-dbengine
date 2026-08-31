@@ -506,6 +506,16 @@ Learned the hard way. Check here before debugging.
     one that looks extreme.** `0xF000…` looks extreme and does *not* overflow (as int64 it is only
     −1.15e18); `0x9000…` does, because it is −8.07e18 against a floor of −9.22e18.
 
+74. **A local array of a type with any default member initialiser is constructed unconditionally,
+    and the declaration is not inside your `if`.** `SnapshotRow subscriber_rows[MAX_LEVELS]` looked
+    free because it was only *filled* when something was subscribed. It is not: `SnapshotRow` carries
+    `{}` on three padding members, so it is not trivially default constructible, and every
+    `apply_delta` ran a thousand default constructors and touched 48 KB of stack. Measured on
+    i3-7100U, Release, `BM_IngestionThroughput`: **2559 → 4511 ns/op, +76%, 6/6 interleaved rounds.**
+    Ask `std::is_trivially_default_constructible` rather than reading the struct — those three `{}`s
+    are on *padding*, which is exactly where nobody looks. And the general form: a benchmark run is
+    what turned a change that read as free into a number.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

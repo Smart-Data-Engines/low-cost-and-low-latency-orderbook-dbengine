@@ -20,10 +20,12 @@ Built by [Smart Data Engines](https://smartdataengines.com), who build custom da
 - **Aggregation engine** (VWAP, spread, mid-price, imbalance, etc.) with optional AVX2/AVX-512 SIMD,
   reachable over the wire protocol: every result carries its scale factor and distinguishes an empty
   aggregate from a zero
-- **SQL-like query language** with time-range filters and aggregations. It also parses
-  `SUBSCRIBE`, and the embedded API (`Engine::subscribe()`, `ob_subscribe()`) delivers rows to a
-  callback as they are written — but the **wire protocol has no subscribe command**, so a network
-  client polls. Implementing the pushed form is roadmap #45
+- **SQL-like query language** with time-range filters and aggregations
+- **Streaming subscriptions, pushed** — `SUBSCRIBE 'SYM'.'EXCH'` over the wire and the server sends
+  rows as they are written, prefixed `PUSH <id>` with the same seven columns as a query row. A
+  bounded queue per subscriber, and a consumer that stops reading is disconnected rather than
+  allowed to grow the server's memory. Also available embedded (`Engine::subscribe()`,
+  `ob_subscribe()`) and from the Python client (`subscribe()` / `poll()`)
 - **TCP server** — connect remotely via telnet/nc, like PostgreSQL or ClickHouse
 - **Multi-master replication** — write to any node, automatic conflict resolution via HLC + LWW
 - **C API** for FFI integration (Python, Rust, Go, etc.)
