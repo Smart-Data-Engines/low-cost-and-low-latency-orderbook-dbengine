@@ -18,9 +18,20 @@ Scenario:
   4. The feed keeps running through the bootstrap and past it.
   5. Both nodes are read back and compared, and node 1's snapshot metrics are printed.
 
-What it measures: the slowest write to node 1 inside the bootstrap window against the slowest
-outside it. With snapshot creation on the io loop, the first would have to include a whole
-flush-and-checksum pass over the store — which is the thing #79 removed.
+What it measures, and why a client write is the right probe. Before #79, handle_snapshot_request()
+created the snapshot while holding MultiMasterManager::mtx_ — so for its whole duration the peer io
+loop stopped *and* every client write to that node queued behind it, because the write path takes
+that same mutex in broadcast_local(). The slowest write inside the bootstrap window against the
+slowest outside it therefore sees the difference directly.
+
+Known limit of this instrument, stated because the run will show it: Binance sends a depth update
+about once a second, and on a store of this size the whole bootstrap finishes in single-digit
+milliseconds — so the window usually contains no writes at all and the comparison prints "no
+samples". That is a real result about the ratio of the two, not a broken script; a store large
+enough to make creation take hundreds of milliseconds is not something a 90-second run can build.
+What the run does establish end to end is that the flush and checksum happened on a worker
+(`ob_mm_snapshot_create_ms`) while a live feed kept being ingested, and that the snapshot arrived
+whole (`ob_mm_snapshot_sent_total`, `discarded == 0`).
 
 etcd runs as a native process. This engine does not use containers, in tests either.
 """
@@ -79,13 +90,24 @@ def metrics_of(port: int) -> dict:
         return {}
     out = {}
     for line in body.splitlines():
-        if line.startswith("#") or " " not in line:
+        line = line.strip()
+        if not line or line.startswith("#"):
             continue
-        name, _, value = line.rpartition(" ")
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        # Names carry a label set: `ob_mm_snapshot_sent_total{node_role="standalone"} 0`. Looking
+        # them up by bare name without stripping it returns nothing, and a script that treats
+        # "absent" as "zero" then reports that the thing it was testing never happened. That is
+        # exactly what the first version of this script did.
+        name = parts[0].split("{", 1)[0]
         try:
-            out[name.strip()] = float(value)
+            out[name] = float(parts[-1])
         except ValueError:
-            pass
+            continue
+    if not out:
+        print(f"  (metrics on :{port} parsed to nothing; first lines were: "
+              f"{body.splitlines()[:3]})")
     return out
 
 
@@ -198,14 +220,16 @@ def main() -> int:
                     if msg.get("e") != "depthUpdate":
                         continue
                     counters["updates"] += 1
-                    ts = int(time.time() * 1_000_000_000)
-                    for side, side_word in (("bid", "BID"), ("ask", "ASK")):
+                    for side in ("bid", "ask"):
                         lv = levels(msg, side)
                         if not lv:
                             continue
-                        payload = " ".join(f"{p} {q}" for p, q in lv)
-                        cmd = (f"MINSERT {SYMBOL} {EXCHANGE} {ts} {side_word} "
-                               f"{len(lv)} {payload}")
+                        # MINSERT is a header line and one "price qty count" line per level, the
+                        # form python/orderbook_engine builds. Getting this wrong is quiet: the
+                        # server answers ERR per write and a script that does not read the reply
+                        # reports a successful run over an empty database.
+                        cmd = (f"MINSERT {SYMBOL} {EXCHANGE} {side} {len(lv)}\n"
+                               + "\n".join(f"{p} {q} 1" for p, q in lv))
                         t0 = time.perf_counter()
                         try:
                             resp = client.execute(cmd)
@@ -216,6 +240,8 @@ def main() -> int:
                         writes.append((time.monotonic(), dt_ms))
                         if resp.startswith("ERR"):
                             counters["errors"] += 1
+                            if counters["errors"] <= 3:
+                                print(f"  write rejected: {resp.strip()!r}")
                         else:
                             counters["inserts"] += len(lv)
 
@@ -260,10 +286,13 @@ def main() -> int:
         if bootstrap_done and writes:
             window = [ms for (t, ms) in writes if join_t0 <= t <= bootstrap_done]
             outside = [ms for (t, ms) in writes if t < join_t0 or t > bootstrap_done]
-            print("\nMINSERT round-trip on node 1, the loop that also produced the snapshot:")
+            print("\nMINSERT round-trip on node 1. Before #79 a write during creation queued on"
+                  "\nMultiMasterManager::mtx_, which the write path needs for broadcast_local():")
             for label, xs in (("during the bootstrap", window), ("outside it", outside)):
                 if not xs:
-                    print(f"  {label:22}: no samples")
+                    print(f"  {label:22}: no samples — the window was "
+                          f"{(bootstrap_done - join_t0) * 1000:.0f} ms and the feed writes about "
+                          f"twice a second")
                     continue
                 xs_sorted = sorted(xs)
                 p50 = statistics.median(xs_sorted)
@@ -283,14 +312,20 @@ def main() -> int:
         print("\nreading back from the engine:")
         for node in nodes:
             c = TCPClient("127.0.0.1", node.tcp)
-            rows = c.execute(f"SELECT {SYMBOL} {EXCHANGE} 0 9999999999999999999 LIMIT 5")
-            count = sum(1 for ln in rows.splitlines() if ln and not ln.startswith(("OK", "ERR")))
-            vwap = c.execute(f"SELECT VWAP({SYMBOL}) {EXCHANGE} 0 9999999999999999999").strip()
-            status = c.execute("STATUS")
-            total_rows = next((ln for ln in status.splitlines() if "rows" in ln.lower()), "").strip()
-            print(f"  node {node.index}: first rows returned={count}  VWAP={vwap!r}")
-            if total_rows:
-                print(f"          {total_rows}")
+            agg = c.execute(
+                f"SELECT SPREAD(*), MID_PRICE(*), VWAP(*), IMBALANCE(10) "
+                f"FROM '{SYMBOL}'.'{EXCHANGE}'").strip()
+            status = c.execute("STATUS").strip().splitlines()
+            print(f"  node {node.index}:")
+            for ln in agg.splitlines():
+                print(f"      {ln}")
+            # SPREAD comes out negative here and that is not a defect. This script stores every
+            # depth delta as a row and never deletes, so the stored set keeps bids from minutes ago
+            # that now sit above the current asks: over an append-only history of deltas, "best bid"
+            # and "best ask" are extremes of the whole history, not the current top of book.
+            # Reading these aggregates as the live market spread would be the mistake.
+            for ln in status[-2:]:
+                print(f"      STATUS  {ln}")
         return 0
 
     finally:
