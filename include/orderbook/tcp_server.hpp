@@ -7,6 +7,7 @@
 #include "orderbook/response_formatter.hpp"
 #include "orderbook/shard_coordinator.hpp"
 #include "orderbook/session.hpp"
+#include "orderbook/subscription_hub.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -84,6 +85,20 @@ struct ServerConfig {
     /// in tests to reach the ceiling without generating 64 MB of traffic.
     size_t      mm_max_peer_send_buf_bytes{64ULL << 20};
 
+    // Streaming subscriptions
+    /// --max-subscriber-queue-bytes: how much queued output one subscription may hold before its
+    /// session is closed.
+    ///
+    /// 8 MB, and the number is given with its arithmetic rather than on its own: a pushed row is
+    /// about 60 bytes on the wire, so this is roughly **140 000 rows** of backlog. A consumer that
+    /// has not read 140 000 rows is not slow, it is absent. Lower it in tests to reach the ceiling
+    /// without generating 8 MB of traffic — the same trick as `--mm-max-peer-send-buffer` for #69.
+    size_t   max_subscriber_queue_bytes{8ULL << 20};
+
+    /// --max-subscriptions-per-session: without a limit one session can order an unbounded amount
+    /// of work onto every other client's write path.
+    int      max_subscriptions_per_session{16};
+
     // io_uring (used only when OB_USE_IO_URING is active)
     uint32_t uring_ring_size{256};            // --ring-size
     uint32_t uring_sqpoll_idle_ms{1000};      // --sqpoll-idle-ms
@@ -136,13 +151,17 @@ private:
 /// When registry is non-null, latency histograms and operation counters are updated.
 /// When shard_coord is non-null, sharding commands (SHARD_MAP, SHARD_INFO, MIGRATE)
 /// are handled and INSERT/MINSERT ownership checks are enforced.
+/// When hub is non-null, SUBSCRIBE and UNSUBSCRIBE are handled; when it is null they are refused
+/// with a message saying so. Refused rather than accepted-and-ignored: a client that receives OK and
+/// then silence cannot tell that from a market with no updates.
 std::string execute_command(const Command& cmd,
                             Engine& engine,
                             Session& session,
                             ServerStats& stats,
                             bool read_only = false,
                             MetricsRegistry* registry = nullptr,
-                            ShardCoordinator* shard_coord = nullptr);
+                            ShardCoordinator* shard_coord = nullptr,
+                            SubscriptionHub* hub = nullptr);
 
 /// Parse CLI arguments into a ServerConfig. Applies defaults for missing args.
 ServerConfig parse_cli_args(int argc, char* argv[]);

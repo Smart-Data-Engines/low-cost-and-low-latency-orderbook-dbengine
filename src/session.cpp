@@ -15,9 +15,11 @@ namespace ob {
 
 // ── Session ──────────────────────────────────────────────────────────────────
 
-Session::Session(int fd) : fd_(fd) {}
+Session::Session(int fd, uint64_t conn_id) : fd_(fd), conn_id_(conn_id) {}
 
 int Session::fd() const { return fd_; }
+
+uint64_t Session::conn_id() const { return conn_id_; }
 
 std::vector<std::string> Session::feed(const char* data, size_t len) {
     read_buffer_.append(data, len);
@@ -242,12 +244,12 @@ uint64_t Session::compress_bytes_out() const { return compress_bytes_out_; }
 SessionManager::SessionManager(int max_sessions)
     : max_sessions_(max_sessions) {}
 
-bool SessionManager::add_session(int fd) {
+bool SessionManager::add_session(int fd, uint64_t conn_id) {
     std::lock_guard<std::mutex> lock(mtx_);
     if (static_cast<int>(sessions_.size()) >= max_sessions_) {
         return false;
     }
-    sessions_.emplace(fd, std::make_unique<Session>(fd));
+    sessions_.emplace(fd, std::make_unique<Session>(fd, conn_id));
     return true;
 }
 

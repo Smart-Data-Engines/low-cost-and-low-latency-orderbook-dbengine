@@ -382,6 +382,7 @@ add_library(orderbook_tcp_server_lib STATIC
     src/command_parser.cpp
     src/response_formatter.cpp
     src/session.cpp
+    src/subscription_hub.cpp
 )
 target_link_libraries(orderbook_tcp_server_lib PUBLIC orderbook_engine orderbook_logger orderbook_metrics_server orderbook_shard_coordinator)
 
@@ -414,6 +415,7 @@ if(OB_USE_IO_URING)
         src/command_parser.cpp
         src/response_formatter.cpp
         src/session.cpp
+        src/subscription_hub.cpp
     )
     target_compile_definitions(orderbook_iouring_server_lib PUBLIC OB_USE_IO_URING)
     target_link_libraries(orderbook_iouring_server_lib PUBLIC

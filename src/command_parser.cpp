@@ -178,6 +178,36 @@ Command parse_command(std::string_view line) {
         return cmd;
     }
 
+    if (iequals(first, "SUBSCRIBE")) {
+        cmd.type = CommandType::SUBSCRIBE;
+        // The whole line, including the keyword: the query engine parses it, not this layer.
+        cmd.subscribe_sql = std::string(trimmed);
+        OB_LOG_DEBUG("cmd_parser", "Parsed command: SUBSCRIBE %s", cmd.subscribe_sql.c_str());
+        return cmd;
+    }
+
+    if (iequals(first, "UNSUBSCRIBE")) {
+        cmd.type = CommandType::UNSUBSCRIBE;
+        if (tokens.size() >= 2) {
+            uint64_t id_val = 0;
+            auto sv = tokens[1];
+            auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), id_val);
+            if (ec != std::errc{} || ptr != sv.data() + sv.size()) {
+                // A malformed id is UNKNOWN rather than "cancel everything". Silently widening a
+                // typo into "all of them" is the shape of the argument-parser defect in #36: a flag
+                // that did not parse started the server anyway.
+                cmd.type = CommandType::UNKNOWN;
+                OB_LOG_WARN("cmd_parser", "UNSUBSCRIBE with an id that is not a number: %.*s",
+                            static_cast<int>(sv.size()), sv.data());
+                return cmd;
+            }
+            cmd.unsubscribe_id = id_val;
+        }
+        OB_LOG_DEBUG("cmd_parser", "Parsed command: UNSUBSCRIBE id=%llu",
+                     static_cast<unsigned long long>(cmd.unsubscribe_id));
+        return cmd;
+    }
+
     return cmd; // UNKNOWN
 }
 
@@ -333,6 +363,15 @@ std::string format_command(const Command& cmd) {
     case CommandType::MIGRATE:
         return "MIGRATE " + cmd.migrate_symbol + " " + cmd.migrate_target_shard + "\n";
     case CommandType::MM_PEERS:  return "MM_PEERS\n";
+    case CommandType::SUBSCRIBE:
+        return cmd.subscribe_sql + "\n";
+
+    case CommandType::UNSUBSCRIBE:
+        if (cmd.unsubscribe_id != 0) {
+            return "UNSUBSCRIBE " + std::to_string(cmd.unsubscribe_id) + "\n";
+        }
+        return "UNSUBSCRIBE\n";
+
     case CommandType::MM_CONFLICTS:
         if (cmd.mm_conflicts_limit != 100) {
             return "MM_CONFLICTS " + std::to_string(cmd.mm_conflicts_limit) + "\n";

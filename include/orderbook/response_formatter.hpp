@@ -128,6 +128,22 @@ std::string format_query_response(const std::vector<QueryResult>& rows);
 /// hardcoding that mid-price happens to be scaled by a million.
 std::string format_agg_response(const std::vector<AggValue>& values);
 
+/// Format one pushed subscription row.
+/// Returns "PUSH <id>\t<timestamp>\t<price>\t<quantity>\t<order_count>\t<side>\t<level>\t<seq>\n"
+///
+/// The seven columns are the seven columns of a `SELECT` row, in the same order (#65 put the
+/// sequence number last), so a client that already parses query results adds one branch on the
+/// prefix rather than a second format.
+///
+/// `PUSH` rather than a second connection for pushed data. A separate channel would be cleaner to
+/// parse and would require agreeing on the identity of two connections, which is the problem
+/// `conn_id` solves internally — exposed to the client this time.
+///
+/// One line, complete, and that is why the subscriber queue holds formatted bytes rather than rows:
+/// a partial socket write then resumes mid-line instead of mid-row, and a row is never split across
+/// two framings.
+std::string format_push(uint64_t subscription_id, const QueryResult& row);
+
 /// Format an error response.
 /// Returns "ERR <message>\n"
 std::string format_error(std::string_view message);

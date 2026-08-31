@@ -25,6 +25,8 @@ enum class CommandType {
     MIGRATE,
     MM_PEERS,
     MM_CONFLICTS,
+    SUBSCRIBE,
+    UNSUBSCRIBE,
     UNKNOWN
 };
 
@@ -65,6 +67,17 @@ struct Command {
     std::string migrate_symbol;       // "symbol.exchange" for MIGRATE
     std::string migrate_target_shard; // target shard_id for MIGRATE
     size_t      mm_conflicts_limit{100}; // for MM_CONFLICTS
+
+    /// The whole SUBSCRIBE line, handed to the query engine unparsed.
+    ///
+    /// Not decomposed here, deliberately. `QueryEngine::parse()` already accepts the full grammar -
+    /// symbol, exchange, timestamp and price filters - and re-implementing a subset of it in the
+    /// command parser would make two languages with one name. So this layer decides only *which*
+    /// command arrived.
+    std::string subscribe_sql;
+
+    /// The id for UNSUBSCRIBE, or 0 meaning "every subscription of this session".
+    uint64_t    unsubscribe_id{0};
 };
 
 // ── Free functions ────────────────────────────────────────────────────────────

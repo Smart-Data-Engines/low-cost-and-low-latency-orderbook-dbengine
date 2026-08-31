@@ -98,6 +98,31 @@ std::string format_agg_response(const std::vector<AggValue>& values) {
 
 // ── format_error ──────────────────────────────────────────────────────────────
 
+// ── format_push ───────────────────────────────────────────────────────────────
+
+std::string format_push(uint64_t subscription_id, const QueryResult& row) {
+    std::string out;
+    out.reserve(96);
+    out += "PUSH ";
+    out += std::to_string(subscription_id);
+    out += '\t';
+    out += std::to_string(row.timestamp_ns);
+    out += '\t';
+    out += std::to_string(row.price);
+    out += '\t';
+    out += std::to_string(row.quantity);
+    out += '\t';
+    out += std::to_string(row.order_count);
+    out += '\t';
+    out += std::to_string(row.side);
+    out += '\t';
+    out += std::to_string(row.level);
+    out += '\t';
+    out += std::to_string(row.sequence_number);
+    out += '\n';
+    return out;
+}
+
 std::string format_error(std::string_view message) {
     std::string out;
     out.reserve(5 + message.size());

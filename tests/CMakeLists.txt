@@ -385,6 +385,11 @@ ob_add_tcp_test(test_session_compress
     test_session_compress.cpp
 )
 
+# ── Subscription hub tests (streaming-subscriptions, Task group 3) ────────────
+ob_add_tcp_test(test_subscription_hub
+    test_subscription_hub.cpp
+)
+
 # ── Incremental flush tests (incremental-flush, Tasks 6.1–7.3) ────────────────
 add_executable(test_incremental_flush test_incremental_flush.cpp)
 target_link_libraries(test_incremental_flush

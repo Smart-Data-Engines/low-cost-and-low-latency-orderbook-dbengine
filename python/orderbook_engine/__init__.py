@@ -28,7 +28,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 try:
     import lz4.frame as _lz4_frame
@@ -178,6 +178,9 @@ class _TcpBackend:
         self._buf = b""
         self._timeout = timeout
         self._compressed = False
+        # Rows pushed by subscriptions, taken off the front of the buffer before a response is
+        # matched. See _take_pushes().
+        self._pushes: List[Tuple[int, OrderbookRow]] = []
         self._connect()
         if compress:
             self._negotiate_compression()
@@ -301,9 +304,78 @@ class _TcpBackend:
         decompressed = _lz4_frame.decompress(compressed)
         return decompressed.decode("utf-8", errors="replace")
 
+    def _take_pushes(self) -> None:
+        """Move any complete `PUSH` lines off the front of the buffer into `_pushes`.
+
+        This is not a convenience — without it the client hangs. `_recv_plain_response()` matches on
+        the *front* of the buffer, so a pushed row arriving before the reply to a command matches
+        none of its branches and the loop reads until it times out. Subscriptions (#45) allow exactly
+        that interleaving, so adding an unsolicited server-to-client message broke every client whose
+        response parser works this way, ours included.
+
+        Only from the front, and only complete lines: a half-received push stays in the buffer.
+        """
+        while True:
+            if not self._buf.startswith(b"PUSH "):
+                return
+            nl = self._buf.find(b"\n")
+            if nl == -1:
+                return   # incomplete; wait for the rest
+            line = self._buf[:nl].decode("utf-8", errors="replace")
+            self._buf = self._buf[nl + 1:]
+            fields = line.split("\t")
+            if len(fields) != 8:
+                # Not a push after all, or a malformed one. Dropped with no exception: a subscriber
+                # that dies on one bad line loses the stream it was reading correctly.
+                continue
+            try:
+                sub_id = int(fields[0].split(" ", 1)[1])
+                self._pushes.append((sub_id, OrderbookRow(
+                    timestamp_ns=int(fields[1]),
+                    price=int(fields[2]),
+                    quantity=int(fields[3]),
+                    order_count=int(fields[4]),
+                    side=int(fields[5]),
+                    level=int(fields[6]),
+                    sequence_number=int(fields[7]),
+                )))
+            except (ValueError, IndexError):
+                continue
+
+    def take_pushes(self) -> List[Tuple[int, OrderbookRow]]:
+        """Every pushed row received so far, and clear the queue."""
+        out = self._pushes
+        self._pushes = []
+        return out
+
+    def poll_pushes(self, timeout: float) -> List[Tuple[int, OrderbookRow]]:
+        """Wait up to `timeout` for pushed rows, then return whatever arrived.
+
+        A subscriber with no command in flight has to read the socket somewhere, and `execute()`
+        would block waiting for a response that is not coming.
+        """
+        deadline = time.monotonic() + timeout
+        self._take_pushes()
+        while not self._pushes and time.monotonic() < deadline:
+            remaining = max(0.01, deadline - time.monotonic())
+            self._sock.settimeout(remaining)
+            try:
+                chunk = self._sock.recv(65536)
+            except socket.timeout:
+                break
+            finally:
+                self._sock.settimeout(self._timeout)
+            if not chunk:
+                raise OrderbookError(-1, "TCP connection closed by server")
+            self._buf += chunk
+            self._take_pushes()
+        return self.take_pushes()
+
     def _recv_plain_response(self) -> str:
         """Receive an uncompressed response (original logic)."""
         while True:
+            # Before matching anything: a pushed row may sit in front of the reply.
+            self._take_pushes()
             decoded = self._buf.decode("utf-8", errors="replace")
 
             # ERR line
@@ -1489,6 +1561,61 @@ class OrderbookEngine:
         if limit is not None:
             sql += f" LIMIT {limit}"
         return self.query(sql)
+
+    def subscribe(self, symbol: str, exchange: str, *, where: str = "") -> int:
+        """Ask the server to push rows for one book. Returns the subscription id.
+
+        The id matters: a client with two subscriptions has nothing to cancel one of them with, and
+        every pushed row carries it so a reader can tell them apart.
+
+        Only over TCP. The local backend has no server to push from, and saying so is better than
+        returning an id that will never deliver anything.
+        """
+        if self._tcp is None:
+            raise OrderbookError(
+                -1, "subscriptions need a TCP connection; this engine is in "
+                    f"{self._mode} mode")
+        sql = f"SUBSCRIBE * FROM '{symbol}'.'{exchange}'"
+        if where:
+            sql += f" WHERE {where}"
+        reply = self._tcp.execute(sql)
+        if reply.startswith("ERR"):
+            raise OrderbookError(-1, reply.strip())
+        # "OK SUB <id>\n\n"
+        parts = reply.split()
+        if len(parts) < 3 or parts[1] != "SUB":
+            raise OrderbookError(-1, f"unexpected subscribe reply: {reply!r}")
+        return int(parts[2])
+
+    def unsubscribe(self, subscription_id: Optional[int] = None) -> int:
+        """Cancel one subscription, or every subscription of this connection. Returns the count.
+
+        Zero is not an error: cancelling something already gone is the client and the server
+        agreeing. And one more row may still arrive afterwards, because a notification already in
+        flight is not recalled — documented on the server side too.
+        """
+        if self._tcp is None:
+            raise OrderbookError(
+                -1, "subscriptions need a TCP connection; this engine is in "
+                    f"{self._mode} mode")
+        command = "UNSUBSCRIBE" if subscription_id is None else f"UNSUBSCRIBE {subscription_id}"
+        reply = self._tcp.execute(command)
+        if reply.startswith("ERR"):
+            raise OrderbookError(-1, reply.strip())
+        parts = reply.split()
+        return int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+
+    def poll(self, timeout: float = 1.0) -> List[Tuple[int, "OrderbookRow"]]:
+        """Wait for pushed rows and return them as `(subscription_id, row)`.
+
+        This is the whole point of subscribing: no polling of the *server*. The client still has to
+        read its socket, which is what this does.
+        """
+        if self._tcp is None:
+            raise OrderbookError(
+                -1, "subscriptions need a TCP connection; this engine is in "
+                    f"{self._mode} mode")
+        return self._tcp.poll_pushes(timeout)
 
     def query_agg(self, symbol: str, exchange: str,
                   *exprs: str) -> Dict[str, "AggValue"]:
