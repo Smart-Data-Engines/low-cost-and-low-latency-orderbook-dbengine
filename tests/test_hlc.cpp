@@ -290,3 +290,77 @@ TEST(HLCUnit, IsZeroFalseNodeId) {
     ob::HLCTimestamp ts{0, 0, 1};
     EXPECT_FALSE(ts.is_zero());
 }
+
+// ── A peer's nonsense timestamp poisons the state, and the next local tick trips over it ──────────
+//
+// #83 found `static_cast<int64_t>(new_physical) - static_cast<int64_t>(now)` overflowing in
+// `update()` and fixed it there. The identical expression in `tick_local()`, three lines away, was
+// left alone, and `HLCProperty.prop_causal_ordering` kept failing UBSan on the ASan job - but only
+// sometimes, because it needs the random sequence to do a receive with a huge physical component
+// and then a local tick.
+//
+// That "only sometimes" is why these two tests exist and are deterministic. A test that catches a
+// defect in a minority of runs reads as flaky and gets a re-run rather than a reading; this
+// repository has paid for that twice (the 5%-of-runs salt truncation in the SDK, and the
+// publish-then-notify ordering test in #79).
+//
+// The mechanism worth naming: `update()` stores `max(now, last_.physical_ns, remote.physical_ns)`
+// into `last_`, so sanitising the arithmetic at the point of arrival leaves the absurd value **in
+// the clock**. The next `tick_local()` reads it back and does the same subtraction. Fixing where the
+// reproducer points is not the same as fixing the expression.
+//
+// **What each test actually detects, established by mutation rather than by assumption.** The first
+// two versions of these tests both survived reverting the fix, for two different reasons, and both
+// reasons are worth keeping:
+//
+//   `max_drift_ns_` is a *running maximum* fed by both `tick_receive()` and `tick_local()`, and in
+//   this scenario the two compute the **same distance**. So whichever one is still correct supplies
+//   the expected value and masks the other. No behavioural test through this API can isolate one
+//   site; the clamp assertion below fails only when the pattern is lost in *both*. Verified: with
+//   both reverted it reports 2941098686781934426 against INT64_MAX.
+//
+//   For the overflow itself the assertion cannot distinguish the implementations at all - two's
+//   complement wrap lands on almost the correct magnitude. **UBSan is the detector**, which is why
+//   the first test carries almost no assertion and says so instead of pretending otherwise.
+
+TEST(HLCUnit, ALocalTickAfterAPeerSentAnAbsurdPhysicalTimeDoesNotOverflow) {
+    ob::HybridLogicalClock hlc(7);
+
+    // Chosen so that the signed subtraction crosses INT64_MIN: as int64 this is -8.07e18, and a
+    // 2026 wall clock is about 1.79e18, so the difference is -9.86e18 against a floor of -9.22e18.
+    // Under UBSan the failure is the report. The assertions below only prove the path ran.
+    ob::HLCTimestamp poison{};
+    poison.physical_ns = 0x9000'0000'0000'0000ULL;
+    poison.logical     = 0;
+    poison.node_id     = 9;
+
+    hlc.tick_receive(poison);
+    const ob::HLCTimestamp after = hlc.tick_local();
+
+    EXPECT_EQ(after.physical_ns, poison.physical_ns)
+        << "the clock must still carry the peer's physical component forward; clamping the drift is "
+           "about the drift metric, not about rewriting the timestamp";
+    EXPECT_GT(hlc.max_drift_ns(), 0)
+        << "a drift this large has to be reported as large, not silently lost";
+}
+
+TEST(HLCUnit, ADriftPastInt64MaxIsClampedRatherThanNegated) {
+    ob::HybridLogicalClock hlc(7);
+
+    // As int64 this is only -1.15e18, so the subtraction does not overflow - but the true distance
+    // from a 2026 wall clock is 1.55e19, past INT64_MAX, so the correct answer is the clamp and the
+    // signed-then-negate form produces 2.94e18. Detectable without a sanitizer, and only when both
+    // sites have lost the pattern; see the note above.
+    ob::HLCTimestamp poison{};
+    poison.physical_ns = 0xF000'0000'0000'0000ULL;
+    poison.logical     = 0;
+    poison.node_id     = 9;
+
+    hlc.tick_receive(poison);
+    hlc.tick_local();
+
+    EXPECT_EQ(hlc.max_drift_ns(), INT64_MAX)
+        << "clamped, not computed signed and negated: the true distance is past INT64_MAX, so any "
+           "smaller number here means the subtraction was done in the wrong domain in both "
+           "tick_receive() and tick_local()";
+}

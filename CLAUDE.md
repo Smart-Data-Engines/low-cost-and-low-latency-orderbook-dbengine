@@ -457,6 +457,65 @@ Learned the hard way. Check here before debugging.
     a loop variable. Same shape as pitfall 58 with a different second toolchain: **a sanitizer job
     is a second set of compiler flags before it is a sanitizer.**
 
+68. **A callback invoked under a lock it may itself need is a deadlock, and `shared_mutex` does not
+    save you: it is not recursive.** The first cut of the subscription fix called `sub.cb()` under
+    the *shared* lock, with a comment asserting that a callback cancelling its own subscription was
+    safe "because it only marks the entry dead". Marking takes the *exclusive* lock, and a thread
+    holding `std::shared_mutex` in any mode that asks again is undefined behaviour — including a
+    second *shared* acquisition. The comment described the intent and not the code. Unconditional
+    rule, exactly like pitfall 63 about `join()`: **collect under the lock, release it, then call.**
+    Pointer validity comes from a separate in-flight counter that compaction refuses to run against.
+
+69. **A test for a data race may not need a sanitizer — run it without one before you claim it
+    does.** The concurrent `subscribe()`/`notify_subscribers()` test was written on the assumption
+    that only TSan would show anything. It aborts on **every** run of a plain Debug build:
+    `std::bad_function_call`, exit 134, because the notifier holds a reference into the vector,
+    `push_back` relocates it, and the `std::function` it then invokes has been moved from. This
+    matters beyond tidiness — a test that fails only under a sanitizer runs only in the jobs that
+    build one, and this one gates ordinary `ctest`.
+
+70. **A "how many are there" counter kept next to a collection drifts from it the first time the
+    collection is tidied.** `has_subscribers()` reads an atomic so the no-subscriber path takes no
+    lock. Incrementing on register and decrementing on cancel looks obvious and, with deferred
+    removal, gives two sources of truth: marking dead and compacting both count the same event. It
+    is recounted from the vector under the lock instead. **Write the safe direction into the code:**
+    too high costs one pointless lock acquisition, too low drops a row — so it may only ever be too
+    high.
+
+71. **Sanitising a computation at the point of arrival leaves the poisoned value in the state, and
+    the next caller trips over it.** #83 found `static_cast<int64_t>(new_physical) -
+    static_cast<int64_t>(now)` overflowing in `HybridLogicalClock::update()` — reachable from the
+    network, because `physical_ns` comes from a peer — and fixed it there. The identical expression
+    in `tick_local()`, three lines away, was left alone and kept failing UBSan on the ASan job,
+    because `update()` stores `max(now, last, remote)` into `last_`: the absurd value stays in the
+    clock and the next local tick reads it back. **Fixing where the reproducer points is not the same
+    as fixing the expression** — grep the expression, not the stack trace.
+
+72. **A running maximum fed by two functions cannot isolate either of them.** `tick_receive()` and
+    `tick_local()` fold their drift into one `max_drift_ns_`, and in the scenario that exposes the
+    bug they compute the *same* distance — so whichever function is still correct supplies the
+    expected value and masks the other. Two versions of the test survived reverting the fix before
+    this was noticed. A behavioural assertion on that counter fails only when **both** sites lose the
+    pattern; per-site protection comes from UBSan. **Establish what a test detects by reverting the
+    fix, not by reading the test.**
+
+73. **Name a test whose only detector is a sanitizer, instead of dressing it in an assertion that
+    passes either way.** For the overflow in `tick_local()` no assertion can distinguish the two
+    implementations — two's complement wrap lands on almost the correct magnitude — so the test says
+    UBSan is the detector. The other half of the same rule: **compute the poison value, do not pick
+    one that looks extreme.** `0xF000…` looks extreme and does *not* overflow (as int64 it is only
+    −1.15e18); `0x9000…` does, because it is −8.07e18 against a floor of −9.22e18.
+
+74. **A local array of a type with any default member initialiser is constructed unconditionally,
+    and the declaration is not inside your `if`.** `SnapshotRow subscriber_rows[MAX_LEVELS]` looked
+    free because it was only *filled* when something was subscribed. It is not: `SnapshotRow` carries
+    `{}` on three padding members, so it is not trivially default constructible, and every
+    `apply_delta` ran a thousand default constructors and touched 48 KB of stack. Measured on
+    i3-7100U, Release, `BM_IngestionThroughput`: **2559 → 4511 ns/op, +76%, 6/6 interleaved rounds.**
+    Ask `std::is_trivially_default_constructible` rather than reading the struct — those three `{}`s
+    are on *padding*, which is exactly where nobody looks. And the general form: a benchmark run is
+    what turned a change that read as free into a number.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -489,7 +548,26 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   second request during creation is refused as busy, and a finished snapshot whose requester has gone
   is discarded rather than sent — matched on `conn_id`, because the case that `node_id` cannot see is
   the same node reconnecting.
+- **Streaming subscriptions work embedded and not over TCP** (#45, in progress — see below).
 - `rapidcheck` is pinned to `master` rather than a commit SHA, unlike every other dependency.
+
+### In flight: #45, streaming subscriptions on the wire
+
+Spec: `kiro-workspace/specs/streaming-subscriptions/` (requirements, design, tasks). Branch
+`feat/subscriptions-thread-safety`. **Task groups 1 and 2 are done; 3 onwards are not started.**
+
+What landed: the subscription list is synchronised. It was a bare `std::vector` shared between the
+epoll loop (`apply_delta`) and `MultiMasterManager::io_loop` (`apply_remote_delta`,
+`multi_master.cpp:499`), with no lock — a data race that was latent only because the sole callers of
+`ob_subscribe()` were single-threaded tests. `notify_subscribers()` now takes a
+`std::span<const SnapshotRow>` and is called **once per delta** rather than once per level, so a
+1000-level MINSERT is one lock acquisition and not a thousand. `has_subscribers()` keeps the
+no-subscriber path — every deployment that does not use them, and almost every test — at one relaxed
+atomic read.
+
+What is not built: the wire itself. `CommandType` still has no `SUBSCRIBE`, there is no
+`SubscriptionHub`, no bounded per-subscriber queue, no eventfd waking the epoll loop, no `PUSH`
+framing, no metrics. Design for all of it is in the spec; task group 3 is the next thing to write.
 
 *Two entries used to sit here and no longer describe the code.* "Deference on election cannot tell a
 further replica from a dead one" was true until #72 gave published positions per-node leases. "A node

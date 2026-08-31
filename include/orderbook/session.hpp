@@ -16,9 +16,17 @@ namespace ob {
 
 class Session {
 public:
-    explicit Session(int fd);
+    Session(int fd, uint64_t conn_id = 0);
 
     int fd() const;
+
+    /// Connection identity, monotonic per server run.
+    ///
+    /// Descriptor numbers are reused, so anything that outlives one connection and refers to it by
+    /// `fd` alone eventually refers to somebody else. A subscription is exactly that kind of thing:
+    /// pinned to `fd`, it would push rows to whoever inherits the number. Same reasoning, and same
+    /// name, as `PeerConnection::conn_id` in the multi-master path.
+    uint64_t conn_id() const;
 
     /// Append incoming bytes to read buffer. Returns complete lines (if any).
     std::vector<std::string> feed(const char* data, size_t len);
@@ -65,6 +73,7 @@ public:
 
 private:
     int         fd_;
+    uint64_t    conn_id_;
     std::string read_buffer_;
 
     /// Bytes accepted from execute_command() but not yet taken by the socket.
@@ -100,7 +109,10 @@ public:
     explicit SessionManager(int max_sessions);
 
     /// Create session for new connection. Returns false if limit reached.
-    bool add_session(int fd);
+    ///
+    /// `conn_id` defaults to 0 so existing callers and tests are unaffected; the server passes a
+    /// real one. Zero means "not tracked", which is honest for a caller that does not need it.
+    bool add_session(int fd, uint64_t conn_id = 0);
 
     /// Remove session on disconnect.
     void remove_session(int fd);

@@ -15,6 +15,9 @@
 #include <vector>
 #include <unordered_map>
 #include <cstdlib>
+#include <atomic>
+#include <span>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -309,19 +312,94 @@ TEST(QueryEngineUnit, SubscribeCallbackInvokedOnMatch) {
     row.quantity        = 100;
     row.order_count     = 1;
 
-    fix.engine.notify_subscribers("AAPL", "NYSE", row);
+    fix.engine.notify_subscribers("AAPL", "NYSE", std::span<const ob::SnapshotRow>{&row, 1});
     EXPECT_EQ(called, 1);
 
     // Row outside price range — should not trigger callback
     row.price = 25000;
-    fix.engine.notify_subscribers("AAPL", "NYSE", row);
+    fix.engine.notify_subscribers("AAPL", "NYSE", std::span<const ob::SnapshotRow>{&row, 1});
     EXPECT_EQ(called, 1);
 
     // Unsubscribe — no more callbacks
     fix.engine.unsubscribe(sub_id);
     row.price = 15000;
-    fix.engine.notify_subscribers("AAPL", "NYSE", row);
+    fix.engine.notify_subscribers("AAPL", "NYSE", std::span<const ob::SnapshotRow>{&row, 1});
     EXPECT_EQ(called, 1);
+}
+
+// ── The subscription list is shared across threads, and was not synchronised ──────────────────
+//
+// `notify_subscribers()` is called from the write path, and the write path is not one thread:
+//
+//   Engine::apply_delta        -> the server's epoll loop (a client sent INSERT/MINSERT)
+//   Engine::apply_delta_mm     -> the same loop
+//   Engine::apply_remote_delta -> MultiMasterManager::io_loop (multi_master.cpp:499)
+//
+// `subscriptions_` was a plain std::vector with no lock: subscribe() push_back'd, unsubscribe()
+// erased, notify_subscribers() iterated. Nothing made those safe together.
+//
+// The race was latent rather than absent. The only callers of ob_subscribe() are single-threaded
+// tests, so nobody had two threads on this list — but an embedded consumer on a multi-master node
+// that subscribes and then receives a peer's delta has it immediately, and exposing SUBSCRIBE over
+// the wire (#45) makes it certain, because registration then arrives on the epoll loop while
+// notification can arrive from io_loop.
+//
+// This test was written expecting to need TSan to show anything, on the reasoning that a data race
+// has no deterministic observable behaviour. The measurement disagreed and the note is worth
+// keeping: on the unfixed tree it aborts on **every** run, in a plain Debug build, with
+// `std::bad_function_call`. The notifier holds a reference into the vector, `push_back` reallocates
+// and moves the element, and the callback it then invokes is a moved-from `std::function`. So the
+// gate is ordinary `ctest`, not the sanitizer - which matters, because a test that only fails under
+// a sanitizer only runs in the jobs that build one.
+//
+// The assertion below is still weak, and that is now the only honest form: what is being proven is
+// that nothing aborts, and an abort is not something an EXPECT can see.
+TEST(QueryEngineUnit, SubscribingWhileNotifyingIsSafeAcrossThreads) {
+    QEFixture fix;
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> notifications{0};
+
+    ob::SnapshotRow row{};
+    row.timestamp_ns    = 1000000000ULL;
+    row.sequence_number = 1;
+    row.price           = 15000;
+    row.quantity        = 100;
+    row.order_count     = 1;
+
+    // The notifier: what the write path does, as fast as it can.
+    std::thread notifier([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            fix.engine.notify_subscribers("AAPL", "NYSE", std::span<const ob::SnapshotRow>{&row, 1});
+            notifications.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+    // The registrar: what a session does when SUBSCRIBE arrives and when it disconnects. Enough
+    // churn to force the vector to reallocate repeatedly, which is what moves the element a
+    // concurrent iteration is holding.
+    std::vector<uint64_t> ids;
+    for (int round = 0; round < 400; ++round) {
+        uint64_t id = fix.engine.subscribe(
+            "SUBSCRIBE price FROM 'AAPL'.'NYSE'",
+            [](const ob::QueryResult&) {}
+        );
+        ASSERT_NE(id, 0u);
+        ids.push_back(id);
+        if (ids.size() > 8) {
+            fix.engine.unsubscribe(ids.front());
+            ids.erase(ids.begin());
+        }
+    }
+
+    stop.store(true, std::memory_order_relaxed);
+    notifier.join();
+
+    for (uint64_t id : ids) fix.engine.unsubscribe(id);
+
+    // Weak on purpose, per the comment above: what is being proven is the absence of a report from
+    // the sanitizer, not a value. This only asserts the threads actually ran, because a test whose
+    // notifier never got scheduled proves nothing and would pass forever.
+    EXPECT_GT(notifications.load(), 0u);
 }
 
 TEST(QueryEngineUnit, FormatIsReparseable) {

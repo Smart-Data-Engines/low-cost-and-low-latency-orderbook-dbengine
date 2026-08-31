@@ -101,11 +101,11 @@ static Gen<ob::Command> genCommand() {
             return cmd;
         }),
         // Simple commands
-        gen::just(ob::Command{ob::CommandType::FLUSH, {}, {}, {}, {}, {}, {}}),
-        gen::just(ob::Command{ob::CommandType::PING, {}, {}, {}, {}, {}, {}}),
-        gen::just(ob::Command{ob::CommandType::STATUS, {}, {}, {}, {}, {}, {}}),
-        gen::just(ob::Command{ob::CommandType::ROLE, {}, {}, {}, {}, {}, {}}),
-        gen::just(ob::Command{ob::CommandType::QUIT, {}, {}, {}, {}, {}, {}})
+        gen::just(ob::Command{ob::CommandType::FLUSH, {}, {}, {}, {}, {}, {}, {}, {}, {}}),
+        gen::just(ob::Command{ob::CommandType::PING, {}, {}, {}, {}, {}, {}, {}, {}, {}}),
+        gen::just(ob::Command{ob::CommandType::STATUS, {}, {}, {}, {}, {}, {}, {}, {}, {}}),
+        gen::just(ob::Command{ob::CommandType::ROLE, {}, {}, {}, {}, {}, {}, {}, {}, {}}),
+        gen::just(ob::Command{ob::CommandType::QUIT, {}, {}, {}, {}, {}, {}, {}, {}, {}})
     );
 }
 
@@ -1037,4 +1037,68 @@ TEST(ResponseFormatterStatus, ReplicaCountIsReportedEvenWhenZero) {
         << "STATUS omitted the replica count for a node with no replicas:\n" << wire;
     EXPECT_EQ(wire.find("replica["), std::string::npos)
         << "per-replica detail lines should not appear when there are none";
+}
+
+// ── SUBSCRIBE / UNSUBSCRIBE on the wire (streaming-subscriptions, task 4.1) ───────────────────────
+
+TEST(CommandParserSubscribe, TheWholeLineIsHandedToTheQueryEngine) {
+    // Not decomposed here: `QueryEngine::parse()` already accepts the full grammar, and
+    // re-implementing a subset in the command parser would make two languages with one name.
+    const std::string line =
+        "SUBSCRIBE price FROM 'AAPL'.'NYSE' WHERE price BETWEEN 10000 AND 20000";
+    const ob::Command parsed = ob::parse_command(line);
+    EXPECT_EQ(parsed.type, ob::CommandType::SUBSCRIBE);
+    EXPECT_EQ(parsed.subscribe_sql, line)
+        << "the filter clause was dropped, so a client's WHERE would be silently ignored and they "
+           "would receive every row for the symbol";
+}
+
+TEST(CommandParserSubscribe, UnsubscribeWithAnIdCarriesIt) {
+    const ob::Command parsed = ob::parse_command("UNSUBSCRIBE 42");
+    EXPECT_EQ(parsed.type, ob::CommandType::UNSUBSCRIBE);
+    EXPECT_EQ(parsed.unsubscribe_id, 42u);
+}
+
+TEST(CommandParserSubscribe, UnsubscribeWithNoIdMeansEveryOneOfThisSession) {
+    const ob::Command parsed = ob::parse_command("UNSUBSCRIBE");
+    EXPECT_EQ(parsed.type, ob::CommandType::UNSUBSCRIBE);
+    EXPECT_EQ(parsed.unsubscribe_id, 0u) << "zero is the sentinel for 'all of them'";
+}
+
+TEST(CommandParserSubscribe, AMalformedIdIsUnknownRatherThanCancelEverything) {
+    // Widening a typo into "all of them" is the shape of the argument-parser defect in #36, where a
+    // flag that did not parse started the server anyway. Here it would silently cancel a
+    // subscription the client still wanted.
+    for (const char* bad : {"UNSUBSCRIBE abc", "UNSUBSCRIBE 12x", "UNSUBSCRIBE -1"}) {
+        const ob::Command parsed = ob::parse_command(bad);
+        EXPECT_EQ(parsed.type, ob::CommandType::UNKNOWN) << bad;
+        EXPECT_EQ(parsed.unsubscribe_id, 0u) << bad;
+    }
+}
+
+TEST(CommandParserSubscribe, BothRoundTripThroughFormatCommand) {
+    for (const std::string& line : {std::string("SUBSCRIBE * FROM 'AAPL'.'NYSE'"),
+                                    std::string("UNSUBSCRIBE 7"),
+                                    std::string("UNSUBSCRIBE")}) {
+        const ob::Command parsed = ob::parse_command(line);
+        ASSERT_NE(parsed.type, ob::CommandType::UNKNOWN) << line;
+        EXPECT_EQ(ob::format_command(parsed), line + "\n") << line;
+    }
+}
+
+TEST(ResponseFormatterPush, APushedRowIsTheSameSevenColumnsAsASelectRow) {
+    ob::QueryResult row{};
+    row.timestamp_ns    = 1'756'640'400'000'000'000ULL;
+    row.sequence_number = 91823;
+    row.price           = 7'845'812;
+    row.quantity        = 1500;
+    row.order_count     = 3;
+    row.side            = 0;
+    row.level           = 0;
+
+    // Byte-exact, because a client parses this with one branch on the prefix and then the same code
+    // it uses for SELECT. A column order that drifts from #65's is a client reading price as
+    // quantity, with nothing failing.
+    EXPECT_EQ(ob::format_push(4, row),
+              "PUSH 4\t1756640400000000000\t7845812\t1500\t3\t0\t0\t91823\n");
 }

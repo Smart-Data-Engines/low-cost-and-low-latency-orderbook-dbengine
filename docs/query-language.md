@@ -147,7 +147,53 @@ SUBSCRIBE price FROM 'BTC-USD'.'BINANCE'
   WHERE price BETWEEN 6490000 AND 6510000
 ```
 
-Subscriptions are used programmatically via the C API (`ob_subscribe`) or Python bindings. The CLI does not support interactive subscriptions.
+### Over the wire
+
+Send the same statement as a command and the server pushes matching rows to that connection until
+the subscription is cancelled or the connection closes:
+
+```
+C: SUBSCRIBE 'BTC-USD'.'BINANCE'
+S: OK SUB 1
+
+S: PUSH 1	1756640400000000000	7845812	1500	3	0	0	91823
+S: PUSH 1	1756640400000000123	7845813	900	1	0	0	91824
+
+C: UNSUBSCRIBE 1
+S: OK 1
+```
+
+`PUSH <id>` is followed by the **same seven columns as a query row, in the same order**, tab
+separated. A client that already parses `SELECT` output adds one branch on the prefix rather than a
+second format.
+
+Four things worth knowing before writing a client:
+
+- **A push can arrive between your command and its reply.** The protocol allows it, so a reader that
+  matches on the front of its buffer has to take complete `PUSH` lines off first. The bundled Python
+  client does this; a client that does not will block waiting for a reply that is already in its
+  buffer.
+- **A cancelled subscription may still deliver one more row**, if a notification was already running
+  when the cancellation landed. Waiting for notifications to quiesce inside `UNSUBSCRIBE` would
+  block one server thread on another, so the cost is pushed here instead.
+- **A slow consumer is disconnected, not throttled.** Each subscription has a queue ceiling
+  (`--max-subscriber-queue-bytes`, 8 MB by default — roughly 140 000 rows). Past it the session is
+  closed and `ob_subscription_overflow_disconnects_total` is incremented. The queue is not discarded
+  first: taking back bytes the client has partly read would truncate its input instead of
+  disconnecting it.
+- **`UNSUBSCRIBE` with no id cancels every subscription of that connection** and answers with the
+  count. A malformed id is rejected as an unknown command rather than widened into "all of them".
+
+There is a limit per session (`--max-subscriptions-per-session`, 16 by default), because without one
+a single connection can order an unbounded amount of work onto every other client's write path.
+
+### Embedded
+
+The same statement through the C API (`ob_subscribe`) or `Engine::subscribe()` delivers rows to a
+callback in-process. The callback runs on the thread that performed the write — which for a
+multi-master node may be the replication io thread — so it must not block. It may cancel its own
+subscription: cancellation marks the entry and the removal happens later, so no lock is held across
+the callback.
 
 ## Column Names
 

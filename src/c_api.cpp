@@ -188,16 +188,23 @@ extern "C" ob_status_t ob_apply_delta(ob_engine_t*    engine,
         }
 
         // ── Notify subscribers ────────────────────────────────────────────────
-        for (uint16_t i = 0; i < delta.n_levels; ++i) {
-            ob::SnapshotRow row{};
-            row.timestamp_ns    = ts_ns;
-            row.sequence_number = seq;
-            row.side            = static_cast<uint8_t>(side);
-            row.level_index     = i;
-            row.price           = prices[i];
-            row.quantity        = qtys[i];
-            row.order_count     = cnts[i];
-            engine->query_engine->notify_subscribers(symbol, exchange, row);
+        // One call for the whole delta. Guarded, because a caller with no subscriptions - the
+        // common case, and every test that is not about subscriptions - should not build the array.
+        if (engine->query_engine->has_subscribers()) {
+            std::vector<ob::SnapshotRow> rows;
+            rows.reserve(delta.n_levels);
+            for (uint16_t i = 0; i < delta.n_levels; ++i) {
+                ob::SnapshotRow row{};
+                row.timestamp_ns    = ts_ns;
+                row.sequence_number = seq;
+                row.side            = static_cast<uint8_t>(side);
+                row.level_index     = i;
+                row.price           = prices[i];
+                row.quantity        = qtys[i];
+                row.order_count     = cnts[i];
+                rows.push_back(row);
+            }
+            engine->query_engine->notify_subscribers(symbol, exchange, rows);
         }
 
         return to_c_status(apply_status);

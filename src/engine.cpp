@@ -11,6 +11,7 @@
 #include "orderbook/crc32c.hpp"
 #include "orderbook/logger.hpp"
 
+#include <span>
 #include <cerrno>
 #include <chrono>
 #include <cinttypes>
@@ -491,7 +492,17 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta_in, const Level* levels
     bool gap_detected = false;   // unused: gaps are decided per origin in stamp_sequence()
     ob_status_t status = ob::apply_delta(buf, delta, levels, gap_detected);
 
-    // 4. Enqueue SnapshotRows for background columnar flush + notify subscribers.
+    // 4. Enqueue SnapshotRows for background columnar flush + collect them for subscribers.
+    //
+    // The notification used to happen inside this loop, once per level. That made a 1000-level
+    // MINSERT a thousand calls into the subscription list, so once that list needed a lock it would
+    // have been a thousand acquisitions on the write path. It is now one call per delta.
+    //
+    // `has_subscribers()` is one relaxed atomic read and it is checked first because zero
+    // subscriptions is the case in every deployment that does not use them: nothing below runs and
+    // no lock is taken. It may read high for a moment and never low, so a row is never dropped.
+    const size_t rows_before = pending_rows_.size();
+
     for (uint16_t i = 0; i < delta.n_levels; ++i) {
         SnapshotRow row{};
         row.timestamp_ns    = delta.timestamp_ns;
@@ -503,9 +514,28 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta_in, const Level* levels
         row.order_count     = levels[i].cnt;
 
         pending_rows_.push_back({delta.symbol, delta.exchange, row});
+    }
 
-        // 5. Notify streaming subscribers synchronously (within 1 µs budget, Requirement 10.9).
-        query_engine_->notify_subscribers(delta.symbol, delta.exchange, row);
+    // 5. Notify streaming subscribers synchronously (within 1 µs budget, Requirement 10.9).
+    //
+    // The batch is copied out of `pending_rows_` here rather than collected in the loop above, and
+    // that shape was arrived at through a measured 76% regression. The first version declared
+    // `SnapshotRow subscriber_rows[MAX_LEVELS]` in this function and filled it only when something
+    // was subscribed — but the *declaration* is unconditional, and `SnapshotRow` is not trivially
+    // default constructible: the `{}` on its three padding members gives it a real default
+    // constructor. So every apply_delta ran a thousand of them and touched 48 KB of stack whether
+    // anyone was subscribed or not. Measured on i3-7100U, Release, BM_IngestionThroughput:
+    // 2559 ns/op before, 4511 ns/op after, 6/6 interleaved rounds.
+    //
+    // Now nothing is constructed unless there is a subscriber, and the cost of the copy belongs to
+    // whoever asked for the stream.
+    if (query_engine_->has_subscribers() && pending_rows_.size() > rows_before) {
+        std::vector<SnapshotRow> batch;
+        batch.reserve(pending_rows_.size() - rows_before);
+        for (size_t i = rows_before; i < pending_rows_.size(); ++i) {
+            batch.push_back(pending_rows_[i].row);
+        }
+        query_engine_->notify_subscribers(delta.symbol, delta.exchange, batch);
     }
 
     // Update gauge: pending rows after enqueue.
@@ -561,7 +591,11 @@ ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta_in, const Level* lev
     bool gap_detected = false;   // unused: gaps are decided per origin in stamp_sequence()
     ob_status_t status = ob::apply_delta(buf, delta, levels, gap_detected);
 
-    // 5. Enqueue SnapshotRows for background columnar flush + notify subscribers.
+    // 5. Enqueue SnapshotRows for background columnar flush, then notify subscribers once for the
+    //    whole delta. Nothing is allocated or constructed when nobody is subscribed - see the note
+    //    in apply_delta() about the 76% regression a stack array cost here.
+    const size_t rows_before = pending_rows_.size();
+
     for (uint16_t i = 0; i < delta.n_levels; ++i) {
         SnapshotRow row{};
         row.timestamp_ns    = delta.timestamp_ns;
@@ -573,7 +607,15 @@ ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta_in, const Level* lev
         row.order_count     = levels[i].cnt;
 
         pending_rows_.push_back({delta.symbol, delta.exchange, row});
-        query_engine_->notify_subscribers(delta.symbol, delta.exchange, row);
+    }
+
+    if (query_engine_->has_subscribers() && pending_rows_.size() > rows_before) {
+        std::vector<SnapshotRow> batch;
+        batch.reserve(pending_rows_.size() - rows_before);
+        for (size_t i = rows_before; i < pending_rows_.size(); ++i) {
+            batch.push_back(pending_rows_[i].row);
+        }
+        query_engine_->notify_subscribers(delta.symbol, delta.exchange, batch);
     }
 
     registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
@@ -732,7 +774,14 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
             }
         }
 
-        // Enqueue for columnar flush.
+        // Enqueue for columnar flush, and collect the same rows for subscribers.
+        //
+        // This is the call site the whole synchronisation exists for: it runs on
+        // `MultiMasterManager::io_loop`, not on the server's epoll loop, so an embedded consumer
+        // that subscribed from another thread is notified from here. That is what made the
+        // unsynchronised subscription list a live race rather than a latent one.
+        const size_t rows_before = pending_rows_.size();
+
         for (uint16_t idx : winning_levels) {
             SnapshotRow row{};
             row.timestamp_ns    = delta.timestamp_ns;
@@ -744,7 +793,15 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
             row.order_count     = levels[idx].cnt;
 
             pending_rows_.push_back({delta.symbol, delta.exchange, row});
-            query_engine_->notify_subscribers(delta.symbol, delta.exchange, row);
+        }
+
+        if (query_engine_->has_subscribers() && pending_rows_.size() > rows_before) {
+            std::vector<SnapshotRow> batch;
+            batch.reserve(pending_rows_.size() - rows_before);
+            for (size_t i = rows_before; i < pending_rows_.size(); ++i) {
+                batch.push_back(pending_rows_[i].row);
+            }
+            query_engine_->notify_subscribers(delta.symbol, delta.exchange, batch);
         }
     }
 

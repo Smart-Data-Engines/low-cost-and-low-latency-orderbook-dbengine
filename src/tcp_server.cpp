@@ -1,4 +1,5 @@
 #include "orderbook/tcp_server.hpp"
+#include "orderbook/subscription_hub.hpp"
 #include "orderbook/logger.hpp"
 #include "orderbook/metrics.hpp"
 #include "orderbook/metrics_server.hpp"
@@ -34,7 +35,8 @@ std::string execute_command(const Command& cmd,
                             ServerStats& stats,
                             bool read_only,
                             MetricsRegistry* registry,
-                            ShardCoordinator* shard_coord) {
+                            ShardCoordinator* shard_coord,
+                            SubscriptionHub* hub) {
     switch (cmd.type) {
 
     case CommandType::COMPRESS: {
@@ -345,6 +347,34 @@ std::string execute_command(const Command& cmd,
         return engine.multi_master_manager()->handle_mm_conflicts_command(cmd.mm_conflicts_limit);
     }
 
+    case CommandType::SUBSCRIBE: {
+        session.increment_commands();
+        if (hub == nullptr) {
+            // The io_uring transport builds the same execute_command() without a hub. Saying so is
+            // better than accepting the command and never pushing anything: a client that gets OK
+            // and then silence has no way to tell that from a market with no updates.
+            return format_error("subscriptions are not available on this transport");
+        }
+        std::string error;
+        const uint64_t id =
+            hub->add(engine, session.fd(), session.conn_id(), cmd.subscribe_sql, &error);
+        if (id == 0) return format_error(error.empty() ? "subscribe_refused" : error);
+        // The id is in the acknowledgement because a client with two subscriptions has nothing to
+        // cancel one with otherwise.
+        return "OK SUB " + std::to_string(id) + "\n\n";
+    }
+
+    case CommandType::UNSUBSCRIBE: {
+        session.increment_commands();
+        if (hub == nullptr) return format_error("subscriptions are not available on this transport");
+        const int removed = (cmd.unsubscribe_id != 0)
+                                ? hub->remove(engine, cmd.unsubscribe_id)
+                                : hub->remove_connection(engine, session.fd(), session.conn_id());
+        // A count rather than a bare OK, and zero is not an error: cancelling something already
+        // gone is the client and the server agreeing.
+        return "OK " + std::to_string(removed) + "\n\n";
+    }
+
     case CommandType::QUIT:
         session.increment_commands();
         return ""; // empty string signals session close
@@ -459,6 +489,10 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
             config.max_sessions = cursor.value_as<int>();
         } else if (arg == "--workers") {
             config.worker_threads = cursor.value_as<int>();
+        } else if (arg == "--max-subscriber-queue-bytes") {
+            config.max_subscriber_queue_bytes = cursor.value_as<size_t>();
+        } else if (arg == "--max-subscriptions-per-session") {
+            config.max_subscriptions_per_session = cursor.value_as<int>();
         } else if (arg == "--read-only") {
             config.read_only = true;
         } else if (arg == "--replication-port") {
@@ -810,6 +844,29 @@ void TcpServer::run() {
     // 7. Create SessionManager and ServerStats.
     SessionManager session_mgr(config_.max_sessions);
 
+    // Streaming subscriptions (#45). Owned by this loop, and its eventfd joins the epoll set below:
+    // a notification arriving from MultiMasterManager::io_loop enqueues and wakes us, because
+    // Session is not thread-safe and arming EPOLLOUT belongs to this thread.
+    SubscriptionHub subscription_hub(config_.max_subscriber_queue_bytes,
+                                     config_.max_subscriptions_per_session);
+
+    /// Monotonic per run. Descriptor numbers are reused, so a subscription pinned to `fd` alone
+    /// would outlive its connection and push rows to whoever inherits the number.
+    uint64_t next_conn_id = 1;
+
+    if (subscription_hub.wakeup_fd() >= 0) {
+        struct epoll_event hub_ev{};
+        hub_ev.events  = EPOLLIN;
+        hub_ev.data.fd = subscription_hub.wakeup_fd();
+        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, subscription_hub.wakeup_fd(), &hub_ev) < 0) {
+            OB_LOG_ERROR("tcp_server", "epoll_ctl on the subscription wakeup fd failed: %s",
+                         std::strerror(errno));
+        } else {
+            OB_LOG_INFO("tcp_server", "Subscription hub wakeup fd=%d joined the epoll set",
+                        subscription_hub.wakeup_fd());
+        }
+    }
+
     ServerStats stats;
     // One place that closes a session, so every close carries a reason in the log.
     // This used to be five copies of the same four lines, none of them logging,
@@ -823,6 +880,12 @@ void TcpServer::run() {
                     "Closing session: fd=%d reason=%s pending_bytes=%zu",
                     fd, reason, pending);
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+        // Before remove_session, and the order is load-bearing: the other way round leaves a window
+        // in which a notification lands in a queue whose session is already gone, and the hub would
+        // have to tolerate that instead of the invariant holding.
+        if (Session* s = session_mgr.get_session(fd)) {
+            subscription_hub.remove_connection(*engine_, fd, s->conn_id());
+        }
         session_mgr.remove_session(fd);
         stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
         engine_->registry().increment_gauge("ob_active_sessions", -1);
@@ -841,12 +904,52 @@ void TcpServer::run() {
     // them.
     bool drain_started = false;
 
+    // What has already been published to the monotonic counters, so the loop can publish deltas.
+    uint64_t published_rows_pushed{0};
+    uint64_t published_overflow_disconnects{0};
+    uint64_t published_refused{0};
+
     // 8. Epoll loop.
     while (running_.load(std::memory_order_relaxed)) {
         int nfds = ::epoll_wait(epoll_fd_, events, MAX_EVENTS, 100 /*ms timeout*/);
         if (nfds < 0) {
             if (errno == EINTR) continue;
             break; // fatal epoll error
+        }
+
+        // Subscriptions, once per iteration and before the event loop below.
+        //
+        // Unconditional, and not inside a branch on the wakeup fd — the same decision as
+        // `poll_snapshot_preparation()` in the multi-master loop (#79): a plain 100 ms timeout also
+        // picks up anything queued, so a lost wake-up costs latency rather than delivery.
+        {
+            const auto condemned = subscription_hub.drain(
+                session_mgr, [&](int fd) { arm_epollout(fd); });
+            for (int fd : condemned) {
+                close_session(fd, "subscriber queue overflowed");
+            }
+            engine_->registry().set_gauge(
+                "ob_subscriptions_active",
+                static_cast<int64_t>(subscription_hub.active()));
+            engine_->registry().set_gauge(
+                "ob_subscription_queued_bytes",
+                static_cast<int64_t>(subscription_hub.queued_bytes()));
+            // Counters are monotonic and only ever incremented, so the loop publishes the delta
+            // against what it last saw rather than the hub's total. The hub keeps its own totals
+            // because it is testable without a registry, and a second source of truth here would be
+            // the kind that drifts.
+            const auto publish = [&](const char* name, uint64_t total, uint64_t& seen) {
+                if (total > seen) {
+                    engine_->registry().increment_counter(name, total - seen);
+                    seen = total;
+                }
+            };
+            publish("ob_subscription_rows_pushed_total", subscription_hub.rows_pushed(),
+                    published_rows_pushed);
+            publish("ob_subscription_overflow_disconnects_total",
+                    subscription_hub.overflow_disconnects(), published_overflow_disconnects);
+            publish("ob_subscription_refused_total", subscription_hub.refused(),
+                    published_refused);
         }
 
         // Once per loop iteration, not per event: the sum walks the session map, and
@@ -886,7 +989,7 @@ void TcpServer::run() {
                         break; // accept error, continue loop
                     }
 
-                    if (!session_mgr.add_session(client_fd)) {
+                    if (!session_mgr.add_session(client_fd, next_conn_id++)) {
                         // Server full — reject.
                         const char* msg = "ERR server full\n";
                         auto wr = ::send(client_fd, msg, std::strlen(msg), MSG_NOSIGNAL);
@@ -969,7 +1072,7 @@ void TcpServer::run() {
                         Command cmd = (line.find('\n') != std::string::npos)
                                           ? parse_minsert(line)
                                           : parse_command(line);
-                        std::string response = execute_command(cmd, *engine_, *session, stats, read_only_.load(std::memory_order_acquire), &engine_->registry(), shard_coord.get());
+                        std::string response = execute_command(cmd, *engine_, *session, stats, read_only_.load(std::memory_order_acquire), &engine_->registry(), shard_coord.get(), &subscription_hub);
 
                         if (response.empty()) {
                             // QUIT. If a previous response is still draining, let it

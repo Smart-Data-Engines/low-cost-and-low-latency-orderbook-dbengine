@@ -578,6 +578,30 @@ and getting data into their existing Python stack without a copy.
   What does not exist: any way to ask for it over TCP. `CommandType` has no `SUBSCRIBE`, and
   `QueryEngine::execute()` says so outright ("SUBSCRIBE via execute() is not supported"). A network
   client polls. The README now says exactly that.
+- **Built, and not yet closed.** Spec: `kiro-workspace/specs/streaming-subscriptions/`.
+  `SUBSCRIBE 'SYM'.'EXCH'` and `UNSUBSCRIBE [id]` are wire commands; the server pushes matching rows
+  as `PUSH <id>` with the same seven columns as a query row. Bounded queue per subscriber
+  (`--max-subscriber-queue-bytes`, 8 MB ≈ 140 000 rows), overflow closes the session, per-session
+  limit on subscriptions, five metrics, and `subscribe()` / `poll()` in the Python client.
+- **The subscription list had been a data race the whole time.** A bare `std::vector` shared between
+  the epoll loop (`apply_delta`) and `MultiMasterManager::io_loop` (`apply_remote_delta`), latent
+  only because the sole callers of `ob_subscribe()` were single-threaded tests. Now a `shared_mutex`
+  with deferred removal, and the callback runs with **no lock held** — the first fix invoked it under
+  the shared lock, which deadlocks, because marking an entry dead takes the exclusive lock and
+  `std::shared_mutex` is not recursive.
+- **Cost on the write path with nobody subscribed: none measurable.** `BM_IngestionThroughput`,
+  i3-7100U, Release, six interleaved rounds: master 2600.6 ns/op (cv 0.99%), branch 2560.4 ns/op
+  (cv 2.60%), median of per-round ratios 0.9848 over a 0.967-1.025 range. The difference is inside
+  this machine's noise and is not claimed as a speed-up.
+  Getting there cost a **measured 76% regression** first: the batch was collected into a
+  `SnapshotRow subscriber_rows[MAX_LEVELS]` declared in `apply_delta`, and the declaration is
+  unconditional while the type is *not* trivially default constructible — the `{}` on its three
+  padding members gives it a real default constructor, so every write ran a thousand of them and
+  touched 48 KB of stack whether anyone was subscribed or not. 2559 → 4511 ns/op, 6/6 rounds.
+- **Still open:** task 6.3, running the subscription module under TSan in
+  `sanitizers-integration (tsan)`. Blocked on **#85** — doing it now makes a required check red for a
+  pre-existing race in the WAL position accessors, which that module is simply the first thing to
+  reach.
 - Effort: M | Impact: Real-time consumers stop polling
 
 ### 46. Apache Arrow output
@@ -1543,6 +1567,33 @@ ignore checks.
 
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
+
+### 85. The WAL position is read from four threads without synchronisation, as an inconsistent pair
+
+- `WALWriter::current_offset()` and `current_file_index()` return plain members that
+  `write_record()` mutates. TSan reports the read from `FailoverManager::publish_position_if_due()`
+  against the write from the flush thread; the same members are also read by
+  `ReplicationManager`, by `MultiMasterManager::io_loop` and by the `STATUS` handler.
+- **The atomicity is the smaller half.** The two are read as a *pair* and must agree:
+  `multi_master.cpp:1327-1328` takes the file index on one line and the offset on the next, so a
+  rotation between them yields `(new index, old offset)` — a position that never existed, used to
+  ask a peer for a catch-up range. Stale is survivable; incoherent is not.
+- It reaches a decision, which is why this is not cosmetic: `get_wal_position()` feeds the published
+  position that election deference compares to pick the replica furthest ahead (#70, #72). A
+  position that never existed can decide who becomes primary.
+- **Found by running the subscription integration module under TSan** (#45, task 6.3), and it is
+  not caused by that work: the same report appears from `test_replication.py` and
+  `test_aggregations.py`, which predate it. It had been invisible because
+  `sanitizers-integration (tsan)` runs only the three multi-master modules, and none of those starts
+  the failover monitor. That is the #80 lesson a second time — a gap in sanitizer coverage justified
+  by a comment, and the comment was wrong again.
+- A seqlock is not available here: `orderbook_soa`'s does not compile under TSan (#83), so this needs
+  either atomics with a paired accessor whose incoherence is documented and tolerated by every
+  caller, or a lock the write path can afford. Deciding which is the work.
+- Blocks #45 task 6.3: adding the subscription module to the TSan job before this is fixed makes a
+  required check red for a defect it did not introduce.
+- Effort: M | Impact: Correctness of failover and of catch-up ranges, and it unblocks running the
+  whole integration battery under TSan rather than a third of it
 
 ### 84. MM_PEERS counted inbound connections that had not said who they were ✅
 

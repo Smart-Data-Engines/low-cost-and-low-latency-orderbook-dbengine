@@ -35,6 +35,16 @@ MetricsRegistry::MetricsRegistry() {
     counters_.push_back(make_counter("ob_total_inserts",         "Total number of insert operations"));
     counters_.push_back(make_counter("ob_total_queries",         "Total number of query operations"));
     counters_.push_back(make_counter("ob_total_flushes",         "Total number of flush operations"));
+    // Streaming subscriptions (#45).
+    counters_.push_back(make_counter("ob_subscription_rows_pushed_total",
+                                     "Rows delivered to subscribers over the wire"));
+    counters_.push_back(make_counter("ob_subscription_overflow_disconnects_total",
+                                     "Sessions closed because a subscriber queue passed its "
+                                     "ceiling. The only way an operator learns that a consumer "
+                                     "cannot keep up."));
+    counters_.push_back(make_counter("ob_subscription_refused_total",
+                                     "Subscriptions refused: unparseable query or per-session "
+                                     "limit reached"));
     counters_.push_back(make_counter("ob_wal_records_written",   "Total number of WAL records written"));
     counters_.push_back(make_counter("ob_repl_records_replayed", "Total number of replication records replayed"));
 
@@ -42,6 +52,15 @@ MetricsRegistry::MetricsRegistry() {
     gauges_.push_back(make_gauge("ob_active_sessions", "Number of active TCP sessions"));
     gauges_.push_back(make_gauge("ob_session_pending_bytes",
                                  "Response bytes queued across sessions (a slow client shows up here)"));
+    // Streaming subscriptions (#45). Registered in the same task that writes them, because
+    // set_gauge() on an unregistered name is dropped in silence — that was #77, five dead gauges
+    // serving a flat zero while the engine worked — and scripts/check_metrics.py fails CI for a
+    // written-but-unregistered name.
+    gauges_.push_back(make_gauge("ob_subscriptions_active",
+                                 "Live streaming subscriptions"));
+    gauges_.push_back(make_gauge("ob_subscription_queued_bytes",
+                                 "Push bytes queued across subscribers (a consumer that stopped "
+                                 "reading shows up here before it is disconnected)"));
     gauges_.push_back(make_gauge("ob_pending_rows",    "Number of rows pending flush"));
     gauges_.push_back(make_gauge("ob_wal_file_index",  "Current WAL file index"));
     gauges_.push_back(make_gauge("ob_segment_count",   "Number of columnar segments"));
