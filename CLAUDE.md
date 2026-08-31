@@ -444,6 +444,19 @@ Learned the hard way. Check here before debugging.
     since `trunc` empties the target before the replacement arrives and a manifest describing
     nothing is precisely the corruption at issue.
 
+66. **`/metrics` names carry a label set, so a lookup by bare name finds nothing — and "absent"
+    reads as "zero".** The exposition is
+    `ob_mm_snapshot_sent_total{node_role="standalone"} 0`. A harness that split on whitespace and
+    used the first field as the key got a map whose keys all ended in `{node_role="..."}`, so every
+    lookup missed, every counter came back absent, and the script announced that the snapshot it was
+    testing had never been sent. It had — the log said so. Strip from `{`, and make a scraper say
+    "not found" rather than return 0.
+67. **A `snprintf` into a fixed buffer can build clean at `-O0` and fail the sanitizer job.**
+    `char name[8]` with `"SYM%02d"` passes a Debug build and fails Debug-plus-`-O1`, because
+    `-Wformat-truncation` needs optimisation to run its value-range analysis and then cannot narrow
+    a loop variable. Same shape as pitfall 58 with a different second toolchain: **a sanitizer job
+    is a second set of compiler flags before it is a sanitizer.**
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
