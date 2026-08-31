@@ -1,5 +1,7 @@
 #pragma once
 
+#include "orderbook/async_snapshot.hpp"
+#include "orderbook/snapshot.hpp"
 #include "orderbook/wal.hpp"
 
 #include <atomic>
@@ -70,29 +72,6 @@ inline constexpr size_t kMaxSnapshotPathLen = 255;
 /// case where a component of `base` itself is a symlink pointing elsewhere.
 /// Returns false if the path escapes, or if the check cannot be performed.
 [[nodiscard]] bool path_stays_within(const std::string& base, std::string_view rel);
-
-// ── Snapshot manifest ─────────────────────────────────────────────────────────
-
-struct SnapshotFileEntry {
-    std::string path;       // relative to data dir
-    size_t      size{0};    // file size in bytes
-    uint32_t    crc32c{0};  // CRC32C of file contents
-};
-
-struct SnapshotManifest {
-    uint32_t    wal_file_index{0};
-    size_t      wal_byte_offset{0};
-    size_t      total_bytes{0};
-    size_t      total_rows{0};
-    uint64_t    created_at_ns{0};
-    std::vector<SnapshotFileEntry> files;
-
-    /// Serialize to JSON string (deterministic alphabetical field ordering).
-    std::string to_json() const;
-
-    /// Parse from JSON string. Returns true on success.
-    static bool from_json(std::string_view json, SnapshotManifest& out);
-};
 
 // ── Snapshot transfer state (per-replica, primary side) ───────────────────────
 
@@ -207,6 +186,11 @@ private:
 
 struct ReplicaInfo {
     int         fd{-1};
+    /// Identifies this connection, not this replica: assigned from a counter on accept, never
+    /// reused. A snapshot is now created on a worker thread (#79), so the result can land after the
+    /// requester has gone — and a descriptor number alone cannot tell "still here" from "closed and
+    /// handed to somebody else".
+    uint64_t    conn_id{0};
     std::string address;
     uint32_t    confirmed_file{0};
     size_t      confirmed_offset{0};
@@ -220,6 +204,16 @@ struct ReplicaInfo {
 
     // Per-replica snapshot transfer state (active during SNAPSHOT_REQUEST handling).
     SnapshotTransferState snapshot_transfer;
+};
+
+/// A snapshot being created on a worker thread for a replica that asked for one (#79).
+struct ReplicaSnapshotPrepare {
+    bool     active{false};
+    int      fd{-1};
+    /// Which connection asked. A descriptor number on its own cannot say that.
+    uint64_t conn_id{0};
+    uint64_t token{0};
+    std::chrono::steady_clock::time_point started_at{};
 };
 
 // ── ReplicationManager (primary side) ─────────────────────────────────────────
@@ -263,6 +257,16 @@ private:
     mutable std::mutex         mtx_;
     std::vector<ReplicaInfo>   replicas_;
 
+    /// Creating a snapshot is a flush plus a checksum of the whole store, which used to happen on
+    /// this manager's own epoll thread (#79).
+    AsyncSnapshotBuilder   snapshot_builder_;
+    ReplicaSnapshotPrepare snapshot_prepare_;
+    uint64_t               next_snapshot_token_{1};
+
+    /// Source of ReplicaInfo::conn_id. Atomic rather than mutex-protected because it is read on the
+    /// accept path before the record joins `replicas_`, where the mutex starts applying.
+    std::atomic<uint64_t>      next_conn_id_{1};
+
     void run_loop();
     void accept_replica();
     void handle_replica_data(int fd);
@@ -270,8 +274,20 @@ private:
                          const void* payload, size_t payload_len);
     void handle_catchup(ReplicaInfo& replica, uint32_t from_file, size_t from_offset);
 
-    /// Handle a SNAPSHOT_REQUEST from a replica: create snapshot and begin streaming.
+    /// Handle a SNAPSHOT_REQUEST from a replica: hand the creation to a worker thread.
     void handle_snapshot_request(ReplicaInfo& replica);
+
+    /// Begin streaming a snapshot a worker has finished creating.
+    void begin_snapshot_transfer(ReplicaInfo& replica, SnapshotManifest&& manifest);
+
+    /// Collect a finished snapshot, if there is one, and act on it.
+    ///
+    /// Called once per pass of run_loop(), which has a 100 ms timeout — so unlike the multi-master
+    /// side there is no notification and none is needed: a result is picked up within 100 ms of
+    /// being ready, against a creation measured in milliseconds to seconds. Adding an eventfd to a
+    /// manager that has none would buy that back and cost a descriptor and a wake-up path. Written
+    /// down so the absence reads as a decision rather than an oversight.
+    void poll_snapshot_preparation();
 
     /// Continue streaming snapshot data to a replica (called on EPOLLOUT).
     /// Returns false if the transfer failed and the replica should be removed.

@@ -9,6 +9,7 @@
 #include "orderbook/metrics.hpp"
 #include "orderbook/multi_master.hpp"
 #include "orderbook/query_engine.hpp"
+#include "orderbook/snapshot.hpp"
 #include "orderbook/replication.hpp"
 #include "orderbook/soa_buffer.hpp"
 #include "orderbook/sequence_tracker.hpp"
@@ -182,17 +183,10 @@ public:
     /// Returns the manifest. Writes snapshot_manifest.json to data dir.
     SnapshotManifest create_snapshot();
 
-    /// A snapshot plus what the sender holds, captured together.
-    struct SnapshotWithSequenceState {
-        SnapshotManifest                          manifest;
-        std::vector<SequenceTracker::VectorEntry> vector;
-        std::vector<SequenceTracker::HeldRanges>  held;
-        bool vector_truncated{false};
-        bool held_truncated{false};
-        /// How long the capture took. Measured rather than assumed: this runs on the caller's
-        /// thread, and for multi-master that thread is `io_loop()`.
-        double create_ms{0.0};
-    };
+    /// A snapshot plus what the sender holds, captured together. Defined in snapshot.hpp so
+    /// that multi_master.hpp and replication.hpp can hold fields of it; the alias keeps every
+    /// existing `Engine::SnapshotWithSequenceState` spelling working.
+    using SnapshotWithSequenceState = ob::SnapshotWithSequenceState;
 
     /// The same snapshot, with the sequence state a receiver needs to declare frontiers from it.
     ///
