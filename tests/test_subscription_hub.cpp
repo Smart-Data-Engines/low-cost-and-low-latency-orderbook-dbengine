@@ -325,3 +325,46 @@ TEST(SubscriptionHubUnit, CancellingFromInsideTheNotificationDoesNotDeadlock) {
     fix.write("AAPL", "NYSE", 2, 2);
     SUCCEED();
 }
+
+// ── The counter's error direction ─────────────────────────────────────────────────────────────────
+
+TEST(SubscriptionHubUnit, NothingIsDeliveredOnceEverySubscriptionIsCancelled) {
+    // `QueryEngine::has_subscribers()` is what keeps the no-subscriber write path away from the
+    // lock, so it is read on the hot path and being wrong there matters in one direction only: too
+    // high costs one pointless lock acquisition, too low drops a row. Deferred removal means a
+    // cancelled entry can still be counted until compaction, which is the high side.
+    //
+    // What is asserted is the consequence rather than the counter, because the counter is not
+    // reachable from here: after cancelling everything, a write must reach nobody.
+    //
+    // Established by mutation, and the limit is worth recording. This catches the hub failing to
+    // erase a cancelled queue — as does the simpler `AddAndRemove`, so that part is redundant. What
+    // it does **not** catch is `QueryEngine` continuing to notify a dead entry: `enqueue()` finds no
+    // queue and returns, so the hub's removal masks the engine's dead-flag check. The direction of
+    // the count is therefore guaranteed by construction (recounted from the vector under the lock,
+    // never incremented) rather than by this test, and its unique value is the user-visible
+    // contract: a write after the last cancellation reaches nobody.
+    EngineFixture fix;
+    ob::SubscriptionHub hub(1 << 20, 8);
+
+    std::string error;
+    std::vector<uint64_t> ids;
+    for (int i = 0; i < 5; ++i) {
+        const uint64_t id = hub.add(fix.engine, 10 + i, 1, kSub, &error);
+        ASSERT_NE(id, 0u) << error;
+        ids.push_back(id);
+    }
+
+    fix.write("AAPL", "NYSE", 2, 1);
+    EXPECT_GT(hub.queued_bytes(), 0u) << "nothing was delivered while subscribed, so the second "
+                                         "half of this test would prove nothing";
+
+    ob::SessionManager sessions(4);
+    hub.drain(sessions, [](int) {});
+    for (uint64_t id : ids) hub.remove(fix.engine, id);
+
+    fix.write("AAPL", "NYSE", 3, 2);
+    EXPECT_EQ(hub.queued_bytes(), 0u)
+        << "a write was delivered after every subscription had been cancelled";
+    EXPECT_EQ(hub.active(), 0u);
+}
