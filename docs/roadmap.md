@@ -578,6 +578,14 @@ and getting data into their existing Python stack without a copy.
   What does not exist: any way to ask for it over TCP. `CommandType` has no `SUBSCRIBE`, and
   `QueryEngine::execute()` says so outright ("SUBSCRIBE via execute() is not supported"). A network
   client polls. The README now says exactly that.
+- **In progress.** The half that is a *defect* rather than a feature has landed: the subscription
+  list was a bare `std::vector` shared between the server's epoll loop and
+  `MultiMasterManager::io_loop`, with no synchronisation. It is now a `shared_mutex` with deferred
+  removal, `notify_subscribers()` takes a span and is called once per delta rather than once per
+  level, and `has_subscribers()` keeps the common no-subscriber path at one relaxed atomic read.
+  The wire — `CommandType::SUBSCRIBE`, a bounded per-subscriber queue, an eventfd waking the loop,
+  `PUSH` framing, slow-consumer disconnect, metrics — is designed and not written. Spec:
+  `kiro-workspace/specs/streaming-subscriptions/`.
 - Effort: M | Impact: Real-time consumers stop polling
 
 ### 46. Apache Arrow output

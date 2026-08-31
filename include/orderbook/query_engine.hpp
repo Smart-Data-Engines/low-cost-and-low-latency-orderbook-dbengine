@@ -5,9 +5,13 @@
 #include "orderbook/data_model.hpp"
 #include "orderbook/soa_buffer.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
+#include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -93,30 +97,97 @@ public:
     /// Pretty-print AST back to canonical SQL string.
     std::string format(const QueryAST& ast);
 
-    /// Register streaming subscription; returns subscription id.
+    /// Register streaming subscription; returns subscription id, or 0 if the SQL does not parse.
     uint64_t subscribe(std::string_view sql, RowCallback cb);
 
     /// Unregister a streaming subscription.
+    ///
+    /// Marks it dead and returns; the entry is removed later, under the exclusive lock, when no
+    /// notification is in flight. So a cancelled subscription may still receive one more row if a
+    /// notification was already running - stated here because a client assuming "nothing after
+    /// unsubscribe" is a client with a race.
+    ///
+    /// The alternative, waiting here for notifications to quiesce, would block whichever thread
+    /// cancels on whichever thread notifies. Those are the epoll loop and `io_loop`.
     void unsubscribe(uint64_t id);
 
+    /// Whether anything is subscribed at all. One relaxed atomic read.
+    ///
+    /// The write path calls this before building a batch, because zero subscriptions is the case in
+    /// every deployment that does not use them and in almost every test, and it must not pay for a
+    /// lock. May read high for a moment - a subscription marked dead and not yet compacted still
+    /// counts - and never low. That direction is the safe one: high costs one pointless lock
+    /// acquisition, low drops a row.
+    bool has_subscribers() const {
+        return live_.load(std::memory_order_relaxed) > 0;
+    }
+
     /// Called by the Engine when a new delta is committed to the SoA buffer.
-    /// Notifies all matching subscriptions synchronously (within 1µs budget).
+    ///
+    /// Takes the lock **once per delta**, not once per row. It used to be called from inside the
+    /// per-level loop in `apply_delta`, so a 1000-level MINSERT meant a thousand calls; adding a
+    /// lock to that shape would have meant a thousand acquisitions on the hot path.
+    ///
+    /// Called from whichever thread owns the write path - the server's epoll loop for client
+    /// writes, `MultiMasterManager::io_loop` for a peer's delta. It may not touch anything owned by
+    /// one of those in particular, which is why a callback that wants to reach a socket has to
+    /// enqueue rather than write.
     void notify_subscribers(const std::string& symbol, const std::string& exchange,
-                            const SnapshotRow& row);
+                            std::span<const SnapshotRow> rows);
 
 private:
     const ColumnarStore& store_;
     const std::unordered_map<std::string, SoABuffer*>& live_buffers_;
     const AggregationEngine& agg_;
 
-    // Subscription tracking
+    // ── Subscription tracking ────────────────────────────────────────────────────────────────
+    //
+    // Shared between the write path and whatever registers subscriptions, which are different
+    // threads. Before this it was a bare vector: subscribe() push_back'd, unsubscribe() erased, and
+    // notify_subscribers() iterated, with nothing making those safe together. On the unfixed tree
+    // `QueryEngineUnit.SubscribingWhileNotifyingIsSafeAcrossThreads` aborts on every run.
     struct Subscription {
-        uint64_t   id;
-        QueryAST   ast;
-        RowCallback cb;
+        uint64_t          id;
+        QueryAST          ast;
+        RowCallback       cb;
+        std::atomic<bool> dead{false};
     };
-    std::vector<Subscription> subscriptions_;
+
+    /// Held shared while notifying, exclusive while registering or compacting.
+    ///
+    /// `shared_mutex` rather than `mutex` because notification is frequent and read-only while
+    /// registration is rare and writes. It is the more expensive of the two at zero contention,
+    /// which is affordable only because `has_subscribers()` keeps the no-subscriber path away from
+    /// it entirely.
+    mutable std::shared_mutex subs_mtx_;
+
+    /// `unique_ptr` rather than the object, so an entry's address does not move.
+    ///
+    /// A vector of objects relocates its elements on `push_back`, and a notification in progress
+    /// holds a reference into one of them. The shared lock does not save that on its own, since
+    /// registration takes the exclusive lock and could therefore be the only thing running - the
+    /// indirection makes the address stable regardless, instead of resting on an argument about
+    /// when the vector does and does not reallocate.
+    std::vector<std::unique_ptr<Subscription>> subscriptions_;
+
+    /// Notifications currently running. Compaction waits for zero.
+    std::atomic<uint32_t> notifying_{0};
+
+    /// Entries not marked dead, for `has_subscribers()`.
+    std::atomic<size_t> live_{0};
+
     uint64_t next_sub_id_{1};
+
+    /// Drop dead entries. Caller holds the exclusive lock; does nothing while a notification runs.
+    void compact_locked();
+
+    /// Count entries not marked dead. Caller holds the lock in either mode.
+    ///
+    /// Recounted rather than incremented and decremented, so the counter cannot drift away from
+    /// what the vector actually holds across a compaction. It is read on the hot path through
+    /// `has_subscribers()`, so being wrong there is worse than being slightly slower here - and
+    /// this runs on registration, which happens once per subscription.
+    size_t count_live_locked() const;
 };
 
 } // namespace ob

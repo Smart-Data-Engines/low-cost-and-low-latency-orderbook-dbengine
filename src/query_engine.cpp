@@ -981,45 +981,154 @@ std::string QueryEngine::format(const QueryAST& ast) {
     return os.str();
 }
 
+void QueryEngine::compact_locked() {
+    // Caller holds subs_mtx_ exclusively. Does nothing while a notification is running: a
+    // notification holds a raw pointer to an entry, and erasing the unique_ptr that owns it while
+    // that is true is the defect this whole mechanism replaced, moved one level down.
+    if (notifying_.load(std::memory_order_acquire) != 0) return;
+
+    const size_t before = subscriptions_.size();
+    subscriptions_.erase(
+        std::remove_if(subscriptions_.begin(), subscriptions_.end(),
+                       [](const std::unique_ptr<Subscription>& s) {
+                           return s->dead.load(std::memory_order_relaxed);
+                       }),
+        subscriptions_.end());
+    if (subscriptions_.size() != before) {
+        OB_LOG_DEBUG("query", "Compacted subscriptions: %zu -> %zu",
+                     before, subscriptions_.size());
+    }
+}
+
 uint64_t QueryEngine::subscribe(std::string_view sql, RowCallback cb) {
     QueryAST ast;
-    if (!parse(sql, ast).empty()) return 0;
-    uint64_t id = next_sub_id_++;
-    subscriptions_.push_back({id, std::move(ast), std::move(cb)});
+    std::string err = parse(sql, ast);
+    if (!err.empty()) {
+        OB_LOG_WARN("query", "Subscription refused, query does not parse: %s", err.c_str());
+        return 0;
+    }
+
+    std::unique_lock<std::shared_mutex> lock(subs_mtx_);
+    compact_locked();
+
+    auto sub  = std::make_unique<Subscription>();
+    sub->id   = next_sub_id_++;
+    sub->ast  = std::move(ast);
+    sub->cb   = std::move(cb);
+    const uint64_t id     = sub->id;
+    const std::string sym = sub->ast.symbol;
+    const std::string exc = sub->ast.exchange;
+    subscriptions_.push_back(std::move(sub));
+    // Recounted from the vector rather than incremented, so the counter cannot drift away from
+    // what is actually there across a compaction.
+    live_.store(count_live_locked(), std::memory_order_relaxed);
+
+    OB_LOG_INFO("query", "Subscription %llu registered for %s.%s (%zu live)",
+                static_cast<unsigned long long>(id), sym.c_str(), exc.c_str(),
+                static_cast<size_t>(live_.load(std::memory_order_relaxed)));
     return id;
 }
 
 void QueryEngine::unsubscribe(uint64_t id) {
-    subscriptions_.erase(
-        std::remove_if(subscriptions_.begin(), subscriptions_.end(),
-                       [id](const Subscription& s) { return s.id == id; }),
-        subscriptions_.end());
+    std::unique_lock<std::shared_mutex> lock(subs_mtx_);
+    bool found = false;
+    for (auto& sub : subscriptions_) {
+        if (sub->id == id && !sub->dead.load(std::memory_order_relaxed)) {
+            sub->dead.store(true, std::memory_order_relaxed);
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        OB_LOG_DEBUG("query", "Unsubscribe for unknown or already-cancelled id %llu",
+                     static_cast<unsigned long long>(id));
+        return;
+    }
+    live_.store(count_live_locked(), std::memory_order_relaxed);
+    OB_LOG_INFO("query", "Subscription %llu cancelled (%zu live)",
+                static_cast<unsigned long long>(id),
+                static_cast<size_t>(live_.load(std::memory_order_relaxed)));
+    compact_locked();
+}
+
+size_t QueryEngine::count_live_locked() const {
+    size_t live = 0;
+    for (const auto& sub : subscriptions_) {
+        if (!sub->dead.load(std::memory_order_relaxed)) ++live;
+    }
+    return live;
 }
 
 void QueryEngine::notify_subscribers(const std::string& symbol,
                                      const std::string& exchange,
-                                     const SnapshotRow& row) {
-    for (const auto& sub : subscriptions_) {
-        const QueryAST& ast = sub.ast;
-        // Check symbol/exchange match
-        if (ast.symbol != symbol || ast.exchange != exchange) continue;
-        // Check timestamp filter
-        if (ast.ts_start_ns.has_value() && row.timestamp_ns < ast.ts_start_ns.value()) continue;
-        if (ast.ts_end_ns.has_value()   && row.timestamp_ns > ast.ts_end_ns.value())   continue;
-        // Check price filter
-        if (ast.price_lo.has_value() && row.price < ast.price_lo.value()) continue;
-        if (ast.price_hi.has_value() && row.price > ast.price_hi.value()) continue;
-        // Build QueryResult and invoke callback
-        QueryResult qr{};
-        qr.timestamp_ns    = row.timestamp_ns;
-        qr.sequence_number = row.sequence_number;
-        qr.price           = row.price;
-        qr.quantity        = row.quantity;
-        qr.order_count     = row.order_count;
-        qr.side            = row.side;
-        qr.level           = row.level_index;
-        sub.cb(qr);
+                                     std::span<const SnapshotRow> rows) {
+    if (rows.empty()) return;
+
+    // ── Why the callback runs with no lock held ───────────────────────────────────────────────
+    //
+    // The first version of this invoked `sub.cb()` under the shared lock, with a comment claiming a
+    // callback that cancels its own subscription was safe because it only marks an entry dead.
+    // That was wrong: marking takes the exclusive lock, and `std::shared_mutex` is not recursive -
+    // a thread that already holds it in any mode and asks again is undefined behaviour, and in
+    // practice a deadlock. The comment described the intent and not the code, which is the same
+    // shape as an invariant living in a comment that nobody establishes.
+    //
+    // So: gather matching entries under the shared lock, release it, then invoke. `notifying_` is
+    // raised first and stays raised for the whole call, and `compact_locked()` refuses to erase
+    // anything while it is non-zero - so the pointers below stay valid without the lock. Only
+    // appends can happen in that window, which is why resuming by index is sound.
+    notifying_.fetch_add(1, std::memory_order_acquire);
+
+    static constexpr size_t kBatch = 32;
+    const Subscription* matched[kBatch];
+    size_t index = 0;
+
+    while (true) {
+        size_t found = 0;
+        size_t size  = 0;
+        {
+            std::shared_lock<std::shared_mutex> lock(subs_mtx_);
+            size = subscriptions_.size();
+            while (index < size && found < kBatch) {
+                const Subscription& sub = *subscriptions_[index];
+                ++index;
+                if (sub.dead.load(std::memory_order_relaxed)) continue;
+                // Symbol and exchange are per-subscription, so they are checked once for the whole
+                // batch of rows rather than once per row.
+                if (sub.ast.symbol != symbol || sub.ast.exchange != exchange) continue;
+                matched[found++] = &sub;
+            }
+        }
+
+        for (size_t i = 0; i < found; ++i) {
+            const Subscription& sub = *matched[i];
+            const QueryAST& ast     = sub.ast;
+            for (const SnapshotRow& row : rows) {
+                // Check timestamp filter
+                if (ast.ts_start_ns.has_value() && row.timestamp_ns < ast.ts_start_ns.value())
+                    continue;
+                if (ast.ts_end_ns.has_value() && row.timestamp_ns > ast.ts_end_ns.value())
+                    continue;
+                // Check price filter
+                if (ast.price_lo.has_value() && row.price < ast.price_lo.value()) continue;
+                if (ast.price_hi.has_value() && row.price > ast.price_hi.value()) continue;
+                // Build QueryResult and invoke callback
+                QueryResult qr{};
+                qr.timestamp_ns    = row.timestamp_ns;
+                qr.sequence_number = row.sequence_number;
+                qr.price           = row.price;
+                qr.quantity        = row.quantity;
+                qr.order_count     = row.order_count;
+                qr.side            = row.side;
+                qr.level           = row.level_index;
+                sub.cb(qr);
+            }
+        }
+
+        if (index >= size) break;
     }
+
+    notifying_.fetch_sub(1, std::memory_order_release);
 }
 
 } // namespace ob
