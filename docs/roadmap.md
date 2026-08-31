@@ -1833,7 +1833,7 @@ and allocation, not arithmetic.
 - Effort: S | Impact: +17.6% ingestion throughput measured; every WAL record, every replication frame
   and every snapshot file checksummed 15-25× faster
 
-### 79. Creating a snapshot blocks the multi-master io thread, and the measurement says how much (mostly closed)
+### 79. Creating a snapshot blocks the multi-master io thread, and the measurement says how much ✅
 
 Filed because #76 measured its own cost instead of estimating it, and the number does not scale.
 
@@ -1907,19 +1907,87 @@ and 3 ms of reading and checksumming 2.37 MB, which is close to the floor for "r
 check it".
 
 That puts a gigabyte at roughly **1.7 seconds** rather than 7, on the io thread. Better, and still
-not nothing — so candidate 2 stays open on its own merits:
+not nothing — so candidate 2 was done on its own merits.
 
-- **Get it off the io thread.** The flush-and-checksum on a short-lived worker, handing the manifest
-  back through the `wakeup_fd_` eventfd that `stop()` already uses. This bounds the worst case
-  instead of shrinking it, and it adds the cross-thread state whose bug class ThreadSanitizer has
-  now found twice (#37, #80) — so it wants doing carefully, not quickly.
+**Candidate 2: off the io thread.** `AsyncSnapshotBuilder` runs the creation on a short-lived worker
+and hands the result back through a notification whose only job is to wake the owner's loop; the
+owner collects it from its own thread, so every field it owns still has exactly one owner at a time.
+Both askers were converted, because both are io loops and the second one had the same defect with
+nobody watching it:
 
-The repeatable seam is `MMSnapshotMeasurement.DISABLED_SnapshotCreationCost`, which now prints the
-breakdown as well as the total, because three wrong guesses in a row is an argument for keeping the
-instrument rather than the conclusion.
+Measured on the same store as every other number in this item — 100 000 rows, 20 symbols, 184 files,
+2.37 MB, Release build on the development machine (i3-7100U), three rounds:
 
-- Effort: S remaining | Impact: A snapshot of a large store no longer stalls the io thread for many
-  seconds; it still stalls it for one or two
+| What the io thread pays when a snapshot is requested | Time |
+|---|---|
+| Before: the whole creation, inline | 6.4 / 4.1 / 5.0 ms |
+| After: starting a worker and returning | **0.146 / 0.099 / 0.060 ms** |
+
+Roughly 40–70× on this store, but the ratio is not the point and quoting it alone would be
+misleading. The first row grows with the store — the same table above puts a gigabyte at about 1.7
+seconds — and the second row does not, because it is a thread creation. That is the difference
+between shrinking the worst case and bounding it, which is what this half of the item was for.
+
+| | Before | After |
+|---|---|---|
+| `MultiMasterManager::io_loop()` | ran the whole creation | starts a worker and goes back to `epoll_wait()` |
+| `ReplicationManager::run_loop()` | ran it, and released `mtx_` mid-function to do so | starts a worker; nothing is released and nothing has to be re-found |
+
+The replication side was not in this item's title and had the bug anyway. It also had a second one
+worth naming: `handle_snapshot_request()` unlocked `mtx_`, created the snapshot, locked again and then
+searched `replicas_` for the entry it had been holding a reference to, because that entry could have
+been removed while the lock was down. None of that is needed once the wait happens elsewhere.
+
+Three properties, each of them a refusal:
+
+- **One at a time, no queue.** A second request during creation is answered `busy`. Two concurrent
+  flush-and-checksum passes would double the cost the move exists to avoid.
+- **A finished snapshot whose requester has gone is discarded.** Matched on a new
+  `PeerConnection::conn_id` rather than `node_id` or descriptor, because the case that neither can
+  see is the node that dropped and *came back*: the new connection asked for nothing, and installing
+  a snapshot discards local contents. Sending it one would be a wipe it never requested.
+- **The work is not cancellable.** A disconnect marks the request dead; the flush is not abandoned
+  half-way. Price named: until that worker finishes, another peer is refused as busy. Once per node
+  bootstrap, that beats both alternatives.
+
+**One defect fixed on the way, older than this item.** `snapshot_manifest.json` was written straight
+onto its own path with `trunc` and no synchronisation. The multi-master and replication loops have
+always been separate threads, so two creators could already interleave their JSON and a reader could
+already catch the file empty; #79 only added two more possible writers. It goes through a temporary
+file and a rename now.
+
+**What it cost to get right, in one sentence each.**
+
+- The first `shutdown()` held the object's mutex across `join()`, and the worker's last act is to take
+  that mutex to publish — deadlock, and the hang printed nothing, so gdb was the log. `take_result()`
+  had the identical shape one function away and was *safe*, because it only joins once the result is
+  published. Two functions, same shape, one deadlock: the rule is now blanket, no mutex held across
+  any join in that class.
+- The test for "publish before you notify" **survived its own mutation**: it woke a collector from a
+  condition variable and raced it against the worker's very next line, which the worker won on every
+  run. It now makes the notification sleep after announcing itself, which makes the check decisive.
+- The test for the manifest race survived too, for a different reason: a two-file manifest fits in one
+  stdio buffer and goes out in a single `write()`, so there is no partial state to catch. Thirty
+  symbols and counting an empty read as a failure fixed it.
+
+The repeatable seam is `MMSnapshotMeasurement.DISABLED_SnapshotCreationCost`, which prints the
+breakdown, the total, and now the io-loop cost per request, because three wrong guesses in a row is an
+argument for keeping the instrument rather than the conclusion.
+
+**Hot-path control, and how it was settled.** Nothing here is on the ingestion path, but "the diff
+says so" is not a measurement. `BM_IngestionThroughput` could not decide it: the machine, an hour into
+this work, produced cv 7.95%, and a paired run in a quieter window gave medians of 2602 ns with the
+change against 2607 ns on stashed `master` — identical, and both about 6% above the 2455 ns this
+document records for #81, on **unmodified** code. So the absolute figure is a machine-state artefact
+and only same-session pairs mean anything.
+
+What did decide it was the machine code. `objdump` of `Engine::apply_delta`, with hex literals
+normalised away, is **identical** between the two builds. Without that normalisation 34 lines differ,
+and every one is a jump target displaced by four bytes because the function's `.cold` section moved —
+which is the kind of difference that would have looked like a finding.
+
+- Effort: M | Impact: A snapshot of a large store no longer stalls either io loop at all; the loop
+  pays a thread creation and goes back to `epoll_wait()`
 
 ### 78. A payload larger than 65535 bytes produces a record header that understates it ✅
 

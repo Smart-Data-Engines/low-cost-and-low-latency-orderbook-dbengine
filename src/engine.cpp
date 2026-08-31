@@ -17,7 +17,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <random>
+#include <thread>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -1089,13 +1091,44 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
     manifest.total_bytes = total_bytes;
     manifest.total_rows  = total_rows;
 
-    // Write snapshot_manifest.json (at-most-one policy: overwrite previous).
+    // Write snapshot_manifest.json (at-most-one policy: overwrite previous), through a temporary
+    // file and a rename.
+    //
+    // This function has always had callers on more than one thread — the multi-master io loop and the
+    // replication loop are separate threads — and since #79 it also has two worker threads. Writing
+    // straight onto the target let two of them interleave their JSON into one file, and nothing
+    // guarded it. rename() within a directory is atomic, so a reader now sees one complete manifest
+    // and concurrent writers race only over which of them is last, which "overwrite previous"
+    // already permits.
+    //
+    // A crash between the write and the rename leaves the temporary behind. Nothing reads it and the
+    // directory walk above skips it (neither a `.col` nor `meta.json`), so the cost is a stray file,
+    // paid to avoid a corrupt one.
     {
-        std::string manifest_path = base_dir_ + "/snapshot_manifest.json";
-        std::ofstream f(manifest_path, std::ios::out | std::ios::trunc);
-        if (f.is_open()) {
-            f << manifest.to_json();
-            f.flush();
+        const std::string final_path = base_dir_ + "/snapshot_manifest.json";
+        const std::string tmp_path   =
+            final_path + ".tmp." + std::to_string(manifest.created_at_ns) + "." +
+            std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+
+        bool written = false;
+        {
+            std::ofstream f(tmp_path, std::ios::out | std::ios::trunc);
+            if (f.is_open()) {
+                f << manifest.to_json();
+                f.flush();
+                written = f.good();
+            }
+        }
+        if (!written) {
+            // Previously both of these failures were silent, so a snapshot could report success
+            // while leaving no manifest, or half of one.
+            OB_LOG_ERROR("engine", "Snapshot: cannot write manifest to '%s': %s",
+                         tmp_path.c_str(), std::strerror(errno));
+            ::unlink(tmp_path.c_str());
+        } else if (::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
+            OB_LOG_ERROR("engine", "Snapshot: cannot install manifest as '%s': %s",
+                         final_path.c_str(), std::strerror(errno));
+            ::unlink(tmp_path.c_str());
         }
     }
 

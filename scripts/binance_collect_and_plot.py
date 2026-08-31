@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-Binance BTC/USDT depth → 2-node MM cluster with failover → plot best bid/ask.
+Binance BTC/USDT depth → one engine node → read it back → plot bid, ask and spread.
 
 Usage:
-    python3 scripts/binance_collect_and_plot.py [--duration 90]
+    OB_SERVER_BINARY=./build-release/ob_tcp_server \
+        python3 scripts/binance_collect_and_plot.py [--duration 90]
 
 Scenario:
-1. Start 2-node multi-master cluster (etcd + node0 + node1)
-2. Stream Binance depth data to node0 for ~30s (both nodes alive)
-3. Kill node1 — continue streaming to node0 for ~30s
-4. Restart node1 — continue streaming to node0 for ~30s (re-sync happens)
-5. Query BOTH nodes independently
-6. Plot best bid/ask from both nodes overlaid — gaps = missing data on node1
+1. Start one ob_tcp_server on a free port with a temporary data directory
+2. Stream live depth updates from Binance and MINSERT each side
+3. Read the book back out of the engine after every update
+4. Plot best bid and ask, with the spread on its own axis
+
+The docstring here used to describe a five-step two-node multi-master scenario with
+a kill, a restart and a comparison of both nodes. None of that was implemented: the
+script starts one server. It was a description of a mechanism that does not exist,
+which is the same shape as several real defects in this engine — so it has been
+replaced by what the code does. The multi-master version of the same idea, with a
+node bootstrapping from a live-fed peer, is scripts/binance_live_bootstrap.py.
 """
 
 import argparse
@@ -31,7 +37,10 @@ from typing import List, Optional, Tuple
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SERVER_BINARY = str(PROJECT_ROOT / "build" / "ob_tcp_server")
+# Overridable the same way the CI jobs do it, so a run can point at a Release or a
+# sanitizer build without editing this file.
+SERVER_BINARY = os.environ.get(
+    "OB_SERVER_BINARY", str(PROJECT_ROOT / "build" / "ob_tcp_server"))
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@depth"
 SYMBOL = "BTCUSDT"
 EXCHANGE = "BINANCE"
@@ -335,27 +344,44 @@ def main():
         bid_prices = [s.best_bid for s in snapshots]
         ask_prices = [s.best_ask for s in snapshots]
 
-        # Create plot
-        fig, ax = plt.subplots(figsize=(14, 6))
+        spreads = [a - b for a, b in zip(ask_prices, bid_prices)]
 
-        ax.plot(times, bid_prices, color="green", linewidth=0.8,
+        # Two panels, because one cannot carry both facts.
+        #
+        # The first version drew bid, ask and a shaded spread on a single linear axis and produced a
+        # single visible line: BTC/USDT trades at a one-cent spread, so at a price of ~$78,000 over a
+        # range of a few tens of dollars the two series are the same pixel and the shaded band is
+        # thinner than the stroke. The chart was not wrong, it was empty — a legend promising three
+        # things and showing one. The spread is where the information is, and it needs an axis of its
+        # own.
+        fig, (ax, ax_spread) = plt.subplots(
+            2, 1, figsize=(14, 8), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
+
+        ax.plot(times, bid_prices, color="green", linewidth=1.6,
                 label="Best Bid", alpha=0.9)
         ax.plot(times, ask_prices, color="red", linewidth=0.8,
                 label="Best Ask", alpha=0.9)
-
-        # Fill spread
-        ax.fill_between(times, bid_prices, ask_prices,
-                        alpha=0.1, color="gray", label="Spread")
-
-        ax.set_xlabel("Time")
         ax.set_ylabel("Price (USD)")
-        ax.set_title(f"BTC/USDT Best Bid & Ask — {args.duration}s live from Binance")
+        ax.set_title(f"BTC/USDT from the engine — {args.duration}s live from Binance\n"
+                     f"bid and ask overlap at this scale; the spread is below")
         ax.legend(loc="upper left")
         ax.grid(True, alpha=0.3)
 
+        ax_spread.plot(times, spreads, color="steelblue", linewidth=0.9)
+        ax_spread.fill_between(times, 0, spreads, alpha=0.2, color="steelblue")
+        ax_spread.set_ylabel("Spread (USD)")
+        ax_spread.set_xlabel("Time")
+        ax_spread.grid(True, alpha=0.3)
+        ax_spread.set_ylim(bottom=0)
+
         # Format x-axis
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+        ax_spread.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
         fig.autofmt_xdate()
+
+        neg = [sp for sp in spreads if sp < 0]
+        print(f"Spread over the run: min ${min(spreads):.2f} / median "
+              f"${sorted(spreads)[len(spreads) // 2]:.2f} / max ${max(spreads):.2f}"
+              + (f"  ({len(neg)} crossed book(s))" if neg else ""))
 
         plt.tight_layout()
         plt.savefig(args.output, dpi=150)

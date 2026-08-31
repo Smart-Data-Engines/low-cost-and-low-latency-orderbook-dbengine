@@ -32,9 +32,14 @@ ETCD = os.environ.get("OB_ETCD_BINARY") or shutil.which("etcd") or "/usr/local/b
 
 
 def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    """The shared allocator, which never hands out the same number twice.
+
+    A local copy binding to port 0 and returning the number was the same TOCTOU that made a CI run
+    fail with `bind() failed on port N: Address already in use`: the socket is closed before the
+    caller can use it. One allocator per process is what makes "never twice" true.
+    """
+    from conftest import ClusterManager
+    return ClusterManager.find_free_port()
 
 
 class MmNode:

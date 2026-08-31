@@ -187,7 +187,9 @@ MultiMasterManager::MultiMasterManager(MultiMasterConfig config, Engine& engine,
     : config_(std::move(config))
     , engine_(engine)
     , wal_(wal)
-    , hlc_(hlc) {
+    , hlc_(hlc)
+    // The worker's only job when it finishes is to make io_loop() come back and look.
+    , snapshot_builder_([this] { wake_io_loop(); }) {
     conflict_resolver_ = std::make_unique<ConflictResolver>();
 
     OB_LOG_DEBUG("mm", "MultiMasterManager created: node_id=%u port=%u",
@@ -199,6 +201,14 @@ MultiMasterManager::~MultiMasterManager() {
 }
 
 // ── Start / Stop ──────────────────────────────────────────────────────────────
+
+void MultiMasterManager::wake_io_loop() {
+    const int fd = wakeup_fd_;
+    if (fd < 0) return;
+    const uint64_t one = 1;
+    const ssize_t wr = ::write(fd, &one, sizeof(one));
+    (void)wr;   // a full eventfd counter still means the loop will wake
+}
 
 void MultiMasterManager::start() {
     if (running_.load(std::memory_order_acquire)) return;
@@ -335,16 +345,20 @@ void MultiMasterManager::stop() {
     // inside epoll_wait() on Linux — so shutdown waited out the 500 ms timeout anyway, while the io
     // loop could call epoll_wait() on a descriptor number the kernel had already reassigned.
     // ThreadSanitizer reported it as a data race on file descriptor 4 between stop() and io_loop().
-    if (wakeup_fd_ >= 0) {
-        const uint64_t one = 1;
-        const ssize_t wr = ::write(wakeup_fd_, &one, sizeof(one));
-        (void)wr;   // a full eventfd counter still means the loop will wake
-    }
+    wake_io_loop();
 
     // Join threads. Both check running_, and the io thread is now woken at once rather than in up
     // to half a second.
     if (io_thread_.joinable()) io_thread_.join();
     if (reconnect_thread_.joinable()) reconnect_thread_.join();
+
+    // And the snapshot worker, before anything closes wakeup_fd_ — the worker writes to it when it
+    // finishes, so closing first would hand it a descriptor number the kernel has reassigned. That
+    // is pitfall 41 and #80, in a path that did not exist when either was written. A snapshot in
+    // flight is waited for, not cancelled: abandoning a flush half-way is worse than waiting for
+    // work whose result is about to be discarded.
+    snapshot_builder_.shutdown();
+    snapshot_prepare_ = MMSnapshotPrepare{};
 
     // Only now that the io thread is gone is it safe to touch the transfer state it owns. An
     // in-flight snapshot holds an open descriptor and a staging directory; a shutdown mid-transfer
@@ -621,6 +635,12 @@ void MultiMasterManager::io_loop() {
             break;
         }
 
+        // Before dispatching anything: has a snapshot worker finished? Checked here rather than in
+        // the wakeup_fd_ branch on purpose, so the plain 500 ms timeout picks a result up too. The
+        // notification is what makes it prompt; this is what makes a lost notification cost half a
+        // second instead of a stuck bootstrap.
+        poll_snapshot_preparation();
+
         for (int i = 0; i < nfds; ++i) {
             int ev_fd = events[i].data.fd;
             uint32_t ev_events = events[i].events;
@@ -674,6 +694,7 @@ void MultiMasterManager::io_loop() {
                     PeerConnection conn{};
                     conn.node_id = 0;  // unknown until handshake
                     conn.fd = client_fd;
+                    conn.conn_id = next_conn_id_++;
                     conn.connected = true;
                     conn.handshake_done = false;
                     conn.compress = config_.compress;
@@ -761,7 +782,9 @@ void MultiMasterManager::io_loop() {
                     // Process received data — parse frames.
                     process_recv_buf(*peer_ptr);
 
-                    // After handshake, re-key the peer if needed.
+                    // After handshake, re-key the peer if needed. The whole record moves, so
+                    // conn_id moves with it: the connection accepted under a temporary key keeps
+                    // its identity once the handshake names the node behind it.
                     if (peer_ptr->handshake_done && peer_ptr->node_id != 0 &&
                         peer_key != peer_ptr->node_id) {
                         // Move peer to correct key.
@@ -885,8 +908,12 @@ void MultiMasterManager::connect_to_peer(const PeerInfo& peer) {
     conn.node_id = peer.node_id;
     conn.address = peer.address;
     conn.fd = fd;
+    conn.conn_id = next_conn_id_++;
     conn.connected = true;
     conn.compress = config_.compress;
+    OB_LOG_INFO("mm", "Connected to peer %u at %s (fd=%d, connection %llu)",
+                conn.node_id, conn.address.c_str(), fd,
+                static_cast<unsigned long long>(conn.conn_id));
     peers_[peer.node_id] = std::move(conn);
 
     // Add peer fd to epoll (edge-triggered EPOLLIN).

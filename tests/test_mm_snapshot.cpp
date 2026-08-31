@@ -25,14 +25,17 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <fcntl.h>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -138,6 +141,22 @@ struct WiredPeer {
     WiredPeer(const WiredPeer&) = delete;
     WiredPeer& operator=(const WiredPeer&) = delete;
 
+private:
+    ob::PeerConnection* installed_{nullptr};
+
+public:
+
+    /// The record the manager operates on: the same socket, but living in the manager's peer table.
+    ///
+    /// Needed since #79, because the snapshot path looks its target up there rather than keeping the
+    /// reference it was handed — a request and its finished snapshot are separated by a worker
+    /// thread, and the peer can be gone by then. A test that drove the manager through its own copy
+    /// would be driving a different `send_buf` from the one the manager fills.
+    ob::PeerConnection& mgr(ob::MultiMasterManager& mm) {
+        if (installed_ == nullptr) installed_ = &mm.install_peer_for_test(peer);
+        return *installed_;
+    }
+
     /// Move whatever the manager has written into `inbox`.
     void collect() {
         uint8_t buf[64 * 1024];
@@ -188,13 +207,32 @@ void deliver(ob::MultiMasterManager& to, ob::PeerConnection& from_peer, const Fr
     }
 }
 
+/// Ask for a snapshot and let the worker finish, the way io_loop() does.
+///
+/// Since #79 handle_snapshot_request() only starts a worker thread: the SNAPSHOT_BEGIN frame appears
+/// when the io loop collects the result. A test that stops after the request observes nothing, which
+/// is the whole point of the change — the loop is free in between.
+void request_snapshot_and_settle(Node& sender, WiredPeer& to) {
+    sender.mm->handle_snapshot_request(to.mgr(*sender.mm));
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (sender.mm->snapshot_preparing()) {
+        sender.mm->poll_snapshot_preparation();
+        if (std::chrono::steady_clock::now() > deadline) {
+            FAIL() << "the snapshot worker did not finish within 10 s";
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 /// Run a whole transfer: request, then pump until the sender has nothing left.
 /// `mutate` gets a chance to damage each frame before it is delivered.
 template <typename Mutate>
 void run_transfer(Node& sender, WiredPeer& to_receiver,
                   Node& receiver, ob::PeerConnection& sender_peer,
                   Mutate mutate) {
-    sender.mm->handle_snapshot_request(to_receiver.peer);
+    request_snapshot_and_settle(sender, to_receiver);
 
     for (int round = 0; round < 10'000; ++round) {
         to_receiver.collect();
@@ -211,7 +249,7 @@ void run_transfer(Node& sender, WiredPeer& to_receiver,
             }
             return;
         }
-        sender.mm->advance_snapshot_send(to_receiver.peer);
+        sender.mm->advance_snapshot_send(to_receiver.mgr(*sender.mm));
     }
     FAIL() << "transfer did not finish";
 }
@@ -519,11 +557,11 @@ TEST(MMSnapshotRefusal, AnEndWithFilesStillMissingIsRefused) {
     // Drop the last file chunk, then let END through. Without the completeness check the receiver
     // would install a manifest it never fully received.
     std::vector<Frame> seen;
-    sender.mm->handle_snapshot_request(to_receiver.peer);
+    request_snapshot_and_settle(sender, to_receiver);
     for (int round = 0; round < 10'000 && sender.mm->snapshot_send_active(); ++round) {
         to_receiver.collect();
         for (auto& f : take_frames(to_receiver.inbox)) seen.push_back(std::move(f));
-        sender.mm->advance_snapshot_send(to_receiver.peer);
+        sender.mm->advance_snapshot_send(to_receiver.mgr(*sender.mm));
     }
     to_receiver.collect();
     for (auto& f : take_frames(to_receiver.inbox)) seen.push_back(std::move(f));
@@ -568,7 +606,7 @@ TEST(MMSnapshotRefusal, ASecondBeginDoesNotDisturbTheFirstTransfer) {
     second.node_id = 3;
     second.handshake_done = true;
 
-    sender.mm->handle_snapshot_request(to_receiver.peer);
+    request_snapshot_and_settle(sender, to_receiver);
     to_receiver.collect();
     auto frames = take_frames(to_receiver.inbox);
     ASSERT_FALSE(frames.empty());
@@ -598,11 +636,11 @@ TEST(MMSnapshotRefusal, ASecondRequestToASenderAlreadyStreamingIsRefused) {
     WiredPeer a(2, /*tiny_buffers=*/true);
     WiredPeer b(3);
 
-    sender.mm->handle_snapshot_request(a.peer);
+    request_snapshot_and_settle(sender, a);
     ASSERT_TRUE(sender.mm->snapshot_send_active())
         << "the transfer should have paused on a full socket, not run to completion";
 
-    sender.mm->handle_snapshot_request(b.peer);
+    sender.mm->handle_snapshot_request(b.mgr(*sender.mm));
     EXPECT_TRUE(sender.mm->snapshot_send_active())
         << "the transfer in flight must survive the second request";
 
@@ -625,7 +663,7 @@ TEST(MMSnapshotRefusal, LosingTheSourceMidTransferClearsTheFlag) {
     source.node_id = 1;
     source.handshake_done = true;
 
-    sender.mm->handle_snapshot_request(to_receiver.peer);
+    request_snapshot_and_settle(sender, to_receiver);
     to_receiver.collect();
     auto frames = take_frames(to_receiver.inbox);
     ASSERT_FALSE(frames.empty());
@@ -757,6 +795,210 @@ TEST(MMSnapshotCompatibility, AnUnknownRecordTypeIsSkippedNotFatal) {
 //   ./build-release/tests/test_mm_snapshot --gtest_also_run_disabled_tests
 //       --gtest_filter='*SnapshotCreationCost*'
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Creating it off the io thread (#79): who the finished snapshot belongs to
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// The request no longer produces anything by itself. That is the change: io_loop() accepts the
+// request and goes back to epoll_wait(), and the frames appear when it collects the result.
+TEST(MMSnapshotPreparation, TheRequestItselfSendsNothing) {
+    Node sender(1);
+    sender.write_rows("BTC", 8, 20'000'000);
+    WiredPeer to_receiver(2);
+
+    sender.mm->handle_snapshot_request(to_receiver.mgr(*sender.mm));
+
+    EXPECT_TRUE(sender.mm->snapshot_preparing());
+    EXPECT_FALSE(sender.mm->snapshot_send_active());
+
+    to_receiver.collect();
+    EXPECT_TRUE(to_receiver.inbox.empty())
+        << "handle_snapshot_request() must not put a byte on the wire: the snapshot does not exist "
+           "yet, and the io thread is free precisely because it is not waiting for it";
+
+    // And collecting it does produce a transfer, so the test above is not passing for want of a
+    // working path.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (sender.mm->snapshot_preparing() && std::chrono::steady_clock::now() < deadline) {
+        sender.mm->poll_snapshot_preparation();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    to_receiver.collect();
+    const auto frames = take_frames(to_receiver.inbox);
+    ASSERT_FALSE(frames.empty());
+    EXPECT_EQ(frames[0].hdr.record_type, ob::MM_MSG_SNAPSHOT_BEGIN);
+}
+
+TEST(MMSnapshotPreparation, APeerThatLeftBeforeCollectionGetsNothing) {
+    Node sender(1);
+    sender.write_rows("BTC", 8, 21'000'000);
+    WiredPeer to_receiver(2);
+
+    auto& stored = to_receiver.mgr(*sender.mm);
+    sender.mm->handle_snapshot_request(stored);
+    ASSERT_TRUE(sender.mm->snapshot_preparing());
+
+    stored.connected = false;
+    sender.mm->on_peer_disconnected(stored);
+    EXPECT_FALSE(sender.mm->snapshot_preparing());
+
+    // Collect what the worker produced. It has to be thrown away rather than sent.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (sender.mm->snapshot_builder_busy() && std::chrono::steady_clock::now() < deadline) {
+        sender.mm->poll_snapshot_preparation();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    EXPECT_FALSE(sender.mm->snapshot_send_active());
+    to_receiver.collect();
+    EXPECT_TRUE(to_receiver.inbox.empty())
+        << "a snapshot finished for a peer that has gone must be discarded, not streamed at "
+           "whatever is on that descriptor now";
+}
+
+// The harder half of the same idea, and the reason PeerConnection carries a conn_id: the node that
+// asked comes *back*. Same node_id, possibly the same descriptor number, and it has requested
+// nothing — installing a snapshot discards local contents, so sending it one would be handing it a
+// wipe it never asked for.
+TEST(MMSnapshotPreparation, TheSameNodeOnANewConnectionGetsNothing) {
+    Node sender(1);
+    sender.write_rows("BTC", 8, 22'000'000);
+
+    uint64_t asked_on = 0;
+    {
+        WiredPeer first(2);
+        auto& stored = first.mgr(*sender.mm);
+        asked_on     = stored.conn_id;
+        sender.mm->handle_snapshot_request(stored);
+        ASSERT_TRUE(sender.mm->snapshot_preparing());
+    }   // the socket goes away without the manager ever being told
+
+    // Node 2 reconnects. Nothing announced the loss of the previous connection, so this is the case
+    // that node_id alone cannot distinguish.
+    WiredPeer second(2);
+    auto& fresh = second.mgr(*sender.mm);
+    ASSERT_NE(fresh.conn_id, asked_on) << "a new connection must not reuse a connection id";
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (sender.mm->snapshot_builder_busy() && std::chrono::steady_clock::now() < deadline) {
+        sender.mm->poll_snapshot_preparation();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    EXPECT_FALSE(sender.mm->snapshot_send_active());
+    EXPECT_FALSE(sender.mm->snapshot_preparing());
+    second.collect();
+    EXPECT_TRUE(second.inbox.empty())
+        << "the reconnected node asked for nothing and must be sent nothing";
+}
+
+TEST(MMSnapshotPreparation, ASecondRequestWhileOneIsBeingCreatedIsRefused) {
+    Node sender(1);
+    sender.write_rows("BTC", 8, 23'000'000);
+
+    WiredPeer a(2);
+    WiredPeer b(3);
+
+    sender.mm->handle_snapshot_request(a.mgr(*sender.mm));
+    ASSERT_TRUE(sender.mm->snapshot_preparing());
+
+    sender.mm->handle_snapshot_request(b.mgr(*sender.mm));
+
+    b.collect();
+    const auto frames = take_frames(b.inbox);
+    ASSERT_EQ(frames.size(), 1u);
+    EXPECT_EQ(frames[0].hdr.record_type, ob::MM_MSG_SNAPSHOT_ABORT);
+    EXPECT_EQ(ob::decode_snapshot_abort(frames[0].payload.data(), frames[0].payload.size()),
+              "busy");
+
+    // The first request is untouched by the second.
+    EXPECT_TRUE(sender.mm->snapshot_preparing());
+}
+
+// Value of this one is mostly under instrumentation: it is the ASan and TSan jobs that decide
+// whether a manager destroyed with a snapshot in flight left a thread holding a reference to it.
+TEST(MMSnapshotPreparation, TearingDownWithASnapshotInFlightIsClean) {
+    auto sender = std::make_unique<Node>(1);
+    sender->write_rows("BTC", 8, 24'000'000);
+    WiredPeer to_receiver(2);
+
+    sender->mm->handle_snapshot_request(to_receiver.mgr(*sender->mm));
+    ASSERT_TRUE(sender->mm->snapshot_preparing());
+
+    sender.reset();   // ~MultiMasterManager → ~AsyncSnapshotBuilder → join
+    SUCCEED();
+}
+
+// The manifest file is written by whoever creates a snapshot, and that is now up to four threads: a
+// multi-master worker, a replication worker, and anything on the main thread. It used to be written
+// straight onto the target path with no lock, so two of them could interleave their JSON.
+//
+// Two details make this test able to see that, and the first version had neither. The store holds
+// thirty symbols so the manifest is tens of kilobytes — a two-file manifest fits in one stdio buffer
+// and goes out in a single write(), which no reader can catch mid-way. And an empty read counts as a
+// failure once the file has been seen non-empty: `trunc` on the target path empties it before the
+// first byte of the replacement arrives, and a manifest that describes nothing is exactly the
+// corruption at issue. With a rename neither window exists.
+TEST(MMSnapshotPreparation, ConcurrentCreationNeverLeavesAHalfWrittenManifest) {
+    Node node(1);
+    for (int sym = 0; sym < 30; ++sym) {
+        // std::to_string rather than snprintf into a fixed buffer: at -O1 and above GCC cannot
+        // narrow the loop variable and reports "%02d may write up to 11 bytes into a region of
+        // size 5" as an error. A Debug build at -O0 does not run that analysis at all, so the
+        // sanitizer job — which builds Debug *plus* -O1 — was the first thing to see it.
+        const std::string sym_name = "SYM" + std::to_string(sym);
+        node.write_rows(sym_name.c_str(), 2, 25'000'000 + static_cast<uint64_t>(sym) * 1000);
+    }
+
+    const std::string manifest_path = node.tmp.path + "/snapshot_manifest.json";
+
+    // One synchronous creation first, so the file exists and its size is known before any race.
+    (void)node.engine->create_snapshot();
+    {
+        std::ifstream f(manifest_path);
+        ASSERT_TRUE(f.is_open());
+        const std::string content((std::istreambuf_iterator<char>(f)),
+                                   std::istreambuf_iterator<char>());
+        ASSERT_GT(content.size(), 8192u)
+            << "the manifest has to be larger than a stdio buffer for this test to be able to "
+               "observe a partial write at all";
+    }
+
+    std::atomic<bool> stop_reading{false};
+    std::atomic<int>  parsed{0};
+    std::atomic<int>  broken{0};
+
+    std::thread reader([&] {
+        while (!stop_reading.load()) {
+            std::ifstream f(manifest_path);
+            if (!f.is_open()) { broken.fetch_add(1); continue; }
+            const std::string content((std::istreambuf_iterator<char>(f)),
+                                       std::istreambuf_iterator<char>());
+            ob::SnapshotManifest m;
+            if (!content.empty() && ob::SnapshotManifest::from_json(content, m)) {
+                parsed.fetch_add(1);
+            } else {
+                broken.fetch_add(1);
+            }
+        }
+    });
+
+    std::thread writers[2];
+    for (auto& w : writers) {
+        w = std::thread([&] {
+            for (int i = 0; i < 15; ++i) (void)node.engine->create_snapshot();
+        });
+    }
+    for (auto& w : writers) w.join();
+    stop_reading.store(true);
+    reader.join();
+
+    EXPECT_EQ(broken.load(), 0)
+        << broken.load() << " read(s) of the manifest found it absent, empty or unparseable while "
+           "two threads were writing it, out of " << (broken.load() + parsed.load());
+    EXPECT_GT(parsed.load(), 0) << "the reader never managed to read the manifest at all";
+}
+
 TEST(MMSnapshotMeasurement, DISABLED_SnapshotCreationCost) {
     Node node(1);
 
@@ -855,6 +1097,37 @@ TEST(MMSnapshotMeasurement, DISABLED_SnapshotCreationCost) {
                     round, msec(t0, t1), msec(t1, t1b), msec(t1b, t1c), msec(t1c, t2),
                     bytes, msec(t2, t3), entries, counted);
     }
+
+    // And the number #79 is actually about: what one pass of the io loop pays when a snapshot
+    // request arrives. Before, that pass ran the whole creation printed above; now it starts a
+    // worker and returns. The comparison is between the two figures — the second is what the io
+    // thread still pays per request, and it is a thread creation.
+    for (int round = 0; round < 3; ++round) {
+        WiredPeer peer(static_cast<uint16_t>(50 + round));
+        auto& stored = peer.mgr(*node.mm);
+
+        const auto t0 = std::chrono::steady_clock::now();
+        node.mm->handle_snapshot_request(stored);
+        const double accept_ms = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - t0).count();
+
+        // Let the worker finish before the next round, so the rounds do not measure each other.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (node.mm->snapshot_builder_busy() &&
+               std::chrono::steady_clock::now() < deadline) {
+            node.mm->poll_snapshot_preparation();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        node.mm->on_peer_disconnected(stored);
+        while (node.mm->snapshot_builder_busy() &&
+               std::chrono::steady_clock::now() < deadline) {
+            node.mm->poll_snapshot_preparation();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        std::printf("io-loop cost %d: accepting a snapshot request took %.3f ms\n",
+                    round, accept_ms);
+    }
     SUCCEED();
 }
 
@@ -871,7 +1144,7 @@ TEST(MMSnapshotRefusal, AManifestTooLargeToAddressIsRefusedRatherThanWrapped) {
     Node sender(1);
     sender.write_rows("BTC", 2, 11'000'000);
     WiredPeer peer(2);
-    sender.mm->handle_snapshot_request(peer.peer);
+    request_snapshot_and_settle(sender, peer);
     EXPECT_FALSE(sender.mm->snapshot_send_active())
         << "a two-row store fits in one pass, so the transfer should already be complete";
 }

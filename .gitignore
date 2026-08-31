@@ -71,3 +71,7 @@ _skbuild/
 # ── OS junk ───────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+
+# Local Python environment for the integration suite (CI builds its own).
+.venv/
+venv/

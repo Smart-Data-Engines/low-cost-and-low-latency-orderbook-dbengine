@@ -354,6 +354,9 @@ bool SnapshotManifest::from_json(std::string_view json, SnapshotManifest& out) {
 ReplicationManager::ReplicationManager(ReplicationConfig config, WALWriter& wal)
     : config_(std::move(config))
     , wal_(wal)
+    // No notification: run_loop() already comes back every 100 ms and polls. See
+    // poll_snapshot_preparation() in the header for why that is enough here.
+    , snapshot_builder_([] {})
 {}
 
 ReplicationManager::~ReplicationManager() {
@@ -422,6 +425,12 @@ void ReplicationManager::stop() {
     if (thread_.joinable()) {
         thread_.join();
     }
+
+    // And the snapshot worker, before any descriptor it might be about to be handed goes away. A
+    // snapshot in flight is waited for rather than cancelled — abandoning a flush half-way is worse
+    // than waiting for a result that is about to be discarded.
+    snapshot_builder_.shutdown();
+    snapshot_prepare_ = ReplicaSnapshotPrepare{};
 
     // Close all replica fds.
     {
@@ -554,6 +563,16 @@ bool ReplicationManager::drain_send_buffer(ReplicaInfo& replica) {
 }
 
 void ReplicationManager::remove_replica_locked(int fd) {
+    // A snapshot being created for this replica is now pointless. It is not cancellable, so the
+    // request is marked dead and poll_snapshot_preparation() discards the result when it lands.
+    if (snapshot_prepare_.active && snapshot_prepare_.fd == fd) {
+        OB_LOG_WARN("repl_mgr",
+                    "replica fd=%d left while its snapshot was being created (token %llu); the "
+                    "work will finish and the result will be discarded",
+                    fd, static_cast<unsigned long long>(snapshot_prepare_.token));
+        snapshot_prepare_.active = false;
+    }
+
     ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
     ::close(fd);
 }
@@ -570,6 +589,9 @@ void ReplicationManager::run_loop() {
             if (errno == EINTR) continue;
             break; // fatal epoll error
         }
+
+        // Has a snapshot worker finished? Before dispatching events, and on the timeout path too.
+        poll_snapshot_preparation();
 
         for (int i = 0; i < nfds; ++i) {
             int fd = events[i].data.fd;
@@ -693,6 +715,7 @@ void ReplicationManager::accept_replica() {
         // Add to replicas list.
         ReplicaInfo info;
         info.fd               = client_fd;
+        info.conn_id          = next_conn_id_.fetch_add(1, std::memory_order_relaxed);
         info.address          = std::move(address);
         info.confirmed_file   = 0;
         info.confirmed_offset = 0;
@@ -710,7 +733,8 @@ void ReplicationManager::accept_replica() {
         }
 
         replicas_.push_back(std::move(info));
-        OB_LOG_INFO("repl_mgr", "replica added, total replicas=%zu", replicas_.size());
+        OB_LOG_INFO("repl_mgr", "replica added on connection %llu, total replicas=%zu",
+                    static_cast<unsigned long long>(replicas_.back().conn_id), replicas_.size());
     }
 }
 
@@ -924,30 +948,119 @@ void ReplicationManager::handle_snapshot_request(ReplicaInfo& replica) {
         return;
     }
 
-    // Create snapshot (releases mtx_ internally for CRC computation).
-    // We must release our own mtx_ first since create_snapshot() acquires Engine::mtx_.
-    SnapshotManifest manifest;
-    {
-        // Temporarily release replication mtx_ to avoid deadlock with Engine::mtx_.
-        mtx_.unlock();
-        try {
-            manifest = engine_->create_snapshot();
-        } catch (const std::exception& e) {
-            mtx_.lock();
-            char err[256];
-            int len = std::snprintf(err, sizeof(err), "ERR SNAPSHOT_FAILED %s\n", e.what());
-            enqueue_send(replica, err, static_cast<size_t>(len));
-            return;
-        }
-        mtx_.lock();
-
-        // Re-find the replica (it may have been removed while we released the lock).
-        bool found = false;
-        for (auto& r : replicas_) {
-            if (r.fd == replica.fd) { found = true; break; }
-        }
-        if (!found) return;
+    // Since #79 the flush and the checksum pass happen on a worker thread. What that removes here is
+    // not only the stall — this function used to unlock mtx_ in the middle, create the snapshot, lock
+    // it again and then re-find the replica, because the state it was holding a reference to could
+    // have been removed while the lock was down. Nothing is released and nothing has to be re-found
+    // now: the wait happens elsewhere.
+    if (replica.snapshot_transfer.active) {
+        const char* err = "ERR SNAPSHOT_FAILED busy\n";
+        enqueue_send(replica, err, std::strlen(err));
+        return;
     }
+    if (snapshot_prepare_.active || snapshot_builder_.busy()) {
+        OB_LOG_WARN("repl_mgr",
+                    "refusing snapshot for fd=%d: one is already being created (token %llu)",
+                    replica.fd, static_cast<unsigned long long>(snapshot_prepare_.token));
+        const char* err = "ERR SNAPSHOT_FAILED busy\n";
+        enqueue_send(replica, err, std::strlen(err));
+        return;
+    }
+
+    const uint64_t token = next_snapshot_token_++;
+
+    // The pointer is captured by value rather than read from the member on the worker, so the
+    // worker never touches state this manager can change under it.
+    Engine* engine = engine_;
+    if (!snapshot_builder_.start(token, [engine] {
+            SnapshotWithSequenceState out;
+            out.manifest = engine->create_snapshot();
+            return out;
+        })) {
+        OB_LOG_ERROR("repl_mgr", "could not start a snapshot worker for fd=%d (token %llu)",
+                     replica.fd, static_cast<unsigned long long>(token));
+        const char* err = "ERR SNAPSHOT_FAILED worker_unavailable\n";
+        enqueue_send(replica, err, std::strlen(err));
+        return;
+    }
+
+    snapshot_prepare_            = ReplicaSnapshotPrepare{};
+    snapshot_prepare_.active     = true;
+    snapshot_prepare_.fd         = replica.fd;
+    snapshot_prepare_.conn_id    = replica.conn_id;
+    snapshot_prepare_.token      = token;
+    snapshot_prepare_.started_at = std::chrono::steady_clock::now();
+
+    OB_LOG_INFO("repl_mgr",
+                "snapshot for replica fd=%d (connection %llu) is being created on a worker thread "
+                "(token %llu)",
+                replica.fd, static_cast<unsigned long long>(replica.conn_id),
+                static_cast<unsigned long long>(token));
+}
+
+void ReplicationManager::poll_snapshot_preparation() {
+    // Collected without mtx_: the worker has published by the time take_result() returns anything,
+    // so this joins a thread that is already on its way out.
+    auto result = snapshot_builder_.take_result();
+    if (!result) return;
+
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    auto& prep = snapshot_prepare_;
+    const double prepare_ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - prep.started_at).count();
+
+    auto discard = [&](const char* why) {
+        OB_LOG_WARN("repl_mgr", "discarding a finished snapshot (token %llu) after %.1f ms: %s",
+                    static_cast<unsigned long long>(result->token), prepare_ms, why);
+        prep = ReplicaSnapshotPrepare{};
+    };
+
+    if (!prep.active) {
+        discard("the replica that asked for it is gone");
+        return;
+    }
+    if (prep.token != result->token) {
+        discard("it answers a request nobody is waiting for");
+        return;
+    }
+
+    // Matched on the connection, not the descriptor alone: a closed fd can be reissued to the next
+    // replica to connect, which has asked for nothing.
+    ReplicaInfo* replica = nullptr;
+    for (auto& r : replicas_) {
+        if (r.fd == prep.fd && r.conn_id == prep.conn_id) {
+            replica = &r;
+            break;
+        }
+    }
+    if (replica == nullptr) {
+        discard("connection to the replica that asked no longer exists");
+        return;
+    }
+
+    if (!result->ok) {
+        OB_LOG_ERROR("repl_mgr", "snapshot creation failed for fd=%d (token %llu): %s",
+                     replica->fd, static_cast<unsigned long long>(result->token),
+                     result->error.c_str());
+        char err[256];
+        int len = std::snprintf(err, sizeof(err), "ERR SNAPSHOT_FAILED %s\n",
+                                result->error.c_str());
+        prep = ReplicaSnapshotPrepare{};
+        enqueue_send(*replica, err, static_cast<size_t>(len));
+        return;
+    }
+
+    OB_LOG_INFO("repl_mgr", "snapshot for fd=%d ready after %.1f ms on the worker (token %llu)",
+                replica->fd, prepare_ms, static_cast<unsigned long long>(result->token));
+
+    prep = ReplicaSnapshotPrepare{};
+    begin_snapshot_transfer(*replica, std::move(result->snap.manifest));
+}
+
+void ReplicationManager::begin_snapshot_transfer(ReplicaInfo& replica,
+                                                 SnapshotManifest&& manifest_in) {
+    SnapshotManifest manifest = std::move(manifest_in);
 
     // Initialize snapshot transfer state.
     auto& st = replica.snapshot_transfer;

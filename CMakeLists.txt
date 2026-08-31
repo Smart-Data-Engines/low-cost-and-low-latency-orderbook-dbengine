@@ -267,9 +267,13 @@ target_link_libraries(orderbook_peer_registry PUBLIC orderbook_hlc orderbook_coo
 add_library(orderbook_anti_entropy STATIC src/anti_entropy.cpp)
 target_link_libraries(orderbook_anti_entropy PUBLIC orderbook_peer_registry orderbook_hlc orderbook_logger)
 
+# ── Async snapshot builder (snapshot creation off the io thread, #79) ─────────
+add_library(orderbook_async_snapshot STATIC src/async_snapshot.cpp)
+target_link_libraries(orderbook_async_snapshot PUBLIC orderbook_core orderbook_sequence orderbook_logger)
+
 # ── Multi-master manager compiled library (peer networking, WAL broadcast) ─────
 add_library(orderbook_multi_master STATIC src/multi_master.cpp src/mm_snapshot.cpp)
-target_link_libraries(orderbook_multi_master PUBLIC orderbook_peer_registry orderbook_conflict_resolver orderbook_anti_entropy orderbook_hlc orderbook_compression orderbook_logger)
+target_link_libraries(orderbook_multi_master PUBLIC orderbook_async_snapshot orderbook_peer_registry orderbook_conflict_resolver orderbook_anti_entropy orderbook_hlc orderbook_compression orderbook_logger)
 
 # ── Shard map compiled library ─────────────────────────────────────────────────
 add_library(orderbook_shard_map STATIC src/shard_map.cpp)
