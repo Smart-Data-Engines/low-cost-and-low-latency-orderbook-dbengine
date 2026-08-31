@@ -9,6 +9,7 @@
 // Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 9.1, 9.2, 9.3, 9.4
 
 #include "orderbook/anti_entropy.hpp"
+#include "orderbook/async_snapshot.hpp"
 #include "orderbook/conflict_resolver.hpp"
 #include "orderbook/hlc.hpp"
 #include "orderbook/peer_registry.hpp"
@@ -197,6 +198,15 @@ struct PeerConnection {
     uint16_t     node_id{0};
     std::string  address;            // host:port
     int          fd{-1};             // socket fd (-1 = disconnected)
+    /// Identifies this *connection*, not this peer: assigned from a counter when the socket is
+    /// established, and never reused.
+    ///
+    /// Anything that outlives a single connection needs it, and snapshot creation is the first such
+    /// thing — a request arrives, a worker spends milliseconds to seconds on it, and by the time the
+    /// result lands the peer may have dropped and come back (#79). Neither of the obvious keys
+    /// works there: `node_id` is the same node returning, and descriptor numbers are reused by the
+    /// kernel. Zero means no connection has been established on this record.
+    uint64_t     conn_id{0};
     bool         connected{false};
     bool         handshake_done{false};  // handshake completed
     bool         compress{false};    // LZ4 negotiated
@@ -256,6 +266,20 @@ struct MMSnapshotSend {
     size_t           file_offset{0};
     int              fd{-1};
     uint64_t         bytes_sent{0};
+    std::chrono::steady_clock::time_point started_at{};
+};
+
+/// Sending side, before there is anything to send: a snapshot being created on a worker thread for
+/// a peer that asked for one (#79).
+///
+/// Separate from MMSnapshotSend because the two cannot overlap and mean different things: this one
+/// has no manifest, no bytes and no descriptor yet, and its target may disappear before it has any.
+struct MMSnapshotPrepare {
+    bool     active{false};
+    uint16_t target_node_id{0};
+    /// Which connection asked. The node returning on a new connection has asked for nothing.
+    uint64_t target_conn_id{0};
+    uint64_t token{0};
     std::chrono::steady_clock::time_point started_at{};
 };
 
@@ -373,6 +397,24 @@ public:
     /// A peer asked us for a snapshot. Creates one and starts streaming, or aborts with a reason.
     void handle_snapshot_request(PeerConnection& peer);
 
+    /// Start sending a snapshot that a worker thread has finished creating.
+    ///
+    /// Every refusal that used to happen inside handle_snapshot_request() lives here now, because
+    /// each one needs the created snapshot to decide: an untransportable version vector, a manifest
+    /// too large to address with a 16-bit index, metadata beyond what a receiver will assemble.
+    void begin_snapshot_send(PeerConnection& peer, SnapshotWithSequenceState&& snap);
+
+    /// Collect a finished snapshot, if there is one, and act on it. Called from io_loop() once per
+    /// pass — after a wake-up from wakeup_fd_, and also after a plain epoll timeout.
+    void poll_snapshot_preparation();
+
+    /// Write to wakeup_fd_ so io_loop() returns from epoll_wait() now rather than in up to 500 ms.
+    ///
+    /// Safe to call from any thread while the io loop is alive. The descriptor is only closed after
+    /// that loop and the snapshot worker have both been joined — the ordering pitfall 41 and #80
+    /// were both about.
+    void wake_io_loop();
+
     /// A peer is about to send us one. Validates the manifest whole, then opens staging.
     void handle_snapshot_begin(PeerConnection& peer, const uint8_t* payload, size_t len);
 
@@ -401,6 +443,21 @@ public:
     /// protocol handlers directly; production code asks `is_bootstrapping()`, which is atomic.
     bool snapshot_send_active() const { return snapshot_send_.active; }
     bool snapshot_recv_active() const { return snapshot_recv_.active; }
+    /// True between accepting a snapshot request and collecting the worker's result.
+    bool snapshot_preparing() const { return snapshot_prepare_.active; }
+    /// True while a worker is running or its result is still uncollected. Distinct from the above:
+    /// a request cancelled by a disconnect clears that flag and leaves this one set, because the
+    /// work carries on to the end.
+    bool snapshot_builder_busy() const { return snapshot_builder_.busy(); }
+
+    /// Put a connection into the peer table and hand back the stored record.
+    ///
+    /// Only sensible from a test. Production connections arrive through accept() or
+    /// connect_to_peer(), which is where conn_id is assigned — but a test that drives the snapshot
+    /// path needs the record to be *in* the table, because that path looks its target up rather than
+    /// keeping the reference it was handed: the request and the finished snapshot are separated by a
+    /// worker thread, and the peer may be gone by then (#79).
+    PeerConnection& install_peer_for_test(PeerConnection peer);
 
     /// Enter the bootstrap state: this node holds no data yet and must not serve as though it did.
     ///
@@ -450,6 +507,16 @@ private:
     /// kernel had already handed to something else. ThreadSanitizer reported it as a race on
     /// file descriptor 4 between stop() and io_loop().
     int wakeup_fd_{-1};
+
+    /// Creating a snapshot is a flush plus a checksum of the whole store, so it does not belong on
+    /// the thread that carries live deltas (#79). One at a time; the notification does nothing but
+    /// wake io_loop().
+    AsyncSnapshotBuilder snapshot_builder_;
+    MMSnapshotPrepare    snapshot_prepare_;
+    uint64_t             next_snapshot_token_{1};
+
+    /// Source of PeerConnection::conn_id. Read and bumped under mtx_, like peers_ itself.
+    uint64_t next_conn_id_{1};
     std::thread io_thread_;
     std::thread reconnect_thread_;
     std::atomic<bool> running_{false};

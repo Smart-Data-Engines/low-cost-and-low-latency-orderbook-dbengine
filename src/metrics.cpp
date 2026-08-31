@@ -94,8 +94,14 @@ MetricsRegistry::MetricsRegistry() {
                                      "Bytes of snapshot chunk payload received"));
     counters_.push_back(make_counter("ob_mm_records_dropped_bootstrapping_total",
                                      "Remote records dropped, unrecorded, while installing a snapshot"));
+    counters_.push_back(make_counter("ob_mm_snapshot_discarded_total",
+                                     "Snapshots created and then thrown away because the peer that "
+                                     "asked for one had gone (#79)"));
     gauges_.push_back(make_gauge("ob_mm_snapshot_create_ms",
                                  "Milliseconds the last snapshot creation took"));
+    gauges_.push_back(make_gauge("ob_mm_snapshot_prepare_ms",
+                                 "Milliseconds from a snapshot request to its result being "
+                                 "collected by the io loop (#79)"));
     gauges_.push_back(make_gauge("ob_mm_hlc_drift_ns",             "Maximum HLC drift in nanoseconds"));
 
 #ifdef OB_USE_IO_URING

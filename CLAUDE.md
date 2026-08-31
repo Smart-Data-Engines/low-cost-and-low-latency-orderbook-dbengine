@@ -420,6 +420,30 @@ Learned the hard way. Check here before debugging.
     order of magnitude — not the sanitizers, which kept passing. The proof is one grep of
     `flags.make`; do that after touching any global flag (#83).
 
+63. **A mutex held across `join()` deadlocks whenever the thread being joined still needs that
+    mutex.** `AsyncSnapshotBuilder::shutdown()` took the object's mutex and then joined the snapshot
+    worker — and the worker's last act is to take the same mutex to publish its result. What makes
+    this worth a pitfall rather than a bug is that `take_result()`, one function away, has the
+    identical shape and is *safe*: it only joins once the result is published, so the mutex is
+    already free. Two functions, same shape, one deadlock. The rule has to be blanket — move the
+    thread object out under the lock, release it, then join — because the case-by-case version is
+    correct reasoning that the next edit invalidates. The hang printed nothing at all, so
+    `sudo gdb -p <pid> -batch -ex "thread apply all bt"` was the log (pitfall 20 again).
+64. **Publish the result, then notify — and a test for that ordering is probably racing.** Reversing
+    the two loses the wake-up: the owner looks, finds nothing, and no second notification is coming.
+    The first test for it was worthless and looked fine: it woke a collector from a condition
+    variable and raced it against the worker's very next line, which the worker won on every run, so
+    swapping the two statements under test did not fail it once. Making the notification sleep after
+    announcing itself makes the check decisive — and note which way the residual timing risk points,
+    because the correct order then passes regardless of load and only a mutation can survive.
+65. **A test for a race between two writers sees nothing if the write fits in one buffer.** The
+    manifest race test passed against a completely unsynchronised `ofstream` on the target path,
+    because a two-file manifest is a few hundred bytes: one `write()`, nothing to catch half-way.
+    Thirty symbols made it tens of kilobytes and the same mutation failed immediately. The second
+    half of the same fix: count an *empty* read as a failure once the file has been seen non-empty,
+    since `trunc` empties the target before the replacement arrives and a manifest describing
+    nothing is precisely the corruption at issue.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -428,7 +452,7 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 744 C++ tests (`ctest -j1`, ~2 min) and 136 integration tests plus 2
+**Where the suites stand:** 761 C++ tests (`ctest -j1`, ~2 min) and 136 integration tests plus 2
 opt-in skips (`pytest tests/integration/`, ~7.5 min), all green, and **no `xfail` left** — every
 marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the multi-master modules a second time under ThreadSanitizer, and the tree also builds and
@@ -448,6 +472,10 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   Measured: 10.2 s → 20.1 s after a `kill -9`. The alternative that costs no latency makes a primary
   read-only during a brief etcd hiccup, so the cost was moved to latency deliberately;
   `--election-lease-wait-ms` is the knob.
+- **Creating a snapshot happens on a worker thread, not on either io loop** (#79). One at a time; a
+  second request during creation is refused as busy, and a finished snapshot whose requester has gone
+  is discarded rather than sent — matched on `conn_id`, because the case that `node_id` cannot see is
+  the same node reconnecting.
 - `rapidcheck` is pinned to `master` rather than a commit SHA, unlike every other dependency.
 
 *Two entries used to sit here and no longer describe the code.* "Deference on election cannot tell a

@@ -82,6 +82,15 @@ ob_add_test(test_crc32c
     test_crc32c.cpp
 )
 
+# ── The snapshot handoff between a worker and an io loop (#79) ────────────────
+add_executable(test_async_snapshot test_async_snapshot.cpp)
+target_link_libraries(test_async_snapshot
+    PRIVATE
+        orderbook_async_snapshot
+        GTest::gtest_main
+)
+gtest_discover_tests(test_async_snapshot PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+
 # ── What a read of the leader key means (#82): three answers, not one ────────
 add_executable(test_coordinator_leader_read test_coordinator_leader_read.cpp)
 target_link_libraries(test_coordinator_leader_read

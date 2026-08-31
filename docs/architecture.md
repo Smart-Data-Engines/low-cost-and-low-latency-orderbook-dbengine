@@ -219,10 +219,38 @@ all**, not merely when it is behind. Installing one discards local contents, and
 its own rows because a peer looked further ahead is a worse failure than any amount of redundant
 traffic. Repairing a node that does hold data is anti-entropy's job.
 
-One cost is known and measured rather than estimated: creating the snapshot — a flush plus a CRC32C
-pass over every columnar file — runs on the io thread. 2.37 MB across 184 files took 16–18 ms in a
-Release build on the development machine, so a gigabyte would stall that thread for roughly seven
-seconds. Roadmap #79 moves it to a worker thread.
+#### Who creates the snapshot, and on which thread
+
+Creating one is a flush plus a CRC32C pass over every columnar file, so the work grows with the
+store: 2.37 MB across 184 files measured 16–18 ms in a Release build on the development machine, and
+a gigabyte would be several seconds. It used to run on whichever thread asked, and both askers are
+io loops — `MultiMasterManager::io_loop()`, which also carries live deltas, catch-up and handshakes,
+and `ReplicationManager::run_loop()`. A loop stopped for seconds answers nothing while it waits.
+
+Since #79 the request only starts an `AsyncSnapshotBuilder`, which runs the creation on a short-lived
+worker and hands the result back through a notification whose only job is to wake the loop. The loop
+collects the result from its own thread, so every field it owns still has exactly one owner at a
+time.
+
+Three consequences are worth stating because each is a refusal:
+
+- **One at a time, no queue.** A second request while one is being created is answered
+  `SNAPSHOT_ABORT busy`. Two concurrent flush-and-checksum passes would double the cost the move
+  exists to avoid.
+- **A finished snapshot is discarded if its requester is gone.** The target is matched on a
+  connection id, not on `node_id` or descriptor: the node that asked may have dropped and come back,
+  and the new connection asked for nothing. Sending it a snapshot would hand it a wipe of its local
+  contents that it never requested.
+- **The work is not cancellable.** A disconnect marks the request dead and the result is thrown away
+  when it lands; the flush is not abandoned half-way. The price is named: until that worker finishes,
+  another peer's request is refused as busy. For an operation that happens once per node bootstrap,
+  that beats both alternatives.
+
+One side effect landed with it. `snapshot_manifest.json` is written by whoever creates a snapshot, and
+was written straight onto its own path with `trunc` and no synchronisation — so two creators could
+interleave their JSON, and a reader could catch the file empty. It now goes to a temporary file and is
+renamed into place. The window predates #79, because the two managers have always had separate
+threads; #79 only made it easier to reach.
 
 ### Anti-entropy: what reconciliation is for, and what it is not
 

@@ -177,17 +177,17 @@ void MultiMasterManager::send_snapshot_abort(PeerConnection& peer, const char* r
 }
 
 void MultiMasterManager::handle_snapshot_request(PeerConnection& peer) {
-    // Reached from io_loop() with MM's mtx_ held, and it calls into the engine — so it inherits
-    // the lock order that #80 is about (io_loop takes MM::mtx_ then Engine::mtx_, while a client
-    // write takes them the other way round). It also widens it: create_snapshot_with_sequence_state()
-    // takes Engine::flush_mtx_ before Engine::mtx_. The cycle predates this path — the received-delta
-    // path has the same shape — but whoever fixes #80 has to cover this call and
-    // request_snapshot_from() below, not only apply_remote_delta().
-    OB_LOG_INFO("mm", "Peer %u requested a snapshot", peer.node_id);
+    // Reached from io_loop() with MM's mtx_ held. Since #79 nothing here calls into the engine: the
+    // flush and the checksum pass over every stored file happen on a worker thread, and this
+    // function's whole job is to decide whether to start one. Two consequences worth naming. The io
+    // loop no longer stops for the length of a snapshot — measured at 4.1 ms for a 2.37 MB store,
+    // which puts a gigabyte at about 1.7 seconds. And the edge
+    // MM::mtx_ → Engine::flush_mtx_ → Engine::mtx_ is gone from this path, so the cycle #80 was
+    // about is one caller shorter; request_snapshot_from() below still has it.
+    OB_LOG_INFO("mm", "Peer %u requested a snapshot (connection %llu)", peer.node_id,
+                static_cast<unsigned long long>(peer.conn_id));
 
     if (snapshot_send_.active) {
-        // One at a time. Creating a snapshot flushes and checksums the whole store, and two of
-        // them at once would double that on a thread that also carries live traffic.
         OB_LOG_WARN("mm", "Refusing snapshot for peer %u: already sending one to peer %u",
                     peer.node_id, snapshot_send_.target_node_id);
         engine_.registry().increment_counter("ob_mm_snapshot_refused_total");
@@ -195,15 +195,138 @@ void MultiMasterManager::handle_snapshot_request(PeerConnection& peer) {
         return;
     }
 
-    Engine::SnapshotWithSequenceState snap;
-    try {
-        snap = engine_.create_snapshot_with_sequence_state();
-    } catch (const std::exception& e) {
-        OB_LOG_ERROR("mm", "Snapshot creation failed for peer %u: %s", peer.node_id, e.what());
-        engine_.registry().increment_counter("ob_mm_snapshot_failed_total");
-        send_snapshot_abort(peer, "create_failed");
+    // One at a time, and deliberately without a queue. Two flushes and two checksum passes at once
+    // would double the cost that moving this off the io thread exists to avoid. `busy()` also stays
+    // true while a finished snapshot waits to be collected, so the window between a worker ending
+    // and io_loop() noticing cannot start a second one either.
+    if (snapshot_prepare_.active || snapshot_builder_.busy()) {
+        OB_LOG_WARN("mm",
+                    "Refusing snapshot for peer %u: one is already being created for peer %u "
+                    "(token %llu)",
+                    peer.node_id, snapshot_prepare_.target_node_id,
+                    static_cast<unsigned long long>(snapshot_prepare_.token));
+        engine_.registry().increment_counter("ob_mm_snapshot_refused_total");
+        send_snapshot_abort(peer, "busy");
         return;
     }
+
+    const uint64_t token = next_snapshot_token_++;
+
+    if (!snapshot_builder_.start(token, [this] {
+            return engine_.create_snapshot_with_sequence_state();
+        })) {
+        // The builder refuses only when it is busy or has no producer, and neither is reachable
+        // here — so this is a thread that could not be created. Say so and refuse; the peer retries.
+        OB_LOG_ERROR("mm", "Could not start a snapshot worker for peer %u (token %llu)",
+                     peer.node_id, static_cast<unsigned long long>(token));
+        engine_.registry().increment_counter("ob_mm_snapshot_failed_total");
+        send_snapshot_abort(peer, "worker_unavailable");
+        return;
+    }
+
+    snapshot_prepare_                = MMSnapshotPrepare{};
+    snapshot_prepare_.active         = true;
+    snapshot_prepare_.target_node_id = peer.node_id;
+    snapshot_prepare_.target_conn_id = peer.conn_id;
+    snapshot_prepare_.token          = token;
+    snapshot_prepare_.started_at     = std::chrono::steady_clock::now();
+
+    OB_LOG_INFO("mm",
+                "Snapshot for peer %u is being created on a worker thread (token %llu, "
+                "connection %llu)",
+                peer.node_id, static_cast<unsigned long long>(token),
+                static_cast<unsigned long long>(peer.conn_id));
+}
+
+PeerConnection& MultiMasterManager::install_peer_for_test(PeerConnection peer) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (peer.conn_id == 0) peer.conn_id = next_conn_id_++;
+    const uint16_t key = peer.node_id;
+    peers_[key]        = std::move(peer);
+    OB_LOG_DEBUG("mm", "Peer %u installed directly (connection %llu) — test seam", key,
+                 static_cast<unsigned long long>(peers_[key].conn_id));
+    return peers_[key];
+}
+
+void MultiMasterManager::poll_snapshot_preparation() {
+    // Collected without MM's mtx_. take_result() joins the worker, and the worker has already
+    // published by then — its last act was the notification that brought us here — so this waits on
+    // nothing, and in particular on nothing that wants this lock.
+    auto result = snapshot_builder_.take_result();
+    if (!result) return;
+
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    auto& prep = snapshot_prepare_;
+    const double prepare_ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - prep.started_at).count();
+
+    auto discard = [&](const char* why) {
+        OB_LOG_WARN("mm", "Discarding a finished snapshot (token %llu) after %.1f ms: %s",
+                    static_cast<unsigned long long>(result->token), prepare_ms, why);
+        engine_.registry().increment_counter("ob_mm_snapshot_discarded_total");
+        prep = MMSnapshotPrepare{};
+    };
+
+    if (!prep.active) {
+        // on_peer_disconnected() got here first. The work was not cancellable, so it ran to the end
+        // and is thrown away now.
+        discard("the peer that asked for it is gone");
+        return;
+    }
+    if (prep.token != result->token) {
+        // Nothing produces this today — one worker at a time, one token per worker — which is
+        // exactly why it is checked: a future second producer must not be able to deliver a
+        // snapshot to a request that did not ask for it.
+        discard("it answers a request nobody is waiting for");
+        return;
+    }
+
+    // Find the connection that asked, not merely the node. A peer that dropped and came back is a
+    // new connection which has requested nothing, and it may hold data of its own by now — so
+    // handing it a snapshot would be handing it a wipe it never asked for.
+    PeerConnection* peer = nullptr;
+    for (auto& [key, conn] : peers_) {
+        (void)key;
+        if (conn.node_id == prep.target_node_id && conn.conn_id == prep.target_conn_id) {
+            peer = &conn;
+            break;
+        }
+    }
+    if (peer == nullptr) {
+        discard("connection to the peer that asked no longer exists");
+        return;
+    }
+    if (!peer->connected || peer->fd < 0 || !peer->handshake_done) {
+        discard("the connection that asked is no longer usable");
+        return;
+    }
+
+    engine_.registry().set_gauge("ob_mm_snapshot_prepare_ms",
+                                 static_cast<int64_t>(prepare_ms));
+
+    if (!result->ok) {
+        OB_LOG_ERROR("mm", "Snapshot creation failed for peer %u (token %llu): %s",
+                     peer->node_id, static_cast<unsigned long long>(result->token),
+                     result->error.c_str());
+        engine_.registry().increment_counter("ob_mm_snapshot_failed_total");
+        prep = MMSnapshotPrepare{};
+        send_snapshot_abort(*peer, "create_failed");
+        return;
+    }
+
+    OB_LOG_INFO("mm",
+                "Snapshot for peer %u is ready after %.1f ms on the worker (token %llu)",
+                peer->node_id, prepare_ms, static_cast<unsigned long long>(result->token));
+
+    prep = MMSnapshotPrepare{};
+    begin_snapshot_send(*peer, std::move(result->snap));
+}
+
+void MultiMasterManager::begin_snapshot_send(PeerConnection& peer,
+                                             SnapshotWithSequenceState&& snap_in) {
+    SnapshotWithSequenceState snap = std::move(snap_in);
+
     engine_.registry().set_gauge("ob_mm_snapshot_create_ms",
                                  static_cast<int64_t>(snap.create_ms));
 
@@ -805,6 +928,24 @@ void MultiMasterManager::abort_bootstrap(const char* reason) {
 }
 
 void MultiMasterManager::on_peer_disconnected(PeerConnection& peer) {
+    // A snapshot being created for this connection is now pointless, but it is not stoppable: the
+    // producer is a flush and a checksum pass, and abandoning either half-way is worse than
+    // finishing work whose result gets thrown away. So the request is marked dead and
+    // poll_snapshot_preparation() discards the result when it lands.
+    //
+    // The cost is named rather than hidden: until that worker finishes, another peer's request is
+    // answered with `busy`. For an operation that happens once per node bootstrap, that is cheaper
+    // than either alternative — a cancellable flush, or a second concurrent one.
+    if (snapshot_prepare_.active && snapshot_prepare_.target_node_id == peer.node_id &&
+        snapshot_prepare_.target_conn_id == peer.conn_id) {
+        OB_LOG_WARN("mm",
+                    "Peer %u dropped connection %llu while its snapshot was being created "
+                    "(token %llu); the work will finish and the result will be discarded",
+                    peer.node_id, static_cast<unsigned long long>(peer.conn_id),
+                    static_cast<unsigned long long>(snapshot_prepare_.token));
+        snapshot_prepare_.active = false;
+    }
+
     if (snapshot_send_.active && snapshot_send_.target_node_id == peer.node_id) {
         finish_snapshot_send(false, "peer_disconnected");
     }
