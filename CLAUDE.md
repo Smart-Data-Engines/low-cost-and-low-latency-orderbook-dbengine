@@ -482,6 +482,30 @@ Learned the hard way. Check here before debugging.
     too high costs one pointless lock acquisition, too low drops a row — so it may only ever be too
     high.
 
+71. **Sanitising a computation at the point of arrival leaves the poisoned value in the state, and
+    the next caller trips over it.** #83 found `static_cast<int64_t>(new_physical) -
+    static_cast<int64_t>(now)` overflowing in `HybridLogicalClock::update()` — reachable from the
+    network, because `physical_ns` comes from a peer — and fixed it there. The identical expression
+    in `tick_local()`, three lines away, was left alone and kept failing UBSan on the ASan job,
+    because `update()` stores `max(now, last, remote)` into `last_`: the absurd value stays in the
+    clock and the next local tick reads it back. **Fixing where the reproducer points is not the same
+    as fixing the expression** — grep the expression, not the stack trace.
+
+72. **A running maximum fed by two functions cannot isolate either of them.** `tick_receive()` and
+    `tick_local()` fold their drift into one `max_drift_ns_`, and in the scenario that exposes the
+    bug they compute the *same* distance — so whichever function is still correct supplies the
+    expected value and masks the other. Two versions of the test survived reverting the fix before
+    this was noticed. A behavioural assertion on that counter fails only when **both** sites lose the
+    pattern; per-site protection comes from UBSan. **Establish what a test detects by reverting the
+    fix, not by reading the test.**
+
+73. **Name a test whose only detector is a sanitizer, instead of dressing it in an assertion that
+    passes either way.** For the overflow in `tick_local()` no assertion can distinguish the two
+    implementations — two's complement wrap lands on almost the correct magnitude — so the test says
+    UBSan is the detector. The other half of the same rule: **compute the poison value, do not pick
+    one that looks extreme.** `0xF000…` looks extreme and does *not* overflow (as int64 it is only
+    −1.15e18); `0x9000…` does, because it is −8.07e18 against a floor of −9.22e18.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

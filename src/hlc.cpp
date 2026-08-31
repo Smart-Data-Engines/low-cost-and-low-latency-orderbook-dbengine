@@ -170,6 +170,27 @@ HybridLogicalClock::HybridLogicalClock(uint16_t node_id)
     last_.node_id = node_id_;
 }
 
+namespace {
+
+/// Absolute distance between two nanosecond stamps, clamped to something representable.
+///
+/// One function rather than the same three lines in two places, and that is the whole point of it
+/// existing. #83 found the signed form overflowing in `update()` and fixed it there; the identical
+/// arithmetic in `tick_local()`, three lines away, was left alone and kept failing UBSan on a
+/// property test that only reaches it for extreme generated values. The fix had gone where the
+/// reproducer pointed instead of to every site of the same expression.
+///
+/// The subtraction is unsigned, so it cannot overflow and needs no sign test - `-drift` on
+/// `INT64_MIN` was the second undefined step in the original three lines. The clamp keeps the
+/// result representable, and a drift reported at `INT64_MAX` says "absurd" as well as any other
+/// number would.
+int64_t drift_between(uint64_t a, uint64_t b) {
+    const uint64_t magnitude = (a > b) ? (a - b) : (b - a);
+    return static_cast<int64_t>(std::min<uint64_t>(magnitude, static_cast<uint64_t>(INT64_MAX)));
+}
+
+} // namespace
+
 HLCTimestamp HybridLogicalClock::tick_local() {
     std::lock_guard<std::mutex> lock(mtx_);
 
@@ -185,9 +206,14 @@ HLCTimestamp HybridLogicalClock::tick_local() {
 
     last_ = HLCTimestamp{new_physical, new_logical, node_id_};
 
-    // Track drift: difference between wall clock and HLC physical
-    int64_t drift = static_cast<int64_t>(new_physical) - static_cast<int64_t>(now);
-    if (drift < 0) drift = -drift;
+    // Track drift: distance between the wall clock and the HLC physical component.
+    //
+    // `new_physical` is `max(now, last_.physical_ns)`, and `last_` is whatever `update()` last
+    // stored - which is `max(now, last_.physical_ns, remote.physical_ns)`, so a peer that sends a
+    // nonsense timestamp **poisons the state** and this line trips over it on the next local tick.
+    // That is why fixing the arithmetic in `update()` alone was not enough: it sanitised the
+    // computation at the point of arrival and left the poisoned value behind.
+    const int64_t drift = drift_between(new_physical, now);
     if (drift > max_drift_ns_) {
         max_drift_ns_ = drift;
     }
@@ -228,20 +254,12 @@ HLCTimestamp HybridLogicalClock::tick_receive(const HLCTimestamp& remote) {
 
     last_ = HLCTimestamp{new_physical, new_logical, node_id_};
 
-    // Track drift, in unsigned arithmetic and then clamped.
-    //
-    // `static_cast<int64_t>(new_physical) - static_cast<int64_t>(now)` overflows when the physical
-    // component is large, and `new_physical` comes from a **peer's** timestamp on the wire — so a
-    // node sending a nonsense value caused undefined behaviour on every node that received it, not
-    // just a wrong number. UBSan reported it as
+    // Track drift. See `drift_between()`: the signed form overflowed here when the physical
+    // component was large, and `new_physical` comes from a **peer's** timestamp on the wire, so a
+    // node sending a nonsense value caused undefined behaviour on every node that received it
+    // rather than merely a wrong number. UBSan reported it as
     // "-7914833802811814732 - 1788012145016597349 cannot be represented in type 'long int'".
-    // `-drift` on INT64_MIN was the second undefined step in the same three lines.
-    //
-    // Unsigned difference cannot overflow and needs no sign test; the clamp keeps the result
-    // representable, and a drift at INT64_MAX is as good as any other way of saying "absurd".
-    const uint64_t drift_unsigned = (new_physical > now) ? (new_physical - now) : (now - new_physical);
-    const int64_t drift = static_cast<int64_t>(
-        std::min<uint64_t>(drift_unsigned, static_cast<uint64_t>(INT64_MAX)));
+    const int64_t drift = drift_between(new_physical, now);
     if (drift > max_drift_ns_) {
         max_drift_ns_ = drift;
     }
