@@ -627,6 +627,27 @@ Learned the hard way. Check here before debugging.
     ruleset, and **read the ruleset back** — this API answers 200 for writes that change nothing.
     Then fix the count wherever prose states it; it was in two documents.
 
+87. **A readiness check that counts the wrong token always answers the same thing.** The bootstrap
+    script waited for `MM_PEERS` to show two peers by counting lines containing `node_id` — which
+    appears in the *header* and never in a peer row, so the count was always 1 and the wait always
+    timed out against a cluster that was up and healthy. Counting `connected` is also the stronger
+    condition, because #84 made `MM_PEERS` list connections still in their handshake, and a peer
+    that is listed but not connected cannot receive a write. Third instance of this shape today: a
+    guard matching `[0-9]+ skipped` fired on `0 skipped`, and one matching `LimitMEMLOCK` matched the
+    comment explaining its absence.
+88. **`SIGTERM` is a request, so a script that reports "stopped" without waiting reports a state it
+    has not confirmed.** `stop` killed three nodes and printed success while all three were still
+    draining and flushing — which is what a graceful shutdown does. It now polls `kill -0`, and on
+    timeout escalates *and says so*, pointing at the log: a node that will not drain in fifteen
+    seconds has something to say.
+89. **Writing an operator-facing tool is how operator-facing defects get found.** Running
+    `scripts/bootstrap-cluster.sh` and reading the metrics endpoint it prints showed every metric on
+    a multi-master node labelled `node_role="standalone"` — `set_node_role()` is called only from
+    `promote_to_primary()` and `demote_to_replica()`, and a multi-master node runs neither. So a
+    three-node mesh reported three nodes each claiming to be alone, the one thing that label exists
+    to distinguish, while `ROLE` on the wire answered `MULTI_MASTER` correctly. Two operator-facing
+    signals disagreeing; the metric was the wrong one.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

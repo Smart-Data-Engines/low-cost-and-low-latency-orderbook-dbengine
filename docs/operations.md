@@ -27,6 +27,69 @@ sudo systemctl enable --now ob_tcp_server
 `/etc/orderbook/ob.conf` is marked as a configuration file, so a package upgrade will not overwrite
 your edits.
 
+## A cluster on one host, in one command
+
+For evaluation, or for a machine that is going to hold the whole cluster:
+
+```bash
+./scripts/bootstrap-cluster.sh          # three multi-master nodes plus etcd, native processes
+./scripts/bootstrap-cluster.sh stop
+```
+
+It writes a configuration file per node — the same shape as `/etc/orderbook/ob.conf`, so what you
+end up editing on a real host is what the script writes here — waits until **every node sees both
+peers as connected**, and then prints how to reach them. Waiting for that rather than for the ports
+to open is deliberate: a node that is merely listening can accept a write and have nobody to send it
+to.
+
+`BASE_PORT`, `NODES`, `STATE_DIR` and `OB_SERVER_BINARY` override the defaults. Everything binds to
+127.0.0.1, because the wire protocol has no authentication (roadmap #30).
+
+This is not `scripts/mm_harness.py`, which kills nodes, blocks links and counts rows to reproduce
+specific defects. The bootstrap script's job ends when the mesh is up.
+
+## A cluster across hosts
+
+**There is deliberately no script for this**, and the reason is worth stating: it could not be
+verified on the machine this was written on — `sshd` is installed but inactive and no key is set up,
+and standing one up would be a change to a developer's system rather than a test. A deployment
+script nobody has run is worse than a procedure someone has read. Roadmap #33 records what verifying
+it would take.
+
+The procedure, per host, with three hosts as the example:
+
+```bash
+# 1. On every host: install the package and an etcd the three can reach.
+sudo dpkg -i orderbook-dbengine_0.1.0_amd64.deb
+
+# 2. On every host: edit /etc/orderbook/ob.conf. Only four lines differ between them.
+#
+#    node-id               = node-1          # node-2, node-3
+#    mm-node-id            = 1               # 2, 3
+#    mm-replication-port   = 9092            # the same on each host is fine; they differ by address
+#    coordinator-endpoints = http://10.0.0.1:2379,http://10.0.0.2:2379,http://10.0.0.3:2379
+#    multi-master          = true
+
+# 3. Confirm what each node resolved before starting it. This is the step that catches a typo in a
+#    file you edited on three machines by hand.
+ob_tcp_server --config /etc/orderbook/ob.conf --print-config
+
+# 4. Start them.
+sudo systemctl enable --now ob_tcp_server
+
+# 5. Confirm the mesh from any node, rather than trusting that three services started.
+printf 'MM_PEERS\nQUIT\n' | nc 10.0.0.1 9090
+```
+
+Two things that bite here and are not obvious:
+
+- **`mm-replication-port` must be reachable between hosts**, and it is a different port from the one
+  clients use. A firewall that allows 9090 and not 9092 gives you three nodes that each accept
+  writes and never exchange one — and each looks healthy on its own.
+- **etcd must be reachable from every node, not just from one.** Peer discovery is
+  `etcd → PeerRegistry::start_watch → handle_topology_change → connect_to_peer → send_handshake`,
+  and a node that cannot read etcd stays alone without saying anything louder than a log line.
+
 ## Tuning that is real for this engine
 
 Three of the knobs people expect are **not** tuning for this engine, and saying so is more useful

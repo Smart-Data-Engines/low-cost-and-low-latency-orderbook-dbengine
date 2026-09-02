@@ -390,11 +390,32 @@ value.** Checked by grepping the sources rather than assumed:
   setting in a database was unreachable. Added, with an unrecognised value refused rather than read
   as the default.
 
-- **Still open:** `scripts/bootstrap-cluster.sh` — three multi-master nodes on one host or across
-  hosts over SSH, native processes, one command. The package had to exist first for the script to
-  have something to stand up.
-- Effort: M, part one done | Impact: Time-to-first-run drops from an hour to minutes, without a
-  container layer between the engine and the hardware
+**Part two: `scripts/bootstrap-cluster.sh`, single host, verified.** Three multi-master nodes plus
+etcd as native processes, a configuration file per node in the same shape as `/etc/orderbook/ob.conf`,
+and a wait for **every node seeing both peers as connected** rather than for the ports to open — a
+node that is merely listening can accept a write and have nobody to send it to.
+
+- **The SSH half is deliberately not a script**, and this is a scope decision rather than an
+  omission: it could not be verified here — `sshd` is installed but inactive and no key is set up,
+  and standing one up is a change to a developer's machine rather than a test. A deployment script
+  nobody has run is worse than a procedure someone has read, so `docs/operations.md` carries the
+  multi-host procedure with the two things that bite (`mm-replication-port` is a different port from
+  the client one, and etcd must be reachable from *every* node). Verifying a script would need a
+  second host, which is a decision with an owner.
+- **Three defects in it, each from running it rather than reading it.** The readiness check counted
+  lines containing `node_id` and always got 1, because that appears in the header and never in a peer
+  row — counting `connected` is also the stronger condition, since #84 made `MM_PEERS` list
+  connections still in their handshake. `stop` printed "stopped" and returned while all three nodes
+  were still draining, so it now waits and escalates with a message rather than reporting a state it
+  has not confirmed. And `case "$1"` under `set -u` failed with no argument.
+- **And it found a defect in the engine.** Every metric on a multi-master node carried
+  `node_role="standalone"`: `set_node_role()` is called only from `promote_to_primary()` and
+  `demote_to_replica()`, neither of which a multi-master node runs. An operator scraping a three-node
+  mesh saw three nodes each claiming to be alone — the one thing that label exists to distinguish —
+  while `ROLE` on the wire correctly answered `MULTI_MASTER`. Two operator-facing signals
+  disagreeing, and the metric was the wrong one. Fixed, with an integration test.
+- Effort: M, done except the SSH script | Impact: Time-to-first-run drops from an hour to minutes,
+  without a container layer between the engine and the hardware
 
 ### 34. Backup, restore, point-in-time recovery
 - `ob_backup` / `ob_restore` tooling on top of existing snapshots plus WAL
