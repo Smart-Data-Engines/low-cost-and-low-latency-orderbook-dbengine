@@ -459,6 +459,14 @@ set_target_properties(orderbook_shared PROPERTIES
 # So: relative paths, with CPACK_PACKAGING_INSTALL_PREFIX putting them under `/`. A plain
 # `cmake --install` then places files under `<prefix>/usr/...`, which is odd and acceptable: these
 # rules exist for packaging, and the wheel's rule is guarded by SKBUILD above.
+# `if(NOT SKBUILD)` around all of it, and the asymmetry is what broke the wheel build: guarding the
+# wheel's rule with `if(SKBUILD)` was only half the separation. These rules stayed unconditional, so
+# scikit-build-core's install step ran them too — and the wheel build compiles only
+# `orderbook_shared`, so `install(TARGETS ob_tcp_server)` looked for a binary that build never
+# produced and failed with "cannot find .../ob_tcp_server". Two consumers of one tree need the guard
+# on **both** sides, not one.
+if(NOT SKBUILD)
+
 install(TARGETS ob_tcp_server
     RUNTIME DESTINATION usr/bin
     COMPONENT runtime
@@ -484,6 +492,8 @@ install(FILES README.md SECURITY.md LICENSE docs/cli.md
     DESTINATION usr/share/doc/orderbook-dbengine
     COMPONENT runtime
 )
+
+endif()  # NOT SKBUILD
 
 # ── CPack ─────────────────────────────────────────────────────────────────────
 #

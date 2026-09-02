@@ -84,10 +84,17 @@ gh api -X PUT repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengi
 JSON
 ```
 
-The list above is **eleven** checks as of 28 August 2026, not the four the JSON block shows — see
+The list above is **twelve** checks as of 2 September 2026 — eleven, plus `package` from #33 — not
+the four the JSON block shows; see
 §1.1, which is about how it came to be wrong.
 
-The eleventh is `coverage`, added with roadmap #37. It gates three things and deliberately not a
+`package` is the twelfth, from roadmap #33. It builds the `.deb`, the tarball and — where
+`rpmbuild` exists, which is CI and not the development machine — the `.rpm`, then checks the layout,
+the metadata, the conffile mark, and that **the packaged binary accepts the packaged configuration**.
+It runs on pull requests as well as tags: a packaging job first exercised on a tag is first
+exercised at the moment it matters most.
+
+`coverage` came with roadmap #37. It gates three things and deliberately not a
 percentage: that the tree builds with coverage instrumentation, that the suite passes under it, and
 that the instrumentation **reaches the libraries** — which it did not for as long as the option
 existed (#83), while the number it printed looked like a number. No third-party service is involved;

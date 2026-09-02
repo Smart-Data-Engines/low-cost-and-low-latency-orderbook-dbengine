@@ -612,6 +612,21 @@ Learned the hard way. Check here before debugging.
     repository that a document and the tree disagreed, with the document right about what should
     exist.
 
+85. **Two consumers of one tree need the guard on both sides.** Guarding the Python wheel's
+    `install()` with `if(SKBUILD)` was half a separation: the system rules stayed unconditional, so
+    scikit-build-core ran them too — and the wheel build compiles only `orderbook_shared`, so
+    `install(TARGETS ob_tcp_server)` looked for a binary that build never produced. One missing
+    `if(NOT SKBUILD)` turned into **two** red required checks, because both integration jobs install
+    the package with `pip install -e`. When a rule exists for one consumer, ask what the other does
+    with it.
+
+86. **A new CI job is a ruleset change, and the repository checks that for you.** `docs-integrity`
+    failed with `produced but not required: 'package'` twelve seconds into the run. A job nobody
+    requires looks like coverage, so `check_contexts.py` refuses the drift in either direction.
+    Adding a job means: add the context to `.github/rulesets/master.json`, `PUT` it to the live
+    ruleset, and **read the ruleset back** — this API answers 200 for writes that change nothing.
+    Then fix the count wherever prose states it; it was in two documents.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -624,7 +639,9 @@ because commit messages and specs cite these numbers.
 opt-in Binance skips (`pytest tests/integration/`, ~8 min), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that
-fails the job on any skip, and the tree also builds and tests under Clang.
+fails the job on any skip, and the tree also builds and tests under Clang. Twelve required checks on
+`master` since #33 added `package`, which builds the .deb, the tarball and the RPM and verifies them
+— including that the packaged binary accepts the packaged configuration.
 
 Read the sanitizer claims with #83 in mind: until it landed, `OB_ENABLE_ASAN`, `OB_ENABLE_TSAN` and
 `OB_ENABLE_COVERAGE` instrumented the test binaries and the server but **none of the static
