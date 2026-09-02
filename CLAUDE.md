@@ -666,7 +666,7 @@ Learned the hard way. Check here before debugging.
     alive to `poll()`. Measured (i3-7100U, Release, default level): 2000 writes cost **153 bytes in
     total**, because writes are not logged at INFO, but **each client connection costs ~153 bytes**,
     putting the ceiling at roughly **418 connections per node**. The `cluster` fixture is
-    session-scoped across 145 tests, so the battery goes past it. Second half, in the diagnostic
+    session-scoped across 146 tests, so the battery goes past it. Second half, in the diagnostic
     path itself: `server_proc.stderr.read()` in a "server failed to start" handler **waits for EOF**,
     so with a process that is alive and not answering — the case it was written for — it hangs
     instead of printing.
@@ -761,7 +761,7 @@ Things a newcomer should know, because they are real limits rather than bugs to 
 
 - **The wire protocol has no authentication or encryption.** Roadmap #30. Do not expose a node
   outside a trusted network.
-- **The whole integration battery runs under ThreadSanitizer**, not a subset — since #85. 145 tests,
+- **The whole integration battery runs under ThreadSanitizer**, not a subset — since #85. 146 tests,
   **zero skips**, zero reports. Before that the job ran three multi-master modules, and the reason
   given for the narrow scope was a hypothesis that turned out to be false (pitfall 75). Widening it
   also revealed that four modules built their own path to the server and ignored `OB_SERVER_BINARY`,
@@ -789,6 +789,13 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   8 MB queue ceiling, about 140 000 rows, and past it the session is closed. There is no flow control
   and no resumption; a consumer needing continuity re-reads with `SELECT` from a known sequence
   number (#65).
+- **Integration nodes log to a file in their own data directory, and a node that dies without a test
+  killing it fails that test.** Both came from #86. Node output used to go to a `subprocess.PIPE`
+  nothing read, which loses the evidence and — past roughly 418 connections per node — blocks the
+  node inside `write()`. And `healthy_cluster` restarted anything not running with no way to tell a
+  deliberate `kill_node()` from a crash, so a crashing node was repaired in silence. If you add a
+  fixture that stops a node on purpose, record it the way `kill_node()` does, or
+  `unexplained_deaths()` will report your own teardown as a defect.
 - `rapidcheck` is pinned to `master` rather than a commit SHA, unlike every other dependency.
 
 *Entries used to sit here and no longer describe the code, and the list is kept because the pattern
