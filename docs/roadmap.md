@@ -2491,11 +2491,14 @@ Things a reviewer will notice, listed here so they do not look like oversights:
   told `busy` rather than queued.
 - **Benchmark baselines were recorded on one developer machine** with no hardware description. The
   table below fixes that going forward. Any published number needs its hardware next to it.
-- **Streaming subscriptions work embedded and not over TCP** (#45). `Engine::subscribe()` and
-  `ob_subscribe()` really do push rows to a callback, and `notify_subscribers()` runs on every write,
-  but `CommandType` has no `SUBSCRIBE`, so a network client polls. The README used to list the
-  feature without that distinction and now states it; the claim was the half that was free to fix,
-  the wire protocol is still open.
+- **A subscriber that stops reading is disconnected, not throttled** (#45). Each subscription has an
+  8 MB queue ceiling — roughly 140 000 rows — and past it the session is closed with
+  `ob_subscription_overflow_disconnects_total` incremented. There is no flow control and no
+  resumption: a consumer that needs continuity re-reads with `SELECT` from a known sequence number
+  (#65). And a cancelled subscription may deliver one more row, because a notification already in
+  flight is not recalled.
+  *(This bullet used to say subscriptions worked embedded and not over TCP. That was true until #45
+  closed.)*
 - **Aggregation SIMD is opt-in and off by default** (`OB_ENABLE_AVX2=OFF`), so default builds do not
   show the SIMD numbers.
 
