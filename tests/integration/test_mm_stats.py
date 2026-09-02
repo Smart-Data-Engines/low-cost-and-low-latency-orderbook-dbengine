@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 
 import pytest
-from conftest import server_binary_path
+from conftest import patience, server_binary_path
 import re
 
 pytestmark = pytest.mark.multi_master
@@ -54,6 +54,10 @@ class MmNode:
         self.etcd: subprocess.Popen | None = None
 
     def start(self, timeout: float = 30.0) -> None:
+        # Scaled under a sanitizer, for the reason `patience()` gives in conftest: every wait here
+        # was chosen against an uninstrumented build. This module is one of the three this job has
+        # run since it was created.
+        timeout = patience(timeout)
         client_port, peer_port = free_port(), free_port()
         etcd_url = f"http://127.0.0.1:{client_port}"
         self.etcd = subprocess.Popen(

@@ -1651,7 +1651,7 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
-### 89. A graceful handover demotes the outgoing primary twice
+### 89. A graceful handover demotes the outgoing primary twice ✅
 
 - **A race window, not stale bookkeeping, and the first version of this entry got that wrong.** The
   handover does store `NodeRole::REPLICA` — `src/failover.cpp:346`. The problem is the order around
@@ -1675,6 +1675,41 @@ ignore checks.
   Reordering — storing the role before revoking — is the obvious alternative and is worse: the
   revoke has an explicit "staying primary" path on failure, so the role would have to be put back,
   which is the same window pointing the other way.
+- **Fix: `handing_over_`, set through a scope guard, and the guard is the load-bearing part.** It is
+  true only between revoking our own lease and recording the new role, and the monitor loop's
+  "Absent" branch treats the key's disappearance as expected while it holds — logging at INFO that
+  the handover demotes this node itself, and doing nothing. A flag that suppresses a safety check
+  must be impossible to leave set, and `initiate_graceful_failover()` has **seven** return paths,
+  one of which keeps the role when the revoke fails. So it is RAII rather than a pair of stores: if
+  the handover dies after revoking, the guard clears on unwind and the next pass demotes, and the
+  net #82 added is still there.
+- **The flag alone was not enough, and reasoning about the mutation is what found that.** The
+  monitor reads `role_` at the top of an iteration and reads the leader key later in the same one,
+  with an etcd round trip in between — so a handover that starts *and finishes* inside that gap
+  clears the flag before the Absent branch runs, and the branch then acts on a `current` that still
+  says PRIMARY. Two windows, and neither guard covers the other: the flag is for a handover in
+  flight, and a **re-read of `role_` immediately before stepping down** is for one that completed
+  while we were asking etcd. Acting on a stale role is the actual defect; the flag was treating a
+  symptom of the narrower half.
+- The TTL clock rule alongside it needs no change: a handover completes in milliseconds, orders
+  below a lease TTL, so it cannot reach that threshold. Checked rather than assumed.
+- **The integration test catches it about one run in three, measured — so it is the backstop and
+  not the proof.** Three runs against a build with both conditions disabled: one failure, two
+  passes. A test that waits for a one-in-three race reads as flaky and gets a re-run instead of a
+  reading, which is the lesson the probabilistic salt test taught in the sibling repository. So the
+  decision moved into `decide_on_absent_key(role_now, handing_over)` — pure, next to
+  `decide_election()` and for the same stated reason — and its six combinations are one assertion
+  each with no cluster. Both mutations are caught deterministically and by *different* tests:
+  disabling the flag fails `HandoverInFlightIsNotAFault`, disabling the role re-read fails
+  `ARoleThatMovedOnLeavesNothingToStepDownFrom`. The third case, a genuinely lost lease, passes
+  under both mutations, which is what shows the guards do not swallow the situation #82 exists for.
+- **The integration test is an absence, and it is only possible because of #86.** Nodes log to a file in their
+  own data directory now, so the integration test records the log offset before the `FAILOVER` and
+  asserts that what follows contains the handover and **not** `lease lost, demoting to REPLICA` nor
+  the lease-lost warning. Over the produced slice rather than the whole file, because a
+  session-scoped cluster's log is mostly other tests' output and an assertion over all of it would
+  pass or fail on history. It does *not* assert the new INFO line is present: whether a monitor pass
+  lands inside that window is timing, and asserting it would be an assertion about the machine.
 - Effort: S | Impact: three warnings during a healthy planned handover, which is how operators learn
   to discount warnings
 
@@ -1845,6 +1880,17 @@ ignore checks.
   The assertion now prints the exit status, so `signal 9` would settle it. Guessing beyond that is
   not worth it: the next red run reports which, because the three layers above no longer discard the
   answer.
+- **A third cause of the same flakiness, and it is not a defect in the engine: every wait in the
+  integration suite was chosen against an uninstrumented build.** The job failed with `node-1 never
+  accepted connections` on a branch whose only changes were Python files and documentation — a
+  30-second startup budget for a node that starts in two, under ThreadSanitizer, on a shared runner
+  that was also running the rest of the battery. ThreadSanitizer costs five to fifteen times the run
+  time, so the numbers were never wrong for the machine they were written on and never right for
+  this job.
+  `patience()` in `conftest.py` triples every startup wait when `TSAN_OPTIONS` or `ASAN_OPTIONS` is
+  set — read from the environment, because that is what makes it true. It is scaling rather than
+  silencing: a node that cannot start inside the scaled window is still a failure, and still says
+  so. Applied to the shared fixture and to the two modules that start their own nodes.
 - Effort: S for the test half (done), S for the diagnostic half (done), M for the server half |
   Impact: a required check that fails at random trains everyone to re-run it, which is how a real
   failure gets re-run too
