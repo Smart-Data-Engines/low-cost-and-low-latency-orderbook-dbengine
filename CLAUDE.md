@@ -553,6 +553,12 @@ Learned the hard way. Check here before debugging.
     check**, and every mechanism that lets it shrink — a missing artefact, an unset variable, a
     hard-coded path — needs something that notices.
 
+    And the guard itself got this wrong on its first run: it matched `[0-9]+ skipped`, the summary
+    line reads `0 skipped`, so it failed the job with the battery green underneath. **A check that
+    fires on the presence of a word rather than on a count is the same class of mistake as the thing
+    it was added to catch.** `[1-9][0-9]* skipped`, and both cases exercised against a fixture line
+    before pushing.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

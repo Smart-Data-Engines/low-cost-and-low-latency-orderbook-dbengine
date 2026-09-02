@@ -557,9 +557,14 @@ jobs:
       # its PostgreSQL cross-section did not skip.
       - name: Fail if anything skipped
         run: |
-          if grep -qE "[0-9]+ skipped" tsan-pytest.log; then
+          # A non-zero count, not the word. The first version matched "[0-9]+ skipped" and the
+          # summary line reads "0 skipped", so the guard against a false negative produced a false
+          # positive on its first run — with the battery green underneath it. Worth the two lines of
+          # comment: a check that fires on the *presence of a word* rather than on a *count* is the
+          # same class of mistake as the thing it was added to catch.
+          if grep -qE "[1-9][0-9]* skipped" tsan-pytest.log; then
             echo "Tests skipped in the sanitizer battery. A skip here reads as a pass:"
-            grep -E "^SKIPPED|[0-9]+ skipped" tsan-pytest.log
+            grep -E "^SKIPPED|[1-9][0-9]* skipped" tsan-pytest.log
             exit 1
           fi
           echo "No skips."
