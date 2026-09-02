@@ -418,9 +418,13 @@ void ReplicationManager::start() {
 }
 
 void ReplicationManager::stop() {
-    if (!running_.load(std::memory_order_relaxed)) return;
-
-    running_.store(false, std::memory_order_release);
+    // Serialised, and the guard is now an exchange, so a second caller waits here and then returns
+    // knowing the stop is *finished*. It used to return knowing only that one had begun: the old
+    // code stored `false` before joining, so caller two skipped the join, destroyed this object, and
+    // its destructor's `stop()` hit the same guard — destroying a joinable `std::thread`, which
+    // calls `std::terminate`. The node died with SIGABRT on a graceful FAILOVER.
+    std::lock_guard<std::mutex> serialise(stop_mtx_);
+    if (!running_.exchange(false, std::memory_order_acq_rel)) return;
 
     if (thread_.joinable()) {
         thread_.join();
@@ -1202,9 +1206,11 @@ void ReplicationClient::start() {
 }
 
 void ReplicationClient::stop() {
-    if (!running_.load(std::memory_order_relaxed)) return;
-
-    running_.store(false, std::memory_order_release);
+    // Same change as `ReplicationManager::stop()`, and made at the same time rather than after this
+    // one is observed to abort as well: identical guard, identical destructor calling it, and the
+    // demotion path stops both objects in one function.
+    std::lock_guard<std::mutex> serialise(stop_mtx_);
+    if (!running_.exchange(false, std::memory_order_acq_rel)) return;
 
     // Shutdown the socket to unblock any blocking recv() in the receive thread.
     //

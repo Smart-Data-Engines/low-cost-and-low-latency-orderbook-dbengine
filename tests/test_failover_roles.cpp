@@ -10,9 +10,11 @@
 #include <gtest/gtest.h>
 #include <rapidcheck.h>
 
+#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -212,4 +214,59 @@ TEST(FailoverRoles, prop_write_rejected_after_demotion) {
 
         engine.close();
     });
+}
+
+// ── Concurrent demotion ───────────────────────────────────────────────────────
+//
+// The other half of #88, and it needed its own test: the fix was in two places and only one of them
+// had one. `ReplicationManager::stop()` is covered by
+// `ReplicationProtocolTest.ConcurrentStopsJoinTheThreadExactlyOnce`; this covers
+// `Engine::demote_to_replica()`, which used to read `repl_mgr_`, release `mtx_` to stop it, relock
+// and reset — a window two demotions both entered, the second working on an object the first was
+// destroying.
+//
+// Two demotions is what a graceful handover produces: the outgoing primary revokes its own lease,
+// so #82's unconditional lease-lost demotion runs alongside the handover's own.
+TEST(FailoverRoles, ConcurrentDemotionsLeaveOneNodeAndNoWreckage) {
+    TempDir dir;
+
+    // A replication port, because `promote_to_primary()` only builds a ReplicationManager when one
+    // is configured — and without a manager there is nothing for two callers to fight over, so the
+    // test would pass against the defect it guards.
+    //
+    // A counter, not a bind-to-zero-and-close: that idiom hands out a number the caller then races
+    // to bind, and it is what made a CI run fail with `bind() failed: Address already in use` (the
+    // reason `test_mm_stats.py` uses one shared allocator). A distinct base keeps this out of the
+    // range `test_replication.cpp` allocates from.
+    static std::atomic<uint16_t> next_port{21987};
+    ob::ReplicationConfig repl{};
+    repl.port = next_port.fetch_add(1, std::memory_order_relaxed);
+    repl.max_replicas = 4;
+
+    ob::Engine engine(dir.path, 100'000'000ULL, ob::FsyncPolicy::INTERVAL, repl);
+    engine.open();
+    engine.promote_to_primary(ob::EpochValue{7});
+    ASSERT_EQ(engine.node_role(), ob::NodeRole::PRIMARY);
+
+    std::atomic<int> ready{0};
+    auto demote = [&] {
+        ready.fetch_add(1, std::memory_order_release);
+        while (ready.load(std::memory_order_acquire) < 2) { /* align the two callers */ }
+        engine.demote_to_replica("");
+    };
+
+    std::thread first(demote);
+    std::thread second(demote);
+    first.join();
+    second.join();
+
+    // The properties this test is actually about: the node is alive, it settled on one role, and
+    // nothing was left half-destroyed for `close()` to trip over. Reaching this line at all is the
+    // main assertion — the defect aborted the process.
+    //
+    // Deliberately not asserting the exact `ROLE` string: after a promotion the epoch is 7 rather
+    // than 0, and pinning an incidental detail here would make a failure point at the wrong thing.
+    EXPECT_EQ(engine.node_role(), ob::NodeRole::REPLICA);
+    EXPECT_EQ(engine.handle_role_command().rfind("REPLICA", 0), 0u);
+    engine.close();
 }

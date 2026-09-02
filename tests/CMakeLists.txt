@@ -3,6 +3,29 @@ include(GoogleTest)
 # Reduce RapidCheck iterations from default 100 → 25 for faster test runs.
 set(RC_TEST_ENV "RC_PARAMS=max_success=25")
 
+# ── Per-test timeout ──────────────────────────────────────────────────────────
+#
+# CTest's default is 1500 seconds, so a test that hangs holds a CI job for twenty-five minutes and
+# then fails - which reads as a stuck runner rather than as a defect. Five minutes is far above any
+# honest test here (the whole suite is about two minutes, and five to ten times that under a
+# sanitizer) and far below the point where a human gives up on the job.
+#
+# It is also what makes one regression test work: the concurrent-`stop()` test for #88 **hangs**
+# under the defect it guards rather than aborting, because the old code left two threads joining one
+# thread object. Without a timeout that test detects the defect and reports nothing.
+# Scaled where instrumentation is on, because the same suite runs under ASan and TSan as required
+# checks and a timeout that reddens them would be a self-inflicted outage. Measured on this machine:
+# the slowest single test is `LZ4Property.prop_roundtrip` at 25 s uninstrumented, and sanitizers cost
+# three to ten times that on the network and property tests - so 300 s is comfortable plain and thin
+# under TSan. Tripled rather than guessed at from the plain number.
+if(OB_ENABLE_ASAN OR OB_ENABLE_TSAN)
+    set(OB_TEST_TIMEOUT_DEFAULT 900)
+else()
+    set(OB_TEST_TIMEOUT_DEFAULT 300)
+endif()
+set(OB_TEST_TIMEOUT ${OB_TEST_TIMEOUT_DEFAULT} CACHE STRING "Per-test timeout in seconds")
+message(STATUS "Per-test timeout: ${OB_TEST_TIMEOUT}s")
+
 # ── Helper to register a test executable ──────────────────────────────────────
 function(ob_add_test name)
     add_executable(${name} ${ARGN})
@@ -13,7 +36,7 @@ function(ob_add_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 endfunction()
 
 # ── Helper to register a test executable that needs the soa library ───────────
@@ -26,7 +49,7 @@ function(ob_add_soa_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 endfunction()
 
 # ── Helper to register a test executable that needs the sequence tracker ─────
@@ -39,7 +62,7 @@ function(ob_add_sequence_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 endfunction()
 
 ob_add_sequence_test(test_sequence_tracker
@@ -61,7 +84,7 @@ function(ob_add_wal_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 endfunction()
 
 # ── Helper to register a test executable that needs the codec library ─────────
@@ -74,7 +97,7 @@ function(ob_add_codec_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 endfunction()
 
 # ── Task 1 smoke test ─────────────────────────────────────────────────────────
@@ -89,7 +112,7 @@ target_link_libraries(test_async_snapshot
         orderbook_async_snapshot
         GTest::gtest_main
 )
-gtest_discover_tests(test_async_snapshot PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_async_snapshot PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── What a read of the leader key means (#82): three answers, not one ────────
 add_executable(test_coordinator_leader_read test_coordinator_leader_read.cpp)
@@ -98,7 +121,7 @@ target_link_libraries(test_coordinator_leader_read
         orderbook_coordinator
         GTest::gtest_main
 )
-gtest_discover_tests(test_coordinator_leader_read PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_coordinator_leader_read PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 ob_add_test(test_types_and_data_model
     test_types_and_data_model.cpp
@@ -141,7 +164,7 @@ function(ob_add_mmap_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 endfunction()
 
 # ── Tasks 6.1–6.2: MmapStore unit tests ───────────────────────────────────────
@@ -159,7 +182,7 @@ function(ob_add_columnar_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 endfunction()
 
 # ── Tasks 7.2–7.6: ColumnarStore property and unit tests ──────────────────────
@@ -177,7 +200,7 @@ function(ob_add_agg_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 endfunction()
 
 # ── Tasks 9.3–9.4: Aggregation Engine property and unit tests ─────────────────
@@ -195,7 +218,7 @@ function(ob_add_query_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 endfunction()
 
 # ── Tasks 10.5–10.11: Query Engine property and unit tests ────────────────────
@@ -215,7 +238,7 @@ function(ob_add_capi_test name)
             orderbook_capi
             GTest::gtest_main
     )
-    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 endfunction()
 
 # ── Task 12.2: C API unit tests ───────────────────────────────────────────────
@@ -231,7 +254,7 @@ function(ob_add_engine_test name)
             orderbook_engine
             GTest::gtest_main
     )
-    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 endfunction()
 
 # ── Task 13.2: Engine integration tests ───────────────────────────────────────
@@ -273,7 +296,7 @@ function(ob_add_tcp_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 endfunction()
 
 # ── TCP Server tests ──────────────────────────────────────────────────────────
@@ -301,7 +324,7 @@ target_link_libraries(test_snapshot_path_safety
         rapidcheck
         rapidcheck_gtest
 )
-gtest_discover_tests(test_snapshot_path_safety PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_snapshot_path_safety PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── Epoch tests (ha-automatic-failover) ───────────────────────────────────────
 add_executable(test_epoch test_epoch.cpp)
@@ -312,7 +335,7 @@ target_link_libraries(test_epoch
         GTest::gtest_main
         rapidcheck
 )
-gtest_discover_tests(test_epoch PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_epoch PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── Wire protocol epoch tests (ha-automatic-failover) ─────────────────────────
 add_executable(test_wire_protocol_epoch test_wire_protocol_epoch.cpp)
@@ -322,7 +345,7 @@ target_link_libraries(test_wire_protocol_epoch
         GTest::gtest_main
         rapidcheck
 )
-gtest_discover_tests(test_wire_protocol_epoch PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_wire_protocol_epoch PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── Failover election tests (ha-automatic-failover, Property 9) ───────────────
 add_executable(test_failover_election test_failover_election.cpp)
@@ -333,7 +356,7 @@ target_link_libraries(test_failover_election
         rapidcheck
         rapidcheck_gtest
 )
-gtest_discover_tests(test_failover_election PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_failover_election PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── Failover roles tests (ha-automatic-failover, Properties 10, 15, 16) ──────
 add_executable(test_failover_roles test_failover_roles.cpp)
@@ -344,7 +367,7 @@ target_link_libraries(test_failover_roles
         GTest::gtest_main
         rapidcheck
 )
-gtest_discover_tests(test_failover_roles PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_failover_roles PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── CLI failover tests (ha-automatic-failover, Property 11) ──────────────────
 add_executable(test_cli_failover test_cli_failover.cpp)
@@ -354,7 +377,7 @@ target_link_libraries(test_cli_failover
         GTest::gtest_main
         rapidcheck
 )
-gtest_discover_tests(test_cli_failover PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_cli_failover PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── Failover integration tests (ha-automatic-failover) ────────────────────────
 add_executable(test_failover_integration test_failover_integration.cpp)
@@ -363,7 +386,7 @@ target_link_libraries(test_failover_integration
         orderbook_engine
         GTest::gtest_main
 )
-gtest_discover_tests(test_failover_integration PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_failover_integration PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── Helper to register a test executable that needs the compression library ───
 function(ob_add_compression_test name)
@@ -375,7 +398,7 @@ function(ob_add_compression_test name)
             rapidcheck
             rapidcheck_gtest
     )
-    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 endfunction()
 
 # ── Compression property and unit tests (compression-and-ttl) ─────────────────
@@ -390,7 +413,7 @@ target_link_libraries(test_replication_compress
         orderbook_engine
         GTest::gtest_main
 )
-gtest_discover_tests(test_replication_compress PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_replication_compress PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── Session compression negotiation tests (compression-and-ttl, Task 4.4) ────
 ob_add_tcp_test(test_session_compress
@@ -420,7 +443,7 @@ target_link_libraries(test_incremental_flush
         rapidcheck
         rapidcheck_gtest
 )
-gtest_discover_tests(test_incremental_flush PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_incremental_flush PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 add_executable(test_flush_race test_flush_race.cpp)
 target_link_libraries(test_flush_race
@@ -440,12 +463,12 @@ target_link_libraries(test_ttl_retention
         rapidcheck
         rapidcheck_gtest
 )
-gtest_discover_tests(test_ttl_retention PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_ttl_retention PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── Batch insert tests (batch-insert, Properties 1–5 + unit tests) ────────────
 add_executable(test_batch_insert test_batch_insert.cpp)
 target_link_libraries(test_batch_insert PRIVATE orderbook_tcp_server_lib GTest::gtest_main rapidcheck rapidcheck_gtest)
-gtest_discover_tests(test_batch_insert PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_batch_insert PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── MetricsRegistry property and unit tests (observability, Tasks 1.3–1.7) ────
 add_executable(test_metrics_registry test_metrics_registry.cpp)
@@ -456,7 +479,7 @@ target_link_libraries(test_metrics_registry
         rapidcheck
         rapidcheck_gtest
 )
-gtest_discover_tests(test_metrics_registry PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_metrics_registry PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── MetricsServer property and integration tests (observability, Tasks 5.6–5.7) ─
 add_executable(test_metrics_server test_metrics_server.cpp)
@@ -468,7 +491,7 @@ target_link_libraries(test_metrics_server
         rapidcheck
         rapidcheck_gtest
 )
-gtest_discover_tests(test_metrics_server PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_metrics_server PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── StructuredLogger property and unit tests (observability, Tasks 3.3–3.7) ───
 add_executable(test_structured_logger test_structured_logger.cpp)
@@ -479,7 +502,7 @@ target_link_libraries(test_structured_logger
         rapidcheck
         rapidcheck_gtest
 )
-gtest_discover_tests(test_structured_logger PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_structured_logger PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── Stress tests (gated behind OB_STRESS_TESTS env var) ──────────────────────
 add_executable(test_stress test_stress.cpp)
@@ -513,7 +536,7 @@ target_link_libraries(test_client
         rapidcheck
         rapidcheck_gtest
 )
-gtest_discover_tests(test_client PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_client PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── io_uring property-based and unit tests (io-uring-transport, Task 9) ───────
 # ── ShardMap & ConsistentHashRing property and unit tests (symbol-sharding) ───
@@ -656,7 +679,7 @@ target_link_libraries(test_cli_mm
         orderbook_tcp_server_lib
         GTest::gtest_main
 )
-gtest_discover_tests(test_cli_mm PROPERTIES ENVIRONMENT "${RC_TEST_ENV}")
+gtest_discover_tests(test_cli_mm PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── MM Replication Networking property-based tests (mm-replication-networking, Tasks 1.2–1.5) ─
 add_executable(test_mm_networking test_mm_networking.cpp)

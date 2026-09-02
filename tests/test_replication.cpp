@@ -1473,3 +1473,58 @@ TEST(Crc32cRunning, FoldingInPiecesMatchesOneCall) {
 TEST(Crc32cRunning, EmptyInputMatchesTheOneShotForm) {
     EXPECT_EQ(ob::crc32c_finish(ob::crc32c_init), ob::crc32c(nullptr, 0));
 }
+
+// ── Concurrent stop() ─────────────────────────────────────────────────────────
+//
+// A graceful `FAILOVER` killed the outgoing primary with SIGABRT, and the node's own log ended on
+// `terminate called without an active exception` — libstdc++ for a joinable `std::thread` being
+// destroyed (#86, #88).
+//
+// The mechanism was in the guard. `stop()` began `if (!running_) return;` and then stored `false`
+// **before** joining, so its early return meant *a stop has begun* while reading as *stopped*. Two
+// callers therefore both got past the null checks in `Engine::demote_to_replica()`, and the second
+// skipped the join and destroyed the object the first was still inside.
+//
+// Two callers is not exotic here: the handover revokes the outgoing primary's own lease, so #82's
+// unconditional lease-lost demotion fires while the handover's demotion is still running.
+TEST_F(ReplicationProtocolTest, ConcurrentStopsJoinTheThreadExactlyOnce) {
+    auto mgr = start_manager();
+
+    // Both callers race into the same window deliberately. Under the old guard this became two
+    // concurrent `thread_.join()` calls on one thread object, and the measured behaviour is worth
+    // recording because it is not the obvious one: it **hangs** rather than aborting - one join
+    // succeeds and the other waits on a thread id that will never be signalled. Twelve runs against
+    // the reverted fix hung; none aborted.
+    //
+    // A hanging test detects a defect and reports nothing, so this needed the per-test `TIMEOUT`
+    // added to `tests/CMakeLists.txt` in the same change. CTest's default is 1500 seconds, which in
+    // CI reads as a stuck runner rather than as a failure.
+    std::atomic<int> ready{0};
+    auto racer = [&] {
+        ready.fetch_add(1, std::memory_order_release);
+        while (ready.load(std::memory_order_acquire) < 2) { /* spin to align the callers */ }
+        mgr->stop();
+    };
+
+    std::thread first(racer);
+    std::thread second(racer);
+    first.join();
+    second.join();
+
+    // Both returned, and the one that returned early did so knowing the stop had *finished*: the
+    // manager is stopped and destroying it must not need to join anything.
+    EXPECT_FALSE(mgr->is_running());
+    mgr.reset();
+}
+
+// Sequential idempotence, which is the property the early return is supposed to have and did not.
+// Cheap, deterministic, and it holds when the race above happens to serialise on its own.
+TEST_F(ReplicationProtocolTest, StopIsIdempotent) {
+    auto mgr = start_manager();
+
+    mgr->stop();
+    EXPECT_FALSE(mgr->is_running());
+    mgr->stop();          // must be a no-op rather than a second join
+    mgr->stop();
+    EXPECT_FALSE(mgr->is_running());
+}
