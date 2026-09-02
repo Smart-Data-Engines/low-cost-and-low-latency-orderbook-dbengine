@@ -162,6 +162,30 @@ Put the data directory on the fastest local device you have, and **not** on the 
 journal of a busy filesystem: the WAL is sequential and small-record, so it is exactly the workload
 that suffers from sharing a queue.
 
+## Which build is running
+
+Three ways to ask, all reporting the same number:
+
+```bash
+ob_tcp_server --help | head -1                      # not this: --help does not carry a version
+echo "STATUS" | nc localhost 9090 | grep '^version:' # a running node, over the wire
+curl -s localhost:9091/metrics | grep ob_build_info  # a running node, for a monitoring system
+```
+
+The startup line says **starting**, not listening, and the line that reports a working socket comes
+from the log once the bind has succeeded:
+
+```
+ob_tcp_server v0.1.0 starting on port 9090, data-dir: /var/lib/orderbook
+{"ts":"...","level":"INFO","component":"tcp_server","msg":"listening on port 9090, version 0.1.0, ..."}
+```
+
+The distinction matters when a port is taken. The old line announced `listening on port N` before
+the bind was attempted, so a failed start printed a claim to be listening with the error underneath
+it — and because it went to `stdout` unflushed, redirecting the server's output to a file or a
+journal delayed it until the process exited. Grep the log's `listening on port` line, from the
+logger, to confirm a start.
+
 ## What the metrics say when something is wrong
 
 `--metrics-port` exposes a Prometheus endpoint. Three gauges answer most questions before a log does:

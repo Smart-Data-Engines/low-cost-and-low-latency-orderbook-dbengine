@@ -7,6 +7,7 @@
 //   SIGINT / SIGTERM → graceful shutdown
 
 #include "orderbook/tcp_server.hpp"
+#include "orderbook/version.hpp"
 #ifdef OB_USE_IO_URING
 #include "orderbook/io_uring_server.hpp"
 #endif
@@ -58,8 +59,21 @@ int main(int argc, char* argv[]) {
     // MSG_NOSIGNAL, so this is the net for any path that forgets to.
     signal(SIGPIPE, SIG_IGN);
 
-    std::printf("ob_tcp_server v0.1.0 listening on port %u, data-dir: %s\n",
+    // "Starting", not "listening", and flushed.
+    //
+    // This line said `listening on port N` and ran *before* the server was constructed, so it
+    // announced a socket that did not exist yet — and if the bind then failed for a taken port, the
+    // output claimed to be listening with the error underneath it. It also went to `stdout` through
+    // `printf` with no flush, which is block-buffered when redirected to a file, a pipe or a
+    // journal: the one line an operator greps to confirm a start arrived at process **exit**. Every
+    // other line was on time because the logger writes to unbuffered `stderr`. Measured: the banner
+    // was absent from a node's log file while the node was up and answering (#90).
+    //
+    // The actual listen is logged by the server once the bind has succeeded.
+    std::printf("ob_tcp_server v%s starting on port %u, data-dir: %s\n",
+                std::string(ob::version()).c_str(),
                 static_cast<unsigned>(config.port), config.data_dir.c_str());
+    std::fflush(stdout);
 
 #ifdef OB_USE_IO_URING
     ob::IoUringServer server(std::move(config));

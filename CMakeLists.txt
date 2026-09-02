@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 project(orderbook-dbengine VERSION 0.1.0 LANGUAGES CXX)
 
+# ── Version ───────────────────────────────────────────────────────────────────
+#
+# `project(... VERSION)` above is the source, and it reaches the binary as a compile definition
+# rather than being retyped. It was retyped: a literal `v0.1.0` in `tools/ob_tcp_server.cpp` was the
+# only place a running node's version appeared anywhere, and nothing checked it against this line
+# or against `pyproject.toml` (#90). Three copies of one fact, two of which could drift silently.
+set(OB_VERSION "${PROJECT_VERSION}")
+
 # ── Language standard ──────────────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -160,6 +168,10 @@ target_include_directories(orderbook_core INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 target_compile_features(orderbook_core INTERFACE cxx_std_20)
+
+# The version reaches every translation unit that links the engine, so `ob::version()` has one
+# definition and nobody retypes the number.
+target_compile_definitions(orderbook_core INTERFACE OB_VERSION="${OB_VERSION}")
 
 # ── SoA buffer compiled library ────────────────────────────────────────────────
 add_library(orderbook_soa STATIC src/soa_buffer.cpp)

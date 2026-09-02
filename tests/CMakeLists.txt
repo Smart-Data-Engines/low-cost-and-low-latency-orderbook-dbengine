@@ -101,6 +101,16 @@ function(ob_add_codec_test name)
 endfunction()
 
 # ── Task 1 smoke test ─────────────────────────────────────────────────────────
+ob_add_test(test_version
+    test_version.cpp
+)
+
+# The drift guards read `CMakeLists.txt` and `pyproject.toml`, so the tree has to be findable at
+# test time — same reason `test_wal_position` and `test_cli_config` get this.
+target_compile_definitions(test_version
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
 ob_add_test(test_crc32c
     test_crc32c.cpp
 )

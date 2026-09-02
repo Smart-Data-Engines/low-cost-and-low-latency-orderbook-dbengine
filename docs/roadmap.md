@@ -1652,6 +1652,45 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 90. A running node could not be asked its version, and the banner that carried it lied twice ✅
+
+- **There was no way to ask a running node what version it is.** Not `--print-config`, not `STATUS`,
+  not `/metrics`. The only occurrence of the version anywhere in the C++ was a hardcoded literal in
+  `tools/ob_tcp_server.cpp`. For a database an evaluator is deciding whether to trust, "which build
+  is this node running" was a question with no answer.
+- Found while writing the comparative harness for #39, which records the version of every system it
+  measures beside the numbers — that is the whole point of its requirement 2.1. It can read
+  ClickHouse's from `SELECT version()` and ours from nothing, so its results file said "unreported
+  (the server has no way to report its version)". That sentence was the honest artefact and the
+  argument for this item.
+- **The banner was printed before the server bound.** `std::printf("... listening on port %u ...")`
+  ran before the `TcpServer` was constructed, so it announced listening that had not happened; a
+  bind that then failed for a taken port left the output claiming to listen with the error
+  underneath it.
+- **And it was never flushed.** It went to `stdout` via `printf`, which is block-buffered when
+  redirected to a file, a pipe or a journal — so the line arrived at **process exit**. Every other
+  line was on time because the logger writes to `stderr`, unbuffered. Measured: the banner was
+  absent from a node's log file while the node was up and answering, and present after it stopped.
+  The one line an operator greps to confirm a start was the last one to appear.
+- **Fixed in all three parts, and verified on a live node rather than by reading.** The version
+  reaches the binary from `project(... VERSION)` through a compile definition, so the C++ has one
+  copy and `ob::version()` is the only way to get it. The startup line says **starting** and is
+  flushed; the line reporting a working socket is logged by the server after the bind and the listen
+  have both succeeded. And the version is askable three ways: `STATUS` gains a `version:` key/value
+  line — not a column, so no client parsing the tab-separated table has to change — and `/metrics`
+  gains `ob_build_info{version="…",node_role="…"} 1`, the conventional shape, which is what lets a
+  monitoring system tell an old binary from a new one across a fleet.
+- Checked by starting a node and asking it: the banner is in the redirected file **while the node is
+  up** rather than after it exits, the logger's `listening on port …, version 0.1.0` line is there,
+  `STATUS` answers `version: 0.1.0`, and `/metrics` answers `ob_build_info{version="0.1.0"} 1`.
+- **Two drift guards, both mutation-checked.** `pyproject.toml` still carries its own version,
+  because a wheel's metadata cannot be a C++ macro — a test holds the two in step, and another
+  refuses the version as a literal in any of the four sources that report it. A literal which agrees
+  today is one that drifts at the first bump, and the symptom is an operator told the wrong build is
+  running, which is worse than being told nothing.
+- Effort: S | Impact: an operator could not tell which build was running, and the line saying the
+  server was up was neither true when printed nor visible when needed
+
 ### 89. A graceful handover demotes the outgoing primary twice
 
 - **A race window, not stale bookkeeping, and the first version of this entry got that wrong.** The
