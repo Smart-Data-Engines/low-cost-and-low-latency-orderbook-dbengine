@@ -350,16 +350,51 @@ because the two mechanisms overlap there — which is why the three-node test ex
   default config and a systemd unit
 
 ### 33. Native packaging and cluster bootstrap
-- Distribution packages: `.deb` and `.rpm` built on tag, plus a static tarball for everything else.
-  Binary, headers, default config, systemd unit, man page
-- `systemd` units for `ob_tcp_server` with `LimitMEMLOCK`, `CPUAffinity`, `Restart=on-failure`, and
-  ordering against a local etcd unit
-- `scripts/bootstrap-cluster.sh`: brings up a three-node multi-master cluster on one host or across
-  hosts over SSH, native processes only, one command
-- Install docs that cover the tuning the engine actually cares about: CPU pinning, isolated cores,
-  `vm.swappiness`, huge pages, NIC queue affinity, fsync policy per storage device
-- Effort: M | Impact: Time-to-first-run drops from an hour to minutes, without a container layer
-  between the engine and the hardware
+
+**Packages, unit and operations documentation are done; the bootstrap script is not.** Spec:
+`kiro-workspace/specs/native-packaging/`.
+
+- `.deb` and a static tarball with **byte-identical relative layouts**, holding the binary, headers,
+  `/etc/orderbook/ob.conf`, the systemd unit, a man page and the docs. Dependencies resolved by
+  `dpkg-shlibdeps` rather than hand-listed, because a hand-written list goes stale at the first new
+  link and the symptom is an install that succeeds and a binary that will not start.
+- `.rpm` **conditional on `rpmbuild` existing**, so a machine without it configures DEB and TGZ
+  rather than failing every `cpack`. Built and inspected in CI, which is the only place it can be.
+- The `package` job runs **on tags and on every pull request**, not on tags alone: a job first
+  exercised on a tag is a job first exercised at the moment it matters most, and CPack failures are
+  configuration failures that appear only when a generator runs.
+- `ExecStart` is the binary plus `--config`, which is the whole payoff of #32 — before it, that line
+  would have carried up to 37 flags and changing one setting would have meant editing a unit file.
+
+**Three things this item asked for are theatre for this engine, and establishing that was the first
+value.** Checked by grepping the sources rather than assumed:
+  `LimitMEMLOCK` — nothing calls `mlock`, `MAP_LOCKED` or `MAP_HUGETLB`, so the limit would be
+  raised for nothing, and in a unit file it reads as knowledge about the engine's requirements;
+  huge pages — `MADV_HUGEPAGE` does not appear, so any tuning claim would be an unmeasured one;
+  a default `CPUAffinity` — pinning to particular cores on an unknown machine is a mistake rather
+  than a tuning. All three are absent with the reason written down, and a test holds two of them
+  absent so nobody "fixes" it.
+
+**Four defects, each from reading the artefact rather than from anything failing:**
+  the Python wheel's install rule leaked into the .deb, because CPack with component install off
+  takes every rule regardless of `CPACK_COMPONENTS_ALL` — a `SKBUILD` guard removes it from the
+  build instead;
+  `${CMAKE_INSTALL_SYSCONFDIR}` is relative, so the config landed in `/usr/etc/orderbook/ob.conf`
+  while `conffiles` declared `/etc/orderbook/ob.conf`, which would have marked nothing and let the
+  first upgrade silently revert every local edit;
+  making that path absolute fixed the .deb and **made the archive generator try to create
+  /etc/orderbook on the build host** — it failed only for want of privileges, and a root or
+  container build would have written into the host's /etc while producing a package;
+  and `--fsync-policy` **did not exist**. Writing `docs/operations.md` asked an operator to choose
+  durability per storage device, and the server hardcoded `INTERVAL`, so the most consequential
+  setting in a database was unreachable. Added, with an unrecognised value refused rather than read
+  as the default.
+
+- **Still open:** `scripts/bootstrap-cluster.sh` — three multi-master nodes on one host or across
+  hosts over SSH, native processes, one command. The package had to exist first for the script to
+  have something to stand up.
+- Effort: M, part one done | Impact: Time-to-first-run drops from an hour to minutes, without a
+  container layer between the engine and the hardware
 
 ### 34. Backup, restore, point-in-time recovery
 - `ob_backup` / `ob_restore` tooling on top of existing snapshots plus WAL

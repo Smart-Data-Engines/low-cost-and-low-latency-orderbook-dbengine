@@ -1,0 +1,20 @@
+#!/bin/sh
+# Create the system user the unit runs as. The state directory is not created here: systemd's
+# StateDirectory= makes it on every start with the right ownership, so doing it twice would leave
+# two places that have to agree about the mode.
+set -e
+
+if [ "$1" = "configure" ]; then
+    if ! getent passwd orderbook >/dev/null; then
+        adduser --system --group --no-create-home --home /var/lib/orderbook \
+                --shell /usr/sbin/nologin orderbook >/dev/null
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    # Deliberately not enabled or started. A database that begins serving on a port the moment it is
+    # unpacked is a surprise, and the default configuration is a single node an operator has not yet
+    # pointed at anything.
+    echo "orderbook-dbengine installed. Review /etc/orderbook/ob.conf, then:"
+    echo "  systemctl enable --now ob_tcp_server"
+fi

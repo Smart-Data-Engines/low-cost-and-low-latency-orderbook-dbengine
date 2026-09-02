@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
+    systemctl stop ob_tcp_server >/dev/null 2>&1 || true
+    systemctl disable ob_tcp_server >/dev/null 2>&1 || true
+fi
+# The user and /var/lib/orderbook are left behind on remove: the directory holds the database. Purge
+# is where data goes, and this package does not implement purge rather than implementing it wrongly.

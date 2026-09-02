@@ -1,0 +1,66 @@
+[Unit]
+Description=Orderbook DB Engine — L2 orderbook database for HFT
+Documentation=https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine
+After=network-online.target
+Wants=network-online.target
+
+# Conditional, not required. A single node needs no coordinator, and `Requires=` would turn an
+# optional dependency into a mandatory one: the service would refuse to start on a host with no
+# etcd, which is the common single-node install. `After=` only orders the two when both are present.
+After=etcd.service
+
+[Service]
+Type=simple
+
+# Everything the operator can change lives in the config file, which is why ExecStart is two
+# arguments. Before the config file existed this line would have carried up to thirty-seven flags,
+# and changing one setting would have meant editing a unit file and running daemon-reload.
+ExecStart=/usr/bin/ob_tcp_server --config /etc/orderbook/ob.conf
+
+Restart=on-failure
+RestartSec=5s
+
+# A dedicated system user, created by the package. StateDirectory makes systemd create
+# /var/lib/orderbook with the right ownership on every start, so the package does not have to get
+# that right and then hope nothing changes it.
+User=orderbook
+Group=orderbook
+StateDirectory=orderbook
+StateDirectoryMode=0750
+
+# File descriptors, with the arithmetic rather than a round number: one per client session
+# (max-sessions, 64 by default and raised in production), one per replication peer, one per
+# multi-master peer, the listening sockets, the metrics socket, the WAL file, and one per open
+# columnar segment during a flush. 64 sessions is nowhere near 65536; the headroom is for
+# max-sessions raised into the thousands, which is the case this limit exists for.
+LimitNOFILE=65536
+
+# ── What is deliberately absent ───────────────────────────────────────────────
+#
+# LimitMEMLOCK: the engine does not lock memory. No mlock, no MAP_LOCKED, no MAP_HUGETLB anywhere in
+# src/ or include/ — checked, not assumed. Raising the limit would be raising it for nothing, and in
+# a unit file it reads as knowledge about the engine's requirements, so it is worse than its absence:
+# the next reader concludes the engine locks memory.
+#
+# CPUAffinity: pinning to particular cores on an unknown machine is a mistake rather than a tuning.
+# The engine's hot path is one epoll loop plus a flush thread plus, in multi-master, one io loop, so
+# what helps is keeping those off the cores handling NIC interrupts. That is a per-host calculation;
+# see docs/operations.md. Example for a host whose NIC interrupts land on 0-1:
+#   CPUAffinity=2 3 4 5
+#
+# MemoryMax / CPUQuota: an engine tuned for specific hardware and then capped below it is a
+# contradiction. If a host is shared, the cap belongs to whatever else is on it.
+
+# ── Hardening that costs nothing here ─────────────────────────────────────────
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+# The engine writes only to its state directory, which StateDirectory grants.
+ReadWritePaths=/var/lib/orderbook
+
+[Install]
+WantedBy=multi-user.target

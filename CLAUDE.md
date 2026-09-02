@@ -588,6 +588,30 @@ Learned the hard way. Check here before debugging.
     responses, they need different return values**, and an exception is the cheapest way to stop a
     caller from conflating them by accident.
 
+82. **An absolute install destination makes the archive generator write to the build host.** CPack's
+    TGZ generator honours an absolute `DESTINATION` literally, so `install(FILES ... DESTINATION
+    /etc/orderbook)` made `cpack` try to create `/etc/orderbook` on the machine doing the build. It
+    failed here only for want of privileges; a build as root, or in a container, would have written
+    into the host's `/etc` **while producing a package**. Relative destinations plus
+    `CPACK_PACKAGING_INSTALL_PREFIX` give the .deb and the tarball identical layouts and touch
+    nothing. The near miss before it is the same family: `${CMAKE_INSTALL_SYSCONFDIR}` is *relative*,
+    so with the prefix at `/usr` the config went to `/usr/etc/...` while `conffiles` declared
+    `/etc/...` — a conffile mark naming a path the package does not contain marks nothing, and the
+    first upgrade reverts every local edit in silence.
+83. **A CPack component does not filter anything unless component install is on.** The Python
+    wheel's `install(TARGETS orderbook_shared DESTINATION orderbook_engine)` appeared inside the
+    .deb at a path that means nothing on a system, because `CPACK_DEB_COMPONENT_INSTALL OFF` takes
+    every rule and `CPACK_COMPONENTS_ALL` is then decoration. Guard the rule out of the build —
+    `if(SKBUILD)` — rather than asking the packager to filter it afterwards. And `dpkg-deb -c` is
+    how this was found: read the artefact, not the configuration that produced it.
+84. **Writing the operations document is what proved the knob missing.** `docs/operations.md` had a
+    table telling an operator to choose `--fsync-policy` per storage device. The flag did not exist:
+    `FsyncPolicy` is in the engine and `tcp_server.cpp` passed `FsyncPolicy::INTERVAL` as a literal,
+    so the most consequential setting in a database was unreachable. Documentation written for a
+    reader rather than from the code is a test of the code — and this is the third time in this
+    repository that a document and the tree disagreed, with the document right about what should
+    exist.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
