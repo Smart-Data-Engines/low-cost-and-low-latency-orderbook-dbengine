@@ -1607,8 +1607,24 @@ ignore checks.
   is not claimed as a speed-up. `objdump` of `write_record` confirms the claim the design rests on:
   zero `lock`, `cmpxchg`, `mfence` or `xchg` — the relaxed load and store are plain moves.
 - **And the gap that hid it is closed:** `sanitizers-integration (tsan)` runs the **whole** battery
-  now, not three modules. Verified per module first — 19 modules, 154 tests, zero reports — so the
-  job entered green rather than with known failures. This also unblocked task 6.3 of #45.
+  now, not three modules. This also unblocked task 6.3 of #45.
+- **Widening the job found a second defect, and it is the worse one.** Four modules built their own
+  `os.path.join(REPO, "build", "ob_tcp_server")` and ignored `OB_SERVER_BINARY` — they start their
+  own nodes rather than using `ClusterManager`, so each grew the path and none grew the override.
+  Consequence in CI: three of them **skipped** (14 tests, reported as skips in a summary nobody
+  reads) and the fourth crashed on a missing file. `test_cpp_client.py` skipped another seven for the
+  same reason with its own harness path. Consequence locally, which is worse: a stale
+  `build/ob_tcp_server` was there to be found, so a per-module check of "clean under TSan" reported
+  clean for runs in which **TSan was not present at all** — and `test_mm_stats.py` is one of the
+  three modules this job had been running since it was created. *Part of a required check had been
+  measuring an uninstrumented binary since the day it was written.*
+  Fixed with one `server_binary_path()` in `conftest.py`, a derivation for the client harness, a
+  static test in `test_smoke.py` that refuses a module building its own path, and a CI step that
+  **fails the job on any skip** — the same shape as the SDE repository's step checking its PostgreSQL
+  cross-section did not skip.
+- Verified as CI will run it: **145 tests, zero skips, zero ThreadSanitizer reports**, 8m25s on the
+  development machine. The earlier claim of "19 modules, 154 tests, zero reports" was made before
+  this was found and was wrong for four of those modules.
 
 ### 84. MM_PEERS counted inbound connections that had not said who they were ✅
 

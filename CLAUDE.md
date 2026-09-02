@@ -535,6 +535,24 @@ Learned the hard way. Check here before debugging.
     magnitude higher than the original**, because a deliberate two-store sequence is a much wider
     window than a compiler-scheduled one.
 
+77. **A test module that builds its own path to the artefact under test silently measures the wrong
+    one.** Four integration modules had their own `os.path.join(REPO, "build", "ob_tcp_server")` and
+    ignored `OB_SERVER_BINARY`. They start their own nodes instead of using `ClusterManager` —
+    simultaneous starts, crash recovery, multi-master stats — so each grew the path and none grew the
+    override. In CI that made three of them **skip** (14 tests) and the fourth crash. Locally it was
+    worse: a stale `build/ob_tcp_server` was there to be found, so "this module is clean under TSan"
+    got reported for runs in which **TSan was not present**. `test_mm_stats.py` is one of the three
+    modules `sanitizers-integration (tsan)` had run since the job was created, so part of a required
+    check had been measuring an uninstrumented binary from day one. One `server_binary_path()` in
+    `conftest.py`, plus a static test that refuses a module building its own.
+
+78. **A skip in a sanitizer job is a failure.** Fourteen tests reported as skips while the job stayed
+    green and claimed to speak for the battery — a summary line makes a skip and a pass look the
+    same, which the SDE repository already had a CI step for. The job now greps its own output and
+    exits non-zero on any skip. The general rule: **a check whose scope can shrink silently is not a
+    check**, and every mechanism that lets it shrink — a missing artefact, an unset variable, a
+    hard-coded path — needs something that notices.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -558,9 +576,12 @@ Things a newcomer should know, because they are real limits rather than bugs to 
 
 - **The wire protocol has no authentication or encryption.** Roadmap #30. Do not expose a node
   outside a trusted network.
-- **The whole integration battery runs under ThreadSanitizer**, not a subset — since #85. Nineteen
-  modules, 154 tests, zero reports. Before that the job ran three multi-master modules, and the
-  reason given for the narrow scope was a hypothesis that turned out to be false; see pitfall 75.
+- **The whole integration battery runs under ThreadSanitizer**, not a subset — since #85. 145 tests,
+  **zero skips**, zero reports. Before that the job ran three multi-master modules, and the reason
+  given for the narrow scope was a hypothesis that turned out to be false (pitfall 75). Widening it
+  also revealed that four modules built their own path to the server and ignored `OB_SERVER_BINARY`,
+  so part of that job had been testing an *uninstrumented* binary since it was written (pitfall 77).
+  A skip in that job now fails it.
 - **Failover takes about twice as long as it used to, on purpose.** Since #82 a candidate waits one
   lease TTL after the leader key goes absent, so the previous holder has certainly stepped down.
   Measured: 10.2 s → 20.1 s after a `kill -9`. The alternative that costs no latency makes a primary

@@ -29,11 +29,12 @@ import urllib.error
 import urllib.request
 
 import pytest
+from conftest import server_binary_path
 
 pytestmark = pytest.mark.failover
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SERVER = os.path.join(REPO, "build", "ob_tcp_server")
+SERVER = server_binary_path()
 ETCD = os.environ.get("OB_ETCD_BINARY") or shutil.which("etcd") or "/usr/local/bin/etcd"
 
 LEASE_TTL = 5

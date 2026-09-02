@@ -510,8 +510,12 @@ jobs:
 
       - name: Configure and build the server under TSan
         run: |
-          cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DOB_ENABLE_TSAN=ON -DOB_BUILD_TESTS=OFF
-          cmake --build build-tsan -j$(nproc) --target ob_tcp_server
+          cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DOB_ENABLE_TSAN=ON -DOB_BUILD_TESTS=ON
+          cmake --build build-tsan -j$(nproc) --target ob_tcp_server ob_integration_test
+          # ob_integration_test as well as the server: test_cpp_client.py skips all seven of its
+          # tests when that binary is absent, and a skipped integration test is indistinguishable
+          # from a passing one in a summary line. Building it puts the C++ client's wire handling
+          # under TSan too, which is where a client and a server disagreeing about bytes would show.
 
       - name: Install Python package and test extras
         run: |
@@ -539,10 +543,26 @@ jobs:
           OB_SERVER_BINARY: ${{ github.workspace }}/build-tsan/ob_tcp_server
           TSAN_OPTIONS: detect_deadlocks=1:second_deadlock_stack=1:halt_on_error=0:log_path=${{ github.workspace }}/tsan-report
         run: |
-          PYTHONPATH=$PWD/python .venv/bin/python -m pytest -q \
+          set -o pipefail
+          PYTHONPATH=$PWD/python .venv/bin/python -m pytest -q -rs \
             --ignore=tests/integration/test_binance_live.py \
             --ignore=tests/integration/test_binance_failover_sync.py \
-            tests/integration/
+            tests/integration/ | tee tsan-pytest.log
+
+      # A skip in this job is a failure, and that is not pedantry — it is the defect this job just
+      # had. Three modules built their own path to `build/ob_tcp_server`, ignored OB_SERVER_BINARY,
+      # and therefore **skipped** in CI: fourteen tests reported as skips in a summary nobody reads,
+      # while the job stayed green and claimed to speak for the battery. `test_cpp_client.py` skipped
+      # another seven for a missing binary. The same shape as the SDE repository's step that checks
+      # its PostgreSQL cross-section did not skip.
+      - name: Fail if anything skipped
+        run: |
+          if grep -qE "[0-9]+ skipped" tsan-pytest.log; then
+            echo "Tests skipped in the sanitizer battery. A skip here reads as a pass:"
+            grep -E "^SKIPPED|[0-9]+ skipped" tsan-pytest.log
+            exit 1
+          fi
+          echo "No skips."
 
       - name: Fail on any ThreadSanitizer report
         run: |
