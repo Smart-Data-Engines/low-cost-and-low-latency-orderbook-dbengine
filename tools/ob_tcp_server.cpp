@@ -28,19 +28,8 @@ static void signal_handler(int /*signum*/) {
 
 // ── Help ──────────────────────────────────────────────────────────────────────
 
-static void print_usage(const char* prog) {
-    std::printf(
-        "Usage: %s [OPTIONS]\n"
-        "\n"
-        "Options:\n"
-        "  --port <PORT>          TCP port to listen on (default: 9090)\n"
-        "  --data-dir <DIR>       Data directory for the engine (default: /tmp/ob_data)\n"
-        "  --flush-interval-ms <N> Background flush interval in ms (default: 100)\n"
-        "  --max-sessions <N>     Maximum concurrent client sessions (default: 64)\n"
-        "  --workers <N>          Number of worker threads (default: 4)\n"
-        "  --help                 Show this help message and exit\n",
-        prog);
-}
+// The text itself lives in `ob::format_usage()`, generated from the parser's own flag list. It was
+// six hardcoded lines here for forty accepted flags, and `--help` is the first command anyone runs.
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -48,7 +37,7 @@ int main(int argc, char* argv[]) {
     // Check for --help before full CLI parsing.
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            print_usage(argv[0]);
+            std::printf("%s", ob::format_usage(argv[0]).c_str());
             return 0;
         }
     }

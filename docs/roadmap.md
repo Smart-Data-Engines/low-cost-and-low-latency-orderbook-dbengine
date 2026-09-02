@@ -1651,6 +1651,43 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 87. `--help` listed six of forty flags, and the documents that promised the rest were incomplete too ✅
+
+- `ob_tcp_server --help` printed **six** options. The parser accepts **forty**. `--help` is the
+  first command anyone runs against an unfamiliar binary, so what it omits is what the engine does
+  not appear to have — and this engine is a portfolio piece read by people deciding whether to talk
+  to us.
+- The three omissions that matter say why it is not cosmetic: **`--config` and `--print-config`**,
+  which exist precisely so that forty flags are manageable, were undiscoverable from the one command
+  that would show them; and **`--fsync-policy`**, the durability setting in a database, which #33 had
+  already found missing altogether once.
+- **Fix:** the text is generated from `known_flags()` — the parser's own list — rather than written
+  beside it, so a flag added to the parser cannot be absent from the help. A flag with no
+  description prints `(undocumented)`, which is visible rather than blank, and fails
+  `CliConfigStatic.EveryKnownFlagIsDocumented`. Same reasoning as #32 feeding the config file
+  through the existing parser instead of building a second dictionary of flag names.
+- **Following the chain found two false statements in artefacts the package installs.** The man page
+  points at `docs/cli.md` for the full set, which was the right design — except `cli.md` documented
+  **21 of 40**, so the artefact that promised completeness was the incomplete one, and the promise
+  is printed on every host. `cli.md` also said WAL durability was set "at build/config level" by
+  `EVERY`, `INTERVAL`, `NEVER`: #33 made it a flag, and the parser compares `every`, `interval`,
+  `none` — lower case, exactly — so two of the three documented spellings **refuse to start the
+  server**. And the man page said the binary defaults to `DEBUG` logging; it defaults to `INFO`,
+  and that sentence is what made a log-volume estimate wrong by an order of magnitude while chasing
+  a hung node in #86.
+- **A guard whose first run caught my own mistake, and whose first mutation caught the guard.**
+  `DocumentedEnumValuesAreTheOnesTheParserAccepts` takes the values out of the parser's own branch
+  and requires the help to name them: it fired immediately, because my generated text said
+  `--fsync-policy` accepts ALWAYS and NEVER. It fired a second time on `--failover-enabled`, which
+  accepts `true/1/yes` and `false/0/no` — the flag whose branch used to map **anything unrecognised
+  to false**, so the spellings are the difference between failover on and silently off. Then the
+  completeness test for `cli.md` **survived its own mutation**: it searched the whole file, and a
+  row deleted from the table was still found in a paragraph above. It matches the table row now.
+- Worth keeping: the two enum flags disagree on case, both as the shipped `ob.conf` writes them —
+  `log-level = INFO` and `fsync-policy = interval` — so each description says which case it wants.
+- Effort: S | Impact: the first command an evaluator runs described 15% of the binary, and two
+  installed documents named values that do not work
+
 ### 86. A required check is flaky, and the assertion that flickers is asserting a race
 
 - `test_handover_lands_on_the_named_target` asserts that `FAILOVER <target>` answers `OK`. The
