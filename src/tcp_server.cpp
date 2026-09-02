@@ -540,6 +540,96 @@ const std::vector<std::string>& known_flags() {
     return flags;
 }
 
+namespace {
+
+// One description per accepted flag, keyed by the same name the parser accepts.
+//
+// `--help` used to be a hardcoded string in `tools/ob_tcp_server.cpp` listing **six** of the forty
+// flags this parser takes. The three most consequential omissions say why that matters: `--config`
+// and `--print-config` exist precisely so an operator can manage forty flags, and were themselves
+// undiscoverable from the one command everyone runs first; and `--fsync-policy` is the durability
+// setting in a database, which #33 had already found missing once.
+//
+// So the help text is generated from `known_flags()` rather than written beside it. A flag added to
+// the parser without a line here prints as `(undocumented)` at runtime - visible rather than absent -
+// and fails `CliConfigStatic.EveryKnownFlagIsDocumented`. The names stay in one place, which is the
+// same reason #32 fed the config file through the existing parser instead of building a second
+// dictionary of them.
+const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
+    // flag -> (argument placeholder, description). An empty placeholder means a boolean flag.
+    static const std::map<std::string, std::pair<std::string, std::string>> help = {
+        {"anti-entropy-interval-seconds", {"<N>", "Multi-master reconciliation interval (default: 60)"}},
+        {"config", {"<FILE>", "Read `key = value` settings from FILE; command line wins"}},
+        {"coordinator-endpoints", {"<URLS>", "Comma-separated etcd endpoints for HA and failover"}},
+        {"coordinator-lease-ttl", {"<N>", "Leader lease TTL in seconds (default: 10)"}},
+        {"data-dir", {"<DIR>", "Data directory for the engine (default: /tmp/ob_data)"}},
+        {"election-deference-ms", {"<N>", "Wait for a replica further ahead in the log; 0 disables"}},
+        {"election-lease-wait-ms", {"<N>", "Wait after the leader key vanishes before standing"}},
+        {"failover-enabled", {"<BOOL>", "Participate in automatic failover: true/1/yes or false/0/no (default: true)"}},
+        {"flush-interval-ms", {"<N>", "Background flush interval in ms (default: 100)"}},
+        {"fsync-policy", {"<POLICY>", "WAL durability: every, interval or none (lower case; default: interval)"}},
+        {"handover-cooldown-seconds", {"<N>", "How long a node that handed the role over abstains"}},
+        {"handover-grace-seconds", {"<N>", "Grace period granted to a handover target"}},
+        {"log-level", {"<LEVEL>", "ERROR, WARN, INFO or DEBUG (upper case; default: INFO)"}},
+        {"max-sessions", {"<N>", "Maximum concurrent client sessions (default: 64)"}},
+        {"max-subscriber-queue-bytes", {"<N>", "Per-subscriber queue ceiling; past it the session closes"}},
+        {"max-subscriptions-per-session", {"<N>", "Subscription limit per session (default: 16)"}},
+        {"metrics-port", {"<PORT>", "Prometheus metrics port; 0 disables the endpoint"}},
+        {"mm-max-catchup-bytes", {"<N>", "WAL bytes a peer may scan before a snapshot is used"}},
+        {"mm-max-peer-send-buffer", {"<N>", "Per-peer send buffer ceiling; past it the peer is dropped"}},
+        {"mm-node-id", {"<N>", "Multi-master node id, unique in the mesh"}},
+        {"mm-replication-port", {"<PORT>", "Multi-master peer port"}},
+        {"multi-master", {"", "Run as a multi-master node instead of primary/replica"}},
+        {"no-sqpoll", {"", "Disable io_uring SQPOLL even where it is available"}},
+        {"node-id", {"<ID>", "This node's name, as it appears to the coordinator"}},
+        {"port", {"<PORT>", "TCP port to listen on (default: 9090)"}},
+        {"primary-host", {"<HOST>", "Primary to replicate from, when starting as a replica"}},
+        {"primary-port", {"<PORT>", "Primary's replication port"}},
+        {"print-config", {"", "Print every setting with its origin and exit; opens no port"}},
+        {"read-only", {"", "Refuse writes regardless of role"}},
+        {"replication-compress", {"", "Compress the replication stream with LZ4"}},
+        {"replication-port", {"<PORT>", "Port replicas connect to on this node"}},
+        {"ring-size", {"<N>", "io_uring submission queue size"}},
+        {"shard-id", {"<N>", "This node's shard, when sharding by symbol"}},
+        {"shard-vnodes", {"<N>", "Virtual nodes per shard in the consistent hash ring"}},
+        {"snapshot-chunk-size", {"<N>", "Bytes per snapshot transfer chunk"}},
+        {"snapshot-staging-dir", {"<DIR>", "Where an incoming snapshot is staged before install"}},
+        {"sqpoll-idle-ms", {"<N>", "io_uring SQPOLL idle timeout in ms"}},
+        {"ttl-hours", {"<N>", "Retention in hours; 0 keeps everything"}},
+        {"ttl-scan-interval-seconds", {"<N>", "How often retention scans for expired rows"}},
+        {"workers", {"<N>", "Number of worker threads (default: 4)"}},
+    };
+    return help;
+}
+
+} // namespace
+
+std::string format_usage(const std::string& program) {
+    std::string out = "Usage: " + program + " [OPTIONS]\n\nOptions:\n";
+
+    size_t width = 0;
+    for (const auto& flag : known_flags()) {
+        const auto it = flag_help().find(flag);
+        const std::string placeholder = (it != flag_help().end()) ? it->second.first : "<VALUE>";
+        const size_t length = flag.size() + (placeholder.empty() ? 0 : placeholder.size() + 1);
+        width = std::max(width, length);
+    }
+    width = std::max(width, std::string("help").size());
+
+    for (const auto& flag : known_flags()) {
+        const auto it = flag_help().find(flag);
+        const std::string placeholder = (it != flag_help().end()) ? it->second.first : "<VALUE>";
+        const std::string description =
+            (it != flag_help().end()) ? it->second.second : "(undocumented)";
+
+        std::string left = "--" + flag;
+        if (!placeholder.empty()) left += " " + placeholder;
+        out += "  " + left + std::string(width + 2 - (left.size() - 2), ' ') + description + "\n";
+    }
+    out += "  --help" + std::string(width - 2, ' ') + "Show this help message and exit\n";
+    return out;
+}
+
 const std::vector<std::string>& boolean_flags() {
     static const std::vector<std::string> flags = {
         "multi-master",

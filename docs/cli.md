@@ -204,9 +204,71 @@ non-zero after a crash that landed between writing the segment files and recordi
 |------|---------|---------|
 | `--flush-interval-ms <N>` | 100 | How often the background thread moves pending rows into columnar segments. Lower means less to replay after a crash and more segment churn; higher means the opposite. A long interval is also how the recovery tests keep rows in the WAL instead of racing the flush |
 
-Durability of the WAL write itself is set at build/config level by `FsyncPolicy` (`EVERY`, `INTERVAL`,
-`NEVER`). With anything other than `EVERY`, an acknowledged write can be lost on a power cut — the
+Durability of the WAL write itself is `--fsync-policy`, which takes `every`, `interval` or `none`
+— lower case, compared exactly, and an unrecognised value is refused rather than read as the
+default. With anything other than `every`, an acknowledged write can be lost on a power cut: the
 replay described above cannot recover a record that never reached the platter.
+
+This paragraph used to say the policy was set "at build/config level" and name the values `EVERY`,
+`INTERVAL` and `NEVER`. Roadmap #33 made it a flag, and two of those three spellings are refused by
+the parser — so the installed CLI reference told an operator that the most consequential setting in
+a database was unreachable, and named values that will not start the server. Note the two enum flags
+disagree on case, both as the shipped `ob.conf` writes them: `log-level = INFO` and
+`fsync-policy = interval`.
+
+## Full flag reference
+
+Every flag the parser accepts, which is also every key the configuration file accepts —
+the file is rewritten into arguments and handed to this same parser, so the two lists cannot
+drift apart. `ob_tcp_server --help` prints this same set, generated from the same source.
+
+This section exists because the man page promises it. `--help` used to list six of forty,
+the man page said the full set was here, and this file had twenty-one — so the artefact that
+promised completeness was the incomplete one, and that promise is printed on every host the
+package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` holds it now.
+
+| Flag | Argument | Meaning |
+|------|----------|---------|
+| `--anti-entropy-interval-seconds` | `<N>` | Multi-master reconciliation interval (default: 60) |
+| `--config` | `<FILE>` | Read `key = value` settings from FILE; command line wins |
+| `--coordinator-endpoints` | `<URLS>` | Comma-separated etcd endpoints for HA and failover |
+| `--coordinator-lease-ttl` | `<N>` | Leader lease TTL in seconds (default: 10) |
+| `--data-dir` | `<DIR>` | Data directory for the engine (default: /tmp/ob_data) |
+| `--election-deference-ms` | `<N>` | Wait for a replica further ahead in the log; 0 disables |
+| `--election-lease-wait-ms` | `<N>` | Wait after the leader key vanishes before standing |
+| `--failover-enabled` | `<BOOL>` | Participate in automatic failover: true/1/yes or false/0/no (default: true) |
+| `--flush-interval-ms` | `<N>` | Background flush interval in ms (default: 100) |
+| `--fsync-policy` | `<POLICY>` | WAL durability: every, interval or none (lower case; default: interval) |
+| `--handover-cooldown-seconds` | `<N>` | How long a node that handed the role over abstains |
+| `--handover-grace-seconds` | `<N>` | Grace period granted to a handover target |
+| `--log-level` | `<LEVEL>` | ERROR, WARN, INFO or DEBUG (upper case; default: INFO) |
+| `--max-sessions` | `<N>` | Maximum concurrent client sessions (default: 64) |
+| `--max-subscriber-queue-bytes` | `<N>` | Per-subscriber queue ceiling; past it the session closes |
+| `--max-subscriptions-per-session` | `<N>` | Subscription limit per session (default: 16) |
+| `--metrics-port` | `<PORT>` | Prometheus metrics port; 0 disables the endpoint |
+| `--mm-max-catchup-bytes` | `<N>` | WAL bytes a peer may scan before a snapshot is used |
+| `--mm-max-peer-send-buffer` | `<N>` | Per-peer send buffer ceiling; past it the peer is dropped |
+| `--mm-node-id` | `<N>` | Multi-master node id, unique in the mesh |
+| `--mm-replication-port` | `<PORT>` | Multi-master peer port |
+| `--multi-master` | — (boolean) | Run as a multi-master node instead of primary/replica |
+| `--no-sqpoll` | — (boolean) | Disable io_uring SQPOLL even where it is available |
+| `--node-id` | `<ID>` | This node's name, as it appears to the coordinator |
+| `--port` | `<PORT>` | TCP port to listen on (default: 9090) |
+| `--primary-host` | `<HOST>` | Primary to replicate from, when starting as a replica |
+| `--primary-port` | `<PORT>` | Primary's replication port |
+| `--print-config` | — (boolean) | Print every setting with its origin and exit; opens no port |
+| `--read-only` | — (boolean) | Refuse writes regardless of role |
+| `--replication-compress` | — (boolean) | Compress the replication stream with LZ4 |
+| `--replication-port` | `<PORT>` | Port replicas connect to on this node |
+| `--ring-size` | `<N>` | io_uring submission queue size |
+| `--shard-id` | `<N>` | This node's shard, when sharding by symbol |
+| `--shard-vnodes` | `<N>` | Virtual nodes per shard in the consistent hash ring |
+| `--snapshot-chunk-size` | `<N>` | Bytes per snapshot transfer chunk |
+| `--snapshot-staging-dir` | `<DIR>` | Where an incoming snapshot is staged before install |
+| `--sqpoll-idle-ms` | `<N>` | io_uring SQPOLL idle timeout in ms |
+| `--ttl-hours` | `<N>` | Retention in hours; 0 keeps everything |
+| `--ttl-scan-interval-seconds` | `<N>` | How often retention scans for expired rows |
+| `--workers` | `<N>` | Number of worker threads (default: 4) |
 
 ## Argument handling
 

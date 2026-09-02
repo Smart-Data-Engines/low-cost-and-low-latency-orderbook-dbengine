@@ -64,7 +64,13 @@ in the shipped unit.
 .B INFO
 or
 .BR DEBUG .
-Default INFO in the shipped configuration, DEBUG in the binary.
+Default INFO, in both the shipped configuration and the binary. This line said DEBUG in the
+binary, which was wrong: the default is
+.B INFO
+in
+.IR TcpServerConfig ,
+and the mistaken sentence is what made a log-volume estimate wrong by an order of magnitude while
+chasing a hung node.
 .TP
 .BI \-\-metrics\-port " n"
 Prometheus endpoint. 0 disables it.

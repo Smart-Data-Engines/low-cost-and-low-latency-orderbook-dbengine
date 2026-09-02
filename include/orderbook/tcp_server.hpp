@@ -234,4 +234,13 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]);
 /// Render a resolved configuration for a human, sorted, with the provenance of each value.
 std::string format_config(const ResolvedConfig& resolved);
 
+/// The `--help` text, generated from `known_flags()` rather than written beside it.
+///
+/// It used to be a hardcoded string in `tools/ob_tcp_server.cpp` naming six of the forty flags the
+/// parser accepts - including neither `--config` nor `--print-config`, which exist so that forty
+/// flags are manageable, nor `--fsync-policy`, which is the durability setting in a database. A
+/// flag with no description prints as `(undocumented)` and fails a static test, so the drift is
+/// visible in both directions.
+std::string format_usage(const std::string& program);
+
 } // namespace ob

@@ -231,3 +231,143 @@ TEST(CliConfigStatic, EveryValuelessBooleanDefaultsToFalse) {
                "flag a value on the command line, or add an explicit negation.";
     }
 }
+
+// `--help` was six hardcoded lines in `tools/ob_tcp_server.cpp` while the parser accepted forty
+// flags. The omissions that matter most: `--config` and `--print-config`, which exist so that forty
+// flags are manageable at all, and `--fsync-policy`, the durability setting in a database - which
+// roadmap #33 had already found missing once, in the other direction. `--help` is the first command
+// anybody runs against an unfamiliar binary, so what it omits is what the engine does not appear to
+// have.
+//
+// Generating the text from `known_flags()` makes the drift impossible rather than absent, and this
+// test is the half that points the other way: a flag with no description reaches the operator as
+// `(undocumented)` and stops here first.
+TEST(CliConfigStatic, EveryKnownFlagIsDocumented) {
+    const std::string usage = ob::format_usage("ob_tcp_server");
+
+    for (const std::string& flag : ob::known_flags()) {
+        EXPECT_NE(usage.find("--" + flag), std::string::npos)
+            << flag << " is accepted by the parser and absent from --help, so an operator reading "
+                       "the one command everyone runs first cannot discover it";
+    }
+
+    EXPECT_EQ(usage.find("(undocumented)"), std::string::npos)
+        << "a flag reached --help without a description. Add one to flag_help() in "
+           "src/tcp_server.cpp; the placeholder is deliberately visible rather than blank, because "
+           "a blank line reads as a flag that does not exist";
+
+    EXPECT_NE(usage.find("--help"), std::string::npos);
+}
+
+// Two shapes, and the difference is visible to whoever reads the text: a flag taking a value shows
+// its placeholder, a valueless boolean shows none. Getting this backwards teaches the operator to
+// pass a value the parser will reject, or to omit one it needs.
+TEST(CliConfigStatic, HelpShowsAPlaceholderForValueFlagsAndNoneForBooleans) {
+    const std::string usage = ob::format_usage("ob_tcp_server");
+
+    for (const std::string& flag : ob::boolean_flags()) {
+        const auto position = usage.find("--" + flag);
+        ASSERT_NE(position, std::string::npos) << flag;
+        const auto line_end = usage.find('\n', position);
+        const std::string line = usage.substr(position, line_end - position);
+        EXPECT_EQ(line.find('<'), std::string::npos)
+            << flag << " is a valueless boolean and --help shows it taking an argument: " << line;
+    }
+
+    // `port` takes a value, and the placeholder is the only thing in the text that says so.
+    const auto position = usage.find("--port ");
+    ASSERT_NE(position, std::string::npos);
+    const auto line_end = usage.find('\n', position);
+    EXPECT_NE(usage.substr(position, line_end - position).find('<'), std::string::npos)
+        << "--port takes a value and --help does not show a placeholder for it";
+}
+
+// The values a flag accepts, taken from the parser rather than from what I remembered writing.
+//
+// This test exists because the first version of the generated help said `--fsync-policy` takes
+// ALWAYS, INTERVAL or NEVER. The parser compares against `every`, `interval` and `none`, lower
+// case and exactly - so two of the three documented values are refused, and the operator finds out
+// when the server will not start. Documentation that names values the parser rejects is worse than
+// no documentation, because it is followed.
+//
+// The two enum flags do not even share a case convention: `log-level = INFO` and
+// `fsync-policy = interval`, both from the shipped `ob.conf`. That is exactly the kind of thing an
+// operator gets wrong once per install, so both descriptions say which case they want.
+//
+// Limit worth stating: this only sees values the parser compares as literals in its own branch.
+// `--log-level` delegates to `StructuredLogger::parse_level()`, so its four values are not visible
+// here and are covered by the message in the parser instead.
+TEST(CliConfigStatic, DocumentedEnumValuesAreTheOnesTheParserAccepts) {
+    const std::string source = read_source("src/tcp_server.cpp");
+    ASSERT_FALSE(source.empty());
+    const size_t parser = source.find("ResolvedConfig resolve_cli_args(");
+    ASSERT_NE(parser, std::string::npos);
+    const std::string body = source.substr(parser);
+    const std::string usage = ob::format_usage("ob_tcp_server");
+
+    // Split the parser into one chunk per flag, so a literal is attributed to the flag whose
+    // branch holds it.
+    const std::regex branch(R"(arg == \"--([a-z0-9-]+)\")");
+    std::vector<std::pair<std::string, size_t>> starts;
+    for (auto it = std::sregex_iterator(body.begin(), body.end(), branch);
+         it != std::sregex_iterator(); ++it) {
+        starts.emplace_back((*it)[1].str(), static_cast<size_t>(it->position(0)));
+    }
+    ASSERT_GT(starts.size(), 30u) << "the branch scan found almost nothing, so it is not scanning";
+
+    size_t checked = 0;
+    for (size_t i = 0; i < starts.size(); ++i) {
+        const std::string& flag = starts[i].first;
+        const size_t from = starts[i].second;
+        const size_t to = (i + 1 < starts.size()) ? starts[i + 1].second : body.size();
+        const std::string chunk = body.substr(from, to - from);
+
+        // Only comparisons against a value the flag itself carries, which is what an enum flag
+        // looks like in this parser: `val == "every"`.
+        const std::regex literal(R"((?:val|value|level|policy) == \"([a-z][a-z0-9_-]*)\")");
+        std::set<std::string> accepted;
+        for (auto it = std::sregex_iterator(chunk.begin(), chunk.end(), literal);
+             it != std::sregex_iterator(); ++it) {
+            accepted.insert((*it)[1].str());
+        }
+        if (accepted.empty()) continue;
+
+        const size_t line_start = usage.find("--" + flag);
+        ASSERT_NE(line_start, std::string::npos) << flag;
+        const std::string line = usage.substr(line_start, usage.find('\n', line_start) - line_start);
+
+        for (const std::string& value : accepted) {
+            EXPECT_NE(line.find(value), std::string::npos)
+                << "--" << flag << " accepts '" << value << "' and --help does not mention it: "
+                << line;
+            ++checked;
+        }
+    }
+    EXPECT_GT(checked, 0u) << "no enum flag was checked, so this test proves nothing";
+}
+
+// The man page tells every host the package is installed on that the full flag set lives in
+// `cli.md`. It has to be true there, not just true when someone last looked: `--help` listed six of
+// forty, the man page pointed here for the rest, and this file had twenty-one - so the artefact
+// that promised completeness was the incomplete one, and the promise is printed on the host.
+TEST(CliConfigStatic, EveryKnownFlagIsInTheCliReference) {
+    const std::string reference = read_source("docs/cli.md");
+    ASSERT_FALSE(reference.empty()) << "cannot read docs/cli.md, which the man page points at";
+
+    // The row, not the string. The first version searched the whole file, and its mutation - a row
+    // deleted from the table - **passed**, because the same flag is named in a paragraph a few
+    // lines above. A flag mentioned in prose and absent from the reference is exactly the gap this
+    // test is for, so it looks for the table row: `| `--flag` |`.
+    std::vector<std::string> missing;
+    for (const std::string& flag : ob::known_flags()) {
+        if (reference.find("| `--" + flag + "` |") == std::string::npos) missing.push_back(flag);
+    }
+    EXPECT_TRUE(missing.empty())
+        << missing.size() << " flag(s) the parser accepts are absent from docs/cli.md, which "
+        << "packaging/ob_tcp_server.1 names as the full set: "
+        << [&missing] {
+               std::string joined;
+               for (const auto& flag : missing) joined += "--" + flag + " ";
+               return joined;
+           }();
+}
