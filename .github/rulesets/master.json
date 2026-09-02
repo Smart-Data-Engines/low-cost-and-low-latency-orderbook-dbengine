@@ -41,13 +41,13 @@
         "strict_required_status_checks_policy": true,
         "required_status_checks": [
           {
+            "context": "CodeQL"
+          },
+          {
+            "context": "analyze (c-cpp)"
+          },
+          {
             "context": "build-and-test"
-          },
-          {
-            "context": "integration-tests"
-          },
-          {
-            "context": "release-build"
           },
           {
             "context": "clang-build"
@@ -59,7 +59,13 @@
             "context": "docs-integrity"
           },
           {
-            "context": "analyze (c-cpp)"
+            "context": "integration-tests"
+          },
+          {
+            "context": "package"
+          },
+          {
+            "context": "release-build"
           },
           {
             "context": "sanitizers (asan)"
@@ -69,9 +75,6 @@
           },
           {
             "context": "sanitizers-integration (tsan)"
-          },
-          {
-            "context": "CodeQL"
           }
         ]
       }

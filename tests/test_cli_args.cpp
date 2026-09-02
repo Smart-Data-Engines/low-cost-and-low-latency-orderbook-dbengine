@@ -160,3 +160,20 @@ TEST(CliArgsDeath, MultiMasterAndReadOnlyTogetherAreRefused) {
                        "--coordinator-endpoints", "http://127.0.0.1:2379", "--read-only"}),
                 ::testing::ExitedWithCode(1), "--multi-master is incompatible with --read-only");
 }
+
+TEST(CliArgsDeath, AnInvalidFsyncPolicyIsRefused) {
+    // Durability is the most consequential setting in a database, and it was hardcoded to
+    // `interval` until #33 needed `docs/operations.md` to describe choosing it per storage device.
+    // Reading an unrecognised value as the default would mean an operator who asked for `every` and
+    // got something weaker finding out from a lost write.
+    EXPECT_EXIT(parse({"--fsync-policy", "sometimes"}), ::testing::ExitedWithCode(1),
+                "expects every, interval or none");
+}
+
+TEST(CliArgs, EachFsyncPolicyNameMaps) {
+    EXPECT_EQ(parse({"--fsync-policy", "every"}).fsync_policy, ob::FsyncPolicy::EVERY);
+    EXPECT_EQ(parse({"--fsync-policy", "interval"}).fsync_policy, ob::FsyncPolicy::INTERVAL);
+    EXPECT_EQ(parse({"--fsync-policy", "none"}).fsync_policy, ob::FsyncPolicy::NONE);
+    // The default, stated so a change to it fails a test rather than surprising an operator.
+    EXPECT_EQ(parse({}).fsync_policy, ob::FsyncPolicy::INTERVAL);
+}

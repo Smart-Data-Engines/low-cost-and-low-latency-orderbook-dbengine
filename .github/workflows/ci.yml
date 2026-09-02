@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [master]
+    tags: ["v*"]
   pull_request:
     branches: [master]
 
@@ -481,6 +482,57 @@ jobs:
   # client write going Engine -> MM against a received delta going MM -> Engine). The modules that
   # kill nodes are left out for now — their fixtures wait on timeouts that instrumentation makes
   # unreliable, and a flaky required check teaches people to ignore checks.
+  # ── Packaging ───────────────────────────────────────────────────────────────
+  #
+  # Runs on tags, and on any pull request that touches packaging. The second half matters: a job
+  # first exercised on a tag is a job first exercised at the moment it matters most, and CPack
+  # failures are configuration failures that show up only when a generator actually runs.
+  package:
+    name: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Install build and packaging dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq liblz4-dev libcurl4-openssl-dev liburing-dev rpm
+          # rpm brings rpmbuild, which is what makes the RPM generator appear. Without it CMake
+          # configures DEB and TGZ only — see the note by CPACK_GENERATOR.
+
+      - name: Configure and build
+        run: |
+          cmake -S . -B build-pkg -DCMAKE_BUILD_TYPE=Release -DOB_BUILD_TESTS=OFF
+          cmake --build build-pkg -j$(nproc) --target ob_tcp_server
+
+      - name: Build the packages
+        run: cd build-pkg && cpack
+
+      - name: Verify the packages
+        run: ./scripts/verify_package.sh build-pkg
+
+      - name: Inspect the RPM
+        run: |
+          RPM=$(ls build-pkg/orderbook-dbengine-*.rpm | head -1)
+          echo "package: $RPM"
+          rpm -qip "$RPM"
+          rpm -qlp "$RPM"
+          # The same two properties the .deb is held to: the config is at /etc, and it is marked so
+          # an upgrade does not replace an operator's edits.
+          rpm -qlp "$RPM" | grep -qx /etc/orderbook/ob.conf
+          rpm -qcp "$RPM" | grep -qx /etc/orderbook/ob.conf
+
+      - name: Upload the packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: packages
+          path: |
+            build-pkg/orderbook-dbengine-*.deb
+            build-pkg/orderbook-dbengine-*.tar.gz
+            build-pkg/orderbook-dbengine-*.rpm
+          if-no-files-found: error
+
   sanitizers-integration:
     name: sanitizers-integration (tsan)
     runs-on: ubuntu-24.04

@@ -505,6 +505,7 @@ const std::vector<std::string>& known_flags() {
         "election-lease-wait-ms",
         "failover-enabled",
         "flush-interval-ms",
+        "fsync-policy",
         "handover-cooldown-seconds",
         "handover-grace-seconds",
         "log-level",
@@ -730,6 +731,23 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.max_subscriber_queue_bytes = cursor.value_as<size_t>();
         } else if (arg == "--max-subscriptions-per-session") {
             config.max_subscriptions_per_session = cursor.value_as<int>();
+        } else if (arg == "--fsync-policy") {
+            const std::string val{cursor.value()};
+            if (val == "every") {
+                config.fsync_policy = FsyncPolicy::EVERY;
+            } else if (val == "interval") {
+                config.fsync_policy = FsyncPolicy::INTERVAL;
+            } else if (val == "none") {
+                config.fsync_policy = FsyncPolicy::NONE;
+            } else {
+                // Refused rather than defaulted. Reading an unrecognised durability policy as
+                // "interval" would mean an operator who asked for `every` and got something weaker
+                // finding out from a lost write.
+                std::fprintf(stderr,
+                    "Error: --fsync-policy expects every, interval or none, got '%s'\n",
+                    val.c_str());
+                std::exit(1);
+            }
         } else if (arg == "--config") {
             // Consumed in the pre-scan above; this branch exists so the flag is not an unknown one.
             (void)cursor.value();
@@ -1000,6 +1018,9 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("election-lease-wait-ms", std::to_string(c.election_lease_wait_ms));
     line("failover-enabled", c.failover_enabled ? "true" : "false");
     line("flush-interval-ms", std::to_string(c.flush_interval_ms));
+    line("fsync-policy",
+         c.fsync_policy == FsyncPolicy::EVERY ? "every"
+             : c.fsync_policy == FsyncPolicy::NONE ? "none" : "interval");
     line("handover-cooldown-seconds", std::to_string(c.handover_cooldown_seconds));
     line("handover-grace-seconds", std::to_string(c.handover_grace_seconds));
     line("log-level", c.log_level);
@@ -1075,7 +1096,7 @@ TcpServer::TcpServer(ServerConfig config)
 
     engine_ = std::make_unique<Engine>(config_.data_dir,
                                       config_.flush_interval_ms * 1'000'000ULL,
-                                      FsyncPolicy::INTERVAL,
+                                      config_.fsync_policy,
                                        repl_config, repl_client_config, failover_config,
                                        TTLConfig{config_.ttl_hours,
                                                  config_.ttl_scan_interval_seconds},

@@ -30,6 +30,15 @@ struct ServerConfig {
     size_t      max_line_length{262144}; // max command bytes (256KB, supports MINSERT with 1000 levels)
     bool        read_only{false};       // reject INSERT/FLUSH when true (replica mode)
 
+    /// --fsync-policy: when the write-ahead log becomes durable. `every`, `interval` or `none`.
+    ///
+    /// It was hardcoded to INTERVAL, which made the single most consequential setting in a database
+    /// unreachable — and `docs/operations.md` was written asking an operator to choose it per
+    /// storage device before anything let them. On a device with power-loss protection an fsync per
+    /// record is a cost with no matching guarantee; without one, an acknowledged write that was not
+    /// fsynced is a write you can lose.
+    FsyncPolicy fsync_policy{FsyncPolicy::INTERVAL};
+
     /// Background flush interval. Shorter means less unflushed data at any moment and
     /// more segment writes; longer means the opposite. Configurable because it decides
     /// how much sits in the WAL rather than in a segment, which is exactly what crash

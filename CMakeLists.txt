@@ -441,11 +441,120 @@ set_target_properties(orderbook_shared PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
-# Install shared lib into the Python package directory for scikit-build-core
-install(TARGETS orderbook_shared
-    LIBRARY DESTINATION orderbook_engine
-    RUNTIME DESTINATION orderbook_engine
+# ── Install rules ─────────────────────────────────────────────────────────────
+#
+# Destinations are **explicitly relative** and the packaging prefix is `/`, so the .deb and the
+# tarball contain byte-identical paths. Three attempts got here and both failures are worth keeping.
+#
+# `${CMAKE_INSTALL_SYSCONFDIR}` is relative, so with the prefix at /usr the config landed in
+# `/usr/etc/orderbook/ob.conf` while `packaging/debian/conffiles` declared `/etc/orderbook/ob.conf`.
+# The declaration would then have named a path the package does not contain, so the conffile mark
+# would have done nothing and the first upgrade would have silently reverted every local edit.
+#
+# Making it absolute `/etc/orderbook` fixed the .deb and broke the tarball in a worse way: the
+# archive generator honours an absolute destination literally and **tried to create /etc/orderbook
+# on the build host**. It failed here only for want of privileges — a build running as root, or in a
+# container, would have written into the host's /etc while producing a package.
+#
+# So: relative paths, with CPACK_PACKAGING_INSTALL_PREFIX putting them under `/`. A plain
+# `cmake --install` then places files under `<prefix>/usr/...`, which is odd and acceptable: these
+# rules exist for packaging, and the wheel's rule is guarded by SKBUILD above.
+# `if(NOT SKBUILD)` around all of it, and the asymmetry is what broke the wheel build: guarding the
+# wheel's rule with `if(SKBUILD)` was only half the separation. These rules stayed unconditional, so
+# scikit-build-core's install step ran them too — and the wheel build compiles only
+# `orderbook_shared`, so `install(TARGETS ob_tcp_server)` looked for a binary that build never
+# produced and failed with "cannot find .../ob_tcp_server". Two consumers of one tree need the guard
+# on **both** sides, not one.
+if(NOT SKBUILD)
+
+install(TARGETS ob_tcp_server
+    RUNTIME DESTINATION usr/bin
+    COMPONENT runtime
 )
+install(DIRECTORY include/orderbook
+    DESTINATION usr/include
+    COMPONENT runtime
+    FILES_MATCHING PATTERN "*.hpp" PATTERN "*.h"
+)
+install(FILES packaging/ob.conf
+    DESTINATION etc/orderbook
+    COMPONENT runtime
+)
+install(FILES packaging/ob_tcp_server.service
+    DESTINATION usr/lib/systemd/system
+    COMPONENT runtime
+)
+install(FILES packaging/ob_tcp_server.1
+    DESTINATION usr/share/man/man1
+    COMPONENT runtime
+)
+install(FILES README.md SECURITY.md LICENSE docs/cli.md
+    DESTINATION usr/share/doc/orderbook-dbengine
+    COMPONENT runtime
+)
+
+endif()  # NOT SKBUILD
+
+# ── CPack ─────────────────────────────────────────────────────────────────────
+#
+# DEB and a plain tarball. **No RPM generator**, and that is a decision rather than an omission:
+# `rpmbuild` is not on the development machine, so its output could not be built or inspected here,
+# and a generator configuration nobody has run is a mechanism that looks present and is not. The
+# packaging CI job installs `rpm` and can add it once there is a job that actually produces and
+# checks one.
+set(CPACK_PACKAGE_NAME "orderbook-dbengine")
+set(CPACK_PACKAGE_VENDOR "Smart Data Engines")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+    "Level 2 orderbook database engine for HFT environments")
+set(CPACK_PACKAGE_HOMEPAGE_URL
+    "https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine")
+set(CPACK_PACKAGE_CONTACT "Krzysztof Macewicz <krzysztof@smartdataengines.com>")
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+set(CPACK_PACKAGE_INSTALL_DIRECTORY "orderbook-dbengine")
+# DEB and a plain tarball always. RPM **only when rpmbuild exists**, which is a decision rather
+# than a convenience: `rpmbuild` is not on the development machine, so an unconditional RPM
+# generator would fail every local `cpack` run, and a generator configuration nobody can execute is
+# a mechanism that looks present and is not. The packaging CI job installs `rpm`, so the RPM is
+# produced and inspected there — and that job runs on pull requests touching packaging as well as on
+# tags, because a job first exercised on a tag is a job first exercised when it matters most.
+set(CPACK_GENERATOR "DEB;TGZ")
+find_program(RPMBUILD_EXECUTABLE rpmbuild)
+if(RPMBUILD_EXECUTABLE)
+    list(APPEND CPACK_GENERATOR "RPM")
+    set(CPACK_RPM_PACKAGE_GROUP "Applications/Databases")
+    set(CPACK_RPM_PACKAGE_LICENSE "MIT")
+    # /etc/orderbook/ob.conf must survive an upgrade, the same requirement the .deb meets through
+    # its conffiles declaration.
+    set(CPACK_RPM_USER_FILELIST "%config(noreplace) /etc/orderbook/ob.conf")
+    # rpm claims directories it did not create otherwise, and /etc, /usr/bin and the rest belong to
+    # the distribution's filesystem package.
+    set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
+        "/etc;/usr;/usr/bin;/usr/include;/usr/lib;/usr/lib/systemd;/usr/lib/systemd/system;/usr/share;/usr/share/doc;/usr/share/man;/usr/share/man/man1")
+endif()
+# Both generators produce the same relative layout; see the note above the install rules.
+set(CPACK_PACKAGING_INSTALL_PREFIX "/")
+
+# One package rather than one per component: the headers are a few kilobytes, and splitting them
+# into -dev would create two packages that must be installed together for the common case.
+#
+# CPACK_COMPONENTS_ALL is deliberately **not** set. It only takes effect with component install
+# enabled, and setting it while component install is off reads as a filter that is doing something.
+# What keeps the wheel's library out of the package is the SKBUILD guard above.
+set(CPACK_DEB_COMPONENT_INSTALL OFF)
+set(CPACK_ARCHIVE_COMPONENT_INSTALL OFF)
+
+set(CPACK_DEBIAN_PACKAGE_SECTION "database")
+set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
+# Shared library dependencies resolved by dpkg-shlibdeps rather than listed by hand, because a
+# hand-written list goes stale at the first new link and the symptom is an install that succeeds and
+# a binary that will not start.
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+# The configuration file is marked conffile, so a package upgrade does not overwrite an operator's
+# edits. Without this the first upgrade silently reverts every local change.
+set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
+    "${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/postinst;${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/prerm;${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/conffiles")
+
+include(CPack)
 
 # ── Tests ──────────────────────────────────────────────────────────────────────
 if(OB_BUILD_TESTS)

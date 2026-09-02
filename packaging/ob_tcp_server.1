@@ -1,0 +1,114 @@
+.TH OB_TCP_SERVER 1 "September 2026" "orderbook-dbengine 0.1.0" "Orderbook DB Engine"
+.SH NAME
+ob_tcp_server \- Level 2 orderbook database server
+.SH SYNOPSIS
+.B ob_tcp_server
+.RI [ options ]
+.br
+.B ob_tcp_server
+.B \-\-config
+.I path
+.RB [ \-\-print\-config ]
+.SH DESCRIPTION
+.B ob_tcp_server
+serves Level 2 orderbook data over a line-oriented TCP protocol. It stores writes in a
+write-ahead log, keeps live depth in structure-of-arrays buffers, and flushes to columnar
+segments with delta, zigzag and Simple8b compression.
+.PP
+The server runs natively on the host. There is no containerised deployment path and there will
+not be one: a container layer between the engine and the hardware defeats the point of an engine
+tuned for specific hardware.
+.SH CONFIGURATION
+Every option is both a command-line flag and a key in the configuration file, because the file is
+rewritten into arguments and handed to the same parser. A key is a flag name without the leading
+dashes.
+.PP
+A flag overrides the file; the file overrides the default. Precedence needs no merge rule: the
+file's arguments simply come first.
+.TP
+.BI \-\-config " path"
+Read settings from
+.IR path .
+A missing file, an unknown key, a line without an
+.BR = ,
+a duplicated key or a value of the wrong type stops the start rather than being ignored.
+.TP
+.B \-\-print\-config
+Print the resolved configuration with the provenance of each value \(em default, file or command
+line \(em and exit without opening a port. A list of values does not say which of them you chose,
+and not opening a port matters because a taken port is one of the situations you reach for this in.
+.SH OPTIONS
+Only the ones an operator changes first. The full set is in
+.B \-\-print\-config
+output and in
+.IR /usr/share/doc/orderbook\-dbengine/cli.md .
+.TP
+.BI \-\-port " n"
+TCP port for clients. Default 9090.
+.TP
+.BI \-\-data\-dir " path"
+Where the write-ahead log and columnar segments live. Default
+.IR /tmp/ob_data ,
+and the package ships
+.I /var/lib/orderbook
+in its configuration file.
+.TP
+.BI \-\-max\-sessions " n"
+Client connections accepted at once. Default 64. Each costs a file descriptor; see
+.B LimitNOFILE
+in the shipped unit.
+.TP
+.BI \-\-log\-level " level"
+.BR ERROR ,
+.BR WARN ,
+.B INFO
+or
+.BR DEBUG .
+Default INFO in the shipped configuration, DEBUG in the binary.
+.TP
+.BI \-\-metrics\-port " n"
+Prometheus endpoint. 0 disables it.
+.TP
+.BI \-\-coordinator\-endpoints " urls"
+Comma-separated etcd endpoints. Required for automatic failover and for multi-master.
+.TP
+.B \-\-multi\-master
+Every node accepts writes; conflicts resolve by hybrid logical clock and last-writer-wins.
+Requires
+.B \-\-coordinator\-endpoints
+and
+.BR \-\-mm\-node\-id ,
+and is refused together with
+.B \-\-read\-only
+or with single-primary replication rather than one of them being silently preferred.
+.SH FILES
+.TP
+.I /etc/orderbook/ob.conf
+Shipped configuration. Marked as a configuration file, so a package upgrade does not overwrite
+local changes.
+.TP
+.I /var/lib/orderbook
+Default state directory in the shipped configuration. Created by systemd through
+.BR StateDirectory= ,
+so the package does not have to create it and then hope nothing changes its ownership.
+.TP
+.I /lib/systemd/system/ob_tcp_server.service
+Shipped unit.
+.SH SECURITY
+.B The wire protocol has no authentication and no encryption.
+Do not expose a node outside a trusted network. This is a deployment constraint rather than an
+oversight; see
+.IR SECURITY.md .
+.SH EXIT STATUS
+.TP
+.B 0
+Normal shutdown, or
+.B \-\-print\-config
+completing.
+.TP
+.B 1
+A command line or configuration file the server does not fully understand, a port it cannot bind,
+or a data directory it cannot open. The server refuses to start rather than starting with a
+configuration nobody intended.
+.SH SEE ALSO
+.BR etcd (1)

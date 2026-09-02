@@ -588,6 +588,45 @@ Learned the hard way. Check here before debugging.
     responses, they need different return values**, and an exception is the cheapest way to stop a
     caller from conflating them by accident.
 
+82. **An absolute install destination makes the archive generator write to the build host.** CPack's
+    TGZ generator honours an absolute `DESTINATION` literally, so `install(FILES ... DESTINATION
+    /etc/orderbook)` made `cpack` try to create `/etc/orderbook` on the machine doing the build. It
+    failed here only for want of privileges; a build as root, or in a container, would have written
+    into the host's `/etc` **while producing a package**. Relative destinations plus
+    `CPACK_PACKAGING_INSTALL_PREFIX` give the .deb and the tarball identical layouts and touch
+    nothing. The near miss before it is the same family: `${CMAKE_INSTALL_SYSCONFDIR}` is *relative*,
+    so with the prefix at `/usr` the config went to `/usr/etc/...` while `conffiles` declared
+    `/etc/...` — a conffile mark naming a path the package does not contain marks nothing, and the
+    first upgrade reverts every local edit in silence.
+83. **A CPack component does not filter anything unless component install is on.** The Python
+    wheel's `install(TARGETS orderbook_shared DESTINATION orderbook_engine)` appeared inside the
+    .deb at a path that means nothing on a system, because `CPACK_DEB_COMPONENT_INSTALL OFF` takes
+    every rule and `CPACK_COMPONENTS_ALL` is then decoration. Guard the rule out of the build —
+    `if(SKBUILD)` — rather than asking the packager to filter it afterwards. And `dpkg-deb -c` is
+    how this was found: read the artefact, not the configuration that produced it.
+84. **Writing the operations document is what proved the knob missing.** `docs/operations.md` had a
+    table telling an operator to choose `--fsync-policy` per storage device. The flag did not exist:
+    `FsyncPolicy` is in the engine and `tcp_server.cpp` passed `FsyncPolicy::INTERVAL` as a literal,
+    so the most consequential setting in a database was unreachable. Documentation written for a
+    reader rather than from the code is a test of the code — and this is the third time in this
+    repository that a document and the tree disagreed, with the document right about what should
+    exist.
+
+85. **Two consumers of one tree need the guard on both sides.** Guarding the Python wheel's
+    `install()` with `if(SKBUILD)` was half a separation: the system rules stayed unconditional, so
+    scikit-build-core ran them too — and the wheel build compiles only `orderbook_shared`, so
+    `install(TARGETS ob_tcp_server)` looked for a binary that build never produced. One missing
+    `if(NOT SKBUILD)` turned into **two** red required checks, because both integration jobs install
+    the package with `pip install -e`. When a rule exists for one consumer, ask what the other does
+    with it.
+
+86. **A new CI job is a ruleset change, and the repository checks that for you.** `docs-integrity`
+    failed with `produced but not required: 'package'` twelve seconds into the run. A job nobody
+    requires looks like coverage, so `check_contexts.py` refuses the drift in either direction.
+    Adding a job means: add the context to `.github/rulesets/master.json`, `PUT` it to the live
+    ruleset, and **read the ruleset back** — this API answers 200 for writes that change nothing.
+    Then fix the count wherever prose states it; it was in two documents.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -600,7 +639,9 @@ because commit messages and specs cite these numbers.
 opt-in Binance skips (`pytest tests/integration/`, ~8 min), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that
-fails the job on any skip, and the tree also builds and tests under Clang.
+fails the job on any skip, and the tree also builds and tests under Clang. Twelve required checks on
+`master` since #33 added `package`, which builds the .deb, the tarball and the RPM and verifies them
+— including that the packaged binary accepts the packaged configuration.
 
 Read the sanitizer claims with #83 in mind: until it landed, `OB_ENABLE_ASAN`, `OB_ENABLE_TSAN` and
 `OB_ENABLE_COVERAGE` instrumented the test binaries and the server but **none of the static
