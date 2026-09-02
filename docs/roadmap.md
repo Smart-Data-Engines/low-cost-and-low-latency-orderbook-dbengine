@@ -1576,6 +1576,34 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 86. A required check is flaky, and the assertion that flickers is asserting a race
+
+- `test_handover_lands_on_the_named_target` asserts that `FAILOVER <target>` answers `OK`. The
+  handover is accepted, the node then stops being primary, and whether the acknowledgement reaches
+  the client is a matter of which happens first — so the assertion is on an ordering between two
+  independent things, which is pitfall 54's shape in a different place.
+- **Measured across four CI job executions on three branches, it failed in three:** twice on a branch
+  whose only functional change was the CLI flag parser, once on a branch carrying only that parser
+  change *under ThreadSanitizer* while the plain integration job on the same commit passed, and it
+  passed once on an empty commit off master. So it is neither a branch effect nor a load effect. It
+  had been invisible because master's runs happened to be green.
+- The diagnosis cost most of the time, and the reason is worth recording: `send_command()` slept
+  0.3 s and took one `recv`, so **an orderly close and a reply that had not arrived yet both came
+  back as `''`**. A failing assertion could not say which had happened, and `FAILOVER` legitimately
+  takes seconds because it is etcd round-trips and a grace period.
+- Partially addressed: the helper now reads until data or a real timeout and **raises** on an orderly
+  close, so the two events are distinguishable; and the test keeps the protection the assertion was
+  added for (#60 made every `FAILOVER` answer `ERR unknown_target`, so an `ERR` is still a failure)
+  while no longer asserting when the acknowledgement arrives. The two assertions that follow check
+  the property the test is named after.
+- **What is still open is the server side, and it is the interesting half:** if the node closes a
+  client session while stepping down, an operator issuing `FAILOVER` sees a dropped connection rather
+  than an answer, and cannot tell success from a refused command. That is a real interface question
+  and not a test problem. Establishing it needs the node's own log at the moment of the close, which
+  the harness does not currently keep for a passing-then-failing case.
+- Effort: S for the test half (done), M for the server half | Impact: a required check that fails at
+  random trains everyone to re-run it, which is how a real failure gets re-run too
+
 ### 85. The WAL position was read from four threads without synchronisation, as an inconsistent pair ✅
 
 - `WALWriter::current_offset()` and `current_file_index()` returned plain members that
