@@ -327,6 +327,18 @@ FailoverManager::HandoverResult FailoverManager::initiate_graceful_failover(
     // 4. Revoke the lease; the leader key is held under it, so it disappears and
     //    the target sees an empty leader with an intent naming it.
     const int64_t lease = lease_id_.load();
+    // From here until the role is recorded, the leader key's absence is expected rather than a
+    // fault. Scoped so that every one of this function's seven exits clears it, including the
+    // revoke-failure path below which keeps the role: a flag that suppresses a safety check must be
+    // impossible to leave set.
+    struct HandoverScope {
+        std::atomic<bool>& flag;
+        explicit HandoverScope(std::atomic<bool>& f) : flag(f) {
+            flag.store(true, std::memory_order_release);
+        }
+        ~HandoverScope() { flag.store(false, std::memory_order_release); }
+    } handover_scope{handing_over_};
+
     if (!coordinator_->revoke_lease(lease)) {
         // We are still primary as far as etcd is concerned. Undo the block and
         // clear the intent so the cluster is not left in a half-handed-over
@@ -534,6 +546,32 @@ void FailoverManager::monitor_loop() {
                         last_ownership_confirmed_ = std::chrono::steady_clock::now();
                     }
                 } else if (verdict == CoordinatorClient::LeaderRead::Absent) {
+                    // `current` was read at the top of this iteration and the key read above took a
+                    // network round trip, so both the role and a handover may have moved underneath
+                    // us. The decision is `decide_on_absent_key()` — pure, so its six combinations
+                    // are tested without a cluster, which matters because the race it rules out
+                    // reproduces about one run in three (#89).
+                    const AbsentKeyAction action = decide_on_absent_key(
+                        role_.load(std::memory_order_acquire),
+                        handing_over_.load(std::memory_order_acquire));
+
+                    if (action != AbsentKeyAction::StepDown) {
+                        if (action == AbsentKeyAction::HandoverInFlight) {
+                            OB_LOG_INFO("failover",
+                                        "the leader key is gone because we are handing the role "
+                                        "over; the handover demotes this node itself");
+                        } else {
+                            OB_LOG_INFO("failover",
+                                        "the leader key is gone and this node is no longer PRIMARY "
+                                        "— the role changed while we were reading the key, so "
+                                        "there is nothing to step down from");
+                        }
+                        for (int i = 0; i < 10 && running_.load(std::memory_order_relaxed); ++i) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+                        continue;
+                    }
+
                     OB_LOG_WARN("failover",
                                 "we hold the PRIMARY role but the leader key is gone — stepping "
                                 "down. Its lease expired or was revoked, so the role is not ours "
@@ -734,6 +772,16 @@ void FailoverManager::handle_lease_expiry() {
 }
 
 // ── attempt_promotion() ─────────────────────────────────────────────────────
+
+AbsentKeyAction decide_on_absent_key(NodeRole role_now, bool handing_over) {
+    if (handing_over) {
+        return AbsentKeyAction::HandoverInFlight;
+    }
+    if (role_now != NodeRole::PRIMARY) {
+        return AbsentKeyAction::RoleAlreadyChanged;
+    }
+    return AbsentKeyAction::StepDown;
+}
 
 ElectionDecision decide_election(const std::vector<PublishedPosition>& positions,
                                  const std::string& self_node_id,

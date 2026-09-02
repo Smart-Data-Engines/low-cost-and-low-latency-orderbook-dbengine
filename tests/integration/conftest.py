@@ -52,6 +52,31 @@ class NodeInfo:
 # ClusterManager
 # ---------------------------------------------------------------------------
 
+def instrumented_run() -> bool:
+    """Whether the server under test is running under a sanitizer.
+
+    Read from the environment rather than from the binary, because the environment is what makes it
+    true: the sanitizer job exports `TSAN_OPTIONS`, and instrumentation without those options set is
+    not a configuration this suite has.
+    """
+    return bool(os.environ.get("TSAN_OPTIONS") or os.environ.get("ASAN_OPTIONS"))
+
+
+def patience(seconds: float) -> float:
+    """A timeout, tripled where a sanitizer is instrumenting the server.
+
+    ThreadSanitizer costs five to fifteen times the run time, so every wait in this suite was chosen
+    against an uninstrumented build and then applied to an instrumented one. That is how
+    `sanitizers-integration (tsan)` failed with "node-1 never accepted connections" on a branch
+    whose only changes were Python files and documentation: a 30-second startup budget on a loaded
+    shared runner, for a node that takes two seconds here.
+
+    It is scaling, not silencing. A node that cannot start inside the scaled window is a defect, and
+    the failure still says so — this only stops an honest slow start from being reported as one.
+    """
+    return seconds * (3.0 if instrumented_run() else 1.0)
+
+
 def open_node_log(data_dir: str) -> "io.TextIOWrapper":
     """A file for a node's stdout and stderr, in its own data directory.
 
@@ -84,6 +109,30 @@ def open_node_log(data_dir: str) -> "io.TextIOWrapper":
     if exists:
         handle.write("\n──────── node restarted, same data directory ────────\n")
     return handle
+
+
+def node_log_size(node: "NodeInfo") -> int:
+    """Where a node's log has got to, so a test can read only what it caused.
+
+    The whole log of a shared session cluster is other tests' output; an assertion over it would
+    pass or fail on history. Recording the offset first turns "the log does not contain X" into "the
+    log did not gain X during this test", which is the claim worth making.
+    """
+    try:
+        return os.path.getsize(os.path.join(node.data_dir, "node.log"))
+    except OSError:
+        return 0
+
+
+def node_log_since(node: "NodeInfo", offset: int) -> str:
+    """Everything a node logged after `offset`."""
+    path = os.path.join(node.data_dir, "node.log")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(offset)
+            return handle.read()
+    except OSError as exc:
+        return f"(no log at {path}: {exc})"
 
 
 def tail_node_log(node: "NodeInfo", lines: int = 40) -> str:
@@ -171,20 +220,20 @@ class ClusterManager:
         """
         self._check_prerequisites()
         self._start_etcd()
-        self._wait_for_etcd(timeout=30)
+        self._wait_for_etcd(timeout=patience(30))
 
         # Start node-0 first and wait for it to become PRIMARY
         node0 = self._start_node(0)
         self.nodes.append(node0)
-        self._wait_for_node(node0, timeout=15)
-        self._wait_for_primary(node0, timeout=15)
+        self._wait_for_node(node0, timeout=patience(15))
+        self._wait_for_primary(node0, timeout=patience(15))
 
         # Now start node-1 — it will discover node-0 as leader via etcd
         node1 = self._start_node(1)
         self.nodes.append(node1)
-        self._wait_for_node(node1, timeout=15)
+        self._wait_for_node(node1, timeout=patience(15))
 
-        self._wait_for_election(timeout=15)
+        self._wait_for_election(timeout=patience(15))
         self._started = True
 
         # Safety net — clean up even on unhandled exit
@@ -334,7 +383,7 @@ class ClusterManager:
         """
         self._check_prerequisites()
         self._start_etcd()
-        self._wait_for_etcd(timeout=30)
+        self._wait_for_etcd(timeout=patience(30))
 
         for index in range(node_count):
             node = self._start_node(index, multi_master_id=index + 1)
@@ -600,7 +649,7 @@ class ClusterManager:
             stderr=subprocess.STDOUT,
         )
         self.nodes[node_index] = new
-        self._wait_for_node(new, timeout=15)
+        self._wait_for_node(new, timeout=patience(15))
 
     def unexplained_deaths(self) -> list:
         """Nodes that are not running and were not killed by a test, with their own last words.

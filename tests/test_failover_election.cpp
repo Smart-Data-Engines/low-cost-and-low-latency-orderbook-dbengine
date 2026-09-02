@@ -364,3 +364,39 @@ TEST(ElectionWait, ClockGoingBackwardsDoesNotGrantAnEarlyCampaign) {
     const auto seen = std::chrono::steady_clock::now();
     EXPECT_FALSE(ob::election_wait_elapsed(seen, seen - std::chrono::seconds(5), 10'000));
 }
+
+// ── decide_on_absent_key: what an absent leader key means ─────────────────────
+//
+// Six combinations, one assertion each, and no cluster — which is the whole reason this is a
+// function. The race it rules out (#89) reproduces in roughly **one integration run in three**,
+// measured: three runs against a build with both conditions disabled gave one failure. A test that
+// waits for a one-in-three race reads as flaky and gets a re-run instead of a reading, which is the
+// lesson the probabilistic salt test taught in the sibling repository. The integration test stays
+// as a backstop; this is the proof.
+TEST(FailoverAbsentKey, HandoverInFlightIsNotAFault) {
+    // The revoke happens before the role is recorded, so the role still says PRIMARY here. That is
+    // exactly why `handing_over` is checked first: the specific answer must not be lost to the
+    // general one.
+    EXPECT_EQ(ob::decide_on_absent_key(ob::NodeRole::PRIMARY, true),
+              ob::AbsentKeyAction::HandoverInFlight);
+    EXPECT_EQ(ob::decide_on_absent_key(ob::NodeRole::REPLICA, true),
+              ob::AbsentKeyAction::HandoverInFlight);
+}
+
+TEST(FailoverAbsentKey, ARoleThatMovedOnLeavesNothingToStepDownFrom) {
+    // The other window: a handover that started *and finished* between the loop reading the role
+    // and reading the key has already cleared the flag, and only the current role says so.
+    EXPECT_EQ(ob::decide_on_absent_key(ob::NodeRole::REPLICA, false),
+              ob::AbsentKeyAction::RoleAlreadyChanged);
+    EXPECT_EQ(ob::decide_on_absent_key(ob::NodeRole::STANDALONE, false),
+              ob::AbsentKeyAction::RoleAlreadyChanged);
+    EXPECT_EQ(ob::decide_on_absent_key(ob::NodeRole::MULTI_MASTER, false),
+              ob::AbsentKeyAction::RoleAlreadyChanged);
+}
+
+TEST(FailoverAbsentKey, AGenuinelyLostLeaseStillStepsDown) {
+    // The case #82 added, and the one that must survive both guards: still PRIMARY, no handover,
+    // key gone. Weakening this is how a node keeps taking writes after losing its lease.
+    EXPECT_EQ(ob::decide_on_absent_key(ob::NodeRole::PRIMARY, false),
+              ob::AbsentKeyAction::StepDown);
+}
