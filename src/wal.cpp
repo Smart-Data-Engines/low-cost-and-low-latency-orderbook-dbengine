@@ -39,13 +39,24 @@ static std::string wal_filename(const std::string& dir, uint32_t index) {
 WALWriter::WALWriter(std::string_view dir, size_t rotate_threshold_bytes,
                      FsyncPolicy fsync_policy)
     : fd_(-1)
-    , written_(0)
     , rotate_threshold_(rotate_threshold_bytes)
     , fsync_policy_(fsync_policy)
     , dir_(dir)
-    , file_index_(0)
     , pending_sync_(0)
 {
+    // The offset half of WalPosition is 32 bits so the pair fits one lock-free atomic, so the
+    // threshold has to keep it there. Refused rather than clamped: WAL rotation decides how much has
+    // to be replayed after a crash, and an operator who asked for eight gigabyte files should not
+    // silently get two and find out during a recovery.
+    if (rotate_threshold_bytes > MAX_WAL_ROTATE_THRESHOLD) {
+        throw std::invalid_argument(
+            "WALWriter: rotate threshold " + std::to_string(rotate_threshold_bytes) +
+            " bytes exceeds the maximum of " + std::to_string(MAX_WAL_ROTATE_THRESHOLD) +
+            " (2 GiB). The offset is 32 bits so that the file index and the offset can be read as "
+            "one coherent value; a larger file would let the offset wrap and report a position "
+            "inside the wrong part of the file.");
+    }
+
     // Pre-allocate write buffer (enough for largest possible record).
     write_buf_.reserve(sizeof(WALRecord) + sizeof(DeltaUpdate) + MAX_LEVELS * sizeof(Level));
 
@@ -53,19 +64,20 @@ WALWriter::WALWriter(std::string_view dir, size_t rotate_threshold_bytes,
     std::filesystem::create_directories(dir_);
 
     // Find the highest existing WAL file index so we continue from there.
+    uint32_t highest = 0;
     for (auto& entry : std::filesystem::directory_iterator(dir_)) {
         const std::string name = entry.path().filename().string();
         if (name.size() == 14 &&
             name.substr(0, 4) == "wal_" &&
             name.substr(10) == ".bin") {
             uint32_t idx = static_cast<uint32_t>(std::stoul(name.substr(4, 6)));
-            if (idx >= file_index_) {
-                file_index_ = idx;
+            if (idx >= highest) {
+                highest = idx;
             }
         }
     }
-
-    open_current();
+    // One publish, with both halves already known.
+    position_.store(WalPosition{highest, open_current(highest)}, std::memory_order_relaxed);
 }
 
 WALWriter::~WALWriter() {
@@ -76,14 +88,14 @@ WALWriter::~WALWriter() {
     }
 }
 
-void WALWriter::open_current() {
+uint32_t WALWriter::open_current(uint32_t index) {
     if (fd_ >= 0) {
         ::fsync(fd_);
         ::close(fd_);
         fd_ = -1;
     }
 
-    const std::string path = wal_filename(dir_, file_index_);
+    const std::string path = wal_filename(dir_, index);
     // O_APPEND ensures all writes go to the end even across processes.
     fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd_ < 0) {
@@ -91,9 +103,10 @@ void WALWriter::open_current() {
                                  ": " + std::strerror(errno));
     }
 
-    // Determine how many bytes are already in the file (for rotation accounting).
+    // How many bytes the file already holds, for rotation accounting. Returned rather than stored:
+    // see the declaration.
     const off_t pos = ::lseek(fd_, 0, SEEK_END);
-    written_ = (pos >= 0) ? static_cast<size_t>(pos) : 0;
+    return (pos >= 0) ? static_cast<uint32_t>(pos) : 0;
 }
 
 void WALWriter::write_record(const WALRecord& hdr, const void* payload,
@@ -120,7 +133,12 @@ void WALWriter::write_record(const WALRecord& hdr, const void* payload,
 
     // No fsync here — caller is responsible for calling sync() at group commit boundaries.
     // Exception: FsyncPolicy::EVERY fsyncs after every record.
-    written_ += total;
+    // One load, one store, on the writer's own thread - the engine's mutexes serialise writers, so
+    // no compare-exchange is needed. On x86-64 a relaxed load and store of an aligned eight-byte
+    // value are plain moves.
+    WalPosition pos = position_.load(std::memory_order_relaxed);
+    pos.offset += static_cast<uint32_t>(total);
+    position_.store(pos, std::memory_order_relaxed);
     ++pending_sync_;
 
     if (allow_fsync && fsync_policy_ == FsyncPolicy::EVERY) {
@@ -155,7 +173,7 @@ void WALWriter::append(const DeltaUpdate& update, const Level* levels) {
     write_record(hdr, payload, payload_len);
 
     // Auto-rotate if threshold exceeded.
-    if (written_ >= rotate_threshold_) {
+    if (current_position().offset >= rotate_threshold_) {
         rotate();
     }
 }
@@ -182,7 +200,12 @@ void WALWriter::write_record_v2(const WALRecordV2& hdr, const void* payload,
         remaining -= static_cast<size_t>(n);
     }
 
-    written_ += total;
+    // One load, one store, on the writer's own thread - the engine's mutexes serialise writers, so
+    // no compare-exchange is needed. On x86-64 a relaxed load and store of an aligned eight-byte
+    // value are plain moves.
+    WalPosition pos = position_.load(std::memory_order_relaxed);
+    pos.offset += static_cast<uint32_t>(total);
+    position_.store(pos, std::memory_order_relaxed);
     ++pending_sync_;
 
     if (fsync_policy_ == FsyncPolicy::EVERY) {
@@ -224,7 +247,7 @@ void WALWriter::append_with_origin(const DeltaUpdate& update, const Level* level
     write_record_v2(hdr, payload, payload_len);
 
     // Auto-rotate if threshold exceeded.
-    if (written_ >= rotate_threshold_) {
+    if (current_position().offset >= rotate_threshold_) {
         rotate();
     }
 }
@@ -270,8 +293,9 @@ void WALWriter::append_version_vector(const uint8_t* payload, size_t payload_len
 
     write_record(hdr, payload, payload_len, /*allow_fsync=*/false);
 
-    OB_LOG_DEBUG("wal", "Version vector appended (not fsynced): bytes=%zu file=%u offset=%zu",
-                 payload_len, current_file_index(), current_offset());
+    const WalPosition vv_pos = current_position();
+    OB_LOG_DEBUG("wal", "Version vector appended (not fsynced): bytes=%zu file=%u offset=%u",
+                 payload_len, vv_pos.file_index, vv_pos.offset);
 }
 
 void WALWriter::append_held_sequences(const uint8_t* payload, size_t payload_len) {
@@ -298,8 +322,9 @@ void WALWriter::append_held_sequences(const uint8_t* payload, size_t payload_len
 
     write_record(hdr, payload, payload_len, /*allow_fsync=*/false);
 
-    OB_LOG_DEBUG("wal", "Held sequences appended (not fsynced): bytes=%zu file=%u offset=%zu",
-                 payload_len, current_file_index(), current_offset());
+    const WalPosition held_pos = current_position();
+    OB_LOG_DEBUG("wal", "Held sequences appended (not fsynced): bytes=%zu file=%u offset=%u",
+                 payload_len, held_pos.file_index, held_pos.offset);
 }
 
 void WALWriter::append_checkpoint(uint64_t timestamp_ns) {
@@ -317,8 +342,9 @@ void WALWriter::append_checkpoint(uint64_t timestamp_ns) {
     // FLUSH to protect a record whose loss is harmless.
     write_record(hdr, nullptr, 0, /*allow_fsync=*/false);
 
-    OB_LOG_DEBUG("wal", "Checkpoint appended (not fsynced): file=%u offset=%zu",
-                 current_file_index(), current_offset());
+    const WalPosition ckpt_pos = current_position();
+    OB_LOG_DEBUG("wal", "Checkpoint appended (not fsynced): file=%u offset=%u",
+                 ckpt_pos.file_index, ckpt_pos.offset);
 }
 
 void WALWriter::append_epoch(const EpochValue& epoch) {
@@ -349,9 +375,14 @@ void WALWriter::rotate() {
 
     write_record(hdr, nullptr, 0);
 
-    // Open the next file.
-    ++file_index_;
-    open_current();
+    // Open the next file and publish the new position in **one** store. Incrementing the index and
+    // letting open_current() set the offset afterwards would make `(N+1, previous file's offset)`
+    // observable - the very pair this change removes. The cross-thread test found that at 96
+    // observations in 4.3 million.
+    const uint32_t next_index = current_position().file_index + 1;
+    const uint32_t next_offset = open_current(next_index);
+    position_.store(WalPosition{next_index, next_offset}, std::memory_order_relaxed);
+    OB_LOG_DEBUG("wal", "rotated to file %u at offset %u", next_index, next_offset);
 }
 
 void WALWriter::flush() {

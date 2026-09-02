@@ -865,7 +865,11 @@ Engine::Stats Engine::stats() {
     std::unique_lock<std::mutex> lock(mtx_);
     Stats s{};
     s.pending_rows      = pending_rows_.size();
-    s.wal_file_index    = wal_.current_file_index();
+    // Through the pair even though `mtx_` is held and formally it need not be: two ways of reading
+    // the same thing are two ways of which one eventually stops being correct, and nobody notices
+    // because both give the same number today.
+    const WalPosition wal_pos = wal_.current_position();
+    s.wal_file_index    = wal_pos.file_index;
     s.segment_count     = combined_store_.segment_count();
     s.symbol_count      = buffers_.size();
     s.flush_interval_ns = flush_interval_ns_;
@@ -998,8 +1002,11 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
                                          std::memory_order_relaxed);
 
         // Capture WAL position atomically with the flush.
-        manifest.wal_file_index  = wal_.current_file_index();
-        manifest.wal_byte_offset = wal_.current_offset();
+        // One load: a manifest is what a joining peer catches up from, so a pair assembled from two
+        // moments points it at a position that never existed.
+        const WalPosition manifest_pos = wal_.current_position();
+        manifest.wal_file_index  = manifest_pos.file_index;
+        manifest.wal_byte_offset = manifest_pos.offset;
 
         // And the sequence state, in the same critical section. See the header for why the
         // boundary has to be exactly here and not a line later.
@@ -1309,8 +1316,11 @@ SnapshotManifest Engine::create_symbol_snapshot(const std::string& symbol_key) {
         }
 
         // Capture WAL position atomically with the flush.
-        manifest.wal_file_index  = wal_.current_file_index();
-        manifest.wal_byte_offset = wal_.current_offset();
+        // One load: a manifest is what a joining peer catches up from, so a pair assembled from two
+        // moments points it at a position that never existed.
+        const WalPosition manifest_pos = wal_.current_position();
+        manifest.wal_file_index  = manifest_pos.file_index;
+        manifest.wal_byte_offset = manifest_pos.offset;
     }
 
     auto now = std::chrono::steady_clock::now().time_since_epoch();
@@ -1516,7 +1526,14 @@ void Engine::demote_to_replica(const std::string& new_primary_address) {
 }
 
 std::pair<uint32_t, size_t> Engine::get_wal_position() const {
-    return {wal_.current_file_index(), wal_.current_offset()};
+    // One load, and that is the whole of #85. This used to be two - the index on one line and the
+    // offset on the next - so a rotation between them returned a fresh file index carrying the
+    // previous file's offset: a position that never existed. It feeds
+    // `FailoverManager::publish_position_if_due()`, and election deference compares published
+    // positions to pick the replica furthest ahead (#70, #72), where such a pair reads as a
+    // candidate that went backwards by a whole file.
+    const WalPosition pos = wal_.current_position();
+    return {pos.file_index, pos.offset};
 }
 
 EpochValue Engine::get_current_epoch() const {
@@ -1739,8 +1756,9 @@ void Engine::flush_drain_pending() {
     // before this point, so a segment closed from these rows covers that symbol's WAL up to here.
     // That is the fact replay needs, and the reason it no longer has to guess from timestamps
     // (#63).
-    const uint32_t wal_file   = wal_.current_file_index();
-    const uint64_t wal_offset = static_cast<uint64_t>(wal_.current_offset());
+    const WalPosition wal_pos = wal_.current_position();
+    const uint32_t wal_file   = wal_pos.file_index;
+    const uint64_t wal_offset = static_cast<uint64_t>(wal_pos.offset);
 
     for (const auto& pr : pending_rows_) {
         ColumnarStore& store = get_or_create_store(pr.symbol, pr.exchange);

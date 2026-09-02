@@ -519,16 +519,30 @@ jobs:
           .venv/bin/pip install -q --upgrade pip
           .venv/bin/pip install -q -e ".[test]"
 
-      - name: Run the multi-master modules against the TSan server
+      # The whole battery, not a subset — and the subset is what hid #85 for months.
+      #
+      # This job used to run three multi-master modules. None of them starts the failover monitor,
+      # because multi-master has no election, so `FailoverManager::publish_position_if_due()` was
+      # never on a TSan build — and that is where the WAL position race lived. The subset had been
+      # chosen around the defect we were fixing when the job was written (#80), which is exactly the
+      # shape of gap #80 itself was about: coverage justified by an argument that stops being true.
+      #
+      # Cost, stated: this takes minutes rather than the two the subset took, because TSan slows the
+      # server and the battery is ~154 tests. That is the price of a check that speaks for the whole
+      # tree. Verified clean per module before switching it on — all 19 modules, zero reports.
+      #
+      # Binance modules are excluded because they need the live feed and skip without it, which in a
+      # summary line is indistinguishable from passing.
+      - name: Run the integration battery against the TSan server
         env:
           OB_INTEGRATION_TESTS: "1"
           OB_SERVER_BINARY: ${{ github.workspace }}/build-tsan/ob_tcp_server
           TSAN_OPTIONS: detect_deadlocks=1:second_deadlock_stack=1:halt_on_error=0:log_path=${{ github.workspace }}/tsan-report
         run: |
           PYTHONPATH=$PWD/python .venv/bin/python -m pytest -q \
-            tests/integration/test_mm_convergence.py \
-            tests/integration/test_mm_stats.py \
-            tests/integration/test_mm_snapshot_bootstrap.py
+            --ignore=tests/integration/test_binance_live.py \
+            --ignore=tests/integration/test_binance_failover_sync.py \
+            tests/integration/
 
       - name: Fail on any ThreadSanitizer report
         run: |

@@ -114,6 +114,18 @@ ob_add_wal_test(test_wal
     test_wal.cpp
 )
 
+# ── WAL position coherence (wal-position-coherence, #85) ──────────────────────
+ob_add_wal_test(test_wal_position
+    test_wal_position.cpp
+)
+# One test in here is static: it reads src/*.cpp and refuses any site that composes the WAL position
+# from two separate calls. A behavioural test cannot cover that - the window is two instructions and
+# the measured rate is one in 150 million reads - so the guard is the source, and the source has to
+# be findable at test time.
+target_compile_definitions(test_wal_position
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
 # ── Tasks 5.3–5.6: Codec property and unit tests ──────────────────────────────
 ob_add_codec_test(test_codec
     test_codec.cpp

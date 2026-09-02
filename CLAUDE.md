@@ -516,6 +516,25 @@ Learned the hard way. Check here before debugging.
     are on *padding*, which is exactly where nobody looks. And the general form: a benchmark run is
     what turned a change that read as free into a number.
 
+75. **A comment justifying a gap in coverage is a hypothesis, and this is the third time.** The
+    `sanitizers-integration (tsan)` job ran three multi-master modules, and the note explaining why
+    said the modules that kill nodes were excluded "because their fixtures wait on timings that
+    instrumentation makes unreliable". When #85 ran the whole battery under TSan, **all nineteen
+    modules passed with zero reports**, the node-killing three included. The narrow scope had a
+    price: none of those modules starts the failover monitor, so the WAL position race lived in
+    `publish_position_if_due()` for months with a required check standing over it. #80 was this
+    lesson about the job existing at all; this is the same lesson about its *scope*.
+
+76. **Fix the pair, not the field: two loads of related state compose a value from two moments.**
+    `current_file_index()` and `current_offset()` were separately correct and read together at five
+    sites — including two snapshot manifests, which is where a joining peer is told to catch up
+    from. Measured rate of an incoherent pair: **one in 150 million reads**, so no behavioural test
+    will find it; the guard is a static test over `src/` that refuses the shape. And when the fix
+    itself published `(N+1, previous offset)` as an intermediate state, the cross-thread test caught
+    it at 96 in 4.3 million — **the reproduction rate of the reintroduced bug was six orders of
+    magnitude higher than the original**, because a deliberate two-store sequence is a much wider
+    window than a compiler-scheduled one.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -539,6 +558,9 @@ Things a newcomer should know, because they are real limits rather than bugs to 
 
 - **The wire protocol has no authentication or encryption.** Roadmap #30. Do not expose a node
   outside a trusted network.
+- **The whole integration battery runs under ThreadSanitizer**, not a subset — since #85. Nineteen
+  modules, 154 tests, zero reports. Before that the job ran three multi-master modules, and the
+  reason given for the narrow scope was a hypothesis that turned out to be false; see pitfall 75.
 - **Failover takes about twice as long as it used to, on purpose.** Since #82 a candidate waits one
   lease TTL after the leader key goes absent, so the previous holder has certainly stepped down.
   Measured: 10.2 s → 20.1 s after a `kill -9`. The alternative that costs no latency makes a primary
