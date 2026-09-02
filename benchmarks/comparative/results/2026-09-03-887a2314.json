@@ -1,0 +1,75 @@
+{
+  "dataset": {
+    "interval_ns": 1000000,
+    "levels": 20,
+    "price_tick_base": 100000,
+    "rows": 20000,
+    "seed": 7,
+    "sha256": "4f4dc8054d3a0911189a36930db7e5d7767d45288ecea933f54a2cb66e3f7c89",
+    "size_lot_max": 5000,
+    "start_ns": 1700000000000000000,
+    "symbols": 10
+  },
+  "hardware": {
+    "compiler": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "cores": 4,
+    "cpu_model": "Intel(R) Core(TM) i3-7100U CPU @ 2.40GHz",
+    "digest": "887a2314",
+    "disk_model": "ADATA SX7000NP",
+    "disk_rotational": false,
+    "disk_stack": "vgubuntu-root \u2192 nvme0n1p3_crypt \u2192 nvme0n1p3 \u2192 nvme0n1",
+    "filesystem": "ext4",
+    "kernel": "6.8.0-138-generic",
+    "mhz": 2400.581,
+    "ram_mib": 15896
+  },
+  "limitations": [
+    "orderbook: no general-purpose SQL - a fixed set of commands, not a query language",
+    "orderbook: no joins, and no cross-symbol queries",
+    "orderbook: the schema is imposed, not derived from a model",
+    "orderbook: append-only; nothing deletes rows except TTL retention",
+    "orderbook: aggregates run over the live book, so a VWAP over a historical time range is not the same question the SQL equivalents answer"
+  ],
+  "losses": [],
+  "losses_search": "Only one system was measured in this run, so no comparison was possible and no loss could be found. This sentence is required rather than optional: an empty losses list with nothing beside it is a selected table.",
+  "resolution": {
+    "control_ratios": [
+      0.6673093342292162,
+      0.9812862044379708,
+      1.1085918669356152,
+      0.8313858358917152,
+      0.7659337777451912,
+      1.0881588017360262
+    ],
+    "discarded_outlier": 0.33269066577078377,
+    "floor": 0.23406622225480878,
+    "note": "control floor 0.2341 over 6 interleaved rounds; this machine does not separate differences smaller than that. One extreme of 0.3327 was discarded as an outlier and every control ratio is in the results file. Above 10%: only double-digit differences are separable here",
+    "rounds": 6,
+    "verdict": "usable",
+    "warmup": 2
+  },
+  "run": {
+    "build_type": "Release",
+    "rounds": 6,
+    "seed": 7,
+    "timestamp": "2026-09-03T00:36:54+00:00"
+  },
+  "systems": [
+    {
+      "available": true,
+      "config": "# Resolved configuration. Provenance in brackets: a list of values does not say which\n# of them you chose, and that is the question this flag exists to answer.\n  anti-entropy-interval-seconds    30  (default)\n  coordinator-endpoints              (default)\n  coordinator-lease-ttl            10  (default)\n  data-dir                         /tmp/ob_bench_ymii8o9v  (command line)\n  election-deference-ms            3000  (default)\n  election-lease-wait-ms           0  (default)\n  failover-enabled                 true  (default)\n  flush-interval-ms                1000  (command line)\n  fsync-policy                     interval  (default)\n  handover-cooldown-seconds        15  (default)\n  handover-grace-seconds           5  (default)\n  log-level                        INFO  (default)\n  max-sessions                     64  (default)\n  max-subscriber-queue-bytes       8388608  (default)\n  max-subscriptions-per-session    16  (default)\n  metrics-port                     0  (default)\n  mm-max-catchup-bytes             536870912  (default)\n  mm-max-peer-send-buffer          67108864  (default)\n  mm-node-id                       0  (default)\n  mm-replication-port              0  (default)\n  multi-master                     false  (default)\n  no-sqpoll                        false  (default)\n  node-id                            (default)\n  port                             49497  (command line)\n  primary-host                       (default)\n  primary-port                     0  (default)\n  read-only                        false  (default)\n  replication-compress             false  (default)\n  replication-port                 0  (default)\n  ring-size                        256  (default)\n  shard-id                           (default)\n  shard-vnodes                     150  (default)\n  snapshot-chunk-size              262144  (default)\n  snapshot-staging-dir               (default)\n  sqpoll-idle-ms                   1000  (default)\n  ttl-hours                        0  (default)\n  ttl-scan-interval-seconds        300  (default)\n  workers                          4  (default)\n\n# workers is parsed and not used: client commands run inline on the epoll loop. It is\n# printed because hiding it would leave an operator tuning a knob that does nothing.\n",
+      "name": "orderbook",
+      "tuning_applied": [
+        "--flush-interval-ms 1000 (default 100): fewer, larger segment writes during a bulk load",
+        "one MINSERT per update rather than one INSERT per level: a round trip per book change instead of per price level, which is what the wire protocol is shaped for"
+      ],
+      "version": "0.1.0",
+      "workloads": {
+        "ingest": {
+          "unit": "rows/s",
+          "value": 79148.93680912578
+        }
+      }
+    }
+  ]
+}

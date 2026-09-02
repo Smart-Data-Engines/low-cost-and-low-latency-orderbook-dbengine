@@ -75,3 +75,8 @@ Thumbs.db
 # Local Python environment for the integration suite (CI builds its own).
 .venv/
 venv/
+
+# Generated benchmark datasets. Regenerated from a seed in seconds, 19 MB at 400k rows, and the
+# manifest in every results file carries the SHA-256 — so the identity is committed and the bytes
+# are not.
+benchmarks/comparative/results/dataset-*.csv

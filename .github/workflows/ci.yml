@@ -147,6 +147,16 @@ jobs:
           .venv/bin/pip install -q --upgrade pip
           .venv/bin/pip install -q -e ".[test]"
 
+      # The comparative benchmark harness's own tests: `classify()`, the report validator, the
+      # generator's determinism, and the static rule that only one file may call one system faster
+      # than another. Milliseconds, no engine, no competitors.
+      #
+      # The comparative **run** deliberately does not happen in CI. A shared runner's noise floor
+      # would exceed every difference we would want to publish, and a job that always answers "this
+      # machine cannot resolve the comparison" is a job everyone learns to ignore.
+      - name: Benchmark harness unit tests
+        run: .venv/bin/python -m pytest benchmarks/comparative/tests/ -q
+
       # The harness starts its own etcd per cluster, so nothing is started here. Binance tests are
       # opt-in and stay skipped without OB_BINANCE_TESTS.
       - name: Run the integration suite
