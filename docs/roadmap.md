@@ -349,10 +349,11 @@ because the two mechanisms overlap there — which is why the three-node test ex
 - Effort: S | Impact: Ops ergonomics, fewer misconfigurations — and it unblocks #33, which packages a
   default config and a systemd unit
 
-### 33. Native packaging and cluster bootstrap
+### 33. Native packaging and cluster bootstrap ✅
 
-**Packages, unit and operations documentation are done; the bootstrap script is not.** Spec:
-`kiro-workspace/specs/native-packaging/`.
+**Both halves are done and merged (PR #66).** Packages, unit and operations documentation, plus
+`scripts/bootstrap-cluster.sh` for a single host; the multi-host procedure is written rather than
+scripted, for the reason given below. Spec: `kiro-workspace/specs/native-packaging/`.
 
 - `.deb` and a static tarball with **byte-identical relative layouts**, holding the binary, headers,
   `/etc/orderbook/ob.conf`, the systemd unit, a man page and the docs. Dependencies resolved by
@@ -1819,7 +1820,7 @@ ignore checks.
   written that the unread pipes fill because nodes log at DEBUG. The binary's default is **INFO**.
   Measured on i3-7100U, Release, default level: 2000 writes cost **153 bytes in total** — writes are
   not logged at INFO — but **each client connection costs ~153 bytes**, so the 64 KB pipe fills at
-  roughly **418 connections per node**. The `cluster` fixture is session-scoped across 145 tests,
+  roughly **418 connections per node**. The `cluster` fixture is session-scoped across 146 tests,
   each opening a connection per command, so the battery goes past that: a node blocking inside
   `write()` was reachable, and is now impossible. It is a real hazard removed, and it is **not** the
   cause of this failure — a blocked node refuses nothing.
@@ -1845,6 +1846,12 @@ ignore checks.
   The assertion now prints the exit status, so `signal 9` would settle it. Guessing beyond that is
   not worth it: the next red run reports which, because the three layers above no longer discard the
   answer.
+- **After the diagnostic commit the check passed, and that is not evidence that it is fixed.** One
+  green run is what this very item already recorded as an anecdote: it passed once on an empty
+  commit off master while failing three times elsewhere, which is why the measurement was four
+  executions across three branches rather than one. Nothing in that commit changed a line of the
+  server, so if the cause is on the server it is still there. The server half stays open, and the
+  next failure reports the exit status, the liveness and the node's own log instead of one word.
 - Effort: S for the test half (done), S for the diagnostic half (done), M for the server half |
   Impact: a required check that fails at random trains everyone to re-run it, which is how a real
   failure gets re-run too
