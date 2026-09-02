@@ -35,16 +35,44 @@ pytestmark = pytest.mark.failover
 custom_metrics: dict = {}
 
 
+class ClosedWithoutReply(Exception):
+    """The node accepted the command and closed the connection without answering."""
+
+
 def send_command(port: int, command: str, timeout: float = 10.0) -> str:
+    """Send one command and return the reply.
+
+    Reads until data arrives or the timeout expires, rather than sleeping 0.3 s and taking one
+    `recv`. The old shape lost the distinction that matters: an orderly close and a reply that had
+    not arrived yet both came back as `''`, so a failing assertion could not say which had happened
+    — and `FAILOVER` legitimately takes seconds, because it is etcd round-trips and a grace period.
+
+    An orderly close raises rather than returning `''`, so a caller has to decide what it means
+    instead of comparing against the empty string and getting the same answer for two different
+    events.
+    """
     with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
         sock.settimeout(timeout)
         sock.recv(4096)  # banner
         sock.sendall((command + "\n").encode())
-        time.sleep(0.3)
-        try:
-            return sock.recv(65536).decode(errors="replace")
-        except socket.timeout:
-            return ""
+
+        deadline = time.monotonic() + timeout
+        buffered = b""
+        while time.monotonic() < deadline:
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                break
+            if not chunk:
+                if buffered:
+                    break          # closed after answering; the answer is what we asked for
+                raise ClosedWithoutReply(
+                    f"node on port {port} closed the connection after {command!r} "
+                    f"without sending anything")
+            buffered += chunk
+            if b"\n" in buffered:
+                break
+        return buffered.decode(errors="replace")
 
 
 def role_of(port: int, timeout: float = 5.0) -> str:
@@ -132,8 +160,24 @@ def test_handover_lands_on_the_named_target(healthy_cluster):
     primary = healthy_cluster.primary()
     target = healthy_cluster.replica()
 
-    reply = send_command(primary.tcp_port, f"FAILOVER {target.node_id}")
-    assert reply.strip().startswith("OK"), f"handover refused: {reply!r}"
+    # A refusal is a failure; a lost answer is not the property under test.
+    #
+    # This assertion was `startswith("OK")` and it raced the node's own step-down: the handover is
+    # accepted, the node stops being primary, and whether the `OK` reaches the client is a matter of
+    # which happens first. Measured across four CI runs on three branches, it failed in three of
+    # them, including one whose only change was to the flag parser and one under ThreadSanitizer,
+    # so it is neither a branch nor a load effect. Roadmap #86.
+    #
+    # What the assertion was added for is #60: the command used to answer `ERR unknown_target` for
+    # every target, because nothing published WAL positions. That protection is kept — an `ERR` is
+    # still a failure — while the timing of the acknowledgement is not asserted, because the two
+    # assertions below check the thing the test is named after.
+    try:
+        reply = send_command(primary.tcp_port, f"FAILOVER {target.node_id}")
+    except ClosedWithoutReply as closed:
+        reply = ""
+        print(f"note: {closed}; continuing to the effect assertions")
+    assert not reply.strip().startswith("ERR"), f"handover refused: {reply!r}"
 
     elapsed = wait_for_role(target.tcp_port, "PRIMARY", timeout=30)
     custom_metrics["failover_time_sec"] = elapsed
