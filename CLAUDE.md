@@ -559,6 +559,18 @@ Learned the hard way. Check here before debugging.
     it was added to catch.** `[1-9][0-9]* skipped`, and both cases exercised against a fixture line
     before pushing.
 
+79. **A list you wrote yourself is not evidence about the code.** Adding config-file support needed
+    to know which flags take no value, so I wrote the list — and put `failover-enabled` on it,
+    because its default is true and I reasoned from the default. It takes a value:
+    `--failover-enabled false` had always worked. On that false premise I added a
+    `--no-failover-enabled` negation, a table mapping keys to negations, and a test asserting the
+    negation was emitted. **The static test comparing the list against the parser's own branches
+    deleted all three.** Derive the list from the source, and when the derivation disagrees with you,
+    it is right.
+
+    The same branch turned out to map anything unrecognised to *false*, so `--failover-enabled tru`
+    silently disabled failover — pitfall 27 again, in a flag that had a value all along.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -567,11 +579,11 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 761 C++ tests (`ctest -j1`, ~2 min) and 136 integration tests plus 2
-opt-in skips (`pytest tests/integration/`, ~7.5 min), all green, and **no `xfail` left** — every
-marker that recorded a known defect went with the defect. Both suites run in CI on every pull
-request, the multi-master modules a second time under ThreadSanitizer, and the tree also builds and
-tests under Clang.
+**Where the suites stand:** 802 C++ tests (`ctest -j1`, ~2 min) and 145 integration tests plus 2
+opt-in Binance skips (`pytest tests/integration/`, ~8 min), all green, and **no `xfail` left** —
+every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
+request, the **whole** integration battery a second time under ThreadSanitizer with a step that
+fails the job on any skip, and the tree also builds and tests under Clang.
 
 Read the sanitizer claims with #83 in mind: until it landed, `OB_ENABLE_ASAN`, `OB_ENABLE_TSAN` and
 `OB_ENABLE_COVERAGE` instrumented the test binaries and the server but **none of the static
@@ -597,31 +609,19 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   second request during creation is refused as busy, and a finished snapshot whose requester has gone
   is discarded rather than sent — matched on `conn_id`, because the case that `node_id` cannot see is
   the same node reconnecting.
-- **Streaming subscriptions work embedded and not over TCP** (#45, in progress — see below).
+- **A subscriber that stops reading is disconnected, not throttled** (#45). Each subscription has an
+  8 MB queue ceiling, about 140 000 rows, and past it the session is closed. There is no flow control
+  and no resumption; a consumer needing continuity re-reads with `SELECT` from a known sequence
+  number (#65).
 - `rapidcheck` is pinned to `master` rather than a commit SHA, unlike every other dependency.
 
-### In flight: #45, streaming subscriptions on the wire
-
-Spec: `kiro-workspace/specs/streaming-subscriptions/` (requirements, design, tasks). Branch
-`feat/subscriptions-thread-safety`. **Task groups 1 and 2 are done; 3 onwards are not started.**
-
-What landed: the subscription list is synchronised. It was a bare `std::vector` shared between the
-epoll loop (`apply_delta`) and `MultiMasterManager::io_loop` (`apply_remote_delta`,
-`multi_master.cpp:499`), with no lock — a data race that was latent only because the sole callers of
-`ob_subscribe()` were single-threaded tests. `notify_subscribers()` now takes a
-`std::span<const SnapshotRow>` and is called **once per delta** rather than once per level, so a
-1000-level MINSERT is one lock acquisition and not a thousand. `has_subscribers()` keeps the
-no-subscriber path — every deployment that does not use them, and almost every test — at one relaxed
-atomic read.
-
-What is not built: the wire itself. `CommandType` still has no `SUBSCRIBE`, there is no
-`SubscriptionHub`, no bounded per-subscriber queue, no eventfd waking the epoll loop, no `PUSH`
-framing, no metrics. Design for all of it is in the spec; task group 3 is the next thing to write.
-
-*Two entries used to sit here and no longer describe the code.* "Deference on election cannot tell a
-further replica from a dead one" was true until #72 gave published positions per-node leases. "A node
-that joins an origin's stream mid-way never establishes a contiguous frontier" was true until #76
-made snapshot bootstrap real and #67 closed on it.
+*Entries used to sit here and no longer describe the code, and the list is kept because the pattern
+matters more than any one of them.* "Deference on election cannot tell a further replica from a dead
+one" was true until #72 gave published positions per-node leases. "A node that joins an origin's
+stream mid-way never establishes a contiguous frontier" was true until #76 made snapshot bootstrap
+real and #67 closed on it. "Streaming subscriptions work embedded and not over TCP", plus a whole
+in-flight section describing them as unbuilt, were true until #45 merged — and survived two commits
+past it, which is the ordinary half-life of a status note nothing checks.
 
 ## Before you call a change done
 
