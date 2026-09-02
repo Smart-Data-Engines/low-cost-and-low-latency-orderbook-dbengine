@@ -148,6 +148,31 @@ Two smaller things learned in the same hour, both about believing a command that
 - The engine repository's own count above was quoted in a commit message before it was checked twice.
   The commit is in the history; the number in this document is the corrected one.
 
+### One dismissal of our own code, and why it is not a fix
+
+Every dismissal above is vendored third-party code. **Alert 87 is the first in code we wrote**:
+`cpp/path-injection` on the `--config <path>` value flowing into `std::ifstream` (#32). Dismissed
+`won't fix`, with the reason on the alert and repeated here because a dismissal that only lives in a
+web UI is a decision nobody can review:
+
+> The path is this server's own `--config` argument. Whoever starts the process already reads any
+> file; `--data-dir` is the same shape and unflagged. Sanitising it would break legitimate paths and
+> protect nobody. A bad path is refused with `cannot open config file`.
+
+The distinction worth keeping: path injection is a real class when the path crosses a trust boundary
+— an HTTP parameter, a filename inside an archive, a value from a config file that a less privileged
+user can write. A command-line argument to a service binary does not cross one, because the caller
+already has the privileges the sanitisation would be protecting. Adding a check there is security
+theatre with a cost: it rejects symlinked and relative paths that operators legitimately use.
+
+What would change this answer: if `ob_tcp_server` ever grew a way to be handed a config path by
+something other than its own operator — a management API, a supervisor reading a request — then the
+sink is real and the dismissal must be revisited. That is worth writing down, because a dismissal
+carries an assumption and the assumption is what expires.
+
+And the `PATCH` trap from §2 applies to dismissals too: the state was **read back** after the call
+rather than inferred from a 200.
+
 **The query suite is an open question, deliberately not decided here.** Dropping
 `security-and-quality` for the default suite would remove 44 of the 45 alerts in one line and keep the
 only one with a security severity — and this repository has `-Wall -Wextra -Werror`, ASan, UBSan and

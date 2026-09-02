@@ -402,6 +402,15 @@ ob_add_tcp_test(test_subscription_hub
     test_subscription_hub.cpp
 )
 
+# ── Config file tests (config-file, #32) ──────────────────────────────────────
+ob_add_tcp_test(test_cli_config
+    test_cli_config.cpp
+)
+# Two tests here read src/tcp_server.cpp and check the flag lists against the parser's own branches.
+target_compile_definitions(test_cli_config
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
 # ── Incremental flush tests (incremental-flush, Tasks 6.1–7.3) ────────────────
 add_executable(test_incremental_flush test_incremental_flush.cpp)
 target_link_libraries(test_incremental_flush

@@ -324,11 +324,30 @@ because the two mechanisms overlap there — which is why the three-node test ex
 - Read-only users, per-symbol and per-exchange ACLs, admin-only commands (`FAILOVER`, `MIGRATE`)
 - Effort: M | Impact: Multi-tenant deployments, compliance conversations
 
-### 32. Configuration file support
-- YAML or TOML config, with CLI flags overriding file values. Twenty-plus flags is past the point
-  where flags alone are reasonable for ops
-- Config validation with clear error messages, `--print-config` for support
-- Effort: S | Impact: Ops ergonomics, fewer misconfigurations
+### 32. Configuration file support ✅
+- `--config <path>`, flat `key = value` with `#` comments, CLI flags overriding file values.
+  It was **thirty-seven** flags, not "twenty-plus".
+- Config validation with clear error messages, and `--print-config` which prints the resolved
+  configuration **with the provenance of each value** — default, file, or command line — and exits
+  without opening a port.
+- **The file is rewritten into arguments and handed to the existing parser.** A config key *is* a
+  flag name by construction rather than through a mapping table, there is one type validation and
+  one error message, and precedence falls out of argument order because the parser assigns. The
+  alternative considered first — a declarative option table — would have made the config key a
+  second vocabulary maintained beside the `arg == "--x"` branches, and the symptom of those
+  diverging is a key an operator wrote that does nothing.
+- Two static tests hold the two lists this needs against the parser's own source: the valid keys, and
+  the flags that take no value. A mutation dropping one flag from the list fails the first.
+- **The static test deleted a feature built on a false premise.** A `--no-failover-enabled` negation
+  was added because `failover_enabled` defaults to true and a valueless flag cannot express false —
+  except `--failover-enabled` *takes a value*, so `--failover-enabled false` had always worked. The
+  belief came from reading the default rather than the parser's branch, and the list check disagreed
+  with the list I had written myself.
+- Found in that branch and fixed: `--failover-enabled` mapped anything unrecognised to **false**, so
+  `--failover-enabled tru` silently disabled failover. Same class as #36. The accepted spellings are
+  unchanged; what is new is that a value outside them is refused.
+- Effort: S | Impact: Ops ergonomics, fewer misconfigurations — and it unblocks #33, which packages a
+  default config and a systemd unit
 
 ### 33. Native packaging and cluster bootstrap
 - Distribution packages: `.deb` and `.rpm` built on tag, plus a static tarball for everything else.

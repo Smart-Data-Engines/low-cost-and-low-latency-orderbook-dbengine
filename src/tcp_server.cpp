@@ -5,8 +5,14 @@
 #include "orderbook/metrics_server.hpp"
 #include "orderbook/shard_coordinator.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <fstream>
+#include <map>
+#include <optional>
+#include <set>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -474,10 +480,241 @@ private:
 
 // ── parse_cli_args ────────────────────────────────────────────────────────────
 
-ServerConfig parse_cli_args(int argc, char* argv[]) {
-    ServerConfig config;
+// ── Configuration file ────────────────────────────────────────────────────────
+//
+// The file is rewritten into arguments and handed to the flag parser. Not parsed into a
+// ServerConfig, and that is the design rather than a shortcut:
+//
+//   * a config key *is* a flag name, by construction rather than through a table somebody has to
+//     remember to update — and the symptom of such a table falling behind is a key an operator
+//     wrote that silently does nothing;
+//   * type validation and its error message stay in one place, so a bad value reads the same
+//     whether it came from a file or a flag;
+//   * precedence falls out of argument order, because the parser assigns rather than accumulates.
+//     There is no merge step, so there is no merge step to get wrong.
 
-    ArgCursor cursor(std::span<char* const>(argv, static_cast<std::size_t>(argc)));
+const std::vector<std::string>& known_flags() {
+    // Sorted, and checked against the parser's own source by CliConfigStatic.KnownFlagsMatchTheParser.
+    static const std::vector<std::string> flags = {
+        "anti-entropy-interval-seconds",
+        "config",
+        "coordinator-endpoints",
+        "coordinator-lease-ttl",
+        "data-dir",
+        "election-deference-ms",
+        "election-lease-wait-ms",
+        "failover-enabled",
+        "flush-interval-ms",
+        "handover-cooldown-seconds",
+        "handover-grace-seconds",
+        "log-level",
+        "max-sessions",
+        "max-subscriber-queue-bytes",
+        "max-subscriptions-per-session",
+        "metrics-port",
+        "mm-max-catchup-bytes",
+        "mm-max-peer-send-buffer",
+        "mm-node-id",
+        "mm-replication-port",
+        "multi-master",
+        "no-sqpoll",
+        "node-id",
+        "port",
+        "primary-host",
+        "primary-port",
+        "print-config",
+        "read-only",
+        "replication-compress",
+        "replication-port",
+        "ring-size",
+        "shard-id",
+        "shard-vnodes",
+        "snapshot-chunk-size",
+        "snapshot-staging-dir",
+        "sqpoll-idle-ms",
+        "ttl-hours",
+        "ttl-scan-interval-seconds",
+        "workers",
+    };
+    return flags;
+}
+
+const std::vector<std::string>& boolean_flags() {
+    static const std::vector<std::string> flags = {
+        "multi-master",
+        "no-sqpoll",
+        "print-config",
+        "read-only",
+        "replication-compress",
+    };
+    return flags;
+}
+
+namespace {
+
+[[noreturn]] void config_error(const std::string& path, size_t line, const std::string& message) {
+    std::fprintf(stderr, "Error: %s:%zu: %s\n", path.c_str(), line, message.c_str());
+    std::exit(1);
+}
+
+/// The three closest known keys to `key`, by a cheap edit distance. A refusal that only says
+/// "unknown" leaves an operator comparing their file against a manual character by character.
+std::string suggestions_for(const std::string& key) {
+    auto distance = [](const std::string& a, const std::string& b) {
+        std::vector<size_t> previous(b.size() + 1), current(b.size() + 1);
+        for (size_t j = 0; j <= b.size(); ++j) previous[j] = j;
+        for (size_t i = 1; i <= a.size(); ++i) {
+            current[0] = i;
+            for (size_t j = 1; j <= b.size(); ++j) {
+                const size_t cost = (a[i - 1] == b[j - 1]) ? 0u : 1u;
+                current[j] = std::min({previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost});
+            }
+            previous = current;
+        }
+        return previous[b.size()];
+    };
+
+    std::vector<std::pair<size_t, std::string>> scored;
+    for (const auto& candidate : known_flags()) {
+        scored.emplace_back(distance(key, candidate), candidate);
+    }
+    std::sort(scored.begin(), scored.end());
+    std::string out;
+    for (size_t i = 0; i < scored.size() && i < 3; ++i) {
+        if (i > 0) out += ", ";
+        out += scored[i].second;
+    }
+    return out;
+}
+
+std::string trimmed(std::string_view text) {
+    size_t begin = 0;
+    size_t end = text.size();
+    while (begin < end && std::isspace(static_cast<unsigned char>(text[begin]))) ++begin;
+    while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1]))) --end;
+    return std::string{text.substr(begin, end - begin)};
+}
+
+}  // namespace
+
+std::vector<std::string> config_file_to_args(const std::string& path,
+                                             std::set<std::string>* keys_seen) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        // Refused rather than ignored: a node started with a configuration nobody knows about is
+        // worse than a node that did not start.
+        std::fprintf(stderr, "Error: cannot open config file '%s': %s\n", path.c_str(),
+                     std::strerror(errno));
+        std::exit(1);
+    }
+
+    std::vector<std::string> args;
+    std::set<std::string> seen;
+    std::string line;
+    size_t number = 0;
+
+    while (std::getline(file, line)) {
+        ++number;
+        // A comment runs to end of line, including after a value.
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line.erase(hash);
+        const std::string content = trimmed(line);
+        if (content.empty()) continue;
+
+        const size_t equals = content.find('=');
+        if (equals == std::string::npos) {
+            config_error(path, number,
+                         "expected 'key = value', got '" + content + "'");
+        }
+        const std::string key = trimmed(std::string_view{content}.substr(0, equals));
+        const std::string value = trimmed(std::string_view{content}.substr(equals + 1));
+
+        if (key.empty()) config_error(path, number, "empty key");
+        if (std::find(known_flags().begin(), known_flags().end(), key) == known_flags().end()) {
+            config_error(path, number,
+                         "unknown key '" + key + "'. Closest known keys: " + suggestions_for(key));
+        }
+        if (key == "config") {
+            // A config file that names another one is a chain nobody can debug, and a config file
+            // that names itself is a loop. Refused outright rather than depth-limited.
+            config_error(path, number, "'config' cannot be set from inside a config file");
+        }
+        if (!seen.insert(key).second) {
+            // Last-wins would be a silent choice between two things the operator wrote.
+            config_error(path, number, "'" + key + "' is set more than once");
+        }
+
+        const bool is_boolean =
+            std::find(boolean_flags().begin(), boolean_flags().end(), key) != boolean_flags().end();
+        if (is_boolean) {
+            if (value == "true") {
+                args.push_back("--" + key);
+            } else if (value != "false") {
+                config_error(path, number,
+                             "'" + key + "' takes true or false, got '" + value + "'");
+            }
+            // `false` contributes nothing, and that is only sound because every valueless boolean
+            // defaults to false — asserted by CliConfigStatic.EveryValuelessBooleanDefaultsToFalse.
+            // A valueless flag whose default were true could not be turned off this way.
+            continue;
+        }
+
+        if (value.empty()) {
+            config_error(path, number, "'" + key + "' has no value");
+        }
+        args.push_back("--" + key);
+        args.push_back(value);
+    }
+
+    if (keys_seen) *keys_seen = seen;
+    OB_LOG_INFO("cli", "Read %zu setting(s) from %s", seen.size(), path.c_str());
+    return args;
+}
+
+ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
+    ServerConfig config;
+    std::map<std::string, Origin> origin;
+    bool print_config_requested = false;
+
+    // ── Pre-scan for --config, then merge ────────────────────────────────────────────────────────
+    //
+    // File arguments first, real ones second. Precedence needs no merge logic: the loop below
+    // assigns, so the last occurrence of a flag wins, and the real command line is last.
+    std::string config_path;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string_view{argv[i]} == "--config") {
+            config_path = argv[i + 1];
+            break;
+        }
+    }
+
+    std::vector<std::string> storage;   // owns the strings the merged argv points into
+    std::vector<char*>       merged;
+    std::set<std::string>    from_file;
+    std::set<std::string>    from_command_line;
+
+    if (!config_path.empty()) {
+        // The keys the file set, not the flags it emitted. For a valueless boolean, `= false` emits
+        // nothing at all, so deriving provenance from the emitted arguments would report a key the
+        // operator wrote as coming from the default - the one thing `--print-config` exists not to
+        // do.
+        storage = config_file_to_args(config_path, &from_file);
+    }
+    for (int i = 1; i < argc; ++i) {
+        std::string_view item{argv[i]};
+        if (item.rfind("--", 0) != 0) continue;
+        from_command_line.insert(std::string{item.substr(2)});
+    }
+
+    merged.reserve(storage.size() + static_cast<size_t>(argc) + 1);
+    merged.push_back(argv[0]);
+    for (std::string& item : storage) merged.push_back(item.data());
+    for (int i = 1; i < argc; ++i) merged.push_back(argv[i]);
+
+    for (const std::string& key : from_file) origin[key] = Origin::File;
+    for (const std::string& key : from_command_line) origin[key] = Origin::CommandLine;
+
+    ArgCursor cursor(std::span<char* const>(merged.data(), merged.size()));
     while (cursor.next()) {
         const std::string arg{cursor.arg()};
 
@@ -493,6 +730,11 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
             config.max_subscriber_queue_bytes = cursor.value_as<size_t>();
         } else if (arg == "--max-subscriptions-per-session") {
             config.max_subscriptions_per_session = cursor.value_as<int>();
+        } else if (arg == "--config") {
+            // Consumed in the pre-scan above; this branch exists so the flag is not an unknown one.
+            (void)cursor.value();
+        } else if (arg == "--print-config") {
+            print_config_requested = true;
         } else if (arg == "--read-only") {
             config.read_only = true;
         } else if (arg == "--replication-port") {
@@ -533,8 +775,24 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
         } else if (arg == "--node-id") {
             config.node_id = std::string{cursor.value()};
         } else if (arg == "--failover-enabled") {
+            // Takes a value, so `--failover-enabled false` has always worked - which is worth a note
+            // because a config-file change was almost built on the belief that it did not, from
+            // reading the default rather than this branch.
+            //
+            // What it did do was map anything unrecognised to *false*: `--failover-enabled tru`
+            // silently disabled failover. Same class as #36, where a mistyped flag started the
+            // server. The accepted spellings are unchanged so no existing invocation breaks; what is
+            // new is that a value outside them is refused instead of read as "no".
             const std::string val{cursor.value()};
-            config.failover_enabled = (val == "true" || val == "1" || val == "yes");
+            if (val == "true" || val == "1" || val == "yes") {
+                config.failover_enabled = true;
+            } else if (val == "false" || val == "0" || val == "no") {
+                config.failover_enabled = false;
+            } else {
+                std::fprintf(stderr,
+                    "Error: --failover-enabled expects true or false, got '%s'\n", val.c_str());
+                std::exit(1);
+            }
         } else if (arg == "--ttl-hours") {
             config.ttl_hours = cursor.value_as<uint64_t>();
         } else if (arg == "--ttl-scan-interval-seconds") {
@@ -692,7 +950,93 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
                     config.anti_entropy_interval_sec);
     }
 
-    return config;
+    ResolvedConfig resolved{config, origin};
+
+    if (print_config_requested) {
+        // Printed and exited, without opening a port. Diagnostics that need a free port are useless
+        // exactly when the port is taken - which is one of the situations you reach for them in.
+        std::fputs(format_config(resolved).c_str(), stdout);
+        std::exit(0);
+    }
+
+    return resolved;
+}
+
+std::string format_config(const ResolvedConfig& resolved) {
+    const ServerConfig& c = resolved.config;
+
+    auto where = [&resolved](const char* key) -> const char* {
+        const auto it = resolved.origin.find(key);
+        if (it == resolved.origin.end()) return "default";
+        switch (it->second) {
+            case Origin::File:        return "file";
+            case Origin::CommandLine: return "command line";
+            case Origin::Default:     break;
+        }
+        return "default";
+    };
+
+    std::string out;
+    auto line = [&out, &where](const char* key, const std::string& value) {
+        std::string padded = key;
+        padded.resize(std::max<size_t>(padded.size(), 32), ' ');
+        out += "  " + padded + " " + value + "  (" + where(key) + ")\n";
+    };
+
+    out += "# Resolved configuration. Provenance in brackets: a list of values does not say which\n";
+    out += "# of them you chose, and that is the question this flag exists to answer.\n";
+    line("anti-entropy-interval-seconds", std::to_string(c.anti_entropy_interval_sec));
+    {
+        std::string joined;
+        for (size_t i = 0; i < c.coordinator_endpoints.size(); ++i) {
+            if (i > 0) joined += ",";
+            joined += c.coordinator_endpoints[i];
+        }
+        line("coordinator-endpoints", joined);
+    }
+    line("coordinator-lease-ttl", std::to_string(c.coordinator_lease_ttl));
+    line("data-dir", c.data_dir);
+    line("election-deference-ms", std::to_string(c.election_deference_ms));
+    line("election-lease-wait-ms", std::to_string(c.election_lease_wait_ms));
+    line("failover-enabled", c.failover_enabled ? "true" : "false");
+    line("flush-interval-ms", std::to_string(c.flush_interval_ms));
+    line("handover-cooldown-seconds", std::to_string(c.handover_cooldown_seconds));
+    line("handover-grace-seconds", std::to_string(c.handover_grace_seconds));
+    line("log-level", c.log_level);
+    line("max-sessions", std::to_string(c.max_sessions));
+    line("max-subscriber-queue-bytes", std::to_string(c.max_subscriber_queue_bytes));
+    line("max-subscriptions-per-session", std::to_string(c.max_subscriptions_per_session));
+    line("metrics-port", std::to_string(c.metrics_port));
+    line("mm-max-catchup-bytes", std::to_string(c.mm_max_catchup_bytes));
+    line("mm-max-peer-send-buffer", std::to_string(c.mm_max_peer_send_buf_bytes));
+    line("mm-node-id", std::to_string(c.mm_node_id));
+    line("mm-replication-port", std::to_string(c.mm_replication_port));
+    line("multi-master", c.multi_master ? "true" : "false");
+    line("no-sqpoll", c.uring_no_sqpoll ? "true" : "false");
+    line("node-id", c.node_id);
+    line("port", std::to_string(c.port));
+    line("primary-host", c.primary_host);
+    line("primary-port", std::to_string(c.primary_port));
+    line("read-only", c.read_only ? "true" : "false");
+    line("replication-compress", c.replication_compress ? "true" : "false");
+    line("replication-port", std::to_string(c.replication_port));
+    line("ring-size", std::to_string(c.uring_ring_size));
+    line("shard-id", c.shard_id);
+    line("shard-vnodes", std::to_string(c.shard_vnodes));
+    line("snapshot-chunk-size", std::to_string(c.snapshot_chunk_size));
+    line("snapshot-staging-dir", c.snapshot_staging_dir);
+    line("sqpoll-idle-ms", std::to_string(c.uring_sqpoll_idle_ms));
+    line("ttl-hours", std::to_string(c.ttl_hours));
+    line("ttl-scan-interval-seconds", std::to_string(c.ttl_scan_interval_seconds));
+    line("workers", std::to_string(c.worker_threads));
+    out += "\n";
+    out += "# workers is parsed and not used: client commands run inline on the epoll loop. It is\n";
+    out += "# printed because hiding it would leave an operator tuning a knob that does nothing.\n";
+    return out;
+}
+
+ServerConfig parse_cli_args(int argc, char* argv[]) {
+    return resolve_cli_args(argc, argv).config;
 }
 
 // ── TcpServer ─────────────────────────────────────────────────────────────────

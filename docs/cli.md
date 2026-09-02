@@ -232,6 +232,77 @@ flag with no value fell through, a non-numeric value threw an uncaught `std::inv
 on a port nobody had named. If you have scripts passing flags this binary does not know, they will now
 fail instead of starting a server with a configuration you did not intend.
 
+## Configuration file
+
+Thirty-seven flags is past the point where a command line is a reasonable way to configure a
+service, and a systemd unit carrying them all means an operator changing one setting edits the unit.
+So `--config` reads them from a file:
+
+```ini
+# /etc/orderbook/ob.conf — keys are flag names without the dashes.
+port          = 9090
+data-dir      = /var/lib/orderbook
+max-sessions  = 256          # a comment may follow a value
+log-level     = INFO
+
+# Booleans take true or false.
+multi-master  = true
+mm-node-id    = 1
+read-only     = false
+```
+
+```
+$ ob_tcp_server --config /etc/orderbook/ob.conf
+```
+
+**A key is a flag name.** Not a parallel vocabulary with a mapping table — the file is rewritten into
+command-line arguments and handed to the same parser, so a new flag is a valid key the moment it
+exists, and a value is validated by the same code with the same message whether it came from a file
+or a flag. Two static tests hold that: the list of valid keys is checked against the parser's own
+branches, and so is the list of flags that take no value.
+
+**A flag overrides the file; the file overrides the default.** There is no merge step, because the
+file's arguments simply come first and the parser assigns.
+
+### Seeing what the server resolved
+
+```
+$ ob_tcp_server --config /etc/orderbook/ob.conf --port 9191 --print-config
+# Resolved configuration. Provenance in brackets: a list of values does not say which
+# of them you chose, and that is the question this flag exists to answer.
+  data-dir                         /var/lib/orderbook  (file)
+  log-level                        INFO  (file)
+  max-sessions                     256  (file)
+  port                             9191  (command line)
+  read-only                        false  (default)
+  ...
+```
+
+`--print-config` prints and exits **without opening a port**, so it still works when the port is
+taken — which is one of the situations you reach for it in.
+
+The output includes `workers`, which is parsed and not used: client commands run inline on the epoll
+loop. It is printed rather than hidden, because hiding it would leave an operator tuning a knob that
+does nothing.
+
+### Refusals
+
+A configuration file with a mistake in it does not start a server. Same rule as a mistyped flag:
+
+| What | Message |
+|---|---|
+| unknown key | `unknown key 'prot'. Closest known keys: port, ...` |
+| missing file | `cannot open config file '...'` |
+| line without `=` | `<path>:12: expected 'key = value', got '...'` |
+| the same key twice | `<path>:8: 'port' is set more than once` |
+| non-boolean for a boolean key | `'read-only' takes true or false, got 'yes'` |
+| empty value | `'data-dir' has no value` |
+| `config` inside a config file | `'config' cannot be set from inside a config file` |
+
+Duplicate keys are refused rather than resolved last-wins, because last-wins is a silent choice
+between two things you wrote. A chain of config files is refused outright rather than depth-limited,
+because a depth limit answers "how deep" when the question is "why".
+
 ## Multi-Master Replication
 
 Multi-master mode allows multiple nodes to accept writes simultaneously. All nodes in the cluster replicate data to each other via WAL streaming in a full-mesh topology. Conflicts (concurrent writes to the same price level) are resolved automatically using Last-Writer-Wins (LWW) based on Hybrid Logical Clock (HLC).
