@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -146,6 +147,38 @@ using WALReplayCallbackV2 = std::function<void(const WALReplayContext& ctx)>;
 // next numbered file.
 //
 // flush() calls fsync on the current file descriptor.
+// ── WalPosition ───────────────────────────────────────────────────────────────
+//
+// Where the WAL is: which file, and how far into it. **One value, not two.**
+//
+// It used to be two plain members read by four threads, and the atomicity was the smaller half of
+// the problem. `Engine::get_wal_position()` and `MultiMasterManager::send_handshake()` each read the
+// index on one line and the offset on the next, so a rotation between them produced a pair that
+// never existed - a fresh file index carrying the previous file's offset. That pair feeds the
+// published WAL position which election deference compares to pick the replica furthest ahead
+// (#70, #72), where it reads as a candidate that went backwards by a whole file.
+//
+// Measured before the fix, with a reader polling in a tight loop: **one incoherent pair in about
+// 150 million reads**, in two runs out of three. So the coherence defect is real and rare - the
+// window is two adjacent instructions - while the data race is on *every* concurrent read, which is
+// what ThreadSanitizer reports and what the compiler is entitled to act on.
+struct WalPosition {
+    uint32_t file_index{0};
+    uint32_t offset{0};
+};
+
+static_assert(sizeof(WalPosition) == 8, "WalPosition must fit a lock-free atomic");
+static_assert(std::atomic<WalPosition>::is_always_lock_free,
+              "std::atomic<WalPosition> must be lock-free: an atomic that quietly takes a lock "
+              "would put that lock on the WAL write path, which is the cost this exists to avoid");
+
+/// Largest rotate threshold that keeps the offset inside 32 bits with room to spare.
+///
+/// The offset is 32 bits so the pair fits one atomic. Rotation is checked *after* a write
+/// (`offset >= threshold`), so the offset can exceed the threshold by at most one record - and a
+/// record is bounded by the payload limit, far below the two gigabytes of headroom this leaves.
+inline constexpr size_t MAX_WAL_ROTATE_THRESHOLD = 2ULL << 30;
+
 class WALWriter {
 public:
     explicit WALWriter(std::string_view dir,
@@ -214,11 +247,24 @@ public:
     /// Number of records written since last sync.
     size_t pending_sync_count() const { return pending_sync_; }
 
+    /// Where the WAL is, in one atomic load. Cannot observe a rotation half-applied.
+    ///
+    /// `relaxed`, and that is a decision rather than an omission. A reader wants a coherent *pair*,
+    /// not ordering against other writes: the published position is a heuristic under a lease, not a
+    /// key somebody reads data behind. Coherence here comes from the value being eight bytes, not
+    /// from the memory order, so `acquire`/`release` would cost the write path something and buy
+    /// this mechanism nothing.
+    WalPosition current_position() const { return position_.load(std::memory_order_relaxed); }
+
     /// Index of the WAL file currently being written to.
-    uint32_t current_file_index() const { return file_index_; }
+    uint32_t current_file_index() const { return current_position().file_index; }
 
     /// Current byte offset within the active WAL file.
-    size_t current_offset() const { return written_; }
+    ///
+    /// Prefer :func:`current_position` when you also need the file index. Two calls compose a pair
+    /// from two moments, which is the defect #85 removed; `tests/test_wal_position.cpp` has a static
+    /// test that refuses that shape in `src/`.
+    size_t current_offset() const { return current_position().offset; }
 
     /// Directory where WAL files are stored.
     const std::string& dir() const { return dir_; }
@@ -230,11 +276,19 @@ public:
 
 private:
     int         fd_;
-    size_t      written_;
+
+    /// The only storage for the position. Not a copy published beside `written_` and `file_index_`:
+    /// a copy would need publishing at five mutation sites, and a missed one gives a position that
+    /// is silently stale - a worse symptom than the undefined behaviour it replaces, because a
+    /// sanitizer at least reports that. One location makes the omission unrepresentable.
+    ///
+    /// Written only by the WAL writer, which the engine's mutexes serialise, so the write path does
+    /// load-compute-store rather than a compare-exchange.
+    std::atomic<WalPosition> position_{};
+
     size_t      rotate_threshold_;
     FsyncPolicy fsync_policy_;
     std::string dir_;
-    uint32_t    file_index_;
     size_t      pending_sync_{0};
     uint64_t    current_epoch_{0};
     uint16_t    origin_node_id_{0};  // 0 = legacy mode (no multi-master)
@@ -242,8 +296,14 @@ private:
     // Pre-allocated write buffer to avoid per-record heap allocations.
     std::vector<uint8_t> write_buf_;
 
-    /// Open (or create) the WAL file for file_index_.
-    void open_current();
+    /// Open (or create) the WAL file for `index`, and return how many bytes it already holds.
+    ///
+    /// Deliberately **does not publish** the position: it returns the offset so the caller can store
+    /// the index and the offset as one value. An earlier version incremented the index, then let
+    /// this function store the offset, and that published `(N+1, previous file's offset)` as an
+    /// intermediate state - reintroducing the exact pair #85 exists to remove. The cross-thread test
+    /// caught it at 96 observations in 4.3 million.
+    uint32_t open_current(uint32_t index);
 
     /// Write a complete record (header + payload). Does NOT fsync.
     /// allow_fsync=false writes the record without honouring FsyncPolicy::EVERY. Only

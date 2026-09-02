@@ -10,6 +10,8 @@ import socket
 import pytest
 
 from orderbook_engine import OrderbookEngine
+import pathlib
+import re
 
 pytestmark = pytest.mark.smoke
 
@@ -150,3 +152,44 @@ def test_flush_is_idempotent(primary_client: OrderbookEngine):
     after = len(primary_client.query_all("SMOKE-FLUSH", "BINANCE"))
 
     assert before == after == 1, f"row count changed on second flush: {before} -> {after}"
+
+
+def test_no_module_builds_its_own_server_path() -> None:
+    """Static, over the integration modules. The rule, not the four instances of it.
+
+    Four modules had grown their own `os.path.join(REPO, "build", "ob_tcp_server")` and none of them
+    honoured `OB_SERVER_BINARY`. They start their own nodes rather than using `ClusterManager` -
+    simultaneous starts, crash recovery, multi-master stats, all things the shared fixture
+    deliberately serialises or shares - so each one grew the path and none grew the override.
+
+    The CI failure that exposed it was the cheap part. The expensive part: running any of them
+    against a sanitizer tree silently tested the **plain** build, because a stale
+    `build/ob_tcp_server` was there to be found. `test_mm_stats.py` is one of the three modules
+    `sanitizers-integration (tsan)` had been running since the job was created, so part of a
+    required check had been measuring an uninstrumented binary all along. A check that quietly
+    measures the wrong artefact is worse than no check, because it is believed.
+
+    So the guard is the source, and it has to be: the symptom of a module ignoring the override is a
+    green run, which no assertion inside that run can see.
+    """
+    # Matched on the *shape* of the defect - an assignment naming the binary - rather than on any
+    # mention of "ob_tcp_server". The first version flagged this test's own docstring, which is the
+    # ordinary hazard of a static test that has to describe what it forbids.
+    assignment = re.compile(r"^\s*(SERVER|SERVER_BINARY)\s*=")
+    here = pathlib.Path(__file__).resolve().parent
+    offenders = []
+    for module in sorted(here.glob("test_*.py")):
+        lines = module.read_text(encoding="utf-8").splitlines()
+        for number, line in enumerate(lines, start=1):
+            if not assignment.match(line):
+                continue
+            # The join can span lines - one module wrote it over three - so look at the statement,
+            # not the line.
+            statement = " ".join(lines[number - 1:number + 3])
+            if "ob_tcp_server" in statement and "server_binary_path" not in statement:
+                offenders.append(f"{module.name}:{number}")
+    assert not offenders, (
+        "these lines build a path to the server instead of calling "
+        "conftest.server_binary_path(), so they ignore OB_SERVER_BINARY and will silently test the "
+        f"wrong build: {offenders}"
+    )

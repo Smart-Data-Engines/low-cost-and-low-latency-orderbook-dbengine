@@ -1324,8 +1324,11 @@ void MultiMasterManager::send_handshake(PeerConnection& peer) {
     msg.node_id = config_.node_id;
     msg.protocol_version = MM_PROTOCOL_VERSION;
     msg.compression_preference = config_.compress ? uint8_t(1) : uint8_t(0);
-    msg.wal_file_index = wal_.current_file_index();
-    msg.wal_byte_offset = wal_.current_offset();
+    // One load. These were two adjacent lines, and a rotation between them told the peer to resume
+    // from an offset belonging to the file that had just been closed - see WalPosition (#85).
+    const WalPosition wal_pos = wal_.current_position();
+    msg.wal_file_index = wal_pos.file_index;
+    msg.wal_byte_offset = wal_pos.offset;
 
     uint8_t buf[MM_HANDSHAKE_SIZE];
     msg.serialize(buf);

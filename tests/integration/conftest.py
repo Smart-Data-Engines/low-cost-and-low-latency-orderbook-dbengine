@@ -52,6 +52,29 @@ class NodeInfo:
 # ClusterManager
 # ---------------------------------------------------------------------------
 
+def server_binary_path() -> str:
+    """The server this run tests, honouring OB_SERVER_BINARY.
+
+    One function, because four modules had grown their own copy of
+    `os.path.join(REPO, "build", "ob_tcp_server")` and none of them honoured the override. Those
+    modules start their own nodes rather than using `ClusterManager` - they are about simultaneous
+    starts, crash recovery and multi-master stats, which the shared fixture deliberately serialises
+    or shares - so each grew the path and none grew the override.
+    
+    What that cost is worse than the CI failure that exposed it: running any of them against a
+    sanitizer tree silently tested the **plain** build, because a stale `build/ob_tcp_server` was
+    there to be found. `test_mm_stats.py` is one of the three modules the TSan job had been running
+    since it was created, so part of that job had been checking an uninstrumented binary all along.
+    A required check that quietly measures the wrong artefact is worse than no check.
+
+    `test_binary_path_is_shared` in `test_smoke.py` refuses a module that builds its own.
+    """
+    from_env = os.environ.get("OB_SERVER_BINARY")
+    if from_env:
+        return from_env
+    return str(Path(__file__).resolve().parents[2] / "build" / "ob_tcp_server")
+
+
 class ClusterManager:
     """Manage the full lifecycle of an integration-test cluster:
     a native etcd process + 2 ob_tcp_server nodes.

@@ -567,7 +567,7 @@ and getting data into their existing Python stack without a copy.
 - `GROUP BY time_bucket(interval)`, OHLCV bar generation, time-weighted mid price, rolling windows
 - Effort: L | Impact: This is what people build on top of orderbook data anyway
 
-### 45. Streaming subscriptions
+### 45. Streaming subscriptions ✅
 - `SUBSCRIBE 'SYM'.'EXCH'` pushing updates to the client
 - Backpressure policy per subscriber, slow-consumer disconnect
 - **The claim has been corrected in the meantime, because it was the half that was free.** The
@@ -578,7 +578,7 @@ and getting data into their existing Python stack without a copy.
   What does not exist: any way to ask for it over TCP. `CommandType` has no `SUBSCRIBE`, and
   `QueryEngine::execute()` says so outright ("SUBSCRIBE via execute() is not supported"). A network
   client polls. The README now says exactly that.
-- **Built, and not yet closed.** Spec: `kiro-workspace/specs/streaming-subscriptions/`.
+- **Done.** Spec: `kiro-workspace/specs/streaming-subscriptions/`.
   `SUBSCRIBE 'SYM'.'EXCH'` and `UNSUBSCRIBE [id]` are wire commands; the server pushes matching rows
   as `PUSH <id>` with the same seven columns as a query row. Bounded queue per subscriber
   (`--max-subscriber-queue-bytes`, 8 MB ≈ 140 000 rows), overflow closes the session, per-session
@@ -598,10 +598,10 @@ and getting data into their existing Python stack without a copy.
   unconditional while the type is *not* trivially default constructible — the `{}` on its three
   padding members gives it a real default constructor, so every write ran a thousand of them and
   touched 48 KB of stack whether anyone was subscribed or not. 2559 → 4511 ns/op, 6/6 rounds.
-- **Still open:** task 6.3, running the subscription module under TSan in
-  `sanitizers-integration (tsan)`. Blocked on **#85** — doing it now makes a required check red for a
-  pre-existing race in the WAL position accessors, which that module is simply the first thing to
-  reach.
+- **Closed by #85.** Task 6.3 was blocked on it: running the subscription module under TSan reported
+  a pre-existing race in the WAL position accessors, which that module was simply the first thing to
+  reach. With #85 fixed, `sanitizers-integration (tsan)` runs the whole battery — this module
+  included.
 - Effort: M | Impact: Real-time consumers stop polling
 
 ### 46. Apache Arrow output
@@ -656,10 +656,18 @@ codebase. Each item is also a story we can sell as bespoke work.
 Two jobs, added in two steps and for two different reasons.
 
 **`sanitizers-integration (tsan)`** came first, as a side effect of #80: it installs etcd, builds the
-server under ThreadSanitizer and runs the multi-master modules against a real three-node cluster,
-failing on any sanitizer report. It was the first CI job to run the pytest suite at all. Its scope is
-deliberately narrow — the modules that kill nodes are outside it, because their fixtures wait on
-timings that instrumentation makes unreliable.
+server under ThreadSanitizer and runs the integration battery against real clusters, failing on any
+sanitizer report. It was the first CI job to run the pytest suite at all.
+
+*Its scope used to be three multi-master modules, and the stated reason for that was a hypothesis
+that turned out to be false.* The note here said the modules that kill nodes were excluded "because
+their fixtures wait on timings that instrumentation makes unreliable". When #85 finally ran the whole
+battery under TSan, all nineteen modules passed with zero reports — including `test_failover.py`,
+`test_failover_dead_state.py` and `test_crash_recovery.py`, the three that `SIGKILL` a server. The
+narrow scope had cost something concrete: none of those modules starts the failover monitor, so the
+WAL position race in `publish_position_if_due()` was never on a TSan build, and it sat there for
+months. **A comment justifying a gap in coverage is a hypothesis** — the same lesson as #80 itself,
+and the third time this repository has paid for it.
 
 **`integration-tests`** is the rest: the whole suite against a plain build, and therefore the half
 that gates what the narrow job cannot — failover, crash recovery under `SIGKILL`, and the
@@ -1568,32 +1576,55 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
-### 85. The WAL position is read from four threads without synchronisation, as an inconsistent pair
+### 85. The WAL position was read from four threads without synchronisation, as an inconsistent pair ✅
 
-- `WALWriter::current_offset()` and `current_file_index()` return plain members that
-  `write_record()` mutates. TSan reports the read from `FailoverManager::publish_position_if_due()`
-  against the write from the flush thread; the same members are also read by
-  `ReplicationManager`, by `MultiMasterManager::io_loop` and by the `STATUS` handler.
-- **The atomicity is the smaller half.** The two are read as a *pair* and must agree:
-  `multi_master.cpp:1327-1328` takes the file index on one line and the offset on the next, so a
-  rotation between them yields `(new index, old offset)` — a position that never existed, used to
-  ask a peer for a catch-up range. Stale is survivable; incoherent is not.
-- It reaches a decision, which is why this is not cosmetic: `get_wal_position()` feeds the published
-  position that election deference compares to pick the replica furthest ahead (#70, #72). A
-  position that never existed can decide who becomes primary.
-- **Found by running the subscription integration module under TSan** (#45, task 6.3), and it is
-  not caused by that work: the same report appears from `test_replication.py` and
-  `test_aggregations.py`, which predate it. It had been invisible because
-  `sanitizers-integration (tsan)` runs only the three multi-master modules, and none of those starts
-  the failover monitor. That is the #80 lesson a second time — a gap in sanitizer coverage justified
-  by a comment, and the comment was wrong again.
-- A seqlock is not available here: `orderbook_soa`'s does not compile under TSan (#83), so this needs
-  either atomics with a paired accessor whose incoherence is documented and tolerated by every
-  caller, or a lock the write path can afford. Deciding which is the work.
-- Blocks #45 task 6.3: adding the subscription module to the TSan job before this is fixed makes a
-  required check red for a defect it did not introduce.
-- Effort: M | Impact: Correctness of failover and of catch-up ranges, and it unblocks running the
-  whole integration battery under TSan rather than a third of it
+- `WALWriter::current_offset()` and `current_file_index()` returned plain members that
+  `write_record()` mutates. TSan reported the read from `FailoverManager::publish_position_if_due()`
+  against the write from the flush thread.
+- **The atomicity was the smaller half.** The two were read as a *pair* by two separate loads, so a
+  rotation between them yielded a position that never existed. Measured before the fix with a reader
+  polling in a tight loop: **one incoherent pair in about 150 million reads, in two runs out of
+  three.** So the coherence defect was real and rare — the window is two adjacent instructions —
+  while the data race was on *every* concurrent read.
+- It reached a decision, which is why rare was not the same as harmless: `get_wal_position()` feeds
+  the published position that election deference compares to pick the replica furthest ahead
+  (#70, #72). And the static test found more sites than the report did: **two snapshot manifests**
+  composed the pair as well, which is the point a joining peer catches up from.
+- **Fix:** one `std::atomic<WalPosition>` **replacing** the two members rather than published beside
+  them, because a copy would need publishing at five mutation sites and a missed one gives a
+  silently stale position — a worse symptom than the UB it replaces, which a sanitizer at least
+  reports. `static_assert(is_always_lock_free)`, because an atomic that quietly takes a lock would
+  put that lock on the WAL write path. The offset narrows to 32 bits, so the constructor **refuses**
+  a rotate threshold above 2 GiB rather than clamping it.
+- **My own implementation reintroduced the defect and the test caught it in one run.** The first
+  rotation published `(N+1, previous file's offset)` as an intermediate state, because it
+  incremented the index and let `open_current()` store the offset afterwards: 96 backwards
+  observations in 4.3 million. `open_current(index)` now *returns* the offset and rotation is a
+  single store.
+- **Cost on the write path: none measurable.** `BM_IngestionThroughput`, i3-7100U, Release, six
+  interleaved rounds against `eeb1698`: 2490.0 ns/op (cv 1.31%) against 2466.5 ns/op (cv 0.71%),
+  median of per-round ratios 0.9905 over 0.973-1.008. That is inside this machine's resolution and
+  is not claimed as a speed-up. `objdump` of `write_record` confirms the claim the design rests on:
+  zero `lock`, `cmpxchg`, `mfence` or `xchg` — the relaxed load and store are plain moves.
+- **And the gap that hid it is closed:** `sanitizers-integration (tsan)` runs the **whole** battery
+  now, not three modules. This also unblocked task 6.3 of #45.
+- **Widening the job found a second defect, and it is the worse one.** Four modules built their own
+  `os.path.join(REPO, "build", "ob_tcp_server")` and ignored `OB_SERVER_BINARY` — they start their
+  own nodes rather than using `ClusterManager`, so each grew the path and none grew the override.
+  Consequence in CI: three of them **skipped** (14 tests, reported as skips in a summary nobody
+  reads) and the fourth crashed on a missing file. `test_cpp_client.py` skipped another seven for the
+  same reason with its own harness path. Consequence locally, which is worse: a stale
+  `build/ob_tcp_server` was there to be found, so a per-module check of "clean under TSan" reported
+  clean for runs in which **TSan was not present at all** — and `test_mm_stats.py` is one of the
+  three modules this job had been running since it was created. *Part of a required check had been
+  measuring an uninstrumented binary since the day it was written.*
+  Fixed with one `server_binary_path()` in `conftest.py`, a derivation for the client harness, a
+  static test in `test_smoke.py` that refuses a module building its own path, and a CI step that
+  **fails the job on any skip** — the same shape as the SDE repository's step checking its PostgreSQL
+  cross-section did not skip.
+- Verified as CI will run it: **145 tests, zero skips, zero ThreadSanitizer reports**, 8m25s on the
+  development machine. The earlier claim of "19 modules, 154 tests, zero reports" was made before
+  this was found and was wrong for four of those modules.
 
 ### 84. MM_PEERS counted inbound connections that had not said who they were ✅
 
@@ -2460,11 +2491,14 @@ Things a reviewer will notice, listed here so they do not look like oversights:
   told `busy` rather than queued.
 - **Benchmark baselines were recorded on one developer machine** with no hardware description. The
   table below fixes that going forward. Any published number needs its hardware next to it.
-- **Streaming subscriptions work embedded and not over TCP** (#45). `Engine::subscribe()` and
-  `ob_subscribe()` really do push rows to a callback, and `notify_subscribers()` runs on every write,
-  but `CommandType` has no `SUBSCRIBE`, so a network client polls. The README used to list the
-  feature without that distinction and now states it; the claim was the half that was free to fix,
-  the wire protocol is still open.
+- **A subscriber that stops reading is disconnected, not throttled** (#45). Each subscription has an
+  8 MB queue ceiling — roughly 140 000 rows — and past it the session is closed with
+  `ob_subscription_overflow_disconnects_total` incremented. There is no flow control and no
+  resumption: a consumer that needs continuity re-reads with `SELECT` from a known sequence number
+  (#65). And a cancelled subscription may deliver one more row, because a notification already in
+  flight is not recalled.
+  *(This bullet used to say subscriptions worked embedded and not over TCP. That was true until #45
+  closed.)*
 - **Aggregation SIMD is opt-in and off by default** (`OB_ENABLE_AVX2=OFF`), so default builds do not
   show the SIMD numbers.
 

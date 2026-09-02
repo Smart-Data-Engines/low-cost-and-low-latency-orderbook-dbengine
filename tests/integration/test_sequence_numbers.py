@@ -22,12 +22,11 @@ import tempfile
 import time
 
 import pytest
+from conftest import server_binary_path
 
 pytestmark = pytest.mark.smoke
 
-SERVER = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "build", "ob_tcp_server")
+SERVER = server_binary_path()
 
 
 def free_port() -> int:

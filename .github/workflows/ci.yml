@@ -510,8 +510,12 @@ jobs:
 
       - name: Configure and build the server under TSan
         run: |
-          cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DOB_ENABLE_TSAN=ON -DOB_BUILD_TESTS=OFF
-          cmake --build build-tsan -j$(nproc) --target ob_tcp_server
+          cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DOB_ENABLE_TSAN=ON -DOB_BUILD_TESTS=ON
+          cmake --build build-tsan -j$(nproc) --target ob_tcp_server ob_integration_test
+          # ob_integration_test as well as the server: test_cpp_client.py skips all seven of its
+          # tests when that binary is absent, and a skipped integration test is indistinguishable
+          # from a passing one in a summary line. Building it puts the C++ client's wire handling
+          # under TSan too, which is where a client and a server disagreeing about bytes would show.
 
       - name: Install Python package and test extras
         run: |
@@ -519,16 +523,51 @@ jobs:
           .venv/bin/pip install -q --upgrade pip
           .venv/bin/pip install -q -e ".[test]"
 
-      - name: Run the multi-master modules against the TSan server
+      # The whole battery, not a subset — and the subset is what hid #85 for months.
+      #
+      # This job used to run three multi-master modules. None of them starts the failover monitor,
+      # because multi-master has no election, so `FailoverManager::publish_position_if_due()` was
+      # never on a TSan build — and that is where the WAL position race lived. The subset had been
+      # chosen around the defect we were fixing when the job was written (#80), which is exactly the
+      # shape of gap #80 itself was about: coverage justified by an argument that stops being true.
+      #
+      # Cost, stated: this takes minutes rather than the two the subset took, because TSan slows the
+      # server and the battery is ~154 tests. That is the price of a check that speaks for the whole
+      # tree. Verified clean per module before switching it on — all 19 modules, zero reports.
+      #
+      # Binance modules are excluded because they need the live feed and skip without it, which in a
+      # summary line is indistinguishable from passing.
+      - name: Run the integration battery against the TSan server
         env:
           OB_INTEGRATION_TESTS: "1"
           OB_SERVER_BINARY: ${{ github.workspace }}/build-tsan/ob_tcp_server
           TSAN_OPTIONS: detect_deadlocks=1:second_deadlock_stack=1:halt_on_error=0:log_path=${{ github.workspace }}/tsan-report
         run: |
-          PYTHONPATH=$PWD/python .venv/bin/python -m pytest -q \
-            tests/integration/test_mm_convergence.py \
-            tests/integration/test_mm_stats.py \
-            tests/integration/test_mm_snapshot_bootstrap.py
+          set -o pipefail
+          PYTHONPATH=$PWD/python .venv/bin/python -m pytest -q -rs \
+            --ignore=tests/integration/test_binance_live.py \
+            --ignore=tests/integration/test_binance_failover_sync.py \
+            tests/integration/ | tee tsan-pytest.log
+
+      # A skip in this job is a failure, and that is not pedantry — it is the defect this job just
+      # had. Three modules built their own path to `build/ob_tcp_server`, ignored OB_SERVER_BINARY,
+      # and therefore **skipped** in CI: fourteen tests reported as skips in a summary nobody reads,
+      # while the job stayed green and claimed to speak for the battery. `test_cpp_client.py` skipped
+      # another seven for a missing binary. The same shape as the SDE repository's step that checks
+      # its PostgreSQL cross-section did not skip.
+      - name: Fail if anything skipped
+        run: |
+          # A non-zero count, not the word. The first version matched "[0-9]+ skipped" and the
+          # summary line reads "0 skipped", so the guard against a false negative produced a false
+          # positive on its first run — with the battery green underneath it. Worth the two lines of
+          # comment: a check that fires on the *presence of a word* rather than on a *count* is the
+          # same class of mistake as the thing it was added to catch.
+          if grep -qE "[1-9][0-9]* skipped" tsan-pytest.log; then
+            echo "Tests skipped in the sanitizer battery. A skip here reads as a pass:"
+            grep -E "^SKIPPED|[1-9][0-9]* skipped" tsan-pytest.log
+            exit 1
+          fi
+          echo "No skips."
 
       - name: Fail on any ThreadSanitizer report
         run: |

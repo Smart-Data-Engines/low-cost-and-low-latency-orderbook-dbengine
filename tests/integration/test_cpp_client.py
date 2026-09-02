@@ -16,6 +16,7 @@ import pathlib
 import subprocess
 
 import pytest
+import os
 
 pytestmark = pytest.mark.cpp_client
 
@@ -28,6 +29,19 @@ BINARY_CANDIDATES = [
 
 
 def find_binary() -> pathlib.Path | None:
+    """The client harness, from the same build tree as the server under test.
+
+    `OB_SERVER_BINARY` comes first and is derived rather than guessed: the harness lives at
+    `<build>/tests/ob_integration_test` beside the server's `<build>/ob_tcp_server`. Without this
+    the sanitizer job pointed at `build-tsan/` and this module looked in `build/`, so all seven of
+    its tests skipped - and a skipped integration test is indistinguishable from a passing one in a
+    summary line. That is the same defect four other modules had with the server path itself.
+    """
+    from_env = os.environ.get("OB_SERVER_BINARY")
+    if from_env:
+        derived = pathlib.Path(from_env).resolve().parent / "tests" / "ob_integration_test"
+        if derived.is_file():
+            return derived
     for candidate in BINARY_CANDIDATES:
         if candidate.is_file():
             return candidate
