@@ -207,19 +207,30 @@ def main():
     data_dir = tempfile.mkdtemp(prefix="ob_binance_plot_")
 
     print(f"Starting ob_tcp_server on port {tcp_port}...")
+    # A file rather than `subprocess.PIPE`, for two reasons that both bit. A pipe nobody drains
+    # fills at 64 KB and stops the node inside `write()` — slow to arrive at WARN, but this script
+    # runs for minutes against a live feed. And the failure handler below used to call
+    # `server_proc.stderr.read()`, which waits for EOF: with a process that is alive and not
+    # answering — the case it was written for — it hung instead of printing.
+    log_path = os.path.join(data_dir, "server.log")
+    server_log = open(log_path, "w", encoding="utf-8", buffering=1)
     server_proc = subprocess.Popen(
         [SERVER_BINARY, "--port", str(tcp_port),
          "--data-dir", data_dir,
          "--metrics-port", str(metrics_port),
          "--log-level", "WARN"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=server_log,
+        stderr=subprocess.STDOUT,
     )
 
     try:
         if not wait_for_server(tcp_port):
-            stderr = server_proc.stderr.read().decode(errors="replace")
-            print(f"ERROR: Server failed to start. stderr:\n{stderr}")
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
+                    tail = "".join(handle.readlines()[-40:])
+            except OSError as exc:
+                tail = f"(no log at {log_path}: {exc})"
+            print(f"ERROR: Server failed to start. Its log:\n{tail}")
             sys.exit(1)
         print(f"Server ready on port {tcp_port}")
 
@@ -395,6 +406,7 @@ def main():
         except subprocess.TimeoutExpired:
             server_proc.kill()
             server_proc.wait(timeout=5)
+        server_log.close()   # after the process is gone, or it writes into a closed handle
         shutil.rmtree(data_dir, ignore_errors=True)
         print("Server stopped, temp data cleaned up.")
 

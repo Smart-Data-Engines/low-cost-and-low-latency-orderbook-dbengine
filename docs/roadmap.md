@@ -1682,13 +1682,65 @@ ignore checks.
   assertion **polls for thirty seconds** rather than sampling once — the property is that the
   outgoing node *ends up* a replica, and a single sample asserts it gets there within five seconds,
   which is an assertion about the machine.
+- **The third occurrence said the most, and none of it was about the test.** It failed at 40.81 s —
+  the thirty-second poll exhausted — reporting `UNREACHABLE`. That word now means something precise:
+  `role_of()` returns it for an `OSError` that is *not* a `socket.timeout`, so it is a **refused
+  connection**. A node that is slow, or blocked, keeps its listening socket and times out instead. A
+  refusal means nothing is listening: the node is gone, or has closed its listener. That is a server
+  finding, and the reason it took three runs to reach is that three separate layers were blind.
+- **Layer one, and it is a CI defect worth its own line: the step that would have explained the
+  failure only ran when there was nothing to explain.** `Fail on any ThreadSanitizer report` sits
+  after the pytest step, and in GitHub Actions a step following a failed step is **skipped** —
+  confirmed against the API, which reports `skipped` for it on the red run. So every race report
+  ThreadSanitizer wrote on all three occurrences was deleted with the runner, unread. It now carries
+  `if: always()`, with the rule written next to it: `always()` belongs on a step surfacing evidence
+  that **exists only on the runner**. Checked `coverage` and `package` against that rule and left
+  both alone — a coverage percentage from a failed suite is not a measurement, and a `.deb` rebuilds
+  locally.
+- **Layer two: the harness could not see a dead node.** Every node's stdout and stderr went to a
+  `subprocess.PIPE` that nothing ever read, and both `healthy_cluster` and `healthy_mm_cluster`
+  restart whatever is not running — with **no way to tell a deliberate `kill_node()` from a crash**.
+  These modules kill nodes on purpose constantly, so a node that died of its own accord was repaired
+  in silence while the suite stayed green. Not a workaround for a known defect: an inability to see
+  one. Fixed three ways — nodes log to a file in their own data directory (**appended**, because
+  `restart_node()` reuses the directory and `"w"` would delete the evidence in the act of repairing
+  the cluster), `unexplained_deaths()` reports any node that is not running and was not killed by a
+  test, and the handover assertion prints liveness, exit status and the node's own log tail.
+  `unexplained_deaths()` was verified by mutation — a node killed behind the harness's back produces
+  `node-1 (index 1, port 45999) is not running and no test killed it: signal 9` plus its log.
+- **Layer three, measured, and it corrects a workspace note rather than confirming it.** I had
+  written that the unread pipes fill because nodes log at DEBUG. The binary's default is **INFO**.
+  Measured on i3-7100U, Release, default level: 2000 writes cost **153 bytes in total** — writes are
+  not logged at INFO — but **each client connection costs ~153 bytes**, so the 64 KB pipe fills at
+  roughly **418 connections per node**. The `cluster` fixture is session-scoped across 145 tests,
+  each opening a connection per command, so the battery goes past that: a node blocking inside
+  `write()` was reachable, and is now impossible. It is a real hazard removed, and it is **not** the
+  cause of this failure — a blocked node refuses nothing.
 - **What is still open is the server side, and it is the interesting half:** if the node closes a
   client session while stepping down, an operator issuing `FAILOVER` sees a dropped connection rather
   than an answer, and cannot tell success from a refused command. That is a real interface question
-  and not a test problem. Answering it is now cheaper than it was, because the helper distinguishes
-  the three cases at the point of failure instead of collapsing them into one word.
-- Effort: S for the test half (done), M for the server half | Impact: a required check that fails at
-  random trains everyone to re-run it, which is how a real failure gets re-run too
+  and not a test problem.
+  The third occurrence sharpened it into something falsifiable: the node **stopped listening
+  altogether** for the whole thirty seconds, which is a larger claim than closing one session. Two
+  candidates remain and the exit status separates them. Reading the server narrowed it to those two
+  and no further: `UNREACHABLE` requires that nothing is listening, and only two paths get there —
+  the process is gone, or `draining_` is set, which closes `listen_fd_` and then ends the loop once
+  sessions drain, so that path ends the process too. `draining_` has exactly **one** writer,
+  `TcpServer::shutdown()`, reachable only from the `SIGINT`/`SIGTERM` handler; `SIGPIPE` is ignored
+  and nothing on the failover path calls it. Nothing in `demote_to_replica()` touches `listen_fd_`,
+  and while `failover.cpp` contains **zero `catch`** — so an exception on the monitor thread would
+  call `std::terminate` — the manual etcd parser guards `npos` at all five `substr` sites, so that
+  trigger is not present.
+  **So the node was signalled or it died, and the likeliest producer is memory.** ThreadSanitizer
+  multiplies a process's footprint several times, this job runs three nodes plus etcd on one shared
+  runner, and an OOM kill arrives as `SIGKILL` with no report of any kind — which fits every
+  observation: only under TSan, only sometimes, no race report, and a refusal rather than a timeout.
+  The assertion now prints the exit status, so `signal 9` would settle it. Guessing beyond that is
+  not worth it: the next red run reports which, because the three layers above no longer discard the
+  answer.
+- Effort: S for the test half (done), S for the diagnostic half (done), M for the server half |
+  Impact: a required check that fails at random trains everyone to re-run it, which is how a real
+  failure gets re-run too
 
 ### 85. The WAL position was read from four threads without synchronisation, as an inconsistent pair ✅
 
