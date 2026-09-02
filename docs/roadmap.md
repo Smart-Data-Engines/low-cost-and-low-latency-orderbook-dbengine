@@ -1671,11 +1671,22 @@ ignore checks.
   added for (#60 made every `FAILOVER` answer `ERR unknown_target`, so an `ERR` is still a failure)
   while no longer asserting when the acknowledgement arrives. The two assertions that follow check
   the property the test is named after.
+- **The first fix was not enough, and the second occurrence said something new.** It failed again
+  under ThreadSanitizer with a different assertion: `the outgoing primary reports 'UNREACHABLE'
+  after handing the role over`. `role_of()` had the same defect `send_command()` had — it returned
+  `"UNREACHABLE"` for anything raising `OSError`, which covers a refused connection *and* a
+  `socket.timeout`, since that is an `OSError` subclass. A node that was merely slow read exactly
+  like a node that was gone. One function away from the one that was fixed, which is pitfall 63's
+  shape: two functions, the same mistake, and fixing one.
+  So `role_of()` now answers `NO_ANSWER_YET`, `CLOSED_WITHOUT_REPLY` or `UNREACHABLE`, and the
+  assertion **polls for thirty seconds** rather than sampling once — the property is that the
+  outgoing node *ends up* a replica, and a single sample asserts it gets there within five seconds,
+  which is an assertion about the machine.
 - **What is still open is the server side, and it is the interesting half:** if the node closes a
   client session while stepping down, an operator issuing `FAILOVER` sees a dropped connection rather
   than an answer, and cannot tell success from a refused command. That is a real interface question
-  and not a test problem. Establishing it needs the node's own log at the moment of the close, which
-  the harness does not currently keep for a passing-then-failing case.
+  and not a test problem. Answering it is now cheaper than it was, because the helper distinguishes
+  the three cases at the point of failure instead of collapsing them into one word.
 - Effort: S for the test half (done), M for the server half | Impact: a required check that fails at
   random trains everyone to re-run it, which is how a real failure gets re-run too
 
