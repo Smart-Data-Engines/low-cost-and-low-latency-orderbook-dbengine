@@ -571,6 +571,23 @@ Learned the hard way. Check here before debugging.
     The same branch turned out to map anything unrecognised to *false*, so `--failover-enabled tru`
     silently disabled failover — pitfall 27 again, in a flag that had a value all along.
 
+80. **One green run is not a measurement, and I used it as one.** Two failover tests failed on a PR
+    and passed locally three times including under build load, so I pushed an empty commit off
+    master to see whether master failed too. It passed — once — and I concluded the branch was at
+    fault. It was not: a bisect branch carrying **only** the server change passed the plain
+    integration job and failed the same test under ThreadSanitizer *on the same commit*. Four job
+    executions across three branches, failing in three, is the measurement; the single baseline was
+    the anecdote that pointed the wrong way. Design the experiment to distinguish, and if the answer
+    rests on n=1, run it again before acting on it.
+81. **A helper that returns the same value for two different events makes every failure
+    undiagnosable.** `send_command()` slept 0.3 s and took one `recv`, so an orderly close and a
+    reply that had not arrived yet both came back as `''`. The assertion could then only say "no
+    OK", which is true of a server that refused, a server that closed, and a server that was still
+    thinking — and `FAILOVER` legitimately takes seconds. Most of the diagnosis time went on
+    re-deriving from CI logs what the helper had thrown away. **Where two outcomes need different
+    responses, they need different return values**, and an exception is the cheapest way to stop a
+    caller from conflating them by accident.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
