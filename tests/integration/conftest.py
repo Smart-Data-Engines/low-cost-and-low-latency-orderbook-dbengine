@@ -52,6 +52,50 @@ class NodeInfo:
 # ClusterManager
 # ---------------------------------------------------------------------------
 
+def open_node_log(data_dir: str) -> "io.TextIOWrapper":
+    """A file for a node's stdout and stderr, in its own data directory.
+
+    **Not `subprocess.PIPE`.** Nothing here ever read those pipes, and a pipe nobody drains fills at
+    64 KB — after which the node blocks inside `write()`, stops serving, and still looks alive to
+    `poll()`. Measured on this machine (i3-7100U, Release, default log level, which is INFO and not
+    DEBUG as the workspace notes claimed): 2000 writes cost **153 bytes** in total, because writes
+    are not logged at INFO — but **each client connection costs ~153 bytes**. That puts the ceiling
+    at roughly **418 connections per node**, and the `cluster` fixture is session-scoped across 145
+    tests, each opening a connection per command. The battery goes past that.
+
+    Honest about what it does *not* explain: the failure that sent me looking reported the outgoing
+    primary as `UNREACHABLE`, which `role_of()` returns for a refused connection and not for a
+    timeout. A node blocked in `write()` keeps its listening socket, so it times out rather than
+    refusing. So this is a real hazard removed, not the cause of that run — and the same change is
+    what makes the cause findable, because a file survives to be read.
+
+    `scripts/mm_harness.py` — the harness written *to find* defects — logs each node to its own file
+    and says in its docstring that this is how #61 was found. The pytest fixture did not, and the
+    difference stayed invisible until the pipes mattered.
+
+    A file also gives the diagnosis roadmap #86 asked for and did not have: the node's own log at the
+    moment it stopped answering.
+    """
+    path = os.path.join(data_dir, "node.log")
+    exists = os.path.exists(path)
+    # Append: `restart_node()` reuses the data directory, so "w" would truncate the log of the node
+    # that had just died — deleting the evidence in the act of repairing the cluster.
+    handle = open(path, "a", encoding="utf-8", buffering=1)
+    if exists:
+        handle.write("\n──────── node restarted, same data directory ────────\n")
+    return handle
+
+
+def tail_node_log(node: "NodeInfo", lines: int = 40) -> str:
+    """The end of a node's log, for an assertion that needs to say why rather than what."""
+    path = os.path.join(node.data_dir, "node.log")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return "".join(handle.readlines()[-lines:])
+    except OSError as exc:
+        return f"(no log at {path}: {exc})"
+
+
 def server_binary_path() -> str:
     """The server this run tests, honouring OB_SERVER_BINARY.
 
@@ -99,6 +143,13 @@ class ClusterManager:
         self.etcd_binary: str = (
             etcd_binary or os.environ.get("OB_ETCD_BINARY") or "etcd"
         )
+        # Open log files, closed on shutdown. Held by the manager rather than by NodeInfo because a
+        # restart replaces the NodeInfo and the old handle still needs closing.
+        self._node_logs: list = []
+        # Indices this harness killed on purpose. Without it, teardown cannot tell a test that
+        # killed a node from a node that died on its own, and it silently restarts both — which is
+        # how a crashing node stays invisible for as long as the tests around it pass.
+        self._deliberately_killed: set = set()
         self.etcd_client_port: int = 0
         self.etcd_peer_port: int = 0
         self.etcd_data_dir: str = ""
@@ -151,6 +202,15 @@ class ClusterManager:
                 self._stop_node(node)
             except Exception:
                 pass
+
+        # After the nodes are stopped, not before: a live node writing into a closed handle gets
+        # EBADF, which is the freeze this replaced wearing a different hat.
+        for log in self._node_logs:
+            try:
+                log.close()
+            except Exception:
+                pass
+        self._node_logs = []
 
         try:
             self._stop_etcd()
@@ -384,10 +444,12 @@ class ClusterManager:
                 "--mm-replication-port", str(mm_replication_port),
             ]
 
+        log = open_node_log(data_dir)
+        self._node_logs.append(log)
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=log,
+            stderr=subprocess.STDOUT,
         )
 
         return NodeInfo(
@@ -491,6 +553,7 @@ class ClusterManager:
 
     def restart_node(self, node_index: int) -> None:
         """Restart a node keeping the same ports and data-dir."""
+        self._deliberately_killed.discard(node_index)
         old = self.nodes[node_index]
         self._stop_node(old)
 
@@ -529,16 +592,46 @@ class ClusterManager:
                 "--mm-replication-port", str(old.mm_replication_port),
             ]
 
+        log = open_node_log(new.data_dir)
+        self._node_logs.append(log)
         new.process = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=log,
+            stderr=subprocess.STDOUT,
         )
         self.nodes[node_index] = new
         self._wait_for_node(new, timeout=15)
 
+    def unexplained_deaths(self) -> list:
+        """Nodes that are not running and were not killed by a test, with their own last words.
+
+        Read **before** restarting anything: `restart_node()` reuses the data directory, and the
+        point of this list is the evidence rather than the count.
+
+        This exists because the opposite existed for months. Both `healthy_cluster` and
+        `healthy_mm_cluster` restart whatever is not running, and neither could distinguish a
+        deliberate `kill_node()` from a crash — so a node that died of its own accord was repaired
+        in silence and the suite stayed green. It is the harness-workaround lesson in its purest
+        form: the fixture was not hiding a defect it knew about, it was unable to see one.
+        """
+        deaths = []
+        for index, node in enumerate(self.nodes):
+            if index in self._deliberately_killed:
+                continue
+            if node.process is None:
+                continue
+            code = node.process.poll()
+            if code is None:
+                continue
+            how = f"signal {-code}" if code < 0 else f"exit code {code}"
+            deaths.append(
+                f"{node.node_id} (index {index}, port {node.tcp_port}) is not running and no test "
+                f"killed it: {how}.\n--- tail of its own log ---\n{tail_node_log(node)}")
+        return deaths
+
     def kill_node(self, node_index: int) -> None:
-        """SIGKILL a node (simulate crash)."""
+        """SIGKILL a node (simulate crash), and record that this was on purpose."""
+        self._deliberately_killed.add(node_index)
         node = self.nodes[node_index]
         if node.process and node.process.poll() is None:
             node.process.kill()
@@ -957,6 +1050,9 @@ def healthy_mm_cluster(mm_cluster: ClusterManager) -> Generator[ClusterManager, 
     """
     yield mm_cluster
 
+    # Before the repair, not after: restarting reuses the data directory.
+    deaths = mm_cluster.unexplained_deaths()
+
     for index, node in enumerate(mm_cluster.nodes):
         if node.process is None or node.process.poll() is not None:
             mm_cluster.restart_node(index)
@@ -965,6 +1061,13 @@ def healthy_mm_cluster(mm_cluster: ClusterManager) -> Generator[ClusterManager, 
     # module that has been streaming live market data leaves a WAL worth replaying.
     # A tighter timeout here failed once with the node still coming up.
     mm_cluster.wait_for_mm_mesh(timeout=90)
+
+    # Raised after the mesh is whole, so the next test starts from a good cluster and this reads as
+    # a defect rather than as a cascade.
+    if deaths:
+        raise AssertionError(
+            "A multi-master node died during this test and no test killed it:\n\n"
+            + "\n\n".join(deaths))
 
 
 @pytest.fixture(scope="module")
@@ -998,6 +1101,11 @@ def healthy_cluster(failover_cluster: ClusterManager) -> Generator[ClusterManage
     cluster = failover_cluster
     yield cluster
 
+    # Before the repair, not after: restarting reuses the data directory. These modules kill nodes
+    # on purpose all the time, so the distinction is the whole value — `unexplained_deaths()` skips
+    # anything `kill_node()` recorded.
+    deaths = cluster.unexplained_deaths()
+
     for index, node in enumerate(cluster.nodes):
         if node.process is None or node.process.poll() is not None:
             cluster.restart_node(index)
@@ -1024,6 +1132,12 @@ def healthy_cluster(failover_cluster: ClusterManager) -> Generator[ClusterManage
             f"cluster not restored after the test: expected exactly one primary, "
             f"roles={roles}"
         )
+
+    # Last, so the cluster is whole first: a death report that leaves the next module a broken
+    # cluster turns one finding into a page of unrelated red.
+    if deaths:
+        raise AssertionError(
+            "A node died during this test and no test killed it:\n\n" + "\n\n".join(deaths))
 
 
 @pytest.fixture

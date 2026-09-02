@@ -24,6 +24,7 @@ import urllib.request
 
 import pytest
 from conftest import server_binary_path
+import re
 
 pytestmark = pytest.mark.multi_master
 
@@ -185,3 +186,26 @@ def test_metrics_scrape_on_a_multi_master_node_does_not_kill_it(mm_node):
     assert mm_node.alive(), (
         f"the node died answering a metrics scrape (exit={mm_node.exit_code()}) — the same "
         f"stats() path STATUS uses, and the one a monitoring system hits every few seconds")
+
+
+def test_a_multi_master_node_does_not_report_itself_as_standalone(mm_node):
+    """Every metric carried `node_role="standalone"` on a multi-master node.
+
+    `set_node_role()` was called only from `promote_to_primary()` and `demote_to_replica()`, and a
+    multi-master node runs neither, so the default stood. An operator scraping a three-node mesh saw
+    three nodes each claiming to be alone — the one thing that label exists to distinguish — while
+    `ROLE` on the wire correctly answered `MULTI_MASTER`. Two operator-facing signals disagreeing,
+    and the metric was the wrong one.
+
+    Found by running `scripts/bootstrap-cluster.sh` and reading the metrics endpoint it prints,
+    which is the argument for a bootstrap script that tells you where to look.
+    """
+    mm_node.start()
+    body = mm_node.scrape()
+
+    found = sorted(set(re.findall(r'node_role="([a-z_]+)"', body)))
+    assert "multi_master" in found, (
+        f"a multi-master node labelled its metrics {found} rather than multi_master")
+    assert 'node_role="standalone"' not in body, (
+        "the node still labels itself standalone somewhere; the label is set once, so a mixture "
+        "means two places set it")

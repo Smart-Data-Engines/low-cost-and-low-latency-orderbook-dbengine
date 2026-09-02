@@ -187,6 +187,7 @@ class MMCluster:
         self.etcd_client_port: int = 0
         self.etcd_peer_port: int = 0
         self.etcd_binary: str = os.environ.get("OB_ETCD_BINARY") or "etcd"
+        self._logs: list = []
         self.etcd_data_dir: str = ""
         self.etcd_process = None
         self._etcd_log = None
@@ -233,7 +234,8 @@ class MMCluster:
             "--anti-entropy-interval-seconds", "1",
             "--log-level", "WARN",
         ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        log = self._open_log(old.data_dir)
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
         self.nodes[index] = NodeInfo(
             index=old.index, process=proc, tcp_port=old.tcp_port,
             replication_port=old.replication_port, metrics_port=old.metrics_port,
@@ -254,6 +256,13 @@ class MMCluster:
                         node.process.wait(timeout=5)
             except Exception:
                 pass
+        # After the nodes are gone: a live node writing into a closed handle gets EBADF.
+        for log in self._logs:
+            try:
+                log.close()
+            except Exception:
+                pass
+        self._logs = []
         try:
             self._stop_etcd()
         except Exception:
@@ -358,10 +367,25 @@ class MMCluster:
             "--anti-entropy-interval-seconds", "1",
             "--log-level", "WARN",
         ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        log = self._open_log(data_dir)
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
         return NodeInfo(index=index, process=proc, tcp_port=tcp_port,
                         replication_port=repl_port, metrics_port=metrics_port,
                         data_dir=data_dir, node_id=node_id)
+
+    def _open_log(self, data_dir: str):
+        """A node's log as a file, kept open until shutdown.
+
+        Not `subprocess.PIPE`: nothing here reads one, and a pipe nobody drains fills at 64 KB and
+        stops the node inside `write()`. `--log-level WARN` below makes that slow to arrive, not
+        impossible — and this script runs against a live feed for minutes. A failover script that
+        freezes the node whose failover it measures reports a false result, which is worse than a
+        hang. The integration fixture had the same defect at DEBUG level, where it arrived in
+        seconds; see `open_node_log()` in `tests/integration/conftest.py`.
+        """
+        log = open(os.path.join(data_dir, "node.log"), "w", encoding="utf-8", buffering=1)
+        self._logs.append(log)
+        return log
 
     def _wait_for_node(self, node: NodeInfo, timeout: float = 15.0):
         deadline = time.monotonic() + timeout

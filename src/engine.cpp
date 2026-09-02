@@ -137,6 +137,15 @@ void Engine::open() {
             failover_mgr_->set_role(NodeRole::MULTI_MASTER);
         }
 
+        // And tell the metrics registry, which nothing did. `set_node_role()` was called only from
+        // promote_to_primary() and demote_to_replica(), neither of which a multi-master node runs,
+        // so every metric it exported carried the default `node_role="standalone"`. An operator
+        // scraping a three-node mesh saw three nodes each claiming to be alone — the one thing that
+        // label exists to distinguish — while `ROLE` on the wire correctly answered MULTI_MASTER.
+        // Two operator-facing signals disagreeing, and the metric was the wrong one. Found by
+        // running scripts/bootstrap-cluster.sh and reading its own metrics endpoint.
+        registry_.set_node_role("multi_master");
+
         mm_mgr_->start();
 
         // NOTE: ReplicationManager is NOT created in MM mode.

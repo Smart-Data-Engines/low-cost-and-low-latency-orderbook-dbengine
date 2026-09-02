@@ -390,11 +390,32 @@ value.** Checked by grepping the sources rather than assumed:
   setting in a database was unreachable. Added, with an unrecognised value refused rather than read
   as the default.
 
-- **Still open:** `scripts/bootstrap-cluster.sh` — three multi-master nodes on one host or across
-  hosts over SSH, native processes, one command. The package had to exist first for the script to
-  have something to stand up.
-- Effort: M, part one done | Impact: Time-to-first-run drops from an hour to minutes, without a
-  container layer between the engine and the hardware
+**Part two: `scripts/bootstrap-cluster.sh`, single host, verified.** Three multi-master nodes plus
+etcd as native processes, a configuration file per node in the same shape as `/etc/orderbook/ob.conf`,
+and a wait for **every node seeing both peers as connected** rather than for the ports to open — a
+node that is merely listening can accept a write and have nobody to send it to.
+
+- **The SSH half is deliberately not a script**, and this is a scope decision rather than an
+  omission: it could not be verified here — `sshd` is installed but inactive and no key is set up,
+  and standing one up is a change to a developer's machine rather than a test. A deployment script
+  nobody has run is worse than a procedure someone has read, so `docs/operations.md` carries the
+  multi-host procedure with the two things that bite (`mm-replication-port` is a different port from
+  the client one, and etcd must be reachable from *every* node). Verifying a script would need a
+  second host, which is a decision with an owner.
+- **Three defects in it, each from running it rather than reading it.** The readiness check counted
+  lines containing `node_id` and always got 1, because that appears in the header and never in a peer
+  row — counting `connected` is also the stronger condition, since #84 made `MM_PEERS` list
+  connections still in their handshake. `stop` printed "stopped" and returned while all three nodes
+  were still draining, so it now waits and escalates with a message rather than reporting a state it
+  has not confirmed. And `case "$1"` under `set -u` failed with no argument.
+- **And it found a defect in the engine.** Every metric on a multi-master node carried
+  `node_role="standalone"`: `set_node_role()` is called only from `promote_to_primary()` and
+  `demote_to_replica()`, neither of which a multi-master node runs. An operator scraping a three-node
+  mesh saw three nodes each claiming to be alone — the one thing that label exists to distinguish —
+  while `ROLE` on the wire correctly answered `MULTI_MASTER`. Two operator-facing signals
+  disagreeing, and the metric was the wrong one. Fixed, with an integration test.
+- Effort: M, done except the SSH script | Impact: Time-to-first-run drops from an hour to minutes,
+  without a container layer between the engine and the hardware
 
 ### 34. Backup, restore, point-in-time recovery
 - `ob_backup` / `ob_restore` tooling on top of existing snapshots plus WAL
@@ -1650,13 +1671,76 @@ ignore checks.
   added for (#60 made every `FAILOVER` answer `ERR unknown_target`, so an `ERR` is still a failure)
   while no longer asserting when the acknowledgement arrives. The two assertions that follow check
   the property the test is named after.
+- **The first fix was not enough, and the second occurrence said something new.** It failed again
+  under ThreadSanitizer with a different assertion: `the outgoing primary reports 'UNREACHABLE'
+  after handing the role over`. `role_of()` had the same defect `send_command()` had — it returned
+  `"UNREACHABLE"` for anything raising `OSError`, which covers a refused connection *and* a
+  `socket.timeout`, since that is an `OSError` subclass. A node that was merely slow read exactly
+  like a node that was gone. One function away from the one that was fixed, which is pitfall 63's
+  shape: two functions, the same mistake, and fixing one.
+  So `role_of()` now answers `NO_ANSWER_YET`, `CLOSED_WITHOUT_REPLY` or `UNREACHABLE`, and the
+  assertion **polls for thirty seconds** rather than sampling once — the property is that the
+  outgoing node *ends up* a replica, and a single sample asserts it gets there within five seconds,
+  which is an assertion about the machine.
+- **The third occurrence said the most, and none of it was about the test.** It failed at 40.81 s —
+  the thirty-second poll exhausted — reporting `UNREACHABLE`. That word now means something precise:
+  `role_of()` returns it for an `OSError` that is *not* a `socket.timeout`, so it is a **refused
+  connection**. A node that is slow, or blocked, keeps its listening socket and times out instead. A
+  refusal means nothing is listening: the node is gone, or has closed its listener. That is a server
+  finding, and the reason it took three runs to reach is that three separate layers were blind.
+- **Layer one, and it is a CI defect worth its own line: the step that would have explained the
+  failure only ran when there was nothing to explain.** `Fail on any ThreadSanitizer report` sits
+  after the pytest step, and in GitHub Actions a step following a failed step is **skipped** —
+  confirmed against the API, which reports `skipped` for it on the red run. So every race report
+  ThreadSanitizer wrote on all three occurrences was deleted with the runner, unread. It now carries
+  `if: always()`, with the rule written next to it: `always()` belongs on a step surfacing evidence
+  that **exists only on the runner**. Checked `coverage` and `package` against that rule and left
+  both alone — a coverage percentage from a failed suite is not a measurement, and a `.deb` rebuilds
+  locally.
+- **Layer two: the harness could not see a dead node.** Every node's stdout and stderr went to a
+  `subprocess.PIPE` that nothing ever read, and both `healthy_cluster` and `healthy_mm_cluster`
+  restart whatever is not running — with **no way to tell a deliberate `kill_node()` from a crash**.
+  These modules kill nodes on purpose constantly, so a node that died of its own accord was repaired
+  in silence while the suite stayed green. Not a workaround for a known defect: an inability to see
+  one. Fixed three ways — nodes log to a file in their own data directory (**appended**, because
+  `restart_node()` reuses the directory and `"w"` would delete the evidence in the act of repairing
+  the cluster), `unexplained_deaths()` reports any node that is not running and was not killed by a
+  test, and the handover assertion prints liveness, exit status and the node's own log tail.
+  `unexplained_deaths()` was verified by mutation — a node killed behind the harness's back produces
+  `node-1 (index 1, port 45999) is not running and no test killed it: signal 9` plus its log.
+- **Layer three, measured, and it corrects a workspace note rather than confirming it.** I had
+  written that the unread pipes fill because nodes log at DEBUG. The binary's default is **INFO**.
+  Measured on i3-7100U, Release, default level: 2000 writes cost **153 bytes in total** — writes are
+  not logged at INFO — but **each client connection costs ~153 bytes**, so the 64 KB pipe fills at
+  roughly **418 connections per node**. The `cluster` fixture is session-scoped across 145 tests,
+  each opening a connection per command, so the battery goes past that: a node blocking inside
+  `write()` was reachable, and is now impossible. It is a real hazard removed, and it is **not** the
+  cause of this failure — a blocked node refuses nothing.
 - **What is still open is the server side, and it is the interesting half:** if the node closes a
   client session while stepping down, an operator issuing `FAILOVER` sees a dropped connection rather
   than an answer, and cannot tell success from a refused command. That is a real interface question
-  and not a test problem. Establishing it needs the node's own log at the moment of the close, which
-  the harness does not currently keep for a passing-then-failing case.
-- Effort: S for the test half (done), M for the server half | Impact: a required check that fails at
-  random trains everyone to re-run it, which is how a real failure gets re-run too
+  and not a test problem.
+  The third occurrence sharpened it into something falsifiable: the node **stopped listening
+  altogether** for the whole thirty seconds, which is a larger claim than closing one session. Two
+  candidates remain and the exit status separates them. Reading the server narrowed it to those two
+  and no further: `UNREACHABLE` requires that nothing is listening, and only two paths get there —
+  the process is gone, or `draining_` is set, which closes `listen_fd_` and then ends the loop once
+  sessions drain, so that path ends the process too. `draining_` has exactly **one** writer,
+  `TcpServer::shutdown()`, reachable only from the `SIGINT`/`SIGTERM` handler; `SIGPIPE` is ignored
+  and nothing on the failover path calls it. Nothing in `demote_to_replica()` touches `listen_fd_`,
+  and while `failover.cpp` contains **zero `catch`** — so an exception on the monitor thread would
+  call `std::terminate` — the manual etcd parser guards `npos` at all five `substr` sites, so that
+  trigger is not present.
+  **So the node was signalled or it died, and the likeliest producer is memory.** ThreadSanitizer
+  multiplies a process's footprint several times, this job runs three nodes plus etcd on one shared
+  runner, and an OOM kill arrives as `SIGKILL` with no report of any kind — which fits every
+  observation: only under TSan, only sometimes, no race report, and a refusal rather than a timeout.
+  The assertion now prints the exit status, so `signal 9` would settle it. Guessing beyond that is
+  not worth it: the next red run reports which, because the three layers above no longer discard the
+  answer.
+- Effort: S for the test half (done), S for the diagnostic half (done), M for the server half |
+  Impact: a required check that fails at random trains everyone to re-run it, which is how a real
+  failure gets re-run too
 
 ### 85. The WAL position was read from four threads without synchronisation, as an inconsistent pair ✅
 

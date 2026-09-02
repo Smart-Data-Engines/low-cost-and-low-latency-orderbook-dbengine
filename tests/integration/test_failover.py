@@ -27,6 +27,7 @@ import urllib.request
 
 import pytest
 
+from conftest import tail_node_log
 from orderbook_engine import OrderbookEngine, OrderbookError
 
 pytestmark = pytest.mark.failover
@@ -76,8 +77,24 @@ def send_command(port: int, command: str, timeout: float = 10.0) -> str:
 
 
 def role_of(port: int, timeout: float = 5.0) -> str:
+    """The node's own answer to ROLE, or why it did not give one.
+
+    Three outcomes, not two. The first version returned `"UNREACHABLE"` for anything that raised
+    `OSError` — which covers a refused connection *and* a `socket.timeout`, since that is an
+    `OSError` subclass. So a node that was merely slow read exactly like a node that was gone, and
+    the assertion built on it could not say which.
+
+    That distinction is not academic here: a node in the middle of a demotion is doing etcd work,
+    tearing down a replication manager and starting a client, and under ThreadSanitizer it can take
+    longer than five seconds to answer. Same defect as `send_command()` had before #86, one function
+    away — which is pitfall 63's shape: two functions, the same mistake, and fixing one.
+    """
     try:
         return send_command(port, "ROLE", timeout=timeout).strip().upper()
+    except socket.timeout:
+        return "NO_ANSWER_YET"
+    except ClosedWithoutReply:
+        return "CLOSED_WITHOUT_REPLY"
     except OSError:
         return "UNREACHABLE"
 
@@ -193,9 +210,29 @@ def test_handover_lands_on_the_named_target(healthy_cluster):
     # that same instant — which it never had, because it first has to notice the empty leader key.
     # So the outgoing node kept answering ROLE with PRIMARY, and a client discovering the primary
     # by asking would keep writing to the node that had just given the role away.
-    outgoing_role = role_of(primary.tcp_port)
+    # Polled, not sampled once. The property is that the outgoing node *ends up* a replica, and a
+    # single `role_of()` five seconds after the handover asserts that it gets there within five
+    # seconds — which is an assertion about the machine rather than about the mechanism. It failed
+    # exactly that way under ThreadSanitizer, reporting 'UNREACHABLE' — and the widened vocabulary
+    # is what made the next question answerable. `UNREACHABLE` is a refused connection, not a
+    # timeout: a slow or blocked node keeps its listening socket and times out instead. A refusal
+    # means nothing is listening, so the node is gone or has closed its listener — a server finding
+    # rather than a test one. The assertion below therefore reports liveness, exit status and the
+    # node's own log, because three red runs of this job were diagnosed with none of the three.
+    outgoing_role = ""
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        outgoing_role = role_of(primary.tcp_port)
+        if "REPLICA" in outgoing_role:
+            break
+        time.sleep(0.5)
     assert "REPLICA" in outgoing_role, (
-        f"the outgoing primary reports {outgoing_role!r} after handing the role over")
+        f"the outgoing primary still reports {outgoing_role!r} thirty seconds after handing the "
+        f"role over. 'NO_ANSWER_YET' means it is up and not answering ROLE, which is a different "
+        f"complaint from 'UNREACHABLE'.\n"
+        f"alive={primary.process is not None and primary.process.poll() is None} "
+        f"exit={None if primary.process is None else primary.process.poll()}\n"
+        f"--- tail of {primary.node_id} own log ---\n{tail_node_log(primary)}")
 
     # And refuse writes, which is the consequence that costs data rather than confusion.
     refused = send_command(primary.tcp_port, "INSERT HANDOVER EX bid 100000 1 1")

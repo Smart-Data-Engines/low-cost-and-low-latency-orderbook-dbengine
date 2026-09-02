@@ -76,7 +76,10 @@ Peer discovery pipeline, worth memorising because breaking any link fails silent
 
 ## Logging
 
-Default level is DEBUG. Do not economise on logs.
+The default level is **INFO** (`TcpServerConfig::log_level{"INFO"}`); `--log-level DEBUG`
+raises it. Do not economise on logs — but read the default from the header rather than from a
+document about it: this line said DEBUG for months, and it is what made a log-volume estimate
+wrong by an order of magnitude while chasing pitfall 91.
 
 | Level | Use for |
 |-------|---------|
@@ -627,6 +630,67 @@ Learned the hard way. Check here before debugging.
     ruleset, and **read the ruleset back** — this API answers 200 for writes that change nothing.
     Then fix the count wherever prose states it; it was in two documents.
 
+87. **A readiness check that counts the wrong token always answers the same thing.** The bootstrap
+    script waited for `MM_PEERS` to show two peers by counting lines containing `node_id` — which
+    appears in the *header* and never in a peer row, so the count was always 1 and the wait always
+    timed out against a cluster that was up and healthy. Counting `connected` is also the stronger
+    condition, because #84 made `MM_PEERS` list connections still in their handshake, and a peer
+    that is listed but not connected cannot receive a write. Third instance of this shape today: a
+    guard matching `[0-9]+ skipped` fired on `0 skipped`, and one matching `LimitMEMLOCK` matched the
+    comment explaining its absence.
+88. **`SIGTERM` is a request, so a script that reports "stopped" without waiting reports a state it
+    has not confirmed.** `stop` killed three nodes and printed success while all three were still
+    draining and flushing — which is what a graceful shutdown does. It now polls `kill -0`, and on
+    timeout escalates *and says so*, pointing at the log: a node that will not drain in fifteen
+    seconds has something to say.
+89. **Writing an operator-facing tool is how operator-facing defects get found.** Running
+    `scripts/bootstrap-cluster.sh` and reading the metrics endpoint it prints showed every metric on
+    a multi-master node labelled `node_role="standalone"` — `set_node_role()` is called only from
+    `promote_to_primary()` and `demote_to_replica()`, and a multi-master node runs neither. So a
+    three-node mesh reported three nodes each claiming to be alone, the one thing that label exists
+    to distinguish, while `ROLE` on the wire answered `MULTI_MASTER` correctly. Two operator-facing
+    signals disagreeing; the metric was the wrong one.
+
+90. **A CI step placed after a step that can fail is skipped, so the step that explains a failure
+    only runs when there is nothing to explain.** `Fail on any ThreadSanitizer report` sat behind
+    the pytest step and reported `skipped` on three consecutive red runs — checked against the API,
+    not assumed. Every race report ThreadSanitizer wrote was deleted with the runner, unread, while
+    I patched the test three times. The rule, so `always()` does not get sprinkled everywhere:
+    **`if: always()` belongs on a step that surfaces evidence existing only on the runner.** A race
+    report from a loaded shared runner is that; a coverage percentage from a failed suite is not a
+    measurement, and a `.deb` that failed verification rebuilds locally in a minute. Same family as
+    a required job nobody requires: **a mechanism that exists only when it is redundant.**
+
+91. **A `subprocess.PIPE` nobody reads freezes the process; it does not merely lose the logs.** The
+    pipe fills at 64 KB and the node blocks inside `write()` — it stops serving and still looks
+    alive to `poll()`. Measured (i3-7100U, Release, default level): 2000 writes cost **153 bytes in
+    total**, because writes are not logged at INFO, but **each client connection costs ~153 bytes**,
+    putting the ceiling at roughly **418 connections per node**. The `cluster` fixture is
+    session-scoped across 145 tests, so the battery goes past it. Second half, in the diagnostic
+    path itself: `server_proc.stderr.read()` in a "server failed to start" handler **waits for EOF**,
+    so with a process that is alive and not answering — the case it was written for — it hangs
+    instead of printing.
+
+92. **A refused connection and a timeout are different failures, and the difference turned a test
+    problem into a server finding.** A process that is slow **or blocked** keeps its listening
+    socket, so it times out. **A refusal means nothing is listening** — the node died or closed its
+    listener. While the helper returned one word for both, three red runs read as "the test
+    flickers"; once separated, the same run said "the outgoing primary stopped listening for thirty
+    seconds", which is a claim about the engine and can be falsified.
+
+93. **A fixture that repairs a dead node without distinguishing a deliberate kill from a crash
+    cannot see a crash, and stays green.** `healthy_cluster` and `healthy_mm_cluster` restarted
+    whatever was not running, and the failover modules kill nodes constantly, so a node that died on
+    its own was repaired in silence. Not a workaround for a known defect — an inability to see one.
+    `kill_node()` now records the intent and `unexplained_deaths()` reports the rest with its exit
+    status and log tail. Verified by mutation: a node killed behind the harness's back yields
+    `node-1 ... is not running and no test killed it: signal 9`.
+
+94. **`open(path, "w")` on restart deletes the evidence you just decided to keep.**
+    `restart_node()` reuses the data directory, so repairing the cluster truncated the log of the
+    node that had died a second earlier. Append, with a separator — and gather the death report
+    **before** the repair, because the value of that list is the evidence rather than the count.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -635,8 +699,8 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 802 C++ tests (`ctest -j1`, ~2 min) and 145 integration tests plus 2
-opt-in Binance skips (`pytest tests/integration/`, ~8 min), all green, and **no `xfail` left** —
+**Where the suites stand:** 802 C++ tests (`ctest -j1`, ~2 min) and 146 integration tests plus 2
+opt-in Binance skips (`pytest tests/integration/`, ~8 min on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that
 fails the job on any skip, and the tree also builds and tests under Clang. Twelve required checks on

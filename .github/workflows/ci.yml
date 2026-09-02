@@ -607,8 +607,15 @@ jobs:
       # while the job stayed green and claimed to speak for the battery. `test_cpp_client.py` skipped
       # another seven for a missing binary. The same shape as the SDE repository's step that checks
       # its PostgreSQL cross-section did not skip.
+      # `if: always()`, and this is not belt-and-braces — a step placed after a failing step is
+      # **skipped**, so this guard and the report below only ever ran when they had nothing to say.
       - name: Fail if anything skipped
+        if: always()
         run: |
+          if [ ! -f tsan-pytest.log ]; then
+            echo "No pytest log: the battery step did not get far enough to produce one."
+            exit 0
+          fi
           # A non-zero count, not the word. The first version matched "[0-9]+ skipped" and the
           # summary line reads "0 skipped", so the guard against a false negative produced a false
           # positive on its first run — with the battery green underneath it. Worth the two lines of
@@ -621,7 +628,30 @@ jobs:
           fi
           echo "No skips."
 
+      # Evidence for the leading hypothesis about #86, and it costs two seconds. ThreadSanitizer
+      # multiplies a process's footprint, this job runs three nodes plus etcd on one shared runner,
+      # and an OOM kill arrives as SIGKILL with no report of any kind — indistinguishable, from the
+      # test's side, from a node that closed its listener on purpose. The kernel says so plainly if
+      # anybody asks it.
+      - name: Memory, and whether the kernel killed anything
+        if: always()
+        run: |
+          free -m || true
+          echo "── kernel OOM lines, if any ──"
+          sudo dmesg 2>/dev/null | grep -iE "out of memory|oom-kill|killed process" || echo "none"
+
+      # The step that explains a failure must run **on** failure. Three consecutive red runs of
+      # this job were diagnosed blind because this step sat behind the one that failed: any race
+      # report ThreadSanitizer wrote was deleted with the runner, unread. The same shape as a
+      # required job nobody requires — coverage that exists only when it is not needed.
+      #
+      # The rule this follows, so that its absence elsewhere is a decision and not an oversight:
+      # `if: always()` belongs on a step that surfaces **evidence which exists only on the runner**.
+      # A race report from a loaded shared runner is that; a coverage percentage from a suite that
+      # failed is not a measurement at all, and a `.deb` that failed verification rebuilds locally
+      # in a minute. `coverage` and `package` were both checked against this and left alone.
       - name: Fail on any ThreadSanitizer report
+        if: always()
         run: |
           shopt -s nullglob
           reports=(tsan-report.*)
