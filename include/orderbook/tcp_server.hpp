@@ -10,6 +10,8 @@
 #include "orderbook/subscription_hub.hpp"
 
 #include <atomic>
+#include <map>
+#include <set>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -163,7 +165,64 @@ std::string execute_command(const Command& cmd,
                             ShardCoordinator* shard_coord = nullptr,
                             SubscriptionHub* hub = nullptr);
 
+/// Where a configuration value came from. For `--print-config`, which exists to answer exactly
+/// that: a list of values does not tell an operator which of them they chose.
+enum class Origin { Default, File, CommandLine };
+
+/// Every flag `parse_cli_args()` accepts, without the leading dashes — which is also the set of
+/// valid keys in a config file, because a key *is* a flag name.
+///
+/// Hand-written here and checked against the parser's own source by a static test
+/// (`CliConfigStatic.KnownFlagsMatchTheParser`). Generating it into the build would give the same
+/// guarantee at the cost of a build step; a static test in a required check is cheaper. What neither
+/// tolerates is a hand-written list with nothing checking it, because a list that falls behind the
+/// parser shows up as a config key an operator wrote that does nothing.
+const std::vector<std::string>& known_flags();
+
+/// The flags that take no value on the command line.
+///
+/// In a config file these take `true` or `false`; `false` emits nothing, because for a valueless
+/// flag absence *is* false. That is only sound while every one of them defaults to false, which
+/// `CliConfigStatic.EveryValuelessBooleanDefaultsToFalse` asserts — a valueless flag whose default
+/// were true could not be turned off this way, and the symptom would be `= false` silently ignored.
+///
+/// `--failover-enabled` is **not** here: it takes a value, so `--failover-enabled false` has always
+/// worked. Worth stating, because a negation flag was nearly added on the belief that it had not —
+/// read from the default rather than from the parser.
+const std::vector<std::string>& boolean_flags();
+
+/// Read a config file into synthetic command-line arguments, in file order.
+///
+/// `port = 9090` becomes `--port 9090`; `multi-master = true` becomes `--multi-master`;
+/// `multi-master = false` contributes nothing. Comments run from `#` to end of line.
+///
+/// The file is rewritten into arguments rather than parsed into a ServerConfig, and that is the
+/// whole design: the key is a flag name **by construction** instead of through a mapping table, the
+/// type validation and its error message stay in one place, and precedence falls out of argument
+/// order because the parser assigns rather than accumulates.
+///
+/// Every refusal exits the process with a message naming the line number or the key. A config file
+/// with a typo in it must not start a server — the same rule as #36, where a mistyped flag did.
+/// `keys_seen`, when given, receives the **config keys** the file set — not the flags emitted for
+/// them. `failover-enabled = false` emits `--no-failover-enabled`, and recording provenance under
+/// the emitted name would report the key the operator wrote as coming from the default.
+std::vector<std::string> config_file_to_args(const std::string& path,
+                                             std::set<std::string>* keys_seen = nullptr);
+
 /// Parse CLI arguments into a ServerConfig. Applies defaults for missing args.
+///
+/// With `--config <path>`, the file is read first and the real command line second, so a flag
+/// overrides a file value and a file value overrides a default.
 ServerConfig parse_cli_args(int argc, char* argv[]);
+
+/// The same, plus where each value came from. `parse_cli_args()` is this without the provenance.
+struct ResolvedConfig {
+    ServerConfig                 config;
+    std::map<std::string, Origin> origin;   ///< flag name (no dashes) -> where it came from
+};
+ResolvedConfig resolve_cli_args(int argc, char* argv[]);
+
+/// Render a resolved configuration for a human, sorted, with the provenance of each value.
+std::string format_config(const ResolvedConfig& resolved);
 
 } // namespace ob
