@@ -235,6 +235,12 @@ public:
     /// Stop the replication server.
     void stop();
 
+    /// Whether the replication loop is running.
+    ///
+    /// Exposed because it is the state `stop()`'s early return reads, and that return used to mean
+    /// *stopping* rather than *stopped* - a distinction a test cannot make without seeing this.
+    bool is_running() const { return running_.load(std::memory_order_acquire); }
+
     /// Broadcast a WAL record to all connected replicas (non-blocking enqueue).
     /// Called by Engine after WALWriter::append().
     void broadcast(const WALRecord& hdr, const void* payload, size_t payload_len);
@@ -256,6 +262,32 @@ private:
 
     mutable std::mutex         mtx_;
     std::vector<ReplicaInfo>   replicas_;
+
+    /// Serialises `stop()`, so that its early return means *stopped* rather than *stopping*.
+    ///
+    /// The old guard was `if (!running_) return;` followed by `running_ = false;` and only then the
+    /// join. A second caller therefore saw `false` and returned **without joining** — and its next
+    /// act was usually destroying this object, whose destructor calls `stop()` and hits the same
+    /// guard. So a joinable `std::thread` was destroyed, which calls `std::terminate`: the node died
+    /// with `SIGABRT` and printed `terminate called without an active exception`.
+    ///
+    /// Reached by a graceful `FAILOVER`: the outgoing primary revokes its own lease, so the
+    /// unconditional lease-lost demotion from #82 fires while the handover's own demotion is still
+    /// running, and both call `stop()` on this manager. Diagnosed from the node's own log in #86,
+    /// fixed as #88.
+    ///
+    /// Held across the join on purpose. Releasing it first would let the second caller return while
+    /// the first is still inside this object, which is the same hazard wearing a smaller window.
+    /// Not `mtx_`: the epoll thread takes that one, so holding it across a join is the deadlock
+    /// pitfall 41 came from.
+    ///
+    /// Lock order is `stop_mtx_` → `mtx_`, and only that: `stop()` takes this one and then `mtx_`
+    /// to close the replica descriptors, while `run_loop()` and `broadcast()` take `mtx_` and never
+    /// this one. Verified rather than assumed, because holding a mutex across a `join()` is only
+    /// safe while the joined thread cannot want it — neither worker calls `stop()` nor stores
+    /// `running_`. A future path taking `mtx_` and then this one would invert that and deadlock.
+    std::mutex stop_mtx_;
+
 
     /// Creating a snapshot is a flush plus a checksum of the whole store, which used to happen on
     /// this manager's own epoll thread (#79).
@@ -358,6 +390,12 @@ private:
     /// be closed underneath it, which one mutex on the lifecycle gives — on the connect and shutdown
     /// paths only, never on the receive path.
     mutable std::mutex      fd_mtx_;
+
+    /// Serialises `stop()`, for the reason `ReplicationManager::stop_mtx_` documents at length: the
+    /// early return used to mean *stopping* rather than *stopped*, so a second caller skipped the
+    /// join and then destroyed a joinable thread. The same shape, one class away — which is why both
+    /// were changed together rather than the one that was observed to abort.
+    std::mutex              stop_mtx_;
 
     /// Where replay has got to, and how much of it there has been.
     ///

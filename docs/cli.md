@@ -492,10 +492,26 @@ ordinary election, so an unreachable target cannot leave you without a primary.
 | `ERR unknown_target <id>` | Target is not known to the coordinator, usually a typo in a node id |
 | `ERR failover_failed` | Coordinator error; the node kept its role and its lease |
 
+**The connection may close without any reply, and that is not in the table above because it is not
+an answer.** The outgoing node is tearing down its primary machinery while your session is open, and
+it can drop the session before the acknowledgement reaches you. Treat a closed connection as
+*unknown* rather than as failure: the handover has usually happened. Ask the target, as below.
+
+Roadmap #86 holds this open as an interface question rather than a bug — an operator should not have
+to infer the outcome of a deliberate operation. What is fixed is worse and was real: until #88 the
+outgoing node could **abort** during a graceful handover, so the closed session was sometimes a dead
+process. It stays up and becomes a replica now, which the two checks below confirm.
+
 **`OK` means initiated, not completed.** Confirm the outcome by asking the target:
 
 ```bash
 echo "ROLE" | nc localhost 5556     # expect: PRIMARY <epoch>
+```
+
+And confirm the node you handed it away from is a replica rather than gone:
+
+```bash
+echo "ROLE" | nc localhost 5555     # expect: REPLICA
 ```
 
 Anything other than `OK` leaves the node primary with its lease intact, so a rejected handover is

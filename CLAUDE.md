@@ -691,6 +691,51 @@ Learned the hard way. Check here before debugging.
     node that had died a second earlier. Append, with a separator — and gather the death report
     **before** the repair, because the value of that list is the evidence rather than the count.
 
+95. **`terminate called without an active exception` is not an uncaught exception.** It is
+    libstdc++'s message for a **joinable `std::thread` being destroyed or reassigned**, and reading
+    it as an exception sent me looking for a missing `catch` — `failover.cpp` has none, which looked
+    like the answer and was a red herring. The actual owner of that message is a destructor.
+
+96. **A guard whose early return means "a stop has begun" reads at every call site as "stopped".**
+    `ReplicationManager::stop()` was `if (!running_) return;`, then `running_ = false`, then the
+    join. The second caller saw `false` and returned having joined nothing, then destroyed the
+    object — whose destructor calls `stop()` and hits the same guard. A joinable thread reached
+    `~thread` and the node died with `SIGABRT` on a *planned* `FAILOVER` (#88). The fix is that the
+    guard becomes true: serialise `stop()` on its own mutex, hold it **across** the join, and make
+    the check an `exchange`. Releasing the mutex before the join reintroduces the same hazard with a
+    smaller window.
+
+97. **Releasing a lock around `stop()` while leaving the pointer in place invites a second caller
+    into the window.** `demote_to_replica()` read `repl_mgr_`, unlocked, stopped, relocked, reset —
+    so two demotions both passed the null check and the second worked on an object the first was
+    destroying. Take ownership under the lock (`std::move` out of the `unique_ptr`) and the second
+    caller sees `nullptr`. `AsyncSnapshotBuilder::shutdown()` already did exactly this, from #79:
+    the pattern was in the tree, one file away from the defect.
+
+98. **Audit the operation with the safest name first.** The command that killed the outgoing node
+    was `FAILOVER` — planned, deliberate, the one an operator reaches for *in order to* be careful.
+    Same shape as `abort()` in the flagship product's migration machine claiming the source still
+    had everything. Ask of every reassuring name: what does it do that the alarming ones do not?
+
+99. **Measure what the mutation does; do not assume it fails loudly.** I expected the reverted fix
+    to abort, so a plain regression test would have been enough. Twelve runs: twelve **hangs**, no
+    aborts — one join succeeds and the other waits on a thread id that will never be signalled. A
+    hanging test detects a defect and reports nothing, and CTest's default timeout is **1500
+    seconds**, so in CI it reads as a stuck runner. Every test now has a 300-second `TIMEOUT`,
+    without which that regression test proves nothing.
+
+100. **Building while `ctest` is running invalidates the run, and the failures look real.** A
+    targeted `cmake --build --target X` relinked binaries that a full `ctest` was in the middle of
+    executing, and the run came back **7 failed out of 806**. A clean sequential repeat: 811 of 811.
+    Nothing was wrong with the tree. If a suite fails after concurrent building, repeat it before
+    reading it — and prefer one build-then-test command over two overlapping ones.
+
+101. **Filtering a long run's output to a summary throws away the diagnosis you will need if it
+    fails.** I piped `ctest` through `grep -E "tests passed|tests failed"`, which reported seven
+    failures and **not one name**, so the next step was a rerun rather than a look. Capture
+    everything to a file and filter when reading it. Same shape as the sanitizer report step that
+    only ran on success: the information exists exactly until the moment it matters.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -699,7 +744,7 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 802 C++ tests (`ctest -j1`, ~2 min) and 146 integration tests plus 2
+**Where the suites stand:** 811 C++ tests (`ctest -j1`, ~2 min) and 146 integration tests plus 2
 opt-in Binance skips (`pytest tests/integration/`, ~8 min on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that
@@ -722,6 +767,15 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   also revealed that four modules built their own path to the server and ignored `OB_SERVER_BINARY`,
   so part of that job had been testing an *uninstrumented* binary since it was written (pitfall 77).
   A skip in that job now fails it.
+- **A graceful `FAILOVER` used to be able to abort the outgoing primary, and does not now** (#88).
+  The outgoing node revokes its own lease, so #82's unconditional lease-lost demotion runs alongside
+  the handover's own — two callers into `demote_to_replica()`, whose `stop()` guard returned early
+  meaning *stopping* rather than *stopped*, leaving a joinable thread to be destroyed. If you add a
+  lifecycle `stop()` here, serialise it and hold the mutex across the join; the early return has to
+  mean finished.
+- **Every test has a `TIMEOUT`** — 300 s, 900 s where a sanitizer is on (`tests/CMakeLists.txt`).
+  CTest's default is 1500, and the regression test for #88 **hangs** under the defect it guards
+  rather than aborting, so without a timeout it detects and reports nothing.
 - **Failover takes about twice as long as it used to, on purpose.** Since #82 a candidate waits one
   lease TTL after the leader key goes absent, so the previous holder has certainly stepped down.
   Measured: 10.2 s → 20.1 s after a `kill -9`. The alternative that costs no latency makes a primary

@@ -1651,6 +1651,76 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 89. A graceful handover demotes the outgoing primary twice
+
+- **A race window, not stale bookkeeping, and the first version of this entry got that wrong.** The
+  handover does store `NodeRole::REPLICA` — `src/failover.cpp:346`. The problem is the order around
+  it: `revoke_lease()` makes the leader key disappear *before* `role_.store(REPLICA)` runs, so a
+  monitor pass landing between the two sees "we hold the PRIMARY role and the leader key is gone".
+  That is true, and it is the unconditional demotion #82 added on purpose, so it demotes a node
+  which is a line away from demoting itself. Read from the source rather than inferred from the log,
+  which is what corrected it.
+- Harmless since #88, because both demotions are now idempotent: the second finds the replication
+  objects already gone and re-sets a role and a flag that already hold. Before #88 it was the second
+  caller that aborted the process.
+- It is still worth fixing, for two reasons that are not the crash. It is work done twice on a path
+  where the point is a quick, clean handover. And the log of a **planned** operation reads like a
+  fault: `WARN we hold the PRIMARY role but the leader key is gone`, then `WARN lease lost, demoting
+  to REPLICA`, then `WARN no new primary is published yet`. An operator who runs `FAILOVER` and reads
+  three warnings has been told something went wrong, and nothing did.
+- The fix is to make the expected disappearance distinguishable from the unexpected one: the
+  handover knows it is handing over, so a flag set before the revoke and cleared after the role
+  store lets the monitor loop tell "the key is gone because I gave it away" from "the key is gone
+  and I did not expect that". Only one of those is a fault.
+  Reordering — storing the role before revoking — is the obvious alternative and is worse: the
+  revoke has an explicit "staying primary" path on failure, so the role would have to be put back,
+  which is the same window pointing the other way.
+- Effort: S | Impact: three warnings during a healthy planned handover, which is how operators learn
+  to discount warnings
+
+### 88. A graceful `FAILOVER` could abort the outgoing primary ✅ **P0**
+
+- **`FAILOVER <target>` killed the node that handed the role over.** The process died with
+  `SIGABRT`, so its port stopped accepting connections — an operator issuing a *planned* handover
+  lost the outgoing node entirely, and the tool they reach for when they want to be careful is the
+  one that did it.
+- Found by the diagnostics added for #86, on a **documentation-only** pull request — which is what
+  settled that no code change was responsible. The test reported `alive=False exit=-6`, the fixture's
+  own guard reported `node-0 ... is not running and no test killed it: signal 6`, and the node's log
+  ended on `terminate called without an active exception`. That message is libstdc++ for a joinable
+  `std::thread` being destroyed; it is not an uncaught exception, which is why the absence of any
+  `catch` in `failover.cpp` was a red herring.
+- **The mechanism was a guard whose early return meant the wrong thing.** `ReplicationManager::stop()`
+  began `if (!running_) return;` and stored `false` **before** joining, so a second caller saw
+  `false` and returned having joined nothing — while reading, at every call site, as *stopped*. Its
+  next act was destroying the manager, whose destructor calls `stop()` and hits the same guard, so a
+  joinable thread reached `~thread`. `ReplicationClient::stop()` had the identical shape one class
+  away, and both were changed rather than only the one observed to abort.
+- **Two callers is not exotic; it is what a graceful handover produces.** The outgoing primary
+  revokes its *own* lease, so #82's unconditional lease-lost demotion fires while the handover's own
+  demotion is still running. Both call `demote_to_replica()`, which read `repl_mgr_`, released `mtx_`
+  to call `stop()`, relocked and reset — a window both callers entered, the second operating on an
+  object the first was tearing down. The log shows the whole sequence in three lines: lease revoked
+  and "now REPLICA", then "the leader key is gone — stepping down", then "lease lost, demoting".
+- **Fix, in two places that are not duplicates.** `stop()` is serialised on its own mutex, held
+  across the join, with the guard as an `exchange` — so the early return now means *finished*, and
+  any pair of callers is safe, including `Engine::shutdown()` racing a demotion. And
+  `demote_to_replica()` takes ownership of both objects **under the lock** (`std::move` out of the
+  `unique_ptr`) before releasing it, so a second demotion sees `nullptr`. The mutex is not `mtx_`:
+  the epoll thread takes that one, and holding it across a join is the deadlock pitfall 41 came from.
+  `AsyncSnapshotBuilder::shutdown()` already used exactly this move-out-then-join pattern, from #79.
+- **The regression test hangs under the defect rather than aborting, and that had to be measured.**
+  Twelve runs against the reverted fix: twelve hangs, no aborts — one join succeeds and the other
+  waits on a thread id that will never be signalled. A hanging test detects a defect and reports
+  nothing, so the same change gives every test a `TIMEOUT` (300 s). CTest's default is 1500, which
+  in CI reads as a stuck runner rather than as a failure.
+- **Still open, and filed separately as #89:** the second demotion should not happen at all.
+  Harmless now that both are idempotent, but it is work done twice and it prints three warnings
+  during a healthy planned handover. Kept as its own item rather than a bullet here, because an open
+  defect inside a closed item is one nobody scanning headings will find. It is a window between
+  `revoke_lease()` and `role_.store(REPLICA)`, not the stale role I first assumed from the log.
+- Effort: M | Impact: a planned, operator-initiated handover could take the outgoing node down. P0
+  by consequence, and reachable by the safest-sounding command in the failover interface
 ### 87. `--help` listed six of forty flags, and the documents that promised the rest were incomplete too ✅
 
 - `ob_tcp_server --help` printed **six** options. The parser accepts **forty**. `--help` is the

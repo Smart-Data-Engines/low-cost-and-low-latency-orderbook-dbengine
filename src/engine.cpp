@@ -194,6 +194,14 @@ void Engine::close() {
         failover_mgr_->stop();
     }
 
+    // These two read the pointers without `mtx_`, which is safe only because of the order above:
+    // `failover_mgr_->stop()` joins the monitor thread, and that thread is what starts a demotion.
+    // After it, no `demote_to_replica()` can be running, so nothing else can be moving these
+    // pointers out from under us. Reordering this block reintroduces #88's pair of callers - two
+    // paths tearing down one replication object - so the order is a guarantee rather than a
+    // preference. `stop()` is serialised and idempotent now, which makes a double stop harmless;
+    // it does not make a use-after-free harmless.
+    //
     // Stop replication client first (it calls apply_delta, so must stop before flush thread).
     if (repl_client_) {
         repl_client_->stop();
@@ -1428,12 +1436,24 @@ void Engine::promote_to_primary(const EpochValue& new_epoch) {
 void Engine::demote_to_replica(const std::string& new_primary_address) {
     std::unique_lock<std::mutex> lock(mtx_);
 
-    // Stop ReplicationManager if running.
-    if (repl_mgr_) {
+    // Ownership is taken **under the lock**, so a second demotion sees nullptr rather than an object
+    // the first one is in the middle of destroying.
+    //
+    // The old shape read `repl_mgr_`, released `mtx_` to call `stop()`, relocked and reset. Two
+    // concurrent demotions both passed the null check, both entered that window, and the second
+    // operated on a manager the first was tearing down. A graceful `FAILOVER` reaches exactly that:
+    // the outgoing primary revokes its own lease, so #82's unconditional lease-lost demotion runs
+    // alongside the handover's own — and the node died with SIGABRT (diagnosed in #86, fixed as
+    // #88).
+    //
+    // Same pattern as `AsyncSnapshotBuilder::shutdown()`, which moves the thread out under its
+    // mutex before joining. The release of `mtx_` is still needed: `stop()` joins a thread that can
+    // be waiting on this very lock.
+    if (std::unique_ptr<ReplicationManager> mgr = std::move(repl_mgr_)) {
         lock.unlock();
-        repl_mgr_->stop();
+        mgr->stop();
+        mgr.reset();
         lock.lock();
-        repl_mgr_.reset();
     }
 
     node_role_.store(NodeRole::REPLICA, std::memory_order_release);
@@ -1452,11 +1472,12 @@ void Engine::demote_to_replica(const std::string& new_primary_address) {
     if (!new_primary_address.empty()) {
         // Stop existing ReplicationClient if running (may have been started
         // from static --primary-host config or a previous demote).
-        if (repl_client_) {
+        // Ownership taken under the lock, for the reason above.
+        if (std::unique_ptr<ReplicationClient> client = std::move(repl_client_)) {
             lock.unlock();
-            repl_client_->stop();
+            client->stop();
+            client.reset();
             lock.lock();
-            repl_client_.reset();
         }
 
         // Clear in-memory state to avoid data duplication during catchup.
