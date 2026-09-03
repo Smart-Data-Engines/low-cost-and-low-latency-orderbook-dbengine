@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 
 import pytest
-from conftest import server_binary_path
+from conftest import server_binary_path, patience
 
 pytestmark = pytest.mark.failover
 
@@ -138,7 +138,11 @@ class Cluster:
             stdout=log, stderr=subprocess.STDOUT))
 
     def wait_until_listening(self, index: int, timeout: float = 30.0) -> None:
-        deadline = time.time() + timeout
+        # Scaled where a sanitizer is instrumenting the server: this is the wait that failed with
+        # "node-1 never accepted connections" on a branch containing no C++ at all. Thirty seconds
+        # is generous for a node that starts in two, and thin under ThreadSanitizer on a shared
+        # runner. `patience()` in conftest explains why it is scaling rather than silencing.
+        deadline = time.time() + patience(timeout)
         while time.time() < deadline:
             try:
                 with socket.create_connection(("127.0.0.1", self.ports[index][0]), timeout=2) as s:

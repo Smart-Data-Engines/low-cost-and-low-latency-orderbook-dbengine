@@ -27,7 +27,7 @@ import urllib.request
 
 import pytest
 
-from conftest import tail_node_log
+from conftest import node_log_since, node_log_size, tail_node_log
 from orderbook_engine import OrderbookEngine, OrderbookError
 
 pytestmark = pytest.mark.failover
@@ -633,3 +633,55 @@ def test_the_survivor_does_not_wait_for_a_dead_nodes_position(healthy_cluster):
     # And exactly one node holds the role at the end of it.
     holders = primaries_among(healthy_cluster)
     assert len(holders) == 1, f"expected one primary after failover, saw {holders}"
+
+
+def test_a_graceful_handover_does_not_demote_the_node_twice(healthy_cluster):
+    """A planned handover must not read, in the node's own log, like a fault.
+
+    The outgoing primary revokes its **own** lease, so the leader key legitimately disappears while
+    `role_` still says PRIMARY for a few instructions. A monitor pass landing there saw "we hold the
+    role and the key is gone" and demoted a node that was about to demote itself — #82's
+    unconditional demotion doing exactly what it was added for, in the one situation where the
+    absence is expected. Until #88 that second demotion could abort the process; since #88 it is
+    merely work done twice and three warnings through a healthy operation, which is how operators
+    learn to discount warnings (#89).
+
+    Asserted as an absence, and only over what this test caused: the offset is recorded first,
+    because the log of a session-scoped cluster is mostly other tests' output and an assertion over
+    all of it would pass or fail on history.
+
+    Deliberately not asserting the *presence* of the new "gone because we are handing over" line.
+    Whether a monitor pass lands inside that window at all is timing, and asserting it would be an
+    assertion about the machine rather than about the mechanism.
+    """
+    primary = healthy_cluster.primary()
+    target = healthy_cluster.replica()
+
+    before = node_log_size(primary)
+    reply = send_command(primary.tcp_port, f"FAILOVER {target.node_id}")
+    assert not reply.strip().startswith("ERR"), f"handover refused: {reply!r}"
+
+    # Let the handover finish rather than sampling immediately: the property is that the node ends
+    # up a replica, not that it gets there within any particular second.
+    outgoing_role = ""
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        outgoing_role = role_of(primary.tcp_port)
+        if "REPLICA" in outgoing_role:
+            break
+        time.sleep(0.5)
+    assert "REPLICA" in outgoing_role, (
+        f"the outgoing primary reports {outgoing_role!r}; the handover itself did not complete, so "
+        f"this test cannot say anything about how many times it demoted")
+
+    produced = node_log_since(primary, before)
+
+    assert "Graceful failover" in produced, (
+        "the outgoing node's log does not mention the handover at all, so the offset or the node is "
+        "wrong and the absence below would be vacuous")
+    assert "lease lost, demoting to REPLICA" not in produced, (
+        "the node demoted a second time through the lease-lost path during a planned handover "
+        f"(#89). Its log for this test:\n{produced[-2000:]}")
+    assert "we hold the PRIMARY role but the leader key is gone" not in produced, (
+        "a planned handover logged the lease-lost warning, which tells an operator something went "
+        f"wrong when nothing did. Its log for this test:\n{produced[-2000:]}")

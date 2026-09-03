@@ -724,17 +724,55 @@ Learned the hard way. Check here before debugging.
     seconds**, so in CI it reads as a stuck runner. Every test now has a 300-second `TIMEOUT`,
     without which that regression test proves nothing.
 
-100. **Building while `ctest` is running invalidates the run, and the failures look real.** A
-    targeted `cmake --build --target X` relinked binaries that a full `ctest` was in the middle of
-    executing, and the run came back **7 failed out of 806**. A clean sequential repeat: 811 of 811.
-    Nothing was wrong with the tree. If a suite fails after concurrent building, repeat it before
+100. **The build directory is shared mutable state; a background build or test run holds a lock on
+    the whole tree.** A targeted `cmake --build --target X` relinked binaries that a full `ctest`
+    was in the middle of executing, and the run came back **7 failed out of 806**. A clean sequential
+    repeat: 811 of 811. Nothing was wrong with the tree. If a suite fails after concurrent building, repeat it before
     reading it — and prefer one build-then-test command over two overlapping ones.
+    Three variants of the same mistake in one session: building during a test run, **switching
+    branches during a build** (which produced a binary made of two branches), and `pkill -f "cmake
+    --build"` matching the replacement build it was clearing the way for.
 
 101. **Filtering a long run's output to a summary throws away the diagnosis you will need if it
     fails.** I piped `ctest` through `grep -E "tests passed|tests failed"`, which reported seven
     failures and **not one name**, so the next step was a rerun rather than a look. Capture
     everything to a file and filter when reading it. Same shape as the sanitizer report step that
     only ran on success: the information exists exactly until the moment it matters.
+
+102. **A flag that suppresses a safety check must be impossible to leave set.** `handing_over_`
+    tells the monitor loop that a missing leader key is expected, which means a stuck `true` makes
+    the node ignore a genuine lease loss for ever — a worse defect than the double demotion it
+    fixes. `initiate_graceful_failover()` has **seven** return paths, one of which keeps the role
+    when the revoke fails, so the flag is set by a scope guard rather than by a pair of stores. The
+    test is not "did I remember every path": if the handover dies after revoking, the guard clears
+    on unwind and the next pass demotes.
+
+103. **A pipeline's exit code is the last command's, and `grep -c` reports 1 for no matches.**
+    `cmake --build … | grep -cE " error"` exited 1 on a build that reached 100% with nothing wrong,
+    and the harness reported it as a failed command. Check the build's own status, or put the grep
+    in a separate step. Twice in one session, both times reading a filter's verdict as the thing it
+    was filtering.
+
+104. **A loop that reads state at the top and acts on it after a network call is acting on stale
+    state, and a flag that covers "the change is in flight" does not cover "the change finished
+    while I was asking".** `monitor_loop()` reads `role_` at the start of an iteration and the
+    leader key later in the same one, with an etcd round trip between them. My first fix for #89 was
+    a `handing_over_` flag, which covers a handover *in flight* — and a handover that starts and
+    finishes inside that gap clears the flag before the branch runs, leaving the branch to act on a
+    `current` that still says PRIMARY. Two windows, two guards, neither subsuming the other: the
+    flag, and a **re-read of the role immediately before acting**. Found by reasoning about what the
+    mutation would show rather than by waiting for it — a flag suppressing a symptom is worth
+    re-examining when the symptom has more than one cause.
+
+105. **Every timeout in a test suite was chosen against an uninstrumented build, and the sanitizer
+    job applies all of them.** `sanitizers-integration (tsan)` failed with `node-1 never accepted
+    connections` on a branch containing no C++ at all: a 30-second startup budget for a node that
+    starts in two, under an instrumentation that costs five to fifteen times the run time, on a
+    runner also running the rest of the battery. `patience()` in `conftest.py` triples startup waits
+    when `TSAN_OPTIONS` or `ASAN_OPTIONS` is set. Scaling, not silencing — a node that cannot start
+    inside the scaled window still fails, and the same reasoning gave the ctest `TIMEOUT` its 900 s
+    sanitizer variant (pitfall 99). When a limit and an instrumentation meet, ask which one was
+    measured.
 
 106. **`printf` to `stdout` is block-buffered the moment it is not a terminal, so the line
     confirming a start is the last one to arrive.** The server's banner reached a redirected log
@@ -762,7 +800,7 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 811 C++ tests (`ctest -j1`, ~2 min) and 146 integration tests plus 2
+**Where the suites stand:** 814 C++ tests (`ctest -j1`, ~2 min) and 147 integration tests plus 2
 opt-in Binance skips (`pytest tests/integration/`, ~8 min on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that

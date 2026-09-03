@@ -176,6 +176,22 @@ private:
     mutable std::mutex      mtx_;
     EpochValue              epoch_;
     std::atomic<int64_t>    lease_id_{0};
+
+    /// True only while `initiate_graceful_failover()` is between revoking its own lease and
+    /// recording the new role.
+    ///
+    /// Without it the monitor loop treats a handover as a fault. The handover revokes the outgoing
+    /// primary's **own** lease, so the leader key legitimately disappears while `role_` still says
+    /// PRIMARY for a few instructions — and a pass landing there sees "we hold the role and the key
+    /// is gone", which is #82's unconditional demotion doing exactly what it was added for. The node
+    /// then demotes twice, and prints three warnings during a healthy planned operation. Until #88
+    /// the second demotion also aborted the process.
+    ///
+    /// Set through a scope guard rather than by hand, and that is the load-bearing part: a flag
+    /// which suppresses a safety check must be impossible to leave set, and this function has seven
+    /// return paths — one of which keeps the role when the revoke fails. If the handover dies after
+    /// revoking, the guard clears on unwind and the next pass demotes, so the net is still there.
+    std::atomic<bool>       handing_over_{false};
     std::string             primary_address_;
     std::chrono::steady_clock::time_point last_lease_refresh_;
 
@@ -320,5 +336,31 @@ ElectionDecision decide_election(const std::vector<PublishedPosition>& positions
                                  const std::string& self_node_id,
                                  std::chrono::milliseconds deferred_for,
                                  std::chrono::milliseconds window);
+
+// ── Absent leader key ─────────────────────────────────────────────────────────
+
+/// What a node that believes it is PRIMARY should do when the leader key reads as absent.
+enum class AbsentKeyAction {
+    StepDown,            ///< the lease is genuinely gone; #82's unconditional demotion applies
+    HandoverInFlight,    ///< we revoked it ourselves and are a moment from recording the new role
+    RoleAlreadyChanged,  ///< the role moved on while we were asking etcd about the key
+};
+
+/// Decide what an absent leader key means, given the role *now* and whether a handover is in flight.
+///
+/// Pure for the same reason `decide_election()` is, and here the reason is sharper: the situation
+/// this rules out is a race that reproduces about **one run in three** (measured, #89), so a test
+/// that waits for it reads as flaky and gets re-run rather than read. As a function, all six
+/// combinations are one assertion each.
+///
+/// `handing_over` is checked before the role, because during a handover the role may still say
+/// PRIMARY — the revoke happens first — so the more specific answer would otherwise be lost to the
+/// more general one.
+///
+/// Why two conditions rather than one: `monitor_loop()` reads the role at the top of an iteration
+/// and the key later in the same one, with a network round trip between them. A handover *in
+/// flight* is the flag's case; a handover that started and finished inside that gap has already
+/// cleared the flag, and only the role says so.
+AbsentKeyAction decide_on_absent_key(NodeRole role_now, bool handing_over);
 
 } // namespace ob
