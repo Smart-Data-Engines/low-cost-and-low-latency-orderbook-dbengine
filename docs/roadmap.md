@@ -606,6 +606,34 @@ the fix and what survives of the original claim.
 - Effort: M | Impact: Finds the class of bug that property tests miss; also a credibility signal
 
 ### 39. Reproducible comparative benchmarks
+
+**Part one is done and merged (PR #70): the harness, the dataset, the resolution measurement and our
+own adapter.** What is left is the three competitor adapters, the publication step, and the
+multi-system checkpoint — all of which need ClickHouse, TimescaleDB and kdb+ installed natively,
+which is a decision about this machine rather than code. Spec:
+`kiro-workspace/specs/reproducible-benchmarks/`.
+
+**The centre of it turned out to be a refusal rather than a feature.** This machine does not resolve
+percentages, and now the harness says so with a number: it measures the same system against itself,
+interleaved, and reports anything below that floor as `INDISTINGUISHABLE ON THIS HARDWARE`. Measured
+floors across the first runs: **0.68** with one cold call included, **0.52** from a single scheduler
+hiccup in eight rounds, and **0.12–0.23** once a warm-up and one discarded outlier were added — every
+control ratio published beside them. The word "faster" exists in one function, held there by a static
+test over the package.
+
+**Three things came from running it that reading it had not shown**, and each is recorded in the
+code: the generator gave every row its own timestamp, which a batched load cannot preserve because
+the client takes one timestamp per call; hardware detection reported "unknown" for an ordinary NVMe
+because `lsblk -d` on an LVM-over-LUKS mount source returns the mapper device; and my own glue passed
+a cached number to `measure()`, which returns a floor of exactly 0.0 — so `classify()` called a 1%
+difference faster. A control run whose ratios are all exactly 1.0 is now refused.
+
+**It also produced #90.** The harness has to record the version of every system it measures, reads
+ClickHouse's from `SELECT version()`, and ours could not be asked at all — so the results file said
+"unreported (the server has no way to report its version)". That sentence was the argument for the
+item, and after it merged the adapter reads `STATUS` instead. The first re-run *still* said
+unreported, correctly: `build-release/` predated #90, so the measured binary genuinely had no version
+field. A literal would have printed a version the binary did not have.
 - `benchmarks/README.md` already holds equivalent workload definitions for ClickHouse, TimescaleDB
   and kdb+. Turn them into a **runnable harness**: native installation of each system from its
   official packages, one script, results table with hardware, versions and dataset recorded
