@@ -736,6 +736,24 @@ Learned the hard way. Check here before debugging.
     everything to a file and filter when reading it. Same shape as the sanitizer report step that
     only ran on success: the information exists exactly until the moment it matters.
 
+106. **`printf` to `stdout` is block-buffered the moment it is not a terminal, so the line
+    confirming a start is the last one to arrive.** The server's banner reached a redirected log
+    file at **process exit**, while every JSON line was on time — because the logger writes to
+    `stderr`, which is unbuffered. Measured: absent from the file while the node was up and
+    answering. Worse, the banner also ran *before* the bind, so it announced listening that had not
+    happened and a failed start printed the claim with the error underneath. If a line's purpose is
+    to tell an operator something is true, log it after it becomes true, through the logger, and
+    flush anything that is not.
+
+107. **One fact typed in three places is two chances to drift, and the version was the fact.**
+    `project(... VERSION)`, `pyproject.toml`, and a literal in `tools/ob_tcp_server.cpp` — with
+    nothing comparing them, and the literal being the only version a running node could show. The
+    C++ copy is gone (a compile definition on `orderbook_core`, so `ob::version()` is the only way
+    to get it); the Python one cannot be, because a wheel's metadata is not a C++ macro, so a test
+    holds the two in step and another refuses the version as a literal in any source that reports
+    it. Both mutation-checked. A literal that agrees today drifts at the first bump, and the symptom
+    is an operator told the wrong build is running — worse than being told nothing.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

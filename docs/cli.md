@@ -142,6 +142,23 @@ ob> status
   sequence: 42  inserts: 42  queries: 5
 ```
 
+Over the wire, `STATUS` also reports which build is answering:
+
+```
+$ echo "STATUS" | nc localhost 9090 | grep '^version:'
+version: 0.1.0
+```
+
+That question had no answer before roadmap #90 — not here, not in `--print-config`, not in
+`/metrics`. It is a key/value line rather than a column in the tab-separated table above, so no
+client parsing that table has to change. `/metrics` carries the same fact as
+`ob_build_info{version="0.1.0",node_role="..."} 1`, which is what lets a monitoring system tell a
+node running an old binary from one running the new one.
+
+The number comes from `project(... VERSION)` in `CMakeLists.txt` through a compile definition, so
+there is one copy in the C++ and a test holds `pyproject.toml` in step with it. It used to be a
+literal in `tools/ob_tcp_server.cpp`, which was also the only place it appeared.
+
 ### help
 
 Show the help message.

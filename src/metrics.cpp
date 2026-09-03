@@ -1,4 +1,5 @@
 #include "orderbook/metrics.hpp"
+#include "orderbook/version.hpp"
 #include "orderbook/logger.hpp"
 
 #include <cmath>
@@ -284,6 +285,14 @@ std::string MetricsRegistry::serialize() const {
     std::ostringstream out;
 
     const auto& role = node_role_;
+
+    // Which build is answering, as a labelled gauge fixed at 1 — the conventional shape for build
+    // information in Prometheus, and the third place #90 made the version askable. A monitoring
+    // system that scrapes a fleet can now tell a node running an old binary from one running the
+    // new one, which was not a question this engine could answer at all.
+    out << "# HELP ob_build_info Build information for this node; the value is always 1\n";
+    out << "# TYPE ob_build_info gauge\n";
+    out << "ob_build_info{version=\"" << version() << "\",node_role=\"" << role << "\"} 1\n";
 
     // Counters
     for (auto& c : counters_) {

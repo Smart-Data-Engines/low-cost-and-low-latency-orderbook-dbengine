@@ -1,4 +1,5 @@
 #include "orderbook/tcp_server.hpp"
+#include "orderbook/version.hpp"
 #include "orderbook/subscription_hub.hpp"
 #include "orderbook/logger.hpp"
 #include "orderbook/metrics.hpp"
@@ -1281,6 +1282,13 @@ void TcpServer::run() {
     if (::listen(listen_fd_, 128) < 0) {
         throw std::runtime_error(std::string("listen() failed: ") + std::strerror(errno));
     }
+
+    // The line that says the server is up, logged *after* the bind and the listen have succeeded,
+    // and through the logger so it reaches the operator's file when it happens rather than at exit.
+    // The tool's banner says "starting" and cannot know this (#90).
+    OB_LOG_INFO("tcp_server", "listening on port %u, version %s, data-dir: %s",
+                static_cast<unsigned>(config_.port), std::string(version()).c_str(),
+                config_.data_dir.c_str());
 
     // 5. Create epoll instance.
     epoll_fd_ = ::epoll_create1(0);

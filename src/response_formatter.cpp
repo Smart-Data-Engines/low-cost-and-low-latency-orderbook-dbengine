@@ -1,4 +1,5 @@
 #include "orderbook/response_formatter.hpp"
+#include "orderbook/version.hpp"
 
 #include <charconv>
 #include <string>
@@ -261,6 +262,13 @@ std::string format_status(const ServerStats& stats) {
     out += '\n';
     out += "ttl_bytes_reclaimed: ";
     out += std::to_string(stats.ttl_bytes_reclaimed);
+    out += '\n';
+
+    // The build this node is running, which nothing could be asked before #90: not this command,
+    // not `--print-config`, not `/metrics`. A key/value line rather than a column, so no client
+    // parsing the tab-separated table above has to change.
+    out += "version: ";
+    out += version();
     out += '\n';
 
     // Flush integrity
