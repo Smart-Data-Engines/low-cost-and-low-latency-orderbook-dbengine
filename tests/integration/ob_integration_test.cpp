@@ -25,12 +25,23 @@ static void print_result(const std::string& test, const std::string& status,
               << "\"}" << std::endl;
 }
 
+/// Credentials from the environment, so the Python harness can point this binary at an
+/// authenticated node without a new flag on every subcommand.
+///
+/// Environment rather than argv on purpose: an argument is visible in `/proc/<pid>/cmdline` to
+/// every process on the machine, which is the same reason the server has no flag carrying a secret.
+static void apply_auth_from_env(ob::ClientConfig& cfg) {
+    if (const char* id = std::getenv("OB_AUTH_IDENTITY")) cfg.auth_identity = id;
+    if (const char* sec = std::getenv("OB_AUTH_SECRET"))  cfg.auth_secret = sec;
+}
+
 // ── Test: ping ───────────────────────────────────────────────────────────────
 
 static int run_ping(const std::string& host, uint16_t port) {
     ob::ClientConfig cfg;
     cfg.host = host;
     cfg.port = port;
+    apply_auth_from_env(cfg);
 
     ob::OrderbookClient client(cfg);
     auto conn = client.connect();
@@ -55,6 +66,7 @@ static int run_insert_query(const std::string& host, uint16_t port) {
     ob::ClientConfig cfg;
     cfg.host = host;
     cfg.port = port;
+    apply_auth_from_env(cfg);
 
     ob::OrderbookClient client(cfg);
     auto conn = client.connect();
@@ -104,6 +116,7 @@ static int run_minsert(const std::string& host, uint16_t port) {
     ob::ClientConfig cfg;
     cfg.host = host;
     cfg.port = port;
+    apply_auth_from_env(cfg);
 
     ob::OrderbookClient client(cfg);
     auto conn = client.connect();
@@ -166,6 +179,7 @@ static int run_query_agg(const std::string& host, uint16_t port) {
     ob::ClientConfig cfg;
     cfg.host = host;
     cfg.port = port;
+    apply_auth_from_env(cfg);
 
     ob::OrderbookClient client(cfg);
     auto conn = client.connect();

@@ -168,6 +168,34 @@ def server_binary_path() -> str:
     return str(Path(__file__).resolve().parents[2] / "build" / "ob_tcp_server")
 
 
+def cpp_client_binary_path() -> Optional[str]:
+    """The `ob_integration_test` harness, from the same build tree as the server under test.
+
+    Derived from `OB_SERVER_BINARY` rather than guessed: the harness lives at
+    `<build>/tests/ob_integration_test` beside the server's `<build>/ob_tcp_server`. Without that
+    derivation the sanitizer job pointed at `build-tsan/` while a module looked in `build/`, so its
+    tests skipped - and a skipped integration test is indistinguishable from a passing one in a
+    summary line (#85).
+
+    Here rather than in a module, and this is the second time: `test_cpp_client.py` had its own
+    copy, and `test_auth.py` grew a third one that found nothing under TSan and failed. One place,
+    the same rule as `server_binary_path()`.
+
+    Returns None when the binary was not built. Callers decide between skipping and failing -
+    the TSan job builds it deliberately, so failing there is the honest choice.
+    """
+    from_env = os.environ.get("OB_SERVER_BINARY")
+    if from_env:
+        derived = Path(from_env).resolve().parent / "tests" / "ob_integration_test"
+        if derived.is_file():
+            return str(derived)
+    for candidate in (ClusterManager._PROJECT_ROOT / "build" / "tests" / "ob_integration_test",
+                      ClusterManager._PROJECT_ROOT / "build-release" / "tests" / "ob_integration_test"):
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 class ClusterManager:
     """Manage the full lifecycle of an integration-test cluster:
     a native etcd process + 2 ob_tcp_server nodes.
@@ -195,6 +223,12 @@ class ClusterManager:
         # Open log files, closed on shutdown. Held by the manager rather than by NodeInfo because a
         # restart replaces the NodeInfo and the old handle still needs closing.
         self._node_logs: list = []
+        # Path to a cluster secret file, or None. Set before start()/start_multi_master() by the
+        # fixture that wants an authenticated cluster (#30 part two). On the manager rather than a
+        # per-call argument because it applies to every node including restarts: a node that came
+        # back without the secret would be refused by its peers, and the test would read that as a
+        # replication defect.
+        self.cluster_secret_file: Optional[str] = None
         # Indices this harness killed on purpose. Without it, teardown cannot tell a test that
         # killed a node from a node that died on its own, and it silently restarts both — which is
         # how a crashing node stays invisible for as long as the tests around it pass.
@@ -481,6 +515,8 @@ class ClusterManager:
         ]
         if read_only:
             cmd.append("--read-only")
+        if self.cluster_secret_file:
+            cmd += ["--cluster-secret-file", self.cluster_secret_file]
         mm_replication_port = 0
         if multi_master_id is not None:
             # The server refuses --mm-replication-port equal to --replication-port:

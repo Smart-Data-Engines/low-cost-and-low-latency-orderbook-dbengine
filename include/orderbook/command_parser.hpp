@@ -27,6 +27,7 @@ enum class CommandType {
     MM_CONFLICTS,
     SUBSCRIBE,
     UNSUBSCRIBE,
+    AUTH,
     UNKNOWN
 };
 
@@ -78,6 +79,15 @@ struct Command {
 
     /// The id for UNSUBSCRIBE, or 0 meaning "every subscription of this session".
     uint64_t    unsubscribe_id{0};
+
+    /// AUTH: the claimed identity, and the response to the outstanding challenge.
+    ///
+    /// Both empty for a bare `AUTH`, which is the request for a challenge. Parsed here rather than
+    /// in the gate so that a malformed response never reaches a comparison: the response must be
+    /// exactly 64 lower-case hex characters and the identity must be within the identity charset,
+    /// or the line is UNKNOWN.
+    std::string auth_identity;
+    std::string auth_response;
 };
 
 // ── Free functions ────────────────────────────────────────────────────────────

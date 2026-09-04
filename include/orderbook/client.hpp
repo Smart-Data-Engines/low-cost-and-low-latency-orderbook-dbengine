@@ -34,6 +34,15 @@ struct ClientConfig {
     double      connect_timeout_sec = 5.0;
     double      read_timeout_sec    = 10.0;
     bool        compress            = false;  // negotiate LZ4
+
+    /// Credentials for a server running with `--auth-secret-file` (#30).
+    ///
+    /// Both empty means "do not authenticate", and then a server *with* authentication refuses
+    /// every command after the banner. Setting them against a server *without* authentication
+    /// fails the connection with `auth_disabled`, which is the honest direction: a client
+    /// configured to authenticate has a deployment problem if the server is not.
+    std::string auth_identity;
+    std::string auth_secret;
 };
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -174,6 +183,7 @@ private:
     Result<void>             send_all(size_t len);
     Result<std::string_view> recv_response();
     Result<void>             read_banner();
+    Result<void>             authenticate();
     Result<void>             negotiate_compression();
 };
 

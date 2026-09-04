@@ -43,7 +43,8 @@ to open is deliberate: a node that is merely listening can accept a write and ha
 to.
 
 `BASE_PORT`, `NODES`, `STATE_DIR` and `OB_SERVER_BINARY` override the defaults. Everything binds to
-127.0.0.1, because the wire protocol has no authentication (roadmap #30).
+127.0.0.1, and it stays that way even with authentication on: the wire is still not encrypted, so a
+local mesh is the only one this script should build.
 
 This is not `scripts/mm_harness.py`, which kills nodes, blocks links and counts rows to reproduce
 specific defects. The bootstrap script's job ends when the mesh is up.
@@ -203,6 +204,82 @@ fails CI for the class rather than trusting the reader to notice a flat zero.
 
 ## Security
 
-**The wire protocol has no authentication and no encryption.** Do not expose a node outside a
-trusted network. This is a deployment constraint rather than an oversight; roadmap #30 is the item
-that changes it, and until then a node's port is as trusted as the network it is on.
+**There is no encryption.** Client sessions can authenticate; nothing on the wire is encrypted, so a
+node's traffic is as private as the network it is on. Do not expose a node outside a trusted network.
+The full posture, including what authentication does *not* buy you, is in
+[SECURITY.md](../SECURITY.md).
+
+### Turning on client authentication
+
+Generate a secret per identity and put them in one file, one identity per line:
+
+```bash
+sudo install -d -m 700 -o orderbook -g orderbook /etc/orderbook/secrets
+printf 'grafana %s\n'   "$(openssl rand -hex 32)" | sudo tee    /etc/orderbook/secrets/clients >/dev/null
+printf 'ingest %s\n'    "$(openssl rand -hex 32)" | sudo tee -a /etc/orderbook/secrets/clients >/dev/null
+sudo chown orderbook:orderbook /etc/orderbook/secrets/clients
+sudo chmod 600 /etc/orderbook/secrets/clients
+```
+
+Then `--auth-secret-file /etc/orderbook/secrets/clients`, or `auth-secret-file = ...` in the config
+file.
+
+The server **refuses to start** rather than warning, on every one of these:
+
+| Refusal | Why it is fatal |
+|---------|-----------------|
+| the file is readable by group or world (`mode & 0077`) | a secret every local process can read is not a secret; the message prints the mode it found |
+| the file is not a regular file, is empty, or has no credential line | there is nothing to authenticate against, and starting would mean starting *open* |
+| a secret is shorter than 32 characters | refuses the cases seen in the wild — a word, or `changeme` |
+| an identity appears twice | which secret wins would be an accident of file order |
+| the cluster secret is also a client secret | a client holding it can present itself as a replica and stream the whole write-ahead log |
+
+Nothing here prints the secret, and neither does `--print-config`, which shows the **path**. If you
+are checking a deployment, `grep` your node's log and your `--print-config` output for the secret;
+both should come back empty.
+
+**Only the line terminator is stripped.** Trailing spaces in a secret are part of the secret. A
+general trim would make two different files the same secret, and for a secret that is a property
+worth keeping rather than a convenience to remove.
+
+### Clients
+
+```python
+from orderbook_engine import OrderbookEngine
+eng = OrderbookEngine(host="10.0.0.1", port=9090, auth=("grafana", secret))
+```
+
+For the C++ client, set `ClientConfig::auth_identity` and `auth_secret`. Both authenticate right
+after the banner and before compression negotiation, because the server refuses `COMPRESS` on an
+unauthenticated session.
+
+A client configured with credentials against a server that is **not** authenticating fails to
+connect, with `auth_disabled`. That is deliberate: believing you authenticated when the server
+authenticates nobody is a deployment problem worth an exception.
+
+### Turning on cluster authentication
+
+`--cluster-secret-file` protects the replication and multi-master links. It takes a single line:
+
+```bash
+openssl rand -hex 32 | sudo tee /etc/orderbook/secrets/cluster >/dev/null
+sudo chown orderbook:orderbook /etc/orderbook/secrets/cluster
+sudo chmod 600 /etc/orderbook/secrets/cluster
+```
+
+**There is no mixed mode.** Every node in a cluster either has the secret or does not; a node that
+accepted a peer without proof would be the state this exists to remove. So enabling it on a running
+cluster means a full restart with the file in place on every node, not a rolling one.
+
+### The metrics endpoint
+
+No authentication, deliberately — a Prometheus scraper cannot perform a challenge-response, and a
+bearer token would be a second, weaker mechanism. Bind it where only your scraper can reach it:
+
+```
+--metrics-port 9091 --metrics-bind 127.0.0.1
+```
+
+An invalid address is refused and the endpoint does not start, rather than falling back to every
+interface: an operator who typed a bind address and got `0.0.0.0` has the opposite of what they
+asked for.

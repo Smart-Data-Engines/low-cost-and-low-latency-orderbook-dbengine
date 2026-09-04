@@ -582,9 +582,9 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 
 QueryEngine::QueryEngine(const ColumnarStore& store,
-                         const std::unordered_map<std::string, SoABuffer*>& live_buffers,
+                         LiveBufferLookup live_buffer,
                          const AggregationEngine& agg)
-    : store_(store), live_buffers_(live_buffers), agg_(agg) {}
+    : store_(store), live_buffer_(std::move(live_buffer)), agg_(agg) {}
 
 QueryEngine::~QueryEngine() = default;
 
@@ -665,9 +665,13 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb) {
     }
 
     // ── Symbol/exchange existence check ──────────────────────────────────────
-    // Check live_buffers_ first (key = "symbol.exchange"), then columnar index.
+    // Resolve the live buffer once, through Engine's lock (see LiveBufferLookup), then use the
+    // pointer for the rest of the query. It used to be two unsynchronised reads of Engine's map -
+    // `count()` here and `find()` in the aggregation branch - racing every thread that creates a
+    // symbol.
     const std::string live_key = ast.symbol + "." + ast.exchange;
-    bool found_in_live = (live_buffers_.count(live_key) > 0);
+    SoABuffer* const live_buf = live_buffer_ ? live_buffer_(live_key) : nullptr;
+    bool found_in_live = (live_buf != nullptr);
     bool found_in_store = false;
     if (!found_in_live) {
         auto idx_snapshot = store_.index();
@@ -807,12 +811,11 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb) {
 
     // ── SELECT with aggregation ───────────────────────────────────────────────
     if (has_agg) {
-        auto it = live_buffers_.find(live_key);
-        if (it == live_buffers_.end()) {
+        if (live_buf == nullptr) {
             return "OB_ERR_NOT_FOUND: symbol '" + ast.symbol +
                    "' exchange '" + ast.exchange + "' not found in live buffers";
         }
-        const SoABuffer* buf = it->second;
+        const SoABuffer* buf = live_buf;
 
         // Read a consistent snapshot of both sides
         SoASide snap_bid, snap_ask;

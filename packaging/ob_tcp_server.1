@@ -101,9 +101,16 @@ so the package does not have to create it and then hope nothing changes its owne
 .I /lib/systemd/system/ob_tcp_server.service
 Shipped unit.
 .SH SECURITY
-.B The wire protocol has no authentication and no encryption.
-Do not expose a node outside a trusted network. This is a deployment constraint rather than an
-oversight; see
+.B The wire protocol authenticates and does not encrypt.
+Client sessions authenticate with
+.B \-\-auth\-secret\-file
+and the replication and multi\-master links with
+.BR \-\-cluster\-secret\-file ,
+by challenge\-response over HMAC\-SHA256, so a secret never crosses the wire. Both are off by
+default and the startup log warns for each disabled surface. Nothing is encrypted, so every query
+and every row is readable by anything on the path: do not expose a node outside a trusted network.
+The two secret files must not contain the same secret \- a client holding the cluster secret can
+present itself as a replica \- and the start is refused if they do. See
 .IR SECURITY.md .
 .SH EXIT STATUS
 .TP

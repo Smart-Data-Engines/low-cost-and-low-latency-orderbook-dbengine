@@ -314,10 +314,92 @@ because the two mechanisms overlap there — which is why the three-node test ex
 `kiro-workspace/specs/graceful-failover-fix/`
 
 ### 30. Authentication and TLS on the wire protocol
-- Token or mTLS authentication for client sessions, replication links and multi-master peers
-- TLS termination in-process (OpenSSL) or a documented sidecar pattern, with a benchmark of the cost
-- Per-connection identity in logs and metrics
-- Documented in `SECURITY.md`, which currently states the absence of both as a deployment constraint
+
+**Part one is done: client sessions authenticate.** Spec in
+`kiro-workspace/specs/wire-authentication/`. Two parts remain, both named below.
+
+The item bundles two independent things with different risk profiles, so it is built in that order.
+Authentication is a protocol concern: one place per surface, once per connection, off the hot path,
+and testable deterministically. TLS is a transport concern that enters the I/O loops — and there are
+four of them (epoll, io_uring, replication, multi-master), each with its own framing and its own
+output-buffer machinery. Authentication is also the half with more value per line: without it anyone
+who reaches the port is primary in the cluster, while TLS without authentication encrypts the traffic
+of an unknown peer.
+
+**Part one — client sessions ✅**
+- Challenge-response over HMAC-SHA256 (`AUTH` → `OK CHALLENGE <nonce>` → `AUTH <identity> <hmac>`),
+  **not a bearer token**: with no TLS yet, a token seen by a passive observer is replayable for ever
+  and a response to a fresh 32-byte CSPRNG nonce is not. One round trip per connection.
+- The gate sits **before** `execute_command`'s switch. A per-case check means the next command added
+  without one is reachable unauthenticated and nothing fails; the classifier's switch has no
+  `default:`, so `-Wswitch` makes a new `CommandType` a build failure, and a test refuses a
+  `default:` being added.
+- One seam covers both transports, because epoll and io_uring share `ob::Session` and
+  `execute_command`. No CI job builds the io_uring file, so a static test refuses an
+  `execute_command` call from a transport that passes no credential store.
+- The surface label (`client` / `replication` / `mm`) is inside the HMAC input. Replication and
+  multi-master share one cluster secret, so without domain separation a response captured on one of
+  those links authenticates on the other.
+- Secrets come from files only — `--auth-secret-file`, `--cluster-secret-file`. **No flag carries a
+  secret value**: an argument is in `/proc/<pid>/cmdline` for every process on the machine, and
+  `--print-config` exists to be pasted into a ticket, so `ServerConfig` holds paths.
+- Eight refusals at startup, each fatal, including a file readable beyond its owner (the message
+  prints the mode found) and **the cluster secret also being a client secret** — a client holding
+  that can present itself as a replica and stream the whole write-ahead log.
+- Only the line terminator is stripped from a secret file. A general trim makes two different files
+  the same secret, and for a secret "silently the same" is a security property. The flagship
+  product's `read_bytes().strip()` shortened a random salt in ~5% of files.
+- Identity in logs and in `STATUS`; three unlabelled counters. **No identity label**, deliberately:
+  per-identity attribution belongs to #31 where an identity gains permissions, and a label fed by
+  the name a peer *claims* before authenticating is an unbounded label set an attacker controls.
+- **Found by the integration test, not the unit test:** `request_close_after_flush()` was consulted
+  only in the EPOLLOUT drain, so a response small enough to fit the socket buffer left the session
+  open with the flag set and nothing reading it. `ERR auth_failed` is eighteen bytes, and closing on
+  the first failure *is* the rate limit. The io_uring loop consulted the flag nowhere at all. The
+  unit test had asserted the flag rather than the effect — pitfall 45, from the other side.
+- Also `--metrics-bind`, because the metrics endpoint has no authentication and deliberately none: a
+  Prometheus scraper cannot perform a challenge-response, so a bearer token would be the weaker
+  mechanism that ends up used, and binding to a private interface is the stronger answer.
+
+**Part two — cluster links ✅**
+- Mutual challenge-response on the replication link and the multi-master mesh, under
+  `--cluster-secret-file`. **Mutual on these and one-way on the client link**, because a shared
+  secret only proves identity among holders who are equally trusted: nodes are, a client population
+  is not. A client proving the *server's* identity is TLS's job, and pretending otherwise with a
+  secret every client holds would be theatre — any client could impersonate the server to another.
+- **One flag per side, not two.** This side sends no handshake until the peer has proved itself and
+  the peer applies the same rule, so mutual authentication falls out of the symmetry; `peer_proved`
+  is a property of the *connection* and resets on every reconnect.
+- Replication is a text protocol, so the order is fixed to keep either side from ever handling an
+  out-of-order message: the primary challenges on accept, the replica sends **its challenge before
+  its response**, and the primary's two replies therefore arrive as `AUTH <hmac>` then `OK AUTH`.
+  `ERR unauthenticated` goes on the wire *before* the close — a replica merely missing its secret
+  would otherwise see a reconnect loop with no message.
+- Multi-master gets two frame types (205, 206) before `HandshakeMessage`, and **no protocol version
+  bump is needed** because framing disambiguates them: a handshake frame is exactly 17 bytes and an
+  authentication frame carries a 38-byte `WALRecordV2` header. A 17-byte frame from an
+  unauthenticated peer therefore means **a peer running without a cluster secret**, and is logged as
+  that sentence — the fix is on the other node, and calling it a short or malformed frame would send
+  an operator into this one's code. The handshake **is** the acceptance; there is no third message.
+- No mixed mode, documented rather than left to be discovered.
+- Every refusal is paired with the exchange that must succeed. A gate that refuses everything
+  demonstrates nothing, so `ClusterAuthReplication` has three tests: same secret replicates, no
+  secret replicates nothing, wrong secret replicates nothing.
+
+**Part three — TLS**
+- **Channel binding is the thing it buys beyond confidentiality, and part two cannot have it.**
+  Challenge-response proves knowledge of the secret; nothing ties the exchange to the connection it
+  happened on, so an attacker who can redirect a replica's connection relays both directions and
+  both sides believe they are talking to each other. That is a limit of a shared secret without a
+  channel identity rather than a defect — a relay can forward any value bound only to a nonce — and
+  it is written into `SECURITY.md` as a limit rather than left for a reader to assume otherwise.
+- Per-listener, with the in-process-versus-sidecar decision made **from a measurement**.
+- If in-process: the io_uring path either gets TLS or a **named refusal**. `--tls` together with
+  io_uring must not silently mean plaintext.
+- mTLS as an alternative to the shared secret on cluster links, with the certificate identity
+  landing in the same field part one introduced.
+- Cost published with named hardware, a percentile, and the floor of the range.
+
 - Effort: L | Impact: **Unblocks production adoption**
 
 ### 31. Access control
@@ -1680,6 +1762,63 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 92. A query holds a raw `SoABuffer*` across a snapshot install
+
+Named by #91 rather than fixed by it, because it is a lifetime problem and not a locking one.
+
+`buffers_` owns the `SoABuffer`s and `live_ptrs_` points into them. `load_snapshot()` and the
+snapshot-install path both **clear** them under `flush_mtx_` + `mtx_`, which destroys every buffer.
+A query resolves its pointer under `mtx_` (#91) and then reads through it after releasing the lock,
+so a snapshot install during a query frees memory the query is reading.
+
+Latent today: a snapshot install happens on bootstrap and on a full resync, neither of which
+overlaps steady-state querying in any test — which is exactly the shape of pitfall 22 and the
+`set_read_only_flag()` finding, a raw pointer whose lifetime is nested by convention rather than by
+construction.
+
+Candidate answers, none chosen yet: reference-count the buffers (`shared_ptr`, which costs an atomic
+on the write path's lookup and nothing on the read); keep destroyed buffers alive until no query is
+in flight, the way `SubscriptionHub` already gates compaction on an in-flight counter (#45); or hold
+`mtx_` across the query, which is correct and costs the write path a full scan's latency. The third
+is the one to avoid, and saying so is most of the value of filing this.
+
+- Effort: M | Impact: removes a latent use-after-free on the read path
+
+
+### 91. A `SELECT` racing the creation of a symbol's live buffer ✅
+
+**Found by ThreadSanitizer on the integration battery, exposed by a test written for #30 and not by
+that change.** The new authenticated multi-master test polls `SELECT` on all three nodes while a
+record propagates, so on the two receiving nodes a query ran exactly while `apply_remote_delta`
+created that symbol's buffer. Five reports in one run, all the same pair.
+
+- `Engine` owns `live_ptrs_`, a `std::unordered_map<std::string, SoABuffer*>` inserted into under
+  `mtx_` by **every** write path — a client write, the replication apply path, the multi-master io
+  loop. `QueryEngine` held a **reference** to that map and read it with no lock at all: `count()` at
+  `query_engine.cpp:670` and a second, independent `find()` in the aggregation branch. An
+  `unordered_map` insertion rehashes, so a concurrent reader can follow a bucket that has moved.
+- **Reachable from a plain client `SELECT`**, not only in multi-master: any node taking writes for a
+  symbol it has not seen before is enough. It needed the query and the *first* write for a symbol to
+  overlap, which is why the existing tests — which write, then read — never produced it.
+- **The same defect was one file away, in the C API**, which is the embedded path the Python client
+  uses locally: `ob_insert` creates buffers under `mtx` and `ob_query` read the map without it.
+  Fixing only the server would have left it.
+- Fixed by handing `QueryEngine` a **lookup callable** instead of the map. `Engine`'s implementation
+  takes `mtx_` for the duration of one map read and releases it before the query runs — one
+  uncontended lock per query rather than holding the write path's mutex across a scan, which in this
+  engine would be the worse trade. It also collapses the two lookups into one, so a query can no
+  longer see a symbol exist in one and not in the other.
+- Two tests failing in different directions: one drives the race, and one **refuses the shape** —
+  because a behavioural test for a rehash race is probabilistic and a shape test is not. The shape
+  test also asserts that *both* suppliers of the lookup take a lock, by extracting the callable from
+  each file by brace matching rather than by looking for the word "lock" somewhere in it.
+- **Still open, and named rather than fixed here:** `live_ptrs_` and `buffers_` are *cleared* when a
+  snapshot is installed, and `buffers_` owns the `SoABuffer`s. So a query holding a resolved pointer
+  across a snapshot install would read freed memory. Today the window is narrow and this fix does
+  not widen it, but it is a lifetime problem rather than a locking one — item **#92**.
+- Effort: S | Impact: **removes undefined behaviour on the read path**
+
+
 ### 90. A running node could not be asked its version, and the banner that carried it lied twice ✅
 
 - **There was no way to ask a running node what version it is.** Not `--print-config`, not `STATUS`,
@@ -2843,7 +2982,7 @@ cannot verify its numbers, and cannot put it on a network they do not fully cont
 |----------|------|--------|---------|
 | **P1** | Deployment artifacts (#33) | M | Cheapest large jump in time-to-first-run; today a first run means reading CMake |
 | **P1** | Reproducible comparative benchmarks (#39) | L | Makes the performance claim verifiable by a reader instead of asserted, and the claim is the reason the repo exists |
-| **P1** | Authentication and TLS (#30) | L | The single blocker to production adoption |
+| **P1** | TLS on the wire (#30 part three) | M | Authentication is done on all three surfaces; nothing is encrypted |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Configuration file (#32) | S | Ops ergonomics; past twenty flags, flags alone are unreasonable |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
@@ -2860,7 +2999,9 @@ cannot verify its numbers, and cannot put it on a network they do not fully cont
 
 Things a reviewer will notice, listed here so they do not look like oversights:
 
-- **No authentication, no TLS.** Trusted-network deployment only (#30).
+- **No TLS.** All three surfaces authenticate since #30 parts one and two (`--auth-secret-file`,
+  `--cluster-secret-file`), and nothing is encrypted — so every query and every row is readable by
+  anything on the path. Trusted-network deployment only until #30 part three.
 - **Process death is exercised in three modules, and nowhere else.** Until #62 no module killed
   anything, and that hid total loss of acknowledged writes on crash. Today `test_crash_recovery.py`,
   `test_failover.py` and `test_failover_dead_state.py` `SIGKILL` a server; the last of those also

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "orderbook/auth.hpp"
 #include "orderbook/command_parser.hpp"
 #include "orderbook/engine.hpp"
 #include "orderbook/metrics.hpp"
@@ -78,8 +79,32 @@ struct ServerConfig {
     uint64_t ttl_hours{0};                    // --ttl-hours (0 = disabled)
     uint64_t ttl_scan_interval_seconds{300};  // --ttl-scan-interval-seconds
 
+    // ── Authentication (#30) ──────────────────────────────────────────────────
+    //
+    // Paths, never secrets. `--print-config` renders every value in this struct, so a secret held
+    // here would be printed by a command whose whole purpose is to be pasted into a ticket. The
+    // loaded credentials live in the components that verify against them.
+
+    /// --auth-secret-file: `<identity> <secret>` lines. Empty = client authentication disabled.
+    std::string auth_secret_file;
+
+    /// --cluster-secret-file: a single secret shared by the replication and multi-master links.
+    /// Empty = cluster authentication disabled. Must not be a client secret (see
+    /// stores_share_a_secret): a client able to present itself as a replica can stream the
+    /// entire write-ahead log.
+    std::string cluster_secret_file;
+
     // Observability
     uint16_t    metrics_port{0};              // --metrics-port (0 = disabled)
+
+    /// --metrics-bind: address the metrics listener binds to. Empty means every interface, which
+    /// is what it did before the flag existed.
+    ///
+    /// The metrics endpoint has no authentication and this is deliberate (#30 §8): a Prometheus
+    /// scraper cannot perform a challenge-response, so a bearer token would be a second and weaker
+    /// mechanism - and the weaker one is the one that gets used. Binding to a loopback or private
+    /// interface is the stronger answer, and it costs no protocol.
+    std::string metrics_bind;
     std::string log_level{"INFO"};            // --log-level (ERROR|WARN|INFO|DEBUG)
 
     // Sharding
@@ -116,6 +141,34 @@ struct ServerConfig {
     bool     uring_no_sqpoll{false};          // --no-sqpoll
 };
 
+// ── Loaded credentials ────────────────────────────────────────────────────────
+
+/// The credential stores a node runs with. Either may be empty, meaning that surface does not
+/// authenticate.
+struct LoadedSecrets {
+    SecretStore clients;   ///< --auth-secret-file
+    SecretStore cluster;   ///< --cluster-secret-file
+
+    bool client_auth_enabled() const { return !clients.empty(); }
+    bool cluster_auth_enabled() const { return !cluster.empty(); }
+
+    /// The pointer execute_command() wants: null when client authentication is off.
+    const SecretStore* client_store() const {
+        return clients.empty() ? nullptr : &clients;
+    }
+};
+
+/// Load both secret files, or print a refusal and exit.
+///
+/// Exits rather than throws, and does so for the same reason the CLI parser does since #36: a
+/// misconfigured secret file must not start a server. Three ways to fail, all fatal: the file is
+/// unloadable (see SecretStore), or the cluster secret is also a client secret - which would let a
+/// client present itself as a replica and stream the whole write-ahead log.
+///
+/// Also logs the state of each surface at INFO, including **disabled**. A default-open setting
+/// belongs in the log rather than only in a document nobody reads at three in the morning.
+LoadedSecrets load_secrets_or_exit(const ServerConfig& config);
+
 // ── TcpServer ─────────────────────────────────────────────────────────────────
 
 class TcpServer {
@@ -138,6 +191,13 @@ private:
     ServerConfig             config_;
     std::unique_ptr<Engine>  engine_;
     std::unique_ptr<MetricsServer> metrics_server_;
+
+    /// Credentials this node runs with, loaded once at construction.
+    ///
+    /// Held here rather than in ServerConfig so that `--print-config` has nothing to print, and
+    /// loaded in the constructor so a bad secret file refuses to start the process rather than
+    /// failing on the first client.
+    LoadedSecrets            secrets_;
     std::atomic<bool>        running_{false};
     std::atomic<bool>        draining_{false};  // drain phase: reject new connections, finish in-flight
     std::atomic<bool>        read_only_{false};  // dynamic read-only flag, toggled by failover
@@ -165,6 +225,12 @@ private:
 /// When hub is non-null, SUBSCRIBE and UNSUBSCRIBE are handled; when it is null they are refused
 /// with a message saying so. Refused rather than accepted-and-ignored: a client that receives OK and
 /// then silence cannot tell that from a market with no updates.
+///
+/// When client_secrets is non-null, authentication is enabled: every command except AUTH, PING and
+/// QUIT is refused until the session has answered a challenge. A null pointer means authentication
+/// is off, and then the wire behaves exactly as it did before #30 - not one byte differs - except
+/// that AUTH is refused, so a client configured to authenticate against a server that does not
+/// finds out rather than believing it did.
 std::string execute_command(const Command& cmd,
                             Engine& engine,
                             Session& session,
@@ -172,7 +238,19 @@ std::string execute_command(const Command& cmd,
                             bool read_only = false,
                             MetricsRegistry* registry = nullptr,
                             ShardCoordinator* shard_coord = nullptr,
-                            SubscriptionHub* hub = nullptr);
+                            SubscriptionHub* hub = nullptr,
+                            const SecretStore* client_secrets = nullptr);
+
+/// Whether a command may run on a session that has not authenticated.
+///
+/// True for exactly AUTH (how a session authenticates), PING (so a load balancer's health check
+/// needs no credentials and reveals nothing about the data), QUIT, and UNKNOWN (refused anyway).
+///
+/// Exposed so a test can iterate the enumeration instead of reading the source. The switch inside
+/// has **no `default:` label**, so `-Wswitch` makes a new CommandType a build failure - and a test
+/// refuses a `default:` being added, because that label is what would turn the compiler's
+/// exhaustiveness check off and make the next command's classification an accident.
+bool allowed_before_authentication(CommandType t);
 
 /// Where a configuration value came from. For `--print-config`, which exists to answer exactly
 /// that: a list of values does not tell an operator which of them they chose.

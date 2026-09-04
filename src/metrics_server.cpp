@@ -11,8 +11,8 @@
 
 namespace ob {
 
-MetricsServer::MetricsServer(uint16_t port, MetricsRegistry& registry)
-    : port_(port), registry_(registry) {}
+MetricsServer::MetricsServer(uint16_t port, MetricsRegistry& registry, std::string bind_address)
+    : port_(port), registry_(registry), bind_address_(std::move(bind_address)) {}
 
 MetricsServer::~MetricsServer() { stop(); }
 
@@ -31,6 +31,19 @@ void MetricsServer::start() {
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port        = htons(port_);
+
+    if (!bind_address_.empty()) {
+        // Refused rather than silently falling back to every interface. An operator who typed a
+        // bind address and got a listener on 0.0.0.0 has the opposite of what they asked for, and
+        // this endpoint is the one that has no authentication in front of it.
+        if (::inet_pton(AF_INET, bind_address_.c_str(), &addr.sin_addr) != 1) {
+            OB_LOG_ERROR("metrics", "invalid --metrics-bind address '%s'; metrics endpoint not started",
+                         bind_address_.c_str());
+            ::close(listen_fd_);
+            listen_fd_ = -1;
+            return;
+        }
+    }
 
     if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         OB_LOG_ERROR("metrics", "bind() failed on port %u: %s", port_, std::strerror(errno));

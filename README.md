@@ -9,7 +9,7 @@ A purpose-built C++20 database engine for Level 2 orderbook data in high-frequen
 
 Built by [Smart Data Engines](https://smartdataengines.com), who build custom database engines for specific hardware and workloads.
 
-> **Deployment notes:** the engine runs natively on the host; there is no containerised deployment path by design. The wire protocol has no authentication or transport encryption as of `v0.1.x`, so run it on a trusted network only. See [SECURITY.md](SECURITY.md).
+> **Deployment notes:** the engine runs natively on the host; there is no containerised deployment path by design. The wire protocol authenticates client sessions, replication links and multi-master peers by challenge-response (`--auth-secret-file`, `--cluster-secret-file`), and **encrypts nothing** — so run it on a trusted network only. See [SECURITY.md](SECURITY.md).
 
 ## Features
 

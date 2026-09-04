@@ -46,6 +46,19 @@ MetricsRegistry::MetricsRegistry() {
     counters_.push_back(make_counter("ob_subscription_refused_total",
                                      "Subscriptions refused: unparseable query or per-session "
                                      "limit reached"));
+    // Wire authentication (#30). Unlabelled by identity, and that is a decision rather than a
+    // limitation of the registry: per-identity attribution belongs to #31, where an identity gains
+    // permissions and therefore meaning. While every authenticated identity may run every command,
+    // a counter per identity answers a question nothing can be done about. What must never happen
+    // is a label fed by the identity a peer *claims* before authenticating - that is an unbounded
+    // label set an attacker controls.
+    counters_.push_back(make_counter("ob_auth_challenges_total",
+                                     "Challenges issued to client sessions"));
+    counters_.push_back(make_counter("ob_auth_success_total",
+                                     "Client sessions that authenticated successfully"));
+    counters_.push_back(make_counter("ob_auth_failures_total",
+                                     "Failed client authentication attempts. Each one also closed "
+                                     "a session, so a rising number means someone is trying."));
     counters_.push_back(make_counter("ob_wal_records_written",   "Total number of WAL records written"));
     counters_.push_back(make_counter("ob_repl_records_replayed", "Total number of replication records replayed"));
 

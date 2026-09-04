@@ -581,6 +581,17 @@ void ReplicationManager::remove_replica_locked(int fd) {
     ::close(fd);
 }
 
+void ReplicationManager::disconnect_replica_locked(int fd, const char* reason) {
+    OB_LOG_INFO("repl_mgr", "disconnecting replica fd=%d: %s", fd, reason);
+    remove_replica_locked(fd);
+    for (auto it = replicas_.begin(); it != replicas_.end(); ++it) {
+        if (it->fd == fd) {
+            replicas_.erase(it);
+            break;
+        }
+    }
+}
+
 void ReplicationManager::run_loop() {
     static constexpr int MAX_EVENTS = 32;
     struct epoll_event events[MAX_EVENTS];
@@ -739,6 +750,22 @@ void ReplicationManager::accept_replica() {
         replicas_.push_back(std::move(info));
         OB_LOG_INFO("repl_mgr", "replica added on connection %llu, total replicas=%zu",
                     static_cast<unsigned long long>(replicas_.back().conn_id), replicas_.size());
+
+        // Challenge first, before the replica has said anything (#30 part two). This side speaks
+        // first because it accepted the connection; the replica challenges back, and neither
+        // proceeds to REPLICATE until both have answered.
+        if (!config_.cluster_secret.empty()) {
+            ReplicaInfo& r = replicas_.back();
+            r.auth_nonce = generate_nonce_hex();
+            const std::string line = "CHALLENGE " + r.auth_nonce + "\n";
+            if (!send_all(r.fd, line.data(), line.size())) {
+                OB_LOG_WARN("repl_mgr", "failed to send challenge to replica fd=%d from %s",
+                            r.fd, r.address.c_str());
+            } else {
+                OB_LOG_INFO("repl_mgr", "challenged replica fd=%d from %s", r.fd,
+                            r.address.c_str());
+            }
+        }
     }
 }
 
@@ -773,6 +800,69 @@ void ReplicationManager::handle_replica_data(int fd) {
         if (n == 0) break; // EAGAIN, no more data
 
         std::string line(buf);
+
+        // ── Authentication (#30 part two) ─────────────────────────────────────
+        //
+        // Answering a challenge is unconditional: the replica sends its challenge before its own
+        // response, and by the time the response has been verified `peer_proved` is already true -
+        // so a branch gated on `!peer_proved` would leave the second message unanswered and the
+        // replica waiting for a proof that never comes.
+        if (!config_.cluster_secret.empty() && line.rfind("CHALLENGE ", 0) == 0) {
+            const std::string nonce = line.substr(std::strlen("CHALLENGE "));
+            if (!is_auth_hex(nonce)) {
+                OB_LOG_WARN("repl_mgr", "replica fd=%d from %s sent a malformed challenge",
+                            fd, replica_ptr->address.c_str());
+                disconnect_replica_locked(fd, "malformed challenge");
+                return;
+            }
+            // Answered as the acceptor, which is what makes a reflected nonce useless: the
+            // attacker needs an initiator-side response and this is not one.
+            const std::string answer =
+                "AUTH " + auth_response(config_.cluster_secret.sole().secret,
+                                        AuthSurface::Replication, AuthRole::Acceptor, "",
+                                        nonce) + "\n";
+            send_all(fd, answer.data(), answer.size());
+            continue;
+        }
+
+        if (!config_.cluster_secret.empty() && !replica_ptr->peer_proved) {
+            if (line.rfind("AUTH ", 0) == 0) {
+                const std::string got = line.substr(std::strlen("AUTH "));
+                const std::string expected =
+                    replica_ptr->auth_nonce.empty()
+                        ? std::string{}
+                        : auth_response(config_.cluster_secret.sole().secret,
+                                        AuthSurface::Replication, AuthRole::Initiator, "",
+                                        replica_ptr->auth_nonce);
+                // Single-use: whether it verified or not, this nonce is spent.
+                replica_ptr->auth_nonce.clear();
+                if (!responses_equal(expected, got)) {
+                    OB_LOG_ERROR("repl_mgr", "replica fd=%d from %s failed authentication",
+                                 fd, replica_ptr->address.c_str());
+                    const char* err = "ERR unauthenticated\n";
+                    send_all(fd, err, std::strlen(err));
+                    disconnect_replica_locked(fd, "authentication failed");
+                    return;
+                }
+                replica_ptr->peer_proved = true;
+                const char* ok = "OK AUTH\n";
+                send_all(fd, ok, std::strlen(ok));
+                OB_LOG_INFO("repl_mgr", "replica fd=%d from %s authenticated",
+                            fd, replica_ptr->address.c_str());
+                continue;
+            }
+            // Anything else, REPLICATE included, and the error goes on the wire before the close:
+            // a replica that is simply missing its secret would otherwise see a reconnect loop
+            // with no message.
+            OB_LOG_ERROR("repl_mgr",
+                         "replica fd=%d from %s sent '%s' before authenticating - disconnecting",
+                         fd, replica_ptr->address.c_str(),
+                         sanitise_for_log(line, 32).c_str());
+            const char* err = "ERR unauthenticated\n";
+            send_all(fd, err, std::strlen(err));
+            disconnect_replica_locked(fd, "unauthenticated");
+            return;
+        }
 
         // Parse REPLICATE handshake: REPLICATE <file_index> <byte_offset> <epoch>
         if (line.rfind("REPLICATE ", 0) == 0) {
@@ -1326,6 +1416,19 @@ void ReplicationClient::connect_to_primary() {
     // Reset compression flag for new connection.
     compress_ = false;
 
+    // ── Authentication (#30 part two) ─────────────────────────────────────────
+    //
+    // Mutual, and both directions complete before REPLICATE goes out. The order is fixed so that
+    // neither side ever has to handle an out-of-order message: the primary challenges on accept,
+    // this side answers *after* sending its own challenge, and the primary's two replies therefore
+    // arrive as `AUTH <hmac>` then `OK AUTH`.
+    if (!config_.cluster_secret.empty()) {
+        if (!authenticate_with_primary()) {
+            close_socket();
+            throw std::runtime_error("ReplicationClient: authentication with the primary failed");
+        }
+    }
+
     // Send REPLICATE handshake (Requirement 4.2, 3.1).
     // Even fresh replicas start with REPLICATE 0 0 0. If the primary responds
     // with ERR WAL_TRUNCATED, receive_and_replay() will trigger snapshot bootstrap.
@@ -1339,6 +1442,74 @@ void ReplicationClient::connect_to_primary() {
         throw std::runtime_error("ReplicationClient: failed to send handshake");
     }
     OB_LOG_INFO("repl_client", "handshake sent: %.*s", len - 1, handshake);
+}
+
+bool ReplicationClient::authenticate_with_primary() {
+    const std::string& secret = config_.cluster_secret.sole().secret;
+    char line_buf[512];
+
+    auto read_line = [&]() -> std::string {
+        const ssize_t n = reader_.read_line(line_buf, sizeof(line_buf));
+        if (n <= 0) return {};
+        return std::string(line_buf);
+    };
+
+    // 1. The primary challenges first, because it accepted the connection.
+    const std::string challenge = read_line();
+    if (challenge.rfind("CHALLENGE ", 0) != 0) {
+        // A primary without a cluster secret says nothing here, so this is also the message an
+        // operator sees when only one side has been configured. Naming what arrived instead is what
+        // distinguishes that from a network fault.
+        OB_LOG_ERROR("repl_client",
+                     "expected a challenge from the primary, got '%s' - is the primary running "
+                     "with --cluster-secret-file?",
+                     sanitise_for_log(challenge, 32).c_str());
+        return false;
+    }
+    const std::string primary_nonce = challenge.substr(std::strlen("CHALLENGE "));
+    if (!is_auth_hex(primary_nonce)) {
+        OB_LOG_ERROR("repl_client", "primary sent a malformed challenge");
+        return false;
+    }
+
+    // 2. Our challenge first, then our answer. This ordering is what makes the primary's replies
+    //    arrive in a known order.
+    const std::string our_nonce = generate_nonce_hex();
+    const std::string our_challenge = "CHALLENGE " + our_nonce + "\n";
+    if (!send_all(fd_, our_challenge.data(), our_challenge.size())) return false;
+
+    const std::string answer =
+        "AUTH " + auth_response(secret, AuthSurface::Replication, AuthRole::Initiator, "",
+                                primary_nonce) + "\n";
+    if (!send_all(fd_, answer.data(), answer.size())) return false;
+
+    // 3. The primary's answer to our challenge. Verified before REPLICATE goes out: a primary that
+    //    cannot prove itself must not be handed our WAL position, and must not be trusted with the
+    //    records it would send back.
+    const std::string their_answer = read_line();
+    if (their_answer.rfind("AUTH ", 0) != 0) {
+        OB_LOG_ERROR("repl_client", "primary did not answer our challenge, got '%s'",
+                     sanitise_for_log(their_answer, 32).c_str());
+        return false;
+    }
+    const std::string expected =
+        auth_response(secret, AuthSurface::Replication, AuthRole::Acceptor, "", our_nonce);
+    if (!responses_equal(expected, their_answer.substr(std::strlen("AUTH ")))) {
+        OB_LOG_ERROR("repl_client", "primary failed authentication - refusing to replicate from it");
+        return false;
+    }
+
+    // 4. And its verdict on ours.
+    const std::string verdict = read_line();
+    if (verdict.rfind("OK AUTH", 0) != 0) {
+        OB_LOG_ERROR("repl_client", "primary refused our credentials: '%s'",
+                     sanitise_for_log(verdict, 48).c_str());
+        return false;
+    }
+
+    OB_LOG_INFO("repl_client", "authenticated with primary %s:%u",
+                config_.primary_host.c_str(), config_.primary_port);
+    return true;
 }
 
 void ReplicationClient::receive_and_replay() {

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "orderbook/auth.hpp"
+
 // ── MultiMasterManager — peer networking, WAL broadcast, loop prevention ─────
 //
 // Central component managing multi-master replication: epoll-based peer
@@ -63,6 +65,19 @@ inline constexpr uint8_t MM_MSG_SNAPSHOT_BEGIN   = 201;
 inline constexpr uint8_t MM_MSG_SNAPSHOT_CHUNK   = 202;
 inline constexpr uint8_t MM_MSG_SNAPSHOT_END     = 203;
 inline constexpr uint8_t MM_MSG_SNAPSHOT_ABORT   = 204;
+
+// ── Authentication (#30 part two) ─────────────────────────────────────────────
+//
+// Two frames, exchanged before HandshakeMessage when a cluster secret is configured. Mutual by
+// symmetry: both sides challenge on connect and neither sends its handshake until it has verified
+// the other, so the handshake *is* the acceptance - there is no third message.
+//
+// Framing disambiguates them from a handshake without a version bump. A handshake frame is exactly
+// MM_HANDSHAKE_SIZE bytes; these carry a WALRecordV2 header (38 B) plus a payload, so they can
+// never be 17. A 17-byte frame from an unauthenticated peer therefore means **a peer without
+// authentication**, and is logged as that rather than as a short handshake.
+inline constexpr uint8_t MM_MSG_AUTH_CHALLENGE  = 205;
+inline constexpr uint8_t MM_MSG_AUTH_RESPONSE   = 206;
 
 /// Bytes of file content per chunk frame.
 ///
@@ -190,6 +205,13 @@ struct MultiMasterConfig {
     size_t      snapshot_low_watermark_bytes{MM_SNAPSHOT_LOW_WATERMARK};
     std::string shard_id;                         // optional, if sharding active
     CoordinatorConfig coordinator_config;         // etcd endpoints for peer discovery
+
+    /// Cluster secret (#30 part two). Empty = this mesh does not authenticate.
+    ///
+    /// Same secret as the replication link, which is why the surface label is inside the HMAC
+    /// input: without it a response captured on one of the two links would authenticate on the
+    /// other.
+    SecretStore cluster_secret;
 };
 
 // ── Peer connection state ─────────────────────────────────────────────────────
@@ -209,6 +231,22 @@ struct PeerConnection {
     uint64_t     conn_id{0};
     bool         connected{false};
     bool         handshake_done{false};  // handshake completed
+
+    /// True once this peer has answered our challenge (#30 part two).
+    ///
+    /// One flag rather than two. This side sends no handshake until the peer has proved itself, and
+    /// the peer applies the same rule, so mutual authentication falls out of the symmetry and
+    /// neither side needs to track its own proof.
+    bool         peer_proved{false};
+    /// The nonce we challenged this connection with. Single-use: cleared when answered.
+    std::string  auth_nonce;
+    /// True when *we* accepted this socket, false when we opened it.
+    ///
+    /// The mesh is symmetric, so this is the only thing that tells the two ends apart - and telling
+    /// them apart is the reflection defence (see AuthRole). We answer as this role and verify the
+    /// peer as the other one; without it, both ends compute the same function of a nonce and an
+    /// attacker can echo our own challenge back, be handed the answer, and replay it.
+    bool         we_accepted{false};
     bool         compress{false};    // LZ4 negotiated
     // Reported by the peer in its handshake, kept for the MM_PEERS view only. Catch-up must
     // not use them: they are positions in the peer's own WAL, and #61 was the consequence of
@@ -576,6 +614,15 @@ private:
 
     /// Process incoming handshake from peer.
     void process_handshake(PeerConnection& peer, const uint8_t* data, size_t len);
+
+    /// Send our challenge to a peer whose socket has just been established (#30 part two).
+    void send_auth_challenge(PeerConnection& peer);
+
+    /// Handle a frame arriving from a peer that has not yet proved itself.
+    ///
+    /// Answers a challenge, verifies a response, and disconnects on anything else - including a
+    /// bare handshake frame, which means the peer is not running with a cluster secret.
+    void handle_auth_frame(PeerConnection& peer, const uint8_t* data, size_t len);
 
     // Handshake send (task 7.1)
     /// Send our handshake message to a peer (called after connect or accept).

@@ -155,9 +155,36 @@ Two smaller things learned in the same hour, both about believing a command that
 - The engine repository's own count above was quoted in a commit message before it was checked twice.
   The commit is in the history; the number in this document is the corrected one.
 
-### One dismissal of our own code, and why it is not a fix
+### Dismissals in code we wrote
 
-Every dismissal above is vendored third-party code. **Alert 87 is the first in code we wrote**:
+**Alerts 90 and 91 (#30, wire authentication)** are the same rule and the same shape as alert 87:
+`cpp/path-injection` on `--auth-secret-file` and `--cluster-secret-file` flowing into file opening.
+Dismissed `won't fix`, with the reason on each alert and repeated here:
+
+> Same shape as alert 87 (`--config`, #32): the path is this server's own `--auth-secret-file` /
+> `--cluster-secret-file` argument. Whoever starts the process already reads any file, so the source
+> does not cross a trust boundary. A bad path is refused at startup.
+
+The assumption is the same one, and so is what would expire it: if a config path or a secret path
+could ever be handed to `ob_tcp_server` by something other than its own operator, the sink is real.
+Worth noting for these two specifically — the *contents* are a secret, so the eventual answer if that
+ever changes is not path sanitisation but refusing to take the path from that source at all.
+
+**Alerts 88 and 89** are `cpp/unused-static-function`, note severity, on `is_identity_char` and
+`valid_identity` in `src/auth.cpp`. Dismissed `false positive`, and the evidence is the compiler
+rather than a reading of the code: both are used (one at `auth.cpp:59` as a callable argument to
+`std::all_of`, the other at `:247`), and this tree builds under **GCC and Clang with
+`-Werror=unused-function`**, which fails on a genuinely unused function in an anonymous namespace.
+Verified directly with a two-function test case: the one passed to `std::all_of` is not flagged, the
+unused one fails the build. The query misses a function used only as a callable.
+
+That distinction is worth keeping for the next note-severity alert: **"is this reachable?" is a
+question a compiler already answers on every push, and its answer beats an analyser's.** Where the
+two disagree about liveness, the build is right.
+
+### The first dismissal of our own code, and why it is not a fix
+
+**Alert 87 is the first in code we wrote**:
 `cpp/path-injection` on the `--config <path>` value flowing into `std::ifstream` (#32). Dismissed
 `won't fix`, with the reason on the alert and repeated here because a dismissal that only lives in a
 web UI is a decision nobody can review:

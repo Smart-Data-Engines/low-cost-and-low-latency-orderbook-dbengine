@@ -52,7 +52,18 @@ struct ob_engine {
         : base_dir(dir)
         , wal(dir)
         , combined_store(dir)
-        , query_engine(std::make_unique<ob::QueryEngine>(combined_store, live_ptrs, agg))
+        // A lookup taking `mtx`, not a reference to `live_ptrs`. The same race the embedded path
+        // had: `ob_insert` creates buffers under `mtx` while `ob_query` read this map without it,
+        // and an unordered_map insertion rehashes under a concurrent reader (#91). `ob_query` does
+        // not hold `mtx`, so taking it here cannot self-deadlock.
+        , query_engine(std::make_unique<ob::QueryEngine>(
+              combined_store,
+              [this](const std::string& key) -> ob::SoABuffer* {
+                  std::lock_guard<std::mutex> lock(mtx);
+                  auto it = live_ptrs.find(key);
+                  return (it == live_ptrs.end()) ? nullptr : it->second;
+              },
+              agg))
     {
         // Rebuild segment index from any previously persisted segments.
         combined_store.open_existing();

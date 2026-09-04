@@ -157,7 +157,13 @@ std::string format_ok();
 std::string format_pong();
 
 /// Format STATUS response with server statistics.
-std::string format_status(const ServerStats& stats);
+/// Render STATUS.
+///
+/// `identity` is the authenticated identity of the session asking, or empty when client
+/// authentication is off - rendered as a key/value line rather than a column, so no client parsing
+/// the tab-separated table has to change. Per-session rather than in ServerStats because that is
+/// what it is: two sessions on one node answer this differently.
+std::string format_status(const ServerStats& stats, std::string_view identity = {});
 
 /// Parse a response string back into structured form (for round-trip testing).
 ParsedResponse parse_response(std::string_view response);

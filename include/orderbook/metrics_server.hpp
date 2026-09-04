@@ -13,7 +13,11 @@ namespace ob {
 /// Runs in a separate thread with an epoll event loop.
 class MetricsServer {
 public:
-    MetricsServer(uint16_t port, MetricsRegistry& registry);
+    /// `bind_address` empty means every interface, which is what this did before the parameter
+    /// existed. A loopback or private address is the control that matters here: the endpoint has no
+    /// authentication and deliberately none (#30 §8), because a Prometheus scraper cannot perform a
+    /// challenge-response and a bearer token would be the weaker mechanism that ends up being used.
+    MetricsServer(uint16_t port, MetricsRegistry& registry, std::string bind_address = {});
     ~MetricsServer();
 
     // Non-copyable, non-movable
@@ -33,6 +37,7 @@ public:
 private:
     uint16_t          port_;
     MetricsRegistry&  registry_;
+    std::string       bind_address_;
     std::atomic<bool> running_{false};
     std::thread       thread_;
     int               listen_fd_{-1};

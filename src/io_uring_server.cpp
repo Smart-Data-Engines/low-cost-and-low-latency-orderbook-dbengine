@@ -29,10 +29,12 @@ namespace ob {
 
 IoUringServer::IoUringServer(ServerConfig config)
     : config_(std::move(config))
+    , secrets_(load_secrets_or_exit(config_))
 {
     ReplicationConfig repl_config{};
     repl_config.port = config_.replication_port;
     repl_config.compress = config_.replication_compress;
+    repl_config.cluster_secret = secrets_.cluster;
 
     ReplicationClientConfig repl_client_config{};
     repl_client_config.primary_host = config_.primary_host;
@@ -40,6 +42,7 @@ IoUringServer::IoUringServer(ServerConfig config)
     repl_client_config.state_file   = config_.data_dir + "/repl_state.txt";
     repl_client_config.snapshot_chunk_size = config_.snapshot_chunk_size;
     repl_client_config.snapshot_staging_dir = config_.snapshot_staging_dir;
+    repl_client_config.cluster_secret = secrets_.cluster;
 
     FailoverConfig failover_config{};
     if (!config_.coordinator_endpoints.empty()) {
@@ -376,7 +379,8 @@ void IoUringServer::handle_read(int fd, int bytes_read) {
                           : parse_command(line);
 
         std::string response = execute_command(cmd, *engine_, *session, stats_,
-                                               read_only_.load(std::memory_order_acquire), &engine_->registry());
+                                               read_only_.load(std::memory_order_acquire), &engine_->registry(),
+                                               nullptr, nullptr, secrets_.client_store());
 
         if (response.empty()) {
             // QUIT — close session
@@ -439,6 +443,24 @@ void IoUringServer::handle_write(int fd, int bytes_written) {
 
     // Write completed — free the pending write buffer.
     pending_writes_.erase(fd);
+
+    // A command may have asked for the session to end once its response was out - QUIT while a
+    // response drains, and a failed authentication (#30). This loop consulted the flag nowhere at
+    // all, so `request_close_after_flush()` was a no-op on this transport: the epoll server got
+    // the same thing wrong in the fully-flushed path, and the reason both were invisible is that
+    // the flag was set correctly and nothing read it.
+    if (Session* session = session_mgr_->get_session(fd); session && session->close_requested()) {
+        OB_LOG_INFO("io_uring", "closing fd=%d: close requested after flush", fd);
+        session_mgr_->remove_session(fd);
+        if (fd < static_cast<int>(fd_to_buf_idx_.size()) &&
+            fd_to_buf_idx_[static_cast<size_t>(fd)] >= 0) {
+            free_buffer(fd_to_buf_idx_[static_cast<size_t>(fd)]);
+            fd_to_buf_idx_[static_cast<size_t>(fd)] = -1;
+        }
+        ::close(fd);
+        stats_.active_sessions.fetch_sub(1, std::memory_order_relaxed);
+        engine_->registry().increment_gauge("ob_active_sessions", -1);
+    }
 }
 
 
@@ -460,7 +482,8 @@ void IoUringServer::run() {
 
     // Start MetricsServer if configured.
     if (config_.metrics_port > 0) {
-        metrics_server_ = std::make_unique<MetricsServer>(config_.metrics_port, engine_->registry());
+        metrics_server_ = std::make_unique<MetricsServer>(config_.metrics_port, engine_->registry(),
+                                                          config_.metrics_bind);
         metrics_server_->start();
     }
 

@@ -175,6 +175,7 @@ cluster ready: $NODES nodes, every one seeing $expected peers.
   logs                $STATE_DIR/node*/node.log
   stop                $0 stop
 
-The wire protocol has no authentication or encryption (roadmap #30), so this is bound to 127.0.0.1
-and belongs on a machine you trust.
+These nodes run without authentication, and the wire is not encrypted in any case, so everything is
+bound to 127.0.0.1 and belongs on a machine you trust. For an authenticated cluster see
+--cluster-secret-file and docs/operations.md.
 DONE

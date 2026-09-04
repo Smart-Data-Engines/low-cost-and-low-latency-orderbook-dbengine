@@ -40,7 +40,17 @@ Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
     , flush_interval_ns_(flush_interval_ns)
     , wal_(base_dir, 512ULL << 20, fsync_policy)
     , combined_store_(base_dir)
-    , query_engine_(std::make_unique<QueryEngine>(combined_store_, live_ptrs_, agg_))
+    // The lookup takes mtx_ for one map read and releases it before the query runs. Handing
+    // QueryEngine a reference to `live_ptrs_` instead was a data race: every write path inserts
+    // into that map, and an unordered_map insertion rehashes under a concurrent reader (#91).
+    , query_engine_(std::make_unique<QueryEngine>(
+          combined_store_,
+          [this](const std::string& key) -> SoABuffer* {
+              std::lock_guard<std::mutex> lock(mtx_);
+              auto it = live_ptrs_.find(key);
+              return (it == live_ptrs_.end()) ? nullptr : it->second;
+          },
+          agg_))
     , repl_config_(std::move(repl_config))
     , repl_client_config_(std::move(repl_client_config))
     , failover_config_(std::move(failover_config))

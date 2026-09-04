@@ -16,47 +16,23 @@ import pathlib
 import subprocess
 
 import pytest
+from conftest import cpp_client_binary_path
 import os
 
 pytestmark = pytest.mark.cpp_client
 
-# tests/integration/test_cpp_client.py → repo root → build/tests/
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-BINARY_CANDIDATES = [
-    REPO_ROOT / "build" / "tests" / "ob_integration_test",
-    REPO_ROOT / "build-release" / "tests" / "ob_integration_test",
-]
-
-
-def find_binary() -> pathlib.Path | None:
-    """The client harness, from the same build tree as the server under test.
-
-    `OB_SERVER_BINARY` comes first and is derived rather than guessed: the harness lives at
-    `<build>/tests/ob_integration_test` beside the server's `<build>/ob_tcp_server`. Without this
-    the sanitizer job pointed at `build-tsan/` and this module looked in `build/`, so all seven of
-    its tests skipped - and a skipped integration test is indistinguishable from a passing one in a
-    summary line. That is the same defect four other modules had with the server path itself.
-    """
-    from_env = os.environ.get("OB_SERVER_BINARY")
-    if from_env:
-        derived = pathlib.Path(from_env).resolve().parent / "tests" / "ob_integration_test"
-        if derived.is_file():
-            return derived
-    for candidate in BINARY_CANDIDATES:
-        if candidate.is_file():
-            return candidate
-    return None
+# The harness path comes from conftest, which derives it from OB_SERVER_BINARY. It used to be
+# derived here, and then a third copy appeared in test_auth.py and found nothing under TSan - so it
+# lives in one place now, the same rule as server_binary_path().
 
 
 @pytest.fixture(scope="module")
 def binary() -> pathlib.Path:
-    found = find_binary()
+    found = cpp_client_binary_path()
     if found is None:
-        pytest.skip(
-            "ob_integration_test not built; looked in: "
-            + ", ".join(str(c) for c in BINARY_CANDIDATES)
-            + " (build with -DOB_BUILD_TESTS=ON)")
-    return found
+        pytest.skip("ob_integration_test not built (build with -DOB_BUILD_TESTS=ON); "
+                    "note that the sanitizer job builds it on purpose, so a skip there fails")
+    return pathlib.Path(found)
 
 
 def run_cpp_test(binary: pathlib.Path, port: int, name: str,

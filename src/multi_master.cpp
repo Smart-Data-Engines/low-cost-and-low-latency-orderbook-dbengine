@@ -697,13 +697,21 @@ void MultiMasterManager::io_loop() {
                     conn.conn_id = next_conn_id_++;
                     conn.connected = true;
                     conn.handshake_done = false;
+                    conn.peer_proved = false;
+                    conn.auth_nonce.clear();
+                    conn.we_accepted = true;
                     conn.compress = config_.compress;
 
                     // Store with temp key — will be re-keyed after handshake.
                     peers_[temp_id] = std::move(conn);
 
-                    // Send our handshake to the new peer.
-                    send_handshake(peers_[temp_id]);
+                    // With a cluster secret, challenge first and let the *handshake* be the
+                    // acceptance; without one, handshake straight away as before.
+                    if (!config_.cluster_secret.empty()) {
+                        send_auth_challenge(peers_[temp_id]);
+                    } else {
+                        send_handshake(peers_[temp_id]);
+                    }
                 }
             } else {
                 // ── Peer fd event ────────────────────────────────────────────
@@ -927,8 +935,13 @@ void MultiMasterManager::connect_to_peer(const PeerInfo& peer) {
     OB_LOG_INFO("mm", "Connected to peer %u at %s", peer.node_id,
                 peer.address.c_str());
 
-    // Send handshake to initiate protocol exchange.
-    send_handshake(peers_[peer.node_id]);
+    // Send handshake to initiate protocol exchange - or, with a cluster secret, a challenge, and
+    // the handshake follows once this peer has proved itself.
+    if (!config_.cluster_secret.empty()) {
+        send_auth_challenge(peers_[peer.node_id]);
+    } else {
+        send_handshake(peers_[peer.node_id]);
+    }
 
     // Update metrics: count connected peers.
     size_t connected = 0;
@@ -1029,6 +1042,9 @@ bool MultiMasterManager::drop_peer_if_send_buf_too_large(PeerConnection& peer) {
     }
     peer.connected      = false;
     peer.handshake_done = false;
+    peer.peer_proved = false;
+    peer.auth_nonce.clear();
+    peer.we_accepted = false;
     peer.catching_up    = false;
     peer.needs_snapshot = true;
     peer.send_buf.clear();          // safe now: nobody is reading this socket any more
@@ -1181,6 +1197,13 @@ void MultiMasterManager::process_recv_buf(PeerConnection& peer) {
 
 void MultiMasterManager::handle_frame(PeerConnection& peer,
                                       const uint8_t* data, size_t len) {
+    // Authentication comes before the handshake, so an unauthenticated peer cannot even tell us
+    // which node it claims to be (#30 part two).
+    if (!config_.cluster_secret.empty() && !peer.peer_proved) {
+        handle_auth_frame(peer, data, len);
+        return;
+    }
+
     if (!peer.handshake_done) {
         // First frame on connection must be a handshake.
         process_handshake(peer, data, len);
@@ -1317,6 +1340,128 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
 
     // Dispatch to handle_remote_record.
     handle_remote_record(peer.node_id, hdr, payload_ptr, expected_payload_len);
+}
+
+// ── Authentication (#30 part two) ─────────────────────────────────────────────
+
+void MultiMasterManager::send_auth_challenge(PeerConnection& peer) {
+    peer.auth_nonce = generate_nonce_hex();
+
+    WALRecordV2 hdr{};
+    hdr.sequence_number = 0;
+    hdr.timestamp_ns    = 0;
+    hdr.checksum        = crc32c(peer.auth_nonce.data(), peer.auth_nonce.size());
+    hdr.payload_len     = static_cast<uint16_t>(peer.auth_nonce.size());
+    hdr.record_type     = MM_MSG_AUTH_CHALLENGE;
+    hdr.version         = 1;
+    hdr.origin_node_id  = config_.node_id;
+    std::memset(hdr.hlc_data, 0, sizeof(hdr.hlc_data));
+
+    std::vector<uint8_t> frame;
+    frame.reserve(MM_WALRECORD_V2_SIZE + peer.auth_nonce.size());
+    const auto* hdr_bytes = reinterpret_cast<const uint8_t*>(&hdr);
+    frame.insert(frame.end(), hdr_bytes, hdr_bytes + MM_WALRECORD_V2_SIZE);
+    frame.insert(frame.end(), peer.auth_nonce.begin(), peer.auth_nonce.end());
+
+    enqueue_frame(peer, frame.data(), frame.size());
+    OB_LOG_INFO("mm", "Challenged peer %u at %s", peer.node_id, peer.address.c_str());
+}
+
+void MultiMasterManager::handle_auth_frame(PeerConnection& peer,
+                                           const uint8_t* data, size_t len) {
+    auto disconnect = [&](const char* reason) {
+        OB_LOG_ERROR("mm", "Peer %u at %s: %s - disconnecting",
+                     peer.node_id, peer.address.c_str(), reason);
+        if (peer.fd >= 0) {
+            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, peer.fd, nullptr);
+            ::close(peer.fd);
+            peer.fd = -1;
+        }
+        peer.connected = false;
+        peer.peer_proved = false;
+        peer.auth_nonce.clear();
+        peer.recv_buf.clear();
+        peer.send_buf.clear();
+    };
+
+    if (len == MM_HANDSHAKE_SIZE) {
+        // The one case worth naming: a peer that sent its handshake straight away is a peer running
+        // without --cluster-secret-file. Reported as that rather than as a malformed frame, because
+        // the fix is a configuration change on the other node and nothing about this one.
+        disconnect("sent a handshake before authenticating, so it is running without a cluster "
+                   "secret; there is no mixed mode");
+        return;
+    }
+    if (len < MM_WALRECORD_V2_SIZE) {
+        disconnect("frame too short to be an authentication message");
+        return;
+    }
+
+    WALRecordV2 hdr{};
+    std::memcpy(&hdr, data, MM_WALRECORD_V2_SIZE);
+    const size_t payload_len = len - MM_WALRECORD_V2_SIZE;
+    if (hdr.payload_len != payload_len) {
+        disconnect("authentication frame length disagrees with its header");
+        return;
+    }
+    const std::string payload(reinterpret_cast<const char*>(data + MM_WALRECORD_V2_SIZE),
+                              payload_len);
+    const std::string& secret = config_.cluster_secret.sole().secret;
+
+    if (hdr.record_type == MM_MSG_AUTH_CHALLENGE) {
+        if (!is_auth_hex(payload)) {
+            disconnect("malformed challenge");
+            return;
+        }
+        // Answered as *our* role. The peer verifies it as the other one, so a nonce reflected
+        // back at us produces a response for the wrong role and does not verify.
+        const std::string answer =
+            auth_response(secret, AuthSurface::MultiMaster,
+                          peer.we_accepted ? AuthRole::Acceptor : AuthRole::Initiator,
+                          "", payload);
+
+        WALRecordV2 out{};
+        out.sequence_number = 0;
+        out.timestamp_ns    = 0;
+        out.checksum        = crc32c(answer.data(), answer.size());
+        out.payload_len     = static_cast<uint16_t>(answer.size());
+        out.record_type     = MM_MSG_AUTH_RESPONSE;
+        out.version         = 1;
+        out.origin_node_id  = config_.node_id;
+        std::memset(out.hlc_data, 0, sizeof(out.hlc_data));
+
+        std::vector<uint8_t> frame;
+        frame.reserve(MM_WALRECORD_V2_SIZE + answer.size());
+        const auto* out_bytes = reinterpret_cast<const uint8_t*>(&out);
+        frame.insert(frame.end(), out_bytes, out_bytes + MM_WALRECORD_V2_SIZE);
+        frame.insert(frame.end(), answer.begin(), answer.end());
+        enqueue_frame(peer, frame.data(), frame.size());
+        OB_LOG_DEBUG("mm", "Answered challenge from peer %u", peer.node_id);
+        return;
+    }
+
+    if (hdr.record_type == MM_MSG_AUTH_RESPONSE) {
+        const std::string expected =
+            peer.auth_nonce.empty()
+                ? std::string{}
+                : auth_response(secret, AuthSurface::MultiMaster,
+                                peer.we_accepted ? AuthRole::Initiator : AuthRole::Acceptor,
+                                "", peer.auth_nonce);
+        // Spent either way, so a captured response cannot be replayed on this connection.
+        peer.auth_nonce.clear();
+        if (!responses_equal(expected, payload)) {
+            disconnect("failed authentication");
+            return;
+        }
+        peer.peer_proved = true;
+        OB_LOG_INFO("mm", "Peer %u at %s authenticated", peer.node_id, peer.address.c_str());
+        // The handshake is the acceptance: sending it only now is what makes this mutual, because
+        // the peer applies the same rule to us.
+        send_handshake(peer);
+        return;
+    }
+
+    disconnect("unexpected frame type before authentication");
 }
 
 void MultiMasterManager::send_handshake(PeerConnection& peer) {
@@ -1524,6 +1669,9 @@ void MultiMasterManager::schedule_reconnect(uint16_t node_id) {
 
     peer.connected = false;
     peer.handshake_done = false;
+    peer.peer_proved = false;
+    peer.auth_nonce.clear();
+    peer.we_accepted = false;
     peer.recv_buf.clear();
     peer.send_buf.clear();
 
@@ -1613,6 +1761,9 @@ void MultiMasterManager::reconnect_loop() {
                 peer.fd = fd;
                 peer.connected = true;
                 peer.handshake_done = false;
+                peer.peer_proved = false;
+                peer.auth_nonce.clear();
+                peer.we_accepted = false;
                 peer.backoff.reset();
 
                 // Add peer fd to epoll (edge-triggered EPOLLIN).
@@ -1626,8 +1777,14 @@ void MultiMasterManager::reconnect_loop() {
                 OB_LOG_INFO("mm", "Reconnected to peer %u at %s", nid,
                             peer.address.c_str());
 
-                // Send handshake to initiate protocol exchange.
-                send_handshake(peer);
+                // Challenge first when a cluster secret is configured; the handshake follows
+                // once the peer has proved itself on this *new* socket - a reconnect starts the
+                // exchange again, which is why peer_proved was just cleared.
+                if (!config_.cluster_secret.empty()) {
+                    send_auth_challenge(peer);
+                } else {
+                    send_handshake(peer);
+                }
 
                 // Update metrics.
                 size_t connected = 0;
@@ -1780,6 +1937,9 @@ void MultiMasterManager::check_backpressure(PeerConnection& peer) {
         }
         peer.connected      = false;
         peer.handshake_done = false;
+        peer.peer_proved = false;
+        peer.auth_nonce.clear();
+        peer.we_accepted = false;
         peer.send_buf.clear();
         peer.recv_buf.clear();
         peer.needs_snapshot = true;

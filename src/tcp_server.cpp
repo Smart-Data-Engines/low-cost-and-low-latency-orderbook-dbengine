@@ -36,6 +36,170 @@ namespace ob {
 
 // ── execute_command ───────────────────────────────────────────────────────────
 
+/// Commands a session may run before it has authenticated.
+///
+/// AUTH is how it authenticates. PING is here so that a load balancer's health check needs no
+/// credentials and reveals nothing about the data. QUIT is here because refusing a client's request
+/// to leave would be absurd, and because a client that cannot leave holds a session slot.
+LoadedSecrets load_secrets_or_exit(const ServerConfig& config) {
+    LoadedSecrets out;
+    try {
+        if (!config.auth_secret_file.empty()) {
+            out.clients = SecretStore::load_client_file(config.auth_secret_file);
+        }
+        if (!config.cluster_secret_file.empty()) {
+            out.cluster = SecretStore::load_cluster_file(config.cluster_secret_file);
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "Error: %s\n", e.what());
+        std::exit(1);
+    }
+
+    if (out.client_auth_enabled() && out.cluster_auth_enabled() &&
+        stores_share_a_secret(out.clients, out.cluster)) {
+        // Refused rather than warned about. Sharing the secret means client authentication grants
+        // node privileges: a client presenting itself as a replica streams the entire write-ahead
+        // log, and nothing on either surface looks wrong while it happens.
+        std::fprintf(stderr,
+                     "Error: the cluster secret in '%s' is also a client secret in '%s'. "
+                     "A client holding it can present itself as a replica and stream the whole "
+                     "write-ahead log. Generate separate secrets.\n",
+                     config.cluster_secret_file.c_str(), config.auth_secret_file.c_str());
+        std::exit(1);
+    }
+
+    if (out.client_auth_enabled()) {
+        OB_LOG_INFO("auth", "client authentication enabled (%zu identities from %s)",
+                    out.clients.size(), config.auth_secret_file.c_str());
+    } else {
+        OB_LOG_WARN("auth", "client authentication disabled - trusted-network deployment only "
+                            "(--auth-secret-file)");
+    }
+    if (out.cluster_auth_enabled()) {
+        OB_LOG_INFO("auth", "cluster authentication enabled (%s); every node in this cluster must "
+                            "run with the same secret - there is no mixed mode",
+                    config.cluster_secret_file.c_str());
+    } else {
+        OB_LOG_WARN("auth", "cluster authentication disabled - replication and multi-master links "
+                            "accept any peer (--cluster-secret-file)");
+    }
+    return out;
+}
+
+bool allowed_before_authentication(CommandType t) {
+    switch (t) {
+    case CommandType::AUTH:
+    case CommandType::PING:
+    case CommandType::QUIT:
+    case CommandType::UNKNOWN:   // refused anyway, and by the parser's own message
+        return true;
+    case CommandType::SELECT:
+    case CommandType::INSERT:
+    case CommandType::MINSERT:
+    case CommandType::FLUSH:
+    case CommandType::STATUS:
+    case CommandType::ROLE:
+    case CommandType::FAILOVER:
+    case CommandType::COMPRESS:
+    case CommandType::SHARD_MAP:
+    case CommandType::SHARD_INFO:
+    case CommandType::MIGRATE:
+    case CommandType::MM_PEERS:
+    case CommandType::MM_CONFLICTS:
+    case CommandType::SUBSCRIBE:
+    case CommandType::UNSUBSCRIBE:
+        return false;
+    }
+    // A CommandType outside the enumeration is not a command. Refusing is the safe direction:
+    // returning true here would make a corrupted value a way past the gate.
+    return false;
+}
+
+namespace {
+
+/// The peer's address, for a log line. "unknown" when the socket will not say.
+std::string peer_address(int fd) {
+    sockaddr_in addr{};
+    socklen_t len = sizeof(addr);
+    if (::getpeername(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+        return "unknown";
+    }
+    // Checked rather than assumed: getpeername succeeds on an AF_UNIX socket too - which is what
+    // the unit tests use - and reading a sockaddr_un through a sockaddr_in would put whatever bytes
+    // followed the path into a log line as an address.
+    if (addr.sin_family != AF_INET) {
+        return "unknown";
+    }
+    char host[INET_ADDRSTRLEN] = {0};
+    if (::inet_ntop(AF_INET, &addr.sin_addr, host, sizeof(host)) == nullptr) {
+        return "unknown";
+    }
+    return std::string(host) + ":" + std::to_string(ntohs(addr.sin_port));
+}
+
+/// Handle AUTH. Five outcomes, and the only one that continues the session is the last.
+std::string handle_auth(const Command& cmd,
+                        Session& session,
+                        MetricsRegistry* registry,
+                        const SecretStore& secrets) {
+    if (session.authenticated()) {
+        // Not an error the client can act on by retrying, and answering OK would let a second
+        // response overwrite the identity the log already reported.
+        return format_error("already_authenticated");
+    }
+
+    if (cmd.auth_response.empty()) {
+        // Bare AUTH: issue a challenge. A new one replaces any outstanding one, so a response to
+        // the previous challenge no longer verifies.
+        std::string nonce = generate_nonce_hex();
+        session.set_pending_nonce(nonce);
+        if (registry) registry->increment_counter("ob_auth_challenges_total");
+        OB_LOG_DEBUG("auth", "conn_id=%llu from %s: challenge issued",
+                     static_cast<unsigned long long>(session.conn_id()),
+                     peer_address(session.fd()).c_str());
+        return "OK CHALLENGE " + nonce + "\n\n";
+    }
+
+    if (session.pending_nonce().empty()) {
+        return format_error("auth_no_challenge");
+    }
+
+    const Credential* cred = secrets.find(cmd.auth_identity);
+    const std::string expected =
+        cred ? auth_response(cred->secret, AuthSurface::Client, AuthRole::Initiator,
+                             cred->identity, session.pending_nonce())
+             : std::string{};
+
+    // An unknown identity takes the same path as a wrong response, with the same wire message. The
+    // distinction would tell an attacker which names exist and tells the operator nothing their log
+    // does not already say.
+    if (cred == nullptr || !responses_equal(expected, cmd.auth_response)) {
+        session.increment_auth_attempts();
+        session.set_pending_nonce({});
+        if (registry) registry->increment_counter("ob_auth_failures_total");
+        OB_LOG_WARN("auth",
+                    "conn_id=%llu from %s: authentication failed (attempt %u, claimed identity=%s)",
+                    static_cast<unsigned long long>(session.conn_id()),
+                    peer_address(session.fd()).c_str(),
+                    session.auth_attempts(),
+                    sanitise_for_log(cmd.auth_identity).c_str());
+        // Closed after the response drains, the same way QUIT is: a socket that shuts without the
+        // reason arriving leaves the client with a connection reset and no message.
+        session.request_close_after_flush();
+        return format_error("auth_failed");
+    }
+
+    session.set_authenticated(cred->identity);
+    if (registry) registry->increment_counter("ob_auth_success_total");
+    OB_LOG_INFO("auth", "conn_id=%llu from %s: authenticated as identity=%s",
+                static_cast<unsigned long long>(session.conn_id()),
+                peer_address(session.fd()).c_str(),
+                cred->identity.c_str());
+    return "OK AUTH " + cred->identity + "\n\n";
+}
+
+} // namespace
+
 std::string execute_command(const Command& cmd,
                             Engine& engine,
                             Session& session,
@@ -43,7 +207,29 @@ std::string execute_command(const Command& cmd,
                             bool read_only,
                             MetricsRegistry* registry,
                             ShardCoordinator* shard_coord,
-                            SubscriptionHub* hub) {
+                            SubscriptionHub* hub,
+                            const SecretStore* client_secrets) {
+    // ── Authentication gate ───────────────────────────────────────────────────
+    //
+    // Before the switch, not as a branch inside each case. A per-case check means the next command
+    // added without one is a command reachable without authentication, and nothing fails - the same
+    // shape as a required check nobody requires. AuthGateStatic holds the classification.
+    if (client_secrets == nullptr) {
+        if (cmd.type == CommandType::AUTH) {
+            // Refused rather than answered OK. A client configured to authenticate, talking to a
+            // server that does not, must find out: an OK here would be an assurance with nothing
+            // behind it, which is the failure mode where everything looks done.
+            return format_error("auth_disabled");
+        }
+    } else {
+        if (cmd.type == CommandType::AUTH) {
+            return handle_auth(cmd, session, registry, *client_secrets);
+        }
+        if (!session.authenticated() && !allowed_before_authentication(cmd.type)) {
+            return format_error("unauthenticated");
+        }
+    }
+
     switch (cmd.type) {
 
     case CommandType::COMPRESS: {
@@ -305,7 +491,7 @@ std::string execute_command(const Command& cmd,
             stats.mm_replication_lag_per_peer = es.mm_replication_lag_per_peer;
         }
 
-        return format_status(stats);
+        return format_status(stats, session.identity());
     }
 
     case CommandType::ROLE:
@@ -385,6 +571,11 @@ std::string execute_command(const Command& cmd,
     case CommandType::QUIT:
         session.increment_commands();
         return ""; // empty string signals session close
+
+    case CommandType::AUTH:
+        // Unreachable: the gate above handles AUTH on both paths and returns. Present so that the
+        // switch stays exhaustive, which is what makes -Wswitch tell us about the *next* command.
+        return format_error("auth_disabled");
 
     case CommandType::UNKNOWN:
     default:
@@ -501,6 +692,8 @@ const std::vector<std::string>& known_flags() {
         "config",
         "coordinator-endpoints",
         "coordinator-lease-ttl",
+        "auth-secret-file",
+        "cluster-secret-file",
         "data-dir",
         "election-deference-ms",
         "election-lease-wait-ms",
@@ -513,6 +706,7 @@ const std::vector<std::string>& known_flags() {
         "max-sessions",
         "max-subscriber-queue-bytes",
         "max-subscriptions-per-session",
+        "metrics-bind",
         "metrics-port",
         "mm-max-catchup-bytes",
         "mm-max-peer-send-buffer",
@@ -567,6 +761,8 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"election-deference-ms", {"<N>", "Wait for a replica further ahead in the log; 0 disables"}},
         {"election-lease-wait-ms", {"<N>", "Wait after the leader key vanishes before standing"}},
         {"failover-enabled", {"<BOOL>", "Participate in automatic failover: true/1/yes or false/0/no (default: true)"}},
+        {"auth-secret-file", {"<PATH>", "Client credentials, '<identity> <secret>' per line; mode 600. Empty disables client authentication"}},
+        {"cluster-secret-file", {"<PATH>", "Shared secret for replication and multi-master links, one line; mode 600"}},
         {"flush-interval-ms", {"<N>", "Background flush interval in ms (default: 100)"}},
         {"fsync-policy", {"<POLICY>", "WAL durability: every, interval or none (lower case; default: interval)"}},
         {"handover-cooldown-seconds", {"<N>", "How long a node that handed the role over abstains"}},
@@ -575,6 +771,7 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"max-sessions", {"<N>", "Maximum concurrent client sessions (default: 64)"}},
         {"max-subscriber-queue-bytes", {"<N>", "Per-subscriber queue ceiling; past it the session closes"}},
         {"max-subscriptions-per-session", {"<N>", "Subscription limit per session (default: 16)"}},
+        {"metrics-bind", {"<ADDR>", "Address the metrics listener binds to (default: every interface)"}},
         {"metrics-port", {"<PORT>", "Prometheus metrics port; 0 disables the endpoint"}},
         {"mm-max-catchup-bytes", {"<N>", "WAL bytes a peer may scan before a snapshot is used"}},
         {"mm-max-peer-send-buffer", {"<N>", "Per-peer send buffer ceiling; past it the peer is dropped"}},
@@ -908,6 +1105,12 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.ttl_scan_interval_seconds = cursor.value_as<uint64_t>();
         } else if (arg == "--metrics-port") {
             config.metrics_port = cursor.value_as<uint16_t>();
+        } else if (arg == "--metrics-bind") {
+            config.metrics_bind = std::string{cursor.value()};
+        } else if (arg == "--auth-secret-file") {
+            config.auth_secret_file = std::string{cursor.value()};
+        } else if (arg == "--cluster-secret-file") {
+            config.cluster_secret_file = std::string{cursor.value()};
         } else if (arg == "--flush-interval-ms") {
             config.flush_interval_ms = cursor.value_as<uint64_t>();
         } else if (arg == "--log-level") {
@@ -1109,6 +1312,10 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("election-lease-wait-ms", std::to_string(c.election_lease_wait_ms));
     line("failover-enabled", c.failover_enabled ? "true" : "false");
     line("flush-interval-ms", std::to_string(c.flush_interval_ms));
+    // The *path*, and there is no value to print because the secret is never a field of
+    // ServerConfig. `--print-config` exists to be pasted into a ticket.
+    line("auth-secret-file", c.auth_secret_file.empty() ? "(none)" : c.auth_secret_file);
+    line("cluster-secret-file", c.cluster_secret_file.empty() ? "(none)" : c.cluster_secret_file);
     line("fsync-policy",
          c.fsync_policy == FsyncPolicy::EVERY ? "every"
              : c.fsync_policy == FsyncPolicy::NONE ? "none" : "interval");
@@ -1118,6 +1325,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("max-sessions", std::to_string(c.max_sessions));
     line("max-subscriber-queue-bytes", std::to_string(c.max_subscriber_queue_bytes));
     line("max-subscriptions-per-session", std::to_string(c.max_subscriptions_per_session));
+    line("metrics-bind", c.metrics_bind.empty() ? "(every interface)" : c.metrics_bind);
     line("metrics-port", std::to_string(c.metrics_port));
     line("mm-max-catchup-bytes", std::to_string(c.mm_max_catchup_bytes));
     line("mm-max-peer-send-buffer", std::to_string(c.mm_max_peer_send_buf_bytes));
@@ -1155,12 +1363,14 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
 
 TcpServer::TcpServer(ServerConfig config)
     : config_(std::move(config))
+    , secrets_(load_secrets_or_exit(config_))
     , read_only_(config_.read_only)
 {
     ReplicationConfig repl_config{};
     if (!config_.multi_master) {
         repl_config.port = config_.replication_port;
         repl_config.compress = config_.replication_compress;
+        repl_config.cluster_secret = secrets_.cluster;
     }
     // In MM mode, repl_config.port stays 0 → Engine won't create ReplicationManager
 
@@ -1170,6 +1380,7 @@ TcpServer::TcpServer(ServerConfig config)
     repl_client_config.state_file   = config_.data_dir + "/repl_state.txt";
     repl_client_config.snapshot_chunk_size = config_.snapshot_chunk_size;
     repl_client_config.snapshot_staging_dir = config_.snapshot_staging_dir;
+    repl_client_config.cluster_secret = secrets_.cluster;
 
     FailoverConfig failover_config{};
     if (!config_.coordinator_endpoints.empty()) {
@@ -1210,7 +1421,8 @@ TcpServer::TcpServer(ServerConfig config)
                                                config_.coordinator_lease_ttl,
                                                config_.node_id,
                                                "/ob/"
-                                           }
+                                           },
+                                           .cluster_secret = secrets_.cluster
                                        });
 }
 
@@ -1234,7 +1446,8 @@ void TcpServer::run() {
 
     // Start MetricsServer if configured.
     if (config_.metrics_port > 0) {
-        metrics_server_ = std::make_unique<MetricsServer>(config_.metrics_port, engine_->registry());
+        metrics_server_ = std::make_unique<MetricsServer>(config_.metrics_port, engine_->registry(),
+                                                          config_.metrics_bind);
         metrics_server_->start();
     }
 
@@ -1535,7 +1748,7 @@ void TcpServer::run() {
                         Command cmd = (line.find('\n') != std::string::npos)
                                           ? parse_minsert(line)
                                           : parse_command(line);
-                        std::string response = execute_command(cmd, *engine_, *session, stats, read_only_.load(std::memory_order_acquire), &engine_->registry(), shard_coord.get(), &subscription_hub);
+                        std::string response = execute_command(cmd, *engine_, *session, stats, read_only_.load(std::memory_order_acquire), &engine_->registry(), shard_coord.get(), &subscription_hub, secrets_.client_store());
 
                         if (response.empty()) {
                             // QUIT. If a previous response is still draining, let it
@@ -1563,6 +1776,21 @@ void TcpServer::run() {
                             // on EPOLLOUT; closing here is what truncated every
                             // response larger than the socket buffer.
                             arm_epollout(fd);
+                        } else if (session->close_requested()) {
+                            // A command asked for the session to end once its response was out,
+                            // and the response is out.
+                            //
+                            // This branch was missing. `close_requested()` was consulted only in
+                            // the EPOLLOUT drain, which runs only after a *partial* write - so a
+                            // response small enough to fit the socket buffer left the session
+                            // open with the flag set and nothing reading it. That is exactly the
+                            // case that matters here: `ERR auth_failed\n` is eighteen bytes, so a
+                            // failed authentication kept its connection and could try again,
+                            // which is the entire rate limit gone. Found by the integration test,
+                            // not by the unit test - which asserted the flag rather than the
+                            // effect (pitfall 45).
+                            close_session(fd, "close requested after flush");
+                            goto next_event;
                         }
 
                         // Enable compression AFTER sending the plain-text ack.
