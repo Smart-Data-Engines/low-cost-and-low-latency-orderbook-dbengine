@@ -57,6 +57,13 @@ static Gen<std::string> genSymbol() {
     );
 }
 
+/// A Command carrying nothing but its type.
+static ob::Command simple_command(ob::CommandType t) {
+    ob::Command cmd{};
+    cmd.type = t;
+    return cmd;
+}
+
 // Generator for alphanumeric strings (non-empty, no spaces/newlines/hyphens)
 static Gen<std::string> genExchange() {
     return gen::nonEmpty(
@@ -100,12 +107,17 @@ static Gen<ob::Command> genCommand() {
             cmd.insert_args = std::move(args);
             return cmd;
         }),
-        // Simple commands
-        gen::just(ob::Command{ob::CommandType::FLUSH, {}, {}, {}, {}, {}, {}, {}, {}, {}}),
-        gen::just(ob::Command{ob::CommandType::PING, {}, {}, {}, {}, {}, {}, {}, {}, {}}),
-        gen::just(ob::Command{ob::CommandType::STATUS, {}, {}, {}, {}, {}, {}, {}, {}, {}}),
-        gen::just(ob::Command{ob::CommandType::ROLE, {}, {}, {}, {}, {}, {}, {}, {}, {}}),
-        gen::just(ob::Command{ob::CommandType::QUIT, {}, {}, {}, {}, {}, {}, {}, {}, {}})
+        // Simple commands.
+        //
+        // Built by setting the type on a value-initialised Command rather than by positional
+        // aggregate initialisation. The positional form listed every field, so each new field in
+        // Command broke five lines of this generator with a -Wmissing-field-initializers error and
+        // no relation to what was being tested - which is how #30 first touched this file.
+        gen::just(simple_command(ob::CommandType::FLUSH)),
+        gen::just(simple_command(ob::CommandType::PING)),
+        gen::just(simple_command(ob::CommandType::STATUS)),
+        gen::just(simple_command(ob::CommandType::ROLE)),
+        gen::just(simple_command(ob::CommandType::QUIT))
     );
 }
 

@@ -79,6 +79,14 @@ private:
     std::unique_ptr<SessionManager> session_mgr_;
     ServerStats stats_;
 
+    /// Credentials this node runs with (#30).
+    ///
+    /// This transport shares `ob::Session` and `execute_command()` with the epoll server, so the
+    /// authentication gate is one seam for both loops - but only if this loop passes the store.
+    /// Nothing in CI builds this file (io_uring is off by default), so the guarantee is a static
+    /// test that refuses an `execute_command()` call from a transport without a store argument.
+    LoadedSecrets secrets_;
+
     // ── Inicjalizacja ────────────────────────────────────────────────
     void init_ring();
     void register_buffers();

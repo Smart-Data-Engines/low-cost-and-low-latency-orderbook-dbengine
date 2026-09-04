@@ -39,6 +39,19 @@ function(ob_add_test name)
     gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 endfunction()
 
+# ── Helper to register a test executable that needs the auth library ─────────
+function(ob_add_auth_test name)
+    add_executable(${name} ${ARGN})
+    target_link_libraries(${name}
+        PRIVATE
+            orderbook_auth
+            GTest::gtest_main
+            rapidcheck
+            rapidcheck_gtest
+    )
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
+endfunction()
+
 # ── Helper to register a test executable that needs the soa library ───────────
 function(ob_add_soa_test name)
     add_executable(${name} ${ARGN})
@@ -719,3 +732,17 @@ gtest_discover_tests(test_mm_port_isolation PROPERTIES ENVIRONMENT "RC_PARAMS=ma
 add_executable(ob_integration_test integration/ob_integration_test.cpp)
 target_link_libraries(ob_integration_test PRIVATE orderbook_client)
 # NOT registered with gtest_discover_tests — invoked by Python test_cpp_client.py
+
+# ── Wire authentication (#30) ─────────────────────────────────────────────────
+ob_add_auth_test(test_auth
+    test_auth.cpp
+)
+
+ob_add_tcp_test(test_auth_gate
+    test_auth_gate.cpp
+)
+# Reads src/tcp_server.cpp to refuse a `default:` label in the gate's classifier — the same reason
+# test_cli_config and test_version get this definition.
+target_compile_definitions(test_auth_gate
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)

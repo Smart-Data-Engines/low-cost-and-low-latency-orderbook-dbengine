@@ -71,6 +71,34 @@ public:
     uint64_t commands_executed() const;
     void increment_commands();
 
+    // ── Authentication state (#30) ────────────────────────────────────────────
+    //
+    // The session holds *its own* authentication state and deliberately not the server's secret.
+    // Verification happens in execute_command(), which is handed the credential store; a Session
+    // holding a secret would put credential material into every object the epoll loop copies,
+    // logs or dumps for diagnostics.
+
+    /// True once this connection has answered a challenge correctly.
+    bool authenticated() const;
+
+    /// Who this connection authenticated as. Empty while unauthenticated.
+    const std::string& identity() const;
+
+    void set_authenticated(std::string identity);
+
+    /// The outstanding challenge, or empty when none is outstanding.
+    ///
+    /// Single-use in both directions: issuing a new challenge replaces it, so a response to the
+    /// previous one no longer verifies, and a successful response clears it.
+    const std::string& pending_nonce() const;
+    void set_pending_nonce(std::string nonce);
+
+    /// Failed attempts on this connection. For the log line, which is the only place it is read:
+    /// the session is closed on the first failure, so this counts at most one per connection —
+    /// and a value above one would mean the close stopped working.
+    uint32_t auth_attempts() const;
+    void increment_auth_attempts();
+
 private:
     int         fd_;
     uint64_t    conn_id_;
@@ -93,6 +121,12 @@ private:
     uint64_t    command_count_{0};
     uint64_t    compress_bytes_in_{0};   // raw bytes (before compression / after decompression)
     uint64_t    compress_bytes_out_{0};  // wire bytes (after compression / before decompression)
+
+    // Authentication (#30)
+    bool        authenticated_{false};
+    std::string identity_;
+    std::string pending_nonce_;
+    uint32_t    auth_attempts_{0};
 
     // MINSERT multi-line buffering state
     bool        minsert_pending_{false};

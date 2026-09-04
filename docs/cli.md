@@ -247,6 +247,8 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | Flag | Argument | Meaning |
 |------|----------|---------|
 | `--anti-entropy-interval-seconds` | `<N>` | Multi-master reconciliation interval (default: 60) |
+| `--auth-secret-file` | `<PATH>` | Client credentials, `<identity> <secret>` per line; mode 600. Empty disables client authentication |
+| `--cluster-secret-file` | `<PATH>` | Shared secret for replication and multi-master links, one line; mode 600 |
 | `--config` | `<FILE>` | Read `key = value` settings from FILE; command line wins |
 | `--coordinator-endpoints` | `<URLS>` | Comma-separated etcd endpoints for HA and failover |
 | `--coordinator-lease-ttl` | `<N>` | Leader lease TTL in seconds (default: 10) |
@@ -262,6 +264,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--max-sessions` | `<N>` | Maximum concurrent client sessions (default: 64) |
 | `--max-subscriber-queue-bytes` | `<N>` | Per-subscriber queue ceiling; past it the session closes |
 | `--max-subscriptions-per-session` | `<N>` | Subscription limit per session (default: 16) |
+| `--metrics-bind` | `<ADDR>` | Address the metrics listener binds to (default: every interface) |
 | `--metrics-port` | `<PORT>` | Prometheus metrics port; 0 disables the endpoint |
 | `--mm-max-catchup-bytes` | `<N>` | WAL bytes a peer may scan before a snapshot is used |
 | `--mm-max-peer-send-buffer` | `<N>` | Per-peer send buffer ceiling; past it the peer is dropped |

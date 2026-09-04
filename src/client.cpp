@@ -3,6 +3,8 @@
 //         pool routing, health-check, failover.
 
 #include "orderbook/client.hpp"
+
+#include "orderbook/auth.hpp"
 #include "orderbook/shard_router.hpp"
 #include "orderbook/logger.hpp"
 
@@ -124,6 +126,16 @@ Result<void> OrderbookClient::connect() {
         return br;
     }
 
+    // Authentication, before compression negotiation because the server refuses COMPRESS on an
+    // unauthenticated session.
+    if (!config_.auth_identity.empty() || !config_.auth_secret.empty()) {
+        auto ar = authenticate();
+        if (!ar) {
+            ::close(fd_); fd_ = -1;
+            return ar;
+        }
+    }
+
     // Optional LZ4 compression negotiation
     if (config_.compress) {
         auto cr = negotiate_compression();
@@ -232,6 +244,47 @@ Result<void> OrderbookClient::read_banner() {
     sock_buf_.clear();
     return Result<void>::ok();
 }
+
+Result<void> OrderbookClient::authenticate() {
+    if (config_.auth_identity.empty() || config_.auth_secret.empty()) {
+        // Half a credential is a configuration mistake, and connecting anyway would produce
+        // `unauthenticated` on the first query instead of naming the cause.
+        return Result<void>::err(OB_ERR_INVALID_ARG,
+                                 "auth_identity and auth_secret must both be set");
+    }
+
+    static constexpr char req[] = "AUTH\n";
+    send_buf_.assign(req, sizeof(req) - 1);
+    if (auto sr = send_all(send_buf_.size()); !sr) return sr;
+
+    auto rr = recv_response();
+    if (!rr) return Result<void>::err(rr.error_code(), rr.error_message());
+
+    const std::string_view prefix = "OK CHALLENGE ";
+    std::string_view resp = rr.value();
+    if (resp.rfind(prefix, 0) != 0) {
+        return Result<void>::err(OB_ERR_IO,
+                                 "server refused the authentication request: " + std::string(resp));
+    }
+    std::string_view nonce = resp.substr(prefix.size());
+    while (!nonce.empty() && (nonce.back() == '\n' || nonce.back() == '\r')) {
+        nonce.remove_suffix(1);
+    }
+
+    const std::string digest = auth_response(config_.auth_secret, AuthSurface::Client,
+                                             config_.auth_identity, nonce);
+    send_buf_.assign("AUTH " + config_.auth_identity + " " + digest + "\n");
+    if (auto sr = send_all(send_buf_.size()); !sr) return sr;
+
+    auto ar = recv_response();
+    if (!ar) return Result<void>::err(ar.error_code(), ar.error_message());
+    if (ar.value().rfind("OK AUTH", 0) != 0) {
+        return Result<void>::err(OB_ERR_IO,
+                                 "authentication failed: " + std::string(ar.value()));
+    }
+    return Result<void>::ok();
+}
+
 
 Result<void> OrderbookClient::negotiate_compression() {
 #ifdef OB_CLIENT_LZ4

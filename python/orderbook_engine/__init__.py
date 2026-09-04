@@ -19,6 +19,8 @@ Both modes expose the same API: insert(), flush(), query(), close().
 import base64
 import ctypes
 import ctypes.util
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -171,13 +173,17 @@ class _TcpBackend:
     """Communicates with ob_tcp_server over a TCP socket."""
 
     def __init__(self, host: str, port: int, timeout: float = 10.0,
-                 compress: bool = False):
+                 compress: bool = False,
+                 auth: Optional[Tuple[str, str]] = None):
         self._host = host
         self._port = port
         self._sock: Optional[socket.socket] = None
         self._buf = b""
         self._timeout = timeout
         self._compressed = False
+        # (identity, secret). Kept here and nowhere else; no __repr__ or __str__ in this module
+        # renders it, and it is never passed to a log call.
+        self._auth = auth
         # Rows pushed by subscriptions, taken off the front of the buffer before a response is
         # matched. See _take_pushes().
         self._pushes: List[Tuple[int, OrderbookRow]] = []
@@ -192,6 +198,38 @@ class _TcpBackend:
         self._buf = b""
         # Read and discard the welcome banner ("OK ob_tcp_server v...\n")
         self._read_banner()
+        # Before compression negotiation, because the server refuses COMPRESS on an
+        # unauthenticated session - and before any reconnect resumes work, which is why this lives
+        # in _connect() rather than in __init__.
+        if self._auth is not None:
+            self._authenticate()
+
+    def _authenticate(self):
+        """Answer the server's challenge with HMAC-SHA256 of the shared secret.
+
+        Challenge-response rather than sending the secret: until TLS lands (#30 part two) the wire
+        carries no confidentiality, so a secret in the first packet is replayable by anyone who saw
+        it, while a response to a fresh nonce is not.
+
+        A server with authentication disabled answers ``ERR auth_disabled``, and that surfaces as an
+        error on purpose. A client configured to authenticate against a server that does not
+        authenticate has a deployment problem, and silently continuing would hide it.
+        """
+        identity, secret = self._auth
+        self._send("AUTH")
+        resp = self._recv_response().strip()
+        if not resp.startswith("OK CHALLENGE "):
+            raise OrderbookError(-1, f"Server refused the authentication request: {resp}")
+        nonce = resp[len("OK CHALLENGE "):].strip()
+        # Field layout must match ob::auth_response() byte for byte: a version prefix, the surface
+        # label, the identity and the nonce, NUL-separated so no two tuples concatenate alike.
+        message = b"\x00".join([b"ob-auth-v1", b"client",
+                                identity.encode("utf-8"), nonce.encode("ascii")])
+        digest = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+        self._send(f"AUTH {identity} {digest}")
+        resp = self._recv_response().strip()
+        if not resp.startswith("OK AUTH"):
+            raise OrderbookError(-1, f"Authentication failed: {resp}")
 
     def _read_banner(self):
         """Read the welcome banner from the server (terminated by \\n\\n)."""
@@ -771,10 +809,14 @@ class _ClientPool:
                  health_check_interval: float = 2.0,
                  compress: bool = False,
                  coordinator_endpoints: Optional[List[str]] = None,
-                 cluster_prefix: str = "/ob/"):
+                 cluster_prefix: str = "/ob/",
+                 auth: Optional[Tuple[str, str]] = None):
         self._timeout = timeout
         self._health_check_interval = health_check_interval
         self._compress = compress
+        # Every node in the mesh authenticates with the same client credential: the pool talks to
+        # replicas of one cluster, which share one secret file.
+        self._auth = auth
         self._nodes: List[_NodeState] = []
         self._connections: dict = {}  # "host:port" -> _TcpBackend
         self._primary_key: Optional[str] = None
@@ -831,7 +873,7 @@ class _ClientPool:
                 continue
             try:
                 backend = _TcpBackend(node.host, node.port, self._timeout,
-                                      compress=self._compress)
+                                      compress=self._compress, auth=self._auth)
                 self._connections[key] = backend
                 node.connected = True
             except Exception:
@@ -1072,7 +1114,7 @@ class _ClientPool:
                     host = address
                     port = 5555
                 backend = _TcpBackend(host, port, self._timeout,
-                                      compress=self._compress)
+                                      compress=self._compress, auth=self._auth)
                 self._shard_connections[shard_id] = backend
                 logger.debug("Connected to shard %s at %s", shard_id, address)
             except Exception:
@@ -1356,7 +1398,8 @@ class OrderbookEngine:
                  health_check_interval: float = 2.0,
                  compress: bool = False,
                  coordinator_endpoints: Optional[List[str]] = None,
-                 cluster_prefix: str = "/ob/"):
+                 cluster_prefix: str = "/ob/",
+                 auth: Optional[Tuple[str, str]] = None):
         self._seq = 0
         self._closed = False
         self._pool: Optional[_ClientPool] = None
@@ -1367,13 +1410,14 @@ class OrderbookEngine:
             self._pool = _ClientPool(hosts, timeout, health_check_interval,
                                      compress=compress,
                                      coordinator_endpoints=coordinator_endpoints,
-                                     cluster_prefix=cluster_prefix)
+                                     cluster_prefix=cluster_prefix,
+                                     auth=auth)
             self._tcp = None
             self._local = None
         elif host is not None:
             # TCP mode
             self._mode = "tcp"
-            self._tcp = _TcpBackend(host, port, timeout, compress=compress)
+            self._tcp = _TcpBackend(host, port, timeout, compress=compress, auth=auth)
             self._local = None
         elif data_dir is not None:
             # Local mode

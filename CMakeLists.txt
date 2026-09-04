@@ -213,6 +213,16 @@ find_package(CURL REQUIRED)
 add_library(orderbook_coordinator STATIC src/coordinator.cpp)
 target_link_libraries(orderbook_coordinator PUBLIC orderbook_epoch orderbook_logger CURL::libcurl)
 
+# ── Auth compiled library (wire authentication, #30) ───────────────────────────
+#
+# libcrypto only, not libssl. HMAC, the CSPRNG and the constant-time comparison all live in
+# libcrypto; libssl arrives with TLS in part two of #30. Declared explicitly rather than leaned on
+# through CURL, which links OpenSSL transitively - a dependency you inherit is one that disappears
+# when the library you inherited it from changes its build.
+find_package(OpenSSL REQUIRED)
+add_library(orderbook_auth STATIC src/auth.cpp)
+target_link_libraries(orderbook_auth PUBLIC orderbook_logger OpenSSL::Crypto)
+
 # ── Failover compiled library (role transitions and monitoring) ────────────────
 add_library(orderbook_failover STATIC src/failover.cpp)
 target_link_libraries(orderbook_failover PUBLIC orderbook_coordinator orderbook_epoch orderbook_logger)
@@ -396,11 +406,11 @@ add_library(orderbook_tcp_server_lib STATIC
     src/session.cpp
     src/subscription_hub.cpp
 )
-target_link_libraries(orderbook_tcp_server_lib PUBLIC orderbook_engine orderbook_logger orderbook_metrics_server orderbook_shard_coordinator)
+target_link_libraries(orderbook_tcp_server_lib PUBLIC orderbook_engine orderbook_logger orderbook_metrics_server orderbook_shard_coordinator orderbook_auth)
 
 # ── Native C++ client library ──────────────────────────────────────────────────
 add_library(orderbook_client STATIC src/client.cpp)
-target_link_libraries(orderbook_client PUBLIC orderbook_core orderbook_shard_router)
+target_link_libraries(orderbook_client PUBLIC orderbook_core orderbook_shard_router orderbook_auth)
 
 option(OB_CLIENT_LZ4 "Enable optional LZ4 compression in orderbook_client" OFF)
 if(OB_CLIENT_LZ4)
@@ -431,7 +441,7 @@ if(OB_USE_IO_URING)
     )
     target_compile_definitions(orderbook_iouring_server_lib PUBLIC OB_USE_IO_URING)
     target_link_libraries(orderbook_iouring_server_lib PUBLIC
-        orderbook_engine orderbook_logger orderbook_metrics_server PkgConfig::URING
+        orderbook_engine orderbook_logger orderbook_metrics_server orderbook_auth PkgConfig::URING
     )
 
     add_executable(ob_tcp_server_iouring tools/ob_tcp_server.cpp)

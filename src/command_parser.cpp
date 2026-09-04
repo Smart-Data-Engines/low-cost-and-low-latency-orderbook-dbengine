@@ -1,4 +1,6 @@
 #include "orderbook/command_parser.hpp"
+
+#include "orderbook/auth.hpp"
 #include "orderbook/data_model.hpp"
 #include "orderbook/logger.hpp"
 
@@ -123,6 +125,30 @@ Command parse_command(std::string_view line) {
         if (tokens.size() < 2) return cmd; // need target_node_id
         cmd.type = CommandType::FAILOVER;
         cmd.target_node_id = std::string(tokens[1]);
+        return cmd;
+    }
+
+    if (iequals(first, "AUTH")) {
+        // `AUTH` alone asks for a challenge; `AUTH <identity> <response>` answers one.
+        if (tokens.size() == 1) {
+            cmd.type = CommandType::AUTH;
+            OB_LOG_DEBUG("cmd_parser", "Parsed command: AUTH (challenge request)");
+            return cmd;
+        }
+        if (tokens.size() != 3) return cmd; // UNKNOWN
+        std::string identity(tokens[1]);
+        std::string response(tokens[2]);
+        // Shape is checked here so that nothing malformed reaches a constant-time comparison, and
+        // so that the identity a log line quotes is already within a known charset. A bad shape is
+        // UNKNOWN rather than AUTH: it is not a failed authentication attempt, it is not the
+        // protocol.
+        if (identity.empty() || identity.size() > kMaxIdentityChars) return cmd;
+        if (!is_auth_hex(response)) return cmd;
+        cmd.type          = CommandType::AUTH;
+        cmd.auth_identity = std::move(identity);
+        cmd.auth_response = std::move(response);
+        OB_LOG_DEBUG("cmd_parser", "Parsed command: AUTH response for identity=%s",
+                     cmd.auth_identity.c_str());
         return cmd;
     }
 
@@ -358,6 +384,9 @@ std::string format_command(const Command& cmd) {
         return "FAILOVER " + cmd.target_node_id + "\n";
     case CommandType::QUIT:   return "QUIT\n";
     case CommandType::COMPRESS: return "COMPRESS LZ4\n";
+    case CommandType::AUTH:
+        if (cmd.auth_identity.empty()) return "AUTH\n";
+        return "AUTH " + cmd.auth_identity + " " + cmd.auth_response + "\n";
     case CommandType::SHARD_MAP:  return "SHARD_MAP\n";
     case CommandType::SHARD_INFO: return "SHARD_INFO\n";
     case CommandType::MIGRATE:

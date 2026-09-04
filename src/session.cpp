@@ -287,4 +287,27 @@ size_t SessionManager::total_pending_output_bytes() const {
     return total;
 }
 
+
+// ── Authentication state (#30) ────────────────────────────────────────────────
+
+bool Session::authenticated() const { return authenticated_; }
+
+const std::string& Session::identity() const { return identity_; }
+
+void Session::set_authenticated(std::string identity) {
+    authenticated_ = true;
+    identity_      = std::move(identity);
+    // The challenge has been spent. Leaving it in place would let the same response be replayed on
+    // this connection, which matters less than the cross-connection case but costs nothing to close.
+    pending_nonce_.clear();
+}
+
+const std::string& Session::pending_nonce() const { return pending_nonce_; }
+
+void Session::set_pending_nonce(std::string nonce) { pending_nonce_ = std::move(nonce); }
+
+uint32_t Session::auth_attempts() const { return auth_attempts_; }
+
+void Session::increment_auth_attempts() { ++auth_attempts_; }
+
 } // namespace ob

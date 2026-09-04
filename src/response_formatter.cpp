@@ -147,7 +147,7 @@ std::string format_pong() {
 
 // ── format_status ─────────────────────────────────────────────────────────────
 
-std::string format_status(const ServerStats& stats) {
+std::string format_status(const ServerStats& stats, std::string_view identity) {
     std::string out;
     out += "OK\n";
     out += kStatusHeader;
@@ -269,6 +269,12 @@ std::string format_status(const ServerStats& stats) {
     // parsing the tab-separated table above has to change.
     out += "version: ";
     out += version();
+    out += '\n';
+
+    // Who is asking (#30). A dash when client authentication is disabled, which is a different
+    // statement from an empty value: it says the server is not authenticating anyone.
+    out += "identity: ";
+    out += identity.empty() ? std::string_view{"-"} : identity;
     out += '\n';
 
     // Flush integrity
