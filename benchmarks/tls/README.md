@@ -30,6 +30,34 @@ So a full kernel data path needs TLS 1.2, and part three chooses 1.3 anyway — 
 the spec. To see the 1.2 row, set `SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION)` and a 1.2
 cipher list.
 
+## `ssl_write_retry.c` — which `SSL_CTX` modes the send path needs
+
+```bash
+cc -O2 -o /tmp/ssl_write_retry benchmarks/tls/ssl_write_retry.c -lssl -lcrypto -lpthread
+/tmp/ssl_write_retry 2 /tmp/cert.pem /tmp/key.pem   # SSL_MODE_ENABLE_PARTIAL_WRITE only
+/tmp/ssl_write_retry 1 /tmp/cert.pem /tmp/key.pem   # both modes
+```
+
+`Session::flush_output()` writes from `send_buf_` and then does `erase(0, n)`, which moves the
+remaining bytes to a **different address**. Measured, OpenSSL 3.0.13:
+
+| modes | retrying the same bytes from a different address |
+|---|---|
+| `ENABLE_PARTIAL_WRITE` only | **`error:0A00007F:SSL routines::bad write retry`** |
+| both | `WANT_WRITE`, an ordinary "come back later" |
+| neither | the question does not arise: the first `WANT` lands at offset **0** |
+
+That last row is a separate finding and worse than expected: **without `ENABLE_PARTIAL_WRITE`,
+`SSL_write` accepts nothing at all** until it can take the whole buffer — measured at 4 MB, first
+`WANT` at offset 0. A 30 MB response would make no progress until the remainder fitted in one call,
+which looks like a slow client rather than a bug.
+
+**Worth knowing about this probe: its first two versions found nothing.** They retried from an
+advanced offset in the same allocation, which presents the *same address* for the pending bytes and
+is legal. Only moving those bytes elsewhere — what `erase(0, n)` does — produces `bad write retry`.
+A probe that does not reproduce the shape says "no defect" in the same voice as a probe under which
+there genuinely is none.
+
 ## `tls_cost.c` — what the record layer costs at this protocol's message sizes
 
 ```bash

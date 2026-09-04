@@ -28,3 +28,6 @@ target_link_libraries(ktls_probe PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::T
 
 add_executable(tls_cost tls/tls_cost.c)
 target_link_libraries(tls_cost PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+
+add_executable(ssl_write_retry tls/ssl_write_retry.c)
+target_link_libraries(ssl_write_retry PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)

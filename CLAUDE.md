@@ -927,6 +927,50 @@ Learned the hard way. Check here before debugging.
     sanitizers at all — so it reads as a broken test rather than a missing sysctl. The value on this
     machine is 32 by default; set it back afterwards if you care about the entropy.
 
+122. **`until ! pgrep -f X; do sleep; done` never terminates when the waiting shell's own command
+    line contains X.** The wait is spawned as `bash -c '... until ! pgrep -f "pytest
+    tests/integration" ...; then cat the log'` — so the pattern appears in the waiter's own
+    `/proc/self/cmdline`, `pgrep` finds it, and the loop sleeps forever. Two of these sat wedged for
+    **nine hours**, plus a third on `pgrep -f "cmake --build build"`.
+
+    The `[m]atch` bracket trick does not save you: it stops `grep` matching *its own grep process*,
+    and the process it matches here is the enclosing shell. A neighbouring session had three wedged
+    the same way on `ps aux | grep '[m]ut107sdk'`, where the pattern was in the `cat …/mut107sdk.out`
+    part after the loop.
+
+    Two rules. **Wait on a condition that cannot describe the waiter** — a marker line the job
+    itself appends (`until grep -q DONE file`), or an exit code, never a process name the wait
+    mentions. And **for harness-tracked work, do not poll at all**: a background command re-invokes
+    you when it exits, so a waiter loop is both unnecessary and a chance to wedge. Pitfall 100 is
+    the same family in a smaller form (`pkill -f "cmake --build"` matching its replacement build);
+    this is what it looks like when it costs a day.
+
+    Diagnosing it has the same trap: `pgrep -c -f "cp_c2.out"` reports 1 for a pattern with nothing
+    running, because the diagnostic matches itself. Split the literal — `pgrep -f 'd86414''dc'` — so
+    the searching command's own line cannot contain it.
+
+123. **A probe that does not reproduce the shape says "no defect" in the same voice as a probe under
+    which there genuinely is none.** The design for #30 part three claims that `SSL_write` retried
+    after `WANT_WRITE` fails unless `SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER` is set, because
+    `Session::flush_output()` does `send_buf_.erase(0, n)`. Two probes failed to reproduce it and
+    nearly got the claim deleted from the document.
+
+    Both retried from an **advanced offset in the same allocation** — which presents the *same
+    address* for the still-pending bytes, and is legal. `erase(0, n)` does something else: it moves
+    the same bytes to a **different address**. Doing that produces
+    `error:0A00007F:SSL routines::bad write retry` immediately, and with both modes set the identical
+    sequence returns `WANT_WRITE`.
+
+    So the rule is not "write a probe" but **"write a probe that produces the same bytes at the same
+    addresses as the code you are asking about"**, and treat a negative result from a probe you just
+    wrote as a claim about the probe until the positive control exists. Same family as pitfall 37
+    (a surviving mutation means the test measures something else) and pitfall 24 (an `iptables DROP`
+    that proves nothing about a repair mechanism), from the diagnostic side.
+
+    A third row came free: with neither mode, `SSL_write` accepts **nothing** until the whole buffer
+    fits — first `WANT` at offset 0 with 4 MB pending. That is a worse failure than the one being
+    hunted, and it looks like a slow client rather than a defect.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
