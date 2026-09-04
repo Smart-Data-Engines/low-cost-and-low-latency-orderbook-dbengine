@@ -23,6 +23,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -92,10 +93,18 @@ TEST(TlsSession, ALargeResponseSurvivesPartialWritesAndTheEraseThatFollowsThem) 
     }
 
     std::atomic<bool> handshake_done{false};
+    // The reader waits on this instead of sleeping. It used to sleep 400 ms "and then drain", which
+    // makes the precondition of this whole test - that a partial write happens - a race with the
+    // server's handshake and payload construction. Under ThreadSanitizer those took longer than the
+    // sleep, so the reader was already draining when the first SSL_write ran, the socket kept
+    // accepting, and 1.2 MB went out in one call: `distinct_pending` came back 1 and the test failed
+    // having exercised nothing (pitfall 105 - every timing in this suite was chosen against an
+    // uninstrumented build). Establish the condition, do not hope for it.
+    std::atomic<bool> backpressure_reached{false};
     std::string received;
     received.reserve(payload.size() + 4096);
 
-    // The client: handshake, then deliberately do not read for a while, then drain everything.
+    // The client: handshake, wait until the server is genuinely blocked, then drain everything.
     std::thread client([&] {
         auto ctx = ob::TlsContext::client("", /*verify=*/false);
         const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -119,8 +128,12 @@ TEST(TlsSession, ALargeResponseSurvivesPartialWritesAndTheEraseThatFollowsThem) 
         }
         handshake_done.store(true);
 
-        // Not reading, so the server's queue backs up and flush_output() must hit WANT_WRITE.
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        // Not reading until the server has actually queued bytes it could not send. A deadline, so
+        // a server that never blocks makes this test fail on its own assertion rather than hang.
+        const auto wait_until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (!backpressure_reached.load() && std::chrono::steady_clock::now() < wait_until) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
 
         char buf[4096];
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
@@ -164,18 +177,32 @@ TEST(TlsSession, ALargeResponseSurvivesPartialWritesAndTheEraseThatFollowsThem) 
 
     // Queue the whole payload, then push it out the way the epoll loop does: flush, and flush again
     // whenever bytes remain. This is the loop that erases and retries.
+    // send_response() flushes, so this first attempt happens while the reader is still waiting -
+    // which is what makes the outcome deterministic rather than scheduling-dependent.
     ASSERT_TRUE(session.send_response(payload));
+    ASSERT_TRUE(session.has_pending_output())
+        << "the whole " << payload.size() << "-byte payload went out in one SSL_write with nobody "
+           "reading, so this test cannot exercise a partial write at all - shrink SO_SNDBUF/SO_RCVBUF "
+           "or grow the payload. This is a precondition, not the property under test.";
+    backpressure_reached.store(true);
+
     bool saw_backpressure = false;
-    size_t distinct_pending = 0;
-    size_t last_pending = session.pending_output_bytes() + 1;
+    // A *property*, not a count of samples. The first version of this required more than three
+    // distinct pending values, which is a number that depends on how many times the drain loop got
+    // scheduled - under ThreadSanitizer it came back exactly 3 in one run out of six and the check
+    // went red on a run where the mechanism worked. What actually distinguishes the two SSL modes
+    // is whether the gauge is ever seen *between* the full response and zero: without
+    // ENABLE_PARTIAL_WRITE, `sent_total` stays 0 for the whole drain, so pending is only ever
+    // `payload.size()` and then 0, and no intermediate exists to observe. One intermediate is
+    // therefore the whole signal, and it does not move with the scheduler.
+    bool saw_intermediate_pending = false;
+    size_t smallest_pending = payload.size();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
     while (session.has_pending_output() && std::chrono::steady_clock::now() < deadline) {
-        if (session.pending_output_bytes() == payload.size()) {
-            // Nothing at all accepted on the first pass is what "no partial writes" looks like.
-        }
         saw_backpressure = true;
         const size_t pending_now = session.pending_output_bytes();
-        if (pending_now != last_pending) { ++distinct_pending; last_pending = pending_now; }
+        if (pending_now > 0 && pending_now < payload.size()) saw_intermediate_pending = true;
+        smallest_pending = std::min(smallest_pending, pending_now);
         ASSERT_TRUE(session.flush_output())
             << "flush_output failed on a large TLS response: " << ob::tls_last_error();
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -187,9 +214,10 @@ TEST(TlsSession, ALargeResponseSurvivesPartialWritesAndTheEraseThatFollowsThem) 
     // content assertion below - but `pending_output_bytes()` stays pinned at the full size, which
     // is the number `ob_pending_bytes` publishes and the number an operator reads as "this client
     // is not draining". A gauge that cannot move is a gauge that says the wrong thing.
-    EXPECT_GT(distinct_pending, 3u)
-        << "pending output never shrank while draining (" << distinct_pending
-        << " distinct values), so the queue depth an operator sees is pinned at the full response";
+    EXPECT_TRUE(saw_intermediate_pending)
+        << "pending output went from " << payload.size() << " straight to 0 (smallest seen: "
+        << smallest_pending << "), so the queue depth an operator sees is pinned at the full "
+           "response for the whole drain and then vanishes";
 
     EXPECT_TRUE(saw_backpressure)
         << "the payload went out in one pass, so this test did not exercise a partial write - "

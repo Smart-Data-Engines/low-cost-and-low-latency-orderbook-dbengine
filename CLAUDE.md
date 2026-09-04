@@ -1076,6 +1076,34 @@ Learned the hard way. Check here before debugging.
     bookkeeping that fixes the stalled-response regression — not TLS dispatch, which is 178
     instructions in a function of its own reached through one compare.
 
+133. **A test whose *precondition* is a race fails having exercised nothing, and its message is
+    indistinguishable from the real defect's.** `TlsSession.ALargeResponse…` needs a partial
+    `SSL_write` to happen at all, and it arranged that by having the reader sleep 400 ms "and then
+    drain". Under ThreadSanitizer the server's handshake and its 40 000-string payload took longer
+    than the sleep, so the reader was already draining when the first `SSL_write` ran, the socket
+    kept accepting, and 1.2 MB went out in one call. `distinct_pending` came back **1**.
+
+    The expensive part is that **1 is also what the real defect produces**: dropping
+    `SSL_MODE_ENABLE_PARTIAL_WRITE` prints the identical line. So the flake and the defect are the
+    same message, and a required check went red saying something true about a run that had tested
+    nothing. Pitfall 105 in a new place — every timing in this suite was chosen against an
+    uninstrumented build.
+
+    The fix is not a longer sleep. The reader now waits on an atomic the server sets **after
+    asserting** `has_pending_output()`, so the condition is established rather than hoped for, and
+    the failure mode when the buffers are too big is a precondition assertion naming that. Same
+    lesson as the notify-ordering test in #79 (pitfall 64): do not race the thing you are asserting.
+
+    **And that fix was only half of it**, which is the part worth carrying. With the precondition
+    established the test still failed 1 in 6 under TSan, now reporting `3 vs 3`: the assertion was
+    `distinct_pending > 3`, a count of *samples*, and how many times a drain loop gets scheduled is
+    not a property of the code. Threshold pinned to a count → fails on legitimate variation → gets
+    re-run until green. What actually separates the two SSL modes is whether the gauge is ever seen
+    **between** the full response and zero: without `ENABLE_PARTIAL_WRITE` pending is only ever
+    `payload.size()` and then 0, so no intermediate exists to observe. One intermediate is the whole
+    signal and it does not move with the scheduler. Both mutations still fail the rebuilt test, and
+    through different assertions — the gauge for one, `bad write retry` for the other.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
