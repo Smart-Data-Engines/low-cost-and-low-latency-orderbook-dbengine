@@ -393,12 +393,39 @@ of an unknown peer.
   both sides believe they are talking to each other. That is a limit of a shared secret without a
   channel identity rather than a defect — a relay can forward any value bound only to a nonce — and
   it is written into `SECURITY.md` as a limit rather than left for a reader to assume otherwise.
-- Per-listener, with the in-process-versus-sidecar decision made **from a measurement**.
-- If in-process: the io_uring path either gets TLS or a **named refusal**. `--tls` together with
-  io_uring must not silently mean plaintext.
+- **The shape is decided, and it was decided from a measurement** — `benchmarks/tls/`, run before
+  any of this was designed. Eight interleaved rounds on i3-7100U over loopback, warm-up discarded,
+  at sizes taken from the wire protocol: 5 B is a `PING`, 60 kB is a `MINSERT` of a thousand levels.
+
+  | payload | plaintext | TLS 1.3 (OpenSSL) | TLS 1.3 + kTLS TX |
+  |---|---|---|---|
+  | 5 B | 31.94 µs (cv 2.7%) | 52.84 µs — **1.68×** (1.56–1.73) | 56.92 µs — 1.77× |
+  | 60 kB | 59.84 µs (cv 4.7%) | 230.28 µs — **3.70×** (3.64–4.20) | 265.48 µs — 4.38× |
+
+- **In-process, not a sidecar.** A sidecar pays the same record-layer cost plus a loopback hop, so
+  it cannot be faster by construction. It stays a documented deployment option with its price
+  named: the engine then sees `127.0.0.1` rather than the client's address, so part one's
+  authentication log lines and #31's ACLs stop distinguishing clients.
+- **No kTLS, and this killed the design that was about to be proposed.** It measured 1.08× and
+  1.15× *slower* than plain OpenSSL, with the range's lower bound at 1.03 on the large size. Scoped
+  honestly: loopback is the record layer's CPU cost with no NIC in the way, and kTLS exists to
+  avoid a copy and to hand encryption to hardware that can do it — so this is evidence against kTLS
+  **on this path** rather than evidence that kTLS is slow, and that assumption expires the day a NIC
+  with TLS offload is in the picture.
+- **TLS 1.3 minimum**, even though TLS 1.2 is what a full kernel data path would need: probed rather
+  than assumed, this OpenSSL negotiates kTLS receive only on 1.2. A public database engine capped at
+  1.2 in 2026 is a review finding, and the io_uring path that would protect is off by default and
+  built by no CI job.
+- Per-listener: client port, replication port, multi-master mesh, each enabled separately.
+- The io_uring path either gets TLS or a **named refusal** — `--tls` together with io_uring must not
+  silently mean plaintext, and the process must not start. Receive is in userspace regardless of
+  kTLS, so that path needs memory BIOs, which is a rewrite of the fast path that exists to be fast.
 - mTLS as an alternative to the shared secret on cluster links, with the certificate identity
-  landing in the same field part one introduced.
+  landing in the same field part one introduced. Only mTLS gives the channel binding above.
 - Cost published with named hardware, a percentile, and the floor of the range.
+- Six things easy to miss because they are not about cryptography — starting with the TLS output
+  buffer being a *second* place the 64 MB send cap has to hold — are in
+  `kiro-workspace/specs/wire-tls/requirements.md` §3.
 
 - Effort: L | Impact: **Unblocks production adoption**
 
