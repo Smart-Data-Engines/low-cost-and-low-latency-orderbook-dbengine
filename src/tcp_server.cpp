@@ -76,7 +76,8 @@ LoadedSecrets load_secrets_or_exit(const ServerConfig& config) {
                             "(--auth-secret-file)");
     }
     if (out.cluster_auth_enabled()) {
-        OB_LOG_INFO("auth", "cluster authentication enabled (%s)",
+        OB_LOG_INFO("auth", "cluster authentication enabled (%s); every node in this cluster must "
+                            "run with the same secret - there is no mixed mode",
                     config.cluster_secret_file.c_str());
     } else {
         OB_LOG_WARN("auth", "cluster authentication disabled - replication and multi-master links "
@@ -165,7 +166,7 @@ std::string handle_auth(const Command& cmd,
 
     const Credential* cred = secrets.find(cmd.auth_identity);
     const std::string expected =
-        cred ? auth_response(cred->secret, AuthSurface::Client,
+        cred ? auth_response(cred->secret, AuthSurface::Client, AuthRole::Initiator,
                              cred->identity, session.pending_nonce())
              : std::string{};
 
@@ -1369,6 +1370,7 @@ TcpServer::TcpServer(ServerConfig config)
     if (!config_.multi_master) {
         repl_config.port = config_.replication_port;
         repl_config.compress = config_.replication_compress;
+        repl_config.cluster_secret = secrets_.cluster;
     }
     // In MM mode, repl_config.port stays 0 → Engine won't create ReplicationManager
 
@@ -1378,6 +1380,7 @@ TcpServer::TcpServer(ServerConfig config)
     repl_client_config.state_file   = config_.data_dir + "/repl_state.txt";
     repl_client_config.snapshot_chunk_size = config_.snapshot_chunk_size;
     repl_client_config.snapshot_staging_dir = config_.snapshot_staging_dir;
+    repl_client_config.cluster_secret = secrets_.cluster;
 
     FailoverConfig failover_config{};
     if (!config_.coordinator_endpoints.empty()) {
@@ -1418,7 +1421,8 @@ TcpServer::TcpServer(ServerConfig config)
                                                config_.coordinator_lease_ttl,
                                                config_.node_id,
                                                "/ob/"
-                                           }
+                                           },
+                                           .cluster_secret = secrets_.cluster
                                        });
 }
 

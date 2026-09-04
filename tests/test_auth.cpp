@@ -62,9 +62,9 @@ TEST(AuthHmac, EmbeddedNulBytesArePartOfTheInput) {
 // ── The input construction ────────────────────────────────────────────────────
 
 TEST(AuthResponse, DomainSeparationAcrossSurfaces) {
-    const auto c = auth_response(kSecret, AuthSurface::Client, "alice", kNonce);
-    const auto r = auth_response(kSecret, AuthSurface::Replication, "alice", kNonce);
-    const auto m = auth_response(kSecret, AuthSurface::MultiMaster, "alice", kNonce);
+    const auto c = auth_response(kSecret, AuthSurface::Client, AuthRole::Initiator, "alice", kNonce);
+    const auto r = auth_response(kSecret, AuthSurface::Replication, AuthRole::Initiator, "alice", kNonce);
+    const auto m = auth_response(kSecret, AuthSurface::MultiMaster, AuthRole::Initiator, "alice", kNonce);
     EXPECT_NE(c, r);
     EXPECT_NE(c, m);
     // The load-bearing pair: replication and multi-master share one cluster secret, so without
@@ -77,40 +77,56 @@ TEST(AuthResponse, FrozenGoldenValues) {
     // times: change it and every existing client fails to authenticate, with a message that says
     // "auth_failed" and nothing about a format change. Computed independently in Python from the
     // documented construction, not read out of this implementation.
-    EXPECT_EQ(auth_response(kSecret, AuthSurface::Client, "alice", kNonce),
-              "98d569810223ea3dd63ae4086520568f3645a2a27f810853e7de4054954c839a");
-    EXPECT_EQ(auth_response(kSecret, AuthSurface::Replication, "alice", kNonce),
-              "6d12eb8de95e02be440ff252a29e1adab06812056c32304796d3e26bc9334df5");
-    EXPECT_EQ(auth_response(kSecret, AuthSurface::MultiMaster, "alice", kNonce),
-              "866fb412f829d13c76b4d8b99ce98b8da8e6492689c54b5c870db92475eab3b5");
+    EXPECT_EQ(auth_response(kSecret, AuthSurface::Client, AuthRole::Initiator, "alice", kNonce),
+              "ffa4c2f4da97192b4fed000cdab7366707999fd6828bc257a6a56cbcac90367e");
+    EXPECT_EQ(auth_response(kSecret, AuthSurface::Replication, AuthRole::Initiator, "alice", kNonce),
+              "1493d62f6aeabd35b233e24f1552bae0ca0afc3ed86697c199ca7a80e8080c0b");
+    EXPECT_EQ(auth_response(kSecret, AuthSurface::MultiMaster, AuthRole::Initiator, "alice", kNonce),
+              "05c24829778cba4086260fa03451630d2d7aeb5178c7e3ca9943369e2fe2c0f0");
     // The cluster surfaces authenticate with an empty identity, so that path has its own golden.
-    EXPECT_EQ(auth_response(kSecret, AuthSurface::MultiMaster, "", kNonce),
-              "ceb4664755822fba40427c313b75167958edb9f9c84164bc8e973d1a6ca1d783");
+    EXPECT_EQ(auth_response(kSecret, AuthSurface::MultiMaster, AuthRole::Initiator, "", kNonce),
+              "8fb4c0863b2fa95b74ccb6d0d255677d6bb1fc2e40cf99f74f062a41e060efee");
+    // And one acceptor-side value, so a mutation that swapped the two labels is caught by a
+    // golden as well as by the inequality above.
+    EXPECT_EQ(auth_response(kSecret, AuthSurface::Client, AuthRole::Acceptor, "alice", kNonce),
+              "197b47d63a4bfb2515e2fa47539bdd28eb3a2b5afe5826c3fe1e8fb1f3df6972");
+}
+
+TEST(AuthResponse, RoleIsBoundAndThatIsTheReflectionDefence) {
+    // Both ends of a cluster link hold the same key. If both computed the same function of a
+    // nonce, an attacker could echo the acceptor's own challenge back as its own, be handed the
+    // answer - answering a challenge needs no authentication - and replay it. This inequality is
+    // the whole defence, and a mutation dropping the role from the MAC input must fail here.
+    EXPECT_NE(auth_response(kSecret, AuthSurface::Replication, AuthRole::Initiator, "", kNonce),
+              auth_response(kSecret, AuthSurface::Replication, AuthRole::Acceptor, "", kNonce));
+    EXPECT_NE(auth_response(kSecret, AuthSurface::MultiMaster, AuthRole::Initiator, "", kNonce),
+              auth_response(kSecret, AuthSurface::MultiMaster, AuthRole::Acceptor, "", kNonce));
+    EXPECT_EQ(role_label(AuthRole::Initiator), "initiator");
+    EXPECT_EQ(role_label(AuthRole::Acceptor), "acceptor");
 }
 
 TEST(AuthResponse, IdentityIsBound) {
     // Under a shared secret, a response for alice must not authenticate bob.
-    EXPECT_NE(auth_response(kSecret, AuthSurface::Client, "alice", kNonce),
-              auth_response(kSecret, AuthSurface::Client, "bob", kNonce));
+    EXPECT_NE(auth_response(kSecret, AuthSurface::Client, AuthRole::Initiator, "alice", kNonce),
+              auth_response(kSecret, AuthSurface::Client, AuthRole::Initiator, "bob", kNonce));
 }
 
 TEST(AuthResponse, NonceIsBound) {
     const std::string other(kAuthHexChars, 'b');
-    EXPECT_NE(auth_response(kSecret, AuthSurface::Client, "alice", kNonce),
-              auth_response(kSecret, AuthSurface::Client, "alice", other));
+    EXPECT_NE(auth_response(kSecret, AuthSurface::Client, AuthRole::Initiator, "alice", kNonce),
+              auth_response(kSecret, AuthSurface::Client, AuthRole::Initiator, "alice", other));
 }
 
 TEST(AuthResponse, SecretIsBound) {
-    EXPECT_NE(auth_response(kSecret, AuthSurface::Client, "alice", kNonce),
-              auth_response("fedcba9876543210fedcba9876543210",
-                            AuthSurface::Client, "alice", kNonce));
+    EXPECT_NE(auth_response(kSecret, AuthSurface::Client, AuthRole::Initiator, "alice", kNonce),
+              auth_response("fedcba9876543210fedcba9876543210", AuthSurface::Client, AuthRole::Initiator, "alice", kNonce));
 }
 
 TEST(AuthResponse, FieldsCannotBeSlidPastTheSeparator) {
     // The NUL separators exist so that no two different tuples concatenate into the same input.
     // With a delimiter that could occur in a field, ("ab", "c") and ("a", "bc") would collide.
-    EXPECT_NE(auth_response(kSecret, AuthSurface::Client, "ab", kNonce),
-              auth_response(kSecret, AuthSurface::Client, "a", "b" + kNonce));
+    EXPECT_NE(auth_response(kSecret, AuthSurface::Client, AuthRole::Initiator, "ab", kNonce),
+              auth_response(kSecret, AuthSurface::Client, AuthRole::Initiator, "a", "b" + kNonce));
 }
 
 TEST(AuthNonce, IsHexAndFreshEveryCall) {

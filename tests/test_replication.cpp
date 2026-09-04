@@ -35,6 +35,35 @@ TEST(ReplicationSmoke, ConfigDefaults) {
 
 namespace {
 
+/// A primary-side replication config, by field rather than by position.
+///
+/// Positional aggregate initialisation listed every field, so each new field in ReplicationConfig
+/// broke six call sites in this file with a -Wmissing-field-initializers error unrelated to what
+/// they test - which is how #30 first touched it.
+ob::ReplicationConfig primary_config(uint16_t port, int max_replicas = 4,
+                                     ob::SecretStore secret = {}) {
+    ob::ReplicationConfig cfg{};
+    cfg.port           = port;
+    cfg.max_replicas   = max_replicas;
+    cfg.cluster_secret = std::move(secret);
+    return cfg;
+}
+
+/// The replica side of the same.
+ob::ReplicationClientConfig replica_config(uint16_t port, const std::string& state_file,
+                                           ob::SecretStore secret = {}) {
+    ob::ReplicationClientConfig cfg{};
+    cfg.primary_host   = "127.0.0.1";
+    cfg.primary_port   = port;
+    cfg.state_file     = state_file;
+    cfg.cluster_secret = std::move(secret);
+    return cfg;
+}
+
+} // namespace
+
+namespace {
+
 // Unique temp directory helper (same pattern as test_wal.cpp).
 static std::filesystem::path make_repl_temp_dir(const std::string& suffix = "") {
     static std::atomic<uint64_t> counter{0};
@@ -768,7 +797,7 @@ TEST(ReplicationIntegration, PrimaryReplicaFullCycle) {
 
     // 2. Create primary Engine with replication enabled.
     ob::Engine primary(primary_dir.str(), 100'000'000ULL, ob::FsyncPolicy::NONE,
-                       {repl_port, 4}, {});
+                       primary_config(repl_port), {});
     primary.open();
 
     // Give the primary's ReplicationManager time to bind and start listening.
@@ -777,7 +806,7 @@ TEST(ReplicationIntegration, PrimaryReplicaFullCycle) {
     // 3. Create replica Engine pointing to the primary's replication port.
     ob::Engine replica(replica_dir.str(), 100'000'000ULL, ob::FsyncPolicy::NONE,
                        {},
-                       {"127.0.0.1", repl_port, replica_dir.str() + "/repl_state.txt", 262144, ""});
+                       replica_config(repl_port, replica_dir.str() + "/repl_state.txt"));
     replica.open();
 
     // Give the replica time to connect and complete the REPLICATE handshake.
@@ -954,6 +983,8 @@ TEST_F(ReplicationProtocolTest, WalTruncationBlockedBySlowestReplica) {
 
 #include "orderbook/crc32c.hpp"
 #include <fstream>
+
+
 
 // ── Test: SnapshotManifest round-trip serialization ───────────────────────────
 // Validates: Requirements 9.1, 9.3
@@ -1319,7 +1350,7 @@ TEST(SnapshotIntegration, BootstrapOnTruncatedWAL) {
 
     // 1. Create primary with replication enabled.
     ob::Engine primary(primary_dir->str(), 100'000'000ULL, ob::FsyncPolicy::NONE,
-                       {repl_port, 4}, {});
+                       primary_config(repl_port), {});
     primary.open();
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -1356,7 +1387,7 @@ TEST(SnapshotIntegration, BootstrapOnTruncatedWAL) {
     // available for catchup. This tests the normal path.
     ob::Engine replica(replica_dir->str(), 100'000'000ULL, ob::FsyncPolicy::NONE,
                        {},
-                       {"127.0.0.1", repl_port, replica_dir->str() + "/repl_state.txt", 262144, ""});
+                       replica_config(repl_port, replica_dir->str() + "/repl_state.txt"));
     replica.open();
 
     // Give replica time to connect and catch up.
@@ -1379,7 +1410,7 @@ TEST(SnapshotIntegration, BootstrapResumesStreaming) {
 
     // 1. Create primary with data.
     ob::Engine primary(primary_dir->str(), 100'000'000ULL, ob::FsyncPolicy::NONE,
-                       {repl_port, 4}, {});
+                       primary_config(repl_port), {});
     primary.open();
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
@@ -1404,7 +1435,7 @@ TEST(SnapshotIntegration, BootstrapResumesStreaming) {
     // 2. Connect replica.
     ob::Engine replica(replica_dir->str(), 100'000'000ULL, ob::FsyncPolicy::NONE,
                        {},
-                       {"127.0.0.1", repl_port, replica_dir->str() + "/repl_state.txt", 262144, ""});
+                       replica_config(repl_port, replica_dir->str() + "/repl_state.txt"));
     replica.open();
 
     // Give replica time to connect and catch up.

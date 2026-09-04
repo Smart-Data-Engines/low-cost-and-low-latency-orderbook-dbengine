@@ -117,7 +117,24 @@ Returns server statistics, parsed from every `key: value` field the server sends
 
 #### engine.ping() → str
 
-Returns `"PONG"`. Useful for connection health checks in TCP mode.
+Returns `"PONG"`. Useful for connection health checks in TCP mode, and it works before
+authentication so a health check needs no credentials.
+
+#### auth=(identity, secret)
+
+For a server running with `--auth-secret-file`:
+
+```python
+eng = OrderbookEngine(host="10.0.0.1", port=9090, auth=("grafana", secret))
+```
+
+Authentication happens on connect, after the banner and before compression negotiation, and again on
+every reconnect in pool mode. The secret never crosses the wire — the client answers a challenge with
+HMAC-SHA256 — and it is not rendered by any `repr` in the library.
+
+Against a server that is **not** authenticating, this raises `OrderbookError`. Deliberately: a client
+that believes it authenticated while the server authenticates nobody has a deployment problem, and
+continuing silently would hide it.
 
 #### engine.close()
 

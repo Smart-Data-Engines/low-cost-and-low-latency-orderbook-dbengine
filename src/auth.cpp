@@ -121,6 +121,16 @@ std::string_view surface_label(AuthSurface s) {
     return {};
 }
 
+std::string_view role_label(AuthRole r) {
+    switch (r) {
+    case AuthRole::Initiator: return "initiator";
+    case AuthRole::Acceptor:  return "acceptor";
+    }
+    // Same reasoning as surface_label: an empty label authenticates against nothing, while any
+    // non-empty fallback would let a corrupted value collide with a real role.
+    return {};
+}
+
 // ── generate_nonce_hex ────────────────────────────────────────────────────────
 
 std::string generate_nonce_hex() {
@@ -151,16 +161,19 @@ std::string hmac_sha256_hex(std::string_view key, std::string_view data) {
 
 std::string auth_response(std::string_view secret,
                           AuthSurface      surface,
+                          AuthRole         role,
                           std::string_view identity,
                           std::string_view nonce_hex) {
-    // "ob-auth-v1\0<surface>\0<identity>\0<nonce_hex>". NUL separators rather than a delimiter
-    // character, so no two different tuples can concatenate into the same input - the classic way
-    // a MAC over joined fields stops binding the fields.
+    // "ob-auth-v1\0<surface>\0<role>\0<identity>\0<nonce_hex>". NUL separators rather than a
+    // delimiter character, so no two different tuples can concatenate into the same input - the
+    // classic way a MAC over joined fields stops binding the fields.
     std::string input;
-    input.reserve(11 + 12 + identity.size() + nonce_hex.size() + 3);
+    input.reserve(11 + 12 + 10 + identity.size() + nonce_hex.size() + 4);
     input.append("ob-auth-v1");
     input.push_back('\0');
     input.append(surface_label(surface));
+    input.push_back('\0');
+    input.append(role_label(role));
     input.push_back('\0');
     input.append(identity);
     input.push_back('\0');

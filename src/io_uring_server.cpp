@@ -34,6 +34,7 @@ IoUringServer::IoUringServer(ServerConfig config)
     ReplicationConfig repl_config{};
     repl_config.port = config_.replication_port;
     repl_config.compress = config_.replication_compress;
+    repl_config.cluster_secret = secrets_.cluster;
 
     ReplicationClientConfig repl_client_config{};
     repl_client_config.primary_host = config_.primary_host;
@@ -41,6 +42,7 @@ IoUringServer::IoUringServer(ServerConfig config)
     repl_client_config.state_file   = config_.data_dir + "/repl_state.txt";
     repl_client_config.snapshot_chunk_size = config_.snapshot_chunk_size;
     repl_client_config.snapshot_staging_dir = config_.snapshot_staging_dir;
+    repl_client_config.cluster_secret = secrets_.cluster;
 
     FailoverConfig failover_config{};
     if (!config_.coordinator_endpoints.empty()) {

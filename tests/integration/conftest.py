@@ -195,6 +195,12 @@ class ClusterManager:
         # Open log files, closed on shutdown. Held by the manager rather than by NodeInfo because a
         # restart replaces the NodeInfo and the old handle still needs closing.
         self._node_logs: list = []
+        # Path to a cluster secret file, or None. Set before start()/start_multi_master() by the
+        # fixture that wants an authenticated cluster (#30 part two). On the manager rather than a
+        # per-call argument because it applies to every node including restarts: a node that came
+        # back without the secret would be refused by its peers, and the test would read that as a
+        # replication defect.
+        self.cluster_secret_file: Optional[str] = None
         # Indices this harness killed on purpose. Without it, teardown cannot tell a test that
         # killed a node from a node that died on its own, and it silently restarts both — which is
         # how a crashing node stays invisible for as long as the tests around it pass.
@@ -481,6 +487,8 @@ class ClusterManager:
         ]
         if read_only:
             cmd.append("--read-only")
+        if self.cluster_secret_file:
+            cmd += ["--cluster-secret-file", self.cluster_secret_file]
         mm_replication_port = 0
         if multi_master_id is not None:
             # The server refuses --mm-replication-port equal to --replication-port:

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "orderbook/auth.hpp"
+
 #include "orderbook/async_snapshot.hpp"
 #include "orderbook/snapshot.hpp"
 #include "orderbook/wal.hpp"
@@ -29,12 +31,24 @@ struct ReplicationConfig {
     uint16_t port{0};           // 0 = disabled
     int      max_replicas{4};
     bool     compress{false};   // --replication-compress
+
+    /// Cluster secret (#30 part two). Empty = this link does not authenticate.
+    ///
+    /// A credential in a config struct, which `ServerConfig` deliberately refuses - the difference
+    /// is that nothing renders this one. `format_config()` walks every field of `ServerConfig` and
+    /// prints it, so a secret there would be printed by the command that exists to be pasted into a
+    /// ticket. If anything ever renders this struct, the secret moves out of it.
+    SecretStore cluster_secret;
 };
 
 struct ReplicationClientConfig {
     std::string primary_host;
     uint16_t    primary_port{0};  // 0 = no replication
     std::string state_file{"repl_state.txt"};
+
+    /// Cluster secret (#30 part two). Empty = do not authenticate, and then a primary that *does*
+    /// authenticate refuses this replica before `REPLICATE`.
+    SecretStore cluster_secret;
 
     // Snapshot bootstrap configuration
     size_t      snapshot_chunk_size{262144};     // --snapshot-chunk-size (default 256 KB)
@@ -196,6 +210,16 @@ struct ReplicaInfo {
     size_t      confirmed_offset{0};
     bool        compress{false};  // true after COMPRESS LZ4 directive sent
 
+    /// Authentication state (#30 part two), meaningful only when a cluster secret is configured.
+    ///
+    /// One flag, not two, and the asymmetry is deliberate: this side refuses to serve `REPLICATE`
+    /// until the replica has proved itself, and the replica refuses to *send* `REPLICATE` until we
+    /// have proved ourselves. Mutual authentication falls out of both sides applying that rule, so
+    /// neither has to track its own proof.
+    bool        peer_proved{false};
+    /// The nonce we challenged this connection with. Single-use: cleared when it is answered.
+    std::string auth_nonce;
+
     // Per-replica send buffer for non-blocking broadcast (EPOLLOUT drain).
     std::vector<uint8_t> send_buf;
 
@@ -334,6 +358,13 @@ private:
     /// Remove a replica by fd (closes fd, removes from epoll and replicas_ list).
     /// Caller must hold mtx_.
     void remove_replica_locked(int fd);
+
+    /// Close a replica connection and drop its record, with the reason logged.
+    ///
+    /// The three-line "remove, then find and erase" sequence appeared three times in
+    /// handle_replica_data() before this existed, and forgetting the erase leaves a record pointing
+    /// at a closed descriptor - which the broadcast path then writes to.
+    void disconnect_replica_locked(int fd, const char* reason);
 };
 
 // ── ReplicationClient (replica side) ──────────────────────────────────────────
@@ -429,6 +460,13 @@ private:
 
     void run_loop();
     void connect_to_primary();
+    /// Complete the mutual challenge-response with the primary (#30 part two).
+    ///
+    /// Returns false on any failure, including a primary that says nothing - which is what a
+    /// primary without a cluster secret does, and the log line says so rather than reporting a
+    /// timeout.
+    bool authenticate_with_primary();
+
     void receive_and_replay();
 
     /// Close the socket and forget it, once, under fd_mtx_.

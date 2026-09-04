@@ -47,10 +47,73 @@ scanner without a reproducible case.
 
 ## Security posture you should know about
 
-This engine is designed for deployment on a **trusted network**. As of `v0.1.x` the TCP wire
-protocol has **no authentication and no transport encryption**. Do not expose `ob_tcp_server`,
-the replication port, the multi-master port, or the metrics port to the public internet. Put them
-behind a private network, a VPN, or a mutually authenticated proxy.
+This engine is designed for deployment on a **trusted network**, and the reason is now narrower than
+it was: client sessions can authenticate, and nothing is encrypted.
 
-If you are evaluating this engine for production, treat that as a deployment requirement and not a
-vulnerability. Adding authentication and TLS is on the roadmap (`docs/roadmap.md`, phase 7).
+### What authentication gives you
+
+`--auth-secret-file` turns on authentication for client sessions. A session that has not
+authenticated may run only `AUTH`, `PING` and `QUIT`; everything else is refused with
+`ERR unauthenticated`. The scheme is challenge-response over HMAC-SHA256, so **the secret never
+crosses the wire**:
+
+```
+C: AUTH
+S: OK CHALLENGE <64 hex characters>
+C: AUTH <identity> <HMAC-SHA256 of the challenge>
+S: OK AUTH <identity>
+```
+
+A failed attempt closes the connection, which is also the rate limit: one attempt per connection,
+and connections are bounded by `--max-sessions`. Successes and failures are logged with the peer
+address and counted in `ob_auth_success_total` and `ob_auth_failures_total`.
+
+`--cluster-secret-file` holds the secret for the replication and multi-master links. **The two files
+must not contain the same secret** and the server refuses to start when they do: a client holding
+the cluster secret could present itself as a replica and stream the entire write-ahead log.
+
+Generating and installing them is in [docs/operations.md](docs/operations.md).
+
+### What authentication does not give you
+
+**Not confidentiality.** There is still no TLS, so every query, every row and every response is
+readable by anything on the path. Authentication answers "may this peer talk to us"; it says nothing
+about who else is listening. If your threat model includes a passive observer on the network, this
+engine does not yet meet it — that is roadmap item #30 part two.
+
+**Not authorisation.** Every authenticated identity may run every command, including `FAILOVER` and
+`MIGRATE`. Per-identity permissions are roadmap item #31, and they will attach to exactly the
+identity name this scheme establishes.
+
+**Not protection against an active man-in-the-middle**, and this one is worth understanding rather
+than glossing. Challenge-response proves *knowledge of the secret*; nothing binds the exchange to
+the connection it happened on. So an attacker who can redirect a replica's connection — by
+controlling DNS, ARP or routing — can relay: it takes the real primary's challenge, presents it to
+the replica as its own, forwards the replica's answer to the primary, and asks the primary to answer
+the replica's challenge. Both sides then believe they are talking to each other.
+
+Channel binding is what stops that, and channel binding needs a channel with an identity — which is
+TLS, roadmap #30 part three. It is not fixable at this layer: a relay can always forward a value
+that is bound to nothing but a nonce.
+
+In practice this changes little about where you may deploy a node, because an attacker with that
+level of network control already reads every row in the clear and can inject records into the
+plaintext stream, authentication or not. What it does mean is that **authentication is not a reason
+to move a node onto a network you do not trust.**
+
+**Nothing on `/metrics`.** The endpoint has no authentication and that is deliberate: a Prometheus
+scraper cannot perform a challenge-response, so a bearer token would be a second and weaker
+mechanism — and the weaker one is the one that gets used. Bind it to a private interface with
+`--metrics-bind` instead. Note that the exposition discloses symbol counts, row volumes and cluster
+role, which is information about your business.
+
+**Nothing at all, by default.** With neither secret file set, the wire behaves exactly as it did
+before: no authentication anywhere. The server logs a `WARN` for each disabled surface at startup, so
+"default open" is visible in the log rather than only in this document.
+
+### Therefore
+
+Do not expose `ob_tcp_server`, the replication port, the multi-master port, or the metrics port to
+the public internet, authenticated or not. Put them behind a private network, a VPN, or a mutually
+authenticated proxy. If you are evaluating this engine for production, treat that as a deployment
+requirement and not a vulnerability.

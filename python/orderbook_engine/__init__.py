@@ -222,8 +222,10 @@ class _TcpBackend:
             raise OrderbookError(-1, f"Server refused the authentication request: {resp}")
         nonce = resp[len("OK CHALLENGE "):].strip()
         # Field layout must match ob::auth_response() byte for byte: a version prefix, the surface
-        # label, the identity and the nonce, NUL-separated so no two tuples concatenate alike.
-        message = b"\x00".join([b"ob-auth-v1", b"client",
+        # label, the role, the identity and the nonce, NUL-separated so no two tuples concatenate
+        # alike. The role is always `initiator` on this surface - a client opens the connection, and
+        # the server never proves itself here (that is TLS's job, #30 part three).
+        message = b"\x00".join([b"ob-auth-v1", b"client", b"initiator",
                                 identity.encode("utf-8"), nonce.encode("ascii")])
         digest = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
         self._send(f"AUTH {identity} {digest}")

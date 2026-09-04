@@ -167,6 +167,49 @@ Show the help message.
 
 Shut down the engine (flushes all data) and exit.
 
+### AUTH
+
+Only when the server runs with `--auth-secret-file`. An unauthenticated session may run `AUTH`,
+`PING` and `QUIT`, and nothing else — every other command answers `ERR unauthenticated`.
+
+```
+C: AUTH
+S: OK CHALLENGE 3f1c...9ab2          (64 hex characters)
+C: AUTH grafana 7d40...c18e          (HMAC-SHA256, 64 hex characters)
+S: OK AUTH grafana
+```
+
+The response is
+
+```
+HMAC-SHA256(secret, "ob-auth-v1\0client\0initiator\0<identity>\0<challenge>")
+```
+
+hex-encoded lower case, with **NUL separators** between the five fields. Challenge-response rather
+than sending the secret, because there is no TLS yet: a secret in the first packet is replayable by
+anyone who saw it, and a response to a fresh nonce is not.
+
+`client` is the surface — the cluster links use `replication` and `mm`, so a response captured on
+one surface is useless on another. `initiator` is the end that opened the connection, and on this
+surface it is the only value that ever appears: the server never proves itself to a client. It is in
+the input because on the **cluster** links both ends hold the same key and both answer challenges,
+so without a role an attacker could reflect a node's own challenge back at it, be handed the answer,
+and replay it.
+
+| Response | Means |
+|----------|-------|
+| `OK CHALLENGE <hex>` | answer this, and only this — a new `AUTH` replaces the outstanding challenge |
+| `OK AUTH <identity>` | the session is authenticated |
+| `ERR auth_failed` | wrong response **or** unknown identity, deliberately indistinguishable; the connection is then closed |
+| `ERR auth_no_challenge` | a response arrived with no challenge outstanding |
+| `ERR already_authenticated` | this session has already authenticated |
+| `ERR auth_disabled` | the server is not running with `--auth-secret-file` |
+
+`AUTH` does not count as the session's first command, so `AUTH` followed by `COMPRESS LZ4` works.
+
+A failed attempt closes the connection, which is also the rate limit: one attempt per connection,
+and connections are bounded by `--max-sessions`.
+
 ## Large responses and slow clients
 
 A response is queued per session and written as the socket accepts it, so a result set larger than the

@@ -741,6 +741,10 @@ ob_add_auth_test(test_auth
 ob_add_tcp_test(test_auth_gate
     test_auth_gate.cpp
 )
+
+ob_add_tcp_test(test_auth_cluster
+    test_auth_cluster.cpp
+)
 # Reads src/tcp_server.cpp to refuse a `default:` label in the gate's classifier — the same reason
 # test_cli_config and test_version get this definition.
 target_compile_definitions(test_auth_gate

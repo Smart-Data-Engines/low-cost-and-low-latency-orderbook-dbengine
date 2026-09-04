@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import server_binary_path
+from conftest import ClusterManager, patience, server_binary_path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 from orderbook_engine import OrderbookEngine, OrderbookError  # noqa: E402
@@ -41,13 +41,14 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def client_response(secret: str, identity: str, nonce: str, surface: str = "client") -> str:
+def client_response(secret: str, identity: str, nonce: str, surface: str = "client",
+                    role: str = "initiator") -> str:
     """The response the server expects, computed independently of the client library.
 
     Written out here rather than imported so that this test would fail if the client and the
     server agreed with each other on a construction different from the documented one.
     """
-    message = b"\x00".join([b"ob-auth-v1", surface.encode(),
+    message = b"\x00".join([b"ob-auth-v1", surface.encode(), role.encode(),
                             identity.encode(), nonce.encode()])
     return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
 
@@ -88,6 +89,9 @@ class Node:
         return args
 
     def start(self, timeout: float = 20.0) -> None:
+        # Scaled, because every wait here was chosen against an uninstrumented build and the
+        # `sanitizers-integration (tsan)` job applies all of them (pitfall 105).
+        timeout = patience(timeout)
         self.port = free_port()
         if self.metrics:
             self.metrics_port = free_port()
@@ -111,7 +115,8 @@ class Node:
     def run_and_wait(self, timeout: float = 20.0) -> subprocess.CompletedProcess:
         """Start the node expecting it *not* to stay up, and return the finished process."""
         self.port = free_port()
-        return subprocess.run(self.argv(), capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(self.argv(), capture_output=True, text=True,
+                              timeout=patience(timeout))
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -195,8 +200,15 @@ def test_a_full_challenge_response_admits_the_session(authed_node):
         nonce = challenge.split()[2]
         digest = client_response(ALICE_SECRET, "alice", nonce)
         assert "OK AUTH alice" in w.send(f"AUTH alice {digest}")
-        # And the session works from here.
-        assert "ERR unauthenticated" not in w.send("SELECT * FROM orderbook")
+        # And the session works from here: write, flush, read the row back. Asserting the row
+        # rather than the absence of `unauthenticated` - an invalid query, an empty engine and a
+        # symbol that does not exist all lack that string too, so the weaker form passes against a
+        # gate that let the command through and an engine that then refused it.
+        assert w.send("INSERT BTCUSD BINANCE bid 50000 10 1").startswith("OK")
+        assert w.send("FLUSH", settle=1.0).startswith("OK")
+        rows = w.send("SELECT * FROM 'BTCUSD'.'BINANCE'", settle=1.0)
+        assert rows.startswith("OK"), rows
+        assert "50000" in rows, rows
         status = w.send("STATUS")
         assert "identity: alice" in status, status
     finally:
@@ -394,3 +406,107 @@ def test_the_cpp_client_without_credentials_is_refused(authed_node):
                            "--port", str(authed_node.port), "--test", "insert_query"],
                           capture_output=True, text=True, timeout=60, env=env)
     assert done.returncode != 0, done.stdout + done.stderr
+
+
+# ── Cluster links (#30 part two) ──────────────────────────────────────────────
+#
+# Three real nodes with a shared secret, and the same three without it. The negative half needs the
+# positive one to mean anything: a mesh that never converges proves nothing about authentication.
+
+
+@pytest.fixture(scope="module")
+def authenticated_mm_cluster():
+    """A three-node multi-master mesh where every node holds the cluster secret."""
+    with tempfile.TemporaryDirectory(prefix="ob_mm_auth_") as d:
+        secret_file = write_secret_file(Path(d) / "cluster", f"{CLUSTER_SECRET}\n")
+        cm = ClusterManager()
+        cm.cluster_secret_file = str(secret_file)
+        cm.start_multi_master(node_count=3)
+        try:
+            yield cm
+        finally:
+            cm.shutdown()
+
+
+def mm_row_count(port: int, symbol: str = "BTCUSD", exchange: str = "BINANCE",
+                 timeout: float = 10.0) -> int:
+    """Rows this node holds for one symbol.
+
+    The query form is `FROM 'sym'.'exch'` — the engine's own grammar. An invalid query answers
+    `ERR`, which counts as zero rows and reads exactly like a mesh that has not converged, so this
+    raises instead.
+    """
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
+        s.settimeout(timeout)
+        s.recv(4096)
+        s.sendall(f"SELECT * FROM '{symbol}'.'{exchange}'\n".encode())
+        time.sleep(1.0)
+        try:
+            body = s.recv(1 << 20).decode(errors="replace")
+        except socket.timeout:
+            return 0
+    if body.startswith("ERR"):
+        raise AssertionError(f"query refused, so a row count would be meaningless: {body.strip()}")
+    # Rows are tab-separated: ts, price, qty, count, side, level, seq.
+    return sum(1 for line in body.splitlines() if line.count("\t") >= 6)
+
+
+def test_an_authenticated_mesh_converges(authenticated_mm_cluster):
+    cm = authenticated_mm_cluster
+    writer = cm.nodes[0]
+    with socket.create_connection(("127.0.0.1", writer.tcp_port), timeout=10) as s:
+        s.settimeout(10)
+        s.recv(4096)
+        s.sendall(b"INSERT BTCUSD BINANCE bid 50000 10 1\n")
+        time.sleep(0.5)
+        s.recv(4096)
+
+    deadline = time.time() + patience(30)
+    while time.time() < deadline:
+        counts = [mm_row_count(n.tcp_port) for n in cm.nodes]
+        if all(c >= 1 for c in counts):
+            break
+        time.sleep(1.0)
+    counts = [mm_row_count(n.tcp_port) for n in cm.nodes]
+    assert all(c >= 1 for c in counts), f"row counts across the mesh: {counts}"
+
+    # And every node says it authenticated its peers, which is the statement the log makes that a
+    # row count cannot.
+    for node in cm.nodes:
+        log = Path(node.data_dir, "node.log").read_text(errors="replace")
+        assert "authenticated" in log, f"{node.node_id} never logged an authentication"
+        assert CLUSTER_SECRET not in log, f"{node.node_id} logged the cluster secret"
+
+
+def test_a_peer_without_the_secret_is_refused_and_the_reason_is_named():
+    """One node with the secret, one without: the mesh must not form, and the log must say why.
+
+    The message matters more than the refusal. A peer that sent its handshake straight away is a
+    peer running without --cluster-secret-file, and reporting it as a short or malformed frame would
+    send an operator into this node's code instead of the other node's configuration.
+    """
+    with tempfile.TemporaryDirectory(prefix="ob_mm_mixed_") as d:
+        secret_file = write_secret_file(Path(d) / "cluster", f"{CLUSTER_SECRET}\n")
+        cm = ClusterManager()
+        cm.cluster_secret_file = str(secret_file)
+        cm.start_multi_master(node_count=2)
+        try:
+            # Bring node 1 back without the secret, which is the mixed mode the design refuses.
+            cm.kill_node(1)
+            cm.cluster_secret_file = None
+            cm.restart_node(1)
+
+            # Polled rather than slept: the refusal happens on the peer's next connect attempt,
+            # which is a reconnect backoff away, and a fixed sleep chosen here is a flake waiting
+            # for the instrumented job.
+            log_path = Path(cm.nodes[0].data_dir, "node.log")
+            deadline = time.time() + patience(25)
+            log = ""
+            while time.time() < deadline:
+                log = log_path.read_text(errors="replace")
+                if "running without a cluster secret" in log:
+                    break
+                time.sleep(1.0)
+            assert "running without a cluster secret" in log, log[-3000:]
+        finally:
+            cm.shutdown()

@@ -31,6 +31,30 @@ enum class AuthSurface { Client, Replication, MultiMaster };
 /// Stable wire label for a surface: "client", "replication", "mm".
 std::string_view surface_label(AuthSurface s);
 
+/// Which end of a connection computed a response.
+///
+/// **This is what stops a reflection attack, and without it the cluster links were bypassable with
+/// no knowledge of the secret.** Both ends of a cluster link hold the same key, so if both compute
+/// the same function of a nonce, an attacker can echo the acceptor's own challenge back as its
+/// own, be handed the answer, and replay it:
+///
+///     primary  -> attacker : CHALLENGE n
+///     attacker -> primary  : CHALLENGE n      (the primary's own nonce, reflected)
+///     primary  -> attacker : AUTH   H(n)      (answering a challenge needs no authentication)
+///     attacker -> primary  : AUTH   H(n)      (replaying what it was just given)
+///
+/// Binding *both* nonces does not help: with the nonce reflected, "mine then theirs" and "theirs
+/// then mine" are the same pair. The two directions have to compute different values, so the role
+/// goes into the MAC input.
+///
+/// `Initiator` is the side that opened the connection - the replica, the connecting peer, a client.
+/// `Acceptor` is the side that accepted it. On the client surface only `Initiator` is ever used,
+/// because the server never proves itself there; that is stated rather than left implicit.
+enum class AuthRole { Initiator, Acceptor };
+
+/// Stable wire label for a role: "initiator", "acceptor".
+std::string_view role_label(AuthRole r);
+
 /// Bytes of a challenge nonce, before hex encoding.
 ///
 /// 32 from the system CSPRNG. A nonce an attacker can predict turns challenge-response back into a
@@ -120,15 +144,16 @@ std::string generate_nonce_hex();
 /// construction, and "we call OpenSSL correctly" would be untested.
 std::string hmac_sha256_hex(std::string_view key, std::string_view data);
 
-/// HMAC-SHA256(secret, "ob-auth-v1\0<surface>\0<identity>\0<nonce_hex>"), hex-encoded lower case.
+/// HMAC-SHA256(secret, "ob-auth-v1\0<surface>\0<role>\0<identity>\0<nonce_hex>"), hex, lower case.
 ///
 /// Every field is inside the MAC and separated by a NUL, so no two different tuples produce the
 /// same input by concatenation. The version prefix exists so a future scheme cannot be mistaken for
-/// this one; the surface label is the domain separation described on AuthSurface; the identity is
-/// there so that a response for identity A is not a valid response for identity B under a shared
-/// secret.
+/// this one; the surface label is the domain separation described on AuthSurface; the role is the
+/// reflection defence described on AuthRole; and the identity is there so that a response for
+/// identity A is not a valid response for identity B under a shared secret.
 std::string auth_response(std::string_view secret,
                           AuthSurface      surface,
+                          AuthRole         role,
                           std::string_view identity,
                           std::string_view nonce_hex);
 

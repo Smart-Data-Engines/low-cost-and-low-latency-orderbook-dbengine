@@ -100,7 +100,8 @@ protected:
                              const std::string& secret = kSecret) {
         const auto challenge = run(s, "AUTH");
         const auto nonce     = nonce_from(challenge);
-        const auto response  = ob::auth_response(secret, ob::AuthSurface::Client, identity, nonce);
+        const auto response  = ob::auth_response(secret, ob::AuthSurface::Client, ob::AuthRole::Initiator,
+                                                 identity, nonce);
         return run(s, "AUTH " + identity + " " + response);
     }
 };
@@ -261,8 +262,18 @@ TEST_F(AuthGateTest, PingAndQuitWorkBeforeAuthentication) {
 TEST_F(AuthGateTest, SelectAfterAuthenticationReachesTheEngine) {
     ob::Session s(fd_server_);
     ASSERT_EQ(authenticate(s), "OK AUTH alice\n\n");
-    const auto response = run(s, "SELECT * FROM orderbook");
-    EXPECT_EQ(response.find("ERR unauthenticated"), std::string::npos) << response;
+    // Write, then read it back. Asserting a *row* rather than the absence of `unauthenticated`:
+    // a malformed query and an empty engine both lack that string, so the weaker assertion would
+    // pass against a gate that let the command through and an engine that then refused it. The
+    // first version of this test did exactly that, and the engine was answering
+    // `symbol 'BTCUSD' ... not found`.
+    ASSERT_EQ(run(s, "INSERT BTCUSD BINANCE bid 50000 10 1").rfind("OK", 0), 0u);
+    // FLUSH between them, because the query engine reads the columnar store and not the live SoA
+    // buffer (pitfall 13) - and it makes this a third command passing the gate.
+    ASSERT_EQ(run(s, "FLUSH").rfind("OK", 0), 0u);
+    const auto response = run(s, "SELECT * FROM 'BTCUSD'.'BINANCE'");
+    EXPECT_EQ(response.rfind("OK", 0), 0u) << response;
+    EXPECT_NE(response.find("50000"), std::string::npos) << response;
 }
 
 TEST_F(AuthGateTest, CompressStillCountsAsTheFirstCommandAfterAuthenticating) {
@@ -278,7 +289,8 @@ TEST_F(AuthGateTest, CompressStillCountsAsTheFirstCommandAfterAuthenticating) {
 TEST_F(AuthGateTest, ANewChallengeInvalidatesThePreviousOne) {
     ob::Session s(fd_server_);
     const auto first  = nonce_from(run(s, "AUTH"));
-    const auto stale  = ob::auth_response(kSecret, ob::AuthSurface::Client, "alice", first);
+    const auto stale  = ob::auth_response(kSecret, ob::AuthSurface::Client,
+                                        ob::AuthRole::Initiator, "alice", first);
     const auto second = nonce_from(run(s, "AUTH"));
     ASSERT_NE(first, second);
     EXPECT_EQ(run(s, "AUTH alice " + stale), "ERR auth_failed\n");
@@ -291,7 +303,8 @@ TEST_F(AuthGateTest, AResponseForAnotherSurfaceDoesNotAuthenticateAClient) {
     ob::Session s(fd_server_);
     const auto nonce = nonce_from(run(s, "AUTH"));
     const auto wrong_surface =
-        ob::auth_response(kSecret, ob::AuthSurface::Replication, "alice", nonce);
+        ob::auth_response(kSecret, ob::AuthSurface::Replication,
+                          ob::AuthRole::Initiator, "alice", nonce);
     EXPECT_EQ(run(s, "AUTH alice " + wrong_surface), "ERR auth_failed\n");
 }
 

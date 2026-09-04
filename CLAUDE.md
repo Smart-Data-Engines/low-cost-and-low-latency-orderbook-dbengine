@@ -792,6 +792,109 @@ Learned the hard way. Check here before debugging.
     it. Both mutation-checked. A literal that agrees today drifts at the first bump, and the symptom
     is an operator told the wrong build is running — worse than being told nothing.
 
+108. **A flag is a mechanism only where something reads it in the path that matters.**
+    `request_close_after_flush()` was consulted in exactly one place: the EPOLLOUT drain, which runs
+    only after a *partial* write. So a response small enough to fit the socket buffer left the
+    session open with the flag set and nothing reading it — and `ERR auth_failed` is eighteen bytes,
+    with closing on the first failure being the entire rate limit for authentication (#30). The
+    io_uring loop read the flag **nowhere at all**. What makes this worth keeping is which test
+    found it: the unit test asserted `close_requested()` was true (it was), and the integration test
+    asserted the connection was gone (it was not). Assert the effect, not the branch — pitfall 45
+    from the other side.
+
+109. **A gate written per-case is a gate the next case misses.** The authentication check sits
+    *before* `execute_command`'s switch, because a branch in each `case` means the eighteenth
+    command added without one is reachable unauthenticated and nothing fails. The enforcement is the
+    compiler: the classifier's switch has **no `default:`**, so `-Wswitch` makes a new
+    `CommandType` a build failure — and a test refuses a `default:` being added, because that one
+    label silently turns the exhaustiveness check off and hands every future command whatever the
+    default says.
+
+110. **A test asserting the absence of one error message passes for a dozen wrong reasons.**
+    `EXPECT_EQ(response.find("ERR unauthenticated"), npos)` was meant to prove a command reached the
+    engine after authenticating. It passed while the engine answered
+    `ERR OB_ERR_NOT_FOUND: symbol 'BTCUSD' ... not found`, and then again when the query returned
+    `OK` with a column header and no rows. Only `INSERT`, `FLUSH`, `SELECT`, and an assertion on the
+    **row** made it decisive. A negative assertion about one string is satisfied by every other
+    failure.
+
+111. **Do not trim a secret; remove the line terminator and nothing else.** A general trim makes a
+    file containing `"abc "` and a file containing `"abc"` the same secret, and for a secret
+    "silently the same" is a security property rather than a convenience. The flagship product's
+    `read_bytes().strip()` on a random salt removed bytes in about 5% of files, so the process that
+    generated it used 32 bytes and every later process used the remainder.
+
+112. **A log line announcing a guarantee the code does not provide is worse than no log line, and I
+    shipped one for an hour.** `--cluster-secret-file` initially loaded and validated the file while
+    nothing on the replication or multi-master links required it, and the startup log said
+    `cluster authentication enabled`. An operator greps exactly that line to confirm exactly that
+    guarantee. Found while **writing the operations document** — the third time in this repository
+    that writing for a reader tested the code (pitfall 84), and the reason the fix was to implement
+    the enforcement rather than to reword the line.
+
+113. **Positional aggregate initialisation of a config struct breaks call sites that have nothing to
+    do with the change.** One new field in `ReplicationConfig` produced six `-Wmissing-field-`
+    `initializers` errors in `test_replication.cpp` and two more in `test_tcp_server.cpp`, none of
+    them about what those tests check. **Designated initialisers do not help** — verified, GCC still
+    warns for the omitted members in C++20. A factory helper (`primary_config()`,
+    `simple_command()`) does, and it is where the defaults belong anyway.
+
+114. **A benchmark difference above the control's own variation is not automatically a regression —
+    read the instruction stream.** `BM_IngestionThroughput` came out 1.8% slower on median across
+    six interleaved rounds (master cv 0.75%, branch cv 1.36%), which is outside noise by that
+    measure. `objdump` with mnemonics only: `Engine::apply_delta` 1761 instructions, `write_record`
+    536, `WAL::append` 863, **byte-identical in both builds**. So no work was added and the
+    difference is code placement — on the machine that once reported −40.6% in 8/8 rounds for an
+    identical function (pitfall 33). Diffing the disassembly of the measured path is faster than
+    arguing about the number.
+
+115. **`getpeername()` succeeds on an `AF_UNIX` socket, and a `sockaddr_in` cast then reads
+    whatever followed the path.** The unit tests use `socketpair(AF_UNIX, ...)`, so the address in
+    an authentication log line would have been arbitrary bytes rendered as an IP. Check
+    `sin_family` before formatting; the cost is one comparison and the alternative is a log that
+    lies about where a connection came from.
+
+116. **A metric label fed by an unauthenticated peer is an unbounded label set an attacker
+    controls.** The claimed identity in a failed `AUTH` is peer-supplied, so
+    `ob_auth_failures_total{identity="..."}` would let anyone who can reach the port grow the
+    registry without limit. The counters carry no identity label at all; the identity goes to the
+    log and to `STATUS`, both of which are bounded by the connection. Same rule for #31 when
+    identities gain permissions.
+
+117. **Anything a peer sends that reaches a log must be length-bounded and stripped of
+    non-printables.** One newline in a claimed identity and the log says whatever the peer wants it
+    to, in the format an operator's tooling parses. `sanitise_for_log()` is the funnel, and the
+    integration test sends `alice\nINFO forged` and greps for `INFO forged`.
+
+118. **The shell's working directory survives between commands, so a `cd` inside one leaks into the
+    next.** A `cd` in an unrelated heredoc left the session in `kiro-workspace`, and the next
+    `git checkout -b` created the feature branch **in the shared context repository** rather than in
+    the engine. Nothing was lost because the branch had no commits, but that repository is the one
+    every session writes to. Absolute paths, or `git -C <repo>`, on every git command.
+
+119. **Two ends of a link holding the same key and computing the same function of a nonce are each
+    other's oracle, and my first cut of cluster authentication was bypassable with no knowledge of
+    the secret.** Answering a challenge cannot require authentication — the peer has not proved
+    itself either — so an attacker could receive `CHALLENGE n`, send `CHALLENGE n` straight back,
+    be handed `AUTH H(n)`, and replay it. Four messages, zero secrets.
+
+    The trap inside the trap: **binding both nonces does not fix it.** With the nonce reflected,
+    `H(theirs, mine)` and `H(mine, theirs)` are the same pair, so the orderings collapse. The fix
+    has to make the two directions compute *different values*, which means a **role** in the MAC
+    input (`initiator` / `acceptor`). In a symmetric mesh that role has to be recorded explicitly
+    (`PeerConnection::we_accepted`), and it resets with every reconnect because it is a property of
+    the connection.
+
+    Two tests, failing in different directions: one replays the four steps against a live socket,
+    and one pins the inequality the defence rests on — because the first also fails for unrelated
+    reasons, and the second says *which* property broke.
+
+    And the honest limit, in `SECURITY.md` rather than assumed away: the role stops **reflection**
+    and not an active **man-in-the-middle**. Nothing binds the exchange to the connection, so an
+    attacker who can redirect a replica relays both directions and both ends are satisfied. A relay
+    can forward any value bound only to a nonce; stopping it needs a channel with an identity, which
+    is TLS.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -800,7 +903,7 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 817 C++ tests (`ctest -j1`, ~2 min) and 147 integration tests plus 2
+**Where the suites stand:** 886 C++ tests (`ctest -j1`, ~2 min) and 165 integration tests plus 2
 opt-in Binance skips (`pytest tests/integration/`, ~8 min on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that
@@ -815,8 +918,17 @@ sat below all of them.
 
 Things a newcomer should know, because they are real limits rather than bugs to file again:
 
-- **The wire protocol has no authentication or encryption.** Roadmap #30. Do not expose a node
-  outside a trusted network.
+- **The wire protocol has authentication and no encryption.** All three surfaces authenticate since
+  #30 parts one and two — client sessions with `--auth-secret-file`, the replication link and the
+  multi-master mesh with `--cluster-secret-file` — by challenge-response over HMAC-SHA256, so a
+  secret never crosses the wire. **Nothing is encrypted**, so every query and every row is readable
+  by anything on the path: do not expose a node outside a trusted network. Both files are off by
+  default, and the startup log WARNs for each disabled surface rather than leaving "default open" in
+  a document. Three things to know before touching it: the client gate sits *before*
+  `execute_command`'s switch and its classifier has no `default:` (pitfall 109); the surface label
+  is inside the HMAC input because replication and multi-master share one secret; and the two secret
+  files must differ, which the start enforces, because a client holding the cluster secret can
+  present itself as a replica and stream the whole write-ahead log.
 - **The whole integration battery runs under ThreadSanitizer**, not a subset — since #85. 146 tests,
   **zero skips**, zero reports. Before that the job ran three multi-master modules, and the reason
   given for the narrow scope was a hypothesis that turned out to be false (pitfall 75). Widening it

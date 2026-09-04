@@ -272,7 +272,7 @@ Result<void> OrderbookClient::authenticate() {
     }
 
     const std::string digest = auth_response(config_.auth_secret, AuthSurface::Client,
-                                             config_.auth_identity, nonce);
+                                             AuthRole::Initiator, config_.auth_identity, nonce);
     send_buf_.assign("AUTH " + config_.auth_identity + " " + digest + "\n");
     if (auto sr = send_all(send_buf_.size()); !sr) return sr;
 
