@@ -903,7 +903,7 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 886 C++ tests (`ctest -j1`, ~2 min) and 165 integration tests plus 2
+**Where the suites stand:** 889 C++ tests (`ctest -j1`, ~2 min) and 165 integration tests plus 2
 opt-in Binance skips (`pytest tests/integration/`, ~8 min on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that
