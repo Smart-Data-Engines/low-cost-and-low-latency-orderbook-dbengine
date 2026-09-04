@@ -270,57 +270,62 @@ bool Session::send_response(std::string_view response) {
     return flush_output();
 }
 
-bool Session::flush_output() {
+// Out of line, and the attribute is the point rather than a hint - the numbers and the reasoning
+// are on `Session::flush_output()` in the header. One call on the TLS path, which is nothing beside
+// encrypting a record.
+[[gnu::noinline]] bool Session::flush_output_tls() {
     size_t sent_total = 0;
 
-    if (ssl_ != nullptr) {
-        if (tls_handshaking_) {
-            // Reached before a single byte has arrived from the client: the banner is queued at
-            // accept and `send_response()` flushes. `SSL_write` here would begin the handshake from
-            // the write path, so two functions would be advancing one state machine while
-            // `tls_handshaking_` still said the handshake had not started. It happens to work -
-            // `SSL_accept` continues whatever `SSL_write` began - and "works because both callers
-            // are reentrant into the same state machine" is not a property to build on. The
-            // handshake has one owner, and the loop flushes the banner the moment it completes.
-            return true;
-        }
-        while (sent_total < send_buf_.size()) {
-            ERR_clear_error();
-            const int n = SSL_write(ssl_.get(), send_buf_.data() + sent_total,
-                                    static_cast<int>(send_buf_.size() - sent_total));
-            if (n > 0) {
-                sent_total += static_cast<size_t>(n);
-                io_want_ = IoWant::Read;
-                continue;
-            }
-            const int err = SSL_get_error(ssl_.get(), n);
-            if (err == SSL_ERROR_WANT_WRITE) { io_want_ = IoWant::Write; break; }
-            if (err == SSL_ERROR_WANT_READ) {
-                // A *write* that needs to read first - a TLS 1.3 key update. Arming EPOLLOUT here
-                // would spin: the socket is writable and OpenSSL is not asking for that.
-                io_want_ = IoWant::Read;
-                break;
-            }
-            if (sent_total > 0) send_buf_.erase(0, sent_total);
-            OB_LOG_WARN("tls", "write failed: fd=%d conn_id=%llu %s: %s pending=%zu",
-                        fd_, static_cast<unsigned long long>(conn_id_),
-                        tls_error_name(err), tls_last_error().c_str(), send_buf_.size());
-            return false;
-        }
-        // The erase is what makes SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER load-bearing: it moves the
-        // pending bytes to a different address, and a retry presenting a different address is
-        // refused with `bad write retry` without that mode. Measured -
-        // benchmarks/tls/ssl_write_retry.c.
-        if (sent_total > 0) send_buf_.erase(0, sent_total);
-        // Stated rather than inferred, the same line as the plaintext path below. Today the loop
-        // body always runs when there is data and leaves `Read` behind, so this is redundant - and
-        // that is exactly the kind of correctness that survives by circumstance: called with an
-        // already-empty buffer this function would keep a stale `Write`, the loop would leave
-        // EPOLLOUT armed on an edge-triggered descriptor with nothing to send, and pitfall 5 says
-        // what that costs. Cheap enough to make unconditional (pitfall 63).
-        if (send_buf_.empty()) io_want_ = IoWant::Read;
+    if (tls_handshaking_) {
+        // Reached before a single byte has arrived from the client: the banner is queued at
+        // accept and `send_response()` flushes. `SSL_write` here would begin the handshake from
+        // the write path, so two functions would be advancing one state machine while
+        // `tls_handshaking_` still said the handshake had not started. It happens to work -
+        // `SSL_accept` continues whatever `SSL_write` began - and "works because both callers
+        // are reentrant into the same state machine" is not a property to build on. The
+        // handshake has one owner, and the loop flushes the banner the moment it completes.
         return true;
     }
+    while (sent_total < send_buf_.size()) {
+        ERR_clear_error();
+        const int n = SSL_write(ssl_.get(), send_buf_.data() + sent_total,
+                                static_cast<int>(send_buf_.size() - sent_total));
+        if (n > 0) {
+            sent_total += static_cast<size_t>(n);
+            io_want_ = IoWant::Read;
+            continue;
+        }
+        const int err = SSL_get_error(ssl_.get(), n);
+        if (err == SSL_ERROR_WANT_WRITE) { io_want_ = IoWant::Write; break; }
+        if (err == SSL_ERROR_WANT_READ) {
+            // A *write* that needs to read first - a TLS 1.3 key update. Arming EPOLLOUT here
+            // would spin: the socket is writable and OpenSSL is not asking for that.
+            io_want_ = IoWant::Read;
+            break;
+        }
+        if (sent_total > 0) send_buf_.erase(0, sent_total);
+        OB_LOG_WARN("tls", "write failed: fd=%d conn_id=%llu %s: %s pending=%zu",
+                    fd_, static_cast<unsigned long long>(conn_id_),
+                    tls_error_name(err), tls_last_error().c_str(), send_buf_.size());
+        return false;
+    }
+    // The erase is what makes SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER load-bearing: it moves the
+    // pending bytes to a different address, and a retry presenting a different address is
+    // refused with `bad write retry` without that mode. Measured -
+    // benchmarks/tls/ssl_write_retry.c.
+    if (sent_total > 0) send_buf_.erase(0, sent_total);
+    // Stated rather than inferred, the same line as the plaintext path below. Today the loop
+    // body always runs when there is data and leaves `Read` behind, so this is redundant - and
+    // that is exactly the kind of correctness that survives by circumstance: called with an
+    // already-empty buffer this function would keep a stale `Write`, the loop would leave
+    // EPOLLOUT armed on an edge-triggered descriptor with nothing to send, and pitfall 5 says
+    // what that costs. Cheap enough to make unconditional (pitfall 63).
+    if (send_buf_.empty()) io_want_ = IoWant::Read;
+    return true;
+}
+
+bool Session::flush_output_plain() {
+    size_t sent_total = 0;
 
     while (sent_total < send_buf_.size()) {
         // send() with MSG_NOSIGNAL, not write(): a client that disconnects while we

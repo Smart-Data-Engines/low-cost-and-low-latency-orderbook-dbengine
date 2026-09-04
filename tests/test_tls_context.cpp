@@ -248,3 +248,42 @@ TEST(TlsStatic, EveryTlsFlagIsRefusedByTheIoUringTransport) {
     }
     EXPECT_GE(checked, 3u) << "expected at least three tls-* keys; found " << checked;
 }
+
+// ── The leak class, refused by shape rather than caught by a sanitizer ────────
+
+TEST(TlsStatic, EveryContextAllocationIsOwnedBeforeAnythingCanThrow) {
+    // A leak is not observable without an allocator hook, so the thing that *catches* one is
+    // `sanitizers (asan)` — and it did, on a required check, after review had passed over this
+    // three times. What is observable here is the shape.
+    //
+    // `SSL_CTX_new` whose result lands in a raw pointer is a cleanup obligation on every path out
+    // of the function, including the paths that throw from somewhere else. Six of those were
+    // hand-written and every one was correct; the seventh threw through `check_file_or_throw()` on
+    // the CA bundle, where nobody wrote a free because nobody wrote a `throw`. Not a test artefact
+    // either: `OrderbookClient::ensure_tls_context()` turns that exception into an error and leaves
+    // the pointer null, so a pool retrying `connect()` against a mistyped CA path leaked a context
+    // per attempt, for ever (pitfall 32).
+    //
+    // So this refuses the shape, which makes the class impossible rather than fixed once.
+    std::ifstream tls_src(std::string(OB_SOURCE_DIR) + "/src/tls.cpp");
+    ASSERT_TRUE(tls_src);
+    const std::string src((std::istreambuf_iterator<char>(tls_src)),
+                          std::istreambuf_iterator<char>());
+
+    size_t found = 0;
+    for (size_t at = src.find("SSL_CTX_new("); at != std::string::npos;
+         at = src.find("SSL_CTX_new(", at + 1)) {
+        const size_t line_start = src.rfind('\n', at) + 1;
+        const size_t line_end   = src.find('\n', at);
+        const std::string line  = src.substr(line_start, line_end - line_start);
+        // Ownership is handed over on the same line: `CtxGuard guard(SSL_CTX_new(...), &free);`
+        EXPECT_NE(line.find("CtxGuard"), std::string::npos)
+            << "SSL_CTX_new on a line that hands ownership to nothing, so every path out of that "
+               "function - including a throw from a helper - leaks the context:\n  "
+            << line;
+        ++found;
+    }
+    EXPECT_GE(found, 2u)
+        << "expected the server and the client factory each to allocate a context; finding none "
+           "would make this test pass by looking at nothing";
+}

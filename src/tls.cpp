@@ -72,34 +72,46 @@ void set_engine_modes(SSL_CTX* ctx) {
     SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 }
 
+/// Owns an `SSL_CTX` until its factory succeeds.
+///
+/// Not a seventh hand-written `SSL_CTX_free`. There were six, one per throw path, and every one of
+/// them was correct - the leak came from the single path that throws through a *helper*
+/// (`check_file_or_throw` on the CA bundle), where no free was written because no `throw` was
+/// written either. Found by LeakSanitizer on a required check, not by review.
+///
+/// It was a real leak and not a test artefact: `OrderbookClient::ensure_tls_context()` turns that
+/// exception into an error and leaves `tls_ctx_` null, so a pool retrying `connect()` against a
+/// mistyped CA path leaked a context **per attempt, for ever** - 1616 bytes plus about 3 kB
+/// indirect, measured, once per health check. Pitfall 32: a retry loop exposes leaks that one-shot
+/// code hides.
+using CtxGuard = std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)>;
+
 } // namespace
 
 TlsContext TlsContext::server(const std::string& cert_file, const std::string& key_file) {
     check_file_or_throw(cert_file, "TLS certificate", /*require_owner_only=*/false);
     check_file_or_throw(key_file,  "TLS private key", /*require_owner_only=*/true);
 
-    SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
-    if (ctx == nullptr) {
+    CtxGuard guard(SSL_CTX_new(TLS_server_method()), &SSL_CTX_free);
+    if (!guard) {
         throw std::runtime_error("TLS: SSL_CTX_new failed: " + tls_last_error());
     }
+    SSL_CTX* const ctx = guard.get();
 
     // TLS 1.3 only. Not a default to be overridden by a flag: the version floor is the one setting
     // where "configurable" means "misconfigurable", and 1.2 exists here only because kernel TLS
     // wants it (requirements §1.3).
     if (SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION) != 1) {
-        SSL_CTX_free(ctx);
         throw std::runtime_error("TLS: cannot require TLS 1.3: " + tls_last_error());
     }
     set_engine_modes(ctx);
 
     if (SSL_CTX_use_certificate_chain_file(ctx, cert_file.c_str()) != 1) {
         const std::string why = tls_last_error();
-        SSL_CTX_free(ctx);
         throw std::runtime_error("TLS certificate '" + cert_file + "' rejected: " + why);
     }
     if (SSL_CTX_use_PrivateKey_file(ctx, key_file.c_str(), SSL_FILETYPE_PEM) != 1) {
         const std::string why = tls_last_error();
-        SSL_CTX_free(ctx);
         throw std::runtime_error("TLS private key '" + key_file + "' rejected: " + why);
     }
     // Unreachable for a mismatched pair *in this order*, and kept anyway.
@@ -112,23 +124,22 @@ TlsContext TlsContext::server(const std::string& cert_file, const std::string& k
     // as a gap (pitfall 45).
     if (SSL_CTX_check_private_key(ctx) != 1) {
         const std::string why = tls_last_error();
-        SSL_CTX_free(ctx);
         throw std::runtime_error("TLS private key '" + key_file + "' does not match certificate '" +
                                  cert_file + "': " + why);
     }
 
     OB_LOG_INFO("tls", "server context ready: cert=%s key=%s min=TLSv1.3",
                 cert_file.c_str(), key_file.c_str());
-    return TlsContext(ctx);
+    return TlsContext(guard.release());
 }
 
 TlsContext TlsContext::client(const std::string& ca_file, bool verify) {
-    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
-    if (ctx == nullptr) {
+    CtxGuard guard(SSL_CTX_new(TLS_client_method()), &SSL_CTX_free);
+    if (!guard) {
         throw std::runtime_error("TLS: SSL_CTX_new failed: " + tls_last_error());
     }
+    SSL_CTX* const ctx = guard.get();
     if (SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION) != 1) {
-        SSL_CTX_free(ctx);
         throw std::runtime_error("TLS: cannot require TLS 1.3: " + tls_last_error());
     }
     set_engine_modes(ctx);
@@ -139,12 +150,10 @@ TlsContext TlsContext::client(const std::string& ca_file, bool verify) {
             check_file_or_throw(ca_file, "TLS CA bundle", /*require_owner_only=*/false);
             if (SSL_CTX_load_verify_locations(ctx, ca_file.c_str(), nullptr) != 1) {
                 const std::string why = tls_last_error();
-                SSL_CTX_free(ctx);
                 throw std::runtime_error("TLS CA bundle '" + ca_file + "' rejected: " + why);
             }
         } else if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
             const std::string why = tls_last_error();
-            SSL_CTX_free(ctx);
             throw std::runtime_error("TLS: no CA bundle given and the system trust store would not "
                                      "load: " + why);
         }
@@ -156,7 +165,7 @@ TlsContext TlsContext::client(const std::string& ca_file, bool verify) {
         OB_LOG_WARN("tls", "certificate verification disabled - this protects against a passive "
                            "observer and not against a man in the middle");
     }
-    return TlsContext(ctx);
+    return TlsContext(guard.release());
 }
 
 TlsContext::~TlsContext() {

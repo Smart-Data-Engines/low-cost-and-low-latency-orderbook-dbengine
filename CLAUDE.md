@@ -1044,6 +1044,38 @@ Learned the hard way. Check here before debugging.
     callers are reentrant into the same state machine" is not a property to build on, so the
     handshake now has one owner and the comment is true.
 
+131. **Six hand-written `SSL_CTX_free` calls on six throw paths were all correct, and the leak was
+    on the seventh — the one that throws through a helper.** `TlsContext::client()` allocated the
+    context and *then* called `check_file_or_throw()` on the CA bundle, so nobody wrote a free there
+    because nobody wrote a `throw` there either. `sanitizers (asan)` found it on a required check,
+    after review had passed over it three times: 1616 bytes direct plus about 3 kB indirect, 242
+    allocations, in the three tests that exercise a refusal.
+
+    It was a real leak and not a test artefact, which is the part worth carrying:
+    `OrderbookClient::ensure_tls_context()` turns that exception into an error and leaves `tls_ctx_`
+    null, so a pool retrying `connect()` against a mistyped CA path leaks a context **per attempt,
+    for ever** — once per health-check interval. Pitfall 32 exactly: a retry loop exposes leaks that
+    one-shot code hides.
+
+    The fix is RAII and not a seventh free, because cleanup written per throw path is correct right
+    up until a `throw` arrives from a function you did not write. A static test refuses an
+    `SSL_CTX_new` whose result lands anywhere but a `CtxGuard`, so the class is impossible rather
+    than fixed once — a leak has no assertion without an allocator hook, but its *shape* does.
+
+132. **A disassembly comparison that matches the symbol by substring reports the sum of two
+    functions as the size of one, and the number is plausible enough to act on.** `flush_output_tls`
+    contains `flush_output`, so the awk "am I inside the function" flag never cleared and the
+    extractor reported **310, then 335**, for a function that is 148. On the strength of that I
+    nearly restructured the send path a second time to fix a regression that existed only in my own
+    instrument. Match `<demangled signature>:` exactly.
+
+    Same family as the `/metrics` lookup that missed because the key carried a label set
+    (pitfall 66): the instrument had the defect, and it answered in the same voice it uses when
+    there is nothing wrong. The real numbers, once it was fixed: `feed()` and `send_response()`
+    byte-identical, `flush_output_plain()` 135 → 147, and those twelve are the `io_want_`
+    bookkeeping that fixes the stalled-response regression — not TLS dispatch, which is 178
+    instructions in a function of its own reached through one compare.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

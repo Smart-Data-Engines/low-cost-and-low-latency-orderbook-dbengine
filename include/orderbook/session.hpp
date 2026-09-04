@@ -83,7 +83,40 @@ public:
     bool send_response(std::string_view response);
 
     /// Push queued bytes towards the socket. Same contract as send_response().
-    bool flush_output();
+    /// Push queued output to the socket. False means the session is finished.
+    ///
+    /// The branch lives here, in the header, and not inside either half - measured, and the
+    /// measurement is the reason. With the TLS loop inlined into one function, Release grew it from
+    /// 135 to 310 instructions and turned its prologue from "test, then set up a frame" into "push
+    /// six registers, then test", so every *plaintext* response paid for a branch it never takes.
+    /// Marking the TLS half `noinline` brought that to 148 instructions and four pushes before the
+    /// test - better, and still not the promise the design made, which was that the non-TLS path
+    /// pays nothing.
+    ///
+    /// Dispatching from the header puts the one compare at the call site and keeps the TLS loop
+    /// entirely out of the plaintext function - 178 instructions in `flush_output_tls()`, reached
+    /// through that compare.
+    ///
+    /// What is left is not zero and is not TLS. `flush_output_plain()` is **147** instructions
+    /// against the 135 it had before this work, and the twelve are the `io_want_` bookkeeping: two
+    /// enum stores with their branches, plus four alignment nops. That bookkeeping is the fix for a
+    /// regression on this very path - `io_want_` left at `Read` on EAGAIN made the loop disarm
+    /// EPOLLOUT with bytes queued, and a 4 MB response stalled - so it is a cost this path had to
+    /// take, not one TLS imposed on it. `feed()` and `send_response()` are byte-identical.
+    ///
+    /// Measured on i3-7100U, Release, GCC 13, two worktrees, `objdump -d --demangle` on
+    /// `session.cpp.o` with mnemonics only (pitfall 114). Match the symbol **exactly** when you
+    /// repeat it: `flush_output_tls` contains `flush_output`, and a substring match concatenates
+    /// the two and reports their sum as the first one's size - which is what the first run of that
+    /// comparison did, giving 310 and then 335 for a function that is 148.
+    bool flush_output() { return ssl_ == nullptr ? flush_output_plain() : flush_output_tls(); }
+
+private:
+    bool flush_output_plain();
+    /// Never inlined into its caller: see `flush_output()`.
+    [[gnu::noinline]] bool flush_output_tls();
+
+public:
 
     /// True while bytes are still queued, so the caller must keep EPOLLOUT armed.
     bool has_pending_output() const;
