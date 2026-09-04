@@ -971,6 +971,79 @@ Learned the hard way. Check here before debugging.
     fits — first `WANT` at offset 0 with 4 MB pending. That is a worse failure than the one being
     hunted, and it looks like a slow client rather than a defect.
 
+124. **Chain verification is not peer verification, and `SSL_VERIFY_PEER` only does the chain.** It
+    answers "was this certificate signed by a CA I trust" and says nothing about whether the
+    certificate belongs to the host you dialled. With a private CA that signs a whole cluster —
+    which is how anyone deploys this — node B's certificate is therefore perfectly acceptable for
+    node A, the man-in-the-middle relay works again *between two holders of legitimate
+    certificates*, and every verification reports success. The name check is a separate call:
+    `X509_VERIFY_PARAM_set1_host`, or `set1_ip_asc` for a literal address, and the two branches
+    differ in both halves — no SNI for an IP (RFC 6066 §3 forbids it) and matching against
+    `iPAddress` rather than `dNSName`, so `set1_host("127.0.0.1")` hunts for a DNS entry spelled
+    that way and fails against a *correct* certificate.
+
+    The test that carries this has a **good chain and the wrong name**: the certificate is handed to
+    the client as its own trust anchor, issued for `10.0.0.2`, served on `127.0.0.1`. Deleting the
+    name check makes exactly that test fail and leaves the trust test passing, which is the
+    discrimination worth having. Both clients have it at unit and integration level.
+
+    And a smaller trap inside it: the failed `set1_ip_asc` on a host name **queues OpenSSL errors on
+    a call that then succeeds**, so the next real failure reports this one. A function that succeeds
+    still has to drain.
+
+125. **A permanent configuration error has to be reported before the transient transport one.**
+    `OrderbookClient::connect()` built its TLS context after `::connect()`, so a CA file that does
+    not exist was masked by `connection refused` whenever the server was also down — sending the
+    operator to debug the network for a typo in a path. The trust anchor loads first now: it is
+    knowable without a socket, and it will not fix itself. Found by a test written for the *message*
+    rather than for the ordering, which is the usual way this class shows up.
+
+126. **A readiness probe that also verifies trust answers two questions with one word.** The TLS
+    integration fixture decided a node was up by opening a **verifying** connection, so a node
+    deliberately issued a certificate for another address reported `node never answered` while its
+    own log said `listening` two lines above. Liveness and trust are different questions and the
+    tests below the fixture ask the second one. Pitfall 92's shape, in a fixture.
+
+127. **Three sites hand-copying a config's fields is how a field arrives that nothing carries.**
+    `PoolConfig` and `ShardRouterConfig` carried neither credentials nor transport, so from #30 part
+    one the C++ pool and the sharded client could not reach an authenticated node **at all** —
+    `auth_identity` existed on `ClientConfig`, three call sites copied the fields each happened to
+    know about, and none of them knew about that one. The symptom is `ERR unauthenticated` from a
+    configuration that reads as complete. One `copy_client_access()` template carries them now, and
+    a static test derives `ClientConfig`'s field list **from the header** and refuses a field that
+    neither the template nor every construction site mentions. Deriving both sides from the source
+    matters: a list written by hand is not evidence about the code (pitfall 79).
+
+128. **A protocol whose server speaks first cannot diagnose a plaintext client.** Forget `tls=True`
+    against a TLS port and the connection **hangs until the client's own timeout**, with nothing in
+    the server's log: the client waits for the banner, the server waits for a ClientHello, and until
+    a byte arrives the server cannot tell a plaintext client from a slow one. The opposite mistake
+    fails instantly — a forgotten `--tls-client` sends the plaintext banner where a ServerHello was
+    expected, and OpenSSL says `wrong version number`. Neither is fixable; both are now in
+    `docs/operations.md` as a two-row table, and the test is **named after the behaviour** so a
+    reader does not file the hang as a bug.
+
+129. **On a blocking socket with `SO_RCVTIMEO`, OpenSSL reports the timeout as `WANT_READ`.** The
+    socket BIO maps `EAGAIN` to "should retry" whether the descriptor is non-blocking or merely
+    impatient, so the synchronous clients get the same code a non-blocking event loop gets — and a
+    helper that treats a want as "come back later" waits out another full timeout, for ever, against
+    a peer that has stopped talking, with the caller never told. The blocking helpers translate a
+    want into a timeout *error*; the event-loop path still treats it as the four-way `IoWant`
+    question. Same code, opposite meaning, decided by how the descriptor was configured.
+
+130. **A comment I wrote described the mechanism I intended, in a file where the mechanism was
+    absent, and the code worked anyway for an unrelated reason.** The accept path said the banner
+    "goes out with the first flush after the handshake completes … `SSL_write` is not reached until
+    `tls_handshaking_` clears". `send_response()` ends in `flush_output()`, so `SSL_write` **was**
+    reached at accept — and it worked, because OpenSSL lets a write drive a handshake and
+    `SSL_accept` then continues whatever it began. Two functions advancing one state machine while
+    a flag said the handshake had not started. Found by reading the accept path to answer an
+    unrelated question, not by any test, because there is nothing here for a test to catch: the
+    bytes arrive either way. Pitfall 68's lesson with the polarity reversed — there the comment
+    excused unsafe code, here it described safe code that did not exist yet. "Works because both
+    callers are reentrant into the same state machine" is not a property to build on, so the
+    handshake now has one owner and the comment is true.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

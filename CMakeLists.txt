@@ -223,6 +223,14 @@ find_package(OpenSSL REQUIRED)
 add_library(orderbook_auth STATIC src/auth.cpp)
 target_link_libraries(orderbook_auth PUBLIC orderbook_logger OpenSSL::Crypto)
 
+# ── TLS compiled library (#30 part three) ──────────────────────────────────────
+#
+# libssl as well as libcrypto here, which orderbook_auth deliberately did not need: the record
+# layer is what this is for. Separate from orderbook_auth because a translation unit that hashes a
+# secret has no business pulling in the TLS state machine.
+add_library(orderbook_tls STATIC src/tls.cpp)
+target_link_libraries(orderbook_tls PUBLIC orderbook_logger OpenSSL::SSL OpenSSL::Crypto)
+
 # ── Failover compiled library (role transitions and monitoring) ────────────────
 add_library(orderbook_failover STATIC src/failover.cpp)
 target_link_libraries(orderbook_failover PUBLIC orderbook_coordinator orderbook_epoch orderbook_logger)
@@ -406,11 +414,11 @@ add_library(orderbook_tcp_server_lib STATIC
     src/session.cpp
     src/subscription_hub.cpp
 )
-target_link_libraries(orderbook_tcp_server_lib PUBLIC orderbook_engine orderbook_logger orderbook_metrics_server orderbook_shard_coordinator orderbook_auth)
+target_link_libraries(orderbook_tcp_server_lib PUBLIC orderbook_engine orderbook_logger orderbook_metrics_server orderbook_shard_coordinator orderbook_auth orderbook_tls)
 
 # ── Native C++ client library ──────────────────────────────────────────────────
 add_library(orderbook_client STATIC src/client.cpp)
-target_link_libraries(orderbook_client PUBLIC orderbook_core orderbook_shard_router orderbook_auth)
+target_link_libraries(orderbook_client PUBLIC orderbook_core orderbook_shard_router orderbook_auth orderbook_tls)
 
 option(OB_CLIENT_LZ4 "Enable optional LZ4 compression in orderbook_client" OFF)
 if(OB_CLIENT_LZ4)

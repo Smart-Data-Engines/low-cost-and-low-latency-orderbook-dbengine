@@ -59,6 +59,36 @@ OrderbookClient& OrderbookClient::operator=(OrderbookClient&& other) noexcept {
 // ── 3.2  connect() ────────────────────────────────────────────────────────────
 
 Result<void> OrderbookClient::connect() {
+    // Refuse a configuration whose parts contradict each other, before opening anything. Both of
+    // these describe a caller who believes the connection is protected in a way it is not, and the
+    // useful moment to say so is now rather than after the first row has crossed the wire.
+    if (!config_.tls) {
+        if (!config_.tls_ca_file.empty()) {
+            return Result<void>::err(OB_ERR_INVALID_ARG,
+                                     "tls_ca_file is set with tls=false: it verifies nothing and "
+                                     "the connection would be plain text");
+        }
+        if (!config_.tls_verify) {
+            return Result<void>::err(OB_ERR_INVALID_ARG,
+                                     "tls_verify=false with tls=false: there is no certificate to "
+                                     "decline to check");
+        }
+    } else if (!config_.tls_verify && !config_.tls_ca_file.empty()) {
+        return Result<void>::err(OB_ERR_INVALID_ARG,
+                                 "tls_ca_file is set with tls_verify=false: a trust anchor nothing "
+                                 "consults");
+    }
+
+    // The trust anchor is loaded before the socket, deliberately. A CA path that does not exist is
+    // a permanent configuration error and is knowable without a network; a refused connection is
+    // transient. In the other order an operator whose server is also down is told "connection
+    // refused" and goes to debug the network - measured, that is exactly what this said before the
+    // test for it was written.
+    if (config_.tls) {
+        auto tr = ensure_tls_context();
+        if (!tr) return tr;
+    }
+
     if (fd_ != -1) disconnect();
 
     fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -119,10 +149,21 @@ Result<void> OrderbookClient::connect() {
         ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
 
+    // TLS before the banner, because the banner is the server's first application bytes and it
+    // sends them once the handshake finishes. A client that read first would consume a TLS record
+    // as text.
+    if (config_.tls) {
+        auto tr = start_tls();
+        if (!tr) {
+            close_transport();
+            return tr;
+        }
+    }
+
     // Read server welcome banner
     auto br = read_banner();
     if (!br) {
-        ::close(fd_); fd_ = -1;
+        close_transport();
         return br;
     }
 
@@ -131,7 +172,7 @@ Result<void> OrderbookClient::connect() {
     if (!config_.auth_identity.empty() || !config_.auth_secret.empty()) {
         auto ar = authenticate();
         if (!ar) {
-            ::close(fd_); fd_ = -1;
+            close_transport();
             return ar;
         }
     }
@@ -140,7 +181,7 @@ Result<void> OrderbookClient::connect() {
     if (config_.compress) {
         auto cr = negotiate_compression();
         if (!cr) {
-            ::close(fd_); fd_ = -1;
+            close_transport();
             return cr;
         }
     }
@@ -155,9 +196,76 @@ void OrderbookClient::disconnect() {
     if (fd_ == -1) return;  // no-op on inactive connection
     // Best-effort QUIT — ignore errors
     static constexpr char quit[] = "QUIT\n";
-    ::send(fd_, quit, sizeof(quit) - 1, MSG_NOSIGNAL);
-    ::close(fd_);
-    fd_ = -1;
+    if (ssl_) {
+        std::string why;
+        (void)tls_blocking_write_all(ssl_.get(), quit, sizeof(quit) - 1, &why);
+    } else {
+        ::send(fd_, quit, sizeof(quit) - 1, MSG_NOSIGNAL);
+    }
+    close_transport();
+}
+
+void OrderbookClient::close_transport() {
+    if (ssl_) {
+        // close_notify before the descriptor goes, so the server's read reports a clean close
+        // rather than a truncation it has to log as one. The SSL object is freed by its deleter.
+        tls_blocking_shutdown(ssl_.get());
+        ssl_.reset();
+    }
+    if (fd_ != -1) {
+        ::close(fd_);
+        fd_ = -1;
+    }
+    // tls_ctx_ deliberately survives: it holds the parsed trust anchor, and a pool that reconnects
+    // on every health check would otherwise re-read the CA bundle from disk each time.
+}
+
+Result<void> OrderbookClient::ensure_tls_context() {
+    // Once per client and kept across reconnects: it holds the parsed trust anchor, and a pool
+    // reconnecting on every health check would otherwise re-read the CA bundle from disk each time.
+    if (tls_ctx_ != nullptr) return Result<void>::ok();
+    try {
+        tls_ctx_ = std::make_unique<TlsContext>(
+            TlsContext::client(config_.tls_ca_file, config_.tls_verify));
+    } catch (const std::exception& e) {
+        return Result<void>::err(OB_ERR_INVALID_ARG,
+                                 std::string("TLS client context: ") + e.what());
+    }
+    return Result<void>::ok();
+}
+
+Result<void> OrderbookClient::start_tls() {
+    try {
+        ssl_ = tls_ctx_->wrap(fd_, /*server_side=*/false);
+    } catch (const std::exception& e) {
+        return Result<void>::err(OB_ERR_IO, std::string("TLS setup: ") + e.what());
+    }
+
+    // Only under verification, so that a client which does not verify has no name check *visible at
+    // the call site* rather than one silently computed and ignored.
+    if (config_.tls_verify && !tls_expect_host(ssl_.get(), config_.host)) {
+        ssl_.reset();
+        return Result<void>::err(OB_ERR_INVALID_ARG,
+                                 "TLS: cannot require the certificate to cover '" + config_.host +
+                                 "'");
+    }
+
+    std::string why;
+    const int hs = tls_blocking_handshake(ssl_.get(), &why);
+    if (hs == 0) {
+        ssl_.reset();
+        return Result<void>::err(OB_ERR_IO,
+                                 "TLS handshake: the server closed the connection - check that it "
+                                 "runs with --tls-client");
+    }
+    if (hs < 0) {
+        ssl_.reset();
+        return Result<void>::err(OB_ERR_IO, "TLS handshake: " + why);
+    }
+    OB_LOG_INFO("client", "TLS established with %s:%u verify=%s",
+                config_.host.c_str(), static_cast<unsigned>(config_.port),
+                config_.tls_verify ? "on" : "off");
+    return Result<void>::ok();
 }
 
 bool OrderbookClient::connected() const {
@@ -168,6 +276,13 @@ bool OrderbookClient::connected() const {
 
 Result<void> OrderbookClient::send_all(size_t len) {
     const char* ptr = send_buf_.data();
+    if (ssl_) {
+        std::string why;
+        const int w = tls_blocking_write_all(ssl_.get(), ptr, len, &why);
+        if (w == 0) return Result<void>::err(OB_ERR_IO, "connection closed");
+        if (w < 0)  return Result<void>::err(OB_ERR_IO, why);
+        return Result<void>::ok();
+    }
     size_t remaining = len;
     while (remaining > 0) {
         ssize_t n = ::send(fd_, ptr, remaining, MSG_NOSIGNAL);
@@ -181,17 +296,36 @@ Result<void> OrderbookClient::send_all(size_t len) {
     return Result<void>::ok();
 }
 
+ssize_t OrderbookClient::read_some(char* buf, size_t len, std::string* why) {
+    if (ssl_) {
+        // >0 / 0 / -1 already, and `why` distinguishes the two closes and the timeout, which the
+        // plaintext branch below has to reconstruct from errno.
+        return tls_blocking_read(ssl_.get(), buf, len, why);
+    }
+    for (;;) {
+        const ssize_t n = ::recv(fd_, buf, len, 0);
+        if (n >= 0) return n;
+        if (errno == EINTR) continue;
+        if (why != nullptr) {
+            *why = (errno == EAGAIN || errno == EWOULDBLOCK)
+                       ? "recv timed out"
+                       : std::string("recv failed: ") + std::strerror(errno);
+        }
+        return -1;
+    }
+}
+
 Result<std::string_view> OrderbookClient::recv_response() {
     sock_buf_.clear();
     char tmp[4096];
 
     for (;;) {
-        ssize_t n = ::recv(fd_, tmp, sizeof(tmp), 0);
+        std::string why;
+        ssize_t n = read_some(tmp, sizeof(tmp), &why);
         if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
             if (n == 0)
                 return Result<std::string_view>::err(OB_ERR_IO, "connection closed");
-            return Result<std::string_view>::err(OB_ERR_IO, "recv timeout");
+            return Result<std::string_view>::err(OB_ERR_IO, why);
         }
         sock_buf_.append(tmp, static_cast<size_t>(n));
 
@@ -228,12 +362,12 @@ Result<void> OrderbookClient::read_banner() {
     sock_buf_.clear();
     char tmp[4096];
     for (;;) {
-        ssize_t n = ::recv(fd_, tmp, sizeof(tmp), 0);
+        std::string why;
+        ssize_t n = read_some(tmp, sizeof(tmp), &why);
         if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
             if (n == 0)
                 return Result<void>::err(OB_ERR_IO, "connection closed during banner");
-            return Result<void>::err(OB_ERR_IO, "recv timeout during banner");
+            return Result<void>::err(OB_ERR_IO, "banner: " + why);
         }
         sock_buf_.append(tmp, static_cast<size_t>(n));
         if (sock_buf_.size() >= 2 &&
@@ -771,6 +905,11 @@ OrderbookPool::OrderbookPool(PoolConfig config)
         sr_cfg.read_timeout_sec       = config_.read_timeout_sec;
         sr_cfg.health_check_interval_sec = config_.health_check_interval_sec;
         sr_cfg.compress               = config_.compress;
+        sr_cfg.auth_identity          = config_.auth_identity;
+        sr_cfg.auth_secret            = config_.auth_secret;
+        sr_cfg.tls                    = config_.tls;
+        sr_cfg.tls_ca_file            = config_.tls_ca_file;
+        sr_cfg.tls_verify             = config_.tls_verify;
 
         shard_router_ = std::make_unique<ShardRouter>(std::move(sr_cfg));
         auto res = shard_router_->initialize();
@@ -804,6 +943,7 @@ OrderbookPool::OrderbookPool(PoolConfig config)
         cc.connect_timeout_sec = config_.connect_timeout_sec;
         cc.read_timeout_sec    = config_.read_timeout_sec;
         cc.compress            = config_.compress;
+        copy_client_access(config_, cc);
 
         nodes_.push_back(std::move(ns));
         clients_.push_back(std::make_unique<OrderbookClient>(std::move(cc)));

@@ -30,6 +30,13 @@ struct ShardRouterConfig {
     double read_timeout_sec{10.0};
     double health_check_interval_sec{2.0};
     bool   compress{false};
+
+    // Credentials and transport, carried to every shard's ClientConfig by copy_client_access().
+    std::string auth_identity;
+    std::string auth_secret;
+    bool        tls{false};
+    std::string tls_ca_file;
+    bool        tls_verify{true};
 };
 
 // ── ShardRouter ───────────────────────────────────────────────────────────────

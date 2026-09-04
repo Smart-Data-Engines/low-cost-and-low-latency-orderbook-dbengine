@@ -8,6 +8,7 @@
 #include "orderbook/response_formatter.hpp"
 #include "orderbook/shard_coordinator.hpp"
 #include "orderbook/session.hpp"
+#include "orderbook/tls.hpp"
 #include "orderbook/subscription_hub.hpp"
 
 #include <atomic>
@@ -87,6 +88,19 @@ struct ServerConfig {
 
     /// --auth-secret-file: `<identity> <secret>` lines. Empty = client authentication disabled.
     std::string auth_secret_file;
+
+    // ── TLS (#30 part three) ──────────────────────────────────────────────────
+    //
+    // Paths, never contents, for the same reason as the secret files: `format_config()` prints
+    // every field of this struct.
+
+    /// --tls-cert-file / --tls-key-file: server certificate chain and private key, PEM.
+    std::string tls_cert_file;
+    std::string tls_key_file;
+
+    /// --tls-client: TLS on the client port. Requires the two files above, and the process refuses
+    /// to start without them rather than listening in plaintext.
+    bool tls_client{false};
 
     /// --cluster-secret-file: a single secret shared by the replication and multi-master links.
     /// Empty = cluster authentication disabled. Must not be a client secret (see
@@ -169,6 +183,13 @@ struct LoadedSecrets {
 /// belongs in the log rather than only in a document nobody reads at three in the morning.
 LoadedSecrets load_secrets_or_exit(const ServerConfig& config);
 
+/// Build the TLS context, or print a refusal and exit. Null when `--tls-client` is off.
+///
+/// Refuses `--tls-client` without a certificate and key rather than listening in plaintext, and
+/// warns when a certificate is configured with no surface enabled - a certificate that protects
+/// nothing looks exactly like one that does.
+std::unique_ptr<TlsContext> load_tls_or_exit(const ServerConfig& config);
+
 // ── TcpServer ─────────────────────────────────────────────────────────────────
 
 class TcpServer {
@@ -198,6 +219,10 @@ private:
     /// loaded in the constructor so a bad secret file refuses to start the process rather than
     /// failing on the first client.
     LoadedSecrets            secrets_;
+
+    /// The TLS context, or null when `--tls-client` is off. Built at construction so a bad
+    /// certificate stops the start rather than failing every handshake.
+    std::unique_ptr<TlsContext> tls_ctx_;
     std::atomic<bool>        running_{false};
     std::atomic<bool>        draining_{false};  // drain phase: reject new connections, finish in-flight
     std::atomic<bool>        read_only_{false};  // dynamic read-only flag, toggled by failover

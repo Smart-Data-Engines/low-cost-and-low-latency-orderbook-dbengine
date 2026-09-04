@@ -217,6 +217,7 @@ TEST(CliConfigStatic, EveryValuelessBooleanDefaultsToFalse) {
         {"no-sqpoll",            defaults.uring_no_sqpoll},
         {"read-only",            defaults.read_only},
         {"replication-compress", defaults.replication_compress},
+        {"tls-client",           defaults.tls_client},
     };
 
     for (const std::string& key : ob::boolean_flags()) {

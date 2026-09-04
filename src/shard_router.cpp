@@ -128,6 +128,7 @@ void ShardRouter::update_connections(const ShardMap& new_map) {
         cc.connect_timeout_sec = config_.connect_timeout_sec;
         cc.read_timeout_sec    = config_.read_timeout_sec;
         cc.compress            = config_.compress;
+        copy_client_access(config_, cc);
 
         auto colon = node.address.rfind(':');
         if (colon != std::string::npos) {
@@ -182,6 +183,7 @@ void ShardRouter::update_connections(const ShardMap& new_map) {
             cc.connect_timeout_sec = config_.connect_timeout_sec;
             cc.read_timeout_sec    = config_.read_timeout_sec;
             cc.compress            = config_.compress;
+        copy_client_access(config_, cc);
 
             auto colon = mm.address.rfind(':');
             if (colon != std::string::npos) {

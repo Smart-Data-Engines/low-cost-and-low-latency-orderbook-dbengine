@@ -1,5 +1,7 @@
 #pragma once
 
+#include "orderbook/tls.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -30,6 +32,46 @@ public:
 
     /// Append incoming bytes to read buffer. Returns complete lines (if any).
     std::vector<std::string> feed(const char* data, size_t len);
+
+    // ── TLS (#30 part three) ──────────────────────────────────────────────────
+    //
+    // TLS lives here and nowhere else, for the same reason the authentication gate lives in
+    // execute_command(): this class already owns the byte path in both directions, so the event
+    // loop keeps saying "data arrived" and "the socket will take a write" without knowing whether
+    // anything is encrypted.
+
+    /// What a receive attempt produced. Four outcomes, not three.
+    ///
+    /// `Again` and `Error` are separate values on purpose. A helper that returns the same thing for
+    /// "come back later" and "this connection is finished" makes every failure undiagnosable, and
+    /// this repository has paid for that once already (pitfall 81) - with TLS the two are even
+    /// easier to conflate, because `SSL_read` reports an incomplete *record* on a readable socket
+    /// as WANT_READ rather than as zero bytes.
+    enum class IoResult { Data, Closed, Again, Error };
+
+    /// Take bytes off the wire, decrypting when TLS is on.
+    ///
+    /// The plaintext path is `::read`; the TLS path is `SSL_read`. On `Again` the caller consults
+    /// io_want() rather than assuming readability: TLS 1.3 updates keys, so a *read* can need the
+    /// socket to become writable.
+    IoResult receive(char* buf, size_t len, size_t& out_n);
+
+    /// Attach an SSL object and enter the handshake. Until it completes, feed() gets no bytes.
+    ///
+    /// Nothing may reach feed() during the handshake: a command arriving before TLS finished would
+    /// be a command from an unauthenticated transport, and the gate from part one checks the
+    /// *application* identity and knows nothing about TLS.
+    void enable_tls(std::shared_ptr<ssl_st> ssl);
+
+    bool tls_enabled() const;
+    bool tls_handshaking() const;
+
+    /// Drive one step of the handshake. False means fatal; the reason is logged by the caller.
+    bool continue_tls_handshake();
+
+    /// What OpenSSL wants next, so the loop arms the right event rather than the one matching the
+    /// operation it just tried. Always `Read` on a plaintext session.
+    IoWant io_want() const;
 
     /// Queue a response and push as much of it to the socket as it accepts now.
     ///
@@ -121,6 +163,12 @@ private:
     uint64_t    command_count_{0};
     uint64_t    compress_bytes_in_{0};   // raw bytes (before compression / after decompression)
     uint64_t    compress_bytes_out_{0};  // wire bytes (after compression / before decompression)
+
+    // TLS (#30 part three). Null means plaintext, and then every branch below is the one that
+    // existed before - one pointer test on a path that already does a syscall.
+    std::shared_ptr<ssl_st> ssl_;
+    bool        tls_handshaking_{false};
+    IoWant      io_want_{IoWant::Read};
 
     // Authentication (#30)
     bool        authenticated_{false};
