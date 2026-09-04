@@ -49,7 +49,15 @@ struct AggFixture {
     AggFixture()
         : dir(make_temp_dir("qagg_test_"))
         , store(dir)
-        , engine(store, live, agg) {
+        , engine(store,
+                 // A lookup rather than the map: QueryEngine no longer holds a reference to a
+                 // live-buffer map, because reading it while a write path inserted into it was a
+                 // data race (#91). One thread here, so no lock is needed.
+                 [this](const std::string& key) -> ob::SoABuffer* {
+                     auto it = live.find(key);
+                     return (it == live.end()) ? nullptr : it->second;
+                 },
+                 agg) {
         std::strncpy(buffer.symbol, "BTC-USD", sizeof(buffer.symbol) - 1);
         std::strncpy(buffer.exchange, "BINANCE", sizeof(buffer.exchange) - 1);
         buffer.sequence_number.store(7, std::memory_order_relaxed);

@@ -750,3 +750,12 @@ ob_add_tcp_test(test_auth_cluster
 target_compile_definitions(test_auth_gate
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
+
+# ── Live-buffer lookup race (#91) ─────────────────────────────────────────────
+ob_add_engine_test(test_query_live_buffer_race
+    test_query_live_buffer_race.cpp
+)
+# Reads include/ and src/ to refuse the shape that made the race possible.
+target_compile_definitions(test_query_live_buffer_race
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)

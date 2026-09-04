@@ -193,3 +193,23 @@ def test_no_module_builds_its_own_server_path() -> None:
         "conftest.server_binary_path(), so they ignore OB_SERVER_BINARY and will silently test the "
         f"wrong build: {offenders}"
     )
+
+    # The same rule for the C++ client harness, added after it went wrong the same way: this module
+    # and test_auth.py each derived `ob_integration_test` themselves, and the second copy found
+    # nothing when the suite ran against a TSan tree. Any line naming that binary must go through
+    # conftest.cpp_client_binary_path().
+    client_offenders = []
+    for module in sorted(here.glob("test_*.py")):
+        for number, line in enumerate(module.read_text(encoding="utf-8").splitlines(), start=1):
+            if "ob_integration_test" not in line:
+                continue
+            if "cpp_client_binary_path" in line:
+                continue
+            # Prose is fine; a path expression is not.
+            if "/" in line or "join" in line or "Path(" in line:
+                client_offenders.append(f"{module.name}:{number}")
+    assert not client_offenders, (
+        "these lines build a path to ob_integration_test instead of calling "
+        "conftest.cpp_client_binary_path(), so they ignore OB_SERVER_BINARY and will look in the "
+        f"wrong build tree: {client_offenders}"
+    )

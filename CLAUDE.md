@@ -895,6 +895,38 @@ Learned the hard way. Check here before debugging.
     can forward any value bound only to a nonce; stopping it needs a channel with an identity, which
     is TLS.
 
+120. **A reference to another object's container is a lock you did not take.** `QueryEngine` held
+    `const std::unordered_map<std::string, SoABuffer*>&` into `Engine::live_ptrs_` and read it with
+    no lock, while every write path — a client write, the replication apply path, the multi-master io
+    loop — inserted into it under `Engine::mtx_`. An `unordered_map` insertion rehashes, so a query
+    concurrent with the **first** write for a symbol followed a bucket that had moved (#91).
+    Reachable from a plain `SELECT`; invisible for as long as the tests wrote first and read after.
+
+    Measured, because "only a sanitizer sees it" is a claim: plain Debug, **5 of 5 runs pass**;
+    under TSan, **exit 66 and 20 reports**, the first naming `_M_rehash_aux`; with the fix, zero.
+    A reader who assumed `ctest` covers this would have been wrong five times out of five.
+
+    The fix is a **lookup callable** rather than the map, so `Engine` takes `mtx_` for one map read
+    and releases it before the query runs — one uncontended lock per query instead of holding the
+    write path's mutex across a scan, which in this engine is the worse trade. Two tests, failing in
+    different directions: one drives the race, one refuses the shape, because a behavioural test for
+    a rehash is probabilistic and a shape test is not.
+
+    Two things worth carrying forward. **The identical defect was one file away**, in `c_api.cpp`,
+    which is the embedded path the Python client uses locally: `ob_insert` creates buffers under its
+    mutex and `ob_query` read the map without it. Fixing the server alone would have left it, so the
+    shape test asserts that *both* suppliers of the lookup take a lock. And **the fix does not close
+    the lifetime problem**: `buffers_` owns the `SoABuffer`s and a snapshot install clears them, so a
+    query holding a resolved pointer can read freed memory. Filed as #92 rather than commented on,
+    with the tempting answer — hold `mtx_` across the query — named as the one to avoid.
+
+121. **A local ThreadSanitizer binary segfaults before `main` unless ASLR entropy is lowered.**
+    `sudo sysctl -w vm.mmap_rnd_bits=28`, which is what the `sanitizers-integration (tsan)` job does
+    in its own step. Without it the failure is a `Segmentation fault` from
+    `GoogleTestAddTests.cmake` during test discovery, at *build* time, with no message about
+    sanitizers at all — so it reads as a broken test rather than a missing sysctl. The value on this
+    machine is 32 by default; set it back afterwards if you care about the entropy.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

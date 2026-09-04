@@ -168,6 +168,34 @@ def server_binary_path() -> str:
     return str(Path(__file__).resolve().parents[2] / "build" / "ob_tcp_server")
 
 
+def cpp_client_binary_path() -> Optional[str]:
+    """The `ob_integration_test` harness, from the same build tree as the server under test.
+
+    Derived from `OB_SERVER_BINARY` rather than guessed: the harness lives at
+    `<build>/tests/ob_integration_test` beside the server's `<build>/ob_tcp_server`. Without that
+    derivation the sanitizer job pointed at `build-tsan/` while a module looked in `build/`, so its
+    tests skipped - and a skipped integration test is indistinguishable from a passing one in a
+    summary line (#85).
+
+    Here rather than in a module, and this is the second time: `test_cpp_client.py` had its own
+    copy, and `test_auth.py` grew a third one that found nothing under TSan and failed. One place,
+    the same rule as `server_binary_path()`.
+
+    Returns None when the binary was not built. Callers decide between skipping and failing -
+    the TSan job builds it deliberately, so failing there is the honest choice.
+    """
+    from_env = os.environ.get("OB_SERVER_BINARY")
+    if from_env:
+        derived = Path(from_env).resolve().parent / "tests" / "ob_integration_test"
+        if derived.is_file():
+            return str(derived)
+    for candidate in (ClusterManager._PROJECT_ROOT / "build" / "tests" / "ob_integration_test",
+                      ClusterManager._PROJECT_ROOT / "build-release" / "tests" / "ob_integration_test"):
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 class ClusterManager:
     """Manage the full lifecycle of an integration-test cluster:
     a native etcd process + 2 ob_tcp_server nodes.

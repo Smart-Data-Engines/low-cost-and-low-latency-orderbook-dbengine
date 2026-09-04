@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import ClusterManager, patience, server_binary_path
+from conftest import ClusterManager, cpp_client_binary_path, patience, server_binary_path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 from orderbook_engine import OrderbookEngine, OrderbookError  # noqa: E402
@@ -384,10 +384,13 @@ def test_the_python_client_with_credentials_against_an_open_server_fails_loudly(
 
 
 def test_the_cpp_client_authenticates(authed_node):
-    binary = Path(SERVER).parent / "tests" / "ob_integration_test"
-    if not binary.exists():
-        binary = Path(SERVER).parent / "ob_integration_test"
-    assert binary.exists(), f"ob_integration_test not built at {binary}"
+    # Through conftest, not derived here. This module had its own two-candidate guess, which found
+    # nothing when the suite ran against a TSan tree and failed with a path instead of telling
+    # anybody what to build - the third copy of a rule #85 already made one place for.
+    found = cpp_client_binary_path()
+    assert found is not None, ("ob_integration_test not built; build the `ob_integration_test` "
+                              "target in the same tree as the server under test")
+    binary = Path(found)
     env = dict(os.environ, OB_AUTH_IDENTITY="alice", OB_AUTH_SECRET=ALICE_SECRET)
     done = subprocess.run([str(binary), "--host", "127.0.0.1",
                            "--port", str(authed_node.port), "--test", "ping"],
@@ -397,9 +400,9 @@ def test_the_cpp_client_authenticates(authed_node):
 
 
 def test_the_cpp_client_without_credentials_is_refused(authed_node):
-    binary = Path(SERVER).parent / "tests" / "ob_integration_test"
-    if not binary.exists():
-        binary = Path(SERVER).parent / "ob_integration_test"
+    found = cpp_client_binary_path()
+    assert found is not None, "ob_integration_test not built"
+    binary = Path(found)
     env = {k: v for k, v in os.environ.items()
            if k not in ("OB_AUTH_IDENTITY", "OB_AUTH_SECRET")}
     done = subprocess.run([str(binary), "--host", "127.0.0.1",

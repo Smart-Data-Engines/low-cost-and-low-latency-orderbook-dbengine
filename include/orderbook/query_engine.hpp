@@ -74,12 +74,26 @@ struct QueryAST {
 
 using RowCallback = std::function<void(const QueryResult&)>;
 
+/// Resolve the live SoA buffer for a `"symbol.exchange"` key, or nullptr.
+///
+/// A callable rather than a reference to Engine's map, and the difference is a data race.
+/// `live_ptrs_` is inserted into by every thread that applies a write - a client, the replication
+/// apply path, the multi-master io loop - while a query reads it. `unordered_map` insertion
+/// rehashes, so a concurrent reader can follow a bucket that has moved: undefined behaviour, and
+/// ThreadSanitizer reported it five times on the first integration run that issued a `SELECT` while
+/// a new symbol's buffer was being created on another thread (#91).
+///
+/// Engine's implementation takes `mtx_` for the duration of **one map lookup** and releases it
+/// before the query runs, so this costs one uncontended lock per query rather than holding the
+/// write path's mutex across a scan.
+using LiveBufferLookup = std::function<SoABuffer*(const std::string& key)>;
+
 // ── QueryEngine ───────────────────────────────────────────────────────────────
 
 class QueryEngine {
 public:
     explicit QueryEngine(const ColumnarStore& store,
-                         const std::unordered_map<std::string, SoABuffer*>& live_buffers,
+                         LiveBufferLookup live_buffer,
                          const AggregationEngine& agg);
 
     ~QueryEngine();
@@ -137,7 +151,7 @@ public:
 
 private:
     const ColumnarStore& store_;
-    const std::unordered_map<std::string, SoABuffer*>& live_buffers_;
+    LiveBufferLookup     live_buffer_;
     const AggregationEngine& agg_;
 
     // ── Subscription tracking ────────────────────────────────────────────────────────────────

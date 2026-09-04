@@ -1762,6 +1762,63 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 92. A query holds a raw `SoABuffer*` across a snapshot install
+
+Named by #91 rather than fixed by it, because it is a lifetime problem and not a locking one.
+
+`buffers_` owns the `SoABuffer`s and `live_ptrs_` points into them. `load_snapshot()` and the
+snapshot-install path both **clear** them under `flush_mtx_` + `mtx_`, which destroys every buffer.
+A query resolves its pointer under `mtx_` (#91) and then reads through it after releasing the lock,
+so a snapshot install during a query frees memory the query is reading.
+
+Latent today: a snapshot install happens on bootstrap and on a full resync, neither of which
+overlaps steady-state querying in any test — which is exactly the shape of pitfall 22 and the
+`set_read_only_flag()` finding, a raw pointer whose lifetime is nested by convention rather than by
+construction.
+
+Candidate answers, none chosen yet: reference-count the buffers (`shared_ptr`, which costs an atomic
+on the write path's lookup and nothing on the read); keep destroyed buffers alive until no query is
+in flight, the way `SubscriptionHub` already gates compaction on an in-flight counter (#45); or hold
+`mtx_` across the query, which is correct and costs the write path a full scan's latency. The third
+is the one to avoid, and saying so is most of the value of filing this.
+
+- Effort: M | Impact: removes a latent use-after-free on the read path
+
+
+### 91. A `SELECT` racing the creation of a symbol's live buffer ✅
+
+**Found by ThreadSanitizer on the integration battery, exposed by a test written for #30 and not by
+that change.** The new authenticated multi-master test polls `SELECT` on all three nodes while a
+record propagates, so on the two receiving nodes a query ran exactly while `apply_remote_delta`
+created that symbol's buffer. Five reports in one run, all the same pair.
+
+- `Engine` owns `live_ptrs_`, a `std::unordered_map<std::string, SoABuffer*>` inserted into under
+  `mtx_` by **every** write path — a client write, the replication apply path, the multi-master io
+  loop. `QueryEngine` held a **reference** to that map and read it with no lock at all: `count()` at
+  `query_engine.cpp:670` and a second, independent `find()` in the aggregation branch. An
+  `unordered_map` insertion rehashes, so a concurrent reader can follow a bucket that has moved.
+- **Reachable from a plain client `SELECT`**, not only in multi-master: any node taking writes for a
+  symbol it has not seen before is enough. It needed the query and the *first* write for a symbol to
+  overlap, which is why the existing tests — which write, then read — never produced it.
+- **The same defect was one file away, in the C API**, which is the embedded path the Python client
+  uses locally: `ob_insert` creates buffers under `mtx` and `ob_query` read the map without it.
+  Fixing only the server would have left it.
+- Fixed by handing `QueryEngine` a **lookup callable** instead of the map. `Engine`'s implementation
+  takes `mtx_` for the duration of one map read and releases it before the query runs — one
+  uncontended lock per query rather than holding the write path's mutex across a scan, which in this
+  engine would be the worse trade. It also collapses the two lookups into one, so a query can no
+  longer see a symbol exist in one and not in the other.
+- Two tests failing in different directions: one drives the race, and one **refuses the shape** —
+  because a behavioural test for a rehash race is probabilistic and a shape test is not. The shape
+  test also asserts that *both* suppliers of the lookup take a lock, by extracting the callable from
+  each file by brace matching rather than by looking for the word "lock" somewhere in it.
+- **Still open, and named rather than fixed here:** `live_ptrs_` and `buffers_` are *cleared* when a
+  snapshot is installed, and `buffers_` owns the `SoABuffer`s. So a query holding a resolved pointer
+  across a snapshot install would read freed memory. Today the window is narrow and this fix does
+  not widen it, but it is a lifetime problem rather than a locking one — item **#92**.
+- Effort: S | Impact: **removes undefined behaviour on the read path**
+
+
 ### 90. A running node could not be asked its version, and the banner that carried it lied twice ✅
 
 - **There was no way to ask a running node what version it is.** Not `--print-config`, not `STATUS`,

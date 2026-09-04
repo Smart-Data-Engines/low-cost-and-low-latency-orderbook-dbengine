@@ -40,7 +40,15 @@ struct QEFixture {
     QEFixture()
         : dir(make_temp_dir("qe_test_"))
         , store(dir)
-        , engine(store, live, agg)
+        // A lookup rather than the map itself: QueryEngine no longer holds a reference to
+        // Engine's live-buffer map, because reading it unsynchronised while a write path inserted
+        // into it was a data race (#91). This fixture has one thread, so no lock is needed here.
+        , engine(store,
+                 [this](const std::string& key) -> ob::SoABuffer* {
+                     auto it = live.find(key);
+                     return (it == live.end()) ? nullptr : it->second;
+                 },
+                 agg)
     {}
 
     ~QEFixture() {
