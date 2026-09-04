@@ -329,6 +329,9 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--snapshot-chunk-size` | `<N>` | Bytes per snapshot transfer chunk |
 | `--snapshot-staging-dir` | `<DIR>` | Where an incoming snapshot is staged before install |
 | `--sqpoll-idle-ms` | `<N>` | io_uring SQPOLL idle timeout in ms |
+| `--tls-cert-file` | `<PATH>` | Server certificate chain (PEM) for --tls-client |
+| `--tls-client` | | TLS on the client port; needs --tls-cert-file and --tls-key-file |
+| `--tls-key-file` | `<PATH>` | Server private key (PEM); mode 600 |
 | `--ttl-hours` | `<N>` | Retention in hours; 0 keeps everything |
 | `--ttl-scan-interval-seconds` | `<N>` | How often retention scans for expired rows |
 | `--workers` | `<N>` | Number of worker threads (default: 4) |

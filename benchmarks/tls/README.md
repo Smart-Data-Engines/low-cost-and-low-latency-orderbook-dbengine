@@ -47,10 +47,23 @@ remaining bytes to a **different address**. Measured, OpenSSL 3.0.13:
 | both | `WANT_WRITE`, an ordinary "come back later" |
 | neither | the question does not arise: the first `WANT` lands at offset **0** |
 
-That last row is a separate finding and worse than expected: **without `ENABLE_PARTIAL_WRITE`,
-`SSL_write` accepts nothing at all** until it can take the whole buffer — measured at 4 MB, first
-`WANT` at offset 0. A 30 MB response would make no progress until the remainder fitted in one call,
-which looks like a slow client rather than a bug.
+That last row is a separate finding: **without `ENABLE_PARTIAL_WRITE`, `SSL_write` accepts nothing
+at all** until it can take the whole buffer — measured at 4 MB, first `WANT` at offset 0.
+
+**Corrected after implementing it, because this paragraph claimed too much.** That does *not* mean a
+large response stalls: OpenSSL resumes its own pending write across retries, so the bytes arrive
+either way — measured through a real `Session`, the content assertion passes with the mode removed.
+What breaks is the *caller's* view. `send_buf_` never shrinks until the final call, so
+`pending_output_bytes()` — the number `ob_pending_bytes` publishes, and the one an operator reads as
+"this client is not draining" — stays pinned at the full response. Of the two modes, only
+`ACCEPT_MOVING_WRITE_BUFFER` is required for correctness.
+
+**And the hazard window is narrower than it looks.** `sent_total` advances only on a *fully*
+accepted `SSL_write`, so with a socket send buffer below one TLS record (16 kB) every `WANT_WRITE`
+arrives with `sent_total == 0`, the erase is skipped, and the retry presents the same address —
+which is legal. The hazard needs a buffer that accepts at least one whole record and *then* blocks.
+Three versions of the regression test used 4 kB and detected nothing; the fourth used 64 kB and the
+mutation failed immediately.
 
 **Worth knowing about this probe: its first two versions found nothing.** They retried from an
 advanced offset in the same allocation, which presents the *same address* for the pending bytes and

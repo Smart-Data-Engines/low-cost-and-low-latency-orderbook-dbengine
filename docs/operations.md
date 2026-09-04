@@ -271,6 +271,85 @@ sudo chmod 600 /etc/orderbook/secrets/cluster
 accepted a peer without proof would be the state this exists to remove. So enabling it on a running
 cluster means a full restart with the file in place on every node, not a rolling one.
 
+### Turning on TLS
+
+Client sessions only, for now: the replication link and the multi-master mesh come next, and until
+then they authenticate without encrypting. So `--cluster-secret-file` is still what protects them,
+and it protects identity rather than content.
+
+```bash
+sudo install -d -m 700 -o orderbook -g orderbook /etc/orderbook/tls
+# A real certificate from your CA, or for a private network a self-signed one:
+openssl req -x509 -newkey rsa:2048 -days 365 -nodes \
+        -keyout /etc/orderbook/tls/key.pem -out /etc/orderbook/tls/cert.pem \
+        -subj "/CN=db1.internal" -addext "subjectAltName=DNS:db1.internal"
+sudo chown orderbook:orderbook /etc/orderbook/tls/*
+sudo chmod 600 /etc/orderbook/tls/key.pem
+```
+
+Then `--tls-client --tls-cert-file /etc/orderbook/tls/cert.pem --tls-key-file
+/etc/orderbook/tls/key.pem`, or the same three keys in the config file.
+
+The start is **refused**, not degraded, on each of these:
+
+| Refusal | Why it is fatal |
+|---|---|
+| `--tls-client` without both files | a flag that quietly meant plaintext is the worst outcome this feature can produce, and it would look identical to working |
+| the key readable by group or world | the message prints the mode it found, the same rule as the secret files |
+| the key does not match the certificate | otherwise every client's handshake fails with a message an operator reads as a client problem |
+| either file unreadable, empty, or not a regular file | there is nothing to serve |
+| `--tls-client` on an io_uring build | receive stays in userspace even with kernel TLS, so that transport needs a rewrite; refusing beats listening in plaintext |
+
+**TLS 1.3 is the floor and is not configurable.** A client offering only 1.2 is refused. That is
+deliberate: the version floor is the one setting where "configurable" means "misconfigurable".
+
+**Certificate rotation needs a restart.** Reloading in place would mean two live contexts and a
+question about sessions established on the old one; that is a separate item rather than a silent
+half-measure. Plan the restart the way you plan any other: one node at a time, and the cluster
+keeps serving.
+
+### Connecting over TLS
+
+```python
+from orderbook_engine import OrderbookEngine
+eng = OrderbookEngine(host="db1.internal", port=9090,
+                      tls=True, tls_ca_file="/etc/ssl/certs/internal-ca.pem",
+                      auth=("grafana", secret))
+```
+
+For the C++ client the same three fields are on `ClientConfig`: `tls`, `tls_ca_file`, `tls_verify`.
+`PoolConfig` and `ShardRouterConfig` carry them too, alongside `auth_identity` and `auth_secret`, so
+a pool and a sharded client reach an authenticated, encrypted cluster the same way a single
+connection does.
+
+Verification is on by default and turning it off is a named act (`tls_verify=False`), because a
+client that does not verify has confidentiality against a passive observer and **nothing** against a
+man in the middle — which is exactly the half authentication alone could not give you.
+
+**Verification includes the name.** The client requires the certificate to cover the address or
+hostname it dialled, not merely to chain to a trusted CA. This matters most where it is least
+visible: with a private CA that signs your whole cluster, chain-only verification would make node
+B's certificate perfectly acceptable for node A, and every check would report success. So a
+certificate for `db1.internal` presented on `db2.internal` is refused — and if you connect by IP,
+the certificate needs an `IP:` entry in its `subjectAltName`, because an address is matched against
+`iPAddress` and never against `DNS:`.
+
+Both misconfigurations, and they fail differently:
+
+| What you forgot | What you see |
+|---|---|
+| `--tls-client` on the server | the client fails at once with `wrong version number`: the plaintext banner arrived where a ServerHello was expected |
+| `tls=True` on the client | the connection **hangs until your client's timeout**, and the server's log says nothing |
+
+The second one is worth knowing in advance. This protocol has the server speak first, so a plaintext
+client waits for the banner while the server waits for a ClientHello, and until a byte arrives the
+server cannot tell a plaintext client from a slow one. There is nothing to fix there; there is only
+knowing it, so that a hang is read as the right thing.
+
+TLS and authentication are for different things and you want both: TLS establishes the channel,
+`AUTH` establishes who is on it. Neither substitutes for the other, and a client with credentials
+against a TLS-only node still gets `ERR unauthenticated`.
+
 ### The metrics endpoint
 
 No authentication, deliberately — a Prometheus scraper cannot perform a challenge-response, and a

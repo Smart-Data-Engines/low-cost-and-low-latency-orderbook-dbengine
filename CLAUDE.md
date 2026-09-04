@@ -971,6 +971,139 @@ Learned the hard way. Check here before debugging.
     fits — first `WANT` at offset 0 with 4 MB pending. That is a worse failure than the one being
     hunted, and it looks like a slow client rather than a defect.
 
+124. **Chain verification is not peer verification, and `SSL_VERIFY_PEER` only does the chain.** It
+    answers "was this certificate signed by a CA I trust" and says nothing about whether the
+    certificate belongs to the host you dialled. With a private CA that signs a whole cluster —
+    which is how anyone deploys this — node B's certificate is therefore perfectly acceptable for
+    node A, the man-in-the-middle relay works again *between two holders of legitimate
+    certificates*, and every verification reports success. The name check is a separate call:
+    `X509_VERIFY_PARAM_set1_host`, or `set1_ip_asc` for a literal address, and the two branches
+    differ in both halves — no SNI for an IP (RFC 6066 §3 forbids it) and matching against
+    `iPAddress` rather than `dNSName`, so `set1_host("127.0.0.1")` hunts for a DNS entry spelled
+    that way and fails against a *correct* certificate.
+
+    The test that carries this has a **good chain and the wrong name**: the certificate is handed to
+    the client as its own trust anchor, issued for `10.0.0.2`, served on `127.0.0.1`. Deleting the
+    name check makes exactly that test fail and leaves the trust test passing, which is the
+    discrimination worth having. Both clients have it at unit and integration level.
+
+    And a smaller trap inside it: the failed `set1_ip_asc` on a host name **queues OpenSSL errors on
+    a call that then succeeds**, so the next real failure reports this one. A function that succeeds
+    still has to drain.
+
+125. **A permanent configuration error has to be reported before the transient transport one.**
+    `OrderbookClient::connect()` built its TLS context after `::connect()`, so a CA file that does
+    not exist was masked by `connection refused` whenever the server was also down — sending the
+    operator to debug the network for a typo in a path. The trust anchor loads first now: it is
+    knowable without a socket, and it will not fix itself. Found by a test written for the *message*
+    rather than for the ordering, which is the usual way this class shows up.
+
+126. **A readiness probe that also verifies trust answers two questions with one word.** The TLS
+    integration fixture decided a node was up by opening a **verifying** connection, so a node
+    deliberately issued a certificate for another address reported `node never answered` while its
+    own log said `listening` two lines above. Liveness and trust are different questions and the
+    tests below the fixture ask the second one. Pitfall 92's shape, in a fixture.
+
+127. **Three sites hand-copying a config's fields is how a field arrives that nothing carries.**
+    `PoolConfig` and `ShardRouterConfig` carried neither credentials nor transport, so from #30 part
+    one the C++ pool and the sharded client could not reach an authenticated node **at all** —
+    `auth_identity` existed on `ClientConfig`, three call sites copied the fields each happened to
+    know about, and none of them knew about that one. The symptom is `ERR unauthenticated` from a
+    configuration that reads as complete. One `copy_client_access()` template carries them now, and
+    a static test derives `ClientConfig`'s field list **from the header** and refuses a field that
+    neither the template nor every construction site mentions. Deriving both sides from the source
+    matters: a list written by hand is not evidence about the code (pitfall 79).
+
+128. **A protocol whose server speaks first cannot diagnose a plaintext client.** Forget `tls=True`
+    against a TLS port and the connection **hangs until the client's own timeout**, with nothing in
+    the server's log: the client waits for the banner, the server waits for a ClientHello, and until
+    a byte arrives the server cannot tell a plaintext client from a slow one. The opposite mistake
+    fails instantly — a forgotten `--tls-client` sends the plaintext banner where a ServerHello was
+    expected, and OpenSSL says `wrong version number`. Neither is fixable; both are now in
+    `docs/operations.md` as a two-row table, and the test is **named after the behaviour** so a
+    reader does not file the hang as a bug.
+
+129. **On a blocking socket with `SO_RCVTIMEO`, OpenSSL reports the timeout as `WANT_READ`.** The
+    socket BIO maps `EAGAIN` to "should retry" whether the descriptor is non-blocking or merely
+    impatient, so the synchronous clients get the same code a non-blocking event loop gets — and a
+    helper that treats a want as "come back later" waits out another full timeout, for ever, against
+    a peer that has stopped talking, with the caller never told. The blocking helpers translate a
+    want into a timeout *error*; the event-loop path still treats it as the four-way `IoWant`
+    question. Same code, opposite meaning, decided by how the descriptor was configured.
+
+130. **A comment I wrote described the mechanism I intended, in a file where the mechanism was
+    absent, and the code worked anyway for an unrelated reason.** The accept path said the banner
+    "goes out with the first flush after the handshake completes … `SSL_write` is not reached until
+    `tls_handshaking_` clears". `send_response()` ends in `flush_output()`, so `SSL_write` **was**
+    reached at accept — and it worked, because OpenSSL lets a write drive a handshake and
+    `SSL_accept` then continues whatever it began. Two functions advancing one state machine while
+    a flag said the handshake had not started. Found by reading the accept path to answer an
+    unrelated question, not by any test, because there is nothing here for a test to catch: the
+    bytes arrive either way. Pitfall 68's lesson with the polarity reversed — there the comment
+    excused unsafe code, here it described safe code that did not exist yet. "Works because both
+    callers are reentrant into the same state machine" is not a property to build on, so the
+    handshake now has one owner and the comment is true.
+
+131. **Six hand-written `SSL_CTX_free` calls on six throw paths were all correct, and the leak was
+    on the seventh — the one that throws through a helper.** `TlsContext::client()` allocated the
+    context and *then* called `check_file_or_throw()` on the CA bundle, so nobody wrote a free there
+    because nobody wrote a `throw` there either. `sanitizers (asan)` found it on a required check,
+    after review had passed over it three times: 1616 bytes direct plus about 3 kB indirect, 242
+    allocations, in the three tests that exercise a refusal.
+
+    It was a real leak and not a test artefact, which is the part worth carrying:
+    `OrderbookClient::ensure_tls_context()` turns that exception into an error and leaves `tls_ctx_`
+    null, so a pool retrying `connect()` against a mistyped CA path leaks a context **per attempt,
+    for ever** — once per health-check interval. Pitfall 32 exactly: a retry loop exposes leaks that
+    one-shot code hides.
+
+    The fix is RAII and not a seventh free, because cleanup written per throw path is correct right
+    up until a `throw` arrives from a function you did not write. A static test refuses an
+    `SSL_CTX_new` whose result lands anywhere but a `CtxGuard`, so the class is impossible rather
+    than fixed once — a leak has no assertion without an allocator hook, but its *shape* does.
+
+132. **A disassembly comparison that matches the symbol by substring reports the sum of two
+    functions as the size of one, and the number is plausible enough to act on.** `flush_output_tls`
+    contains `flush_output`, so the awk "am I inside the function" flag never cleared and the
+    extractor reported **310, then 335**, for a function that is 148. On the strength of that I
+    nearly restructured the send path a second time to fix a regression that existed only in my own
+    instrument. Match `<demangled signature>:` exactly.
+
+    Same family as the `/metrics` lookup that missed because the key carried a label set
+    (pitfall 66): the instrument had the defect, and it answered in the same voice it uses when
+    there is nothing wrong. The real numbers, once it was fixed: `feed()` and `send_response()`
+    byte-identical, `flush_output_plain()` 135 → 147, and those twelve are the `io_want_`
+    bookkeeping that fixes the stalled-response regression — not TLS dispatch, which is 178
+    instructions in a function of its own reached through one compare.
+
+133. **A test whose *precondition* is a race fails having exercised nothing, and its message is
+    indistinguishable from the real defect's.** `TlsSession.ALargeResponse…` needs a partial
+    `SSL_write` to happen at all, and it arranged that by having the reader sleep 400 ms "and then
+    drain". Under ThreadSanitizer the server's handshake and its 40 000-string payload took longer
+    than the sleep, so the reader was already draining when the first `SSL_write` ran, the socket
+    kept accepting, and 1.2 MB went out in one call. `distinct_pending` came back **1**.
+
+    The expensive part is that **1 is also what the real defect produces**: dropping
+    `SSL_MODE_ENABLE_PARTIAL_WRITE` prints the identical line. So the flake and the defect are the
+    same message, and a required check went red saying something true about a run that had tested
+    nothing. Pitfall 105 in a new place — every timing in this suite was chosen against an
+    uninstrumented build.
+
+    The fix is not a longer sleep. The reader now waits on an atomic the server sets **after
+    asserting** `has_pending_output()`, so the condition is established rather than hoped for, and
+    the failure mode when the buffers are too big is a precondition assertion naming that. Same
+    lesson as the notify-ordering test in #79 (pitfall 64): do not race the thing you are asserting.
+
+    **And that fix was only half of it**, which is the part worth carrying. With the precondition
+    established the test still failed 1 in 6 under TSan, now reporting `3 vs 3`: the assertion was
+    `distinct_pending > 3`, a count of *samples*, and how many times a drain loop gets scheduled is
+    not a property of the code. Threshold pinned to a count → fails on legitimate variation → gets
+    re-run until green. What actually separates the two SSL modes is whether the gauge is ever seen
+    **between** the full response and zero: without `ENABLE_PARTIAL_WRITE` pending is only ever
+    `payload.size()` and then 0, so no intermediate exists to observe. One intermediate is the whole
+    signal and it does not move with the scheduler. Both mutations still fail the rebuilt test, and
+    through different assertions — the gauge for one, `bad write retry` for the other.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

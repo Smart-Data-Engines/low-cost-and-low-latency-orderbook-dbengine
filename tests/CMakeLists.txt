@@ -39,6 +39,19 @@ function(ob_add_test name)
     gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 endfunction()
 
+# ── Helper to register a test executable that needs the TLS library ──────────
+function(ob_add_tls_test name)
+    add_executable(${name} ${ARGN})
+    target_link_libraries(${name}
+        PRIVATE
+            orderbook_tls
+            GTest::gtest_main
+            rapidcheck
+            rapidcheck_gtest
+    )
+    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
+endfunction()
+
 # ── Helper to register a test executable that needs the auth library ─────────
 function(ob_add_auth_test name)
     add_executable(${name} ${ARGN})
@@ -757,5 +770,36 @@ ob_add_engine_test(test_query_live_buffer_race
 )
 # Reads include/ and src/ to refuse the shape that made the race possible.
 target_compile_definitions(test_query_live_buffer_race
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
+# ── TLS context (#30 part three) ──────────────────────────────────────────────
+ob_add_tls_test(test_tls_context
+    test_tls_context.cpp
+)
+# Reads src/ to hold the io_uring refusal against the parser's own flag list.
+target_compile_definitions(test_tls_context
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
+# TLS through a real Session, where the socket buffers are ours to shrink - the integration battery
+# cannot force a partial SSL_write over loopback.
+ob_add_tcp_test(test_tls_session
+    test_tls_session.cpp
+)
+
+# The C++ client's TLS path against a real handshake, plus the name check that turns chain
+# verification into peer verification.
+add_executable(test_tls_client test_tls_client.cpp)
+target_link_libraries(test_tls_client
+    PRIVATE
+        orderbook_client
+        orderbook_tls
+        OpenSSL::SSL
+        GTest::gtest_main
+)
+gtest_discover_tests(test_tls_client PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
+# Reads include/ and src/ to hold copy_client_access() against ClientConfig's own field list.
+target_compile_definitions(test_tls_client
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )

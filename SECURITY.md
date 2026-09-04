@@ -76,25 +76,36 @@ Generating and installing them is in [docs/operations.md](docs/operations.md).
 
 ### What authentication does not give you
 
-**Not confidentiality.** There is still no TLS, so every query, every row and every response is
-readable by anything on the path. Authentication answers "may this peer talk to us"; it says nothing
-about who else is listening. If your threat model includes a passive observer on the network, this
-engine does not yet meet it — that is roadmap item #30 part two.
+**Not confidentiality on its own.** Authentication answers "may this peer talk to us"; it says
+nothing about who else is listening. **Client sessions can now be encrypted** with `--tls-client`
+(TLS 1.3, certificate verification on by default in our clients) — see
+[docs/operations.md](docs/operations.md). The **replication link and the multi-master mesh are still
+plaintext**: they authenticate, and every record they carry is readable on the path. If your threat
+model includes a passive observer, encrypt the client port and keep the cluster links on a network
+you trust until the cluster half of #30 part three lands.
 
 **Not authorisation.** Every authenticated identity may run every command, including `FAILOVER` and
 `MIGRATE`. Per-identity permissions are roadmap item #31, and they will attach to exactly the
 identity name this scheme establishes.
 
-**Not protection against an active man-in-the-middle**, and this one is worth understanding rather
-than glossing. Challenge-response proves *knowledge of the secret*; nothing binds the exchange to
+**Not protection against an active man-in-the-middle, on the links that are not encrypted**, and
+this one is worth understanding rather than glossing. On a TLS client session with verification on,
+the channel is bound to a certificate and the relay below does not apply — **provided the client
+checks the name and not only the chain.** Both of ours do: `tls_verify=True` requires the
+certificate to cover the address dialled. Without that, a private CA signing a whole cluster makes
+every node's certificate acceptable for every other node, so the relay works again between two
+holders of legitimate certificates, and every verification reports success. Chain verification alone
+is not peer verification. On the cluster links,
+which are not yet encrypted, it does. Challenge-response proves *knowledge of the secret*; nothing binds the exchange to
 the connection it happened on. So an attacker who can redirect a replica's connection — by
 controlling DNS, ARP or routing — can relay: it takes the real primary's challenge, presents it to
 the replica as its own, forwards the replica's answer to the primary, and asks the primary to answer
 the replica's challenge. Both sides then believe they are talking to each other.
 
 Channel binding is what stops that, and channel binding needs a channel with an identity — which is
-TLS, roadmap #30 part three. It is not fixable at this layer: a relay can always forward a value
-that is bound to nothing but a nonce.
+TLS. The client port has it since #30 part three; the cluster links do not yet, and that is the
+remaining half of that item. It is not fixable at the authentication layer: a relay can always
+forward a value that is bound to nothing but a nonce.
 
 In practice this changes little about where you may deploy a node, because an attacker with that
 level of network control already reads every row in the clear and can inject records into the

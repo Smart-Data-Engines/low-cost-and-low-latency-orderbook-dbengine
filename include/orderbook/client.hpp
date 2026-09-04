@@ -18,6 +18,7 @@
 #include <poll.h>
 #include <fcntl.h>
 
+#include "orderbook/tls.hpp"
 #include "orderbook/types.hpp"
 
 namespace ob {
@@ -43,7 +44,38 @@ struct ClientConfig {
     /// configured to authenticate has a deployment problem if the server is not.
     std::string auth_identity;
     std::string auth_secret;
+
+    /// TLS on this connection (#30 part three). The server needs `--tls-client`.
+    ///
+    /// `tls_verify` defaults to on, and the default is the point: a client that encrypts without
+    /// checking the certificate has confidentiality against a passive observer and nothing against
+    /// a man in the middle - which is the half the shared secret of part two could not give, and
+    /// the reason TLS is here at all. Empty `tls_ca_file` means the system trust store.
+    ///
+    /// The verification includes the *name*: `connect()` requires the certificate to cover the
+    /// address it dialled, so a certificate the CA signed for another node is refused. Without
+    /// that, a private CA signing the cluster makes every node's certificate good for every other.
+    bool        tls        = false;
+    std::string tls_ca_file;
+    bool        tls_verify = true;
 };
+
+/// Copy the fields that decide *how* to connect - credentials and transport - from a pool-shaped
+/// config into a per-node one.
+///
+/// A template rather than three hand-written copies, because three hand-written copies is how the
+/// C++ pool and the shard router reached #30 part one unable to authenticate at all: `auth_identity`
+/// was on `ClientConfig`, nothing carried it there, and the symptom is `ERR unauthenticated` from a
+/// pool whose configuration reads as complete. A static test refuses a new `ClientConfig` field
+/// this function does not mention, because the next field is the one that drifts.
+template <typename FromConfig>
+void copy_client_access(const FromConfig& from, ClientConfig& to) {
+    to.auth_identity = from.auth_identity;
+    to.auth_secret   = from.auth_secret;
+    to.tls           = from.tls;
+    to.tls_ca_file   = from.tls_ca_file;
+    to.tls_verify    = from.tls_verify;
+}
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -179,12 +211,23 @@ private:
     std::string  sock_buf_;   // socket read accumulation buffer
     bool         compressed_ = false;
 
-    // Communication
+    // TLS, both null when config_.tls is false. The context is per client rather than per process:
+    // a client that connects once parses its trust anchor once, and a pool of N parses it N times,
+    // which is a startup cost nobody measures against a shared-mutable-state problem nobody wants.
+    std::unique_ptr<TlsContext>  tls_ctx_;
+    std::shared_ptr<ssl_st>      ssl_;
+
+    // Communication. Both route through TLS when ssl_ is set; nothing above this line knows.
     Result<void>             send_all(size_t len);
     Result<std::string_view> recv_response();
     Result<void>             read_banner();
     Result<void>             authenticate();
     Result<void>             negotiate_compression();
+    Result<void>             ensure_tls_context();
+    Result<void>             start_tls();
+    /// Read into `sock_buf_`. >0 bytes, 0 on close, -1 on error, with `why` naming which.
+    ssize_t                  read_some(char* buf, size_t len, std::string* why);
+    void                     close_transport();
 };
 
 // ── Pool configuration ────────────────────────────────────────────────────────
@@ -199,6 +242,15 @@ struct PoolConfig {
     // Sharding (optional — when set, enables ShardRouter)
     std::vector<std::string> coordinator_endpoints;  // etcd endpoints
     std::string cluster_prefix{"/ob/"};
+
+    // Credentials and transport, carried to every node's ClientConfig by copy_client_access().
+    // One cluster means one client secret and one trust anchor, so these are per-pool and not
+    // per-host.
+    std::string auth_identity;
+    std::string auth_secret;
+    bool        tls        = false;
+    std::string tls_ca_file;
+    bool        tls_verify = true;
 };
 
 // ── OrderbookPool ─────────────────────────────────────────────────────────────

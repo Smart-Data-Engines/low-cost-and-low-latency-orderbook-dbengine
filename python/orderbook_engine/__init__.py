@@ -25,9 +25,11 @@ import json
 import logging
 import os
 import socket
+import ssl
 import struct
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -43,7 +45,8 @@ except ImportError:  # pragma: no cover - depends on the install extras
 logger = logging.getLogger("orderbook_engine")
 
 __version__ = "0.2.0"
-__all__ = ["OrderbookEngine", "OrderbookRow", "OrderbookError", "AggValue",
+__all__ = ["OrderbookEngine", "OrderbookRow", "OrderbookError", "OrderbookTlsError",
+           "AggValue",
            "_murmurhash3_x86_32", "_ConsistentHashRing",
            "_parse_shard_map_response", "_parse_shard_info_response",
            "_parse_shard_error"]
@@ -169,14 +172,91 @@ def _parse_tcp_response(raw: str):
 
 # ── TCP Backend ────────────────────────────────────────────────────────────────
 
+class OrderbookTlsError(Exception):
+    """A TLS problem that reconnecting cannot fix.
+
+    Deliberately neither an ``OrderbookError`` nor an ``OSError``. The pool's retry paths catch
+    both, and ``ssl.SSLError`` *is* an ``OSError`` - so a certificate that fails to verify against
+    one node would be retried against every other node in the mesh, each failing identically
+    because the cause is this client's configuration, and the operator would read "No primary
+    available" instead of ``certificate verify failed``. A peer that drops mid-handshake stays an
+    ``OSError`` and stays retryable, which is the honest split: one of these is transient and the
+    other is a deployment mistake.
+    """
+
+
+def _build_tls_context(tls: bool, tls_ca_file: Optional[str],
+                       tls_verify: bool) -> Optional["ssl.SSLContext"]:
+    """Build the client context once, up front, or refuse the configuration.
+
+    Up front and not on first connect, for the same reason the server loads its certificate at
+    startup: the pool's ``_connect_all()`` wraps every backend construction in
+    ``except Exception``, so a bad CA path there would mark all nodes unreachable and say nothing
+    about why. Called from ``OrderbookEngine.__init__`` before any socket exists.
+
+    Every refusal here describes a caller who believes the connection is protected in a way it is
+    not - which is the failure this whole item exists to remove, so it may not be reachable by
+    passing arguments that look careful. Deliberately not counted in this sentence: a docstring
+    saying "three" is a number the next edit falsifies silently, and this file already has one of
+    those in its history.
+    """
+    if not tls:
+        if tls_ca_file is not None:
+            raise OrderbookTlsError(
+                "tls_ca_file is set with tls=False: it verifies nothing and the connection would "
+                "be plain text")
+        if not tls_verify:
+            raise OrderbookTlsError(
+                "tls_verify=False with tls=False: there is no certificate to decline to check")
+        return None
+
+    if tls_ca_file is not None and not tls_verify:
+        raise OrderbookTlsError(
+            "tls_ca_file is set with tls_verify=False: a trust anchor nothing consults")
+    if tls_ca_file is not None and not os.path.isfile(tls_ca_file):
+        raise OrderbookTlsError(f"tls_ca_file {tls_ca_file!r} is not a readable file")
+    if not ssl.HAS_TLSv1_3:
+        raise OrderbookTlsError(
+            "this Python's OpenSSL has no TLS 1.3, which the server requires as a minimum; "
+            "negotiating anything lower would fail mid-handshake with a version error")
+
+    try:
+        ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH, cafile=tls_ca_file)
+    except (ssl.SSLError, OSError) as e:
+        raise OrderbookTlsError(f"tls_ca_file {tls_ca_file!r} rejected: {e}") from e
+    # Stated rather than inherited: the server sets TLS1_3_VERSION as its floor, and two documents
+    # agreeing today is not the same as one of them being derived from the other.
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+
+    if not tls_verify:
+        # Order matters and the error is unhelpful in the other order: setting verify_mode to
+        # CERT_NONE while check_hostname is on raises ValueError.
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        # warnings.warn rather than the module logger, because this has to be visible in a process
+        # that never configured logging, and stacklevel points at the caller's line rather than at
+        # this file.
+        warnings.warn(
+            "orderbook_engine: tls_verify=False - the connection is encrypted against a passive "
+            "observer and unprotected against a man in the middle, which is the half a shared "
+            "secret already covers",
+            stacklevel=3)
+    return ctx
+
+
 class _TcpBackend:
     """Communicates with ob_tcp_server over a TCP socket."""
 
     def __init__(self, host: str, port: int, timeout: float = 10.0,
                  compress: bool = False,
-                 auth: Optional[Tuple[str, str]] = None):
+                 auth: Optional[Tuple[str, str]] = None,
+                 tls_ctx: Optional["ssl.SSLContext"] = None):
         self._host = host
         self._port = port
+        # A ready context, not the three arguments that build one: the refusals belong at the
+        # engine's constructor, outside the pool's except-Exception, and building one per backend
+        # would re-read the CA bundle once per node.
+        self._tls_ctx = tls_ctx
         self._sock: Optional[socket.socket] = None
         self._buf = b""
         self._timeout = timeout
@@ -192,9 +272,29 @@ class _TcpBackend:
             self._negotiate_compression()
 
     def _connect(self):
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.settimeout(self._timeout)
-        self._sock.connect((self._host, self._port))
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(self._timeout)
+        sock.connect((self._host, self._port))
+        if self._tls_ctx is not None:
+            # Before the banner: the banner is the server's first application bytes and it sends
+            # them once the handshake finishes, so a read here would consume a TLS record as text.
+            #
+            # server_hostname carries the name the certificate must cover. For an IP literal Python
+            # sends no SNI (RFC 6066 forbids one) and matches the iPAddress SAN instead, which is
+            # what makes verification against a `-addext subjectAltName=IP:127.0.0.1` certificate
+            # work at all.
+            try:
+                sock = self._tls_ctx.wrap_socket(sock, server_hostname=self._host)
+            except ssl.SSLError as e:
+                sock.close()
+                # "wrong version number" here almost always means the port is not running with
+                # --tls-client: the plaintext banner arrives where a ServerHello was expected.
+                raise OrderbookTlsError(
+                    f"TLS handshake with {self._host}:{self._port} failed: {e}") from e
+            except OSError:
+                sock.close()
+                raise
+        self._sock = sock
         self._buf = b""
         # Read and discard the welcome banner ("OK ob_tcp_server v...\n")
         self._read_banner()
@@ -207,9 +307,10 @@ class _TcpBackend:
     def _authenticate(self):
         """Answer the server's challenge with HMAC-SHA256 of the shared secret.
 
-        Challenge-response rather than sending the secret: until TLS lands (#30 part two) the wire
+        Challenge-response rather than sending the secret: without TLS (#30 part three) the wire
         carries no confidentiality, so a secret in the first packet is replayable by anyone who saw
-        it, while a response to a fresh nonce is not.
+        it, while a response to a fresh nonce is not. It stays challenge-response with TLS on: the
+        two protect different things, and `tls=False` is still a supported configuration.
 
         A server with authentication disabled answers ``ERR auth_disabled``, and that surfaces as an
         error on purpose. A client configured to authenticate against a server that does not
@@ -224,7 +325,7 @@ class _TcpBackend:
         # Field layout must match ob::auth_response() byte for byte: a version prefix, the surface
         # label, the role, the identity and the nonce, NUL-separated so no two tuples concatenate
         # alike. The role is always `initiator` on this surface - a client opens the connection, and
-        # the server never proves itself here (that is TLS's job, #30 part three).
+        # the server proves itself only under TLS (#30 part three), never through this exchange.
         message = b"\x00".join([b"ob-auth-v1", b"client", b"initiator",
                                 identity.encode("utf-8"), nonce.encode("ascii")])
         digest = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
@@ -812,10 +913,13 @@ class _ClientPool:
                  compress: bool = False,
                  coordinator_endpoints: Optional[List[str]] = None,
                  cluster_prefix: str = "/ob/",
-                 auth: Optional[Tuple[str, str]] = None):
+                 auth: Optional[Tuple[str, str]] = None,
+                 tls_ctx: Optional["ssl.SSLContext"] = None):
         self._timeout = timeout
         self._health_check_interval = health_check_interval
         self._compress = compress
+        # One cluster, one trust anchor: the pool talks to replicas of one deployment.
+        self._tls_ctx = tls_ctx
         # Every node in the mesh authenticates with the same client credential: the pool talks to
         # replicas of one cluster, which share one secret file.
         self._auth = auth
@@ -875,7 +979,8 @@ class _ClientPool:
                 continue
             try:
                 backend = _TcpBackend(node.host, node.port, self._timeout,
-                                      compress=self._compress, auth=self._auth)
+                                      compress=self._compress, auth=self._auth,
+                                      tls_ctx=self._tls_ctx)
                 self._connections[key] = backend
                 node.connected = True
             except Exception:
@@ -1116,7 +1221,8 @@ class _ClientPool:
                     host = address
                     port = 5555
                 backend = _TcpBackend(host, port, self._timeout,
-                                      compress=self._compress, auth=self._auth)
+                                      compress=self._compress, auth=self._auth,
+                                      tls_ctx=self._tls_ctx)
                 self._shard_connections[shard_id] = backend
                 logger.debug("Connected to shard %s at %s", shard_id, address)
             except Exception:
@@ -1401,10 +1507,18 @@ class OrderbookEngine:
                  compress: bool = False,
                  coordinator_endpoints: Optional[List[str]] = None,
                  cluster_prefix: str = "/ob/",
-                 auth: Optional[Tuple[str, str]] = None):
+                 auth: Optional[Tuple[str, str]] = None,
+                 tls: bool = False,
+                 tls_ca_file: Optional[str] = None,
+                 tls_verify: bool = True):
         self._seq = 0
         self._closed = False
         self._pool: Optional[_ClientPool] = None
+
+        # Before any socket, and before the mode branch, so a contradictory configuration is
+        # refused identically in every mode - including local mode, where TLS arguments mean
+        # nothing and passing them means the caller believes something false about the connection.
+        tls_ctx = _build_tls_context(tls, tls_ca_file, tls_verify)
 
         if hosts is not None:
             # Multi-host pool mode
@@ -1413,16 +1527,21 @@ class OrderbookEngine:
                                      compress=compress,
                                      coordinator_endpoints=coordinator_endpoints,
                                      cluster_prefix=cluster_prefix,
-                                     auth=auth)
+                                     auth=auth, tls_ctx=tls_ctx)
             self._tcp = None
             self._local = None
         elif host is not None:
             # TCP mode
             self._mode = "tcp"
-            self._tcp = _TcpBackend(host, port, timeout, compress=compress, auth=auth)
+            self._tcp = _TcpBackend(host, port, timeout, compress=compress, auth=auth,
+                                    tls_ctx=tls_ctx)
             self._local = None
         elif data_dir is not None:
             # Local mode
+            if tls_ctx is not None:
+                raise OrderbookTlsError(
+                    "tls=True with data_dir: local mode opens no socket, so there is nothing to "
+                    "encrypt")
             self._mode = "local"
             self._local = _LocalBackend(data_dir)
             self._tcp = None

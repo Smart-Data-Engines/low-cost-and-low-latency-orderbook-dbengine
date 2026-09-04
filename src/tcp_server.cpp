@@ -41,6 +41,34 @@ namespace ob {
 /// AUTH is how it authenticates. PING is here so that a load balancer's health check needs no
 /// credentials and reveals nothing about the data. QUIT is here because refusing a client's request
 /// to leave would be absurd, and because a client that cannot leave holds a session slot.
+std::unique_ptr<TlsContext> load_tls_or_exit(const ServerConfig& config) {
+    if (!config.tls_client) {
+        if (!config.tls_cert_file.empty() || !config.tls_key_file.empty()) {
+            // A warning here and a *refusal* in the clients, deliberately, because the two have
+            // different innocent explanations. On a server this is a staged rollout: the paths go
+            // into ob.conf on every node first and `tls-client = true` follows, which is the right
+            // way to do it. A client call has no such story - `tls_ca_file` without `tls` is one
+            // expression written by someone who believes the connection is encrypted.
+            OB_LOG_WARN("tls", "a certificate or key was given but no --tls-* surface is enabled, "
+                               "so this node listens in plaintext");
+        }
+        return nullptr;
+    }
+    if (config.tls_cert_file.empty() || config.tls_key_file.empty()) {
+        // Refused rather than falling back: `--tls-client` that quietly meant plaintext is the
+        // worst possible outcome of this feature.
+        std::fprintf(stderr, "Error: --tls-client needs both --tls-cert-file and --tls-key-file\n");
+        std::exit(1);
+    }
+    try {
+        return std::make_unique<TlsContext>(
+            TlsContext::server(config.tls_cert_file, config.tls_key_file));
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "Error: %s\n", e.what());
+        std::exit(1);
+    }
+}
+
 LoadedSecrets load_secrets_or_exit(const ServerConfig& config) {
     LoadedSecrets out;
     try {
@@ -728,6 +756,9 @@ const std::vector<std::string>& known_flags() {
         "snapshot-chunk-size",
         "snapshot-staging-dir",
         "sqpoll-idle-ms",
+        "tls-cert-file",
+        "tls-client",
+        "tls-key-file",
         "ttl-hours",
         "ttl-scan-interval-seconds",
         "workers",
@@ -793,6 +824,9 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"snapshot-chunk-size", {"<N>", "Bytes per snapshot transfer chunk"}},
         {"snapshot-staging-dir", {"<DIR>", "Where an incoming snapshot is staged before install"}},
         {"sqpoll-idle-ms", {"<N>", "io_uring SQPOLL idle timeout in ms"}},
+        {"tls-cert-file", {"<PATH>", "Server certificate chain (PEM) for --tls-client"}},
+        {"tls-client", {"", "TLS on the client port; needs --tls-cert-file and --tls-key-file"}},
+        {"tls-key-file", {"<PATH>", "Server private key (PEM); mode 600"}},
         {"ttl-hours", {"<N>", "Retention in hours; 0 keeps everything"}},
         {"ttl-scan-interval-seconds", {"<N>", "How often retention scans for expired rows"}},
         {"workers", {"<N>", "Number of worker threads (default: 4)"}},
@@ -835,6 +869,7 @@ const std::vector<std::string>& boolean_flags() {
         "print-config",
         "read-only",
         "replication-compress",
+        "tls-client",
     };
     return flags;
 }
@@ -1107,6 +1142,12 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.metrics_port = cursor.value_as<uint16_t>();
         } else if (arg == "--metrics-bind") {
             config.metrics_bind = std::string{cursor.value()};
+        } else if (arg == "--tls-cert-file") {
+            config.tls_cert_file = std::string{cursor.value()};
+        } else if (arg == "--tls-key-file") {
+            config.tls_key_file = std::string{cursor.value()};
+        } else if (arg == "--tls-client") {
+            config.tls_client = true;
         } else if (arg == "--auth-secret-file") {
             config.auth_secret_file = std::string{cursor.value()};
         } else if (arg == "--cluster-secret-file") {
@@ -1346,6 +1387,9 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("snapshot-chunk-size", std::to_string(c.snapshot_chunk_size));
     line("snapshot-staging-dir", c.snapshot_staging_dir);
     line("sqpoll-idle-ms", std::to_string(c.uring_sqpoll_idle_ms));
+    line("tls-cert-file", c.tls_cert_file.empty() ? "(none)" : c.tls_cert_file);
+    line("tls-client", c.tls_client ? "true" : "false");
+    line("tls-key-file", c.tls_key_file.empty() ? "(none)" : c.tls_key_file);
     line("ttl-hours", std::to_string(c.ttl_hours));
     line("ttl-scan-interval-seconds", std::to_string(c.ttl_scan_interval_seconds));
     line("workers", std::to_string(c.worker_threads));
@@ -1364,6 +1408,7 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
 TcpServer::TcpServer(ServerConfig config)
     : config_(std::move(config))
     , secrets_(load_secrets_or_exit(config_))
+    , tls_ctx_(load_tls_or_exit(config_))
     , read_only_(config_.read_only)
 {
     ReplicationConfig repl_config{};
@@ -1686,8 +1731,29 @@ void TcpServer::run() {
                     stats.active_sessions.fetch_add(1, std::memory_order_relaxed);
                     engine_->registry().increment_gauge("ob_active_sessions");
 
-                    // Send welcome message.
                     Session* s = session_mgr.get_session(client_fd);
+                    if (s && tls_ctx_) {
+                        // Wrap before anything is written: the banner is application data and must
+                        // not precede the handshake. It is queued here and goes out with the first
+                        // flush after the handshake completes, which is what send_response() on a
+                        // handshaking session does - the bytes sit in send_buf_ and SSL_write is
+                        // not reached until tls_handshaking_ clears.
+                        try {
+                            s->enable_tls(tls_ctx_->wrap(client_fd, /*server_side=*/true));
+                            OB_LOG_DEBUG("tls", "handshake started: fd=%d", client_fd);
+                        } catch (const std::exception& e) {
+                            OB_LOG_WARN("tls", "cannot start a handshake on fd=%d: %s",
+                                        client_fd, e.what());
+                            session_mgr.remove_session(client_fd);
+                            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr);
+                            ::close(client_fd);
+                            stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
+                            engine_->registry().increment_gauge("ob_active_sessions", -1);
+                            continue;
+                        }
+                    }
+
+                    // Send welcome message.
                     if (s) {
                         s->send_response("OK ob_tcp_server v0.1.0\n\n");
                     }
@@ -1699,43 +1765,99 @@ void TcpServer::run() {
                 if (events[i].events & EPOLLOUT) {
                     Session* session = session_mgr.get_session(fd);
                     if (session) {
+                        // A handshake that wanted to write is why this event arrived.
+                        if (session->tls_handshaking()) {
+                            if (!session->continue_tls_handshake()) {
+                                close_session(fd, "tls handshake failed");
+                                continue;
+                            }
+                            if (session->io_want() == IoWant::Write) continue;  // still writing
+                            disarm_epollout(fd);
+                            if (session->tls_handshaking()) continue;           // now wants to read
+                        }
                         if (!session->flush_output()) {
                             close_session(fd, "flush failed");
                             continue;
                         }
-                        if (!session->has_pending_output()) {
+                        // Disarm unless OpenSSL still wants to write. With TLS, bytes can remain
+                        // queued while OpenSSL is waiting to *read* - a key update - and keeping
+                        // EPOLLOUT armed then spins the loop on a writable socket (pitfall 5). The
+                        // EPOLLIN path below retries the flush for exactly that case.
+                        const bool wants_write = session->io_want() == IoWant::Write;
+                        if (!session->has_pending_output() || !wants_write) {
                             disarm_epollout(fd);
-                            if (session->close_requested()) {
-                                close_session(fd, "quit after flush");
-                                continue;
-                            }
+                        }
+                        if (!session->has_pending_output() && session->close_requested()) {
+                            close_session(fd, "quit after flush");
+                            continue;
                         }
                     }
                 }
 
                 if (!(events[i].events & EPOLLIN)) continue;
 
+                {
+                    // A handshake in progress consumes this event and nothing else: not one byte
+                    // reaches feed() until TLS is up, because a command arriving before that is a
+                    // command from an unauthenticated transport.
+                    Session* session = session_mgr.get_session(fd);
+                    if (session && session->tls_handshaking()) {
+                        if (!session->continue_tls_handshake()) {
+                            close_session(fd, "tls handshake failed");
+                            continue;
+                        }
+                        if (session->io_want() == IoWant::Write) arm_epollout(fd);
+                        if (session->tls_handshaking()) continue;
+                        // Just completed: the queued banner has not been written yet.
+                        if (!session->flush_output()) {
+                            close_session(fd, "flush failed after handshake");
+                            continue;
+                        }
+                        if (session->has_pending_output() &&
+                            session->io_want() == IoWant::Write) {
+                            arm_epollout(fd);
+                        }
+                    }
+                    // A write that stopped because OpenSSL wanted to read resumes here - the one
+                    // case where readability is what unblocks a *send*.
+                    if (session && !session->tls_handshaking() &&
+                        session->has_pending_output() && session->io_want() == IoWant::Read) {
+                        if (!session->flush_output()) {
+                            close_session(fd, "flush failed");
+                            continue;
+                        }
+                        if (session->has_pending_output() &&
+                            session->io_want() == IoWant::Write) {
+                            arm_epollout(fd);
+                        }
+                    }
+                }
+
                 // Client data ready.
                 // Edge-triggered: read until EAGAIN.
                 char buf[4096];
                 while (true) {
-                    ssize_t n = ::read(fd, buf, sizeof(buf));
-                    if (n == 0) {
-                        // Client disconnected.
-                        close_session(fd, "peer closed or read error");
-                        break;
-                    }
-                    if (n < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        // Read error — disconnect.
-                        close_session(fd, "peer closed or read error");
-                        break;
-                    }
-
                     Session* session = session_mgr.get_session(fd);
                     if (!session) break;
 
-                    auto lines = session->feed(buf, static_cast<size_t>(n));
+                    size_t got = 0;
+                    const Session::IoResult r = session->receive(buf, sizeof(buf), got);
+                    if (r == Session::IoResult::Closed) {
+                        close_session(fd, "peer closed");
+                        break;
+                    }
+                    if (r == Session::IoResult::Error) {
+                        close_session(fd, "read error");
+                        break;
+                    }
+                    if (r == Session::IoResult::Again) {
+                        // Nothing more now. With TLS this can mean OpenSSL wants to *write*, so
+                        // arm what it asked for rather than assuming readability.
+                        if (session->io_want() == IoWant::Write) arm_epollout(fd);
+                        break;
+                    }
+
+                    auto lines = session->feed(buf, got);
                     for (const auto& line : lines) {
                         // Check line length.
                         if (line.size() > config_.max_line_length) {

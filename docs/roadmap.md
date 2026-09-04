@@ -386,7 +386,58 @@ of an unknown peer.
   demonstrates nothing, so `ClusterAuthReplication` has three tests: same secret replicates, no
   secret replicates nothing, wrong secret replicates nothing.
 
-**Part three — TLS**
+**Part three — TLS: the client surface is done, the cluster links are not.**
+
+Spec: `kiro-workspace/specs/wire-tls/`. `--tls-client --tls-cert-file --tls-key-file`, TLS 1.3
+minimum, and both shipped clients verify by default. What remains is the replication link, the
+multi-master mesh, and mTLS as an alternative to the shared secret there.
+
+- **Verification is two checks, and only one of them is what `SSL_VERIFY_PEER` does.** Chain
+  verification says the certificate was signed by a CA you trust; it says nothing about whether the
+  certificate belongs to the host you dialled. So with a private CA that signs a whole cluster —
+  which is how anyone actually deploys this — node B's certificate is perfectly acceptable for node
+  A, the relay of the paragraph below works again between two holders of *legitimate* certificates,
+  and every verification reports success. `tls_expect_host()` binds the name; an IP literal takes
+  the other branch in both halves (no SNI, per RFC 6066, and matched against `iPAddress` rather than
+  `dNSName`), and getting either wrong looks like working code.
+- **The test that carries this is the one with a good chain and the wrong name.** A certificate
+  handed to the client as its own trust anchor, issued for `10.0.0.2`, served on `127.0.0.1`.
+  Deleting the name check makes it pass; the neighbouring trust test does not move, so the two
+  failures discriminate rather than overlap. Both clients have it, at unit and integration level.
+- **A protection an operator cannot see is a protection on our word**, so `tls_verify=False` is a
+  named act in both clients: a startup WARN from the C++ context and a `warnings.warn` from Python,
+  and the escape hatch has its own test where the certificate the other tests refuse is accepted.
+- **The trust anchor loads before the socket.** A CA path that does not exist is permanent and
+  knowable without a network; a refused connection is transient. In the other order an operator
+  whose server is also down is told `connection refused` and goes to debug the network — which is
+  what it said until the test for it was written.
+- **Four client configurations are refused rather than interpreted**, each describing a caller who
+  believes the connection is protected in a way it is not: a CA file without TLS, `tls_verify=False`
+  without TLS, a CA file with verification off, and TLS in local mode. All four fire before a socket
+  exists.
+- **`OrderbookTlsError` is deliberately neither `OrderbookError` nor `OSError`.** The Python pool's
+  retry paths catch both, and `ssl.SSLError` *is* an `OSError`, so a certificate that fails to
+  verify would be retried against every node in the mesh — each failing identically, because the
+  cause is the client's own configuration — and the operator would read `No primary available`
+  instead of `certificate verify failed`. A peer that drops mid-handshake stays retryable.
+- **A gap from part one closed on the way past:** `PoolConfig` and `ShardRouterConfig` carried
+  neither credentials nor transport, so the C++ pool and the sharded client could not reach an
+  authenticated node **at all** — `auth_identity` existed on `ClientConfig` and nothing put it
+  there. Three sites hand-copied the fields each happened to know about. One
+  `copy_client_access()` template now carries them, and a static test derives `ClientConfig`'s field
+  list from the header and refuses a field that neither the template nor every construction site
+  mentions, because the next field is the one that drifts (pitfall 79: a list you wrote yourself is
+  not evidence about the code).
+- **Both misconfigurations were measured, and they fail differently.** A forgotten `--tls-client` on
+  the server fails the client at once with `wrong version number`: the plaintext banner arrives
+  where a ServerHello was expected. A forgotten `tls=True` on the client **hangs until the client's
+  timeout** and the server logs nothing — this protocol has the server speak first, so both sides
+  wait, and until a byte arrives the server cannot tell a plaintext client from a slow one. Not
+  fixable; the test is named after the behaviour so the hang is read as the right thing.
+- **The harness had the same defect in miniature.** The TLS node fixture used a *verifying*
+  connection as its readiness probe, so a node deliberately issued a certificate for another
+  address reported `node never answered` while its own log said `listening`. A probe that answers
+  two questions with one word — pitfall 92's shape, in a fixture.
 - **Channel binding is the thing it buys beyond confidentiality, and part two cannot have it.**
   Challenge-response proves knowledge of the secret; nothing ties the exchange to the connection it
   happened on, so an attacker who can redirect a replica's connection relays both directions and
@@ -420,8 +471,9 @@ of an unknown peer.
 - The io_uring path either gets TLS or a **named refusal** — `--tls` together with io_uring must not
   silently mean plaintext, and the process must not start. Receive is in userspace regardless of
   kTLS, so that path needs memory BIOs, which is a rewrite of the fast path that exists to be fast.
-- mTLS as an alternative to the shared secret on cluster links, with the certificate identity
-  landing in the same field part one introduced. Only mTLS gives the channel binding above.
+- **Still to do:** the replication link and the multi-master mesh, plus mTLS as an alternative to the
+  shared secret there, with the certificate identity landing in the same field part one introduced.
+  Only mTLS gives the channel binding above, and only on those links does the relay still apply.
 - Cost published with named hardware, a percentile, and the floor of the range.
 - Six things easy to miss because they are not about cryptography — starting with the TLS output
   buffer being a *second* place the 64 MB send cap has to hold — are in
@@ -3009,7 +3061,7 @@ cannot verify its numbers, and cannot put it on a network they do not fully cont
 |----------|------|--------|---------|
 | **P1** | Deployment artifacts (#33) | M | Cheapest large jump in time-to-first-run; today a first run means reading CMake |
 | **P1** | Reproducible comparative benchmarks (#39) | L | Makes the performance claim verifiable by a reader instead of asserted, and the claim is the reason the repo exists |
-| **P1** | TLS on the wire (#30 part three) | M | Authentication is done on all three surfaces; nothing is encrypted |
+| **P1** | TLS on the cluster links (#30 part three, remainder) | M | Client sessions are encrypted; the replication link and the multi-master mesh still carry every row in the clear |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Configuration file (#32) | S | Ops ergonomics; past twenty flags, flags alone are unreasonable |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
@@ -3026,9 +3078,12 @@ cannot verify its numbers, and cannot put it on a network they do not fully cont
 
 Things a reviewer will notice, listed here so they do not look like oversights:
 
-- **No TLS.** All three surfaces authenticate since #30 parts one and two (`--auth-secret-file`,
-  `--cluster-secret-file`), and nothing is encrypted — so every query and every row is readable by
-  anything on the path. Trusted-network deployment only until #30 part three.
+- **TLS on client sessions only.** All three surfaces authenticate (`--auth-secret-file`,
+  `--cluster-secret-file`), and since #30 part three the client port can be encrypted with
+  `--tls-client` — TLS 1.3, and both shipped clients verify the chain *and* the name by default. The
+  **replication link and the multi-master mesh are still plaintext**: they authenticate, and every
+  record they carry is readable on the path. So a cluster still wants a network you trust between
+  its nodes, while the clients talking to it no longer do.
 - **Process death is exercised in three modules, and nowhere else.** Until #62 no module killed
   anything, and that hid total loss of acknowledged writes on crash. Today `test_crash_recovery.py`,
   `test_failover.py` and `test_failover_dead_state.py` `SIGKILL` a server; the last of those also

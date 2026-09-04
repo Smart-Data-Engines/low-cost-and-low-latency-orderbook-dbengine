@@ -31,6 +31,24 @@ IoUringServer::IoUringServer(ServerConfig config)
     : config_(std::move(config))
     , secrets_(load_secrets_or_exit(config_))
 {
+    // ── TLS is not supported on this transport, and the refusal is the feature ───────────
+    //
+    // Receive is in userspace whether or not kernel TLS is available - measured, this OpenSSL
+    // negotiates kTLS on transmit only for TLS 1.3 (benchmarks/tls/, requirements §1.2) - so this
+    // loop would need memory BIOs, which is a rewrite of the fast path that exists to be fast
+    // (PING 24 us against 45 us on epoll).
+    //
+    // Refusing beats ignoring by a wide margin: `--tls-client` that quietly meant plaintext would
+    // be the single worst outcome this feature can produce, and it would look identical to working.
+    if (config_.tls_client || !config_.tls_cert_file.empty() || !config_.tls_key_file.empty()) {
+        std::fprintf(stderr,
+                     "Error: TLS is not supported on the io_uring transport (--tls-client, "
+                     "--tls-cert-file, --tls-key-file). Receive stays in userspace even with "
+                     "kernel TLS, so this loop needs a memory-BIO rewrite; see roadmap #30 part "
+                     "three. Build without OB_USE_IO_URING to use TLS.\n");
+        std::exit(1);
+    }
+
     ReplicationConfig repl_config{};
     repl_config.port = config_.replication_port;
     repl_config.compress = config_.replication_compress;

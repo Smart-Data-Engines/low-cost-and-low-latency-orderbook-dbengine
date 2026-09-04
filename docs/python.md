@@ -136,6 +136,57 @@ Against a server that is **not** authenticating, this raises `OrderbookError`. D
 that believes it authenticated while the server authenticates nobody has a deployment problem, and
 continuing silently would hide it.
 
+#### tls=True, tls_ca_file=..., tls_verify=True
+
+For a server running with `--tls-client`:
+
+```python
+eng = OrderbookEngine(host="db1.internal", port=9090,
+                      tls=True, tls_ca_file="/etc/ssl/certs/internal-ca.pem",
+                      auth=("grafana", secret))
+```
+
+TLS 1.3 minimum, matching the server's floor. `tls_ca_file` defaults to the system trust store.
+
+`tls_verify` is on by default, and it checks two separate things: that the certificate chains to a
+trusted CA, **and** that it covers the address or hostname you dialled. The second is the one that
+is easy to omit and impossible to notice — with a private CA that signs a whole cluster, chain-only
+verification accepts node B's certificate for node A and reports success. Connecting by IP therefore
+needs an `IP:` entry in the certificate's `subjectAltName`; an address is never matched against a
+`DNS:` entry.
+
+Turning verification off warns, once, through `warnings.warn`:
+
+```python
+eng = OrderbookEngine(host="10.0.0.1", port=9090, tls=True, tls_verify=False)
+# UserWarning: tls_verify=False - the connection is encrypted against a passive observer and
+# unprotected against a man in the middle, which is the half a shared secret already covers
+```
+
+Failures raise **`OrderbookTlsError`**, which is deliberately neither an `OrderbookError` nor an
+`OSError`. In pool mode the retry paths catch both — and `ssl.SSLError` *is* an `OSError` — so a
+certificate that does not verify would otherwise be retried against every node in the mesh, each
+failing identically because the cause is your configuration, and the report would read
+`No primary available` instead of `certificate verify failed`. A peer that drops mid-handshake stays
+an `OSError` and stays retryable.
+
+Four configurations are refused at construction, before any socket exists, because each one
+describes a caller who believes the connection is protected in a way it is not:
+
+| Passed | Refusal |
+|---|---|
+| `tls_ca_file=...` without `tls=True` | it verifies nothing and the connection would be plain text |
+| `tls_verify=False` without `tls=True` | there is no certificate to decline to check |
+| `tls_ca_file=...` with `tls_verify=False` | a trust anchor nothing consults |
+| `tls=True` with `data_dir=...` | local mode opens no socket |
+
+**If you forget `tls=True` against a TLS port, the connection hangs until `timeout` and then
+raises.** Not a defect and not fixable: this protocol has the server speak first, so your client
+waits for the banner while the server waits for a ClientHello, and until a byte arrives the server
+cannot tell a plaintext client from a slow one. The opposite mistake — `tls=True` against a
+plaintext port — fails immediately with `wrong version number`, because the banner arrives where a
+ServerHello was expected.
+
 #### engine.close()
 
 Shut down / disconnect. Called automatically by context manager.

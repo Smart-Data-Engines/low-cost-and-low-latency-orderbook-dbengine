@@ -33,6 +33,14 @@ static void print_result(const std::string& test, const std::string& status,
 static void apply_auth_from_env(ob::ClientConfig& cfg) {
     if (const char* id = std::getenv("OB_AUTH_IDENTITY")) cfg.auth_identity = id;
     if (const char* sec = std::getenv("OB_AUTH_SECRET"))  cfg.auth_secret = sec;
+
+    // TLS the same way, so every subcommand covers it without four more flags. A CA path is not a
+    // secret, but keeping one mechanism means the harness has one thing to set.
+    if (std::getenv("OB_TLS") != nullptr) cfg.tls = true;
+    if (const char* ca = std::getenv("OB_TLS_CA_FILE")) cfg.tls_ca_file = ca;
+    if (const char* v = std::getenv("OB_TLS_VERIFY")) {
+        cfg.tls_verify = !(std::strcmp(v, "0") == 0);
+    }
 }
 
 // ── Test: ping ───────────────────────────────────────────────────────────────
