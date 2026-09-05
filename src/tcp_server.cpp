@@ -41,32 +41,84 @@ namespace ob {
 /// AUTH is how it authenticates. PING is here so that a load balancer's health check needs no
 /// credentials and reveals nothing about the data. QUIT is here because refusing a client's request
 /// to leave would be absurd, and because a client that cannot leave holds a session slot.
-std::unique_ptr<TlsContext> load_tls_or_exit(const ServerConfig& config) {
-    if (!config.tls_client) {
-        if (!config.tls_cert_file.empty() || !config.tls_key_file.empty()) {
+LoadedTlsContexts load_tls_or_exit(const ServerConfig& config) {
+    LoadedTlsContexts out;
+    const bool any_node_link = config.tls_replication || config.tls_multi_master;
+    const bool any_surface   = config.tls_client || any_node_link;
+
+    if (!any_surface) {
+        if (!config.tls_cert_file.empty() || !config.tls_key_file.empty() ||
+            !config.tls_ca_file.empty()   || !config.tls_peer_names.empty()) {
             // A warning here and a *refusal* in the clients, deliberately, because the two have
             // different innocent explanations. On a server this is a staged rollout: the paths go
-            // into ob.conf on every node first and `tls-client = true` follows, which is the right
-            // way to do it. A client call has no such story - `tls_ca_file` without `tls` is one
+            // into ob.conf on every node first and the surface flags follow, which is the right way
+            // to do it. A client call has no such story - `tls_ca_file` without `tls` is one
             // expression written by someone who believes the connection is encrypted.
-            OB_LOG_WARN("tls", "a certificate or key was given but no --tls-* surface is enabled, "
-                               "so this node listens in plaintext");
+            OB_LOG_WARN("tls", "TLS files or peer names were given but no --tls-* surface is "
+                               "enabled, so this node listens and dials in plaintext");
         }
-        return nullptr;
+        return out;
     }
+
     if (config.tls_cert_file.empty() || config.tls_key_file.empty()) {
-        // Refused rather than falling back: `--tls-client` that quietly meant plaintext is the
+        // Refused rather than falling back: a `--tls-*` flag that quietly meant plaintext is the
         // worst possible outcome of this feature.
-        std::fprintf(stderr, "Error: --tls-client needs both --tls-cert-file and --tls-key-file\n");
+        std::fprintf(stderr, "Error: --tls-client, --tls-replication and --tls-multi-master each "
+                             "need both --tls-cert-file and --tls-key-file\n");
         std::exit(1);
     }
+
+    if (any_node_link && config.tls_ca_file.empty()) {
+        // The one refusal the client port does not have. On a node link both ends are nodes, so
+        // "encrypt and do not check who the peer is" leaves the relay in SECURITY.md open - two
+        // ends each believing they are talking to the cluster - and reads as protection. There is no
+        // fallback to the system trust store either: that would mean every public CA may introduce a
+        // replica.
+        std::fprintf(stderr,
+                     "Error: --tls-replication and --tls-multi-master need --tls-ca-file. A node "
+                     "link verifies its peer's certificate in both directions; without a trust "
+                     "anchor it would encrypt without authenticating, which leaves the relay "
+                     "described in SECURITY.md open.\n");
+        std::exit(1);
+    }
+
+    if (!config.tls_peer_names.empty() && !any_node_link) {
+        OB_LOG_WARN("tls", "--tls-peer-names constrains which peers may connect to a node link, and "
+                           "no node-link surface is enabled");
+    }
+
     try {
-        return std::make_unique<TlsContext>(
-            TlsContext::server(config.tls_cert_file, config.tls_key_file));
+        if (config.tls_client) {
+            out.client_port = std::make_shared<TlsContext>(
+                TlsContext::server(config.tls_cert_file, config.tls_key_file));
+        }
+        if (config.tls_replication) {
+            out.replication_server = std::make_shared<TlsContext>(
+                TlsContext::node_server(config.tls_cert_file, config.tls_key_file,
+                                        config.tls_ca_file, config.tls_peer_names));
+            out.replication_client = std::make_shared<TlsContext>(
+                TlsContext::node_client(config.tls_cert_file, config.tls_key_file,
+                                        config.tls_ca_file, config.tls_peer_names));
+            OB_LOG_INFO("tls", "replication link: TLS 1.3, mutual certificate verification");
+        } else {
+            OB_LOG_INFO("tls", "replication link: plaintext");
+        }
+        if (config.tls_multi_master) {
+            out.mesh_server = std::make_shared<TlsContext>(
+                TlsContext::node_server(config.tls_cert_file, config.tls_key_file,
+                                        config.tls_ca_file, config.tls_peer_names));
+            out.mesh_client = std::make_shared<TlsContext>(
+                TlsContext::node_client(config.tls_cert_file, config.tls_key_file,
+                                        config.tls_ca_file, config.tls_peer_names));
+            OB_LOG_INFO("tls", "multi-master mesh: TLS 1.3, mutual certificate verification");
+        } else {
+            OB_LOG_INFO("tls", "multi-master mesh: plaintext");
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "Error: %s\n", e.what());
         std::exit(1);
     }
+    return out;
 }
 
 LoadedSecrets load_secrets_or_exit(const ServerConfig& config) {
@@ -756,9 +808,13 @@ const std::vector<std::string>& known_flags() {
         "snapshot-chunk-size",
         "snapshot-staging-dir",
         "sqpoll-idle-ms",
+        "tls-ca-file",
         "tls-cert-file",
         "tls-client",
         "tls-key-file",
+        "tls-multi-master",
+        "tls-peer-names",
+        "tls-replication",
         "ttl-hours",
         "ttl-scan-interval-seconds",
         "workers",
@@ -824,9 +880,18 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"snapshot-chunk-size", {"<N>", "Bytes per snapshot transfer chunk"}},
         {"snapshot-staging-dir", {"<DIR>", "Where an incoming snapshot is staged before install"}},
         {"sqpoll-idle-ms", {"<N>", "io_uring SQPOLL idle timeout in ms"}},
-        {"tls-cert-file", {"<PATH>", "Server certificate chain (PEM) for --tls-client"}},
+        {"tls-ca-file", {"<PATH>", "Trust anchor (PEM) for verifying peer certificates on node "
+                                   "links; required by --tls-replication and --tls-multi-master"}},
+        {"tls-cert-file", {"<PATH>", "This node's certificate chain (PEM), used on every TLS "
+                                     "surface and in both roles"}},
         {"tls-client", {"", "TLS on the client port; needs --tls-cert-file and --tls-key-file"}},
-        {"tls-key-file", {"<PATH>", "Server private key (PEM); mode 600"}},
+        {"tls-key-file", {"<PATH>", "This node's private key (PEM); mode 600"}},
+        {"tls-multi-master", {"", "TLS with mutual certificate verification on the multi-master "
+                                  "mesh; needs --tls-ca-file"}},
+        {"tls-peer-names", {"<NAMES>", "Comma-separated identities an accepted peer's certificate "
+                                       "may carry; empty accepts any name this CA signed"}},
+        {"tls-replication", {"", "TLS with mutual certificate verification on the replication "
+                                 "link, in both roles; needs --tls-ca-file"}},
         {"ttl-hours", {"<N>", "Retention in hours; 0 keeps everything"}},
         {"ttl-scan-interval-seconds", {"<N>", "How often retention scans for expired rows"}},
         {"workers", {"<N>", "Number of worker threads (default: 4)"}},
@@ -870,6 +935,8 @@ const std::vector<std::string>& boolean_flags() {
         "read-only",
         "replication-compress",
         "tls-client",
+        "tls-multi-master",
+        "tls-replication",
     };
     return flags;
 }
@@ -1146,8 +1213,27 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.tls_cert_file = std::string{cursor.value()};
         } else if (arg == "--tls-key-file") {
             config.tls_key_file = std::string{cursor.value()};
+        } else if (arg == "--tls-ca-file") {
+            config.tls_ca_file = std::string{cursor.value()};
         } else if (arg == "--tls-client") {
             config.tls_client = true;
+        } else if (arg == "--tls-replication") {
+            config.tls_replication = true;
+        } else if (arg == "--tls-multi-master") {
+            config.tls_multi_master = true;
+        } else if (arg == "--tls-peer-names") {
+            // Comma-separated, the same idiom as --coordinator-endpoints; empty entries skipped.
+            const std::string names{cursor.value()};
+            std::string one;
+            for (char c : names) {
+                if (c == ',') {
+                    if (!one.empty()) config.tls_peer_names.push_back(one);
+                    one.clear();
+                } else {
+                    one.push_back(c);
+                }
+            }
+            if (!one.empty()) config.tls_peer_names.push_back(one);
         } else if (arg == "--auth-secret-file") {
             config.auth_secret_file = std::string{cursor.value()};
         } else if (arg == "--cluster-secret-file") {
@@ -1387,9 +1473,20 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("snapshot-chunk-size", std::to_string(c.snapshot_chunk_size));
     line("snapshot-staging-dir", c.snapshot_staging_dir);
     line("sqpoll-idle-ms", std::to_string(c.uring_sqpoll_idle_ms));
+    line("tls-ca-file", c.tls_ca_file.empty() ? "(none)" : c.tls_ca_file);
     line("tls-cert-file", c.tls_cert_file.empty() ? "(none)" : c.tls_cert_file);
     line("tls-client", c.tls_client ? "true" : "false");
     line("tls-key-file", c.tls_key_file.empty() ? "(none)" : c.tls_key_file);
+    line("tls-multi-master", c.tls_multi_master ? "true" : "false");
+    {
+        std::string joined;
+        for (const auto& n : c.tls_peer_names) {
+            if (!joined.empty()) joined += ",";
+            joined += n;
+        }
+        line("tls-peer-names", joined.empty() ? "(any name the CA signed)" : joined);
+    }
+    line("tls-replication", c.tls_replication ? "true" : "false");
     line("ttl-hours", std::to_string(c.ttl_hours));
     line("ttl-scan-interval-seconds", std::to_string(c.ttl_scan_interval_seconds));
     line("workers", std::to_string(c.worker_threads));
@@ -1408,7 +1505,7 @@ ServerConfig parse_cli_args(int argc, char* argv[]) {
 TcpServer::TcpServer(ServerConfig config)
     : config_(std::move(config))
     , secrets_(load_secrets_or_exit(config_))
-    , tls_ctx_(load_tls_or_exit(config_))
+    , tls_(load_tls_or_exit(config_))
     , read_only_(config_.read_only)
 {
     ReplicationConfig repl_config{};
@@ -1416,6 +1513,7 @@ TcpServer::TcpServer(ServerConfig config)
         repl_config.port = config_.replication_port;
         repl_config.compress = config_.replication_compress;
         repl_config.cluster_secret = secrets_.cluster;
+        repl_config.tls_server = tls_.replication_server;
     }
     // In MM mode, repl_config.port stays 0 → Engine won't create ReplicationManager
 
@@ -1426,6 +1524,7 @@ TcpServer::TcpServer(ServerConfig config)
     repl_client_config.snapshot_chunk_size = config_.snapshot_chunk_size;
     repl_client_config.snapshot_staging_dir = config_.snapshot_staging_dir;
     repl_client_config.cluster_secret = secrets_.cluster;
+    repl_client_config.tls_client     = tls_.replication_client;
 
     FailoverConfig failover_config{};
     if (!config_.coordinator_endpoints.empty()) {
@@ -1467,7 +1566,9 @@ TcpServer::TcpServer(ServerConfig config)
                                                config_.node_id,
                                                "/ob/"
                                            },
-                                           .cluster_secret = secrets_.cluster
+                                           .cluster_secret = secrets_.cluster,
+                                           .tls_server = tls_.mesh_server,
+                                           .tls_client = tls_.mesh_client
                                        });
 }
 
@@ -1732,14 +1833,14 @@ void TcpServer::run() {
                     engine_->registry().increment_gauge("ob_active_sessions");
 
                     Session* s = session_mgr.get_session(client_fd);
-                    if (s && tls_ctx_) {
+                    if (s && tls_.client_port) {
                         // Wrap before anything is written: the banner is application data and must
                         // not precede the handshake. It is queued here and goes out with the first
                         // flush after the handshake completes, which is what send_response() on a
                         // handshaking session does - the bytes sit in send_buf_ and SSL_write is
                         // not reached until tls_handshaking_ clears.
                         try {
-                            s->enable_tls(tls_ctx_->wrap(client_fd, /*server_side=*/true));
+                            s->enable_tls(tls_.client_port->wrap(client_fd, /*server_side=*/true));
                             OB_LOG_DEBUG("tls", "handshake started: fd=%d", client_fd);
                         } catch (const std::exception& e) {
                             OB_LOG_WARN("tls", "cannot start a handshake on fd=%d: %s",

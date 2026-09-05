@@ -218,6 +218,8 @@ TEST(CliConfigStatic, EveryValuelessBooleanDefaultsToFalse) {
         {"read-only",            defaults.read_only},
         {"replication-compress", defaults.replication_compress},
         {"tls-client",           defaults.tls_client},
+        {"tls-multi-master",     defaults.tls_multi_master},
+        {"tls-replication",      defaults.tls_replication},
     };
 
     for (const std::string& key : ob::boolean_flags()) {

@@ -1104,6 +1104,85 @@ Learned the hard way. Check here before debugging.
     signal and it does not move with the scheduler. Both mutations still fail the rebuilt test, and
     through different assertions — the gauge for one, `bad write retry` for the other.
 
+134. **`send_all()` on a non-blocking socket reads the first `EAGAIN` as a dead peer, and it
+    dropped a replica in the middle of every catch-up bigger than a socket buffer.** The helper is
+    correct on the *replica's* blocking socket, where `EAGAIN` means the `SO_RCVTIMEO` deadline
+    expired; on the primary's accepted sockets it means "come back later". `send_to_replica()` -
+    the only sender in the catch-up path - used it, so the replica was removed, reconnected, asked
+    for the same range and was removed again. **Measured: 17 270 of 40 000 records delivered**, then
+    `send_to_replica failed for fd=7, marking disconnected`.
+
+    Not a TLS defect and not introduced by series D - **found** by it, because "where does this code
+    put `SSL_ERROR_WANT_WRITE`" has the same answer as "where does it put `EAGAIN`": nowhere. Every
+    write to a replica now goes through `enqueue_send()` and the EPOLLOUT drain, which is the only
+    shape in which a socket saying "later" has somewhere to say it. The ceiling still drops a replica
+    that is not draining, at 16 MB of queued output instead of one socket buffer; #93 is the cursor
+    that removes the reconnects.
+
+135. **A test that needs a full socket buffer needs that buffer's *measured* capacity, not a
+    generous-looking number.** The first version of the catch-up test wrote 2 MB and **passed
+    against the defect**: with neither side setting a buffer size, this loopback pair absorbs
+    **2.6 MB** before the sender first sees `EAGAIN` (539 of 1600 records got through). Shrinking the
+    receiver to `SO_RCVBUF=4096` reproduced it reliably and made the test take **49 seconds**, because
+    2 MB through a 2 kB window is one delayed ACK per few kilobytes. 8 MB of WAL and no window tricks
+    reproduces it in 0.66 s. Pitfall 123 from the other side: a probe that does not reproduce the
+    shape says "no defect" in the same voice as one under which there is none.
+
+    Second half, on setup cost: **wide records, not many records.** 40 000 one-level appends took
+    ~60 s of the test's runtime; 1600 appends of 200 levels put the same bytes on the wire in a
+    fortieth of the time.
+
+136. **On a mutual TLS link the accepting end has no name to expect, and that is a design question
+    rather than an omission.** After `accept()` the only fact about the peer is its source address.
+    Matching the certificate against *that* sounds strong and breaks on the first `DNS:`-only
+    certificate, behind NAT and behind a proxy - it turns "TLS on" into "the cluster does not form" -
+    and puts a reverse lookup in the accept path. Chain-only is genuinely sufficient **when the CA
+    signs nothing but this cluster**, because every holder of a signed certificate then already has
+    the cluster secret and the whole WAL; with a corporate CA the same sentence means every host in
+    the organisation may become a replica.
+
+    So the answer is a mechanism, not a paragraph: `--tls-peer-names` is an identity allowlist, empty
+    means chain-only, and **the startup log says which of the two is in force**. A weaker mode that
+    is not visible is the one that ends up on production - part one paid for the mirror image of
+    this, a log line claiming a guarantee nothing enforced (pitfall 112).
+
+137. **A verification check placed after the handshake runs after OpenSSL has already buffered the
+    peer's decrypted bytes.** The peer-name allowlist could have been checked by the caller; that
+    would be four call sites across two event loops, each needing to refuse *before* touching the
+    receive buffer, and one forgotten `if` means a peer whose certificate we rejected feeding frames
+    to the parser. It lives inside `TlsChannel::continue_handshake()`'s success path instead and
+    fails the handshake, which makes the gate impossible to forget rather than merely present -
+    the same move as part one putting the client gate before the `switch` instead of in every
+    `case` (pitfall 109).
+
+138. **A harness that builds one command line in two places drifts, and the comment warning about
+    one flag is the tell.** `ClusterManager.restart_node()` constructed its own argv and had never
+    learned about `--cluster-secret-file`, so a restarted node in an authenticated cluster came back
+    **without the cluster secret** and was refused by its peers - which reads as a replication
+    defect. Series D found it with `--tls-*`: the restarted replica connected in plaintext and its
+    log said `Connection reset by peer` with no TLS line above it. Sitting next to the old copy was a
+    comment explaining that `--multi-master` had to be repeated there "or the test that noticed would
+    look like a convergence bug" - correct about one flag while three others were missing. One
+    `_node_argv()` now; same family as pitfall 77.
+
+139. **Per-connection state belongs behind a `shared_ptr` when its record lives in a container that
+    moves.** `replicas_` is a `std::vector<ReplicaInfo>` whose `push_back` moves its elements;
+    `peers_` is a map in which a `PeerConnection` **changes key** after the handshake by
+    erase-and-move; and `replica_states()` / `peer_states()` return *copies* for `STATUS`. A
+    by-value TLS member holding any pointer into its own record - the reader pointing at the
+    channel, say - dangles from the first reallocation, and the symptom is corrupt bytes on the
+    sixth replica rather than anything that reads as a lifetime bug. One heap object with a
+    reference count survives all three, and a copy made for `STATUS` reports on the connection it is
+    actually about.
+
+140. **On an edge-triggered loop, read until the TLS layer says it has nothing - not until the
+    socket does.** OpenSSL reads a whole record, up to 16 kB, decrypts it into its own buffer and
+    returns only what was asked for, so a socket-level `EAGAIN` can arrive with decrypted bytes still
+    pending and no further epoll event coming. `SSL_read` returning `WANT_READ` cannot. The
+    replication reader keeps `::recv` semantics for its two callers by mapping a want onto
+    `errno == EAGAIN`, and exposes `io_want()` separately - because the thing errno cannot carry is
+    *which* want, and a read waiting to **write** needs EPOLLOUT rather than readability.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

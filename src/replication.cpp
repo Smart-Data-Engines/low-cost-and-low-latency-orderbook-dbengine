@@ -197,16 +197,30 @@ static std::string wal_filename(const std::string& dir, uint32_t index) {
     return dir + "/" + buf;
 }
 
-/// Send all bytes, handling partial writes. Returns true on success.
-static bool send_all(int fd, const void* data, size_t len) {
+/// Send all bytes on a **blocking** socket, handling partial writes. True on success.
+///
+/// `ReplicationClient` only, and the qualifier is the whole point. On a blocking socket EAGAIN means
+/// the `SO_RCVTIMEO`/`SO_SNDTIMEO` deadline expired, which is a genuine failure; on the *primary's*
+/// non-blocking replica sockets it means "come back later", and treating it as failure dropped a
+/// replica in the middle of catch-up (series D §16). The primary side therefore has no
+/// write-it-now helper at all: everything it sends goes through `enqueue_send()` and the EPOLLOUT
+/// drain, which is the only shape in which a socket saying "later" has somewhere to say it - and the
+/// same shape TLS needs for `SSL_ERROR_WANT_WRITE`.
+static bool blocking_send_all(int fd, TlsChannel* tls, const void* data, size_t len) {
+    if (tls != nullptr) {
+        std::string why;
+        const int rc = tls_blocking_write_all(tls->raw(), static_cast<const char*>(data), len, &why);
+        if (rc != 1) {
+            OB_LOG_WARN("repl_client", "TLS write of %zu bytes failed: %s", len, why.c_str());
+            return false;
+        }
+        return true;
+    }
     const auto* ptr = static_cast<const uint8_t*>(data);
     size_t remaining = len;
     while (remaining > 0) {
         ssize_t n = ::send(fd, ptr, remaining, MSG_NOSIGNAL);
         if (n <= 0) {
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                return false;
-            }
             return false;
         }
         ptr += n;
@@ -218,6 +232,12 @@ static bool send_all(int fd, const void* data, size_t len) {
 /// Maximum per-replica send buffer size before we consider the replica too slow
 /// and disconnect it. 16 MB is generous for WAL streaming.
 static constexpr size_t MAX_SEND_BUF_SIZE = 16 * 1024 * 1024;
+
+/// How much catch-up output accumulates before it is pushed towards the socket.
+///
+/// Roughly one default socket send buffer, so a replica that is reading keeps the queue at this
+/// order of magnitude rather than at the size of the requested WAL range.
+static constexpr size_t kCatchupDrainThreshold = 256 * 1024;
 
 } // anonymous namespace
 
@@ -441,6 +461,7 @@ void ReplicationManager::stop() {
         std::lock_guard<std::mutex> lock(mtx_);
         for (auto& r : replicas_) {
             if (r.fd >= 0) {
+                if (r.tls != nullptr) r.tls->shutdown();
                 ::close(r.fd);
                 r.fd = -1;
             }
@@ -522,6 +543,86 @@ bool ReplicationManager::snapshot_active() const {
     return false;
 }
 
+ssize_t BufferedReader::pull(void* dst, size_t len) {
+    if (tls_ == nullptr) return ::recv(fd_, dst, len, 0);
+
+    size_t got = 0;
+    switch (tls_->read(dst, len, got)) {
+    case TlsChannel::Io::Data:
+        return static_cast<ssize_t>(got);
+    case TlsChannel::Io::Closed:
+        return 0;
+    case TlsChannel::Io::Again:
+        // Both wants collapse to EAGAIN here, which is what makes this a drop-in for `::recv`. The
+        // one that does not collapse is `io_want()`, and an edge-triggered caller has to read it:
+        // a TLS *read* waiting to write needs EPOLLOUT, not readability.
+        errno = EAGAIN;
+        return -1;
+    case TlsChannel::Io::Error:
+        break;
+    }
+    errno = EIO;
+    return -1;
+}
+
+void ReplicationManager::arm_epollout(const ReplicaInfo& replica) {
+    if (epoll_fd_ < 0 || replica.fd < 0) return;
+    struct epoll_event ev{};
+    ev.events  = EPOLLIN | EPOLLOUT | EPOLLET;
+    ev.data.fd = replica.fd;
+    ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, replica.fd, &ev);
+}
+
+void ReplicationManager::disarm_epollout(const ReplicaInfo& replica) {
+    if (epoll_fd_ < 0 || replica.fd < 0) return;
+    struct epoll_event ev{};
+    ev.events  = EPOLLIN | EPOLLET;
+    ev.data.fd = replica.fd;
+    ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, replica.fd, &ev);
+}
+
+ReplicaInfo* ReplicationManager::find_replica_locked(int fd) {
+    for (auto& r : replicas_) {
+        if (r.fd == fd) return &r;
+    }
+    return nullptr;
+}
+
+bool ReplicationManager::advance_tls_handshake(ReplicaInfo& replica) {
+    if (replica.tls == nullptr || !replica.tls->handshaking()) return true;
+
+    if (!replica.tls->continue_handshake()) return false;
+    if (replica.tls->handshaking()) {
+        // Not finished. Arm what OpenSSL asked for rather than what the event was: a handshake with
+        // ServerHello to send needs writability even though this side never called write.
+        if (replica.tls->io_want() == IoWant::Write) arm_epollout(replica);
+        else                                        disarm_epollout(replica);
+        return true;
+    }
+
+    replica.identity = replica.tls->identity();
+    OB_LOG_INFO("repl_mgr", "replica fd=%d from %s authenticated by certificate: %s",
+                replica.fd, replica.address.c_str(), replica.identity.c_str());
+    publish_tls_gauge();
+    // Whatever was queued before the handshake - the challenge, on an authenticating link - goes out
+    // now. This is the flush the accept path deliberately did not perform.
+    return drain_send_buffer(replica);
+}
+
+void ReplicationManager::publish_tls_gauge() {
+    if (engine_ == nullptr) return;
+    size_t verified = 0;
+    for (const auto& r : replicas_) {
+        if (r.fd >= 0 && r.tls != nullptr && !r.tls->handshaking()) ++verified;
+    }
+    engine_->registry().set_gauge("ob_replicas_tls_verified", static_cast<int64_t>(verified));
+}
+
+void ReplicationManager::enqueue_and_flush(ReplicaInfo& replica, const void* data, size_t len) {
+    enqueue_send(replica, data, len);
+    drain_send_buffer(replica);
+}
+
 void ReplicationManager::enqueue_send(ReplicaInfo& replica, const void* data, size_t len) {
     const bool was_empty = replica.send_buf.empty();
     const auto* bytes = static_cast<const uint8_t*>(data);
@@ -538,6 +639,11 @@ void ReplicationManager::enqueue_send(ReplicaInfo& replica, const void* data, si
 }
 
 bool ReplicationManager::drain_send_buffer(ReplicaInfo& replica) {
+    return replica.tls == nullptr ? drain_send_buffer_plain(replica)
+                                  : drain_send_buffer_tls(replica);
+}
+
+bool ReplicationManager::drain_send_buffer_plain(ReplicaInfo& replica) {
     while (!replica.send_buf.empty()) {
         ssize_t n = ::send(replica.fd, replica.send_buf.data(),
                            replica.send_buf.size(), MSG_NOSIGNAL);
@@ -557,12 +663,40 @@ bool ReplicationManager::drain_send_buffer(ReplicaInfo& replica) {
     }
 
     // Buffer fully drained — disarm EPOLLOUT to avoid busy-spinning.
-    if (epoll_fd_ >= 0) {
-        struct epoll_event ev{};
-        ev.events  = EPOLLIN | EPOLLET;
-        ev.data.fd = replica.fd;
-        ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, replica.fd, &ev);
+    disarm_epollout(replica);
+    return true;
+}
+
+bool ReplicationManager::drain_send_buffer_tls(ReplicaInfo& replica) {
+    // The handshake has one owner, and it is advance_tls_handshake(). Writing here while it runs
+    // would work — OpenSSL lets a write drive a handshake — and that is exactly the accident series
+    // C shipped a comment about (pitfall 130): two functions advancing one state machine.
+    if (replica.tls->handshaking()) return true;
+
+    while (!replica.send_buf.empty()) {
+        size_t sent = 0;
+        const TlsChannel::Io r =
+            replica.tls->write(replica.send_buf.data(), replica.send_buf.size(), sent);
+        if (r == TlsChannel::Io::Data) {
+            // This erase moves the *pending* bytes to a lower address in the same allocation, which
+            // is a different address — so a retry after WANT_WRITE presents a pointer OpenSSL did
+            // not see before, and refuses it with `bad write retry` unless
+            // SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER is set. Every context this engine builds sets it.
+            replica.send_buf.erase(replica.send_buf.begin(),
+                                   replica.send_buf.begin() + static_cast<ptrdiff_t>(sent));
+            continue;
+        }
+        if (r == TlsChannel::Io::Again) {
+            // WANT_WRITE arms EPOLLOUT. WANT_READ must not: the socket is writable and OpenSSL is
+            // waiting to read, so arming it spins the loop (pitfall 5). handle_replica_data() retries
+            // the drain for that case, which is the fourth of the four combinations.
+            if (replica.tls->io_want() == IoWant::Write) arm_epollout(replica);
+            return true;
+        }
+        return false;   // Closed or Error, both already logged by the channel
     }
+
+    disarm_epollout(replica);
     return true;
 }
 
@@ -575,6 +709,13 @@ void ReplicationManager::remove_replica_locked(int fd) {
                     "work will finish and the result will be discarded",
                     fd, static_cast<unsigned long long>(snapshot_prepare_.token));
         snapshot_prepare_.active = false;
+    }
+
+    // close_notify before the descriptor goes, so the replica's read reports a clean close rather
+    // than a truncation it cannot tell from a network fault. Best effort: on a socket that is
+    // already gone this does nothing, which is why it is not checked.
+    if (ReplicaInfo* r = find_replica_locked(fd); r != nullptr && r->tls != nullptr) {
+        r->tls->shutdown();
     }
 
     ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
@@ -614,6 +755,21 @@ void ReplicationManager::run_loop() {
             if (fd == listen_fd_) {
                 accept_replica();
                 continue;
+            }
+
+            // A handshake in progress consumes this event and nothing else. Not one byte of
+            // application data may be read before it finishes: a frame arriving earlier would be a
+            // frame from a transport that has not proved who it is, and the cluster-secret gate is a
+            // different mechanism that knows nothing about TLS.
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                ReplicaInfo* r = find_replica_locked(fd);
+                if (r != nullptr && r->tls != nullptr && r->tls->handshaking()) {
+                    if (!advance_tls_handshake(*r)) {
+                        disconnect_replica_locked(fd, "tls handshake failed");
+                    }
+                    continue;
+                }
             }
 
             // Handle EPOLLOUT: drain send buffer and continue snapshot transfer.
@@ -709,9 +865,18 @@ void ReplicationManager::accept_replica() {
             if (static_cast<int>(replicas_.size()) >= config_.max_replicas) {
                 OB_LOG_WARN("repl_mgr", "max replicas reached (%d), rejecting fd=%d",
                             config_.max_replicas, client_fd);
-                const char* msg = "ERR max_replicas_reached\n";
-                auto wr = ::write(client_fd, msg, std::strlen(msg));
-                (void)wr;
+                // The one raw socket write left on this side, and only when TLS is off. The peer
+                // has negotiated nothing yet, so a plaintext line would arrive where a ServerHello
+                // is expected and the replica would report `wrong version number` - the reason
+                // rather than a red herring, but a worse message than none. Completing a handshake
+                // in order to refuse would also be a handshake performed on demand for an
+                // unauthenticated peer. The reason is in this node's log, which is where an
+                // operator looks for it.
+                if (config_.tls_server == nullptr) {
+                    const char* msg = "ERR max_replicas_reached\n";
+                    auto wr = ::write(client_fd, msg, std::strlen(msg));
+                    (void)wr;
+                }
                 ::close(client_fd);
                 continue;
             }
@@ -737,6 +902,25 @@ void ReplicationManager::accept_replica() {
         info.compress         = false;
         info.reader.set_fd(client_fd);
 
+        // TLS before the record joins the list, so a channel that cannot even be created never
+        // becomes a replica. `set_tls` after `set_fd`, because `set_fd` clears the channel - it is
+        // the "this reader now belongs to a different connection" call.
+        if (config_.tls_server != nullptr) {
+            try {
+                info.tls = config_.tls_server->open_channel(client_fd, /*server_side=*/true,
+                                                            info.address);
+                info.reader.set_tls(info.tls);
+                OB_LOG_DEBUG("repl_mgr", "tls handshake started for replica fd=%d from %s",
+                             client_fd, info.address.c_str());
+            } catch (const std::exception& e) {
+                OB_LOG_WARN("repl_mgr", "cannot start a TLS handshake for fd=%d from %s: %s",
+                            client_fd, info.address.c_str(), e.what());
+                ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr);
+                ::close(client_fd);
+                continue;
+            }
+        }
+
         std::lock_guard<std::mutex> lock(mtx_);
 
         // NOTE: We only set the compress flag here. The actual COMPRESS LZ4 directive
@@ -758,13 +942,12 @@ void ReplicationManager::accept_replica() {
             ReplicaInfo& r = replicas_.back();
             r.auth_nonce = generate_nonce_hex();
             const std::string line = "CHALLENGE " + r.auth_nonce + "\n";
-            if (!send_all(r.fd, line.data(), line.size())) {
-                OB_LOG_WARN("repl_mgr", "failed to send challenge to replica fd=%d from %s",
-                            r.fd, r.address.c_str());
-            } else {
-                OB_LOG_INFO("repl_mgr", "challenged replica fd=%d from %s", r.fd,
-                            r.address.c_str());
-            }
+            // Queued, not written. Under TLS the handshake has not finished at this point, so the
+            // drain returns early and these bytes go out with the first flush afterwards - exactly
+            // how the client port's banner works. Without TLS the drain sends them here.
+            enqueue_send(r, line.data(), line.size());
+            drain_send_buffer(r);
+            OB_LOG_INFO("repl_mgr", "challenged replica fd=%d from %s", r.fd, r.address.c_str());
         }
     }
 }
@@ -783,6 +966,11 @@ void ReplicationManager::handle_replica_data(int fd) {
         }
     }
     if (!replica_ptr) return;
+
+    // Nothing may reach the parser while the handshake is running; run_loop() consumes that event
+    // before it gets here, and this is the second half of the same statement, for a caller that
+    // reaches this function some other way.
+    if (replica_ptr->tls != nullptr && replica_ptr->tls->handshaking()) return;
 
     while (true) {
         ssize_t n = replica_ptr->reader.read_line(buf, sizeof(buf));
@@ -821,7 +1009,7 @@ void ReplicationManager::handle_replica_data(int fd) {
                 "AUTH " + auth_response(config_.cluster_secret.sole().secret,
                                         AuthSurface::Replication, AuthRole::Acceptor, "",
                                         nonce) + "\n";
-            send_all(fd, answer.data(), answer.size());
+            enqueue_and_flush(*replica_ptr, answer.data(), answer.size());
             continue;
         }
 
@@ -840,13 +1028,13 @@ void ReplicationManager::handle_replica_data(int fd) {
                     OB_LOG_ERROR("repl_mgr", "replica fd=%d from %s failed authentication",
                                  fd, replica_ptr->address.c_str());
                     const char* err = "ERR unauthenticated\n";
-                    send_all(fd, err, std::strlen(err));
+                    enqueue_and_flush(*replica_ptr, err, std::strlen(err));
                     disconnect_replica_locked(fd, "authentication failed");
                     return;
                 }
                 replica_ptr->peer_proved = true;
                 const char* ok = "OK AUTH\n";
-                send_all(fd, ok, std::strlen(ok));
+                enqueue_and_flush(*replica_ptr, ok, std::strlen(ok));
                 OB_LOG_INFO("repl_mgr", "replica fd=%d from %s authenticated",
                             fd, replica_ptr->address.c_str());
                 continue;
@@ -859,7 +1047,7 @@ void ReplicationManager::handle_replica_data(int fd) {
                          fd, replica_ptr->address.c_str(),
                          sanitise_for_log(line, 32).c_str());
             const char* err = "ERR unauthenticated\n";
-            send_all(fd, err, std::strlen(err));
+            enqueue_and_flush(*replica_ptr, err, std::strlen(err));
             disconnect_replica_locked(fd, "unauthenticated");
             return;
         }
@@ -877,8 +1065,7 @@ void ReplicationManager::handle_replica_data(int fd) {
                 // Stale-primary check: if replica's epoch > our epoch, reject (Requirement 3.4).
                 if (parsed == 3 && replica_epoch > wal_.current_epoch()) {
                     const char* err = "ERR STALE_PRIMARY\n";
-                    auto wr = ::write(replica_ptr->fd, err, std::strlen(err));
-                    (void)wr;
+                    enqueue_and_flush(*replica_ptr, err, std::strlen(err));
                     remove_replica_locked(fd);
                     for (auto it = replicas_.begin(); it != replicas_.end(); ++it) {
                         if (it->fd == fd) {
@@ -897,7 +1084,7 @@ void ReplicationManager::handle_replica_data(int fd) {
                 // This must come AFTER catchup because catchup sends plain text.
                 if (replica_ptr->compress && replica_ptr->fd >= 0) {
                     const char* directive = "COMPRESS LZ4\n";
-                    send_all(replica_ptr->fd, directive, std::strlen(directive));
+                    enqueue_and_flush(*replica_ptr, directive, std::strlen(directive));
                     OB_LOG_INFO("replication", "sent COMPRESS LZ4 to replica fd=%d after catchup", fd);
                 }
             }
@@ -923,6 +1110,20 @@ void ReplicationManager::handle_replica_data(int fd) {
 
         // Unknown message — ignore.
     }
+
+    // The fourth of the four combinations, and the one whose absence looks like a wedged peer.
+    // A TLS *read* can leave OpenSSL wanting to write - a key update - and a TLS *write* can leave
+    // it wanting to read, in which case the drain deliberately did not arm EPOLLOUT because the
+    // socket is already writable. Either way the retry has to happen on a readable event, which is
+    // this one, and there is no other path back into the drain.
+    replica_ptr = find_replica_locked(fd);
+    if (replica_ptr == nullptr || replica_ptr->tls == nullptr) return;
+    if (replica_ptr->reader.io_want() == IoWant::Write) {
+        arm_epollout(*replica_ptr);
+    }
+    if (!replica_ptr->send_buf.empty() && !drain_send_buffer(*replica_ptr)) {
+        disconnect_replica_locked(fd, "tls write failed");
+    }
 }
 
 void ReplicationManager::send_to_replica(ReplicaInfo& replica, const WALRecord& hdr,
@@ -945,9 +1146,40 @@ void ReplicationManager::send_to_replica(ReplicaInfo& replica, const WALRecord& 
         std::memcpy(msg.data() + line_len + sizeof(WALRecord), payload, payload_len);
     }
 
-    if (!send_all(replica.fd, msg.data(), msg.size())) {
-        OB_LOG_WARN("repl_mgr", "send_to_replica failed for fd=%d, marking disconnected", replica.fd);
-        // Mark fd as -1; caller should clean up.
+    // Queued rather than written, and this is the fix for a defect older than TLS (series D §16).
+    // This used to be `send_all()` on a **non-blocking** socket, so the first EAGAIN - which arrives
+    // as soon as the socket send buffer fills, measured at about 208 kB - was read as a dead replica
+    // and dropped it mid catch-up. It then reconnected, asked for the same range and was dropped
+    // again. Measured before the change: 17 270 of 40 000 records delivered, then
+    // `send_to_replica failed`.
+    enqueue_send(replica, msg.data(), msg.size());
+
+    // The ceiling still applies, and reaching it still drops the replica - what changed is that it
+    // is reached at 16 MB of queued output rather than at one socket buffer. A replica behind by
+    // more than that reconnects and resumes from the position it has confirmed, so progress is
+    // monotonic in 16 MB steps. The cursor that would remove the reconnects is roadmap #93.
+    if (replica.send_buf.size() > MAX_SEND_BUF_SIZE) {
+        OB_LOG_WARN("repl_mgr",
+                    "replica fd=%d is not draining during catch-up: send_buf=%zu > %zu - dropping "
+                    "the connection so it reconnects and resumes from its confirmed position",
+                    replica.fd, replica.send_buf.size(), MAX_SEND_BUF_SIZE);
+        remove_replica_locked(replica.fd);
+        replica.fd = -1;
+        return;
+    }
+
+    // Push what the socket will take, but not once per record: `enqueue_send()` arms EPOLLOUT when
+    // the queue was empty and a completed drain disarms it, so draining after every record would
+    // cost two `epoll_ctl` calls per WAL record - worse than the one `send` this replaced. A
+    // threshold of about one socket buffer keeps the queue at a few hundred kilobytes against a
+    // replica that is reading, and lets it grow to the 16 MB ceiling only against one that is not.
+    //
+    // Without any drain here the whole requested range would be queued before a byte moved, so the
+    // ceiling above would be reached by any catch-up over 16 MB even against a fast replica.
+    if (replica.send_buf.size() < kCatchupDrainThreshold) return;
+    if (!drain_send_buffer(replica)) {
+        OB_LOG_WARN("repl_mgr", "replica fd=%d failed during catch-up, marking disconnected",
+                    replica.fd);
         remove_replica_locked(replica.fd);
         replica.fd = -1;
     }
@@ -970,7 +1202,7 @@ void ReplicationManager::handle_catchup(ReplicaInfo& replica, uint32_t from_file
             // File doesn't exist — WAL has been truncated (Requirement 6.3).
             if (fi == from_file) {
                 const char* err = "ERR WAL_TRUNCATED\n";
-                send_all(replica.fd, err, std::strlen(err));
+                enqueue_and_flush(replica, err, std::strlen(err));
                 OB_LOG_INFO("repl_mgr", "sent ERR WAL_TRUNCATED to replica fd=%d", replica.fd);
                 return;
             }
@@ -984,7 +1216,7 @@ void ReplicationManager::handle_catchup(ReplicaInfo& replica, uint32_t from_file
             if (pos < 0) {
                 ::close(fd);
                 const char* err = "ERR WAL_TRUNCATED\n";
-                send_all(replica.fd, err, std::strlen(err));
+                enqueue_and_flush(replica, err, std::strlen(err));
                 return;
             }
         }
@@ -1031,6 +1263,12 @@ void ReplicationManager::handle_catchup(ReplicaInfo& replica, uint32_t from_file
 
         done_file:
         ::close(fd);
+    }
+    if (replica.fd >= 0 && !replica.send_buf.empty() && !drain_send_buffer(replica)) {
+        OB_LOG_WARN("repl_mgr", "replica fd=%d failed while flushing the catch-up tail", replica.fd);
+        remove_replica_locked(replica.fd);
+        replica.fd = -1;
+        return;
     }
     OB_LOG_INFO("repl_mgr", "catchup complete for fd=%d", replica.fd);
 }
@@ -1330,8 +1568,16 @@ void ReplicationClient::close_socket() {
     std::lock_guard<std::mutex> lk(fd_mtx_);
     const int fd = fd_.exchange(-1, std::memory_order_acq_rel);
     if (fd >= 0) {
+        // close_notify first, so the primary's read reports a clean close. Under the same mutex as
+        // the descriptor: the channel holds the `SSL` bound to it, and shutting one down after the
+        // number has been reused would write into somebody else's connection.
+        if (tls_ != nullptr) tls_->shutdown();
         ::close(fd);
     }
+    // The channel belongs to the connection, not to this object, so it goes with it. Left in place
+    // it would be handed to the next connection's reader and decrypt with the previous session's
+    // keys - a failure that reads as corruption rather than as a lifetime mistake.
+    tls_.reset();
 }
 
 ReplicationClient::State ReplicationClient::state() const {
@@ -1413,6 +1659,35 @@ void ReplicationClient::connect_to_primary() {
     // Initialize the buffered reader for this connection.
     reader_.set_fd(fd_);
 
+    // ── TLS (#30 part three, series D) ────────────────────────────────────────
+    //
+    // Before authentication and before REPLICATE, because everything after this point is
+    // application data. The handshake is blocking here - this client has its own thread and a
+    // 5-second `SO_RCVTIMEO`, so a primary that accepts TCP and then says nothing is a transient
+    // failure that `run_loop()` retries, not a stalled event loop.
+    if (config_.tls_client != nullptr) {
+        tls_ = config_.tls_client->open_channel(fd_, /*server_side=*/false, config_.primary_host);
+        // The name check, and it is not what SSL_VERIFY_PEER does. Without it any certificate this
+        // CA signed authenticates any host, so with a private CA signing the cluster another node's
+        // certificate would be accepted here and the relay in SECURITY.md would still work
+        // (pitfall 124).
+        if (!tls_expect_host(tls_->raw(), config_.primary_host)) {
+            close_socket();
+            throw std::runtime_error("ReplicationClient: cannot require the primary's certificate "
+                                     "to cover " + config_.primary_host);
+        }
+        std::string why;
+        if (!tls_->blocking_handshake(&why)) {
+            close_socket();
+            throw std::runtime_error("ReplicationClient: TLS handshake with " +
+                                     config_.primary_host + " failed: " + why);
+        }
+        reader_.set_tls(tls_);
+        OB_LOG_INFO("repl_client", "TLS established with primary %s:%u, certificate cn=%s",
+                    config_.primary_host.c_str(), config_.primary_port,
+                    tls_->identity().c_str());
+    }
+
     // Reset compression flag for new connection.
     compress_ = false;
 
@@ -1437,7 +1712,7 @@ void ReplicationClient::connect_to_primary() {
                             confirmed_file_.load(std::memory_order_relaxed),
                             confirmed_offset_.load(std::memory_order_relaxed),
                             local_epoch_.load(std::memory_order_relaxed));
-    if (!send_all(fd_, handshake, static_cast<size_t>(len))) {
+    if (!blocking_send_all(fd_, tls_.get(), handshake, static_cast<size_t>(len))) {
         close_socket();
         throw std::runtime_error("ReplicationClient: failed to send handshake");
     }
@@ -1476,12 +1751,12 @@ bool ReplicationClient::authenticate_with_primary() {
     //    arrive in a known order.
     const std::string our_nonce = generate_nonce_hex();
     const std::string our_challenge = "CHALLENGE " + our_nonce + "\n";
-    if (!send_all(fd_, our_challenge.data(), our_challenge.size())) return false;
+    if (!blocking_send_all(fd_, tls_.get(), our_challenge.data(), our_challenge.size())) return false;
 
     const std::string answer =
         "AUTH " + auth_response(secret, AuthSurface::Replication, AuthRole::Initiator, "",
                                 primary_nonce) + "\n";
-    if (!send_all(fd_, answer.data(), answer.size())) return false;
+    if (!blocking_send_all(fd_, tls_.get(), answer.data(), answer.size())) return false;
 
     // 3. The primary's answer to our challenge. Verified before REPLICATE goes out: a primary that
     //    cannot prove itself must not be handed our WAL position, and must not be trusted with the
@@ -1833,7 +2108,7 @@ void ReplicationClient::send_ack() {
     int len = std::snprintf(ack, sizeof(ack), "ACK %u %zu\n",
                             confirmed_file_.load(std::memory_order_relaxed),
                             confirmed_offset_.load(std::memory_order_relaxed));
-    send_all(fd_, ack, static_cast<size_t>(len));
+    blocking_send_all(fd_, tls_.get(), ack, static_cast<size_t>(len));
 }
 
 void ReplicationClient::save_state() {
@@ -1892,7 +2167,7 @@ void ReplicationClient::request_and_receive_snapshot() {
 
     // Send SNAPSHOT_REQUEST.
     const char* req = "SNAPSHOT_REQUEST\n";
-    if (!send_all(fd_, req, std::strlen(req))) {
+    if (!blocking_send_all(fd_, tls_.get(), req, std::strlen(req))) {
         bootstrapping_.store(false, std::memory_order_release);
         return;
     }

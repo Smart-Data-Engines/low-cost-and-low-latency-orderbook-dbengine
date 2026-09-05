@@ -33,19 +33,31 @@ IoUringServer::IoUringServer(ServerConfig config)
 {
     // ── TLS is not supported on this transport, and the refusal is the feature ───────────
     //
-    // Receive is in userspace whether or not kernel TLS is available - measured, this OpenSSL
-    // negotiates kTLS on transmit only for TLS 1.3 (benchmarks/tls/, requirements §1.2) - so this
-    // loop would need memory BIOs, which is a rewrite of the fast path that exists to be fast
-    // (PING 24 us against 45 us on epoll).
+    // For the **client port** the reason is technical: receive is in userspace whether or not kernel
+    // TLS is available - measured, this OpenSSL negotiates kTLS on transmit only for TLS 1.3
+    // (benchmarks/tls/, requirements §1.2) - so this loop would need memory BIOs, which is a rewrite
+    // of the fast path that exists to be fast (PING 24 us against 45 us on epoll).
     //
-    // Refusing beats ignoring by a wide margin: `--tls-client` that quietly meant plaintext would
-    // be the single worst outcome this feature can produce, and it would look identical to working.
-    if (config_.tls_client || !config_.tls_cert_file.empty() || !config_.tls_key_file.empty()) {
+    // For the **node links** it is not technical, and saying so is the honest version. Replication
+    // and the mesh have their own epoll loops, unchanged by this transport, so `--tls-replication`
+    // and `--tls-multi-master` would work in this build. They are refused anyway because **no CI job
+    // builds this file**: a surface that "should work" here is a surface nobody has run, and
+    // `--tls-*` must never be the flag that turns out to mean plaintext. Narrowing this refusal is a
+    // reasonable thing to do on the day this transport gets a job of its own.
+    //
+    // Refusing beats ignoring by a wide margin either way: a `--tls-*` flag that quietly meant
+    // plaintext would be the single worst outcome this feature can produce, and it would look
+    // identical to working.
+    if (config_.tls_client || config_.tls_replication || config_.tls_multi_master ||
+        !config_.tls_cert_file.empty() || !config_.tls_key_file.empty() ||
+        !config_.tls_ca_file.empty() || !config_.tls_peer_names.empty()) {
         std::fprintf(stderr,
                      "Error: TLS is not supported on the io_uring transport (--tls-client, "
-                     "--tls-cert-file, --tls-key-file). Receive stays in userspace even with "
-                     "kernel TLS, so this loop needs a memory-BIO rewrite; see roadmap #30 part "
-                     "three. Build without OB_USE_IO_URING to use TLS.\n");
+                     "--tls-replication, --tls-multi-master, --tls-cert-file, --tls-key-file, "
+                     "--tls-ca-file, --tls-peer-names). Receive stays in userspace even with "
+                     "kernel TLS, so the client port needs a memory-BIO rewrite; the node links "
+                     "would work here and are refused because no CI job builds this transport. "
+                     "See roadmap #30 part three. Build without OB_USE_IO_URING to use TLS.\n");
         std::exit(1);
     }
 

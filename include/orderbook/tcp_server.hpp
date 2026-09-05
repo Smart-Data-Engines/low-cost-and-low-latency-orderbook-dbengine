@@ -102,6 +102,34 @@ struct ServerConfig {
     /// to start without them rather than listening in plaintext.
     bool tls_client{false};
 
+    // ── Node links (series D) ─────────────────────────────────────────────────
+    //
+    // On a node link TLS is always mutual: both ends present a certificate and both verify. There
+    // is deliberately no flag for "encrypt but do not verify the peer" - that configuration leaves
+    // the man-in-the-middle relay described in SECURITY.md open while looking like protection, and
+    // it is the case this whole part exists to remove. The consequence is a refusal: either flag
+    // below without `--tls-ca-file` does not start.
+
+    /// --tls-replication: TLS on the replication link, in **both** roles - the primary's listener
+    /// and the replica's client. One flag, because a node is both at different times.
+    bool tls_replication{false};
+
+    /// --tls-multi-master: TLS on the mesh, in both roles, because the mesh is symmetric.
+    bool tls_multi_master{false};
+
+    /// --tls-ca-file: the trust anchor peer certificates are verified against. Required by either
+    /// node-link flag; deliberately not defaulted to the system trust store, which would mean every
+    /// public CA on earth may introduce a replica.
+    std::string tls_ca_file;
+
+    /// --tls-peer-names: identities an accepted peer's certificate may carry, comma separated.
+    ///
+    /// The accepting end of a node link knows only the source address, so unlike the dialling end it
+    /// has no name to expect. Empty means "any identity this CA signed", which is true when the CA
+    /// signs nothing but this cluster and false for a corporate CA - so the startup log says which
+    /// mode is in force rather than leaving it to a document.
+    std::vector<std::string> tls_peer_names;
+
     /// --cluster-secret-file: a single secret shared by the replication and multi-master links.
     /// Empty = cluster authentication disabled. Must not be a client secret (see
     /// stores_share_a_secret): a client able to present itself as a replica can stream the
@@ -183,12 +211,26 @@ struct LoadedSecrets {
 /// belongs in the log rather than only in a document nobody reads at three in the morning.
 LoadedSecrets load_secrets_or_exit(const ServerConfig& config);
 
-/// Build the TLS context, or print a refusal and exit. Null when `--tls-client` is off.
+/// The TLS contexts a node runs with. A null member means that surface and role is plaintext.
 ///
-/// Refuses `--tls-client` without a certificate and key rather than listening in plaintext, and
-/// warns when a certificate is configured with no surface enabled - a certificate that protects
-/// nothing looks exactly like one that does.
-std::unique_ptr<TlsContext> load_tls_or_exit(const ServerConfig& config);
+/// Four instances and two shapes: the client port needs a server context that asks nothing of the
+/// caller, and each node link needs one of each role. Replication and the mesh share the shapes but
+/// not the instances, so a future difference between the two surfaces has somewhere to live.
+struct LoadedTlsContexts {
+    std::shared_ptr<TlsContext> client_port;      ///< --tls-client
+    std::shared_ptr<TlsContext> replication_server;
+    std::shared_ptr<TlsContext> replication_client;
+    std::shared_ptr<TlsContext> mesh_server;
+    std::shared_ptr<TlsContext> mesh_client;
+};
+
+/// Build every configured TLS context, or print a refusal and exit.
+///
+/// Refuses a `--tls-*` surface without a certificate and key rather than listening in plaintext,
+/// refuses a **node link** without `--tls-ca-file` rather than encrypting without authenticating the
+/// peer, and warns when a certificate or a peer-name list is configured with no surface enabled - a
+/// certificate that protects nothing looks exactly like one that does.
+LoadedTlsContexts load_tls_or_exit(const ServerConfig& config);
 
 // ── TcpServer ─────────────────────────────────────────────────────────────────
 
@@ -220,9 +262,9 @@ private:
     /// failing on the first client.
     LoadedSecrets            secrets_;
 
-    /// The TLS context, or null when `--tls-client` is off. Built at construction so a bad
+    /// The TLS contexts, one per surface and role. Built at construction so a bad
     /// certificate stops the start rather than failing every handshake.
-    std::unique_ptr<TlsContext> tls_ctx_;
+    LoadedTlsContexts tls_;
     std::atomic<bool>        running_{false};
     std::atomic<bool>        draining_{false};  // drain phase: reject new connections, finish in-flight
     std::atomic<bool>        read_only_{false};  // dynamic read-only flag, toggled by failover

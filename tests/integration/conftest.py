@@ -48,6 +48,29 @@ class NodeInfo:
     mm_replication_port: int = 0            # multi-master peer port (0 = not MM)
 
 
+@dataclass
+class NodeTls:
+    """TLS on the node links, for a whole cluster (#30 part three, series D).
+
+    On the manager rather than a per-call argument, for the same reason `cluster_secret_file` is:
+    it has to apply to restarts too. A node that came back without TLS would be refused by its
+    peers, and the test would read that as a replication defect.
+
+    `cert_dir` holds `node-<i>.pem` and `node-<i>-key.pem`, one per node index, plus `ca.pem`. One
+    certificate per node rather than one shared: sharing would work and would make the mesh unable
+    to tell its members apart, which is the property `--tls-peer-names` is about.
+    """
+
+    cert_dir: str
+    ca: str
+    peer_names: str = ""        # comma separated; empty = any identity this CA signed
+    replication: bool = True
+    multi_master: bool = True
+
+    def files_for(self, index: int) -> tuple[str, str]:
+        return (f"{self.cert_dir}/node-{index}.pem", f"{self.cert_dir}/node-{index}-key.pem")
+
+
 # ---------------------------------------------------------------------------
 # ClusterManager
 # ---------------------------------------------------------------------------
@@ -229,6 +252,9 @@ class ClusterManager:
         # back without the secret would be refused by its peers, and the test would read that as a
         # replication defect.
         self.cluster_secret_file: Optional[str] = None
+        # TLS on the node links, or None. Same placement and the same reason as the secret file
+        # above: it must survive a restart.
+        self.node_tls: Optional[NodeTls] = None
         # Indices this harness killed on purpose. Without it, teardown cannot tell a test that
         # killed a node from a node that died on its own, and it silently restarts both — which is
         # how a crashing node stays invisible for as long as the tests around it pass.
@@ -493,17 +519,23 @@ class ClusterManager:
             except socket.timeout:
                 return ""
 
-    def _start_node(self, node_index: int, read_only: bool = False,
-                    multi_master_id: Optional[int] = None) -> NodeInfo:
-        tcp_port = self.find_free_port()
-        replication_port = self.find_free_port()
-        metrics_port = self.find_free_port()
-        data_dir = tempfile.mkdtemp(prefix=f"ob_node{node_index}_")
-        self.temp_dirs.append(data_dir)
-        node_id = f"node-{node_index}"
+    def _node_argv(self, *, node_index: int, node_id: str, data_dir: str, tcp_port: int,
+                   replication_port: int, metrics_port: int, read_only: bool,
+                   multi_master_id: Optional[int], mm_replication_port: int) -> list:
+        """The command line for one node. The **only** place it is built.
 
+        `restart_node()` used to construct its own copy, and it drifted exactly the way a duplicated
+        list does: it never learned about `--cluster-secret-file`, so a restarted node in an
+        authenticated cluster came back **without the cluster secret** and was refused by its peers -
+        which a test reads as a replication defect rather than as a harness defect. Series D found it
+        by the same route with `--tls-*`: the restarted replica connected in plaintext and the log
+        said `Connection reset by peer` with no TLS line above it.
+
+        The comment that survived next to the multi-master flags in the old copy is the tell - it
+        warns about precisely this failure for one flag while three others were missing. Same family
+        as pitfall 77, where four modules built their own path to the server binary.
+        """
         etcd_url = f"http://127.0.0.1:{self.etcd_client_port}"
-
         cmd = [
             self.server_binary,
             "--port", str(tcp_port),
@@ -517,17 +549,42 @@ class ClusterManager:
             cmd.append("--read-only")
         if self.cluster_secret_file:
             cmd += ["--cluster-secret-file", self.cluster_secret_file]
-        mm_replication_port = 0
+        if self.node_tls is not None:
+            cert, key = self.node_tls.files_for(node_index)
+            cmd += ["--tls-cert-file", cert, "--tls-key-file", key,
+                    "--tls-ca-file", self.node_tls.ca]
+            if self.node_tls.replication:
+                cmd.append("--tls-replication")
+            if self.node_tls.multi_master:
+                cmd.append("--tls-multi-master")
+            if self.node_tls.peer_names:
+                cmd += ["--tls-peer-names", self.node_tls.peer_names]
         if multi_master_id is not None:
             # The server refuses --mm-replication-port equal to --replication-port:
             # they are two different listeners, and colliding them would have one
             # silently shadow the other.
-            mm_replication_port = self.find_free_port()
             cmd += [
                 "--multi-master",
                 "--mm-node-id", str(multi_master_id),
                 "--mm-replication-port", str(mm_replication_port),
             ]
+        return cmd
+
+    def _start_node(self, node_index: int, read_only: bool = False,
+                    multi_master_id: Optional[int] = None) -> NodeInfo:
+        tcp_port = self.find_free_port()
+        replication_port = self.find_free_port()
+        metrics_port = self.find_free_port()
+        data_dir = tempfile.mkdtemp(prefix=f"ob_node{node_index}_")
+        self.temp_dirs.append(data_dir)
+        node_id = f"node-{node_index}"
+
+        mm_replication_port = self.find_free_port() if multi_master_id is not None else 0
+        cmd = self._node_argv(node_index=node_index, node_id=node_id, data_dir=data_dir,
+                              tcp_port=tcp_port, replication_port=replication_port,
+                              metrics_port=metrics_port, read_only=read_only,
+                              multi_master_id=multi_master_id,
+                              mm_replication_port=mm_replication_port)
 
         log = open_node_log(data_dir)
         self._node_logs.append(log)
@@ -654,28 +711,15 @@ class ClusterManager:
             mm_replication_port=old.mm_replication_port,
         )
 
-        etcd_url = f"http://127.0.0.1:{self.etcd_client_port}"
-        cmd = [
-            self.server_binary,
-            "--port", str(new.tcp_port),
-            "--data-dir", new.data_dir,
-            "--metrics-port", str(new.metrics_port),
-            "--replication-port", str(new.replication_port),
-            "--coordinator-endpoints", etcd_url,
-            "--node-id", new.node_id,
-        ]
-        if new.read_only:
-            cmd.append("--read-only")
-        if old.mm_replication_port:
-            # Without this, restarting a multi-master node brings it back as an
-            # ordinary primary/replica node: same ports, same data dir, silently a
-            # different topology. The test that noticed would look like a
-            # convergence bug.
-            cmd += [
-                "--multi-master",
-                "--mm-node-id", str(old.index + 1),
-                "--mm-replication-port", str(old.mm_replication_port),
-            ]
+        # Through `_node_argv()`, not a second copy of it. A restarted node must come back with
+        # *every* flag it had - the cluster secret and the TLS files included - or its peers refuse
+        # it and the test reads that as a defect in the engine.
+        cmd = self._node_argv(
+            node_index=old.index, node_id=new.node_id, data_dir=new.data_dir,
+            tcp_port=new.tcp_port, replication_port=new.replication_port,
+            metrics_port=new.metrics_port, read_only=new.read_only,
+            multi_master_id=(old.index + 1) if old.mm_replication_port else None,
+            mm_replication_port=old.mm_replication_port)
 
         log = open_node_log(new.data_dir)
         self._node_logs.append(log)

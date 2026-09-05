@@ -1,6 +1,7 @@
 #pragma once
 
 #include "orderbook/auth.hpp"
+#include "orderbook/tls.hpp"
 
 #include "orderbook/async_snapshot.hpp"
 #include "orderbook/snapshot.hpp"
@@ -39,6 +40,13 @@ struct ReplicationConfig {
     /// prints it, so a secret there would be printed by the command that exists to be pasted into a
     /// ticket. If anything ever renders this struct, the secret moves out of it.
     SecretStore cluster_secret;
+
+    /// TLS for accepted replica connections (#30 part three, series D). Null = plaintext.
+    ///
+    /// A `node_server` context: it presents this node's certificate and **requires** one from the
+    /// replica, so there is no flag here saying whether to verify. Built once at startup, so a
+    /// certificate that does not load stops the process rather than every handshake.
+    std::shared_ptr<TlsContext> tls_server;
 };
 
 struct ReplicationClientConfig {
@@ -49,6 +57,13 @@ struct ReplicationClientConfig {
     /// Cluster secret (#30 part two). Empty = do not authenticate, and then a primary that *does*
     /// authenticate refuses this replica before `REPLICATE`.
     SecretStore cluster_secret;
+
+    /// TLS for the connection to the primary (#30 part three, series D). Null = plaintext.
+    ///
+    /// A `node_client` context. The name this side requires is `primary_host`, pinned through
+    /// `tls_expect_host()` - and since `connect_to_primary()` resolves nothing (`inet_pton` only),
+    /// that name is always an address, so the primary's certificate needs an `IP:` SAN.
+    std::shared_ptr<TlsContext> tls_client;
 
     // Snapshot bootstrap configuration
     size_t      snapshot_chunk_size{262144};     // --snapshot-chunk-size (default 256 KB)
@@ -113,7 +128,19 @@ public:
         : buf_(buf_size), pos_(0), end_(0) {}
 
     /// Set the file descriptor to read from.
-    void set_fd(int fd) { fd_ = fd; pos_ = 0; end_ = 0; }
+    void set_fd(int fd) { fd_ = fd; pos_ = 0; end_ = 0; tls_.reset(); }
+
+    /// Read through TLS instead of straight off the descriptor. Call after `set_fd`.
+    ///
+    /// Holds the channel by `shared_ptr` and not a pointer to the record that owns it: `ReplicaInfo`
+    /// lives in a `std::vector` whose `push_back` moves its elements, so a pointer into the enclosing
+    /// record dangles from the first reallocation - and the symptom would be corrupt bytes on the
+    /// sixth replica rather than anything that reads as a lifetime bug.
+    void set_tls(std::shared_ptr<TlsChannel> tls) { tls_ = std::move(tls); }
+
+    /// What OpenSSL wanted after the last attempt that produced nothing, or `Read` on a plaintext
+    /// reader. The caller arms this: a TLS *read* can need the socket to become writable.
+    IoWant io_want() const { return tls_ ? tls_->io_want() : IoWant::Read; }
 
     /// Read exactly `len` bytes into `out`. Uses buffered data first, then reads
     /// from the socket for the remainder. Returns true on success, false on error/disconnect.
@@ -132,7 +159,7 @@ public:
 
         // 2. Read remainder directly from socket (bypass buffer for large reads).
         while (written < len) {
-            ssize_t n = ::recv(fd_, dst + written, len - written, 0);
+            ssize_t n = pull(dst + written, len - written);
             if (n <= 0) return false;
             written += static_cast<size_t>(n);
         }
@@ -177,7 +204,7 @@ public:
             }
 
             // Read a chunk from the socket.
-            ssize_t n = ::recv(fd_, buf_.data() + end_, buf_.size() - end_, 0);
+            ssize_t n = pull(buf_.data() + end_, buf_.size() - end_);
             if (n == 0) return -1; // disconnect
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -190,7 +217,21 @@ public:
     }
 
 private:
+    /// One receive attempt, with `::recv`'s convention: >0 bytes, 0 = the peer closed, -1 with
+    /// `errno == EAGAIN` = nothing available now, -1 otherwise = error.
+    ///
+    /// Out of line because the TLS branch needs OpenSSL's headers and this one is included by
+    /// everything that holds a replication config. Keeping `read_exact` and `read_line` inline keeps
+    /// the per-record path free of a call: `read_line` reaches here only when it needs bytes.
+    ///
+    /// The errno channel is deliberate - it makes the TLS transport a drop-in for `::recv`, so the
+    /// two readers above keep their logic unchanged. What it cannot carry is *which* want OpenSSL
+    /// has, and an edge-triggered caller needs that: a TLS read wanting to **write** must arm
+    /// EPOLLOUT rather than wait for readability that is not coming. Hence `io_want()`.
+    ssize_t pull(void* dst, size_t len);
+
     int fd_{-1};
+    std::shared_ptr<TlsChannel> tls_;
     std::vector<char> buf_;
     size_t pos_;
     size_t end_;
@@ -219,6 +260,17 @@ struct ReplicaInfo {
     bool        peer_proved{false};
     /// The nonce we challenged this connection with. Single-use: cleared when it is answered.
     std::string auth_nonce;
+
+    /// TLS state for this connection (#30 part three, series D). Null = plaintext.
+    std::shared_ptr<TlsChannel> tls;
+
+    /// Who the replica's certificate says it is, once the handshake completes. Empty otherwise.
+    ///
+    /// The field requirement 8.4 of part one asked for: the cluster form of a secret file carries no
+    /// identity, because a node's identity was its `node_id` from a handshake that authentication
+    /// precedes - so mTLS is the first thing on this link that has one. Read by the log line today
+    /// and by the ACLs of #31 when they exist, from here rather than from a second source.
+    std::string identity;
 
     // Per-replica send buffer for non-blocking broadcast (EPOLLOUT drain).
     std::vector<uint8_t> send_buf;
@@ -352,8 +404,46 @@ private:
     /// Enqueue bytes into a replica's send buffer and arm EPOLLOUT if needed.
     void enqueue_send(ReplicaInfo& replica, const void* data, size_t len);
 
+    /// Queue bytes and push what the socket takes now.
+    ///
+    /// For a short message that precedes a disconnect - `ERR unauthenticated`, `OK AUTH`,
+    /// `ERR WAL_TRUNCATED`. If the socket will not take them the bytes are lost, which is what the
+    /// old direct write did too; the difference is that they now go through TLS when TLS is on, and
+    /// that a full socket buffer no longer reads as a failure.
+    void enqueue_and_flush(ReplicaInfo& replica, const void* data, size_t len);
+
+    /// Step this replica's TLS handshake and arm what OpenSSL asked for. False = fatal, and the
+    /// caller disconnects. True with `tls->handshaking()` still set means "not finished yet".
+    bool advance_tls_handshake(ReplicaInfo& replica);
+
+    /// Publish how many connected replicas presented a verified certificate.
+    ///
+    /// The readable form of the guarantee (requirement 6.6): a guarantee whose state cannot be read
+    /// on a live node is a guarantee on our word. A count and not a label, because a label fed by a
+    /// peer is an unbounded label set (pitfall 116). Through `engine_`, which is null in the unit
+    /// tests that construct this class directly - so the absence of the metric there is a property
+    /// of the fixture, not a branch anybody has to remember.
+    void publish_tls_gauge();
+
+    /// Arm or disarm EPOLLOUT for one replica. Extracted because the TLS paths need it from four
+    /// places, and an inline `epoll_ctl` in each is how the two event masks drift apart.
+    void arm_epollout(const ReplicaInfo& replica);
+    void disarm_epollout(const ReplicaInfo& replica);
+
     /// Drain a replica's send buffer. Returns false if the replica should be removed.
+    ///
+    /// One pointer test and then one of two loops. The TLS half is a separate function rather than a
+    /// branch inside the plaintext one, for the reason series C measured on `Session`: an inlined
+    /// TLS loop changes the *plaintext* function's prologue, so the unencrypted path pays for a
+    /// branch it never takes.
     bool drain_send_buffer(ReplicaInfo& replica);
+    bool drain_send_buffer_plain(ReplicaInfo& replica);
+    [[gnu::noinline]] bool drain_send_buffer_tls(ReplicaInfo& replica);
+
+    /// The replica record for `fd`, or null. Caller must hold `mtx_`.
+    ///
+    /// There were four copies of this loop before it existed, and the handshake path needed a fifth.
+    ReplicaInfo* find_replica_locked(int fd);
 
     /// Remove a replica by fd (closes fd, removes from epoll and replicas_ list).
     /// Caller must hold mtx_.
@@ -457,6 +547,10 @@ private:
 
     // Client-side buffered reader for efficient line parsing from primary.
     BufferedReader reader_;
+
+    /// TLS state for the current connection to the primary. Null = plaintext, and reset on every
+    /// reconnect because it belongs to the connection rather than to this object.
+    std::shared_ptr<TlsChannel> tls_;
 
     void run_loop();
     void connect_to_primary();

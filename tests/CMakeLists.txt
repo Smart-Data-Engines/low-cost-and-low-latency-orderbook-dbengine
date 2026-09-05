@@ -788,6 +788,15 @@ ob_add_tcp_test(test_tls_session
     test_tls_session.cpp
 )
 
+# TLS on the node links: mutual verification, the peer-name allowlist, and the two static tests
+# that make the disconnect and socket-I/O shapes impossible rather than fixed once (series D).
+ob_add_tls_test(test_tls_node_link
+    test_tls_node_link.cpp
+)
+target_compile_definitions(test_tls_node_link
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
 # The C++ client's TLS path against a real handshake, plus the name check that turns chain
 # verification into peer verification.
 add_executable(test_tls_client test_tls_client.cpp)
