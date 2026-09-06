@@ -1909,26 +1909,104 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
-### 96. The temporary key for an accepted connection lives in the node-id space
+### 97. One unreachable peer address stops every write on the node **P0**
 
-`peers_` is keyed by node id, and a connection this node accepts is inserted under
-`static_cast<uint16_t>(client_fd)` until its handshake says who is behind it. The comment above that
-line describes a different design — "use a high node_id range (fd + 10000) as temp key" — which is
-the one that would be safe. The code does not do it.
+The multi-master reconnect loop holds `mtx_` across the whole of its pass — the prune, the dial and
+the gauges — and the dial is a **blocking** `::connect()`: `set_nonblocking()` comes after it, not
+before. `connect_to_peer()`, the copy of that logic on the topology-change path, does the same
+thing from its first line. `mtx_` is the mutex the io loop takes for every peer event and the one
+`broadcast_local()` takes on the client write path, so while that connect is outstanding the node
+accepts no peer connection, reads no peer frame, and **finishes no client write**.
 
-So an inbound connection landing on descriptor N silently replaces the live record of peer node N:
-the assignment drops that peer's send buffer, loses its backoff state, and leaves its descriptor in
-the epoll set with no record behind it — the next event on it takes the "unknown fd" branch and
-closes it, so the peer sees a truncation. Nothing logs anything, on either side.
+A refused connection returns at once, which is why a healthy cluster and every existing test miss
+this: a peer that is merely down refuses. What hurts is a SYN that goes nowhere — a firewalled
+peer, a host that has vanished, a registry entry pointing somewhere unrouted — where the kernel
+retries for `tcp_syn_retries` doublings. That is the failure a multi-master cluster exists to
+survive.
 
-Reaching it needs a node id equal to a descriptor number, and `--mm-node-id` takes any `uint16_t`
-with no range check: a cluster numbered 1..3 is safe by accident, one numbered by rack position is
-not.
+Measured on i3-7100U, Debug (the number is a kernel timeout, not code speed), with
+`tcp_syn_retries = 6` and one peer record whose address was `10.9.9.7:7100`:
 
-The fix is not the reserved range. It is a separate container for connections that have not yet been
-identified, which also removes the two places that ask "is this record a real peer?" by testing
-`node_id == 0` — the MM_PEERS skip from #84 and the reconnect-loop cleanup from #95 — and a third
-such site is a thing to remember to copy.
+| what was blocked | measured |
+|---|---|
+| an inbound mesh connection waiting for the node's handshake | **132.5 s** (floor of 132.5 / 132.8 / 134.7 across three runs) |
+| one client write through `apply_delta_mm()` | **135.7 s** — one write completed in the whole run |
+
+Found by accident, and the accident is the useful part: a unit test for #96 installed a peer record
+with a made-up address, and the file became flaky **3 runs in 12** because its own node stopped
+answering for over two minutes. `getaddrinfo()` is inside the same critical section, so a peer
+address written as a hostname adds DNS resolution to it.
+
+**Two of my own measurements were wrong before this one was right, in different ways.** The first
+ran the write and the dial *in sequence* and reported 0 ms, having issued every write after the
+connect returned. The second ran them concurrently and still reported 1 ms, because it called
+`Engine::apply_delta()` — and on a multi-master node the server calls `apply_delta_mm()`, which is
+the overload that broadcasts. A measurement of the wrong entry point exonerates the code in the
+same voice it would use if the code were fine.
+
+The fix has two halves and only the first is small: dial **outside** `mtx_` and re-check under it
+before installing the record — which still leaves the reconnect thread, and therefore every other
+peer's dial, stuck behind one dead address — and then make the connect non-blocking with a bounded
+deadline, driven from the EPOLLOUT machinery that already exists for writes. The two copies of the
+dial should become one on the way.
+
+- Effort: M | Impact: a client write on a healthy node waits out a dead peer's TCP timeout. P0 by
+  consequence: the node is up, answering `PING`, and accepting nothing
+
+### 96. The temporary key for an accepted connection lives in the node-id space ✅
+
+`peers_` is keyed by node id, and a connection this node accepted was inserted under
+`static_cast<uint16_t>(client_fd)` until its handshake said who was behind it. The comment above
+that line described a different design — "use a high node_id range (fd + 10000) as temp key" —
+which is the one that would have been safe. The code did not do it.
+
+So an inbound connection landing on descriptor N silently replaced the live record of peer N: the
+assignment dropped that peer's send buffer, lost its backoff and its advertised address, and left
+its descriptor in the epoll set with no record behind it — the next event on it took the "unknown
+fd" branch and closed it, so the peer saw a truncation. Nothing logged anything, on either side;
+that branch warns now, because a descriptor in the epoll set with nothing behind it is never
+routine.
+
+**Measured before it was fixed, and how it had to be measured is the interesting part.** A cluster
+cannot be the instrument: the collision needs a node id equal to a descriptor number, the
+integration fixture numbers its nodes 1..3, and `--mm-node-id` accepts any `uint16_t` with no range
+check — so a mesh numbered 1..3 is safe by accident and one numbered by rack position is not. A
+test can do what a cluster cannot: install a peer record for **every** descriptor number the
+accepted socket might get, which makes the coincidence certain rather than lucky. The connection
+arrived on descriptor **8**, and the record of peer 8 was gone.
+
+Three more numbers, from live meshes, because *reachable* and *reached* are different claims:
+**14** replacements of an existing peer record across three multi-master integration modules —
+every one of a record with no live socket, so what they destroyed was the advertised address and not
+a connection; **0** orphaned descriptors; and **0** duplicate links even with all three nodes
+launched at once, because peer discovery goes through an etcd watch whose latency is orders of
+magnitude above a loopback connect, so the second dialler always finds itself already connected.
+That last one is a fact about this deployment rather than about the protocol.
+
+The fix is not the reserved range — that is still a node id, still in the same space, and still one
+arithmetic slip from a live record. It is a separate container, `pending_`, keyed by `conn_id`:
+minted once, never reused, and meaningless to every other subsystem, which is what a key needs.
+Nothing there is broadcast to, dialled, counted or reconciled, and that removed the six
+`node_id == 0` tests standing in for "is this record real?" — the MM_PEERS skip from #84, the
+reconnect-loop cleanup from #95, and four in the io loop, three of which collapsed into one
+`connection_lost()` stating the difference once: an identified peer keeps its record and takes
+backoff, an unidentified connection is gone for good.
+
+**Two further defects came out of writing the fix, both older than it.** The re-key did
+`peers_.erase(peer_key); peers_[real_id] = std::move(moved);` and the io loop went on using the
+pointer it had taken into the erased record — the EPOLLOUT branch below reads `peer_ptr->connected`
+and drains through it, so an event carrying both EPOLLIN and EPOLLOUT read freed memory. The same
+class as #92, found by reading rather than by a sanitizer, and impossible now by construction:
+adoption *returns* the new location, so the caller has nothing stale to use. And a handshake could
+claim node id **0** or this node's own id — the first would have left the connection in the
+unidentified container for ever, connected and never adoptable; the second keys a record as us,
+which broadcast then sends our own records to. Both refused, with the reason in the log.
+
+Two live links to one node now resolve to one, and to the *same* one at both ends: the surviving
+link is the one the lower-numbered node dialled, which each end evaluates from its own id, the
+peer's, and which of the two it accepted. A rule that is not a function of exactly those three lets
+each end close the link the other kept, leaving the pair with none — so the two tests for it are
+the same situation seen from both ends, and flipping the comparison fails both.
 
 - Effort: M | Impact: a live peer link is silently replaced, with no log line
 

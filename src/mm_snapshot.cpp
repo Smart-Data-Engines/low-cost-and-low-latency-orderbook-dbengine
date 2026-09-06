@@ -241,11 +241,22 @@ void MultiMasterManager::handle_snapshot_request(PeerConnection& peer) {
 PeerConnection& MultiMasterManager::install_peer_for_test(PeerConnection peer) {
     std::lock_guard<std::mutex> lock(mtx_);
     if (peer.conn_id == 0) peer.conn_id = next_conn_id_++;
-    const uint16_t key = peer.node_id;
-    peers_[key]        = std::move(peer);
-    OB_LOG_DEBUG("mm", "Peer %u installed directly (connection %llu) — test seam", key,
-                 static_cast<unsigned long long>(peers_[key].conn_id));
-    return peers_[key];
+    const uint16_t node_id = peer.node_id;
+    if (node_id == 0) {
+        // A record with no node id is a connection that has not identified itself, and those do
+        // not live in the peer table (#96). Routed rather than refused, because "install an
+        // unidentified inbound connection" is a thing a test legitimately wants — and because a
+        // seam that can break the invariant is a seam that will.
+        const uint64_t key = peers_.size() + pending_.size() + 1;
+        pending_[key]      = std::move(peer);
+        OB_LOG_DEBUG("mm", "Unidentified connection installed directly under key %llu — test seam",
+                     static_cast<unsigned long long>(key));
+        return pending_[key];
+    }
+    peers_[node_id]        = std::move(peer);
+    OB_LOG_DEBUG("mm", "Peer %u installed directly (connection %llu) — test seam", node_id,
+                 static_cast<unsigned long long>(peers_[node_id].conn_id));
+    return peers_[node_id];
 }
 
 void MultiMasterManager::poll_snapshot_preparation() {

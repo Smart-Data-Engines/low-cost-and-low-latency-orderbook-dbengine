@@ -538,6 +538,14 @@ public:
     /// caller decides what to do about the failure; this only guarantees the state has an exit.
     void finish_bootstrap(bool succeeded);
 
+    /// Connections accepted whose handshake has not yet said which node is behind them.
+    ///
+    /// Diagnostic and test seam. These are not peers: nothing broadcasts to them, nothing dials
+    /// them, and neither MM_PEERS nor the mesh gauges count them (#84, #94) — so the number is not
+    /// derivable from anything else the class exposes, and a connection stuck here is invisible
+    /// without it.
+    size_t pending_connection_count() const;
+
     /// Handle MM_PEERS command — return TSV response.
     std::string handle_mm_peers_command() const;
 
@@ -559,6 +567,59 @@ private:
 
     mutable std::mutex mtx_;
     std::unordered_map<uint16_t, PeerConnection> peers_;
+
+    /// Connections this node accepted, before their handshake says which node opened them.
+    ///
+    /// A container of their own because they have no node id yet, and `peers_` is keyed by one.
+    /// They used to be inserted into `peers_` under `static_cast<uint16_t>(fd)`, which that map
+    /// cannot tell from a node id: an inbound connection landing on descriptor N replaced the
+    /// record of peer N, taking its send buffer, its backoff and its advertised address with the
+    /// assignment and leaving its descriptor in the epoll set with nothing behind it (#96).
+    /// Measured with a peer record installed for every plausible descriptor number: the connection
+    /// arrived on 8 and the record of peer 8 was gone.
+    ///
+    /// Keyed by `conn_id` rather than by the descriptor. Descriptor numbers are reused by the
+    /// kernel and mean something to the epoll set; a `conn_id` is minted once and means nothing to
+    /// anyone else, which is the property a key needs.
+    ///
+    /// Nothing here is broadcast to, dialled, counted or reconciled — which is what removes the
+    /// six `node_id == 0` tests that used to stand in for "is this record a real peer?".
+    std::unordered_map<uint64_t, PeerConnection> pending_;
+
+    /// Where a descriptor's connection record lives. Requires `mtx_` held.
+    struct ConnectionRef {
+        PeerConnection* peer{nullptr};
+        /// The record's key in `pending_`, or 0 when it is an identified peer. `conn_id` starts at
+        /// 1, so zero is unambiguous.
+        uint64_t pending_key{0};
+
+        bool is_pending() const { return pending_key != 0; }
+    };
+
+    /// Find the connection a descriptor belongs to, in either container.
+    ///
+    /// A null `peer` means the descriptor belongs to neither, which the io loop treats as an fd it
+    /// must close. Which container it came from decides what losing the connection means: an
+    /// identified peer keeps its record and takes backoff, an unidentified one is gone for good —
+    /// the port it arrived on was the peer's ephemeral source port, so there is nothing to dial
+    /// and nothing for it to become (#95).
+    ConnectionRef find_connection_by_fd(int fd);
+
+    /// Move a connection from `pending_` into `peers_` under the node id its handshake gave.
+    ///
+    /// Returns the stored record — the caller's pointer into `pending_` is dangling afterwards and
+    /// must be replaced by this one — or null when the connection was dropped instead of adopted,
+    /// in which case the caller must touch neither.
+    PeerConnection* adopt_identified_connection(uint64_t pending_key);
+
+    /// Close an unidentified connection and forget it. Requires `mtx_` held.
+    void drop_pending_connection(uint64_t pending_key, const char* why);
+
+    /// Take the socket out of a connection record: epoll registration, TLS, descriptor, buffers,
+    /// and the per-connection protocol state. Leaves the record itself alone — whether it survives
+    /// is the caller's decision, and that is the only difference between a peer and a pending
+    /// connection going down.
+    void close_connection_socket(PeerConnection& conn, const char* why);
 
     // Networking
     int listen_fd_{-1};
