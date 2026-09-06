@@ -1183,6 +1183,51 @@ Learned the hard way. Check here before debugging.
     `errno == EAGAIN`, and exposes `io_want()` separately - because the thing errno cannot carry is
     *which* want, and a read waiting to **write** needs EPOLLOUT rather than readability.
 
+141. **`-Werror` is not the same set of errors in Debug and Release.** `maybe-uninitialized` is an
+    optimisation-time analysis, so it does not exist in a Debug build: the series D branch had 930
+    green tests and **did not compile** in Release. The specific shape is worth knowing on its own -
+    a `switch` over an enum is **not exhaustive to the compiler** even when every enumerator is
+    covered, because a value outside the enumerator set is representable. Initialise the variable to
+    the failure case rather than trusting the switch to fill it, so "impossible" means "disconnect
+    this peer" and not "whatever was on the stack".
+142. **A stale build directory reports a perfect measurement.** A mnemonic diff of the branch
+    against master said *identical* for every function, including two that had been rewritten. The
+    Release build had failed on the error above; the compound command ended in `echo` and `tail`, so
+    the shell's exit status was 0 and the task reported success. Archives dated two days earlier were
+    compared against master and agreed with it, because they **were** master. The check that catches
+    this costs one line: grep the head artefact for a symbol that exists only on the branch.
+143. **A gauge published only where it goes up cannot come down.** `ob_replicas_tls_verified` was
+    set at the end of a successful handshake and nowhere else, so a replica that dropped left its
+    contribution behind — and `verified` could exceed `connected`, which reads as impossible and
+    sends an operator after the wrong fault. The same defect had the other shape on the mesh side
+    (roadmap #94): `ob_mm_peers_connected` was recomputed inline at three sites and none of them was
+    `accept()`. The fix is not more call sites: recompute both counts from the connection table on
+    every pass of the loop that owns it, and let the call sites be latency only.
+144. **Every failure branch in a retry loop has to move the next-attempt time.** One branch in the
+    multi-master reconnect loop did not, so a failure that would never clear was retried at loop
+    frequency and logged at loop frequency: `Reconnect: invalid peer address:` every 100 ms for the
+    life of the process (roadmap #95). Backoff is what makes a permanent failure legible; a log line
+    at 10 Hz is a log an operator cannot read.
+145. **A record that cannot become a peer has to be erased, not retried.** A connection this node
+    *accepts* is stored with no node id and no address, because the port it arrived on is the peer's
+    ephemeral source port. Once it closes before its handshake names a node there is nothing to dial
+    and nothing for it to become - it was one dead entry per refused inbound connection, kept
+    forever, and the thing that dialled us will dial again by itself.
+146. **`"disconnected".count("connected") == 1`.** An integration test counted the word `connected`
+    in the `MM_PEERS` view and read one live peer plus one refused peer as two peers - an assertion
+    that would also have passed against a node connected to nobody. The token that answers the
+    question was a suffix of the token that answers its opposite. Parse the column; and when two
+    modules already have their own copy of the parser, the fix is one helper on the harness, not a
+    third copy.
+147. **Alignment NOPs and call-target addresses make two identical functions read as different.**
+    A disassembly diff reported `broadcast` as 173 against 170 instructions with the first
+    divergence `nopl` against `cs nopw`, and every `call` site as a difference because the
+    section-relative address moved. Both are code layout, which is the thing the tool exists to see
+    through: drop padding, normalise `ADDR <target>` as a unit, and keep matching symbols by their
+    **exact** demangled signature (pitfall 132). What is left over is real - and here it was member
+    offsets, +48 bytes into `ReplicaInfo` and `PeerConnection`, which is the honest reading of "the
+    same instructions in the same order, reading fields that moved".
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -1191,8 +1236,8 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 893 C++ tests (`ctest -j1`, ~2 min) and 165 integration tests plus 2
-opt-in Binance skips (`pytest tests/integration/`, ~8 min on i3-7100U), all green, and **no `xfail` left** —
+**Where the suites stand:** 932 C++ tests (`ctest -j1`, ~2.5 min) and 189 integration tests plus 2
+opt-in Binance skips (`pytest tests/integration/`, ~10.5 min on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that
 fails the job on any skip, and the tree also builds and tests under Clang. Twelve required checks on
