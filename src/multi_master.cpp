@@ -782,9 +782,15 @@ void MultiMasterManager::io_loop() {
                         // buffer and hands back what was asked for, so on an edge-triggered loop a
                         // socket-level EAGAIN can arrive with decrypted bytes still pending and no
                         // further event coming. `Again` here is `WANT_*`, which cannot.
-                        ssize_t n;
+                        // Initialised to the error case rather than left to the switch: all four
+                        // enumerators are covered, but a switch over an enum is not exhaustive to
+                        // the compiler - Release says so through -Werror=maybe-uninitialized,
+                        // which Debug never runs - and "impossible" has to mean "disconnect this
+                        // peer", not "whatever ssize_t was on the stack".
+                        ssize_t n = -1;
                         if (peer_ptr->tls != nullptr) {
                             size_t got = 0;
+                            errno = EIO;
                             switch (peer_ptr->tls->read(buf, sizeof(buf), got)) {
                             case TlsChannel::Io::Data:   n = static_cast<ssize_t>(got); break;
                             case TlsChannel::Io::Closed: n = 0; break;
