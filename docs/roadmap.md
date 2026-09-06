@@ -1958,10 +1958,14 @@ is worse: it writes `WAL <current_file> 0 ...`, a literal zero. The replica does
   append-only, so a re-applied delta appends its rows a second time (the note at `engine.cpp:718`
   says this about the multi-master path, where the sequence check stops it; the replication path has
   no such check).
-- **WAL retention** is gated on `replica.confirmed_offset` (#62's `WalTruncationBlockedBySlowestReplica`).
-  The direction is the safe one — the field is far behind reality, so truncation is refused when it
-  could be allowed — but it is safe by accident, and the same accident would be data loss if the
-  arithmetic ever ran the other way.
+- **WAL retention is gated on the file index, and that is why this has been survivable.**
+  `Engine`'s retention pass takes `min(current_file_index, every replica's confirmed_file)` and
+  truncates below it — it never reads the offset. And the file index on the wire is *correct* on the
+  live path: `broadcast()` sends `wal_.current_file_index()`. During a catch-up it is stale in the
+  safe direction — every record claims the file the replica asked from, so a replica catching up
+  across files 3 to 7 keeps retention pinned at 3 until it is done. So the field that is wrong is
+  the one nothing depends on, and the field something depends on is right. That is the shape of a
+  defect that survives four phases of work: it is load-bearing nowhere.
 
 The record's true position is not hard to come by: the cursor from #93 holds it (`cur.file`,
 `cur.offset`), and on the live path `wal_.current_position()` immediately after the append is the
