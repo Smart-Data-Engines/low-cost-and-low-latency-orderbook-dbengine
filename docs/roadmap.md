@@ -2342,10 +2342,30 @@ created that symbol's buffer. Five reports in one run, all the same pair.
   each opening a connection per command, so the battery goes past that: a node blocking inside
   `write()` was reachable, and is now impossible. It is a real hazard removed, and it is **not** the
   cause of this failure — a blocked node refuses nothing.
-- **What is still open is the server side, and it is the interesting half:** if the node closes a
-  client session while stepping down, an operator issuing `FAILOVER` sees a dropped connection rather
-  than an answer, and cannot tell success from a refused command. That is a real interface question
-  and not a test problem.
+- **The server side is answered, and the answer is no.** The question was whether a node closes a
+  client session while stepping down, leaving an operator unable to tell success from a refusal.
+  Nothing on the failover path touches a session or the listener: the session-closing sites are all
+  in the epoll loop and all about the session's own state, and `draining_` - the only writer of
+  `listen_fd_`'s closure - is reachable only from the `SIGINT`/`SIGTERM` handler. Measured rather
+  than argued: `FAILOVER <target>` answers **`OK`** on the same connection that issued it.
+  What *is* true is that the command runs inside `execute_command` on the epoll thread - three
+  coordinator round-trips, `repl_mgr_->stop()` joining threads, and `demote_to_replica()` wiping
+  every columnar segment directory - so every **other** client of that node waits for it.
+  `scripts/measure_failover_stall.py` puts a number on that, i3-7100U with etcd on loopback:
+
+  | columnar files | `FAILOVER` answered in | worst concurrent `PING` | `PING` baseline p50 |
+  |---|---|---|---|
+  | 280 | 69.3 ms | 19.4 ms | 0.053 ms |
+  | 2800 | 75.1 ms | 73.2 ms | 0.057 ms |
+
+  Ten times the segment files cost 6 ms more, so the stall is the coordinator round-trips and not
+  the local wipe. Tens of milliseconds is a cost to write down, not a reason to move the handover
+  off the io loop the way #79 moved snapshot creation - there the figure was 1.7 s and grew with the
+  store. And it would change the command's meaning: an operator issuing `FAILOVER` wants the answer
+  *after* the handover, not a receipt for having asked.
+  This also does not explain the third occurrence's `UNREACHABLE`, which requires that nothing is
+  listening; a busy epoll thread still has a listening socket and a kernel accept queue, so it
+  produces a timeout rather than a refusal. The memory hypothesis below stands.
   The third occurrence sharpened it into something falsifiable: the node **stopped listening
   altogether** for the whole thirty seconds, which is a larger claim than closing one session. Two
   candidates remain and the exit status separates them. Reading the server narrowed it to those two
