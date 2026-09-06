@@ -1303,6 +1303,50 @@ Learned the hard way. Check here before debugging.
     0 duplicate links even with all nodes launched at once — the etcd watch is slower than a
     loopback connect by orders of magnitude).
 
+156. **A blocking `connect()` under a lock turns one unreachable peer into a node-wide stall, and a
+    refused connection hides it perfectly.** The multi-master reconnect loop held `mtx_` across its
+    whole pass, dial included, and `set_nonblocking()` came *after* the connect rather than before.
+    That is the mutex the io loop takes for every peer event and `broadcast_local()` takes on the
+    client write path, so a SYN that goes nowhere — a firewalled peer, a vanished host, a registry
+    entry pointing nowhere — stopped everything for `tcp_syn_retries` doublings. **Measured with
+    `tcp_syn_retries = 6`: an inbound mesh connection waited 132.5 s for its first byte, and one
+    client write blocked 135.7 s** (#97). Every healthy cluster and every existing test missed it
+    because a peer that is merely *down* refuses, and a refusal returns in microseconds. Put the
+    socket in non-blocking mode before `connect()`, bound the wait yourself, and do it with no lock
+    held: the kernel's own answer is two minutes, which is never the answer a mesh wants.
+
+157. **`poll()` reporting `POLLOUT` on a connecting socket does not mean the connection
+    succeeded** — a refused connection is also reported as writable. `getsockopt(SO_ERROR)` is the
+    authority, so read it even on the path where `poll()` says ready. Same family as pitfall 34
+    (an HTTP 200 that means nothing): find the field that carries the answer.
+
+158. **When a decision and its action are split by a lock release, whatever stops a second actor
+    has to be written down before the lock goes.** Dialling outside `mtx_` means the reconnect loop
+    comes round 100 ms later and sees the same peer still disconnected, so the attempt and its
+    backoff are claimed *before* the release — otherwise the loop opens a fresh connection to a peer
+    it is already dialling, every 100 ms, for as long as the dial lasts. Two more states appear in
+    that window and both need an answer under the lock afterwards: the peer may have left the
+    topology, and it may already be connected through a link somebody else opened. This is
+    pitfall 144 (#95) applied to a branch that now spans a lock release.
+
+159. **Measure the entry point the caller actually uses, and run the load concurrently with the
+    thing you claim it is blocked by.** Two of my own measurements of #97 came back clean before
+    one came back right. The first issued the writes and started the dial *in sequence* and reported
+    0 ms — every write landed after the connect had already returned. The second ran them
+    concurrently and still reported 1 ms, because it called `Engine::apply_delta()`, while a
+    multi-master node's server calls `apply_delta_mm()` — the overload that broadcasts, and
+    broadcasting is what takes the mutex. **A measurement of the wrong entry point exonerates the
+    code in the same voice it would use if the code were fine.** Pitfall 149 from the other side:
+    there the test never reached the instruction, here the measurement never reached the function.
+
+160. **`git checkout <path>` is a destructive command, and I ran it as cleanup.** After killing a
+    hung mutation run I reverted `src/multi_master.cpp` "for tidiness" and deleted a finished,
+    unpushed fix — the header and the tests were untouched, so the loss was invisible until a grep
+    for the new container came back empty. Two rules, and the second is the real one: reach for
+    `git stash` rather than `checkout` when a file may hold work, and **commit the fix before
+    mutation-testing it**, not after. A mutation harness that edits the tree is a good reason for
+    the tree to be committed.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -1311,7 +1355,7 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 941 C++ tests (`ctest -j1`, ~2.5 min) and 189 integration tests plus 2
+**Where the suites stand:** 943 C++ tests (`ctest -j1`, ~2.5 min) and 189 integration tests plus 2
 opt-in Binance skips (`pytest tests/integration/`, ~10.5 min on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that

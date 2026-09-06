@@ -1909,7 +1909,7 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
-### 97. One unreachable peer address stops every write on the node **P0**
+### 97. One unreachable peer address stops every write on the node ✅ **P0**
 
 The multi-master reconnect loop holds `mtx_` across the whole of its pass — the prune, the dial and
 the gauges — and the dial is a **blocking** `::connect()`: `set_nonblocking()` comes after it, not
@@ -1944,11 +1944,42 @@ connect returned. The second ran them concurrently and still reported 1 ms, beca
 the overload that broadcasts. A measurement of the wrong entry point exonerates the code in the
 same voice it would use if the code were fine.
 
-The fix has two halves and only the first is small: dial **outside** `mtx_` and re-check under it
-before installing the record — which still leaves the reconnect thread, and therefore every other
-peer's dial, stuck behind one dead address — and then make the connect non-blocking with a bounded
-deadline, driven from the EPOLLOUT machinery that already exists for writes. The two copies of the
-dial should become one on the way.
+Not the replication link: `ReplicationClient::connect_to_primary()` blocks in the same way, on its
+own dedicated thread and holding no mutex, so it delays that replica's own reconnect and nothing
+else. Worth stating, because the code looks identical.
+
+**The fix is three phases and one dial.** Decide under the lock, dial with it released, install
+under it again — and the two copies of the dial (the reconnect loop's inline one and
+`connect_to_peer()`) became one `dial_address()` plus one `finish_dial()`. The socket is put in
+non-blocking mode **before** `connect()` rather than after, so the wait is ours to bound:
+`MM_CONNECT_TIMEOUT_MS` is 5 s, which allows two SYN retransmissions, and a peer that misses it is
+retried by the backoff instead of waited on. `poll()` reporting POLLOUT is not the answer to "did it
+connect" — a refusal is also writable — so `SO_ERROR` is read even on the ready path.
+
+Three things the lock release made necessary, each of which is a way to get this wrong:
+
+- **The attempt is claimed before the lock goes**, not after the dial returns. Otherwise
+  `next_reconnect_time` stays in the past for the whole dial and the loop opens a fresh connection
+  to the same peer every 100 ms. This is #95's rule — every failure branch moves the next-attempt
+  time — applied to a branch that now spans a lock release.
+- **The record may be gone**: a topology change during the dial means the descriptor is closed and
+  dropped rather than installed.
+- **The peer may already be connected** through a link somebody else opened — its own second dial,
+  or the peer dialling us and its handshake being adopted (#96). One link per peer, and the one
+  already carrying traffic keeps it.
+
+**What this deliberately does not do**, so the limit is named rather than discovered: the dial is
+bounded and off the lock, but its completion is not driven from the epoll set, so a pass with N
+unreachable peers spends up to N × 5 s on the dialling thread. That delays those peers' own next
+attempts and nothing else — no client write, no peer frame, no shutdown beyond one deadline — which
+is why it is a cost rather than the defect. Driving the connect from the same EPOLLOUT machinery the
+writes already use would remove it too.
+
+Three mutations, three caught, and they fail through *different* tests, which is what says the two
+tests are measuring different things: putting the dial back under the lock fails the responsiveness
+test; removing the deadline fails only the shutdown test (a node stopped mid-dial waited out the
+kernel — which is why every measurement run of this defect took 133 s); claiming the attempt after
+the dial fails the "exactly one attempt in flight" assertion.
 
 - Effort: M | Impact: a client write on a healthy node waits out a dead peer's TCP timeout. P0 by
   consequence: the node is up, answering `PING`, and accepting nothing
