@@ -1968,6 +1968,13 @@ Three things the lock release made necessary, each of which is a way to get this
   or the peer dialling us and its handshake being adopted (#96). One link per peer, and the one
   already carrying traffic keeps it.
 
+**What this deliberately does not do**, so the limit is named rather than discovered: the dial is
+bounded and off the lock, but its completion is not driven from the epoll set, so a pass with N
+unreachable peers spends up to N × 5 s on the dialling thread. That delays those peers' own next
+attempts and nothing else — no client write, no peer frame, no shutdown beyond one deadline — which
+is why it is a cost rather than the defect. Driving the connect from the same EPOLLOUT machinery the
+writes already use would remove it too.
+
 Three mutations, three caught, and they fail through *different* tests, which is what says the two
 tests are measuring different things: putting the dial back under the lock fails the responsiveness
 test; removing the deadline fails only the shutdown test (a node stopped mid-dial waited out the

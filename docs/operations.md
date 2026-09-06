@@ -202,6 +202,26 @@ logger, to confirm a start.
 A metric written under a name nobody registered is dropped in silence, so `scripts/check_metrics.py`
 fails CI for the class rather than trusting the reader to notice a flat zero.
 
+### A mesh peer that is unreachable rather than down
+
+`Dial to peer 3 at 10.0.0.3:7100 failed: no answer within the connect deadline (attempt #4)` means
+the node's SYNs are going nowhere — a firewall dropping them, a host that has vanished, or an
+address the registry still advertises for a machine that no longer answers on it. A peer that is
+merely *stopped* refuses the connection instead, and the line then carries the kernel's own words
+(`Connection refused`). The difference is worth reading: one is a network or configuration problem,
+the other is a process to restart.
+
+The deadline is **5 seconds** and is not configurable. That is deliberate — the kernel's own answer
+is about two minutes of SYN retransmissions, and nothing in a mesh wants to wait that long to learn
+that a peer is unreachable. The dial happens on the reconnect thread with no lock held, so a peer in
+this state costs nothing but its own retries: since #97 it does not delay the io loop, other peers'
+links, client writes, or shutdown. If you are on a release before that, the same situation stops the
+node for as long as the kernel keeps retrying.
+
+Backoff applies to every failure, including this one, so the log rate falls away rather than
+repeating at loop frequency (#95). `ob_mm_peers_connected` beside `ob_mm_peers_tls_verified` is the
+pair to alert on — alert on the *difference*, not on either number.
+
 ## Security
 
 **There is no encryption.** Client sessions can authenticate; nothing on the wire is encrypted, so a
