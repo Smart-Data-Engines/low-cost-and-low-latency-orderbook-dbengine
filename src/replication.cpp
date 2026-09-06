@@ -1266,6 +1266,10 @@ void ReplicationManager::handle_catchup(ReplicaInfo& replica, uint32_t from_file
         ::close(probe);
     }
 
+    // A second REPLICATE on the same connection restarts this: the cursor is overwritten and
+    // `pending` is dropped. That loses nothing, because the records it held are in the WAL below
+    // the new `through` and will be streamed again if the new request reaches back that far - and
+    // if it does not, that is the replica's own request rather than a record we mislaid.
     CatchupCursor& cur = replica.catchup;
     cur.active         = true;
     cur.file           = from_file;
@@ -1289,7 +1293,9 @@ void ReplicationManager::continue_catchup(ReplicaInfo& replica) {
     int      fd        = -1;
     uint32_t open_file = 0;
 
-    // One `goto`-free way to be sure the descriptor is closed on all eleven exits.
+    // Closes the descriptor on every exit from the loop below, of which there are several and the
+    // number is not worth writing down - it changes with the code and a stale count reads as a
+    // fact. The explicit closes in the loop are for switching files, not for correctness here.
     struct FdGuard {
         int& fd;
         ~FdGuard() { if (fd >= 0) ::close(fd); }
