@@ -237,6 +237,44 @@ private:
     size_t end_;
 };
 
+// ── CatchupCursor ─────────────────────────────────────────────────────────────
+
+/// How far a catch-up has streamed, so the pass can stop and be resumed (#93).
+///
+/// `handle_catchup()` used to stream the whole requested range in one synchronous pass, which put
+/// the weight of that range into the send queue: past the 16 MB ceiling the replica was dropped, it
+/// reconnected, asked again and was dropped again. This is the shape `SnapshotTransferState` already
+/// gives the snapshot stream, one function away in this file.
+struct CatchupCursor {
+    bool     active{false};
+
+    /// The next byte to send: which WAL file, and where in it. A real position, unlike the one the
+    /// wire carries (#98).
+    uint32_t file{0};
+    size_t   offset{0};
+
+    /// Where the stream ends. Fixed when the cursor is created rather than chased, and that is what
+    /// keeps a record from being sent twice.
+    ///
+    /// The end is the WAL's append position at that moment. A record appended afterwards sits at or
+    /// past it, so the cursor never reads it - and its broadcast waits in `pending` instead, because
+    /// a live record may not overtake the history in front of it. A cursor that chased the live end
+    /// would instead read a record whose own `broadcast()` was still blocked on `mtx_`, and that
+    /// record would go out twice: once from the file, once from the call that was waiting.
+    uint32_t through_file{0};
+    size_t   through_offset{0};
+
+    /// Live records that arrived while this cursor was streaming, framed exactly as `broadcast()`
+    /// would have queued them - compressed too, if this replica asked for that. Appended to
+    /// `send_buf` when the cursor reaches its end.
+    std::vector<uint8_t> pending;
+
+    /// Send `COMPRESS LZ4` when the cursor finishes. The catch-up stream is plain text, so the
+    /// directive cannot go out before its last byte - the reason it was sent after the synchronous
+    /// pass, kept as the reason it is sent from the cursor's end.
+    bool     compress_after{false};
+};
+
 // ── ReplicaInfo ───────────────────────────────────────────────────────────────
 
 struct ReplicaInfo {
@@ -280,6 +318,9 @@ struct ReplicaInfo {
 
     // Per-replica snapshot transfer state (active during SNAPSHOT_REQUEST handling).
     SnapshotTransferState snapshot_transfer;
+
+    // Per-replica catch-up state (active while a requested WAL range is being streamed).
+    CatchupCursor catchup;
 };
 
 /// A snapshot being created on a worker thread for a replica that asked for one (#79).
@@ -381,6 +422,35 @@ private:
     void send_to_replica(ReplicaInfo& replica, const WALRecord& hdr,
                          const void* payload, size_t payload_len);
     void handle_catchup(ReplicaInfo& replica, uint32_t from_file, size_t from_offset);
+
+    /// Stream the next batch of a replica's catch-up.
+    ///
+    /// Bounded twice over: it stops once `kCatchupBatchBytes` have been queued in this pass, so the
+    /// mutex the write path needs is not held for the length of the range, and it stops at half the
+    /// send-buffer ceiling, so the queue is never grown to the size of what was asked for.
+    ///
+    /// Returns nothing, deliberately: a replica that dies mid-batch has already been removed by
+    /// `send_to_replica()`, and the caller can read that off `replica.fd`. A bool here would be a
+    /// second account of a removal that has happened either way.
+    void continue_catchup(ReplicaInfo& replica);
+
+    /// Hand the replica back to live streaming: the directive, then the records that waited.
+    void finish_catchup(ReplicaInfo& replica);
+
+    /// Queue a live message: into the send buffer, or behind an unfinished catch-up.
+    ///
+    /// One function because the choice is a property of the replica rather than of the caller, and
+    /// two callers that each decide it are two callers that can disagree - which here would put a
+    /// live record in front of the history it belongs after.
+    void queue_to_replica(ReplicaInfo& replica, const void* data, size_t len);
+
+    /// Whether some replica's catch-up could queue more bytes right now. Requires `mtx_`.
+    ///
+    /// This is the run loop's timeout: a cursor with room to write is work in hand, so the loop
+    /// must not sit in `epoll_wait` for 100 ms holding it. A cursor with a full queue is *not* work
+    /// in hand - polling that would be the busy-spin of pitfall 5 - and EPOLLOUT is what says the
+    /// socket drained.
+    bool catchup_can_progress_locked() const;
 
     /// Handle a SNAPSHOT_REQUEST from a replica: hand the creation to a worker thread.
     void handle_snapshot_request(ReplicaInfo& replica);
