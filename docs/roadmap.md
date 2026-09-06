@@ -313,12 +313,14 @@ turns the fallback test red. Worth recording that the two-node test catches *nei
 because the two mechanisms overlap there — which is why the three-node test exists. Spec:
 `kiro-workspace/specs/graceful-failover-fix/`
 
-### 30. Authentication and TLS on the wire protocol
+### 30. Authentication and TLS on the wire protocol ✅
 
-**Part one is done: client sessions authenticate.** Spec in
-`kiro-workspace/specs/wire-authentication/`. Two parts remain, both named below.
+**All three parts are done.** Client sessions authenticate and so do the node links (parts one and
+two, spec in `kiro-workspace/specs/wire-authentication/`), the client port encrypts with both
+shipped clients verifying the name, and the replication link and the mesh encrypt and verify each
+other (part three, spec in `kiro-workspace/specs/wire-tls/`).
 
-The item bundles two independent things with different risk profiles, so it is built in that order.
+The item bundled two independent things with different risk profiles, so it was built in that order.
 Authentication is a protocol concern: one place per surface, once per connection, off the hot path,
 and testable deterministically. TLS is a transport concern that enters the I/O loops — and there are
 four of them (epoll, io_uring, replication, multi-master), each with its own framing and its own
