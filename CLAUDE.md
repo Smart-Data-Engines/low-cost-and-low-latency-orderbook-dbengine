@@ -1232,6 +1232,16 @@ Learned the hard way. Check here before debugging.
     offsets, +48 bytes into `ReplicaInfo` and `PeerConnection`, which is the honest reading of "the
     same instructions in the same order, reading fields that moved".
 
+148. **On an unfinished GitHub check run `conclusion` is the empty string, not null** - so
+    `jq '.conclusion // .status'` prints nothing rather than falling through to `IN_PROGRESS`, and a
+    poll loop that decides "pending" by matching a status word at end of line sees `name: ` and
+    counts zero. Mine then announced `ALL CHECKS SETTLED (12 reporting)` with six checks still
+    running. Ask jq for the branch explicitly - `if .status == "COMPLETED" then .conclusion else
+    .status end` - or count with `select(.status != "COMPLETED") | length`, and make the loop report
+    the states it did **not** recognise instead of treating them as done. Second instance in one
+    session of the same shape: a compound shell command ending in `echo`/`tail` returned 0 while the
+    build inside it had failed. **A verification loop that cannot say "I do not know" says "fine".**
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
