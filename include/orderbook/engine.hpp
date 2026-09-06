@@ -38,7 +38,7 @@ struct TTLConfig {
 /// Top-level facade that owns and coordinates all subsystems.
 ///
 /// Subsystem ownership order (construction/destruction):
-///   wal_ → agg_ → buffers_/live_ptrs_ → stores_ → combined_store_ → query_engine_
+///   wal_ → agg_ → buffers_ → stores_ → combined_store_ → query_engine_
 ///
 /// Requirements: 7.3, 7.4, 7.5, 8.1, 8.3
 class Engine : public RoleTransitionHandler {
@@ -323,8 +323,11 @@ private:
     MetricsRegistry   registry_;
 
     // Per-symbol SoABuffers
-    std::unordered_map<std::string, std::unique_ptr<SoABuffer>> buffers_;
-    std::unordered_map<std::string, SoABuffer*>                 live_ptrs_;
+    // `shared_ptr` and not `unique_ptr`, so a query can hold a buffer alive across the snapshot
+    // install that clears this map (#92). `live_ptrs_` used to sit beside it as a raw-pointer
+    // index of the same keys, populated and cleared in the same three places; one map cannot
+    // disagree with itself.
+    std::unordered_map<std::string, std::shared_ptr<SoABuffer>> buffers_;
 
     // Per-symbol ColumnarStores
     std::unordered_map<std::string, std::unique_ptr<ColumnarStore>> stores_;

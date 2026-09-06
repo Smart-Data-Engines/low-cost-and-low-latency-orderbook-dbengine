@@ -670,7 +670,11 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb) {
     // `count()` here and `find()` in the aggregation branch - racing every thread that creates a
     // symbol.
     const std::string live_key = ast.symbol + "." + ast.exchange;
-    SoABuffer* const live_buf = live_buffer_ ? live_buffer_(live_key) : nullptr;
+    // Held for the whole query, not dereferenced and dropped: this handle is what keeps the
+    // buffer alive if a snapshot install clears `Engine::buffers_` mid-query (#92). An install
+    // that lands here now means the query finishes against the contents it started with, which is
+    // the same answer any query gets when a write lands after it began.
+    const std::shared_ptr<SoABuffer> live_buf = live_buffer_ ? live_buffer_(live_key) : nullptr;
     bool found_in_live = (live_buf != nullptr);
     bool found_in_store = false;
     if (!found_in_live) {
@@ -815,7 +819,7 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb) {
             return "OB_ERR_NOT_FOUND: symbol '" + ast.symbol +
                    "' exchange '" + ast.exchange + "' not found in live buffers";
         }
-        const SoABuffer* buf = live_buf;
+        const SoABuffer* buf = live_buf.get();
 
         // Read a consistent snapshot of both sides
         SoASide snap_bid, snap_ask;

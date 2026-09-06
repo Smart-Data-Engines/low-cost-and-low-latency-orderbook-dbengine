@@ -768,6 +768,10 @@ target_compile_definitions(test_auth_gate
 )
 
 # ── Live-buffer lookup race (#91) ─────────────────────────────────────────────
+ob_add_engine_test(test_query_buffer_lifetime
+    test_query_buffer_lifetime.cpp
+)
+
 ob_add_engine_test(test_query_live_buffer_race
     test_query_live_buffer_race.cpp
 )

@@ -74,19 +74,26 @@ struct QueryAST {
 
 using RowCallback = std::function<void(const QueryResult&)>;
 
-/// Resolve the live SoA buffer for a `"symbol.exchange"` key, or nullptr.
+/// Resolve the live SoA buffer for a `"symbol.exchange"` key, or nullptr if there is none.
 ///
-/// A callable rather than a reference to Engine's map, and the difference is a data race.
-/// `live_ptrs_` is inserted into by every thread that applies a write - a client, the replication
-/// apply path, the multi-master io loop - while a query reads it. `unordered_map` insertion
-/// rehashes, so a concurrent reader can follow a bucket that has moved: undefined behaviour, and
-/// ThreadSanitizer reported it five times on the first integration run that issued a `SELECT` while
-/// a new symbol's buffer was being created on another thread (#91).
+/// **A callable rather than a reference to Engine's map**, and the difference is a data race. The
+/// map is inserted into by every thread that applies a write - a client, the replication apply
+/// path, the multi-master io loop - while a query reads it. `unordered_map` insertion rehashes, so
+/// a concurrent reader can follow a bucket that has moved: undefined behaviour, and ThreadSanitizer
+/// reported it five times on the first integration run that issued a `SELECT` while a new symbol's
+/// buffer was being created on another thread (#91). Engine's implementation takes `mtx_` for the
+/// duration of **one map lookup** and releases it before the query runs, so this costs one
+/// uncontended lock per query rather than holding the write path's mutex across a scan.
 ///
-/// Engine's implementation takes `mtx_` for the duration of **one map lookup** and releases it
-/// before the query runs, so this costs one uncontended lock per query rather than holding the
-/// write path's mutex across a scan.
-using LiveBufferLookup = std::function<SoABuffer*(const std::string& key)>;
+/// **An owning handle rather than a pointer**, and that is #92. Engine owns the buffers and a
+/// snapshot install clears them, so a query that resolved a raw pointer under the lock and then
+/// read through it after releasing the lock read freed memory. Measured with AddressSanitizer, 3
+/// of 3 runs: `heap-use-after-free` on the seqlock version load inside `read_snapshot()`, from the
+/// query thread, with the free in `load_snapshot()`. The cost is one atomic increment per query and
+/// nothing on the write path, which resolves its buffer under the same lock it writes beneath. The
+/// alternative that costs more is named in the roadmap: holding `Engine::mtx_` across a whole query
+/// puts a scan's latency on every writer.
+using LiveBufferLookup = std::function<std::shared_ptr<SoABuffer>(const std::string& key)>;
 
 // ── QueryEngine ───────────────────────────────────────────────────────────────
 

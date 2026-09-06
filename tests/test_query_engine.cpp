@@ -34,7 +34,7 @@ struct QEFixture {
     std::string dir;
     ob::ColumnarStore store;
     ob::AggregationEngine agg;
-    std::unordered_map<std::string, ob::SoABuffer*> live;
+    std::unordered_map<std::string, std::shared_ptr<ob::SoABuffer>> live;
     ob::QueryEngine engine;
 
     QEFixture()
@@ -44,7 +44,7 @@ struct QEFixture {
         // Engine's live-buffer map, because reading it unsynchronised while a write path inserted
         // into it was a data race (#91). This fixture has one thread, so no lock is needed here.
         , engine(store,
-                 [this](const std::string& key) -> ob::SoABuffer* {
+                 [this](const std::string& key) -> std::shared_ptr<ob::SoABuffer> {
                      auto it = live.find(key);
                      return (it == live.end()) ? nullptr : it->second;
                  },

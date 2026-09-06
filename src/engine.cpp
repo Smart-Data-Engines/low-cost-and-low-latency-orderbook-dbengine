@@ -41,14 +41,16 @@ Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
     , wal_(base_dir, 512ULL << 20, fsync_policy)
     , combined_store_(base_dir)
     // The lookup takes mtx_ for one map read and releases it before the query runs. Handing
-    // QueryEngine a reference to `live_ptrs_` instead was a data race: every write path inserts
-    // into that map, and an unordered_map insertion rehashes under a concurrent reader (#91).
+    // QueryEngine a reference to the buffer map instead was a data race: every write path inserts
+    // into it, and an unordered_map insertion rehashes under a concurrent reader (#91). What it
+    // hands back is an owning handle, so the buffer outlives a snapshot install that clears the
+    // map while the query is still reading (#92).
     , query_engine_(std::make_unique<QueryEngine>(
           combined_store_,
-          [this](const std::string& key) -> SoABuffer* {
+          [this](const std::string& key) -> std::shared_ptr<SoABuffer> {
               std::lock_guard<std::mutex> lock(mtx_);
-              auto it = live_ptrs_.find(key);
-              return (it == live_ptrs_.end()) ? nullptr : it->second;
+              auto it = buffers_.find(key);
+              return (it == buffers_.end()) ? nullptr : it->second;
           },
           agg_))
     , repl_config_(std::move(repl_config))
@@ -1275,8 +1277,9 @@ void Engine::load_snapshot(const SnapshotManifest& /*manifest*/) {
 
     // Clear all in-memory state.
     stores_.clear();
+    // A query already in flight keeps its own buffer alive through the handle it holds (#92); the
+    // buffer leaves the engine here and is destroyed when that query drops it.
     buffers_.clear();
-    live_ptrs_.clear();
     pending_rows_.clear();
 
     // Rebuild columnar index from the new files on disk.
@@ -1509,7 +1512,6 @@ void Engine::demote_to_replica(const std::string& new_primary_address) {
 
         stores_.clear();
         buffers_.clear();
-        live_ptrs_.clear();
         pending_rows_.clear();
 
         // Close and wipe columnar store to prevent stale data from appearing in queries.
@@ -1681,7 +1683,7 @@ SoABuffer& Engine::get_or_create_buffer(const std::string& key, const char* symb
     auto it = buffers_.find(key);
     if (it != buffers_.end()) return *it->second;
 
-    auto buf = std::make_unique<SoABuffer>();
+    auto buf = std::make_shared<SoABuffer>();
     buf->bid.depth = 0;
     buf->ask.depth = 0;
     buf->bid.version.store(0, std::memory_order_relaxed);
@@ -1691,7 +1693,6 @@ SoABuffer& Engine::get_or_create_buffer(const std::string& key, const char* symb
     std::strncpy(buf->symbol,   symbol,   sizeof(buf->symbol)   - 1);
     std::strncpy(buf->exchange, exchange, sizeof(buf->exchange) - 1);
 
-    live_ptrs_[key] = buf.get();
     auto& ref = *buf;
     buffers_[key] = std::move(buf);
 

@@ -42,8 +42,10 @@ struct AggFixture {
     std::string dir;
     ob::ColumnarStore store;
     ob::AggregationEngine agg;
-    ob::SoABuffer buffer{};
-    std::unordered_map<std::string, ob::SoABuffer*> live;
+    // A handle rather than a member object: the lookup below hands out ownership now, so that
+    // a snapshot install cannot free a buffer a query is reading (#92).
+    std::shared_ptr<ob::SoABuffer> buffer{std::make_shared<ob::SoABuffer>()};
+    std::unordered_map<std::string, std::shared_ptr<ob::SoABuffer>> live;
     ob::QueryEngine engine;
 
     AggFixture()
@@ -53,16 +55,16 @@ struct AggFixture {
                  // A lookup rather than the map: QueryEngine no longer holds a reference to a
                  // live-buffer map, because reading it while a write path inserted into it was a
                  // data race (#91). One thread here, so no lock is needed.
-                 [this](const std::string& key) -> ob::SoABuffer* {
+                 [this](const std::string& key) -> std::shared_ptr<ob::SoABuffer> {
                      auto it = live.find(key);
                      return (it == live.end()) ? nullptr : it->second;
                  },
                  agg) {
-        std::strncpy(buffer.symbol, "BTC-USD", sizeof(buffer.symbol) - 1);
-        std::strncpy(buffer.exchange, "BINANCE", sizeof(buffer.exchange) - 1);
-        buffer.sequence_number.store(7, std::memory_order_relaxed);
-        buffer.last_timestamp_ns = 1'700'000'000'000'000'000ULL;
-        live["BTC-USD.BINANCE"] = &buffer;
+        std::strncpy(buffer->symbol, "BTC-USD", sizeof(buffer->symbol) - 1);
+        std::strncpy(buffer->exchange, "BINANCE", sizeof(buffer->exchange) - 1);
+        buffer->sequence_number.store(7, std::memory_order_relaxed);
+        buffer->last_timestamp_ns = 1'700'000'000'000'000'000ULL;
+        live["BTC-USD.BINANCE"] = buffer;
     }
 
     ~AggFixture() {
@@ -72,10 +74,10 @@ struct AggFixture {
     }
 
     void add_bid(int64_t price, uint64_t qty, uint32_t cnt = 1) {
-        ASSERT_EQ(ob::insert_level(buffer.bid, price, qty, cnt, /*descending=*/true), ob::OB_OK);
+        ASSERT_EQ(ob::insert_level(buffer->bid, price, qty, cnt, /*descending=*/true), ob::OB_OK);
     }
     void add_ask(int64_t price, uint64_t qty, uint32_t cnt = 1) {
-        ASSERT_EQ(ob::insert_level(buffer.ask, price, qty, cnt, /*descending=*/false), ob::OB_OK);
+        ASSERT_EQ(ob::insert_level(buffer->ask, price, qty, cnt, /*descending=*/false), ob::OB_OK);
     }
 
     /// Run a query and return the single QueryResult an aggregate query produces.

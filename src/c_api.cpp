@@ -22,8 +22,9 @@
 #include <vector>
 
 // ── ob_engine (C++ side) ──────────────────────────────────────────────────────
-// Owns all subsystems.  The QueryEngine holds const-refs to store_, live_ptrs_,
-// and agg_, so those members must be constructed before query_engine_.
+// Owns all subsystems.  The QueryEngine holds a reference to the store and the aggregation
+// engine, and a callable that resolves a live buffer, so those members must be constructed before
+// query_engine_.
 //
 // We use one ColumnarStore per (symbol, exchange) pair so that segment metadata
 // carries the correct symbol/exchange strings required by the query engine's
@@ -34,10 +35,12 @@ struct ob_engine {
     ob::WALWriter     wal;
     ob::AggregationEngine agg;
 
-    // One SoABuffer per "symbol.exchange" key.
-    std::unordered_map<std::string, std::unique_ptr<ob::SoABuffer>> buffers;
-    // Raw-pointer view used by QueryEngine (stable because unique_ptr owns storage).
-    std::unordered_map<std::string, ob::SoABuffer*> live_ptrs;
+    // One SoABuffer per "symbol.exchange" key. `shared_ptr` for the same reason as the server's
+    // map (#92): what a query holds has to keep the buffer alive. Nothing clears this map today,
+    // so the lifetime defect was the server's alone - but a type that only happens to be safe is
+    // the shape that produced #92 in the first place. The raw-pointer index that used to sit here
+    // is gone; one map cannot disagree with itself.
+    std::unordered_map<std::string, std::shared_ptr<ob::SoABuffer>> buffers;
 
     // One ColumnarStore per "symbol.exchange" key.
     std::unordered_map<std::string, std::unique_ptr<ob::ColumnarStore>> stores;
@@ -52,16 +55,17 @@ struct ob_engine {
         : base_dir(dir)
         , wal(dir)
         , combined_store(dir)
-        // A lookup taking `mtx`, not a reference to `live_ptrs`. The same race the embedded path
-        // had: `ob_insert` creates buffers under `mtx` while `ob_query` read this map without it,
+        // A lookup taking `mtx`, not a reference to the map. The same race the embedded path
+        // had: `ob_insert` creates buffers under `mtx` while `ob_query` read the map without it,
         // and an unordered_map insertion rehashes under a concurrent reader (#91). `ob_query` does
-        // not hold `mtx`, so taking it here cannot self-deadlock.
+        // not hold `mtx`, so taking it here cannot self-deadlock. It returns an owning handle for
+        // the same reason the server's does (#92).
         , query_engine(std::make_unique<ob::QueryEngine>(
               combined_store,
-              [this](const std::string& key) -> ob::SoABuffer* {
+              [this](const std::string& key) -> std::shared_ptr<ob::SoABuffer> {
                   std::lock_guard<std::mutex> lock(mtx);
-                  auto it = live_ptrs.find(key);
-                  return (it == live_ptrs.end()) ? nullptr : it->second;
+                  auto it = buffers.find(key);
+                  return (it == buffers.end()) ? nullptr : it->second;
               },
               agg))
     {
@@ -158,7 +162,7 @@ extern "C" ob_status_t ob_apply_delta(ob_engine_t*    engine,
         // ── Get or create SoABuffer for this symbol.exchange ──────────────────
         const std::string key = std::string(symbol) + "." + exchange;
         if (engine->buffers.find(key) == engine->buffers.end()) {
-            auto buf = std::make_unique<ob::SoABuffer>();
+            auto buf = std::make_shared<ob::SoABuffer>();
             // Zero-initialise plain data fields; atomics are default-constructed.
             buf->bid.depth = 0;
             buf->ask.depth = 0;
@@ -168,8 +172,7 @@ extern "C" ob_status_t ob_apply_delta(ob_engine_t*    engine,
             buf->last_timestamp_ns = 0;
             std::strncpy(buf->symbol,   symbol,   sizeof(buf->symbol)   - 1);
             std::strncpy(buf->exchange, exchange, sizeof(buf->exchange) - 1);
-            engine->live_ptrs[key] = buf.get();
-            engine->buffers[key]   = std::move(buf);
+            engine->buffers[key] = std::move(buf);
         }
 
         ob::SoABuffer* buf = engine->buffers[key].get();
