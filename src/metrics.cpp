@@ -82,6 +82,19 @@ MetricsRegistry::MetricsRegistry() {
                                  "Segments refused as already indexed (a flush race; should stay 0)"));
     gauges_.push_back(make_gauge("ob_symbol_count",    "Number of tracked symbols"));
     gauges_.push_back(make_gauge("ob_current_epoch",   "Current failover epoch"));
+    // TLS on the node links (#30 part three, series D). Registered in the same change that writes
+    // them: `set_gauge()` on an unregistered name is dropped in silence, which is how five gauges
+    // served a flat zero while the engine worked (#77), and `scripts/check_metrics.py` fails CI for
+    // a written-but-unregistered name.
+    gauges_.push_back(make_gauge("ob_replicas_connected",
+                                 "Replicas currently connected to this primary. Exported next to "
+                                 "the verified count because the guarantee is the comparison, and "
+                                 "a number an operator has to read off STATUS cannot be alerted "
+                                 "on."));
+    gauges_.push_back(make_gauge("ob_replicas_tls_verified",
+                                 "Connected replicas that presented a certificate this node "
+                                 "verified. Equal to ob_replicas_connected on a link running with "
+                                 "--tls-replication; a gap is a replica talking plaintext."));
 
     // Histograms
     histograms_.push_back(make_histogram("ob_insert_latency_seconds", "Insert operation latency in seconds"));
@@ -90,6 +103,10 @@ MetricsRegistry::MetricsRegistry() {
 
     // Multi-master metrics
     gauges_.push_back(make_gauge("ob_mm_peers_connected",          "Number of connected multi-master peers"));
+    gauges_.push_back(make_gauge("ob_mm_peers_tls_verified",
+                                 "Connected peers that presented a certificate this node verified. "
+                                 "Equal to ob_mm_peers_connected on a mesh running with "
+                                 "--tls-multi-master, and zero without it."));
     counters_.push_back(make_counter("ob_mm_conflicts_total",      "Total number of multi-master conflicts resolved"));
     // Written by Engine::apply_remote_delta() since receive-side dedup existed, and never
     // registered — so /metrics reported a flat zero for the one number that says whether

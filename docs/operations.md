@@ -273,9 +273,13 @@ cluster means a full restart with the file in place on every node, not a rolling
 
 ### Turning on TLS
 
-Client sessions only, for now: the replication link and the multi-master mesh come next, and until
-then they authenticate without encrypting. So `--cluster-secret-file` is still what protects them,
-and it protects identity rather than content.
+Three surfaces, each with its own flag: `--tls-client` for client sessions, `--tls-replication` for
+the replication link, `--tls-multi-master` for the mesh. The metrics endpoint has none, for the
+reason given below.
+
+The client port and the node links differ in one important way, so they are documented separately:
+on the client port the server presents a certificate and the client verifies it. **On a node link
+both ends do both**, and there is no way to ask for less.
 
 ```bash
 sudo install -d -m 700 -o orderbook -g orderbook /etc/orderbook/tls
@@ -294,11 +298,12 @@ The start is **refused**, not degraded, on each of these:
 
 | Refusal | Why it is fatal |
 |---|---|
-| `--tls-client` without both files | a flag that quietly meant plaintext is the worst outcome this feature can produce, and it would look identical to working |
+| any `--tls-*` surface without both files | a flag that quietly meant plaintext is the worst outcome this feature can produce, and it would look identical to working |
 | the key readable by group or world | the message prints the mode it found, the same rule as the secret files |
 | the key does not match the certificate | otherwise every client's handshake fails with a message an operator reads as a client problem |
 | either file unreadable, empty, or not a regular file | there is nothing to serve |
-| `--tls-client` on an io_uring build | receive stays in userspace even with kernel TLS, so that transport needs a rewrite; refusing beats listening in plaintext |
+| a node-link surface without `--tls-ca-file` | a node link verifies its peer in both directions; without a trust anchor it would encrypt without authenticating, which leaves the relay below open and looks like protection |
+| any `--tls-*` flag on an io_uring build | for the client port, receive stays in userspace even with kernel TLS, so that transport needs a rewrite. The node links would work there — they have their own epoll loops — and are refused anyway because no CI job builds that transport, so a surface that "should work" is one nobody has run |
 
 **TLS 1.3 is the floor and is not configurable.** A client offering only 1.2 is refused. That is
 deliberate: the version floor is the one setting where "configurable" means "misconfigurable".
@@ -307,6 +312,108 @@ deliberate: the version floor is the one setting where "configurable" means "mis
 question about sessions established on the old one; that is a separate item rather than a silent
 half-measure. Plan the restart the way you plan any other: one node at a time, and the cluster
 keeps serving.
+
+### TLS on the replication link and the mesh
+
+This is the part that closes the man-in-the-middle relay, and it is why the node links get mutual
+verification rather than the one-sided kind the client port has. Challenge-response proves that the
+peer knows the cluster secret; it does not prove **which connection** the exchange happened on, so
+an attacker who can redirect a replica relays both directions and both ends are satisfied. A channel
+with an identity is the only thing that stops that, which is what mTLS is.
+
+Each node needs a certificate of its own and the CA that signed the others. One CA for the cluster:
+
+```bash
+# The cluster CA. Keep this key off the nodes.
+openssl req -x509 -newkey rsa:4096 -days 3650 -nodes \
+        -keyout cluster-ca-key.pem -out cluster-ca.pem -subj "/CN=orderbook cluster CA"
+
+# One per node. The SAN is what the *dialling* end verifies, so it has to be the address or name
+# the other nodes use to reach this one.
+for host in 10.0.0.1 10.0.0.2 10.0.0.3; do
+  openssl req -newkey rsa:2048 -nodes -keyout "node-$host-key.pem" \
+          -out "node-$host.csr" -subj "/CN=node-$host"
+  printf 'subjectAltName=IP:%s\n' "$host" > "node-$host.ext"
+  openssl x509 -req -in "node-$host.csr" -CA cluster-ca.pem -CAkey cluster-ca-key.pem \
+          -CAcreateserial -days 365 -extfile "node-$host.ext" -out "node-$host.pem"
+done
+```
+
+`IP:` and not `DNS:`, unless you are sure. **The replication client dials an address and never a
+name** — it resolves nothing — so a replica's certificate for `db1.internal` presented at
+`10.0.0.1` is refused, correctly, and the message names the certificate. The mesh does resolve
+names, so `DNS:` works there; a certificate carrying both entries works everywhere.
+
+Then on every node:
+
+```
+tls-cert-file = /etc/orderbook/tls/node.pem
+tls-key-file = /etc/orderbook/tls/node-key.pem
+tls-ca-file = /etc/orderbook/tls/cluster-ca.pem
+tls-replication = true
+tls-multi-master = true
+```
+
+**There is no mixed mode here either.** A node with `--tls-replication` cannot replicate from a
+node without it: the plaintext side sends its `CHALLENGE` where a ClientHello is expected. So
+enabling it means a restart of the whole cluster with the files in place, not a rolling one.
+
+#### Which peers count as cluster members
+
+The end that **dials** knows the name it dialled and requires the certificate to cover it. The end
+that **accepts** knows only the source address, so it has nothing to compare a name against — it
+verifies the chain, and by default accepts any identity the CA signed.
+
+That is exactly right when the CA signs nothing but this cluster, which is what the CA above is for.
+It is wrong if you point `--tls-ca-file` at a corporate CA that signs every host in the
+organisation: then every host in the organisation may present itself as a replica and stream the
+write-ahead log. `--tls-peer-names` is the answer, and it is a mechanism rather than a warning:
+
+```
+tls-peer-names = node-10.0.0.1,node-10.0.0.2,node-10.0.0.3
+```
+
+An accepted peer's certificate must cover one of those. Entries may be names or addresses; an entry
+that parses as an address is matched against `iPAddress` and everything else against `dNSName`, the
+same rule the dialling end uses. Get it wrong and the cluster does not form, loudly, with a log line
+naming the identity that was presented — which is the failure you want rather than the quiet one.
+
+Which mode is in force is in the startup log, not only here:
+
+```
+node-link context ready: cert=... ca=... - any identity this CA signed is accepted as a cluster
+member (no --tls-peer-names given), which is true only if this CA signs nothing but this cluster
+```
+
+#### Checking that it worked
+
+Two pairs of numbers on `/metrics`, and they answer the question a configuration file cannot. Both
+halves of each pair are exported, because the guarantee is the *comparison*: a count of verified
+links means nothing without the count it is measured against, and a number an operator has to read
+off `STATUS` cannot be alerted on.
+
+| Metric | Read it as |
+|---|---|
+| `ob_replicas_tls_verified` vs `ob_replicas_connected` | equal means every replication link is mutually authenticated; a gap means a replica is connected in plaintext |
+| `ob_mm_peers_tls_verified` vs `ob_mm_peers_connected` | the same for the mesh; the peer count excludes inbound connections still in their handshake, which is what `MM_PEERS` lists too |
+
+Alert on the difference, not on either number: both drop to zero when a link goes away, and both
+are recomputed from the connection table on every pass of the loop that owns it, so neither can be
+left behind by a disconnection.
+
+Plus one INFO line per connection naming the certificate identity:
+
+```
+replica fd=12 from 10.0.0.2:51344 authenticated by certificate: node-10.0.0.2
+```
+
+#### The cluster secret and mTLS compose, they do not replace each other
+
+Configure both and both are required. mTLS is an *alternative* to `--cluster-secret-file` in the
+sense that a cluster can run on mTLS alone — the certificate proves who the peer is, and it does so
+bound to the channel, which the secret cannot. It is not an alternative in the sense of one
+switching the other off: two mechanisms combined by AND mean a failure of either is visible, and
+combined by OR mean neither can be seen to have stopped working.
 
 ### Connecting over TLS
 

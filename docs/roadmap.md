@@ -386,11 +386,13 @@ of an unknown peer.
   demonstrates nothing, so `ClusterAuthReplication` has three tests: same secret replicates, no
   secret replicates nothing, wrong secret replicates nothing.
 
-**Part three — TLS: the client surface is done, the cluster links are not.**
+**Part three — TLS on all three surfaces ✅**
 
-Spec: `kiro-workspace/specs/wire-tls/`. `--tls-client --tls-cert-file --tls-key-file`, TLS 1.3
-minimum, and both shipped clients verify by default. What remains is the replication link, the
-multi-master mesh, and mTLS as an alternative to the shared secret there.
+Spec: `kiro-workspace/specs/wire-tls/`. Series C did the client port
+(`--tls-client --tls-cert-file --tls-key-file`, TLS 1.3 minimum, both shipped clients verifying by
+default); series D did the replication link and the mesh (`--tls-replication`,
+`--tls-multi-master`, `--tls-ca-file`, `--tls-peer-names`), where TLS is **mutual** and mTLS is what
+gives channel binding.
 
 - **Verification is two checks, and only one of them is what `SSL_VERIFY_PEER` does.** Chain
   verification says the certificate was signed by a CA you trust; it says nothing about whether the
@@ -471,9 +473,73 @@ multi-master mesh, and mTLS as an alternative to the shared secret there.
 - The io_uring path either gets TLS or a **named refusal** — `--tls` together with io_uring must not
   silently mean plaintext, and the process must not start. Receive is in userspace regardless of
   kTLS, so that path needs memory BIOs, which is a rewrite of the fast path that exists to be fast.
-- **Still to do:** the replication link and the multi-master mesh, plus mTLS as an alternative to the
-  shared secret there, with the certificate identity landing in the same field part one introduced.
-  Only mTLS gives the channel binding above, and only on those links does the relay still apply.
+**Series D — the node links, and one question the client port does not have.**
+
+- **On a node link TLS is always mutual, and there is no flag for less.** Both ends present a
+  certificate and both verify; `--tls-replication` and `--tls-multi-master` therefore **require**
+  `--tls-ca-file` and the process refuses to start without one. "Encrypt but do not check who the
+  peer is" leaves the relay above open while looking like protection, which is the configuration
+  this part exists to remove. mTLS is not a separate switch: on a node link it *is* what TLS is, and
+  it costs nothing extra to configure because every node already has a certificate for its listener.
+- **The accepting end has no name to expect, and that is the whole design question.** After
+  `accept()` the only fact about the peer is its source address. Matching the certificate against
+  *that* sounds strong and breaks on the first `DNS:`-only certificate, behind NAT and behind a
+  proxy — turning "TLS on" into "the cluster does not form" — and would put a reverse DNS lookup in
+  the accept path. Chain-only is sufficient **when the CA signs nothing but this cluster**, because
+  every holder of a signed certificate then already has the cluster secret and the whole WAL; with a
+  corporate CA the same sentence means every host in the organisation may become a replica. So the
+  constraint is a mechanism rather than a sentence in a document: `--tls-peer-names` is an identity
+  allowlist an accepted certificate must satisfy, empty means chain-only, and **the startup log says
+  which of the two is in force** — the mistake part one paid for was a line claiming a guarantee
+  nothing enforced (pitfall 112).
+- **The allowlist check happens inside the handshake, not after it.** Four call sites across two
+  loops, and by the time a caller could check, OpenSSL has already buffered the peer's decrypted
+  bytes — so one forgotten `if` means a peer whose certificate we rejected feeding frames to the
+  parser. `TlsChannel::continue_handshake()` fails the handshake instead, which makes the gate
+  impossible to forget rather than merely present. Same move as part one putting the client gate
+  before the `switch` instead of in every `case`.
+- **The cluster secret and mTLS compose by AND.** Configured both means required both. OR would let
+  a failure of either be covered silently by the other, so nothing could observe that one had
+  stopped working. mTLS *is* an alternative in the sense that a cluster can run on it alone.
+- **`TlsChannel` is one object per connection, held by `shared_ptr`, and neither choice is taste.**
+  Repeating three fields and a handshake state machine in `ReplicaInfo` and `PeerConnection` would
+  mean two implementations of the four `IoWant` combinations, which are the only hard thing here.
+  And `replicas_` is a `std::vector` whose `push_back` moves its elements while a `PeerConnection`
+  **changes key** after the handshake by erase-and-move, so a by-value member holding any pointer
+  into itself dangles from the first reallocation — a defect that would surface as corrupt bytes on
+  the sixth replica.
+- **The state of the guarantee is readable on a live node**, because a guarantee whose state cannot
+  be read is a guarantee on our word: `ob_mm_peers_tls_verified` against `ob_mm_peers_connected`,
+  `ob_replicas_tls_verified` against `ob_replicas_connected`, and one INFO line per connection
+  naming the certificate identity. A count and not a label — a label fed by a peer is an unbounded
+  label set (part one, #31). Both halves of both pairs are exported, and both are recomputed on
+  every pass of the loop that owns the connections: publishing a count only where it goes up leaves
+  a dropped link counted, which is the shape #94 had on the mesh side.
+- **The certificate identity lands in a field, which these links did not have.** A node's identity
+  used to be its `node_id`, arriving in a handshake that authentication precedes, so the cluster form
+  of a secret file carries no name at all. `ReplicaInfo::identity` and `PeerConnection::identity`
+  hold the certificate's common name, sanitised on the way to a log because a CN is a string the peer
+  chose (pitfall 117). Verification matches SANs and the identity is the CN — the log line prints
+  both, so the two cannot be mistaken for each other.
+- **Every write to a replica now goes through one queue, and that fixed a defect older than TLS.**
+  `send_to_replica()` — the only sender in the catch-up path — called a `send_all()` helper on a
+  **non-blocking** socket, so the first `EAGAIN` was read as a dead replica and dropped it mid
+  catch-up; it reconnected, asked for the same range, and was dropped again. Measured before the
+  change: **17 270 of 40 000 records delivered**, then `send_to_replica failed`. It was found by
+  asking where that code would put `SSL_ERROR_WANT_WRITE`, which has the same answer as where it
+  puts `EAGAIN`: nowhere. The ceiling still drops a replica that is not draining, at 16 MB of queued
+  output instead of one socket buffer, and it resumes from its confirmed position. Test
+  mutation-checked in both directions; the remaining reconnects are #93.
+- **The test for it needed a measured number, not a generous one.** With neither side setting a
+  buffer size, the loopback pair absorbed **2.6 MB** before the sender first saw `EAGAIN`, so a 2 MB
+  version of that test passed against the defect. Shrinking the receiver's window to 4 kB reproduced
+  it reliably and made the test take 49 seconds; 8 MB of WAL and no window tricks reproduce it in
+  0.66 s. Pitfall 123 again: a probe that does not reproduce the shape says "no defect" in the same
+  voice as one under which there is none.
+- **The io_uring refusal stays broad, and the reason is coverage rather than epoll.** The node links
+  have their own loops and would work in that build. No CI job builds that file, so a surface that
+  "should work" there is a surface nobody has run, and `--tls-*` must never turn out to mean
+  plaintext. Said in the refusal message rather than implied.
 - Cost published with named hardware, a percentile, and the floor of the range.
 - Six things easy to miss because they are not about cryptography — starting with the TLS output
   buffer being a *second* place the 64 MB send cap has to hold — are in
@@ -1841,6 +1907,98 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 96. The temporary key for an accepted connection lives in the node-id space
+
+`peers_` is keyed by node id, and a connection this node accepts is inserted under
+`static_cast<uint16_t>(client_fd)` until its handshake says who is behind it. The comment above that
+line describes a different design — "use a high node_id range (fd + 10000) as temp key" — which is
+the one that would be safe. The code does not do it.
+
+So an inbound connection landing on descriptor N silently replaces the live record of peer node N:
+the assignment drops that peer's send buffer, loses its backoff state, and leaves its descriptor in
+the epoll set with no record behind it — the next event on it takes the "unknown fd" branch and
+closes it, so the peer sees a truncation. Nothing logs anything, on either side.
+
+Reaching it needs a node id equal to a descriptor number, and `--mm-node-id` takes any `uint16_t`
+with no range check: a cluster numbered 1..3 is safe by accident, one numbered by rack position is
+not.
+
+The fix is not the reserved range. It is a separate container for connections that have not yet been
+identified, which also removes the two places that ask "is this record a real peer?" by testing
+`node_id == 0` — the MM_PEERS skip from #84 and the reconnect-loop cleanup from #95 — and a third
+such site is a thing to remember to copy.
+
+- Effort: M | Impact: a live peer link is silently replaced, with no log line
+
+### 95. The reconnect loop retried a permanent failure ten times a second ✅
+
+`Reconnect: invalid peer address: ` in the log every 100 ms, for the life of the process, on a node
+that had refused an inbound connection. Older than the change that surfaced it (#30 part three).
+
+Two causes, both worth naming. Every failure branch in that loop moves `next_reconnect_time` and
+takes the backoff — except the unparseable address, which simply continued, so a failure that would
+never clear was retried at loop frequency and said so at loop frequency. And the record being
+retried could not be dialled at all: a connection this node *accepted* is stored with no node id and
+no address, because the port it arrived on is the peer's ephemeral source port. Once such a
+connection closes before its handshake names a node, there is nothing to dial and nothing for it to
+become — so it was one dead entry in `peers_` per refused inbound connection, kept for the life of
+the process.
+
+Measured on a three-node mesh with one node outside `--tls-peer-names`, over fifteen seconds: **0**
+`invalid peer address` lines where there had been about 150 per node, and 15 dead records dropped
+per node. A peer that completed its handshake but is not in the registry keeps its record — it can
+still dial us — and is now logged at DEBUG with backoff rather than at WARN with none.
+
+- Effort: S | Impact: a log line at 10 Hz is a log an operator cannot read
+
+### 94. `ob_mm_peers_connected` never counted a connection the node accepted ✅
+
+Found by the integration test written for series D's own gauge, the one that asserts the two mesh
+numbers agree: `ob_mm_peers_tls_verified` **2** against `ob_mm_peers_connected` **1**, on a
+three-node mesh where every link was mutually verified. An operator reads that gap as a peer talking
+plaintext — the exact opposite of what was true.
+
+The count was recomputed inline at three sites — `connect_to_peer()`, `disconnect_peer()` and the
+reconnect loop — and none of them is `accept()`. The number was therefore right for peers this node
+dialled and short by one for every peer that dialled it, which in a three-node mesh is consistently
+half of them.
+
+Both gauges now come from one `publish_peer_gauges()` over `peers_`, and the correctness does not
+come from its call sites: it also runs once per reconnect-loop pass, so no state change anywhere can
+leave either gauge stale for more than 100 ms, whichever of the twenty-odd places that move a peer's
+state made it. The denominator is the one MM_PEERS uses — a connection accepted but not yet named by
+its handshake is not a peer (#84) — so the view and the gauge cannot disagree either. A static test
+refuses a second write site for either name: three copies of a count is how the fourth site comes to
+be missing.
+
+- Effort: S | Impact: the mesh's own guarantee metric read as a violation of itself
+
+### 93. Catch-up above the send-buffer ceiling costs one reconnect per 16 MB
+
+Named by #30 part three series D rather than fixed by it, because the fix there was the one that
+belonged with the change: every write to a replica now goes through `enqueue_send()` and the
+EPOLLOUT drain, which is the only shape in which a socket saying "come back later" has anywhere to
+say it — and the only shape in which `SSL_ERROR_WANT_WRITE` does.
+
+What that left: `handle_catchup()` still streams the whole requested WAL range in one synchronous
+pass, so a replica that is not draining reaches the 16 MB queue ceiling and is dropped. It reconnects
+and resumes from the position it confirmed, so progress is monotonic — but a replica a gigabyte
+behind needs sixty-odd reconnects to get there. Before series D the same thing happened at **one
+socket buffer** (measured: 2.6 MB on loopback with no buffer sizes set, ~208 kB with
+`net.core.wmem_default`), so this is two orders of magnitude better and still not right.
+
+The answer is a catch-up cursor on `ReplicaInfo` — the file index and offset reached, plus a flag —
+resumed from the EPOLLOUT branch. That is not a new mechanism: `continue_snapshot_transfer()` in the
+same class already does exactly this for snapshot streaming, so the shape is in the file, one
+function away.
+
+Worth stating what this is *not*: a replica far enough behind that the WAL no longer covers its
+position already falls through to snapshot bootstrap (`ERR WAL_TRUNCATED`), which is the path for the
+genuinely-far-behind case. This is about the band in between.
+
+- Effort: S | Impact: removes the reconnect loop from a large catch-up
+
+
 ### 92. A query holds a raw `SoABuffer*` across a snapshot install
 
 Named by #91 rather than fixed by it, because it is a lifetime problem and not a locking one.
@@ -3061,7 +3219,6 @@ cannot verify its numbers, and cannot put it on a network they do not fully cont
 |----------|------|--------|---------|
 | **P1** | Deployment artifacts (#33) | M | Cheapest large jump in time-to-first-run; today a first run means reading CMake |
 | **P1** | Reproducible comparative benchmarks (#39) | L | Makes the performance claim verifiable by a reader instead of asserted, and the claim is the reason the repo exists |
-| **P1** | TLS on the cluster links (#30 part three, remainder) | M | Client sessions are encrypted; the replication link and the multi-master mesh still carry every row in the clear |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Configuration file (#32) | S | Ops ergonomics; past twenty flags, flags alone are unreasonable |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |

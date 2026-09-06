@@ -226,10 +226,13 @@ target_link_libraries(orderbook_auth PUBLIC orderbook_logger OpenSSL::Crypto)
 # ── TLS compiled library (#30 part three) ──────────────────────────────────────
 #
 # libssl as well as libcrypto here, which orderbook_auth deliberately did not need: the record
-# layer is what this is for. Separate from orderbook_auth because a translation unit that hashes a
-# secret has no business pulling in the TLS state machine.
+# layer is what this is for. Still separate from orderbook_auth, and the dependency points one way:
+# a translation unit that hashes a secret has no business pulling in the TLS state machine, while
+# this one needs `sanitise_for_log()` from there - a peer's certificate common name is a string the
+# peer chose, and every such string reaching a log goes through one funnel (pitfall 117). Copying
+# the sanitiser here to keep the libraries independent would make it two funnels.
 add_library(orderbook_tls STATIC src/tls.cpp)
-target_link_libraries(orderbook_tls PUBLIC orderbook_logger OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(orderbook_tls PUBLIC orderbook_logger orderbook_auth OpenSSL::SSL OpenSSL::Crypto)
 
 # ── Failover compiled library (role transitions and monitoring) ────────────────
 add_library(orderbook_failover STATIC src/failover.cpp)
@@ -332,7 +335,7 @@ target_link_libraries(orderbook_query PUBLIC orderbook_columnar orderbook_agg or
 
 # ── Engine facade compiled library ────────────────────────────────────────────
 add_library(orderbook_engine STATIC src/engine.cpp src/replication.cpp)
-target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression orderbook_metrics orderbook_logger orderbook_multi_master orderbook_sequence orderbook_auth)
+target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression orderbook_metrics orderbook_logger orderbook_multi_master orderbook_sequence orderbook_auth orderbook_tls)
 
 # ── C API compiled library ────────────────────────────────────────────────────
 add_library(orderbook_capi STATIC src/c_api.cpp)

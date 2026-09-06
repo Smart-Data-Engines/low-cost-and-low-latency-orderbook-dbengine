@@ -48,7 +48,7 @@ scanner without a reproducible case.
 ## Security posture you should know about
 
 This engine is designed for deployment on a **trusted network**, and the reason is now narrower than
-it was: client sessions can authenticate, and nothing is encrypted.
+it was: all three surfaces can authenticate, and all three can be encrypted.
 
 ### What authentication gives you
 
@@ -77,40 +77,57 @@ Generating and installing them is in [docs/operations.md](docs/operations.md).
 ### What authentication does not give you
 
 **Not confidentiality on its own.** Authentication answers "may this peer talk to us"; it says
-nothing about who else is listening. **Client sessions can now be encrypted** with `--tls-client`
-(TLS 1.3, certificate verification on by default in our clients) — see
-[docs/operations.md](docs/operations.md). The **replication link and the multi-master mesh are still
-plaintext**: they authenticate, and every record they carry is readable on the path. If your threat
-model includes a passive observer, encrypt the client port and keep the cluster links on a network
-you trust until the cluster half of #30 part three lands.
+nothing about who else is listening. Encryption is a separate switch per surface, and all three
+exist: `--tls-client` for client sessions, `--tls-replication` for the replication link,
+`--tls-multi-master` for the mesh (TLS 1.3 throughout, no configurable floor) — see
+[docs/operations.md](docs/operations.md). Every one of them is **off by default**, and a node with
+none of them carries every query and every row in the clear.
 
 **Not authorisation.** Every authenticated identity may run every command, including `FAILOVER` and
 `MIGRATE`. Per-identity permissions are roadmap item #31, and they will attach to exactly the
 identity name this scheme establishes.
 
-**Not protection against an active man-in-the-middle, on the links that are not encrypted**, and
-this one is worth understanding rather than glossing. On a TLS client session with verification on,
-the channel is bound to a certificate and the relay below does not apply — **provided the client
-checks the name and not only the chain.** Both of ours do: `tls_verify=True` requires the
-certificate to cover the address dialled. Without that, a private CA signing a whole cluster makes
-every node's certificate acceptable for every other node, so the relay works again between two
-holders of legitimate certificates, and every verification reports success. Chain verification alone
-is not peer verification. On the cluster links,
-which are not yet encrypted, it does. Challenge-response proves *knowledge of the secret*; nothing binds the exchange to
-the connection it happened on. So an attacker who can redirect a replica's connection — by
-controlling DNS, ARP or routing — can relay: it takes the real primary's challenge, presents it to
-the replica as its own, forwards the replica's answer to the primary, and asks the primary to answer
-the replica's challenge. Both sides then believe they are talking to each other.
+**Not protection against an active man-in-the-middle — that comes from TLS, and only when the name
+is checked as well as the chain.** This is worth understanding rather than glossing, because it is
+the reason encryption is not merely about eavesdropping.
 
-Channel binding is what stops that, and channel binding needs a channel with an identity — which is
-TLS. The client port has it since #30 part three; the cluster links do not yet, and that is the
-remaining half of that item. It is not fixable at the authentication layer: a relay can always
-forward a value that is bound to nothing but a nonce.
+Challenge-response proves *knowledge of the secret* and nothing more: no part of the exchange is
+bound to the connection it happened on. So on an unencrypted link an attacker who can redirect a
+replica — by controlling DNS, ARP or routing — relays. It takes the real primary's challenge,
+presents it to the replica as its own, forwards the replica's answer to the primary, and asks the
+primary to answer the replica's challenge. Both sides then believe they are talking to each other.
+This is not fixable at the authentication layer: a relay can always forward a value bound to nothing
+but a nonce.
 
-In practice this changes little about where you may deploy a node, because an attacker with that
-level of network control already reads every row in the clear and can inject records into the
-plaintext stream, authentication or not. What it does mean is that **authentication is not a reason
-to move a node onto a network you do not trust.**
+Channel binding is what stops it, and channel binding needs a channel with an identity. So:
+
+| Surface | With no TLS | With TLS |
+|---|---|---|
+| client port | relay works | stopped, because our clients require the certificate to cover the address they dialled |
+| replication link | relay works | stopped: TLS there is **mutual** and cannot be configured otherwise |
+| multi-master mesh | relay works | stopped, same |
+
+**The name check is the load-bearing half, and chain verification is not peer verification.**
+`SSL_VERIFY_PEER` answers "did a trusted CA sign this certificate" and says nothing about whose it
+is. With a private CA signing a whole cluster — how anyone deploys this — chain-only verification
+makes every node's certificate acceptable for every other node, the relay works again *between two
+holders of legitimate certificates*, and every check reports success. Both of our clients check the
+name; on the node links the dialling end checks the name it dialled, and the accepting end verifies
+the chain plus, when `--tls-peer-names` is given, an explicit identity allowlist. Without that
+allowlist the accepting end accepts any identity your CA signed, which is correct when the CA signs
+nothing but the cluster and wrong when it is a corporate CA — the startup log says which mode is in
+force, and `ob_mm_peers_tls_verified` against `ob_mm_peers_connected` says how many live peers are
+actually verified — with `ob_replicas_tls_verified` against `ob_replicas_connected` for the
+replication link.
+
+A node link needs a trust anchor (`--tls-ca-file`) and the process refuses to start without one.
+There is deliberately no "encrypt but do not verify the peer" mode for those links: it would leave
+this relay open while looking like protection.
+
+What has not changed: an attacker with that level of network control over a **plaintext** cluster
+link already reads every row and can inject records into the stream, authentication or not. So
+**authentication alone is not a reason to move a node onto a network you do not trust** — with TLS
+and mutual verification on the node links, it is.
 
 **Nothing on `/metrics`.** The endpoint has no authentication and that is deliberate: a Prometheus
 scraper cannot perform a challenge-response, so a bearer token would be a second and weaker

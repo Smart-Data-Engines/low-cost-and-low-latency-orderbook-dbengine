@@ -16,6 +16,7 @@
 #include "orderbook/hlc.hpp"
 #include "orderbook/peer_registry.hpp"
 #include "orderbook/replication.hpp"
+#include "orderbook/tls.hpp"
 #include "orderbook/wal.hpp"
 
 #include <atomic>
@@ -212,6 +213,17 @@ struct MultiMasterConfig {
     /// input: without it a response captured on one of the two links would authenticate on the
     /// other.
     SecretStore cluster_secret;
+
+    // ── TLS on the mesh (#30 part three, series D) ────────────────────────────
+    //
+    // Two contexts because the mesh is symmetric: this node accepts connections and opens them, and
+    // the two ends of a node link verify different things. Which one a connection uses is decided
+    // by `PeerConnection::we_accepted` - the same field part one introduced as the reflection
+    // defence, which is not a coincidence: it is the only thing that tells the two ends apart.
+    //
+    // Null = plaintext. Both are set or neither is; `load_tls_or_exit()` refuses the halves.
+    std::shared_ptr<TlsContext> tls_server;
+    std::shared_ptr<TlsContext> tls_client;
 };
 
 // ── Peer connection state ─────────────────────────────────────────────────────
@@ -240,6 +252,20 @@ struct PeerConnection {
     bool         peer_proved{false};
     /// The nonce we challenged this connection with. Single-use: cleared when answered.
     std::string  auth_nonce;
+
+    /// TLS state for this connection (#30 part three, series D). Null = plaintext.
+    ///
+    /// Reset on every disconnect, because it belongs to the connection: left in place it would be
+    /// handed to the next socket and decrypt with the previous session's keys, which reads as
+    /// corruption rather than as a lifetime mistake.
+    std::shared_ptr<TlsChannel> tls;
+
+    /// Who the peer's certificate says it is, once the handshake completes. Empty otherwise.
+    ///
+    /// The field requirement 8.4 of part one asked for. A node's identity used to be its `node_id`
+    /// from the handshake, which authentication precedes - so mTLS is the first thing on this link
+    /// with a name of its own. Read by the log line now and by the ACLs of #31 later, from here.
+    std::string  identity;
     /// True when *we* accepted this socket, false when we opened it.
     ///
     /// The mesh is symmetric, so this is the only thing that tells the two ends apart - and telling
@@ -595,6 +621,43 @@ private:
     /// EPIPE/ECONNRESET (disconnect + reconnect).
     /// Returns false if peer was disconnected.
     bool try_drain_send_buf(PeerConnection& peer);
+
+    /// One pointer test, then one of two loops. Separate functions rather than a branch inside the
+    /// plaintext one, for the reason series C measured on `Session`: an inlined TLS loop changes the
+    /// *plaintext* function's prologue, so the unencrypted path pays for a branch it never takes.
+    bool try_drain_send_buf_plain(PeerConnection& peer);
+    [[gnu::noinline]] bool try_drain_send_buf_tls(PeerConnection& peer);
+
+    /// Attach a TLS channel to a freshly established connection, choosing the role from
+    /// `we_accepted`. False means this connection cannot proceed and the caller must close it.
+    ///
+    /// Does not drive the handshake. That has one owner - `io_loop()` - so a connection opened from
+    /// the reconnect thread is armed here and stepped there, and no two threads ever advance the
+    /// same `SSL` state machine.
+    bool attach_tls(PeerConnection& peer);
+
+    /// Step this peer's handshake and arm what OpenSSL asked for. False = fatal.
+    bool advance_tls_handshake(PeerConnection& peer);
+
+    /// close_notify, then forget the channel. Called from every path that closes a peer socket.
+    void release_tls(PeerConnection& peer);
+
+    /// Publish both mesh peer gauges from `peers_`. Requires `mtx_` held.
+    ///
+    /// `ob_mm_peers_tls_verified` is the readable form of the guarantee (requirement 6.6): a
+    /// guarantee whose state cannot be read on a live node is a guarantee on our word. A count and
+    /// not a label, because a label fed by a peer is an unbounded label set (pitfall 116) - and
+    /// here it would name a peer that is by definition authenticated, which is exactly the value an
+    /// operator would then trust.
+    ///
+    /// **Both** gauges, from one loop, because `ob_mm_peers_connected` was recomputed inline at
+    /// three sites - `connect_to_peer()`, `disconnect_peer()` and the reconnect loop - and none of
+    /// them is the accept path, so a node that *accepted* a connection never counted it. Measured
+    /// on a three-node TLS mesh: `ob_mm_peers_tls_verified` 2 against `ob_mm_peers_connected` 1,
+    /// which reads as a peer talking plaintext. The correctness does not come from the call sites
+    /// either: this runs once per reconnect-loop tick, so no state change anywhere can leave the
+    /// gauges stale for longer than that, whichever of the twenty-odd sites made it.
+    void publish_peer_gauges();
 
     /// Arm EPOLLOUT for a peer's fd (when send_buf is non-empty after EAGAIN).
     void arm_epollout(PeerConnection& peer);

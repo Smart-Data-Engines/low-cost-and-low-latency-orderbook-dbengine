@@ -926,6 +926,10 @@ Learned the hard way. Check here before debugging.
     `GoogleTestAddTests.cmake` during test discovery, at *build* time, with no message about
     sanitizers at all — so it reads as a broken test rather than a missing sysctl. The value on this
     machine is 32 by default; set it back afterwards if you care about the entropy.
+    Under the **integration** battery the symptom is different and reads worse: every node dies at
+    startup, so the harness says `not ready after 45s: Connection refused` and the sanitizer's own
+    line — `FATAL: ThreadSanitizer: unexpected memory mapping` — is in the node's log, which is why
+    `_wait_for_node()` now tails that log instead of reading a pipe that is not there.
 
 122. **`until ! pgrep -f X; do sleep; done` never terminates when the waiting shell's own command
     line contains X.** The wait is spawned as `bash -c '... until ! pgrep -f "pytest
@@ -1104,6 +1108,130 @@ Learned the hard way. Check here before debugging.
     signal and it does not move with the scheduler. Both mutations still fail the rebuilt test, and
     through different assertions — the gauge for one, `bad write retry` for the other.
 
+134. **`send_all()` on a non-blocking socket reads the first `EAGAIN` as a dead peer, and it
+    dropped a replica in the middle of every catch-up bigger than a socket buffer.** The helper is
+    correct on the *replica's* blocking socket, where `EAGAIN` means the `SO_RCVTIMEO` deadline
+    expired; on the primary's accepted sockets it means "come back later". `send_to_replica()` -
+    the only sender in the catch-up path - used it, so the replica was removed, reconnected, asked
+    for the same range and was removed again. **Measured: 17 270 of 40 000 records delivered**, then
+    `send_to_replica failed for fd=7, marking disconnected`.
+
+    Not a TLS defect and not introduced by series D - **found** by it, because "where does this code
+    put `SSL_ERROR_WANT_WRITE`" has the same answer as "where does it put `EAGAIN`": nowhere. Every
+    write to a replica now goes through `enqueue_send()` and the EPOLLOUT drain, which is the only
+    shape in which a socket saying "later" has somewhere to say it. The ceiling still drops a replica
+    that is not draining, at 16 MB of queued output instead of one socket buffer; #93 is the cursor
+    that removes the reconnects.
+
+135. **A test that needs a full socket buffer needs that buffer's *measured* capacity, not a
+    generous-looking number.** The first version of the catch-up test wrote 2 MB and **passed
+    against the defect**: with neither side setting a buffer size, this loopback pair absorbs
+    **2.6 MB** before the sender first sees `EAGAIN` (539 of 1600 records got through). Shrinking the
+    receiver to `SO_RCVBUF=4096` reproduced it reliably and made the test take **49 seconds**, because
+    2 MB through a 2 kB window is one delayed ACK per few kilobytes. 8 MB of WAL and no window tricks
+    reproduces it in 0.66 s. Pitfall 123 from the other side: a probe that does not reproduce the
+    shape says "no defect" in the same voice as one under which there is none.
+
+    Second half, on setup cost: **wide records, not many records.** 40 000 one-level appends took
+    ~60 s of the test's runtime; 1600 appends of 200 levels put the same bytes on the wire in a
+    fortieth of the time.
+
+136. **On a mutual TLS link the accepting end has no name to expect, and that is a design question
+    rather than an omission.** After `accept()` the only fact about the peer is its source address.
+    Matching the certificate against *that* sounds strong and breaks on the first `DNS:`-only
+    certificate, behind NAT and behind a proxy - it turns "TLS on" into "the cluster does not form" -
+    and puts a reverse lookup in the accept path. Chain-only is genuinely sufficient **when the CA
+    signs nothing but this cluster**, because every holder of a signed certificate then already has
+    the cluster secret and the whole WAL; with a corporate CA the same sentence means every host in
+    the organisation may become a replica.
+
+    So the answer is a mechanism, not a paragraph: `--tls-peer-names` is an identity allowlist, empty
+    means chain-only, and **the startup log says which of the two is in force**. A weaker mode that
+    is not visible is the one that ends up on production - part one paid for the mirror image of
+    this, a log line claiming a guarantee nothing enforced (pitfall 112).
+
+137. **A verification check placed after the handshake runs after OpenSSL has already buffered the
+    peer's decrypted bytes.** The peer-name allowlist could have been checked by the caller; that
+    would be four call sites across two event loops, each needing to refuse *before* touching the
+    receive buffer, and one forgotten `if` means a peer whose certificate we rejected feeding frames
+    to the parser. It lives inside `TlsChannel::continue_handshake()`'s success path instead and
+    fails the handshake, which makes the gate impossible to forget rather than merely present -
+    the same move as part one putting the client gate before the `switch` instead of in every
+    `case` (pitfall 109).
+
+138. **A harness that builds one command line in two places drifts, and the comment warning about
+    one flag is the tell.** `ClusterManager.restart_node()` constructed its own argv and had never
+    learned about `--cluster-secret-file`, so a restarted node in an authenticated cluster came back
+    **without the cluster secret** and was refused by its peers - which reads as a replication
+    defect. Series D found it with `--tls-*`: the restarted replica connected in plaintext and its
+    log said `Connection reset by peer` with no TLS line above it. Sitting next to the old copy was a
+    comment explaining that `--multi-master` had to be repeated there "or the test that noticed would
+    look like a convergence bug" - correct about one flag while three others were missing. One
+    `_node_argv()` now; same family as pitfall 77.
+
+139. **Per-connection state belongs behind a `shared_ptr` when its record lives in a container that
+    moves.** `replicas_` is a `std::vector<ReplicaInfo>` whose `push_back` moves its elements;
+    `peers_` is a map in which a `PeerConnection` **changes key** after the handshake by
+    erase-and-move; and `replica_states()` / `peer_states()` return *copies* for `STATUS`. A
+    by-value TLS member holding any pointer into its own record - the reader pointing at the
+    channel, say - dangles from the first reallocation, and the symptom is corrupt bytes on the
+    sixth replica rather than anything that reads as a lifetime bug. One heap object with a
+    reference count survives all three, and a copy made for `STATUS` reports on the connection it is
+    actually about.
+
+140. **On an edge-triggered loop, read until the TLS layer says it has nothing - not until the
+    socket does.** OpenSSL reads a whole record, up to 16 kB, decrypts it into its own buffer and
+    returns only what was asked for, so a socket-level `EAGAIN` can arrive with decrypted bytes still
+    pending and no further epoll event coming. `SSL_read` returning `WANT_READ` cannot. The
+    replication reader keeps `::recv` semantics for its two callers by mapping a want onto
+    `errno == EAGAIN`, and exposes `io_want()` separately - because the thing errno cannot carry is
+    *which* want, and a read waiting to **write** needs EPOLLOUT rather than readability.
+
+141. **`-Werror` is not the same set of errors in Debug and Release.** `maybe-uninitialized` is an
+    optimisation-time analysis, so it does not exist in a Debug build: the series D branch had 930
+    green tests and **did not compile** in Release. The specific shape is worth knowing on its own -
+    a `switch` over an enum is **not exhaustive to the compiler** even when every enumerator is
+    covered, because a value outside the enumerator set is representable. Initialise the variable to
+    the failure case rather than trusting the switch to fill it, so "impossible" means "disconnect
+    this peer" and not "whatever was on the stack".
+142. **A stale build directory reports a perfect measurement.** A mnemonic diff of the branch
+    against master said *identical* for every function, including two that had been rewritten. The
+    Release build had failed on the error above; the compound command ended in `echo` and `tail`, so
+    the shell's exit status was 0 and the task reported success. Archives dated two days earlier were
+    compared against master and agreed with it, because they **were** master. The check that catches
+    this costs one line: grep the head artefact for a symbol that exists only on the branch.
+143. **A gauge published only where it goes up cannot come down.** `ob_replicas_tls_verified` was
+    set at the end of a successful handshake and nowhere else, so a replica that dropped left its
+    contribution behind — and `verified` could exceed `connected`, which reads as impossible and
+    sends an operator after the wrong fault. The same defect had the other shape on the mesh side
+    (roadmap #94): `ob_mm_peers_connected` was recomputed inline at three sites and none of them was
+    `accept()`. The fix is not more call sites: recompute both counts from the connection table on
+    every pass of the loop that owns it, and let the call sites be latency only.
+144. **Every failure branch in a retry loop has to move the next-attempt time.** One branch in the
+    multi-master reconnect loop did not, so a failure that would never clear was retried at loop
+    frequency and logged at loop frequency: `Reconnect: invalid peer address:` every 100 ms for the
+    life of the process (roadmap #95). Backoff is what makes a permanent failure legible; a log line
+    at 10 Hz is a log an operator cannot read.
+145. **A record that cannot become a peer has to be erased, not retried.** A connection this node
+    *accepts* is stored with no node id and no address, because the port it arrived on is the peer's
+    ephemeral source port. Once it closes before its handshake names a node there is nothing to dial
+    and nothing for it to become - it was one dead entry per refused inbound connection, kept
+    forever, and the thing that dialled us will dial again by itself.
+146. **`"disconnected".count("connected") == 1`.** An integration test counted the word `connected`
+    in the `MM_PEERS` view and read one live peer plus one refused peer as two peers - an assertion
+    that would also have passed against a node connected to nobody. The token that answers the
+    question was a suffix of the token that answers its opposite. Parse the column; and when two
+    modules already have their own copy of the parser, the fix is one helper on the harness, not a
+    third copy.
+147. **Alignment NOPs and call-target addresses make two identical functions read as different.**
+    A disassembly diff reported `broadcast` as 173 against 170 instructions with the first
+    divergence `nopl` against `cs nopw`, and every `call` site as a difference because the
+    section-relative address moved. Both are code layout, which is the thing the tool exists to see
+    through: drop padding, normalise `ADDR <target>` as a unit, and keep matching symbols by their
+    **exact** demangled signature (pitfall 132). What is left over is real - and here it was member
+    offsets, +48 bytes into `ReplicaInfo` and `PeerConnection`, which is the honest reading of "the
+    same instructions in the same order, reading fields that moved".
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -1112,8 +1240,8 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 893 C++ tests (`ctest -j1`, ~2 min) and 165 integration tests plus 2
-opt-in Binance skips (`pytest tests/integration/`, ~8 min on i3-7100U), all green, and **no `xfail` left** —
+**Where the suites stand:** 932 C++ tests (`ctest -j1`, ~2.5 min) and 189 integration tests plus 2
+opt-in Binance skips (`pytest tests/integration/`, ~10.5 min on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that
 fails the job on any skip, and the tree also builds and tests under Clang. Twelve required checks on

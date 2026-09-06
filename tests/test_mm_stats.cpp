@@ -13,6 +13,9 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <thread>
 
@@ -104,3 +107,41 @@ TEST(MultiMasterStats, WithoutAPeerRegistryThereIsNoSchedulerAndThatIsNotACrash)
 
 // That the scheduler does run when there *is* a registry needs etcd, so it is asserted in
 // tests/integration/test_mm_stats.py against a real node.
+
+// ── The two mesh peer gauges come from one place ─────────────────────────────
+
+TEST(MultiMasterStatsStatic, BothMeshPeerGaugesArePublishedFromOneFunction) {
+    // `ob_mm_peers_connected` was recomputed inline at three sites - connect_to_peer(),
+    // disconnect_peer() and the reconnect loop - and none of them is the accept path, so a node
+    // that *accepted* a connection never counted the peer. Measured on a three-node TLS mesh:
+    // ob_mm_peers_tls_verified 2 against ob_mm_peers_connected 1, which an operator reads as one
+    // peer talking plaintext. Three copies of a count is how the fourth site comes to be missing.
+    //
+    // The behavioural test is the integration one that scrapes both gauges off a live mesh; this
+    // one exists to stop the copies coming back, because a fourth inline loop would pass it.
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/src/multi_master.cpp");
+    ASSERT_TRUE(in) << "cannot read src/multi_master.cpp";
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const std::string src = ss.str();
+
+    for (const char* gauge : {"set_gauge(\"ob_mm_peers_connected\"",
+                              "set_gauge(\"ob_mm_peers_tls_verified\""}) {
+        size_t writes = 0;
+        for (size_t at = src.find(gauge); at != std::string::npos; at = src.find(gauge, at + 1)) {
+            ++writes;
+            // Every write has to sit inside publish_peer_gauges(): the member function whose
+            // definition is the last one to open before it.
+            const size_t owner = src.rfind("MultiMasterManager::", at);
+            ASSERT_NE(owner, std::string::npos) << gauge << " is written outside any member";
+            EXPECT_EQ(src.compare(owner, std::strlen("MultiMasterManager::publish_peer_gauges"),
+                                  "MultiMasterManager::publish_peer_gauges"), 0)
+                << gauge << " is written by " << src.substr(owner, 60)
+                << ", not by publish_peer_gauges(), so the two gauges can disagree depending on "
+                   "which path moved a peer's state";
+        }
+        EXPECT_EQ(writes, 1u)
+            << gauge << " is written at " << writes << " sites; one site per gauge is what makes "
+                        "the count independent of which path changed the peer";
+    }
+}

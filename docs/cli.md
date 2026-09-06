@@ -329,9 +329,13 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--snapshot-chunk-size` | `<N>` | Bytes per snapshot transfer chunk |
 | `--snapshot-staging-dir` | `<DIR>` | Where an incoming snapshot is staged before install |
 | `--sqpoll-idle-ms` | `<N>` | io_uring SQPOLL idle timeout in ms |
-| `--tls-cert-file` | `<PATH>` | Server certificate chain (PEM) for --tls-client |
-| `--tls-client` | | TLS on the client port; needs --tls-cert-file and --tls-key-file |
-| `--tls-key-file` | `<PATH>` | Server private key (PEM); mode 600 |
+| `--tls-ca-file` | `<PATH>` | Trust anchor (PEM) for verifying peer certificates on node links; required by `--tls-replication` and `--tls-multi-master` |
+| `--tls-cert-file` | `<PATH>` | This node's certificate chain (PEM), used on every TLS surface and in both roles |
+| `--tls-client` | — (boolean) | TLS on the client port; needs --tls-cert-file and --tls-key-file |
+| `--tls-key-file` | `<PATH>` | This node's private key (PEM); mode 600 |
+| `--tls-multi-master` | — (boolean) | TLS with mutual certificate verification on the multi-master mesh; needs `--tls-ca-file` |
+| `--tls-peer-names` | `<NAMES>` | Comma-separated identities an accepted peer's certificate may carry; empty accepts any name this CA signed |
+| `--tls-replication` | — (boolean) | TLS with mutual certificate verification on the replication link, in both roles; needs `--tls-ca-file` |
 | `--ttl-hours` | `<N>` | Retention in hours; 0 keeps everything |
 | `--ttl-scan-interval-seconds` | `<N>` | How often retention scans for expired rows |
 | `--workers` | `<N>` | Number of worker threads (default: 4) |

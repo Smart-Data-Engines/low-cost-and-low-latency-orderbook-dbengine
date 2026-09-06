@@ -385,6 +385,7 @@ void MultiMasterManager::stop() {
         std::lock_guard<std::mutex> lock(mtx_);
         for (auto& [nid, peer] : peers_) {
             if (peer.fd >= 0) {
+                release_tls(peer);
                 ::close(peer.fd);
                 peer.fd = -1;
                 peer.connected = false;
@@ -705,6 +706,16 @@ void MultiMasterManager::io_loop() {
                     // Store with temp key — will be re-keyed after handshake.
                     peers_[temp_id] = std::move(conn);
 
+                    // TLS before a byte is queued. What follows is queued rather than written: the
+                    // drain returns early while the handshake runs, so these frames go out with the
+                    // first flush afterwards - the same shape as the client port's banner.
+                    if (!attach_tls(peers_[temp_id])) {
+                        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr);
+                        ::close(client_fd);
+                        peers_.erase(temp_id);
+                        continue;
+                    }
+
                     // With a cluster secret, challenge first and let the *handshake* be the
                     // acceptance; without one, handshake straight away as before.
                     if (!config_.cluster_secret.empty()) {
@@ -735,13 +746,60 @@ void MultiMasterManager::io_loop() {
                     continue;
                 }
 
+                // A handshake in progress consumes this event and nothing else. Not one frame may
+                // be parsed before it finishes: a frame arriving earlier would come from a
+                // transport that has not proved who it is, and the cluster-secret gate is a
+                // different mechanism that knows nothing about TLS.
+                if (peer_ptr->tls != nullptr && peer_ptr->tls->handshaking()) {
+                    if (!advance_tls_handshake(*peer_ptr)) {
+                        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, ev_fd, nullptr);
+                        release_tls(*peer_ptr);
+                        ::close(ev_fd);
+                        peer_ptr->fd        = -1;
+                        peer_ptr->connected = false;
+                        peer_ptr->recv_buf.clear();
+                        peer_ptr->send_buf.clear();
+                        on_peer_disconnected(*peer_ptr);
+                        if (peer_ptr->node_id != 0) {
+                            const uint32_t delay_ms = peer_ptr->backoff.next_delay_ms();
+                            peer_ptr->next_reconnect_time =
+                                std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(delay_ms);
+                        }
+                        publish_peer_gauges();
+                    }
+                    continue;
+                }
+
                 // Handle EPOLLIN — recv data.
                 if (ev_events & EPOLLIN) {
                     // Edge-triggered: read in a loop until EAGAIN.
                     bool disconnected = false;
                     while (true) {
                         uint8_t buf[8192];
-                        ssize_t n = ::recv(ev_fd, buf, sizeof(buf), 0);
+                        // Read until the *TLS layer* says it has nothing, not until the socket does.
+                        // OpenSSL reads a whole record - up to 16 kB - decrypts it into its own
+                        // buffer and hands back what was asked for, so on an edge-triggered loop a
+                        // socket-level EAGAIN can arrive with decrypted bytes still pending and no
+                        // further event coming. `Again` here is `WANT_*`, which cannot.
+                        // Initialised to the error case rather than left to the switch: all four
+                        // enumerators are covered, but a switch over an enum is not exhaustive to
+                        // the compiler - Release says so through -Werror=maybe-uninitialized,
+                        // which Debug never runs - and "impossible" has to mean "disconnect this
+                        // peer", not "whatever ssize_t was on the stack".
+                        ssize_t n = -1;
+                        if (peer_ptr->tls != nullptr) {
+                            size_t got = 0;
+                            errno = EIO;
+                            switch (peer_ptr->tls->read(buf, sizeof(buf), got)) {
+                            case TlsChannel::Io::Data:   n = static_cast<ssize_t>(got); break;
+                            case TlsChannel::Io::Closed: n = 0; break;
+                            case TlsChannel::Io::Again:  n = -1; errno = EAGAIN; break;
+                            case TlsChannel::Io::Error:  n = -1; errno = EIO; break;
+                            }
+                        } else {
+                            n = ::recv(ev_fd, buf, sizeof(buf), 0);
+                        }
                         if (n > 0) {
                             peer_ptr->recv_buf.insert(peer_ptr->recv_buf.end(),
                                                      buf, buf + n);
@@ -765,6 +823,7 @@ void MultiMasterManager::io_loop() {
 
                     if (disconnected) {
                         ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, ev_fd, nullptr);
+                        release_tls(*peer_ptr);
                         ::close(ev_fd);
                         peer_ptr->fd = -1;
                         peer_ptr->connected = false;
@@ -789,6 +848,15 @@ void MultiMasterManager::io_loop() {
 
                     // Process received data — parse frames.
                     process_recv_buf(*peer_ptr);
+
+                    // The fourth of the four combinations, and the one whose absence looks like a
+                    // wedged peer. A TLS write can leave OpenSSL wanting to *read*, in which case
+                    // the drain deliberately did not arm EPOLLOUT because the socket is already
+                    // writable - so a readable event is the only way back in.
+                    if (peer_ptr->tls != nullptr && peer_ptr->connected) {
+                        if (peer_ptr->tls->io_want() == IoWant::Write) arm_epollout(*peer_ptr);
+                        if (!peer_ptr->send_buf.empty()) try_drain_send_buf(*peer_ptr);
+                    }
 
                     // After handshake, re-key the peer if needed. The whole record moves, so
                     // conn_id moves with it: the connection accepted under a temporary key keeps
@@ -817,6 +885,7 @@ void MultiMasterManager::io_loop() {
                     if (peer_ptr && peer_ptr->connected) {
                         OB_LOG_WARN("mm", "Peer fd=%d EPOLLERR/HUP — disconnecting", ev_fd);
                         ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, ev_fd, nullptr);
+                        release_tls(*peer_ptr);
                         ::close(ev_fd);
                         peer_ptr->fd = -1;
                         peer_ptr->connected = false;
@@ -935,6 +1004,17 @@ void MultiMasterManager::connect_to_peer(const PeerInfo& peer) {
     OB_LOG_INFO("mm", "Connected to peer %u at %s", peer.node_id,
                 peer.address.c_str());
 
+    // TLS before anything is queued. The handshake itself is *not* driven here: this function runs
+    // on the topology-change path and the reconnect thread, and io_loop() owns the epoll set - so
+    // arming here and stepping there is what keeps one `SSL` state machine to one thread.
+    if (!attach_tls(peers_[peer.node_id])) {
+        if (epoll_fd_ >= 0) ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+        ::close(fd);
+        peers_[peer.node_id].fd        = -1;
+        peers_[peer.node_id].connected = false;
+        return;
+    }
+
     // Send handshake to initiate protocol exchange - or, with a cluster secret, a challenge, and
     // the handshake follows once this peer has proved itself.
     if (!config_.cluster_secret.empty()) {
@@ -943,13 +1023,7 @@ void MultiMasterManager::connect_to_peer(const PeerInfo& peer) {
         send_handshake(peers_[peer.node_id]);
     }
 
-    // Update metrics: count connected peers.
-    size_t connected = 0;
-    for (const auto& [nid, p] : peers_) {
-        if (p.connected) ++connected;
-    }
-    engine_.registry().set_gauge("ob_mm_peers_connected",
-                                 static_cast<int64_t>(connected));
+    publish_peer_gauges();
 }
 
 void MultiMasterManager::disconnect_peer(uint16_t node_id) {
@@ -959,19 +1033,14 @@ void MultiMasterManager::disconnect_peer(uint16_t node_id) {
     if (it == peers_.end()) return;
 
     if (it->second.fd >= 0) {
+        release_tls(it->second);
         ::close(it->second.fd);
     }
     peers_.erase(it);
 
     OB_LOG_INFO("mm", "Peer %u disconnected", node_id);
 
-    // Update metrics: count connected peers.
-    size_t connected = 0;
-    for (const auto& [nid, p] : peers_) {
-        if (p.connected) ++connected;
-    }
-    engine_.registry().set_gauge("ob_mm_peers_connected",
-                                 static_cast<int64_t>(connected));
+    publish_peer_gauges();
 }
 
 void MultiMasterManager::handle_peer_data(uint16_t node_id) {
@@ -1037,6 +1106,7 @@ bool MultiMasterManager::drop_peer_if_send_buf_too_large(PeerConnection& peer) {
     // Deliberately not send_buf.clear() while keeping the socket: after a partial write the buffer
     // can start mid-frame, and abandoning half a frame desynchronises the peer's parser.
     if (peer.fd >= 0) {
+        release_tls(peer);
         ::close(peer.fd);
         peer.fd = -1;
     }
@@ -1053,7 +1123,146 @@ bool MultiMasterManager::drop_peer_if_send_buf_too_large(PeerConnection& peer) {
     return true;
 }
 
+bool MultiMasterManager::attach_tls(PeerConnection& peer) {
+    if (peer.we_accepted) {
+        if (config_.tls_server == nullptr) return true;
+    } else if (config_.tls_client == nullptr) {
+        return true;
+    }
+
+    const TlsContext& ctx = peer.we_accepted ? *config_.tls_server : *config_.tls_client;
+    try {
+        peer.tls = ctx.open_channel(peer.fd, /*server_side=*/peer.we_accepted,
+                                    peer.address.empty() ? std::string("(accepted)") : peer.address);
+    } catch (const std::exception& e) {
+        OB_LOG_ERROR("mm", "cannot start a TLS handshake on fd=%d (%s): %s", peer.fd,
+                     peer.address.c_str(), e.what());
+        return false;
+    }
+
+    if (!peer.we_accepted) {
+        // The name check, and it is not what SSL_VERIFY_PEER does: without it any certificate this
+        // CA signed authenticates any peer, so another node's certificate would be accepted here
+        // and the relay in SECURITY.md would still work (pitfall 124). The accepting end has no
+        // name to expect and uses --tls-peer-names instead (requirements §6.3).
+        std::string host;
+        uint16_t    port = 0;
+        if (!parse_address(peer.address, host, port)) {
+            OB_LOG_ERROR("mm", "cannot require a certificate name for peer %u: unparsable address "
+                               "'%s'", peer.node_id, peer.address.c_str());
+            peer.tls.reset();
+            return false;
+        }
+        if (!tls_expect_host(peer.tls->raw(), host)) {
+            OB_LOG_ERROR("mm", "cannot require peer %u's certificate to cover %s", peer.node_id,
+                         host.c_str());
+            peer.tls.reset();
+            return false;
+        }
+    }
+
+    // Both events armed: the dialling end has a ClientHello to send and the accepting end has one
+    // to read, and the loop that steps the handshake needs to be woken either way.
+    if (epoll_fd_ >= 0 && peer.fd >= 0) {
+        struct epoll_event ev{};
+        ev.events  = EPOLLIN | EPOLLOUT | EPOLLET;
+        ev.data.fd = peer.fd;
+        ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, peer.fd, &ev);
+    }
+    OB_LOG_DEBUG("mm", "tls handshake started on fd=%d (%s, %s)", peer.fd,
+                 peer.address.c_str(), peer.we_accepted ? "accepted" : "dialled");
+    return true;
+}
+
+bool MultiMasterManager::advance_tls_handshake(PeerConnection& peer) {
+    if (peer.tls == nullptr || !peer.tls->handshaking()) return true;
+
+    if (!peer.tls->continue_handshake()) return false;
+    if (peer.tls->handshaking()) {
+        if (peer.tls->io_want() == IoWant::Write) arm_epollout(peer);
+        else                                      disarm_epollout(peer);
+        return true;
+    }
+
+    peer.identity = peer.tls->identity();
+    OB_LOG_INFO("mm", "peer at %s (fd=%d) authenticated by certificate: %s",
+                peer.address.c_str(), peer.fd, peer.identity.c_str());
+    publish_peer_gauges();
+    // Whatever was queued before the handshake - the challenge, or the handshake frame on a mesh
+    // without a cluster secret - goes out now. This is the flush the connect paths did not perform.
+    return try_drain_send_buf(peer);
+}
+
+void MultiMasterManager::release_tls(PeerConnection& peer) {
+    if (peer.tls == nullptr) return;
+    // close_notify before the descriptor goes, so the peer's read reports a clean close rather than
+    // a truncation it cannot tell from a network fault.
+    peer.tls->shutdown();
+    peer.tls.reset();
+    peer.identity.clear();
+}
+
+void MultiMasterManager::publish_peer_gauges() {
+    size_t connected = 0;
+    size_t verified  = 0;
+    for (const auto& [nid, p] : peers_) {
+        // The same denominator as MM_PEERS: a connection accepted but not yet named by its
+        // handshake is not a peer (#84). Counting it would make the gauge disagree with the view
+        // an operator reads beside it, and would count a connection that may still be refused.
+        if (p.node_id == 0 || !p.connected) continue;
+        ++connected;
+        if (p.tls != nullptr && !p.tls->handshaking()) ++verified;
+    }
+    engine_.registry().set_gauge("ob_mm_peers_connected",     static_cast<int64_t>(connected));
+    engine_.registry().set_gauge("ob_mm_peers_tls_verified",  static_cast<int64_t>(verified));
+}
+
 bool MultiMasterManager::try_drain_send_buf(PeerConnection& peer) {
+    return peer.tls == nullptr ? try_drain_send_buf_plain(peer) : try_drain_send_buf_tls(peer);
+}
+
+bool MultiMasterManager::try_drain_send_buf_tls(PeerConnection& peer) {
+    // The handshake has one owner, advance_tls_handshake(). Writing here while it runs would work -
+    // OpenSSL lets a write drive a handshake - and that is the accident series C shipped a comment
+    // about (pitfall 130): two functions advancing one state machine.
+    if (peer.tls->handshaking()) return true;
+    if (!peer.connected || peer.fd < 0) return false;
+
+    while (!peer.send_buf.empty()) {
+        size_t sent = 0;
+        const TlsChannel::Io r = peer.tls->write(peer.send_buf.data(), peer.send_buf.size(), sent);
+        if (r == TlsChannel::Io::Data) {
+            // Moves the pending bytes to a lower address in the same allocation, so a retry after
+            // WANT_WRITE presents a pointer OpenSSL has not seen - refused with `bad write retry`
+            // without SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER, which every context here sets.
+            peer.send_buf.erase(peer.send_buf.begin(),
+                                peer.send_buf.begin() + static_cast<ptrdiff_t>(sent));
+            continue;
+        }
+        if (r == TlsChannel::Io::Again) {
+            // WANT_WRITE arms EPOLLOUT; WANT_READ must not, because the socket is writable and
+            // OpenSSL is waiting to read, so arming it spins (pitfall 5). The EPOLLIN branch of
+            // io_loop() retries the drain for that case - the fourth of the four combinations.
+            if (peer.tls->io_want() == IoWant::Write) arm_epollout(peer);
+            return true;
+        }
+        // Closed or Error, both already logged by the channel.
+        OB_LOG_WARN("mm", "Peer %u: TLS write failed - disconnecting", peer.node_id);
+        peer.connected = false;
+        if (peer.fd >= 0) {
+            release_tls(peer);
+            ::close(peer.fd);
+            peer.fd = -1;
+        }
+        peer.send_buf.clear();
+        return false;
+    }
+
+    disarm_epollout(peer);
+    return true;
+}
+
+bool MultiMasterManager::try_drain_send_buf_plain(PeerConnection& peer) {
     if (peer.send_buf.empty()) {
         disarm_epollout(peer);
         return true;
@@ -1102,6 +1311,7 @@ bool MultiMasterManager::try_drain_send_buf(PeerConnection& peer) {
                             peer.node_id, std::strerror(err));
                 peer.connected = false;
                 if (peer.fd >= 0) {
+                    release_tls(peer);
                     ::close(peer.fd);
                     peer.fd = -1;
                 }
@@ -1115,6 +1325,7 @@ bool MultiMasterManager::try_drain_send_buf(PeerConnection& peer) {
                          peer.node_id, std::strerror(err));
             peer.connected = false;
             if (peer.fd >= 0) {
+                release_tls(peer);
                 ::close(peer.fd);
                 peer.fd = -1;
             }
@@ -1166,6 +1377,7 @@ void MultiMasterManager::process_recv_buf(PeerConnection& peer) {
             OB_LOG_ERROR("mm", "Peer %u: frame too large (%u bytes > %zu max) — disconnecting",
                          peer.node_id, length, MM_MAX_FRAME_PAYLOAD);
             if (peer.fd >= 0) {
+                release_tls(peer);
                 ::close(peer.fd);
                 peer.fd = -1;
             }
@@ -1215,6 +1427,7 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
         OB_LOG_ERROR("mm", "Peer %u: frame too short for WAL record (%zu < %zu) — disconnecting",
                      peer.node_id, len, MM_WALRECORD_V2_SIZE);
         if (peer.fd >= 0) {
+            release_tls(peer);
             ::close(peer.fd);
             peer.fd = -1;
         }
@@ -1234,6 +1447,7 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
                      peer.node_id, hdr.payload_len,
                      expected_payload_len);
         if (peer.fd >= 0) {
+            release_tls(peer);
             ::close(peer.fd);
             peer.fd = -1;
         }
@@ -1374,6 +1588,7 @@ void MultiMasterManager::handle_auth_frame(PeerConnection& peer,
                      peer.node_id, peer.address.c_str(), reason);
         if (peer.fd >= 0) {
             ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, peer.fd, nullptr);
+            release_tls(peer);
             ::close(peer.fd);
             peer.fd = -1;
         }
@@ -1491,6 +1706,7 @@ void MultiMasterManager::process_handshake(PeerConnection& peer,
         OB_LOG_ERROR("mm", "Peer %u: handshake too short (%zu < %zu) — disconnecting",
                      peer.node_id, len, MM_HANDSHAKE_SIZE);
         if (peer.fd >= 0) {
+            release_tls(peer);
             ::close(peer.fd);
             peer.fd = -1;
         }
@@ -1505,6 +1721,7 @@ void MultiMasterManager::process_handshake(PeerConnection& peer,
         OB_LOG_ERROR("mm", "Peer %u: handshake deserialization failed — disconnecting",
                      peer.node_id);
         if (peer.fd >= 0) {
+            release_tls(peer);
             ::close(peer.fd);
             peer.fd = -1;
         }
@@ -1518,6 +1735,7 @@ void MultiMasterManager::process_handshake(PeerConnection& peer,
         OB_LOG_WARN("mm", "Peer %u: unsupported protocol version %u (expected %u) — disconnecting",
                     peer.node_id, msg.protocol_version, MM_PROTOCOL_VERSION);
         if (peer.fd >= 0) {
+            release_tls(peer);
             ::close(peer.fd);
             peer.fd = -1;
         }
@@ -1663,6 +1881,7 @@ void MultiMasterManager::schedule_reconnect(uint16_t node_id) {
 
     // Close the socket if still open.
     if (peer.fd >= 0) {
+        release_tls(peer);
         ::close(peer.fd);
         peer.fd = -1;
     }
@@ -1692,18 +1911,50 @@ void MultiMasterManager::reconnect_loop() {
             std::lock_guard<std::mutex> lock(mtx_);
             auto now = std::chrono::steady_clock::now();
 
+            // A connection we accepted and never identified is not a peer, and once it is down it
+            // cannot become one: the port it arrived on is the peer's ephemeral source port, so
+            // there is no address to dial and no node behind the record yet. Keeping it left one
+            // dead entry in peers_ per refused inbound connection - and, because the dial below
+            // then had nothing to parse, put `Reconnect: invalid peer address:` in the log ten
+            // times a second for the rest of the process's life. The peer that dialled us will
+            // dial again by itself; that is the only way this connection can come back.
+            for (auto it = peers_.begin(); it != peers_.end();) {
+                const PeerConnection& dead = it->second;
+                if (dead.node_id == 0 && !dead.connected && dead.fd < 0) {
+                    OB_LOG_DEBUG("mm", "Dropping the record of an inbound connection that closed "
+                                       "before its handshake named a node (key=%u)", it->first);
+                    it = peers_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
             for (auto& [nid, peer] : peers_) {
                 if (peer.connected) continue;
 
                 // Check if it's time to attempt reconnect.
                 if (now < peer.next_reconnect_time) continue;
 
+                // Every failure branch in this loop has to move next_reconnect_time. This one did
+                // not, so a permanent failure was retried at loop frequency and said so in the log
+                // at the same rate; backoff is what makes a failure that will not clear legible.
+                if (peer.address.empty()) {
+                    const uint32_t delay_ms = peer.backoff.next_delay_ms();
+                    peer.next_reconnect_time = now + std::chrono::milliseconds(delay_ms);
+                    OB_LOG_DEBUG("mm", "Reconnect: peer %u advertises no address (it is not in the "
+                                       "registry), so it has to dial us; next look in %u ms",
+                                 nid, delay_ms);
+                    continue;
+                }
+
                 // Attempt to connect.
                 std::string host;
                 uint16_t port = 0;
                 if (!parse_address(peer.address, host, port)) {
-                    OB_LOG_WARN("mm", "Reconnect: invalid peer address: %s",
-                                peer.address.c_str());
+                    const uint32_t delay_ms = peer.backoff.next_delay_ms();
+                    peer.next_reconnect_time = now + std::chrono::milliseconds(delay_ms);
+                    OB_LOG_WARN("mm", "Reconnect: invalid peer address for peer %u: '%s', next "
+                                      "attempt in %u ms", nid, peer.address.c_str(), delay_ms);
                     continue;
                 }
 
@@ -1777,6 +2028,18 @@ void MultiMasterManager::reconnect_loop() {
                 OB_LOG_INFO("mm", "Reconnected to peer %u at %s", nid,
                             peer.address.c_str());
 
+                // A reconnect starts the TLS handshake again too: the channel belongs to the
+                // connection, which is why `release_tls()` cleared it when the last one went.
+                if (!attach_tls(peer)) {
+                    if (epoll_fd_ >= 0) ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+                    ::close(fd);
+                    peer.fd        = -1;
+                    peer.connected = false;
+                    const uint32_t delay_ms = peer.backoff.next_delay_ms();
+                    peer.next_reconnect_time = now + std::chrono::milliseconds(delay_ms);
+                    continue;
+                }
+
                 // Challenge first when a cluster secret is configured; the handshake follows
                 // once the peer has proved itself on this *new* socket - a reconnect starts the
                 // exchange again, which is why peer_proved was just cleared.
@@ -1785,15 +2048,13 @@ void MultiMasterManager::reconnect_loop() {
                 } else {
                     send_handshake(peer);
                 }
-
-                // Update metrics.
-                size_t connected = 0;
-                for (const auto& [id, p] : peers_) {
-                    if (p.connected) ++connected;
-                }
-                engine_.registry().set_gauge("ob_mm_peers_connected",
-                                             static_cast<int64_t>(connected));
             }
+
+            // Both gauges, once per pass, from the one place that computes them. This tick is the
+            // mechanism and the call sites are only latency: whichever of the twenty-odd places
+            // that move a peer's state ran since the last pass - including accept(), which none of
+            // the old inline copies covered - the gauges are right again within 100 ms.
+            publish_peer_gauges();
         }
 
         // Sleep 100ms between iterations.
@@ -1932,6 +2193,7 @@ void MultiMasterManager::check_backpressure(PeerConnection& peer) {
         // and reading the next frames as its tail. Closing the connection is the only answer that
         // does not lie about the state of the stream.
         if (peer.fd >= 0) {
+            release_tls(peer);
             ::close(peer.fd);
             peer.fd = -1;
         }

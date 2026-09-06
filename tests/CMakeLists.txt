@@ -317,6 +317,9 @@ ob_add_engine_test(test_mm_snapshot
 ob_add_engine_test(test_mm_stats
     test_mm_stats.cpp
 )
+target_compile_definitions(test_mm_stats
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
 
 ob_add_engine_test(test_anti_entropy
     test_anti_entropy.cpp
@@ -786,6 +789,15 @@ target_compile_definitions(test_tls_context
 # cannot force a partial SSL_write over loopback.
 ob_add_tcp_test(test_tls_session
     test_tls_session.cpp
+)
+
+# TLS on the node links: mutual verification, the peer-name allowlist, and the two static tests
+# that make the disconnect and socket-I/O shapes impossible rather than fixed once (series D).
+ob_add_tls_test(test_tls_node_link
+    test_tls_node_link.cpp
+)
+target_compile_definitions(test_tls_node_link
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 
 # The C++ client's TLS path against a real handshake, plus the name check that turns chain

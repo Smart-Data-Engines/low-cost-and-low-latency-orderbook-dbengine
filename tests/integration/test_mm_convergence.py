@@ -25,9 +25,7 @@ def client_for(node, timeout: float = 20.0) -> OrderbookEngine:
 
 def peers_of(cluster, node) -> list[list[str]]:
     """MM_PEERS rows as split columns: node_id, address, status, hlc, lag."""
-    reply = cluster._send(node, "MM_PEERS")
-    lines = [ln for ln in reply.strip().splitlines() if ln]
-    return [ln.split("\t") for ln in lines[1:]]
+    return cluster.mm_peer_rows(node)
 
 
 def wait_for_rows(node, symbol: str, exchange: str, expected: int,
