@@ -55,9 +55,7 @@ def wait_for_prices(node, symbol: str, expected: list[int],
 
 
 def peer_status(cluster, node) -> dict[str, str]:
-    reply = cluster._send(node, "MM_PEERS")
-    rows = [ln.split("\t") for ln in reply.strip().splitlines()[1:] if ln]
-    return {row[0]: row[2] for row in rows}
+    return {row[0]: row[2] for row in cluster.mm_peer_rows(node)}
 
 
 def test_losing_a_node_leaves_the_others_writable(healthy_mm_cluster):

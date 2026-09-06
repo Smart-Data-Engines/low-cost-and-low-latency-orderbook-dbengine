@@ -352,17 +352,19 @@ def test_a_peer_outside_the_name_allowlist_cannot_join_the_mesh(tmp_path) -> Non
     try:
         cm.start_multi_master(node_count=3)
 
-        # Counting `connected`, not rows. `wait_for_mm_mesh()` counts MM_PEERS rows, and since #84
-        # that view lists connections still in their handshake - so a peer being refused can still
-        # appear, and the mesh reads as converged. Pitfall 87 is the same mistake with a different
-        # token.
+        # Counting peers whose status column *is* `connected`, not rows and not occurrences of
+        # the word. Rows are wrong because `wait_for_mm_mesh()` counted them and since #84 the
+        # view lists a peer discovered through etcd before its link is up, so a refused peer
+        # still appears. The word is worse: `"disconnected".count("connected") == 1`, so the
+        # first version of this test read one live peer plus one refused peer as two peers, and
+        # would have passed against a node connected to nobody.
         deadline = time.time() + patience(20)
         while time.time() < deadline:
             time.sleep(1.0)
         for node in cm.nodes[:2]:
-            connected = cm._send(node, "MM_PEERS").count("connected")
-            assert connected <= 1, (
-                f"{node.node_id} connected to {connected} peers; node-2 is not in "
+            connected = cm.mm_connected_peers(node)
+            assert len(connected) <= 1, (
+                f"{node.node_id} connected to peers {connected}; node-2 is not in "
                 f"--tls-peer-names and should have been refused:\n" + tail_node_log(node))
 
         refusals = [tail_node_log(n, lines=400) for n in cm.nodes[:2]]
@@ -373,7 +375,7 @@ def test_a_peer_outside_the_name_allowlist_cannot_join_the_mesh(tmp_path) -> Non
 
         # And the other half, which is what makes the first half a statement about the *name*:
         # node-0 and node-1 are in the allowlist and do connect to each other.
-        assert cm._send(cm.nodes[0], "MM_PEERS").count("connected") == 1, (
+        assert len(cm.mm_connected_peers(cm.nodes[0])) == 1, (
             "the two allowed nodes did not connect to each other either, so this test would also "
             "pass if TLS refused everything:\n" + tail_node_log(cm.nodes[0]))
     finally:

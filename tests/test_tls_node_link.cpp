@@ -257,6 +257,49 @@ TEST(TlsNodeLink, AnAllowlistMatchesAnAddressAsWellAsAName) {
     fs::remove_all(ca.dir);
 }
 
+TEST(TlsNodeLink, TheDiallingEndEnforcesTheAllowlistToo) {
+    // The design error of this series, in the direction that weakened the flag. The first version
+    // applied the allowlist only on the accepting side, reasoning that the dialling side already
+    // pins the name it dialled. The mesh is symmetric, so every pair has two possible connections:
+    // node A refused the connection *from* an unlisted node B and then successfully **dialled** B,
+    // where the dialled-name check passes because B's certificate is genuinely for B's address.
+    // Measured on a three-node mesh with two of the three names allowed: node-0 ended up connected
+    // to two peers.
+    //
+    // The two checks answer different questions - "is this the host I dialled" and "is this host
+    // allowed in the cluster" - so the second cannot be inferred from the first. Here the stranger's
+    // certificate carries the address being dialled, which is exactly the case that makes the
+    // dialled-name check pass and the allowlist the only thing left to refuse it.
+    const Ca ca = make_ca();
+    ASSERT_FALSE(ca.cert.empty());
+    const NodeCert mine     = sign_node(ca, "node-1",   "IP:127.0.0.1");
+    const NodeCert stranger = sign_node(ca, "laptop-7", "IP:127.0.0.1");
+    ASSERT_FALSE(mine.cert.empty());
+    ASSERT_FALSE(stranger.cert.empty());
+
+    // The server has no allowlist, so it accepts us: the refusal under test has to come from our
+    // own end, not from the peer's.
+    const auto host = ob::TlsContext::node_server(stranger.cert, stranger.key, ca.cert);
+    const auto strict = ob::TlsContext::node_client(mine.cert, mine.key, ca.cert,
+                                                    {"node-1", "node-2", "node-3"});
+    const Shaken refused = shake(host, strict, "127.0.0.1");
+    EXPECT_FALSE(refused.client_ok)
+        << "the dialling end accepted an identity outside --tls-peer-names because the address in "
+           "the certificate happened to be the one it dialled";
+    EXPECT_EQ(refused.client_why, "peer certificate identity is not in --tls-peer-names")
+        << "refused for some other reason, so this test would pass with no allowlist at all: "
+        << refused.client_why;
+
+    // The other half, which makes the first a statement about the *list*: the same certificate for
+    // the same dialled address, with no allowlist, is accepted.
+    const auto host2 = ob::TlsContext::node_server(stranger.cert, stranger.key, ca.cert);
+    const auto open = ob::TlsContext::node_client(mine.cert, mine.key, ca.cert);
+    const Shaken accepted = shake(host2, open, "127.0.0.1");
+    EXPECT_TRUE(accepted.client_ok) << accepted.client_why;
+    EXPECT_EQ(accepted.client_identity, "laptop-7");
+    fs::remove_all(ca.dir);
+}
+
 // ── Refusal 3: the dialling end checks the name it dialled ───────────────────
 
 TEST(TlsNodeLink, TheDiallingEndRefusesACertificateIssuedForAnotherAddress) {

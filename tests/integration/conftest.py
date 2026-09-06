@@ -469,11 +469,16 @@ class ClusterManager:
         return node
 
     def wait_for_mm_mesh(self, timeout: float = 30.0) -> None:
-        """Wait until every node sees all the others in MM_PEERS.
+        """Wait until every node is **connected** to all the others in MM_PEERS.
 
         Without this, a test writing to node 0 and reading from node 2 can run before
         the two have connected, and the failure looks like lost data rather than a
         test that started too early.
+
+        Counting listed rows was not enough for that job: a peer discovered through the
+        etcd topology watch gets a row before its connection is up, and one whose link
+        has dropped keeps it. Both read as converged while the write has nowhere to go -
+        the same distinction series D needed to tell a refused peer from a live one.
         """
         expected_peers = len(self.nodes) - 1
         deadline = time.monotonic() + timeout
@@ -485,11 +490,7 @@ class ClusterManager:
             errors = {}
             for node in self.nodes:
                 try:
-                    reply = self._send(node, "MM_PEERS")
-                    # One header line, then one line per peer.
-                    rows = [ln for ln in reply.strip().splitlines()[1:]
-                            if ln and not ln.startswith("OK")]
-                    counts.append(len(rows))
+                    counts.append(len(self.mm_connected_peers(node)))
                 except Exception as exc:  # noqa: BLE001
                     # Recorded, not swallowed: "saw [2, -1, 2]" says a node did not
                     # answer and nothing about why, which is the difference between a
@@ -518,6 +519,30 @@ class ClusterManager:
                 return sock.recv(1 << 20).decode(errors="replace")
             except socket.timeout:
                 return ""
+
+    def mm_peer_rows(self, node: NodeInfo) -> list:
+        """MM_PEERS rows as split columns: node_id, address, status, hlc, lag_bytes.
+
+        The one place these rows are parsed. Two modules had their own copy before, which is
+        how the substring below survived in a third.
+        """
+        reply = self._send(node, "MM_PEERS")
+        lines = [ln for ln in reply.strip().splitlines()[1:]
+                 if ln and not ln.startswith("OK")]
+        return [ln.split("\t") for ln in lines]
+
+    def mm_connected_peers(self, node: NodeInfo) -> list:
+        """The node_ids of the peers whose connection is up, by the status column.
+
+        **The word `connected` cannot be counted**, because the column carries `connected` or
+        `disconnected` and `"disconnected".count("connected") == 1`. The series D allowlist test
+        counted the word and read a mesh with one live peer and one refused one as two peers -
+        an assertion that would have passed against a node that connected to nobody at all.
+        Same family as pitfall 87: the token that answers the question is a suffix of the token
+        that answers the opposite one.
+        """
+        return [row[0] for row in self.mm_peer_rows(node)
+                if len(row) > 2 and row[2] == "connected"]
 
     def _node_argv(self, *, node_index: int, node_id: str, data_dir: str, tcp_port: int,
                    replication_port: int, metrics_port: int, read_only: bool,
