@@ -387,12 +387,19 @@ member (no --tls-peer-names given), which is true only if this CA signs nothing 
 
 #### Checking that it worked
 
-Two numbers on `/metrics`, and they answer the question a configuration file cannot:
+Two pairs of numbers on `/metrics`, and they answer the question a configuration file cannot. Both
+halves of each pair are exported, because the guarantee is the *comparison*: a count of verified
+links means nothing without the count it is measured against, and a number an operator has to read
+off `STATUS` cannot be alerted on.
 
 | Metric | Read it as |
 |---|---|
-| `ob_mm_peers_tls_verified` vs `ob_mm_peers_connected` | equal means every peer link is mutually authenticated; a gap means some peer is connected in plaintext |
-| `ob_replicas_tls_verified` | connected replicas that presented a certificate this node verified |
+| `ob_replicas_tls_verified` vs `ob_replicas_connected` | equal means every replication link is mutually authenticated; a gap means a replica is connected in plaintext |
+| `ob_mm_peers_tls_verified` vs `ob_mm_peers_connected` | the same for the mesh; the peer count excludes inbound connections still in their handshake, which is what `MM_PEERS` lists too |
+
+Alert on the difference, not on either number: both drop to zero when a link goes away, and both
+are recomputed from the connection table on every pass of the loop that owns it, so neither can be
+left behind by a disconnection.
 
 Plus one INFO line per connection naming the certificate identity:
 

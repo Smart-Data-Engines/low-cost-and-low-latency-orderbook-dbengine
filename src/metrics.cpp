@@ -86,10 +86,15 @@ MetricsRegistry::MetricsRegistry() {
     // them: `set_gauge()` on an unregistered name is dropped in silence, which is how five gauges
     // served a flat zero while the engine worked (#77), and `scripts/check_metrics.py` fails CI for
     // a written-but-unregistered name.
+    gauges_.push_back(make_gauge("ob_replicas_connected",
+                                 "Replicas currently connected to this primary. Exported next to "
+                                 "the verified count because the guarantee is the comparison, and "
+                                 "a number an operator has to read off STATUS cannot be alerted "
+                                 "on."));
     gauges_.push_back(make_gauge("ob_replicas_tls_verified",
                                  "Connected replicas that presented a certificate this node "
-                                 "verified. Compare with the replica count: a node link is only "
-                                 "mutually authenticated where these agree."));
+                                 "verified. Equal to ob_replicas_connected on a link running with "
+                                 "--tls-replication; a gap is a replica talking plaintext."));
 
     // Histograms
     histograms_.push_back(make_histogram("ob_insert_latency_seconds", "Insert operation latency in seconds"));

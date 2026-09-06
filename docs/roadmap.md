@@ -510,8 +510,11 @@ gives channel binding.
   the sixth replica.
 - **The state of the guarantee is readable on a live node**, because a guarantee whose state cannot
   be read is a guarantee on our word: `ob_mm_peers_tls_verified` against `ob_mm_peers_connected`,
-  `ob_replicas_tls_verified`, and one INFO line per connection naming the certificate identity. A
-  count and not a label — a label fed by a peer is an unbounded label set (part one, #31).
+  `ob_replicas_tls_verified` against `ob_replicas_connected`, and one INFO line per connection
+  naming the certificate identity. A count and not a label — a label fed by a peer is an unbounded
+  label set (part one, #31). Both halves of both pairs are exported, and both are recomputed on
+  every pass of the loop that owns the connections: publishing a count only where it goes up leaves
+  a dropped link counted, which is the shape #94 had on the mesh side.
 - **The certificate identity lands in a field, which these links did not have.** A node's identity
   used to be its `node_id`, arriving in a handshake that authentication precedes, so the cluster form
   of a secret file carries no name at all. `ReplicaInfo::identity` and `PeerConnection::identity`

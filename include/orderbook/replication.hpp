@@ -423,7 +423,16 @@ private:
     /// peer is an unbounded label set (pitfall 116). Through `engine_`, which is null in the unit
     /// tests that construct this class directly - so the absence of the metric there is a property
     /// of the fixture, not a branch anybody has to remember.
-    void publish_tls_gauge();
+    /// Publish both replica gauges from `replicas_`. Requires `mtx_` held.
+    ///
+    /// Both, from one loop, and from the run loop's every-pass tick rather than only from the
+    /// handshake: the verified count used to be published *only* where it goes up, so a replica
+    /// that dropped left its contribution behind and the gauge could report more verified links
+    /// than there were links. `ob_replicas_connected` is here because the guarantee is the
+    /// *comparison* - a count of verified links means nothing without the count it is measured
+    /// against, and telling an operator to read that one off `STATUS` means it cannot be alerted
+    /// on. Same defect from the other side as roadmap #94.
+    void publish_replica_gauges();
 
     /// Arm or disarm EPOLLOUT for one replica. Extracted because the TLS paths need it from four
     /// places, and an inline `epoll_ctl` in each is how the two event masks drift apart.

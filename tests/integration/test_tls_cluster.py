@@ -242,6 +242,76 @@ def test_a_mesh_converges_over_tls_without_a_cluster_secret(
         assert rows[0].price == 77_000
 
 
+def test_metrics_report_the_replica_as_verified(tls_ha_cluster: ClusterManager) -> None:
+    """The same guarantee as the mesh one below, on the link that has a direction.
+
+    Both numbers are exported so the comparison is one scrape: a verified count on its own says
+    nothing, and the count it is measured against used to live only in `STATUS`, where an alert
+    cannot reach it. The verified gauge is also published on every pass of the run loop rather than
+    only where a handshake succeeds, which is what makes a dropped replica leave the count.
+    """
+    primary = tls_ha_cluster.primary()
+    deadline = time.time() + patience(20)
+    m: dict = {}
+    while time.time() < deadline:
+        m = scrape(primary.metrics_port)
+        if m.get("ob_replicas_connected", 0) >= 1:
+            break
+        time.sleep(0.5)
+
+    assert m.get("ob_replicas_connected", 0) >= 1, (
+        "the primary reports no connected replica, so this test would assert nothing:\n"
+        + tail_node_log(primary))
+    assert m["ob_replicas_tls_verified"] == m["ob_replicas_connected"], (
+        f"{m['ob_replicas_tls_verified']} of {m['ob_replicas_connected']} replicas are verified, "
+        f"so one is talking plaintext:\n" + tail_node_log(primary))
+
+
+def test_a_dropped_replica_leaves_both_replica_gauges(tmp_path) -> None:
+    """A count that only goes up is not a count.
+
+    The verified gauge was published from one place - the end of a successful handshake - so it was
+    correct until the first disconnection and then reported a link that no longer existed. Worse
+    than a wrong number: `verified` could exceed `connected`, which reads as impossible and sends
+    an operator looking for the wrong fault. Its own cluster rather than the module fixture,
+    because the point of the test is to take a node away.
+    """
+    cm = ClusterManager()
+    cm.node_tls = make_cluster_certs(tmp_path, node_count=2)
+    try:
+        cm.start()
+        primary = cm.primary()
+
+        deadline = time.time() + patience(20)
+        while time.time() < deadline:
+            m = scrape(primary.metrics_port)
+            if m.get("ob_replicas_connected", 0) >= 1 and m.get("ob_replicas_tls_verified", 0) >= 1:
+                break
+            time.sleep(0.5)
+        assert m.get("ob_replicas_tls_verified", 0) >= 1, (
+            "no verified replica to lose, so the second half asserts nothing:\n"
+            + tail_node_log(primary))
+
+        replica_index = next(n.index for n in cm.nodes if n.node_id != primary.node_id)
+        cm.kill_node(replica_index)
+
+        deadline = time.time() + patience(30)
+        while time.time() < deadline:
+            m = scrape(primary.metrics_port)
+            if m.get("ob_replicas_connected", 0) == 0:
+                break
+            time.sleep(0.5)
+
+        assert m.get("ob_replicas_connected", 1) == 0, (
+            f"the primary still reports {m.get('ob_replicas_connected')} connected replicas after "
+            f"the replica was killed:\n" + tail_node_log(primary))
+        assert m.get("ob_replicas_tls_verified", 1) == 0, (
+            f"the replica is gone and {m.get('ob_replicas_tls_verified')} links are still counted "
+            f"as verified:\n" + tail_node_log(primary))
+    finally:
+        cm.shutdown()
+
+
 def test_metrics_report_every_peer_as_verified(tls_mm_cluster: ClusterManager) -> None:
     """A guarantee whose state cannot be read on a live node is a guarantee on our word.
 

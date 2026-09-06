@@ -116,7 +116,9 @@ name; on the node links the dialling end checks the name it dialled, and the acc
 the chain plus, when `--tls-peer-names` is given, an explicit identity allowlist. Without that
 allowlist the accepting end accepts any identity your CA signed, which is correct when the CA signs
 nothing but the cluster and wrong when it is a corporate CA — the startup log says which mode is in
-force, and `ob_mm_peers_tls_verified` says how many live peers are actually verified.
+force, and `ob_mm_peers_tls_verified` against `ob_mm_peers_connected` says how many live peers are
+actually verified — with `ob_replicas_tls_verified` against `ob_replicas_connected` for the
+replication link.
 
 A node link needs a trust anchor (`--tls-ca-file`) and the process refuses to start without one.
 There is deliberately no "encrypt but do not verify the peer" mode for those links: it would leave

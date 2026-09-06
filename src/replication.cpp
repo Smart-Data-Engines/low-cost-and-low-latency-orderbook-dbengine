@@ -603,18 +603,22 @@ bool ReplicationManager::advance_tls_handshake(ReplicaInfo& replica) {
     replica.identity = replica.tls->identity();
     OB_LOG_INFO("repl_mgr", "replica fd=%d from %s authenticated by certificate: %s",
                 replica.fd, replica.address.c_str(), replica.identity.c_str());
-    publish_tls_gauge();
+    publish_replica_gauges();
     // Whatever was queued before the handshake - the challenge, on an authenticating link - goes out
     // now. This is the flush the accept path deliberately did not perform.
     return drain_send_buffer(replica);
 }
 
-void ReplicationManager::publish_tls_gauge() {
+void ReplicationManager::publish_replica_gauges() {
     if (engine_ == nullptr) return;
-    size_t verified = 0;
+    size_t connected = 0;
+    size_t verified  = 0;
     for (const auto& r : replicas_) {
-        if (r.fd >= 0 && r.tls != nullptr && !r.tls->handshaking()) ++verified;
+        if (r.fd < 0) continue;
+        ++connected;
+        if (r.tls != nullptr && !r.tls->handshaking()) ++verified;
     }
+    engine_->registry().set_gauge("ob_replicas_connected",    static_cast<int64_t>(connected));
     engine_->registry().set_gauge("ob_replicas_tls_verified", static_cast<int64_t>(verified));
 }
 
@@ -748,6 +752,15 @@ void ReplicationManager::run_loop() {
 
         // Has a snapshot worker finished? Before dispatching events, and on the timeout path too.
         poll_snapshot_preparation();
+
+        // Both replica gauges, once per pass. This tick is the mechanism: publishing them only
+        // where a link is established - which is what the verified count did - leaves a dropped
+        // replica counted until the next handshake, so the gauge could claim more verified links
+        // than there were links at all.
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            publish_replica_gauges();
+        }
 
         for (int i = 0; i < nfds; ++i) {
             int fd = events[i].data.fd;
