@@ -317,6 +317,9 @@ ob_add_engine_test(test_mm_snapshot
 ob_add_engine_test(test_mm_stats
     test_mm_stats.cpp
 )
+target_compile_definitions(test_mm_stats
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
 
 ob_add_engine_test(test_anti_entropy
     test_anti_entropy.cpp

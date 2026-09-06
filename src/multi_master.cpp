@@ -766,7 +766,7 @@ void MultiMasterManager::io_loop() {
                                 std::chrono::steady_clock::now() +
                                 std::chrono::milliseconds(delay_ms);
                         }
-                        publish_tls_gauge();
+                        publish_peer_gauges();
                     }
                     continue;
                 }
@@ -1017,13 +1017,7 @@ void MultiMasterManager::connect_to_peer(const PeerInfo& peer) {
         send_handshake(peers_[peer.node_id]);
     }
 
-    // Update metrics: count connected peers.
-    size_t connected = 0;
-    for (const auto& [nid, p] : peers_) {
-        if (p.connected) ++connected;
-    }
-    engine_.registry().set_gauge("ob_mm_peers_connected",
-                                 static_cast<int64_t>(connected));
+    publish_peer_gauges();
 }
 
 void MultiMasterManager::disconnect_peer(uint16_t node_id) {
@@ -1040,13 +1034,7 @@ void MultiMasterManager::disconnect_peer(uint16_t node_id) {
 
     OB_LOG_INFO("mm", "Peer %u disconnected", node_id);
 
-    // Update metrics: count connected peers.
-    size_t connected = 0;
-    for (const auto& [nid, p] : peers_) {
-        if (p.connected) ++connected;
-    }
-    engine_.registry().set_gauge("ob_mm_peers_connected",
-                                 static_cast<int64_t>(connected));
+    publish_peer_gauges();
 }
 
 void MultiMasterManager::handle_peer_data(uint16_t node_id) {
@@ -1193,7 +1181,7 @@ bool MultiMasterManager::advance_tls_handshake(PeerConnection& peer) {
     peer.identity = peer.tls->identity();
     OB_LOG_INFO("mm", "peer at %s (fd=%d) authenticated by certificate: %s",
                 peer.address.c_str(), peer.fd, peer.identity.c_str());
-    publish_tls_gauge();
+    publish_peer_gauges();
     // Whatever was queued before the handshake - the challenge, or the handshake frame on a mesh
     // without a cluster secret - goes out now. This is the flush the connect paths did not perform.
     return try_drain_send_buf(peer);
@@ -1208,12 +1196,19 @@ void MultiMasterManager::release_tls(PeerConnection& peer) {
     peer.identity.clear();
 }
 
-void MultiMasterManager::publish_tls_gauge() {
-    size_t verified = 0;
+void MultiMasterManager::publish_peer_gauges() {
+    size_t connected = 0;
+    size_t verified  = 0;
     for (const auto& [nid, p] : peers_) {
-        if (p.connected && p.tls != nullptr && !p.tls->handshaking()) ++verified;
+        // The same denominator as MM_PEERS: a connection accepted but not yet named by its
+        // handshake is not a peer (#84). Counting it would make the gauge disagree with the view
+        // an operator reads beside it, and would count a connection that may still be refused.
+        if (p.node_id == 0 || !p.connected) continue;
+        ++connected;
+        if (p.tls != nullptr && !p.tls->handshaking()) ++verified;
     }
-    engine_.registry().set_gauge("ob_mm_peers_tls_verified", static_cast<int64_t>(verified));
+    engine_.registry().set_gauge("ob_mm_peers_connected",     static_cast<int64_t>(connected));
+    engine_.registry().set_gauge("ob_mm_peers_tls_verified",  static_cast<int64_t>(verified));
 }
 
 bool MultiMasterManager::try_drain_send_buf(PeerConnection& peer) {
@@ -1910,18 +1905,50 @@ void MultiMasterManager::reconnect_loop() {
             std::lock_guard<std::mutex> lock(mtx_);
             auto now = std::chrono::steady_clock::now();
 
+            // A connection we accepted and never identified is not a peer, and once it is down it
+            // cannot become one: the port it arrived on is the peer's ephemeral source port, so
+            // there is no address to dial and no node behind the record yet. Keeping it left one
+            // dead entry in peers_ per refused inbound connection - and, because the dial below
+            // then had nothing to parse, put `Reconnect: invalid peer address:` in the log ten
+            // times a second for the rest of the process's life. The peer that dialled us will
+            // dial again by itself; that is the only way this connection can come back.
+            for (auto it = peers_.begin(); it != peers_.end();) {
+                const PeerConnection& dead = it->second;
+                if (dead.node_id == 0 && !dead.connected && dead.fd < 0) {
+                    OB_LOG_DEBUG("mm", "Dropping the record of an inbound connection that closed "
+                                       "before its handshake named a node (key=%u)", it->first);
+                    it = peers_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
             for (auto& [nid, peer] : peers_) {
                 if (peer.connected) continue;
 
                 // Check if it's time to attempt reconnect.
                 if (now < peer.next_reconnect_time) continue;
 
+                // Every failure branch in this loop has to move next_reconnect_time. This one did
+                // not, so a permanent failure was retried at loop frequency and said so in the log
+                // at the same rate; backoff is what makes a failure that will not clear legible.
+                if (peer.address.empty()) {
+                    const uint32_t delay_ms = peer.backoff.next_delay_ms();
+                    peer.next_reconnect_time = now + std::chrono::milliseconds(delay_ms);
+                    OB_LOG_DEBUG("mm", "Reconnect: peer %u advertises no address (it is not in the "
+                                       "registry), so it has to dial us; next look in %u ms",
+                                 nid, delay_ms);
+                    continue;
+                }
+
                 // Attempt to connect.
                 std::string host;
                 uint16_t port = 0;
                 if (!parse_address(peer.address, host, port)) {
-                    OB_LOG_WARN("mm", "Reconnect: invalid peer address: %s",
-                                peer.address.c_str());
+                    const uint32_t delay_ms = peer.backoff.next_delay_ms();
+                    peer.next_reconnect_time = now + std::chrono::milliseconds(delay_ms);
+                    OB_LOG_WARN("mm", "Reconnect: invalid peer address for peer %u: '%s', next "
+                                      "attempt in %u ms", nid, peer.address.c_str(), delay_ms);
                     continue;
                 }
 
@@ -2015,15 +2042,13 @@ void MultiMasterManager::reconnect_loop() {
                 } else {
                     send_handshake(peer);
                 }
-
-                // Update metrics.
-                size_t connected = 0;
-                for (const auto& [id, p] : peers_) {
-                    if (p.connected) ++connected;
-                }
-                engine_.registry().set_gauge("ob_mm_peers_connected",
-                                             static_cast<int64_t>(connected));
             }
+
+            // Both gauges, once per pass, from the one place that computes them. This tick is the
+            // mechanism and the call sites are only latency: whichever of the twenty-odd places
+            // that move a peer's state ran since the last pass - including accept(), which none of
+            // the old inline copies covered - the gauges are right again within 100 ms.
+            publish_peer_gauges();
         }
 
         // Sleep 100ms between iterations.

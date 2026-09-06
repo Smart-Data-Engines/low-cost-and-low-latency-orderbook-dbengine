@@ -642,13 +642,22 @@ private:
     /// close_notify, then forget the channel. Called from every path that closes a peer socket.
     void release_tls(PeerConnection& peer);
 
-    /// Publish how many connected peers presented a verified certificate.
+    /// Publish both mesh peer gauges from `peers_`. Requires `mtx_` held.
     ///
-    /// The readable form of the guarantee (requirement 6.6): a guarantee whose state cannot be read
-    /// on a live node is a guarantee on our word. A count and not a label, because a label fed by a
-    /// peer is an unbounded label set (pitfall 116) - and here it would name a peer that is by
-    /// definition authenticated, which is exactly the value an operator would then trust.
-    void publish_tls_gauge();
+    /// `ob_mm_peers_tls_verified` is the readable form of the guarantee (requirement 6.6): a
+    /// guarantee whose state cannot be read on a live node is a guarantee on our word. A count and
+    /// not a label, because a label fed by a peer is an unbounded label set (pitfall 116) - and
+    /// here it would name a peer that is by definition authenticated, which is exactly the value an
+    /// operator would then trust.
+    ///
+    /// **Both** gauges, from one loop, because `ob_mm_peers_connected` was recomputed inline at
+    /// three sites - `connect_to_peer()`, `disconnect_peer()` and the reconnect loop - and none of
+    /// them is the accept path, so a node that *accepted* a connection never counted it. Measured
+    /// on a three-node TLS mesh: `ob_mm_peers_tls_verified` 2 against `ob_mm_peers_connected` 1,
+    /// which reads as a peer talking plaintext. The correctness does not come from the call sites
+    /// either: this runs once per reconnect-loop tick, so no state change anywhere can leave the
+    /// gauges stale for longer than that, whichever of the twenty-odd sites made it.
+    void publish_peer_gauges();
 
     /// Arm EPOLLOUT for a peer's fd (when send_buf is non-empty after EAGAIN).
     void arm_epollout(PeerConnection& peer);

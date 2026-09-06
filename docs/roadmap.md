@@ -1904,6 +1904,72 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 96. The temporary key for an accepted connection lives in the node-id space
+
+`peers_` is keyed by node id, and a connection this node accepts is inserted under
+`static_cast<uint16_t>(client_fd)` until its handshake says who is behind it. The comment above that
+line describes a different design — "use a high node_id range (fd + 10000) as temp key" — which is
+the one that would be safe. The code does not do it.
+
+So an inbound connection landing on descriptor N silently replaces the live record of peer node N:
+the assignment drops that peer's send buffer, loses its backoff state, and leaves its descriptor in
+the epoll set with no record behind it — the next event on it takes the "unknown fd" branch and
+closes it, so the peer sees a truncation. Nothing logs anything, on either side.
+
+Reaching it needs a node id equal to a descriptor number, and `--mm-node-id` takes any `uint16_t`
+with no range check: a cluster numbered 1..3 is safe by accident, one numbered by rack position is
+not.
+
+The fix is not the reserved range. It is a separate container for connections that have not yet been
+identified, which also removes the two places that ask "is this record a real peer?" by testing
+`node_id == 0` — the MM_PEERS skip from #84 and the reconnect-loop cleanup from #95 — and a third
+such site is a thing to remember to copy.
+
+- Effort: M | Impact: a live peer link is silently replaced, with no log line
+
+### 95. The reconnect loop retried a permanent failure ten times a second ✅
+
+`Reconnect: invalid peer address: ` in the log every 100 ms, for the life of the process, on a node
+that had refused an inbound connection. Older than the change that surfaced it (#30 part three).
+
+Two causes, both worth naming. Every failure branch in that loop moves `next_reconnect_time` and
+takes the backoff — except the unparseable address, which simply continued, so a failure that would
+never clear was retried at loop frequency and said so at loop frequency. And the record being
+retried could not be dialled at all: a connection this node *accepted* is stored with no node id and
+no address, because the port it arrived on is the peer's ephemeral source port. Once such a
+connection closes before its handshake names a node, there is nothing to dial and nothing for it to
+become — so it was one dead entry in `peers_` per refused inbound connection, kept for the life of
+the process.
+
+Measured on a three-node mesh with one node outside `--tls-peer-names`, over fifteen seconds: **0**
+`invalid peer address` lines where there had been about 150 per node, and 15 dead records dropped
+per node. A peer that completed its handshake but is not in the registry keeps its record — it can
+still dial us — and is now logged at DEBUG with backoff rather than at WARN with none.
+
+- Effort: S | Impact: a log line at 10 Hz is a log an operator cannot read
+
+### 94. `ob_mm_peers_connected` never counted a connection the node accepted ✅
+
+Found by the integration test written for series D's own gauge, the one that asserts the two mesh
+numbers agree: `ob_mm_peers_tls_verified` **2** against `ob_mm_peers_connected` **1**, on a
+three-node mesh where every link was mutually verified. An operator reads that gap as a peer talking
+plaintext — the exact opposite of what was true.
+
+The count was recomputed inline at three sites — `connect_to_peer()`, `disconnect_peer()` and the
+reconnect loop — and none of them is `accept()`. The number was therefore right for peers this node
+dialled and short by one for every peer that dialled it, which in a three-node mesh is consistently
+half of them.
+
+Both gauges now come from one `publish_peer_gauges()` over `peers_`, and the correctness does not
+come from its call sites: it also runs once per reconnect-loop pass, so no state change anywhere can
+leave either gauge stale for more than 100 ms, whichever of the twenty-odd places that move a peer's
+state made it. The denominator is the one MM_PEERS uses — a connection accepted but not yet named by
+its handshake is not a peer (#84) — so the view and the gauge cannot disagree either. A static test
+refuses a second write site for either name: three copies of a count is how the fourth site comes to
+be missing.
+
+- Effort: S | Impact: the mesh's own guarantee metric read as a violation of itself
+
 ### 93. Catch-up above the send-buffer ceiling costs one reconnect per 16 MB
 
 Named by #30 part three series D rather than fixed by it, because the fix there was the one that
