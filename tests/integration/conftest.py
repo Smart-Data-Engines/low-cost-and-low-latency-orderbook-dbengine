@@ -651,14 +651,17 @@ class ClusterManager:
                 last_err = exc
             time.sleep(0.5)
 
-        # Grab stderr for diagnostics
-        stderr_text = ""
-        if node.process and node.process.poll() is not None:
-            stderr_text = (node.process.stderr.read() or b"").decode(errors="replace")
-
+        # Why, not just what - and this path had erased the why twice over. `node.process.stderr`
+        # is None, because nodes log to a file in their data directory since the unread-pipe fix, so
+        # reading it raised `AttributeError: 'NoneType' object has no attribute 'read'` and replaced
+        # the diagnosis with a traceback about the diagnosis. And it only looked when the process had
+        # **exited**, which is the case that needs it least: a node that is alive and not answering
+        # is exactly the one whose log has to be read. Third instance of the same class as the CI
+        # step that printed a TSan report only when there was none.
+        alive = node.process is None or node.process.poll() is None
         raise RuntimeError(
-            f"Node {node.node_id} (port {node.tcp_port}) not ready after "
-            f"{timeout}s: {last_err}\nstderr: {stderr_text}"
+            f"Node {node.node_id} (port {node.tcp_port}) not ready after {timeout}s: {last_err}\n"
+            f"process alive: {alive}\n" + tail_node_log(node, lines=60)
         )
 
     def _stop_node(self, node: NodeInfo) -> None:

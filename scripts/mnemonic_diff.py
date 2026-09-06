@@ -70,35 +70,35 @@ def disassemble(path: pathlib.Path) -> dict[str, list[list[str]]]:
     return functions
 
 
-# Padding, not work. Alignment NOPs move whenever code layout moves, which is the thing this tool
-# exists to see through: without this filter `broadcast` reported 173 against 170 instructions and
-# the first difference was `nopl` against `cs nopw`. A NOP is the one instruction that provably
-# changes nothing, so dropping it cannot hide a change in behaviour.
-PADDING = ("nop", "nopl", "nopw", "nopb", "cs", "data16", "xchg")
+def is_padding(text: str) -> bool:
+    """Whether this instruction is alignment padding under any encoding objdump prints for one.
+
+    Padding, not work: alignment NOPs move whenever code layout moves, which is the thing this tool
+    exists to see through. Without this filter `broadcast` reported 173 against 170 instructions
+    with the first difference `nopl` against `cs nopw`. A NOP is the one instruction that provably
+    changes nothing, so dropping it cannot hide a change in behaviour - which is why the test is on
+    the whole text rather than on a list of mnemonics: `cs` and `data16` are prefixes, and dropping
+    every instruction that starts with one would drop instructions that do something.
+    """
+    mnemonic = text.split(maxsplit=1)[0]
+    if mnemonic.startswith("nop"):
+        return True
+    if mnemonic in ("cs", "data16", "xchg") and " nop" in f" {text}":
+        return True
+    # The two-byte NOP; a real `xchg` has other operands.
+    return mnemonic == "xchg" and "%ax,%ax" in text
 
 
 def mnemonics(instructions: list[str], keep_padding: bool = False) -> list[str]:
-    out = []
-    for text in instructions:
-        if not text:
-            continue
-        mnemonic = text.split(maxsplit=1)[0]
-        if not keep_padding and mnemonic in PADDING:
-            # `xchg %ax,%ax` is the two-byte NOP; a real xchg has different operands.
-            if mnemonic != "xchg" or "%ax,%ax" in text:
-                continue
-        out.append(mnemonic)
-    return out
+    return [text.split(maxsplit=1)[0] for text in instructions
+            if text and (keep_padding or not is_padding(text))]
 
 
 def operands(instructions: list[str]) -> list[str]:
     """Instruction text with everything that legitimately moves between builds removed."""
     normalised = []
     for text in instructions:
-        if not text:
-            continue
-        mnemonic = text.split(maxsplit=1)[0]
-        if mnemonic in PADDING and (mnemonic != "xchg" or "%ax,%ax" in text):
+        if not text or is_padding(text):
             continue
         text = text.split("#", 1)[0].strip()
         text = CALL_TARGET_RE.sub("<T>", text)
