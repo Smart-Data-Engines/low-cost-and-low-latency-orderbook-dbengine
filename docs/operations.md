@@ -222,6 +222,37 @@ Backoff applies to every failure, including this one, so the log rate falls away
 repeating at loop frequency (#95). `ob_mm_peers_connected` beside `ob_mm_peers_tls_verified` is the
 pair to alert on — alert on the *difference*, not on either number.
 
+### A replica that is slow, rather than one that is behind
+
+`replica fd=9 is not draining: queued=16780544 > 16777216 - dropping the connection` means this
+node is holding 16 MB of output for one replica and the socket is not moving it. Read it as a
+statement about the **link or the replica**, not about how far behind that replica was: since #93 a
+catch-up streams in bounded batches and stops at half this ceiling until the socket drains, so the
+size of the range a replica asks for cannot reach the ceiling on its own. Before #93 it could, and
+the same message meant something quite different — a replica more than 16 MB behind was dropped by
+the act of catching it up, reconnected, and was dropped again.
+
+A catch-up that is progressing says so twice: once at the start, with where it is going —
+
+```
+catchup for fd=9: from_file=3, from_offset=1048576, through_file=7, through_offset=41904,
+wal_dir=/var/lib/orderbook/wal
+```
+
+— and once at the end, with where it arrived and how much live traffic it held back:
+
+```
+catchup complete for fd=9 at file=7 offset=41904; releasing 24576 bytes of live records
+that arrived while it streamed
+```
+
+Those held-back bytes are the ordering guarantee, not a queue to worry about: a record written while
+a replica is still receiving history must arrive after that history. If the number is large and the
+completion line is slow to appear, the replica is behind by a lot and the write rate is high — the
+pair to watch is that number growing across successive completions, which says the catch-up is
+losing ground to live traffic. It is bounded by the same 16 MB ceiling as the send queue, and
+reaching it drops the replica as above.
+
 ## Security
 
 **There is no encryption.** Client sessions can authenticate; nothing on the wire is encrypted, so a

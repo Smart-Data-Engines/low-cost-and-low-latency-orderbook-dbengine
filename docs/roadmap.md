@@ -531,7 +531,7 @@ gives channel binding.
   asking where that code would put `SSL_ERROR_WANT_WRITE`, which has the same answer as where it
   puts `EAGAIN`: nowhere. The ceiling still drops a replica that is not draining, at 16 MB of queued
   output instead of one socket buffer, and it resumes from its confirmed position. Test
-  mutation-checked in both directions; the remaining reconnects are #93.
+  mutation-checked in both directions; the reconnects that remained were #93, now closed.
 - **The test for it needed a measured number, not a generous one.** With neither side setting a
   buffer size, the loopback pair absorbed **2.6 MB** before the sender first saw `EAGAIN`, so a 2 MB
   version of that test passed against the defect. Shrinking the receiver's window to 4 kB reproduced
@@ -1909,6 +1909,80 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 99. A live write during a snapshot transfer is spliced into the snapshot's byte stream
+
+Named by #93 rather than fixed by it: the mechanism #93 built for the catch-up stream is the one
+this needs, but they are different streams and a fix that changes both in one commit is a fix whose
+measurement covers neither.
+
+`broadcast()` walks every entry in `replicas_` and there is no branch on
+`snapshot_transfer.active`, so a replica being bootstrapped receives live `WAL ...` records
+interleaved into a stream of `SNAPSHOT_FILE` headers and raw file bytes. On the replica side
+`request_and_receive_snapshot()` reads a header with `read_line()` and then exactly `file_size`
+bytes with `read_exact()` — so a record that lands between two files makes the next `read_line()`
+return `WAL 3 0 4888 7` where `SNAPSHOT_FILE` was expected, and the bootstrap is abandoned; a record
+that lands *inside* a file's bytes becomes file content, and the transfer fails its CRC instead.
+
+Not measured, and the distinction matters: what is established is that nothing suppresses the
+broadcast, which is a statement about the code. Whether a real bootstrap loses the race depends on
+whether the primary takes writes while it streams, and every test that bootstraps a replica today
+does it against a primary that has stopped writing — which is exactly the coincidence that hides
+this. The measurement to take first is a bootstrap under load, with the answer read off the
+replica's own bootstrap outcome rather than off a log line.
+
+The answer is `queue_to_replica()` from #93 with the snapshot transfer as its second condition: live
+records wait, and are released when `SNAPSHOT_END` goes out. The snapshot already carries the WAL
+position it was taken at, so what waits is what the replica needs next anyway.
+
+- Effort: S | Impact: a replica cannot be bootstrapped from a primary that is taking writes, which
+  is every primary worth bootstrapping from
+
+
+### 98. The WAL position a replica is told is not the position of the record it is told about
+
+Named by #93, and larger than the item that found it. Its own text claimed a dropped replica
+"resumes from the position it confirmed, so progress is monotonic". It does not.
+
+`send_to_replica()` writes `WAL <replica.confirmed_file> <replica.confirmed_offset> ...` — the
+position this replica last **acknowledged**, not the position of the record being sent. `broadcast()`
+is worse: it writes `WAL <current_file> 0 ...`, a literal zero. The replica does
+`confirmed_offset = byte_offset + total_len` and saves that to its state file, so:
+
+- **During a catch-up** the field never moves, because the ACKs that would move it are read by
+  `handle_replica_data()`, and that is the function the synchronous pass was running inside.
+  **Measured**: every one of 112 records delivered before the drop carried `file=0 offset=0`. The
+  replica therefore recorded `24112` — one record's worth — no matter how many it received, and a
+  reconnect resumed one record along. The 16 MB steps this was assumed to make were one record.
+- **In steady state** every record says offset `0`, so a replica that restarts asks for
+  `total_len` bytes into the current WAL file and is re-sent nearly all of it. Storage is
+  append-only, so a re-applied delta appends its rows a second time (the note at `engine.cpp:718`
+  says this about the multi-master path, where the sequence check stops it; the replication path has
+  no such check).
+- **WAL retention is gated on the file index, and that is why this has been survivable.**
+  `Engine`'s retention pass takes `min(current_file_index, every replica's confirmed_file)` and
+  truncates below it — it never reads the offset. And the file index on the wire is *correct* on the
+  live path: `broadcast()` sends `wal_.current_file_index()`. During a catch-up it is stale in the
+  safe direction — every record claims the file the replica asked from, so a replica catching up
+  across files 3 to 7 keeps retention pinned at 3 until it is done. So the field that is wrong is
+  the one nothing depends on, and the field something depends on is right. That is the shape of a
+  defect that survives four phases of work: it is load-bearing nowhere.
+
+The record's true position is not hard to come by: the cursor from #93 holds it (`cur.file`,
+`cur.offset`), and on the live path `wal_.current_position()` immediately after the append is the
+end of the record just written, because the append and the broadcast happen under one engine lock
+with nothing between them.
+
+**Both halves have to change together**, and that is the whole design note. Fix the catch-up alone
+and a replica's position jumps to 24 MB and then back to `total_len` on its first live record —
+worse than a field that is uniformly meaningless, because a position that moves backwards is one a
+retention gate can act on. The wire format does not change: the field is already there and already
+`uint32`/`size_t`; what changes is what is written into it, and one side of the seam being right is
+not an improvement.
+
+- Effort: S | Impact: a replica's saved position becomes true, so a restart resumes where it stopped
+  instead of replaying a WAL file, and retention is gated on a real number
+
+
 ### 97. One unreachable peer address stops every write on the node ✅ **P0**
 
 The multi-master reconnect loop holds `mtx_` across the whole of its pass — the prune, the dial and
@@ -2084,30 +2158,112 @@ be missing.
 
 - Effort: S | Impact: the mesh's own guarantee metric read as a violation of itself
 
-### 93. Catch-up above the send-buffer ceiling costs one reconnect per 16 MB
+### 93. Catch-up above the send-buffer ceiling costs one reconnect per 16 MB ✅
 
 Named by #30 part three series D rather than fixed by it, because the fix there was the one that
 belonged with the change: every write to a replica now goes through `enqueue_send()` and the
 EPOLLOUT drain, which is the only shape in which a socket saying "come back later" has anywhere to
 say it — and the only shape in which `SSL_ERROR_WANT_WRITE` does.
 
-What that left: `handle_catchup()` still streams the whole requested WAL range in one synchronous
-pass, so a replica that is not draining reaches the 16 MB queue ceiling and is dropped. It reconnects
-and resumes from the position it confirmed, so progress is monotonic — but a replica a gigabyte
-behind needs sixty-odd reconnects to get there. Before series D the same thing happened at **one
-socket buffer** (measured: 2.6 MB on loopback with no buffer sizes set, ~208 kB with
-`net.core.wmem_default`), so this is two orders of magnitude better and still not right.
+What that left: `handle_catchup()` streamed the whole requested WAL range in one synchronous pass,
+so the weight of that range became the depth of the send queue.
 
-The answer is a catch-up cursor on `ReplicaInfo` — the file index and offset reached, plus a flag —
-resumed from the EPOLLOUT branch. That is not a new mechanism: `continue_snapshot_transfer()` in the
-same class already does exactly this for snapshot streaming, so the shape is in the file, one
-function away.
+**Measured before the fix** (i3-7100U, GCC 13.3, Debug, 1000 records of 1000 levels = **24.11 MB**
+requested, one replica that reads nothing for a second): the connection was dropped **61 ms** in,
+`send_buf=16780544 > 16777216`, having delivered **112 of 1000 records**. That is 2.70 MB, which is
+what this loopback pair absorbs before the sender's first `EAGAIN` — series D measured 2.6 MB for
+the same reason, on the same machine.
 
-Worth stating what this is *not*: a replica far enough behind that the WAL no longer covers its
-position already falls through to snapshot bootstrap (`ERR WAL_TRUNCATED`), which is the path for the
-genuinely-far-behind case. This is about the band in between.
+**The title understated it, and this item's own text was wrong about why.** It said the replica
+"resumes from the position it confirmed, so progress is monotonic — but a replica a gigabyte behind
+needs sixty-odd reconnects to get there". Measured: **every record of a catch-up carries
+`file=0 offset=0`**, because `send_to_replica()` puts the replica's own last-confirmed position on
+the wire rather than the record's, and the ACKs that would move it are not read until the pass
+returns. So the replica saves `0 + total_len` whatever it received, and a reconnect resumes one
+record along instead of 16 MB along. The reconnect loop was not slow progress; it was **no
+progress**. Filed as #98, which is the larger half of what this item was pointing at.
 
-- Effort: S | Impact: removes the reconnect loop from a large catch-up
+The fix is the cursor this item asked for: `CatchupCursor` on `ReplicaInfo` — which WAL file, where
+in it, and where the stream ends — which is the shape `SnapshotTransferState` already gives the
+snapshot stream, one function away in the same class.
+
+**The design content is not the resuming, it is what resuming gives up.** A synchronous pass held
+`mtx_` from the first record to the last, so `broadcast()` could not interleave and ordering was
+free. A pass that stops and resumes has to buy that back, and there are exactly two ways:
+
+- **Chase the live WAL end.** Rejected, and the reason is measurable: a record is appended and then
+  broadcast under the engine's write lock, so while the cursor holds `mtx_` that `broadcast()` call
+  is *waiting*. `::write()` puts the record in the file immediately, so the cursor reads it and
+  sends it — and then releases the lock and the waiting call sends it again. Not a rare race: with
+  a live write during the pass it is the outcome of every handoff.
+- **Fix the end when the cursor is created, and hold live records behind it.** Taken. A record
+  appended afterwards sits at or past that point, so the cursor never reads it; its `broadcast()`
+  goes into `pending` and is released, in arrival order, when the cursor reaches the end. Arrival
+  order is WAL order because both happen under the engine's write lock.
+
+Two bounds, and they are different promises. The **queue** bound is half the ceiling, so the queue
+is never grown to the size of the range — that is the one this item is about. The **batch** bound
+(`kCatchupBatchBytes`, 1 MB) is about the mutex: `broadcast()` needs it, so a pass holding it for
+the length of a range stalls every client write for that long, which is the shape #97 measured at
+135 s on the mesh side.
+
+**What a client write waits, measured at the entry point the write path uses** — `broadcast()`, not
+`handle_catchup()`, because #97's lesson is that measuring the wrong entry point acquits the code in
+the same voice it would use if the code were fine. i3-7100U, Debug, 24.11 MB range, ~6700 samples
+per window, floor of three or more runs, with a control window on the same run:
+
+| window | p50 | p99 | p999 | longest | replica survives |
+|---|---|---|---|---|---|
+| control, nothing running | 0.009 ms | 0.020 ms | 0.031 ms | 0.080 ms | — |
+| **before**, receiver reading nothing | 0.003 ms | 0.009 ms | — | **49.4 ms** | **no**, 2.70 of 24.11 MB |
+| after, receiver reading nothing | 0.004 ms | 0.019 ms | 0.048 ms | 19.5 ms | yes, all 24.11 MB |
+| after, receiver draining | 0.009 ms | 0.021 ms | 0.041 ms | 12.0 ms | yes, all 24.11 MB |
+
+The before/after percentiles are not comparable and saying so is the point: **before**, the replica
+is dropped 61 ms in, so the rest of that window has no catch-up running at all — its p99 is low
+because the work stopped. The comparable numbers are the longest wait and whether the range
+arrived.
+
+The batch bound's own worth is the last row, and it is smaller than expected: removing it moves the
+longest wait for a **draining** receiver from 12.0 ms to **25.3 ms** (floor of two runs each) and
+moves the non-draining case not at all (28.7 against 28.7), because there the queue ceiling already
+bounds the pass. A measured factor of two, on the case where nothing else bounds it.
+
+Resumption is single-sited: the run loop's per-pass tick, after that pass's EPOLLOUT drains have
+made room, and **not** also in the EPOLLOUT branch beside the snapshot transfer's. A cursor has to
+be resumed from three situations — the socket drained, the batch budget ran out with the queue
+already empty, and the first batch was queued by `handle_catchup()` — and only one of those arrives
+as an event. The loop's own timeout carries the rest: zero while some cursor has room to queue more,
+100 ms otherwise. A cursor whose queue is *full* is deliberately not "room", because polling that
+would be the busy-spin of pitfall 5, and EPOLLOUT is what says the socket drained.
+
+The `COMPRESS LZ4` directive travelled with the cursor. "After the last plain byte of the catch-up"
+used to be a line in `handle_replica_data()` after a pass nothing could interrupt; it is a moment
+the cursor decides now. The records in `pending` were framed at broadcast time and are already
+compressed if the replica asked for that, which is the other half of the same seam.
+
+**Mutations: nine, seven caught, and the two that survive are pacing rather than correctness.**
+
+| mutation | caught by |
+|---|---|
+| a live record is queued straight away instead of waiting | order of 1001, and the seam |
+| no back-off at half the ceiling | the 24.11 MB catch-up |
+| the file index does not advance at a file boundary | the seven-file range |
+| a ROTATE record is streamed instead of ending its file | the seven-file range |
+| what waited is dropped rather than released | order of 1001 |
+| the directive is sent after the frames it frames | the seam |
+| the cursor chases the live WAL end | order of 1001 — **after** the reader was fixed |
+| **no batch bound** | **survived**: changes only how long one pass holds `mtx_`, and the measurement above is its whole defence. A test would be a wall-clock gate, which is what #10.7's own docstring warns teaches people to re-run until green |
+| **the loop always sleeps 100 ms** | **survived**: changes only how fast a catch-up advances (one batch per tick, so 24 MB takes 2.4 s instead of 0.2 s). Nothing arrives differently, and the test for it would again be a clock |
+
+**The mutation that chased the live WAL end survived its first run, and the reason is worth more
+than the mutation.** The test read until the *expected* count and stopped — so the duplicate record
+was sitting in the reader's own buffer, discarded when the function returned, indistinguishable from
+one that was never sent. The reader now reads until the socket goes quiet and the assertion is exact
+in both directions. A test that stops when it has seen enough cannot see too many.
+
+- Effort: S | Impact: a catch-up of any size completes on one connection; a live write during it
+  arrives after the history it follows, exactly once
 
 
 ### 92. A query holds a raw `SoABuffer*` across a snapshot install ✅

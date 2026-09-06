@@ -170,6 +170,38 @@ could ever be handed to `ob_tcp_server` by something other than its own operator
 Worth noting for these two specifically — the *contents* are a secret, so the eventual answer if that
 ever changes is not path sanitisation but refusing to take the path from that source at all.
 
+**Alert 92 (#93, the catch-up cursor)** is `cpp/path-injection` again, and it is the first one here
+where the source **does** cross a trust boundary: the `<file>` field of a `REPLICATE` line, read off
+a socket, reaching `::open()` through `wal_filename()`. Dismissed `false positive`, with the reason
+on the alert and repeated here:
+
+> A uint32_t from REPLICATE, rendered by snprintf("wal_%06u.bin") inside the servers own
+> --data-dir. No peer byte reaches the path: an integer cannot emit a separator or "..". A file
+> index above ours is answered ERR WAL_TRUNCATED, which is the right remedy.
+
+The argument had to move from the source to the **sink**, and that is the distinction worth keeping.
+For alerts 87, 90 and 91 the answer was "the caller already has these privileges"; that answer is
+unavailable here, because a replica is a peer and not an operator. What holds instead is that the
+tainted value is an *integer* and the only thing built from it is `%06u` inside a directory this
+process chose — so there is no byte of peer input in the path at all, and sanitising a `uint32_t`
+against traversal is not a coherent operation.
+
+What would change the answer: if `wal_filename()` ever interpolated a **string**, or if the WAL
+directory could come from the wire. Both are the same condition stated twice — the moment a peer
+contributes a character rather than a number, this is a real sink.
+
+**A code change was considered and rejected, and the reason is not the analyser.** Refusing a
+`from_file` above our own current file index looks like the tidy answer, but the client matches
+`WAL_TRUNCATED` specifically to trigger snapshot bootstrap (`replication.cpp:2249`), and a snapshot
+is the correct recovery for *both* causes — retention removed the position, or the replica rotated
+files while it was briefly a primary. A new error code would carry a new name for the same remedy
+and leave any replica that does not know it retrying forever. The existing answer is right; only its
+log line is less specific than the cause.
+
+Alert 74 (`src/wal.cpp:100`) is the same sink through the same helper with a **command-line** source,
+so it belongs to the 87/90/91 group rather than this one. It is still open, which is the open
+question at the end of this section rather than an oversight.
+
 **Alerts 88 and 89** are `cpp/unused-static-function`, note severity, on `is_identity_char` and
 `valid_identity` in `src/auth.cpp`. Dismissed `false positive`, and the evidence is the compiler
 rather than a reading of the code: both are used (one at `auth.cpp:59` as a callable argument to

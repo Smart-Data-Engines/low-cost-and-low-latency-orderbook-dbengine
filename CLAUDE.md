@@ -1121,7 +1121,7 @@ Learned the hard way. Check here before debugging.
     write to a replica now goes through `enqueue_send()` and the EPOLLOUT drain, which is the only
     shape in which a socket saying "later" has somewhere to say it. The ceiling still drops a replica
     that is not draining, at 16 MB of queued output instead of one socket buffer; #93 is the cursor
-    that removes the reconnects.
+    that removed the reconnects, and #98 is what it found about the position on the wire.
 
 135. **A test that needs a full socket buffer needs that buffer's *measured* capacity, not a
     generous-looking number.** The first version of the catch-up test wrote 2 MB and **passed
@@ -1347,6 +1347,53 @@ Learned the hard way. Check here before debugging.
     mutation-testing it**, not after. A mutation harness that edits the tree is a good reason for
     the tree to be committed.
 
+161. **A test that stops when it has seen enough cannot see too many.** The mutation that made the
+    catch-up cursor chase the live WAL end — which delivers a record twice, once from the file and
+    once from the queue that held it — **survived** its first run. The test read until the expected
+    1001 records and returned, so the duplicate was sitting in the reader's own 64 kB buffer,
+    discarded on return, indistinguishable from a record that was never sent. It reads until the
+    socket goes quiet now and the assertion is exact in both directions. An assertion of the form
+    `read(n); expect n` cannot fail for "too many" — it has to be `read until quiet; expect exactly
+    n`.
+
+162. **Turning a synchronous pass into a resumable one gives up an ordering guarantee that was
+    never written down.** `handle_catchup()` held `mtx_` from the first record to the last, so
+    `broadcast()` could not interleave; nothing said so, because nothing had to. The moment the pass
+    could stop, a live write landed in front of the history it comes after. Before making a pass
+    resumable, ask what the pass was holding and who else needs it — the answer is the design, not a
+    detail.
+
+163. **"Chase the live end" and "fix the end" differ by a duplicate you can predict.** A record is
+    appended and then broadcast under one engine lock, and `::write()` makes it visible in the WAL
+    file immediately — so while a cursor holds `mtx_`, that `broadcast()` is *waiting*. A cursor that
+    re-reads the WAL's live position therefore reads the record, sends it, releases the lock, and the
+    waiting call sends it again. Not a race: the outcome of every handoff under write load. Fixing
+    the end at creation makes the split by offset instead of by timing, and a record cannot be on
+    both sides of an offset.
+
+164. **A number in a `WAL <file> <offset>` line was never the record's offset, and nothing said
+    so for four phases of replication work.** `send_to_replica()` sends the replica's last
+    *acknowledged* position, `broadcast()` sends a literal `0`. Measured: all 112 records of a
+    catch-up carried `file=0 offset=0`, so the replica saved one record's worth however many it
+    received. The roadmap item that described the reconnect loop as "monotonic progress in 16 MB
+    steps" was quoting the mechanism it assumed rather than the field it could have read. When a
+    wire field carries a position, print it in a test and look at it — the assumption that a field
+    named `offset` holds an offset is not a measurement (#98).
+
+165. **A bound whose worth you have not measured may be worth half of what you assumed, and
+    that is still worth saying.** `kCatchupBatchBytes` bounds how long one catch-up pass holds the
+    mutex the write path needs. Measured, i3-7100U: removing it moves the longest `broadcast()` wait
+    from 12.0 ms to 25.3 ms for a **draining** receiver and **not at all** for a receiver that reads
+    nothing — because there the queue ceiling already bounds the pass. A factor of two on one of the
+    two cases, not the order of magnitude the reasoning suggested. The mutation for it survives, and
+    it is recorded as surviving: a test would have to be a wall-clock gate.
+
+166. **A worst-case latency needs a control window in the same run, on the same machine.** The
+    first read of the catch-up measurement said "max 25 ms" and looked like a lock being held. A
+    window with nothing running at all, in the same process seconds earlier, reached **5.1 ms** on
+    one run of this two-core machine — so the max was part scheduler. p999 (0.048 ms) and the
+    control's own max are the honest pair; a max without a control is a number about Linux.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -1355,7 +1402,7 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 943 C++ tests (`ctest -j1`, ~2.5 min) and 189 integration tests plus 2
+**Where the suites stand:** 947 C++ tests (`ctest -j1`, ~3 min) and 189 integration tests plus 2
 opt-in Binance skips (`pytest tests/integration/`, ~10.5 min on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that

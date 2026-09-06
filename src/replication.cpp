@@ -239,6 +239,25 @@ static constexpr size_t MAX_SEND_BUF_SIZE = 16 * 1024 * 1024;
 /// order of magnitude rather than at the size of the requested WAL range.
 static constexpr size_t kCatchupDrainThreshold = 256 * 1024;
 
+/// How much one pass of a catch-up may queue before it yields (#93).
+///
+/// The bound the cursor exists for is the send queue; this is the other one, and it is about the
+/// mutex. `broadcast()` needs `mtx_` and runs under the engine's write lock, so a catch-up holding
+/// `mtx_` for the length of its range stalls every client write for that long - the shape roadmap
+/// #97 measured at 135 s on the mesh side. A megabyte is read out of the page cache and copied in
+/// about a millisecond, and the loop comes straight back for the next one.
+static constexpr size_t kCatchupBatchBytes = 1024 * 1024;
+
+/// Everything queued for a replica: what is on its way out, plus what is waiting behind an
+/// unfinished catch-up.
+///
+/// The ceiling is a statement about how much this process is holding for one replica, so it has to
+/// count both. A function rather than the sum written out at each of the four sites: the ceiling
+/// that forgets the second buffer is a ceiling that can be walked past.
+static size_t queued_bytes(const ReplicaInfo& replica) {
+    return replica.send_buf.size() + replica.catchup.pending.size();
+}
+
 } // anonymous namespace
 
 // ── SnapshotManifest serialization ────────────────────────────────────────────
@@ -514,14 +533,14 @@ void ReplicationManager::broadcast(const WALRecord& hdr, const void* payload,
             len_prefix[1] = static_cast<uint8_t>((comp_len >> 16) & 0xFF);
             len_prefix[2] = static_cast<uint8_t>((comp_len >> 8) & 0xFF);
             len_prefix[3] = static_cast<uint8_t>(comp_len & 0xFF);
-            enqueue_send(*it, len_prefix, 4);
-            enqueue_send(*it, compressed.data(), compressed.size());
+            queue_to_replica(*it, len_prefix, 4);
+            queue_to_replica(*it, compressed.data(), compressed.size());
         } else {
-            enqueue_send(*it, msg.data(), msg.size());
+            queue_to_replica(*it, msg.data(), msg.size());
         }
 
         // If the send buffer is too large, the replica is too slow — disconnect it.
-        if (it->send_buf.size() > MAX_SEND_BUF_SIZE) {
+        if (queued_bytes(*it) > MAX_SEND_BUF_SIZE) {
             remove_replica_locked(it->fd);
             it = replicas_.erase(it);
         } else {
@@ -743,8 +762,15 @@ void ReplicationManager::run_loop() {
 
     auto last_heartbeat = std::chrono::steady_clock::now();
 
+    // How long this loop is allowed to sleep. 100 ms when there is nothing in hand; zero while a
+    // catch-up has room to queue more, because that cursor is work this thread already owns and
+    // sleeping on it would cap a catch-up at one batch per tick. A cursor whose queue is *full* is
+    // not work in hand - waiting on that would be the busy-spin of pitfall 5, and EPOLLOUT is what
+    // says the socket drained. Recomputed at the end of every pass, after this pass's drains.
+    int wait_ms = 100;
+
     while (running_.load(std::memory_order_acquire)) {
-        int nfds = ::epoll_wait(epoll_fd_, events, MAX_EVENTS, 100 /*ms timeout*/);
+        int nfds = ::epoll_wait(epoll_fd_, events, MAX_EVENTS, wait_ms);
         if (nfds < 0) {
             if (errno == EINTR) continue;
             break; // fatal epoll error
@@ -815,6 +841,22 @@ void ReplicationManager::run_loop() {
             }
         }
 
+        // Advance every catch-up that has room, once per pass and *after* this pass's EPOLLOUT
+        // drains have made that room (#93).
+        //
+        // One site, and not also inside the EPOLLOUT branch beside the snapshot transfer's: the
+        // cursor has to be resumed from three different situations - the socket drained, the batch
+        // budget ran out with the queue already empty, and the first batch was queued by
+        // `handle_catchup()` - and only one of those arrives as an event. Two places advancing one
+        // cursor is the shape series C shipped a comment about.
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            for (auto& r : replicas_) {
+                if (r.fd >= 0 && r.catchup.active) continue_catchup(r);
+            }
+            wait_ms = catchup_can_progress_locked() ? 0 : 100;
+        }
+
         // Send heartbeat every 5 seconds when idle.
         auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - last_heartbeat).count() >= 5) {
@@ -834,12 +876,12 @@ void ReplicationManager::run_loop() {
                     len_prefix[1] = static_cast<uint8_t>((comp_len >> 16) & 0xFF);
                     len_prefix[2] = static_cast<uint8_t>((comp_len >> 8) & 0xFF);
                     len_prefix[3] = static_cast<uint8_t>(comp_len & 0xFF);
-                    enqueue_send(*it, len_prefix, 4);
-                    enqueue_send(*it, compressed.data(), compressed.size());
+                    queue_to_replica(*it, len_prefix, 4);
+                    queue_to_replica(*it, compressed.data(), compressed.size());
                 } else {
-                    enqueue_send(*it, hb, static_cast<size_t>(hb_len));
+                    queue_to_replica(*it, hb, static_cast<size_t>(hb_len));
                 }
-                if (it->send_buf.size() > MAX_SEND_BUF_SIZE) {
+                if (queued_bytes(*it) > MAX_SEND_BUF_SIZE) {
                     remove_replica_locked(it->fd);
                     it = replicas_.erase(it);
                 } else {
@@ -1090,16 +1132,11 @@ void ReplicationManager::handle_replica_data(int fd) {
                 }
                 replica_ptr->confirmed_file   = from_file;
                 replica_ptr->confirmed_offset = from_offset;
-                // Perform catchup from the requested position (plain text).
+                // Start the catch-up from the requested position. Since #93 this queues the
+                // first batch and returns; the run loop streams the rest. The COMPRESS LZ4
+                // directive left with it - "after the last plain byte" is the cursor's moment to
+                // pick, and it is no longer this one.
                 handle_catchup(*replica_ptr, from_file, from_offset);
-
-                // After catchup, send COMPRESS LZ4 directive if compression is enabled.
-                // This must come AFTER catchup because catchup sends plain text.
-                if (replica_ptr->compress && replica_ptr->fd >= 0) {
-                    const char* directive = "COMPRESS LZ4\n";
-                    enqueue_and_flush(*replica_ptr, directive, std::strlen(directive));
-                    OB_LOG_INFO("replication", "sent COMPRESS LZ4 to replica fd=%d after catchup", fd);
-                }
             }
             continue;
         }
@@ -1167,15 +1204,16 @@ void ReplicationManager::send_to_replica(ReplicaInfo& replica, const WALRecord& 
     // `send_to_replica failed`.
     enqueue_send(replica, msg.data(), msg.size());
 
-    // The ceiling still applies, and reaching it still drops the replica - what changed is that it
-    // is reached at 16 MB of queued output rather than at one socket buffer. A replica behind by
-    // more than that reconnects and resumes from the position it has confirmed, so progress is
-    // monotonic in 16 MB steps. The cursor that would remove the reconnects is roadmap #93.
-    if (replica.send_buf.size() > MAX_SEND_BUF_SIZE) {
+    // The ceiling still applies, and reaching it still drops the replica - but since #93 it is no
+    // longer reachable by asking for a large range. The cursor stops at half of it and comes back,
+    // so a queue this deep now means the socket is not moving: the replica is slow, which is the
+    // case this ceiling was written for.
+    if (queued_bytes(replica) > MAX_SEND_BUF_SIZE) {
         OB_LOG_WARN("repl_mgr",
-                    "replica fd=%d is not draining during catch-up: send_buf=%zu > %zu - dropping "
-                    "the connection so it reconnects and resumes from its confirmed position",
-                    replica.fd, replica.send_buf.size(), MAX_SEND_BUF_SIZE);
+                    "replica fd=%d is not draining: queued=%zu > %zu - dropping the connection. "
+                    "Since #93 a catch-up stops at half this ceiling and resumes, so reaching it "
+                    "means the replica itself is not keeping up",
+                    replica.fd, queued_bytes(replica), MAX_SEND_BUF_SIZE);
         remove_replica_locked(replica.fd);
         replica.fd = -1;
         return;
@@ -1200,90 +1238,208 @@ void ReplicationManager::send_to_replica(ReplicaInfo& replica, const WALRecord& 
 
 void ReplicationManager::handle_catchup(ReplicaInfo& replica, uint32_t from_file,
                                          size_t from_offset) {
-    const uint32_t current_file = wal_.current_file_index();
+    const WalPosition through = wal_.current_position();
     const std::string& wal_dir = wal_.dir();
 
-    OB_LOG_INFO("repl_mgr", "catchup for fd=%d: from_file=%u, from_offset=%zu, current_file=%u, wal_dir=%s",
-                replica.fd, from_file, from_offset, current_file, wal_dir.c_str());
+    OB_LOG_INFO("repl_mgr",
+                "catchup for fd=%d: from_file=%u, from_offset=%zu, through_file=%u, "
+                "through_offset=%zu, wal_dir=%s",
+                replica.fd, from_file, from_offset, through.file_index,
+                static_cast<size_t>(through.offset), wal_dir.c_str());
 
-    // Stream records from from_file to current_file.
-    for (uint32_t fi = from_file; fi <= current_file; ++fi) {
-        std::string path = wal_filename(wal_dir, fi);
-        int fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) {
-            OB_LOG_WARN("repl_mgr", "catchup: cannot open WAL file %s: %s", path.c_str(), std::strerror(errno));
-            // File doesn't exist — WAL has been truncated (Requirement 6.3).
-            if (fi == from_file) {
-                const char* err = "ERR WAL_TRUNCATED\n";
-                enqueue_and_flush(replica, err, std::strlen(err));
-                OB_LOG_INFO("repl_mgr", "sent ERR WAL_TRUNCATED to replica fd=%d", replica.fd);
-                return;
-            }
-            // Later files missing is unexpected but not fatal — stop catchup.
-            break;
+    // The first file has to exist, and that is the one refusal which has to happen before a byte is
+    // streamed: a replica asking from a position retention has already removed belongs on the
+    // snapshot-bootstrap path (Requirement 6.3), not on this one. Checked here rather than inside
+    // the cursor because it is the answer to the *request*, and the cursor's own failures are all
+    // "stop where you are".
+    {
+        const std::string path = wal_filename(wal_dir, from_file);
+        int probe = ::open(path.c_str(), O_RDONLY);
+        if (probe < 0) {
+            OB_LOG_WARN("repl_mgr", "catchup: cannot open WAL file %s: %s", path.c_str(),
+                        std::strerror(errno));
+            const char* err = "ERR WAL_TRUNCATED\n";
+            enqueue_and_flush(replica, err, std::strlen(err));
+            OB_LOG_INFO("repl_mgr", "sent ERR WAL_TRUNCATED to replica fd=%d", replica.fd);
+            return;
         }
-
-        // If this is the first file and we have an offset, seek to it.
-        if (fi == from_file && from_offset > 0) {
-            off_t pos = ::lseek(fd, static_cast<off_t>(from_offset), SEEK_SET);
-            if (pos < 0) {
-                ::close(fd);
-                const char* err = "ERR WAL_TRUNCATED\n";
-                enqueue_and_flush(replica, err, std::strlen(err));
-                return;
-            }
-        }
-
-        // Read records and stream them.
-        //
-        // There used to be a `file_offset` counter here, advanced by every record and read by
-        // nothing. The primary does not need one: it streams sequentially, and where the replica
-        // has got to comes back in the replica's ACKs, which is the only account of it that can be
-        // trusted anyway. Clang reports it (-Wunused-but-set-variable); GCC does not.
-        while (true) {
-            WALRecord hdr{};
-            ssize_t n = ::read(fd, &hdr, sizeof(WALRecord));
-            if (n == 0) break; // EOF
-            if (n != static_cast<ssize_t>(sizeof(WALRecord))) break; // truncated
-
-            // Read payload.
-            std::vector<uint8_t> payload(hdr.payload_len);
-            if (hdr.payload_len > 0) {
-                size_t remaining = hdr.payload_len;
-                uint8_t* ptr = payload.data();
-                while (remaining > 0) {
-                    ssize_t r = ::read(fd, ptr, remaining);
-                    if (r <= 0) goto done_file;
-                    ptr += r;
-                    remaining -= static_cast<size_t>(r);
-                }
-            }
-
-            // Skip ROTATE records — they're internal to WAL file management.
-            if (hdr.record_type == WAL_RECORD_ROTATE) {
-                break; // move to next file
-            }
-
-            // Send this record to the replica.
-            send_to_replica(replica, hdr, payload.data(), hdr.payload_len);
-            if (replica.fd < 0) {
-                // Replica disconnected during catchup.
-                ::close(fd);
-                return;
-            }
-
-        }
-
-        done_file:
-        ::close(fd);
+        ::close(probe);
     }
-    if (replica.fd >= 0 && !replica.send_buf.empty() && !drain_send_buffer(replica)) {
+
+    // A second REPLICATE on the same connection restarts this: the cursor is overwritten and
+    // `pending` is dropped. That loses nothing, because the records it held are in the WAL below
+    // the new `through` and will be streamed again if the new request reaches back that far - and
+    // if it does not, that is the replica's own request rather than a record we mislaid.
+    CatchupCursor& cur = replica.catchup;
+    cur.active         = true;
+    cur.file           = from_file;
+    cur.offset         = from_offset;
+    cur.through_file   = through.file_index;
+    cur.through_offset = through.offset;
+    cur.pending.clear();
+    // The directive travels with the cursor rather than with this function, because "after the
+    // last plain byte of the catch-up" is now a moment the cursor decides.
+    cur.compress_after = replica.compress;
+
+    continue_catchup(replica);
+}
+
+void ReplicationManager::continue_catchup(ReplicaInfo& replica) {
+    CatchupCursor& cur = replica.catchup;
+    if (!cur.active) return;
+
+    const std::string& wal_dir = wal_.dir();
+    size_t   queued_this_pass = 0;
+    int      fd        = -1;
+    uint32_t open_file = 0;
+
+    // Closes the descriptor on every exit from the loop below, of which there are several and the
+    // number is not worth writing down - it changes with the code and a stale count reads as a
+    // fact. The explicit closes in the loop are for switching files, not for correctness here.
+    struct FdGuard {
+        int& fd;
+        ~FdGuard() { if (fd >= 0) ::close(fd); }
+    } guard{fd};
+
+    const auto next_file = [&]() {
+        if (fd >= 0) { ::close(fd); fd = -1; }
+        ++cur.file;
+        cur.offset = 0;
+    };
+
+    while (true) {
+        // A record that failed to send took the replica with it; `send_to_replica()` has already
+        // removed it and set `fd` to -1.
+        if (replica.fd < 0) {
+            cur.active = false;
+            cur.pending.clear();
+            return;
+        }
+
+        // The end, and the only place this cursor finishes on purpose. `>` and not just `==`
+        // because a WAL file shorter than the position recorded for it - a torn tail - walks the
+        // cursor past `through_file` rather than leaving it reading forever.
+        if (cur.file > cur.through_file ||
+            (cur.file == cur.through_file && cur.offset >= cur.through_offset)) {
+            if (fd >= 0) { ::close(fd); fd = -1; }
+            finish_catchup(replica);
+            return;
+        }
+
+        // Two bounds, and they are different promises. The queue is about how much of this range
+        // the process is holding for one replica; the batch is about how long the write path waits
+        // for `mtx_`. Reaching the first means EPOLLOUT will say when there is room; reaching the
+        // second means the loop comes straight back.
+        if (replica.send_buf.size() >= MAX_SEND_BUF_SIZE / 2) return;
+        if (queued_this_pass >= kCatchupBatchBytes) return;
+
+        if (fd < 0 || open_file != cur.file) {
+            if (fd >= 0) { ::close(fd); fd = -1; }
+            const std::string path = wal_filename(wal_dir, cur.file);
+            fd = ::open(path.c_str(), O_RDONLY);
+            if (fd < 0) {
+                // A file in the middle of the range is missing. Unexpected but not fatal, and the
+                // same answer the synchronous pass gave: stop here and go live. The first file is
+                // the only one whose absence is an answer to the replica, and that was checked
+                // before this cursor existed.
+                OB_LOG_WARN("repl_mgr",
+                            "catchup for fd=%d: cannot open WAL file %s: %s - stopping at file %u",
+                            replica.fd, path.c_str(), std::strerror(errno), cur.file);
+                finish_catchup(replica);
+                return;
+            }
+            open_file = cur.file;
+        }
+
+        WALRecord hdr{};
+        const ssize_t n = ::pread(fd, &hdr, sizeof(WALRecord), static_cast<off_t>(cur.offset));
+        if (n != static_cast<ssize_t>(sizeof(WALRecord))) {
+            next_file();   // EOF, or a header too short to be one
+            continue;
+        }
+
+        std::vector<uint8_t> payload(hdr.payload_len);
+        if (hdr.payload_len > 0) {
+            const ssize_t r = ::pread(fd, payload.data(), hdr.payload_len,
+                                      static_cast<off_t>(cur.offset + sizeof(WALRecord)));
+            if (r != static_cast<ssize_t>(hdr.payload_len)) {
+                next_file();   // a record whose payload is not all there yet is the end of this file
+                continue;
+            }
+        }
+
+        const size_t record_bytes = sizeof(WALRecord) + hdr.payload_len;
+
+        // ROTATE is internal to WAL file management, and it is the last thing in its file.
+        if (hdr.record_type == WAL_RECORD_ROTATE) {
+            next_file();
+            continue;
+        }
+
+        send_to_replica(replica, hdr, payload.data(), hdr.payload_len);
+        cur.offset       += record_bytes;
+        queued_this_pass += record_bytes;
+    }
+}
+
+void ReplicationManager::finish_catchup(ReplicaInfo& replica) {
+    CatchupCursor& cur = replica.catchup;
+    cur.active = false;
+
+    if (replica.fd < 0) {
+        cur.pending.clear();
+        return;
+    }
+
+    // Plain text up to here, LZ4 from here: the directive is the seam, so it goes out after the
+    // last catch-up byte and before the first live one. The records in `pending` were framed at
+    // broadcast time and are already compressed if this replica asked for that, which is the other
+    // half of the same ordering.
+    if (cur.compress_after) {
+        const char* directive = "COMPRESS LZ4\n";
+        enqueue_send(replica, directive, std::strlen(directive));
+        OB_LOG_INFO("repl_mgr", "sent COMPRESS LZ4 to replica fd=%d after catchup", replica.fd);
+    }
+    cur.compress_after = false;
+
+    if (!cur.pending.empty()) {
+        OB_LOG_INFO("repl_mgr",
+                    "catchup complete for fd=%d at file=%u offset=%zu; releasing %zu bytes of live "
+                    "records that arrived while it streamed",
+                    replica.fd, cur.file, cur.offset, cur.pending.size());
+        enqueue_send(replica, cur.pending.data(), cur.pending.size());
+        cur.pending.clear();
+        cur.pending.shrink_to_fit();
+    } else {
+        OB_LOG_INFO("repl_mgr", "catchup complete for fd=%d at file=%u offset=%zu", replica.fd,
+                    cur.file, cur.offset);
+    }
+
+    if (!replica.send_buf.empty() && !drain_send_buffer(replica)) {
         OB_LOG_WARN("repl_mgr", "replica fd=%d failed while flushing the catch-up tail", replica.fd);
         remove_replica_locked(replica.fd);
         replica.fd = -1;
+    }
+}
+
+void ReplicationManager::queue_to_replica(ReplicaInfo& replica, const void* data, size_t len) {
+    if (!replica.catchup.active) {
+        enqueue_send(replica, data, len);
         return;
     }
-    OB_LOG_INFO("repl_mgr", "catchup complete for fd=%d", replica.fd);
+    // A live record may not overtake the history in front of it. It waits here, framed exactly as
+    // it would have been queued, and `finish_catchup()` releases it in arrival order - which is WAL
+    // order, because both happen under the engine's write lock.
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    replica.catchup.pending.insert(replica.catchup.pending.end(), bytes, bytes + len);
+}
+
+bool ReplicationManager::catchup_can_progress_locked() const {
+    for (const auto& r : replicas_) {
+        if (r.fd < 0 || !r.catchup.active) continue;
+        if (r.send_buf.size() < MAX_SEND_BUF_SIZE / 2) return true;
+    }
+    return false;
 }
 
 void ReplicationManager::handle_snapshot_request(ReplicaInfo& replica) {
