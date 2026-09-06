@@ -1242,6 +1242,20 @@ Learned the hard way. Check here before debugging.
     session of the same shape: a compound shell command ending in `echo`/`tail` returned 0 while the
     build inside it had failed. **A verification loop that cannot say "I do not know" says "fine".**
 
+149. **A test that resolves a pointer and never dereferences it proves nothing about that
+    pointer.** The driver for #92's use-after-free used `SELECT *`, which resolves the live buffer
+    for an **existence check** and reads through it never; three AddressSanitizer runs came back
+    clean against a defect that reproduces 3 of 3 with `SELECT VWAP(price)`, because only the
+    aggregation branch calls `read_snapshot(*buf, ...)`. #91's test picked VWAP for the same
+    reason. Before believing a clean sanitizer run, check that the code under test reaches the
+    instruction you are trying to catch.
+150. **`grep -E " error |warning:"` does not match `foo.cpp:52:11: error: ...`** - there is no space
+    after the word. Two `cmake --build` invocations reported nothing while two test files failed to
+    compile, and `ctest` then ran the previously-built binaries and reported 934/934 passing. The
+    stale binary also failed a static test about a type it had been compiled *before*, which read
+    as the fix not working. **Check the build's exit status, not its output**, and when a test
+    result surprises you, compare the binary's timestamp against the source's.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -1250,7 +1264,7 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 932 C++ tests (`ctest -j1`, ~2.5 min) and 189 integration tests plus 2
+**Where the suites stand:** 934 C++ tests (`ctest -j1`, ~2.5 min) and 189 integration tests plus 2
 opt-in Binance skips (`pytest tests/integration/`, ~10.5 min on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that

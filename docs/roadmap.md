@@ -2001,7 +2001,7 @@ genuinely-far-behind case. This is about the band in between.
 - Effort: S | Impact: removes the reconnect loop from a large catch-up
 
 
-### 92. A query holds a raw `SoABuffer*` across a snapshot install
+### 92. A query holds a raw `SoABuffer*` across a snapshot install ✅
 
 Named by #91 rather than fixed by it, because it is a lifetime problem and not a locking one.
 
@@ -2015,13 +2015,51 @@ overlaps steady-state querying in any test — which is exactly the shape of pit
 `set_read_only_flag()` finding, a raw pointer whose lifetime is nested by convention rather than by
 construction.
 
-Candidate answers, none chosen yet: reference-count the buffers (`shared_ptr`, which costs an atomic
-on the write path's lookup and nothing on the read); keep destroyed buffers alive until no query is
-in flight, the way `SubscriptionHub` already gates compaction on an in-flight counter (#45); or hold
-`mtx_` across the query, which is correct and costs the write path a full scan's latency. The third
-is the one to avoid, and saying so is most of the value of filing this.
+**Measured before being fixed, because "latent" and "unreachable" are different claims.** A reader
+thread issuing `SELECT VWAP(price)` against a loop of 600 snapshot installs reports
+`heap-use-after-free` under AddressSanitizer in **3 of 3 runs** — on the seqlock version load inside
+`read_snapshot()`, from the query thread, with the free in `load_snapshot()`. Reachable through the
+public API by any replica that serves reads while it bootstraps or resyncs.
 
-- Effort: M | Impact: removes a latent use-after-free on the read path
+The answer is the first of the three that were filed: `LiveBufferLookup` returns
+`std::shared_ptr<SoABuffer>` and the query holds it for its own length, so a buffer cleared out of
+the map mid-query stays alive until that query drops it. Such a query answers with the contents it
+started with, which is what any query gets when a write lands after it began. The cost is one atomic
+increment per query and **nothing on the write path**, which resolves its buffer under the same lock
+it writes beneath — the accounting in the original note had this backwards. The third candidate,
+holding `mtx_` across a whole query, stays the one to avoid.
+
+`live_ptrs_` went with it. It was a raw-pointer index of the same keys as `buffers_`, populated and
+cleared in the same three places; one map cannot disagree with itself.
+
+The type change is what made the fix complete: the compiler required both suppliers of the lookup to
+be visited, the server's in `src/engine.cpp` and the embedded path's in `src/c_api.cpp`. Nothing
+clears the C API's map today, so the defect was the server's alone — but a type that is only
+accidentally safe is the shape that produced this item in the first place.
+
+The test that drives the race passed for the wrong reason first: `SELECT *` resolves the buffer for
+an existence check and **never dereferences it**, so three clean ASan runs said nothing at all. The
+aggregation branch is the one that reads through the pointer, which is also why #91's test picked
+VWAP.
+
+**The cost, by disassembly rather than by stopwatch** (`scripts/mnemonic_diff.py`, i3-7100U, GCC
+13.3, Release, `9376d39` against the fix):
+
+| Function | master | fix | reading |
+|---|---|---|---|
+| `Engine::apply_delta` | 501 | 501 | same instructions; 29 operands differ, all member offsets |
+| `Engine::apply_delta_mm` | 597 | 597 | same, 34 offsets |
+| `WALWriter::append` | 88 | 88 | identical |
+| `QueryEngine::execute` | 2197 | 2224 | +27: the handle's stack slot and its lifetime |
+
+Offsets moved because the map's value type grew from 8 bytes to 16. The atomic is countable and was
+counted: **0 → 1 lock-prefixed instruction** in `QueryEngine::execute`, and none in the write path
+or in either cold clone. No wall-clock number is quoted for the ingestion benchmark, because it
+measures `apply_delta` and `WALWriter::append` — and an instruction-for-instruction identity is a
+stronger statement about those than a timing on a machine that has produced ±40% for an unchanged
+function.
+
+- Effort: M | Impact: removes a reachable use-after-free on the read path
 
 
 ### 91. A `SELECT` racing the creation of a symbol's live buffer ✅
