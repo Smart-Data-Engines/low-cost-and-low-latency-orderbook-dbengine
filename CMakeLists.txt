@@ -396,7 +396,12 @@ if(OB_ENABLE_COVERAGE)
                     -instr-profile=coverage.profdata
                     -format=html
                     -output-dir=coverage_html
-                    -ignore-filename-regex='(_deps|tests|benchmarks)/'
+                    # Double quotes, and neither of the two obvious alternatives. Single quotes
+                    # are not string delimiters in CMake, so `'...'` passed the apostrophes
+                    # through to llvm-cov and the filter ignored nothing; bare, the `(` opens a
+                    # CMake token of its own. Both forms make CMake print "Syntax Warning in cmake
+                    # code" on every configure, which is how this was noticed.
+                    "-ignore-filename-regex=(_deps|tests|benchmarks)/"
             COMMAND ${CMAKE_COMMAND} -E echo
                     "Coverage report: ${CMAKE_BINARY_DIR}/coverage_html/index.html"
             WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
