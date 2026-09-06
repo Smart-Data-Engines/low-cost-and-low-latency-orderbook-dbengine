@@ -926,6 +926,10 @@ Learned the hard way. Check here before debugging.
     `GoogleTestAddTests.cmake` during test discovery, at *build* time, with no message about
     sanitizers at all — so it reads as a broken test rather than a missing sysctl. The value on this
     machine is 32 by default; set it back afterwards if you care about the entropy.
+    Under the **integration** battery the symptom is different and reads worse: every node dies at
+    startup, so the harness says `not ready after 45s: Connection refused` and the sanitizer's own
+    line — `FATAL: ThreadSanitizer: unexpected memory mapping` — is in the node's log, which is why
+    `_wait_for_node()` now tails that log instead of reading a pipe that is not there.
 
 122. **`until ! pgrep -f X; do sleep; done` never terminates when the waiting shell's own command
     line contains X.** The wait is spawned as `bash -c '... until ! pgrep -f "pytest
