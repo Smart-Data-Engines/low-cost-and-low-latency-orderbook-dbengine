@@ -188,227 +188,6 @@ TEST_F(ReplicationProtocolTest, ManagerAcceptsConnection) {
     mgr->stop();
 }
 
-// ── Catch-up past the socket send buffer ──────────────────────────────────────
-
-TEST_F(ReplicationProtocolTest, CatchupSurvivesAWalLargerThanTheSocketSendBuffer) {
-    // `handle_catchup()` streams the whole requested WAL range on the epoll thread. Whether it can
-    // is a question about where a full socket gets to say "come back later" - and the same question
-    // decides whether the TLS path has anywhere to put `SSL_ERROR_WANT_WRITE` (series D §16).
-    //
-    // Before the fix this used `send_all()` on a **non-blocking** socket, so the first EAGAIN was
-    // read as a dead replica: measured, 17 270 of 40 000 records delivered and then
-    // `send_to_replica failed for fd=7, marking disconnected`.
-    //
-    // Wide records rather than many, so the WAL passes the socket buffer in 1600 appends instead of
-    // 60 000 - the same bytes on the wire for a fortieth of the setup time.
-    //
-    // 8 MB, and the number is measured rather than generous: with neither side setting a buffer
-    // size, this loopback pair absorbed **2.6 MB** before the sender first saw EAGAIN (539 of 1600
-    // records got through under the old code). A 2 MB version of this test passed against the defect.
-    constexpr int    kRecords = 1600;
-    constexpr size_t kLevels  = 200;
-    const size_t payload_len = sizeof(ob::DeltaUpdate) + kLevels * sizeof(ob::Level);
-    ASSERT_LT(payload_len, 65536u) << "a wider record would overflow WALRecord::payload_len "
-                                      "(pitfall 44)";
-
-    std::vector<ob::Level> levels(kLevels);
-    for (int i = 0; i < kRecords; ++i) {
-        ob::DeltaUpdate delta{};
-        std::strncpy(delta.symbol, "BTCUSD", sizeof(delta.symbol) - 1);
-        std::strncpy(delta.exchange, "BINANCE", sizeof(delta.exchange) - 1);
-        delta.sequence_number = static_cast<uint64_t>(i) + 1;
-        delta.timestamp_ns    = 1'000'000'000ULL + static_cast<uint64_t>(i);
-        delta.side            = ob::SIDE_BID;
-        delta.n_levels        = static_cast<uint16_t>(kLevels);
-        for (size_t l = 0; l < kLevels; ++l) {
-            levels[l].price = static_cast<int64_t>(50000 + i * 1000 + static_cast<int>(l));
-            levels[l].qty   = 100;
-            levels[l].cnt   = 1;
-            levels[l]._pad  = 0;
-        }
-        wal_->append(delta, levels.data());
-    }
-    wal_->flush();
-
-    const size_t wire_bytes = static_cast<size_t>(kRecords) * (sizeof(ob::WALRecord) + payload_len);
-    ASSERT_GT(wire_bytes, 1u << 20) << "the WAL must be well past one socket send buffer for this "
-                                       "test to be about anything";
-
-    auto mgr = start_manager();
-
-    int fd = connect_to_localhost(port_);
-    ASSERT_GE(fd, 0);
-    // Deliberately no `SO_RCVBUF` shrink. A 4 kB receive window does fill the sender reliably, and
-    // it also made this test take 49 seconds: 2 MB through a window that small is one delayed ACK
-    // per few kilobytes. Not reading for half a second while the WAL is several times
-    // `net.ipv4.tcp_wmem[1]` (16 kB here, autotuned up only as the receiver drains) fills it just as
-    // certainly and drains at full speed afterwards.
-
-    const char* handshake = "REPLICATE 0 0 0\n";
-    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
-
-    // Long enough for catch-up to run to completion or to give up, and with this side reading
-    // nothing at all while it does.
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-    auto states = mgr->replica_states();
-    ASSERT_EQ(states.size(), 1u);
-    EXPECT_GE(states[0].fd, 0)
-        << "the primary closed the replica's socket during catch-up. A full socket buffer is not a "
-           "dead replica - the same confusion pitfall 11 is about, one class away. (The record "
-           "itself lingers with fd=-1 until the next read fails, so asserting on the *count* would "
-           "have passed here.)";
-
-    // Drain and parse, rather than search for a marker: each record arrives as
-    // `WAL <file> <offset> <total_len> <epoch>\n` followed by exactly total_len bytes, so walking
-    // the framing counts records exactly and notices a byte lost mid-stream immediately - which
-    // searching for "WAL " cannot, since the payloads are binary and contain those four bytes.
-    struct timeval tv{};
-    tv.tv_sec = 5;
-    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    std::string in;
-    size_t records = 0;
-    char buf[65536];
-    bool stream_ok = true;
-    while (records < static_cast<size_t>(kRecords)) {
-        const size_t nl = in.find('\n');
-        if (nl == std::string::npos) {
-            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-            if (n <= 0) break;
-            in.append(buf, static_cast<size_t>(n));
-            continue;
-        }
-        const std::string header = in.substr(0, nl);
-        unsigned file = 0, epoch_lo = 0;
-        size_t offset = 0, total_len = 0;
-        if (std::sscanf(header.c_str(), "WAL %u %zu %zu %u", &file, &offset, &total_len,
-                        &epoch_lo) < 3) {
-            ADD_FAILURE() << "unexpected line in the catch-up stream: '" << header << "'";
-            stream_ok = false;
-            break;
-        }
-        if (in.size() < nl + 1 + total_len) {
-            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-            if (n <= 0) break;
-            in.append(buf, static_cast<size_t>(n));
-            continue;
-        }
-        in.erase(0, nl + 1 + total_len);
-        ++records;
-    }
-
-    EXPECT_TRUE(stream_ok);
-    EXPECT_EQ(records, static_cast<size_t>(kRecords))
-        << "catch-up delivered " << records << " of " << kRecords << " records ("
-        << wire_bytes << " bytes requested); the stream stopped part way";
-
-    ::close(fd);
-    mgr->stop();
-}
-
-TEST_F(ReplicationProtocolTest, ACatchupLargerThanTheQueueCeilingDoesNotDropTheReplica) {
-    // The test above stops one order of magnitude short of the thing that still drops a replica:
-    // `handle_catchup()` streams the whole requested range in one synchronous pass, so the queue
-    // grows to whatever that range weighs. Past 16 MB the ceiling in `send_to_replica()` closes the
-    // connection (roadmap #93). It reconnects and asks again, so a replica far enough behind spends
-    // one reconnect per ceiling's worth of WAL.
-    //
-    // Widest records the header can carry - `payload_len` is a `uint16_t` - so 24 MB is 1000
-    // appends rather than five thousand.
-    constexpr int    kRecords = 1000;
-    constexpr size_t kLevels  = 1000;
-    const size_t payload_len = sizeof(ob::DeltaUpdate) + kLevels * sizeof(ob::Level);
-    ASSERT_LT(payload_len, 65536u) << "a wider record would overflow WALRecord::payload_len "
-                                      "(pitfall 44)";
-
-    std::vector<ob::Level> levels(kLevels);
-    for (int i = 0; i < kRecords; ++i) {
-        ob::DeltaUpdate delta{};
-        std::strncpy(delta.symbol, "BTCUSD", sizeof(delta.symbol) - 1);
-        std::strncpy(delta.exchange, "BINANCE", sizeof(delta.exchange) - 1);
-        delta.sequence_number = static_cast<uint64_t>(i) + 1;
-        delta.timestamp_ns    = 1'000'000'000ULL + static_cast<uint64_t>(i);
-        delta.side            = ob::SIDE_BID;
-        delta.n_levels        = static_cast<uint16_t>(kLevels);
-        for (size_t l = 0; l < kLevels; ++l) {
-            levels[l].price = static_cast<int64_t>(50000 + i * 1000 + static_cast<int>(l));
-            levels[l].qty   = 100;
-            levels[l].cnt   = 1;
-            levels[l]._pad  = 0;
-        }
-        wal_->append(delta, levels.data());
-    }
-    wal_->flush();
-
-    const size_t wire_bytes = static_cast<size_t>(kRecords) * (sizeof(ob::WALRecord) + payload_len);
-    ASSERT_GT(wire_bytes, 20u << 20) << "the requested range must be well past the 16 MB queue "
-                                        "ceiling for this test to be about anything";
-
-    auto mgr = start_manager();
-
-    int fd = connect_to_localhost(port_);
-    ASSERT_GE(fd, 0);
-
-    const char* handshake = "REPLICATE 0 0 0\n";
-    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
-
-    // Nothing is read for this second. Long enough for the whole range to be queued - reading
-    // 24 MB out of the page cache is milliseconds - and therefore long enough for the ceiling to
-    // be crossed if the pass does not stop at it.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-
-    auto states = mgr->replica_states();
-    ASSERT_EQ(states.size(), 1u);
-    EXPECT_GE(states[0].fd, 0)
-        << "the primary dropped the replica because its own catch-up queued " << wire_bytes
-        << " bytes into a 16 MB buffer. A range larger than the ceiling is not a slow replica";
-
-    struct timeval tv{};
-    tv.tv_sec = 10;
-    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    std::string in;
-    size_t records = 0;
-    char buf[65536];
-    bool stream_ok = true;
-    while (records < static_cast<size_t>(kRecords)) {
-        const size_t nl = in.find('\n');
-        if (nl == std::string::npos) {
-            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-            if (n <= 0) break;
-            in.append(buf, static_cast<size_t>(n));
-            continue;
-        }
-        const std::string header = in.substr(0, nl);
-        unsigned file = 0, epoch_lo = 0;
-        size_t offset = 0, total_len = 0;
-        if (std::sscanf(header.c_str(), "WAL %u %zu %zu %u", &file, &offset, &total_len,
-                        &epoch_lo) < 3) {
-            ADD_FAILURE() << "unexpected line in the catch-up stream: '" << header << "'";
-            stream_ok = false;
-            break;
-        }
-        if (in.size() < nl + 1 + total_len) {
-            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-            if (n <= 0) break;
-            in.append(buf, static_cast<size_t>(n));
-            continue;
-        }
-        in.erase(0, nl + 1 + total_len);
-        ++records;
-    }
-
-    EXPECT_TRUE(stream_ok);
-    EXPECT_EQ(records, static_cast<size_t>(kRecords))
-        << "catch-up delivered " << records << " of " << kRecords << " records ("
-        << wire_bytes << " bytes requested); the stream stopped part way";
-
-    ::close(fd);
-    mgr->stop();
-}
-
-
 namespace {
 
 /// Fill a WAL with `records` deltas of `levels` levels each. Returns the bytes they weigh on the
@@ -495,6 +274,136 @@ std::vector<uint64_t> recv_sequence_numbers(int fd, size_t want, int quiet_ms = 
 }
 
 } // namespace
+
+// ── Catch-up past the socket send buffer ──────────────────────────────────────
+
+TEST_F(ReplicationProtocolTest, CatchupSurvivesAWalLargerThanTheSocketSendBuffer) {
+    // A catch-up runs on the epoll thread, and whether it can deliver more than one socket buffer
+    // is a question about where a full socket gets to say "come back later" - the same question
+    // that decides whether the TLS path has anywhere to put `SSL_ERROR_WANT_WRITE` (series D §16).
+    // Since #93 the pass is also bounded and resumable; this test is about the first of those.
+    //
+    // Before the fix this used `send_all()` on a **non-blocking** socket, so the first EAGAIN was
+    // read as a dead replica: measured, 17 270 of 40 000 records delivered and then
+    // `send_to_replica failed for fd=7, marking disconnected`.
+    //
+    // Wide records rather than many, so the WAL passes the socket buffer in 1600 appends instead of
+    // 60 000 - the same bytes on the wire for a fortieth of the setup time.
+    //
+    // 8 MB, and the number is measured rather than generous: with neither side setting a buffer
+    // size, this loopback pair absorbed **2.6 MB** before the sender first saw EAGAIN (539 of 1600
+    // records got through under the old code). A 2 MB version of this test passed against the defect.
+    constexpr int    kRecords = 1600;
+    constexpr size_t kLevels  = 200;
+    const size_t payload_len = sizeof(ob::DeltaUpdate) + kLevels * sizeof(ob::Level);
+    ASSERT_LT(payload_len, 65536u) << "a wider record would overflow WALRecord::payload_len "
+                                      "(pitfall 44)";
+
+    const size_t wire_bytes = fill_wal(*wal_, kRecords, kLevels);
+    ASSERT_GT(wire_bytes, 1u << 20) << "the WAL must be well past one socket send buffer for this "
+                                       "test to be about anything";
+
+    auto mgr = start_manager();
+
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+    // Deliberately no `SO_RCVBUF` shrink. A 4 kB receive window does fill the sender reliably, and
+    // it also made this test take 49 seconds: 2 MB through a window that small is one delayed ACK
+    // per few kilobytes. Not reading for half a second while the WAL is several times
+    // `net.ipv4.tcp_wmem[1]` (16 kB here, autotuned up only as the receiver drains) fills it just as
+    // certainly and drains at full speed afterwards.
+
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+
+    // Long enough for catch-up to run to completion or to give up, and with this side reading
+    // nothing at all while it does.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    auto states = mgr->replica_states();
+    ASSERT_EQ(states.size(), 1u);
+    EXPECT_GE(states[0].fd, 0)
+        << "the primary closed the replica's socket during catch-up. A full socket buffer is not a "
+           "dead replica - the same confusion pitfall 11 is about, one class away. (The record "
+           "itself lingers with fd=-1 until the next read fails, so asserting on the *count* would "
+           "have passed here.)";
+
+    // Walking the framing rather than searching for a marker: each record arrives as
+    // `WAL <file> <offset> <total_len> <epoch>\n` followed by exactly total_len bytes, so the
+    // framing counts records exactly and notices a byte lost mid-stream immediately - which
+    // searching for "WAL " cannot, since the payloads are binary and contain those four bytes. And
+    // the sequence numbers say the order, which counting cannot.
+    const auto seqs = recv_sequence_numbers(fd, static_cast<size_t>(kRecords));
+
+    EXPECT_EQ(seqs.size(), static_cast<size_t>(kRecords))
+        << "catch-up delivered " << seqs.size() << " of " << kRecords << " records ("
+        << wire_bytes << " bytes requested); the stream stopped part way";
+    for (size_t i = 0; i < seqs.size() && i < static_cast<size_t>(kRecords); ++i) {
+        ASSERT_EQ(seqs[i], i + 1) << "record " << i << " arrived out of order";
+    }
+
+    ::close(fd);
+    mgr->stop();
+}
+
+TEST_F(ReplicationProtocolTest, ACatchupLargerThanTheQueueCeilingDoesNotDropTheReplica) {
+    // The test above stops one order of magnitude short of the thing that still drops a replica:
+    // `handle_catchup()` streamed the whole requested range in one synchronous pass, so the queue
+    // grew to whatever that range weighed. Past 16 MB the ceiling in `send_to_replica()` closed the
+    // connection (roadmap #93), and the reconnect made almost no progress: every record of a
+    // catch-up carries the replica's own last-acked position rather than its own, so the replica
+    // saved one record's worth however many it received (#98).
+    //
+    // Widest records the header can carry - `payload_len` is a `uint16_t` - so 24 MB is 1000
+    // appends rather than five thousand.
+    constexpr int    kRecords = 1000;
+    constexpr size_t kLevels  = 1000;
+    const size_t payload_len = sizeof(ob::DeltaUpdate) + kLevels * sizeof(ob::Level);
+    ASSERT_LT(payload_len, 65536u) << "a wider record would overflow WALRecord::payload_len "
+                                      "(pitfall 44)";
+
+    const size_t wire_bytes = fill_wal(*wal_, kRecords, kLevels);
+    ASSERT_GT(wire_bytes, 20u << 20) << "the requested range must be well past the 16 MB queue "
+                                        "ceiling for this test to be about anything";
+
+    auto mgr = start_manager();
+
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+
+    // Nothing is read for this second. Long enough for the whole range to be queued - reading
+    // 24 MB out of the page cache is milliseconds - and therefore long enough for the ceiling to
+    // be crossed if the pass does not stop at it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+    auto states = mgr->replica_states();
+    ASSERT_EQ(states.size(), 1u);
+    EXPECT_GE(states[0].fd, 0)
+        << "the primary dropped the replica because its own catch-up queued " << wire_bytes
+        << " bytes into a 16 MB buffer. A range larger than the ceiling is not a slow replica";
+
+    // Walking the framing rather than searching for a marker: each record arrives as
+    // `WAL <file> <offset> <total_len> <epoch>\n` followed by exactly total_len bytes, so the
+    // framing counts records exactly and notices a byte lost mid-stream immediately - which
+    // searching for "WAL " cannot, since the payloads are binary and contain those four bytes. And
+    // the sequence numbers say the order, which counting cannot.
+    const auto seqs = recv_sequence_numbers(fd, static_cast<size_t>(kRecords));
+
+    EXPECT_EQ(seqs.size(), static_cast<size_t>(kRecords))
+        << "catch-up delivered " << seqs.size() << " of " << kRecords << " records ("
+        << wire_bytes << " bytes requested); the stream stopped part way";
+    for (size_t i = 0; i < seqs.size() && i < static_cast<size_t>(kRecords); ++i) {
+        ASSERT_EQ(seqs[i], i + 1) << "record " << i << " arrived out of order";
+    }
+
+    ::close(fd);
+    mgr->stop();
+}
+
+
 
 TEST_F(ReplicationProtocolTest, ALiveRecordDoesNotOvertakeAnUnfinishedCatchup) {
     // What the cursor of #93 costs, and the assertion that pays for it. A synchronous pass held
