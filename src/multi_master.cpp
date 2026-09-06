@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -55,6 +56,105 @@ bool parse_address(const std::string& addr, std::string& host, uint16_t& port) {
         return false;
     }
     return true;
+}
+
+/// Open a connection to `address`, on a socket that is non-blocking from the start, giving up after
+/// `timeout_ms`. Returns the descriptor, or -1 with `why` set to something an operator can act on.
+///
+/// Two properties, and the first is the one #97 was about. **The socket is non-blocking before
+/// `connect()`, not after**, so this function returns in bounded time — it used to run under the
+/// mesh mutex, and a SYN that goes nowhere is retried for `tcp_syn_retries` doublings, which stopped
+/// the io loop and every client write on the node for **135.7 s** (measured, `tcp_syn_retries = 6`).
+/// The caller now runs it with no lock held; this makes the wait bounded as well, so a peer that
+/// cannot answer does not hold a dialling thread for two minutes either.
+///
+/// `poll()` reporting POLLOUT is not the answer to "did it connect" — a refused connection is also
+/// reported as writable. `SO_ERROR` is, which is why it is read even on the ready path.
+int dial_address(const std::string& address, uint32_t timeout_ms, std::string& why) {
+    std::string host;
+    uint16_t port = 0;
+    if (!parse_address(address, host, port)) {
+        why = "the address does not parse as host:port";
+        return -1;
+    }
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);
+    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
+        // A name rather than a literal. This resolution also used to happen under the mutex.
+        struct addrinfo hints{}, *res = nullptr;
+        hints.ai_family   = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (::getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || res == nullptr) {
+            why = "the host name does not resolve";
+            return -1;
+        }
+        addr.sin_addr = reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr;
+        ::freeaddrinfo(res);
+    }
+
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        why = std::strerror(errno);
+        return -1;
+    }
+    if (!set_nonblocking(fd)) {
+        why = "the socket could not be put in non-blocking mode";
+        ::close(fd);
+        return -1;
+    }
+
+    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0) {
+        return fd;  // loopback usually completes in the call
+    }
+    if (errno != EINPROGRESS) {
+        why = std::strerror(errno);
+        ::close(fd);
+        return -1;
+    }
+
+    // Wait for the handshake to finish, or for the deadline. The loop is here for EINTR: a signal
+    // arriving mid-dial is not a peer that failed, and treating it as one would cost an attempt.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (left <= 0) {
+            why = "no answer within the connect deadline";
+            ::close(fd);
+            return -1;
+        }
+        struct pollfd pfd{};
+        pfd.fd     = fd;
+        pfd.events = POLLOUT;
+        const int ready = ::poll(&pfd, 1, static_cast<int>(left));
+        if (ready > 0) break;
+        if (ready == 0) {
+            why = "no answer within the connect deadline";
+            ::close(fd);
+            return -1;
+        }
+        if (errno != EINTR) {
+            why = std::strerror(errno);
+            ::close(fd);
+            return -1;
+        }
+    }
+
+    int err = 0;
+    socklen_t len = sizeof(err);
+    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0) {
+        why = std::strerror(errno);
+        ::close(fd);
+        return -1;
+    }
+    if (err != 0) {
+        why = std::strerror(err);
+        ::close(fd);
+        return -1;
+    }
+    return fd;
 }
 
 } // anonymous namespace
@@ -1009,108 +1109,118 @@ PeerConnection* MultiMasterManager::adopt_identified_connection(uint64_t pending
 void MultiMasterManager::connect_to_peer(const PeerInfo& peer) {
     if (peer.node_id == config_.node_id) return;  // don't connect to self
 
-    std::lock_guard<std::mutex> lock(mtx_);
-
-    // Check if already connected.
-    auto it = peers_.find(peer.node_id);
-    if (it != peers_.end() && it->second.connected) {
-        OB_LOG_DEBUG("mm", "Already connected to peer %u", peer.node_id);
-        return;
-    }
-
-    std::string host;
-    uint16_t port = 0;
-    if (!parse_address(peer.address, host, port)) {
-        OB_LOG_WARN("mm", "Invalid peer address: %s", peer.address.c_str());
-        return;
-    }
-
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        OB_LOG_ERROR("mm", "socket() failed for peer %u: %s",
-                     peer.node_id, std::strerror(errno));
-        return;
-    }
-
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
-        // Try hostname resolution.
-        struct addrinfo hints{}, *res = nullptr;
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        if (::getaddrinfo(host.c_str(), nullptr, &hints, &res) == 0 && res) {
-            addr.sin_addr = reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr;
-            ::freeaddrinfo(res);
-        } else {
-            OB_LOG_WARN("mm", "Cannot resolve peer %u address: %s",
-                        peer.node_id, host.c_str());
-            ::close(fd);
+    // Three phases, and the middle one is the point of the shape: decide under the lock, dial with
+    // it released, install under it again. The dial used to happen between the first line of this
+    // function and its last, all of it holding `mtx_` — which the io loop takes for every peer
+    // event and `broadcast_local()` takes on the client write path (#97).
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto it = peers_.find(peer.node_id);
+        if (it != peers_.end() && it->second.connected) {
+            OB_LOG_DEBUG("mm", "Already connected to peer %u", peer.node_id);
             return;
         }
+        if (it == peers_.end()) {
+            // A record before the dial rather than after it: `finish_dial()` needs somewhere to
+            // install the connection, and the reconnect loop needs to see that this peer's next
+            // attempt is already claimed.
+            PeerConnection conn{};
+            conn.node_id   = peer.node_id;
+            conn.address   = peer.address;
+            conn.fd        = -1;
+            conn.connected = false;
+            conn.compress  = config_.compress;
+            peers_[peer.node_id] = std::move(conn);
+        } else if (it->second.address.empty()) {
+            it->second.address = peer.address;
+        }
+        // Claim the attempt before the lock goes, so the reconnect loop does not open a second
+        // connection to the same peer while this one is in flight.
+        PeerConnection& rec = peers_[peer.node_id];
+        rec.next_reconnect_time = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(rec.backoff.next_delay_ms());
     }
 
-    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        OB_LOG_WARN("mm", "connect() to peer %u at %s failed: %s",
-                    peer.node_id, peer.address.c_str(), std::strerror(errno));
-        ::close(fd);
+    std::string why;
+    const int fd = dial_address(peer.address, MM_CONNECT_TIMEOUT_MS, why);
 
-        // Store as disconnected peer.
-        PeerConnection conn{};
-        conn.node_id = peer.node_id;
-        conn.address = peer.address;
-        conn.fd = -1;
-        conn.connected = false;
-        conn.compress = config_.compress;
-        peers_[peer.node_id] = std::move(conn);
+    std::lock_guard<std::mutex> lock(mtx_);
+    finish_dial(peer.node_id, fd, why);
+}
+
+void MultiMasterManager::finish_dial(uint16_t node_id, int fd, const std::string& why) {
+    auto it = peers_.find(node_id);
+    if (it == peers_.end()) {
+        // The topology changed while we were dialling: this peer is no longer one of ours.
+        if (fd >= 0) {
+            OB_LOG_INFO("mm", "Dialled peer %u is no longer in the topology — closing fd=%d",
+                        node_id, fd);
+            ::close(fd);
+        }
+        return;
+    }
+    PeerConnection& peer = it->second;
+
+    if (fd < 0) {
+        // next_reconnect_time was moved before the lock was released, so there is nothing to
+        // schedule here — every failure branch has already taken its backoff (#95).
+        OB_LOG_INFO("mm", "Dial to peer %u at %s failed: %s (attempt #%u)", node_id,
+                    peer.address.c_str(), why.c_str(), peer.backoff.attempt);
         return;
     }
 
-    set_nonblocking(fd);
+    if (peer.connected) {
+        // Somebody got there first while the lock was released: our own second dial, or the peer
+        // dialling us and its handshake being adopted (#96). One link per peer, and the one already
+        // carrying traffic keeps it.
+        OB_LOG_INFO("mm",
+                    "Peer %u became connected while we were dialling it (its fd=%d); closing the "
+                    "second link on fd=%d",
+                    node_id, peer.fd, fd);
+        ::close(fd);
+        return;
+    }
+
     int tcp_nodelay = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &tcp_nodelay, sizeof(tcp_nodelay));
 
-    PeerConnection conn{};
-    conn.node_id = peer.node_id;
-    conn.address = peer.address;
-    conn.fd = fd;
-    conn.conn_id = next_conn_id_++;
-    conn.connected = true;
-    conn.compress = config_.compress;
-    OB_LOG_INFO("mm", "Connected to peer %u at %s (fd=%d, connection %llu)",
-                conn.node_id, conn.address.c_str(), fd,
-                static_cast<unsigned long long>(conn.conn_id));
-    peers_[peer.node_id] = std::move(conn);
+    peer.fd             = fd;
+    peer.conn_id        = next_conn_id_++;
+    peer.connected      = true;
+    peer.handshake_done = false;
+    peer.peer_proved    = false;
+    peer.auth_nonce.clear();
+    peer.we_accepted    = false;
+    peer.compress       = config_.compress;
+    peer.backoff.reset();
 
-    // Add peer fd to epoll (edge-triggered EPOLLIN).
+    OB_LOG_INFO("mm", "Connected to peer %u at %s (fd=%d, connection %llu)", node_id,
+                peer.address.c_str(), fd, static_cast<unsigned long long>(peer.conn_id));
+
     if (epoll_fd_ >= 0) {
         struct epoll_event ev{};
-        ev.events = EPOLLIN | EPOLLET;
+        ev.events  = EPOLLIN | EPOLLET;
         ev.data.fd = fd;
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
     }
 
-    OB_LOG_INFO("mm", "Connected to peer %u at %s", peer.node_id,
-                peer.address.c_str());
-
-    // TLS before anything is queued. The handshake itself is *not* driven here: this function runs
-    // on the topology-change path and the reconnect thread, and io_loop() owns the epoll set - so
-    // arming here and stepping there is what keeps one `SSL` state machine to one thread.
-    if (!attach_tls(peers_[peer.node_id])) {
+    // TLS before anything is queued. The handshake itself is *not* driven here: this runs on the
+    // topology-change path and the reconnect thread, and io_loop() owns the epoll set - so arming
+    // here and stepping there is what keeps one `SSL` state machine to one thread.
+    if (!attach_tls(peer)) {
         if (epoll_fd_ >= 0) ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
         ::close(fd);
-        peers_[peer.node_id].fd        = -1;
-        peers_[peer.node_id].connected = false;
+        peer.fd        = -1;
+        peer.connected = false;
         return;
     }
 
-    // Send handshake to initiate protocol exchange - or, with a cluster secret, a challenge, and
-    // the handshake follows once this peer has proved itself.
+    // A challenge first when a cluster secret is configured; the handshake follows once the peer
+    // has proved itself on this *new* socket, which is why peer_proved was just cleared.
     if (!config_.cluster_secret.empty()) {
-        send_auth_challenge(peers_[peer.node_id]);
+        send_auth_challenge(peer);
     } else {
-        send_handshake(peers_[peer.node_id]);
+        send_handshake(peer);
     }
 
     publish_peer_gauges();
@@ -2021,6 +2131,11 @@ void MultiMasterManager::reconnect_loop() {
     OB_LOG_DEBUG("mm", "reconnect_loop started");
 
     while (running_.load(std::memory_order_acquire)) {
+        // Which peers are due, decided under the lock. The dials happen below it: the loop used to
+        // hold `mtx_` across a blocking `::connect()`, so one peer address that black-holes SYNs
+        // stopped the io loop and every client write on this node for the whole TCP timeout —
+        // measured at 135.7 s (#97).
+        std::vector<std::pair<uint16_t, std::string>> due;
         {
             std::lock_guard<std::mutex> lock(mtx_);
             auto now = std::chrono::steady_clock::now();
@@ -2050,8 +2165,6 @@ void MultiMasterManager::reconnect_loop() {
 
             for (auto& [nid, peer] : peers_) {
                 if (peer.connected) continue;
-
-                // Check if it's time to attempt reconnect.
                 if (now < peer.next_reconnect_time) continue;
 
                 // Every failure branch in this loop has to move next_reconnect_time. This one did
@@ -2066,114 +2179,30 @@ void MultiMasterManager::reconnect_loop() {
                     continue;
                 }
 
-                // Attempt to connect.
-                std::string host;
-                uint16_t port = 0;
-                if (!parse_address(peer.address, host, port)) {
-                    const uint32_t delay_ms = peer.backoff.next_delay_ms();
-                    peer.next_reconnect_time = now + std::chrono::milliseconds(delay_ms);
-                    OB_LOG_WARN("mm", "Reconnect: invalid peer address for peer %u: '%s', next "
-                                      "attempt in %u ms", nid, peer.address.c_str(), delay_ms);
-                    continue;
-                }
-
-                int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-                if (fd < 0) {
-                    OB_LOG_ERROR("mm", "Reconnect: socket() failed for peer %u: %s",
-                                 nid, std::strerror(errno));
-                    // Schedule next attempt.
-                    uint32_t delay_ms = peer.backoff.next_delay_ms();
-                    peer.next_reconnect_time = now + std::chrono::milliseconds(delay_ms);
-                    OB_LOG_INFO("mm", "Reconnect attempt #%u to peer %u failed, next in %u ms",
-                                peer.backoff.attempt, nid, delay_ms);
-                    continue;
-                }
-
-                struct sockaddr_in addr{};
-                addr.sin_family = AF_INET;
-                addr.sin_port = htons(port);
-                if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
-                    // Try hostname resolution.
-                    struct addrinfo hints{}, *res = nullptr;
-                    hints.ai_family = AF_INET;
-                    hints.ai_socktype = SOCK_STREAM;
-                    if (::getaddrinfo(host.c_str(), nullptr, &hints, &res) == 0 && res) {
-                        addr.sin_addr = reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr;
-                        ::freeaddrinfo(res);
-                    } else {
-                        OB_LOG_WARN("mm", "Reconnect: cannot resolve peer %u address: %s",
-                                    nid, host.c_str());
-                        ::close(fd);
-                        uint32_t delay_ms = peer.backoff.next_delay_ms();
-                        peer.next_reconnect_time = now + std::chrono::milliseconds(delay_ms);
-                        OB_LOG_INFO("mm", "Reconnect attempt #%u to peer %u failed, next in %u ms",
-                                    peer.backoff.attempt, nid, delay_ms);
-                        continue;
-                    }
-                }
-
-                if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-                    ::close(fd);
-                    uint32_t delay_ms = peer.backoff.next_delay_ms();
-                    peer.next_reconnect_time = now + std::chrono::milliseconds(delay_ms);
-                    OB_LOG_INFO("mm", "Reconnect attempt #%u to peer %u at %s failed: %s, next in %u ms",
-                                peer.backoff.attempt, nid, peer.address.c_str(),
-                                std::strerror(errno), delay_ms);
-                    continue;
-                }
-
-                // Connection successful!
-                set_nonblocking(fd);
-                int tcp_nodelay = 1;
-                ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
-                             &tcp_nodelay, sizeof(tcp_nodelay));
-
-                peer.fd = fd;
-                peer.connected = true;
-                peer.handshake_done = false;
-                peer.peer_proved = false;
-                peer.auth_nonce.clear();
-                peer.we_accepted = false;
-                peer.backoff.reset();
-
-                // Add peer fd to epoll (edge-triggered EPOLLIN).
-                if (epoll_fd_ >= 0) {
-                    struct epoll_event ev{};
-                    ev.events = EPOLLIN | EPOLLET;
-                    ev.data.fd = fd;
-                    ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
-                }
-
-                OB_LOG_INFO("mm", "Reconnected to peer %u at %s", nid,
-                            peer.address.c_str());
-
-                // A reconnect starts the TLS handshake again too: the channel belongs to the
-                // connection, which is why `release_tls()` cleared it when the last one went.
-                if (!attach_tls(peer)) {
-                    if (epoll_fd_ >= 0) ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-                    ::close(fd);
-                    peer.fd        = -1;
-                    peer.connected = false;
-                    const uint32_t delay_ms = peer.backoff.next_delay_ms();
-                    peer.next_reconnect_time = now + std::chrono::milliseconds(delay_ms);
-                    continue;
-                }
-
-                // Challenge first when a cluster secret is configured; the handshake follows
-                // once the peer has proved itself on this *new* socket - a reconnect starts the
-                // exchange again, which is why peer_proved was just cleared.
-                if (!config_.cluster_secret.empty()) {
-                    send_auth_challenge(peer);
-                } else {
-                    send_handshake(peer);
-                }
+                // The attempt is claimed here rather than after the dial, because the lock is about
+                // to be released: without this the next pass, 100 ms later, would start a second
+                // connection to a peer this one is still dialling.
+                const uint32_t delay_ms = peer.backoff.next_delay_ms();
+                peer.next_reconnect_time = now + std::chrono::milliseconds(delay_ms);
+                due.emplace_back(nid, peer.address);
             }
 
-            // Both gauges, once per pass, from the one place that computes them. This tick is the
+            // Both mesh peer gauges, recomputed from the peer table once per pass rather than at
+            // the places that change a peer's state. That is what makes them right: the tick is the
             // mechanism and the call sites are only latency: whichever of the twenty-odd places
             // that move a peer's state ran since the last pass - including accept(), which none of
             // the old inline copies covered - the gauges are right again within 100 ms.
             publish_peer_gauges();
+        }
+
+        for (const auto& [node_id, address] : due) {
+            if (!running_.load(std::memory_order_acquire)) break;
+
+            std::string why;
+            const int fd = dial_address(address, MM_CONNECT_TIMEOUT_MS, why);
+
+            std::lock_guard<std::mutex> lock(mtx_);
+            finish_dial(node_id, fd, why);
         }
 
         // Sleep 100ms between iterations.

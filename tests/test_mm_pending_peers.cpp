@@ -523,3 +523,117 @@ TEST(PendingPeersStatic, NoPeerRecordIsKeyedByAnythingButANodeId) {
                "and never reused, which is the property a key needs";
     }
 }
+
+// ── One unreachable peer address must not stop the node — roadmap #97 ─────────
+//
+// The reconnect loop used to hold `mtx_` across a blocking `::connect()`, and that is the mutex the
+// io loop takes for every peer event and `broadcast_local()` takes on the client write path. A
+// refused connection returns at once, which is why a healthy cluster never showed this; a SYN that
+// goes nowhere is retried for `tcp_syn_retries` doublings.
+//
+// Measured before the fix, on i3-7100U with `tcp_syn_retries = 6` and one peer record addressed
+// `10.9.9.7:7100`: an inbound mesh connection waited **132.5 s** for its first byte, and one client
+// write through `apply_delta_mm()` blocked for **135.7 s**. This file's other tests were flaky 3
+// runs in 12 for the same reason, which is how it was found.
+
+namespace {
+
+/// A peer record with an address whose SYNs go nowhere, due for a dial immediately.
+///
+/// 10.9.9.7 is not routed on this machine. That matters more than it sounds: a *refused* connection
+/// (`127.0.0.1:1`) returns in microseconds and reproduces nothing.
+ob::PeerConnection black_holed_peer_record(uint16_t node_id) {
+    ob::PeerConnection p{};
+    p.node_id   = node_id;
+    p.address   = "10.9.9.7:7100";
+    p.fd        = -1;
+    p.connected = false;
+    return p;  // next_reconnect_time default-constructed: due now
+}
+
+}  // namespace
+
+TEST(PeerDial, AnUnreachablePeerAddressDoesNotStopTheNode) {
+    const uint16_t port = g_port.fetch_add(1, std::memory_order_relaxed);
+    TempDir tmp("mm_dial_blackhole_");
+    ob::Engine engine(tmp.path, kNoAutoFlush, ob::FsyncPolicy::NONE, {}, {}, {}, {},
+                      mm_config(1, port));
+    engine.open();
+    auto* mm = engine.multi_master_manager();
+    ASSERT_NE(mm, nullptr);
+
+    mm->install_peer_for_test(black_holed_peer_record(7));
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));  // let the dial start
+
+    // The two things that were blocked, and the budget is **below** MM_CONNECT_TIMEOUT_MS on
+    // purpose: a dial with a deadline but still under the lock would pass a 6-second budget, and
+    // this test is about the lock rather than about the deadline.
+    const auto t0 = std::chrono::steady_clock::now();
+    MeshClient client(port);
+    EXPECT_TRUE(client.wait_for_bytes()) << "the node did not answer an inbound mesh connection";
+    const auto accept_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    EXPECT_LT(accept_ms, 3000)
+        << "an inbound mesh connection waited " << accept_ms << " ms for its first byte while one "
+           "peer address was being dialled; it was 132.5 s before #97";
+
+    // `apply_delta_mm` and not `apply_delta`: on a multi-master node the server calls the overload
+    // that broadcasts, and broadcasting is what takes the mesh mutex. Measuring the other one
+    // reported 1 ms against the defect and exonerated it.
+    ob::DeltaUpdate d{};
+    std::strncpy(d.symbol, "BTCUSD", sizeof(d.symbol) - 1);
+    std::strncpy(d.exchange, "EX", sizeof(d.exchange) - 1);
+    d.timestamp_ns = 1'000'000;
+    d.side         = ob::SIDE_BID;
+    d.n_levels     = 1;
+    ob::Level lv{};
+    lv.price = 100;
+    lv.qty   = 1;
+
+    const auto w0 = std::chrono::steady_clock::now();
+    engine.apply_delta_mm(d, &lv);
+    const auto write_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - w0).count();
+    EXPECT_LT(write_ms, 3000)
+        << "a client write blocked for " << write_ms << " ms while one peer address was being "
+           "dialled; it was 135.7 s before #97";
+
+    // One dial in flight, one attempt taken — pinned in both directions. Too low (0) means the
+    // attempt is claimed *after* the dial returns, so `next_reconnect_time` stays in the past and
+    // the loop starts a fresh connection every 100 ms to a peer it is already dialling. Too high
+    // means that storm is already happening. This is #95's rule applied to a dial that now spans a
+    // lock release: every failure branch has to move the next-attempt time, and here it has to move
+    // it *before* the branch can run again.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1600));
+    const auto peers = mm->peer_states();
+    const ob::PeerConnection* p = find_peer(peers, 7);
+    ASSERT_NE(p, nullptr);
+    EXPECT_EQ(p->backoff.attempt, 1u)
+        << "after ~2 s with one 5 s dial outstanding, exactly one attempt should have been claimed";
+
+    client.close();
+    engine.close();
+}
+
+TEST(PeerDial, TheNodeStopsWhileADialIsOutstanding) {
+    const uint16_t port = g_port.fetch_add(1, std::memory_order_relaxed);
+    TempDir tmp("mm_dial_shutdown_");
+    ob::Engine engine(tmp.path, kNoAutoFlush, ob::FsyncPolicy::NONE, {}, {}, {}, {},
+                      mm_config(1, port));
+    engine.open();
+    auto* mm = engine.multi_master_manager();
+    ASSERT_NE(mm, nullptr);
+
+    mm->install_peer_for_test(black_holed_peer_record(7));
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+    // `stop()` joins the reconnect thread, so before #97 a shutdown during a dial waited out the
+    // kernel's SYN retries — every measurement run of this defect took 133 s for exactly that
+    // reason. A node that cannot be stopped for two minutes is its own incident.
+    const auto t0 = std::chrono::steady_clock::now();
+    engine.close();
+    const auto close_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    EXPECT_LT(close_ms, 10000)
+        << "closing the engine took " << close_ms << " ms while one peer was being dialled";
+}

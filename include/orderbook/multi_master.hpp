@@ -45,6 +45,16 @@ inline constexpr size_t   MM_MAX_VV_ENTRIES     = 4096; // ~172 kB on the wire
 inline constexpr size_t   MM_MAX_PEER_SEND_BUF  = 64ULL << 20;
 inline constexpr uint64_t MM_VV_GRACE_MS        = 2000; // wait for a peer's vector before
                                                         // assuming it holds nothing
+/// How long a dial to a peer may take before it is treated as failed (#97).
+///
+/// A constant rather than a flag, and the reason is that the kernel's own answer is unusable: a SYN
+/// that goes nowhere is retried for `tcp_syn_retries` doublings, about 127 s on a default Linux, and
+/// nothing in a mesh wants to wait that long to learn that a peer is unreachable. Five seconds
+/// allows two SYN retransmissions (the first at 1 s, the second at 3 s cumulative), so a peer that
+/// is merely slow to answer still connects, and one that is unreachable is retried by the backoff
+/// rather than waited on.
+inline constexpr uint32_t MM_CONNECT_TIMEOUT_MS  = 5000;
+
 inline constexpr size_t   MM_FRAME_HEADER_SIZE  = 4;            // uint32 LE length
 inline constexpr size_t   MM_HANDSHAKE_SIZE     = 17;           // HandshakeMessage wire size
 inline constexpr size_t   MM_MAX_FRAME_PAYLOAD  = 64ULL << 20;  // 64 MB
@@ -611,6 +621,18 @@ private:
     /// must be replaced by this one — or null when the connection was dropped instead of adopted,
     /// in which case the caller must touch neither.
     PeerConnection* adopt_identified_connection(uint64_t pending_key);
+
+    /// Install the result of one dial, successful or not. Requires `mtx_` held.
+    ///
+    /// The other half of dialling with the lock released: by the time this runs the peer may have
+    /// left the topology, or may already be connected through a link somebody else opened — its own
+    /// second dial, or the peer dialling us and its handshake being adopted (#96). One link per
+    /// peer, and the one already carrying traffic keeps it.
+    ///
+    /// Nothing here schedules a retry: the attempt was claimed, and its backoff taken, before the
+    /// lock was released. That is what stops a second dial starting to a peer this one is still
+    /// dialling.
+    void finish_dial(uint16_t node_id, int fd, const std::string& why);
 
     /// Close an unidentified connection and forget it. Requires `mtx_` held.
     void drop_pending_connection(uint64_t pending_key, const char* why);
