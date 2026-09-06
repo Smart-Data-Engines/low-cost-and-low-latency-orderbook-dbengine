@@ -380,10 +380,11 @@ void MultiMasterManager::stop() {
         epoll_fd_ = -1;
     }
 
-    // Disconnect all peers.
+    // Disconnect all peers, and every connection that had not become one yet.
     {
         std::lock_guard<std::mutex> lock(mtx_);
         for (auto& [nid, peer] : peers_) {
+            (void)nid;
             if (peer.fd >= 0) {
                 release_tls(peer);
                 ::close(peer.fd);
@@ -391,7 +392,17 @@ void MultiMasterManager::stop() {
                 peer.connected = false;
             }
         }
+        for (auto& [key, conn] : pending_) {
+            (void)key;
+            if (conn.fd >= 0) {
+                release_tls(conn);
+                ::close(conn.fd);
+                conn.fd = -1;
+                conn.connected = false;
+            }
+        }
         peers_.clear();
+        pending_.clear();
     }
 
     // Stop anti-entropy if running.
@@ -558,27 +569,29 @@ void MultiMasterManager::finish_bootstrap(bool succeeded) {
 
 // ── Diagnostic commands ───────────────────────────────────────────────────────
 
+size_t MultiMasterManager::pending_connection_count() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return pending_.size();
+}
+
 std::string MultiMasterManager::handle_mm_peers_command() const {
     std::lock_guard<std::mutex> lock(mtx_);
 
     std::ostringstream oss;
     oss << "node_id\taddress\tstatus\thlc_timestamp\tlag_bytes\n";
 
-    // An accepted connection lands in peers_ under a temporary key with node_id 0 and no address,
-    // and stays there until its handshake says who it is. Those are not peers, and listing them made
-    // MM_PEERS answer "0, (no address), disconnected" — which an operator reads as a peer that has
-    // fallen over, and which anything comparing the row count against the cluster size reads as one
-    // node too many. Both readings are wrong: it is an inbound connection mid-handshake.
+    // Only peers appear here, and that is now a property of the container rather than a test in
+    // this loop: a connection accepted and not yet named by its handshake lives in `pending_`
+    // (#96), so there is nothing to skip. It used to be listed as "0, (no address),
+    // disconnected" — which an operator reads as a peer that has fallen over, and which anything
+    // comparing the row count against the cluster size reads as one node too many (#84).
     //
-    // Skipped rather than reported differently, because these rows are parsed — by the integration
-    // harness among others — so a trailing summary line would be counted as a peer by anything
-    // splitting on newlines. The count goes to the log, so nothing is hidden by being dropped.
-    size_t unidentified = 0;
+    // The count of connections mid-handshake goes to the log rather than to a trailing line here,
+    // because these rows are parsed — by the integration harness among others — and a summary line
+    // would be counted as a peer by anything splitting on newlines.
+    const size_t unidentified = pending_.size();
     for (const auto& [nid, peer] : peers_) {
-        if (peer.node_id == 0) {
-            ++unidentified;
-            continue;
-        }
+        (void)nid;
         oss << peer.node_id << '\t'
             << peer.address << '\t'
             << (peer.connected ? "connected" : "disconnected") << '\t'
@@ -681,19 +694,15 @@ void MultiMasterManager::io_loop() {
 
                     OB_LOG_INFO("mm", "Accepted peer connection fd=%d", client_fd);
 
-                    // Create a temporary PeerConnection for this accepted fd.
-                    // The peer will identify itself via handshake.
-                    // Use node_id=0 as placeholder until handshake completes.
                     std::lock_guard<std::mutex> lock(mtx_);
 
-                    // Find an unused temporary node_id slot for accepted connections.
-                    // We use fd as a temporary key in a separate lookup, but store
-                    // in peers_ with a placeholder. After handshake, we'll re-key.
-                    // For simplicity, use a high node_id range (fd + 10000) as temp key.
-                    uint16_t temp_id = static_cast<uint16_t>(client_fd);
-
+                    // An accepted connection has no node id until its handshake supplies one, so
+                    // it goes into the container for exactly that: `pending_`, keyed by its own
+                    // conn_id. It used to go into `peers_` under `static_cast<uint16_t>(fd)`,
+                    // which is a node id as far as that map is concerned, so a connection on
+                    // descriptor N silently replaced the record of peer N (#96).
                     PeerConnection conn{};
-                    conn.node_id = 0;  // unknown until handshake
+                    conn.node_id = 0;  // unknown until handshake — and never a key
                     conn.fd = client_fd;
                     conn.conn_id = next_conn_id_++;
                     conn.connected = true;
@@ -703,25 +712,26 @@ void MultiMasterManager::io_loop() {
                     conn.we_accepted = true;
                     conn.compress = config_.compress;
 
-                    // Store with temp key — will be re-keyed after handshake.
-                    peers_[temp_id] = std::move(conn);
+                    const uint64_t pending_key = conn.conn_id;
+                    PeerConnection& pending = pending_[pending_key];
+                    pending = std::move(conn);
 
                     // TLS before a byte is queued. What follows is queued rather than written: the
                     // drain returns early while the handshake runs, so these frames go out with the
                     // first flush afterwards - the same shape as the client port's banner.
-                    if (!attach_tls(peers_[temp_id])) {
+                    if (!attach_tls(pending)) {
                         ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr);
                         ::close(client_fd);
-                        peers_.erase(temp_id);
+                        pending_.erase(pending_key);
                         continue;
                     }
 
                     // With a cluster secret, challenge first and let the *handshake* be the
                     // acceptance; without one, handshake straight away as before.
                     if (!config_.cluster_secret.empty()) {
-                        send_auth_challenge(peers_[temp_id]);
+                        send_auth_challenge(pending);
                     } else {
-                        send_handshake(peers_[temp_id]);
+                        send_handshake(pending);
                     }
                 }
             } else {
@@ -729,22 +739,43 @@ void MultiMasterManager::io_loop() {
                 // Find the peer by fd.
                 std::lock_guard<std::mutex> lock(mtx_);
 
-                PeerConnection* peer_ptr = nullptr;
-                uint16_t peer_key = 0;
-                for (auto& [nid, p] : peers_) {
-                    if (p.fd == ev_fd) {
-                        peer_ptr = &p;
-                        peer_key = nid;
-                        break;
-                    }
-                }
+                ConnectionRef ref = find_connection_by_fd(ev_fd);
+                PeerConnection* peer_ptr = ref.peer;
 
                 if (!peer_ptr) {
-                    // Unknown fd — remove from epoll.
+                    // A descriptor in the epoll set with no record behind it. This is not a
+                    // routine case: every close removes the registration, so reaching it means
+                    // some path dropped a record while its socket was still armed, and the peer
+                    // at the other end sees a truncation rather than a close. #96 was one such
+                    // path and said nothing on either side.
+                    OB_LOG_WARN("mm", "epoll event on fd=%d with no connection behind it — closing "
+                                      "it; the peer will see a truncated stream", ev_fd);
                     ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, ev_fd, nullptr);
                     ::close(ev_fd);
                     continue;
                 }
+
+                // What a lost connection means, in one place, because it means two different
+                // things. An identified peer keeps its record and comes back through the reconnect
+                // loop; an unidentified one is dropped, because the port it arrived on is the
+                // peer's ephemeral source port and the peer that dialled us will dial again by
+                // itself (#95).
+                auto connection_lost = [&](const char* why) {
+                    close_connection_socket(*peer_ptr, why);
+                    if (ref.is_pending()) {
+                        drop_pending_connection(ref.pending_key, why);
+                        peer_ptr = nullptr;
+                        ref = ConnectionRef{};
+                    } else {
+                        const uint32_t delay_ms = peer_ptr->backoff.next_delay_ms();
+                        peer_ptr->next_reconnect_time =
+                            std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(delay_ms);
+                        OB_LOG_INFO("mm", "Scheduled reconnect for peer %u (delay %u ms): %s",
+                                    peer_ptr->node_id, delay_ms, why);
+                    }
+                    publish_peer_gauges();
+                };
 
                 // A handshake in progress consumes this event and nothing else. Not one frame may
                 // be parsed before it finishes: a frame arriving earlier would come from a
@@ -752,21 +783,7 @@ void MultiMasterManager::io_loop() {
                 // different mechanism that knows nothing about TLS.
                 if (peer_ptr->tls != nullptr && peer_ptr->tls->handshaking()) {
                     if (!advance_tls_handshake(*peer_ptr)) {
-                        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, ev_fd, nullptr);
-                        release_tls(*peer_ptr);
-                        ::close(ev_fd);
-                        peer_ptr->fd        = -1;
-                        peer_ptr->connected = false;
-                        peer_ptr->recv_buf.clear();
-                        peer_ptr->send_buf.clear();
-                        on_peer_disconnected(*peer_ptr);
-                        if (peer_ptr->node_id != 0) {
-                            const uint32_t delay_ms = peer_ptr->backoff.next_delay_ms();
-                            peer_ptr->next_reconnect_time =
-                                std::chrono::steady_clock::now() +
-                                std::chrono::milliseconds(delay_ms);
-                        }
-                        publish_peer_gauges();
+                        connection_lost("the TLS handshake failed");
                     }
                     continue;
                 }
@@ -822,27 +839,7 @@ void MultiMasterManager::io_loop() {
                     }
 
                     if (disconnected) {
-                        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, ev_fd, nullptr);
-                        release_tls(*peer_ptr);
-                        ::close(ev_fd);
-                        peer_ptr->fd = -1;
-                        peer_ptr->connected = false;
-                        peer_ptr->recv_buf.clear();
-                        peer_ptr->send_buf.clear();
-                        on_peer_disconnected(*peer_ptr);
-
-                        uint16_t node_to_reconnect = peer_ptr->node_id;
-                        if (node_to_reconnect != 0) {
-                            // Schedule reconnect (outside lock would be ideal,
-                            // but schedule_reconnect acquires its own lock — 
-                            // we handle it inline here).
-                            uint32_t delay_ms = peer_ptr->backoff.next_delay_ms();
-                            peer_ptr->next_reconnect_time =
-                                std::chrono::steady_clock::now() +
-                                std::chrono::milliseconds(delay_ms);
-                            OB_LOG_INFO("mm", "Scheduled reconnect for peer %u (delay %u ms)",
-                                        node_to_reconnect, delay_ms);
-                        }
+                        connection_lost("the peer closed the connection or the read failed");
                         continue;
                     }
 
@@ -858,16 +855,16 @@ void MultiMasterManager::io_loop() {
                         if (!peer_ptr->send_buf.empty()) try_drain_send_buf(*peer_ptr);
                     }
 
-                    // After handshake, re-key the peer if needed. The whole record moves, so
-                    // conn_id moves with it: the connection accepted under a temporary key keeps
-                    // its identity once the handshake names the node behind it.
-                    if (peer_ptr->handshake_done && peer_ptr->node_id != 0 &&
-                        peer_key != peer_ptr->node_id) {
-                        // Move peer to correct key.
-                        uint16_t real_id = peer_ptr->node_id;
-                        PeerConnection moved = std::move(*peer_ptr);
-                        peers_.erase(peer_key);
-                        peers_[real_id] = std::move(moved);
+                    // Once the handshake has named a node, the connection stops being anonymous
+                    // and moves into the peer table. `peer_ptr` is replaced rather than reused:
+                    // the record it pointed at has been moved out of `pending_` and erased, and
+                    // the EPOLLOUT branch below runs on the same pointer — the old code left it
+                    // dangling and read through it whenever one event carried both flags.
+                    if (ref.is_pending() && peer_ptr->handshake_done) {
+                        peer_ptr = adopt_identified_connection(ref.pending_key);
+                        ref = ConnectionRef{peer_ptr, 0};
+                        if (peer_ptr == nullptr) continue;  // dropped, not adopted
+                        publish_peer_gauges();
                     }
                 }
 
@@ -884,21 +881,7 @@ void MultiMasterManager::io_loop() {
                 if (ev_events & (EPOLLERR | EPOLLHUP)) {
                     if (peer_ptr && peer_ptr->connected) {
                         OB_LOG_WARN("mm", "Peer fd=%d EPOLLERR/HUP — disconnecting", ev_fd);
-                        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, ev_fd, nullptr);
-                        release_tls(*peer_ptr);
-                        ::close(ev_fd);
-                        peer_ptr->fd = -1;
-                        peer_ptr->connected = false;
-                        peer_ptr->recv_buf.clear();
-                        peer_ptr->send_buf.clear();
-                        on_peer_disconnected(*peer_ptr);
-
-                        if (peer_ptr->node_id != 0) {
-                            uint32_t delay_ms = peer_ptr->backoff.next_delay_ms();
-                            peer_ptr->next_reconnect_time =
-                                std::chrono::steady_clock::now() +
-                                std::chrono::milliseconds(delay_ms);
-                        }
+                        connection_lost("epoll reported an error or a hangup");
                     }
                 }
             }
@@ -914,6 +897,113 @@ void MultiMasterManager::io_loop() {
     }
 
     OB_LOG_DEBUG("mm", "io_loop exited");
+}
+
+// ── Connection records ────────────────────────────────────────────────────────
+
+MultiMasterManager::ConnectionRef MultiMasterManager::find_connection_by_fd(int fd) {
+    // Pending first: the container is small — one entry per inbound connection still in its
+    // handshake — and a descriptor cannot be in both.
+    for (auto& [key, conn] : pending_) {
+        if (conn.fd == fd) return ConnectionRef{&conn, key};
+    }
+    for (auto& [node_id, peer] : peers_) {
+        (void)node_id;
+        if (peer.fd == fd) return ConnectionRef{&peer, 0};
+    }
+    return ConnectionRef{};
+}
+
+void MultiMasterManager::close_connection_socket(PeerConnection& conn, const char* why) {
+    if (conn.fd >= 0) {
+        if (epoll_fd_ >= 0) ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, conn.fd, nullptr);
+        // close_notify before the descriptor goes, so the peer reads a clean close rather than a
+        // truncation it cannot tell from a network fault.
+        release_tls(conn);
+        OB_LOG_INFO("mm", "Closing connection %llu on fd=%d (peer %u): %s",
+                    static_cast<unsigned long long>(conn.conn_id), conn.fd, conn.node_id, why);
+        ::close(conn.fd);
+        conn.fd = -1;
+    }
+    conn.connected      = false;
+    // Everything below belongs to the connection rather than to the peer, so it goes with it. A
+    // record that kept `handshake_done` across a disconnect would skip the handshake on the next
+    // one — masked today only because connect_to_peer() replaces the whole record.
+    conn.handshake_done = false;
+    conn.peer_proved    = false;
+    conn.auth_nonce.clear();
+    conn.recv_buf.clear();
+    conn.send_buf.clear();
+    on_peer_disconnected(conn);
+}
+
+void MultiMasterManager::drop_pending_connection(uint64_t pending_key, const char* why) {
+    auto it = pending_.find(pending_key);
+    if (it == pending_.end()) return;
+    close_connection_socket(it->second, why);
+    OB_LOG_DEBUG("mm",
+                 "Dropping the record of inbound connection %llu, which closed before its "
+                 "handshake named a node: %s",
+                 static_cast<unsigned long long>(pending_key), why);
+    pending_.erase(it);
+}
+
+PeerConnection* MultiMasterManager::adopt_identified_connection(uint64_t pending_key) {
+    auto it = pending_.find(pending_key);
+    if (it == pending_.end()) return nullptr;
+
+    PeerConnection& fresh = it->second;
+    const uint16_t node_id = fresh.node_id;
+    auto existing = peers_.find(node_id);
+
+    if (existing != peers_.end() && existing->second.connected &&
+        existing->second.fd != fresh.fd) {
+        // Two live links to one node, which a symmetric mesh can produce when both ends dial at
+        // the same moment. Both ends have to resolve it the same way or they close both links, so
+        // the rule is a function of the two node ids and nothing else: the surviving link is the
+        // one the lower-numbered node dialled. Each end can evaluate that from what it already
+        // knows — its own id, the peer's, and which of the two connections it accepted.
+        if (config_.node_id < node_id) {
+            OB_LOG_INFO("mm",
+                        "Peer %u dialled us while our own connection to it (fd=%d) was up; "
+                        "keeping ours, because the link the lower-numbered node opened wins "
+                        "(%u < %u)",
+                        node_id, existing->second.fd, config_.node_id, node_id);
+            drop_pending_connection(pending_key, "a second link to an already-connected peer");
+            return nullptr;
+        }
+        OB_LOG_INFO("mm",
+                    "Peer %u dialled us while our own connection to it (fd=%d) was up; keeping "
+                    "theirs, because the link the lower-numbered node opened wins (%u > %u)",
+                    node_id, existing->second.fd, config_.node_id, node_id);
+        close_connection_socket(existing->second, "superseded by the link the peer opened");
+    }
+
+    // The record being replaced may know one thing this connection cannot: the address the peer
+    // advertises. An accepted socket's source port is the peer's ephemeral one, so a connection
+    // has no address of its own, and replacing the record wholesale is what used to lose it —
+    // after which the reconnect loop had nothing to dial and the link could only come back if the
+    // peer dialled us again.
+    if (existing != peers_.end() && fresh.address.empty() && !existing->second.address.empty()) {
+        fresh.address = existing->second.address;
+        OB_LOG_DEBUG("mm", "Kept the advertised address %s for peer %u across its inbound "
+                           "connection", fresh.address.c_str(), node_id);
+    }
+
+    PeerConnection moved = std::move(fresh);
+    pending_.erase(it);
+    // A connection that has just completed a handshake is not in a failure state, whatever the
+    // previous record's attempt count said.
+    moved.backoff.reset();
+    peers_[node_id] = std::move(moved);
+
+    PeerConnection& adopted = peers_[node_id];
+    OB_LOG_INFO("mm",
+                "Peer %u identified itself on the connection it opened to us (connection %llu, "
+                "fd=%d, address %s)",
+                node_id, static_cast<unsigned long long>(adopted.conn_id), adopted.fd,
+                adopted.address.empty() ? "(unknown)" : adopted.address.c_str());
+    return &adopted;
 }
 
 void MultiMasterManager::connect_to_peer(const PeerInfo& peer) {
@@ -1206,10 +1296,12 @@ void MultiMasterManager::publish_peer_gauges() {
     size_t connected = 0;
     size_t verified  = 0;
     for (const auto& [nid, p] : peers_) {
-        // The same denominator as MM_PEERS: a connection accepted but not yet named by its
-        // handshake is not a peer (#84). Counting it would make the gauge disagree with the view
-        // an operator reads beside it, and would count a connection that may still be refused.
-        if (p.node_id == 0 || !p.connected) continue;
+        // The same denominator as MM_PEERS, and for the same structural reason: a connection
+        // accepted but not yet named by its handshake is not a peer and is not in this container
+        // (#84, #96). Counting one would make the gauge disagree with the view an operator reads
+        // beside it, and would count a connection that may still be refused.
+        (void)nid;
+        if (!p.connected) continue;
         ++connected;
         if (p.tls != nullptr && !p.tls->handshaking()) ++verified;
     }
@@ -1744,6 +1836,28 @@ void MultiMasterManager::process_handshake(PeerConnection& peer,
         return;
     }
 
+    // Two node ids cannot be adopted, and both would leave the connection in a state with no way
+    // out. Zero is the value that means "this connection has not said who it is", so a peer
+    // claiming it would stay in the unidentified container for ever — connected, counted nowhere,
+    // never a peer. Our own id would key a record as us, which broadcast would then send our own
+    // records to. `--mm-node-id` refuses zero at startup, so neither is a well-behaved peer.
+    if (msg.node_id == 0 || msg.node_id == config_.node_id) {
+        OB_LOG_WARN("mm",
+                    "Peer on fd=%d claims node id %u, which is %s — disconnecting",
+                    peer.fd, msg.node_id,
+                    msg.node_id == 0 ? "the value reserved for a connection that has not "
+                                       "identified itself"
+                                     : "this node's own id");
+        if (peer.fd >= 0) {
+            release_tls(peer);
+            ::close(peer.fd);
+            peer.fd = -1;
+        }
+        peer.connected = false;
+        peer.recv_buf.clear();
+        return;
+    }
+
     // Update peer state from handshake.
     peer.node_id = msg.node_id;
     peer.confirmed_file = msg.wal_file_index;
@@ -1914,16 +2028,21 @@ void MultiMasterManager::reconnect_loop() {
             // A connection we accepted and never identified is not a peer, and once it is down it
             // cannot become one: the port it arrived on is the peer's ephemeral source port, so
             // there is no address to dial and no node behind the record yet. Keeping it left one
-            // dead entry in peers_ per refused inbound connection - and, because the dial below
-            // then had nothing to parse, put `Reconnect: invalid peer address:` in the log ten
-            // times a second for the rest of the process's life. The peer that dialled us will
-            // dial again by itself; that is the only way this connection can come back.
-            for (auto it = peers_.begin(); it != peers_.end();) {
+            // dead entry per refused inbound connection - and, because the dial below then had
+            // nothing to parse, put `Reconnect: invalid peer address:` in the log ten times a
+            // second for the rest of the process's life (#95). The peer that dialled us will dial
+            // again by itself; that is the only way this connection can come back.
+            //
+            // The io loop drops such a connection as soon as it sees the close. This pass is for
+            // the ones it cannot see - a handshake refused inside process_handshake() closes the
+            // descriptor without an event to follow.
+            for (auto it = pending_.begin(); it != pending_.end();) {
                 const PeerConnection& dead = it->second;
-                if (dead.node_id == 0 && !dead.connected && dead.fd < 0) {
-                    OB_LOG_DEBUG("mm", "Dropping the record of an inbound connection that closed "
-                                       "before its handshake named a node (key=%u)", it->first);
-                    it = peers_.erase(it);
+                if (!dead.connected && dead.fd < 0) {
+                    OB_LOG_DEBUG("mm", "Dropping the record of inbound connection %llu, which "
+                                       "closed before its handshake named a node",
+                                 static_cast<unsigned long long>(it->first));
+                    it = pending_.erase(it);
                 } else {
                     ++it;
                 }

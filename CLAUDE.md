@@ -1256,6 +1256,53 @@ Learned the hard way. Check here before debugging.
     as the fix not working. **Check the build's exit status, not its output**, and when a test
     result surprises you, compare the binary's timestamp against the source's.
 
+151. **A container's key type is a claim about what may be a key, and a map cannot tell a
+    descriptor number from the node id it is standing in for.** An accepted mesh connection was
+    inserted into `peers_` — keyed by node id — under `static_cast<uint16_t>(client_fd)`, so a
+    connection landing on descriptor N replaced the live record of peer N: its send buffer, its
+    backoff and its advertised address went with the assignment, and its descriptor stayed armed in
+    the epoll set with nothing behind it (#96). The reserved range the comment above it described
+    (`fd + 10000`) is not the fix — it is still a node id, in the same space, one arithmetic slip
+    from a live record. A **separate container** is, keyed by something no other subsystem gives
+    meaning to; `conn_id` is minted once and never reused, which is what a key needs. It also
+    removed six `node_id == 0` tests that stood in for "is this record real?".
+
+152. **A record that changes container leaves every pointer to it dangling, including the one the
+    caller is still using.** The re-key was `peers_.erase(key); peers_[real_id] = std::move(rec);`
+    and the io loop kept the pointer it had taken into the erased record — the EPOLLOUT branch a
+    few lines below reads `peer_ptr->connected` and drains through it, so one event carrying both
+    EPOLLIN and EPOLLOUT read freed memory. Same class as #92 and #120. The shape that makes it
+    impossible rather than fixed: the function that relocates a record **returns the new location**
+    and the caller has nothing stale to reach for. `nullptr` then means "dropped, not moved", which
+    the caller must also handle — the third state a bool cannot carry.
+
+153. **A tie-break that two peers evaluate independently must be a function of the values both of
+    them have, and nothing else.** A symmetric mesh can end up with two links to one node, and if
+    each end resolves that by preferring its own dial, each closes the link the other kept and the
+    pair is left with none. The surviving link is the one the **lower-numbered node** dialled, which
+    each end can evaluate from its own id, the peer's, and which of the two it accepted. The two
+    tests for it are the same situation seen from the two ends, because a rule that is consistent
+    is exactly the one whose two views agree — and flipping the comparison fails both.
+
+154. **A sentinel meaning "not known yet" has to be refused when a peer claims it as a value.** The
+    handshake sets `node_id` from the peer's own message, and a peer claiming **0** — the value that
+    means "this connection has not identified itself" — would have stayed in the unidentified
+    container for ever: connected, counted nowhere, never adoptable. Claiming *our own* id is the
+    other one, keying a record as us, which broadcast then sends our own records to. `--mm-node-id`
+    refuses zero at startup, so neither is a well-behaved peer; that is an argument for refusing
+    them, not for assuming they cannot arrive.
+
+155. **A defect a live cluster does not reach cannot be measured by the harness that builds live
+    clusters — so build the coincidence instead of waiting for it.** Reaching #96 needs a node id
+    equal to a descriptor number, and the integration fixture numbers its nodes 1..3: measured over
+    three multi-master modules, **zero** collisions, which is a fact about that fixture and not
+    about the code. A unit test installed a peer record for **every** descriptor number the accepted
+    socket could get; the connection arrived on 8 and the record of peer 8 was gone, deterministically.
+    The live measurements were still worth taking, because they say which consequences are reached
+    today (14 records replaced, all of them idle) and which are not (0 orphaned descriptors,
+    0 duplicate links even with all nodes launched at once — the etcd watch is slower than a
+    loopback connect by orders of magnitude).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -1264,7 +1311,7 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 934 C++ tests (`ctest -j1`, ~2.5 min) and 189 integration tests plus 2
+**Where the suites stand:** 941 C++ tests (`ctest -j1`, ~2.5 min) and 189 integration tests plus 2
 opt-in Binance skips (`pytest tests/integration/`, ~10.5 min on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that

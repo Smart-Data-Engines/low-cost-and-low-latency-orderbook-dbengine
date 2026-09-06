@@ -259,16 +259,22 @@ TEST(MultiMasterUnit, MmPeersDoesNotListAConnectionThatHasNotIdentifiedItself) {
     ASSERT_TRUE(connected) << "could not connect to the multi-master listener";
 
     // Deliberately send no handshake. Wait until the manager has accepted the connection, which
-    // peer_states() shows because it reports every entry including the un-identified ones.
+    // pending_connection_count() reports: since #96 an unidentified connection is not in the peer
+    // table at all, so this readiness signal used to be "peer_states() contains a node_id 0 entry"
+    // and is now a stronger statement — the connection is accounted for, separately, as one that
+    // has not said who it is. The assertion below is unchanged, and it is the reason this wait
+    // exists: without it the test would pass against a manager that never accepted anything.
     bool accepted = false;
     for (int attempt = 0; attempt < 50 && !accepted; ++attempt) {
-        for (const auto& p : mgr.peer_states()) {
-            if (p.node_id == 0) accepted = true;
+        if (mgr.pending_connection_count() == 1) {
+            accepted = true;
+            break;
         }
-        if (accepted) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     ASSERT_TRUE(accepted) << "the connection was never accepted, so this test proves nothing";
+    EXPECT_TRUE(mgr.peer_states().empty())
+        << "an inbound connection that has not identified itself is not in the peer table";
 
     const std::string reply = mgr.handle_mm_peers_command();
 
