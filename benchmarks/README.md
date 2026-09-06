@@ -28,6 +28,65 @@ timestamp fields emitted by Google Benchmark automatically.
 
 ---
 
+## Comparing two builds instead of two timings
+
+`scripts/mnemonic_diff.py` disassembles named functions in two Release builds and compares the
+instruction sequences. It exists because the question "what does this change cost the path that
+does not use it?" is not answerable with a stopwatch on this hardware: a control experiment on
+i3-7100U produced −40.6% in 8 of 8 rounds for a function that had not changed, and the suite above
+measures `apply_delta` and `WALWriter::append`, which a change to the network write path never
+touches.
+
+```bash
+git worktree add /tmp/ob_base origin/master
+cmake -S /tmp/ob_base -B /tmp/ob_base/build-release -DCMAKE_BUILD_TYPE=Release -DOB_BUILD_TESTS=OFF
+cmake --build /tmp/ob_base/build-release -j$(nproc)
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DOB_BUILD_TESTS=OFF
+cmake --build build-release -j$(nproc)
+
+scripts/mnemonic_diff.py --base /tmp/ob_base/build-release --head build-release \
+    --symbol 'ob::WALWriter::append(ob::DeltaUpdate const&, ob::Level const*)' \
+    --symbol 'ob::ReplicationManager::drain_send_buffer(ob::ReplicaInfo&) => ob::ReplicationManager::drain_send_buffer_plain(ob::ReplicaInfo&)'
+```
+
+Symbols are matched on the **exact** demangled signature, `A => B` compares a function that was
+renamed or split, alignment NOPs are dropped, and clones (`[clone .cold]`) are reported as rows of
+their own. Every one of those is a lesson rather than a feature: matching by substring once summed
+`flush_output` with `flush_output_tls` and reported 310 instructions for a function that has 148;
+padding once made `broadcast` read as 173 against 170; and a change that adds only a cold path
+leaves the hot count identical.
+
+### What TLS on the node links cost the plaintext path (#30 part three, series D)
+
+i3-7100U, GCC 13.3, Release, `be1bd1b` against the series D branch:
+
+| Function | master | branch | reading |
+|---|---|---|---|
+| `WALWriter::append` | 88 | 88 | identical, instruction for instruction |
+| `Engine::apply_delta` | 501 | 501 | same instructions; 27 operands differ, all of them member offsets |
+| `ReplicationManager::enqueue_send` | 166 | 166 | same, 11 offsets moved |
+| `MultiMasterManager::broadcast_local` | 92 | 92 | same, 5 offsets moved |
+| `ReplicationManager::broadcast` | 166 | 163 | changed on purpose: the blocking send is gone |
+| `drain_send_buffer` → `drain_send_buffer_plain` | 83 | 79 | the plaintext drain, four instructions shorter |
+| `try_drain_send_buf` → `try_drain_send_buf_plain` | 140 | 144 | the plaintext drain, four instructions longer |
+
+The offsets moved because `ReplicaInfo` and `PeerConnection` gained a channel pointer and an
+identity string (+48 bytes) and `Engine` grew with them: the same instructions in the same order,
+reading fields that sit further along. `Engine::apply_delta_mm` went 602 → 597 for the same reason
+and is **not** reported as a speedup — `src/engine.cpp` is byte-identical between the two commits,
+so five fewer instructions is the optimiser choosing `lea` over `add` for an offset that moved.
+
+What the plaintext path actually pays is the dispatcher, and it is worth quoting in full:
+
+```
+endbr64
+cmpq   $0x0,0x68(%rsi)      # replica.tls == nullptr?
+je     <drain_send_buffer_plain>
+jmp    <drain_send_buffer_tls>
+```
+
+One compare against null and a tail jump, on a function that then does 79 instructions of work.
+
 ## Equivalent workload: ClickHouse
 
 **Version tested**: 23.x (Community Edition)
