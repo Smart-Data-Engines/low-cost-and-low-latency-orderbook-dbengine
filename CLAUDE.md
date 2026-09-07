@@ -1470,6 +1470,24 @@ Learned the hard way. Check here before debugging.
     `enqueue_send()` or `enqueue_and_flush()` at all, because `queue_to_replica()` is the only
     function that knows about deferring (#99).
 
+177. **A `catch` does not stop an abort when a joinable thread is still in scope.** `main()` had no
+    handler at all, so a failed bind left through the default terminate handler — SIGABRT, exit -6,
+    a supervisor logging a crash for a taken port. Adding the handler is half the fix: the shutdown
+    monitor is a local `std::thread`, and one that is still joinable when its destructor runs calls
+    `std::terminate`, so the catch block would have returned **past** the destructor that aborts.
+    Both mechanisms were live at once, and the second is #88's, whose message (`terminate called
+    without an active exception`) sends readers looking for a missing `catch`. The mutation that
+    says so is the useful one: with the catch present and the join guard removed, both refusal tests
+    still fail. Pin the exit code, not the message — the message was correct throughout (#102).
+
+178. **One flag serving two meanings makes the log claim something nobody asked for.** Winding the
+    shutdown monitor down by setting `g_shutdown_requested` made a node that never started print
+    `Shutdown requested — the epoll loop will drain and close` on its way out, which reads as an
+    operator having signalled it. Two flags: one means "a shutdown was requested", the other means
+    "this thread has no further reason to exist". Same defect as a line announcing a guarantee the
+    code does not give (pitfall 112), and it is pinned by an assertion rather than left to the
+    comment claiming the separation matters (#102).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -1478,7 +1496,7 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 960 C++ tests (`ctest -j1`, ~3.5 min) and 190 integration tests plus 2
+**Where the suites stand:** 961 C++ tests (`ctest -j1`, ~3.5 min) and 195 integration tests plus 2
 opt-in Binance skips (`pytest tests/integration/`, ~10.5 min on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that

@@ -199,8 +199,38 @@ and leave any replica that does not know it retrying forever. The existing answe
 log line is less specific than the cause.
 
 Alert 74 (`src/wal.cpp:100`) is the same sink through the same helper with a **command-line** source,
-so it belongs to the 87/90/91 group rather than this one. It is still open, which is the open
-question at the end of this section rather than an oversight.
+so it belongs to the 87/90/91 group rather than this one. It was left open here deliberately, and is
+now dismissed — see its own entry below.
+
+**Alert 74 (the WAL writer's own file)** is `cpp/path-injection` on `--data-dir` reaching `::open()`
+through `wal_filename()`. Dismissed `false positive`, with the reason on the alert and repeated here:
+
+> Only user input is this servers own --data-dir; the filename is snprintf("wal_%06u.bin") from a
+> uint32_t. Whoever starts the process already reads any file it can, and no peer byte reaches the
+> path. data_dir has one assignment, from the CLI parser; there is no getenv in the tree.
+
+It is the two earlier arguments at once: the source is the operator's, as in 87, 90 and 91, **and**
+the filename is generated from an integer, as in 92. Either alone would settle it; both hold.
+
+**It had been open since 14 August 2026** — named in this document and deferred rather than missed,
+which is the weaker of the two failures but still a check left red for whoever came next. What
+finally surfaced it is worth recording, because the mechanism will do this again. Nothing about
+`src/wal.cpp` changed. #102 moved the body of
+`main()` into `run_server(int argc, char* argv[])` so a startup failure could be caught, which put the
+**taint source** on a changed line — so CodeQL attributed a three-week-old alert to that pull request
+and reported `1 new alert including 1 high severity security vulnerability`. The branch-ref query
+found nothing, because a pull request's alerts hang off `refs/pull/<n>/merge`.
+
+Two things follow. **A pre-existing open alert is a blocked merge waiting for whoever next touches the
+function the flow starts in** — so triage on merit rather than routing around it; the check was doing
+its job, and the untriaged alert was ours. And **"new" in that check's title means new *attribution*,
+not new code**: read the alert's `created_at` before believing a PR introduced it.
+
+What would change the answer: `--data-dir` arriving from anywhere but the operator (there is no
+`getenv` in `src/` or `include/`, and `config.data_dir` has exactly one assignment, from the CLI
+parser), or `wal_filename()` interpolating a string. Snapshot installation *does* take file names
+from a peer and is a genuine sink — which is why `is_safe_snapshot_path()` exists and is not this
+alert.
 
 **Alerts 88 and 89** are `cpp/unused-static-function`, note severity, on `is_identity_char` and
 `valid_identity` in `src/auth.cpp`. Dismissed `false positive`, and the evidence is the compiler

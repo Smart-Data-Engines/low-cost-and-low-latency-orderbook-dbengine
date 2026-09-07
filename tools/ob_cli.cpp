@@ -18,6 +18,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <exception>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -376,7 +377,7 @@ void cmd_status() {
 
 } // namespace
 
-int main(int argc, char* argv[]) {
+static int run_cli(int argc, char* argv[]) {
     std::string data_dir = "/tmp/ob_cli_data";
     if (argc > 1) data_dir = argv[1];
 
@@ -438,4 +439,24 @@ int main(int argc, char* argv[]) {
     engine.close();
     std::cout << "Done.\n";
     return 0;
+}
+
+int main(int argc, char* argv[]) {
+    // A refusal to start is a refusal, not a crash - the same contract as `ob_tcp_server` (#102),
+    // and here for the same reason it was worth closing there: a fix that exists at one of two entry
+    // points is not a fix, it is the shape that has cost this repository three separate defects.
+    //
+    // `Engine::open()` throws when it cannot open the WAL, which a data directory it may not write
+    // is enough to produce. Nothing supervises this tool, so the exit code matters less than it does
+    // for the server; what matters is that both entry points answer the question the same way, and a
+    // static test over `tools/` now requires it of any that gets added.
+    try {
+        return run_cli(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    } catch (...) {
+        std::cerr << "Error: startup failed with an unknown exception\n";
+        return 1;
+    }
 }

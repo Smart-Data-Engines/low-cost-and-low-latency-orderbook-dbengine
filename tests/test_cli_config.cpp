@@ -374,3 +374,48 @@ TEST(CliConfigStatic, EveryKnownFlagIsInTheCliReference) {
                return joined;
            }();
 }
+
+// ── #102: how an entry point refuses to start ────────────────────────────────────────────────────
+
+TEST(CliConfig, EveryEntryPointRefusesToStartRatherThanAborting) {
+    // Static, over `tools/`, and it enumerates the directory rather than naming the two files it
+    // knows about - a list written by hand is not evidence about the code, and the whole reason this
+    // test exists is that fixing one of two entry points is not fixing anything.
+    //
+    // What it forbids: an `int main` that lets an exception reach the default terminate handler.
+    // `TcpServer::run()` throws for eleven startup conditions and `Engine::open()` throws when it
+    // cannot open the WAL, and until #102 both left through SIGABRT - which a supervisor reads as a
+    // crash and may write a core file for, over a taken port or an unwritable directory.
+    //
+    // Deliberately a shape test. The behavioural half lives in
+    // `tests/integration/test_startup_refusal.py`, which pins the exit code and the message for two
+    // separate throw sites; this one pins that a *third* entry point cannot be added without one.
+    const std::filesystem::path tools = std::filesystem::path(OB_SOURCE_DIR) / "tools";
+    ASSERT_TRUE(std::filesystem::is_directory(tools)) << tools.string();
+
+    std::vector<std::string> checked;
+    std::vector<std::string> offenders;
+    for (const auto& entry : std::filesystem::directory_iterator(tools)) {
+        if (entry.path().extension() != ".cpp") continue;
+        std::ifstream in(entry.path());
+        const std::string src((std::istreambuf_iterator<char>(in)),
+                              std::istreambuf_iterator<char>());
+        if (src.find("int main(") == std::string::npos) continue;
+        checked.push_back(entry.path().filename().string());
+        if (src.find("catch (const std::exception&") == std::string::npos) {
+            offenders.push_back(entry.path().filename().string());
+        }
+    }
+
+    // The pair that stops this passing by finding nothing: if the enumeration breaks, or the tools
+    // move, "no offenders" is what an empty list produces too.
+    EXPECT_GE(checked.size(), 2u)
+        << "expected at least ob_tcp_server.cpp and ob_cli.cpp to have an entry point; found "
+        << checked.size() << ", so this test is not looking at what it thinks it is";
+
+    std::string joined;
+    for (const auto& name : offenders) joined += name + " ";
+    EXPECT_TRUE(offenders.empty())
+        << "these entry points let a startup exception reach the default terminate handler, so a "
+        << "configuration mistake exits by SIGABRT instead of a message and 1: " << joined;
+}
