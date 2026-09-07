@@ -157,11 +157,16 @@ protected:
     }
 
     // Start a ReplicationManager and wait for it to be ready.
-    std::unique_ptr<ob::ReplicationManager> start_manager() {
+    ///
+    /// `engine` is set **before** `start()`, which is the order `Engine::open()` and the promotion
+    /// path both use. Setting it afterwards is safe since the setter takes the mutex, but a test
+    /// should exercise the ordering production has.
+    std::unique_ptr<ob::ReplicationManager> start_manager(ob::Engine* engine = nullptr) {
         ob::ReplicationConfig cfg;
         cfg.port = port_;
         cfg.max_replicas = 4;
         auto mgr = std::make_unique<ob::ReplicationManager>(cfg, *wal_);
+        if (engine != nullptr) mgr->set_engine(engine);
         mgr->start();
         // Give the epoll thread time to start and bind.
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1662,8 +1667,7 @@ TEST_F(ReplicationProtocolTest, ALiveRecordDoesNotEnterASnapshotStream) {
     }
     engine.flush_incremental();
 
-    auto mgr = start_manager();
-    mgr->set_engine(&engine);
+    auto mgr = start_manager(&engine);
 
     int fd = connect_to_localhost(port_);
     ASSERT_GE(fd, 0);

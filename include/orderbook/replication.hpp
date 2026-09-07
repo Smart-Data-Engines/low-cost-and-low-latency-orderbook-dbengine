@@ -399,7 +399,17 @@ public:
     ReplicationManager& operator=(const ReplicationManager&) = delete;
 
     /// Set the Engine pointer so the manager can call create_snapshot().
-    void set_engine(Engine* engine) { engine_ = engine; }
+    /// Hand the manager the engine it takes snapshots from and publishes gauges through.
+    ///
+    /// Takes `mtx_`, and that is not decoration: every reader of `engine_` is on the epoll thread
+    /// under this mutex (`publish_replica_gauges()` once per pass, `handle_snapshot_request()` and
+    /// `begin_snapshot_transfer()` from the data path), so a plain store here is a data race with a
+    /// running loop. Both production callers set it *before* `start()`, which is why nothing had
+    /// reported it — ThreadSanitizer did, on the first test to set it the other way round.
+    void set_engine(Engine* engine) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        engine_ = engine;
+    }
 
     /// Start the replication server (binds port, starts epoll thread).
     void start();

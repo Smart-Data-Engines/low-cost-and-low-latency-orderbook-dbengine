@@ -2084,6 +2084,14 @@ comment of mine being untrue.**
 abandoned means a replica with no data, and it could happen for seven different reasons without a
 single line — including the one #99 takes.
 
+**And the new test found a data race older than this item, which is the argument for writing it.**
+`set_engine()` stored a plain pointer while `publish_replica_gauges()` read it on the epoll thread
+under `mtx_`. Both production callers set the engine *before* `start()`, so nothing had reported it;
+the first test to set it the other way round made ThreadSanitizer say so, on this machine and
+independently in the `sanitizers (tsan)` check on the pull request. The setter takes `mtx_` now —
+every reader of `engine_` was already holding it — and the fixture sets the engine before `start()`,
+which is the order production uses.
+
 - Effort: S | Impact: a replica can be bootstrapped from a primary that is taking writes, which is
   every primary worth bootstrapping from
 
