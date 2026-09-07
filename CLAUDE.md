@@ -1394,6 +1394,39 @@ Learned the hard way. Check here before debugging.
     one run of this two-core machine — so the max was part scheduler. p999 (0.048 ms) and the
     control's own max are the honest pair; a max without a control is a number about Linux.
 
+167. **A function that writes has to return where it wrote, because rotation makes the position
+    underivable.** `WALWriter::append()` checks the rotate threshold **after** the write, and
+    `rotate()` publishes `{next_index, next_offset}` in one store — so for the one record per WAL
+    file that crosses the threshold, `current_position()` is already in the next file while the
+    record sits at the end of the previous one. `current_position() - total_len` therefore names a
+    file the record is not in, and can underflow. `append()` and `append_with_origin()` return a
+    `WalPosition` now. The five internal `append_*` deliberately do not: nothing needs their
+    position and one of them can refuse to write, so it has none to give — a returned value nobody
+    reads is the `provisional`/`basis`/`in_use`/`key_id`/`partition_by` shape again (#98).
+
+168. **Tests that drive a manager directly say nothing about which arguments its caller passes.**
+    Every behavioural test for the replication wire drives `ReplicationManager`, so a mutation that
+    derived the position at the *engine's* call site survived all 951 of them. The behavioural test
+    for it would need `Engine`'s hardcoded 512 MB rotate threshold to become configurable for a
+    test's sake, which is the wrong trade. A static test over `Engine::apply_delta` is the mechanism
+    instead, and for this claim it is stronger: the engine may not *compute* a position at all
+    (#98).
+
+169. **A test whose premise is wrong can pass for a reason unrelated to its name, and the node's
+    log is where you find out.** An integration test asserting that a restarted replica resumes
+    rather than replays passed — while the node logged `clearing local data before starting
+    replication` and `REPLICATE 0 0 0`. A failover-managed replica reaches `demote_to_replica()` on
+    its own restart, which wipes the store and deletes the saved position, so the test measured the
+    wipe. Read the log of the thing you restarted before believing the assertion about it (#98,
+    #101).
+
+170. **`accept()` is not the moment a replica exists, and `broadcast()` did not know that.**
+    `replicas_` gets an entry as soon as the socket is accepted, so a live write between the accept
+    and the `REPLICATE` line is queued to a replica that has not asked for anything — and then the
+    catch-up, whose range ends past that record, sends it again. Measured: ten records broadcast in
+    that window, twenty received, in the pattern 1..10 then 1..10. Found because a live-path test
+    for something else saw fourteen where twelve were sent (#100).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -1402,7 +1435,7 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 947 C++ tests (`ctest -j1`, ~3 min) and 189 integration tests plus 2
+**Where the suites stand:** 952 C++ tests (`ctest -j1`, ~3 min) and 190 integration tests plus 2
 opt-in Binance skips (`pytest tests/integration/`, ~10.5 min on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that
@@ -1417,17 +1450,25 @@ sat below all of them.
 
 Things a newcomer should know, because they are real limits rather than bugs to file again:
 
-- **The wire protocol has authentication and no encryption.** All three surfaces authenticate since
-  #30 parts one and two — client sessions with `--auth-secret-file`, the replication link and the
-  multi-master mesh with `--cluster-secret-file` — by challenge-response over HMAC-SHA256, so a
-  secret never crosses the wire. **Nothing is encrypted**, so every query and every row is readable
-  by anything on the path: do not expose a node outside a trusted network. Both files are off by
-  default, and the startup log WARNs for each disabled surface rather than leaving "default open" in
-  a document. Three things to know before touching it: the client gate sits *before*
-  `execute_command`'s switch and its classifier has no `default:` (pitfall 109); the surface label
-  is inside the HMAC input because replication and multi-master share one secret; and the two secret
-  files must differ, which the start enforces, because a client holding the cluster secret can
-  present itself as a replica and stream the whole write-ahead log.
+- **The wire protocol authenticates and encrypts on all three surfaces, and every one of those
+  flags is off by default.** Authentication came with #30 parts one and two — client sessions with
+  `--auth-secret-file`, the replication link and the multi-master mesh with `--cluster-secret-file`
+  — by challenge-response over HMAC-SHA256, so a secret never crosses the wire. Encryption came
+  with #30 part three: `--tls-client` for client sessions (series C, PR #80) and
+  `--tls-replication` / `--tls-multi-master` for the node links (series D, PR #81), TLS 1.3 with no
+  configurable floor, and on the node links verification is mutual and cannot be configured
+  otherwise. *(This bullet said "nothing is encrypted" until 7 September 2026, four weeks after
+  that stopped being true. A limit that has been lifted and is still documented as a limit is the
+  same defect as one that was never documented.)*
+  What is still true: **an unconfigured node is plaintext and unauthenticated on all three
+  surfaces**, and the startup log WARNs for each disabled surface rather than leaving "default open"
+  in a document. The io_uring transport **refuses** every `--tls-*` flag — the client port needs a
+  memory-BIO rewrite, and the node links would work there but no CI job builds that file.
+  Certificate rotation needs a restart. Three things to know before touching authentication: the
+  client gate sits *before* `execute_command`'s switch and its classifier has no `default:` (pitfall
+  109); the surface label is inside the HMAC input because replication and multi-master share one
+  secret; and the two secret files must differ, which the start enforces, because a client holding
+  the cluster secret can present itself as a replica and stream the whole write-ahead log.
 - **The whole integration battery runs under ThreadSanitizer**, not a subset — since #85. 146 tests,
   **zero skips**, zero reports. Before that the job ran three multi-master modules, and the reason
   given for the narrow scope was a hypothesis that turned out to be false (pitfall 75). Widening it
