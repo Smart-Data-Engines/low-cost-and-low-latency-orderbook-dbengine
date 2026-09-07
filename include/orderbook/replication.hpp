@@ -273,6 +273,14 @@ struct CatchupCursor {
     /// directive cannot go out before its last byte - the reason it was sent after the synchronous
     /// pass, kept as the reason it is sent from the cursor's end.
     bool     compress_after{false};
+
+    /// Where the record this cursor is about to send lives, as a `WalPosition`.
+    ///
+    /// The narrowing is the same one `WALWriter::write_record()` does and is bounded by the same
+    /// thing: `MAX_WAL_ROTATE_THRESHOLD` is 2 GiB and the constructor refuses more, so a WAL
+    /// file's offsets fit 32 bits with a bit to spare. One place for the cast rather than one per
+    /// call site.
+    WalPosition position() const { return WalPosition{file, static_cast<uint32_t>(offset)}; }
 };
 
 // ── ReplicaInfo ───────────────────────────────────────────────────────────────
@@ -359,8 +367,15 @@ public:
     bool is_running() const { return running_.load(std::memory_order_acquire); }
 
     /// Broadcast a WAL record to all connected replicas (non-blocking enqueue).
-    /// Called by Engine after WALWriter::append().
-    void broadcast(const WALRecord& hdr, const void* payload, size_t payload_len);
+    ///
+    /// Called by Engine immediately after `WALWriter::append()`, with the position that append
+    /// returned. That position is a parameter rather than something read off the WAL here, and
+    /// #98 is the reason: the replica computes `confirmed_offset = byte_offset + total_len` and
+    /// saves it, so this field decides where a restarted replica resumes. It used to send a
+    /// literal zero. Reading `wal_.current_position()` here would be wrong too — the append may
+    /// have rotated, and this manager cannot see that it did.
+    void broadcast(const WALRecord& hdr, const void* payload, size_t payload_len,
+                   WalPosition record_pos);
 
     /// Get current replica states (for STATUS command).
     std::vector<ReplicaInfo> replica_states() const;
@@ -419,8 +434,13 @@ private:
     void run_loop();
     void accept_replica();
     void handle_replica_data(int fd);
+    /// Frame one record to one replica, announcing the position that record occupies in the WAL.
+    ///
+    /// `record_pos` is the record's own position, not the replica's confirmed one: what the
+    /// replica saves is derived from this field, so telling it what it already knows left it
+    /// resuming a single record along however much it had received (#98).
     void send_to_replica(ReplicaInfo& replica, const WALRecord& hdr,
-                         const void* payload, size_t payload_len);
+                         const void* payload, size_t payload_len, WalPosition record_pos);
     void handle_catchup(ReplicaInfo& replica, uint32_t from_file, size_t from_offset);
 
     /// Stream the next batch of a replica's catch-up.

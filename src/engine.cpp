@@ -491,7 +491,7 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta_in, const Level* levels
     //    Origin 0 outside multi-master; a record streamed from a primary arrives here with
     //    the primary's number already set and keeps it.
     stamp_sequence(delta, mm_config_.node_id, symbol_key);
-    wal_.append(delta, levels);
+    const WalPosition record_pos = wal_.append(delta, levels);
 
     // 1b. Broadcast to replicas if replication is enabled (Requirement 1.2).
     //     Must be within the same mutex lock to maintain WAL ordering.
@@ -513,7 +513,10 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta_in, const Level* levels
         hdr.record_type     = WAL_RECORD_DELTA;
         hdr._pad            = 0;
 
-        repl_mgr_->broadcast(hdr, payload, payload_len);
+        // The position comes from the append above rather than from the WAL's current position:
+        // that append may have rotated, in which case the current position is in the next file
+        // while this record is at the end of the previous one (#98).
+        repl_mgr_->broadcast(hdr, payload, payload_len, record_pos);
     }
 
     // 2. Apply to SoA buffer using seqlock writer protocol.

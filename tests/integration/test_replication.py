@@ -52,6 +52,19 @@ def wait_for_rows(port: int, symbol: str, exchange: str, expected: int,
     return seen
 
 
+def count_rows(port: int, symbol: str, exchange: str) -> int:
+    """Count the rows a node holds for one symbol, right now.
+
+    Separate from `wait_for_rows` on purpose: that one returns as soon as it has seen enough, so it
+    cannot see too many. Duplication is exactly the failure this module needs to be able to see -
+    the same lesson a surviving mutation taught the C++ side of #93.
+    """
+    sql = (f"SELECT * FROM \'{symbol}\'.\'{exchange}\' "
+           f"WHERE timestamp BETWEEN 0 AND 9999999999999999999\n")
+    reply = raw_command(port, sql, settle=0.4)
+    lines = [ln for ln in reply.strip().splitlines() if ln.strip()]
+    return max(0, len(lines) - 2)
+
 def test_replica_reports_replica_role(cluster):
     reply = raw_command(cluster.replica().tcp_port, "ROLE\n")
     assert "REPLICA" in reply.upper(), f"got {reply!r}"
@@ -142,3 +155,51 @@ def test_replica_catches_up_after_more_writes(cluster,
 
     got = wait_for_rows(cluster.replica().tcp_port, "REPL-CATCH", "BINANCE", 4)
     assert got == 4, f"replica stopped following after the first batch (saw {got})"
+
+
+def test_a_restarted_replica_resumes_instead_of_replaying(cluster,
+                                                          primary_client: OrderbookEngine):
+    """A replica that restarts must ask for what it has not got, not for the file it was in.
+
+    This is the consequence #98 was about. The `WAL <file> <offset>` line is what a replica saves,
+    and the offset used to be a literal zero on the live path - so a restarted replica recorded one
+    record's worth however many it had received, asked for the whole current WAL file again, and
+    re-applied it. Storage is append-only and the replication path has no sequence check, so the
+    rows land a second time and a `SELECT` returns each of them twice.
+
+    The row count is read exactly rather than waited for: waiting for `n` cannot fail upwards.
+    """
+    symbol, exchange = "REPL-RESUME", "BINANCE"
+    rows = 40
+    for i in range(rows):
+        primary_client.insert(symbol, exchange, "bid", [400_000 + i], [i + 1])
+    primary_client.flush()
+
+    replica = cluster.replica()
+    assert wait_for_rows(replica.tcp_port, symbol, exchange, rows) == rows, (
+        "the replica never received the first batch, so this test cannot say anything about a "
+        "restart")
+
+    # The position the replica is about to persist. A real one is far past a single record; the
+    # defect made this the length of one.
+    status = raw_command(replica.tcp_port, "STATUS\n")
+    line = next((ln for ln in status.splitlines() if ln.startswith("replication:")), "")
+    assert line, f"STATUS on the replica has no replication line: {status!r}"
+    offset = int(line.split("offset=")[1].split()[0])
+    assert offset > 4096, (
+        f"the replica's confirmed offset is {offset}, which is about one record - it is not "
+        f"tracking what it has received ({line!r})")
+
+    before = count_rows(replica.tcp_port, symbol, exchange)
+    assert before == rows, f"expected {rows} rows before the restart, found {before}"
+
+    cluster.restart_node(replica.index)
+
+    # Long enough for the reconnect, the handshake and whatever catch-up it asks for. If it asks
+    # for the whole file, this is more than long enough to receive it: the batch above is small.
+    time.sleep(4.0)
+
+    after = count_rows(replica.tcp_port, symbol, exchange)
+    assert after == rows, (
+        f"the restarted replica holds {after} rows where {rows} were written: it replayed records "
+        f"it already had, and append-only storage kept both copies")

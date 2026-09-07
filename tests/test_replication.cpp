@@ -31,6 +31,7 @@ TEST(ReplicationSmoke, ConfigDefaults) {
 #include <vector>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -215,22 +216,31 @@ size_t fill_wal(ob::WALWriter& wal, int records, size_t levels) {
     return static_cast<size_t>(records) * (sizeof(ob::WALRecord) + payload_len);
 }
 
-/// Read framed records off a replication socket until it goes quiet, and return their WAL sequence
-/// numbers in arrival order.
+/// One record as it arrived on the wire: the position its header claimed, its framed length, and
+/// the sequence number inside it.
+struct WireRecord {
+    uint32_t file{0};
+    size_t   offset{0};
+    size_t   total_len{0};
+    uint64_t seq{0};
+};
+
+/// Read framed records off a replication socket until it goes quiet, and return them in arrival
+/// order with the position each one's header claimed.
 ///
 /// Until quiet rather than until `want`, and that is the difference between a test that can see a
 /// record delivered twice and one that cannot: stopping at the expected count leaves the extra copy
 /// in this function's own buffer, where it is indistinguishable from never having been sent. Found
 /// by a mutation that survived for exactly that reason.
-std::vector<uint64_t> recv_sequence_numbers(int fd, size_t want, int quiet_ms = 400,
-                                            int total_cap_s = 20) {
+std::vector<WireRecord> recv_wire_records(int fd, size_t want, int quiet_ms = 400,
+                                           int total_cap_s = 20) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(total_cap_s);
     struct timeval tv{};
     tv.tv_sec  = quiet_ms / 1000;
     tv.tv_usec = (quiet_ms % 1000) * 1000;
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    std::vector<uint64_t> seqs;
+    std::vector<WireRecord> recs;
     std::string in;
     char buf[65536];
     while (std::chrono::steady_clock::now() < deadline) {
@@ -264,11 +274,55 @@ std::vector<uint64_t> recv_sequence_numbers(int fd, size_t want, int quiet_ms = 
         }
         uint64_t seq = 0;
         std::memcpy(&seq, in.data() + nl + 1, sizeof(seq));   // WALRecord::sequence_number is first
-        seqs.push_back(seq);
+        recs.push_back(WireRecord{file, offset, total_len, seq});
         in.erase(0, nl + 1 + total_len);
         // A stream longer than expected is a finding, not a reason to keep reading for twenty
         // seconds. Two extra records are enough to say "too many" with the numbers in the message.
-        if (seqs.size() > want + 1) break;
+        if (recs.size() > want + 1) break;
+    }
+    return recs;
+}
+
+/// Read the record the WAL on disk holds at `(file, offset)` and return its sequence number, or -1
+/// if there is no whole record there.
+///
+/// This is the instrument the whole of #98 needs: the claim under test is that the position on the
+/// wire names the record it was sent with, and the only way to check a claim about a position is to
+/// go to it. Comparing wire positions against each other proves they are self-consistent, which a
+/// column of zeroes also is.
+int64_t seq_at_wal_position(const std::string& dir, uint32_t file, size_t offset) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "wal_%06u.bin", file);
+    const std::string path = dir + "/" + name;
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return -1;
+    ob::WALRecord hdr{};
+    const ssize_t n = ::pread(fd, &hdr, sizeof(hdr), static_cast<off_t>(offset));
+    ::close(fd);
+    if (n != static_cast<ssize_t>(sizeof(hdr))) return -1;
+    return static_cast<int64_t>(hdr.sequence_number);
+}
+
+/// Every record's header names the position that record occupies in the WAL. One helper for both
+/// paths, because "the position of the record being sent" is one promise however it got sent.
+void expect_positions_name_their_records(const std::string& dir,
+                                          const std::vector<WireRecord>& recs) {
+    for (size_t i = 0; i < recs.size(); ++i) {
+        const WireRecord& r = recs[i];
+        EXPECT_EQ(seq_at_wal_position(dir, r.file, r.offset), static_cast<int64_t>(r.seq))
+            << "record " << i << " (seq " << r.seq << ") was announced at file " << r.file
+            << " offset " << r.offset << ", and that is not where it is in the WAL";
+    }
+}
+
+/// The sequence numbers of what arrived, in order. A projection of `recv_wire_records()` rather
+/// than a second framing loop: two copies of this protocol's framing is two places for it to be
+/// read differently.
+std::vector<uint64_t> recv_sequence_numbers(int fd, size_t want, int quiet_ms = 400,
+                                            int total_cap_s = 20) {
+    std::vector<uint64_t> seqs;
+    for (const WireRecord& r : recv_wire_records(fd, want, quiet_ms, total_cap_s)) {
+        seqs.push_back(r.seq);
     }
     return seqs;
 }
@@ -465,9 +519,9 @@ TEST_F(ReplicationProtocolTest, ALiveRecordDoesNotOvertakeAnUnfinishedCatchup) {
     hdr.payload_len     = static_cast<uint16_t>(payload.size());
     hdr.checksum        = ob::crc32c(payload.data(), payload.size());
     hdr.record_type     = ob::WAL_RECORD_DELTA;
-    wal_->append(marker, lv.data());
+    const ob::WalPosition marker_pos = wal_->append(marker, lv.data());
     wal_->flush();
-    mgr->broadcast(hdr, payload.data(), payload.size());
+    mgr->broadcast(hdr, payload.data(), payload.size(), marker_pos);
 
     const auto seqs = recv_sequence_numbers(fd, static_cast<size_t>(kRecords) + 1);
 
@@ -520,6 +574,221 @@ TEST_F(ReplicationProtocolTest, ACatchupWalksEveryWalFileInTheRequestedRange) {
         ASSERT_EQ(seqs[static_cast<size_t>(i)], static_cast<uint64_t>(i) + 1)
             << "record " << i << " arrived out of order across a file boundary";
     }
+
+    ::close(fd);
+    mgr->stop();
+}
+
+
+// ── #98: the position on the wire is the position of the record it carries ────────────────────
+
+TEST_F(ReplicationProtocolTest, EveryCatchupRecordIsAnnouncedAtItsOwnWalPosition) {
+    // The replica does `confirmed_offset = byte_offset + total_len` and saves that, so this field
+    // is where a reconnect resumes from. Before #98 the catch-up wrote the position the replica had
+    // last **acknowledged** instead - and during a catch-up nothing acknowledges anything, because
+    // the ACKs that would move it are read by the same loop that is doing the sending. Measured:
+    // every one of 112 records delivered before a drop carried `file=0 offset=0`.
+    constexpr int    kRecords = 40;
+    constexpr size_t kLevels  = 8;
+    fill_wal(*wal_, kRecords, kLevels);
+
+    auto mgr = start_manager();
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+
+    const auto recs = recv_wire_records(fd, static_cast<size_t>(kRecords));
+    ASSERT_EQ(recs.size(), static_cast<size_t>(kRecords));
+
+    expect_positions_name_their_records(tmp_->str(), recs);
+
+    // And the positions have to move, which is the half a column of zeroes fails on its own terms:
+    // a replica whose saved position never advances resumes one record along however much it got.
+    EXPECT_EQ(recs.front().offset, 0u) << "the first record of file 0 starts at offset 0";
+    for (size_t i = 1; i < recs.size(); ++i) {
+        EXPECT_EQ(recs[i].offset, recs[i - 1].offset + recs[i - 1].total_len)
+            << "record " << i << " does not begin where record " << (i - 1) << " ended";
+    }
+
+    ::close(fd);
+    mgr->stop();
+}
+
+TEST_F(ReplicationProtocolTest, ACatchupAcrossFilesAnnouncesTheFileTheRecordIsIn) {
+    // The same promise where it can go wrong in a second way: a position is a pair, and a pair
+    // whose offset walks correctly while the file index stands still names records in the wrong
+    // file from the second file onwards. WAL retention is gated on that index.
+    constexpr int    kRecords = 300;
+    constexpr size_t kLevels  = 1000;
+
+    wal_ = std::make_unique<ob::WALWriter>(tmp_->str(), 1024 * 1024);
+    fill_wal(*wal_, kRecords, kLevels);
+    ASSERT_GT(wal_->current_file_index(), 3u);
+
+    auto mgr = start_manager();
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+
+    const auto recs = recv_wire_records(fd, static_cast<size_t>(kRecords));
+    ASSERT_EQ(recs.size(), static_cast<size_t>(kRecords));
+
+    expect_positions_name_their_records(tmp_->str(), recs);
+
+    // Distinct files actually appeared in the stream, so the assertion above was asked about more
+    // than one of them.
+    uint32_t highest = 0;
+    for (const WireRecord& r : recs) highest = std::max(highest, r.file);
+    EXPECT_GT(highest, 3u) << "every record was announced in file " << highest
+                           << ", so this test never asked about a file boundary";
+
+    ::close(fd);
+    mgr->stop();
+}
+
+TEST_F(ReplicationProtocolTest, ALiveRecordIsAnnouncedAtItsOwnWalPosition) {
+    // The live path was worse than the catch-up: it wrote a literal zero for the offset. So a
+    // replica that restarted asked for `total_len` bytes into the current file and was re-sent
+    // nearly all of it - and replication storage is append-only with no sequence check on this
+    // path, so those rows land a second time.
+    //
+    // Two records are written before the handshake and read back before the live run starts, and
+    // that read is what makes this test about the live path: a stream that has gone quiet after
+    // delivering the catch-up is a cursor that has finished. Waiting on a sleep instead would make
+    // the assertion depend on how the machine was scheduled, and broadcasting *during* the window
+    // between `accept()` and the handshake measures #100 rather than this.
+    constexpr int    kPrefill = 2;
+    fill_wal(*wal_, kPrefill, 4);
+
+    auto mgr = start_manager();
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+
+    const auto caught_up = recv_wire_records(fd, static_cast<size_t>(kPrefill));
+    ASSERT_EQ(caught_up.size(), static_cast<size_t>(kPrefill))
+        << "the catch-up has to finish before the live run, or this test is about both paths";
+    expect_positions_name_their_records(tmp_->str(), caught_up);
+
+    constexpr int    kRecords = 12;
+    constexpr size_t kLevels  = 6;
+    std::vector<ob::Level> lv(kLevels);
+    for (size_t l = 0; l < kLevels; ++l) {
+        lv[l].price = static_cast<int64_t>(l) + 1;
+        lv[l].qty   = 1;
+        lv[l].cnt   = 1;
+        lv[l]._pad  = 0;
+    }
+
+    // Appended and then broadcast, in that order and with nothing between, which is what the
+    // engine does under one lock (`engine.cpp` apply_delta step 1 and 1b).
+    for (int i = 0; i < kRecords; ++i) {
+        ob::DeltaUpdate d{};
+        std::strncpy(d.symbol, "BTCUSD", sizeof(d.symbol) - 1);
+        std::strncpy(d.exchange, "BINANCE", sizeof(d.exchange) - 1);
+        d.sequence_number = static_cast<uint64_t>(i) + 1 + kPrefill;
+        d.timestamp_ns    = 3'000'000'000ULL + static_cast<uint64_t>(i);
+        d.side            = ob::SIDE_BID;
+        d.n_levels        = static_cast<uint16_t>(kLevels);
+
+        std::vector<uint8_t> payload(sizeof(ob::DeltaUpdate) + kLevels * sizeof(ob::Level));
+        std::memcpy(payload.data(), &d, sizeof(d));
+        std::memcpy(payload.data() + sizeof(d), lv.data(), kLevels * sizeof(ob::Level));
+
+        ob::WALRecord hdr{};
+        hdr.sequence_number = d.sequence_number;
+        hdr.timestamp_ns    = d.timestamp_ns;
+        hdr.payload_len     = static_cast<uint16_t>(payload.size());
+        hdr.checksum        = ob::crc32c(payload.data(), payload.size());
+        hdr.record_type     = ob::WAL_RECORD_DELTA;
+
+        const ob::WalPosition pos = wal_->append(d, lv.data());
+        mgr->broadcast(hdr, payload.data(), payload.size(), pos);
+    }
+    wal_->flush();
+
+    const auto recs = recv_wire_records(fd, static_cast<size_t>(kRecords));
+    ASSERT_EQ(recs.size(), static_cast<size_t>(kRecords));
+    expect_positions_name_their_records(tmp_->str(), recs);
+
+    ::close(fd);
+    mgr->stop();
+}
+
+TEST_F(ReplicationProtocolTest, ARotatingAppendAnnouncesTheFileTheRecordWentInto) {
+    // This is the test the obvious fix fails, and it is why #98 needed a design note rather than a
+    // subtraction. `append()` rotates **after** the write, and `rotate()` publishes
+    // `{next_index, next_offset}` in one store - so for the record that crosses the threshold,
+    // `current_position()` is in the **new** file while the record itself sits near the end of the
+    // **old** one. Deriving the position as `current_position() - total_len` therefore names a file
+    // the record is not in, and can underflow. Only a function that returns where it wrote knows.
+    constexpr size_t kLevels = 8;
+    const size_t record_bytes =
+        sizeof(ob::WALRecord) + sizeof(ob::DeltaUpdate) + kLevels * sizeof(ob::Level);
+
+    // A threshold a few records wide, so the run below rotates several times rather than once.
+    wal_ = std::make_unique<ob::WALWriter>(tmp_->str(), record_bytes * 4);
+
+    // Prefilled and read back before the live run, for the reason given in the test above: it is
+    // what proves the cursor has finished without asking a clock.
+    constexpr int kPrefill = 2;
+    fill_wal(*wal_, kPrefill, kLevels);
+
+    auto mgr = start_manager();
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+
+    const auto caught_up = recv_wire_records(fd, static_cast<size_t>(kPrefill));
+    ASSERT_EQ(caught_up.size(), static_cast<size_t>(kPrefill));
+    expect_positions_name_their_records(tmp_->str(), caught_up);
+
+    constexpr int kRecords = 25;
+    std::vector<ob::Level> lv(kLevels);
+    for (size_t l = 0; l < kLevels; ++l) {
+        lv[l].price = static_cast<int64_t>(l) + 1;
+        lv[l].qty   = 1;
+        lv[l].cnt   = 1;
+        lv[l]._pad  = 0;
+    }
+    for (int i = 0; i < kRecords; ++i) {
+        ob::DeltaUpdate d{};
+        std::strncpy(d.symbol, "BTCUSD", sizeof(d.symbol) - 1);
+        std::strncpy(d.exchange, "BINANCE", sizeof(d.exchange) - 1);
+        d.sequence_number = static_cast<uint64_t>(i) + 1 + kPrefill;
+        d.timestamp_ns    = 4'000'000'000ULL + static_cast<uint64_t>(i);
+        d.side            = ob::SIDE_BID;
+        d.n_levels        = static_cast<uint16_t>(kLevels);
+
+        std::vector<uint8_t> payload(sizeof(ob::DeltaUpdate) + kLevels * sizeof(ob::Level));
+        std::memcpy(payload.data(), &d, sizeof(d));
+        std::memcpy(payload.data() + sizeof(d), lv.data(), kLevels * sizeof(ob::Level));
+
+        ob::WALRecord hdr{};
+        hdr.sequence_number = d.sequence_number;
+        hdr.timestamp_ns    = d.timestamp_ns;
+        hdr.payload_len     = static_cast<uint16_t>(payload.size());
+        hdr.checksum        = ob::crc32c(payload.data(), payload.size());
+        hdr.record_type     = ob::WAL_RECORD_DELTA;
+
+        const ob::WalPosition pos = wal_->append(d, lv.data());
+        mgr->broadcast(hdr, payload.data(), payload.size(), pos);
+    }
+    wal_->flush();
+    ASSERT_GT(wal_->current_file_index(), 2u) << "the run has to rotate for this test to be about "
+                                                 "anything";
+
+    const auto recs = recv_wire_records(fd, static_cast<size_t>(kRecords));
+    ASSERT_EQ(recs.size(), static_cast<size_t>(kRecords));
+    expect_positions_name_their_records(tmp_->str(), recs);
 
     ::close(fd);
     mgr->stop();
@@ -586,7 +855,10 @@ TEST_F(ReplicationProtocolTest, DISABLED_TheWritePathWaitOfALargeCatchup) {
         std::thread writer([&] {
             while (!stop.load(std::memory_order_relaxed)) {
                 const auto t0 = std::chrono::steady_clock::now();
-                mgr->broadcast(hdr, payload.data(), payload.size());
+                // This harness measures how long `broadcast()` waits for `mtx_`, and never
+                // appends, so it has no position of its own to announce. The WAL's current one is
+                // the honest stand-in here: nothing reads it, and the alternative is a literal.
+                mgr->broadcast(hdr, payload.data(), payload.size(), wal_->current_position());
                 const auto t1 = std::chrono::steady_clock::now();
                 sink->push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
                 std::this_thread::sleep_for(std::chrono::microseconds(200));
@@ -827,7 +1099,7 @@ TEST_F(ReplicationProtocolTest, BroadcastToMultipleReplicas) {
     hdr.record_type     = ob::WAL_RECORD_DELTA;
     hdr._pad            = 0;
     uint8_t payload[] = {0xDE, 0xAD, 0xBE, 0xEF};
-    mgr->broadcast(hdr, payload, 4);
+    mgr->broadcast(hdr, payload, 4, wal_->current_position());
 
     // Both replicas should receive the WAL header line.
     std::string line1 = recv_line(fd1, 3000);
@@ -875,7 +1147,7 @@ TEST_F(ReplicationProtocolTest, BroadcastRemovesDisconnectedReplica) {
     hdr.record_type     = ob::WAL_RECORD_DELTA;
     hdr._pad            = 0;
     uint8_t payload[] = {0xDE, 0xAD, 0xBE, 0xEF};
-    mgr->broadcast(hdr, payload, 4);
+    mgr->broadcast(hdr, payload, 4, wal_->current_position());
 
     // The surviving replica should receive the WAL message.
     std::string line2 = recv_line(fd2, 3000);
