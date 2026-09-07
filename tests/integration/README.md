@@ -50,21 +50,43 @@ OB_INTEGRATION_TESTS=1 pytest tests/integration/ -m smoke -v
 
 ## Directory Structure
 
+This list is complete as of #101, and it is worth keeping that way: it read as ten modules for
+months while the directory held twenty-six, which understates the suite to anyone deciding whether
+to trust it.
+
 ```
 tests/integration/
-├── conftest.py              # ClusterManager, fixtures, report plugin, env gate
-├── pytest.ini               # Markers, testpaths, timeout config
-├── test_smoke.py            # Basic single-node operations
-├── test_replication.py      # WAL replication primary → replica
-├── test_failover.py         # Automatic failover after primary kill
-├── test_compression.py      # LZ4 compression negotiation and data integrity
-├── test_stress.py           # Sustained throughput and concurrent read/write
-├── test_edge_cases.py       # Invalid inputs, oversized lines, read-only writes
-├── test_metrics.py          # Prometheus /metrics endpoint and STATUS command
-├── test_pool.py             # _ClientPool discovery, routing, failover
-├── test_cpp_client.py       # Native C++ client binary (optional)
-├── ob_integration_test.cpp  # C++ test binary source (compiled by CMake)
-└── README.md                # This file
+├── conftest.py                     # ClusterManager, fixtures, report plugin, env gate
+├── pytest.ini                      # Markers, testpaths, timeout config
+├── binance_support.py              # Shared depth-feed client for the two opt-in modules
+├── test_smoke.py                   # Basic single-node operations
+├── test_startup_refusal.py         # A node that cannot listen exits 1 with a message, not -6
+├── test_replication.py             # WAL replication primary → replica
+├── test_replica_restart.py         # A restarted replica keeps its store and resumes (#101)
+├── test_sequence_numbers.py        # Per-origin sequence numbers on the wire and in SELECT
+├── test_crash_recovery.py          # WAL replay after a kill, and what the startup log says
+├── test_failover.py                # Automatic failover after primary kill
+├── test_failover_dead_state.py     # A node that lost the election race is not left inert
+├── test_mm_convergence.py          # Three-node mesh: convergence and LWW
+├── test_mm_failover.py             # Mesh: node loss and rejoin
+├── test_mm_snapshot_bootstrap.py   # Mesh: a joining node bootstrapped by snapshot
+├── test_mm_stats.py                # Mesh: STATUS and MM_PEERS on every node
+├── test_auth.py                    # Challenge-response on all three surfaces
+├── test_tls.py                     # TLS on the client port, chain *and* name
+├── test_tls_cluster.py             # TLS on the node links, mutual by construction
+├── test_subscriptions.py           # SUBSCRIBE / PUSH / UNSUBSCRIBE
+├── test_aggregations.py            # Aggregates over the wire, including refusals
+├── test_compression.py             # LZ4 compression negotiation and data integrity
+├── test_large_response.py          # Responses above the socket buffer, slow readers
+├── test_stress.py                  # Sustained throughput and concurrent read/write
+├── test_edge_cases.py              # Invalid inputs, oversized lines, read-only writes
+├── test_metrics.py                 # Prometheus /metrics endpoint and STATUS command
+├── test_pool.py                    # _ClientPool discovery, routing, failover
+├── test_cpp_client.py              # Native C++ client binary (optional)
+├── test_binance_live.py            # Live depth feed — opt-in (OB_BINANCE_TESTS=1)
+├── test_binance_failover_sync.py   # Live feed across a failover — opt-in
+├── ob_integration_test.cpp         # C++ test binary source (compiled by CMake)
+└── README.md                       # This file
 ```
 
 ## Test Categories

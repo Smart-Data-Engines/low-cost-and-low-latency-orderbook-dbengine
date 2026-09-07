@@ -2013,32 +2013,78 @@ folded in.
 - Effort: S | Impact: A configuration mistake was reported to the supervisor as a crash, so restart
   policy and post-mortem both treated it as one
 
-### 101. A replica that restarts wipes its store and re-syncs from zero
+### 101. A replica that restarts wipes its store and re-syncs from zero ✅
 
 Found while writing #98's integration test, which had asserted the opposite and passed anyway.
 
-`demote_to_replica()` clears `stores_`, `buffers_` and `pending_rows_`, deletes every columnar
-segment directory on disk, deletes `repl_state.txt` and then starts a `ReplicationClient` at
-position zero. The comment gives the reason, and the reason is sound for the case it names: "the
-node was previously PRIMARY with its own data, and the new primary may have different data".
+`demote_to_replica()` cleared `stores_`, `buffers_` and `pending_rows_`, deleted every columnar
+segment directory on disk, deleted `repl_state.txt` and started a `ReplicationClient` at position
+zero. The comment gave the reason, and the reason is sound for the case it names: "the node was
+previously PRIMARY with its own data, and the new primary may have different data".
 
-The case it does not name is the ordinary one. A failover-managed node restarts, its
+The case it did not name is the ordinary one. A failover-managed node restarts, its
 `FailoverManager` reads etcd, finds a primary and calls the same function — so a node that was
-already a replica of that same primary, holding exactly what that primary sent it, throws all of it
-away and streams the whole WAL again. **Measured** on a plain restart with no role change:
-`clearing local data before starting replication from 127.0.0.1:58169`, then `REPLICATE 0 0 0`, then
-43 records replayed for a store that already had 40 of them.
+already a replica of that same primary, holding exactly what that primary sent it, threw all of it
+away and streamed the whole WAL again.
 
-Named, and the cost is **not measured**: for a store of a few megabytes this is a second, and the
-saved position it deletes is the thing that would make it unnecessary. What makes it worth an item
-is that the safe direction and the cheap direction are not the same here, and the distinction the
-fix needs is available: a node is in this position either because its role changed or because it
-restarted, and only the first has a reason to distrust what it holds. The second one has a WAL
-identity (`wal_identity`) and a saved position, which is exactly the pair that says "this is the
-same stream I was following".
+**The strongest number is not about time or bytes.** In the window the wipe creates, the replica
+answers reads with `OK` and a partial result, and never refuses. Measured, 23 501 rows per symbol:
 
-- Effort: M | Impact: replica restart time is proportional to the store rather than to what the
-  replica is missing, and the mechanism that would fix it is deleted on the way past
+| t from restart | reply | rows |
+|---|---|---|
+| 0.72 s | `OK ob_tcp_server v0.1.0` | **1** |
+| 3.92 s | `OK …` | 22 501 |
+| 7.13 s | `OK …` | 23 501 (complete) |
+
+Zero refusals, zero `ERR`, zero empty replies: for **6.4 s** the replica served reads missing
+**99.996 %** of the data, reported as success — with all 23 501 rows on its disk a second earlier.
+Not an outage a client notices; silent incompleteness. And the window is manufactured rather than
+inherited: `engine_->open()`, WAL tail replay included, runs in `TcpServer::run()` **before**
+`::bind()`, so a node that keeps its data is complete in its first reply.
+
+**The second number is cumulative.** The replica appends every replayed record to its **own** WAL,
+so each restart adds a full copy of the primary's log: ×2.00 in four runs out of four, N restarts
+giving N+1 copies, bounded only by retention.
+
+Before and after, same machine (i3-7100U, Debug, two-node `ClusterManager`, restart with no role
+change):
+
+| | before | after |
+|---|---|---|
+| columnar files | 2261 deleted | 252 → 252, none deleted |
+| replica's own WAL | ×2.00 (a full copy added) | +0 B, against a 469 930 B primary log |
+| first reply after restart | 1 row of 23 501 | 2401 of 2401 |
+| records re-streamed | the whole store | **2**, at both a 33-record and a 97-record store |
+
+That last row is the item in one line: the work after a restart is two records at either size —
+the checkpoints the primary appended while the node was down — where it used to be everything.
+
+**The fix is not "skip the wipe on a restart", and the distinction this item originally proposed was
+wrong.** The text here used to say the node has "a WAL identity (`wal_identity`) and a saved
+position, which is exactly the pair that says this is the same stream I was following". It is not:
+`wal_identity` names **this node's own** WAL, while the saved position indexes the **primary's**.
+The pair says nothing. So the primary announces the identity of the WAL it writes, in answer to a
+`STREAMID?` that carries no position, and the replica saves that next to the position and compares
+them on every connection. A match resumes; anything else discards and replays from zero.
+
+The question goes out **before** the position, and that ordering is the design. A pre-#101 primary
+lands in its "unknown message — ignore" branch and sends nothing, so no record is in flight while
+the replica decides — no apply gate, no re-handshake on a busy socket, no ordering to reconcile. The
+decision also stops depending on which of the four callers demoted the node, which matters because
+that list grows: the condition is a property of the data, and a static test pins that nothing about
+the caller reaches it.
+
+**What this does not give.** The saved position is written on a ten-second timer, so a replica can
+still re-stream up to a window of writes — bounded by time rather than by the store, which is the
+whole change, but not zero. Cross-version upgrades cost one socket timeout per connection attempt
+against a primary that does not know the command. A node that held PRIMARY and accepted writes
+still discards everything, by design and without being asked whether it did:
+`promote_to_primary()` deletes the position, so there is nothing left to match. And the identity is
+random per data directory, so restoring a primary from a backup is a new stream to every replica —
+correct, and it means a restore costs every replica a full re-sync.
+
+- Effort: M | Impact: a restarted replica keeps its store, and the window in which it served
+  incomplete reads reporting success is gone
 
 
 ### 100. A record broadcast between `accept()` and the handshake is delivered twice ✅
@@ -2294,8 +2340,9 @@ threshold to become configurable for a test's sake. The mechanism is a static te
 only thing that catches a derivation made inside `broadcast()`.
 
 **The integration test's first premise was wrong, and the node's own log said so.** It asserted
-that a restarted replica resumes instead of replaying. A failover-managed replica clears its local
-data and re-syncs from zero whenever it is told its primary — **including on its own restart**:
+that a restarted replica resumes instead of replaying. A failover-managed replica **at the time**
+cleared its local data and re-synced from zero whenever it was told its primary — **including on its
+own restart** (that is #101, closed since, and the premise is true now):
 measured, `clearing local data before starting replication from 127.0.0.1:58169` followed by
 `REPLICATE 0 0 0`, on a plain restart of a node that was already a replica of that same primary.
 So the restart measured the wipe rather than the resume and passed for an unrelated reason. What
@@ -3867,12 +3914,13 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 #96's own test).
 
 **One defect is open, and it leads this table rather than sitting under the capabilities.**
-That is a correction: this paragraph used to say every remaining item was a capability or a proof.
-It did not come out of a bug report, and neither did the four closed alongside it; each came out of
-measuring the item before it, which is the usual way here. #93's measurement produced #98 and #99;
-#98's own tests produced #100 (ten records broadcast before a handshake, twenty received) and #101;
-and #99's own pull request produced #102, from a CI run in which a node whose port was still held
-reported `exited with -6`. All but #101 are closed.
+That is a correction kept from an earlier revision: this paragraph used to say every remaining item
+was a capability or a proof. None of these came out of a bug report; each came out of measuring the
+item before it, which is the usual way here. #93's measurement produced #98 and #99; #98's own tests
+produced #100 (ten records broadcast before a handshake, twenty received) and #101; #99's own pull
+request produced #102, from a CI run in which a node whose port was still held reported
+`exited with -6`; and #101's own tests produced #103, from an assertion that expected the engine's
+epoch on the wire and got a zero. All but #103 are closed.
 
 Below the defects the ordering is about who we want to be able to say yes to. A reader can build the
 engine, read its tests and now deploy it from a package (#33), and still **cannot verify its
@@ -3882,7 +3930,7 @@ performance claim is the reason this repo exists.
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
 | **P1** | Reproducible comparative benchmarks (#39 part two) | L | Makes the performance claim verifiable by a reader instead of asserted; needs ClickHouse, TimescaleDB and kdb+ installed natively, which is a decision about the machine rather than code |
-| **P2** | A replica that restarts wipes its store and re-syncs from zero (#101) | M | Restart cost is proportional to the store rather than to what is missing, and the position that would avoid it is deleted on the way past |
+| **P2** | A replica's epoch protection starts every connection at zero (#103) | S | `ERR STALE_PRIMARY` and the replica's own epoch filter are both inert on a first connection, which is every connection after a restart or a role change; #82 is why this is a second line rather than a P0 |
 | **P2** | The unexplained node death behind #86's third occurrence | S | An `UNREACHABLE` that needs nothing listening, on a node whose epoll thread is merely busy; the OOM-kill hypothesis is untested and the harness should name an unexplained death |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
@@ -4022,8 +4070,8 @@ Measured on machine B, on the commit that carries this table, rather than carrie
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 961 | all passing, ~195 s with `ctest -j1` on machine B. `ctest -N` reports 963: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
-| Python integration | 195 | passing, plus 2 skipped, on i3-7100U in ~10 min. The two skips are the Binance tests, opt-in on a live feed (`OB_BINANCE_TESTS=1`), and they are **collection-time** skips (`pytest.skip(allow_module_level=True)`) — so they are not in the 195, produce no progress character, and the suite's own report plugin says `0 skipped` while pytest says 2. This row read 190 until it was recounted; if you recompute it, count what pytest reports rather than what `--collect-only` does. **No xfails left**: #60's and #61's markers both fell with their fixes |
+| C++ (GTest + RapidCheck) | 980 | all passing, ~200 s with `ctest -j1` on machine B. `ctest -N` reports 982: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
+| Python integration | 199 | passing, plus 2 skipped, on i3-7100U in ~13 min. The two skips are the Binance tests, opt-in on a live feed (`OB_BINANCE_TESTS=1`), and they are **collection-time** skips (`pytest.skip(allow_module_level=True)`) — so they are not in the 199, produce no progress character, and the suite's own report plugin says `0 skipped` while pytest says 2. This row read 190 until it was recounted; if you recompute it, count what pytest reports rather than what `--collect-only` does. **No xfails left**: #60's and #61's markers both fell with their fixes |
 
 `ctest -j1` is not a preference. The network tests bind ports, so a parallel run fails for a reason
 that has nothing to do with the code under test.

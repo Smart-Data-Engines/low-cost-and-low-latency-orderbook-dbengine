@@ -255,6 +255,40 @@ pair to watch is that number growing across successive completions, which says t
 losing ground to live traffic. It is bounded by the same 16 MB ceiling as the send queue, and
 reaching it drops the replica as above.
 
+### A replica that restarted, and which stream it decided it was on
+
+Since #101 a replica keeps its store across a restart and asks the primary to continue from where
+it stopped. It says which of three things it decided, on every connection, and the line names the
+reason rather than only the action:
+
+```
+primary serves stream 7213...  the one our position belongs to - resuming from file=3 offset=1048576
+```
+
+Nothing is re-streamed beyond what the primary appended while the node was down. This is the
+ordinary line, and its absence after a restart is the thing to look at.
+
+```
+primary serves stream 4471... and our position belongs to 7213... - a different WAL at the same
+address: discarding and replaying from zero
+```
+
+The primary's data directory is not the one this replica was following. **The address is not the
+identity, deliberately** — this is what a primary rebuilt from a bare disk, restored from a backup,
+or replaced by a different node reusing its address looks like from here, and in all three the
+replica's position indexes a WAL that no longer exists. The full re-sync is correct and expected;
+the operational consequence worth knowing in advance is that **restoring a primary from a backup
+costs every replica a complete re-sync**, because a restored data directory draws a new identity.
+
+```
+primary 10.0.0.2:9090 did not name its stream - a pre-#101 primary, so what we hold cannot be
+attributed to it: discarding and replaying from zero
+```
+
+The primary is older than this version. Every connection attempt to it waits five seconds for an
+answer that is not coming and then re-syncs in full. Not a refusal and not data loss — a delay, for
+as long as the two versions are mixed. Upgrading the primary ends it.
+
 ## Security
 
 **Everything is off by default, and a node nobody configured is plaintext and unauthenticated on
