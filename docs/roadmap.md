@@ -3531,41 +3531,62 @@ measures the harness.
 
 ## Recommended order
 
-No P0 is open, and none of the correctness work is. Every P0 that has been raised — #60, #61, #62,
-#64, #68, #73, #74 — is closed, and two of those were found by running a real cluster rather than by
-reading the code (#73 while proving #70, #82's true cause while proving #82's smaller half).
+No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #74, #80, #88 and
+#97 — is closed, and several were found by running a real cluster rather than by reading the code
+(#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
+#96's own test).
 
-**What that changes about this table.** Every remaining item is a capability or a proof, not a
-defect. The ordering below is therefore about who we want to be able to say yes to, and the first
-three rows are one answer: a reader can build the engine and read its tests, but cannot deploy it,
-cannot verify its numbers, and cannot put it on a network they do not fully control.
+**Three defects are open, and they lead this table rather than sitting under the capabilities.**
+That is a correction: this paragraph used to say every remaining item was a capability or a proof.
+Two of the three came out of measuring #93 rather than out of a bug report, which is the usual way
+here — and the more interesting one, #98, is a field that has been wrong since the feature shipped
+and survived four phases of replication work *because nothing depends on it yet*.
+
+Below the defects the ordering is about who we want to be able to say yes to. A reader can build the
+engine, read its tests and now deploy it from a package (#33), and still **cannot verify its
+numbers** against another system — which is why #39 part two sits where it does, given that the
+performance claim is the reason this repo exists.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **P1** | Deployment artifacts (#33) | M | Cheapest large jump in time-to-first-run; today a first run means reading CMake |
-| **P1** | Reproducible comparative benchmarks (#39) | L | Makes the performance claim verifiable by a reader instead of asserted, and the claim is the reason the repo exists |
+| **P1** | The WAL position on the wire is not the record's position (#98) | M | Measured wrong today, and both halves have to move in one change or the position goes backwards |
+| **P1** | A live write is spliced into a snapshot transfer (#99) | S | A replica cannot be bootstrapped from a primary that is taking writes; the mechanism is #93's, the measurement is not taken yet |
+| **P1** | Reproducible comparative benchmarks (#39 part two) | L | Makes the performance claim verifiable by a reader instead of asserted; needs ClickHouse, TimescaleDB and kdb+ installed natively, which is a decision about the machine rather than code |
+| **P2** | The unexplained node death behind #86's third occurrence | S | An `UNREACHABLE` that needs nothing listening, on a node whose epoll thread is merely busy; the OOM-kill hypothesis is untested and the harness should name an unexplained death |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
-| **P2** | Configuration file (#32) | S | Ops ergonomics; past twenty flags, flags alone are unreasonable |
+| **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
 | **P2** | Release engineering + PyPI wheels (#42) | S | `pip install` is the shortest path to a first user |
-| **P2** | Streaming subscriptions on the wire (#45) | M | The embedded half works; the network half is the one a reader assumes from the feature list |
 | **P3** | Time-bucketed aggregation (#44) | L | The most-requested analytical capability for this data |
 | **P3** | Arrow output (#46) | M | Near-zero integration cost for analytics teams |
 | **P3** | Backup and restore (#34) | M | Table stakes for a database |
 | **P3** | Fuzzing (#38) | M | Finds the class of bug property tests miss, in the three places that read untrusted bytes |
+| **P3** | Access control (#31) | M | Multi-tenant deployments and the compliance conversation; authentication landed with #30, authorisation did not |
 | **P4** | Chaos testing (#54) | L | Do this once there are users whose data can be lost |
-| **P4** | Performance frontier (#49-50) | varies | Proves the bespoke-engine claim; pick one and write it up |
+| **P4** | Rolling upgrade support (#56) | M | Required before anyone runs this longer than one release |
+| **P4** | Performance frontier (#49-53) | varies | Proves the bespoke-engine claim; pick one and write it up |
 
 ## Known gaps and honest caveats
 
 Things a reviewer will notice, listed here so they do not look like oversights:
 
-- **TLS on client sessions only.** All three surfaces authenticate (`--auth-secret-file`,
-  `--cluster-secret-file`), and since #30 part three the client port can be encrypted with
-  `--tls-client` — TLS 1.3, and both shipped clients verify the chain *and* the name by default. The
-  **replication link and the multi-master mesh are still plaintext**: they authenticate, and every
-  record they carry is readable on the path. So a cluster still wants a network you trust between
-  its nodes, while the clients talking to it no longer do.
+- **Every encrypted surface is off by default, and one transport cannot have it at all.** All
+  three surfaces authenticate (`--auth-secret-file`, `--cluster-secret-file`) and all three can be
+  encrypted since #30 part three — `--tls-client` for client sessions, `--tls-replication` and
+  `--tls-multi-master` for the node links, TLS 1.3 with no configurable floor. Both shipped clients
+  verify the chain *and* the name; on the node links verification is mutual and cannot be configured
+  otherwise. Four things are still worth a reviewer's notice. **Every one of those flags defaults
+  to off**, so a cluster that nobody configured is plaintext on all three surfaces and says so only
+  in its startup log. **The io_uring transport refuses every `--tls-*` flag** — for the client port
+  because receive stays in userspace even with kernel TLS, so that loop needs a memory-BIO rewrite;
+  for the node links because no CI job builds that file, and a surface that "should work" is one
+  nobody has run. So the faster transport is the plaintext-only one. **Certificate rotation needs a
+  restart**, one node at a time. And **`--tls-peer-names` empty means chain-only verification**,
+  which under a company-wide CA means any host it signs may join the cluster — the list is the
+  mechanism that narrows that, and the startup log names which mode is in force.
+  *(This bullet used to say the replication link and the mesh were plaintext. That was true until
+  #30 part three, series D — and a caveats section that understates the engine is the same defect as
+  one that overstates it, in the document a reader checks for honesty.)*
 - **Process death is exercised in three modules, and nowhere else.** Until #62 no module killed
   anything, and that hid total loss of acknowledged writes on crash. Today `test_crash_recovery.py`,
   `test_failover.py` and `test_failover_dead_state.py` `SIGKILL` a server; the last of those also
@@ -3663,7 +3684,12 @@ absolute thresholds for a designated benchmark host.
 
 ### Test suite
 
+Measured on machine B, on the commit that carries this table, rather than carried forward:
+
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 673 | all passing, ~152s with `ctest -j1` on machine B |
-| Python integration | 121 | passing, plus 2 skipped. **No xfails left**: #60's and #61's markers both fell with their fixes |
+| C++ (GTest + RapidCheck) | 947 | all passing, 177 s with `ctest -j1` on machine B. `ctest -N` reports 949: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
+| Python integration | 189 | passing, plus 2 skipped, 10 min 28 s. The two skips are the Binance tests, which are opt-in on a live feed (`OB_BINANCE_TESTS=1`). **No xfails left**: #60's and #61's markers both fell with their fixes |
+
+`ctest -j1` is not a preference. The network tests bind ports, so a parallel run fails for a reason
+that has nothing to do with the code under test.
