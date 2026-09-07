@@ -1444,6 +1444,32 @@ Learned the hard way. Check here before debugging.
     answers PING in **0.39 s**, and 0.39/0.46/0.54 s for three started together. The scaling lives
     inside `_wait_for_node()` now, with a static guard that forbids a call site scaling again.
 
+173. **A test that asserts an absence needs a control, and mine failed the moment it had one.** The
+    #99 measurement splices a live record into a snapshot stream and requires the bootstrap to be
+    abandoned. Its control — the same stream without the record — **also** failed, because
+    `SNAPSHOT_END` carries the CRC32C of the manifest the replica assembles and the mock primary
+    sent a bare `SNAPSHOT_END`. Without the control the spliced test would have passed by not
+    finding anything (#99).
+
+174. **A window you cannot observe is a window that was not there.** The primary-side #99 test
+    needs a snapshot transfer to be *in progress*. `continue_snapshot_transfer()` backs off at half
+    of `MAX_SEND_BUF_SIZE`, so a 7.3 MB snapshot streamed in one pass and `snapshot_active()` was
+    never true; 14.6 MB across 208 files stalls. Poll the state the code publishes
+    (`snapshot_active()`) rather than sleeping, and check the window existed before asserting about
+    what happens inside it (#99).
+
+175. **A mutation can survive because a comment overstates the code.** Swapping `st.active = false`
+    with the release of deferred bytes survived, and the comment claiming that ordering was
+    load-bearing was simply wrong: `release_deferred_live()` goes through `enqueue_send()` and could
+    not re-defer its own bytes whatever the order. The comment changed, not the code (#99).
+
+176. **A defect on a five-second timer needs a structural guard, not a slower test.** The heartbeat
+    loop splices into a snapshot stream exactly as a live record does, with no client write
+    involved. A behavioural test would have to wait out the interval inside a stalled transfer, or
+    make the interval configurable for a test's sake. Instead: `run_loop()` may not call
+    `enqueue_send()` or `enqueue_and_flush()` at all, because `queue_to_replica()` is the only
+    function that knows about deferring (#99).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -1452,7 +1478,7 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 955 C++ tests (`ctest -j1`, ~3 min) and 190 integration tests plus 2
+**Where the suites stand:** 960 C++ tests (`ctest -j1`, ~3.5 min) and 190 integration tests plus 2
 opt-in Binance skips (`pytest tests/integration/`, ~10.5 min on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that
