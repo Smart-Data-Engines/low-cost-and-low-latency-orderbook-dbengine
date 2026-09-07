@@ -496,6 +496,23 @@ private:
     ob_status_t apply_delta_impl(const DeltaUpdate& delta_in, const Level* levels,
                                  DuplicatePolicy policy);
 
+    /// Path of the file holding the replication position, or empty when nothing saves one.
+    ///
+    /// Read from `repl_client_config_.state_file` rather than rebuilt from `base_dir_`. The
+    /// rebuilt form happened to be right in production, where `tcp_server.cpp` sets the config to
+    /// `<data_dir>/repl_state.txt` — and silently deleted nothing anywhere the path is configured
+    /// differently, which every unit test does.
+    std::string replication_state_path() const;
+
+    /// Forget where we were in a primary's stream, because this node's data is no longer a prefix
+    /// of it.
+    ///
+    /// Called from `promote_to_primary()` and **not** from `demote_to_replica()`, which is the
+    /// inversion #101 is about: the position used to be deleted on the way *into* replication,
+    /// which is exactly when it is needed. The moment that matters is the one where this node
+    /// starts writing records of its own.
+    void discard_saved_replication_position();
+
     void load_or_create_wal_identity();
     uint64_t wal_identity_{0};
 

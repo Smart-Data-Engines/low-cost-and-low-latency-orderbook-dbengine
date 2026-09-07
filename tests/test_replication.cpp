@@ -957,6 +957,48 @@ std::string function_body(const std::string& file, const std::string& signature)
     return {};
 }
 
+/// The body of whichever `Engine::` function contains `marker`, found by walking back to the last
+/// definition line that starts at column 0.
+///
+/// Derived rather than named, and that is the point: this check used to name
+/// `Engine::apply_delta`, and when #101 split it into a delegating pair the body moved to
+/// `apply_delta_impl` — so the test found a four-line wrapper and reported that the engine had
+/// stopped capturing the append's position. A static test pinned to a function *name* stops
+/// checking anything the day the body moves, and the failure looks like the defect it guards.
+std::string enclosing_engine_function(const std::string& file, const std::string& marker) {
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/" + file);
+    if (!in) return {};
+    const std::string src((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+    const auto at = src.find(marker);
+    if (at == std::string::npos) return {};
+
+    // A definition's signature starts at column 0; nothing inside a body does.
+    std::size_t sig = std::string::npos;
+    for (std::size_t line = 0; line < at;) {
+        const std::size_t next = src.find('\n', line);
+        if (next == std::string::npos || next > at) break;
+        const char first = src[line];
+        if (first != ' ' && first != '\t' && first != '\n' &&
+            src.compare(line, 2, "//") != 0 &&
+            src.find("Engine::", line) < next && src.find('(', line) < next) {
+            sig = line;
+        }
+        line = next + 1;
+    }
+    if (sig == std::string::npos) return {};
+
+    auto pos = src.find('{', sig);
+    if (pos == std::string::npos) return {};
+    int depth = 0;
+    const auto start = pos;
+    for (; pos < src.size(); ++pos) {
+        if (src[pos] == '{') ++depth;
+        else if (src[pos] == '}' && --depth == 0) return src.substr(start, pos - start + 1);
+    }
+    return {};
+}
+
 } // namespace
 
 TEST(WalPositionWireStatic, NothingQueuedFromTheRunLoopBypassesTheTransferDecision) {
@@ -1002,10 +1044,20 @@ TEST(WalPositionWireStatic, TheEngineBroadcastsThePositionItsAppendReturned) {
     // is not configurable and should not become configurable for a test. This is the mechanism
     // instead, and it is the stronger one for this claim: the engine may not *compute* a position
     // at all.
-    const std::string body = function_body("src/engine.cpp",
-                                           "ob_status_t Engine::apply_delta(const DeltaUpdate&");
-    ASSERT_FALSE(body.empty()) << "could not find Engine::apply_delta in src/engine.cpp; if it was "
-                                  "renamed, this test has stopped checking anything";
+    // Whichever function appends a client write and broadcasts it - derived from the two markers
+    // rather than named, so a rename or a split cannot retire the check (it already did once).
+    const std::string body =
+        enclosing_engine_function("src/engine.cpp", "= wal_.append(delta, levels);");
+    ASSERT_FALSE(body.empty()) << "nothing in src/engine.cpp captures wal_.append(delta, levels); "
+                                  "if the write path changed shape, this test has stopped checking "
+                                  "anything";
+
+    // And they are the *same* function, which is part of the claim rather than a detail: the append
+    // and the broadcast happen under one acquisition of `mtx_`, which is what keeps the WAL order
+    // and the wire order the same.
+    EXPECT_EQ(body, enclosing_engine_function("src/engine.cpp", "repl_mgr_->broadcast("))
+        << "the append and the broadcast are in different functions, so nothing holds them under "
+           "one lock";
 
     // The append's position is captured, and the name it is captured under is the one handed to
     // broadcast(). Read out of the source rather than written down here, so renaming the variable
@@ -1013,7 +1065,7 @@ TEST(WalPositionWireStatic, TheEngineBroadcastsThePositionItsAppendReturned) {
     const std::string marker = "= wal_.append(delta, levels);";
     const auto assign = body.find(marker);
     ASSERT_NE(assign, std::string::npos)
-        << "Engine::apply_delta no longer captures what wal_.append() returns";
+        << "the write path no longer captures what wal_.append() returns";
     const auto line_start = body.rfind('\n', assign) + 1;
     const std::string decl = body.substr(line_start, assign - line_start);
     // "    const WalPosition record_pos " -> "record_pos"
@@ -1026,7 +1078,7 @@ TEST(WalPositionWireStatic, TheEngineBroadcastsThePositionItsAppendReturned) {
         << "'";
 
     const auto call = body.find("repl_mgr_->broadcast(");
-    ASSERT_NE(call, std::string::npos) << "Engine::apply_delta no longer broadcasts";
+    ASSERT_NE(call, std::string::npos) << "the write path no longer broadcasts";
     const auto call_end = body.find(");", call);
     ASSERT_NE(call_end, std::string::npos);
     const std::string args = body.substr(call, call_end - call);
@@ -3124,5 +3176,69 @@ TEST(ReplicationDedup, TheFrontierThatMakesDedupWorkSurvivesARestart) {
         << "the re-delivered record entered the write pipeline, so the sequence frontier did not "
         << "survive the restart: dedup then protects one process life, and a resumed replica "
         << "duplicates every record its saved position lagged behind";
+    engine.close();
+}
+
+// ── #101 group 3: the saved position is invalidated by promotion, not by demotion ────────────────
+
+TEST_F(ReplicationClientTest, PromotionForgetsWhereWeWereInThePrimarysStream) {
+    // The inversion this item turns on. The position used to be deleted on the way *into*
+    // replication, which is exactly when it is needed; the moment it stops being true is the one
+    // where this node starts writing records of its own.
+    //
+    // Without this, a node that was a replica at (f,o), got promoted, accepted writes and later came
+    // back as a replica would resume from (f,o) - with records above it that the primary never had.
+    ob::ReplicationClientConfig cfg;
+    cfg.state_file = tmp_->str() + "/repl_state.txt";     // primary_port stays 0: no client, no socket
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE, {}, cfg);
+    engine.open();
+
+    // A saved position, of the shape a replica leaves behind.
+    { std::ofstream out(cfg.state_file); out << "file_index=3\nbyte_offset=4096\n"; }
+    ASSERT_TRUE(std::filesystem::exists(cfg.state_file));
+
+    engine.promote_to_primary(ob::EpochValue{7});
+
+    EXPECT_FALSE(std::filesystem::exists(cfg.state_file))
+        << "a promoted node kept the position it had in someone else's stream; after a restart it "
+        << "would resume from there, with its own records sitting above it";
+    engine.close();
+}
+
+TEST_F(ReplicationClientTest, AClientStoppedByThePromotionDoesNotRecreateThePosition) {
+    // Pins an ordering that is currently a property of how `promote_to_primary()` happens to be
+    // arranged rather than of anything written down - and a comment claiming a property the code
+    // does not have has already survived a mutation in this repository.
+    //
+    // `ReplicationClient::stop()` ends with `save_state()`. So a deletion placed before the client
+    // is stopped is undone by the client on its way out, and the node comes back after a restart
+    // resuming from a stream it no longer follows. The deletion has to run after the stop.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;                            // so `open()` starts a client
+    cfg.state_file   = tmp_->str() + "/repl_state.txt";
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE, {}, cfg);
+    engine.open();
+
+    // Wait until the client is really up, rather than sleeping: it has to be alive for its stop to
+    // be able to rewrite the file, or this test passes for the wrong reason.
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0) << "the replication client never connected, so nothing here could have "
+                               "rewritten the position file";
+    ASSERT_TRUE(recv_line(client_fd, 3000).rfind("REPLICATE", 0) == 0);
+
+    engine.promote_to_primary(ob::EpochValue{9});
+
+    EXPECT_FALSE(std::filesystem::exists(cfg.state_file))
+        << "the position file is back: the client wrote it while stopping, after the promotion had "
+        << "deleted it, so the deletion ran too early";
+
+    ::close(client_fd);
+    ::close(listen_fd);
     engine.close();
 }

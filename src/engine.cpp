@@ -371,6 +371,22 @@ void Engine::restore_held_sequences() {
                 held.size(), numbers);
 }
 
+std::string Engine::replication_state_path() const {
+    return repl_client_config_.state_file;
+}
+
+void Engine::discard_saved_replication_position() {
+    const std::string path = replication_state_path();
+    if (path.empty()) return;
+    std::error_code ec;
+    if (std::filesystem::remove(path, ec)) {
+        OB_LOG_INFO("engine",
+                    "discarded the saved replication position (%s): this node writes its own "
+                    "records now, so its data is no longer a prefix of any primary's stream",
+                    path.c_str());
+    }
+}
+
 void Engine::load_or_create_wal_identity() {
     const std::string path = base_dir_ + "/wal_identity";
 
@@ -1448,6 +1464,12 @@ void Engine::promote_to_primary(const EpochValue& new_epoch) {
         lock.lock();
     }
 
+    // After the client is gone, and that ordering is load-bearing rather than tidy:
+    // `ReplicationClient::stop()` ends with `save_state()`, so a deletion that ran first would be
+    // undone by the client on its way out - and this node would come back after a restart resuming
+    // from a stream it no longer follows.
+    discard_saved_replication_position();
+
     // Increment epoch and write Epoch_Record to WAL.
     current_epoch_.store(new_epoch.term, std::memory_order_release);
     wal_.set_epoch(new_epoch.term);
@@ -1574,11 +1596,21 @@ void Engine::demote_to_replica(const std::string& new_primary_address) {
         // ReplicationClient so a catch-up flush does not wait on this function.
         flush_lock.unlock();
 
-        // Delete replication state file so catchup starts from position 0.
+        // Delete the replication state file so catch-up starts from position 0.
+        //
+        // Through the accessor rather than a path rebuilt from `base_dir_`: the rebuilt form is
+        // right wherever `tcp_server.cpp` set the config (`<data_dir>/repl_state.txt`) and deleted
+        // nothing at all wherever the path is configured differently, which is every unit test.
+        //
+        // This deletion is what #101 removes - but not before the client can tell whether resuming
+        // is safe. Removing it while this function still wipes the store would leave a replica
+        // asking to resume from a position whose data it has just deleted.
         {
-            std::string state_path = base_dir_ + "/repl_state.txt";
-            std::error_code ec;
-            std::filesystem::remove(state_path, ec);
+            const std::string state_path = replication_state_path();
+            if (!state_path.empty()) {
+                std::error_code ec;
+                std::filesystem::remove(state_path, ec);
+            }
         }
 
         // Parse host:port from address.
