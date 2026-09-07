@@ -3082,6 +3082,14 @@ TEST(ReplicationDedup, TheFrontierThatMakesDedupWorkSurvivesARestart) {
     // What restores it is the replica's own WAL - `restore_version_vector()` runs in `open()`,
     // before the tail replay, from the vector records the flush writes. So the flush before the
     // close is part of the subject and not tidiness.
+    //
+    // **The observable is `pending_rows`, and counting stored rows instead was wrong.** The first
+    // version of this test asserted one row after the re-delivery and **passed with the guard
+    // disabled** - measured, not supposed. After a restart the re-flushed segment covers the
+    // timestamp range the restored one already covers, and `ColumnarStore` refuses that merge as a
+    // duplicate, so the row count was measuring the store's own refusal and said nothing about the
+    // frontier. That confound is already on record from the mesh's dedup work. `pending_rows` moves
+    // if and only if the record entered the write pipeline.
     ReplTempDir tmp;
     ob::Level lvl{};
     lvl.price = 31'337; lvl.qty = 3; lvl.cnt = 1; lvl._pad = 0;
@@ -3104,19 +3112,17 @@ TEST(ReplicationDedup, TheFrontierThatMakesDedupWorkSurvivesARestart) {
 
     ob::Engine engine(tmp.str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
     engine.open();
+    engine.flush_incremental();   // a known queue depth, whatever the tail replay left behind
+    ASSERT_EQ(engine.stats().pending_rows, 0u)
+        << "the queue is not empty before the re-delivery, so its depth afterwards decides nothing";
+
     // The same record, re-delivered after the restart - which is exactly what resuming from a
     // position written on a ten-second timer produces.
     ASSERT_EQ(engine.apply_delta_replicated(d, &lvl), ob::OB_OK);
-    engine.flush_incremental();
 
-    size_t rows = 0;
-    const std::string err = engine.execute(
-        "SELECT * FROM 'AFTERBOOT'.'BINANCE' WHERE timestamp BETWEEN 0 AND 9999999999999999999",
-        [&](const ob::QueryResult&) { ++rows; });
-    EXPECT_TRUE(err.empty()) << err;
-    EXPECT_EQ(rows, 1u)
-        << "the record was stored " << rows << " times across a restart: the sequence frontier did "
-        << "not survive, so dedup protects one process life and a resumed replica duplicates every "
-        << "record its saved position lagged behind";
+    EXPECT_EQ(engine.stats().pending_rows, 0u)
+        << "the re-delivered record entered the write pipeline, so the sequence frontier did not "
+        << "survive the restart: dedup then protects one process life, and a resumed replica "
+        << "duplicates every record its saved position lagged behind";
     engine.close();
 }
