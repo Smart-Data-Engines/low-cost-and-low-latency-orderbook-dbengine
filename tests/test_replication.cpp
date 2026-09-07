@@ -2903,3 +2903,220 @@ TEST_F(ReplicationProtocolTest, StopIsIdempotent) {
     mgr->stop();
     EXPECT_FALSE(mgr->is_running());
 }
+
+// ── #101 requirement 5: over-delivery on the replication link must not duplicate rows ────────
+TEST_F(ReplicationClientTest, ARecordDeliveredTwiceIsAppliedOnce) {
+    // The load-bearing measurement of #101, and the reason its requirement 5 comes before its
+    // requirement 1. `repl_state.txt` is written every ten seconds while `confirmed_*` advances per
+    // record, so a replica resuming from its saved position is handed records it already has.
+    // Storage is append-only, so applying a duplicate appends its rows a second time - which would
+    // turn a fix about cost into a defect about correctness.
+    //
+    // The guard exists one function away: `apply_remote_delta()`, the mesh path, drops a record
+    // whose sequence number it has seen, with the comment explaining that catch-up over-delivers on
+    // purpose. `ReplicationClient` calls `apply_delta()`, which had no such guard.
+    //
+    // Roadmap #100 says of exactly this: "whether that produces duplicate rows depends on flush
+    // timing, and that half is not measured". This is the measurement.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;
+    cfg.state_file   = tmp_->str() + "/repl_state.txt";
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0);
+    const std::string handshake = recv_line(client_fd, 3000);
+    ASSERT_TRUE(handshake.rfind("REPLICATE", 0) == 0) << "got: " << handshake;
+
+    // One record, one level, carrying a sequence number the primary minted - which is what makes it
+    // a replicated record rather than a client write. `stamp_sequence()` only assigns when the
+    // number is zero, so this one passes through untouched.
+    auto [payload, crc] =
+        build_delta_payload("DUPSYM", "BINANCE", 7, 1'700'000'000ULL, 0, 50'000, 100);
+    ob::WALRecord hdr{};
+    hdr.sequence_number = 7;
+    hdr.timestamp_ns    = 1'700'000'000ULL;
+    hdr.checksum        = crc;
+    hdr.payload_len     = static_cast<uint16_t>(payload.size());
+    hdr.record_type     = ob::WAL_RECORD_DELTA;
+    hdr._pad            = 0;
+
+    const auto msg = build_wal_message(0, 0, hdr, payload.data(), payload.size());
+    ASSERT_EQ(::send(client_fd, msg.data(), msg.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(msg.size()));
+    ASSERT_TRUE(recv_line(client_fd, 5000).rfind("ACK ", 0) == 0);
+
+    // The same record again, announced at the same position - which is exactly what a resume from a
+    // lagging saved position re-delivers. The wait is the second ACK rather than a sleep: the client
+    // acknowledges either way, so this synchronises without deciding the outcome.
+    ASSERT_EQ(::send(client_fd, msg.data(), msg.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(msg.size()));
+    ASSERT_TRUE(recv_line(client_fd, 5000).rfind("ACK ", 0) == 0);
+
+    engine.flush_incremental();
+
+    size_t rows = 0;
+    const std::string err = engine.execute(
+        "SELECT * FROM 'DUPSYM'.'BINANCE' WHERE timestamp BETWEEN 0 AND 9999999999999999999",
+        [&](const ob::QueryResult&) { ++rows; });
+    EXPECT_TRUE(err.empty()) << "query failed: " << err;
+    EXPECT_EQ(rows, 1u)
+        << "the same record arrived twice and its row was stored " << rows << " times; storage is "
+        << "append-only, so over-delivery on this link is a correctness defect rather than a cost";
+
+    client.stop();
+    ::close(client_fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
+// ── #101 requirement 5: what the dedup guard must and must not touch ─────────────────────────────
+
+TEST(ReplicationDedup, AnEmbeddedWriteKeepsItsOwnSequenceNumbering) {
+    // The regression test for the finding that changed this design. The obvious guard - drop when
+    // `sequence_number != 0`, since "a client write always carries zero" - is false of the embedded
+    // path: `ob_apply_delta()` takes `seq` as a caller parameter and the Python client's
+    // `insert(..., seq, timestamp_ns)` has it as a *required* argument. An embedded user numbering
+    // their own records from 1 per symbol would then have had every write after the first silently
+    // dropped: data loss introduced by an item about restart cost, in a public API.
+    //
+    // So `apply_delta()` applies whatever it is handed, and the two records below - deliberately
+    // sharing a sequence number - both have to be stored. If this test ever fails, the guard has
+    // leaked out of `apply_delta_replicated()`.
+    ReplTempDir tmp;
+    ob::Engine engine(tmp.str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+
+    ob::Level lvl{};
+    lvl.price = 42'000; lvl.qty = 7; lvl.cnt = 1; lvl._pad = 0;
+    for (int i = 0; i < 2; ++i) {
+        ob::DeltaUpdate d{};
+        std::strncpy(d.symbol, "EMBED", sizeof(d.symbol) - 1);
+        std::strncpy(d.exchange, "LOCAL", sizeof(d.exchange) - 1);
+        d.sequence_number = 5;                     // the caller's own numbering, repeated
+        d.timestamp_ns    = 1'700'000'000ULL + static_cast<uint64_t>(i);
+        d.side            = ob::SIDE_BID;
+        d.n_levels        = 1;
+        ASSERT_EQ(engine.apply_delta(d, &lvl), ob::OB_OK);
+    }
+    engine.flush_incremental();
+
+    size_t rows = 0;
+    const std::string err = engine.execute(
+        "SELECT * FROM 'EMBED'.'LOCAL' WHERE timestamp BETWEEN 0 AND 9999999999999999999",
+        [&](const ob::QueryResult&) { ++rows; });
+    EXPECT_TRUE(err.empty()) << err;
+    EXPECT_EQ(rows, 2u)
+        << "apply_delta() dropped a write because its sequence number repeated; that number belongs "
+        << "to the caller on this path, and dropping it loses an embedded user's data";
+    engine.close();
+}
+
+TEST(ReplicationDedup, TheGuardIsOnEveryEntryPointAnOverDeliveringLinkUses) {
+    // Static, and the list of functions comes from the source rather than from this test: whatever
+    // `replication.cpp` and `multi_master.cpp` call on the engine to apply a record is what has to
+    // carry the guard. A list written here by hand would be a claim about the code rather than
+    // evidence about it, and the shape this guards against - a fix present at one of two sites - has
+    // cost this repository three separate defects.
+    const auto read = [](const char* rel) {
+        std::ifstream in(std::string(OB_SOURCE_DIR) + "/" + rel);
+        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    };
+    const std::string engine_src = read("src/engine.cpp");
+    ASSERT_FALSE(engine_src.empty());
+
+    // Which engine methods do the two over-delivering links apply through?
+    std::set<std::string> applied_through;
+    for (const char* rel : {"src/replication.cpp", "src/multi_master.cpp"}) {
+        const std::string src = read(rel);
+        ASSERT_FALSE(src.empty()) << rel;
+        const std::string needle = "engine_.apply_";
+        for (size_t at = src.find(needle); at != std::string::npos;
+             at = src.find(needle, at + 1)) {
+            const size_t name_at = at + std::strlen("engine_.");
+            const size_t paren   = src.find('(', name_at);
+            if (paren == std::string::npos) continue;
+            applied_through.insert(src.substr(name_at, paren - name_at));
+        }
+    }
+    // The pair: if this came back empty, "every one of them has the guard" would be vacuous.
+    EXPECT_GE(applied_through.size(), 2u)
+        << "expected at least two apply entry points across the replication link and the mesh; "
+        << "found " << applied_through.size() << ", so this test is not looking at what it thinks";
+
+    std::string missing;
+    for (const std::string& fn : applied_through) {
+        const std::string sig = "ob_status_t Engine::" + fn + "(";
+        const size_t begin = engine_src.find(sig);
+        if (begin == std::string::npos) continue;          // not defined here (e.g. a wrapper)
+        const size_t end = engine_src.find("\nob_status_t Engine::", begin + sig.size());
+        const std::string body = engine_src.substr(begin, end == std::string::npos
+                                                          ? std::string::npos : end - begin);
+        // `apply_delta_replicated` delegates, so accept the policy it passes as well as the guard
+        // itself. Accepting the *name* of the shared implementation would not do: `apply_delta`
+        // delegates to the very same function with the opposite policy, so a call site moved back
+        // to `apply_delta` would still read as guarded. The token has to be the one that differs.
+        const bool guarded = body.find("has_seen(") != std::string::npos ||
+                             body.find("DropIfSeen") != std::string::npos;
+        if (!guarded) missing += fn + " ";
+    }
+    EXPECT_TRUE(missing.empty())
+        << "these engine entry points are used by a link that over-delivers on purpose and do not "
+        << "drop what they have already applied, so storage grows a duplicate row per repeat: "
+        << missing;
+}
+
+TEST(ReplicationDedup, TheFrontierThatMakesDedupWorkSurvivesARestart) {
+    // Without this, the guard protects one process life and #101's resume protects nothing: a
+    // replica restarts, is handed the ten seconds of records its saved position lags behind, and
+    // has forgotten that it applied them.
+    //
+    // What restores it is the replica's own WAL - `restore_version_vector()` runs in `open()`,
+    // before the tail replay, from the vector records the flush writes. So the flush before the
+    // close is part of the subject and not tidiness.
+    ReplTempDir tmp;
+    ob::Level lvl{};
+    lvl.price = 31'337; lvl.qty = 3; lvl.cnt = 1; lvl._pad = 0;
+
+    ob::DeltaUpdate d{};
+    std::strncpy(d.symbol, "AFTERBOOT", sizeof(d.symbol) - 1);
+    std::strncpy(d.exchange, "BINANCE", sizeof(d.exchange) - 1);
+    d.sequence_number = 7;
+    d.timestamp_ns    = 1'700'000'000ULL;
+    d.side            = ob::SIDE_BID;
+    d.n_levels        = 1;
+
+    {
+        ob::Engine engine(tmp.str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+        engine.open();
+        ASSERT_EQ(engine.apply_delta_replicated(d, &lvl), ob::OB_OK);
+        engine.flush_incremental();
+        engine.close();
+    }
+
+    ob::Engine engine(tmp.str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    // The same record, re-delivered after the restart - which is exactly what resuming from a
+    // position written on a ten-second timer produces.
+    ASSERT_EQ(engine.apply_delta_replicated(d, &lvl), ob::OB_OK);
+    engine.flush_incremental();
+
+    size_t rows = 0;
+    const std::string err = engine.execute(
+        "SELECT * FROM 'AFTERBOOT'.'BINANCE' WHERE timestamp BETWEEN 0 AND 9999999999999999999",
+        [&](const ob::QueryResult&) { ++rows; });
+    EXPECT_TRUE(err.empty()) << err;
+    EXPECT_EQ(rows, 1u)
+        << "the record was stored " << rows << " times across a restart: the sequence frontier did "
+        << "not survive, so dedup protects one process life and a resumed replica duplicates every "
+        << "record its saved position lagged behind";
+    engine.close();
+}

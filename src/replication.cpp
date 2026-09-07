@@ -2175,7 +2175,7 @@ void ReplicationClient::receive_and_replay() {
                     if (sizeof(DeltaUpdate) + levels_bytes <= payload_len) {
                         const auto* levels = reinterpret_cast<const Level*>(
                             payload + sizeof(DeltaUpdate));
-                        engine_.apply_delta(delta, levels);
+                        engine_.apply_delta_replicated(delta, levels);
                     }
                 }
 
@@ -2311,7 +2311,7 @@ void ReplicationClient::receive_and_replay() {
                         payload + sizeof(DeltaUpdate));
 
                     // Replay via Engine::apply_delta() (Requirement 2.1).
-                    engine_.apply_delta(delta, levels);
+                    engine_.apply_delta_replicated(delta, levels);
                 }
             }
 

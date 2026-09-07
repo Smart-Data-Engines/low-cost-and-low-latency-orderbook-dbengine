@@ -74,6 +74,25 @@ public:
     /// Returns OB_OK on success, error code on failure.
     ob_status_t apply_delta(const DeltaUpdate& delta, const Level* levels);
 
+    /// Apply a record streamed from a primary on the replication link.
+    ///
+    /// Identical to `apply_delta()` except that a record whose sequence number this node has
+    /// already seen for that symbol is **dropped** rather than applied. Storage is append-only, so
+    /// applying a duplicate appends its rows a second time (#101, and the half of #100 that was
+    /// left unmeasured).
+    ///
+    /// A separate entry point rather than a condition inside `apply_delta()`, because the fact that
+    /// decides it is *where the record came from* and only the caller knows that. The obvious
+    /// version — drop when `sequence_number != 0`, since a client write carries zero — is false of
+    /// the embedded path: `ob_apply_delta()` takes `seq` as a caller parameter and the Python
+    /// client's `insert()` has it as a required argument, so an embedded user numbering their own
+    /// records from 1 per symbol would have had every write after the first silently dropped.
+    ///
+    /// The engine already separates apply paths by origin — this one, `apply_remote_delta()` for
+    /// the mesh, `apply_delta_replayed()` for WAL recovery — so this completes the set rather than
+    /// adding an exception to it.
+    ob_status_t apply_delta_replicated(const DeltaUpdate& delta, const Level* levels);
+
     /// Execute a SQL query.
     std::string execute(std::string_view sql, RowCallback cb);
 
@@ -464,6 +483,19 @@ private:
     /// apart from one that arrived with a snapshot. Read from `<base_dir>/wal_identity`, generated
     /// on first open. Deliberately outside every segment directory: a snapshot ships segment
     /// directories, and an identity that travelled with them would defeat its own purpose.
+    /// Whether a record already seen for this (symbol, origin) is applied again or dropped.
+    /// Named rather than a bool at the call site: `apply_delta_impl(delta, levels, true)` says
+    /// nothing about which way true goes.
+    enum class DuplicatePolicy { Apply, DropIfSeen };
+
+    /// The body shared by `apply_delta()` and `apply_delta_replicated()`. One acquisition of
+    /// `mtx_`: a wrapper that checked `has_seen()`, released the lock and delegated would leave a
+    /// window between the check and the append. Only the replication client applies on a replica
+    /// today, so nothing would use that window — which is exactly the kind of assumption that
+    /// expires.
+    ob_status_t apply_delta_impl(const DeltaUpdate& delta_in, const Level* levels,
+                                 DuplicatePolicy policy);
+
     void load_or_create_wal_identity();
     uint64_t wal_identity_{0};
 

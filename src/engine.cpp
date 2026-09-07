@@ -462,6 +462,15 @@ void Engine::stamp_sequence(DeltaUpdate& delta, uint16_t origin, const std::stri
 }
 
 ob_status_t Engine::apply_delta(const DeltaUpdate& delta_in, const Level* levels) {
+    return apply_delta_impl(delta_in, levels, DuplicatePolicy::Apply);
+}
+
+ob_status_t Engine::apply_delta_replicated(const DeltaUpdate& delta_in, const Level* levels) {
+    return apply_delta_impl(delta_in, levels, DuplicatePolicy::DropIfSeen);
+}
+
+ob_status_t Engine::apply_delta_impl(const DeltaUpdate& delta_in, const Level* levels,
+                                     DuplicatePolicy policy) {
     // Local copy, because the sequence number is stamped below and the public signature
     // takes a const reference — a caller's DeltaUpdate is not ours to modify.
     DeltaUpdate delta = delta_in;
@@ -477,6 +486,26 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta_in, const Level* levels
         OB_LOG_WARN("engine", "Rejecting write to migrated symbol: symbol_key=%s",
                     symbol_key.c_str());
         return OB_ERR_MIGRATED;
+    }
+
+    // Drop what we already applied, before the WAL append, before any state change, and before
+    // the backpressure wait — a record that is about to be discarded should not queue behind the
+    // flush thread.
+    //
+    // Catch-up over-delivers on purpose, and since #101 it over-delivers by design: a replica
+    // resuming from its saved position is handed up to ten seconds of records it already holds,
+    // because `repl_state.txt` is written on a timer while the confirmed position advances per
+    // record. Storage is append-only, so without this the restart saving would be paid for in
+    // duplicated rows. `apply_remote_delta()` has had the same guard for the mesh since the
+    // measurement in #61's wake turned 9 written rows into 25 stored ones.
+    if (policy == DuplicatePolicy::DropIfSeen && delta.sequence_number != 0 &&
+        seq_tracker_.has_seen(symbol_key, mm_config_.node_id, delta.sequence_number)) {
+        OB_LOG_DEBUG("engine",
+                     "Dropping duplicate replicated record: sym=%s origin=%u seq=%llu",
+                     symbol_key.c_str(), static_cast<unsigned>(mm_config_.node_id),
+                     static_cast<unsigned long long>(delta.sequence_number));
+        registry_.increment_counter("ob_replication_duplicates_dropped");
+        return OB_OK;
     }
 
     // Backpressure: wait until pending queue has room.

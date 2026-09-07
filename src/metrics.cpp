@@ -113,6 +113,10 @@ MetricsRegistry::MetricsRegistry() {
     // over-delivery is being handled. The registry logs an ERROR for every such write; that log
     // line is how this was found.
     counters_.push_back(make_counter("ob_mm_duplicates_dropped",   "Remote records refused because this node had already applied them"));
+    // Separate from ob_mm_duplicates_dropped rather than shared with it: two links
+    // over-deliver for different reasons, and one counter cannot say which one is doing it.
+    counters_.push_back(make_counter("ob_replication_duplicates_dropped",
+                                     "Replicated records refused because this node had already applied them"));
     counters_.push_back(make_counter("ob_sequence_gaps_detected",  "Gaps detected in an origin's sequence numbering"));
     gauges_.push_back(make_gauge("ob_mm_replication_lag_bytes",    "Replication lag in bytes (max across peers)"));
     counters_.push_back(make_counter("ob_mm_anti_entropy_runs_total",    "Total number of anti-entropy runs"));
