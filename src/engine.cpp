@@ -97,6 +97,12 @@ void Engine::open() {
     // Which WAL these segments' positions refer to. Before the replay, which needs it.
     load_or_create_wal_identity();
 
+    // What the replication manager announces to a replica asking `STREAMID?` (#101). Set here
+    // rather than at each `make_unique<ReplicationManager>` site, so the one inside
+    // `promote_to_primary()` gets it too - and set as a value rather than reached through
+    // `engine_`, which the read loop would have to take `mtx_` to consult.
+    repl_config_.wal_identity = wal_identity_;
+
     // What this node holds, from the last vector it wrote down. Before the tail replay, so
     // the tail can only raise it.
     restore_version_vector();

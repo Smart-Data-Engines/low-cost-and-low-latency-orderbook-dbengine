@@ -41,6 +41,15 @@ struct ReplicationConfig {
     /// ticket. If anything ever renders this struct, the secret moves out of it.
     SecretStore cluster_secret;
 
+    /// Identity of the WAL this node streams, announced in answer to `STREAMID?` (#101).
+    ///
+    /// Copied in by the engine rather than reached through `engine_`, which is null in most unit
+    /// tests and would need `mtx_` taken from the read loop to consult. **0 means "unknown"**, and
+    /// a manager holding 0 answers nothing at all - which is exactly how a pre-#101 primary
+    /// behaves, so the replica's mixed-version path is the one already written. A real engine
+    /// always has a non-zero one: `load_or_create_wal_identity()` forces 1 when the draw is 0.
+    uint64_t wal_identity{0};
+
     /// TLS for accepted replica connections (#30 part three, series D). Null = plaintext.
     ///
     /// A `node_server` context: it presents this node's certificate and **requires** one from the
@@ -702,6 +711,14 @@ private:
     std::atomic<uint64_t> records_replayed_{0};
     std::atomic<uint64_t> local_epoch_{0};
 
+    /// Whose stream the saved position belongs to (#101). 0 = we do not know, which is what a
+    /// state file written before #101 says by having no such line at all.
+    ///
+    /// A position without this is a number that could belong to any primary. Two data directories
+    /// restored from the same backup, or one primary rebuilt from scratch at the same address,
+    /// produce byte offsets that read as valid and name different records.
+    std::atomic<uint64_t> stream_id_{0};
+
     // Snapshot bootstrap state
     std::atomic<bool> bootstrapping_{false};
     std::atomic<size_t> snapshot_bytes_received_{0};
@@ -733,6 +750,22 @@ private:
     void send_ack();
     void save_state();
     void load_state();
+
+    /// Ask the primary which stream it serves and decide what to do with what we hold (#101).
+    ///
+    /// Sent after authentication and **before** `REPLICATE`, so the question carries no position:
+    /// a primary that does not know the command answers nothing and streams nothing, which means
+    /// no record is in flight while this decides and there is no apply gate to write (design
+    /// §3.1). Either resumes from the saved position or wipes and starts from zero; throws when
+    /// the connection fails, because a broken socket is not evidence about the primary's version.
+    void resolve_stream_identity();
+
+    /// Send `REPLICATE <file> <offset> <epoch>`.
+    ///
+    /// Extracted because #101 gave the position two forms - the saved one when the stream matches,
+    /// zero when it does not - and a second `snprintf` with the same format string is how two
+    /// forms of one line drift apart.
+    void send_replicate_from(uint32_t file_index, size_t byte_offset);
 
     /// Handle snapshot bootstrap: send SNAPSHOT_REQUEST, receive files, verify, load.
     void request_and_receive_snapshot();

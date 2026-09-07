@@ -288,6 +288,15 @@ public:
     void discard_local_data_for_resync();
 
     std::pair<uint32_t, size_t> get_wal_position() const override;
+
+    /// Identity of the WAL this node writes (#101). Non-zero from the moment `open()` returns.
+    ///
+    /// No lock: written once in `open()`, before any thread that could read it exists. A replica
+    /// compares the one its primary announces against the one it saved, and a data directory
+    /// restored from scratch has a different one even at the same address - which is the case
+    /// requirement 4.3 exists for.
+    uint64_t wal_identity() const { return wal_identity_; }
+
     EpochValue get_current_epoch() const override;
     void truncate_and_rebootstrap(const EpochValue& new_epoch,
                                   const std::string& primary_address) override;
@@ -493,11 +502,6 @@ private:
     /// **Caller must hold mtx_** — it is called from inside the flush's merge block.
     void persist_version_vector_if_changed();
 
-    /// Restore the version vector from the last one recorded in the WAL.
-    /// Identity of this data directory's WAL, so a position recorded in a segment can be told
-    /// apart from one that arrived with a snapshot. Read from `<base_dir>/wal_identity`, generated
-    /// on first open. Deliberately outside every segment directory: a snapshot ships segment
-    /// directories, and an identity that travelled with them would defeat its own purpose.
     /// Whether a record already seen for this (symbol, origin) is applied again or dropped.
     /// Named rather than a bool at the call site: `apply_delta_impl(delta, levels, true)` says
     /// nothing about which way true goes.
@@ -528,6 +532,10 @@ private:
     /// starts writing records of its own.
     void discard_saved_replication_position();
 
+    /// Identity of this data directory's WAL, so a position recorded in a segment can be told
+    /// apart from one that arrived with a snapshot. Read from `<base_dir>/wal_identity`, generated
+    /// on first open. Deliberately outside every segment directory: a snapshot ships segment
+    /// directories, and an identity that travelled with them would defeat its own purpose.
     void load_or_create_wal_identity();
     uint64_t wal_identity_{0};
 

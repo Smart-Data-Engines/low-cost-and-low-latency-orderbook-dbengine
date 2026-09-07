@@ -161,10 +161,14 @@ protected:
     /// `engine` is set **before** `start()`, which is the order `Engine::open()` and the promotion
     /// path both use. Setting it afterwards is safe since the setter takes the mutex, but a test
     /// should exercise the ordering production has.
-    std::unique_ptr<ob::ReplicationManager> start_manager(ob::Engine* engine = nullptr) {
+    /// `wal_identity` defaults to 0, which is how a manager with no engine behind it answers
+    /// `STREAMID?`: not at all, exactly as a pre-#101 primary does. Tests that care pass one.
+    std::unique_ptr<ob::ReplicationManager> start_manager(ob::Engine* engine = nullptr,
+                                                          uint64_t wal_identity = 0) {
         ob::ReplicationConfig cfg;
         cfg.port = port_;
         cfg.max_replicas = 4;
+        cfg.wal_identity = wal_identity;
         auto mgr = std::make_unique<ob::ReplicationManager>(cfg, *wal_);
         if (engine != nullptr) mgr->set_engine(engine);
         mgr->start();
@@ -1563,6 +1567,21 @@ static int accept_with_timeout(int listen_fd, int timeout_ms = 5000) {
     return client_fd;
 }
 
+// Answer `STREAMID?` the way a #101 primary does, so the client goes on to send its position.
+//
+// Every mock primary needs this. Without it the client waits out its deadline, concludes it is
+// talking to a pre-#101 primary, discards what it holds and asks from zero - correct behaviour,
+// and the wrong subject for a test about anything else. The one test that *is* about that has no
+// call to this.
+static void answer_stream_id(int fd, uint64_t identity, int timeout_ms = 3000) {
+    const std::string question = recv_line(fd, timeout_ms);
+    ASSERT_EQ(question.rfind("STREAMID?", 0), 0u)
+        << "the client asks which stream this is before sending its position, got: " << question;
+    const std::string answer = "STREAM " + std::to_string(identity) + "\n";
+    ASSERT_EQ(::send(fd, answer.data(), answer.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(answer.size()));
+}
+
 // Build a valid WAL wire message: "WAL <file_index> <byte_offset> <total_len>\n<WALRecord><payload>"
 // Returns the complete message bytes.
 static std::vector<uint8_t> build_wal_message(uint32_t file_index, size_t byte_offset,
@@ -1661,7 +1680,8 @@ TEST_F(ReplicationClientTest, ClientConnectsAndSendsHandshake) {
     int client_fd = accept_with_timeout(listen_fd, 5000);
     ASSERT_GE(client_fd, 0) << "Client should connect to mock primary";
 
-    // 5. Read the REPLICATE handshake.
+    // 5. Answer which stream this is, then read the REPLICATE handshake (#101).
+    answer_stream_id(client_fd, 0x51DULL);
     std::string handshake = recv_line(client_fd, 3000);
     EXPECT_TRUE(handshake.rfind("REPLICATE 0 0", 0) == 0)
         << "Client should send REPLICATE 0 0 handshake, got: " << handshake;
@@ -1922,6 +1942,9 @@ namespace {
 struct SnapshotBootstrapOutcome {
     bool first_file_installed{false};
     bool second_file_installed{false};
+    /// `repl_state.txt` as it stands once the install is done, read before `stop()` so it is the
+    /// install's own write rather than the one on the way out (#101 requirement 4.4).
+    std::string saved_state;
 };
 
 SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t port,
@@ -1945,6 +1968,7 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
     const int peer_fd = accept_with_timeout(listen_fd, 5000);
     if (peer_fd < 0) { client.stop(); ::close(listen_fd); engine.close(); return out; }
 
+    answer_stream_id(peer_fd, 0x51DULL);
     const std::string handshake = recv_line(peer_fd, 3000);
     EXPECT_EQ(handshake.rfind("REPLICATE", 0), 0u) << "got: " << handshake;
 
@@ -1963,8 +1987,12 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
                static_cast<ssize_t>(text.size());
     };
 
+    // A non-zero WAL position, deliberately: a snapshot taken at 0 0 is indistinguishable from
+    // the zeros a wipe writes, so an assertion about where the bootstrap left the replica would
+    // hold for the wrong reason (#101 requirement 4.4).
     char begin[128];
-    std::snprintf(begin, sizeof(begin), "SNAPSHOT_BEGIN %zu 0 0 2\n", a_body.size() + b_body.size());
+    std::snprintf(begin, sizeof(begin), "SNAPSHOT_BEGIN %zu 3 4096 2\n",
+                  a_body.size() + b_body.size());
     EXPECT_TRUE(send_str(begin));
 
     char header[256];
@@ -1998,8 +2026,8 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
     // is what the control test caught: a bare `SNAPSHOT_END` fails `sscanf` and the bootstrap is
     // abandoned for a reason that has nothing to do with what the test is about.
     ob::SnapshotManifest expected;
-    expected.wal_file_index  = 0;
-    expected.wal_byte_offset = 0;
+    expected.wal_file_index  = 3;
+    expected.wal_byte_offset = 4096;
     expected.total_bytes     = a_body.size() + b_body.size();
     expected.files.push_back(ob::SnapshotFileEntry{"SNAPA/EXCH/seg/a.col", a_body.size(), a_crc});
     expected.files.push_back(ob::SnapshotFileEntry{"SNAPB/EXCH/seg/b.col", b_body.size(), b_crc});
@@ -2015,6 +2043,11 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
 
     out.first_file_installed  = std::filesystem::exists(dir + "/SNAPA/EXCH/seg/a.col");
     out.second_file_installed = std::filesystem::exists(dir + "/SNAPB/EXCH/seg/b.col");
+    {
+        std::ifstream in(cfg.state_file);
+        out.saved_state.assign(std::istreambuf_iterator<char>(in),
+                               std::istreambuf_iterator<char>());
+    }
 
     client.stop();
     ::close(peer_fd);
@@ -2072,9 +2105,10 @@ TEST_F(ReplicationClientTest, ClientReceivesAndReplaysWalRecord) {
     ob::ReplicationClient client(cfg, engine);
     client.start();
 
-    // 4. Accept connection and read handshake.
+    // 4. Accept connection, name the stream (#101) and read the handshake.
     int client_fd = accept_with_timeout(listen_fd, 5000);
     ASSERT_GE(client_fd, 0);
+    answer_stream_id(client_fd, 0x51DULL);
     std::string handshake = recv_line(client_fd, 3000);
     EXPECT_TRUE(handshake.rfind("REPLICATE", 0) == 0);
 
@@ -2134,9 +2168,10 @@ TEST_F(ReplicationClientTest, ClientRejectsBadCrc) {
     ob::ReplicationClient client(cfg, engine);
     client.start();
 
-    // 4. Accept connection and read handshake.
+    // 4. Accept connection, name the stream (#101) and read the handshake.
     int client_fd = accept_with_timeout(listen_fd, 5000);
     ASSERT_GE(client_fd, 0);
+    answer_stream_id(client_fd, 0x51DULL);
     std::string handshake = recv_line(client_fd, 3000);
     EXPECT_TRUE(handshake.rfind("REPLICATE", 0) == 0);
 
@@ -2985,6 +3020,7 @@ TEST_F(ReplicationClientTest, ARecordDeliveredTwiceIsAppliedOnce) {
 
     int client_fd = accept_with_timeout(listen_fd, 5000);
     ASSERT_GE(client_fd, 0);
+    answer_stream_id(client_fd, 0x51DULL);
     const std::string handshake = recv_line(client_fd, 3000);
     ASSERT_TRUE(handshake.rfind("REPLICATE", 0) == 0) << "got: " << handshake;
 
@@ -3230,6 +3266,7 @@ TEST_F(ReplicationClientTest, AClientStoppedByThePromotionDoesNotRecreateThePosi
     int client_fd = accept_with_timeout(listen_fd, 5000);
     ASSERT_GE(client_fd, 0) << "the replication client never connected, so nothing here could have "
                                "rewritten the position file";
+    answer_stream_id(client_fd, 0x51DULL);
     ASSERT_TRUE(recv_line(client_fd, 3000).rfind("REPLICATE", 0) == 0);
 
     engine.promote_to_primary(ob::EpochValue{9});
@@ -3358,4 +3395,359 @@ TEST(ReplicationDedup, EveryPathThatDiscardsTheStoreAlsoDiscardsTheFrontier) {
         << "these functions discard the store and keep the sequence frontier that describes it, so "
         << "the records replayed afterwards are dropped as duplicates and the store stays short: "
         << joined;
+}
+
+// ── #101 group 4: whose stream is this ───────────────────────────────────────────────────────────
+//
+// A saved position is a pair of numbers, and numbers do not say which WAL they index. Two data
+// directories restored from the same backup, or one primary rebuilt from scratch at the same
+// address, hand out offsets that read as valid and name different records. So the primary
+// announces an identity, the replica saves it next to the position, and a mismatch means start
+// over. The address is deliberately not the identity, and the tests below keep it constant to say
+// so (requirement 4.3).
+
+namespace {
+
+/// One flushed row, so a wipe has something to take. `apply_delta_replicated` rather than
+/// `apply_delta`: the sequence number comes from the primary on this path, which is the entry
+/// point a replica actually uses.
+void insert_one_replicated_row(ob::Engine& engine, const char* symbol, uint64_t seq) {
+    ob::Level lvl{};
+    lvl.price = 42'000; lvl.qty = 3; lvl.cnt = 1; lvl._pad = 0;
+    ob::DeltaUpdate d{};
+    std::strncpy(d.symbol, symbol, sizeof(d.symbol) - 1);
+    std::strncpy(d.exchange, "BINANCE", sizeof(d.exchange) - 1);
+    d.sequence_number = seq;
+    d.timestamp_ns    = 1'700'000'000ULL + seq;
+    d.side            = ob::SIDE_BID;
+    d.n_levels        = 1;
+    ASSERT_EQ(engine.apply_delta_replicated(d, &lvl), ob::OB_OK);
+    engine.flush_incremental();
+}
+
+size_t count_rows(ob::Engine& engine, const char* symbol) {
+    size_t rows = 0;
+    const std::string q = std::string("SELECT * FROM '") + symbol +
+                          "'.'BINANCE' WHERE timestamp BETWEEN 0 AND 9999999999999999999";
+    const std::string err = engine.execute(q, [&](const ob::QueryResult&) { ++rows; });
+    // A wiped store does not hold an empty symbol, it holds no symbol - so the query refuses
+    // rather than returning nothing. That one refusal means zero rows; any other error is a
+    // failure, because "the query broke" must not read as "the store was discarded".
+    if (err.find("OB_ERR_NOT_FOUND") != std::string::npos) return 0;
+    EXPECT_TRUE(err.empty()) << err;
+    return rows;
+}
+
+std::string read_whole_file(const std::string& path) {
+    std::ifstream in(path);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+}  // namespace
+
+TEST_F(ReplicationClientTest, APositionIsResumedFromWhenThePrimaryNamesTheStreamItBelongsTo) {
+    // The case this whole item exists for: a replica that restarted keeps what it holds and asks
+    // for the rest. Before #101 the restart wiped the store and re-synced from zero.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    insert_one_replicated_row(engine, "KEPT", 5);
+    ASSERT_EQ(count_rows(engine, "KEPT"), 1u);
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;
+    cfg.state_file   = tmp_->str() + "/repl_state.txt";
+
+    // What the previous run left behind: a position, and whose stream it indexes.
+    { std::ofstream out(cfg.state_file);
+      out << "file_index=2\nbyte_offset=1024\nstream_id=777\n"; }
+
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0);
+    answer_stream_id(client_fd, 777);
+
+    const std::string handshake = recv_line(client_fd, 3000);
+    EXPECT_EQ(handshake, "REPLICATE 2 1024 0")
+        << "the primary named the stream this position belongs to and the replica still asked from "
+        << "somewhere else, got: " << handshake;
+    EXPECT_EQ(count_rows(engine, "KEPT"), 1u)
+        << "the store was discarded although the position was still valid - which is the re-sync "
+        << "this item removes";
+
+    client.stop();
+
+    // The file a downgrade would read. `stop()` rewrote it, so these are the bytes on disk.
+    //
+    // The identity is an *added line*, not a change to the two that were there: a build without
+    // the `stream_id` branch ignores what it does not recognise, so it still reads file 2 at
+    // offset 1024. Had the identity been folded into either of those lines, a downgrade would read
+    // a wrong position and say nothing (requirement 6.2).
+    const std::string saved = read_whole_file(cfg.state_file);
+    EXPECT_EQ(saved, "file_index=2\nbyte_offset=1024\nstream_id=777\n") << saved;
+
+    ::close(client_fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
+TEST_F(ReplicationClientTest, ADifferentStreamAtTheSameAddressMakesTheReplicaStartOver) {
+    // Requirement 4.3, and the reason the address is not the identity: the mock primary here is at
+    // the same host and port as the one the position came from. Only the identity differs, which is
+    // what a data directory rebuilt from scratch looks like from the outside.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    insert_one_replicated_row(engine, "STALE", 5);
+    ASSERT_EQ(count_rows(engine, "STALE"), 1u);
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;
+    cfg.state_file   = tmp_->str() + "/repl_state.txt";
+    { std::ofstream out(cfg.state_file);
+      out << "file_index=2\nbyte_offset=1024\nstream_id=777\n"; }
+
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0);
+    answer_stream_id(client_fd, 778);      // one apart, and that is the whole difference
+
+    const std::string handshake = recv_line(client_fd, 3000);
+    EXPECT_EQ(handshake, "REPLICATE 0 0 0")
+        << "the replica asked to resume inside a WAL it has never seen, got: " << handshake;
+    EXPECT_EQ(count_rows(engine, "STALE"), 0u)
+        << "the replica kept rows from a stream it no longer follows, and the records the new "
+        << "primary sends will not overwrite them";
+
+    // Written before the position went out, so a crash in between leaves a file describing the
+    // empty store rather than the deleted stream's offset.
+    const std::string saved = read_whole_file(cfg.state_file);
+    EXPECT_EQ(saved, "file_index=0\nbyte_offset=0\nstream_id=778\n") << saved;
+
+    client.stop();
+    ::close(client_fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
+TEST_F(ReplicationClientTest, APositionThatNamesNoStreamIsNotResumedFrom) {
+    // A state file written before #101, byte for byte. It parses - the loop ignores lines it does
+    // not recognise - and it yields no identity, which is the answer that makes the replica start
+    // over rather than resume against a stream it cannot attribute the numbers to.
+    //
+    // On real bytes rather than against a fake that pretends to be the old format: a fake would
+    // pretend to be what I remember of it.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    insert_one_replicated_row(engine, "OLDFILE", 5);
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;
+    cfg.state_file   = tmp_->str() + "/repl_state.txt";
+    { std::ofstream out(cfg.state_file); out << "file_index=2\nbyte_offset=1024\n"; }
+
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0);
+    answer_stream_id(client_fd, 777);
+
+    const std::string handshake = recv_line(client_fd, 3000);
+    EXPECT_EQ(handshake, "REPLICATE 0 0 0") << handshake;
+    EXPECT_EQ(count_rows(engine, "OLDFILE"), 0u);
+    EXPECT_EQ(read_whole_file(cfg.state_file), "file_index=0\nbyte_offset=0\nstream_id=777\n")
+        << "the file still names no stream, so the next restart would wipe again - the upgrade "
+        << "would never take";
+
+    client.stop();
+    ::close(client_fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
+TEST_F(ReplicationClientTest, APrimaryThatNamesNoStreamMakesTheReplicaStartOver) {
+    // The mixed-version window, in the direction that costs something: this mock primary is a
+    // pre-#101 one, so `STREAMID?` lands in its "unknown message - ignore" branch and it answers
+    // nothing at all. The replica waits out its deadline, concludes it cannot attribute what it
+    // holds, and starts over. That wait is the named price of design §3.1 - and it is a delay, on
+    // one connection attempt, not a refusal.
+    //
+    // Which makes this the slowest test in the file. Deliberately not shortened by making the
+    // deadline configurable: the value under test is the one production runs with.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    insert_one_replicated_row(engine, "OLDPRIM", 5);
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;
+    cfg.state_file   = tmp_->str() + "/repl_state.txt";
+    { std::ofstream out(cfg.state_file);
+      out << "file_index=2\nbyte_offset=1024\nstream_id=777\n"; }
+
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0);
+
+    // The question arrives and goes unanswered, which is all a pre-#101 primary does with it.
+    const std::string question = recv_line(client_fd, 3000);
+    ASSERT_EQ(question.rfind("STREAMID?", 0), 0u) << question;
+
+    const std::string handshake = recv_line(client_fd, 12000);
+    EXPECT_EQ(handshake, "REPLICATE 0 0 0")
+        << "a replica that cannot tell whose stream it is asked to resume anyway, got: "
+        << handshake;
+    EXPECT_EQ(count_rows(engine, "OLDPRIM"), 0u);
+
+    client.stop();
+    ::close(client_fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
+TEST_F(ReplicationProtocolTest, ThePrimaryAnswersTheStreamQuestionAndStreamsNothing) {
+    // The primary's whole half of this: it answers and it decides nothing. Stateless, so asking
+    // twice on one connection gives the same answer twice; and it must not start streaming, or the
+    // replica would be reading records before it has decided whether to keep what it holds.
+    fill_wal(*wal_, 4, 2);
+    auto mgr = start_manager(nullptr, 0xC0FFEEULL);
+
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+
+    const char* q = "STREAMID?\n";
+    ASSERT_GT(::send(fd, q, std::strlen(q), MSG_NOSIGNAL), 0);
+    EXPECT_EQ(recv_line(fd, 3000), "STREAM 12648430");
+
+    ASSERT_GT(::send(fd, q, std::strlen(q), MSG_NOSIGNAL), 0);
+    EXPECT_EQ(recv_line(fd, 3000), "STREAM 12648430")
+        << "the second answer differs from the first, so the question changed something";
+
+    // Nothing else, and not just "no records": a `HEARTBEAT` here would be read by the replica
+    // where it expects `STREAM`, which is why this side no longer sends one to a connection that
+    // has not asked for the stream. Six seconds covers the five-second heartbeat timer.
+    const std::string quiet = recv_line(fd, 6000);
+    EXPECT_TRUE(quiet.empty())
+        << "the primary sent something to a connection that has only asked which stream this is: "
+        << quiet;
+
+    ::close(fd);
+    mgr->stop();
+}
+
+TEST_F(ReplicationProtocolTest, AReplicaThatNeverAsksWhichStreamGetsWhatItAlwaysGot) {
+    // The other compatibility direction: a pre-#101 replica sends `REPLICATE` straight away and
+    // never asks. The branch added on this side is additive, so the old exchange has to be
+    // untouched - on real bytes, because a fake old replica is a fake of what I remember.
+    const size_t bytes = fill_wal(*wal_, 4, 2);
+    ASSERT_GT(bytes, 0u);
+    auto mgr = start_manager(nullptr, 0xC0FFEEULL);
+
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+
+    const std::string first = recv_line(fd, 5000);
+    EXPECT_EQ(first.rfind("WAL ", 0), 0u)
+        << "a replica that does not know about stream identities got something other than its "
+        << "catch-up, got: " << first;
+
+    ::close(fd);
+    mgr->stop();
+}
+
+TEST_F(ReplicationClientTest, ASnapshotBootstrapRecordsWhichStreamThePositionCameFrom) {
+    // Requirement 4.4, and the case that costs the most if it is missing: a replica bootstrapped by
+    // snapshot holds a whole store and a position it did not walk to. Without the identity beside
+    // it, its very next restart cannot attribute either, wipes, and asks for the snapshot again -
+    // the loop this item exists to end, entered by the most expensive path into it.
+    //
+    // It needs no code of its own, and that is the §3.1 inversion paying for itself twice: the
+    // identity is resolved *before* the position is ever asked for, so every write of the position
+    // after that point already has it. Asserted rather than assumed - the alternative design,
+    // where the identity travels with `REPLICATE`, would leave this path saving a zero.
+    const auto out = run_snapshot_bootstrap(tmp_->str(), port_, /*splice_a_live_record=*/false);
+    ASSERT_TRUE(out.first_file_installed && out.second_file_installed)
+        << "the bootstrap did not finish, so what the state file says is about something else";
+    EXPECT_EQ(out.saved_state, "file_index=3\nbyte_offset=4096\nstream_id=1309\n")
+        << out.saved_state;
+}
+
+TEST_F(ReplicationClientTest, ARealPrimaryAnnouncesTheIdentityOfTheWalItWrites) {
+    // The seam between the engine and the manager, on real bytes. Everything else in this group
+    // hands the manager an identity directly, so nothing yet says the engine gives it its own -
+    // and dropping that one assignment is silent: every primary would answer nothing, every
+    // replica would read that as "pre-#101" and wipe on every restart, and the whole item would
+    // be undone while the suite stayed green.
+    ob::ReplicationConfig repl;
+    repl.port = port_;
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE, repl);
+    engine.open();
+    ASSERT_NE(engine.wal_identity(), 0u)
+        << "a real engine always has one - 0 is reserved for \"unknown\"";
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));   // let the manager bind
+
+    const int fd = connect_to_localhost(port_, 5000);
+    ASSERT_GE(fd, 0);
+    const char* q = "STREAMID?\n";
+    ASSERT_GT(::send(fd, q, std::strlen(q), MSG_NOSIGNAL), 0);
+
+    EXPECT_EQ(recv_line(fd, 3000), "STREAM " + std::to_string(engine.wal_identity()));
+
+    ::close(fd);
+    engine.close();
+}
+
+TEST_F(ReplicationClientTest, TheIdentitySurvivesARestartAndDiffersBetweenDataDirectories) {
+    // What requirement 4.3 rests on, and neither half was pinned anywhere. Survives a restart, or
+    // a replica would wipe every time its own primary restarts; differs between directories, or a
+    // primary rebuilt from scratch at the same address would be trusted to continue a stream it
+    // never had - two directories restored from one backup being the case that says why it is
+    // random rather than derived from the path.
+    uint64_t first = 0;
+    {
+        ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+        engine.open();
+        first = engine.wal_identity();
+        engine.close();
+    }
+    ASSERT_NE(first, 0u);
+    {
+        ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+        engine.open();
+        EXPECT_EQ(engine.wal_identity(), first)
+            << "the same data directory came back as a different stream, so every replica of it "
+            << "discards what it holds whenever this node restarts";
+        engine.close();
+    }
+
+    ReplTempDir other("identity-other");
+    ob::Engine fresh(other.str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    fresh.open();
+    EXPECT_NE(fresh.wal_identity(), first)
+        << "a directory built from scratch claims the stream the old one was serving";
+    fresh.close();
 }
