@@ -200,23 +200,41 @@ def test_the_replica_persists_the_position_of_what_it_received(cluster,
     assert os.path.exists(wal_path), f"the primary has no {wal_path}"
     wal_size = os.path.getsize(wal_path)
 
-    # Within one record: the primary may have appended a checkpoint since the replica's last ack,
-    # and the ack is sent per record rather than per byte.
-    one_record = 4096
-    assert wal_size - reported <= one_record, (
+    # The remaining difference is whatever the primary appended after the last delta - a checkpoint
+    # from its own flush loop, at most a few records. A few kilobytes of slack, against a stream
+    # that the defect left 5428 bytes behind on a 5564-byte WAL.
+    slack = 4096
+    assert wal_size - reported <= slack, (
         f"the replica reports offset {reported} in file {reported_file} while the primary's WAL is "
         f"{wal_size} bytes - it is {wal_size - reported} bytes behind its own stream, which is what "
         f"a position that does not track what arrived looks like ({line!r})")
 
-    # And the position it persists is the one it reports: the state file is what a restart reads.
+    # And what a restart would read has to move as records arrive. Asserted as *advancement* rather
+    # than as agreement with the line above, because `save_state()` runs on a ten-second timer: a
+    # state file lagging the live position by a window of writes is correct, and a state file pinned
+    # to one record's worth for ever is the defect. Comparing the two numbers directly passed here
+    # and failed in CI, where the session cluster had already written a file.
     state_path = os.path.join(replica.data_dir, "repl_state.txt")
-    deadline = time.monotonic() + patience(20)
+    deadline = time.monotonic() + patience(30)
     while time.monotonic() < deadline and not os.path.exists(state_path):
         time.sleep(0.5)
     assert os.path.exists(state_path), (
         f"the replica never wrote {state_path}; the position it holds in memory is the only copy "
         f"and a restart would replay the whole WAL")
-    saved = dict(kv.split("=", 1) for kv in open(state_path).read().split())
-    assert int(saved["byte_offset"]) >= reported - one_record, (
-        f"the state file says {saved} while STATUS said offset {reported}: what a restart reads is "
-        f"not what the replica knows")
+
+    def saved_offset() -> int:
+        parts = dict(kv.split("=", 1) for kv in open(state_path).read().split())
+        return int(parts["byte_offset"])
+
+    first_saved = saved_offset()
+    for i in range(rows):
+        primary_client.insert(symbol, exchange, "bid", [500_000 + i], [i + 1])
+    primary_client.flush()
+    assert wait_for_rows(replica.tcp_port, symbol, exchange, rows * 2) == rows * 2
+
+    deadline = time.monotonic() + patience(30)
+    while time.monotonic() < deadline and saved_offset() <= first_saved:
+        time.sleep(0.5)
+    assert saved_offset() > first_saved, (
+        f"the persisted position stayed at {first_saved} while another {rows} records arrived - "
+        f"what a restart reads is not tracking what the replica received")
