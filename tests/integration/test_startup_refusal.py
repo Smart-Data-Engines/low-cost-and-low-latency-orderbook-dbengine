@@ -93,6 +93,15 @@ def test_a_taken_client_port_is_a_refusal_not_a_crash(tmp_path) -> None:
     assert "terminate called" not in done.stderr, (
         f"the process still left through the terminate handler: {done.stderr.strip()[-400:]}"
     )
+    # The shutdown monitor has to be wound down without pretending a shutdown was asked for. Reusing
+    # `g_shutdown_requested` to stop it made this path print "Shutdown requested - the epoll loop
+    # will drain and close", which reads as an operator having sent a signal to a node that never
+    # started. A line announcing something nobody asked for is the same defect as a line announcing
+    # a guarantee the code does not give.
+    assert "Shutdown requested" not in done.stderr, (
+        "a node that never started must not report a shutdown nobody requested: "
+        f"{done.stderr.strip()[-400:]}"
+    )
 
 
 def test_a_taken_replication_port_leaves_the_same_way(tmp_path) -> None:
