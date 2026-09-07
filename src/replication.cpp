@@ -1172,6 +1172,17 @@ void ReplicationManager::handle_replica_data(int fd) {
             enqueue_and_flush(*replica_ptr, answer, static_cast<size_t>(alen));
             OB_LOG_DEBUG("repl_mgr", "answered STREAMID? for fd=%d with %" PRIu64,
                          fd, config_.wal_identity);
+            // This is the first message on this link that a peer can repeat for free and be
+            // answered every time: an `ACK` and an unknown line produce nothing, a second
+            // `REPLICATE` restarts a cursor that is bounded, and an unauthenticated peer is
+            // disconnected. `enqueue_send()` has no ceiling of its own - every other caller
+            // checks one - so a peer that asks and never reads would grow this buffer without
+            // bound. That is #69 in a new place, and the answer is the same as everywhere else
+            // here: the connection goes.
+            if (queued_bytes(*replica_ptr) > MAX_SEND_BUF_SIZE) {
+                disconnect_replica_locked(fd, "not draining its stream-identity answers");
+                return;
+            }
             continue;
         }
 

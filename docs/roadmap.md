@@ -2074,14 +2074,26 @@ decision also stops depending on which of the four callers demoted the node, whi
 that list grows: the condition is a property of the data, and a static test pins that nothing about
 the caller reaches it.
 
-**What this does not give.** The saved position is written on a ten-second timer, so a replica can
-still re-stream up to a window of writes — bounded by time rather than by the store, which is the
-whole change, but not zero. Cross-version upgrades cost one socket timeout per connection attempt
-against a primary that does not know the command. A node that held PRIMARY and accepted writes
-still discards everything, by design and without being asked whether it did:
-`promote_to_primary()` deletes the position, so there is nothing left to match. And the identity is
-random per data directory, so restoring a primary from a backup is a new stream to every replica —
-correct, and it means a restore costs every replica a full re-sync.
+**What this does not give, and the first one is the case most people will expect it to cover.**
+**A failover is still a full re-sync for every replica, and that is correct rather than
+unfinished.** Two reasons, and only the first is about bookkeeping: the identity belongs to a data
+directory, so a promoted node's WAL is a different stream and the position a replica held in the old
+primary's log indexes nothing in the new one — resuming across a promotion would need a *logical*
+position, a sequence vector rather than a byte offset. But even with one, the replica could not keep
+what it holds: the promoted node may be **behind** it (#70's election prefers the replica furthest
+ahead precisely because the losers' extra records are lost), so a replica keeping its own suffix
+would serve records the new primary does not have. Dedup makes over-delivery safe; it does not make
+a divergent suffix safe. So the wipe on a role change is the same wipe as before, now reached
+because the identity differs rather than because the function always did it — and this item buys
+the restart, not the failover.
+Then: the saved position is written on a ten-second timer, so even a restart can re-stream up to a
+window of writes — bounded by time rather than by the store, which is the whole change, but not
+zero. Cross-version upgrades cost one socket timeout per connection attempt against a primary that
+does not know the command. A node that held PRIMARY and accepted writes discards everything, by
+design and without being asked whether it did: `promote_to_primary()` deletes the position, so
+there is nothing left to match. And restoring a primary from a backup draws a new identity, so it
+costs every replica a full re-sync — correct, and worth knowing before the restore rather than
+after.
 
 - Effort: M | Impact: a restarted replica keeps its store, and the window in which it served
   incomplete reads reporting success is gone

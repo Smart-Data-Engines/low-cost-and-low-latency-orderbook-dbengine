@@ -289,6 +289,15 @@ The primary is older than this version. Every connection attempt to it waits fiv
 answer that is not coming and then re-syncs in full. Not a refusal and not data loss — a delay, for
 as long as the two versions are mixed. Upgrading the primary ends it.
 
+**A failover is still a full re-sync, and it appears above as the second line rather than as an
+omission.** The identity belongs to a data directory: a promoted node writes to its own WAL, so the
+position a replica held in the old primary's log indexes nothing in the new one. It is also the
+right answer for a reason that has nothing to do with byte offsets — the promoted node may be
+*behind* this replica, and a replica that kept its own extra records would serve rows the primary
+does not have. Expect every surviving replica to discard and re-stream after a promotion, exactly as
+before. What changed is the restart of a replica whose primary did not move, which is the common
+case and was paying the same price.
+
 ## Security
 
 **Everything is off by default, and a node nobody configured is plaintext and unauthenticated on

@@ -3652,6 +3652,48 @@ TEST_F(ReplicationProtocolTest, ThePrimaryAnswersTheStreamQuestionAndStreamsNoth
     mgr->stop();
 }
 
+TEST_F(ReplicationProtocolTest, APeerThatAsksAndNeverReadsIsDroppedRatherThanBuffered) {
+    // The cost of adding a message that produces an answer. Every other line this loop reads is
+    // either unanswered (`ACK`, anything unknown), answered once before the connection is closed
+    // (a failed `AUTH`), or answered by a bounded cursor (`REPLICATE`). `STREAMID?` is answered
+    // every time it is asked, and `enqueue_send()` has no ceiling of its own - so this is #69's
+    // shape in a new place: 10 bytes in, 29 bytes of our memory out, from anyone who can reach the
+    // port on a link with no cluster secret.
+    //
+    // The observable is the hang-up rather than a buffer size, because a buffer size is not
+    // reachable from outside. This socket asks and never reads, so the answers pile up; when the
+    // ceiling is reached the primary drops the connection and this side's `send` fails.
+    auto mgr = start_manager(nullptr, 0xC0FFEEULL);
+
+    const int fd = connect_to_localhost(port_, 5000);
+    ASSERT_GE(fd, 0);
+
+    // 16 MB of answers at 29 bytes each needs about 580k questions; the cap is comfortably past
+    // that and small enough that a *missing* ceiling fails this test by reaching it.
+    const std::string question = "STREAMID?\n";
+    std::string chunk;
+    for (int i = 0; i < 4096; ++i) chunk += question;
+
+    bool hung_up = false;
+    size_t sent_bytes = 0;
+    for (int round = 0; round < 400 && !hung_up; ++round) {
+        size_t off = 0;
+        while (off < chunk.size()) {
+            const ssize_t n = ::send(fd, chunk.data() + off, chunk.size() - off, MSG_NOSIGNAL);
+            if (n <= 0) { hung_up = true; break; }
+            off += static_cast<size_t>(n);
+            sent_bytes += static_cast<size_t>(n);
+        }
+    }
+
+    EXPECT_TRUE(hung_up)
+        << "the primary kept answering after " << sent_bytes << " bytes of questions from a peer "
+        << "that never read one of them, so its send buffer for this connection is unbounded";
+
+    ::close(fd);
+    mgr->stop();
+}
+
 TEST_F(ReplicationProtocolTest, AReplicaThatNeverAsksWhichStreamGetsWhatItAlwaysGot) {
     // The other compatibility direction: a pre-#101 replica sends `REPLICATE` straight away and
     // never asks. The branch added on this side is additive, so the old exchange has to be
