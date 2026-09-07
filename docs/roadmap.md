@@ -2051,13 +2051,15 @@ change):
 
 | | before | after |
 |---|---|---|
-| columnar files | 2261 deleted | 252 → 252, none deleted |
+| columnar files | 2261 deleted | unchanged: 252 → 252, and 245 → 245 in the battery run |
 | replica's own WAL | ×2.00 (a full copy added) | +0 B, against a 469 930 B primary log |
 | first reply after restart | 1 row of 23 501 | 2401 of 2401 |
 | records re-streamed | the whole store | **2**, at both a 33-record and a 97-record store |
 
 That last row is the item in one line: the work after a restart is two records at either size —
-the checkpoints the primary appended while the node was down — where it used to be everything.
+the checkpoints the primary appended while the node was down — where it used to be everything. The
+file count is reported as *unchanged* rather than as a figure, because the figure moves with flush
+timing between runs and only the direction is the claim.
 
 **The fix is not "skip the wipe on a restart", and the distinction this item originally proposed was
 wrong.** The text here used to say the node has "a WAL identity (`wal_identity`) and a saved
@@ -2073,6 +2075,32 @@ the replica decides — no apply gate, no re-handshake on a busy socket, no orde
 decision also stops depending on which of the four callers demoted the node, which matters because
 that list grows: the condition is a property of the data, and a static test pins that nothing about
 the caller reaches it.
+
+Resuming also needs over-delivery to be harmless, because a saved position is written on a timer
+and a primary may re-send what a replica already applied. So the replication link drops a record
+whose `(symbol, origin, sequence)` it has already seen — **gated by the caller, not by the value**:
+the C API and the Python client pass sequence numbers of their own, so a guard keyed on "the number
+is non-zero" would have silently deduplicated embedded writes. That coupling produced this item's
+worst defect, in code this item added: the wipe cleared the store and **kept the sequence
+frontier**, so every record replayed into the empty store was dropped as a duplicate. Measured, 0
+rows where 1 was replayed, and closed as a class by a static test rather than by two fixes.
+
+**What it costs the primary's write path is five instructions, and they have addresses.** The dedup
+guard sits in a body both entry points share, so the policy argument is parked in the prologue
+(`mov %ecx,%r12d`) and tested once (`cmp $0x1,%r12d; je`) — not taken for a client write, because
+the guard's body is out of line and a client write never reaches the `has_seen()` call site. The
+function grew 504 → 551 instructions in Release, of which one 33-instruction block is that
+out-of-line body. `WALWriter::append` is identical, instruction for instruction;
+`ReplicationManager::broadcast` has the same sequence with six shifted field offsets, because
+`ReplicationConfig` grew by eight bytes. Measured with `scripts/mnemonic_diff.py`, which also showed
+why the obvious comparison is wrong here: `apply_delta` reads 503 → 3, true and silent about the
+work, because the body moved to `apply_delta_impl` and left a tail jump.
+
+One more defect of this item's own making, found by reading it back rather than by a test:
+`STREAMID?` is the first message on this link that a peer can repeat and be answered every time,
+and `enqueue_send()` has no ceiling of its own. A peer that asked and never read grew that
+connection's send buffer without bound — #69 in a new place, 10 bytes in for 29 bytes of memory
+out. It now hangs up at the same ceiling as every other sender here.
 
 **What this does not give, and the first one is the case most people will expect it to cover.**
 **A failover is still a full re-sync for every replica, and that is correct rather than
@@ -4082,7 +4110,7 @@ Measured on machine B, on the commit that carries this table, rather than carrie
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 980 | all passing, ~200 s with `ctest -j1` on machine B. `ctest -N` reports 982: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
+| C++ (GTest + RapidCheck) | 981 | all passing, ~205 s with `ctest -j1` on machine B. `ctest -N` reports 983: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
 | Python integration | 199 | passing, plus 2 skipped, on i3-7100U in ~13 min. The two skips are the Binance tests, opt-in on a live feed (`OB_BINANCE_TESTS=1`), and they are **collection-time** skips (`pytest.skip(allow_module_level=True)`) — so they are not in the 199, produce no progress character, and the suite's own report plugin says `0 skipped` while pytest says 2. This row read 190 until it was recounted; if you recompute it, count what pytest reports rather than what `--collect-only` does. **No xfails left**: #60's and #61's markers both fell with their fixes |
 
 `ctest -j1` is not a preference. The network tests bind ports, so a parallel run fails for a reason
