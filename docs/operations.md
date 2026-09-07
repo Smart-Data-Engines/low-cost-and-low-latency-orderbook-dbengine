@@ -258,15 +258,24 @@ reaching it drops the replica as above.
 ### A replica that restarted, and which stream it decided it was on
 
 Since #101 a replica keeps its store across a restart and asks the primary to continue from where
-it stopped. It says which of three things it decided, on every connection, and the line names the
+it stopped. It says which of four things it decided, on every connection, and the line names the
 reason rather than only the action:
 
 ```
-primary serves stream 7213...  the one our position belongs to - resuming from file=3 offset=1048576
+primary serves stream 7213..., the one our position belongs to - resuming from file=3 offset=1048576
 ```
 
 Nothing is re-streamed beyond what the primary appended while the node was down. This is the
 ordinary line, and its absence after a restart is the thing to look at.
+
+```
+primary serves stream 7213... and we have no position that names a stream: discarding and
+replaying from zero
+```
+
+Either this replica is new, or its `repl_state.txt` was written by a build older than #101 and so
+names no stream. Expect it exactly **once** per replica on the upgrade — the identity is saved with
+the position from then on — and once for every replica you add.
 
 ```
 primary serves stream 4471... and our position belongs to 7213... - a different WAL at the same
