@@ -154,6 +154,50 @@ def test_flush_is_idempotent(primary_client: OrderbookEngine):
     assert before == after == 1, f"row count changed on second flush: {before} -> {after}"
 
 
+def test_no_module_allocates_its_own_port() -> None:
+    """Static, over the integration modules. The fix existed and five modules did not use it.
+
+    `conftest.free_port()` remembers every port it has handed out, because binding to port 0 tells
+    you a port that was free *at that instant* and the socket is closed before the caller can use
+    it - so two calls in quick succession can return the same number. Its docstring has described
+    that failure, with the engine's exact message, since the day it was written for
+    `ClusterManager`.
+
+    Five modules kept a naive two-line copy anyway, and on 7 September 2026 one of them produced
+    the failure verbatim: `test_auth.py` handed the same ephemeral port to `--port` and
+    `--metrics-port`, the metrics server took it, the client port could not, and the node aborted -
+    reported as `node exited with -6`, which reads like a crash rather than a port conflict.
+
+    Same shape as `test_no_module_builds_its_own_server_path` above, and the same reason for being
+    a guard over the source: a module with its own copy fails somewhere else, rarely, on a loaded
+    runner.
+    """
+    # Anchored to a real call - `<name>.bind((..., 0))` as a statement - rather than to the text
+    # `.bind((` anywhere on the line. The first version flagged this test's own matcher, which is
+    # the ordinary hazard of a static test that has to describe what it forbids (the sibling guard
+    # above hit the same thing with its docstring).
+    port_zero_bind = re.compile(r"^\s*\w+\.bind\(\([^)]*,\s*0\)\)")
+    here = pathlib.Path(__file__).resolve().parent
+    offenders = []
+    for module in sorted(here.glob("test_*.py")):
+        lines = module.read_text(encoding="utf-8").splitlines()
+        for number, line in enumerate(lines, start=1):
+            if port_zero_bind.match(line):
+                offenders.append(f"{module.name}:{number}")
+    assert not offenders, (
+        "these lines allocate a port by binding to zero instead of calling conftest.free_port(), "
+        "so they can hand out a port this process has already given to a node: "
+        f"{offenders}"
+    )
+
+    # The pair: the shared allocator has to still be the thing that remembers, or this guard is
+    # forcing every module to call a function that is no better than the copies it replaced.
+    conftest = (here / "conftest.py").read_text(encoding="utf-8")
+    assert "_ports_handed_out" in conftest, (
+        "conftest.free_port() no longer tracks what it has handed out, so calling it buys nothing"
+    )
+
+
 def test_the_startup_budget_is_scaled_in_one_place() -> None:
     """Static, over `conftest.py`. A scaling rule applied by hand is applied once too few.
 
@@ -251,3 +295,4 @@ def test_no_module_builds_its_own_server_path() -> None:
         "conftest.cpp_client_binary_path(), so they ignore OB_SERVER_BINARY and will look in the "
         f"wrong build tree: {client_offenders}"
     )
+

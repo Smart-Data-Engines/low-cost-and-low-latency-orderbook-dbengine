@@ -262,7 +262,7 @@ static constexpr size_t kCatchupBatchBytes = 1024 * 1024;
 /// count both. A function rather than the sum written out at each of the four sites: the ceiling
 /// that forgets the second buffer is a ceiling that can be walked past.
 static size_t queued_bytes(const ReplicaInfo& replica) {
-    return replica.send_buf.size() + replica.catchup.pending.size();
+    return replica.send_buf.size() + replica.deferred_live.size();
 }
 
 } // anonymous namespace
@@ -535,16 +535,17 @@ void ReplicationManager::broadcast(const WALRecord& hdr, const void* payload,
 
     std::lock_guard<std::mutex> lock(mtx_);
     for (auto it = replicas_.begin(); it != replicas_.end(); ) {
-        if (!live_record_is_needed(*it, record_pos)) {
+        if (live_record_action(*it, record_pos) == LiveRecordAction::Drop) {
             OB_LOG_DEBUG("repl_mgr",
                          "not broadcasting seq=%lu at file=%u offset=%u to fd=%d: "
-                         "asked_for_stream=%d catchup_active=%d through=%u/%u - a transfer in "
-                         "progress covers this record",
+                         "asked_for_stream=%d catchup_active=%d through=%u/%u snapshot_active=%d - "
+                         "the transfer in progress covers this record",
                          static_cast<unsigned long>(hdr.sequence_number),
                          record_pos.file_index, record_pos.offset, it->fd,
                          it->asked_for_stream ? 1 : 0, it->catchup.active ? 1 : 0,
                          it->catchup.through_file,
-                         static_cast<unsigned>(it->catchup.through_offset));
+                         static_cast<unsigned>(it->catchup.through_offset),
+                         it->snapshot_transfer.active ? 1 : 0);
             ++it;
             continue;
         }
@@ -1303,16 +1304,17 @@ void ReplicationManager::handle_catchup(ReplicaInfo& replica, uint32_t from_file
     }
 
     // A second REPLICATE on the same connection restarts this: the cursor is overwritten and
-    // `pending` is dropped. That loses nothing, because the records it held are in the WAL below
-    // the new `through` and will be streamed again if the new request reaches back that far - and
-    // if it does not, that is the replica's own request rather than a record we mislaid.
+    // anything deferred is dropped. That loses nothing, because the records it held are in the WAL
+    // below the new `through` and will be streamed again if the new request reaches back that far -
+    // and if it does not, that is the replica's own request rather than a record we mislaid.
     CatchupCursor& cur = replica.catchup;
     cur.active         = true;
     cur.file           = from_file;
     cur.offset         = from_offset;
     cur.through_file   = through.file_index;
     cur.through_offset = through.offset;
-    cur.pending.clear();
+    replica.deferred_live.clear();
+    replica.deferred_live.shrink_to_fit();
     // The directive travels with the cursor rather than with this function, because "after the
     // last plain byte of the catch-up" is now a moment the cursor decides.
     cur.compress_after = replica.compress;
@@ -1348,7 +1350,8 @@ void ReplicationManager::continue_catchup(ReplicaInfo& replica) {
         // removed it and set `fd` to -1.
         if (replica.fd < 0) {
             cur.active = false;
-            cur.pending.clear();
+            replica.deferred_live.clear();
+            replica.deferred_live.shrink_to_fit();
             return;
         }
 
@@ -1418,12 +1421,20 @@ void ReplicationManager::continue_catchup(ReplicaInfo& replica) {
     }
 }
 
+void ReplicationManager::release_deferred_live(ReplicaInfo& replica) {
+    if (replica.deferred_live.empty()) return;
+    enqueue_send(replica, replica.deferred_live.data(), replica.deferred_live.size());
+    replica.deferred_live.clear();
+    replica.deferred_live.shrink_to_fit();
+}
+
 void ReplicationManager::finish_catchup(ReplicaInfo& replica) {
     CatchupCursor& cur = replica.catchup;
     cur.active = false;
 
     if (replica.fd < 0) {
-        cur.pending.clear();
+        replica.deferred_live.clear();
+        replica.deferred_live.shrink_to_fit();
         return;
     }
 
@@ -1438,14 +1449,12 @@ void ReplicationManager::finish_catchup(ReplicaInfo& replica) {
     }
     cur.compress_after = false;
 
-    if (!cur.pending.empty()) {
+    if (!replica.deferred_live.empty()) {
         OB_LOG_INFO("repl_mgr",
                     "catchup complete for fd=%d at file=%u offset=%zu; releasing %zu bytes of live "
                     "records that arrived while it streamed",
-                    replica.fd, cur.file, cur.offset, cur.pending.size());
-        enqueue_send(replica, cur.pending.data(), cur.pending.size());
-        cur.pending.clear();
-        cur.pending.shrink_to_fit();
+                    replica.fd, cur.file, cur.offset, replica.deferred_live.size());
+        release_deferred_live(replica);
     } else {
         OB_LOG_INFO("repl_mgr", "catchup complete for fd=%d at file=%u offset=%zu", replica.fd,
                     cur.file, cur.offset);
@@ -1458,37 +1467,56 @@ void ReplicationManager::finish_catchup(ReplicaInfo& replica) {
     }
 }
 
-bool ReplicationManager::live_record_is_needed(const ReplicaInfo& replica,
-                                                WalPosition record_pos) const {
+bool transfer_in_progress(const ReplicaInfo& replica) {
+    return replica.catchup.active || replica.snapshot_transfer.active;
+}
+
+LiveRecordAction live_record_action(const ReplicaInfo& replica, WalPosition record_pos) {
     // A connection that has not sent `REPLICATE` yet. The catch-up it is about to ask for ends at
     // the WAL position read when that line is processed, and that is at or past this record:
     // positions only grow and this broadcast has already happened. So the cursor will deliver it.
     // If the replica instead asks from a position *ahead* of this record, it already has it.
     // Either way the live copy is a second one (#100).
-    if (!replica.asked_for_stream) return false;
+    if (!replica.asked_for_stream) return LiveRecordAction::Drop;
 
     // A cursor still walking its range reads this record out of the WAL file itself. Only what
-    // lies at or past the end of that range needs the live path, and that is what `pending` is
-    // for. The window where this matters is one mutex hand-off wide - the handshake processed
-    // between an append and its broadcast - so it is narrow rather than absent, and the
-    // comparison costs nothing.
-    if (replica.catchup.active && wal_position_before(record_pos, replica.catchup.through())) {
-        return false;
+    // lies at or past the end of that range needs the live path. The window where the Drop matters
+    // is one mutex hand-off wide - the handshake processed between an append and its broadcast -
+    // so it is narrow rather than absent, and the comparison costs nothing.
+    if (replica.catchup.active) {
+        return wal_position_before(record_pos, replica.catchup.through())
+                   ? LiveRecordAction::Drop
+                   : LiveRecordAction::Defer;
     }
 
-    return true;
+    // A snapshot being streamed. The snapshot carries the WAL position it was taken at, so a
+    // record before that position is already inside the files this replica is installing, and a
+    // record at or past it is exactly what the replica needs next - after the last snapshot byte,
+    // never inside it (#99).
+    if (replica.snapshot_transfer.active) {
+        const auto& m = replica.snapshot_transfer.manifest;
+        const WalPosition taken_at{m.wal_file_index, static_cast<uint32_t>(m.wal_byte_offset)};
+        return wal_position_before(record_pos, taken_at) ? LiveRecordAction::Drop
+                                                         : LiveRecordAction::Defer;
+    }
+
+    return LiveRecordAction::Send;
 }
 
 void ReplicationManager::queue_to_replica(ReplicaInfo& replica, const void* data, size_t len) {
-    if (!replica.catchup.active) {
+    if (!transfer_in_progress(replica)) {
         enqueue_send(replica, data, len);
         return;
     }
-    // A live record may not overtake the history in front of it. It waits here, framed exactly as
-    // it would have been queued, and `finish_catchup()` releases it in arrival order - which is WAL
-    // order, because both happen under the engine's write lock.
+    // Bytes may not overtake the transfer in front of them. They wait here, framed exactly as they
+    // would have been queued, and whichever transfer is running releases them in arrival order -
+    // which is WAL order, because both happen under the engine's write lock.
+    //
+    // For a catch-up this is about ordering. For a snapshot it is about the stream being parseable
+    // at all: the receiver reads a `SNAPSHOT_FILE` header and then exactly as many bytes as it
+    // named, so anything inserted between the two is read as file content or as a header (#99).
     const auto* bytes = static_cast<const uint8_t*>(data);
-    replica.catchup.pending.insert(replica.catchup.pending.end(), bytes, bytes + len);
+    replica.deferred_live.insert(replica.deferred_live.end(), bytes, bytes + len);
 }
 
 bool ReplicationManager::catchup_can_progress_locked() const {
@@ -1720,6 +1748,18 @@ bool ReplicationManager::continue_snapshot_transfer(ReplicaInfo& replica) {
     enqueue_send(replica, line, static_cast<size_t>(line_len));
 
     st.active = false;
+
+    // Anything that arrived while the snapshot streamed goes out now, after its last byte. The
+    // snapshot carries the WAL position it was taken at, so what waited is what this replica needs
+    // next - and putting it here rather than inside the stream is the whole of #99.
+    if (!replica.deferred_live.empty()) {
+        OB_LOG_INFO("repl_mgr",
+                    "snapshot transfer complete for fd=%d at wal file=%u offset=%zu; releasing %zu "
+                    "bytes of live records that arrived while it streamed",
+                    replica.fd, st.manifest.wal_file_index, st.manifest.wal_byte_offset,
+                    replica.deferred_live.size());
+        release_deferred_live(replica);
+    }
     return true;
 }
 
@@ -2394,6 +2434,9 @@ void ReplicationClient::request_and_receive_snapshot() {
     // Send SNAPSHOT_REQUEST.
     const char* req = "SNAPSHOT_REQUEST\n";
     if (!blocking_send_all(fd_, tls_.get(), req, std::strlen(req))) {
+        OB_LOG_WARN("repl_client",
+                    "snapshot bootstrap abandoned: could not send SNAPSHOT_REQUEST on fd=%d: %s",
+                    fd_.load(std::memory_order_relaxed), std::strerror(errno));
         bootstrapping_.store(false, std::memory_order_release);
         return;
     }
@@ -2402,12 +2445,17 @@ void ReplicationClient::request_and_receive_snapshot() {
     char line_buf[512];
     ssize_t n = reader_.read_line(line_buf, sizeof(line_buf));
     if (n <= 0) {
+        OB_LOG_WARN("repl_client",
+                    "snapshot bootstrap abandoned: no SNAPSHOT_BEGIN from the primary "
+                    "(read_line returned %zd)", n);
         bootstrapping_.store(false, std::memory_order_release);
         return;
     }
 
     // Check for error.
     if (std::strncmp(line_buf, "ERR ", 4) == 0) {
+        OB_LOG_WARN("repl_client", "snapshot bootstrap refused by the primary: %s",
+                    sanitise_for_log(line_buf, 200).c_str());
         bootstrapping_.store(false, std::memory_order_release);
         return;
     }
@@ -2419,6 +2467,9 @@ void ReplicationClient::request_and_receive_snapshot() {
 
     if (std::sscanf(line_buf, "SNAPSHOT_BEGIN %zu %u %zu %zu",
                     &total_bytes, &snap_wal_fi, &snap_wal_off, &file_count) != 4) {
+        OB_LOG_WARN("repl_client",
+                    "snapshot bootstrap abandoned: expected SNAPSHOT_BEGIN, got '%s'",
+                    sanitise_for_log(line_buf, 200).c_str());
         bootstrapping_.store(false, std::memory_order_release);
         return;
     }
@@ -2440,6 +2491,10 @@ void ReplicationClient::request_and_receive_snapshot() {
         // Read SNAPSHOT_FILE header.
         n = reader_.read_line(line_buf, sizeof(line_buf));
         if (n <= 0) {
+            OB_LOG_WARN("repl_client",
+                        "snapshot bootstrap abandoned after %zu of %zu file(s): the stream ended "
+                        "where a SNAPSHOT_FILE header was expected (read_line returned %zd)",
+                        i, file_count, n);
             cleanup_staging(staging_dir);
             bootstrapping_.store(false, std::memory_order_release);
             return;
@@ -2451,6 +2506,14 @@ void ReplicationClient::request_and_receive_snapshot() {
 
         if (std::sscanf(line_buf, "SNAPSHOT_FILE %255s %zu %u",
                         rel_path, &file_size, &file_crc) != 3) {
+            // This is where #99 landed: a live `WAL ...` record broadcast into a snapshot stream
+            // arrives here, where a `SNAPSHOT_FILE` header belongs, and the bootstrap is abandoned
+            // with nothing installed. Saying which line arrived is the difference between an
+            // operator seeing a protocol bug and seeing a replica that silently has no data.
+            OB_LOG_ERROR("repl_client",
+                         "snapshot bootstrap abandoned after %zu of %zu file(s): expected a "
+                         "SNAPSHOT_FILE header, got '%s'",
+                         i, file_count, sanitise_for_log(line_buf, 200).c_str());
             cleanup_staging(staging_dir);
             bootstrapping_.store(false, std::memory_order_release);
             return;
@@ -2556,6 +2619,10 @@ void ReplicationClient::request_and_receive_snapshot() {
     // Read SNAPSHOT_END.
     n = reader_.read_line(line_buf, sizeof(line_buf));
     if (n <= 0) {
+        OB_LOG_WARN("repl_client",
+                    "snapshot bootstrap abandoned after %zu file(s): the stream ended where "
+                    "SNAPSHOT_END was expected (read_line returned %zd)",
+                    manifest.files.size(), n);
         cleanup_staging(staging_dir);
         bootstrapping_.store(false, std::memory_order_release);
         return;
@@ -2563,6 +2630,10 @@ void ReplicationClient::request_and_receive_snapshot() {
 
     uint32_t manifest_crc = 0;
     if (std::sscanf(line_buf, "SNAPSHOT_END %u", &manifest_crc) != 1) {
+        OB_LOG_WARN("repl_client",
+                    "snapshot bootstrap abandoned after %zu file(s): expected SNAPSHOT_END, got "
+                    "'%s'",
+                    manifest.files.size(), sanitise_for_log(line_buf, 200).c_str());
         cleanup_staging(staging_dir);
         bootstrapping_.store(false, std::memory_order_release);
         return;
@@ -2572,6 +2643,10 @@ void ReplicationClient::request_and_receive_snapshot() {
     std::string manifest_json = manifest.to_json();
     uint32_t computed_manifest_crc = ob::crc32c(manifest_json.data(), manifest_json.size());
     if (computed_manifest_crc != manifest_crc) {
+        OB_LOG_ERROR("repl_client",
+                     "snapshot bootstrap abandoned: manifest CRC32C mismatch, primary said %u and "
+                     "the %zu file(s) received make %u",
+                     manifest_crc, manifest.files.size(), computed_manifest_crc);
         cleanup_staging(staging_dir);
         bootstrapping_.store(false, std::memory_order_release);
         return;

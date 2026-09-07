@@ -2013,7 +2013,7 @@ contract.
   catch-up twice
 
 
-### 99. A live write during a snapshot transfer is spliced into the snapshot's byte stream
+### 99. A live write during a snapshot transfer is spliced into the snapshot's byte stream ✅
 
 Named by #93 rather than fixed by it: the mechanism #93 built for the catch-up stream is the one
 this needs, but they are different streams and a fix that changes both in one commit is a fix whose
@@ -2027,19 +2027,73 @@ bytes with `read_exact()` — so a record that lands between two files makes the
 return `WAL 3 0 4888 7` where `SNAPSHOT_FILE` was expected, and the bootstrap is abandoned; a record
 that lands *inside* a file's bytes becomes file content, and the transfer fails its CRC instead.
 
-Not measured, and the distinction matters: what is established is that nothing suppresses the
-broadcast, which is a statement about the code. Whether a real bootstrap loses the race depends on
-whether the primary takes writes while it streams, and every test that bootstraps a replica today
-does it against a primary that has stopped writing — which is exactly the coincidence that hides
-this. The measurement to take first is a bootstrap under load, with the answer read off the
-replica's own bootstrap outcome rather than off a log line.
+**Measured**, which this item said had not been done. A mock primary splices one live record into
+an otherwise valid two-file snapshot stream, and the outcome is read off the replica's data
+directory rather than off a log line: **nothing is installed** — including the file that arrived
+intact before the splice, because the install happens at `SNAPSHOT_END`. The abandonment now says
+what arrived: `snapshot bootstrap abandoned after 1 of 2 file(s): expected a SNAPSHOT_FILE header,
+got 'WAL 0 4888 136'`.
 
-The answer is `queue_to_replica()` from #93 with the snapshot transfer as its second condition: live
-records wait, and are released when `SNAPSHOT_END` goes out. The snapshot already carries the WAL
-position it was taken at, so what waits is what the replica needs next anyway.
+**The control test earned its place immediately.** Its first version failed too — `SNAPSHOT_END`
+carries the CRC32C of the manifest the replica assembles from the headers it received, and the mock
+primary had sent a bare `SNAPSHOT_END`. Without a control, the spliced test would have been passing
+by not finding anything, which is the standard failure mode of a test that asserts an absence.
 
-- Effort: S | Impact: a replica cannot be bootstrapped from a primary that is taking writes, which
-  is every primary worth bootstrapping from
+**The heartbeat is the same defect with a five-second timer instead of a write, and this item did
+not name it.** That loop walks every replica with no branch on the transfer either, so any snapshot
+transfer lasting longer than five seconds is spliced with `HEARTBEAT <epoch>` **without a single
+client write**. The reason nobody had seen it: nothing in the integration battery bootstraps a
+replica by snapshot over the replication protocol at all, and the unit tests that exist cover the
+receiving side (paths, CRC) rather than the sending side.
+
+**The decision became one pure function with three answers**, in the header so the cases a socket
+cannot reach are checked directly:
+
+| answer | when |
+|---|---|
+| `Drop` | no handshake yet; inside a catch-up range; or before the snapshot's own WAL position — already inside the files being installed |
+| `Defer` | a transfer is streaming and the record is at or past its boundary |
+| `Send` | nothing in progress |
+
+`pending` moved off the catch-up cursor to `ReplicaInfo::deferred_live`, because it now holds bytes
+waiting for either transfer: one buffer, one release function, two callers.
+
+**The primary-side test is the first in this repo to drive a real `ReplicationManager` through a
+snapshot transfer**, and it is deterministic rather than raced: its socket never reads, so the
+transfer stalls with `active` still true, and `snapshot_active()` is the signal rather than a sleep.
+Two numbers had to be measured to make that work. `continue_snapshot_transfer()` backs off at half
+of `MAX_SEND_BUF_SIZE`, so at 12 symbols the **7.3 MB** snapshot streamed in one pass and the window
+never existed; 24 symbols make **14.6 MB across 208 files** and it stalls. Then the assertion about
+the deferred record failed for a reason worth recording: it used `recv_wire_records()`, which starts
+from an empty buffer and reads the socket, while the record's bytes were already in the test's own
+buffer — the "reader with a buffer of its own" mistake from the other side.
+
+**Mutations: six, all caught — two only after the suite grew a mechanism, and one of those was a
+comment of mine being untrue.**
+
+| # | mutation | caught by |
+|---|---|---|
+| 1 | the snapshot is not a transfer, so live records go into its byte stream | 2 tests |
+| 2 | the snapshot branch answers `Send` instead of `Defer` | the primary-side test |
+| 3 | the snapshot's end never releases what waited | the primary-side test |
+| 4 | the snapshot boundary comparison is inverted | 2 tests |
+| 5 | the release happens before `active` is cleared | **survived** — and correctly: the comment claiming that ordering was load-bearing was wrong, because the release goes through `enqueue_send()` directly. The comment changed, not the code |
+| 6 | the heartbeat is routed around `queue_to_replica()` | **survived**; now a structural guard — `run_loop()` may not call `enqueue_send()` or `enqueue_and_flush()` at all |
+
+**Seven silent early returns in `request_and_receive_snapshot()` now log.** A bootstrap that is
+abandoned means a replica with no data, and it could happen for seven different reasons without a
+single line — including the one #99 takes.
+
+**And the new test found a data race older than this item, which is the argument for writing it.**
+`set_engine()` stored a plain pointer while `publish_replica_gauges()` read it on the epoll thread
+under `mtx_`. Both production callers set the engine *before* `start()`, so nothing had reported it;
+the first test to set it the other way round made ThreadSanitizer say so, on this machine and
+independently in the `sanitizers (tsan)` check on the pull request. The setter takes `mtx_` now —
+every reader of `engine_` was already holding it — and the fixture sets the engine before `start()`,
+which is the order production uses.
+
+- Effort: S | Impact: a replica can be bootstrapped from a primary that is taking writes, which is
+  every primary worth bootstrapping from
 
 
 ### 98. The WAL position a replica is told is not the position of the record it is told about ✅
@@ -3708,11 +3762,12 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Two defects are open, and they lead this table rather than sitting under the capabilities.**
+**One defect is open, and it leads this table rather than sitting under the capabilities.**
 That is a correction: this paragraph used to say every remaining item was a capability or a proof.
-Neither came out of a bug report; each came out of measuring the item before it, which is the usual
-way here. #93's measurement produced #98 and #99; #98's own tests produced #100 (fixed the same
-day — ten records broadcast before a handshake, twenty received) and #101.
+It did not come out of a bug report, and neither did the three closed alongside it; each came out of
+measuring the item before it, which is the usual way here. #93's measurement produced #98 and #99;
+#98's own tests produced #100 (ten records broadcast before a handshake, twenty received) and #101.
+All but #101 are closed.
 
 Below the defects the ordering is about who we want to be able to say yes to. A reader can build the
 engine, read its tests and now deploy it from a package (#33), and still **cannot verify its
@@ -3721,7 +3776,6 @@ performance claim is the reason this repo exists.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **P1** | A live write is spliced into a snapshot transfer (#99) | S | A replica cannot be bootstrapped from a primary that is taking writes; the mechanism is #93's, the measurement is not taken yet |
 | **P1** | Reproducible comparative benchmarks (#39 part two) | L | Makes the performance claim verifiable by a reader instead of asserted; needs ClickHouse, TimescaleDB and kdb+ installed natively, which is a decision about the machine rather than code |
 | **P2** | A replica that restarts wipes its store and re-syncs from zero (#101) | M | Restart cost is proportional to the store rather than to what is missing, and the position that would avoid it is deleted on the way past |
 | **P2** | The unexplained node death behind #86's third occurrence | S | An `UNREACHABLE` that needs nothing listening, on a node whose epoll thread is merely busy; the OOM-kill hypothesis is untested and the harness should name an unexplained death |
@@ -3779,7 +3833,10 @@ Things a reviewer will notice, listed here so they do not look like oversights:
   The third item that used to be on this list — creation running on the io thread — closed with #79:
   the loop now pays 0.060-0.146 ms to hand the work to a worker, and that figure does not grow with
   the store, where creation does. One request at a time, so a second peer arriving mid-creation is
-  told `busy` rather than queued.
+  told `busy` rather than queued. And **nothing in the integration battery bootstraps a replica by
+  snapshot over the replication protocol** — the coverage is unit-level on both halves now (#99
+  added the sending side), which is why a live record and a heartbeat could both be spliced into
+  that stream for as long as they were.
 - **Benchmark baselines were recorded on one developer machine** with no hardware description. The
   table below fixes that going forward. Any published number needs its hardware next to it.
 - **A subscriber that stops reading is disconnected, not throttled** (#45). Each subscription has an
@@ -3860,7 +3917,7 @@ Measured on machine B, on the commit that carries this table, rather than carrie
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 955 | all passing, ~190 s with `ctest -j1` on machine B. `ctest -N` reports 957: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
+| C++ (GTest + RapidCheck) | 960 | all passing, ~195 s with `ctest -j1` on machine B. `ctest -N` reports 962: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
 | Python integration | 190 | passing, plus 2 skipped. The two skips are the Binance tests, which are opt-in on a live feed (`OB_BINANCE_TESTS=1`). **No xfails left**: #60's and #61's markers both fell with their fixes |
 
 `ctest -j1` is not a preference. The network tests bind ports, so a parallel run fails for a reason

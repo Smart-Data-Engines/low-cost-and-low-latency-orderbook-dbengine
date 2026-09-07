@@ -22,7 +22,8 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import ClusterManager, cpp_client_binary_path, patience, server_binary_path
+from conftest import (ClusterManager, cpp_client_binary_path, free_port, patience,
+                      server_binary_path)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 from orderbook_engine import OrderbookEngine, OrderbookError  # noqa: E402
@@ -33,12 +34,6 @@ SERVER = server_binary_path()
 
 ALICE_SECRET = "0123456789abcdef0123456789abcdef-alice"
 CLUSTER_SECRET = "fedcba9876543210fedcba9876543210-cluster"
-
-
-def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def client_response(secret: str, identity: str, nonce: str, surface: str = "client",

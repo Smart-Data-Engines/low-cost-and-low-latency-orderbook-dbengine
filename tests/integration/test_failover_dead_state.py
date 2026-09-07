@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 
 import pytest
-from conftest import server_binary_path, patience
+from conftest import free_port, server_binary_path, patience
 
 pytestmark = pytest.mark.failover
 
@@ -41,12 +41,6 @@ LEASE_TTL = 5
 # Lease expiry, then the deference window (#70), then the promotion itself. Generous on purpose:
 # the assertion is that a promotion happens at all, not that it is quick.
 PROMOTION_BUDGET = 45.0
-
-
-def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def command(port: int, text: str, settle: float = 0.4) -> str:

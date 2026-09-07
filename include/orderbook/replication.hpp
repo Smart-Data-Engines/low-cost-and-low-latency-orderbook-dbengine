@@ -116,6 +116,32 @@ struct SnapshotTransferState {
     size_t              chunk_size{262144};
 };
 
+struct ReplicaInfo;   // defined below; these two only take a reference to it
+
+/// What to do with something bound for a replica right now.
+enum class LiveRecordAction {
+    Send,    ///< Nothing is in progress: straight into the send buffer.
+    Defer,   ///< A transfer is streaming: hold the bytes until it finishes.
+    Drop,    ///< The transfer in progress already covers this record, or covered it.
+};
+
+/// Is a transfer streaming to this replica — a catch-up walking a WAL range, or a snapshot?
+///
+/// Anything queued while one is means bytes spliced into that stream. For a catch-up that is an
+/// ordering problem; for a snapshot it abandons the bootstrap, because the receiver reads a header
+/// and then exactly as many bytes as the header named.
+bool transfer_in_progress(const ReplicaInfo& replica);
+
+/// What to do with a live record at `record_pos`.
+///
+/// A pure function over the replica's transfer state, in the header and tested directly, because
+/// the cases it has to get right are not all reachable from a socket - and a mutation of an
+/// ordering helper this decision depends on survived every behavioural test once already (#100).
+///
+/// Answerable at all only since #98 gave the live path the record's own position: before that
+/// there was nothing to compare against the boundary of the transfer in progress.
+LiveRecordAction live_record_action(const ReplicaInfo& replica, WalPosition record_pos);
+
 // ── BufferedReader ────────────────────────────────────────────────────────────
 // Reads from a socket in chunks (default 4 KB) and provides line-oriented
 // access. Eliminates the byte-by-byte recv() overhead of the old read_line().
@@ -264,11 +290,6 @@ struct CatchupCursor {
     uint32_t through_file{0};
     size_t   through_offset{0};
 
-    /// Live records that arrived while this cursor was streaming, framed exactly as `broadcast()`
-    /// would have queued them - compressed too, if this replica asked for that. Appended to
-    /// `send_buf` when the cursor reaches its end.
-    std::vector<uint8_t> pending;
-
     /// Send `COMPRESS LZ4` when the cursor finishes. The catch-up stream is plain text, so the
     /// directive cannot go out before its last byte - the reason it was sent after the synchronous
     /// pass, kept as the reason it is sent from the cursor's end.
@@ -335,6 +356,18 @@ struct ReplicaInfo {
     // Per-replica catch-up state (active while a requested WAL range is being streamed).
     CatchupCursor catchup;
 
+    /// Bytes waiting for whatever transfer is in progress to finish, framed exactly as they would
+    /// have been queued - compressed too, if this replica asked for that.
+    ///
+    /// It used to live on the catch-up cursor, because a catch-up was the only transfer a live
+    /// record could overtake. A snapshot transfer is the other one, and there the consequence is
+    /// worse than an ordering problem: the receiver reads a `SNAPSHOT_FILE` header with
+    /// `read_line()` and then exactly `file_size` bytes, so a record between two files makes the
+    /// next `read_line()` return `WAL ...` where a header belongs and the bootstrap is abandoned
+    /// with nothing installed (#99, measured). Released in arrival order, which is WAL order,
+    /// because both happen under the engine's write lock.
+    std::vector<uint8_t> deferred_live;
+
     /// Has this connection sent `REPLICATE`?
     ///
     /// The record joins `replicas_` at `accept()`, which is before this connection has said what
@@ -366,7 +399,17 @@ public:
     ReplicationManager& operator=(const ReplicationManager&) = delete;
 
     /// Set the Engine pointer so the manager can call create_snapshot().
-    void set_engine(Engine* engine) { engine_ = engine; }
+    /// Hand the manager the engine it takes snapshots from and publishes gauges through.
+    ///
+    /// Takes `mtx_`, and that is not decoration: every reader of `engine_` is on the epoll thread
+    /// under this mutex (`publish_replica_gauges()` once per pass, `handle_snapshot_request()` and
+    /// `begin_snapshot_transfer()` from the data path), so a plain store here is a data race with a
+    /// running loop. Both production callers set it *before* `start()`, which is why nothing had
+    /// reported it — ThreadSanitizer did, on the first test to set it the other way round.
+    void set_engine(Engine* engine) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        engine_ = engine;
+    }
 
     /// Start the replication server (binds port, starts epoll thread).
     void start();
@@ -476,15 +519,16 @@ private:
     /// One function because the choice is a property of the replica rather than of the caller, and
     /// two callers that each decide it are two callers that can disagree - which here would put a
     /// live record in front of the history it belongs after.
-    /// Does this replica need this record from the live path, or will a transfer already in
-    /// progress deliver it?
-    ///
-    /// One question with the answer in one place, because there are three ways a replica can be
-    /// mid-transfer and `broadcast()` should not learn them separately. Answerable at all only
-    /// since #98 gave the live path the record's own position.
-    bool live_record_is_needed(const ReplicaInfo& replica, WalPosition record_pos) const;
-
     void queue_to_replica(ReplicaInfo& replica, const void* data, size_t len);
+
+    /// Move everything held in `deferred_live` into the send buffer, in arrival order.
+    ///
+    /// Two callers, one per transfer: `finish_catchup()` and the end of a snapshot transfer. Both
+    /// clear their `active` flag first, which is the honest order rather than a guarantee — this
+    /// goes through `enqueue_send()` directly, so it could not re-defer its own bytes whatever the
+    /// order. That distinction is here because the comment first written in its place claimed the
+    /// ordering was load-bearing, and a mutation that swapped it survived, which is what said so.
+    void release_deferred_live(ReplicaInfo& replica);
 
     /// Whether some replica's catch-up could queue more bytes right now. Requires `mtx_`.
     ///
