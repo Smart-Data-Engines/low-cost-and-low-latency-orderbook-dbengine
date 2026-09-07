@@ -1587,6 +1587,386 @@ TEST_F(ReplicationClientTest, ClientConnectsAndSendsHandshake) {
 
 // ── Test 12: Client receives and replays a WAL record ─────────────────────────
 // Validates: Requirements 2.1 (replay), 2.2 (CRC verification), 2.4 (ACK)
+// ── #99: the primary does not splice a live record into a snapshot ───────────────────────────
+
+TEST_F(ReplicationProtocolTest, ALiveRecordDoesNotEnterASnapshotStream) {
+    // The primary half of #99, and the first test in this repo to drive a real
+    // `ReplicationManager` through a snapshot transfer at all - the path had unit coverage for the
+    // receiving side (paths, CRC) and none for the sending side.
+    //
+    // Deterministic rather than raced: this socket never reads, so the transfer stalls with
+    // `snapshot_transfer.active` still true and the live broadcast lands inside the window for
+    // certain. `snapshot_active()` is the signal, so the test does not guess.
+    ob::Engine engine(tmp_->str() + "/engine", 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+
+    // Something to put in the snapshot: rows flushed to columnar files, across several symbols so
+    // the manifest has several entries and "between two files" is a place that exists.
+    // Above the back-off threshold on purpose. `continue_snapshot_transfer()` returns once the
+    // send buffer reaches half of `MAX_SEND_BUF_SIZE` - 8 MB - and this loopback pair absorbs about
+    // 2.6 MB (measured in #93), so a snapshot under about 10 MB is streamed in one pass and
+    // `snapshot_transfer.active` is false again before anything can look at it. Measured here: 12
+    // symbols made 7.3 MB and the transfer never stalled; 24 make about 14.6 MB and it does.
+    constexpr int kSymbols = 24;
+    constexpr int kRows    = 400;
+    std::vector<ob::Level> lv(64);
+    for (size_t l = 0; l < lv.size(); ++l) {
+        lv[l].price = static_cast<int64_t>(l) + 1;
+        lv[l].qty   = 10;
+        lv[l].cnt   = 1;
+        lv[l]._pad  = 0;
+    }
+    for (int sym = 0; sym < kSymbols; ++sym) {
+        char name[16];
+        std::snprintf(name, sizeof(name), "SNAP%02d", sym);
+        for (int i = 0; i < kRows; ++i) {
+            ob::DeltaUpdate d{};
+            std::strncpy(d.symbol, name, sizeof(d.symbol) - 1);
+            std::strncpy(d.exchange, "BINANCE", sizeof(d.exchange) - 1);
+            d.timestamp_ns = 8'000'000'000ULL + static_cast<uint64_t>(i);
+            d.side         = ob::SIDE_BID;
+            d.n_levels     = static_cast<uint16_t>(lv.size());
+            ASSERT_EQ(engine.apply_delta(d, lv.data()), ob::OB_OK);
+        }
+    }
+    engine.flush_incremental();
+
+    auto mgr = start_manager();
+    mgr->set_engine(&engine);
+
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+    ASSERT_TRUE(wait_for_registered_replicas(*mgr, 1));
+
+    const char* request = "SNAPSHOT_REQUEST\n";
+    ASSERT_GT(::send(fd, request, std::strlen(request), MSG_NOSIGNAL), 0);
+
+    // Wait for the transfer to actually be in progress. The snapshot is created on a worker
+    // thread (#79), so this is not immediate and a sleep would be a guess.
+    bool streaming = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (mgr->snapshot_active()) { streaming = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(streaming) << "the snapshot transfer never started, so this test never reached the "
+                              "window it is about";
+
+    // A live write while the snapshot streams. The position is deliberately far past anything the
+    // snapshot could have been taken at, so the decision under test is Defer rather than Drop -
+    // the Drop side is covered by `LiveRecordDecision`.
+    constexpr uint64_t kMarkerSeq = 4242;
+    ob::Level one{};
+    one.price = 1; one.qty = 1; one.cnt = 1;
+    ob::DeltaUpdate marker{};
+    std::strncpy(marker.symbol, "MARKER", sizeof(marker.symbol) - 1);
+    std::strncpy(marker.exchange, "BINANCE", sizeof(marker.exchange) - 1);
+    marker.sequence_number = kMarkerSeq;
+    marker.timestamp_ns    = 9'000'000'000ULL;
+    marker.side            = ob::SIDE_BID;
+    marker.n_levels        = 1;
+    std::vector<uint8_t> payload(sizeof(ob::DeltaUpdate) + sizeof(ob::Level));
+    std::memcpy(payload.data(), &marker, sizeof(marker));
+    std::memcpy(payload.data() + sizeof(marker), &one, sizeof(one));
+    ob::WALRecord mhdr{};
+    mhdr.sequence_number = kMarkerSeq;
+    mhdr.timestamp_ns    = marker.timestamp_ns;
+    mhdr.payload_len     = static_cast<uint16_t>(payload.size());
+    mhdr.checksum        = ob::crc32c(payload.data(), payload.size());
+    mhdr.record_type     = ob::WAL_RECORD_DELTA;
+    mgr->broadcast(mhdr, payload.data(), payload.size(), ob::WalPosition{9999, 0});
+
+    // Now read the whole stream and walk it the way the replica does: a header line, then exactly
+    // as many bytes as it named. Anything else in between is the defect.
+    struct timeval tv{};
+    tv.tv_sec  = 5;
+    tv.tv_usec = 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    std::string in;
+    char rbuf[65536];
+    const auto pull = [&]() {
+        const ssize_t n = ::recv(fd, rbuf, sizeof(rbuf), 0);
+        if (n > 0) in.append(rbuf, static_cast<size_t>(n));
+        return n > 0;
+    };
+    const auto next_line = [&]() -> std::string {
+        for (;;) {
+            const size_t nl = in.find('\n');
+            if (nl != std::string::npos) {
+                const std::string line = in.substr(0, nl);
+                in.erase(0, nl + 1);
+                return line;
+            }
+            if (!pull()) return {};
+        }
+    };
+    const auto skip_bytes = [&](size_t want) {
+        while (in.size() < want) { if (!pull()) return false; }
+        in.erase(0, want);
+        return true;
+    };
+
+    const std::string begin = next_line();
+    ASSERT_EQ(begin.rfind("SNAPSHOT_BEGIN", 0), 0u) << "got: " << begin;
+    size_t total_bytes = 0, file_count = 0;
+    unsigned snap_file = 0;
+    size_t snap_off = 0;
+    ASSERT_EQ(std::sscanf(begin.c_str(), "SNAPSHOT_BEGIN %zu %u %zu %zu", &total_bytes, &snap_file,
+                          &snap_off, &file_count), 4);
+    ASSERT_GT(file_count, 0u) << "the snapshot has no files, so nothing could have been spliced "
+                                 "into it";
+
+    for (size_t i = 0; i < file_count; ++i) {
+        const std::string header = next_line();
+        ASSERT_EQ(header.rfind("SNAPSHOT_FILE", 0), 0u)
+            << "file " << i << " of " << file_count << ": expected a SNAPSHOT_FILE header, got '"
+            << header << "' - a live record was spliced into the snapshot's byte stream (#99)";
+        char rel[256] = {};
+        size_t size = 0;
+        unsigned crc = 0;
+        ASSERT_EQ(std::sscanf(header.c_str(), "SNAPSHOT_FILE %255s %zu %u", rel, &size, &crc), 3)
+            << "got: " << header;
+        ASSERT_TRUE(skip_bytes(size)) << "the stream ended inside file " << i;
+    }
+
+    const std::string end = next_line();
+    EXPECT_EQ(end.rfind("SNAPSHOT_END", 0), 0u)
+        << "expected SNAPSHOT_END, got '" << end << "'";
+
+    // And the deferred record follows it, rather than having been dropped: the snapshot carries the
+    // position it was taken at, so a record past that position is what the replica needs next.
+    //
+    // Read through the same buffer the walk above used, not with `recv_wire_records()`. That helper
+    // starts from an empty buffer and reads the socket, and by this point the record's bytes are
+    // already in `in` - the "reader with a buffer of its own" mistake, from the other side.
+    const std::string wal_line = next_line();
+    ASSERT_EQ(wal_line.rfind("WAL ", 0), 0u)
+        << "expected the deferred live record after SNAPSHOT_END, got '" << wal_line << "'";
+    unsigned wl_file = 0, wl_epoch = 0;
+    size_t wl_offset = 0, wl_total = 0;
+    ASSERT_GE(std::sscanf(wal_line.c_str(), "WAL %u %zu %zu %u", &wl_file, &wl_offset, &wl_total,
+                          &wl_epoch), 3);
+    while (in.size() < wl_total) { ASSERT_TRUE(pull()) << "the deferred record was truncated"; }
+    uint64_t seq = 0;
+    std::memcpy(&seq, in.data(), sizeof(seq));   // WALRecord::sequence_number is first
+    EXPECT_EQ(seq, kMarkerSeq)
+        << "the record released after the snapshot is not the one that waited for it";
+
+    ::close(fd);
+    mgr->stop();
+    engine.close();
+}
+
+
+// ── #99/#100: what to do with a live record, as a contract ───────────────────────────────────
+
+TEST(LiveRecordDecision, TheAnswerIsAContractRatherThanASideEffect) {
+    // A pure function over the replica's transfer state, checked directly. Not every case here is
+    // reachable from a socket - a record appended before a cursor was created but broadcast after
+    // it needs the handshake to land between an append and its broadcast, one mutex hand-off wide -
+    // and an ordering helper this decision rests on already survived every behavioural test once
+    // (#100). So the cases are enumerated rather than provoked.
+    using ob::LiveRecordAction;
+    using ob::WalPosition;
+
+    ob::ReplicaInfo r;
+    const WalPosition somewhere{3, 100};
+
+    // Accepted, and it has not said what it wants yet. Whatever it asks for, the catch-up ends at
+    // or past this record, so the live copy would be the second one.
+    r.asked_for_stream = false;
+    EXPECT_EQ(ob::live_record_action(r, somewhere), LiveRecordAction::Drop);
+    EXPECT_FALSE(ob::transfer_in_progress(r));
+
+    // Streaming, nothing in progress: the live path is the only path.
+    r.asked_for_stream = true;
+    EXPECT_EQ(ob::live_record_action(r, somewhere), LiveRecordAction::Send);
+
+    // A catch-up walking a range. Inside it the cursor will read this record out of the WAL file
+    // itself; at or past its end, the live path is what delivers it - after the cursor's last byte.
+    r.catchup.active         = true;
+    r.catchup.through_file   = 3;
+    r.catchup.through_offset = 100;
+    EXPECT_TRUE(ob::transfer_in_progress(r));
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{3, 99}), LiveRecordAction::Drop);
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{2, 999999}), LiveRecordAction::Drop);
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{3, 100}), LiveRecordAction::Defer);
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{4, 0}), LiveRecordAction::Defer);
+    r.catchup.active = false;
+
+    // A snapshot being streamed. The snapshot carries the WAL position it was taken at: earlier
+    // records are inside the files being installed, later ones are what the replica needs next.
+    r.snapshot_transfer.active                  = true;
+    r.snapshot_transfer.manifest.wal_file_index  = 5;
+    r.snapshot_transfer.manifest.wal_byte_offset = 4096;
+    EXPECT_TRUE(ob::transfer_in_progress(r));
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{5, 4095}), LiveRecordAction::Drop);
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{4, 999999}), LiveRecordAction::Drop);
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{5, 4096}), LiveRecordAction::Defer);
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{6, 0}), LiveRecordAction::Defer);
+
+    // Never `Send` while anything is streaming: a `Send` is what splices bytes into a stream whose
+    // receiver is counting them.
+    for (const WalPosition p : {WalPosition{0, 0}, WalPosition{5, 4095}, WalPosition{5, 4096},
+                                WalPosition{9, 1}}) {
+        EXPECT_NE(ob::live_record_action(r, p), LiveRecordAction::Send)
+            << "a record at file " << p.file_index << " offset " << p.offset
+            << " would be sent into a snapshot stream";
+    }
+
+    // And a replica that has not asked is dropped whatever is in progress, because the request it
+    // makes decides where its stream starts.
+    r.asked_for_stream = false;
+    EXPECT_EQ(ob::live_record_action(r, WalPosition{6, 0}), LiveRecordAction::Drop);
+}
+
+
+// ── #99: a live record spliced into a snapshot stream ────────────────────────────────────────
+
+namespace {
+
+/// Drive a replica through a snapshot bootstrap from a mock primary, optionally splicing a live
+/// `WAL` record into the stream between the two files. Returns whether the snapshot was installed,
+/// judged by the files landing in the replica's data directory rather than by a log line.
+struct SnapshotBootstrapOutcome {
+    bool first_file_installed{false};
+    bool second_file_installed{false};
+};
+
+SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t port,
+                                                 bool splice_a_live_record) {
+    SnapshotBootstrapOutcome out;
+    const int listen_fd = create_mock_primary(port);
+    if (listen_fd < 0) return out;
+
+    ob::Engine engine(dir, 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host         = "127.0.0.1";
+    cfg.primary_port         = port;
+    cfg.state_file           = dir + "/repl_state.txt";
+    cfg.snapshot_staging_dir = dir + "/snapshot_staging";
+
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    const int peer_fd = accept_with_timeout(listen_fd, 5000);
+    if (peer_fd < 0) { client.stop(); ::close(listen_fd); engine.close(); return out; }
+
+    const std::string handshake = recv_line(peer_fd, 3000);
+    EXPECT_EQ(handshake.rfind("REPLICATE", 0), 0u) << "got: " << handshake;
+
+    const char* truncated = "ERR WAL_TRUNCATED\n";
+    EXPECT_GT(::send(peer_fd, truncated, std::strlen(truncated), MSG_NOSIGNAL), 0);
+    const std::string request = recv_line(peer_fd, 5000);
+    EXPECT_EQ(request, "SNAPSHOT_REQUEST") << "got: " << request;
+
+    const std::string a_body = "AAAAA";
+    const std::string b_body = "BBBBB";
+    const uint32_t a_crc = ob::crc32c(a_body.data(), a_body.size());
+    const uint32_t b_crc = ob::crc32c(b_body.data(), b_body.size());
+
+    const auto send_str = [&](const std::string& text) {
+        return ::send(peer_fd, text.data(), text.size(), MSG_NOSIGNAL) ==
+               static_cast<ssize_t>(text.size());
+    };
+
+    char begin[128];
+    std::snprintf(begin, sizeof(begin), "SNAPSHOT_BEGIN %zu 0 0 2\n", a_body.size() + b_body.size());
+    EXPECT_TRUE(send_str(begin));
+
+    char header[256];
+    std::snprintf(header, sizeof(header), "SNAPSHOT_FILE SNAPA/EXCH/seg/a.col %zu %u\n",
+                  a_body.size(), a_crc);
+    EXPECT_TRUE(send_str(header));
+    EXPECT_TRUE(send_str(a_body));
+
+    if (splice_a_live_record) {
+        // Exactly what `broadcast()` puts on the wire, in the place the next `SNAPSHOT_FILE`
+        // header belongs. This is the stream a primary taking writes produces today.
+        auto [payload, crc] = build_delta_payload("BTCUSD", "BINANCE", 7, 7'000'000, 0, 50000, 100);
+        ob::WALRecord hdr{};
+        hdr.sequence_number = 7;
+        hdr.timestamp_ns    = 7'000'000;
+        hdr.checksum        = crc;
+        hdr.payload_len     = static_cast<uint16_t>(payload.size());
+        hdr.record_type     = ob::WAL_RECORD_DELTA;
+        hdr._pad            = 0;
+        const auto msg = build_wal_message(0, 4888, hdr, payload.data(), payload.size());
+        EXPECT_EQ(::send(peer_fd, msg.data(), msg.size(), MSG_NOSIGNAL),
+                  static_cast<ssize_t>(msg.size()));
+    }
+
+    std::snprintf(header, sizeof(header), "SNAPSHOT_FILE SNAPB/EXCH/seg/b.col %zu %u\n",
+                  b_body.size(), b_crc);
+    EXPECT_TRUE(send_str(header));
+    EXPECT_TRUE(send_str(b_body));
+    // SNAPSHOT_END carries the CRC32C of the manifest the replica assembles from the headers it
+    // received, so the mock primary has to build the same manifest to name it. Getting this wrong
+    // is what the control test caught: a bare `SNAPSHOT_END` fails `sscanf` and the bootstrap is
+    // abandoned for a reason that has nothing to do with what the test is about.
+    ob::SnapshotManifest expected;
+    expected.wal_file_index  = 0;
+    expected.wal_byte_offset = 0;
+    expected.total_bytes     = a_body.size() + b_body.size();
+    expected.files.push_back(ob::SnapshotFileEntry{"SNAPA/EXCH/seg/a.col", a_body.size(), a_crc});
+    expected.files.push_back(ob::SnapshotFileEntry{"SNAPB/EXCH/seg/b.col", b_body.size(), b_crc});
+    const std::string manifest_json = expected.to_json();
+    char end[64];
+    std::snprintf(end, sizeof(end), "SNAPSHOT_END %u\n",
+                  ob::crc32c(manifest_json.data(), manifest_json.size()));
+    EXPECT_TRUE(send_str(end));
+
+    // Long enough for the install, and the assertion is on the filesystem rather than on a timer:
+    // a bootstrap that has not finished by now has not finished because it was abandoned.
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+
+    out.first_file_installed  = std::filesystem::exists(dir + "/SNAPA/EXCH/seg/a.col");
+    out.second_file_installed = std::filesystem::exists(dir + "/SNAPB/EXCH/seg/b.col");
+
+    client.stop();
+    ::close(peer_fd);
+    ::close(listen_fd);
+    engine.close();
+    return out;
+}
+
+} // namespace
+
+TEST_F(ReplicationClientTest, ASnapshotBootstrapInstallsWhatThePrimarySends) {
+    // The control, and it is what makes the test below a measurement rather than a tautology: this
+    // stream is the same one minus the spliced record, and it has to install.
+    const auto out = run_snapshot_bootstrap(tmp_->str(), port_, /*splice_a_live_record=*/false);
+    EXPECT_TRUE(out.first_file_installed) << "the first snapshot file was not installed";
+    EXPECT_TRUE(out.second_file_installed) << "the second snapshot file was not installed";
+}
+
+TEST_F(ReplicationClientTest, ASplicedLiveRecordAbandonsTheSnapshotBootstrap) {
+    // Measured rather than argued (#99). `broadcast()` walks every entry in `replicas_` with no
+    // branch on `snapshot_transfer.active`, so a replica being bootstrapped from a primary that is
+    // taking writes receives live `WAL ...` records interleaved into a stream of `SNAPSHOT_FILE`
+    // headers and raw file bytes. On this side `request_and_receive_snapshot()` reads a header with
+    // `read_line()` and then exactly `file_size` bytes - so a record landing between two files
+    // makes the next `read_line()` return `WAL 0 4888 ...` where `SNAPSHOT_FILE` was expected.
+    //
+    // The outcome is read off the replica's data directory, not off a log line: the bootstrap is
+    // abandoned, so nothing is installed - including the file that arrived intact before the
+    // splice, because the install happens at `SNAPSHOT_END`.
+    const auto out = run_snapshot_bootstrap(tmp_->str(), port_, /*splice_a_live_record=*/true);
+    EXPECT_FALSE(out.second_file_installed)
+        << "the bootstrap survived a record spliced into its byte stream, which would mean this "
+           "test no longer measures what #99 is about";
+    EXPECT_FALSE(out.first_file_installed)
+        << "a file arrived before the splice and was installed anyway - the install is supposed to "
+           "happen at SNAPSHOT_END, so a partial install is a second defect";
+}
+
+
 TEST_F(ReplicationClientTest, ClientReceivesAndReplaysWalRecord) {
     // 1. Start mock primary.
     int listen_fd = create_mock_primary(port_);
