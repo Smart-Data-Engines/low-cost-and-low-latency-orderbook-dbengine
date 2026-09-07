@@ -3242,3 +3242,51 @@ TEST_F(ReplicationClientTest, AClientStoppedByThePromotionDoesNotRecreateThePosi
     ::close(listen_fd);
     engine.close();
 }
+
+TEST(ReplicationDedup, DiscardingLocalDataAlsoForgetsWhatWasApplied) {
+    // Dedup and the wipe are only compatible if the wipe clears the sequence frontier too, and this
+    // is the test that says so. `discard_local_data_for_resync()` clears the buffers, the pending
+    // queue and every segment on disk - and the frontier lives in `seq_tracker_`, which is not part
+    // of any of those. Leave it standing and the replica claims to have seen records it has just
+    // deleted, so the `REPLICATE 0 0` that follows a wipe has **every** record dropped as a
+    // duplicate and the store stays empty. Silent, total data loss.
+    //
+    // Before the dedup guard this was harmless, which is why nothing here caught it: without a
+    // guard, an over-claimed frontier costs nothing. `SequenceTracker::reset()`'s own docstring
+    // names the mechanism - "a frontier from the discarded contents would survive the discard and
+    // claim records that are no longer on disk" - and the snapshot install path had been calling it
+    // for exactly that reason all along. The wipe path had not.
+    ReplTempDir tmp;
+    ob::Engine engine(tmp.str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+
+    ob::Level lvl{};
+    lvl.price = 55'555; lvl.qty = 9; lvl.cnt = 1; lvl._pad = 0;
+    ob::DeltaUpdate d{};
+    std::strncpy(d.symbol, "WIPED", sizeof(d.symbol) - 1);
+    std::strncpy(d.exchange, "BINANCE", sizeof(d.exchange) - 1);
+    d.sequence_number = 11;
+    d.timestamp_ns    = 1'700'000'000ULL;
+    d.side            = ob::SIDE_BID;
+    d.n_levels        = 1;
+
+    ASSERT_EQ(engine.apply_delta_replicated(d, &lvl), ob::OB_OK);
+    engine.flush_incremental();
+
+    engine.discard_local_data_for_resync();
+
+    // The stream replayed from zero, which is what follows a wipe.
+    ASSERT_EQ(engine.apply_delta_replicated(d, &lvl), ob::OB_OK);
+    engine.flush_incremental();
+
+    size_t rows = 0;
+    const std::string err = engine.execute(
+        "SELECT * FROM 'WIPED'.'BINANCE' WHERE timestamp BETWEEN 0 AND 9999999999999999999",
+        [&](const ob::QueryResult&) { ++rows; });
+    EXPECT_TRUE(err.empty()) << err;
+    EXPECT_EQ(rows, 1u)
+        << "the wipe kept the sequence frontier, so the record replayed into the empty store was "
+        << "dropped as a duplicate and the store holds " << rows << " rows: a replica that wipes "
+        << "would re-sync into nothing";
+    engine.close();
+}

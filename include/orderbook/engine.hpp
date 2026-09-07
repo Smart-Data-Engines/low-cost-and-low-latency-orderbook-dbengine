@@ -272,6 +272,21 @@ public:
     /// RoleTransitionHandler overrides.
     void promote_to_primary(const EpochValue& new_epoch) override;
     void demote_to_replica(const std::string& new_primary_address) override;
+
+    /// Throw away everything this node holds, so a stream can be replayed into it from zero.
+    ///
+    /// Clears the buffers and the pending queue, closes the columnar store, deletes every segment
+    /// directory on disk and reopens the store empty. The WAL files are left alone.
+    ///
+    /// **Caller must hold neither `flush_mtx_` nor `mtx_`**: this takes both, in that order
+    /// (pitfall 10), and it is called from the replication client's own thread as well as from
+    /// `demote_to_replica()`.
+    ///
+    /// It is only correct where the position this node saved is about to be discarded too. Doing
+    /// one without the other leaves a replica asking to resume from a position whose data it has
+    /// just deleted.
+    void discard_local_data_for_resync();
+
     std::pair<uint32_t, size_t> get_wal_position() const override;
     EpochValue get_current_epoch() const override;
     void truncate_and_rebootstrap(const EpochValue& new_epoch,

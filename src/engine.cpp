@@ -371,6 +371,51 @@ void Engine::restore_held_sequences() {
                 held.size(), numbers);
 }
 
+void Engine::discard_local_data_for_resync() {
+    // Lock order is flush_mtx_ → mtx_ (pitfall 10). `flush_mtx_` guards the whole block because
+    // clearing `stores_` destroys the ColumnarStore objects a concurrent Phase B may be iterating.
+    std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    OB_LOG_INFO("engine", "clearing local data: it is not a prefix of the stream to be replayed");
+
+    stores_.clear();
+    buffers_.clear();
+    pending_rows_.clear();
+
+    // And the sequence frontier, which is not part of any of the above — this is the line without
+    // which the wipe and the dedup guard are incompatible. `SequenceTracker::import_own_vector()`
+    // only ever raises a frontier, so a frontier left standing here claims records this function
+    // has just deleted: the `REPLICATE 0 0` that follows a wipe then has **every** record dropped
+    // as a duplicate and the store stays empty. Measured, before this line existed: 0 rows where 1
+    // was replayed.
+    //
+    // `load_snapshot()` has done this since snapshot bootstrap existed, for the same reason and
+    // with the reason written on `reset()` itself. Before the dedup guard an over-claimed frontier
+    // cost nothing here, which is why nothing noticed.
+    seq_tracker_.reset();
+
+    // Close and wipe the columnar store so stale rows cannot appear in a query.
+    combined_store_.close();
+
+    // Delete every columnar segment directory on disk, leaving the WAL files.
+    {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        for (auto& entry : fs::directory_iterator(base_dir_, ec)) {
+            if (entry.is_directory() && entry.path().filename().string() != "." &&
+                entry.path().filename().string() != "..") {
+                const auto name = entry.path().filename().string();
+                if (name.find("wal_") != 0) {
+                    fs::remove_all(entry.path(), ec);
+                }
+            }
+        }
+    }
+
+    combined_store_.open_existing();
+}
+
 std::string Engine::replication_state_path() const {
     return repl_client_config_.state_file;
 }
@@ -1547,54 +1592,18 @@ void Engine::demote_to_replica(const std::string& new_primary_address) {
             lock.lock();
         }
 
-        // Clear in-memory state to avoid data duplication during catchup.
-        // The ReplicationClient will replay WAL records from the primary,
-        // rebuilding the data from scratch. Without this, records that
-        // already exist locally would be duplicated.
-        OB_LOG_INFO("engine", "clearing local data before starting replication from %s",
-                    new_primary_address.c_str());
-
-        // flush_mtx_ guards this block: clearing stores_ destroys the ColumnarStore
-        // objects a concurrent Phase B may be iterating. Taken here and not at the
-        // top of the function on purpose — repl_mgr_->stop() above joins a thread
-        // that can be inside create_snapshot() waiting for this very lock, so
-        // holding it across the stop would deadlock the demotion.
-        // Lock order is flush_mtx_ → mtx_, hence the release and reacquire.
+        // Clear local state so the stream can be replayed into an empty store.
+        //
+        // The body moved to `discard_local_data_for_resync()` so the replication client can call it
+        // too: only the client knows whether the primary it reached is the stream this node was
+        // following, and that is the question that decides whether this has to happen at all
+        // (#101). `mtx_` is released across it because it takes `flush_mtx_` first (pitfall 10) —
+        // and `flush_mtx_` is deliberately not held from the top of this function, since
+        // `repl_mgr_->stop()` above joins a thread that can be inside `create_snapshot()` waiting
+        // for it.
         lock.unlock();
-        std::unique_lock<std::mutex> flush_lock(flush_mtx_);
+        discard_local_data_for_resync();
         lock.lock();
-
-        stores_.clear();
-        buffers_.clear();
-        pending_rows_.clear();
-
-        // Close and wipe columnar store to prevent stale data from appearing in queries.
-        combined_store_.close();
-
-        // Delete all columnar segment directories on disk.
-        // This is necessary because the node was previously PRIMARY with its own data,
-        // and the new primary may have different data. Catchup will rebuild everything.
-        {
-            namespace fs = std::filesystem;
-            std::error_code ec;
-            for (auto& entry : fs::directory_iterator(base_dir_, ec)) {
-                if (entry.is_directory() && entry.path().filename().string() != "." &&
-                    entry.path().filename().string() != "..") {
-                    // Skip WAL files (wal_*.bin) — only delete columnar segment dirs
-                    auto name = entry.path().filename().string();
-                    if (name.find("wal_") != 0) {
-                        fs::remove_all(entry.path(), ec);
-                    }
-                }
-            }
-        }
-
-        // Reopen empty columnar store.
-        combined_store_.open_existing();
-
-        // The store list is consistent again; release flush_mtx_ before starting the
-        // ReplicationClient so a catch-up flush does not wait on this function.
-        flush_lock.unlock();
 
         // Delete the replication state file so catch-up starts from position 0.
         //
