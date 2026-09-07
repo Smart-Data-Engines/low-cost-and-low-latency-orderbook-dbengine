@@ -23,7 +23,8 @@ import urllib.request
 from pathlib import Path
 
 import pytest
-from conftest import ClusterManager, NodeTls, patience, server_binary_path, tail_node_log
+from conftest import (ClusterManager, NodeTls, free_port, patience, server_binary_path,
+                      tail_node_log)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
@@ -35,13 +36,6 @@ pytestmark = pytest.mark.smoke
 # ---------------------------------------------------------------------------
 # Certificates
 # ---------------------------------------------------------------------------
-
-def free_port() -> int:
-    import socket as _socket
-    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
 
 def make_cluster_certs(tmp: Path, node_count: int) -> NodeTls:
     """A cluster CA and one certificate per node, the way `docs/operations.md` says to make them.

@@ -85,6 +85,44 @@ def instrumented_run() -> bool:
     return bool(os.environ.get("TSAN_OPTIONS") or os.environ.get("ASAN_OPTIONS"))
 
 
+# Every port number this process has handed out, so it is never handed out twice.
+_ports_handed_out: set = set()
+
+
+def free_port() -> int:
+    """Bind to port 0 and return the OS-assigned port, never the same one twice.
+
+    Binding to port 0 tells you a port that was free *at that instant*. The socket is closed before
+    the caller can use it, so two calls in quick succession can return the same number, and the
+    node that binds both dies with `bind() failed on port N: Address already in use`. A single
+    cluster fixture calls this six or more times back to back.
+
+    On a development machine the nodes bind fast enough to hide it. A loaded CI runner widens the
+    gap, which is how it appeared with 134 tests passing around it — and the engine was right: it
+    refused to bind and said exactly why.
+
+    **This lived as a static method on `ClusterManager` while five test modules kept a naive copy**
+    of the two-line version, and on 7 September 2026 one of them produced exactly the failure this
+    docstring describes: `test_auth.py` handed the same ephemeral port to `--port` and
+    `--metrics-port`, and the node aborted after the metrics server had already taken it. The fix
+    existing in the repo and five call sites not using it is pitfall 77's shape - so it is a module
+    function now, and `test_smoke.py` refuses a local copy.
+
+    This does not defend against something outside this process taking the port in between, which
+    is unfixable with this API. It does close the collision the suite was causing itself.
+    """
+    for _ in range(200):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        if port not in _ports_handed_out:
+            _ports_handed_out.add(port)
+            return port
+    raise RuntimeError(
+        "200 attempts and every port the OS offered had already been handed out in this "
+        "process — something is leaking ports or the ephemeral range is exhausted")
+
+
 def patience(seconds: float) -> float:
     """A timeout, tripled where a sanitizer is instrumenting the server.
 
@@ -827,35 +865,10 @@ class ClusterManager:
                 continue
         raise RuntimeError("No node with REPLICA role found")
 
-    # Every port number this process has handed out, so it is never handed out twice.
-    _ports_handed_out: set = set()
-
     @staticmethod
     def find_free_port() -> int:
-        """Bind to port 0 and return the OS-assigned port, never the same one twice.
-
-        Binding to port 0 tells you a port that was free *at that instant*. The socket is closed
-        before the caller can use it, so two calls in quick succession can return the same number,
-        and the second node to start dies with `bind() failed on port N: Address already in use`.
-        A single cluster fixture calls this six or more times back to back.
-
-        On a development machine the nodes bind fast enough to hide it. A loaded CI runner widens
-        the gap, which is how it appeared with 134 tests passing around it — the same shape as
-        pitfall 55 in CLAUDE.md, and the engine was right: it refused to bind and said exactly why.
-
-        This does not defend against something outside this process taking the port in between,
-        which is unfixable with this API. It does close the collision the suite was causing itself.
-        """
-        for _ in range(200):
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("127.0.0.1", 0))
-                port = s.getsockname()[1]
-            if port not in ClusterManager._ports_handed_out:
-                ClusterManager._ports_handed_out.add(port)
-                return port
-        raise RuntimeError(
-            "200 attempts and every port the OS offered had already been handed out in this "
-            "process — something is leaking ports or the ephemeral range is exhausted")
+        """The shared allocator. Kept as a name because this class's own callers use it."""
+        return free_port()
 
     # ── Internal ──────────────────────────────────────────────────
 

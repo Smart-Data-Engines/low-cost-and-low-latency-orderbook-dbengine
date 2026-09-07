@@ -22,17 +22,11 @@ import tempfile
 import time
 
 import pytest
-from conftest import server_binary_path
+from conftest import free_port, server_binary_path
 
 pytestmark = pytest.mark.smoke
 
 SERVER = server_binary_path()
-
-
-def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 class Node:

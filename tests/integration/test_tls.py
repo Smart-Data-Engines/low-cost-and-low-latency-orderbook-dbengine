@@ -21,19 +21,13 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import cpp_client_binary_path, patience, server_binary_path
+from conftest import cpp_client_binary_path, free_port, patience, server_binary_path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 pytestmark = pytest.mark.smoke
 
 SERVER = server_binary_path()
-
-
-def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def make_cert(tmp: Path, san: str = "IP:127.0.0.1", stem: str = "cert") -> tuple[Path, Path]:
