@@ -109,8 +109,8 @@ uint32_t WALWriter::open_current(uint32_t index) {
     return (pos >= 0) ? static_cast<uint32_t>(pos) : 0;
 }
 
-void WALWriter::write_record(const WALRecord& hdr, const void* payload,
-                              size_t payload_len, bool allow_fsync) {
+WalPosition WALWriter::write_record(const WALRecord& hdr, const void* payload,
+                                     size_t payload_len, bool allow_fsync) {
     // Combine header + payload into a single write to minimize syscalls.
     const size_t total = sizeof(WALRecord) + payload_len;
     write_buf_.resize(total);
@@ -137,6 +137,7 @@ void WALWriter::write_record(const WALRecord& hdr, const void* payload,
     // no compare-exchange is needed. On x86-64 a relaxed load and store of an aligned eight-byte
     // value are plain moves.
     WalPosition pos = position_.load(std::memory_order_relaxed);
+    const WalPosition written_at = pos;   // the first byte of the record just written
     pos.offset += static_cast<uint32_t>(total);
     position_.store(pos, std::memory_order_relaxed);
     ++pending_sync_;
@@ -145,9 +146,10 @@ void WALWriter::write_record(const WALRecord& hdr, const void* payload,
         ::fsync(fd_);
         pending_sync_ = 0;
     }
+    return written_at;
 }
 
-void WALWriter::append(const DeltaUpdate& update, const Level* levels) {
+WalPosition WALWriter::append(const DeltaUpdate& update, const Level* levels) {
     // Build payload: DeltaUpdate header (fixed part) + n_levels * sizeof(Level).
     const size_t levels_bytes = update.n_levels * sizeof(Level);
     const size_t payload_len  = sizeof(DeltaUpdate) + levels_bytes;
@@ -170,16 +172,21 @@ void WALWriter::append(const DeltaUpdate& update, const Level* levels) {
     hdr.record_type     = WAL_RECORD_DELTA;
     hdr._pad            = 0;
 
-    write_record(hdr, payload, payload_len);
+    // Captured before the rotation below, and that ordering is the whole of #98. `rotate()`
+    // publishes `{next_index, next_offset}` in one store, so after it `current_position()` is in a
+    // file this record is not in - and a caller who needs to name this record's position has no way
+    // back to it. The replication wire needs exactly that, per record.
+    const WalPosition written_at = write_record(hdr, payload, payload_len);
 
     // Auto-rotate if threshold exceeded.
     if (current_position().offset >= rotate_threshold_) {
         rotate();
     }
+    return written_at;
 }
 
-void WALWriter::write_record_v2(const WALRecordV2& hdr, const void* payload,
-                                 size_t payload_len) {
+WalPosition WALWriter::write_record_v2(const WALRecordV2& hdr, const void* payload,
+                                        size_t payload_len) {
     // Combine 38B header + payload into a single write to minimize syscalls.
     const size_t total = sizeof(WALRecordV2) + payload_len;
     write_buf_.resize(total);
@@ -204,6 +211,7 @@ void WALWriter::write_record_v2(const WALRecordV2& hdr, const void* payload,
     // no compare-exchange is needed. On x86-64 a relaxed load and store of an aligned eight-byte
     // value are plain moves.
     WalPosition pos = position_.load(std::memory_order_relaxed);
+    const WalPosition written_at = pos;   // the first byte of the record just written
     pos.offset += static_cast<uint32_t>(total);
     position_.store(pos, std::memory_order_relaxed);
     ++pending_sync_;
@@ -212,9 +220,10 @@ void WALWriter::write_record_v2(const WALRecordV2& hdr, const void* payload,
         ::fsync(fd_);
         pending_sync_ = 0;
     }
+    return written_at;
 }
 
-void WALWriter::append_with_origin(const DeltaUpdate& update, const Level* levels,
+WalPosition WALWriter::append_with_origin(const DeltaUpdate& update, const Level* levels,
                                     uint16_t origin_node_id, const HLCTimestamp& hlc) {
     // Build payload: DeltaUpdate header + n_levels * sizeof(Level).
     const size_t levels_bytes = update.n_levels * sizeof(Level);
@@ -244,12 +253,13 @@ void WALWriter::append_with_origin(const DeltaUpdate& update, const Level* level
                  static_cast<unsigned>(hlc.node_id),
                  static_cast<unsigned>(payload_len));
 
-    write_record_v2(hdr, payload, payload_len);
+    const WalPosition written_at = write_record_v2(hdr, payload, payload_len);
 
     // Auto-rotate if threshold exceeded.
     if (current_position().offset >= rotate_threshold_) {
         rotate();
     }
+    return written_at;
 }
 
 void WALWriter::set_origin_node_id(uint16_t node_id) {

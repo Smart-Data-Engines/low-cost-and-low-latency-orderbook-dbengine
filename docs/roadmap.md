@@ -1909,6 +1909,67 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 101. A replica that restarts wipes its store and re-syncs from zero
+
+Found while writing #98's integration test, which had asserted the opposite and passed anyway.
+
+`demote_to_replica()` clears `stores_`, `buffers_` and `pending_rows_`, deletes every columnar
+segment directory on disk, deletes `repl_state.txt` and then starts a `ReplicationClient` at
+position zero. The comment gives the reason, and the reason is sound for the case it names: "the
+node was previously PRIMARY with its own data, and the new primary may have different data".
+
+The case it does not name is the ordinary one. A failover-managed node restarts, its
+`FailoverManager` reads etcd, finds a primary and calls the same function — so a node that was
+already a replica of that same primary, holding exactly what that primary sent it, throws all of it
+away and streams the whole WAL again. **Measured** on a plain restart with no role change:
+`clearing local data before starting replication from 127.0.0.1:58169`, then `REPLICATE 0 0 0`, then
+43 records replayed for a store that already had 40 of them.
+
+Named, and the cost is **not measured**: for a store of a few megabytes this is a second, and the
+saved position it deletes is the thing that would make it unnecessary. What makes it worth an item
+is that the safe direction and the cheap direction are not the same here, and the distinction the
+fix needs is available: a node is in this position either because its role changed or because it
+restarted, and only the first has a reason to distrust what it holds. The second one has a WAL
+identity (`wal_identity`) and a saved position, which is exactly the pair that says "this is the
+same stream I was following".
+
+- Effort: M | Impact: replica restart time is proportional to the store rather than to what the
+  replica is missing, and the mechanism that would fix it is deleted on the way past
+
+
+### 100. A record broadcast between `accept()` and the handshake is delivered twice
+
+Measured while writing #98's tests, which is how it was found: a live-path test that broadcast
+records right after connecting saw fourteen where twelve were sent, and the two extra were not
+noise.
+
+`accept_replica()` pushes a `ReplicaInfo` into `replicas_` as soon as the socket is accepted, before
+the `REPLICATE` line has been read. `broadcast()` walks every entry in `replicas_`, so a live write
+in that window is queued to a replica that has not asked for anything yet. Then the handshake
+arrives, `handle_catchup()` fixes the cursor's end at `wal_.current_position()` — which is *past*
+those records, because the append preceded the broadcast — and the catch-up sends every one of them
+again.
+
+**Measured**: ten records broadcast between the accept and the handshake, and the stream carried
+**twenty**, in the pattern 1..10 followed by 1..10. Exactly one non-increasing step in the sequence
+numbers, which is what one clean repeat of the whole batch looks like.
+
+The answer is a **drop, not a queue**, and that is what makes this a different defect from #99
+rather than the same one twice. Every record broadcast before the handshake is necessarily inside
+the catch-up range: the append happens before the broadcast, and the range ends at the WAL position
+read when the handshake is processed. So the catch-up will deliver it, and holding a copy for later
+is what produces the second one. (A handshake that asks from a position *ahead* of such a record is
+also fine to drop: the replica already has it.) What #99 needs instead is a queue, because a
+snapshot transfer's records are not in a range anybody is about to stream.
+
+The replication path has no sequence check — `engine.cpp` says so about the multi-master path, where
+there is one — so a duplicate delta is applied twice. Whether that produces duplicate rows depends
+on flush timing, and that half is not measured.
+
+- Effort: S | Impact: a replica bootstrapping while the primary takes writes applies part of its
+  catch-up twice
+
+
 ### 99. A live write during a snapshot transfer is spliced into the snapshot's byte stream
 
 Named by #93 rather than fixed by it: the mechanism #93 built for the catch-up stream is the one
@@ -1938,7 +1999,7 @@ position it was taken at, so what waits is what the replica needs next anyway.
   is every primary worth bootstrapping from
 
 
-### 98. The WAL position a replica is told is not the position of the record it is told about
+### 98. The WAL position a replica is told is not the position of the record it is told about ✅
 
 Named by #93, and larger than the item that found it. Its own text claimed a dropped replica
 "resumes from the position it confirmed, so progress is monotonic". It does not.
@@ -1967,20 +2028,88 @@ is worse: it writes `WAL <current_file> 0 ...`, a literal zero. The replica does
   the one nothing depends on, and the field something depends on is right. That is the shape of a
   defect that survives four phases of work: it is load-bearing nowhere.
 
-The record's true position is not hard to come by: the cursor from #93 holds it (`cur.file`,
-`cur.offset`), and on the live path `wal_.current_position()` immediately after the append is the
-end of the record just written, because the append and the broadcast happen under one engine lock
-with nothing between them.
+**Both halves had to change together.** Fixing the catch-up alone makes a replica's position jump
+to 24 MB and then back to `total_len` on its first live record — worse than a field that is
+uniformly meaningless, because a position that moves backwards is one a retention gate can act on.
+The wire format did not change: the field was already there and already `uint32`/`size_t`; what
+changed is what is written into it.
 
-**Both halves have to change together**, and that is the whole design note. Fix the catch-up alone
-and a replica's position jumps to 24 MB and then back to `total_len` on its first live record —
-worse than a field that is uniformly meaningless, because a position that moves backwards is one a
-retention gate can act on. The wire format does not change: the field is already there and already
-`uint32`/`size_t`; what changes is what is written into it, and one side of the seam being right is
-not an improvement.
+**Correction to the paragraph this item used to carry.** It said the live path could take the
+position from `wal_.current_position()` immediately after the append, "because the append and the
+broadcast happen under one engine lock with nothing between them". The lock is not the problem —
+**rotation is.** `append()` checks the threshold *after* the write and `rotate()` publishes
+`{next_index, next_offset}` in one store, so for the one record per WAL file that crosses the
+threshold the current position is already in the next file while the record sits at the end of the
+previous one. Subtracting the record's length from it names a file the record is not in, and can
+underflow. So the answer is the #96 lesson applied to the WAL: **a function that writes returns
+where it wrote.** `WALWriter::append()` and `append_with_origin()` return the `WalPosition` of the
+record they wrote; `broadcast()` and `send_to_replica()` take it; the catch-up cursor passes
+`cur.position()`.
 
-- Effort: S | Impact: a replica's saved position becomes true, so a restart resumes where it stopped
-  instead of replaying a WAL file, and retention is gated on a real number
+The five internal `append_*` stay `void`. Only those two write records that travel with a position
+on them, and `append_version_vector()` can *refuse* to write, so it has no position to give — a
+returned value nobody reads is the shape this project has paid for five times (`provisional`,
+`basis`, `in_use`, `key_id`, `partition_by`). `append()` is not `[[nodiscard]]` either: forty
+callers are right to ignore the position, and what enforces the rule is that `broadcast()` cannot
+be called without one.
+
+**Measured before and after** (i3-7100U, Debug):
+
+| | before | after |
+|---|---|---|
+| catch-up across WAL files 0–6, 300 records | every record announced `file=0 offset=0` | each record announced at its own position |
+| replica's reported offset after 40 rows | **136** — one record — against a WAL of 5472 | **5472**, one record behind the primary's own file |
+| replica's `replayed` at that point | 41 | 41 |
+| position persisted to `repl_state.txt` | `byte_offset=136` | `byte_offset=5472` |
+
+**The tests assert the property rather than checking the positions against each other**, and that
+distinction is the whole of them: a column of zeroes is self-consistent. Each one reads the WAL
+file the wire named, at the offset it named, and requires the record there to be the one that was
+sent. The integration half checks the replica's offset against the size of the primary's WAL file,
+because that file is the only thing that knows how long the stream is.
+
+**Mutations: nine, all caught — but one of them only after the test suite grew a mechanism it did
+not have.**
+
+| # | mutation | caught by |
+|---|---|---|
+| 1 | `broadcast()` sends a literal zero offset again | 2 C++ tests + the integration test (`offset 136`, 5428 bytes behind) |
+| 2 | the catch-up announces `replica.confirmed_*` again | 4 C++ tests |
+| 3 | the engine derives the position as `current_position() - total_len` | **survived 951 tests**; now the static test |
+| 3b | `broadcast()` derives it internally instead of using its parameter | only `ARotatingAppendAnnouncesTheFileTheRecordWentInto` |
+| 3c | the append's return is captured but a derived value is broadcast | the static test, on two of its three assertions |
+| 4 | `write_record()` returns the record's end instead of its first byte | 2 C++ tests |
+| 5 | `append()` returns the position after the rotation | 2 C++ tests |
+| 6 | the cursor announces `through_file` instead of the file it is reading | 1 C++ test |
+| 7 | the cursor advances before announcing | 4 C++ tests |
+
+**Mutation 3 is the one worth reading.** The behavioural tests drive `ReplicationManager` directly,
+so they pin what the manager does with a position and say nothing about which position the *engine*
+chooses — and the derivation is wrong only for the record whose append rotated, which no test
+rotates, because the threshold `Engine` hardcodes is 512 MB. A behavioural test would need that
+threshold to become configurable for a test's sake. The mechanism is a static test over
+`Engine::apply_delta` instead, and for this claim it is the stronger one: the engine may not
+*compute* a position at all. Mutation 3b then shows the rotation test is not redundant — it is the
+only thing that catches a derivation made inside `broadcast()`.
+
+**The integration test's first premise was wrong, and the node's own log said so.** It asserted
+that a restarted replica resumes instead of replaying. A failover-managed replica clears its local
+data and re-syncs from zero whenever it is told its primary — **including on its own restart**:
+measured, `clearing local data before starting replication from 127.0.0.1:58169` followed by
+`REPLICATE 0 0 0`, on a plain restart of a node that was already a replica of that same primary.
+So the restart measured the wipe rather than the resume and passed for an unrelated reason. What
+replaced it asserts the position, which is the thing #98 makes true. (Whether that wipe should
+happen on a restart at all is a separate question, named as #101.)
+
+**What this does not claim.** The earlier text said a re-applied delta appends its rows a second
+time, so a `SELECT` returns each of them twice. Measured under the defect: it does not, not at that
+point — the re-applied deltas update the same price levels in the live buffer and enqueue rows that
+are only distinguishable after a flush, and `FLUSH` on a replica is refused (`ERR read-only
+replica`). Re-delivery is real and measured; the duplicate rows are a second-order consequence of
+flush timing that was asserted without being measured, and is not asserted now.
+
+- Effort: S | Impact: a replica's saved position becomes true, so a reconnect resumes where it
+  stopped instead of asking for a WAL file it already has, and retention is gated on a real number
 
 
 ### 97. One unreachable peer address stops every write on the node ✅ **P0**
@@ -3536,11 +3665,12 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Three defects are open, and they lead this table rather than sitting under the capabilities.**
+**Four defects are open, and they lead this table rather than sitting under the capabilities.**
 That is a correction: this paragraph used to say every remaining item was a capability or a proof.
-Two of the three came out of measuring #93 rather than out of a bug report, which is the usual way
-here — and the more interesting one, #98, is a field that has been wrong since the feature shipped
-and survived four phases of replication work *because nothing depends on it yet*.
+None of the four came out of a bug report; every one came out of measuring the item before it, which
+is the usual way here. #93's measurement produced #98 and #99, and #98's own tests produced #100
+(a record delivered twice, measured as ten sent and twenty received) and #101 (a replica that
+throws its store away on a restart).
 
 Below the defects the ordering is about who we want to be able to say yes to. A reader can build the
 engine, read its tests and now deploy it from a package (#33), and still **cannot verify its
@@ -3549,9 +3679,10 @@ performance claim is the reason this repo exists.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **P1** | The WAL position on the wire is not the record's position (#98) | M | Measured wrong today, and both halves have to move in one change or the position goes backwards |
 | **P1** | A live write is spliced into a snapshot transfer (#99) | S | A replica cannot be bootstrapped from a primary that is taking writes; the mechanism is #93's, the measurement is not taken yet |
+| **P1** | A record broadcast before the handshake is delivered twice (#100) | S | Measured: ten sent, twenty received. Same site as #99 and a different answer — drop rather than queue |
 | **P1** | Reproducible comparative benchmarks (#39 part two) | L | Makes the performance claim verifiable by a reader instead of asserted; needs ClickHouse, TimescaleDB and kdb+ installed natively, which is a decision about the machine rather than code |
+| **P2** | A replica that restarts wipes its store and re-syncs from zero (#101) | M | Restart cost is proportional to the store rather than to what is missing, and the position that would avoid it is deleted on the way past |
 | **P2** | The unexplained node death behind #86's third occurrence | S | An `UNREACHABLE` that needs nothing listening, on a node whose epoll thread is merely busy; the OOM-kill hypothesis is untested and the harness should name an unexplained death |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
@@ -3688,8 +3819,8 @@ Measured on machine B, on the commit that carries this table, rather than carrie
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 947 | all passing, 177 s with `ctest -j1` on machine B. `ctest -N` reports 949: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
-| Python integration | 189 | passing, plus 2 skipped, 10 min 28 s. The two skips are the Binance tests, which are opt-in on a live feed (`OB_BINANCE_TESTS=1`). **No xfails left**: #60's and #61's markers both fell with their fixes |
+| C++ (GTest + RapidCheck) | 952 | all passing, 189 s with `ctest -j1` on machine B. `ctest -N` reports 954: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
+| Python integration | 190 | passing, plus 2 skipped. The two skips are the Binance tests, which are opt-in on a live feed (`OB_BINANCE_TESTS=1`). **No xfails left**: #60's and #61's markers both fell with their fixes |
 
 `ctest -j1` is not a preference. The network tests bind ports, so a parallel run fails for a reason
 that has nothing to do with the code under test.

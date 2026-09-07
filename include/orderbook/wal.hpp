@@ -190,15 +190,27 @@ public:
     WALWriter(const WALWriter&)            = delete;
     WALWriter& operator=(const WALWriter&) = delete;
 
-    /// Append a DELTA record for the given update + levels.
+    /// Append a DELTA record for the given update + levels, and return **where it was written**.
     /// Does NOT fsync — call sync() explicitly or rely on group commit.
     /// Automatically rotates if the threshold is exceeded after the write.
-    void append(const DeltaUpdate& update, const Level* levels);
+    ///
+    /// The returned position is the first byte of this record, which is not derivable from
+    /// `current_position()` afterwards. Rotation is checked *after* the write, so for the record
+    /// that crosses the threshold the published position is already `{next_file, next_offset}`
+    /// while the record itself sits near the end of the previous file — subtracting its length
+    /// names a file it is not in, and can underflow. That was #98 on the replication wire: a
+    /// function that writes has to say where it wrote, because nobody else can work it out.
+    ///
+    /// Not `[[nodiscard]]`: most callers append without needing the position and are right to, so
+    /// the attribute would buy forty `(void)` casts. What enforces the rule is that
+    /// `ReplicationManager::broadcast()` *takes* a position, so the one caller who has to get this
+    /// right cannot proceed without one — and the only position that is correct is this one.
+    WalPosition append(const DeltaUpdate& update, const Level* levels);
 
-    /// Append a DELTA record with origin and HLC (multi-master mode).
+    /// Append a DELTA record with origin and HLC (multi-master mode), and return where it went.
     /// Writes a WALRecordV2 header (38 bytes, version=1) + payload.
-    void append_with_origin(const DeltaUpdate& update, const Level* levels,
-                            uint16_t origin_node_id, const HLCTimestamp& hlc);
+    WalPosition append_with_origin(const DeltaUpdate& update, const Level* levels,
+                                    uint16_t origin_node_id, const HLCTimestamp& hlc);
 
     /// Set the local node_id for WAL_Origin (called once at startup).
     void set_origin_node_id(uint16_t node_id);
@@ -207,6 +219,12 @@ public:
     uint16_t origin_node_id() const { return origin_node_id_; }
 
     /// Write a GAP record (called by the engine when a sequence gap is detected).
+    ///
+    /// This and the four `append_*` below stay `void` deliberately. Only `append()` and
+    /// `append_with_origin()` write records that travel record-by-record with a position on them,
+    /// so only those two have a caller that needs one. A return value nobody reads is the shape
+    /// this codebase has paid for five times over — a field that looks load-bearing and is not —
+    /// and `append_version_vector()` can *refuse* to write, so it has no position to give.
     void append_gap(uint64_t sequence_number, uint64_t timestamp_ns);
 
     /// Write a CHECKPOINT record: everything before it is durable in segments.
@@ -305,15 +323,16 @@ private:
     /// caught it at 96 observations in 4.3 million.
     uint32_t open_current(uint32_t index);
 
-    /// Write a complete record (header + payload). Does NOT fsync.
+    /// Write a complete record (header + payload) and return the position it was written at.
+    /// Does NOT fsync.
     /// allow_fsync=false writes the record without honouring FsyncPolicy::EVERY. Only
     /// for records whose loss is harmless: a lost CHECKPOINT costs a redundant replay,
     /// never a lost row, so paying an fsync for it would slow every flush for nothing.
-    void write_record(const WALRecord& hdr, const void* payload, size_t payload_len,
-                      bool allow_fsync = true);
+    WalPosition write_record(const WALRecord& hdr, const void* payload, size_t payload_len,
+                             bool allow_fsync = true);
 
-    /// Write a complete V2 record (38B header + payload). Does NOT fsync.
-    void write_record_v2(const WALRecordV2& hdr, const void* payload, size_t payload_len);
+    /// Write a complete V2 record (38B header + payload) and return where it went. No fsync.
+    WalPosition write_record_v2(const WALRecordV2& hdr, const void* payload, size_t payload_len);
 };
 
 // ── WALReplayer ───────────────────────────────────────────────────────────────

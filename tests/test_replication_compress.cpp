@@ -198,7 +198,12 @@ TEST(ReplCompress, TheDirectiveMarksTheSeamOfAnUnfinishedCatchup) {
     hdr.payload_len     = static_cast<uint16_t>(payload.size());
     hdr.checksum        = ob::crc32c(payload.data(), payload.size());
     hdr.record_type     = ob::WAL_RECORD_DELTA;
-    mgr.broadcast(hdr, payload.data(), payload.size());
+    // Appended as well as broadcast, which is what the engine does under one lock - and since #98
+    // the position announced on the wire is the one that append returns. The append does not widen
+    // the catch-up: the cursor's end was fixed when it was created.
+    const ob::WalPosition marker_pos = wal.append(marker, &one);
+    wal.flush();
+    mgr.broadcast(hdr, payload.data(), payload.size(), marker_pos);
 
     // Walk the stream: plain framed records, then the directive, then LZ4 frames.
     struct timeval tv{};

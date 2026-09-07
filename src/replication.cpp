@@ -11,6 +11,13 @@
 //   Error:      ERR <message>\n
 //   Stale:      ERR STALE_PRIMARY\n
 //
+// What the position on a `WAL` line means, because it was undefined for four phases of this work
+// and the two paths that wrote it disagreed (#98): `<file_index> <byte_offset>` is where **this
+// record** begins in the primary's WAL. The replica derives `byte_offset + total_len` and saves it,
+// so it is the resume point on reconnect and the number `ACK` carries back. It is not the replica's
+// acknowledged position, and it is not the WAL's current position - after a rotating append the
+// current position is in the next file while the record is at the end of the previous one.
+//
 // Design notes:
 //   - broadcast() is non-blocking: it enqueues data into per-replica send buffers.
 //     The epoll thread drains buffers via EPOLLOUT, keeping the hot path lock-free.
@@ -499,19 +506,24 @@ void ReplicationManager::stop() {
 }
 
 void ReplicationManager::broadcast(const WALRecord& hdr, const void* payload,
-                                    size_t payload_len) {
+                                    size_t payload_len, WalPosition record_pos) {
     // Non-blocking broadcast: enqueue the WAL message into each replica's send
     // buffer. The epoll thread will drain buffers via EPOLLOUT.
     //
     // Format: WAL <file_index> <byte_offset> <total_len> <epoch>\n<WALRecord(24)><payload>
-    const uint32_t file_index = wal_.current_file_index();
+    //
+    // `record_pos` comes from the append that wrote this record, and the offset used to be a
+    // literal `0` here (#98). The replica saves `byte_offset + total_len`, so a zero meant every
+    // restarted replica asked for one record into the current file and was re-sent nearly all of
+    // it - re-applied against append-only storage, on the one path that has no sequence check.
     const uint64_t epoch = wal_.current_epoch();
     const size_t total_len = sizeof(WALRecord) + payload_len;
 
     // Build the text header line.
     char line[128];
     int line_len = std::snprintf(line, sizeof(line), "WAL %u %zu %zu %" PRIu64 "\n",
-                                  file_index, static_cast<size_t>(0), total_len, epoch);
+                                  record_pos.file_index,
+                                  static_cast<size_t>(record_pos.offset), total_len, epoch);
 
     // Build the complete message: text header + WALRecord bytes + payload bytes.
     std::vector<uint8_t> msg(static_cast<size_t>(line_len) + total_len);
@@ -1177,15 +1189,22 @@ void ReplicationManager::handle_replica_data(int fd) {
 }
 
 void ReplicationManager::send_to_replica(ReplicaInfo& replica, const WALRecord& hdr,
-                                          const void* payload, size_t payload_len) {
+                                          const void* payload, size_t payload_len,
+                                          WalPosition record_pos) {
     // Format: WAL <file_index> <byte_offset> <total_len> <epoch>\n<WALRecord(24)><payload>
+    //
+    // The position announced is this record's own. It used to be `replica.confirmed_*` - the
+    // position this replica last acknowledged - which during a catch-up never moves at all,
+    // because the ACKs that would move it are read by `handle_replica_data()` and that is the
+    // loop doing the sending. Measured before #98: a catch-up across WAL files 0 to 6 announced
+    // all 300 of its records as `file=0 offset=0`.
     const size_t total_len = sizeof(WALRecord) + payload_len;
     const uint64_t epoch = wal_.current_epoch();
 
     char line[128];
     int line_len = std::snprintf(line, sizeof(line), "WAL %u %zu %zu %" PRIu64 "\n",
-                                  replica.confirmed_file,
-                                  replica.confirmed_offset,
+                                  record_pos.file_index,
+                                  static_cast<size_t>(record_pos.offset),
                                   total_len, epoch);
 
     // Build complete message.
@@ -1376,7 +1395,7 @@ void ReplicationManager::continue_catchup(ReplicaInfo& replica) {
             continue;
         }
 
-        send_to_replica(replica, hdr, payload.data(), hdr.payload_len);
+        send_to_replica(replica, hdr, payload.data(), hdr.payload_len, cur.position());
         cur.offset       += record_bytes;
         queued_this_pass += record_bytes;
     }

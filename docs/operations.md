@@ -43,8 +43,10 @@ to open is deliberate: a node that is merely listening can accept a write and ha
 to.
 
 `BASE_PORT`, `NODES`, `STATE_DIR` and `OB_SERVER_BINARY` override the defaults. Everything binds to
-127.0.0.1, and it stays that way even with authentication on: the wire is still not encrypted, so a
-local mesh is the only one this script should build.
+127.0.0.1, and the script leaves it that way: it sets neither `--cluster-secret-file` nor
+`--tls-multi-master`, so the mesh it builds is unauthenticated and unencrypted. Both are available
+(below), and a mesh that crosses hosts wants them; a bootstrap script that turned them on would be
+generating a secret and a certificate authority for a local demo.
 
 This is not `scripts/mm_harness.py`, which kills nodes, blocks links and counts rows to reproduce
 specific defects. The bootstrap script's job ends when the mesh is up.
@@ -255,8 +257,17 @@ reaching it drops the replica as above.
 
 ## Security
 
-**There is no encryption.** Client sessions can authenticate; nothing on the wire is encrypted, so a
-node's traffic is as private as the network it is on. Do not expose a node outside a trusted network.
+**Everything is off by default, and a node nobody configured is plaintext and unauthenticated on
+all three surfaces** — client sessions, the replication link and the multi-master mesh. What is
+available is all three authenticating (`--auth-secret-file`, `--cluster-secret-file`) and all three
+encrypting (`--tls-client`, `--tls-replication`, `--tls-multi-master`, TLS 1.3), each covered
+below. Until then a node's traffic is as private as the network it is on, and the startup log names
+every surface that is disabled rather than leaving "default open" in a document.
+
+*(This section said "there is no encryption" until 7 September 2026, which stopped being true with
+#30 part three — while the TLS sections below it were already in this same file. A page that
+contradicts itself is read by whoever reaches the top of it first.)*
+
 The full posture, including what authentication does *not* buy you, is in
 [SECURITY.md](../SECURITY.md).
 

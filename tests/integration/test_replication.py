@@ -6,10 +6,12 @@ tail is worse than one that receives nothing, because nothing is obviously broke
 """
 from __future__ import annotations
 
+import os
 import socket
 import time
 
 import pytest
+from conftest import patience
 
 from orderbook_engine import OrderbookEngine
 
@@ -51,6 +53,19 @@ def wait_for_rows(port: int, symbol: str, exchange: str, expected: int,
         time.sleep(0.3)
     return seen
 
+
+def count_rows(port: int, symbol: str, exchange: str) -> int:
+    """Count the rows a node holds for one symbol, right now.
+
+    Separate from `wait_for_rows` on purpose: that one returns as soon as it has seen enough, so it
+    cannot see too many. Duplication is exactly the failure this module needs to be able to see -
+    the same lesson a surviving mutation taught the C++ side of #93.
+    """
+    sql = (f"SELECT * FROM \'{symbol}\'.\'{exchange}\' "
+           f"WHERE timestamp BETWEEN 0 AND 9999999999999999999\n")
+    reply = raw_command(port, sql, settle=0.4)
+    lines = [ln for ln in reply.strip().splitlines() if ln.strip()]
+    return max(0, len(lines) - 2)
 
 def test_replica_reports_replica_role(cluster):
     reply = raw_command(cluster.replica().tcp_port, "ROLE\n")
@@ -142,3 +157,84 @@ def test_replica_catches_up_after_more_writes(cluster,
 
     got = wait_for_rows(cluster.replica().tcp_port, "REPL-CATCH", "BINANCE", 4)
     assert got == 4, f"replica stopped following after the first batch (saw {got})"
+
+
+def test_the_replica_persists_the_position_of_what_it_received(cluster,
+                                                               primary_client: OrderbookEngine):
+    """The saved position has to be the stream's position, not one record's worth.
+
+    This is the consequence #98 was about. The `WAL <file> <offset>` line is what a replica records:
+    it computes `confirmed_offset = byte_offset + total_len`, persists it and resumes from it. The
+    live path used to send a literal zero for the offset, so a replica that had received forty
+    records persisted the length of **one** - measured, 136 bytes against a WAL of 5472 - and asked
+    for the whole current file again on reconnect.
+
+    Checked against the primary's WAL rather than against a constant: the property is that the
+    replica knows how far along the stream it is, and the only thing that knows the answer is the
+    file the primary is writing.
+
+    What this deliberately does not assert is a restart. A failover-managed replica - which is what
+    this fixture builds - clears its local data and re-syncs from zero whenever it is told its
+    primary, including on its own restart (`demote_to_replica`, "clearing local data before
+    starting replication"). That is by design, so a restart here would measure the wipe rather than
+    the resume.
+    """
+    symbol, exchange = "REPL-POS", "BINANCE"
+    rows = 40
+    for i in range(rows):
+        primary_client.insert(symbol, exchange, "bid", [400_000 + i], [i + 1])
+    primary_client.flush()
+
+    replica = cluster.replica()
+    assert wait_for_rows(replica.tcp_port, symbol, exchange, rows) == rows, (
+        "the replica never received the batch, so this test cannot say anything about its position")
+
+    status = raw_command(replica.tcp_port, "STATUS\n")
+    line = next((ln for ln in status.splitlines() if ln.startswith("replication:")), "")
+    assert line, f"STATUS on the replica has no replication line: {status!r}"
+    reported = int(line.split("offset=")[1].split()[0])
+    reported_file = int(line.split("file=")[1].split()[0])
+
+    # The primary's WAL is the only thing that knows how long the stream is.
+    wal_path = os.path.join(cluster.primary().data_dir, f"wal_{reported_file:06d}.bin")
+    assert os.path.exists(wal_path), f"the primary has no {wal_path}"
+    wal_size = os.path.getsize(wal_path)
+
+    # The remaining difference is whatever the primary appended after the last delta - a checkpoint
+    # from its own flush loop, at most a few records. A few kilobytes of slack, against a stream
+    # that the defect left 5428 bytes behind on a 5564-byte WAL.
+    slack = 4096
+    assert wal_size - reported <= slack, (
+        f"the replica reports offset {reported} in file {reported_file} while the primary's WAL is "
+        f"{wal_size} bytes - it is {wal_size - reported} bytes behind its own stream, which is what "
+        f"a position that does not track what arrived looks like ({line!r})")
+
+    # And what a restart would read has to move as records arrive. Asserted as *advancement* rather
+    # than as agreement with the line above, because `save_state()` runs on a ten-second timer: a
+    # state file lagging the live position by a window of writes is correct, and a state file pinned
+    # to one record's worth for ever is the defect. Comparing the two numbers directly passed here
+    # and failed in CI, where the session cluster had already written a file.
+    state_path = os.path.join(replica.data_dir, "repl_state.txt")
+    deadline = time.monotonic() + patience(30)
+    while time.monotonic() < deadline and not os.path.exists(state_path):
+        time.sleep(0.5)
+    assert os.path.exists(state_path), (
+        f"the replica never wrote {state_path}; the position it holds in memory is the only copy "
+        f"and a restart would replay the whole WAL")
+
+    def saved_offset() -> int:
+        parts = dict(kv.split("=", 1) for kv in open(state_path).read().split())
+        return int(parts["byte_offset"])
+
+    first_saved = saved_offset()
+    for i in range(rows):
+        primary_client.insert(symbol, exchange, "bid", [500_000 + i], [i + 1])
+    primary_client.flush()
+    assert wait_for_rows(replica.tcp_port, symbol, exchange, rows * 2) == rows * 2
+
+    deadline = time.monotonic() + patience(30)
+    while time.monotonic() < deadline and saved_offset() <= first_saved:
+        time.sleep(0.5)
+    assert saved_offset() > first_saved, (
+        f"the persisted position stayed at {first_saved} while another {rows} records arrived - "
+        f"what a restart reads is not tracking what the replica received")
