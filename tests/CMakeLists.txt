@@ -358,6 +358,11 @@ ob_add_tcp_test(test_tcp_server
 ob_add_engine_test(test_replication
     test_replication.cpp
 )
+# The static test in this file reads src/engine.cpp: the engine's choice of which position to
+# broadcast is not observable from the manager's own tests (#98).
+target_compile_definitions(test_replication
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
 
 # ── Snapshot path validation (security) ───────────────────────────────────────
 # Needs rapidcheck on top of the engine library, which ob_add_engine_test does

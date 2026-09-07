@@ -6,10 +6,12 @@ tail is worse than one that receives nothing, because nothing is obviously broke
 """
 from __future__ import annotations
 
+import os
 import socket
 import time
 
 import pytest
+from conftest import patience
 
 from orderbook_engine import OrderbookEngine
 
@@ -157,19 +159,27 @@ def test_replica_catches_up_after_more_writes(cluster,
     assert got == 4, f"replica stopped following after the first batch (saw {got})"
 
 
-def test_a_restarted_replica_resumes_instead_of_replaying(cluster,
-                                                          primary_client: OrderbookEngine):
-    """A replica that restarts must ask for what it has not got, not for the file it was in.
+def test_the_replica_persists_the_position_of_what_it_received(cluster,
+                                                               primary_client: OrderbookEngine):
+    """The saved position has to be the stream's position, not one record's worth.
 
-    This is the consequence #98 was about. The `WAL <file> <offset>` line is what a replica saves,
-    and the offset used to be a literal zero on the live path - so a restarted replica recorded one
-    record's worth however many it had received, asked for the whole current WAL file again, and
-    re-applied it. Storage is append-only and the replication path has no sequence check, so the
-    rows land a second time and a `SELECT` returns each of them twice.
+    This is the consequence #98 was about. The `WAL <file> <offset>` line is what a replica records:
+    it computes `confirmed_offset = byte_offset + total_len`, persists it and resumes from it. The
+    live path used to send a literal zero for the offset, so a replica that had received forty
+    records persisted the length of **one** - measured, 136 bytes against a WAL of 5472 - and asked
+    for the whole current file again on reconnect.
 
-    The row count is read exactly rather than waited for: waiting for `n` cannot fail upwards.
+    Checked against the primary's WAL rather than against a constant: the property is that the
+    replica knows how far along the stream it is, and the only thing that knows the answer is the
+    file the primary is writing.
+
+    What this deliberately does not assert is a restart. A failover-managed replica - which is what
+    this fixture builds - clears its local data and re-syncs from zero whenever it is told its
+    primary, including on its own restart (`demote_to_replica`, "clearing local data before
+    starting replication"). That is by design, so a restart here would measure the wipe rather than
+    the resume.
     """
-    symbol, exchange = "REPL-RESUME", "BINANCE"
+    symbol, exchange = "REPL-POS", "BINANCE"
     rows = 40
     for i in range(rows):
         primary_client.insert(symbol, exchange, "bid", [400_000 + i], [i + 1])
@@ -177,29 +187,36 @@ def test_a_restarted_replica_resumes_instead_of_replaying(cluster,
 
     replica = cluster.replica()
     assert wait_for_rows(replica.tcp_port, symbol, exchange, rows) == rows, (
-        "the replica never received the first batch, so this test cannot say anything about a "
-        "restart")
+        "the replica never received the batch, so this test cannot say anything about its position")
 
-    # The position the replica is about to persist. A real one is far past a single record; the
-    # defect made this the length of one.
     status = raw_command(replica.tcp_port, "STATUS\n")
     line = next((ln for ln in status.splitlines() if ln.startswith("replication:")), "")
     assert line, f"STATUS on the replica has no replication line: {status!r}"
-    offset = int(line.split("offset=")[1].split()[0])
-    assert offset > 4096, (
-        f"the replica's confirmed offset is {offset}, which is about one record - it is not "
-        f"tracking what it has received ({line!r})")
+    reported = int(line.split("offset=")[1].split()[0])
+    reported_file = int(line.split("file=")[1].split()[0])
 
-    before = count_rows(replica.tcp_port, symbol, exchange)
-    assert before == rows, f"expected {rows} rows before the restart, found {before}"
+    # The primary's WAL is the only thing that knows how long the stream is.
+    wal_path = os.path.join(cluster.primary().data_dir, f"wal_{reported_file:06d}.bin")
+    assert os.path.exists(wal_path), f"the primary has no {wal_path}"
+    wal_size = os.path.getsize(wal_path)
 
-    cluster.restart_node(replica.index)
+    # Within one record: the primary may have appended a checkpoint since the replica's last ack,
+    # and the ack is sent per record rather than per byte.
+    one_record = 4096
+    assert wal_size - reported <= one_record, (
+        f"the replica reports offset {reported} in file {reported_file} while the primary's WAL is "
+        f"{wal_size} bytes - it is {wal_size - reported} bytes behind its own stream, which is what "
+        f"a position that does not track what arrived looks like ({line!r})")
 
-    # Long enough for the reconnect, the handshake and whatever catch-up it asks for. If it asks
-    # for the whole file, this is more than long enough to receive it: the batch above is small.
-    time.sleep(4.0)
-
-    after = count_rows(replica.tcp_port, symbol, exchange)
-    assert after == rows, (
-        f"the restarted replica holds {after} rows where {rows} were written: it replayed records "
-        f"it already had, and append-only storage kept both copies")
+    # And the position it persists is the one it reports: the state file is what a restart reads.
+    state_path = os.path.join(replica.data_dir, "repl_state.txt")
+    deadline = time.monotonic() + patience(20)
+    while time.monotonic() < deadline and not os.path.exists(state_path):
+        time.sleep(0.5)
+    assert os.path.exists(state_path), (
+        f"the replica never wrote {state_path}; the position it holds in memory is the only copy "
+        f"and a restart would replay the whole WAL")
+    saved = dict(kv.split("=", 1) for kv in open(state_path).read().split())
+    assert int(saved["byte_offset"]) >= reported - one_record, (
+        f"the state file says {saved} while STATUS said offset {reported}: what a restart reads is "
+        f"not what the replica knows")

@@ -26,6 +26,8 @@ TEST(ReplicationSmoke, ConfigDefaults) {
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
@@ -792,6 +794,84 @@ TEST_F(ReplicationProtocolTest, ARotatingAppendAnnouncesTheFileTheRecordWentInto
 
     ::close(fd);
     mgr->stop();
+}
+
+
+// ── #98: the engine hands over the position its append returned ──────────────────────────────
+
+namespace {
+
+/// The body of one function in a source file, by brace matching from its signature.
+std::string function_body(const std::string& file, const std::string& signature) {
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/" + file);
+    if (!in) return {};
+    const std::string src((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+    const auto sig = src.find(signature);
+    if (sig == std::string::npos) return {};
+    auto pos = src.find('{', sig);
+    if (pos == std::string::npos) return {};
+    int depth = 0;
+    const auto start = pos;
+    for (; pos < src.size(); ++pos) {
+        if (src[pos] == '{') ++depth;
+        else if (src[pos] == '}' && --depth == 0) return src.substr(start, pos - start + 1);
+    }
+    return {};
+}
+
+} // namespace
+
+TEST(WalPositionWireStatic, TheEngineBroadcastsThePositionItsAppendReturned) {
+    // The behavioural tests in this file drive `ReplicationManager` directly, so they pin what the
+    // manager does with a position and say nothing about which position the engine chooses. That
+    // gap is not hypothetical: a mutation deriving the position at the engine's call site as
+    // `current_position() - total_len` survived every one of the 951 tests, because the WAL
+    // threshold the engine hardcodes is 512 MB and no test rotates it.
+    //
+    // The derivation is wrong for exactly one record in every WAL file - the one whose append
+    // rotated - so a behavioural test for it would need a WAL that rotates inside `Engine`, which
+    // is not configurable and should not become configurable for a test. This is the mechanism
+    // instead, and it is the stronger one for this claim: the engine may not *compute* a position
+    // at all.
+    const std::string body = function_body("src/engine.cpp",
+                                           "ob_status_t Engine::apply_delta(const DeltaUpdate&");
+    ASSERT_FALSE(body.empty()) << "could not find Engine::apply_delta in src/engine.cpp; if it was "
+                                  "renamed, this test has stopped checking anything";
+
+    // The append's position is captured, and the name it is captured under is the one handed to
+    // broadcast(). Read out of the source rather than written down here, so renaming the variable
+    // cannot silently retire the check.
+    const std::string marker = "= wal_.append(delta, levels);";
+    const auto assign = body.find(marker);
+    ASSERT_NE(assign, std::string::npos)
+        << "Engine::apply_delta no longer captures what wal_.append() returns";
+    const auto line_start = body.rfind('\n', assign) + 1;
+    const std::string decl = body.substr(line_start, assign - line_start);
+    // "    const WalPosition record_pos " -> "record_pos"
+    auto last = decl.find_last_not_of(" \t");
+    auto first = decl.find_last_of(" \t", last) + 1;
+    const std::string name = decl.substr(first, last - first + 1);
+    ASSERT_FALSE(name.empty());
+    EXPECT_NE(decl.find("WalPosition"), std::string::npos)
+        << "the append's return is captured as something other than a WalPosition: '" << decl
+        << "'";
+
+    const auto call = body.find("repl_mgr_->broadcast(");
+    ASSERT_NE(call, std::string::npos) << "Engine::apply_delta no longer broadcasts";
+    const auto call_end = body.find(");", call);
+    ASSERT_NE(call_end, std::string::npos);
+    const std::string args = body.substr(call, call_end - call);
+    EXPECT_NE(args.find(name), std::string::npos)
+        << "the position broadcast is not the one wal_.append() returned; it is '" << args << "'";
+
+    // And nothing in this function derives a position from where the WAL happens to be now. That
+    // is the arithmetic the whole of #98 is about, and after a rotating append it names a file the
+    // record is not in.
+    EXPECT_EQ(body.find("current_position()"), std::string::npos)
+        << "Engine::apply_delta reads the WAL's current position. A record's position is what "
+           "append() returned; the current one is past it, and after a rotation it is in the "
+           "next file (#98)";
 }
 
 
