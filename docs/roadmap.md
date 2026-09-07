@@ -1909,6 +1909,35 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 104. A field that claims a guarantee, written at one site and read at none
+
+`FailoverManager::adopted_primary_address_` is assigned in exactly one place
+(`src/failover.cpp:385`, inside the graceful-handover path) and **read nowhere**. Its docstring says
+what it is for: "the primary address this node has told the engine to follow, so a leader change is
+adopted once and an unchanged leader does not restart replication every second."
+
+**The property is real; the field does not provide it.** Checked rather than assumed: the monitor
+loop's REPLICA branch updates `primary_address_` when it sees a leader and **does not call**
+`demote_to_replica()`, so a replica watching an unchanged leader never restarts replication.
+`adopt_leader_if_present()` — which does call it — is reached only from the STANDALONE branch (#73)
+and from `handle_primary_lease_lost()`, both transitions rather than per-tick work, and it stores
+`REPLICA` into `role_` so the next tick takes the other branch. The "adopted once" guarantee comes
+from **where the calls are**, not from a comparison against this string.
+
+So there is no behavioural symptom to reproduce, and that is what makes it worth an item rather than
+a passing note: this is the **sixth** instance of the shape in this workspace — after `provisional`,
+`basis`, `in_use`, `key_id` and `partition_by` in the flagship product — and the previous five were
+each found while looking for something else. The cost here is a docstring that describes a mechanism
+the code does not have, next to a real guarantee that is documented nowhere. #101 raised the price
+of getting this wrong: re-adopting the same leader now means a fresh connection and a `STREAMID?`
+round trip, not just a client object.
+
+The fix is a deletion plus a comment moved to the two call sites, and a static test of the same
+shape as the flagship's ("does anything read this?") is the thing that would have caught all six.
+
+- Effort: S | Impact: a docstring claiming a guarantee its field does not provide, in the file where
+  role transitions are decided
+
 ### 103. A replica's epoch protection starts every connection at zero
 
 Found by an assertion in a #101 test that expected the engine's epoch on the wire and got a zero.
@@ -3953,14 +3982,17 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**One defect is open, and it leads this table rather than sitting under the capabilities.**
+**Two defects are open, and they lead this table rather than sitting under the capabilities.**
+#103 has a behavioural symptom and #104 deliberately does not — a field written at one site and read
+at none, whose docstring claims a guarantee that in fact comes from where its callers sit.
 That is a correction kept from an earlier revision: this paragraph used to say every remaining item
 was a capability or a proof. None of these came out of a bug report; each came out of measuring the
 item before it, which is the usual way here. #93's measurement produced #98 and #99; #98's own tests
 produced #100 (ten records broadcast before a handshake, twenty received) and #101; #99's own pull
 request produced #102, from a CI run in which a node whose port was still held reported
-`exited with -6`; and #101's own tests produced #103, from an assertion that expected the engine's
-epoch on the wire and got a zero. All but #103 are closed.
+`exited with -6`; #101's own tests produced #103, from an assertion that expected the engine's epoch
+on the wire and got a zero; and reading `failover.cpp` for #101's four demotion call sites produced
+#104. All but #103 and #104 are closed.
 
 Below the defects the ordering is about who we want to be able to say yes to. A reader can build the
 engine, read its tests and now deploy it from a package (#33), and still **cannot verify its
@@ -3971,6 +4003,7 @@ performance claim is the reason this repo exists.
 |----------|------|--------|---------|
 | **P1** | Reproducible comparative benchmarks (#39 part two) | L | Makes the performance claim verifiable by a reader instead of asserted; needs ClickHouse, TimescaleDB and kdb+ installed natively, which is a decision about the machine rather than code |
 | **P2** | A replica's epoch protection starts every connection at zero (#103) | S | `ERR STALE_PRIMARY` and the replica's own epoch filter are both inert on a first connection, which is every connection after a restart or a role change; #82 is why this is a second line rather than a P0 |
+| **P3** | A field claiming a guarantee, written once and read never (#104) | S | No symptom, and that is the point: the sixth instance of this shape here, and the static test that would catch the seventh does not exist yet |
 | **P2** | The unexplained node death behind #86's third occurrence | S | An `UNREACHABLE` that needs nothing listening, on a node whose epoll thread is merely busy; the OOM-kill hypothesis is untested and the harness should name an unexplained death |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
