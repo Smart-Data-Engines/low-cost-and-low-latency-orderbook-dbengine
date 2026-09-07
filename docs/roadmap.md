@@ -3977,7 +3977,7 @@ Measured on machine B, on the commit that carries this table, rather than carrie
 | Suite | Count | Status |
 |-------|-------|--------|
 | C++ (GTest + RapidCheck) | 960 | all passing, ~195 s with `ctest -j1` on machine B. `ctest -N` reports 962: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
-| Python integration | 190 | passing, plus 2 skipped. The two skips are the Binance tests, which are opt-in on a live feed (`OB_BINANCE_TESTS=1`). **No xfails left**: #60's and #61's markers both fell with their fixes |
+| Python integration | 195 | passing, plus 2 skipped, on i3-7100U in ~10 min. The two skips are the Binance tests, opt-in on a live feed (`OB_BINANCE_TESTS=1`), and they are **collection-time** skips (`pytest.skip(allow_module_level=True)`) — so they are not in the 195, produce no progress character, and the suite's own report plugin says `0 skipped` while pytest says 2. This row read 190 until it was recounted; if you recompute it, count what pytest reports rather than what `--collect-only` does. **No xfails left**: #60's and #61's markers both fell with their fixes |
 
 `ctest -j1` is not a preference. The network tests bind ports, so a parallel run fails for a reason
 that has nothing to do with the code under test.
