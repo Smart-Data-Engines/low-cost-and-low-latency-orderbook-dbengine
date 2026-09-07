@@ -1586,6 +1586,19 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   Measured: 10.2 s → 20.1 s after a `kill -9`. The alternative that costs no latency makes a primary
   read-only during a brief etcd hiccup, so the cost was moved to latency deliberately;
   `--election-lease-wait-ms` is the knob.
+- **A replica keeps its store across a restart and resumes; a failover is still a full re-sync**
+  (#101). The primary announces the identity of the WAL it writes — `STREAMID?` answered with
+  `STREAM <id>`, asked **before** `REPLICATE` so a primary that does not know the command answers
+  nothing and streams nothing — and the replica saves that identity beside the position in
+  `repl_state.txt`. A match resumes; anything else discards and replays from zero. Three things
+  follow that are easy to expect otherwise. **A promotion is "anything else"**: the identity belongs
+  to a data directory, so every surviving replica re-syncs in full after a failover — correct rather
+  than unfinished, because the promoted node may be *behind* this one and dedup makes over-delivery
+  safe without making a divergent suffix safe. **Restoring a primary from a backup draws a new
+  identity**, so it costs every replica a full re-sync. And **the discard decision is not made by
+  `demote_to_replica()`** — it needs the primary's identity, which exists only after the connection,
+  so it lives in `ReplicationClient::resolve_stream_identity()` and a static test pins that nothing
+  about which of the four callers demoted the node reaches it.
 - **Creating a snapshot happens on a worker thread, not on either io loop** (#79). One at a time; a
   second request during creation is refused as busy, and a finished snapshot whose requester has gone
   is discarded rather than sent — matched on `conn_id`, because the case that `node_id` cannot see is
