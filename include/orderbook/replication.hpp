@@ -274,6 +274,11 @@ struct CatchupCursor {
     /// pass, kept as the reason it is sent from the cursor's end.
     bool     compress_after{false};
 
+    /// The end of this cursor's range, as a `WalPosition`.
+    WalPosition through() const {
+        return WalPosition{through_file, static_cast<uint32_t>(through_offset)};
+    }
+
     /// Where the record this cursor is about to send lives, as a `WalPosition`.
     ///
     /// The narrowing is the same one `WALWriter::write_record()` does and is bounded by the same
@@ -329,6 +334,15 @@ struct ReplicaInfo {
 
     // Per-replica catch-up state (active while a requested WAL range is being streamed).
     CatchupCursor catchup;
+
+    /// Has this connection sent `REPLICATE`?
+    ///
+    /// The record joins `replicas_` at `accept()`, which is before this connection has said what
+    /// it wants — and `broadcast()` walks every entry. So a live write in that window used to be
+    /// queued to a replica that had asked for nothing, and then sent a second time by the catch-up
+    /// whose range ends past it (#100). Measured: ten records broadcast in that window, twenty
+    /// received.
+    bool asked_for_stream{false};
 };
 
 /// A snapshot being created on a worker thread for a replica that asked for one (#79).
@@ -462,6 +476,14 @@ private:
     /// One function because the choice is a property of the replica rather than of the caller, and
     /// two callers that each decide it are two callers that can disagree - which here would put a
     /// live record in front of the history it belongs after.
+    /// Does this replica need this record from the live path, or will a transfer already in
+    /// progress deliver it?
+    ///
+    /// One question with the answer in one place, because there are three ways a replica can be
+    /// mid-transfer and `broadcast()` should not learn them separately. Answerable at all only
+    /// since #98 gave the live path the record's own position.
+    bool live_record_is_needed(const ReplicaInfo& replica, WalPosition record_pos) const;
+
     void queue_to_replica(ReplicaInfo& replica, const void* data, size_t len);
 
     /// Whether some replica's catch-up could queue more bytes right now. Requires `mtx_`.
