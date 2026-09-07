@@ -173,11 +173,14 @@ def test_the_replica_persists_the_position_of_what_it_received(cluster,
     replica knows how far along the stream it is, and the only thing that knows the answer is the
     file the primary is writing.
 
-    What this deliberately does not assert is a restart. A failover-managed replica - which is what
-    this fixture builds - clears its local data and re-syncs from zero whenever it is told its
-    primary, including on its own restart (`demote_to_replica`, "clearing local data before
-    starting replication"). That is by design, so a restart here would measure the wipe rather than
-    the resume.
+    What this deliberately does not assert is a restart, and the reason has changed. It used to be
+    that a failover-managed replica - which is what this fixture builds - cleared its local data and
+    re-synced from zero whenever it was told its primary, including on its own restart, so a restart
+    here measured the wipe rather than the resume. Since #101 it does not: `demote_to_replica()`
+    discards nothing, and the replication client discards only when the primary it reached serves a
+    different stream from the one the saved position belongs to. The restart is worth asserting and
+    is asserted on its own, because it is a different property from this one - this test is about
+    the position tracking the stream, that one about the position being believed.
     """
     symbol, exchange = "REPL-POS", "BINANCE"
     rows = 40

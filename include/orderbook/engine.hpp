@@ -279,12 +279,14 @@ public:
     /// directory on disk and reopens the store empty. The WAL files are left alone.
     ///
     /// **Caller must hold neither `flush_mtx_` nor `mtx_`**: this takes both, in that order
-    /// (pitfall 10), and it is called from the replication client's own thread as well as from
-    /// `demote_to_replica()`.
+    /// (pitfall 10). Called from the replication client's own thread, which is the only place that
+    /// knows whether it has to happen - `demote_to_replica()` used to call it and no longer does
+    /// (#101), because a role change is not evidence about what this node holds.
     ///
-    /// It is only correct where the position this node saved is about to be discarded too. Doing
-    /// one without the other leaves a replica asking to resume from a position whose data it has
-    /// just deleted.
+    /// It is only correct where the position this node saved is discarded with it. Doing one
+    /// without the other leaves a replica asking to resume from a position whose data it has just
+    /// deleted - so the one caller zeroes the position and writes it down before asking for
+    /// anything.
     void discard_local_data_for_resync();
 
     std::pair<uint32_t, size_t> get_wal_position() const override;

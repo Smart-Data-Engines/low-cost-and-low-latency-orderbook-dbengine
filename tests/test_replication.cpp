@@ -969,15 +969,21 @@ std::string function_body(const std::string& file, const std::string& signature)
 /// `apply_delta_impl` — so the test found a four-line wrapper and reported that the engine had
 /// stopped capturing the append's position. A static test pinned to a function *name* stops
 /// checking anything the day the body moves, and the failure looks like the defect it guards.
-std::string enclosing_engine_function(const std::string& file, const std::string& marker) {
-    std::ifstream in(std::string(OB_SOURCE_DIR) + "/" + file);
+std::string read_source(const std::string& rel) {
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/" + rel);
     if (!in) return {};
-    const std::string src((std::istreambuf_iterator<char>(in)),
-                          std::istreambuf_iterator<char>());
-    const auto at = src.find(marker);
-    if (at == std::string::npos) return {};
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
 
-    // A definition's signature starts at column 0; nothing inside a body does.
+/// Where the definition containing `at` begins, or npos. A definition's signature starts at
+/// column 0 and nothing inside a body does, so walking forward and keeping the last such line
+/// before `at` finds it.
+///
+/// One copy, used three ways: the body of the first match, the name and body of every match, and
+/// whether one function's body contains a call. Three walks would be three chances for one of
+/// them to stop finding anything and go on passing.
+std::size_t definition_start(const std::string& src, std::size_t at,
+                             const std::string& qualifier) {
     std::size_t sig = std::string::npos;
     for (std::size_t line = 0; line < at;) {
         const std::size_t next = src.find('\n', line);
@@ -985,13 +991,16 @@ std::string enclosing_engine_function(const std::string& file, const std::string
         const char first = src[line];
         if (first != ' ' && first != '\t' && first != '\n' &&
             src.compare(line, 2, "//") != 0 &&
-            src.find("Engine::", line) < next && src.find('(', line) < next) {
+            src.find(qualifier, line) < next && src.find('(', line) < next) {
             sig = line;
         }
         line = next + 1;
     }
-    if (sig == std::string::npos) return {};
+    return sig;
+}
 
+/// The braced body that follows the signature at `sig`, braces included.
+std::string body_at(const std::string& src, std::size_t sig) {
     auto pos = src.find('{', sig);
     if (pos == std::string::npos) return {};
     int depth = 0;
@@ -1001,6 +1010,17 @@ std::string enclosing_engine_function(const std::string& file, const std::string
         else if (src[pos] == '}' && --depth == 0) return src.substr(start, pos - start + 1);
     }
     return {};
+}
+
+std::string enclosing_definition(const std::string& file, const std::string& marker,
+                                 const std::string& qualifier = "Engine::") {
+    const std::string src = read_source(file);
+    if (src.empty()) return {};
+    const auto at = src.find(marker);
+    if (at == std::string::npos) return {};
+    const auto sig = definition_start(src, at, qualifier);
+    if (sig == std::string::npos) return {};
+    return body_at(src, sig);
 }
 
 } // namespace
@@ -1051,7 +1071,7 @@ TEST(WalPositionWireStatic, TheEngineBroadcastsThePositionItsAppendReturned) {
     // Whichever function appends a client write and broadcasts it - derived from the two markers
     // rather than named, so a rename or a split cannot retire the check (it already did once).
     const std::string body =
-        enclosing_engine_function("src/engine.cpp", "= wal_.append(delta, levels);");
+        enclosing_definition("src/engine.cpp", "= wal_.append(delta, levels);");
     ASSERT_FALSE(body.empty()) << "nothing in src/engine.cpp captures wal_.append(delta, levels); "
                                   "if the write path changed shape, this test has stopped checking "
                                   "anything";
@@ -1059,7 +1079,7 @@ TEST(WalPositionWireStatic, TheEngineBroadcastsThePositionItsAppendReturned) {
     // And they are the *same* function, which is part of the claim rather than a detail: the append
     // and the broadcast happen under one acquisition of `mtx_`, which is what keeps the WAL order
     // and the wire order the same.
-    EXPECT_EQ(body, enclosing_engine_function("src/engine.cpp", "repl_mgr_->broadcast("))
+    EXPECT_EQ(body, enclosing_definition("src/engine.cpp", "repl_mgr_->broadcast("))
         << "the append and the broadcast are in different functions, so nothing holds them under "
            "one lock";
 
@@ -3344,11 +3364,7 @@ TEST(ReplicationDedup, EveryPathThatDiscardsTheStoreAlsoDiscardsTheFrontier) {
     //
     // The list of functions comes from the source. Naming the two would be a claim about the code
     // rather than evidence about it - and a third path is exactly what this is for.
-    const auto read = [](const char* rel) {
-        std::ifstream in(std::string(OB_SOURCE_DIR) + "/" + rel);
-        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-    };
-    const std::string src = read("src/engine.cpp");
+    const std::string src = read_source("src/engine.cpp");
     ASSERT_FALSE(src.empty());
 
     std::vector<std::string> discarding;
@@ -3356,30 +3372,11 @@ TEST(ReplicationDedup, EveryPathThatDiscardsTheStoreAlsoDiscardsTheFrontier) {
     const std::string marker = "buffers_.clear();";
     for (std::size_t at = src.find(marker); at != std::string::npos;
          at = src.find(marker, at + marker.size())) {
-        // Walk back to the definition line, which starts at column 0.
-        std::size_t sig = std::string::npos;
-        for (std::size_t line = 0; line < at;) {
-            const std::size_t next = src.find('\n', line);
-            if (next == std::string::npos || next > at) break;
-            const char first = src[line];
-            if (first != ' ' && first != '\t' && first != '\n' &&
-                src.compare(line, 2, "//") != 0 &&
-                src.find("Engine::", line) < next && src.find('(', line) < next) {
-                sig = line;
-            }
-            line = next + 1;
-        }
+        const std::size_t sig = definition_start(src, at, "Engine::");
         ASSERT_NE(sig, std::string::npos) << "could not find the function containing a buffers_ clear";
         const std::string name = src.substr(sig, src.find('(', sig) - sig);
-
-        auto pos = src.find('{', sig);
-        int depth = 0;
-        std::size_t end = pos;
-        for (; end < src.size(); ++end) {
-            if (src[end] == '{') ++depth;
-            else if (src[end] == '}' && --depth == 0) break;
-        }
-        const std::string body = src.substr(pos, end - pos + 1);
+        const std::string body = body_at(src, sig);
+        ASSERT_FALSE(body.empty()) << "no body for " << name;
         discarding.push_back(name);
         if (body.find("seq_tracker_.reset()") == std::string::npos) offenders.push_back(name);
     }
@@ -3750,4 +3747,148 @@ TEST_F(ReplicationClientTest, TheIdentitySurvivesARestartAndDiffersBetweenDataDi
     EXPECT_NE(fresh.wal_identity(), first)
         << "a directory built from scratch claims the stream the old one was serving";
     fresh.close();
+}
+
+// ── #101 group 5: the discard is decided by the data, not by who called ──────────────────────────
+
+TEST(ReplicationDedup, NothingDecidesWhetherToDiscardFromWhereItWasCalled) {
+    // Requirement 2.1. `demote_to_replica()` has four call sites - a graceful handover, a lost
+    // lease, `adopt_leader_if_present()` and process start - and it used to discard the store on
+    // all four. The condition is a property of the data ("is what I hold a prefix of this
+    // primary's stream?"), and that list of call sites is a thing that grows: the fifth would
+    // arrive with a comment about why it is different.
+    //
+    // Static, because there is nothing behavioural to catch. A branch on the caller would be
+    // *correct* in every case somebody thought about while writing it; what it breaks is the case
+    // added later. So this asserts the shape: nothing about the caller reaches the decision.
+    const std::string engine = read_source("src/engine.cpp");
+    const std::string repl   = read_source("src/replication.cpp");
+    const std::string failover_hpp = read_source("include/orderbook/failover.hpp");
+    ASSERT_FALSE(engine.empty());
+    ASSERT_FALSE(repl.empty());
+    ASSERT_FALSE(failover_hpp.empty());
+
+    // (a) The signature carries no discriminator. One parameter, the address of the primary to
+    //     follow - so there is no `DemotionReason` or `bool was_primary` to branch on, and adding
+    //     one has to change the interface every failover path calls through.
+    const std::string decl = "virtual void demote_to_replica(";
+    const auto decl_at = failover_hpp.find(decl);
+    ASSERT_NE(decl_at, std::string::npos)
+        << "RoleTransitionHandler no longer declares demote_to_replica, so this test is looking "
+           "at something that has moved";
+    const std::string params = failover_hpp.substr(
+        decl_at + decl.size(), failover_hpp.find(')', decl_at) - decl_at - decl.size());
+    EXPECT_EQ(params.find(','), std::string::npos)
+        << "demote_to_replica takes more than the primary's address now: '" << params << "'. If "
+           "one of those says why the demotion happened, the discard can be decided from the call "
+           "site again";
+
+    // (b) The function makes no discard decision at all: neither the wipe nor the deletion of the
+    //     saved position appears in its body. Derived from the body rather than from a grep over
+    //     the file, so a call added anywhere else in `engine.cpp` does not read as this one.
+    const auto demote_sig = engine.find("void Engine::demote_to_replica(");
+    ASSERT_NE(demote_sig, std::string::npos);
+    const std::string demote_body = body_at(engine, demote_sig);
+    ASSERT_FALSE(demote_body.empty());
+    EXPECT_EQ(demote_body.find("discard_local_data_for_resync()"), std::string::npos)
+        << "demoting discards the store again, so a node that merely restarted re-syncs a full "
+           "store from its primary - which is #101";
+    EXPECT_EQ(demote_body.find("replication_state_path()"), std::string::npos)
+        << "demoting deletes the saved position again, so there is nothing left for the identity "
+           "check to compare and every reconnection starts from zero";
+
+    // (c) And the one place that does decide is the one holding both facts: the identity the
+    //     primary announced and the identity the position was saved under. Every call in the two
+    //     files is accounted for, so a second decision maker fails this rather than being
+    //     silently correct-looking.
+    std::vector<std::string> deciders;
+    for (const auto& [file, src, qualifier] :
+         std::vector<std::tuple<std::string, std::string, std::string>>{
+             {"src/engine.cpp", engine, "Engine::"},
+             {"src/replication.cpp", repl, "Replication"}}) {
+        const std::string call = "discard_local_data_for_resync()";
+        for (std::size_t at = src.find(call); at != std::string::npos;
+             at = src.find(call, at + call.size())) {
+            // The name matches its own definition, and `definition_start` walking back from a
+            // signature line finds the *previous* function - so the definition read as a second
+            // decision maker. A definition starts at column 0 and a call inside a body never
+            // does, which tells the two apart without naming either.
+            const std::size_t line_start = src.rfind('\n', at) + 1;
+            if (src[line_start] != ' ' && src[line_start] != '\t') continue;
+            const std::size_t sig = definition_start(src, at, qualifier);
+            if (sig == std::string::npos) continue;
+            const std::string name = src.substr(sig, src.find('(', sig) - sig);
+            deciders.push_back(file + ": " + name);
+        }
+    }
+
+    ASSERT_EQ(deciders.size(), 1u)
+        << "expected exactly one place to decide whether to discard; found " << deciders.size();
+    EXPECT_NE(deciders.front().find("ReplicationClient::resolve_stream_identity"),
+              std::string::npos)
+        << "the discard is decided in " << deciders.front() << " - the decision needs the "
+           "primary's stream identity, which is known only after the connection";
+}
+
+TEST_F(ReplicationClientTest, ANodeThatAcceptedWritesStartsOverEvenAgainstTheSameStream) {
+    // Requirements 2.2 and 3.3, as one process rather than as two claims. A node that held PRIMARY
+    // and took writes has records of its own above wherever it was in somebody else's stream, so it
+    // must start over - and the interesting part is that this test hands it back **the same stream
+    // identity it was following before**. Nothing about the identity says to discard here. What
+    // says it is the absence of a position, deleted by the promotion, which is the inversion
+    // requirement 3 is about: no position means nothing to match, and no match means start over.
+    //
+    // So the correctness of removing the discard from `demote_to_replica()` does not rest on a
+    // check of "was I primary?" anywhere. It falls out.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::ReplicationClientConfig cfg;
+    cfg.state_file = tmp_->str() + "/repl_state.txt";   // primary_port 0: no client until demotion
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE, {}, cfg);
+    engine.open();
+
+    // Where it was in the primary's stream, and whose stream that was.
+    { std::ofstream out(cfg.state_file);
+      out << "file_index=2\nbyte_offset=1024\nstream_id=777\n"; }
+    insert_one_replicated_row(engine, "WASPRIM", 5);
+    ASSERT_EQ(count_rows(engine, "WASPRIM"), 1u);
+
+    engine.promote_to_primary(ob::EpochValue{7});
+    ASSERT_FALSE(std::filesystem::exists(cfg.state_file))
+        << "the promotion kept the position, so the rest of this test measures nothing";
+
+    // A record of its own, which is what makes its data no longer a prefix of anyone's stream.
+    ob::Level lvl{};
+    lvl.price = 61'000; lvl.qty = 2; lvl.cnt = 1; lvl._pad = 0;
+    ob::DeltaUpdate own{};
+    std::strncpy(own.symbol, "WASPRIM", sizeof(own.symbol) - 1);
+    std::strncpy(own.exchange, "BINANCE", sizeof(own.exchange) - 1);
+    own.timestamp_ns = 1'800'000'000ULL;
+    own.side         = ob::SIDE_BID;
+    own.n_levels     = 1;
+    ASSERT_EQ(engine.apply_delta(own, &lvl), ob::OB_OK);
+    engine.flush_incremental();
+
+    engine.demote_to_replica("127.0.0.1:" + std::to_string(port_));
+
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0) << "the demotion started no replication client";
+    answer_stream_id(client_fd, 777);          // the same stream it used to follow
+
+    // The epoch on that line is 0 rather than 7, and it is not a typo: `local_epoch_` starts at
+    // zero and is only ever raised by what a primary sends, so the engine's own epoch never
+    // reaches the wire on a first connection. Measured here, filed as #103, and left alone -
+    // seeding it changes when a replica refuses a primary, which is not what this item is about.
+    const std::string handshake = recv_line(client_fd, 3000);
+    EXPECT_EQ(handshake, "REPLICATE 0 0 0")
+        << "a node that accepted writes asked to resume inside the stream it left, got: "
+        << handshake;
+    EXPECT_EQ(count_rows(engine, "WASPRIM"), 0u)
+        << "it kept records the primary never had, sitting above where the replay starts";
+
+    ::close(client_fd);
+    ::close(listen_fd);
+    engine.close();
 }

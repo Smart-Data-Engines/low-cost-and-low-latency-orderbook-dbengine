@@ -1613,35 +1613,22 @@ void Engine::demote_to_replica(const std::string& new_primary_address) {
             lock.lock();
         }
 
-        // Clear local state so the stream can be replayed into an empty store.
+        // Nothing is discarded here, and nothing is deleted here. This function used to wipe the
+        // store and remove the saved position, which is #101: it made a node that had merely
+        // restarted re-sync a full store from its primary, because entering replication is exactly
+        // when the position it had is worth the most.
         //
-        // The body moved to `discard_local_data_for_resync()` so the replication client can call it
-        // too: only the client knows whether the primary it reached is the stream this node was
-        // following, and that is the question that decides whether this has to happen at all
-        // (#101). `mtx_` is released across it because it takes `flush_mtx_` first (pitfall 10) —
-        // and `flush_mtx_` is deliberately not held from the top of this function, since
-        // `repl_mgr_->stop()` above joins a thread that can be inside `create_snapshot()` waiting
-        // for it.
-        lock.unlock();
-        discard_local_data_for_resync();
-        lock.lock();
-
-        // Delete the replication state file so catch-up starts from position 0.
+        // The decision needs a fact this function cannot have. Whether what this node holds is a
+        // prefix of the stream it is about to follow depends on *which* stream that is, and the
+        // primary's identity is known only after the connection - so the call moved to
+        // `ReplicationClient::resolve_stream_identity()`, which asks before it asks for a position
+        // and discards only on a mismatch. Deliberately not a branch on which caller demoted us:
+        // three of the four are role changes and one is process start, that list grows, and the
+        // condition is a property of the data rather than of the path here (requirement 2.1).
         //
-        // Through the accessor rather than a path rebuilt from `base_dir_`: the rebuilt form is
-        // right wherever `tcp_server.cpp` set the config (`<data_dir>/repl_state.txt`) and deleted
-        // nothing at all wherever the path is configured differently, which is every unit test.
-        //
-        // This deletion is what #101 removes - but not before the client can tell whether resuming
-        // is safe. Removing it while this function still wipes the store would leave a replica
-        // asking to resume from a position whose data it has just deleted.
-        {
-            const std::string state_path = replication_state_path();
-            if (!state_path.empty()) {
-                std::error_code ec;
-                std::filesystem::remove(state_path, ec);
-            }
-        }
+        // A node that held PRIMARY in this process still discards, and that falls out of
+        // `promote_to_primary()` deleting the position rather than from a check of its own: with no
+        // position saved there is no identity to match, and no match means start over.
 
         // Parse host:port from address.
         auto colon = new_primary_address.rfind(':');

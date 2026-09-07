@@ -1909,6 +1909,41 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 103. A replica's epoch protection starts every connection at zero
+
+Found by an assertion in a #101 test that expected the engine's epoch on the wire and got a zero.
+
+`ReplicationClient::local_epoch_` is initialised to 0 and **only ever raised by what the primary
+sends** — a `WAL` line's epoch, an `EPOCH` record, a `HEARTBEAT`. Nothing seeds it from the engine,
+which knows the answer: `current_epoch_` is restored from the WAL during `open()`. So the first
+`REPLICATE` of every connection carries epoch 0, and a fresh object is what every path produces:
+`demote_to_replica()` constructs a new `ReplicationClient`, and so does a restart.
+
+That disarms two guards, in both directions, on exactly the path they exist for.
+
+The primary's is `ERR STALE_PRIMARY`, refused when `replica_epoch > wal_.current_epoch()`. Zero is
+never greater than anything, so a primary that has been superseded serves a replica that has seen a
+newer epoch. The replica's own is the filter that skips a record whose epoch is below what it has
+seen — also zero, so on a first connection nothing is below it. Both come back to life only after a
+record or heartbeat has arrived on *this* connection carrying a higher number, which is to say
+after the point where a stale primary would already have been served.
+
+**Measured**: an engine promoted to epoch 7, then demoted, sends `REPLICATE 0 0 7`? No — it sends
+`REPLICATE 0 0 0`, with the engine at epoch 7 in the same process.
+
+#82 makes an outgoing primary demote itself unconditionally when it loses its lease, so the ordinary
+failover does not depend on this check. That is what makes it an item rather than a P0: epoch
+fencing is the second line, and a second line that cannot fire is the one you find out about from
+the first line's bad day.
+
+The fix is a seed, not a mechanism — the client can read `engine_.current_epoch()` when it starts —
+but it changes when a replica refuses a primary, so it wants its own tests: a stale primary refused
+on the first connection, and a legitimate promotion still accepted.
+
+- Effort: S | Impact: epoch fencing on the replication link is inert on the first connection, which
+  is every connection after a restart or a role change
+
+
 ### 102. A node that cannot listen leaves by `terminate` rather than by a message and exit 1 ✅
 
 Found in CI on PR #91, where a node whose client port a previous test still held printed
