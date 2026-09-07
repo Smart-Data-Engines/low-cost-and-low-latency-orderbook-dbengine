@@ -1435,6 +1435,15 @@ Learned the hard way. Check here before debugging.
     pinned directly — strict, file first, and a walk across boundaries required to move forwards
     (#100).
 
+172. **A scaling rule applied by hand is applied once too few.** `patience()` triples every wait in
+    the integration battery under a sanitizer, and five of the six `_wait_for_node()` call sites
+    wrapped their budget in it. The sixth was the multi-master fixture — three nodes, so the one
+    with the most to lose — which had a flat 20 s where every other fixture had 45, and
+    `sanitizers-integration (tsan)` went red on a loaded runner. Measured before touching it,
+    because a raised timeout is the standard way to hide a hang: under TSan on this machine a node
+    answers PING in **0.39 s**, and 0.39/0.46/0.54 s for three started together. The scaling lives
+    inside `_wait_for_node()` now, with a static guard that forbids a call site scaling again.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
