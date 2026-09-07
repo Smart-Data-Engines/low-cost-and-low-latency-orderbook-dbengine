@@ -59,7 +59,13 @@ jobs:
         env:
           ETCD_VER: v3.5.17
         run: |
-          curl -fsSL "https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz" | tar xz
+          # Retries because this one line has already failed a required check on somebody
+          # else's network: `curl: (35) Recv failure: Connection reset by peer`, mid-transfer,
+          # on the coverage job of PR #93. A required check that cannot be re-run without a
+          # human is a merge block, and an infrastructure block is indistinguishable from a
+          # real finding until somebody reads the log.
+          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL \
+            "https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz" | tar xz
           sudo install -m755 "etcd-${ETCD_VER}-linux-amd64/etcd" "etcd-${ETCD_VER}-linux-amd64/etcdctl" /usr/local/bin/
           etcd --version
 
@@ -122,7 +128,13 @@ jobs:
         env:
           ETCD_VER: v3.5.17
         run: |
-          curl -fsSL "https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz" | tar xz
+          # Retries because this one line has already failed a required check on somebody
+          # else's network: `curl: (35) Recv failure: Connection reset by peer`, mid-transfer,
+          # on the coverage job of PR #93. A required check that cannot be re-run without a
+          # human is a merge block, and an infrastructure block is indistinguishable from a
+          # real finding until somebody reads the log.
+          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL \
+            "https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz" | tar xz
           sudo install -m755 "etcd-${ETCD_VER}-linux-amd64/etcd" "etcd-${ETCD_VER}-linux-amd64/etcdctl" /usr/local/bin/
           etcd --version
 
@@ -258,7 +270,13 @@ jobs:
         env:
           ETCD_VER: v3.5.17
         run: |
-          curl -fsSL "https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz" | tar xz
+          # Retries because this one line has already failed a required check on somebody
+          # else's network: `curl: (35) Recv failure: Connection reset by peer`, mid-transfer,
+          # on the coverage job of PR #93. A required check that cannot be re-run without a
+          # human is a merge block, and an infrastructure block is indistinguishable from a
+          # real finding until somebody reads the log.
+          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL \
+            "https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz" | tar xz
           sudo install -m755 "etcd-${ETCD_VER}-linux-amd64/etcd" "etcd-${ETCD_VER}-linux-amd64/etcdctl" /usr/local/bin/
 
       - name: Start etcd
@@ -336,7 +354,13 @@ jobs:
         env:
           ETCD_VER: v3.5.17
         run: |
-          curl -fsSL "https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz" | tar xz
+          # Retries because this one line has already failed a required check on somebody
+          # else's network: `curl: (35) Recv failure: Connection reset by peer`, mid-transfer,
+          # on the coverage job of PR #93. A required check that cannot be re-run without a
+          # human is a merge block, and an infrastructure block is indistinguishable from a
+          # real finding until somebody reads the log.
+          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL \
+            "https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz" | tar xz
           sudo install -m755 "etcd-${ETCD_VER}-linux-amd64/etcd" "etcd-${ETCD_VER}-linux-amd64/etcdctl" /usr/local/bin/
 
       - name: Configure and build with coverage
@@ -561,7 +585,10 @@ jobs:
       - name: Install etcd
         run: |
           ETCD_VER=v3.5.17
-          curl -sSL https://github.com/etcd-io/etcd/releases/download/$ETCD_VER/etcd-$ETCD_VER-linux-amd64.tar.gz | tar xz
+          # `-f` as well as the retries: without it an HTTP error page is piped into `tar`,
+          # which fails with "unexpected end of file" instead of naming the download.
+          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL \
+            https://github.com/etcd-io/etcd/releases/download/$ETCD_VER/etcd-$ETCD_VER-linux-amd64.tar.gz | tar xz
           sudo install -m755 etcd-$ETCD_VER-linux-amd64/etcd etcd-$ETCD_VER-linux-amd64/etcdctl /usr/local/bin/
           etcd --version
 
