@@ -167,6 +167,16 @@ struct WalPosition {
     uint32_t offset{0};
 };
 
+/// Ordering of two positions in **one** WAL directory: earlier file first, then earlier offset.
+///
+/// A named function rather than `operator<` on purpose. Positions from two different WAL
+/// directories are not comparable — that is what #61 established for the multi-master catch-up,
+/// which compared byte offsets across independent WALs and lost records — so the comparison should
+/// be something a reader has to ask for.
+inline bool wal_position_before(WalPosition a, WalPosition b) {
+    return a.file_index != b.file_index ? a.file_index < b.file_index : a.offset < b.offset;
+}
+
 static_assert(sizeof(WalPosition) == 8, "WalPosition must fit a lock-free atomic");
 static_assert(std::atomic<WalPosition>::is_always_lock_free,
               "std::atomic<WalPosition> must be lock-free: an atomic that quietly takes a lock "

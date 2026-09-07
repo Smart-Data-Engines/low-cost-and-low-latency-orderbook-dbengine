@@ -797,6 +797,138 @@ TEST_F(ReplicationProtocolTest, ARotatingAppendAnnouncesTheFileTheRecordWentInto
 }
 
 
+// ── #100: a record broadcast before the handshake ────────────────────────────────────────────
+
+namespace {
+
+/// Append one delta to the WAL and broadcast it, the way the engine does under one lock.
+/// Returns the sequence number it used.
+uint64_t append_and_broadcast(ob::WALWriter& wal, ob::ReplicationManager& mgr, uint64_t seq,
+                              size_t levels) {
+    std::vector<ob::Level> lv(levels);
+    for (size_t l = 0; l < levels; ++l) {
+        lv[l].price = static_cast<int64_t>(l) + 1;
+        lv[l].qty   = 1;
+        lv[l].cnt   = 1;
+        lv[l]._pad  = 0;
+    }
+    ob::DeltaUpdate d{};
+    std::strncpy(d.symbol, "BTCUSD", sizeof(d.symbol) - 1);
+    std::strncpy(d.exchange, "BINANCE", sizeof(d.exchange) - 1);
+    d.sequence_number = seq;
+    d.timestamp_ns    = 6'000'000'000ULL + seq;
+    d.side            = ob::SIDE_BID;
+    d.n_levels        = static_cast<uint16_t>(levels);
+
+    std::vector<uint8_t> payload(sizeof(ob::DeltaUpdate) + levels * sizeof(ob::Level));
+    std::memcpy(payload.data(), &d, sizeof(d));
+    std::memcpy(payload.data() + sizeof(d), lv.data(), levels * sizeof(ob::Level));
+
+    ob::WALRecord hdr{};
+    hdr.sequence_number = seq;
+    hdr.timestamp_ns    = d.timestamp_ns;
+    hdr.payload_len     = static_cast<uint16_t>(payload.size());
+    hdr.checksum        = ob::crc32c(payload.data(), payload.size());
+    hdr.record_type     = ob::WAL_RECORD_DELTA;
+
+    const ob::WalPosition pos = wal.append(d, lv.data());
+    mgr.broadcast(hdr, payload.data(), payload.size(), pos);
+    return seq;
+}
+
+/// Wait until the manager has registered `want` replicas, or give up.
+///
+/// This is the signal that `accept()` has run, and it is the protocol's own rather than a sleep:
+/// the window this test needs is between the accept and the `REPLICATE` line, so it has to know
+/// that the first has happened and be sure the second has not.
+bool wait_for_registered_replicas(ob::ReplicationManager& mgr, size_t want, int timeout_ms = 3000) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (mgr.replica_states().size() >= want) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+}
+
+} // namespace
+
+TEST_F(ReplicationProtocolTest, ARecordBroadcastBeforeTheHandshakeArrivesOnce) {
+    // `accept_replica()` puts the entry in `replicas_` as soon as the socket is accepted, before the
+    // `REPLICATE` line has been read - so `broadcast()` queues live records to a replica that has
+    // not asked for anything. Then the handshake arrives, the cursor's range ends at the WAL
+    // position read *then* - which is past those records, because the append precedes the broadcast
+    // - and the catch-up sends every one of them again.
+    //
+    // Measured before the fix: ten broadcast in that window, **twenty** received, in the pattern
+    // 1..10 then 1..10.
+    constexpr int    kRecords = 10;
+    constexpr size_t kLevels  = 4;
+
+    auto mgr = start_manager();
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+    ASSERT_TRUE(wait_for_registered_replicas(*mgr, 1))
+        << "the manager never registered the connection, so this test never reached the window it "
+           "is about";
+
+    for (int i = 0; i < kRecords; ++i) {
+        append_and_broadcast(*wal_, *mgr, static_cast<uint64_t>(i) + 1, kLevels);
+    }
+    wal_->flush();
+
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+
+    const auto recs = recv_wire_records(fd, static_cast<size_t>(kRecords));
+
+    // Read until quiet and count exactly, because the failure is upwards: a reader that stops at
+    // the expected number cannot see a second copy (the lesson a surviving mutation taught #93).
+    ASSERT_EQ(recs.size(), static_cast<size_t>(kRecords))
+        << "the stream carried " << recs.size() << " records where " << kRecords << " were sent";
+    for (size_t i = 0; i < recs.size(); ++i) {
+        EXPECT_EQ(recs[i].seq, static_cast<uint64_t>(i) + 1)
+            << "record " << i << " is out of order, which one repeat of the batch looks like";
+    }
+    expect_positions_name_their_records(tmp_->str(), recs);
+
+    ::close(fd);
+    mgr->stop();
+}
+
+TEST_F(ReplicationProtocolTest, ARecordBroadcastAfterTheHandshakeStillArrives) {
+    // The other half, and it is what makes the one above a fix rather than a silence: dropping the
+    // live copy is only correct while a catch-up is going to deliver it. Once the cursor has
+    // finished, `broadcast()` is the only path a record has.
+    constexpr int    kPrefill = 3;
+    constexpr size_t kLevels  = 4;
+    fill_wal(*wal_, kPrefill, kLevels);
+
+    auto mgr = start_manager();
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+
+    const auto caught_up = recv_wire_records(fd, static_cast<size_t>(kPrefill));
+    ASSERT_EQ(caught_up.size(), static_cast<size_t>(kPrefill));
+
+    constexpr int kLive = 5;
+    for (int i = 0; i < kLive; ++i) {
+        append_and_broadcast(*wal_, *mgr, static_cast<uint64_t>(i) + 1 + kPrefill, kLevels);
+    }
+    wal_->flush();
+
+    const auto live = recv_wire_records(fd, static_cast<size_t>(kLive));
+    ASSERT_EQ(live.size(), static_cast<size_t>(kLive))
+        << "a live record after the catch-up did not arrive: " << live.size() << " of " << kLive;
+    expect_positions_name_their_records(tmp_->str(), live);
+
+    ::close(fd);
+    mgr->stop();
+}
+
+
 // ── #98: the engine hands over the position its append returned ──────────────────────────────
 
 namespace {

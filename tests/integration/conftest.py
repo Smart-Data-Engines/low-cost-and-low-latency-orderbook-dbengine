@@ -285,13 +285,13 @@ class ClusterManager:
         # Start node-0 first and wait for it to become PRIMARY
         node0 = self._start_node(0)
         self.nodes.append(node0)
-        self._wait_for_node(node0, timeout=patience(15))
+        self._wait_for_node(node0, timeout=15)
         self._wait_for_primary(node0, timeout=patience(15))
 
         # Now start node-1 — it will discover node-0 as leader via etcd
         node1 = self._start_node(1)
         self.nodes.append(node1)
-        self._wait_for_node(node1, timeout=patience(15))
+        self._wait_for_node(node1, timeout=15)
 
         self._wait_for_election(timeout=patience(15))
         self._started = True
@@ -632,7 +632,16 @@ class ClusterManager:
         )
 
     def _wait_for_node(self, node: NodeInfo, timeout: float = 15.0) -> None:
-        """Poll TCP connect + PING until the node responds with PONG."""
+        """Poll TCP connect + PING until the node responds with PONG.
+
+        `timeout` is a budget measured against an uninstrumented build, and the scaling for a
+        sanitizer run happens **here** rather than at the call sites. Five of the six call sites
+        wrapped it in `patience()` and the sixth did not — the multi-master fixture, which starts
+        three nodes, so it is the one with the most to lose. Under `sanitizers-integration (tsan)`
+        that call site therefore had a flat 20-second budget while every other fixture had 45, and
+        that is what a scaling rule applied by hand looks like when it is applied once too few.
+        """
+        timeout = patience(timeout)
         deadline = time.monotonic() + timeout
         last_err: Optional[Exception] = None
 
@@ -757,7 +766,7 @@ class ClusterManager:
             stderr=subprocess.STDOUT,
         )
         self.nodes[node_index] = new
-        self._wait_for_node(new, timeout=patience(15))
+        self._wait_for_node(new, timeout=15)
 
     def unexplained_deaths(self) -> list:
         """Nodes that are not running and were not killed by a test, with their own last words.

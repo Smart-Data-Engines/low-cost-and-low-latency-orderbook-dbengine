@@ -535,6 +535,19 @@ void ReplicationManager::broadcast(const WALRecord& hdr, const void* payload,
 
     std::lock_guard<std::mutex> lock(mtx_);
     for (auto it = replicas_.begin(); it != replicas_.end(); ) {
+        if (!live_record_is_needed(*it, record_pos)) {
+            OB_LOG_DEBUG("repl_mgr",
+                         "not broadcasting seq=%lu at file=%u offset=%u to fd=%d: "
+                         "asked_for_stream=%d catchup_active=%d through=%u/%u - a transfer in "
+                         "progress covers this record",
+                         static_cast<unsigned long>(hdr.sequence_number),
+                         record_pos.file_index, record_pos.offset, it->fd,
+                         it->asked_for_stream ? 1 : 0, it->catchup.active ? 1 : 0,
+                         it->catchup.through_file,
+                         static_cast<unsigned>(it->catchup.through_offset));
+            ++it;
+            continue;
+        }
         if (it->compress) {
             // Compress the entire message as a single LZ4 frame.
             auto compressed = ob::lz4_compress(msg.data(), msg.size());
@@ -1144,6 +1157,10 @@ void ReplicationManager::handle_replica_data(int fd) {
                 }
                 replica_ptr->confirmed_file   = from_file;
                 replica_ptr->confirmed_offset = from_offset;
+                // From here `broadcast()` may send this replica live records. Before it, anything
+                // broadcast to this connection would be delivered a second time by the catch-up
+                // below, whose range ends at the WAL position read inside it (#100).
+                replica_ptr->asked_for_stream = true;
                 // Start the catch-up from the requested position. Since #93 this queues the
                 // first batch and returns; the run loop streams the rest. The COMPRESS LZ4
                 // directive left with it - "after the last plain byte" is the cursor's moment to
@@ -1439,6 +1456,27 @@ void ReplicationManager::finish_catchup(ReplicaInfo& replica) {
         remove_replica_locked(replica.fd);
         replica.fd = -1;
     }
+}
+
+bool ReplicationManager::live_record_is_needed(const ReplicaInfo& replica,
+                                                WalPosition record_pos) const {
+    // A connection that has not sent `REPLICATE` yet. The catch-up it is about to ask for ends at
+    // the WAL position read when that line is processed, and that is at or past this record:
+    // positions only grow and this broadcast has already happened. So the cursor will deliver it.
+    // If the replica instead asks from a position *ahead* of this record, it already has it.
+    // Either way the live copy is a second one (#100).
+    if (!replica.asked_for_stream) return false;
+
+    // A cursor still walking its range reads this record out of the WAL file itself. Only what
+    // lies at or past the end of that range needs the live path, and that is what `pending` is
+    // for. The window where this matters is one mutex hand-off wide - the handshake processed
+    // between an append and its broadcast - so it is narrow rather than absent, and the
+    // comparison costs nothing.
+    if (replica.catchup.active && wal_position_before(record_pos, replica.catchup.through())) {
+        return false;
+    }
+
+    return true;
 }
 
 void ReplicationManager::queue_to_replica(ReplicaInfo& replica, const void* data, size_t len) {

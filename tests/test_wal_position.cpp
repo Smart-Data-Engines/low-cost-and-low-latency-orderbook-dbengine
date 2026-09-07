@@ -227,3 +227,39 @@ TEST(WalPosition, NoSourceFileComposesThePairFromTwoSeparateCalls) {
                return joined;
            }();
 }
+
+// ── Ordering ──────────────────────────────────────────────────────────────────
+
+TEST(WalPosition, TheOrderIsFileFirstAndThenOffset) {
+    // A pure function with an ordering contract, tested directly rather than through the one caller
+    // that has one. A mutation dropping the file index from this comparison survived every
+    // behavioural test in the replication suite: it only shows up for a record in an earlier file
+    // with a larger offset than the boundary it is compared against, which is a shape those tests
+    // do not reach. Nothing about the contract needs a socket to check.
+    using ob::wal_position_before;
+    using ob::WalPosition;
+
+    EXPECT_TRUE(wal_position_before(WalPosition{0, 0}, WalPosition{0, 1}));
+    EXPECT_FALSE(wal_position_before(WalPosition{0, 1}, WalPosition{0, 0}));
+
+    // Strict: a position is not before itself, which is what makes "at or past the boundary" the
+    // complement of this.
+    EXPECT_FALSE(wal_position_before(WalPosition{3, 7}, WalPosition{3, 7}));
+
+    // The case the mutation exposed. File 0 at offset 4 GB - 1 is still earlier than file 1 at
+    // offset 0, and comparing offsets alone gets it backwards.
+    EXPECT_TRUE(wal_position_before(WalPosition{0, 0xFFFFFFFFu}, WalPosition{1, 0}));
+    EXPECT_FALSE(wal_position_before(WalPosition{1, 0}, WalPosition{0, 0xFFFFFFFFu}));
+
+    // And it is a total order on what a WAL can actually hold: walk a few file boundaries and
+    // require every step to go forwards.
+    const WalPosition walk[] = {
+        {0, 0}, {0, 24}, {0, 160}, {1, 0}, {1, 24}, {2, 0}, {2, 1}, {7, 0},
+    };
+    for (size_t i = 1; i < std::size(walk); ++i) {
+        EXPECT_TRUE(wal_position_before(walk[i - 1], walk[i]))
+            << "step " << i << " does not move forwards";
+        EXPECT_FALSE(wal_position_before(walk[i], walk[i - 1]))
+            << "step " << i << " is before its own predecessor";
+    }
+}

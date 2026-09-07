@@ -1427,6 +1427,23 @@ Learned the hard way. Check here before debugging.
     that window, twenty received, in the pattern 1..10 then 1..10. Found because a live-path test
     for something else saw fourteen where twelve were sent (#100).
 
+171. **A pure function with a contract gets a test for the contract, not for the one caller that
+    has one.** A mutation dropping the file index from `wal_position_before()` passed every
+    behavioural test in the replication suite: it only shows for a record in an earlier file whose
+    offset is larger than the boundary it is compared against, and no cursor range those tests
+    build straddles a boundary at that moment. Nothing about the ordering needs a socket, so it is
+    pinned directly — strict, file first, and a walk across boundaries required to move forwards
+    (#100).
+
+172. **A scaling rule applied by hand is applied once too few.** `patience()` triples every wait in
+    the integration battery under a sanitizer, and five of the six `_wait_for_node()` call sites
+    wrapped their budget in it. The sixth was the multi-master fixture — three nodes, so the one
+    with the most to lose — which had a flat 20 s where every other fixture had 45, and
+    `sanitizers-integration (tsan)` went red on a loaded runner. Measured before touching it,
+    because a raised timeout is the standard way to hide a hang: under TSan on this machine a node
+    answers PING in **0.39 s**, and 0.39/0.46/0.54 s for three started together. The scaling lives
+    inside `_wait_for_node()` now, with a static guard that forbids a call site scaling again.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -1435,7 +1452,7 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 952 C++ tests (`ctest -j1`, ~3 min) and 190 integration tests plus 2
+**Where the suites stand:** 955 C++ tests (`ctest -j1`, ~3 min) and 190 integration tests plus 2
 opt-in Binance skips (`pytest tests/integration/`, ~10.5 min on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that
