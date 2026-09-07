@@ -11,6 +11,13 @@
 //   Error:      ERR <message>\n
 //   Stale:      ERR STALE_PRIMARY\n
 //
+// What the position on a `WAL` line means, because it was undefined for four phases of this work
+// and the two paths that wrote it disagreed (#98): `<file_index> <byte_offset>` is where **this
+// record** begins in the primary's WAL. The replica derives `byte_offset + total_len` and saves it,
+// so it is the resume point on reconnect and the number `ACK` carries back. It is not the replica's
+// acknowledged position, and it is not the WAL's current position - after a rotating append the
+// current position is in the next file while the record is at the end of the previous one.
+//
 // Design notes:
 //   - broadcast() is non-blocking: it enqueues data into per-replica send buffers.
 //     The epoll thread drains buffers via EPOLLOUT, keeping the hot path lock-free.
