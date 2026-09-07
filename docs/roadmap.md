@@ -1937,7 +1937,7 @@ same stream I was following".
   replica is missing, and the mechanism that would fix it is deleted on the way past
 
 
-### 100. A record broadcast between `accept()` and the handshake is delivered twice
+### 100. A record broadcast between `accept()` and the handshake is delivered twice ✅
 
 Measured while writing #98's tests, which is how it was found: a live-path test that broadcast
 records right after connecting saw fourteen where twelve were sent, and the two extra were not
@@ -1965,6 +1965,49 @@ snapshot transfer's records are not in a range anybody is about to stream.
 The replication path has no sequence check — `engine.cpp` says so about the multi-master path, where
 there is one — so a duplicate delta is applied twice. Whether that produces duplicate rows depends
 on flush timing, and that half is not measured.
+
+**`live_record_is_needed()` is one question with the answer in one place**, because a replica can be
+mid-transfer in more than one way and `broadcast()` should not learn them separately. It is
+answerable at all only since **#98** gave the live path the record's own position — before that
+there was nothing to compare, which is a dependency worth naming: the field that was wrong and
+load-bearing nowhere turned out to be the field this fix is built on.
+
+Its second condition covers a narrower case of the same defect that was not measured separately: a
+record appended *before* a cursor was created but broadcast *after* it. That needs the handshake to
+be processed between an append and its broadcast — one mutex hand-off wide, so narrow rather than
+absent, and the comparison costs nothing. `wal_position_before()` is a named function rather than
+`operator<` because positions from two different WAL directories are not comparable; that is what
+**#61** established, having compared byte offsets across independent WALs and lost records.
+
+**What the fix gives up, named:** `continue_catchup()` abandons its range if a WAL file in the
+middle is missing (`stopping at file N`). A record dropped here would then not arrive by either
+path — where before it would have arrived through `pending`. The records between it and the gap
+would not have arrived either, so the replica has a hole in both worlds; it is not a regression in
+kind, and the file it needs is one nothing else deletes while a replica is behind.
+
+**The tests are a pair, and the second is what makes the first a fix rather than a silence:**
+dropping the live copy is only correct while a catch-up is going to deliver it, so a live record
+*after* the cursor finishes still has to arrive. The accept window is entered by polling
+`replica_states()` rather than by sleeping — the protocol's own signal that the accept has happened
+and the handshake has not. There is no integration test: the harness's replica sends `REPLICATE`
+immediately on connecting, so the window is not reachable from outside the process, and a test that
+cannot enter the window would be asserting about something else.
+
+**Mutations: five, all caught — one only after the ordering got a test of its own.**
+
+| # | mutation | caught by |
+|---|---|---|
+| 1 | the handshake flag is ignored | `ARecordBroadcastBeforeTheHandshakeArrivesOnce` |
+| 2 | the flag is set at `accept()` instead of at `REPLICATE` | same test |
+| 3 | every live record is dropped — the fix taken too far | 7 tests, led by `ARecordBroadcastAfterTheHandshakeStillArrives` |
+| 4 | the range comparison is inverted | 2 tests |
+| 5 | `wal_position_before()` drops the file index | **survived**; now `WalPosition.TheOrderIsFileFirstAndThenOffset` |
+
+Mutation 5 is the reason that ordering has a direct test. It only shows up for a record in an
+earlier file with a larger offset than the boundary it is compared against, and no behavioural test
+reaches that shape — the cursor ranges they build do not straddle a boundary at the moment a live
+record is compared against one. Nothing about the contract needs a socket, so it is checked as a
+contract.
 
 - Effort: S | Impact: a replica bootstrapping while the primary takes writes applies part of its
   catch-up twice
@@ -3665,12 +3708,11 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Four defects are open, and they lead this table rather than sitting under the capabilities.**
+**Two defects are open, and they lead this table rather than sitting under the capabilities.**
 That is a correction: this paragraph used to say every remaining item was a capability or a proof.
-None of the four came out of a bug report; every one came out of measuring the item before it, which
-is the usual way here. #93's measurement produced #98 and #99, and #98's own tests produced #100
-(a record delivered twice, measured as ten sent and twenty received) and #101 (a replica that
-throws its store away on a restart).
+Neither came out of a bug report; each came out of measuring the item before it, which is the usual
+way here. #93's measurement produced #98 and #99; #98's own tests produced #100 (fixed the same
+day — ten records broadcast before a handshake, twenty received) and #101.
 
 Below the defects the ordering is about who we want to be able to say yes to. A reader can build the
 engine, read its tests and now deploy it from a package (#33), and still **cannot verify its
@@ -3680,7 +3722,6 @@ performance claim is the reason this repo exists.
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
 | **P1** | A live write is spliced into a snapshot transfer (#99) | S | A replica cannot be bootstrapped from a primary that is taking writes; the mechanism is #93's, the measurement is not taken yet |
-| **P1** | A record broadcast before the handshake is delivered twice (#100) | S | Measured: ten sent, twenty received. Same site as #99 and a different answer — drop rather than queue |
 | **P1** | Reproducible comparative benchmarks (#39 part two) | L | Makes the performance claim verifiable by a reader instead of asserted; needs ClickHouse, TimescaleDB and kdb+ installed natively, which is a decision about the machine rather than code |
 | **P2** | A replica that restarts wipes its store and re-syncs from zero (#101) | M | Restart cost is proportional to the store rather than to what is missing, and the position that would avoid it is deleted on the way past |
 | **P2** | The unexplained node death behind #86's third occurrence | S | An `UNREACHABLE` that needs nothing listening, on a node whose epoll thread is merely busy; the OOM-kill hypothesis is untested and the harness should name an unexplained death |
@@ -3819,7 +3860,7 @@ Measured on machine B, on the commit that carries this table, rather than carrie
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 952 | all passing, 189 s with `ctest -j1` on machine B. `ctest -N` reports 954: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
+| C++ (GTest + RapidCheck) | 955 | all passing, ~190 s with `ctest -j1` on machine B. `ctest -N` reports 957: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
 | Python integration | 190 | passing, plus 2 skipped. The two skips are the Binance tests, which are opt-in on a live feed (`OB_BINANCE_TESTS=1`). **No xfails left**: #60's and #61's markers both fell with their fixes |
 
 `ctest -j1` is not a preference. The network tests bind ports, so a parallel run fails for a reason
