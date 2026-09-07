@@ -154,6 +154,44 @@ def test_flush_is_idempotent(primary_client: OrderbookEngine):
     assert before == after == 1, f"row count changed on second flush: {before} -> {after}"
 
 
+def test_the_startup_budget_is_scaled_in_one_place() -> None:
+    """Static, over `conftest.py`. A scaling rule applied by hand is applied once too few.
+
+    `patience()` triples every timeout under a sanitizer, because every wait in this suite was
+    chosen against an uninstrumented build. Five of the six `_wait_for_node()` call sites wrapped
+    their budget in it; the sixth - the multi-master fixture, which starts three nodes and so has
+    the most to lose - passed a flat 20. Under `sanitizers-integration (tsan)` that fixture had a
+    20-second budget where every other had 45, and the job failed with "node-2 not ready after 20s"
+    on a process that was alive with its mesh already up.
+
+    The scaling now happens inside `_wait_for_node()`, so no call site can forget it. This is the
+    guard for that: the function has to scale, and no call site may scale again, because double
+    scaling reads as a budget somebody measured.
+    """
+    conftest = pathlib.Path(__file__).resolve().parent / "conftest.py"
+    lines = conftest.read_text(encoding="utf-8").splitlines()
+
+    body_start = next(
+        (n for n, line in enumerate(lines) if "def _wait_for_node(" in line), None
+    )
+    assert body_start is not None, "conftest has no _wait_for_node; this guard checks nothing"
+    body = "\n".join(lines[body_start:body_start + 25])
+    assert "timeout = patience(timeout)" in body, (
+        "_wait_for_node no longer scales its own budget, so every call site is back to remembering "
+        "to do it - which is the defect this guard exists for"
+    )
+
+    doubled = [
+        f"conftest.py:{n}"
+        for n, line in enumerate(lines, start=1)
+        if "_wait_for_node(" in line and "patience(" in line
+    ]
+    assert not doubled, (
+        f"these call sites scale a budget that _wait_for_node already scales: {doubled}. The number "
+        "at a call site should be the one that was measured on an uninstrumented build."
+    )
+
+
 def test_no_module_builds_its_own_server_path() -> None:
     """Static, over the integration modules. The rule, not the four instances of it.
 
