@@ -1751,8 +1751,7 @@ bool ReplicationManager::continue_snapshot_transfer(ReplicaInfo& replica) {
 
     // Anything that arrived while the snapshot streamed goes out now, after its last byte. The
     // snapshot carries the WAL position it was taken at, so what waited is what this replica needs
-    // next - and putting it here rather than inside the stream is the whole of #99. `st.active`
-    // is cleared first, or `queue_to_replica()` would defer these bytes again.
+    // next - and putting it here rather than inside the stream is the whole of #99.
     if (!replica.deferred_live.empty()) {
         OB_LOG_INFO("repl_mgr",
                     "snapshot transfer complete for fd=%d at wal file=%u offset=%zu; releasing %zu "

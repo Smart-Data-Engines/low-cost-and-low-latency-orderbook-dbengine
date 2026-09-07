@@ -954,6 +954,37 @@ std::string function_body(const std::string& file, const std::string& signature)
 
 } // namespace
 
+TEST(WalPositionWireStatic, NothingQueuedFromTheRunLoopBypassesTheTransferDecision) {
+    // The heartbeat is #99 with a five-second timer instead of a write: that loop walks every
+    // replica, and a `HEARTBEAT <epoch>` line landing inside a snapshot's byte stream abandons the
+    // bootstrap exactly as a `WAL` record does - with no client write involved at all, so any
+    // transfer that takes longer than five seconds hits it.
+    //
+    // A behavioural test for that would have to wait out the interval inside a stalled transfer, or
+    // make the interval configurable for a test's sake. This is the mechanism instead: a mutation
+    // routing the heartbeat around `queue_to_replica()` survived the whole suite, and it is what
+    // this refuses. `queue_to_replica()` is the only function that knows about deferring, so
+    // anything the run loop queues has to go through it.
+    const std::string body = function_body("src/replication.cpp",
+                                           "void ReplicationManager::run_loop()");
+    ASSERT_FALSE(body.empty()) << "could not find ReplicationManager::run_loop in "
+                                  "src/replication.cpp; if it was renamed, this test has stopped "
+                                  "checking anything";
+
+    EXPECT_EQ(body.find("enqueue_send("), std::string::npos)
+        << "run_loop() queues bytes to a replica without going through queue_to_replica(), so they "
+           "can be spliced into a catch-up or a snapshot transfer in progress (#99)";
+    EXPECT_EQ(body.find("enqueue_and_flush("), std::string::npos)
+        << "same rule: enqueue_and_flush() writes straight to the socket, which is a splice if a "
+           "transfer is streaming";
+
+    // And the pair that makes this test fail for the right reason rather than by finding nothing:
+    // the queueing it demands has to be there.
+    EXPECT_NE(body.find("queue_to_replica("), std::string::npos)
+        << "run_loop() no longer queues anything to a replica, so this guard is watching an empty "
+           "function";
+}
+
 TEST(WalPositionWireStatic, TheEngineBroadcastsThePositionItsAppendReturned) {
     // The behavioural tests in this file drive `ReplicationManager` directly, so they pin what the
     // manager does with a position and say nothing about which position the engine chooses. That

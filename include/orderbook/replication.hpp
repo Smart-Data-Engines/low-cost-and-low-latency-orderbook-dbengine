@@ -514,8 +514,10 @@ private:
     /// Move everything held in `deferred_live` into the send buffer, in arrival order.
     ///
     /// Two callers, one per transfer: `finish_catchup()` and the end of a snapshot transfer. Both
-    /// clear their `active` flag before calling, or `queue_to_replica()` defers the same bytes
-    /// again.
+    /// clear their `active` flag first, which is the honest order rather than a guarantee — this
+    /// goes through `enqueue_send()` directly, so it could not re-defer its own bytes whatever the
+    /// order. That distinction is here because the comment first written in its place claimed the
+    /// ordering was load-bearing, and a mutation that swapped it survived, which is what said so.
     void release_deferred_live(ReplicaInfo& replica);
 
     /// Whether some replica's catch-up could queue more bytes right now. Requires `mtx_`.
