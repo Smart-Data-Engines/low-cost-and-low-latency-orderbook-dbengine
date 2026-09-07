@@ -1955,9 +1955,20 @@ first. **The third test is the control**: `exit 1` plus a message about a port i
 thoroughly broken server produces, so the same binary has to start on free ports, answer `PONG`, and
 still exit `0` on `SIGTERM` — the half most easily broken by adding a catch.
 
-Mutations: four, all caught — no `try`/`catch`; the catch with the join guard removed (this is the
-one that says the catch alone is insufficient); the guard reusing the shutdown flag; and the guard
-joining without setting its flag, which hangs and dies on the test's own deadline.
+Mutations: five, all caught — no `try`/`catch`; the catch with the join guard removed (this is the
+one that says the catch alone is insufficient); the guard reusing the shutdown flag; the guard
+joining without setting its flag, which hangs and dies on the test's own deadline; and narrowing
+`ob_cli`'s handler to `std::runtime_error`, which the static guard names by filename.
+
+**Both entry points, and a static test so it is a closed class rather than a fix applied twice.**
+`ob_cli` had the same shape — `Engine::open()` throws when it cannot open the WAL, which an
+unwritable data directory produces — and nothing supervises that tool, so the exit code matters less
+there; what matters is that a repository which has paid three times for "the fix exists and is used
+at one of two sites" does not do it again. `CliConfig.EveryEntryPointRefusesToStartRatherThanAborting`
+enumerates `tools/` rather than naming the two files, and carries the pair that stops it passing by
+finding nothing: at least two entry points must have been examined. Measured: `ob_cli /proc/nope`
+exits `1` with `Error: filesystem error: cannot create directories…`, and an ordinary session still
+exits `0`.
 
 **Deliberately not changed:** a taken `--metrics-port` is logged as an error and the node starts
 anyway, so a node whose monitoring is blind looks healthy. That is a different decision — which
@@ -3976,7 +3987,7 @@ Measured on machine B, on the commit that carries this table, rather than carrie
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 960 | all passing, ~195 s with `ctest -j1` on machine B. `ctest -N` reports 962: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
+| C++ (GTest + RapidCheck) | 961 | all passing, ~195 s with `ctest -j1` on machine B. `ctest -N` reports 963: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
 | Python integration | 195 | passing, plus 2 skipped, on i3-7100U in ~10 min. The two skips are the Binance tests, opt-in on a live feed (`OB_BINANCE_TESTS=1`), and they are **collection-time** skips (`pytest.skip(allow_module_level=True)`) — so they are not in the 195, produce no progress character, and the suite's own report plugin says `0 skipped` while pytest says 2. This row read 190 until it was recounted; if you recompute it, count what pytest reports rather than what `--collect-only` does. **No xfails left**: #60's and #61's markers both fell with their fixes |
 
 `ctest -j1` is not a preference. The network tests bind ports, so a parallel run fails for a reason
