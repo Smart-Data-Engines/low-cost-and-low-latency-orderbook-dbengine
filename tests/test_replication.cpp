@@ -3290,3 +3290,72 @@ TEST(ReplicationDedup, DiscardingLocalDataAlsoForgetsWhatWasApplied) {
         << "would re-sync into nothing";
     engine.close();
 }
+
+TEST(ReplicationDedup, EveryPathThatDiscardsTheStoreAlsoDiscardsTheFrontier) {
+    // Static, over `src/engine.cpp`, and it exists because this defect had **two** instances and
+    // the second was found only by going looking. Both clear the store and neither had reset the
+    // frontier that describes it:
+    //
+    //   - `discard_local_data_for_resync()`, the failover wipe;
+    //   - `load_snapshot()`, which the replication bootstrap calls and which got away with it
+    //     because the *mesh* calls `adopt_snapshot_sequence_state()` straight after, and that
+    //     resets.
+    //
+    // A frontier left standing claims rows the discard has just deleted, so every record the
+    // primary sends below it is dropped as a duplicate and nothing ever refills the hole. Measured
+    // on the first instance: 0 rows where 1 was replayed.
+    //
+    // The list of functions comes from the source. Naming the two would be a claim about the code
+    // rather than evidence about it - and a third path is exactly what this is for.
+    const auto read = [](const char* rel) {
+        std::ifstream in(std::string(OB_SOURCE_DIR) + "/" + rel);
+        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    };
+    const std::string src = read("src/engine.cpp");
+    ASSERT_FALSE(src.empty());
+
+    std::vector<std::string> discarding;
+    std::vector<std::string> offenders;
+    const std::string marker = "buffers_.clear();";
+    for (std::size_t at = src.find(marker); at != std::string::npos;
+         at = src.find(marker, at + marker.size())) {
+        // Walk back to the definition line, which starts at column 0.
+        std::size_t sig = std::string::npos;
+        for (std::size_t line = 0; line < at;) {
+            const std::size_t next = src.find('\n', line);
+            if (next == std::string::npos || next > at) break;
+            const char first = src[line];
+            if (first != ' ' && first != '\t' && first != '\n' &&
+                src.compare(line, 2, "//") != 0 &&
+                src.find("Engine::", line) < next && src.find('(', line) < next) {
+                sig = line;
+            }
+            line = next + 1;
+        }
+        ASSERT_NE(sig, std::string::npos) << "could not find the function containing a buffers_ clear";
+        const std::string name = src.substr(sig, src.find('(', sig) - sig);
+
+        auto pos = src.find('{', sig);
+        int depth = 0;
+        std::size_t end = pos;
+        for (; end < src.size(); ++end) {
+            if (src[end] == '{') ++depth;
+            else if (src[end] == '}' && --depth == 0) break;
+        }
+        const std::string body = src.substr(pos, end - pos + 1);
+        discarding.push_back(name);
+        if (body.find("seq_tracker_.reset()") == std::string::npos) offenders.push_back(name);
+    }
+
+    // The pair, because "no offenders" is also what a broken walk produces.
+    EXPECT_GE(discarding.size(), 2u)
+        << "expected at least the failover wipe and the snapshot install to discard the store; "
+        << "found " << discarding.size() << ", so this test is not looking at what it thinks";
+
+    std::string joined;
+    for (const auto& name : offenders) joined += name + "  ";
+    EXPECT_TRUE(offenders.empty())
+        << "these functions discard the store and keep the sequence frontier that describes it, so "
+        << "the records replayed afterwards are dropped as duplicates and the store stays short: "
+        << joined;
+}

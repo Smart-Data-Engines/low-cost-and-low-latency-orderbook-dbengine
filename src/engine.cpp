@@ -1375,6 +1375,21 @@ void Engine::load_snapshot(const SnapshotManifest& /*manifest*/) {
     buffers_.clear();
     pending_rows_.clear();
 
+    // And the sequence frontier, because the contents it described are gone.
+    //
+    // The mesh path got this right by accident of layering: it calls
+    // `adopt_snapshot_sequence_state()` immediately after this, which resets and then imports the
+    // peer's vector. The **replication** path calls only this function, so a replica that
+    // bootstrapped by snapshot after holding data kept a frontier describing the discarded
+    // contents - and once the replication link deduplicates (#101), every record the primary sends
+    // below that frontier is dropped, leaving a hole nothing refills. `multi_master.cpp` names this
+    // hazard exactly ("a frontier claiming a row that does not exist, which no later catch-up will
+    // ever fill") for the concurrent-apply case; this is the same hazard from the install itself.
+    //
+    // Harmless before that guard existed, which is why it survived here. The mesh's double reset
+    // costs one map clear on a path that has just moved gigabytes.
+    seq_tracker_.reset();
+
     // Rebuild columnar index from the new files on disk.
     combined_store_.close();
     combined_store_.open_existing();
