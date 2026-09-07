@@ -4,12 +4,23 @@
 // stream WAL records, handle ACKs, and send heartbeats.
 //
 // Wire protocol (text+binary hybrid, newline-delimited control messages):
+//   Stream ask: STREAMID?\n                      -> STREAM <wal_identity>\n
 //   Handshake:  REPLICATE <file_index> <byte_offset> <epoch>\n
 //   WAL record: WAL <file_index> <byte_offset> <total_len> <epoch>\n<WALRecord(24)><payload>
 //   ACK:        ACK <file_index> <byte_offset>\n
 //   Heartbeat:  HEARTBEAT <epoch>\n
 //   Error:      ERR <message>\n
 //   Stale:      ERR STALE_PRIMARY\n
+//
+// `STREAMID?` goes out first and carries no position, which is what makes it compatible in both
+// directions (#101). A primary that does not know it ignores it and sends nothing - so the replica
+// waits one socket timeout, concludes it cannot attribute the position it holds, and starts over -
+// and a replica that never asks is served exactly as before. Answering it changes nothing on the
+// primary: it is stateless and idempotent, and it does not begin streaming.
+//
+// Everything before the first `REPLICATE` is the handshake, and nothing unprompted may arrive in
+// it. That is why the heartbeat is gated on this connection having asked for the stream: a
+// `HEARTBEAT` line landing between `STREAMID?` and `STREAM` is read where an answer belongs.
 //
 // What the position on a `WAL` line means, because it was undefined for four phases of this work
 // and the two paths that wrote it disagreed (#98): `<file_index> <byte_offset>` is where **this
