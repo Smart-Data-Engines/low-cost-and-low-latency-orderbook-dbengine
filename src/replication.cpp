@@ -4,12 +4,23 @@
 // stream WAL records, handle ACKs, and send heartbeats.
 //
 // Wire protocol (text+binary hybrid, newline-delimited control messages):
+//   Stream ask: STREAMID?\n                      -> STREAM <wal_identity>\n
 //   Handshake:  REPLICATE <file_index> <byte_offset> <epoch>\n
 //   WAL record: WAL <file_index> <byte_offset> <total_len> <epoch>\n<WALRecord(24)><payload>
 //   ACK:        ACK <file_index> <byte_offset>\n
 //   Heartbeat:  HEARTBEAT <epoch>\n
 //   Error:      ERR <message>\n
 //   Stale:      ERR STALE_PRIMARY\n
+//
+// `STREAMID?` goes out first and carries no position, which is what makes it compatible in both
+// directions (#101). A primary that does not know it ignores it and sends nothing - so the replica
+// waits one socket timeout, concludes it cannot attribute the position it holds, and starts over -
+// and a replica that never asks is served exactly as before. Answering it changes nothing on the
+// primary: it is stateless and idempotent, and it does not begin streaming.
+//
+// Everything before the first `REPLICATE` is the handshake, and nothing unprompted may arrive in
+// it. That is why the heartbeat is gated on this connection having asked for the stream: a
+// `HEARTBEAT` line landing between `STREAMID?` and `STREAM` is read where an answer belongs.
 //
 // What the position on a `WAL` line means, because it was undefined for four phases of this work
 // and the two paths that wrote it disagreed (#98): `<file_index> <byte_offset>` is where **this
@@ -893,6 +904,14 @@ void ReplicationManager::run_loop() {
 
             std::lock_guard<std::mutex> lock(mtx_);
             for (auto it = replicas_.begin(); it != replicas_.end(); ) {
+                // A connection that has not sent `REPLICATE` is not a replica yet, and this is the
+                // third sender to learn it: `broadcast()` gates on the same flag since #100, and
+                // `queue_to_replica()` holds bytes back during a transfer since #99. This loop
+                // walked every entry, so an accepted connection still finishing its handshake got
+                // a `HEARTBEAT` in the middle of it - a line the other side reads where it expects
+                // `AUTH`, or since #101 where it expects `STREAM`. Not hypothetical on either
+                // side: the wait for an answer is five seconds and so is this timer.
+                if (!it->asked_for_stream) { ++it; continue; }
                 if (it->compress) {
                     // Compress heartbeat as a single LZ4 frame with length prefix.
                     auto compressed = ob::lz4_compress(hb, static_cast<size_t>(hb_len));
@@ -1131,6 +1150,40 @@ void ReplicationManager::handle_replica_data(int fd) {
             enqueue_and_flush(*replica_ptr, err, std::strlen(err));
             disconnect_replica_locked(fd, "unauthenticated");
             return;
+        }
+
+        // Which stream is this? (#101) Asked before the position and answered without changing
+        // anything: stateless and idempotent, so a repeat costs one line and no state. Deliberately
+        // *not* a variant of REPLICATE - a question carrying no position is one a pre-#101 primary
+        // ignores in silence, which is what lets the replica decide with nothing in flight (§3.1).
+        if (line == "STREAMID?") {
+            if (config_.wal_identity == 0) {
+                // A manager built without an engine. Answering `STREAM 0` would be worse than
+                // silence: 0 is how "unknown" is spelled everywhere else, so a replica that saved
+                // it would find no usable identity next time and wipe again, forever.
+                OB_LOG_DEBUG("repl_mgr",
+                             "STREAMID? from fd=%d and this manager has no identity to announce",
+                             fd);
+                continue;
+            }
+            char answer[64];
+            const int alen = std::snprintf(answer, sizeof(answer), "STREAM %" PRIu64 "\n",
+                                           config_.wal_identity);
+            enqueue_and_flush(*replica_ptr, answer, static_cast<size_t>(alen));
+            OB_LOG_DEBUG("repl_mgr", "answered STREAMID? for fd=%d with %" PRIu64,
+                         fd, config_.wal_identity);
+            // This is the first message on this link that a peer can repeat for free and be
+            // answered every time: an `ACK` and an unknown line produce nothing, a second
+            // `REPLICATE` restarts a cursor that is bounded, and an unauthenticated peer is
+            // disconnected. `enqueue_send()` has no ceiling of its own - every other caller
+            // checks one - so a peer that asks and never reads would grow this buffer without
+            // bound. That is #69 in a new place, and the answer is the same as everywhere else
+            // here: the connection goes.
+            if (queued_bytes(*replica_ptr) > MAX_SEND_BUF_SIZE) {
+                disconnect_replica_locked(fd, "not draining its stream-identity answers");
+                return;
+            }
+            continue;
         }
 
         // Parse REPLICATE handshake: REPLICATE <file_index> <byte_offset> <epoch>
@@ -1765,6 +1818,11 @@ bool ReplicationManager::continue_snapshot_transfer(ReplicaInfo& replica) {
 
 // ── ReplicationClient (Requirements: 2.1, 2.2, 2.3, 2.4, 4.2, 4.3, 4.4) ────
 
+/// `SO_RCVTIMEO` on the connection to the primary: how long a read waits before it can report
+/// that nothing came. One constant rather than a literal per call site, because
+/// `resolve_stream_identity()` derives its deadline from it (#101).
+static constexpr int kRecvTimeoutSec = 5;
+
 ReplicationClient::ReplicationClient(ReplicationClientConfig config, Engine& engine)
     : config_(std::move(config))
     , engine_(engine)
@@ -1918,7 +1976,7 @@ void ReplicationClient::connect_to_primary() {
 
     // Set a receive timeout so we can periodically check running_ flag.
     struct timeval tv{};
-    tv.tv_sec  = 5;
+    tv.tv_sec  = kRecvTimeoutSec;
     tv.tv_usec = 0;
     ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
@@ -1970,19 +2028,115 @@ void ReplicationClient::connect_to_primary() {
         }
     }
 
+    // ── Whose stream is this? (#101) ──────────────────────────────────────────
+    //
+    // Before the position, which is the whole of design §3.1: this question carries none, so a
+    // primary that does not know it sends nothing back and there is no record in flight while we
+    // decide. Either resumes from the saved position or wipes and starts from zero; the position
+    // sent below is whatever this settled on.
+    resolve_stream_identity();
+
     // Send REPLICATE handshake (Requirement 4.2, 3.1).
     // Even fresh replicas start with REPLICATE 0 0 0. If the primary responds
     // with ERR WAL_TRUNCATED, receive_and_replay() will trigger snapshot bootstrap.
+    send_replicate_from(confirmed_file_.load(std::memory_order_relaxed),
+                        confirmed_offset_.load(std::memory_order_relaxed));
+}
+
+void ReplicationClient::send_replicate_from(uint32_t file_index, size_t byte_offset) {
     char handshake[128];
     int len = std::snprintf(handshake, sizeof(handshake), "REPLICATE %u %zu %" PRIu64 "\n",
-                            confirmed_file_.load(std::memory_order_relaxed),
-                            confirmed_offset_.load(std::memory_order_relaxed),
+                            file_index, byte_offset,
                             local_epoch_.load(std::memory_order_relaxed));
     if (!blocking_send_all(fd_, tls_.get(), handshake, static_cast<size_t>(len))) {
         close_socket();
         throw std::runtime_error("ReplicationClient: failed to send handshake");
     }
     OB_LOG_INFO("repl_client", "handshake sent: %.*s", len - 1, handshake);
+}
+
+void ReplicationClient::resolve_stream_identity() {
+    const uint64_t saved = stream_id_.load(std::memory_order_relaxed);
+
+    const char* question = "STREAMID?\n";
+    if (!blocking_send_all(fd_, tls_.get(), question, std::strlen(question))) {
+        close_socket();
+        throw std::runtime_error("ReplicationClient: failed to ask which stream the primary serves");
+    }
+
+    // One line, but a `HEARTBEAT` may come first and it is not an answer. A pre-#101 primary sends
+    // one every five seconds to any connection it has accepted, and the wait here is five seconds
+    // of silence - so in the mixed-version window a heartbeat landing inside this wait is likely
+    // rather than rare. Read as the answer it would mean "unknown identity" and wipe a store that
+    // may not have needed it. This side stopped sending them to a connection that has not asked
+    // for the stream; the primary on the other end of an upgrade has not.
+    //
+    // The deadline is one socket timeout rather than a round number, and that coupling is the
+    // point: `read_line()` blocks for `SO_RCVTIMEO` before it can report nothing, so a deadline
+    // even a second longer starts a second full read and the wait becomes a multiple of the
+    // timeout. Measured on the first version, with a six-second deadline: 10.5 seconds.
+    uint64_t announced = 0;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(kRecvTimeoutSec);
+    char line_buf[128];
+    while (std::chrono::steady_clock::now() < deadline) {
+        const ssize_t n = reader_.read_line(line_buf, sizeof(line_buf));
+        if (n < 0) {
+            // The socket died. Not evidence about the primary's version, and wiping on it would be
+            // wiping because the network broke - so this throws and `run_loop()` reconnects.
+            close_socket();
+            throw std::runtime_error("ReplicationClient: connection lost while asking which "
+                                     "stream the primary serves");
+        }
+        if (n == 0) continue;   // SO_RCVTIMEO expired with nothing to read
+        if (std::strncmp(line_buf, "HEARTBEAT", 9) == 0) continue;
+        if (std::sscanf(line_buf, "STREAM %" SCNu64, &announced) == 1) break;
+
+        // A new primary answers `STREAM`, an old one answers nothing at all. Anything else is a
+        // protocol anomaly of unknown meaning, and the safe reading of "unknown" is to retry
+        // rather than to delete what we hold.
+        close_socket();
+        throw std::runtime_error("ReplicationClient: expected STREAM from the primary, got '" +
+                                 sanitise_for_log(line_buf, 32) + "'");
+    }
+
+    if (announced != 0 && announced == saved) {
+        OB_LOG_INFO("repl_client",
+                    "primary serves stream %" PRIu64 ", the one our position belongs to - "
+                    "resuming from file=%u offset=%zu",
+                    announced, confirmed_file_.load(std::memory_order_relaxed),
+                    confirmed_offset_.load(std::memory_order_relaxed));
+        return;
+    }
+
+    // Every other outcome is the same act, and the reason differs only in the log. Unconditional
+    // rather than gated on holding anything: "wipe unless the identity matches" is one rule with
+    // no value to be wrong about, and on a store that is already empty it costs a few syscalls
+    // once - the identity is saved below, so the next attempt matches.
+    if (announced == 0) {
+        OB_LOG_INFO("repl_client",
+                    "primary %s:%u did not name its stream - a pre-#101 primary, so what we hold "
+                    "cannot be attributed to it: discarding and replaying from zero",
+                    config_.primary_host.c_str(), config_.primary_port);
+    } else if (saved == 0) {
+        OB_LOG_INFO("repl_client",
+                    "primary serves stream %" PRIu64 " and we have no position that names a "
+                    "stream: discarding and replaying from zero",
+                    announced);
+    } else {
+        OB_LOG_INFO("repl_client",
+                    "primary serves stream %" PRIu64 " and our position belongs to %" PRIu64 " - "
+                    "a different WAL at the same address: discarding and replaying from zero",
+                    announced, saved);
+    }
+
+    engine_.discard_local_data_for_resync();
+    confirmed_file_.store(0, std::memory_order_relaxed);
+    confirmed_offset_.store(0, std::memory_order_relaxed);
+    stream_id_.store(announced, std::memory_order_relaxed);
+    // Written before the position is asked for, so a crash between the two leaves a file naming an
+    // empty store at zero rather than the deleted stream's offset.
+    save_state();
 }
 
 bool ReplicationClient::authenticate_with_primary() {
@@ -2175,7 +2329,7 @@ void ReplicationClient::receive_and_replay() {
                     if (sizeof(DeltaUpdate) + levels_bytes <= payload_len) {
                         const auto* levels = reinterpret_cast<const Level*>(
                             payload + sizeof(DeltaUpdate));
-                        engine_.apply_delta(delta, levels);
+                        engine_.apply_delta_replicated(delta, levels);
                     }
                 }
 
@@ -2311,7 +2465,7 @@ void ReplicationClient::receive_and_replay() {
                         payload + sizeof(DeltaUpdate));
 
                     // Replay via Engine::apply_delta() (Requirement 2.1).
-                    engine_.apply_delta(delta, levels);
+                    engine_.apply_delta_replicated(delta, levels);
                 }
             }
 
@@ -2383,9 +2537,12 @@ void ReplicationClient::save_state() {
     std::FILE* f = open_file_private(config_.state_file, "w");
     if (!f) return;
 
-    std::fprintf(f, "file_index=%u\nbyte_offset=%zu\n",
+    // The identity goes with the position, always in the same write: a position saved without one
+    // is a position nothing can attribute, and `load_state()` reads that as "wipe" (#101).
+    std::fprintf(f, "file_index=%u\nbyte_offset=%zu\nstream_id=%" PRIu64 "\n",
                  confirmed_file_.load(std::memory_order_relaxed),
-                 confirmed_offset_.load(std::memory_order_relaxed));
+                 confirmed_offset_.load(std::memory_order_relaxed),
+                 stream_id_.load(std::memory_order_relaxed));
     std::fclose(f);
 }
 
@@ -2397,18 +2554,30 @@ void ReplicationClient::load_state() {
         // No state file — start from beginning.
         confirmed_file_.store(0, std::memory_order_relaxed);
         confirmed_offset_.store(0, std::memory_order_relaxed);
+        stream_id_.store(0, std::memory_order_relaxed);
         return;
     }
 
     uint32_t file_index = 0;
     size_t byte_offset = 0;
+    uint64_t stream_id = 0;
     char line[256];
 
+    // Not left at whatever a previous connection resolved: `start()` may follow a `stop()` on the
+    // same object, and an identity that outlived the file it came from would let a position resume
+    // against a stream this file never named.
+    stream_id_.store(0, std::memory_order_relaxed);
+
+    // A file written before #101 has no `stream_id` line, and this loop ignores what it does not
+    // recognise, so it reads as 0 - "we do not know whose position this is" - which is the answer
+    // that makes the replica start over rather than resume against a stream it cannot identify.
     while (std::fgets(line, sizeof(line), f)) {
         if (std::sscanf(line, "file_index=%u", &file_index) == 1) {
             confirmed_file_.store(file_index, std::memory_order_relaxed);
         } else if (std::sscanf(line, "byte_offset=%zu", &byte_offset) == 1) {
             confirmed_offset_.store(byte_offset, std::memory_order_relaxed);
+        } else if (std::sscanf(line, "stream_id=%" SCNu64, &stream_id) == 1) {
+            stream_id_.store(stream_id, std::memory_order_relaxed);
         }
     }
 

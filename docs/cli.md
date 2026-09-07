@@ -258,6 +258,13 @@ non-zero after a crash that landed between writing the segment files and recordi
 
 `FLUSH` and a clean shutdown both end in a checkpoint, so a restart after either replays nothing.
 
+On a **replica** the same restart also keeps what replication delivered. It saves how far it got in
+the primary's log and, on reconnecting, asks the primary which stream it serves before asking to
+resume — so it continues from that position instead of streaming the whole log again, and it starts
+over only when the answer says the primary's WAL is not the one that position indexes. Which of the
+two happened is a line in the replica's log, and the three forms it takes are in
+`docs/operations.md`, under "A replica that restarted, and which stream it decided it was on".
+
 ### Parameters
 
 | Flag | Default | Meaning |

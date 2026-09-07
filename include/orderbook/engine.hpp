@@ -74,6 +74,25 @@ public:
     /// Returns OB_OK on success, error code on failure.
     ob_status_t apply_delta(const DeltaUpdate& delta, const Level* levels);
 
+    /// Apply a record streamed from a primary on the replication link.
+    ///
+    /// Identical to `apply_delta()` except that a record whose sequence number this node has
+    /// already seen for that symbol is **dropped** rather than applied. Storage is append-only, so
+    /// applying a duplicate appends its rows a second time (#101, and the half of #100 that was
+    /// left unmeasured).
+    ///
+    /// A separate entry point rather than a condition inside `apply_delta()`, because the fact that
+    /// decides it is *where the record came from* and only the caller knows that. The obvious
+    /// version — drop when `sequence_number != 0`, since a client write carries zero — is false of
+    /// the embedded path: `ob_apply_delta()` takes `seq` as a caller parameter and the Python
+    /// client's `insert()` has it as a required argument, so an embedded user numbering their own
+    /// records from 1 per symbol would have had every write after the first silently dropped.
+    ///
+    /// The engine already separates apply paths by origin — this one, `apply_remote_delta()` for
+    /// the mesh, `apply_delta_replayed()` for WAL recovery — so this completes the set rather than
+    /// adding an exception to it.
+    ob_status_t apply_delta_replicated(const DeltaUpdate& delta, const Level* levels);
+
     /// Execute a SQL query.
     std::string execute(std::string_view sql, RowCallback cb);
 
@@ -253,7 +272,33 @@ public:
     /// RoleTransitionHandler overrides.
     void promote_to_primary(const EpochValue& new_epoch) override;
     void demote_to_replica(const std::string& new_primary_address) override;
+
+    /// Throw away everything this node holds, so a stream can be replayed into it from zero.
+    ///
+    /// Clears the buffers and the pending queue, closes the columnar store, deletes every segment
+    /// directory on disk and reopens the store empty. The WAL files are left alone.
+    ///
+    /// **Caller must hold neither `flush_mtx_` nor `mtx_`**: this takes both, in that order
+    /// (pitfall 10). Called from the replication client's own thread, which is the only place that
+    /// knows whether it has to happen - `demote_to_replica()` used to call it and no longer does
+    /// (#101), because a role change is not evidence about what this node holds.
+    ///
+    /// It is only correct where the position this node saved is discarded with it. Doing one
+    /// without the other leaves a replica asking to resume from a position whose data it has just
+    /// deleted - so the one caller zeroes the position and writes it down before asking for
+    /// anything.
+    void discard_local_data_for_resync();
+
     std::pair<uint32_t, size_t> get_wal_position() const override;
+
+    /// Identity of the WAL this node writes (#101). Non-zero from the moment `open()` returns.
+    ///
+    /// No lock: written once in `open()`, before any thread that could read it exists. A replica
+    /// compares the one its primary announces against the one it saved, and a data directory
+    /// restored from scratch has a different one even at the same address - which is the case
+    /// requirement 4.3 exists for.
+    uint64_t wal_identity() const { return wal_identity_; }
+
     EpochValue get_current_epoch() const override;
     void truncate_and_rebootstrap(const EpochValue& new_epoch,
                                   const std::string& primary_address) override;
@@ -459,7 +504,36 @@ private:
     /// **Caller must hold mtx_** — it is called from inside the flush's merge block.
     void persist_version_vector_if_changed();
 
-    /// Restore the version vector from the last one recorded in the WAL.
+    /// Whether a record already seen for this (symbol, origin) is applied again or dropped.
+    /// Named rather than a bool at the call site: `apply_delta_impl(delta, levels, true)` says
+    /// nothing about which way true goes.
+    enum class DuplicatePolicy { Apply, DropIfSeen };
+
+    /// The body shared by `apply_delta()` and `apply_delta_replicated()`. One acquisition of
+    /// `mtx_`: a wrapper that checked `has_seen()`, released the lock and delegated would leave a
+    /// window between the check and the append. Only the replication client applies on a replica
+    /// today, so nothing would use that window — which is exactly the kind of assumption that
+    /// expires.
+    ob_status_t apply_delta_impl(const DeltaUpdate& delta_in, const Level* levels,
+                                 DuplicatePolicy policy);
+
+    /// Path of the file holding the replication position, or empty when nothing saves one.
+    ///
+    /// Read from `repl_client_config_.state_file` rather than rebuilt from `base_dir_`. The
+    /// rebuilt form happened to be right in production, where `tcp_server.cpp` sets the config to
+    /// `<data_dir>/repl_state.txt` — and silently deleted nothing anywhere the path is configured
+    /// differently, which every unit test does.
+    std::string replication_state_path() const;
+
+    /// Forget where we were in a primary's stream, because this node's data is no longer a prefix
+    /// of it.
+    ///
+    /// Called from `promote_to_primary()` and **not** from `demote_to_replica()`, which is the
+    /// inversion #101 is about: the position used to be deleted on the way *into* replication,
+    /// which is exactly when it is needed. The moment that matters is the one where this node
+    /// starts writing records of its own.
+    void discard_saved_replication_position();
+
     /// Identity of this data directory's WAL, so a position recorded in a segment can be told
     /// apart from one that arrived with a snapshot. Read from `<base_dir>/wal_identity`, generated
     /// on first open. Deliberately outside every segment directory: a snapshot ships segment

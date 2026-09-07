@@ -138,6 +138,15 @@ bool send_str(int fd, const std::string& s) {
     return true;
 }
 
+// Answer `STREAMID?` as a #101 primary does, so the client goes on to send its position.
+// Without it the client waits out its deadline, decides it is talking to a pre-#101 primary and
+// starts over from zero - correct, and not what any test in this file is about.
+void answer_stream_id(int fd, uint64_t identity) {
+    const std::string question = recv_line(fd, 3000);
+    ASSERT_EQ(question.rfind("STREAMID?", 0), 0u) << "got: " << question;
+    ASSERT_TRUE(send_str(fd, "STREAM " + std::to_string(identity) + "\n"));
+}
+
 } // namespace
 
 // ── Unit tests: paths that must be accepted ───────────────────────────────────
@@ -328,6 +337,7 @@ TEST(SnapshotPathSafetyE2E, TraversingSnapshotFileIsRejected) {
 
     const int peer_fd = accept_with_timeout(listen_fd, 5000);
     ASSERT_GE(peer_fd, 0) << "client should connect";
+    answer_stream_id(peer_fd, 0x51DULL);
 
     // REPLICATE handshake from the replica.
     const std::string handshake = recv_line(peer_fd, 3000);
@@ -393,6 +403,7 @@ TEST(SnapshotPathSafetyE2E, AbsoluteSnapshotFileIsRejected) {
 
     const int peer_fd = accept_with_timeout(listen_fd, 5000);
     ASSERT_GE(peer_fd, 0);
+    answer_stream_id(peer_fd, 0x51DULL);
     ASSERT_EQ(recv_line(peer_fd, 3000).rfind("REPLICATE", 0), 0u);
     ASSERT_TRUE(send_str(peer_fd, "ERR WAL_TRUNCATED\n"));
     ASSERT_EQ(recv_line(peer_fd, 5000), "SNAPSHOT_REQUEST");
@@ -444,6 +455,7 @@ TEST(SnapshotPathSafetyE2E, CorruptFileLeavesNoStagedArtifact) {
 
     const int peer_fd = accept_with_timeout(listen_fd, 5000);
     ASSERT_GE(peer_fd, 0);
+    answer_stream_id(peer_fd, 0x51DULL);
     ASSERT_EQ(recv_line(peer_fd, 3000).rfind("REPLICATE", 0), 0u);
     ASSERT_TRUE(send_str(peer_fd, "ERR WAL_TRUNCATED\n"));
     ASSERT_EQ(recv_line(peer_fd, 5000), "SNAPSHOT_REQUEST");
@@ -507,6 +519,7 @@ TEST(SnapshotFilePermissions, ReplicationStateFileIsNotWorldAccessible) {
 
     const int peer_fd = accept_with_timeout(listen_fd, 5000);
     ASSERT_GE(peer_fd, 0);
+    answer_stream_id(peer_fd, 0x51DULL);
     ASSERT_EQ(recv_line(peer_fd, 3000).rfind("REPLICATE", 0), 0u);
 
     // Any ACK-triggering traffic causes a state save; a heartbeat is enough.

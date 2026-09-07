@@ -161,10 +161,14 @@ protected:
     /// `engine` is set **before** `start()`, which is the order `Engine::open()` and the promotion
     /// path both use. Setting it afterwards is safe since the setter takes the mutex, but a test
     /// should exercise the ordering production has.
-    std::unique_ptr<ob::ReplicationManager> start_manager(ob::Engine* engine = nullptr) {
+    /// `wal_identity` defaults to 0, which is how a manager with no engine behind it answers
+    /// `STREAMID?`: not at all, exactly as a pre-#101 primary does. Tests that care pass one.
+    std::unique_ptr<ob::ReplicationManager> start_manager(ob::Engine* engine = nullptr,
+                                                          uint64_t wal_identity = 0) {
         ob::ReplicationConfig cfg;
         cfg.port = port_;
         cfg.max_replicas = 4;
+        cfg.wal_identity = wal_identity;
         auto mgr = std::make_unique<ob::ReplicationManager>(cfg, *wal_);
         if (engine != nullptr) mgr->set_engine(engine);
         mgr->start();
@@ -957,6 +961,68 @@ std::string function_body(const std::string& file, const std::string& signature)
     return {};
 }
 
+/// The body of whichever `Engine::` function contains `marker`, found by walking back to the last
+/// definition line that starts at column 0.
+///
+/// Derived rather than named, and that is the point: this check used to name
+/// `Engine::apply_delta`, and when #101 split it into a delegating pair the body moved to
+/// `apply_delta_impl` — so the test found a four-line wrapper and reported that the engine had
+/// stopped capturing the append's position. A static test pinned to a function *name* stops
+/// checking anything the day the body moves, and the failure looks like the defect it guards.
+std::string read_source(const std::string& rel) {
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/" + rel);
+    if (!in) return {};
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+/// Where the definition containing `at` begins, or npos. A definition's signature starts at
+/// column 0 and nothing inside a body does, so walking forward and keeping the last such line
+/// before `at` finds it.
+///
+/// One copy, used three ways: the body of the first match, the name and body of every match, and
+/// whether one function's body contains a call. Three walks would be three chances for one of
+/// them to stop finding anything and go on passing.
+std::size_t definition_start(const std::string& src, std::size_t at,
+                             const std::string& qualifier) {
+    std::size_t sig = std::string::npos;
+    for (std::size_t line = 0; line < at;) {
+        const std::size_t next = src.find('\n', line);
+        if (next == std::string::npos || next > at) break;
+        const char first = src[line];
+        if (first != ' ' && first != '\t' && first != '\n' &&
+            src.compare(line, 2, "//") != 0 &&
+            src.find(qualifier, line) < next && src.find('(', line) < next) {
+            sig = line;
+        }
+        line = next + 1;
+    }
+    return sig;
+}
+
+/// The braced body that follows the signature at `sig`, braces included.
+std::string body_at(const std::string& src, std::size_t sig) {
+    auto pos = src.find('{', sig);
+    if (pos == std::string::npos) return {};
+    int depth = 0;
+    const auto start = pos;
+    for (; pos < src.size(); ++pos) {
+        if (src[pos] == '{') ++depth;
+        else if (src[pos] == '}' && --depth == 0) return src.substr(start, pos - start + 1);
+    }
+    return {};
+}
+
+std::string enclosing_definition(const std::string& file, const std::string& marker,
+                                 const std::string& qualifier = "Engine::") {
+    const std::string src = read_source(file);
+    if (src.empty()) return {};
+    const auto at = src.find(marker);
+    if (at == std::string::npos) return {};
+    const auto sig = definition_start(src, at, qualifier);
+    if (sig == std::string::npos) return {};
+    return body_at(src, sig);
+}
+
 } // namespace
 
 TEST(WalPositionWireStatic, NothingQueuedFromTheRunLoopBypassesTheTransferDecision) {
@@ -1002,10 +1068,20 @@ TEST(WalPositionWireStatic, TheEngineBroadcastsThePositionItsAppendReturned) {
     // is not configurable and should not become configurable for a test. This is the mechanism
     // instead, and it is the stronger one for this claim: the engine may not *compute* a position
     // at all.
-    const std::string body = function_body("src/engine.cpp",
-                                           "ob_status_t Engine::apply_delta(const DeltaUpdate&");
-    ASSERT_FALSE(body.empty()) << "could not find Engine::apply_delta in src/engine.cpp; if it was "
-                                  "renamed, this test has stopped checking anything";
+    // Whichever function appends a client write and broadcasts it - derived from the two markers
+    // rather than named, so a rename or a split cannot retire the check (it already did once).
+    const std::string body =
+        enclosing_definition("src/engine.cpp", "= wal_.append(delta, levels);");
+    ASSERT_FALSE(body.empty()) << "nothing in src/engine.cpp captures wal_.append(delta, levels); "
+                                  "if the write path changed shape, this test has stopped checking "
+                                  "anything";
+
+    // And they are the *same* function, which is part of the claim rather than a detail: the append
+    // and the broadcast happen under one acquisition of `mtx_`, which is what keeps the WAL order
+    // and the wire order the same.
+    EXPECT_EQ(body, enclosing_definition("src/engine.cpp", "repl_mgr_->broadcast("))
+        << "the append and the broadcast are in different functions, so nothing holds them under "
+           "one lock";
 
     // The append's position is captured, and the name it is captured under is the one handed to
     // broadcast(). Read out of the source rather than written down here, so renaming the variable
@@ -1013,7 +1089,7 @@ TEST(WalPositionWireStatic, TheEngineBroadcastsThePositionItsAppendReturned) {
     const std::string marker = "= wal_.append(delta, levels);";
     const auto assign = body.find(marker);
     ASSERT_NE(assign, std::string::npos)
-        << "Engine::apply_delta no longer captures what wal_.append() returns";
+        << "the write path no longer captures what wal_.append() returns";
     const auto line_start = body.rfind('\n', assign) + 1;
     const std::string decl = body.substr(line_start, assign - line_start);
     // "    const WalPosition record_pos " -> "record_pos"
@@ -1026,7 +1102,7 @@ TEST(WalPositionWireStatic, TheEngineBroadcastsThePositionItsAppendReturned) {
         << "'";
 
     const auto call = body.find("repl_mgr_->broadcast(");
-    ASSERT_NE(call, std::string::npos) << "Engine::apply_delta no longer broadcasts";
+    ASSERT_NE(call, std::string::npos) << "the write path no longer broadcasts";
     const auto call_end = body.find(");", call);
     ASSERT_NE(call_end, std::string::npos);
     const std::string args = body.substr(call, call_end - call);
@@ -1511,6 +1587,21 @@ static int accept_with_timeout(int listen_fd, int timeout_ms = 5000) {
     return client_fd;
 }
 
+// Answer `STREAMID?` the way a #101 primary does, so the client goes on to send its position.
+//
+// Every mock primary needs this. Without it the client waits out its deadline, concludes it is
+// talking to a pre-#101 primary, discards what it holds and asks from zero - correct behaviour,
+// and the wrong subject for a test about anything else. The one test that *is* about that has no
+// call to this.
+static void answer_stream_id(int fd, uint64_t identity, int timeout_ms = 3000) {
+    const std::string question = recv_line(fd, timeout_ms);
+    ASSERT_EQ(question.rfind("STREAMID?", 0), 0u)
+        << "the client asks which stream this is before sending its position, got: " << question;
+    const std::string answer = "STREAM " + std::to_string(identity) + "\n";
+    ASSERT_EQ(::send(fd, answer.data(), answer.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(answer.size()));
+}
+
 // Build a valid WAL wire message: "WAL <file_index> <byte_offset> <total_len>\n<WALRecord><payload>"
 // Returns the complete message bytes.
 static std::vector<uint8_t> build_wal_message(uint32_t file_index, size_t byte_offset,
@@ -1609,7 +1700,8 @@ TEST_F(ReplicationClientTest, ClientConnectsAndSendsHandshake) {
     int client_fd = accept_with_timeout(listen_fd, 5000);
     ASSERT_GE(client_fd, 0) << "Client should connect to mock primary";
 
-    // 5. Read the REPLICATE handshake.
+    // 5. Answer which stream this is, then read the REPLICATE handshake (#101).
+    answer_stream_id(client_fd, 0x51DULL);
     std::string handshake = recv_line(client_fd, 3000);
     EXPECT_TRUE(handshake.rfind("REPLICATE 0 0", 0) == 0)
         << "Client should send REPLICATE 0 0 handshake, got: " << handshake;
@@ -1870,6 +1962,9 @@ namespace {
 struct SnapshotBootstrapOutcome {
     bool first_file_installed{false};
     bool second_file_installed{false};
+    /// `repl_state.txt` as it stands once the install is done, read before `stop()` so it is the
+    /// install's own write rather than the one on the way out (#101 requirement 4.4).
+    std::string saved_state;
 };
 
 SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t port,
@@ -1893,6 +1988,7 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
     const int peer_fd = accept_with_timeout(listen_fd, 5000);
     if (peer_fd < 0) { client.stop(); ::close(listen_fd); engine.close(); return out; }
 
+    answer_stream_id(peer_fd, 0x51DULL);
     const std::string handshake = recv_line(peer_fd, 3000);
     EXPECT_EQ(handshake.rfind("REPLICATE", 0), 0u) << "got: " << handshake;
 
@@ -1911,8 +2007,12 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
                static_cast<ssize_t>(text.size());
     };
 
+    // A non-zero WAL position, deliberately: a snapshot taken at 0 0 is indistinguishable from
+    // the zeros a wipe writes, so an assertion about where the bootstrap left the replica would
+    // hold for the wrong reason (#101 requirement 4.4).
     char begin[128];
-    std::snprintf(begin, sizeof(begin), "SNAPSHOT_BEGIN %zu 0 0 2\n", a_body.size() + b_body.size());
+    std::snprintf(begin, sizeof(begin), "SNAPSHOT_BEGIN %zu 3 4096 2\n",
+                  a_body.size() + b_body.size());
     EXPECT_TRUE(send_str(begin));
 
     char header[256];
@@ -1946,8 +2046,8 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
     // is what the control test caught: a bare `SNAPSHOT_END` fails `sscanf` and the bootstrap is
     // abandoned for a reason that has nothing to do with what the test is about.
     ob::SnapshotManifest expected;
-    expected.wal_file_index  = 0;
-    expected.wal_byte_offset = 0;
+    expected.wal_file_index  = 3;
+    expected.wal_byte_offset = 4096;
     expected.total_bytes     = a_body.size() + b_body.size();
     expected.files.push_back(ob::SnapshotFileEntry{"SNAPA/EXCH/seg/a.col", a_body.size(), a_crc});
     expected.files.push_back(ob::SnapshotFileEntry{"SNAPB/EXCH/seg/b.col", b_body.size(), b_crc});
@@ -1963,6 +2063,11 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
 
     out.first_file_installed  = std::filesystem::exists(dir + "/SNAPA/EXCH/seg/a.col");
     out.second_file_installed = std::filesystem::exists(dir + "/SNAPB/EXCH/seg/b.col");
+    {
+        std::ifstream in(cfg.state_file);
+        out.saved_state.assign(std::istreambuf_iterator<char>(in),
+                               std::istreambuf_iterator<char>());
+    }
 
     client.stop();
     ::close(peer_fd);
@@ -2020,9 +2125,10 @@ TEST_F(ReplicationClientTest, ClientReceivesAndReplaysWalRecord) {
     ob::ReplicationClient client(cfg, engine);
     client.start();
 
-    // 4. Accept connection and read handshake.
+    // 4. Accept connection, name the stream (#101) and read the handshake.
     int client_fd = accept_with_timeout(listen_fd, 5000);
     ASSERT_GE(client_fd, 0);
+    answer_stream_id(client_fd, 0x51DULL);
     std::string handshake = recv_line(client_fd, 3000);
     EXPECT_TRUE(handshake.rfind("REPLICATE", 0) == 0);
 
@@ -2082,9 +2188,10 @@ TEST_F(ReplicationClientTest, ClientRejectsBadCrc) {
     ob::ReplicationClient client(cfg, engine);
     client.start();
 
-    // 4. Accept connection and read handshake.
+    // 4. Accept connection, name the stream (#101) and read the handshake.
     int client_fd = accept_with_timeout(listen_fd, 5000);
     ASSERT_GE(client_fd, 0);
+    answer_stream_id(client_fd, 0x51DULL);
     std::string handshake = recv_line(client_fd, 3000);
     EXPECT_TRUE(handshake.rfind("REPLICATE", 0) == 0);
 
@@ -2902,4 +3009,928 @@ TEST_F(ReplicationProtocolTest, StopIsIdempotent) {
     mgr->stop();          // must be a no-op rather than a second join
     mgr->stop();
     EXPECT_FALSE(mgr->is_running());
+}
+
+// ── #101 requirement 5: over-delivery on the replication link must not duplicate rows ────────
+TEST_F(ReplicationClientTest, ARecordDeliveredTwiceIsAppliedOnce) {
+    // The load-bearing measurement of #101, and the reason its requirement 5 comes before its
+    // requirement 1. `repl_state.txt` is written every ten seconds while `confirmed_*` advances per
+    // record, so a replica resuming from its saved position is handed records it already has.
+    // Storage is append-only, so applying a duplicate appends its rows a second time - which would
+    // turn a fix about cost into a defect about correctness.
+    //
+    // The guard exists one function away: `apply_remote_delta()`, the mesh path, drops a record
+    // whose sequence number it has seen, with the comment explaining that catch-up over-delivers on
+    // purpose. `ReplicationClient` calls `apply_delta()`, which had no such guard.
+    //
+    // Roadmap #100 says of exactly this: "whether that produces duplicate rows depends on flush
+    // timing, and that half is not measured". This is the measurement.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;
+    cfg.state_file   = tmp_->str() + "/repl_state.txt";
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0);
+    answer_stream_id(client_fd, 0x51DULL);
+    const std::string handshake = recv_line(client_fd, 3000);
+    ASSERT_TRUE(handshake.rfind("REPLICATE", 0) == 0) << "got: " << handshake;
+
+    // One record, one level, carrying a sequence number the primary minted - which is what makes it
+    // a replicated record rather than a client write. `stamp_sequence()` only assigns when the
+    // number is zero, so this one passes through untouched.
+    auto [payload, crc] =
+        build_delta_payload("DUPSYM", "BINANCE", 7, 1'700'000'000ULL, 0, 50'000, 100);
+    ob::WALRecord hdr{};
+    hdr.sequence_number = 7;
+    hdr.timestamp_ns    = 1'700'000'000ULL;
+    hdr.checksum        = crc;
+    hdr.payload_len     = static_cast<uint16_t>(payload.size());
+    hdr.record_type     = ob::WAL_RECORD_DELTA;
+    hdr._pad            = 0;
+
+    const auto msg = build_wal_message(0, 0, hdr, payload.data(), payload.size());
+    ASSERT_EQ(::send(client_fd, msg.data(), msg.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(msg.size()));
+    ASSERT_TRUE(recv_line(client_fd, 5000).rfind("ACK ", 0) == 0);
+
+    // The same record again, announced at the same position - which is exactly what a resume from a
+    // lagging saved position re-delivers. The wait is the second ACK rather than a sleep: the client
+    // acknowledges either way, so this synchronises without deciding the outcome.
+    ASSERT_EQ(::send(client_fd, msg.data(), msg.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(msg.size()));
+    ASSERT_TRUE(recv_line(client_fd, 5000).rfind("ACK ", 0) == 0);
+
+    engine.flush_incremental();
+
+    size_t rows = 0;
+    const std::string err = engine.execute(
+        "SELECT * FROM 'DUPSYM'.'BINANCE' WHERE timestamp BETWEEN 0 AND 9999999999999999999",
+        [&](const ob::QueryResult&) { ++rows; });
+    EXPECT_TRUE(err.empty()) << "query failed: " << err;
+    EXPECT_EQ(rows, 1u)
+        << "the same record arrived twice and its row was stored " << rows << " times; storage is "
+        << "append-only, so over-delivery on this link is a correctness defect rather than a cost";
+
+    client.stop();
+    ::close(client_fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
+// ── #101 requirement 5: what the dedup guard must and must not touch ─────────────────────────────
+
+TEST(ReplicationDedup, AnEmbeddedWriteKeepsItsOwnSequenceNumbering) {
+    // The regression test for the finding that changed this design. The obvious guard - drop when
+    // `sequence_number != 0`, since "a client write always carries zero" - is false of the embedded
+    // path: `ob_apply_delta()` takes `seq` as a caller parameter and the Python client's
+    // `insert(..., seq, timestamp_ns)` has it as a *required* argument. An embedded user numbering
+    // their own records from 1 per symbol would then have had every write after the first silently
+    // dropped: data loss introduced by an item about restart cost, in a public API.
+    //
+    // So `apply_delta()` applies whatever it is handed, and the two records below - deliberately
+    // sharing a sequence number - both have to be stored. If this test ever fails, the guard has
+    // leaked out of `apply_delta_replicated()`.
+    ReplTempDir tmp;
+    ob::Engine engine(tmp.str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+
+    ob::Level lvl{};
+    lvl.price = 42'000; lvl.qty = 7; lvl.cnt = 1; lvl._pad = 0;
+    for (int i = 0; i < 2; ++i) {
+        ob::DeltaUpdate d{};
+        std::strncpy(d.symbol, "EMBED", sizeof(d.symbol) - 1);
+        std::strncpy(d.exchange, "LOCAL", sizeof(d.exchange) - 1);
+        d.sequence_number = 5;                     // the caller's own numbering, repeated
+        d.timestamp_ns    = 1'700'000'000ULL + static_cast<uint64_t>(i);
+        d.side            = ob::SIDE_BID;
+        d.n_levels        = 1;
+        ASSERT_EQ(engine.apply_delta(d, &lvl), ob::OB_OK);
+    }
+    engine.flush_incremental();
+
+    size_t rows = 0;
+    const std::string err = engine.execute(
+        "SELECT * FROM 'EMBED'.'LOCAL' WHERE timestamp BETWEEN 0 AND 9999999999999999999",
+        [&](const ob::QueryResult&) { ++rows; });
+    EXPECT_TRUE(err.empty()) << err;
+    EXPECT_EQ(rows, 2u)
+        << "apply_delta() dropped a write because its sequence number repeated; that number belongs "
+        << "to the caller on this path, and dropping it loses an embedded user's data";
+    engine.close();
+}
+
+TEST(ReplicationDedup, TheGuardIsOnEveryEntryPointAnOverDeliveringLinkUses) {
+    // Static, and the list of functions comes from the source rather than from this test: whatever
+    // `replication.cpp` and `multi_master.cpp` call on the engine to apply a record is what has to
+    // carry the guard. A list written here by hand would be a claim about the code rather than
+    // evidence about it, and the shape this guards against - a fix present at one of two sites - has
+    // cost this repository three separate defects.
+    const auto read = [](const char* rel) {
+        std::ifstream in(std::string(OB_SOURCE_DIR) + "/" + rel);
+        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    };
+    const std::string engine_src = read("src/engine.cpp");
+    ASSERT_FALSE(engine_src.empty());
+
+    // Which engine methods do the two over-delivering links apply through?
+    std::set<std::string> applied_through;
+    for (const char* rel : {"src/replication.cpp", "src/multi_master.cpp"}) {
+        const std::string src = read(rel);
+        ASSERT_FALSE(src.empty()) << rel;
+        const std::string needle = "engine_.apply_";
+        for (size_t at = src.find(needle); at != std::string::npos;
+             at = src.find(needle, at + 1)) {
+            const size_t name_at = at + std::strlen("engine_.");
+            const size_t paren   = src.find('(', name_at);
+            if (paren == std::string::npos) continue;
+            applied_through.insert(src.substr(name_at, paren - name_at));
+        }
+    }
+    // The pair: if this came back empty, "every one of them has the guard" would be vacuous.
+    EXPECT_GE(applied_through.size(), 2u)
+        << "expected at least two apply entry points across the replication link and the mesh; "
+        << "found " << applied_through.size() << ", so this test is not looking at what it thinks";
+
+    std::string missing;
+    for (const std::string& fn : applied_through) {
+        const std::string sig = "ob_status_t Engine::" + fn + "(";
+        const size_t begin = engine_src.find(sig);
+        if (begin == std::string::npos) continue;          // not defined here (e.g. a wrapper)
+        const size_t end = engine_src.find("\nob_status_t Engine::", begin + sig.size());
+        const std::string body = engine_src.substr(begin, end == std::string::npos
+                                                          ? std::string::npos : end - begin);
+        // `apply_delta_replicated` delegates, so accept the policy it passes as well as the guard
+        // itself. Accepting the *name* of the shared implementation would not do: `apply_delta`
+        // delegates to the very same function with the opposite policy, so a call site moved back
+        // to `apply_delta` would still read as guarded. The token has to be the one that differs.
+        const bool guarded = body.find("has_seen(") != std::string::npos ||
+                             body.find("DropIfSeen") != std::string::npos;
+        if (!guarded) missing += fn + " ";
+    }
+    EXPECT_TRUE(missing.empty())
+        << "these engine entry points are used by a link that over-delivers on purpose and do not "
+        << "drop what they have already applied, so storage grows a duplicate row per repeat: "
+        << missing;
+}
+
+TEST(ReplicationDedup, TheFrontierThatMakesDedupWorkSurvivesARestart) {
+    // Without this, the guard protects one process life and #101's resume protects nothing: a
+    // replica restarts, is handed the ten seconds of records its saved position lags behind, and
+    // has forgotten that it applied them.
+    //
+    // What restores it is the replica's own WAL - `restore_version_vector()` runs in `open()`,
+    // before the tail replay, from the vector records the flush writes. So the flush before the
+    // close is part of the subject and not tidiness.
+    //
+    // **The observable is `pending_rows`, and counting stored rows instead was wrong.** The first
+    // version of this test asserted one row after the re-delivery and **passed with the guard
+    // disabled** - measured, not supposed. After a restart the re-flushed segment covers the
+    // timestamp range the restored one already covers, and `ColumnarStore` refuses that merge as a
+    // duplicate, so the row count was measuring the store's own refusal and said nothing about the
+    // frontier. That confound is already on record from the mesh's dedup work. `pending_rows` moves
+    // if and only if the record entered the write pipeline.
+    ReplTempDir tmp;
+    ob::Level lvl{};
+    lvl.price = 31'337; lvl.qty = 3; lvl.cnt = 1; lvl._pad = 0;
+
+    ob::DeltaUpdate d{};
+    std::strncpy(d.symbol, "AFTERBOOT", sizeof(d.symbol) - 1);
+    std::strncpy(d.exchange, "BINANCE", sizeof(d.exchange) - 1);
+    d.sequence_number = 7;
+    d.timestamp_ns    = 1'700'000'000ULL;
+    d.side            = ob::SIDE_BID;
+    d.n_levels        = 1;
+
+    {
+        ob::Engine engine(tmp.str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+        engine.open();
+        ASSERT_EQ(engine.apply_delta_replicated(d, &lvl), ob::OB_OK);
+        engine.flush_incremental();
+        engine.close();
+    }
+
+    ob::Engine engine(tmp.str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    engine.flush_incremental();   // a known queue depth, whatever the tail replay left behind
+    ASSERT_EQ(engine.stats().pending_rows, 0u)
+        << "the queue is not empty before the re-delivery, so its depth afterwards decides nothing";
+
+    // The same record, re-delivered after the restart - which is exactly what resuming from a
+    // position written on a ten-second timer produces.
+    ASSERT_EQ(engine.apply_delta_replicated(d, &lvl), ob::OB_OK);
+
+    EXPECT_EQ(engine.stats().pending_rows, 0u)
+        << "the re-delivered record entered the write pipeline, so the sequence frontier did not "
+        << "survive the restart: dedup then protects one process life, and a resumed replica "
+        << "duplicates every record its saved position lagged behind";
+    engine.close();
+}
+
+// ── #101 group 3: the saved position is invalidated by promotion, not by demotion ────────────────
+
+TEST_F(ReplicationClientTest, PromotionForgetsWhereWeWereInThePrimarysStream) {
+    // The inversion this item turns on. The position used to be deleted on the way *into*
+    // replication, which is exactly when it is needed; the moment it stops being true is the one
+    // where this node starts writing records of its own.
+    //
+    // Without this, a node that was a replica at (f,o), got promoted, accepted writes and later came
+    // back as a replica would resume from (f,o) - with records above it that the primary never had.
+    ob::ReplicationClientConfig cfg;
+    cfg.state_file = tmp_->str() + "/repl_state.txt";     // primary_port stays 0: no client, no socket
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE, {}, cfg);
+    engine.open();
+
+    // A saved position, of the shape a replica leaves behind.
+    { std::ofstream out(cfg.state_file); out << "file_index=3\nbyte_offset=4096\n"; }
+    ASSERT_TRUE(std::filesystem::exists(cfg.state_file));
+
+    engine.promote_to_primary(ob::EpochValue{7});
+
+    EXPECT_FALSE(std::filesystem::exists(cfg.state_file))
+        << "a promoted node kept the position it had in someone else's stream; after a restart it "
+        << "would resume from there, with its own records sitting above it";
+    engine.close();
+}
+
+TEST_F(ReplicationClientTest, AClientStoppedByThePromotionDoesNotRecreateThePosition) {
+    // Pins an ordering that is currently a property of how `promote_to_primary()` happens to be
+    // arranged rather than of anything written down - and a comment claiming a property the code
+    // does not have has already survived a mutation in this repository.
+    //
+    // `ReplicationClient::stop()` ends with `save_state()`. So a deletion placed before the client
+    // is stopped is undone by the client on its way out, and the node comes back after a restart
+    // resuming from a stream it no longer follows. The deletion has to run after the stop.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;                            // so `open()` starts a client
+    cfg.state_file   = tmp_->str() + "/repl_state.txt";
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE, {}, cfg);
+    engine.open();
+
+    // Wait until the client is really up, rather than sleeping: it has to be alive for its stop to
+    // be able to rewrite the file, or this test passes for the wrong reason.
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0) << "the replication client never connected, so nothing here could have "
+                               "rewritten the position file";
+    answer_stream_id(client_fd, 0x51DULL);
+    ASSERT_TRUE(recv_line(client_fd, 3000).rfind("REPLICATE", 0) == 0);
+
+    engine.promote_to_primary(ob::EpochValue{9});
+
+    EXPECT_FALSE(std::filesystem::exists(cfg.state_file))
+        << "the position file is back: the client wrote it while stopping, after the promotion had "
+        << "deleted it, so the deletion ran too early";
+
+    ::close(client_fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
+TEST(ReplicationDedup, DiscardingLocalDataAlsoForgetsWhatWasApplied) {
+    // Dedup and the wipe are only compatible if the wipe clears the sequence frontier too, and this
+    // is the test that says so. `discard_local_data_for_resync()` clears the buffers, the pending
+    // queue and every segment on disk - and the frontier lives in `seq_tracker_`, which is not part
+    // of any of those. Leave it standing and the replica claims to have seen records it has just
+    // deleted, so the `REPLICATE 0 0` that follows a wipe has **every** record dropped as a
+    // duplicate and the store stays empty. Silent, total data loss.
+    //
+    // Before the dedup guard this was harmless, which is why nothing here caught it: without a
+    // guard, an over-claimed frontier costs nothing. `SequenceTracker::reset()`'s own docstring
+    // names the mechanism - "a frontier from the discarded contents would survive the discard and
+    // claim records that are no longer on disk" - and the snapshot install path had been calling it
+    // for exactly that reason all along. The wipe path had not.
+    ReplTempDir tmp;
+    ob::Engine engine(tmp.str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+
+    ob::Level lvl{};
+    lvl.price = 55'555; lvl.qty = 9; lvl.cnt = 1; lvl._pad = 0;
+    ob::DeltaUpdate d{};
+    std::strncpy(d.symbol, "WIPED", sizeof(d.symbol) - 1);
+    std::strncpy(d.exchange, "BINANCE", sizeof(d.exchange) - 1);
+    d.sequence_number = 11;
+    d.timestamp_ns    = 1'700'000'000ULL;
+    d.side            = ob::SIDE_BID;
+    d.n_levels        = 1;
+
+    ASSERT_EQ(engine.apply_delta_replicated(d, &lvl), ob::OB_OK);
+    engine.flush_incremental();
+
+    engine.discard_local_data_for_resync();
+
+    // The stream replayed from zero, which is what follows a wipe.
+    ASSERT_EQ(engine.apply_delta_replicated(d, &lvl), ob::OB_OK);
+    engine.flush_incremental();
+
+    size_t rows = 0;
+    const std::string err = engine.execute(
+        "SELECT * FROM 'WIPED'.'BINANCE' WHERE timestamp BETWEEN 0 AND 9999999999999999999",
+        [&](const ob::QueryResult&) { ++rows; });
+    EXPECT_TRUE(err.empty()) << err;
+    EXPECT_EQ(rows, 1u)
+        << "the wipe kept the sequence frontier, so the record replayed into the empty store was "
+        << "dropped as a duplicate and the store holds " << rows << " rows: a replica that wipes "
+        << "would re-sync into nothing";
+    engine.close();
+}
+
+TEST(ReplicationDedup, EveryPathThatDiscardsTheStoreAlsoDiscardsTheFrontier) {
+    // Static, over `src/engine.cpp`, and it exists because this defect had **two** instances and
+    // the second was found only by going looking. Both clear the store and neither had reset the
+    // frontier that describes it:
+    //
+    //   - `discard_local_data_for_resync()`, the failover wipe;
+    //   - `load_snapshot()`, which the replication bootstrap calls and which got away with it
+    //     because the *mesh* calls `adopt_snapshot_sequence_state()` straight after, and that
+    //     resets.
+    //
+    // A frontier left standing claims rows the discard has just deleted, so every record the
+    // primary sends below it is dropped as a duplicate and nothing ever refills the hole. Measured
+    // on the first instance: 0 rows where 1 was replayed.
+    //
+    // The list of functions comes from the source. Naming the two would be a claim about the code
+    // rather than evidence about it - and a third path is exactly what this is for.
+    const std::string src = read_source("src/engine.cpp");
+    ASSERT_FALSE(src.empty());
+
+    std::vector<std::string> discarding;
+    std::vector<std::string> offenders;
+    const std::string marker = "buffers_.clear();";
+    for (std::size_t at = src.find(marker); at != std::string::npos;
+         at = src.find(marker, at + marker.size())) {
+        const std::size_t sig = definition_start(src, at, "Engine::");
+        ASSERT_NE(sig, std::string::npos) << "could not find the function containing a buffers_ clear";
+        const std::string name = src.substr(sig, src.find('(', sig) - sig);
+        const std::string body = body_at(src, sig);
+        ASSERT_FALSE(body.empty()) << "no body for " << name;
+        discarding.push_back(name);
+        if (body.find("seq_tracker_.reset()") == std::string::npos) offenders.push_back(name);
+    }
+
+    // The pair, because "no offenders" is also what a broken walk produces.
+    EXPECT_GE(discarding.size(), 2u)
+        << "expected at least the failover wipe and the snapshot install to discard the store; "
+        << "found " << discarding.size() << ", so this test is not looking at what it thinks";
+
+    std::string joined;
+    for (const auto& name : offenders) joined += name + "  ";
+    EXPECT_TRUE(offenders.empty())
+        << "these functions discard the store and keep the sequence frontier that describes it, so "
+        << "the records replayed afterwards are dropped as duplicates and the store stays short: "
+        << joined;
+}
+
+// ── #101 group 4: whose stream is this ───────────────────────────────────────────────────────────
+//
+// A saved position is a pair of numbers, and numbers do not say which WAL they index. Two data
+// directories restored from the same backup, or one primary rebuilt from scratch at the same
+// address, hand out offsets that read as valid and name different records. So the primary
+// announces an identity, the replica saves it next to the position, and a mismatch means start
+// over. The address is deliberately not the identity, and the tests below keep it constant to say
+// so (requirement 4.3).
+
+namespace {
+
+/// One flushed row, so a wipe has something to take. `apply_delta_replicated` rather than
+/// `apply_delta`: the sequence number comes from the primary on this path, which is the entry
+/// point a replica actually uses.
+void insert_one_replicated_row(ob::Engine& engine, const char* symbol, uint64_t seq) {
+    ob::Level lvl{};
+    lvl.price = 42'000; lvl.qty = 3; lvl.cnt = 1; lvl._pad = 0;
+    ob::DeltaUpdate d{};
+    std::strncpy(d.symbol, symbol, sizeof(d.symbol) - 1);
+    std::strncpy(d.exchange, "BINANCE", sizeof(d.exchange) - 1);
+    d.sequence_number = seq;
+    d.timestamp_ns    = 1'700'000'000ULL + seq;
+    d.side            = ob::SIDE_BID;
+    d.n_levels        = 1;
+    ASSERT_EQ(engine.apply_delta_replicated(d, &lvl), ob::OB_OK);
+    engine.flush_incremental();
+}
+
+size_t count_rows(ob::Engine& engine, const char* symbol) {
+    size_t rows = 0;
+    const std::string q = std::string("SELECT * FROM '") + symbol +
+                          "'.'BINANCE' WHERE timestamp BETWEEN 0 AND 9999999999999999999";
+    const std::string err = engine.execute(q, [&](const ob::QueryResult&) { ++rows; });
+    // A wiped store does not hold an empty symbol, it holds no symbol - so the query refuses
+    // rather than returning nothing. That one refusal means zero rows; any other error is a
+    // failure, because "the query broke" must not read as "the store was discarded".
+    if (err.find("OB_ERR_NOT_FOUND") != std::string::npos) return 0;
+    EXPECT_TRUE(err.empty()) << err;
+    return rows;
+}
+
+std::string read_whole_file(const std::string& path) {
+    std::ifstream in(path);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+}  // namespace
+
+TEST_F(ReplicationClientTest, APositionIsResumedFromWhenThePrimaryNamesTheStreamItBelongsTo) {
+    // The case this whole item exists for: a replica that restarted keeps what it holds and asks
+    // for the rest. Before #101 the restart wiped the store and re-synced from zero.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    insert_one_replicated_row(engine, "KEPT", 5);
+    ASSERT_EQ(count_rows(engine, "KEPT"), 1u);
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;
+    cfg.state_file   = tmp_->str() + "/repl_state.txt";
+
+    // What the previous run left behind: a position, and whose stream it indexes.
+    { std::ofstream out(cfg.state_file);
+      out << "file_index=2\nbyte_offset=1024\nstream_id=777\n"; }
+
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0);
+    answer_stream_id(client_fd, 777);
+
+    const std::string handshake = recv_line(client_fd, 3000);
+    EXPECT_EQ(handshake, "REPLICATE 2 1024 0")
+        << "the primary named the stream this position belongs to and the replica still asked from "
+        << "somewhere else, got: " << handshake;
+    EXPECT_EQ(count_rows(engine, "KEPT"), 1u)
+        << "the store was discarded although the position was still valid - which is the re-sync "
+        << "this item removes";
+
+    client.stop();
+
+    // The file a downgrade would read. `stop()` rewrote it, so these are the bytes on disk.
+    //
+    // The identity is an *added line*, not a change to the two that were there: a build without
+    // the `stream_id` branch ignores what it does not recognise, so it still reads file 2 at
+    // offset 1024. Had the identity been folded into either of those lines, a downgrade would read
+    // a wrong position and say nothing (requirement 6.2).
+    const std::string saved = read_whole_file(cfg.state_file);
+    EXPECT_EQ(saved, "file_index=2\nbyte_offset=1024\nstream_id=777\n") << saved;
+
+    ::close(client_fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
+TEST_F(ReplicationClientTest, ADifferentStreamAtTheSameAddressMakesTheReplicaStartOver) {
+    // Requirement 4.3, and the reason the address is not the identity: the mock primary here is at
+    // the same host and port as the one the position came from. Only the identity differs, which is
+    // what a data directory rebuilt from scratch looks like from the outside.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    insert_one_replicated_row(engine, "STALE", 5);
+    ASSERT_EQ(count_rows(engine, "STALE"), 1u);
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;
+    cfg.state_file   = tmp_->str() + "/repl_state.txt";
+    { std::ofstream out(cfg.state_file);
+      out << "file_index=2\nbyte_offset=1024\nstream_id=777\n"; }
+
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0);
+    answer_stream_id(client_fd, 778);      // one apart, and that is the whole difference
+
+    const std::string handshake = recv_line(client_fd, 3000);
+    EXPECT_EQ(handshake, "REPLICATE 0 0 0")
+        << "the replica asked to resume inside a WAL it has never seen, got: " << handshake;
+    EXPECT_EQ(count_rows(engine, "STALE"), 0u)
+        << "the replica kept rows from a stream it no longer follows, and the records the new "
+        << "primary sends will not overwrite them";
+
+    // Written before the position went out, so a crash in between leaves a file describing the
+    // empty store rather than the deleted stream's offset.
+    const std::string saved = read_whole_file(cfg.state_file);
+    EXPECT_EQ(saved, "file_index=0\nbyte_offset=0\nstream_id=778\n") << saved;
+
+    client.stop();
+    ::close(client_fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
+TEST_F(ReplicationClientTest, APositionThatNamesNoStreamIsNotResumedFrom) {
+    // A state file written before #101, byte for byte. It parses - the loop ignores lines it does
+    // not recognise - and it yields no identity, which is the answer that makes the replica start
+    // over rather than resume against a stream it cannot attribute the numbers to.
+    //
+    // On real bytes rather than against a fake that pretends to be the old format: a fake would
+    // pretend to be what I remember of it.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    insert_one_replicated_row(engine, "OLDFILE", 5);
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;
+    cfg.state_file   = tmp_->str() + "/repl_state.txt";
+    { std::ofstream out(cfg.state_file); out << "file_index=2\nbyte_offset=1024\n"; }
+
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0);
+    answer_stream_id(client_fd, 777);
+
+    const std::string handshake = recv_line(client_fd, 3000);
+    EXPECT_EQ(handshake, "REPLICATE 0 0 0") << handshake;
+    EXPECT_EQ(count_rows(engine, "OLDFILE"), 0u);
+    EXPECT_EQ(read_whole_file(cfg.state_file), "file_index=0\nbyte_offset=0\nstream_id=777\n")
+        << "the file still names no stream, so the next restart would wipe again - the upgrade "
+        << "would never take";
+
+    client.stop();
+    ::close(client_fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
+TEST_F(ReplicationClientTest, APrimaryThatNamesNoStreamMakesTheReplicaStartOver) {
+    // The mixed-version window, in the direction that costs something: this mock primary is a
+    // pre-#101 one, so `STREAMID?` lands in its "unknown message - ignore" branch and it answers
+    // nothing at all. The replica waits out its deadline, concludes it cannot attribute what it
+    // holds, and starts over. That wait is the named price of design §3.1 - and it is a delay, on
+    // one connection attempt, not a refusal.
+    //
+    // Which makes this the slowest test in the file. Deliberately not shortened by making the
+    // deadline configurable: the value under test is the one production runs with.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    insert_one_replicated_row(engine, "OLDPRIM", 5);
+
+    ob::ReplicationClientConfig cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;
+    cfg.state_file   = tmp_->str() + "/repl_state.txt";
+    { std::ofstream out(cfg.state_file);
+      out << "file_index=2\nbyte_offset=1024\nstream_id=777\n"; }
+
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0);
+
+    // The question arrives and goes unanswered, which is all a pre-#101 primary does with it.
+    const std::string question = recv_line(client_fd, 3000);
+    ASSERT_EQ(question.rfind("STREAMID?", 0), 0u) << question;
+
+    const std::string handshake = recv_line(client_fd, 12000);
+    EXPECT_EQ(handshake, "REPLICATE 0 0 0")
+        << "a replica that cannot tell whose stream it is asked to resume anyway, got: "
+        << handshake;
+    EXPECT_EQ(count_rows(engine, "OLDPRIM"), 0u);
+
+    client.stop();
+    ::close(client_fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
+TEST_F(ReplicationProtocolTest, ThePrimaryAnswersTheStreamQuestionAndStreamsNothing) {
+    // The primary's whole half of this: it answers and it decides nothing. Stateless, so asking
+    // twice on one connection gives the same answer twice; and it must not start streaming, or the
+    // replica would be reading records before it has decided whether to keep what it holds.
+    fill_wal(*wal_, 4, 2);
+    auto mgr = start_manager(nullptr, 0xC0FFEEULL);
+
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+
+    const char* q = "STREAMID?\n";
+    ASSERT_GT(::send(fd, q, std::strlen(q), MSG_NOSIGNAL), 0);
+    EXPECT_EQ(recv_line(fd, 3000), "STREAM 12648430");
+
+    ASSERT_GT(::send(fd, q, std::strlen(q), MSG_NOSIGNAL), 0);
+    EXPECT_EQ(recv_line(fd, 3000), "STREAM 12648430")
+        << "the second answer differs from the first, so the question changed something";
+
+    // Nothing else, and not just "no records": a `HEARTBEAT` here would be read by the replica
+    // where it expects `STREAM`, which is why this side no longer sends one to a connection that
+    // has not asked for the stream. Six seconds covers the five-second heartbeat timer.
+    const std::string quiet = recv_line(fd, 6000);
+    EXPECT_TRUE(quiet.empty())
+        << "the primary sent something to a connection that has only asked which stream this is: "
+        << quiet;
+
+    ::close(fd);
+    mgr->stop();
+}
+
+TEST_F(ReplicationProtocolTest, APeerThatAsksAndNeverReadsIsDroppedRatherThanBuffered) {
+    // The cost of adding a message that produces an answer. Every other line this loop reads is
+    // either unanswered (`ACK`, anything unknown), answered once before the connection is closed
+    // (a failed `AUTH`), or answered by a bounded cursor (`REPLICATE`). `STREAMID?` is answered
+    // every time it is asked, and `enqueue_send()` has no ceiling of its own - so this is #69's
+    // shape in a new place: 10 bytes in, 29 bytes of our memory out, from anyone who can reach the
+    // port on a link with no cluster secret.
+    //
+    // The observable is the hang-up rather than a buffer size, because a buffer size is not
+    // reachable from outside. This socket asks and never reads, so the answers pile up; when the
+    // ceiling is reached the primary drops the connection and this side's `send` fails.
+    auto mgr = start_manager(nullptr, 0xC0FFEEULL);
+
+    const int fd = connect_to_localhost(port_, 5000);
+    ASSERT_GE(fd, 0);
+
+    // 16 MB of answers at 29 bytes each needs about 580k questions; the cap is comfortably past
+    // that and small enough that a *missing* ceiling fails this test by reaching it.
+    const std::string question = "STREAMID?\n";
+    std::string chunk;
+    for (int i = 0; i < 4096; ++i) chunk += question;
+
+    bool hung_up = false;
+    size_t sent_bytes = 0;
+    for (int round = 0; round < 400 && !hung_up; ++round) {
+        size_t off = 0;
+        while (off < chunk.size()) {
+            const ssize_t n = ::send(fd, chunk.data() + off, chunk.size() - off, MSG_NOSIGNAL);
+            if (n <= 0) { hung_up = true; break; }
+            off += static_cast<size_t>(n);
+            sent_bytes += static_cast<size_t>(n);
+        }
+    }
+
+    EXPECT_TRUE(hung_up)
+        << "the primary kept answering after " << sent_bytes << " bytes of questions from a peer "
+        << "that never read one of them, so its send buffer for this connection is unbounded";
+
+    ::close(fd);
+    mgr->stop();
+}
+
+TEST_F(ReplicationProtocolTest, AReplicaThatNeverAsksWhichStreamGetsWhatItAlwaysGot) {
+    // The other compatibility direction: a pre-#101 replica sends `REPLICATE` straight away and
+    // never asks. The branch added on this side is additive, so the old exchange has to be
+    // untouched - on real bytes, because a fake old replica is a fake of what I remember.
+    const size_t bytes = fill_wal(*wal_, 4, 2);
+    ASSERT_GT(bytes, 0u);
+    auto mgr = start_manager(nullptr, 0xC0FFEEULL);
+
+    int fd = connect_to_localhost(port_);
+    ASSERT_GE(fd, 0);
+
+    const char* handshake = "REPLICATE 0 0 0\n";
+    ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
+
+    const std::string first = recv_line(fd, 5000);
+    EXPECT_EQ(first.rfind("WAL ", 0), 0u)
+        << "a replica that does not know about stream identities got something other than its "
+        << "catch-up, got: " << first;
+
+    ::close(fd);
+    mgr->stop();
+}
+
+TEST_F(ReplicationClientTest, ASnapshotBootstrapRecordsWhichStreamThePositionCameFrom) {
+    // Requirement 4.4, and the case that costs the most if it is missing: a replica bootstrapped by
+    // snapshot holds a whole store and a position it did not walk to. Without the identity beside
+    // it, its very next restart cannot attribute either, wipes, and asks for the snapshot again -
+    // the loop this item exists to end, entered by the most expensive path into it.
+    //
+    // It needs no code of its own, and that is the §3.1 inversion paying for itself twice: the
+    // identity is resolved *before* the position is ever asked for, so every write of the position
+    // after that point already has it. Asserted rather than assumed - the alternative design,
+    // where the identity travels with `REPLICATE`, would leave this path saving a zero.
+    const auto out = run_snapshot_bootstrap(tmp_->str(), port_, /*splice_a_live_record=*/false);
+    ASSERT_TRUE(out.first_file_installed && out.second_file_installed)
+        << "the bootstrap did not finish, so what the state file says is about something else";
+    EXPECT_EQ(out.saved_state, "file_index=3\nbyte_offset=4096\nstream_id=1309\n")
+        << out.saved_state;
+}
+
+TEST_F(ReplicationClientTest, ARealPrimaryAnnouncesTheIdentityOfTheWalItWrites) {
+    // The seam between the engine and the manager, on real bytes. Everything else in this group
+    // hands the manager an identity directly, so nothing yet says the engine gives it its own -
+    // and dropping that one assignment is silent: every primary would answer nothing, every
+    // replica would read that as "pre-#101" and wipe on every restart, and the whole item would
+    // be undone while the suite stayed green.
+    ob::ReplicationConfig repl;
+    repl.port = port_;
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE, repl);
+    engine.open();
+    ASSERT_NE(engine.wal_identity(), 0u)
+        << "a real engine always has one - 0 is reserved for \"unknown\"";
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));   // let the manager bind
+
+    const int fd = connect_to_localhost(port_, 5000);
+    ASSERT_GE(fd, 0);
+    const char* q = "STREAMID?\n";
+    ASSERT_GT(::send(fd, q, std::strlen(q), MSG_NOSIGNAL), 0);
+
+    EXPECT_EQ(recv_line(fd, 3000), "STREAM " + std::to_string(engine.wal_identity()));
+
+    ::close(fd);
+    engine.close();
+}
+
+TEST_F(ReplicationClientTest, TheIdentitySurvivesARestartAndDiffersBetweenDataDirectories) {
+    // What requirement 4.3 rests on, and neither half was pinned anywhere. Survives a restart, or
+    // a replica would wipe every time its own primary restarts; differs between directories, or a
+    // primary rebuilt from scratch at the same address would be trusted to continue a stream it
+    // never had - two directories restored from one backup being the case that says why it is
+    // random rather than derived from the path.
+    uint64_t first = 0;
+    {
+        ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+        engine.open();
+        first = engine.wal_identity();
+        engine.close();
+    }
+    ASSERT_NE(first, 0u);
+    {
+        ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+        engine.open();
+        EXPECT_EQ(engine.wal_identity(), first)
+            << "the same data directory came back as a different stream, so every replica of it "
+            << "discards what it holds whenever this node restarts";
+        engine.close();
+    }
+
+    ReplTempDir other("identity-other");
+    ob::Engine fresh(other.str(), 100'000'000ULL, ob::FsyncPolicy::NONE);
+    fresh.open();
+    EXPECT_NE(fresh.wal_identity(), first)
+        << "a directory built from scratch claims the stream the old one was serving";
+    fresh.close();
+}
+
+// ── #101 group 5: the discard is decided by the data, not by who called ──────────────────────────
+
+TEST(ReplicationDedup, NothingDecidesWhetherToDiscardFromWhereItWasCalled) {
+    // Requirement 2.1. `demote_to_replica()` has four call sites - a graceful handover, a lost
+    // lease, `adopt_leader_if_present()` and process start - and it used to discard the store on
+    // all four. The condition is a property of the data ("is what I hold a prefix of this
+    // primary's stream?"), and that list of call sites is a thing that grows: the fifth would
+    // arrive with a comment about why it is different.
+    //
+    // Static, because there is nothing behavioural to catch. A branch on the caller would be
+    // *correct* in every case somebody thought about while writing it; what it breaks is the case
+    // added later. So this asserts the shape: nothing about the caller reaches the decision.
+    const std::string engine = read_source("src/engine.cpp");
+    const std::string repl   = read_source("src/replication.cpp");
+    const std::string failover_hpp = read_source("include/orderbook/failover.hpp");
+    ASSERT_FALSE(engine.empty());
+    ASSERT_FALSE(repl.empty());
+    ASSERT_FALSE(failover_hpp.empty());
+
+    // (a) The signature carries no discriminator. One parameter, the address of the primary to
+    //     follow - so there is no `DemotionReason` or `bool was_primary` to branch on, and adding
+    //     one has to change the interface every failover path calls through.
+    const std::string decl = "virtual void demote_to_replica(";
+    const auto decl_at = failover_hpp.find(decl);
+    ASSERT_NE(decl_at, std::string::npos)
+        << "RoleTransitionHandler no longer declares demote_to_replica, so this test is looking "
+           "at something that has moved";
+    const std::string params = failover_hpp.substr(
+        decl_at + decl.size(), failover_hpp.find(')', decl_at) - decl_at - decl.size());
+    EXPECT_EQ(params.find(','), std::string::npos)
+        << "demote_to_replica takes more than the primary's address now: '" << params << "'. If "
+           "one of those says why the demotion happened, the discard can be decided from the call "
+           "site again";
+
+    // (b) The function makes no discard decision at all: neither the wipe nor the deletion of the
+    //     saved position appears in its body. Derived from the body rather than from a grep over
+    //     the file, so a call added anywhere else in `engine.cpp` does not read as this one.
+    const auto demote_sig = engine.find("void Engine::demote_to_replica(");
+    ASSERT_NE(demote_sig, std::string::npos);
+    const std::string demote_body = body_at(engine, demote_sig);
+    ASSERT_FALSE(demote_body.empty());
+    EXPECT_EQ(demote_body.find("discard_local_data_for_resync()"), std::string::npos)
+        << "demoting discards the store again, so a node that merely restarted re-syncs a full "
+           "store from its primary - which is #101";
+    EXPECT_EQ(demote_body.find("replication_state_path()"), std::string::npos)
+        << "demoting deletes the saved position again, so there is nothing left for the identity "
+           "check to compare and every reconnection starts from zero";
+
+    // (c) And the one place that does decide is the one holding both facts: the identity the
+    //     primary announced and the identity the position was saved under. Every call in the two
+    //     files is accounted for, so a second decision maker fails this rather than being
+    //     silently correct-looking.
+    std::vector<std::string> deciders;
+    for (const auto& [file, src, qualifier] :
+         std::vector<std::tuple<std::string, std::string, std::string>>{
+             {"src/engine.cpp", engine, "Engine::"},
+             {"src/replication.cpp", repl, "Replication"}}) {
+        const std::string call = "discard_local_data_for_resync()";
+        for (std::size_t at = src.find(call); at != std::string::npos;
+             at = src.find(call, at + call.size())) {
+            // The name matches its own definition, and `definition_start` walking back from a
+            // signature line finds the *previous* function - so the definition read as a second
+            // decision maker. A definition starts at column 0 and a call inside a body never
+            // does, which tells the two apart without naming either.
+            const std::size_t line_start = src.rfind('\n', at) + 1;
+            if (src[line_start] != ' ' && src[line_start] != '\t') continue;
+            const std::size_t sig = definition_start(src, at, qualifier);
+            if (sig == std::string::npos) continue;
+            const std::string name = src.substr(sig, src.find('(', sig) - sig);
+            deciders.push_back(file + ": " + name);
+        }
+    }
+
+    ASSERT_EQ(deciders.size(), 1u)
+        << "expected exactly one place to decide whether to discard; found " << deciders.size();
+    EXPECT_NE(deciders.front().find("ReplicationClient::resolve_stream_identity"),
+              std::string::npos)
+        << "the discard is decided in " << deciders.front() << " - the decision needs the "
+           "primary's stream identity, which is known only after the connection";
+}
+
+TEST_F(ReplicationClientTest, ANodeThatAcceptedWritesStartsOverEvenAgainstTheSameStream) {
+    // Requirements 2.2 and 3.3, as one process rather than as two claims. A node that held PRIMARY
+    // and took writes has records of its own above wherever it was in somebody else's stream, so it
+    // must start over - and the interesting part is that this test hands it back **the same stream
+    // identity it was following before**. Nothing about the identity says to discard here. What
+    // says it is the absence of a position, deleted by the promotion, which is the inversion
+    // requirement 3 is about: no position means nothing to match, and no match means start over.
+    //
+    // So the correctness of removing the discard from `demote_to_replica()` does not rest on a
+    // check of "was I primary?" anywhere. It falls out.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::ReplicationClientConfig cfg;
+    cfg.state_file = tmp_->str() + "/repl_state.txt";   // primary_port 0: no client until demotion
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE, {}, cfg);
+    engine.open();
+
+    // Where it was in the primary's stream, and whose stream that was.
+    { std::ofstream out(cfg.state_file);
+      out << "file_index=2\nbyte_offset=1024\nstream_id=777\n"; }
+    insert_one_replicated_row(engine, "WASPRIM", 5);
+    ASSERT_EQ(count_rows(engine, "WASPRIM"), 1u);
+
+    engine.promote_to_primary(ob::EpochValue{7});
+    ASSERT_FALSE(std::filesystem::exists(cfg.state_file))
+        << "the promotion kept the position, so the rest of this test measures nothing";
+
+    // A record of its own, which is what makes its data no longer a prefix of anyone's stream.
+    ob::Level lvl{};
+    lvl.price = 61'000; lvl.qty = 2; lvl.cnt = 1; lvl._pad = 0;
+    ob::DeltaUpdate own{};
+    std::strncpy(own.symbol, "WASPRIM", sizeof(own.symbol) - 1);
+    std::strncpy(own.exchange, "BINANCE", sizeof(own.exchange) - 1);
+    own.timestamp_ns = 1'800'000'000ULL;
+    own.side         = ob::SIDE_BID;
+    own.n_levels     = 1;
+    ASSERT_EQ(engine.apply_delta(own, &lvl), ob::OB_OK);
+    engine.flush_incremental();
+
+    engine.demote_to_replica("127.0.0.1:" + std::to_string(port_));
+
+    int client_fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(client_fd, 0) << "the demotion started no replication client";
+    answer_stream_id(client_fd, 777);          // the same stream it used to follow
+
+    // The epoch on that line is 0 rather than 7, and it is not a typo: `local_epoch_` starts at
+    // zero and is only ever raised by what a primary sends, so the engine's own epoch never
+    // reaches the wire on a first connection. Measured here, filed as #103, and left alone -
+    // seeding it changes when a replica refuses a primary, which is not what this item is about.
+    const std::string handshake = recv_line(client_fd, 3000);
+    EXPECT_EQ(handshake, "REPLICATE 0 0 0")
+        << "a node that accepted writes asked to resume inside the stream it left, got: "
+        << handshake;
+    EXPECT_EQ(count_rows(engine, "WASPRIM"), 0u)
+        << "it kept records the primary never had, sitting above where the replay starts";
+
+    ::close(client_fd);
+    ::close(listen_fd);
+    engine.close();
 }

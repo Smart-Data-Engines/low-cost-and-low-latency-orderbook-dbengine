@@ -97,6 +97,12 @@ void Engine::open() {
     // Which WAL these segments' positions refer to. Before the replay, which needs it.
     load_or_create_wal_identity();
 
+    // What the replication manager announces to a replica asking `STREAMID?` (#101). Set here
+    // rather than at each `make_unique<ReplicationManager>` site, so the one inside
+    // `promote_to_primary()` gets it too - and set as a value rather than reached through
+    // `engine_`, which the read loop would have to take `mtx_` to consult.
+    repl_config_.wal_identity = wal_identity_;
+
     // What this node holds, from the last vector it wrote down. Before the tail replay, so
     // the tail can only raise it.
     restore_version_vector();
@@ -371,6 +377,67 @@ void Engine::restore_held_sequences() {
                 held.size(), numbers);
 }
 
+void Engine::discard_local_data_for_resync() {
+    // Lock order is flush_mtx_ → mtx_ (pitfall 10). `flush_mtx_` guards the whole block because
+    // clearing `stores_` destroys the ColumnarStore objects a concurrent Phase B may be iterating.
+    std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    OB_LOG_INFO("engine", "clearing local data: it is not a prefix of the stream to be replayed");
+
+    stores_.clear();
+    buffers_.clear();
+    pending_rows_.clear();
+
+    // And the sequence frontier, which is not part of any of the above — this is the line without
+    // which the wipe and the dedup guard are incompatible. `SequenceTracker::import_own_vector()`
+    // only ever raises a frontier, so a frontier left standing here claims records this function
+    // has just deleted: the `REPLICATE 0 0` that follows a wipe then has **every** record dropped
+    // as a duplicate and the store stays empty. Measured, before this line existed: 0 rows where 1
+    // was replayed.
+    //
+    // `load_snapshot()` has done this since snapshot bootstrap existed, for the same reason and
+    // with the reason written on `reset()` itself. Before the dedup guard an over-claimed frontier
+    // cost nothing here, which is why nothing noticed.
+    seq_tracker_.reset();
+
+    // Close and wipe the columnar store so stale rows cannot appear in a query.
+    combined_store_.close();
+
+    // Delete every columnar segment directory on disk, leaving the WAL files.
+    {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        for (auto& entry : fs::directory_iterator(base_dir_, ec)) {
+            if (entry.is_directory() && entry.path().filename().string() != "." &&
+                entry.path().filename().string() != "..") {
+                const auto name = entry.path().filename().string();
+                if (name.find("wal_") != 0) {
+                    fs::remove_all(entry.path(), ec);
+                }
+            }
+        }
+    }
+
+    combined_store_.open_existing();
+}
+
+std::string Engine::replication_state_path() const {
+    return repl_client_config_.state_file;
+}
+
+void Engine::discard_saved_replication_position() {
+    const std::string path = replication_state_path();
+    if (path.empty()) return;
+    std::error_code ec;
+    if (std::filesystem::remove(path, ec)) {
+        OB_LOG_INFO("engine",
+                    "discarded the saved replication position (%s): this node writes its own "
+                    "records now, so its data is no longer a prefix of any primary's stream",
+                    path.c_str());
+    }
+}
+
 void Engine::load_or_create_wal_identity() {
     const std::string path = base_dir_ + "/wal_identity";
 
@@ -462,6 +529,15 @@ void Engine::stamp_sequence(DeltaUpdate& delta, uint16_t origin, const std::stri
 }
 
 ob_status_t Engine::apply_delta(const DeltaUpdate& delta_in, const Level* levels) {
+    return apply_delta_impl(delta_in, levels, DuplicatePolicy::Apply);
+}
+
+ob_status_t Engine::apply_delta_replicated(const DeltaUpdate& delta_in, const Level* levels) {
+    return apply_delta_impl(delta_in, levels, DuplicatePolicy::DropIfSeen);
+}
+
+ob_status_t Engine::apply_delta_impl(const DeltaUpdate& delta_in, const Level* levels,
+                                     DuplicatePolicy policy) {
     // Local copy, because the sequence number is stamped below and the public signature
     // takes a const reference — a caller's DeltaUpdate is not ours to modify.
     DeltaUpdate delta = delta_in;
@@ -477,6 +553,26 @@ ob_status_t Engine::apply_delta(const DeltaUpdate& delta_in, const Level* levels
         OB_LOG_WARN("engine", "Rejecting write to migrated symbol: symbol_key=%s",
                     symbol_key.c_str());
         return OB_ERR_MIGRATED;
+    }
+
+    // Drop what we already applied, before the WAL append, before any state change, and before
+    // the backpressure wait — a record that is about to be discarded should not queue behind the
+    // flush thread.
+    //
+    // Catch-up over-delivers on purpose, and since #101 it over-delivers by design: a replica
+    // resuming from its saved position is handed up to ten seconds of records it already holds,
+    // because `repl_state.txt` is written on a timer while the confirmed position advances per
+    // record. Storage is append-only, so without this the restart saving would be paid for in
+    // duplicated rows. `apply_remote_delta()` has had the same guard for the mesh since the
+    // measurement in #61's wake turned 9 written rows into 25 stored ones.
+    if (policy == DuplicatePolicy::DropIfSeen && delta.sequence_number != 0 &&
+        seq_tracker_.has_seen(symbol_key, mm_config_.node_id, delta.sequence_number)) {
+        OB_LOG_DEBUG("engine",
+                     "Dropping duplicate replicated record: sym=%s origin=%u seq=%llu",
+                     symbol_key.c_str(), static_cast<unsigned>(mm_config_.node_id),
+                     static_cast<unsigned long long>(delta.sequence_number));
+        registry_.increment_counter("ob_replication_duplicates_dropped");
+        return OB_OK;
     }
 
     // Backpressure: wait until pending queue has room.
@@ -1285,6 +1381,21 @@ void Engine::load_snapshot(const SnapshotManifest& /*manifest*/) {
     buffers_.clear();
     pending_rows_.clear();
 
+    // And the sequence frontier, because the contents it described are gone.
+    //
+    // The mesh path got this right by accident of layering: it calls
+    // `adopt_snapshot_sequence_state()` immediately after this, which resets and then imports the
+    // peer's vector. The **replication** path calls only this function, so a replica that
+    // bootstrapped by snapshot after holding data kept a frontier describing the discarded
+    // contents - and once the replication link deduplicates (#101), every record the primary sends
+    // below that frontier is dropped, leaving a hole nothing refills. `multi_master.cpp` names this
+    // hazard exactly ("a frontier claiming a row that does not exist, which no later catch-up will
+    // ever fill") for the concurrent-apply case; this is the same hazard from the install itself.
+    //
+    // Harmless before that guard existed, which is why it survived here. The mesh's double reset
+    // costs one map clear on a path that has just moved gigabytes.
+    seq_tracker_.reset();
+
     // Rebuild columnar index from the new files on disk.
     combined_store_.close();
     combined_store_.open_existing();
@@ -1419,6 +1530,12 @@ void Engine::promote_to_primary(const EpochValue& new_epoch) {
         lock.lock();
     }
 
+    // After the client is gone, and that ordering is load-bearing rather than tidy:
+    // `ReplicationClient::stop()` ends with `save_state()`, so a deletion that ran first would be
+    // undone by the client on its way out - and this node would come back after a restart resuming
+    // from a stream it no longer follows.
+    discard_saved_replication_position();
+
     // Increment epoch and write Epoch_Record to WAL.
     current_epoch_.store(new_epoch.term, std::memory_order_release);
     wal_.set_epoch(new_epoch.term);
@@ -1496,61 +1613,22 @@ void Engine::demote_to_replica(const std::string& new_primary_address) {
             lock.lock();
         }
 
-        // Clear in-memory state to avoid data duplication during catchup.
-        // The ReplicationClient will replay WAL records from the primary,
-        // rebuilding the data from scratch. Without this, records that
-        // already exist locally would be duplicated.
-        OB_LOG_INFO("engine", "clearing local data before starting replication from %s",
-                    new_primary_address.c_str());
-
-        // flush_mtx_ guards this block: clearing stores_ destroys the ColumnarStore
-        // objects a concurrent Phase B may be iterating. Taken here and not at the
-        // top of the function on purpose — repl_mgr_->stop() above joins a thread
-        // that can be inside create_snapshot() waiting for this very lock, so
-        // holding it across the stop would deadlock the demotion.
-        // Lock order is flush_mtx_ → mtx_, hence the release and reacquire.
-        lock.unlock();
-        std::unique_lock<std::mutex> flush_lock(flush_mtx_);
-        lock.lock();
-
-        stores_.clear();
-        buffers_.clear();
-        pending_rows_.clear();
-
-        // Close and wipe columnar store to prevent stale data from appearing in queries.
-        combined_store_.close();
-
-        // Delete all columnar segment directories on disk.
-        // This is necessary because the node was previously PRIMARY with its own data,
-        // and the new primary may have different data. Catchup will rebuild everything.
-        {
-            namespace fs = std::filesystem;
-            std::error_code ec;
-            for (auto& entry : fs::directory_iterator(base_dir_, ec)) {
-                if (entry.is_directory() && entry.path().filename().string() != "." &&
-                    entry.path().filename().string() != "..") {
-                    // Skip WAL files (wal_*.bin) — only delete columnar segment dirs
-                    auto name = entry.path().filename().string();
-                    if (name.find("wal_") != 0) {
-                        fs::remove_all(entry.path(), ec);
-                    }
-                }
-            }
-        }
-
-        // Reopen empty columnar store.
-        combined_store_.open_existing();
-
-        // The store list is consistent again; release flush_mtx_ before starting the
-        // ReplicationClient so a catch-up flush does not wait on this function.
-        flush_lock.unlock();
-
-        // Delete replication state file so catchup starts from position 0.
-        {
-            std::string state_path = base_dir_ + "/repl_state.txt";
-            std::error_code ec;
-            std::filesystem::remove(state_path, ec);
-        }
+        // Nothing is discarded here, and nothing is deleted here. This function used to wipe the
+        // store and remove the saved position, which is #101: it made a node that had merely
+        // restarted re-sync a full store from its primary, because entering replication is exactly
+        // when the position it had is worth the most.
+        //
+        // The decision needs a fact this function cannot have. Whether what this node holds is a
+        // prefix of the stream it is about to follow depends on *which* stream that is, and the
+        // primary's identity is known only after the connection - so the call moved to
+        // `ReplicationClient::resolve_stream_identity()`, which asks before it asks for a position
+        // and discards only on a mismatch. Deliberately not a branch on which caller demoted us:
+        // three of the four are role changes and one is process start, that list grows, and the
+        // condition is a property of the data rather than of the path here (requirement 2.1).
+        //
+        // A node that held PRIMARY in this process still discards, and that falls out of
+        // `promote_to_primary()` deleting the position rather than from a check of its own: with no
+        // position saved there is no identity to match, and no match means start over.
 
         // Parse host:port from address.
         auto colon = new_primary_address.rfind(':');

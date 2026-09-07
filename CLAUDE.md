@@ -1488,6 +1488,42 @@ Learned the hard way. Check here before debugging.
     code does not give (pitfall 112), and it is pinned by an assertion rather than left to the
     comment claiming the separation matters (#102).
 
+179. **A wipe must forget the sequence frontier, or dedup empties the store.** Clearing the store
+    clears `stores_`, `buffers_`, `pending_rows_` and every segment directory — and the frontier
+    lives in `seq_tracker_`, which is none of those. Left standing it claims records the wipe has
+    just deleted, so every record the primary sends below it is dropped as a duplicate and nothing
+    refills the hole: measured, **0 rows where 1 was replayed**. Two instances, and the second was
+    found only by going looking: `discard_local_data_for_resync()`, and `load_snapshot()`, which
+    got away with it because the *mesh* calls `adopt_snapshot_sequence_state()` straight after and
+    that resets — while the replication bootstrap calls only `load_snapshot()`. The mechanism was
+    already written down in `SequenceTracker::reset()`'s own docstring. Closed as a class by a
+    static test that derives the functions from the source, not by two fixes (#101).
+
+180. **A question that carries a request cannot be asked of a peer that will not answer it.** The
+    first design for #101 sent the stream identity **with** `REPLICATE`, and defended itself with an
+    apply gate: hold every record until the primary either confirms the stream or refuses. Cheap on
+    paper. But the position has gone out, so an older primary is **already streaming** by the time
+    the replica learns there will be no answer — which means in-flight records, a second handshake
+    on a busy socket, an ordering to reconcile, and a loop in which every reconnection wipes.
+    `STREAMID?` carries no position, so an older primary ignores it and sends **nothing**: there is
+    nothing to reconcile and no gate to write. Ask first, request second, when the answer decides
+    whether the request is safe (#101).
+
+181. **The decision belongs to whoever holds both facts, not to whoever noticed first.**
+    `demote_to_replica()` discarded the store on all four of its call sites, and the condition it
+    was standing in for — "is what I hold a prefix of this primary's stream?" — needs the primary's
+    identity, which exists only after the connection. Three of those callers are role changes and
+    one is process start; that list grows, and the fifth arrives with a comment about why it is
+    different. A branch on the caller is **correct in every case somebody thought about while
+    writing it**, so there is nothing behavioural to catch: the guard is a static test that the
+    signature carries no discriminator and that exactly one place decides (#101).
+
+182. **A restart timed from the harness measures the harness.** Two stores differing threefold gave
+    6.32 s and 6.33 s — agreement to the third decimal is not a measurement, it is the polling
+    quantum. Read timestamps the node prints, or assert the quantity that made the time grow: after
+    #101 a restart re-streams **2 records at both a 33-record and a 97-record store**, and comparing
+    the larger store's replay against the smaller store's size needs no threshold at all (#101).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -1496,8 +1532,8 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 961 C++ tests (`ctest -j1`, ~3.5 min) and 195 integration tests plus 2
-opt-in Binance skips (`pytest tests/integration/`, ~10.5 min on i3-7100U), all green, and **no `xfail` left** —
+**Where the suites stand:** 981 C++ tests (`ctest -j1`, ~3.5 min) and 199 integration tests plus 2
+opt-in Binance skips (`pytest tests/integration/`, **13:03 measured** on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that
 fails the job on any skip, and the tree also builds and tests under Clang. Twelve required checks on
