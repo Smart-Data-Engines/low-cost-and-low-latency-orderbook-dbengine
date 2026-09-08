@@ -4268,12 +4268,19 @@ TEST_F(ReplicationClientTest, AnEpochLearnedWhileFollowingSurvivesARestart) {
                   static_cast<ssize_t>(hb.size()));
         ASSERT_EQ(recv_line(fd, 3000).rfind("ACK", 0), 0u);
 
+        // Read **before** the shutdown, and that ordering is the assertion: `stop()` saves state
+        // too, so a file checked after it would pass for a build that only writes on the
+        // ten-second timer - and a crash is what this number has to survive. The ACK above went
+        // out after the save, so there is nothing to wait for.
+        const std::string live = read_whole_file(cfg.state_file);
+        EXPECT_NE(live.find("epoch=9"), std::string::npos)
+            << "the epoch reached the file only at shutdown, so a node killed between a failover "
+               "and the next tick of the timer comes back unfenced: " << live;
+
         ::close(fd);
         engine.close();
     }
 
-    // The saved file is what a restart has to work from, so it is asserted before the restart uses
-    // it - otherwise a fix that only worked in memory would read as a fix that survived.
     const std::string saved = read_whole_file(cfg.state_file);
     EXPECT_NE(saved.find("epoch=9"), std::string::npos)
         << "the epoch was not written down, so nothing but this process ever knew it: " << saved;
