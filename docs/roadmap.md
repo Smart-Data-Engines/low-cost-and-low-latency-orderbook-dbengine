@@ -1938,39 +1938,109 @@ shape as the flagship's ("does anything read this?") is the thing that would hav
 - Effort: S | Impact: a docstring claiming a guarantee its field does not provide, in the file where
   role transitions are decided
 
-### 103. A replica's epoch protection starts every connection at zero
+### 103. A replica's epoch protection starts every connection at zero ✅
 
 Found by an assertion in a #101 test that expected the engine's epoch on the wire and got a zero.
 
-`ReplicationClient::local_epoch_` is initialised to 0 and **only ever raised by what the primary
-sends** — a `WAL` line's epoch, an `EPOCH` record, a `HEARTBEAT`. Nothing seeds it from the engine,
-which knows the answer: `current_epoch_` is restored from the WAL during `open()`. So the first
-`REPLICATE` of every connection carries epoch 0, and a fresh object is what every path produces:
-`demote_to_replica()` constructs a new `ReplicationClient`, and so does a restart.
+`ReplicationClient::local_epoch_` was initialised to 0 and **only ever raised by what the primary
+sent** — a `WAL` line's epoch, an `EPOCH` record, a `HEARTBEAT`. Nothing seeded it, and a fresh
+object is what every path produces: `demote_to_replica()` constructs a new `ReplicationClient`, and
+so does a restart.
 
-That disarms two guards, in both directions, on exactly the path they exist for.
+That disarmed two guards, in both directions, on exactly the path they exist for. The primary's is
+`ERR STALE_PRIMARY`, refused when `replica_epoch > wal_.current_epoch()`; zero is never greater than
+anything. The replica's own is the filter that skips a record whose epoch is below what it has seen —
+also zero, so nothing was below it. Both came back to life only after a record or heartbeat had
+arrived on *this* connection carrying a higher number, which is to say after the point where a stale
+primary would already have been served.
 
-The primary's is `ERR STALE_PRIMARY`, refused when `replica_epoch > wal_.current_epoch()`. Zero is
-never greater than anything, so a primary that has been superseded serves a replica that has seen a
-newer epoch. The replica's own is the filter that skips a record whose epoch is below what it has
-seen — also zero, so on a first connection nothing is below it. Both come back to life only after a
-record or heartbeat has arrived on *this* connection carrying a higher number, which is to say
-after the point where a stale primary would already have been served.
+**What the measurements said, and one of them moved the fix.**
 
-**Measured**: an engine promoted to epoch 7, then demoted, sends `REPLICATE 0 0 7`? No — it sends
-`REPLICATE 0 0 0`, with the engine at epoch 7 in the same process.
+| | before | after |
+|---|---|---|
+| a node that held the role in epoch 9, demoted, introduces itself | `REPLICATE 0 0 0` | `REPLICATE 0 0 9` |
+| a node that learned epoch 9 from a heartbeat, then a role change | `REPLICATE 0 0 0` | `REPLICATE 0 0 9` |
+| a record announced at epoch 5 reaching a node that knows 9 | applied and stored: `records_replayed=1`, one row, connection open | refused, connection ends, `count_rows=0` |
+| the same node after a `SIGKILL` and restart, first handshake (live cluster) | epoch `0` | epoch `1`, matching its primary |
+| a primary at epoch 5 answering `REPLICATE 0 0 9` | `ERR STALE_PRIMARY` — this half worked | unchanged |
 
-#82 makes an outgoing primary demote itself unconditionally when it loses its lease, so the ordinary
-failover does not depend on this check. That is what makes it an item rather than a P0: epoch
-fencing is the second line, and a second line that cannot fire is the one you find out about from
-the first line's bad day.
+The second row is the one that changed the design. **The fix this item described — seed the client
+from `engine_.current_epoch()` when it starts — would not have reached it.** Following a primary
+never raised the engine's epoch: `WAL_RECORD_EPOCH` records are written by promotions, so a node
+that has only ever followed holds the number nowhere durable and nowhere shared. Seeding from a
+field that is itself zero is a fix that measures as one only in the case somebody thought of.
 
-The fix is a seed, not a mechanism — the client can read `engine_.current_epoch()` when it starts —
-but it changes when a replica refuses a primary, so it wants its own tests: a stale primary refused
-on the first connection, and a legitimate promotion still accepted.
+So the number was **removed from the client rather than initialised there**. It is a fact about the
+node, and the engine already holds one with that meaning; `Engine::note_primary_epoch()` raises it
+and never lowers it, and the six read/write sites in the client collapse into one guard. #103 was
+not a missing initialiser — it was a second copy of one number, and the copy was the one the guards
+read.
 
-- Effort: S | Impact: epoch fencing on the replication link is inert on the first connection, which
+**Three consequences, all deliberate.**
+
+**The epoch is never forgotten**, including when #101 decides the stream is foreign and wipes the
+store. That was a real choice and it went the other way first: a wipe already discards the position,
+the store and the sequence frontier, so discarding the epoch with them is the consistent-looking
+move. It is wrong, and the case that says so is the ordinary failover: our saved stream identity is
+the *old* primary's, so every failover takes the wipe path — a replica that forgot its epoch there
+would be unfenced exactly when a superseded primary is on the network. The price is named instead: a
+data directory carrying a higher epoch than the cluster it is pointed at refuses to follow it, with
+both numbers in the log line. `docs/operations.md` covers the two ways to read that line, because
+the same line means "your primary is superseded" and "this directory belongs to another cluster",
+and only one of them is fixed by emptying the directory.
+
+**An EPOCH record raises without refusing, unlike the line that carries it.** A catch-up forwards
+every record type but `ROTATE`, and `send_to_replica()` stamps each line with `wal_.current_epoch()`
+— the primary's *now*. So a replica catching up is handed the EPOCH record of every past promotion
+on lines announcing the current epoch: the payload is then, the line is now. Refusing on the payload
+would disconnect every replica replaying a failover out of the log. Pinned by a test that sends
+epoch 3's promotion on a line announcing 9 and then requires the next record to land — because a
+test asserting the absence of a disconnect passes against a replica that has stopped reading.
+
+**`repl_state.txt` carries `epoch=`, written the moment it changes** rather than on the ten-second
+timer, since a crash between a failover and that tick is precisely when the number matters. This is
+the only durable home a follower has: the WAL keeps it for a node that held the role, memory keeps
+it across a role change, and nothing kept it across a restart. A file written before this change has
+no such line and leaves the engine's epoch alone, which is the same downgrade property `stream_id`
+has.
+
+`ROLE` and `ob_current_epoch` on a replica now report the epoch it is following rather than 0. That
+is a side effect of having one number instead of two, and it is an improvement on its own: a replica
+answering `REPLICA <addr> 0` while following a primary in epoch 9 is misinformation an operator
+reads during a failover.
+
+**Write path unchanged, verified rather than asserted**: `apply_delta` (3 instructions),
+`apply_delta_impl` (549, plus its 31-instruction cold clone) and `WALWriter::append` (90) are
+instruction-for-instruction identical to master under `scripts/mnemonic_diff.py` in Release. The
+tool refused the first run — "0 definitions in base — not a measurement" — because the base
+worktree had been configured with `OB_BUILD_TESTS=OFF` and never built the engine archive. An
+instrument that says "not a measurement" instead of "identical" is worth the line it costs.
+
+Eight tests: the two halves of the guard with a control for each (a guard that refuses everything
+passes the refusal test), the epoch outliving a role change and a crash-restart, the historical-record
+asymmetry, the state file asserted **while the client still runs** so a build that only saves at
+shutdown cannot pass, and a static test that the number has one home — because a re-introduced member
+would be seeded correctly on the day it was written and go stale on the next role change somebody
+adds.
+
+Mutations: eight, all caught — but one of them survived its first pass and the reason was in the
+test, not the engine. `epoch_lowerable` relaxes `while (epoch > known)` to `while (epoch != known)`,
+which lets a historical record talk the number down; the test that should have caught it asserted
+the epoch **after** an epoch-9 record that raised the value back, so it measured the recovery
+instead of the damage. Moved between the two records, it kills the mutation and nothing else does.
+Worth keeping as the general form: an assertion placed after the next message tests whether the
+system repairs itself, which is a different question from whether it broke.
+
+Noted while reading, not filed as an item because it is a test rather than a defect in the engine:
+`WireProtocolEpoch.EpochFencingCorrectness` asserts `msg >= local` equals `msg >= local`. It is a
+tautology, true of every implementation including one with no check at all, and it is why this
+fencing had no behavioural coverage until now. The four new behavioural tests are its replacement in
+substance; the property test is left where it is, since deleting it is a separate change to a file
+this item did not otherwise touch.
+
+- Effort: S | Impact: epoch fencing on the replication link was inert on the first connection, which
   is every connection after a restart or a role change
+
 
 
 ### 102. A node that cannot listen leaves by `terminate` rather than by a message and exit 1 ✅
@@ -3982,9 +4052,11 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Two defects are open, and they lead this table rather than sitting under the capabilities.**
-#103 has a behavioural symptom and #104 deliberately does not — a field written at one site and read
-at none, whose docstring claims a guarantee that in fact comes from where its callers sit.
+**One defect is open, and it leads this table rather than sitting under the capabilities.**
+#104 deliberately has no behavioural symptom — a field written at one site and read at none, whose
+docstring claims a guarantee that in fact comes from where its callers sit. #103, which did have
+one, is closed: its own measurement showed that the fix named in the item would have missed the
+commonest case, and the number moved out of the replication client altogether.
 That is a correction kept from an earlier revision: this paragraph used to say every remaining item
 was a capability or a proof. None of these came out of a bug report; each came out of measuring the
 item before it, which is the usual way here. #93's measurement produced #98 and #99; #98's own tests
@@ -3992,7 +4064,7 @@ produced #100 (ten records broadcast before a handshake, twenty received) and #1
 request produced #102, from a CI run in which a node whose port was still held reported
 `exited with -6`; #101's own tests produced #103, from an assertion that expected the engine's epoch
 on the wire and got a zero; and reading `failover.cpp` for #101's four demotion call sites produced
-#104. All but #103 and #104 are closed.
+#104. All but #104 are closed.
 
 Below the defects the ordering is about who we want to be able to say yes to. A reader can build the
 engine, read its tests and now deploy it from a package (#33), and still **cannot verify its
@@ -4002,7 +4074,6 @@ performance claim is the reason this repo exists.
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
 | **P1** | Reproducible comparative benchmarks (#39 part two) | L | Makes the performance claim verifiable by a reader instead of asserted; needs ClickHouse, TimescaleDB and kdb+ installed natively, which is a decision about the machine rather than code |
-| **P2** | A replica's epoch protection starts every connection at zero (#103) | S | `ERR STALE_PRIMARY` and the replica's own epoch filter are both inert on a first connection, which is every connection after a restart or a role change; #82 is why this is a second line rather than a P0 |
 | **P3** | A field claiming a guarantee, written once and read never (#104) | S | No symptom, and that is the point: the sixth instance of this shape here, and the static test that would catch the seventh does not exist yet |
 | **P2** | The unexplained node death behind #86's third occurrence | S | An `UNREACHABLE` that needs nothing listening, on a node whose epoll thread is merely busy; the OOM-kill hypothesis is untested and the harness should name an unexplained death |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
@@ -4143,8 +4214,8 @@ Measured on machine B, on the commit that carries this table, rather than carrie
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 981 | all passing, ~205 s with `ctest -j1` on machine B. `ctest -N` reports 983: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
-| Python integration | 199 | passing, plus 2 skipped, on i3-7100U in **13:03 measured**. The two skips are the Binance tests, opt-in on a live feed (`OB_BINANCE_TESTS=1`), and they are **collection-time** skips (`pytest.skip(allow_module_level=True)`) — so they are not in the 199, produce no progress character, and the suite's own report plugin says `0 skipped` while pytest says 2. This row read 190 until it was recounted; if you recompute it, count what pytest reports rather than what `--collect-only` does. **No xfails left**: #60's and #61's markers both fell with their fixes |
+| C++ (GTest + RapidCheck) | 988 | all passing, ~205 s with `ctest -j1` on machine B. `ctest -N` reports 990: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
+| Python integration | 200 | passing, plus 2 skipped, on i3-7100U in **13:03 measured**. The two skips are the Binance tests, opt-in on a live feed (`OB_BINANCE_TESTS=1`), and they are **collection-time** skips (`pytest.skip(allow_module_level=True)`) — so they are not in the 200, produce no progress character, and the suite's own report plugin says `0 skipped` while pytest says 2. This row read 190 until it was recounted; if you recompute it, count what pytest reports rather than what `--collect-only` does. **No xfails left**: #60's and #61's markers both fell with their fixes |
 
 `ctest -j1` is not a preference. The network tests bind ports, so a parallel run fails for a reason
 that has nothing to do with the code under test.
