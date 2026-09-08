@@ -709,7 +709,6 @@ private:
     std::atomic<uint32_t> confirmed_file_{0};
     std::atomic<size_t>   confirmed_offset_{0};
     std::atomic<uint64_t> records_replayed_{0};
-    std::atomic<uint64_t> local_epoch_{0};
 
     /// Whose stream the saved position belongs to (#101). 0 = we do not know, which is what a
     /// state file written before #101 says by having no such line at all.
@@ -750,6 +749,19 @@ private:
     void send_ack();
     void save_state();
     void load_state();
+
+    /// Decide what a line announcing `epoch` means for this connection, and remember it if it is
+    /// newer than what this node knows (#103).
+    ///
+    /// Returns false when the announcement comes from a primary the cluster has moved past, which
+    /// ends the connection. `what` names the line for the log ("record", "heartbeat").
+    ///
+    /// The number lives in the engine rather than here, and that is the whole of #103: a member of
+    /// this class starts at zero for every fresh object, and `demote_to_replica()` builds a fresh
+    /// one on every role change - so the guard was disarmed on precisely the connection it exists
+    /// for. The engine's epoch is restored from the WAL for a node that held the role and from
+    /// `repl_state.txt` for one that has only followed.
+    bool accept_announced_epoch(uint64_t epoch, const char* what);
 
     /// Ask the primary which stream it serves and decide what to do with what we hold (#101).
     ///

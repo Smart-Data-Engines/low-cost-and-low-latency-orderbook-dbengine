@@ -2045,14 +2045,34 @@ void ReplicationClient::connect_to_primary() {
 
 void ReplicationClient::send_replicate_from(uint32_t file_index, size_t byte_offset) {
     char handshake[128];
+    // The epoch comes from the engine, so it is what this node knows rather than what this
+    // connection has been told (#103). Zero here disarms the primary's `ERR STALE_PRIMARY`, since
+    // zero is never greater than anything, and every fresh client used to send it.
     int len = std::snprintf(handshake, sizeof(handshake), "REPLICATE %u %zu %" PRIu64 "\n",
-                            file_index, byte_offset,
-                            local_epoch_.load(std::memory_order_relaxed));
+                            file_index, byte_offset, engine_.current_epoch());
     if (!blocking_send_all(fd_, tls_.get(), handshake, static_cast<size_t>(len))) {
         close_socket();
         throw std::runtime_error("ReplicationClient: failed to send handshake");
     }
     OB_LOG_INFO("repl_client", "handshake sent: %.*s", len - 1, handshake);
+}
+
+bool ReplicationClient::accept_announced_epoch(uint64_t epoch, const char* what) {
+    const uint64_t known = engine_.current_epoch();
+    if (epoch < known) {
+        OB_LOG_WARN("repl_client", "stale %s epoch %" PRIu64 " < the %" PRIu64
+                    " this node knows, disconnecting", what, epoch, known);
+        return false;
+    }
+    if (epoch > known) {
+        engine_.note_primary_epoch(epoch);
+        // Written now rather than on the next tick of the ten-second timer. An epoch change is one
+        // line per failover, and for a node that has only ever followed this file is the only place
+        // a restart can learn the number from: nothing writes an EPOCH record to a replica's own
+        // WAL, so its `open()` restores zero.
+        save_state();
+    }
+    return true;
 }
 
 void ReplicationClient::resolve_stream_identity() {
@@ -2285,15 +2305,9 @@ void ReplicationClient::receive_and_replay() {
                                 &file_index, &byte_offset, &total_len, &msg_epoch);
                 if (parsed < 3) continue;
 
-                if (parsed == 4 && msg_epoch < local_epoch_.load(std::memory_order_relaxed)) {
-                    OB_LOG_WARN("replication", "stale epoch %" PRIu64
-                                 " < local %" PRIu64 ", disconnecting",
-                                 msg_epoch, local_epoch_.load(std::memory_order_relaxed));
-                    return;
-                }
-                if (parsed == 4 && msg_epoch > local_epoch_.load(std::memory_order_relaxed)) {
-                    local_epoch_.store(msg_epoch, std::memory_order_relaxed);
-                }
+                // A line without an epoch field is exempt by the parse, which is what keeps a
+                // pre-epoch primary readable; `parsed == 4` is the only armed case.
+                if (parsed == 4 && !accept_announced_epoch(msg_epoch, "record")) return;
 
                 if (binary_len < sizeof(WALRecord)) {
                     return;
@@ -2314,11 +2328,12 @@ void ReplicationClient::receive_and_replay() {
                     return;
                 }
 
+                // Raised, never refused - unlike the line above. The payload is **history**: a
+                // primary catching a replica up streams the EPOCH records of every promotion in
+                // its log, so refusing one below what we know would disconnect every replica
+                // replaying a past failover. The line's epoch is now; the record's is then.
                 if (hdr.record_type == WAL_RECORD_EPOCH && payload_len == 8) {
-                    EpochValue received_epoch = epoch_from_payload(payload);
-                    if (received_epoch.term > local_epoch_.load(std::memory_order_relaxed)) {
-                        local_epoch_.store(received_epoch.term, std::memory_order_relaxed);
-                    }
+                    engine_.note_primary_epoch(epoch_from_payload(payload).term);
                 }
 
                 if (hdr.record_type == WAL_RECORD_DELTA && payload_len >= sizeof(DeltaUpdate)) {
@@ -2344,15 +2359,7 @@ void ReplicationClient::receive_and_replay() {
             if (line.rfind("HEARTBEAT", 0) == 0) {
                 uint64_t hb_epoch = 0;
                 if (std::sscanf(line.c_str(), "HEARTBEAT %" SCNu64, &hb_epoch) == 1) {
-                    if (hb_epoch < local_epoch_.load(std::memory_order_relaxed)) {
-                        OB_LOG_WARN("replication", "stale heartbeat epoch %" PRIu64
-                                     " < local %" PRIu64 ", disconnecting",
-                                     hb_epoch, local_epoch_.load(std::memory_order_relaxed));
-                        return;
-                    }
-                    if (hb_epoch > local_epoch_.load(std::memory_order_relaxed)) {
-                        local_epoch_.store(hb_epoch, std::memory_order_relaxed);
-                    }
+                    if (!accept_announced_epoch(hb_epoch, "heartbeat")) return;
                 }
                 send_ack();
                 continue;
@@ -2401,18 +2408,8 @@ void ReplicationClient::receive_and_replay() {
                 continue; // Malformed — skip.
             }
 
-            // Stale-epoch check (Requirement 2.1, 2.2, 3.5).
-            if (parsed == 4 && msg_epoch < local_epoch_.load(std::memory_order_relaxed)) {
-                // Stale primary — disconnect and log warning.
-                OB_LOG_WARN("replication", "stale epoch %" PRIu64
-                             " < local %" PRIu64 ", disconnecting",
-                             msg_epoch, local_epoch_.load(std::memory_order_relaxed));
-                return;
-            }
-            // Epoch advancement: if received epoch > local, update (Requirement 2.4).
-            if (parsed == 4 && msg_epoch > local_epoch_.load(std::memory_order_relaxed)) {
-                local_epoch_.store(msg_epoch, std::memory_order_relaxed);
-            }
+            // Stale-epoch check (Requirement 2.1, 2.2, 3.5), and epoch advancement (2.4).
+            if (parsed == 4 && !accept_announced_epoch(msg_epoch, "record")) return;
 
             if (total_len < sizeof(WALRecord) || total_len > 1024 * 1024) {
                 // Sanity check: total_len must be at least WALRecord header size
@@ -2445,12 +2442,10 @@ void ReplicationClient::receive_and_replay() {
                 return;
             }
 
-            // Handle Epoch_Record: update local epoch (Requirement 2.4).
+            // Handle Epoch_Record: raise, never refuse (Requirement 2.4). See the compressed
+            // path above for why: a catch-up carries the EPOCH record of every past promotion.
             if (hdr.record_type == WAL_RECORD_EPOCH && payload_len == 8) {
-                EpochValue received_epoch = epoch_from_payload(payload);
-                if (received_epoch.term > local_epoch_.load(std::memory_order_relaxed)) {
-                    local_epoch_.store(received_epoch.term, std::memory_order_relaxed);
-                }
+                engine_.note_primary_epoch(epoch_from_payload(payload).term);
             }
 
             // Skip non-DELTA records (GAP, ROTATE, EPOCH, etc.) — only replay DELTA.
@@ -2484,17 +2479,8 @@ void ReplicationClient::receive_and_replay() {
             // Parse epoch from HEARTBEAT message.
             uint64_t hb_epoch = 0;
             if (std::sscanf(line_buf, "HEARTBEAT %" SCNu64, &hb_epoch) == 1) {
-                // Stale-epoch check (Requirement 3.5).
-                if (hb_epoch < local_epoch_.load(std::memory_order_relaxed)) {
-                    OB_LOG_WARN("replication", "stale heartbeat epoch %" PRIu64
-                                 " < local %" PRIu64 ", disconnecting",
-                                 hb_epoch, local_epoch_.load(std::memory_order_relaxed));
-                    return;
-                }
-                // Epoch advancement.
-                if (hb_epoch > local_epoch_.load(std::memory_order_relaxed)) {
-                    local_epoch_.store(hb_epoch, std::memory_order_relaxed);
-                }
+                // Stale-epoch check (Requirement 3.5) and advancement, in one place.
+                if (!accept_announced_epoch(hb_epoch, "heartbeat")) return;
             }
             send_ack();
             continue;
@@ -2539,10 +2525,17 @@ void ReplicationClient::save_state() {
 
     // The identity goes with the position, always in the same write: a position saved without one
     // is a position nothing can attribute, and `load_state()` reads that as "wipe" (#101).
-    std::fprintf(f, "file_index=%u\nbyte_offset=%zu\nstream_id=%" PRIu64 "\n",
+    //
+    // The epoch goes with them because it is the one fact here that a replica's own WAL does not
+    // keep: EPOCH records are written by promotions, so a node that has only ever followed restores
+    // zero and its fencing starts every process unarmed (#103). Unlike the position, it is a
+    // ceiling rather than a place - `load_state()` raises the engine's epoch to it and never lowers
+    // it - so an out-of-date file costs fencing, never correctness of replay.
+    std::fprintf(f, "file_index=%u\nbyte_offset=%zu\nstream_id=%" PRIu64 "\nepoch=%" PRIu64 "\n",
                  confirmed_file_.load(std::memory_order_relaxed),
                  confirmed_offset_.load(std::memory_order_relaxed),
-                 stream_id_.load(std::memory_order_relaxed));
+                 stream_id_.load(std::memory_order_relaxed),
+                 engine_.current_epoch());
     std::fclose(f);
 }
 
@@ -2561,6 +2554,7 @@ void ReplicationClient::load_state() {
     uint32_t file_index = 0;
     size_t byte_offset = 0;
     uint64_t stream_id = 0;
+    uint64_t saved_epoch = 0;
     char line[256];
 
     // Not left at whatever a previous connection resolved: `start()` may follow a `stop()` on the
@@ -2578,6 +2572,11 @@ void ReplicationClient::load_state() {
             confirmed_offset_.store(byte_offset, std::memory_order_relaxed);
         } else if (std::sscanf(line, "stream_id=%" SCNu64, &stream_id) == 1) {
             stream_id_.store(stream_id, std::memory_order_relaxed);
+        } else if (std::sscanf(line, "epoch=%" SCNu64, &saved_epoch) == 1) {
+            // Raised into the engine rather than kept here, which is what makes it survive the next
+            // role change: `demote_to_replica()` builds a new client and this object goes away.
+            // A file written before #103 has no such line and leaves the engine's epoch alone.
+            engine_.note_primary_epoch(saved_epoch);
         }
     }
 

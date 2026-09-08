@@ -309,6 +309,18 @@ public:
     /// Get current epoch value.
     uint64_t current_epoch() const;
 
+    /// Remember an epoch a primary announced, if it is newer than the one this node knows (#103).
+    ///
+    /// **Never lowers.** The epoch is a fact about the cluster and it only ever moves forward, so
+    /// the guards that stand on it - `ERR STALE_PRIMARY` on the primary, the replica's own record
+    /// filter - are only worth anything if this number cannot be talked down. The consequence is
+    /// named rather than avoided: a data directory carrying a higher epoch than the cluster it is
+    /// pointed at refuses to follow it, and `docs/operations.md` covers the two ways to read that.
+    ///
+    /// Called from the replication client's receive thread; the store is a CAS loop rather than a
+    /// compare-then-store so a concurrent promotion cannot be overwritten by a lower number.
+    void note_primary_epoch(uint64_t epoch);
+
     /// Handle ROLE command — returns wire-protocol response.
     std::string handle_role_command() const;
 

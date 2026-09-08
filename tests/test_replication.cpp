@@ -23,11 +23,13 @@ TEST(ReplicationSmoke, ConfigDefaults) {
 
 #include <algorithm>
 #include <atomic>
+#include <cinttypes>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1604,13 +1606,22 @@ static void answer_stream_id(int fd, uint64_t identity, int timeout_ms = 3000) {
 
 // Build a valid WAL wire message: "WAL <file_index> <byte_offset> <total_len>\n<WALRecord><payload>"
 // Returns the complete message bytes.
+//
+// `epoch` is optional because the field count is what arms the replica's epoch filter: the parse
+// requires four fields before it compares anything, so a line without one is deliberately exempt.
+// Passing an explicit zero is therefore a different message from passing none, which is why this
+// takes an optional rather than defaulting the number to 0.
 static std::vector<uint8_t> build_wal_message(uint32_t file_index, size_t byte_offset,
                                                const ob::WALRecord& hdr,
-                                               const void* payload, size_t payload_len) {
+                                               const void* payload, size_t payload_len,
+                                               std::optional<uint64_t> epoch = std::nullopt) {
     const size_t total_len = sizeof(ob::WALRecord) + payload_len;
     char line[128];
-    int line_len = std::snprintf(line, sizeof(line), "WAL %u %zu %zu\n",
-                                  file_index, byte_offset, total_len);
+    int line_len = epoch.has_value()
+        ? std::snprintf(line, sizeof(line), "WAL %u %zu %zu %" PRIu64 "\n",
+                        file_index, byte_offset, total_len, *epoch)
+        : std::snprintf(line, sizeof(line), "WAL %u %zu %zu\n",
+                        file_index, byte_offset, total_len);
 
     std::vector<uint8_t> msg(static_cast<size_t>(line_len) + total_len);
     std::memcpy(msg.data(), line, static_cast<size_t>(line_len));
@@ -3481,12 +3492,13 @@ TEST_F(ReplicationClientTest, APositionIsResumedFromWhenThePrimaryNamesTheStream
 
     // The file a downgrade would read. `stop()` rewrote it, so these are the bytes on disk.
     //
-    // The identity is an *added line*, not a change to the two that were there: a build without
-    // the `stream_id` branch ignores what it does not recognise, so it still reads file 2 at
-    // offset 1024. Had the identity been folded into either of those lines, a downgrade would read
-    // a wrong position and say nothing (requirement 6.2).
+    // Both later fields are *added lines*, not changes to the two that were there: a build without
+    // the `stream_id` branch (or without #103's `epoch`) ignores what it does not recognise, so it
+    // still reads file 2 at offset 1024. Had either been folded into one of those lines, a
+    // downgrade would read a wrong position and say nothing (requirement 6.2). The epoch is 0 here
+    // because nothing in this test ever announced one.
     const std::string saved = read_whole_file(cfg.state_file);
-    EXPECT_EQ(saved, "file_index=2\nbyte_offset=1024\nstream_id=777\n") << saved;
+    EXPECT_EQ(saved, "file_index=2\nbyte_offset=1024\nstream_id=777\nepoch=0\n") << saved;
 
     ::close(client_fd);
     ::close(listen_fd);
@@ -3529,7 +3541,7 @@ TEST_F(ReplicationClientTest, ADifferentStreamAtTheSameAddressMakesTheReplicaSta
     // Written before the position went out, so a crash in between leaves a file describing the
     // empty store rather than the deleted stream's offset.
     const std::string saved = read_whole_file(cfg.state_file);
-    EXPECT_EQ(saved, "file_index=0\nbyte_offset=0\nstream_id=778\n") << saved;
+    EXPECT_EQ(saved, "file_index=0\nbyte_offset=0\nstream_id=778\nepoch=0\n") << saved;
 
     client.stop();
     ::close(client_fd);
@@ -3567,7 +3579,8 @@ TEST_F(ReplicationClientTest, APositionThatNamesNoStreamIsNotResumedFrom) {
     const std::string handshake = recv_line(client_fd, 3000);
     EXPECT_EQ(handshake, "REPLICATE 0 0 0") << handshake;
     EXPECT_EQ(count_rows(engine, "OLDFILE"), 0u);
-    EXPECT_EQ(read_whole_file(cfg.state_file), "file_index=0\nbyte_offset=0\nstream_id=777\n")
+    EXPECT_EQ(read_whole_file(cfg.state_file),
+              "file_index=0\nbyte_offset=0\nstream_id=777\nepoch=0\n")
         << "the file still names no stream, so the next restart would wipe again - the upgrade "
         << "would never take";
 
@@ -3730,7 +3743,7 @@ TEST_F(ReplicationClientTest, ASnapshotBootstrapRecordsWhichStreamThePositionCam
     const auto out = run_snapshot_bootstrap(tmp_->str(), port_, /*splice_a_live_record=*/false);
     ASSERT_TRUE(out.first_file_installed && out.second_file_installed)
         << "the bootstrap did not finish, so what the state file says is about something else";
-    EXPECT_EQ(out.saved_state, "file_index=3\nbyte_offset=4096\nstream_id=1309\n")
+    EXPECT_EQ(out.saved_state, "file_index=3\nbyte_offset=4096\nstream_id=1309\nepoch=0\n")
         << out.saved_state;
 }
 
@@ -3919,12 +3932,12 @@ TEST_F(ReplicationClientTest, ANodeThatAcceptedWritesStartsOverEvenAgainstTheSam
     ASSERT_GE(client_fd, 0) << "the demotion started no replication client";
     answer_stream_id(client_fd, 777);          // the same stream it used to follow
 
-    // The epoch on that line is 0 rather than 7, and it is not a typo: `local_epoch_` starts at
-    // zero and is only ever raised by what a primary sends, so the engine's own epoch never
-    // reaches the wire on a first connection. Measured here, filed as #103, and left alone -
-    // seeding it changes when a replica refuses a primary, which is not what this item is about.
+    // The epoch on that line is the 7 this node held the role in, which is #103: it used to be 0,
+    // because the number lived in the replication client and every fresh client started at zero.
+    // It reaches the wire now, so the primary's `ERR STALE_PRIMARY` has something to compare
+    // against on a first connection - the only kind a role change produces.
     const std::string handshake = recv_line(client_fd, 3000);
-    EXPECT_EQ(handshake, "REPLICATE 0 0 0")
+    EXPECT_EQ(handshake, "REPLICATE 0 0 7")
         << "a node that accepted writes asked to resume inside the stream it left, got: "
         << handshake;
     EXPECT_EQ(count_rows(engine, "WASPRIM"), 0u)
@@ -3933,4 +3946,400 @@ TEST_F(ReplicationClientTest, ANodeThatAcceptedWritesStartsOverEvenAgainstTheSam
     ::close(client_fd);
     ::close(listen_fd);
     engine.close();
+}
+
+// ── #103: the epoch a replica compares against ────────────────────────────────
+//
+// Two guards stand on the same number and neither one holds it. The primary refuses a request from
+// a replica that has seen a newer epoch (`ERR STALE_PRIMARY`); the replica drops a record from a
+// primary that is behind what it has seen. Both are second lines - #82 makes an outgoing primary
+// demote itself when it loses its lease - and a second line that cannot fire is the one you find
+// out about from the first line's bad day.
+
+namespace {
+
+/// True when `fd` sees the peer close within `timeout_ms`.
+///
+/// The replica ends a connection by returning from its receive loop, which closes the socket and
+/// reconnects. From the mock primary's side that is a zero-length read, and it is the only
+/// observable difference between "the record was refused" and "the record was ignored".
+bool wait_for_peer_close(int fd, int timeout_ms) {
+    struct timeval tv{};
+    tv.tv_sec  = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char buf[256];
+    while (true) {
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n == 0) return true;      // orderly close
+        if (n < 0) return false;      // timeout: the peer is still there
+        // Anything else is the replica talking (an ACK, a reconnect's question) - keep reading.
+    }
+}
+
+/// A DELTA record on the wire, at `epoch` if one is given.
+std::vector<uint8_t> delta_message(const char* symbol, uint64_t seq,
+                                   std::optional<uint64_t> epoch) {
+    auto [payload, crc] = build_delta_payload(symbol, "BINANCE", seq, 1'700'000'000ULL + seq,
+                                               ob::SIDE_BID, 61'000, 2);
+    ob::WALRecord hdr{};
+    hdr.sequence_number = seq;
+    hdr.timestamp_ns    = 1'700'000'000ULL + seq;
+    hdr.checksum        = crc;
+    hdr.payload_len     = static_cast<uint16_t>(payload.size());
+    hdr.record_type     = ob::WAL_RECORD_DELTA;
+    hdr._pad            = 0;
+    return build_wal_message(0, 0, hdr, payload.data(), payload.size(), epoch);
+}
+
+/// An EPOCH record on the wire: `term` in the payload, `line_epoch` on the line above it.
+///
+/// The two differ during a catch-up, which is the case that matters - see the test below.
+std::vector<uint8_t> epoch_record_message(uint64_t term, uint64_t line_epoch) {
+    uint8_t payload[8];
+    ob::epoch_to_payload(ob::EpochValue{term}, payload);
+
+    ob::WALRecord hdr{};
+    hdr.sequence_number = 0;
+    hdr.timestamp_ns    = 1'700'000'000ULL;
+    hdr.checksum        = ob::crc32c(payload, sizeof(payload));
+    hdr.payload_len     = static_cast<uint16_t>(sizeof(payload));
+    hdr.record_type     = ob::WAL_RECORD_EPOCH;
+    hdr._pad            = 0;
+    return build_wal_message(0, 0, hdr, payload, sizeof(payload), line_epoch);
+}
+
+}  // namespace
+
+TEST_F(ReplicationClientTest, AnEpochLearnedFromOnePrimaryOutlivesTheConnectionItArrivedOn) {
+    // #103 in the shape a cluster actually produces. This node has never held the role, so
+    // everything it knows about the epoch arrived over the wire; a failover then points it at a new
+    // primary and `demote_to_replica()` builds a **new** client. If the number lives in that
+    // object, the guard restarts at zero exactly when it is needed.
+    const uint16_t port_b = alloc_port();
+    int listen_a = create_mock_primary(port_);
+    int listen_b = create_mock_primary(port_b);
+    ASSERT_GE(listen_a, 0);
+    ASSERT_GE(listen_b, 0);
+
+    ob::ReplicationClientConfig cfg;
+    cfg.state_file = tmp_->str() + "/repl_state.txt";   // primary_port 0: no client until demotion
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE, {}, cfg);
+    engine.open();
+
+    engine.demote_to_replica("127.0.0.1:" + std::to_string(port_));
+    int fd_a = accept_with_timeout(listen_a, 5000);
+    ASSERT_GE(fd_a, 0) << "the demotion started no replication client";
+    answer_stream_id(fd_a, 777);
+    ASSERT_EQ(recv_line(fd_a, 3000), "REPLICATE 0 0 0")
+        << "nothing has announced an epoch yet, so there is none to carry";
+
+    // The only thing that will ever tell this node the epoch. The ACK is what says the line was
+    // read rather than merely sent - a condition that becomes true once and stays true.
+    const std::string hb = "HEARTBEAT 9\n";
+    ASSERT_EQ(::send(fd_a, hb.data(), hb.size(), MSG_NOSIGNAL), static_cast<ssize_t>(hb.size()));
+    ASSERT_EQ(recv_line(fd_a, 3000).rfind("ACK", 0), 0u)
+        << "the heartbeat was not processed, so this test has not established what it needs";
+
+    // The failover: same node, new primary, new client object.
+    engine.demote_to_replica("127.0.0.1:" + std::to_string(port_b));
+    int fd_b = accept_with_timeout(listen_b, 5000);
+    ASSERT_GE(fd_b, 0);
+    answer_stream_id(fd_b, 778);
+
+    EXPECT_EQ(recv_line(fd_b, 3000), "REPLICATE 0 0 9")
+        << "the replica introduced itself to the new primary as having seen no epoch at all, so "
+           "`ERR STALE_PRIMARY` is inert on the connection it exists for (#103)";
+
+    ::close(fd_a);
+    ::close(fd_b);
+    ::close(listen_a);
+    ::close(listen_b);
+    engine.close();
+}
+
+TEST_F(ReplicationClientTest, ARecordFromAPrimaryBehindWhatWeKnowIsNotApplied) {
+    // The replica's own half of the guard, with the epoch known **before** the connection - which
+    // is the only arrangement #103 is about. A node that held the role in epoch 9 knows 9 from its
+    // own WAL; a primary streaming epoch 5 at it is superseded, and its records are not ours to
+    // apply.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    // The engine's own config names no primary, so `open()` starts no client of its own to race
+    // this test's for the one connection the mock accepts.
+    ob::ReplicationClientConfig engine_cfg;
+    engine_cfg.state_file = tmp_->str() + "/repl_state.txt";
+
+    ob::ReplicationClientConfig cfg = engine_cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE, {}, engine_cfg);
+    engine.open();
+    engine.promote_to_primary(ob::EpochValue{9});
+    engine.demote_to_replica("");   // REPLICA, epoch 9, and no client of its own to fight with
+
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    int fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(fd, 0);
+    answer_stream_id(fd, 777);
+    EXPECT_EQ(recv_line(fd, 3000), "REPLICATE 0 0 9")
+        << "the position is gone with the promotion, but the epoch is this node's own";
+
+    const auto msg = delta_message("STALEREC", 1, 5);
+    ASSERT_EQ(::send(fd, msg.data(), msg.size(), MSG_NOSIGNAL), static_cast<ssize_t>(msg.size()));
+
+    EXPECT_TRUE(wait_for_peer_close(fd, 4000))
+        << "the replica stayed on a connection with a primary behind the epoch it holds";
+    EXPECT_EQ(client.state().records_replayed, 0u)
+        << "a record from a superseded primary was applied";
+    engine.flush_incremental();
+    EXPECT_EQ(count_rows(engine, "STALEREC"), 0u)
+        << "the record landed in the store, which is the fencing this link is supposed to have";
+
+    client.stop();
+    ::close(fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
+TEST_F(ReplicationClientTest, ARecordFromALegitimatePromotionIsStillApplied) {
+    // The control, and it is what makes the refusal above mean anything: a guard that drops
+    // everything passes that test. A promotion moves the epoch **up**, so the new primary announces
+    // a number above ours and its records are exactly what we are here for.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    // The engine's own config names no primary, so `open()` starts no client of its own to race
+    // this test's for the one connection the mock accepts.
+    ob::ReplicationClientConfig engine_cfg;
+    engine_cfg.state_file = tmp_->str() + "/repl_state.txt";
+
+    ob::ReplicationClientConfig cfg = engine_cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE, {}, engine_cfg);
+    engine.open();
+    engine.promote_to_primary(ob::EpochValue{9});
+    engine.demote_to_replica("");
+
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    int fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(fd, 0);
+    answer_stream_id(fd, 777);
+    ASSERT_EQ(recv_line(fd, 3000), "REPLICATE 0 0 9");
+
+    const auto msg = delta_message("GOODREC", 1, 10);
+    ASSERT_EQ(::send(fd, msg.data(), msg.size(), MSG_NOSIGNAL), static_cast<ssize_t>(msg.size()));
+
+    ASSERT_EQ(recv_line(fd, 5000).rfind("ACK ", 0), 0u)
+        << "the replica did not acknowledge a record from its new primary";
+    EXPECT_EQ(client.state().records_replayed, 1u);
+    engine.flush_incremental();
+    EXPECT_EQ(count_rows(engine, "GOODREC"), 1u)
+        << "a record from a primary one epoch ahead was refused, which is a failover this replica "
+           "would never complete";
+
+    client.stop();
+    ::close(fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
+TEST_F(ReplicationProtocolTest, APrimaryBehindTheEpochARequestNamesIsRefused) {
+    // The primary's half. Nothing behavioural covered it before: the property test in
+    // `test_wire_protocol_epoch.cpp` asserts `msg >= local` equals `msg >= local`, which is true of
+    // every implementation including one with no check at all.
+    wal_->set_epoch(5);
+    auto mgr = start_manager();
+
+    int ahead_fd = connect_to_localhost(port_);
+    ASSERT_GE(ahead_fd, 0);
+    const std::string ahead = "REPLICATE 0 0 9\n";
+    ASSERT_EQ(::send(ahead_fd, ahead.data(), ahead.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(ahead.size()));
+    EXPECT_EQ(recv_line(ahead_fd, 3000), "ERR STALE_PRIMARY")
+        << "a primary at epoch 5 served a replica that has seen 9";
+
+    // The control: the same request at our own epoch is served, so the refusal is about the number
+    // rather than about a manager that turns away whatever it is handed.
+    int equal_fd = connect_to_localhost(port_);
+    ASSERT_GE(equal_fd, 0);
+    const std::string equal = "REPLICATE 0 0 5\n";
+    ASSERT_EQ(::send(equal_fd, equal.data(), equal.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(equal.size()));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    const auto states = mgr->replica_states();
+    EXPECT_EQ(states.size(), 1u)
+        << "the refused connection should be gone and the current one kept; " << states.size()
+        << " remain";
+
+    ::close(ahead_fd);
+    ::close(equal_fd);
+    mgr->stop();
+}
+
+TEST_F(ReplicationClientTest, AHistoricalEpochRecordIsNotMistakenForASupersededPrimary) {
+    // Why the record's epoch raises and never refuses, while the line's does both. A catch-up
+    // forwards every record type but ROTATE, so a replica replaying the log is handed the EPOCH
+    // record of every past promotion - each on a line announcing the primary's epoch **now**. The
+    // payload is then; the line is now. Refusing on the payload would disconnect every replica
+    // catching up across a failover, which is the shape this test exists to keep out.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::ReplicationClientConfig engine_cfg;
+    engine_cfg.state_file = tmp_->str() + "/repl_state.txt";
+    ob::ReplicationClientConfig cfg = engine_cfg;
+    cfg.primary_host = "127.0.0.1";
+    cfg.primary_port = port_;
+
+    ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE, {}, engine_cfg);
+    engine.open();
+    engine.promote_to_primary(ob::EpochValue{9});
+    engine.demote_to_replica("");
+
+    ob::ReplicationClient client(cfg, engine);
+    client.start();
+
+    int fd = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(fd, 0);
+    answer_stream_id(fd, 777);
+    ASSERT_EQ(recv_line(fd, 3000), "REPLICATE 0 0 9");
+
+    // Epoch 3's promotion, replayed out of the log by a primary that is at 9.
+    const auto history = epoch_record_message(3, 9);
+    ASSERT_EQ(::send(fd, history.data(), history.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(history.size()));
+    ASSERT_EQ(recv_line(fd, 3000).rfind("ACK ", 0), 0u)
+        << "the historical epoch record was not acknowledged, so the connection ended on it";
+
+    // The proof that the connection lived is that the next record lands, not that nothing was
+    // logged: a test asserting the absence of a disconnect passes on a replica that has stopped
+    // reading altogether.
+    const auto msg = delta_message("AFTERHIST", 1, 9);
+    ASSERT_EQ(::send(fd, msg.data(), msg.size(), MSG_NOSIGNAL), static_cast<ssize_t>(msg.size()));
+    ASSERT_EQ(recv_line(fd, 5000).rfind("ACK ", 0), 0u);
+    engine.flush_incremental();
+    EXPECT_EQ(count_rows(engine, "AFTERHIST"), 1u)
+        << "the replica dropped the connection over an EPOCH record from the log's past, so a "
+           "catch-up across a failover would never finish";
+    EXPECT_EQ(engine.current_epoch(), 9u)
+        << "a historical epoch lowered what this node knows";
+
+    client.stop();
+    ::close(fd);
+    ::close(listen_fd);
+    engine.close();
+}
+
+TEST_F(ReplicationClientTest, AnEpochLearnedWhileFollowingSurvivesARestart) {
+    // The other half of the item's title: "every connection after a restart or a role change". A
+    // node that has only ever followed has no EPOCH record in its own WAL - promotions write those
+    // - so a restart used to have nothing to restore the number from. `repl_state.txt` carries it
+    // now, written the moment it changes rather than on the ten-second timer.
+    int listen_fd = create_mock_primary(port_);
+    ASSERT_GE(listen_fd, 0);
+
+    ob::ReplicationClientConfig cfg;
+    cfg.state_file = tmp_->str() + "/repl_state.txt";
+
+    {
+        ob::Engine engine(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE, {}, cfg);
+        engine.open();
+        ASSERT_EQ(engine.current_epoch(), 0u) << "this node has never held the role";
+
+        engine.demote_to_replica("127.0.0.1:" + std::to_string(port_));
+        int fd = accept_with_timeout(listen_fd, 5000);
+        ASSERT_GE(fd, 0);
+        answer_stream_id(fd, 777);
+        ASSERT_EQ(recv_line(fd, 3000), "REPLICATE 0 0 0");
+
+        const std::string hb = "HEARTBEAT 9\n";
+        ASSERT_EQ(::send(fd, hb.data(), hb.size(), MSG_NOSIGNAL),
+                  static_cast<ssize_t>(hb.size()));
+        ASSERT_EQ(recv_line(fd, 3000).rfind("ACK", 0), 0u);
+
+        ::close(fd);
+        engine.close();
+    }
+
+    // The saved file is what a restart has to work from, so it is asserted before the restart uses
+    // it - otherwise a fix that only worked in memory would read as a fix that survived.
+    const std::string saved = read_whole_file(cfg.state_file);
+    EXPECT_NE(saved.find("epoch=9"), std::string::npos)
+        << "the epoch was not written down, so nothing but this process ever knew it: " << saved;
+
+    ob::Engine restarted(tmp_->str(), 100'000'000ULL, ob::FsyncPolicy::NONE, {}, cfg);
+    restarted.open();
+    restarted.demote_to_replica("127.0.0.1:" + std::to_string(port_));
+
+    int fd2 = accept_with_timeout(listen_fd, 5000);
+    ASSERT_GE(fd2, 0);
+    answer_stream_id(fd2, 777);
+    EXPECT_EQ(recv_line(fd2, 3000), "REPLICATE 0 0 9")
+        << "the restarted replica introduced itself as having seen no epoch, which is the state "
+           "#103 left every process in";
+
+    ::close(fd2);
+    ::close(listen_fd);
+    restarted.close();
+}
+
+TEST(ReplicationEpochOwnership, TheEpochAReplicaComparesAgainstLivesInOnePlace) {
+    // #103 was not a missing initialiser, it was a second copy of one number: the client held its
+    // own, the engine held the real one, and the copy started at zero for every fresh object. The
+    // fix removed the copy, so what this pins is that nothing declares another - a behavioural test
+    // cannot, because a re-introduced member would be seeded correctly on the day it was written
+    // and go stale on the next role change somebody added.
+    const std::string hdr = read_source("include/orderbook/replication.hpp");
+    ASSERT_FALSE(hdr.empty());
+
+    const std::size_t start = hdr.find("class ReplicationClient {");
+    ASSERT_NE(start, std::string::npos);
+    const std::size_t end = hdr.find("\n};", start);
+    ASSERT_NE(end, std::string::npos);
+    const std::string body = hdr.substr(start, end - start);
+
+    std::vector<std::string> fields;
+    for (std::size_t line = 0; line < body.size();) {
+        const std::size_t next = body.find('\n', line);
+        const std::string text = body.substr(line, (next == std::string::npos ? body.size() : next)
+                                                       - line);
+        line = (next == std::string::npos) ? body.size() : next + 1;
+
+        // A declaration, not prose and not a function: the comments in this class say "epoch"
+        // repeatedly, and one of them says it about the guard below.
+        const std::size_t first = text.find_first_not_of(" \t");
+        if (first == std::string::npos || text.compare(first, 2, "//") == 0) continue;
+        if (text.find("epoch") == std::string::npos) continue;
+        if (text.find(';') == std::string::npos || text.find('(') != std::string::npos) continue;
+        fields.push_back(text);
+    }
+
+    ASSERT_TRUE(fields.empty())
+        << "ReplicationClient declares its own epoch again: " << fields.front()
+        << " - the number belongs to the engine, which is what makes it outlive this object";
+
+    // The pair that stops the assertion above from passing by finding nothing: the guard has to
+    // exist and be reached from more than one place, or "no epoch field" would be true of a client
+    // that stopped checking epochs altogether.
+    const std::string src = read_source("src/replication.cpp");
+    ASSERT_FALSE(src.empty());
+    std::size_t calls = 0;
+    for (std::size_t at = src.find("accept_announced_epoch("); at != std::string::npos;
+         at = src.find("accept_announced_epoch(", at + 1)) {
+        ++calls;
+    }
+    EXPECT_GE(calls, 3u)
+        << "one definition and at least two call sites were expected (a record line and a "
+           "heartbeat, on each of the two read paths); found " << calls << " mentions";
 }
