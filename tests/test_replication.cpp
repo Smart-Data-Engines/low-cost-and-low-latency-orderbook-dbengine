@@ -4222,6 +4222,13 @@ TEST_F(ReplicationClientTest, AHistoricalEpochRecordIsNotMistakenForASupersededP
     ASSERT_EQ(recv_line(fd, 3000).rfind("ACK ", 0), 0u)
         << "the historical epoch record was not acknowledged, so the connection ended on it";
 
+    // Asserted **here**, before the next record. A mutation letting the number be talked down
+    // survived the first version of this test, because the epoch-9 record below raised it back
+    // before the assertion ran: the test measured the recovery rather than the damage.
+    EXPECT_EQ(engine.current_epoch(), 9u)
+        << "a record from the log's past lowered what this node knows, which is a fence that can "
+           "be talked down by the primary it is meant to fence";
+
     // The proof that the connection lived is that the next record lands, not that nothing was
     // logged: a test asserting the absence of a disconnect passes on a replica that has stopped
     // reading altogether.
@@ -4232,8 +4239,6 @@ TEST_F(ReplicationClientTest, AHistoricalEpochRecordIsNotMistakenForASupersededP
     EXPECT_EQ(count_rows(engine, "AFTERHIST"), 1u)
         << "the replica dropped the connection over an EPOCH record from the log's past, so a "
            "catch-up across a failover would never finish";
-    EXPECT_EQ(engine.current_epoch(), 9u)
-        << "a historical epoch lowered what this node knows";
 
     client.stop();
     ::close(fd);
