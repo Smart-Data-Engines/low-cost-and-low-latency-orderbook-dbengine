@@ -305,11 +305,11 @@ TEST(FieldUsage, TheRulesAreTriedOnTheCasesTheyGotWrong) {
     EXPECT_EQ(declared_name("    auto& buf = pending_writes_[fd];"), "")
         << "a subscript is a declarator too, so the prefix is what has to decide";
     EXPECT_EQ(declared_name("    meta.wal_file_index  = wal_file_index_;"), "");
-    EXPECT_EQ(declared_name("    /// The note that says `pending_ = 0` is the default."), "")
-        << "prose is not code: a `///` line does not start with `/*`, so without cutting the "
-           "comment off first a sentence about an assignment enters the survey as a member. This "
-           "codebase writes exactly such sentences - the pair of comments this item added to "
-           "failover.cpp name two members and a call between them";
+    EXPECT_EQ(declared_name("    // Cleared by pending_ = 0; on the way out."), "")
+        << "prose is not code: a `//` line does not start with `/*`, so without cutting the comment "
+           "off first a sentence describing an assignment enters the survey as a member. No comment "
+           "in the tree has this shape today, which is why the rule needs a case of its own rather "
+           "than a mutation of the survey";
 
     EXPECT_TRUE(pure_write("        adopted_primary_address_  = new_primary;",
                            "adopted_primary_address_"));
