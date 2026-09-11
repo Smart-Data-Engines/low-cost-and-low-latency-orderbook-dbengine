@@ -232,9 +232,6 @@ private:
 
     std::thread             monitor_thread_;
     std::chrono::steady_clock::time_point last_position_publish_{};
-    /// The primary address this node has told the engine to follow, so a leader change is
-    /// adopted once and an unchanged leader does not restart replication every second.
-    std::string             adopted_primary_address_;
     /// When this node started deferring to a better-placed replica; zero when it is not deferring.
     std::chrono::steady_clock::time_point deferring_since_{};
     std::atomic<uint64_t>   deferrals_{0};
@@ -262,6 +259,16 @@ private:
     ///
     /// Must be called without `mtx_` held: it calls `reconcile_epoch()` and the role-transition
     /// handler, both of which take locks of their own.
+    ///
+    /// **Adoption happens once per leader change, and that comes from where this is called rather
+    /// than from any remembered address** (roadmap #104). This is reached only from transitions -
+    /// the STANDALONE branch and `handle_primary_lease_lost()` - and it stores `REPLICA` into
+    /// `role_` before returning, so the next pass of `monitor_loop()` takes the REPLICA branch,
+    /// which updates `primary_address_` and deliberately does **not** call `demote_to_replica()`.
+    /// A replica watching an unchanged leader therefore restarts nothing. There used to be an
+    /// `adopted_primary_address_` field whose docstring claimed to provide this; it was assigned at
+    /// one site and read at none, so it provided nothing. `FieldUsage.NoMemberIsWrittenAndNeverRead`
+    /// is what makes the seventh instance of that shape fail rather than be noticed by accident.
     ///
     /// Exists because losing a race is not a role. `attempt_promotion()` used to return on a lost
     /// CAS without touching `role_`, which left a node at STANDALONE — a state `monitor_loop()`
