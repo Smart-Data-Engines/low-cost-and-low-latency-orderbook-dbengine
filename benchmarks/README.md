@@ -256,6 +256,40 @@ t: select from orderbook
 
 ## Interpreting results
 
-Compare the `items_per_second` (throughput) and `real_time` (latency) fields in
-`results.json` against the equivalent queries on each external system.  All
-measurements should be taken on the same hardware with the OS page cache warm.
+**Do not do this by hand.** `python -m benchmarks.comparative.run` is the harness, and comparing
+`items_per_second` from one file against a query typed into another system's client is exactly the
+procedure it replaced — because that procedure has no way to know whether the difference it found is
+larger than the machine's own noise, and this machine has produced a **40.6% swing in 8 of 8 rounds
+for an identical function**.
+
+```bash
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release && cmake --build build-release -j$(nproc)
+# Competitors first: benchmarks/install_competitors.md, commands to read before pasting.
+PYTHONPATH=$PWD/python python -m benchmarks.comparative.run --rows 200000 --rounds 12
+```
+
+What the harness does that a manual comparison cannot:
+
+- **measures this machine's resolution before believing any difference** — the same system against
+  itself, interleaved, and anything smaller than the worst deviation it saw is reported as
+  `INDISTINGUISHABLE ON THIS HARDWARE` rather than as a win. Measured across four runs on one
+  afternoon: floors of 0.05, 0.07, 0.15 and **0.35**, which is why the floor is published beside
+  every table and why comparisons are only made inside one run;
+- **checks that two systems answered the same question before timing them.** Rows, by value, not by
+  checksum — a checksum says "different" and a value says *which column*;
+- **refuses a competitor that declares no tuning**, because an untuned competitor measures our
+  effort rather than its engine and produces a flattering number that looks exactly like a fair one;
+- **reports an absent system as a row**, never as a blank cell;
+- **requires a `losses` list, or a sentence saying how a loss was looked for.** A table where we win
+  everywhere reads as selected, and usually is.
+
+The workload definitions below stay as the **reference for the adapters** in
+`benchmarks/comparative/systems/`: the SQL and q in this file is what each adapter issues, and a
+reader checking whether the comparison is fair should read them together. What the adapters add is
+the part a document cannot hold — one kept-open connection per system, because a fresh
+`clickhouse-client` costs 80 ms and a fresh `psql` 40-60 ms against queries of a few milliseconds,
+and the first version of this harness charged both of those to the competitor.
+
+Results live in `benchmarks/comparative/results/<date>-<hardware digest>.{json,md}`, never
+overwritten: a second run writes a second file, because the only thing history is kept for is
+seeing whether a number moved.

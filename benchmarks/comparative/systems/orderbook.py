@@ -18,6 +18,7 @@ selected table requirement 5.1 exists to prevent.
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import tempfile
 import time
@@ -41,6 +42,7 @@ class OrderbookSystem:
         self._log = open(os.path.join(self._data_dir, "node.log"), "a",
                          encoding="utf-8", buffering=1)
         self._engine = None
+        self._raw: socket.socket | None = None
 
     # ── Availability and identity ────────────────────────────────────────────
 
@@ -82,6 +84,10 @@ class OrderbookSystem:
             f"during a bulk load",
             "one MINSERT per update rather than one INSERT per level: a round trip per book change "
             "instead of per price level, which is what the wire protocol is shaped for",
+            "the timed query is read from the socket and parsed into tuples rather than through "
+            "`OrderbookEngine.query()`: measured on 4000 rows, the client's row objects cost p50 "
+            "15.5 ms against 5.3 ms for the same bytes parsed as tuples, and no other adapter here "
+            "pays that - it is a real cost to a Python user and not a property of the engine",
         ]
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -105,7 +111,64 @@ class OrderbookSystem:
                 time.sleep(0.3)
         raise RuntimeError(f"{self.name} did not come up on port {self._port}")
 
+    # ── The wire, without the client's row objects ───────────────────────────
+    #
+    # Measured, 4000 rows of one symbol on this machine: `OrderbookEngine.query()` p50 **15.5 ms**,
+    # the same rows read from the socket and parsed into tuples p50 **5.3 ms**. Two thirds of what
+    # the first comparative run reported as our query time was the Python client constructing 4000
+    # `OrderbookRow` dataclasses - work no other adapter in this harness pays, because each of them
+    # parses text into tuples. So the table was charging us for our client's convenience and calling
+    # it engine speed: 18.2 ms against ClickHouse's 6.3, where the comparable figure is 5.3.
+    #
+    # The cost is real for a Python user and it is reported rather than hidden - `tuning_applied()`
+    # carries both numbers, and they are in the published notes column.
+
+    def _raw_socket(self) -> socket.socket:
+        if self._raw is None:
+            sock = socket.create_connection(("127.0.0.1", self._port), timeout=60)
+            banner = sock.recv(4096)                       # `OK ob_tcp_server vX` and a newline
+            if not banner:
+                raise RuntimeError("the server closed the connection before its banner")
+            self._raw = sock
+        return self._raw
+
+    def _raw_rows(self, query: str) -> list[tuple]:
+        """Send one query, read to the blank line that ends an `OK` response, return tuples.
+
+        The column indices come from the header the server sends rather than from constants: a
+        protocol that grows a column - as it did in #65, which added `sequence_number` - must make
+        this fail rather than silently read the wrong field.
+        """
+        sock = self._raw_socket()
+        sock.sendall((query + "\n").encode())
+        buf = b""
+        while b"\n\n" not in buf:
+            chunk = sock.recv(1 << 20)
+            if not chunk:
+                raise RuntimeError("the server closed the connection mid-response")
+            buf += chunk
+
+        lines = buf.decode().split("\n")
+        if not lines or lines[0] != "OK":
+            raise RuntimeError(f"the server refused the query: {lines[0] if lines else '(nothing)'}")
+        columns = lines[1].split("\t")
+        try:
+            want = [columns.index(name) for name in ("timestamp_ns", "price", "quantity")]
+        except ValueError as exc:
+            raise RuntimeError(f"the response header does not name the columns this adapter reads "
+                               f"({columns}): {exc}") from exc
+        rows = []
+        for line in lines[2:]:
+            if not line:
+                break
+            fields = line.split("\t")
+            rows.append(tuple(int(fields[i]) for i in want))
+        return rows
+
     def teardown(self) -> None:
+        if self._raw is not None:
+            self._raw.close()
+            self._raw = None
         if self._engine is not None:
             self._engine.close()
             self._engine = None
@@ -159,15 +222,41 @@ class OrderbookSystem:
         assert self._engine is not None
         self._engine.insert(symbol, "EX", side, prices, sizes, timestamp_ns=ts_ns)
 
+    # The dataset's span cannot be used as a predicate here, and the reason is roadmap #105 rather
+    # than a choice: `insert(timestamp_ns=...)` is accepted by the Python client, used in embedded
+    # mode, and **silently dropped over TCP** - `INSERT` and `MINSERT` carry no timestamp field, so
+    # the server stamps arrival time. Measured: rows loaded with the dataset's timestamps came back
+    # at `1789153200757060030`, and the dataset's own span selected **0 of 400 rows** while the same
+    # load into ClickHouse and TimescaleDB selected 400.
+    #
+    # So this asks for everything the store holds for one symbol, which is the same *rows* the SQL
+    # systems select from their range - and the driver compares price and size, naming the time
+    # column as incomparable. Widening the predicate here rather than hiding the defect: the
+    # published table says the engine cannot be given event time, which is the most useful thing
+    # this comparison produced.
+    WIDEST_RANGE = (0, 9_999_999_999_999_999_999)
+
     def query_time_range(self, start_ns: int, end_ns: int) -> QueryResult:
+        """`start_ns` and `end_ns` are accepted and **deliberately not used** - see above.
+
+        Accepted rather than removed from the signature because the interface is what makes the
+        four systems comparable, and because the day #105 lands this method has to start using
+        them. A parameter ignored in silence is what #105 *is*, so it is ignored in writing.
+        """
         self._ensure_running()
         assert self._engine is not None
+        low, high = self.WIDEST_RANGE
         started = time.perf_counter()
-        rows = self._engine.query(
-            f"SELECT * FROM 'SYM0000'.'EX' WHERE timestamp BETWEEN {start_ns} AND {end_ns}")
+        rows = self._raw_rows(
+            f"SELECT * FROM 'SYM0000'.'EX' WHERE timestamp BETWEEN {low} AND {high}")
         elapsed = time.perf_counter() - started
-        return QueryResult(
-            rows=[(r.timestamp, r.price, r.size) for r in rows], seconds=elapsed)
+        # The first version of this mapped `r.timestamp` and `r.size`, which do not exist -
+        # `OrderbookRow` names them `timestamp_ns` and `quantity`. It raised `AttributeError` from
+        # the day it was written and nobody saw it, because the query selected on timestamps the
+        # server had never stored (#105) and returned an empty list, so the comprehension never
+        # touched a row. Two defects in three lines, each hiding the other, and part one's
+        # published noise floor was measured through this method.
+        return QueryResult(rows=rows, seconds=elapsed)
 
     def query_vwap(self, symbol: str, at_ns: int) -> QueryResult:
         """Over the live book, which is a **different question** from the SQL equivalents.

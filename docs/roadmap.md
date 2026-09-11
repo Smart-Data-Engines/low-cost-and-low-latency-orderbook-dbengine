@@ -834,13 +834,80 @@ the fix and what survives of the original claim.
 - Corpus in-repo, short fuzz run in CI, optional OSS-Fuzz submission
 - Effort: M | Impact: Finds the class of bug that property tests miss; also a credibility signal
 
-### 39. Reproducible comparative benchmarks
+### 39. Reproducible comparative benchmarks ✅
 
-**Part one is done and merged (PR #70): the harness, the dataset, the resolution measurement and our
-own adapter.** What is left is the three competitor adapters, the publication step, and the
-multi-system checkpoint — all of which need ClickHouse, TimescaleDB and kdb+ installed natively,
-which is a decision about this machine rather than code. Spec:
-`kiro-workspace/specs/reproducible-benchmarks/`.
+**Both parts are done.** Part one (PR #70) built the harness, the dataset, the resolution
+measurement and our own adapter. Part two installed ClickHouse and TimescaleDB natively, wrote the
+three competitor adapters, ran the multi-system checkpoint and published the table — and it found
+more in our own code than in theirs. Spec: `kiro-workspace/specs/reproducible-benchmarks/`.
+
+**The published answer is that this engine loses all four comparable workloads**, and the reasons
+are worth more than the numbers. i3-7100U, Release, 200 000 rows, twelve rounds, control floor
+**15.7%**:
+
+| system | ingest (rows/s) | 4000-row query | not like-for-like because |
+|---|---|---|---|
+| orderbook | 78,151 | 10.09 ms (8.98–16.42) | one `MINSERT` round trip per book update |
+| ClickHouse 26.8.2.7 | 433,779 | 5.96 ms (5.10–7.69) | the whole CSV in one request |
+| TimescaleDB 2.30.0 / PG 16.15 | 106,874 | 6.06 ms (5.44–14.85) | `\copy` of the whole CSV, `timescaledb-tune` applied |
+| kdb+ | NOT MEASURED | NOT MEASURED | a vendor registration, and a licence question about publishing its free edition's numbers |
+
+Both losses are limits of the **protocol** rather than of the storage engine, which is the useful
+finding: the same engine ingests **446,219 updates/s in process** here against **4,012 through the
+wire** — a factor of 111, all of it the round trip.
+
+**Five findings came out of running it, and four of them are about our own code.**
+
+**#105, filed rather than patched: `insert(timestamp_ns=…)` is silently dropped over TCP.** The
+Python client accepts it, computes it, uses it in the embedded branch and never mentions it in the
+TCP or pool branches, because `INSERT` and `MINSERT` carry no timestamp field. Measured: rows loaded
+with the dataset's timestamps came back stamped `1789153200757060030`, and the dataset's own span
+selected **0 of 400 rows** while the same load into ClickHouse and TimescaleDB selected 400. Four
+integration call sites pass that argument and none asserts on it, which is the strongest evidence
+that it reads like the right thing to do.
+
+**Part one's published noise floor was measured on a query that returned nothing**, and the same
+three lines held a second defect that hid the first. `query_time_range()` selected on timestamps the
+server had never stored, so it returned an empty list — and its row mapping read `r.timestamp` and
+`r.size`, which do not exist (`timestamp_ns`, `quantity`). The empty result hid the wrong attribute;
+the wrong attribute would have exposed the empty result the moment it stopped being empty. The floor
+published on 3 September (0.2341) therefore describes the latency of a query matching no rows.
+
+**Two thirds of our engine's measured query time was our own Python client.** The first four-system
+run reported 18.2 ms for 4000 rows against ClickHouse's 6.3, and the honest-looking loss was
+`OrderbookEngine.query()` building 4000 `OrderbookRow` dataclasses: measured, p50 **15.5 ms** through
+the client against **5.3 ms** for the same bytes parsed into tuples, which is what every competitor's
+adapter does. The mirror image was on the other side and found first — a fresh `clickhouse-client`
+costs **80 ms** per query and a fresh `psql` 40-60 ms, so the first versions of those adapters
+charged the competitors forty and ten times the work they were asked to do. **An adapter must not
+add work the other adapters do not pay**, in either direction.
+
+**Two of the three competitors were already running on this machine, in containers** — ClickHouse on
+58123 for the flagship product's test engines and PostgreSQL on 5432 for the landing page. A run that
+reached either would have measured a container, which requirement 1.2 forbids, and nothing in the
+numbers would have looked wrong. Each adapter now refuses the container's port **by name before
+asking the server anything**, and each records the endpoint it used: the native ClickHouse answers
+26.8.x and the container answers 24.8.x, so which server replied is a measurement rather than an
+assumption. The second consequence is where PostgreSQL ended up: `pg_createcluster` took **5433**
+because 5432 was busy.
+
+**`classify()` and `verdict_for()` had no callers outside the tests** until this run — written in
+part one for a comparison that could not happen with one system, which is the shape #104 is about.
+And the first thing the multi-system driver did was trip the package's own static test: my summary
+line spelled "faster" in `run.py`, and only `resolution.classify()` may say that. The words are
+named constants in `resolution` now, so a caller counting verdicts refers to them instead of
+repeating the claim.
+
+**The checkpoint's own value was in reading the output** (task 7.4): the first four-system table
+printed `75131.7815` rows per second, carried a 700-character tuning list inside a table cell, put a
+200-character refusal where a number goes, and filed "every figure includes 4.8 ms of Python-side
+parsing" under *What this engine cannot do* — where a property of the measurement reads as a
+deficiency of the engine. All four are fixed in `report.py`, which now formats by unit, moves prose
+below the table and keeps measurement notes in their own section.
+
+Also measured, and it is the floor's own answer to how much this machine can be trusted: five runs
+of the same table in one afternoon gave floors of **0.05, 0.07, 0.15, 0.16 and 0.35**. Twelve rounds
+rather than six is the documented lever, and the published run uses it.
 
 **The centre of it turned out to be a refusal rather than a feature.** This machine does not resolve
 percentages, and now the harness says so with a number: it measures the same system against itself,
@@ -863,14 +930,13 @@ ClickHouse's from `SELECT version()`, and ours could not be asked at all — so 
 item, and after it merged the adapter reads `STATUS` instead. The first re-run *still* said
 unreported, correctly: `build-release/` predated #90, so the measured binary genuinely had no version
 field. A literal would have printed a version the binary did not have.
-- `benchmarks/README.md` already holds equivalent workload definitions for ClickHouse, TimescaleDB
-  and kdb+. Turn them into a **runnable harness**: native installation of each system from its
-  official packages, one script, results table with hardware, versions and dataset recorded
-- Every system compared runs natively. Benchmarking a native engine against containerised
-  competitors would measure the container layer, not the engines
-- Publish results in the README with the exact hardware, kernel, and dataset used
+What kdb+ needs is not code: a vendor registration for the binary and its licence, and a reading of
+that licence about publishing numbers from the free edition. `systems/kdb.py` is written to the same
+interface as the others and refuses early with both reasons, so the day a licence exists this is a
+flag rather than a file.
+
 - Effort: L | Impact: Turns a performance claim into something a reader can verify on their own
-  hardware in an afternoon
+  hardware in an afternoon — and it turned four of them into corrections
 
 ### 40. Documentation site
 - MkDocs or Doxygen on GitHub Pages: architecture, wire protocol reference, operations guide,
@@ -1908,6 +1974,49 @@ ignore checks.
 
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
+
+### 105. Nothing can be written with its own event time over the wire
+
+Found by #39 part two, in the only way it could be found: by loading the same dataset into three
+systems and asking each of them the same time-range question. Two answered with 400 rows. Ours
+answered with none.
+
+`OrderbookEngine.insert()` takes a `timestamp_ns` argument, computes it (`ts = timestamp_ns if
+timestamp_ns is not None else time.time_ns()`), passes it in the **embedded** branch — and never
+mentions it again in the TCP or pool branches, because `INSERT` and `MINSERT` carry no timestamp
+field. The server stamps arrival time. So the same call means two different things depending on how
+the client was constructed, and the one that loses the value is the one that goes over a network.
+
+**Measured**: 200 000 rows loaded with timestamps from `1700000000000000000` came back stamped
+`1789153200757060030`, and `SELECT … WHERE timestamp BETWEEN <dataset span>` returned **0 of 400
+rows** for one symbol while the same CSV in ClickHouse and TimescaleDB returned 400.
+
+The reach is wider than the benchmark, and each part of it is checked rather than assumed:
+
+- **four integration call sites pass `timestamp_ns` over TCP** — two in
+  `test_mm_snapshot_bootstrap.py`, two in `test_failover.py` — and **none of them asserts on the
+  value**, so the drop is invisible to the whole battery. That they pass the argument at all is the
+  evidence worth keeping: it reads like the right thing to do.
+- **the comparative harness's time-range workload has returned zero rows since part one**, and
+  part one's published noise floor was measured through it (see #39).
+- `benchmarks/comparative/dataset.py` states the premise in its own docstring — "the client takes
+  **one** `timestamp_ns` per batch, so a batched load would have stored timestamps that the
+  time-range query then selects on" — which was false when it was written.
+
+**Why this is a capability gap and not a cosmetic one.** This engine's central query is a time range
+over market data. With arrival time as the only timestamp a record can have, replaying history into
+it over the wire is impossible, a live feed's event time is lost at the door, and a `timestamp
+BETWEEN` answers a question about when the engine heard rather than when the market moved. The
+capability exists in the engine — `DeltaUpdate::timestamp_ns` is what the embedded path fills — and
+stops at the protocol.
+
+The fix is a protocol change, which is why it is filed rather than patched inside a benchmark item:
+an optional trailing field on `INSERT` and `MINSERT`, both clients, `docs/cli.md`, and a decision
+about what an older server should do with the extra token. The client must **refuse** rather than
+drop — silently dropping is what this item is.
+
+- Effort: M | Impact: the engine's main query selects on the wrong clock for every record written
+  over a network, and the argument that looks like the fix is accepted and discarded
 
 ### 104. A field that claims a guarantee, written at one site and read at none ✅
 
@@ -4085,7 +4194,9 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**No defect is open.** The last two closed in order. #103 had a behavioural symptom and its own
+**One defect is open, and #39 part two is what found it.** #105 — nothing can be written with its
+own event time over the wire, so the engine's main query selects on arrival time; measured as 0 rows
+of 400 where two SQL systems returned 400. Before it, the last two closed in order. #103 had a behavioural symptom and its own
 measurement moved the fix: seeding the client from the engine would have missed the commonest case,
 so the number moved out of the replication client altogether. #104 deliberately had none — a field
 written at one site and read at none, whose docstring claimed a guarantee that in fact comes from
@@ -4107,7 +4218,7 @@ performance claim is the reason this repo exists.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **P1** | Reproducible comparative benchmarks (#39 part two) | L | Makes the performance claim verifiable by a reader instead of asserted; needs ClickHouse, TimescaleDB and kdb+ installed natively, which is a decision about the machine rather than code |
+| **P1** | Event time over the wire (#105) | M | The engine's central query is a time range, and every record written over a network carries arrival time instead — measured as 0 rows of 400 where ClickHouse and TimescaleDB returned 400. The argument that looks like the fix (`insert(timestamp_ns=…)`) is accepted and discarded |
 | **P2** | The unexplained node death behind #86's third occurrence | S | An `UNREACHABLE` that needs nothing listening, on a node whose epoll thread is merely busy; the OOM-kill hypothesis is untested and the harness should name an unexplained death |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
@@ -4143,6 +4254,12 @@ Things a reviewer will notice, listed here so they do not look like oversights:
   *(This bullet used to say the replication link and the mesh were plaintext. That was true until
   #30 part three, series D — and a caveats section that understates the engine is the same defect as
   one that overstates it, in the document a reader checks for honesty.)*
+- **A record written over the wire carries the time it arrived, not the time it happened.** `INSERT`
+  and `MINSERT` have no timestamp field, so the server stamps its own clock and `timestamp BETWEEN`
+  selects on that. The Python client's `insert(timestamp_ns=…)` is honoured **embedded** and dropped
+  **over TCP**, silently. Measured by #39 part two: 0 rows of 400 where the same CSV in ClickHouse
+  and TimescaleDB returned 400. Filed as #105, with the fix named as a protocol change rather than a
+  client patch — a client that cannot send the value must refuse rather than drop it.
 - **Process death is exercised in three modules, and nowhere else.** Until #62 no module killed
   anything, and that hid total loss of acknowledged writes on crash. Today `test_crash_recovery.py`,
   `test_failover.py` and `test_failover_dead_state.py` `SIGKILL` a server; the last of those also

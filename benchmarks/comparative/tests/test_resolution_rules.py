@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from benchmarks.comparative import equivalence, resolution
+from benchmarks.comparative.systems import base
 
 PACKAGE = Path(__file__).resolve().parent.parent
 
@@ -224,3 +225,54 @@ def test_nothing_is_discarded_below_six_rounds():
     assert result.discarded_outlier is None
     assert result.floor == pytest.approx(0.5, abs=1e-6)
     assert "discarded" not in result.note
+
+
+# ── Task 6.5: a competitor that declares no tuning stops the run for that system ─────────────
+
+def test_a_system_declaring_no_tuning_is_refused_by_name():
+    """Requirement 4.2, as a refusal rather than a default.
+
+    An untuned competitor measures our effort rather than its engine, and the number it produces
+    looks exactly like a fair one - which is why this cannot be a warning. The message has to name
+    the system, because a run comparing four of them needs to say which one was dropped.
+    """
+    class Untuned:
+        name = "untuned"
+
+        def tuning_applied(self):
+            return []
+
+    with pytest.raises(base.NoTuningDeclared) as raised:
+        base.require_tuning(Untuned())
+    assert "untuned" in str(raised.value)
+    assert "measures our effort" in str(raised.value)
+
+
+def test_a_system_declaring_tuning_passes_it_through():
+    """The pair that stops the test above from passing against a function that always raises."""
+    class Tuned:
+        name = "tuned"
+
+        def tuning_applied(self):
+            return ["ORDER BY (symbol, ts): the query filters on both"]
+
+    assert base.require_tuning(Tuned()) == ["ORDER BY (symbol, ts): the query filters on both"]
+
+
+def test_the_runner_reports_an_untuned_system_instead_of_stopping():
+    """A refusal is about one system, not about the run.
+
+    `main()` catches `NoTuningDeclared` per system and records it as unavailable with the reason -
+    so the other three are still measured and the table says what happened to the fourth. This
+    pins the shape by reading the source rather than by driving a full run, because a run needs
+    four servers; what matters is that the exception is caught inside the per-system loop and that
+    the reason reaches the entry.
+    """
+    source = (Path(__file__).resolve().parents[1] / "run.py").read_text()
+    handler = source.split("except NoTuningDeclared as exc:", 1)
+    assert len(handler) == 2, "run.py no longer catches NoTuningDeclared per system"
+    body = handler[1].split("\n\n", 1)[0]
+    assert "entries.append" in body, (
+        "the refusal is caught and not recorded, so a system dropped for declaring no tuning would "
+        "be a blank cell rather than a named row")
+    assert "str(exc)" in body, "the reason is not carried into the report"
