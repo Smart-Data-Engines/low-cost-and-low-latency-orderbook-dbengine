@@ -1588,6 +1588,46 @@ Learned the hard way. Check here before debugging.
     mutation writing `count(...) >= 0` compares an unsigned value, so `-Werror` rejects both, and a
     mutation that does not build measures nothing (#104).
 
+192. **An adapter that adds work the other adapters do not pay measures the harness, and it happens
+    in both directions.** In the comparative benchmark a fresh `clickhouse-client` costs **80 ms**
+    per query and a fresh `psql` **40-60 ms** against queries of a few milliseconds, so the first
+    versions of those adapters charged the competitors forty and ten times the work asked of them.
+    The mirror image was ours and read as an honest loss: `OrderbookEngine.query()` building 4000
+    `OrderbookRow` dataclasses costs p50 **15.5 ms** against **5.3 ms** for the same bytes parsed
+    into tuples, which is what every competitor's adapter does - so the first four-system run
+    reported 18.2 ms against ClickHouse's 6.3. Every timed path now holds one connection open and
+    parses text into tuples (#39 part two).
+
+193. **Two defects in three lines, each hiding the other.** The comparative harness's
+    `query_time_range()` selected on timestamps the server had never stored (#105), so it returned an
+    empty list - and its row mapping read `r.timestamp` and `r.size`, which do not exist. The empty
+    result hid the wrong attribute; the wrong attribute would have raised the moment the result
+    stopped being empty. Part one's **published** noise floor was measured through those three lines,
+    which means it describes the latency of a query matching no rows. When a number looks stable and
+    cheap, check that the work it is timing happened.
+
+194. **A parameter honoured in one mode and dropped in another is the cross-mode form of a field
+    nobody reads.** `OrderbookEngine.insert(timestamp_ns=...)` is used in the embedded branch and
+    never mentioned in the TCP or pool branches, because `INSERT` and `MINSERT` carry no timestamp
+    field. Four integration call sites pass it and **none asserts on it**, which is the strongest
+    evidence that it reads like the right thing to do. A client that cannot send a value must refuse
+    rather than drop it (#105).
+
+195. **The machine may already be running containerised copies of the systems you are about to
+    benchmark natively.** ClickHouse on 58123 for the flagship product's test engines, PostgreSQL on
+    5432 for the landing page - and a run reaching either would have measured a container while
+    nothing in the numbers looked wrong. Refuse the container's port **by name before asking the
+    server anything**, so the reason in the table names the container rather than whatever that
+    server answers first, and let the version prove which one replied: native ClickHouse 26.8.x,
+    container 24.8.x. The second consequence is quieter: `pg_createcluster` takes the next free port,
+    so the native PostgreSQL came up on 5433 (#39 part two).
+
+196. **Generate the artefact, then quote it.** Rewording a limitation meant the published results
+    file no longer matched the code, so I regenerated it - and the README still cited the previous
+    run's numbers and a file I had just deleted. A document quoting a number nothing produced is the
+    defect this repository has recorded four times; the cheap guard is to regenerate last and copy
+    the numbers from the file that will be committed (#39 part two).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -1663,6 +1703,12 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   `demote_to_replica()`** — it needs the primary's identity, which exists only after the connection,
   so it lives in `ReplicationClient::resolve_stream_identity()` and a static test pins that nothing
   about which of the four callers demoted the node reaches it.
+- **A record written over the wire carries the time it arrived, not the time it happened** (#105).
+  `INSERT` and `MINSERT` have no timestamp field, so the server stamps its own clock and
+  `timestamp BETWEEN` selects on that. `OrderbookEngine.insert(timestamp_ns=...)` is honoured
+  **embedded** and dropped **over TCP**, silently - four integration call sites pass it and none
+  asserts on it. Measured by #39 part two: 0 rows of 400 where the same CSV in ClickHouse and
+  TimescaleDB returned 400. Filed as a protocol change rather than a client patch.
 - **Creating a snapshot happens on a worker thread, not on either io loop** (#79). One at a time; a
   second request during creation is refused as busy, and a finished snapshot whose requester has gone
   is discarded rather than sent — matched on `conn_id`, because the case that `node_id` cannot see is
