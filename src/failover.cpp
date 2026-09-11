@@ -381,8 +381,7 @@ FailoverManager::HandoverResult FailoverManager::initiate_graceful_failover(
                                                              : std::string{};
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        primary_address_          = new_primary;
-        adopted_primary_address_  = new_primary;
+        primary_address_ = new_primary;
     }
     handler_.demote_to_replica(new_primary);
 
@@ -646,6 +645,13 @@ void FailoverManager::monitor_loop() {
 
                 if (leader_present) {
                     note_leader_present();
+                    // The address is recorded and **nothing else happens**, which is the whole of
+                    // "an unchanged leader does not restart replication every second" (#104). No
+                    // comparison against a remembered address is needed to get that, and the field
+                    // that claimed to provide it was written once and read nowhere. Adoption -
+                    // `demote_to_replica()`, a fresh replication client, and since #101 a
+                    // `STREAMID?` round trip - happens in `adopt_leader_if_present()`, which this
+                    // branch is not.
                     std::lock_guard<std::mutex> lk(mtx_);
                     primary_address_ = state.leader_address;
                 } else if (verdict == CoordinatorClient::LeaderRead::Unavailable) {

@@ -354,6 +354,16 @@ ob_add_tcp_test(test_tcp_server
     test_tcp_server.cpp
 )
 
+# ── Whole-engine static checks ─────────────────────────────────────────────────
+# Reads every header and source rather than naming classes: the shape it looks for (#104) was found
+# five times in this workspace while looking for something else, so the subject has to be the tree.
+ob_add_engine_test(test_field_usage
+    test_field_usage.cpp
+)
+target_compile_definitions(test_field_usage
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
 # ── Replication tests ──────────────────────────────────────────────────────────
 ob_add_engine_test(test_replication
     test_replication.cpp
