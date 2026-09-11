@@ -19,6 +19,13 @@ from dataclasses import dataclass, asdict
 from typing import Callable
 
 INDISTINGUISHABLE = "INDISTINGUISHABLE ON THIS HARDWARE"
+
+# The two words this package is allowed to say about one system against another, named here because
+# the static test over the package refuses either of them as a literal anywhere else - and it caught
+# the driver's own summary line the first time a run had more than one system to compare. A caller
+# that counts verdicts refers to these; the claim itself is still produced only by `classify()`.
+FASTER = "faster"
+SLOWER = "slower"
 CANNOT_RESOLVE = "machine cannot resolve"
 USABLE = "usable"
 
@@ -155,4 +162,4 @@ def classify(a_seconds: float, b_seconds: float, resolution: Resolution) -> str:
     difference = abs(a_seconds - b_seconds) / max(a_seconds, b_seconds)
     if difference < resolution.floor:
         return INDISTINGUISHABLE
-    return "faster" if a_seconds < b_seconds else "slower"
+    return FASTER if a_seconds < b_seconds else SLOWER

@@ -29,6 +29,11 @@ class Report:
     resolution: dict[str, Any]
     systems: list[dict[str, Any]] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
+    # How to read the numbers, which is not the same list as what the engine cannot do. The first
+    # four-system run put "every figure includes 4.8 ms of Python-side parsing" under the heading
+    # *What this engine cannot do*, where it reads as a deficiency of the engine rather than as a
+    # constant shared by all three measurements.
+    measurement_notes: list[str] = field(default_factory=list)
     losses: list[str] = field(default_factory=list)
     losses_search: str = ""
 
@@ -53,6 +58,7 @@ class Report:
             "resolution": self.resolution,
             "systems": self.systems,
             "limitations": self.limitations,
+            "measurement_notes": self.measurement_notes,
             "losses": self.losses,
             "losses_search": self.losses_search,
         }
@@ -108,35 +114,79 @@ def to_markdown(report: Report) -> str:
                  f"{res.get('rounds')} interleaved rounds after {res.get('warmup')} warm-up calls — differences smaller than this are "
                  f"reported as indistinguishable, not as a win. Verdict: {res.get('verdict')}")
     lines.append("")
-    lines.append("| System | Version | Ingest (rows/s) | Time-range (s) | VWAP (s) | Notes |")
-    lines.append("|--------|---------|-----------------|----------------|----------|-------|")
+    lines.append("| System | Version | Ingest (rows/s) | Time-range | VWAP |")
+    lines.append("|--------|---------|-----------------|------------|------|")
+    refusals: list[str] = []
     for system in report.systems:
         if not system.get("available", True):
-            lines.append(f"| {system['name']} | — | NOT MEASURED | NOT MEASURED | NOT MEASURED "
-                         f"| {system.get('reason', 'unavailable')} |")
+            lines.append(f"| {system['name']} | — | NOT MEASURED | NOT MEASURED | NOT MEASURED |")
+            refusals.append(f"**{system['name']}** — {system.get('reason', 'unavailable')}")
             continue
         workloads = system.get("workloads", {})
 
-        def cell(key: str) -> str:
+        # Formatted by unit rather than by one `%.4f` for everything: the first four-system run
+        # printed `75131.7815` rows per second, which claims a ten-thousandth of a row and reads as
+        # a number nobody looked at.
+        def cell(key: str, name: str = system["name"]) -> str:
             entry = workloads.get(key)
             if entry is None:
                 return "—"
             if "note" in entry:
-                return entry["note"]
-            return f"{entry.get('value', 0):.4f}"
+                kind = entry["note"].split(":", 1)[0]
+                refusals.append(f"**{name}, {key}** — {entry['note']}")
+                return kind
+            value = entry.get("value", 0)
+            if entry.get("unit") == "rows/s":
+                return f"{value:,.0f}"
+            # Milliseconds, with the spread beside it: a median on its own cannot be argued with.
+            span = ""
+            if "min" in entry and "max" in entry:
+                span = f" ({entry['min'] * 1000:.2f}–{entry['max'] * 1000:.2f})"
+            return f"{value * 1000:.2f} ms{span}"
 
         lines.append(f"| {system['name']} | {system.get('version', '?')} | "
-                     f"{cell('ingest')} | {cell('time_range')} | {cell('vwap')} | "
-                     f"{'; '.join(system.get('tuning_applied', [])) or '—'} |")
+                     f"{cell('ingest')} | {cell('time_range')} | {cell('vwap')} |")
+
     lines.append("")
+    lines.append("Medians over the run's rounds, with the round-to-round range in brackets. The "
+                 "floor above governs comparisons **within** this run.")
+    lines.append("")
+
+    if refusals:
+        lines.append("**Not measured, and why** — a system or workload missing from a table reads "
+                     "as one that lost:")
+        for refusal in refusals:
+            lines.append(f"- {refusal}")
+        lines.append("")
+
     lines.append("**What this engine cannot do**, because the comparison is uneven in its favour:")
     for limitation in report.limitations:
         lines.append(f"- {limitation}")
     lines.append("")
+
+    if report.measurement_notes:
+        lines.append("**How to read these numbers** — properties of the measurement rather than of "
+                     "any system in it:")
+        for note in report.measurement_notes:
+            lines.append(f"- {note}")
+        lines.append("")
+
     if report.losses:
         lines.append("**Where it loses:**")
         for loss in report.losses:
             lines.append(f"- {loss}")
     else:
         lines.append(f"**Where it loses:** none found. {report.losses_search}")
+    lines.append("")
+
+    lines.append("**What was raised in each system's favour**, declared because an untuned "
+                 "competitor produces a flattering number that looks exactly like a fair one:")
+    for system in report.systems:
+        tuning = system.get("tuning_applied") or []
+        if not tuning:
+            continue
+        lines.append("")
+        lines.append(f"*{system['name']}*")
+        for item in tuning:
+            lines.append(f"- {item}")
     return "\n".join(lines) + "\n"

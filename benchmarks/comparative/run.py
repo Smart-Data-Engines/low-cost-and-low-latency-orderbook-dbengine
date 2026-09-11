@@ -23,10 +23,14 @@ import socket
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
-from . import dataset, hardware, report, resolution
-from .systems.base import NoTuningDeclared, require_tuning
+from . import dataset, equivalence, hardware, report, resolution
+from .systems.base import NoTuningDeclared, QueryResult, require_tuning
+from .systems.clickhouse import ClickHouseSystem
+from .systems.kdb import KdbSystem
 from .systems.orderbook import OrderbookSystem
+from .systems.timescaledb import TimescaleDbSystem
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -34,12 +38,144 @@ REPO = Path(__file__).resolve().parents[2]
 # engine beating general databases at its one workload is its whole thesis - and a number that does
 # not say what it gives up promises a replacement.
 ENGINE_LIMITATIONS = [
+    "orderbook: nothing can be written with its own event time over the wire - `INSERT` and "
+    "`MINSERT` carry no timestamp, so the server stamps arrival time and `timestamp BETWEEN` "
+    "selects on that. Measured: the dataset's own span selected 0 of 400 rows here while the same "
+    "load into ClickHouse and TimescaleDB selected 400 (roadmap #105). The time-range workload is "
+    "therefore compared on price and size, with the time column excluded rather than quietly "
+    "mismatched",
+    "orderbook: no bulk-load path over the wire, so the ingest row measures the protocol's shape "
+    "as much as the engine's speed - this harness sends one MINSERT round trip per book update "
+    "while the SQL systems receive the whole CSV in one request. Measured on this machine: the "
+    "engine ingests 446,219 updates/s in process (bench_engine BM_IngestionThroughput, 2552 ns/op "
+    "mean over 1,221,610 iterations, Release) and 4,012 updates/s through the wire, a factor of "
+    "111 - the round trip is the whole of it",
+    # Phrased without the two words `resolution.py` owns, and the guard caught this file twice in
+    # one session - the second time on a sentence *denying* a comparison. The rule is deliberately
+    # blunt about use against mention, because the flagship product spent four versions learning
+    # that telling them apart is harder than avoiding the word.
+    "orderbook: no column projection - every row query is `SELECT *`, so a client wanting three "
+    "columns receives seven. Measured, and it is *not* where the query column's extra "
+    "milliseconds go: parsing 4000 seven-column lines and converting three fields costs p50 "
+    "4.795 ms against 4.893 ms for three-column lines, which is the same number twice",
     "orderbook: no general-purpose SQL - a fixed set of commands, not a query language",
     "orderbook: no joins, and no cross-symbol queries",
     "orderbook: the schema is imposed, not derived from a model",
     "orderbook: append-only; nothing deletes rows except TTL retention",
     "orderbook: aggregates run over the live book, so a VWAP over a historical time range is not "
     "the same question the SQL equivalents answer",
+]
+
+
+def timed(call: Callable[[], QueryResult], rounds: int) -> dict:
+    """One warm call, then `rounds` samples, reported as a median with the range beside it.
+
+    A median rather than a mean because one scheduler hiccup on this machine moves a mean and not a
+    median - the same reason `resolution.measure()` discards one extreme - and the range is published
+    rather than summarised away, because a number without its spread cannot be argued with.
+    """
+    call()
+    samples = sorted(call().seconds for _ in range(rounds))
+    return {
+        "value": samples[len(samples) // 2],
+        "unit": "s",
+        "min": samples[0],
+        "max": samples[-1],
+        "samples": samples,
+    }
+
+
+def compare_systems(entries: list[dict], reference_name: str,
+                    floor: resolution.Resolution) -> tuple[list[str], list[str], int, float]:
+    """Every comparable workload, classified by the one function allowed to say "faster".
+
+    Returns the losses, the wins, how many were indistinguishable, and the largest relative
+    difference seen - which is what `verdict_for()` needs to downgrade the verdict when the floor
+    swallows everything the run measured.
+    """
+    reference = next((e for e in entries if e.get("name") == reference_name and e.get("available")),
+                     None)
+    losses: list[str] = []
+    wins: list[str] = []
+    ties = 0
+    largest = 0.0
+    if reference is None:
+        return losses, wins, ties, largest
+
+    for entry in entries:
+        if entry is reference or not entry.get("available"):
+            continue
+        for name, theirs in entry.get("workloads", {}).items():
+            ours = reference.get("workloads", {}).get(name)
+            if not ours or "value" not in ours or "value" not in theirs:
+                continue
+            if ours["value"] <= 0 or theirs["value"] <= 0:
+                continue
+
+            # Ingest is rows per second, so more is better; a workload timed in seconds is the
+            # other way round. Getting this backwards would report every loss as a win, which is
+            # the one direction nobody double-checks.
+            if ours.get("unit") == "rows/s":
+                ours_seconds, theirs_seconds = 1.0 / ours["value"], 1.0 / theirs["value"]
+            else:
+                ours_seconds, theirs_seconds = ours["value"], theirs["value"]
+
+            verdict = resolution.classify(ours_seconds, theirs_seconds, floor)
+            difference = (abs(ours_seconds - theirs_seconds) / max(ours_seconds, theirs_seconds))
+            largest = max(largest, difference)
+            def show(entry: dict) -> str:
+                """The same formatting the table uses, because a sentence quoting `0.0088493 s`
+                next to a table saying `8.85 ms` reads as two different measurements."""
+                if entry.get("unit") == "rows/s":
+                    return f"{entry['value']:,.0f} rows/s"
+                return f"{entry['value'] * 1000:.2f} ms"
+
+            sentence = (f"{name}: orderbook {show(ours)} against {entry['name']} {show(theirs)} "
+                        f"({difference * 100:.1f}% apart, floor {floor.floor * 100:.1f}%)")
+            if verdict == resolution.INDISTINGUISHABLE:
+                ties += 1
+            elif verdict == resolution.FASTER:
+                wins.append(sentence)
+            else:
+                losses.append(sentence)
+    return losses, wins, ties, largest
+
+
+def losses_search(entries: list[dict], reference_name: str, floor: resolution.Resolution,
+                  wins: list[str], ties: int) -> str:
+    """How a loss was looked for, in the words of what this run actually did.
+
+    Required rather than optional: an empty losses list on its own is a selected table, and a
+    sentence that describes the search is what lets a reader decide whether it was a real one.
+    """
+    compared = [e["name"] for e in entries
+                if e.get("available") and e.get("name") != reference_name]
+    absent = [f"{e['name']} ({e.get('reason', 'unavailable')})" for e in entries
+              if not e.get("available")]
+    return (
+        f"Every workload was run against every system that answered, and each pair was classified "
+        f"by resolution.classify() against this machine's measured floor of {floor.floor:.4f} - "
+        f"not by inspection. Compared against: {', '.join(compared) or 'nothing'}. "
+        f"{len(wins)} workload(s) came out {resolution.FASTER}, {ties} inside the floor and "
+        f"therefore reported as indistinguishable rather than as a win. Not measured: "
+        f"{'; '.join(absent) or 'none'}.")
+
+
+# Properties of the measurement, not of any system in it. Kept apart from ENGINE_LIMITATIONS
+# because a constant every system pays is not something the engine cannot do.
+MEASUREMENT_NOTES = [
+    "every figure in the query column includes a measured p50 of about 4.8 ms of Python-side "
+    "parsing for 4000 rows, identical for all three systems, because each adapter turns text into "
+    "tuples. What separates the systems is what is left after that constant, and it is stated here "
+    "rather than subtracted from the table",
+    "each adapter holds one connection open for every timed request. That is not a courtesy: "
+    "measured, a fresh `clickhouse-client` costs 80 ms and a fresh `psql` 40-60 ms, against "
+    "queries of a few milliseconds - and the first version of this harness charged both of those "
+    "to the competitor",
+    "the noise floor is measured inside the run it governs, by timing the reference system's own "
+    "query twice per round. Across runs the same workload varies more than that floor: two "
+    "consecutive runs of this table gave 9.69 ms and 10.97 ms for the same query, which is why a "
+    "comparison is only made between numbers from one run",
 ]
 
 
@@ -74,12 +210,47 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Dataset: {manifest.rows} rows, {manifest.symbols} symbols, sha256 "
           f"{manifest.sha256[:16]}…")
 
-    systems = [OrderbookSystem(args.build_dir / "ob_tcp_server", free_port())]
-    # ClickHouse, TimescaleDB and kdb+ are added here as their adapters land (tasks 6.2-6.4). Until
-    # then the run is honest about being one system wide rather than pretending otherwise.
+    # Ours first, and that position is load-bearing: it is the reference every other system's rows
+    # are compared against, and the control the noise floor is measured on.
+    systems = [
+        OrderbookSystem(args.build_dir / "ob_tcp_server", free_port()),
+        ClickHouseSystem(),
+        TimescaleDbSystem(),
+        KdbSystem(),
+    ]
+
+    span_start = manifest.start_ns
+    span_end = manifest.start_ns + manifest.rows * manifest.interval_ns
+    # One symbol, because the engine's `SELECT` addresses a single book and the comparison has to
+    # ask all four systems the same question.
+    vwap_symbol = "SYM0000"
+
+    # Which columns of a workload's rows every system can be held to. `time_range` drops the
+    # timestamp because one of the four cannot be given event time at all (#105) - declared here,
+    # with the reason, rather than by an adapter quietly returning fewer columns.
+    COMPARABLE_COLUMNS = {
+        "time_range": ((1, 2), "the time column is excluded: the engine stamps arrival time "
+                               "because the wire protocol carries none (#105), so only price and "
+                               "size can be held to the same value"),
+    }
+
+    def projected(workload: str, rows: list[tuple]) -> list[tuple]:
+        keep = COMPARABLE_COLUMNS.get(workload)
+        if keep is None:
+            return rows
+        columns, _ = keep
+        return [tuple(row[i] for i in columns) for row in rows]
+
+    def workload_calls(system) -> dict[str, Callable[[], QueryResult]]:
+        return {
+            "time_range": lambda: system.query_time_range(span_start, span_end),
+            "vwap": lambda: system.query_vwap(vwap_symbol, span_end),
+        }
 
     entries: list[dict] = []
-    reference_load: float | None = None
+    reference_rows: dict[str, list[tuple]] = {}
+    reference_name = systems[0].name
+    measured = 0
     try:
         for system in systems:
             ok, why = system.available()
@@ -97,18 +268,52 @@ def main(argv: list[str] | None = None) -> int:
 
             load = system.load(csv_path)
             rows_per_second = load.rows_loaded / load.seconds if load.seconds > 0 else 0.0
-            if reference_load is None:
-                reference_load = load.seconds
             print(f"{system.name}: loaded {load.rows_loaded} rows in {load.seconds:.2f}s "
                   f"({rows_per_second:,.0f} rows/s)")
 
+            workloads: dict[str, dict] = {
+                "ingest": {"value": rows_per_second, "unit": "rows/s",
+                           "rows_loaded": load.rows_loaded, "seconds": load.seconds},
+            }
+
+            # Rows first, then time. A workload is run once for what it returns, compared against
+            # the reference, and only timed if the two systems answered the same question - because
+            # two different queries time just as cleanly as two equivalent ones and the faster one
+            # wins.
+            for name, call in workload_calls(system).items():
+                try:
+                    first = call()
+                except Exception as exc:                       # noqa: BLE001 - reported, not raised
+                    workloads[name] = {"note": f"FAILED: {exc}"}
+                    print(f"{system.name}: {name} failed — {exc}")
+                    continue
+
+                if system.name == reference_name:
+                    reference_rows[name] = first.rows
+                else:
+                    try:
+                        equivalence.require_equivalent(
+                            reference_name, projected(name, reference_rows.get(name, [])),
+                            system.name, projected(name, first.rows))
+                    except equivalence.EquivalenceError as exc:
+                        excluded = COMPARABLE_COLUMNS.get(name)
+                        why = f"; {excluded[1]}" if excluded else ""
+                        workloads[name] = {"note": f"NOT COMPARABLE: {exc}{why}"}
+                        print(f"{system.name}: {name} not comparable — {exc}")
+                        continue
+
+                workloads[name] = timed(call, args.rounds) | {"rows": len(first.rows)}
+                print(f"{system.name}: {name} {workloads[name]['value'] * 1000:.3f} ms median "
+                      f"over {args.rounds} rounds ({len(first.rows)} rows)")
+
+            measured += 1
             entries.append({
                 "name": system.name,
                 "available": True,
                 "version": system.version(),
                 "tuning_applied": tuning,
                 "config": system.config_dump(),
-                "workloads": {"ingest": {"value": rows_per_second, "unit": "rows/s"}},
+                "workloads": workloads,
             })
 
         # The floor, measured by **running a real workload twice per round** on the reference
@@ -120,18 +325,25 @@ def main(argv: list[str] | None = None) -> int:
         # called noise a win. A mechanism that produces a number without measuring anything is the
         # failure this whole module exists to prevent, and I put it in the glue rather than in the
         # module. The sampler has to be work.
-        if reference_load is None:
+        if measured == 0:
             print("No system produced a measurement, so there is no floor to measure against.")
             return 1
         reference = systems[0]
-        span_start = manifest.start_ns
-        span_end = manifest.start_ns + manifest.rows * manifest.interval_ns
 
         def control_sample() -> float:
             return reference.query_time_range(span_start, span_end).seconds
 
         floor = resolution.measure(control_sample, rounds=args.rounds)
         print(f"Resolution: {floor.note}")
+
+        # The comparison, and this is the first run in which it can happen: `classify()` and
+        # `verdict_for()` were written with part one and had no caller outside the tests, because
+        # one system cannot be compared with anything. Same shape as roadmap #104 - a mechanism
+        # whose reachability arrives with the case it was written for.
+        losses, wins, ties, largest = compare_systems(entries, reference_name, floor)
+        floor = resolution.verdict_for(floor, largest)
+        print(f"Comparison: {len(wins)} {resolution.FASTER}, {len(losses)} {resolution.SLOWER}, "
+              f"{ties} inside the floor (largest difference {largest:.4f})")
     finally:
         for system in systems:
             system.teardown()
@@ -144,11 +356,9 @@ def main(argv: list[str] | None = None) -> int:
         resolution=floor.as_dict(),
         systems=entries,
         limitations=ENGINE_LIMITATIONS,
-        losses=[],
-        losses_search=(
-            "Only one system was measured in this run, so no comparison was possible and no loss "
-            "could be found. This sentence is required rather than optional: an empty losses list "
-            "with nothing beside it is a selected table."),
+        measurement_notes=MEASUREMENT_NOTES,
+        losses=losses,
+        losses_search=losses_search(entries, reference_name, floor, wins, ties),
     )
     path = report.write(document, args.results, hw.digest())
     print(f"Wrote {path} and {path.with_suffix('.md')}")
