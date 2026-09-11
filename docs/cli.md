@@ -588,8 +588,15 @@ echo "ROLE" | nc localhost 5556     # expect: PRIMARY <epoch>
 And confirm the node you handed it away from is a replica rather than gone:
 
 ```bash
-echo "ROLE" | nc localhost 5555     # expect: REPLICA
+echo "ROLE" | nc localhost 5555     # expect: REPLICA <primary address> <epoch>
 ```
+
+The epoch a replica reports is the one it is **following**, and it is the same number both epoch
+guards on the replication link stand on. It survives a restart and a role change, and it never goes
+backwards — so a node whose data directory belongs to a cluster that got further will refuse to
+follow a primary behind it, saying so with both numbers. `docs/operations.md` covers that line, which
+has two readings (#103). Until #103 a replica answered `0` here no matter whose stream it was
+replaying.
 
 Anything other than `OK` leaves the node primary with its lease intact, so a rejected handover is
 never a partial one.

@@ -1684,6 +1684,22 @@ uint64_t Engine::current_epoch() const {
     return current_epoch_.load(std::memory_order_acquire);
 }
 
+void Engine::note_primary_epoch(uint64_t epoch) {
+    uint64_t known = current_epoch_.load(std::memory_order_acquire);
+    while (epoch > known) {
+        if (current_epoch_.compare_exchange_weak(known, epoch,
+                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_acquire)) {
+            OB_LOG_INFO("engine", "epoch advanced to %" PRIu64 " (announced by the primary), was %"
+                        PRIu64, epoch, known);
+            registry_.set_gauge("ob_current_epoch", static_cast<int64_t>(epoch));
+            return;
+        }
+        // The CAS wrote `known` back with whatever is there now; the loop condition re-decides,
+        // because a promotion that ran alongside this may already be ahead of what we were told.
+    }
+}
+
 std::string Engine::handle_role_command() const {
     NodeRole role = node_role_.load(std::memory_order_acquire);
     uint64_t epoch = current_epoch_.load(std::memory_order_acquire);

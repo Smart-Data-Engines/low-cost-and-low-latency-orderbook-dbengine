@@ -13,6 +13,7 @@ before `::bind()`, so a node that keeps its data answers completely from its fir
 from __future__ import annotations
 
 import os
+import re
 import socket
 import time
 
@@ -70,6 +71,22 @@ def store_shape(data_dir: str) -> tuple[int, int]:
             elif name.startswith("wal_") and name.endswith(".bin"):
                 wal += os.path.getsize(os.path.join(root, name))
     return cols, wal
+
+
+def role_epoch(port: int) -> int:
+    """The epoch a node reports for itself: `PRIMARY <epoch>` or `REPLICA <addr> <epoch>`."""
+    reply = raw(port, "ROLE", settle=0.2).strip()
+    parts = reply.split()
+    assert parts and parts[-1].isdigit(), f"the node answered {reply!r} to ROLE, with no epoch in it"
+    return int(parts[-1])
+
+
+def replication_state(data_dir: str) -> str:
+    path = os.path.join(data_dir, "repl_state.txt")
+    if not os.path.exists(path):
+        return "(no repl_state.txt)"
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        return handle.read()
 
 
 def replayed_count(port: int) -> int:
@@ -393,3 +410,73 @@ def test_what_a_restart_costs_does_not_grow_with_the_store() -> None:
     custom_metrics["restart_records_restreamed_small"] = small_replayed
     custom_metrics["restart_records_held_large"] = large_written
     custom_metrics["restart_records_restreamed_large"] = large_replayed
+
+
+def test_a_replica_keeps_the_epoch_it_fences_with_across_a_crash() -> None:
+    """#103: the number both epoch guards stand on, on a real cluster and across a `SIGKILL`.
+
+    Before the fix it lived in the `ReplicationClient` object and started at zero, so the first
+    `REPLICATE` of every connection carried 0 - which is every connection after a restart or a role
+    change. Zero is never greater than anything, so the primary's `ERR STALE_PRIMARY` had nothing to
+    refuse and the replica's own record filter had nothing below it.
+
+    The assertion that decides this is the **first handshake after the restart**, not the node's
+    `ROLE` a while later: a heartbeat arrives within five seconds and would supply the number by
+    itself. The handshake goes out milliseconds after the process starts, so a non-zero epoch on it
+    came from what the node had written down.
+    """
+    cluster = ClusterManager()
+    cluster.start()
+    try:
+        primary, replica = cluster.primary(), cluster.replica()
+
+        want = role_epoch(primary.tcp_port)
+        assert want > 0, "the cluster elected nobody, so there is no epoch for a replica to learn"
+
+        # The replica learns it from the stream: a heartbeat every five seconds, or the first record.
+        deadline = time.time() + patience(30)
+        while time.time() < deadline and role_epoch(replica.tcp_port) != want:
+            time.sleep(0.5)
+        assert role_epoch(replica.tcp_port) == want, (
+            f"the replica reports epoch {role_epoch(replica.tcp_port)} while following a primary in "
+            f"epoch {want}: it is answering ROLE with a number it does not have"
+        )
+
+        state = replication_state(replica.data_dir)
+        assert f"epoch={want}" in state, (
+            f"the epoch is not in the file a restart reads: {state!r}. Promotions write EPOCH "
+            f"records to a WAL and nothing writes one to a replica's own, so this file is the only "
+            f"place this node can learn it from again."
+        )
+
+        log_at = node_log_size(replica)
+        cluster.kill_node(replica.index)          # SIGKILL: no shutdown, no save on the way out
+        cluster.restart_node(replica.index)
+        replica = cluster.nodes[replica.index]
+
+        # Wait for the node to answer at all before reading its log, so a slow start is not read as
+        # a missing handshake.
+        deadline = time.time() + patience(30)
+        while time.time() < deadline:
+            try:
+                role_epoch(replica.tcp_port)
+                break
+            except (OSError, AssertionError):
+                time.sleep(0.5)
+
+        log = node_log_since(replica, log_at)
+        handshakes = re.findall(r"handshake sent: REPLICATE (\d+) (\d+) (\d+)", log)
+        assert handshakes, (
+            "the restarted replica logged no handshake, so this test measured nothing; "
+            f"tail: {log[-800:]!r}"
+        )
+        first_epoch = int(handshakes[0][2])
+        custom_metrics["restart_epoch_on_first_handshake"] = first_epoch
+        custom_metrics["restart_epoch_expected"] = want
+        assert first_epoch == want, (
+            f"the first handshake after the crash carried epoch {first_epoch} rather than {want}, so "
+            f"a superseded primary would have been served on the one connection the guard exists "
+            f"for. Handshakes seen: {handshakes[:3]}"
+        )
+    finally:
+        cluster.shutdown()

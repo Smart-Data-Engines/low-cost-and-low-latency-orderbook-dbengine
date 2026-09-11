@@ -307,6 +307,41 @@ does not have. Expect every surviving replica to discard and re-stream after a p
 before. What changed is the restart of a replica whose primary did not move, which is the common
 case and was paying the same price.
 
+### Which epoch a replica thinks it is in, and the one line that has two readings
+
+A replica reports the epoch of the primary it follows — `REPLICA 10.0.0.2:9090 9` — and keeps that
+number across a restart and a role change. Before #103 it reported `0` while following a primary in
+epoch 9, and the number on the wire was 0 too, which left both epoch guards inert on a first
+connection: `ERR STALE_PRIMARY` because zero is never greater than anything, and the replica's own
+record filter because nothing is below zero.
+
+The epoch **only ever moves forward**, and that is what makes the guard a guard. One line follows
+from it:
+
+```
+stale record epoch 5 < the 9 this node knows, disconnecting
+```
+
+It has two readings and the log cannot tell them apart, so decide by looking at the cluster:
+
+- **The primary really is superseded.** Another node holds the role in a higher epoch, and this
+  replica is refusing records from a node that has not noticed. Nothing to fix here: point the
+  replica at the current primary, and find out why the old one is still streaming (#82 makes a node
+  that loses its lease demote itself, so a node still serving is a node that thinks it holds one).
+- **This data directory belongs to a cluster that had progressed further** — a copied directory, a
+  node moved between clusters, a restore from a backup taken elsewhere. The epoch is a fact this
+  node remembers correctly about a cluster it is no longer in, so it refuses forever and re-connects
+  on a loop. **Give it an empty data directory**, which repurposing already required: a foreign
+  directory also fails the stream-identity check above and has its store wiped, so nothing is being
+  preserved by keeping it.
+
+The number's homes, in the order they are consulted: a promotion writes an `EPOCH` record to this
+node's own WAL, so a node that ever held the role restores it on `open()`; `repl_state.txt` carries
+`epoch=` for a node that has only ever followed, written the moment it changes rather than on the
+ten-second timer; and within a process it lives in one place, so a role change keeps it. A
+`repl_state.txt` written before #103 has no such line and simply leaves the epoch where the WAL put
+it.
+
 ## Security
 
 **Everything is off by default, and a node nobody configured is plaintext and unauthenticated on

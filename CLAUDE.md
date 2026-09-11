@@ -1524,6 +1524,40 @@ Learned the hard way. Check here before debugging.
     #101 a restart re-streams **2 records at both a 33-record and a 97-record store**, and comparing
     the larger store's replay against the smaller store's size needs no threshold at all (#101).
 
+183. **A guard that starts at zero on every fresh object is disarmed on the connection it exists
+    for.** `ReplicationClient::local_epoch_` was raised only by what the primary sent, and
+    `demote_to_replica()` builds a new client on every role change - so the first `REPLICATE` of
+    every connection carried epoch 0, which is never greater than anything and so could not trip
+    `ERR STALE_PRIMARY`. Measured: a node that held the role in epoch 9 **applied and stored** a
+    record announced at epoch 5. The fix is not an initialiser: a number two objects both claim to
+    hold is the defect, and the one that resets is the one the guards read (#103).
+
+184. **Seeding a copy from a field that is itself zero fixes only the case somebody thought of.**
+    The item said to seed the client from `engine_.current_epoch()`. That reaches a node which held
+    the role, because promotions write an `EPOCH` record to its WAL - and misses a node that has
+    only ever followed, because nothing raises the engine's epoch on the follow path. The commonest
+    case, a replica re-pointed after a failover, was the one the named fix would have missed.
+    Measure the case you are not thinking of before writing the fix the item describes (#103).
+
+185. **A monotone number is the whole of a fence, so a wipe must not touch it.** #101's wipe
+    discards the position, the store and the sequence frontier, so discarding the epoch alongside
+    them looks consistent - and would leave every failover unfenced, since a failover always takes
+    the wipe path (the new primary's stream identity differs from the saved one). The price of
+    keeping it is named instead: a data directory carrying a higher epoch than the cluster it is
+    pointed at refuses to follow it, in a log line with two readings (#103, `docs/operations.md`).
+
+186. **On the wire, the line is now and the payload is history.** A catch-up forwards every record
+    type but `ROTATE`, each on a line stamped with the primary's *current* epoch - so the `EPOCH`
+    records of every past promotion arrive announced as current. Refusing on the payload would
+    disconnect every replica replaying a failover out of the log; the payload may raise the epoch
+    and must never refuse on it (#103).
+
+187. **An assertion placed after the next message tests the recovery, not the damage.** The mutation
+    that let the epoch be talked *down* survived, because the test checked the number after a later
+    record had already raised it back. Nothing was wrong with the engine or with the mutation - the
+    assertion stood one message too late. When a mutation survives, ask where the test is looking
+    before you ask what the code does (#103).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -1532,7 +1566,7 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 981 C++ tests (`ctest -j1`, ~3.5 min) and 199 integration tests plus 2
+**Where the suites stand:** 988 C++ tests (`ctest -j1`, ~3.7 min) and 200 integration tests plus 2
 opt-in Binance skips (`pytest tests/integration/`, **13:03 measured** on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that
