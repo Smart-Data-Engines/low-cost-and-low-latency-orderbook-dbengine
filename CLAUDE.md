@@ -1558,6 +1558,36 @@ Learned the hard way. Check here before debugging.
     assertion stood one message too late. When a mutation survives, ask where the test is looking
     before you ask what the code does (#103).
 
+188. **A field written at one site and read at none cannot have a behavioural test, so the check is
+    static and its subject is the tree.** Six instances of this shape in this workspace
+    (`provisional`, `basis`, `in_use`, `key_id`, `partition_by`, then #104), not one with a symptom,
+    every one found while looking for something else. `tests/test_field_usage.cpp` surveys every
+    member declared in `include/orderbook/` against every occurrence in `src/` and `include/` and
+    fails when they are **all** plain writes with the value discarded. One finding in the engine
+    before the fix, none after (#104).
+
+189. **"A trailing-underscore name before a `;` with something in front of it" is also the shape of
+    `x = y_;`.** What separates a declaration from an assignment is what the **prefix ends with** —
+    a type for the first, `=` for the second. Six fields were reported dead because their only read
+    looked like a declaration and was skipped as one, and `return message_;` hid the only read of
+    `Result<void>::message_` the same way. The corollary is sharper than the rule: a checker that
+    skips lines it *classifies* as declarations must instead skip **recorded sites**, or a misparse
+    deletes a read rather than merely misfiling it (#104).
+
+190. **A mutating expression whose value is consumed is a read.** `conn.conn_id = next_conn_id_++`
+    and `if (!unknown_names_reported_.insert(x).second)` both mutate a member *and hand its value to
+    somebody*; four fields read as dead because of it. The cheap rule that gets all of them right:
+    for a pure write, the statement must **begin** with the name. And in the other direction, a
+    constructor's initialiser list (`: pos_(0), end_(0) {}`) is the only write some members ever
+    get, so it has to count as one (#104).
+
+191. **A mutation table needs the verdict each mutation is *supposed* to produce, because some must
+    survive.** A checker that flags everything passes every kill test, so the load-bearing mutation
+    is the control: plant a field that is written **and read** and require silence. Two further
+    traps met the same day — a mutation that drops a call leaves a static function unused and a
+    mutation writing `count(...) >= 0` compares an unsigned value, so `-Werror` rejects both, and a
+    mutation that does not build measures nothing (#104).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -1566,7 +1596,7 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 988 C++ tests (`ctest -j1`, ~3.7 min) and 200 integration tests plus 2
+**Where the suites stand:** 991 C++ tests (`ctest -j1`, ~3.7 min) and 200 integration tests plus 2
 opt-in Binance skips (`pytest tests/integration/`, **13:03 measured** on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that

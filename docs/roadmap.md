@@ -1909,34 +1909,67 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
-### 104. A field that claims a guarantee, written at one site and read at none
+### 104. A field that claims a guarantee, written at one site and read at none ✅
 
-`FailoverManager::adopted_primary_address_` is assigned in exactly one place
-(`src/failover.cpp:385`, inside the graceful-handover path) and **read nowhere**. Its docstring says
-what it is for: "the primary address this node has told the engine to follow, so a leader change is
-adopted once and an unchanged leader does not restart replication every second."
+`FailoverManager::adopted_primary_address_` was assigned in exactly one place, inside the
+graceful-handover path, and **read nowhere**. Its docstring said what it was for: "the primary
+address this node has told the engine to follow, so a leader change is adopted once and an unchanged
+leader does not restart replication every second."
 
-**The property is real; the field does not provide it.** Checked rather than assumed: the monitor
-loop's REPLICA branch updates `primary_address_` when it sees a leader and **does not call**
-`demote_to_replica()`, so a replica watching an unchanged leader never restarts replication.
-`adopt_leader_if_present()` — which does call it — is reached only from the STANDALONE branch (#73)
-and from `handle_primary_lease_lost()`, both transitions rather than per-tick work, and it stores
-`REPLICA` into `role_` so the next tick takes the other branch. The "adopted once" guarantee comes
-from **where the calls are**, not from a comparison against this string.
+**The property is real; the field never provided it.** Checked rather than assumed: the monitor
+loop's REPLICA branch records the address and calls nothing else, so a replica watching an unchanged
+leader restarts nothing. `adopt_leader_if_present()` — which does call `demote_to_replica()` — is
+reached only from the STANDALONE branch (#73) and from `handle_primary_lease_lost()`, both
+transitions rather than per-tick work, and it stores `REPLICA` into `role_` so the next tick takes
+the other branch. The "adopted once" guarantee comes from **where the calls are**. The field is gone
+and the sentence now sits in the two places that produce it.
 
-So there is no behavioural symptom to reproduce, and that is what makes it worth an item rather than
-a passing note: this is the **sixth** instance of the shape in this workspace — after `provisional`,
-`basis`, `in_use`, `key_id` and `partition_by` in the flagship product — and the previous five were
-each found while looking for something else. The cost here is a docstring that describes a mechanism
-the code does not have, next to a real guarantee that is documented nowhere. #101 raised the price
-of getting this wrong: re-adopting the same leader now means a fresh connection and a `STREAMID?`
-round trip, not just a client object.
+There was no behavioural symptom to reproduce, and that is why **the deliverable is the check, not
+the deletion**. This was the sixth instance of the shape in this workspace — after `provisional`,
+`basis`, `in_use`, `key_id` and `partition_by` in the flagship product — and all six were found
+while looking for something else.
 
-The fix is a deletion plus a comment moved to the two call sites, and a static test of the same
-shape as the flagship's ("does anything read this?") is the thing that would have caught all six.
+`tests/test_field_usage.cpp` surveys every member declared in `include/orderbook/` against every
+occurrence in `src/` and `include/`, and fails on any field whose occurrences are **all** plain
+writes with the value discarded. Measured before the deletion: **one** finding in the whole engine,
+this one. After it: none. Three tests, 1.6 s each.
 
-- Effort: S | Impact: a docstring claiming a guarantee its field does not provide, in the file where
-  role transitions are decided
+**Building it produced six false findings and five silent misses, and each is now a case in
+`FieldUsage.TheRulesAreTriedOnTheCasesTheyGotWrong` — the cases come from the mistakes rather than
+from imagination.**
+
+| what the checker got wrong | why | fields affected |
+|---|---|---|
+| `confirmed = last_ownership_confirmed_;` read as a declaration | a name before `;` with something in front of it is *also* an assignment; what separates them is that a declaration's prefix ends in a **type** and an assignment's ends in `=` | six reported dead |
+| a trailing comment containing `(` | the declaration rule refused parentheses after the name, and `// raw bytes (before compression)` has one | four skipped silently |
+| a template's closing `>` | the member-access test skipped spaces, so `std::atomic<int> level_{...}` read as `ptr->level_` | one skipped |
+| `return message_;` read as a declaration | same shape again; filing it as one hid the **only** read of `Result<void>::message_` | one reported dead |
+| `conn_id = next_conn_id_++`, `insert(x).second` | a mutating expression whose value is consumed is a read; the rule is that the statement must **begin** with the name | four reported dead |
+| a constructor's initialiser list | `: pos_(0), end_(0) {}` is the only write some members ever get, so it counts as one | would have hidden a dead field |
+
+**Two tripwires, because a static test whose subject can quietly shrink is not a test.** The refined
+enumeration is compared against a deliberately cruder scan, and a name only the crude one finds is a
+failure — that comparison is what found the five misses. The crude scan itself must find at least
+200 names, so the pair cannot both collapse to nothing.
+
+**What it deliberately does not cover, named rather than left to be discovered:** a field filled
+through a non-const reference (`read_into(x_)`), through `memcpy(&x_, …)`, or by a free
+`std::swap(x_, y_)` reads as used, because the name is not the target of the statement. Tests and
+`tools/` are not searched — a field whose only reader is a test is not a mechanism, and a tool
+reaches a private member only through an accessor, which lives in a header and is searched.
+
+Mutations: ten, each with the verdict it was **supposed** to produce, because one of them is a
+control that has to survive — a checker that reports every field says nothing by saying everything.
+All ten agreed. The two that matter: putting the deleted field back is caught, and planting a
+brand-new write-only field in an unrelated class is caught. Two mutations had to be rephrased
+because they did not compile (`-Werror=unused-function` on a dropped call, `-Werror=type-limits` on
+`count(...) >= 0`), which measures nothing; and **one survived and the reason was in the test** —
+the enumeration tripwire compares two scans that share a helper, so removing comment stripping
+weakened both equally and they went on agreeing. The rule has its own case now.
+
+- Effort: S | Impact: a docstring claiming a guarantee its field did not provide, in the file where
+  role transitions are decided — and, for the class behind it, a check where there was none
+
 
 ### 103. A replica's epoch protection starts every connection at zero ✅
 
@@ -4052,11 +4085,12 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**One defect is open, and it leads this table rather than sitting under the capabilities.**
-#104 deliberately has no behavioural symptom — a field written at one site and read at none, whose
-docstring claims a guarantee that in fact comes from where its callers sit. #103, which did have
-one, is closed: its own measurement showed that the fix named in the item would have missed the
-commonest case, and the number moved out of the replication client altogether.
+**No defect is open.** The last two closed in order. #103 had a behavioural symptom and its own
+measurement moved the fix: seeding the client from the engine would have missed the commonest case,
+so the number moved out of the replication client altogether. #104 deliberately had none — a field
+written at one site and read at none, whose docstring claimed a guarantee that in fact comes from
+where its callers sit — so what closed it is a check over the whole tree rather than the deletion,
+and that check found exactly one instance before the fix and none after.
 That is a correction kept from an earlier revision: this paragraph used to say every remaining item
 was a capability or a proof. None of these came out of a bug report; each came out of measuring the
 item before it, which is the usual way here. #93's measurement produced #98 and #99; #98's own tests
@@ -4064,7 +4098,7 @@ produced #100 (ten records broadcast before a handshake, twenty received) and #1
 request produced #102, from a CI run in which a node whose port was still held reported
 `exited with -6`; #101's own tests produced #103, from an assertion that expected the engine's epoch
 on the wire and got a zero; and reading `failover.cpp` for #101's four demotion call sites produced
-#104. All but #104 are closed.
+#104. All of them are closed.
 
 Below the defects the ordering is about who we want to be able to say yes to. A reader can build the
 engine, read its tests and now deploy it from a package (#33), and still **cannot verify its
@@ -4074,7 +4108,6 @@ performance claim is the reason this repo exists.
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
 | **P1** | Reproducible comparative benchmarks (#39 part two) | L | Makes the performance claim verifiable by a reader instead of asserted; needs ClickHouse, TimescaleDB and kdb+ installed natively, which is a decision about the machine rather than code |
-| **P3** | A field claiming a guarantee, written once and read never (#104) | S | No symptom, and that is the point: the sixth instance of this shape here, and the static test that would catch the seventh does not exist yet |
 | **P2** | The unexplained node death behind #86's third occurrence | S | An `UNREACHABLE` that needs nothing listening, on a node whose epoll thread is merely busy; the OOM-kill hypothesis is untested and the harness should name an unexplained death |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
@@ -4214,7 +4247,7 @@ Measured on machine B, on the commit that carries this table, rather than carrie
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 988 | all passing, ~205 s with `ctest -j1` on machine B. `ctest -N` reports 990: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
+| C++ (GTest + RapidCheck) | 991 | all passing, ~205 s with `ctest -j1` on machine B. `ctest -N` reports 993: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
 | Python integration | 200 | passing, plus 2 skipped, on i3-7100U in **13:03 measured**. The two skips are the Binance tests, opt-in on a live feed (`OB_BINANCE_TESTS=1`), and they are **collection-time** skips (`pytest.skip(allow_module_level=True)`) — so they are not in the 200, produce no progress character, and the suite's own report plugin says `0 skipped` while pytest says 2. This row read 190 until it was recounted; if you recompute it, count what pytest reports rather than what `--collect-only` does. **No xfails left**: #60's and #61's markers both fell with their fixes |
 
 `ctest -j1` is not a preference. The network tests bind ports, so a parallel run fails for a reason
