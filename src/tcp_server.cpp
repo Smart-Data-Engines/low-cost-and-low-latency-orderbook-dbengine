@@ -775,6 +775,7 @@ const std::vector<std::string>& known_flags() {
         "auth-secret-file",
         "cluster-secret-file",
         "data-dir",
+        "drain-timeout-ms",
         "election-deference-ms",
         "election-lease-wait-ms",
         "failover-enabled",
@@ -850,6 +851,7 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"failover-enabled", {"<BOOL>", "Participate in automatic failover: true/1/yes or false/0/no (default: true)"}},
         {"auth-secret-file", {"<PATH>", "Client credentials, '<identity> <secret>' per line; mode 600. Empty disables client authentication"}},
         {"cluster-secret-file", {"<PATH>", "Shared secret for replication and multi-master links, one line; mode 600"}},
+        {"drain-timeout-ms", {"<N>", "On shutdown, how long to wait for open client sessions before closing them (default: 10000; 0 waits indefinitely)"}},
         {"flush-interval-ms", {"<N>", "Background flush interval in ms (default: 100)"}},
         {"fsync-policy", {"<POLICY>", "WAL durability: every, interval or none (lower case; default: interval)"}},
         {"handover-cooldown-seconds", {"<N>", "How long a node that handed the role over abstains"}},
@@ -1238,6 +1240,8 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.auth_secret_file = std::string{cursor.value()};
         } else if (arg == "--cluster-secret-file") {
             config.cluster_secret_file = std::string{cursor.value()};
+        } else if (arg == "--drain-timeout-ms") {
+            config.drain_timeout_ms = cursor.value_as<uint64_t>();
         } else if (arg == "--flush-interval-ms") {
             config.flush_interval_ms = cursor.value_as<uint64_t>();
         } else if (arg == "--log-level") {
@@ -1438,6 +1442,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("election-deference-ms", std::to_string(c.election_deference_ms));
     line("election-lease-wait-ms", std::to_string(c.election_lease_wait_ms));
     line("failover-enabled", c.failover_enabled ? "true" : "false");
+    line("drain-timeout-ms", std::to_string(c.drain_timeout_ms));
     line("flush-interval-ms", std::to_string(c.flush_interval_ms));
     // The *path*, and there is no value to print because the secret is never a field of
     // ServerConfig. `--print-config` exists to be pasted into a ticket.
@@ -1725,6 +1730,8 @@ void TcpServer::run() {
     // the descriptors and the metrics server belong to this thread, and only this thread closes
     // them.
     bool drain_started = false;
+    // Only read once `drain_started` is true, so the value before the drain begins is never used.
+    std::chrono::steady_clock::time_point drain_started_at{};
 
     // What has already been published to the monotonic counters, so the loop can publish deltas.
     uint64_t published_rows_pushed{0};
@@ -2037,6 +2044,7 @@ void TcpServer::run() {
         // "server shutting down" — a better answer than a refused connection.
         if (!drain_started && draining_.load(std::memory_order_acquire)) {
             drain_started = true;
+            drain_started_at = std::chrono::steady_clock::now();
             OB_LOG_INFO("tcp_server", "Drain requested: closing the listen socket, fd=%d",
                         listen_fd_);
             if (metrics_server_) {
@@ -2049,10 +2057,27 @@ void TcpServer::run() {
             }
         }
 
-        // Drain phase: if draining and all sessions are closed, stop the loop.
-        if (draining_.load(std::memory_order_relaxed) &&
-            stats.active_sessions.load(std::memory_order_relaxed) <= 0) {
-            running_.store(false, std::memory_order_relaxed);
+        // Drain phase, decided by `drain_verdict()` rather than here, because the io_uring loop
+        // asks the same question in two more places and a bound written three times is a bound
+        // that drifts (#106).
+        if (drain_started) {
+            const int open = stats.active_sessions.load(std::memory_order_relaxed);
+            switch (drain_verdict(drain_started_at, open, config_.drain_timeout_ms,
+                                  std::chrono::steady_clock::now())) {
+            case DrainVerdict::AllSessionsClosed:
+                running_.store(false, std::memory_order_relaxed);
+                break;
+            case DrainVerdict::DeadlineReached:
+                OB_LOG_WARN("tcp_server",
+                            "Drain deadline of %llu ms reached with %d session(s) still open - "
+                            "closing them and exiting; raise --drain-timeout-ms, or set it to 0 to "
+                            "wait indefinitely",
+                            static_cast<unsigned long long>(config_.drain_timeout_ms), open);
+                running_.store(false, std::memory_order_relaxed);
+                break;
+            case DrainVerdict::KeepWaiting:
+                break;
+            }
         }
     }
 
@@ -2109,6 +2134,18 @@ void TcpServer::disarm_epollout(int fd) {
         OB_LOG_WARN("tcp_server", "disarm_epollout failed: fd=%d errno=%s",
                     fd, std::strerror(errno));
     }
+}
+
+DrainVerdict drain_verdict(std::chrono::steady_clock::time_point drain_started,
+                           int active_sessions,
+                           uint64_t drain_timeout_ms,
+                           std::chrono::steady_clock::time_point now) {
+    if (active_sessions <= 0) return DrainVerdict::AllSessionsClosed;
+    if (drain_timeout_ms == 0) return DrainVerdict::KeepWaiting;   // asked for, not defaulted
+    const auto waited =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - drain_started).count();
+    if (waited >= static_cast<long long>(drain_timeout_ms)) return DrainVerdict::DeadlineReached;
+    return DrainVerdict::KeepWaiting;
 }
 
 void TcpServer::shutdown() {

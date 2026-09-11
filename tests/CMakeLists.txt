@@ -353,6 +353,11 @@ ob_add_tcp_test(test_cli_args
 ob_add_tcp_test(test_tcp_server
     test_tcp_server.cpp
 )
+# The drain rule (#106) is checked by reading both transports' sources: the bound has to live in one
+# place, and the io_uring half is in a file no CI job builds.
+target_compile_definitions(test_tcp_server
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
 
 # ── Whole-engine static checks ─────────────────────────────────────────────────
 # Reads every header and source rather than naming classes: the shape it looks for (#104) was found

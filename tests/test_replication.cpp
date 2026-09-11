@@ -38,6 +38,7 @@ TEST(ReplicationSmoke, ConfigDefaults) {
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <poll.h>
 #include <unistd.h>
 
 namespace {
@@ -3699,9 +3700,32 @@ TEST_F(ReplicationProtocolTest, APeerThatAsksAndNeverReadsIsDroppedRatherThanBuf
         }
     }
 
-    EXPECT_TRUE(hung_up)
-        << "the primary kept answering after " << sent_bytes << " bytes of questions from a peer "
-        << "that never read one of them, so its send buffer for this connection is unbounded";
+    // The observable is that the **connection ends**, and there are three ways that shows from out
+    // here: a send that fails, a read that returns 0, and the peer's FIN arriving while we are not
+    // reading. The first version of this test asserted only the first - and on this machine the
+    // drop lands *after* the send loop finishes, so it failed eight times in a row against an
+    // engine whose log said, in the same run,
+    // `disconnecting replica fd=7: not draining its stream-identity answers`. It had passed three
+    // times earlier the same day on the same binary, which is what a symptom depending on who
+    // notices first looks like (pitfall 54).
+    //
+    // `POLLRDHUP` is the property and it does not consume anything: reading the answers would make
+    // this socket a well-behaved peer, which is the one thing the test must not become.
+    bool connection_gone = hung_up;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!connection_gone && std::chrono::steady_clock::now() < deadline) {
+        struct pollfd probe{};
+        probe.fd     = fd;
+        probe.events = POLLRDHUP;
+        if (::poll(&probe, 1, 100) > 0 &&
+            (probe.revents & (POLLRDHUP | POLLHUP | POLLERR)) != 0) {
+            connection_gone = true;
+        }
+    }
+
+    EXPECT_TRUE(connection_gone)
+        << "the primary kept the connection after " << sent_bytes << " bytes of questions from a "
+        << "peer that never read one of them, so its send buffer for this connection is unbounded";
 
     ::close(fd);
     mgr->stop();

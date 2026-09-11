@@ -4,6 +4,7 @@
 
 #include "orderbook/tcp_server.hpp"  // for ServerConfig, ServerStats, execute_command, etc.
 
+#include <chrono>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -38,6 +39,7 @@ public:
     /// Sygnalizuj zatrzymanie (thread-safe, wywoływane z signal handlera).
     void shutdown();
 
+
     // ── Kodowanie/dekodowanie user_data (public for testing) ─────────
     static uint64_t encode_user_data(IoOp op, int fd);
     static IoOp     decode_op(uint64_t user_data);
@@ -49,7 +51,18 @@ public:
     char* buffer_ptr(int idx);
 
 private:
+    /// One drain decision for both of this loop's checks, through the shared `drain_verdict()`
+    /// (#106). Private: it is the loop's own bookkeeping. It logs the cut, because only the caller
+    /// knows how many sessions it is about to close.
+    void check_drain();
+
     ServerConfig             config_;
+    /// When the drain began, set by `shutdown()` **before** it raises `draining_`, which that store
+    /// publishes with `release` and `check_drain()` reads with `acquire`. Plain rather than atomic
+    /// because of that pairing - and the pairing is load-bearing: the first version of this stored
+    /// the flag `relaxed`, which leaves a non-atomic write racing a concurrent read, and **no CI
+    /// job builds this file**, so ThreadSanitizer would never have reported it.
+    std::chrono::steady_clock::time_point drain_started_at_{};
     std::unique_ptr<Engine>  engine_;
     std::unique_ptr<MetricsServer> metrics_server_;
     std::atomic<bool>        running_{false};

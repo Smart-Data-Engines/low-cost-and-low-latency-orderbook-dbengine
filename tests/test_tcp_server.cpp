@@ -2,6 +2,9 @@
 // Tests cover: CommandParser, ResponseFormatter, Session, SessionManager,
 //              execute_command, and CLI argument parsing.
 
+#include <chrono>
+#include <fstream>
+#include <iterator>
 #include "orderbook/command_parser.hpp"
 #include "orderbook/response_formatter.hpp"
 #include "orderbook/session.hpp"
@@ -1113,4 +1116,85 @@ TEST(ResponseFormatterPush, APushedRowIsTheSameSevenColumnsAsASelectRow) {
     // quantity, with nothing failing.
     EXPECT_EQ(ob::format_push(4, row),
               "PUSH 4\t1756640400000000000\t7845812\t1500\t3\t0\t0\t91823\n");
+}
+
+// ── A bounded drain on shutdown (#106) ───────────────────────────────────────
+//
+// Measured before the bound existed, i3-7100U, Release: `SIGTERM` with nothing connected exits in
+// **0.11 s**; with one **idle** client attached the process was **still running after 60 s**. Not a
+// hang - the listener closes at once and the loop then waits for every session to end, exiting
+// 0.00 s after the last client disconnects. An idle client never disconnects, and a long-lived
+// client is the normal case for a database, so a supervisor reaches its own timeout and sends
+// `SIGKILL`: the flush and checkpoint this path exists for are exactly what then does not run.
+
+TEST(BoundedDrain, NothingConnectedStopsImmediatelyWhateverTheClock) {
+    const auto started = std::chrono::steady_clock::now();
+    // An hour past the deadline, and it does not matter: no sessions is the cleanest possible exit
+    // and must not be reported as a deadline, or the log would claim sessions were cut.
+    EXPECT_EQ(ob::drain_verdict(started, 0, 10'000, started + std::chrono::hours(1)),
+              ob::DrainVerdict::AllSessionsClosed);
+    EXPECT_EQ(ob::drain_verdict(started, 0, 0, started),
+              ob::DrainVerdict::AllSessionsClosed);
+}
+
+TEST(BoundedDrain, AnOpenSessionWaitsUntilTheDeadlineAndThenIsCut) {
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_EQ(ob::drain_verdict(started, 1, 10'000, started + std::chrono::milliseconds(9'999)),
+              ob::DrainVerdict::KeepWaiting);
+    // The boundary is inclusive, because the alternative is a bound that never fires when the loop
+    // happens to poll exactly on it.
+    EXPECT_EQ(ob::drain_verdict(started, 1, 10'000, started + std::chrono::milliseconds(10'000)),
+              ob::DrainVerdict::DeadlineReached);
+    EXPECT_EQ(ob::drain_verdict(started, 3, 10'000, started + std::chrono::seconds(30)),
+              ob::DrainVerdict::DeadlineReached);
+}
+
+TEST(BoundedDrain, ZeroMeansWaitForEverAndHasToBeAskedFor) {
+    // The old behaviour, kept and made explicit. A default of 0 is what #106 is about, so this test
+    // is also the statement that the *default* is not this: `ServerConfig` says 10 s.
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_EQ(ob::drain_verdict(started, 1, 0, started + std::chrono::hours(24)),
+              ob::DrainVerdict::KeepWaiting);
+    EXPECT_EQ(ob::ServerConfig{}.drain_timeout_ms, 10'000u)
+        << "the default is what a supervisor meets, so it cannot be unbounded";
+}
+
+TEST(BoundedDrain, NeitherTransportDecidesForItself) {
+    // The reason this is static: `io_uring_server.cpp` asked the same question in **two** places
+    // and the epoll loop in one, and **no CI job builds the io_uring file** - so a bound written
+    // three times could not even be compiled on one of the two sides. This repository has paid for
+    // "the fix exists and is used at one of two sites" in #91, #101 and #102.
+    const auto read = [](const char* rel) {
+        std::ifstream in(std::string(OB_SOURCE_DIR) + "/" + rel);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+
+    for (const char* rel : {"src/tcp_server.cpp", "src/io_uring_server.cpp"}) {
+        const std::string source = read(rel);
+        ASSERT_FALSE(source.empty()) << rel << " could not be read, so this test checks nothing";
+
+        // Positive half: the file consults the shared decision.
+        EXPECT_NE(source.find("drain_verdict("), std::string::npos)
+            << rel << " does not go through drain_verdict(), so its drain has no bound";
+
+        // Negative half: nobody pairs the flag with the session count on their own again.
+        std::size_t line_no = 0;
+        for (std::size_t at = 0; at < source.size();) {
+            const std::size_t end = source.find('\n', at);
+            const std::string line = source.substr(at, (end == std::string::npos ? source.size()
+                                                                                 : end) - at);
+            at = (end == std::string::npos) ? source.size() : end + 1;
+            ++line_no;
+            if (line.find("//") != std::string::npos &&
+                line.find("//") < line.find("draining_")) {
+                continue;                      // prose about the rule is not the rule
+            }
+            const bool pairs = line.find("draining_") != std::string::npos &&
+                               line.find("active_sessions") != std::string::npos;
+            EXPECT_FALSE(pairs)
+                << rel << ":" << line_no << " decides the drain itself: " << line
+                << "\nThe bound lives in drain_verdict(); a second copy is a second thing to "
+                   "forget, and one of the two transports is not built by any CI job";
+        }
+    }
 }

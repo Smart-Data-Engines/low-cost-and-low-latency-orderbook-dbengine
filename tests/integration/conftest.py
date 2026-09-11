@@ -607,6 +607,13 @@ class ClusterManager:
             "--replication-port", str(replication_port),
             "--coordinator-endpoints", etcd_url,
             "--node-id", node_id,
+            # Short, so a stop in this battery exercises the **graceful** path instead of the
+            # escalation. `_stop_node()` is SIGTERM then SIGKILL after five seconds, and until #106
+            # a node with any client attached never exited at all - so every teardown with a live
+            # connection was a hard kill, silently. The server's default bound is ten seconds, which
+            # is longer than that escalation, so the default would keep the suite on the killing
+            # path; two seconds puts the drain inside it.
+            "--drain-timeout-ms", "2000",
         ]
         if read_only:
             cmd.append("--read-only")
