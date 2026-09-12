@@ -757,11 +757,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Install system dependencies
+        # libclang-rt-dev is named explicitly and that is not redundant: the sanitizer and
+        # libFuzzer runtime archives live there, and `libclang-common-N-dev` only *Recommends* it.
+        # Every other job here installs with --no-install-recommends and never needed it, because
+        # none of them links a sanitizer under Clang. Without this line the harnesses compile and
+        # fail at link on a missing libclang_rt.fuzzer-x86_64.a. The unversioned metapackage
+        # follows the runner's default Clang, the same way the `clang` metapackage does.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake pkg-config clang \
+            build-essential cmake pkg-config clang libclang-rt-dev \
             liblz4-dev libcurl4-openssl-dev libssl-dev liburing-dev
+          clang++ --version
 
       - name: Configure the fuzzing tree (Clang, libFuzzer, ASan + UBSan)
         # OB_BUILD_FUZZERS refuses GCC and refuses to run without OB_ENABLE_ASAN, so an incomplete
