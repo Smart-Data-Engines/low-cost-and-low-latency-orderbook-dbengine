@@ -206,6 +206,91 @@ def tail_node_log(node: "NodeInfo", lines: int = 40) -> str:
         return f"(no log at {path}: {exc})"
 
 
+# ── Asking a node what it is ──────────────────────────────────────────────────
+#
+# These four lived in `test_failover.py` until #54 stage B needed every one of them. Copying them
+# is the shape pitfall 77 is about - four modules had grown their own path to the server binary and
+# none honoured the override - so they moved here instead, verbatim, docstrings included, because
+# each docstring is the record of what that function learned.
+
+class ClosedWithoutReply(Exception):
+    """The node accepted the command and closed the connection without answering."""
+
+
+def send_command(port: int, command: str, timeout: float = 10.0) -> str:
+    """Send one command and return the reply.
+
+    Reads until data arrives or the timeout expires, rather than sleeping 0.3 s and taking one
+    `recv`. The old shape lost the distinction that matters: an orderly close and a reply that had
+    not arrived yet both came back as `''`, so a failing assertion could not say which had happened
+    — and `FAILOVER` legitimately takes seconds, because it is etcd round-trips and a grace period.
+
+    An orderly close raises rather than returning `''`, so a caller has to decide what it means
+    instead of comparing against the empty string and getting the same answer for two different
+    events.
+    """
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.recv(4096)  # banner
+        sock.sendall((command + "\n").encode())
+
+        deadline = time.monotonic() + timeout
+        buffered = b""
+        while time.monotonic() < deadline:
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                break
+            if not chunk:
+                if buffered:
+                    break          # closed after answering; the answer is what we asked for
+                raise ClosedWithoutReply(
+                    f"node on port {port} closed the connection after {command!r} "
+                    f"without sending anything")
+            buffered += chunk
+            if b"\n" in buffered:
+                break
+        return buffered.decode(errors="replace")
+
+
+def role_of(port: int, timeout: float = 5.0) -> str:
+    """The node's own answer to ROLE, or why it did not give one.
+
+    Three outcomes, not two. The first version returned `"UNREACHABLE"` for anything that raised
+    `OSError` — which covers a refused connection *and* a `socket.timeout`, since that is an
+    `OSError` subclass. So a node that was merely slow read exactly like a node that was gone, and
+    the assertion built on it could not say which.
+
+    That distinction is not academic here: a node in the middle of a demotion is doing etcd work,
+    tearing down a replication manager and starting a client, and under ThreadSanitizer it can take
+    longer than five seconds to answer. Same defect as `send_command()` had before #86, one function
+    away — which is pitfall 63's shape: two functions, the same mistake, and fixing one.
+    """
+    try:
+        return send_command(port, "ROLE", timeout=timeout).strip().upper()
+    except socket.timeout:
+        return "NO_ANSWER_YET"
+    except ClosedWithoutReply:
+        return "CLOSED_WITHOUT_REPLY"
+    except OSError:
+        return "UNREACHABLE"
+
+
+def wait_for_role(port: int, expected: str, timeout: float = 30.0) -> float:
+    """Wait until a node reports the expected role. Returns how long it took."""
+    start = time.monotonic()
+    deadline = start + timeout
+    last = ""
+    while time.monotonic() < deadline:
+        last = role_of(port)
+        if expected in last:
+            return time.monotonic() - start
+        time.sleep(0.25)
+    raise AssertionError(
+        f"node on port {port} did not report {expected} within {timeout}s; "
+        f"last ROLE was {last!r}")
+
+
 def server_binary_path() -> str:
     """The server this run tests, honouring OB_SERVER_BINARY.
 
@@ -293,7 +378,8 @@ class ClusterManager:
     _SERVER_BINARY = "build/ob_tcp_server"
 
     def __init__(self, server_binary: Optional[str] = None,
-                 etcd_binary: Optional[str] = None):
+                 etcd_binary: Optional[str] = None,
+                 log_level: str = "INFO"):
         # OB_SERVER_BINARY lets the whole suite run against a different build — a sanitizer
         # tree, most usefully. A lock-order inversion or a data race in the io loop only shows up
         # when real clients and real peers are driving it, which no unit test arranges.
@@ -305,6 +391,13 @@ class ClusterManager:
         self.etcd_binary: str = (
             etcd_binary or os.environ.get("OB_ETCD_BINARY") or "etcd"
         )
+        # Default INFO because that is the server's own default, and because the session cluster is
+        # shared by most of this battery: measured in #86, each client connection costs about 153
+        # bytes of log at INFO, and raising the level for every module to satisfy one of them is
+        # how a shared fixture grows a cost nobody asked for. A module that needs to assert on a
+        # DEBUG line asks for it here - #54 stage B does, because the replica's decision *not* to
+        # campaign is logged at DEBUG and that decision is the whole property under test.
+        self.log_level: str = log_level
         # Open log files, closed on shutdown. Held by the manager rather than by NodeInfo because a
         # restart replaces the NodeInfo and the old handle still needs closing.
         self._node_logs: list = []
@@ -321,6 +414,10 @@ class ClusterManager:
         # killed a node from a node that died on its own, and it silently restarts both — which is
         # how a crashing node stays invisible for as long as the tests around it pass.
         self._deliberately_killed: set = set()
+        # When this harness last took the coordinator away on purpose (#54 stage B). Not a
+        # suppression list: a node that dies while etcd is gone is the defect that stage
+        # hunts, so the report stays and gains the sentence that makes it readable.
+        self._etcd_stopped_at: Optional[float] = None
         # Processes this harness escalated from SIGTERM to SIGKILL, by `id(proc)` and when.
         self._sigkilled_by_harness: dict = {}
         self.etcd_client_port: int = 0
@@ -402,19 +499,38 @@ class ClusterManager:
     # ── etcd management ───────────────────────────────────────────
 
     def _start_etcd(self) -> None:
-        """Start etcd as a native process.
+        """Choose where etcd lives, then launch it there.
 
         The engine is a native-deployment database and the test harness follows the
         same rule: no containers anywhere in the loop. etcd must be on PATH, or its
         location given via the OB_ETCD_BINARY environment variable.
+
+        The port and data directory are chosen **here and only here**, because
+        `start_etcd()` has to be able to bring the coordinator back at the same address:
+        a node is given `--etcd-endpoint http://127.0.0.1:<port>` on its command line at
+        start, so a coordinator that returns on a different port has not returned at all
+        from that node's point of view (#54 stage B).
         """
         self.etcd_client_port = self.find_free_port()
         self.etcd_peer_port = self.find_free_port()
         self.etcd_data_dir = tempfile.mkdtemp(prefix="ob_etcd_")
         self.temp_dirs.append(self.etcd_data_dir)
+        self._launch_etcd(first_start=True)
 
+    def _launch_etcd(self, first_start: bool) -> None:
+        """Launch etcd on the already-chosen port and data directory.
+
+        `--initial-cluster-state` is `new` the first time and `existing` afterwards, which is
+        what etcd asks for when the data directory already holds a member: the restart has to
+        recover from that member's own WAL rather than bootstrap a second cluster over it. The
+        keys the engine wrote before the outage therefore survive the restart, which is the
+        point - a coordinator that comes back empty is a different fault from one that comes
+        back (#54 stage B).
+        """
         etcd_log_path = os.path.join(self.etcd_data_dir, "etcd.log")
-        self._etcd_log = open(etcd_log_path, "wb")
+        # Appended, not truncated: the log of the run before the outage is the evidence for
+        # what the coordinator was doing when it went away (pitfall 94).
+        self._etcd_log = open(etcd_log_path, "ab")
 
         cmd = [
             self.etcd_binary,
@@ -425,7 +541,7 @@ class ClusterManager:
             "--listen-peer-urls", f"http://127.0.0.1:{self.etcd_peer_port}",
             "--initial-advertise-peer-urls", f"http://127.0.0.1:{self.etcd_peer_port}",
             "--initial-cluster", f"ob-test-etcd=http://127.0.0.1:{self.etcd_peer_port}",
-            "--initial-cluster-state", "new",
+            "--initial-cluster-state", "new" if first_start else "existing",
             # Keep the store small: these are short-lived test clusters.
             "--quota-backend-bytes", str(256 * 1024 * 1024),
         ]
@@ -490,6 +606,43 @@ class ClusterManager:
             except OSError:
                 pass
             self._etcd_log = None
+
+    def stop_etcd(self) -> None:
+        """Take the coordinator away on purpose, and write down when (#54 stage B).
+
+        The intent is **recorded rather than used to suppress a report**, and the difference
+        matters. The task this implements asked for a "deliberately stopped" registry so that
+        `unexplained_deaths()` would not report the harness's own teardown - but a node that dies
+        while the coordinator is away is precisely the defect this stage hunts, so suppressing it
+        would hide the finding rather than clean up the noise. What the registry buys instead is
+        the sentence that makes such a report readable: *the coordinator was gone N seconds*. Same
+        shape as #86's SIGKILL annotation, where one exit status had two very different producers
+        and the harness knew which and never said so.
+
+        Teardown does not need suppressing either, because `stop()` stops the nodes before etcd.
+        """
+        self._etcd_stopped_at = time.time()
+        self._stop_etcd()
+
+    def start_etcd(self, timeout: Optional[float] = None) -> None:
+        """Bring the coordinator back **at the same address**, and wait until it answers.
+
+        The address is the whole point: a node is handed `--etcd-endpoint
+        http://127.0.0.1:<port>` on its command line when it starts, so a coordinator that
+        returns on a freshly allocated port has not returned as far as any running node is
+        concerned - the test would then be measuring a permanent outage while claiming to measure
+        a recovery. The port and the data directory are therefore reused, and the member recovers
+        from its own WAL so the keys written before the outage are still there.
+        """
+        if self.etcd_process is not None and self.etcd_process.poll() is None:
+            return
+        self._launch_etcd(first_start=False)
+        self._wait_for_etcd(timeout=timeout if timeout is not None else patience(30))
+        self._etcd_stopped_at = None
+
+    def etcd_is_running(self) -> bool:
+        """Whether the coordinator process is alive - a fact about this harness, not a probe."""
+        return self.etcd_process is not None and self.etcd_process.poll() is None
 
     # ── Node management ───────────────────────────────────────────
 
@@ -627,6 +780,7 @@ class ClusterManager:
         etcd_url = f"http://127.0.0.1:{self.etcd_client_port}"
         cmd = [
             self.server_binary,
+            "--log-level", self.log_level,
             "--port", str(tcp_port),
             "--data-dir", data_dir,
             "--metrics-port", str(metrics_port),
@@ -900,24 +1054,39 @@ class ClusterManager:
         So: if the escalation happened here, say so. If it did not, print what the machine had left,
         because that is the number the OOM hypothesis needs and nobody was recording it.
         """
+        coordinator = ""
+        if self._etcd_stopped_at is not None:
+            coordinator = (
+                f"This harness stopped etcd {time.time() - self._etcd_stopped_at:.1f}s ago and has "
+                f"not brought it back, so the coordinator was absent when this happened. That is "
+                f"context, not an excuse: a node must survive an unreachable coordinator - it may "
+                f"refuse to promote itself and it may go read-only, but it may not exit (#54 stage "
+                f"B, #82). ")
+
         if code == -int(signal.SIGKILL):
             when = self._sigkilled_by_harness.get(id(node.process))
             if when is not None:
-                return (f"This harness escalated SIGTERM to SIGKILL {time.time() - when:.1f}s ago "
+                return coordinator + (
+                        f"This harness escalated SIGTERM to SIGKILL {time.time() - when:.1f}s ago "
                         f"because the node did not exit within five seconds - #106's shape, and it "
                         f"is a harness-side explanation rather than a defect in the server.")
-            return (f"No SIGKILL came from this harness, so it came from outside it. "
+            return coordinator + (
+                    f"No SIGKILL came from this harness, so it came from outside it. "
                     f"MemAvailable is now {self._mem_available_mib()} MiB; an OOM kill leaves a "
                     f"line in `dmesg` and nothing in the process's own log. Measured on this "
                     f"machine for scale: the whole battery's heaviest modules peak at about 250 MiB "
                     f"resident across every node and etcd under ThreadSanitizer.")
+        # Deliberately without the coordinator prefix: exit 66 means the sanitizer never started,
+        # so the node never ran and etcd's state is irrelevant. Saying "the coordinator was absent
+        # when this happened" would be true and would invite the reader to connect two unrelated
+        # facts, which is the failure mode the rest of this function exists to prevent.
         if code == 66:
             return ("Exit 66 under a sanitizer is the sanitizer refusing to start, not the engine "
                     "failing: ThreadSanitizer aborts with `unexpected memory mapping` when the "
                     "kernel's ASLR entropy is higher than it can map around, which happens at "
                     "random on some kernels. Reproduced on this machine; `vm.mmap_rnd_bits=28` is "
                     "the usual answer where it can be set.")
-        return ""
+        return coordinator
 
     def kill_node(self, node_index: int) -> None:
         """SIGKILL a node (simulate crash), and record that this was on purpose."""

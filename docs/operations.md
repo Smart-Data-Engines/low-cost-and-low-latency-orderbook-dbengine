@@ -391,6 +391,34 @@ ten-second timer; and within a process it lives in one place, so a role change k
 `repl_state.txt` written before #103 has no such line and simply leaves the epoch where the WAL put
 it.
 
+## When etcd is unreachable
+
+Measured on a two-node cluster, i3-7100U, with the coordinator stopped for 30 s (#54 stage B):
+
+- **Nothing exits.** Losing the coordinator costs writes and role changes, not processes.
+- **Reads keep being served** on both nodes, whatever their role.
+- **The holder gives the primary role up after 2.28 s.** Its lease keepalive is what fails first,
+  and a holder that cannot renew its lease is holding a claim that has expired wherever etcd is —
+  so it demotes rather than waiting out a TTL. The cluster then has **no** primary and refuses
+  writes until the coordinator is back. That is the intended trade: two nodes both believing they
+  are primary is the failure this gives up availability to avoid (#82).
+- **No replica promotes itself.** A read that failed is not a vacant key. This is the part worth
+  knowing in advance, because from the outside it looks identical to a failover that should have
+  happened and did not.
+
+**Reading the log during such an outage, and two things about it are being fixed.** Each node
+writes about **2.2 lines a second** for the whole outage, and roughly 92% of them are two
+sentences repeated once a second: `could not grant a lease for the published position …` and
+`publish_wal_position failed …`. The first of those says the position is being *published without
+a lease*, and when the coordinator is unreachable it is not published at all — so ignore the part
+about the position outliving the node; nothing was written. Roadmap **#116** is that.
+
+What the log does **not** contain at the default level is the decision that answers the question
+you are probably asking: the replica records "staying REPLICA rather than campaigning on a read
+that failed" at **DEBUG**. Until roadmap **#115** changes that, `--log-level DEBUG` on the replica
+is how you tell the engine deciding from the engine stuck. The holder's step-down, by contrast, is
+fully visible at the default level — four lines, once, naming the mechanism.
+
 ## Loading history, and what its own timestamps change
 
 Since #105 a write can carry the time it happened (`INSERT … [event_time_ns]`), which is what makes

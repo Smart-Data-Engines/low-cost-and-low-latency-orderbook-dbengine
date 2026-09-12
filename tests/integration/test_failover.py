@@ -20,98 +20,20 @@ from __future__ import annotations
 
 import base64
 import json
-import socket
 import time
 import urllib.error
 import urllib.request
 
 import pytest
 
-from conftest import node_log_since, node_log_size, tail_node_log
+from conftest import (ClosedWithoutReply, node_log_since, node_log_size, role_of,
+                      send_command, tail_node_log, wait_for_role)
 from orderbook_engine import OrderbookEngine, OrderbookError
 
 pytestmark = pytest.mark.failover
 
 # Read by the console report; failover_time_sec is rendered specially.
 custom_metrics: dict = {}
-
-
-class ClosedWithoutReply(Exception):
-    """The node accepted the command and closed the connection without answering."""
-
-
-def send_command(port: int, command: str, timeout: float = 10.0) -> str:
-    """Send one command and return the reply.
-
-    Reads until data arrives or the timeout expires, rather than sleeping 0.3 s and taking one
-    `recv`. The old shape lost the distinction that matters: an orderly close and a reply that had
-    not arrived yet both came back as `''`, so a failing assertion could not say which had happened
-    — and `FAILOVER` legitimately takes seconds, because it is etcd round-trips and a grace period.
-
-    An orderly close raises rather than returning `''`, so a caller has to decide what it means
-    instead of comparing against the empty string and getting the same answer for two different
-    events.
-    """
-    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
-        sock.settimeout(timeout)
-        sock.recv(4096)  # banner
-        sock.sendall((command + "\n").encode())
-
-        deadline = time.monotonic() + timeout
-        buffered = b""
-        while time.monotonic() < deadline:
-            try:
-                chunk = sock.recv(65536)
-            except socket.timeout:
-                break
-            if not chunk:
-                if buffered:
-                    break          # closed after answering; the answer is what we asked for
-                raise ClosedWithoutReply(
-                    f"node on port {port} closed the connection after {command!r} "
-                    f"without sending anything")
-            buffered += chunk
-            if b"\n" in buffered:
-                break
-        return buffered.decode(errors="replace")
-
-
-def role_of(port: int, timeout: float = 5.0) -> str:
-    """The node's own answer to ROLE, or why it did not give one.
-
-    Three outcomes, not two. The first version returned `"UNREACHABLE"` for anything that raised
-    `OSError` — which covers a refused connection *and* a `socket.timeout`, since that is an
-    `OSError` subclass. So a node that was merely slow read exactly like a node that was gone, and
-    the assertion built on it could not say which.
-
-    That distinction is not academic here: a node in the middle of a demotion is doing etcd work,
-    tearing down a replication manager and starting a client, and under ThreadSanitizer it can take
-    longer than five seconds to answer. Same defect as `send_command()` had before #86, one function
-    away — which is pitfall 63's shape: two functions, the same mistake, and fixing one.
-    """
-    try:
-        return send_command(port, "ROLE", timeout=timeout).strip().upper()
-    except socket.timeout:
-        return "NO_ANSWER_YET"
-    except ClosedWithoutReply:
-        return "CLOSED_WITHOUT_REPLY"
-    except OSError:
-        return "UNREACHABLE"
-
-
-def wait_for_role(port: int, expected: str, timeout: float = 30.0) -> float:
-    """Wait until a node reports the expected role. Returns how long it took."""
-    start = time.monotonic()
-    deadline = start + timeout
-    last = ""
-    while time.monotonic() < deadline:
-        last = role_of(port)
-        if expected in last:
-            return time.monotonic() - start
-        time.sleep(0.25)
-    raise AssertionError(
-        f"node on port {port} did not report {expected} within {timeout}s; "
-        f"last ROLE was {last!r}")
 
 
 def etcd_post(port: int, path: str, payload: dict) -> tuple[int, str]:
