@@ -28,6 +28,7 @@ the three windows depend on each other's order.
 from __future__ import annotations
 
 import pathlib
+import re
 import time
 
 import pytest
@@ -109,24 +110,46 @@ def serves_reads(port: int) -> bool:
 def coordinator_cluster():
     """A two-node cluster this test may break, torn down whatever the test did to it.
 
-    **At DEBUG, and that is a finding rather than a preference.** The decision this module exists
-    to check - a replica declining to campaign because the read failed, #82's fix - is logged at
-    `OB_LOG_DEBUG`, and the server's default level is INFO. So on a real cluster losing etcd, the
-    node writes two WARN lines every second about a position it could not publish and **nothing at
-    all** about the choice that matters. The signal-to-noise is inverted, and it is filed as
-    roadmap #115; until that changes, a test that wants to see the mechanism has to ask for the
-    level that carries it.
+    **At the server's own default level, and that is the point rather than a detail.** This module
+    ran at DEBUG for one commit, because the decision it exists to check - a replica declining to
+    campaign because the read failed, #82's fix - was a DEBUG-only line while the default is INFO.
+    That gap was the finding, filed as #115 and fixed: the refusal is INFO on the tick the episode
+    opens. So these tests now assert on what an operator actually gets, which is a stronger
+    statement than asserting on what the engine could be made to say.
 
     The first version of this fixture called `mgr.stop()`, which does not exist - the method is
     `shutdown()` - so all three tests errored in teardown. Nothing leaked, because `start()`
     registers `shutdown` with `atexit`, which is the safety net earning its keep.
     """
-    mgr = ClusterManager(log_level="DEBUG")
+    mgr = ClusterManager()
     mgr.start()
     try:
         yield mgr
     finally:
         mgr.shutdown()
+
+
+def failover_source_as_the_logger_sees_it() -> str:
+    """`src/failover.cpp` with adjacent string literals joined, the way the compiler joins them.
+
+    A phrase that a node writes on one line of its log is written in the source across two or three
+    C++ literals, so searching the raw file for it finds nothing: measured here, `"staying REPLICA
+    rather than campaigning"` exists in every log line that says it and in **no** contiguous run of
+    the source, because the literal breaks after `REPLICA `. Implicit concatenation hiding a phrase
+    from a grep is a trap this workspace has paid for in three repositories; this is the first time
+    it has been on the *searching* side.
+
+    `STEP_DOWN_REASONS` passed the same check without this, because those phrases happen to fit
+    inside one literal each — which is precisely why the list that failed is the useful one.
+
+    The limit, named rather than assumed: joining `" "` boundaries is not a C++ preprocessor. It
+    would mis-join a `"` inside a comment written to look like two literals, and it does not expand
+    `%s`. Both are fine for asking "can the engine say this sentence"; neither would be fine for
+    deciding what the engine says.
+    """
+    source = (pathlib.Path(__file__).resolve().parents[2] / "src" / "failover.cpp").read_text()
+    assert len(source) > 10_000, "failover.cpp was not read, so nothing below checked anything"
+    return re.sub(r'"\s*"', "", source)
 
 
 def test_every_step_down_reason_this_module_accepts_is_one_the_engine_can_say():
@@ -142,8 +165,7 @@ def test_every_step_down_reason_this_module_accepts_is_one_the_engine_can_say():
     `handle_primary_lease_lost()` and `demote_to_replica()`, which is a bigger instrument than this
     test needs; the limit is written down rather than left to be assumed.
     """
-    source = (pathlib.Path(__file__).resolve().parents[2] / "src" / "failover.cpp").read_text()
-    assert len(source) > 10_000, "failover.cpp was not read, so this test checked nothing"
+    source = failover_source_as_the_logger_sees_it()
     missing = [reason for reason in STEP_DOWN_REASONS if reason not in source]
     assert not missing, (
         f"these phrases are no longer in src/failover.cpp, so any assertion matching them can "
@@ -308,4 +330,92 @@ def test_nobody_is_promoted_into_an_election_nobody_can_observe(
     # role, so the refusal above was a decision rather than an incapacity.
     mgr.start_etcd()
     wait_for_role(mgr.nodes[survivor].tcp_port, "PRIMARY", timeout=patience(90))
+    assert not mgr.unexplained_deaths(), mgr.unexplained_deaths()
+
+
+# The sentences this test counts, each the opening line of an episode rather than a per-tick one.
+# Taken from `src/failover.cpp` and checked against it below, for the same reason
+# `STEP_DOWN_REASONS` is.
+EPISODE_OPENINGS = (
+    "cannot publish this node's WAL position",              # #116, the publish
+    "the coordinator will not grant a lease",               # #116, the lease
+    "this is a decision, not a stall",                      # #115, the decision — see below
+)
+# That third phrase is a clause of the INFO line and appears in **nothing else**, which is the
+# point. The obvious choice, "staying REPLICA rather than campaigning", is in the INFO line *and*
+# in the per-tick DEBUG line beside it — so a mutation rewording the INFO line survived the source
+# check, satisfied by the DEBUG line. #115 is about the **level**, so a phrase both levels share
+# cannot test it: a check a cross-reference satisfies is worse than no check, because the next
+# reader trusts it. Found by giving each mutation the verdict it was supposed to produce and
+# noticing one disagree.
+RECOVERY_LINES = (
+    "publishing this node's WAL position works again",
+    "granted a position lease again",
+    "the coordinator answers again",
+)
+
+
+def test_the_episode_phrases_this_module_counts_are_ones_the_engine_can_say():
+    """Same reason as the step-down list: a phrase I wrote is not evidence about the code.
+
+    The direction that drifts is a reworded message, after which every "appears at most once"
+    assertion below passes by matching nothing at all — which is the failure mode those assertions
+    exist to prevent, arriving through the test rather than through the engine.
+    """
+    source = failover_source_as_the_logger_sees_it()
+    missing = [p for p in EPISODE_OPENINGS + RECOVERY_LINES if p not in source]
+    assert not missing, f"these phrases are no longer in src/failover.cpp: {missing}"
+
+
+def test_a_coordinator_outage_is_one_episode_in_the_log_not_one_line_a_second(
+        coordinator_cluster: ClusterManager):
+    """#115 and #116: what the default log level carries through an outage, and how much of it.
+
+    **Measured before the fix, over 30 s with the coordinator stopped:** 65 and 67 lines on the two
+    nodes, of which **60 each** were two sentences repeated once a second, and **0** mentioned the
+    replica's decision not to campaign. So the log was ~92% two repeated sentences and was missing
+    the one fact that answers "is the engine deciding or stuck?".
+
+    Both halves are checked here, and the window is long enough that the difference cannot be
+    luck: a per-tick line would appear about twenty times.
+    """
+    mgr = coordinator_cluster
+    one_primary(mgr, timeout=patience(60))
+    offsets = {i: node_log_size(node) for i, node in enumerate(mgr.nodes)}
+
+    outage = patience(20.0)
+    mgr.stop_etcd()
+    settle = time.monotonic() + outage
+    while time.monotonic() < settle:
+        assert not mgr.unexplained_deaths(), mgr.unexplained_deaths()
+        time.sleep(0.5)
+
+    for index, node in enumerate(mgr.nodes):
+        logged = node_log_since(node, offsets[index])
+        lines = [line for line in logged.splitlines() if line.strip()]
+        custom_metrics[f"outage_log_lines_node_{index}"] = len(lines)
+        custom_metrics[f"outage_log_lines_per_sec_node_{index}"] = round(len(lines) / outage, 2)
+
+        for phrase in EPISODE_OPENINGS[:2]:
+            seen = logged.count(phrase)
+            assert seen <= 1, (
+                f"node index {index} logged {seen} copies of {phrase!r} in {outage:.0f}s. One per "
+                f"episode is the whole of #116; once per monitor tick is what it replaced")
+
+        # #115: the decision is present at the **default** level, and present once.
+        decision = logged.count(EPISODE_OPENINGS[2])
+        assert decision == 1, (
+            f"node index {index} logged the decision not to campaign {decision} times at the level "
+            f"an operator reads. Zero is #115, the absence this assertion exists to keep closed; "
+            f"more than one is #116 arriving in a new place. The phrase counted here belongs to "
+            f"the INFO line alone, so this number is about the level and not only the sentence")
+
+    # The control, and it is what makes "at most once" mean something: the episodes end, and say so.
+    mgr.start_etcd()
+    one_primary(mgr, timeout=patience(90))
+    recovered = "".join(node_log_since(node, offsets[i]) for i, node in enumerate(mgr.nodes))
+    assert any(line in recovered for line in RECOVERY_LINES), (
+        "the coordinator came back and no node said so, which means an operator watching a "
+        "recovery sees the noise stop and gets no confirmation that it stopped for the right "
+        "reason")
     assert not mgr.unexplained_deaths(), mgr.unexplained_deaths()

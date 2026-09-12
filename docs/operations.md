@@ -406,18 +406,32 @@ Measured on a two-node cluster, i3-7100U, with the coordinator stopped for 30 s 
   knowing in advance, because from the outside it looks identical to a failover that should have
   happened and did not.
 
-**Reading the log during such an outage, and two things about it are being fixed.** Each node
-writes about **2.2 lines a second** for the whole outage, and roughly 92% of them are two
-sentences repeated once a second: `could not grant a lease for the published position …` and
-`publish_wal_position failed …`. The first of those says the position is being *published without
-a lease*, and when the coordinator is unreachable it is not published at all — so ignore the part
-about the position outliving the node; nothing was written. Roadmap **#116** is that.
+**What the log says, and it is one episode rather than one line a second.** Each condition that
+holds for the length of the outage is logged **once when it starts and once when it ends**:
 
-What the log does **not** contain at the default level is the decision that answers the question
-you are probably asking: the replica records "staying REPLICA rather than campaigning on a read
-that failed" at **DEBUG**. Until roadmap **#115** changes that, `--log-level DEBUG` on the replica
-is how you tell the engine deciding from the engine stuck. The holder's step-down, by contrast, is
-fully visible at the default level — four lines, once, naming the mechanism.
+```
+WARN  failover  the coordinator is unreadable, so this node is staying REPLICA rather than
+                campaigning on a read that failed — this is a decision, not a stall, and no
+                primary will be elected until the coordinator answers
+WARN  failover  cannot publish this node's WAL position (file=0 offset=32); it will be invisible
+                to an election until the coordinator answers again, and this line will not repeat
+                while that lasts
+…
+INFO  failover  publishing this node's WAL position works again after 19 failed attempt(s)
+INFO  failover  the coordinator answers again after 19 tick(s) of declining to campaign
+```
+
+The first of those is the line to look for, because it is the answer to the question: the engine is
+**deciding**, not stuck. The holder's step-down is separately visible at the default level — four
+lines, once, naming the mechanism.
+
+It did not read like this until roadmap **#115** and **#116**. Measured before them, over a
+30-second outage: **2.2 lines a second per node**, of which 60 of 65 were two sentences repeated
+once a second, and **zero** mentioned the decision not to campaign. One of those repeated sentences
+also said the position was being *published without a lease* immediately before the line saying the
+publish had failed — nothing was written, so nothing outlived anything. That warning now appears
+only where it is true: on a tick where the position **was** published and published without a
+lease, which is the case in which it will not expire when this node dies (#72).
 
 ## Loading history, and what its own timestamps change
 

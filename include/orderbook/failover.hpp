@@ -245,6 +245,46 @@ private:
     /// second while a coordinator stays unreachable.
     uint64_t                standalone_polls_{0};
 
+    /// A condition that repeats once per monitor tick, logged once per episode instead.
+    ///
+    /// The idea was already in this file, applied to exactly one of the places that needed it:
+    /// `standalone_polls_` above was written for this and guards the STANDALONE branch alone.
+    /// Pitfall 172's shape - a rule applied by hand is applied once too few. Measured before this
+    /// existed (#116): a node whose coordinator was unreachable wrote about **2.2 lines a second
+    /// for the whole outage**, and 60 of the 65 lines in a 30-second window were two sentences
+    /// repeated once a second.
+    ///
+    /// Touched only from the monitor thread, like the counter above, so no lock.
+    struct LogEpisode {
+        /// Note the condition holding on this tick. True only on the tick that opens an episode,
+        /// which is the tick that should log loudly.
+        bool begin() {
+            ++ticks_;
+            return ticks_ == 1;
+        }
+
+        /// Note the condition absent. Returns how many ticks the episode lasted, or 0 if none was
+        /// open - so `if (const uint64_t n = e.end())` is both the test and the number to report.
+        uint64_t end() {
+            const uint64_t held = ticks_;
+            ticks_ = 0;
+            return held;
+        }
+
+    private:
+        uint64_t ticks_{0};
+    };
+
+    /// The coordinator would not grant a lease for the published position (#116).
+    LogEpisode              lease_grant_episode_{};
+    /// The published position could not be written at all (#116).
+    LogEpisode              publish_episode_{};
+    /// This node is declining to campaign because it cannot read the leader key (#115). Logged at
+    /// INFO when the episode opens, because it is the answer to "etcd is down and nothing failed
+    /// over - is that the engine deciding, or the engine broken?", and that question is asked of
+    /// the default log level.
+    LogEpisode              campaign_refusal_episode_{};
+
     void monitor_loop();
 
     /// Should this node take the role now, or is a better-placed replica expected to?

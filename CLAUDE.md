@@ -1974,6 +1974,34 @@ Learned the hard way. Check here before debugging.
     versus mention, fifth time in this workspace, and this time it put a false clause in a commit
     message — corrected in #113's entry rather than rewritten, because the history was pushed.
 
+237. **A check a cross-reference satisfies is worse than no check, because the next reader trusts
+    it.** #115 is about the *level* a decision is logged at: the replica's refusal to campaign was
+    `OB_LOG_DEBUG` against a default of INFO, so an operator saw it zero times. The test proving
+    the engine can say that sentence counted `staying REPLICA rather than campaigning` — which is
+    in the INFO line **and** in the per-tick DEBUG line beside it. A mutation rewording the INFO
+    line **survived**, satisfied by the DEBUG one, so the check could not decide the thing it
+    existed for. The counted phrase is now a clause belonging to the INFO line alone and the
+    runtime count is exact rather than "at least one".
+238. **A phrase a node writes on one log line does not exist contiguously in the source.** C++
+    implicit concatenation breaks it: `"…so this node is staying REPLICA "` then
+    `"rather than campaigning…"`. A grep for the whole phrase never matches, so a check asking
+    "can the engine say this" passed by **finding nothing**. The reader joins adjacent literals the
+    way the compiler does — `re.sub(r'"\s*"', "", source)` — with the limit named: it is not a
+    preprocessor, it does not expand `%s`, and a quote inside a comment would fool it. This
+    workspace had the trap recorded on the *mutating* side (a one-line edit inside a concatenated
+    string is not a mutation); this is the first time on the **searching** side. `STEP_DOWN_REASONS`
+    had passed the same check without the joining only because those phrases each fit in one
+    literal, which is why the list that failed is the useful one.
+239. **When a long background run dies under memory pressure, try a short one before blaming your
+    workload.** This machine had ~2 GB genuinely free with 8.9 GB in page cache, and its guard
+    killed the full integration battery (48 tests in), then a **single-test** run, then even the
+    CI-polling loop — while `MemAvailable` read 8.5 GB throughout. The single-test log was **zero
+    bytes**, so the process had not allocated anything: the kill was about the machine, not the
+    test. `ctest` then passed in **five** `-I` ranges of about 100 s each (379 + 179 + 160 + 160 +
+    146 = 1024), which is the same suite in the same order with `-j1` inside each range. Say
+    plainly what did **not** run locally rather than leaving it to be inferred — the integration
+    battery's verification for #115 and #116 is CI's, and the PR says so.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2093,9 +2121,11 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   concerned. What the engine promises, measured across three windows: a node that cannot read the
   leader key **does not take the role** (#82's three-state answer), a holder whose lease keepalive
   fails **gives the role up in 2.28 s** rather than waiting out a TTL, reads keep being served, and
-  nothing exits. Two things to know before reading a log from such an outage: the refusal to
-  campaign is **DEBUG-only** (#115) and the two position-publish failures repeat at ~2.2 lines/s for
-  the whole outage (#116). The intent is recorded to **annotate** `unexplained_deaths()`, not to
+  nothing exits. **What the log says about it is one line per condition, since #115 and #116**: the
+  refusal to campaign is INFO on the tick the episode opens, and the two position-publish failures
+  say so once and once more when they recover rather than once a second. Measured, before and
+  after: 2.17 and 2.23 lines/s per node became **0.40 and 0.45**, and the refusal went from **zero**
+  mentions at the default level to exactly one, with the 2.28 s step-down unchanged as the control. The intent is recorded to **annotate** `unexplained_deaths()`, not to
   suppress it — a node that dies while the coordinator is away is the defect that stage hunts.
 - **Storage faults are injectable, and the instrument is `tests/fault/obfault.c`** (#54 stage A) —
   an `LD_PRELOAD` shim over `write`, `pwrite`, `fsync`, `fdatasync` and `ftruncate`, armed by
