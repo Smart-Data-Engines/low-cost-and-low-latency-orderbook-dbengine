@@ -28,6 +28,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -539,17 +540,124 @@ TEST(PendingPeersStatic, NoPeerRecordIsKeyedByAnythingButANodeId) {
 
 namespace {
 
-/// A peer record with an address whose SYNs go nowhere, due for a dial immediately.
+/// A TCP address whose SYNs are dropped — **constructed** rather than assumed.
 ///
-/// 10.9.9.7 is not routed on this machine. That matters more than it sounds: a *refused* connection
-/// (`127.0.0.1:1`) returns in microseconds and reproduces nothing.
-ob::PeerConnection black_holed_peer_record(uint16_t node_id) {
+/// This used to be the literal `10.9.9.7:7100`, under a comment asserting that the address "is not
+/// routed on this machine". That is a claim about the machine, not about the engine, and it rotted:
+/// the host acquired a default route whose gateway answers ICMP "network unreachable", so the dial
+/// came back in about a second instead of hanging. Nothing about the engine had changed. The
+/// assertion that then failed was about attempt counts, several lines away from the premise that
+/// actually broke — which is the expensive part: a test reporting on something other than what
+/// stopped being true (#111).
+///
+/// A listening socket whose accept queue is full does the same job with no routing involved. Linux
+/// drops further SYNs rather than resetting them while `net.ipv4.tcp_abort_on_overflow` is 0, its
+/// default, so a connect retransmits until its own deadline. The port comes from the kernel rather
+/// than from `test_ports.hpp` on purpose: this socket is held open for the whole test, and an
+/// ephemeral port we hold cannot be handed to anybody else, which is the property #109 was about.
+class Blackhole {
+public:
+    Blackhole() {
+        listener_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (listener_ < 0) return;
+        sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+        addr.sin_port        = 0;  // the kernel picks one and we keep it
+        if (::bind(listener_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) return;
+        // The smallest queue the kernel will grant, so filling it takes a handful of sockets.
+        if (::listen(listener_, 1) != 0) return;
+        socklen_t len = sizeof(addr);
+        if (::getsockname(listener_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) return;
+        port_ = ::ntohs(addr.sin_port);
+
+        // Fill the accept queue and never accept from it.
+        //
+        // Non-blocking, and that is not a detail: the first filler that arrives at an already-full
+        // queue is itself black-holed, so a blocking `connect` here waits out the kernel's SYN
+        // retries - about two minutes - inside the constructor. Found by running it.
+        for (int i = 0; i < 8; ++i) {
+            const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+            if (fd < 0) break;
+            sockaddr_in to{};
+            to.sin_family      = AF_INET;
+            to.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+            to.sin_port        = ::htons(port_);
+            ::connect(fd, reinterpret_cast<sockaddr*>(&to), sizeof(to));  // EINPROGRESS expected
+            fillers_.push_back(fd);
+        }
+        // Let the completed ones land in the queue before anybody probes it.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    ~Blackhole() {
+        for (const int fd : fillers_) ::close(fd);
+        if (listener_ >= 0) ::close(listener_);
+    }
+
+    Blackhole(const Blackhole&) = delete;
+    Blackhole& operator=(const Blackhole&) = delete;
+
+    std::string address() const { return "127.0.0.1:" + std::to_string(port_); }
+
+    /// Does a connection to this address really stay open? **Measured, not assumed.**
+    ///
+    /// The premise is what broke last time, so the test states it instead of relying on it. If a
+    /// kernel resets an overflowing queue instead of dropping the SYN — `tcp_abort_on_overflow=1`
+    /// — this returns false and the caller fails with that as the reason, rather than failing an
+    /// assertion about something else entirely.
+    bool swallows_a_connection(std::chrono::milliseconds at_least) const {
+        if (port_ == 0) return false;
+        const int probe = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        if (probe < 0) return false;
+        sockaddr_in to{};
+        to.sin_family      = AF_INET;
+        to.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+        to.sin_port        = ::htons(port_);
+        ::connect(probe, reinterpret_cast<sockaddr*>(&to), sizeof(to));  // EINPROGRESS expected
+        std::this_thread::sleep_for(at_least);
+        int error = 0;
+        socklen_t len = sizeof(error);
+        const bool readable_status =
+            ::getsockopt(probe, SOL_SOCKET, SO_ERROR, &error, &len) == 0;
+        // Still in progress after the wait is what a blackhole looks like. A zero error means the
+        // handshake completed; anything else means the kernel answered.
+        pollfd p{probe, POLLOUT, 0};
+        const int ready = ::poll(&p, 1, 0);
+        ::close(probe);
+        return readable_status && ready == 0 && error == 0;
+    }
+
+private:
+    int              listener_{-1};
+    uint16_t         port_{0};
+    std::vector<int> fillers_;
+};
+
+/// A peer record pointing at an address, due for a dial immediately.
+ob::PeerConnection peer_record_at(uint16_t node_id, const std::string& address) {
     ob::PeerConnection p{};
     p.node_id   = node_id;
-    p.address   = "10.9.9.7:7100";
+    p.address   = address;
     p.fd        = -1;
     p.connected = false;
     return p;  // next_reconnect_time default-constructed: due now
+}
+
+/// The most attempts the backoff schedule can legitimately have claimed in a window.
+///
+/// Two attempts cannot be closer together than the smallest delay the backoff can produce —
+/// `initial_delay_s * (1 - jitter_fraction)`, 750 ms with today's constants — because #97 claims
+/// the attempt and its next-attempt time *before* releasing the lock to dial. Deriving this from
+/// `MM_CONNECT_TIMEOUT_MS` instead, which is what it used to do, assumes every attempt costs a
+/// full connect deadline. That holds only while the dial hangs; when the network refuses a dial
+/// outright the attempts come at the backoff's pace, and the bound called correct behaviour a
+/// storm. A storm is a redial every 100 ms, an order of magnitude above this either way (#111).
+uint32_t attempts_the_backoff_allows(int64_t window_ms) {
+    constexpr double kSmallestDelayMs =
+        ob::ReconnectBackoff::initial_delay_s * (1.0 - ob::ReconnectBackoff::jitter_fraction)
+        * 1000.0;
+    return 1 + static_cast<uint32_t>(static_cast<double>(window_ms) / kSmallestDelayMs);
 }
 
 }  // namespace
@@ -563,7 +671,13 @@ TEST(PeerDial, AnUnreachablePeerAddressDoesNotStopTheNode) {
     auto* mm = engine.multi_master_manager();
     ASSERT_NE(mm, nullptr);
 
-    mm->install_peer_for_test(black_holed_peer_record(7));
+    Blackhole blackhole;
+    ASSERT_TRUE(blackhole.swallows_a_connection(std::chrono::milliseconds(500)))
+        << "this machine will not hold a TCP connection open on a full accept queue, so there is "
+           "no outstanding dial for this test to measure anything against; check "
+           "net.ipv4.tcp_abort_on_overflow";
+
+    mm->install_peer_for_test(peer_record_at(7, blackhole.address()));
     const auto dialling_since = std::chrono::steady_clock::now();
     std::this_thread::sleep_for(std::chrono::milliseconds(400));  // let the dial start
 
@@ -620,14 +734,13 @@ TEST(PeerDial, AnUnreachablePeerAddressDoesNotStopTheNode) {
     ASSERT_NE(p, nullptr);
     const auto dialling_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - dialling_since).count();
-    const uint32_t allowed = 1 + static_cast<uint32_t>(dialling_ms / ob::MM_CONNECT_TIMEOUT_MS);
+    const uint32_t allowed = attempts_the_backoff_allows(dialling_ms);
     EXPECT_GE(p->backoff.attempt, 1u)
         << "no attempt was claimed while a dial was outstanding, so the next one is due "
            "immediately and the loop redials every 100 ms to a peer it is already dialling";
     EXPECT_LE(p->backoff.attempt, allowed)
-        << "after " << dialling_ms << " ms with a " << ob::MM_CONNECT_TIMEOUT_MS
-        << " ms connect timeout, at most " << allowed << " attempt(s) can have been claimed; "
-        << p->backoff.attempt << " means a redial storm";
+        << "after " << dialling_ms << " ms, the backoff schedule allows at most " << allowed
+        << " attempt(s); " << p->backoff.attempt << " means a redial storm";
 
     client.close();
     engine.close();
@@ -642,7 +755,11 @@ TEST(PeerDial, TheNodeStopsWhileADialIsOutstanding) {
     auto* mm = engine.multi_master_manager();
     ASSERT_NE(mm, nullptr);
 
-    mm->install_peer_for_test(black_holed_peer_record(7));
+    Blackhole blackhole;
+    ASSERT_TRUE(blackhole.swallows_a_connection(std::chrono::milliseconds(500)))
+        << "this machine will not hold a TCP connection open on a full accept queue, so no dial "
+           "stays outstanding for the shutdown to interrupt";
+    mm->install_peer_for_test(peer_record_at(7, blackhole.address()));
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
 
     // `stop()` joins the reconnect thread, so before #97 a shutdown during a dial waited out the
@@ -654,4 +771,52 @@ TEST(PeerDial, TheNodeStopsWhileADialIsOutstanding) {
         std::chrono::steady_clock::now() - t0).count();
     EXPECT_LT(close_ms, 10000)
         << "closing the engine took " << close_ms << " ms while one peer was being dialled";
+}
+
+TEST(PeerDial, ADialRefusedOutrightDoesNotBecomeARedialStorm) {
+    // The case the old bound got wrong, made deterministic.
+    //
+    // A dial nobody answers and a dial actively refused are the same event to the reconnect loop
+    // and completely different in cost: the first takes MM_CONNECT_TIMEOUT_MS, the second returns
+    // in microseconds. A bound derived from the connect deadline therefore only holds while the
+    // network is silent, and this repository's own machine stopped being silent — its gateway
+    // started answering ICMP "network unreachable", after which two legitimately paced attempts
+    // read as a storm and a green suite went red against correct code (#111).
+    //
+    // Nothing can listen on port 1 without root, so the kernel refuses immediately and this path
+    // needs no cooperation from any network.
+    const uint16_t port = g_port.fetch_add(1, std::memory_order_relaxed);
+    TempDir tmp("mm_dial_refused_");
+    ob::Engine engine(tmp.path, kNoAutoFlush, ob::FsyncPolicy::NONE, {}, {}, {}, {},
+                      mm_config(1, port));
+    engine.open();
+    auto* mm = engine.multi_master_manager();
+    ASSERT_NE(mm, nullptr);
+
+    mm->install_peer_for_test(peer_record_at(7, "127.0.0.1:1"));
+    const auto dialling_since = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+
+    const auto peers = mm->peer_states();
+    const ob::PeerConnection* p = find_peer(peers, 7);
+    ASSERT_NE(p, nullptr);
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - dialling_since).count();
+    const uint32_t allowed = attempts_the_backoff_allows(elapsed_ms);
+
+    EXPECT_GE(p->backoff.attempt, 1u)
+        << "a refused dial claimed no attempt, so the next one is due immediately and the loop "
+           "retries every 100 ms";
+    EXPECT_LE(p->backoff.attempt, allowed)
+        << "after " << elapsed_ms << " ms of refused dials, the backoff schedule allows at most "
+        << allowed << " attempt(s); " << p->backoff.attempt << " means a redial storm. With the "
+           "bound this test replaced - one attempt per connect deadline - this assertion failed "
+           "on correct code";
+
+    // And the node is still a node: a refused dial must not wedge the loop that owns the mesh.
+    MeshClient client(port);
+    EXPECT_TRUE(client.wait_for_bytes())
+        << "the node did not answer an inbound mesh connection while dialling a refused address";
+    client.close();
+    engine.close();
 }
