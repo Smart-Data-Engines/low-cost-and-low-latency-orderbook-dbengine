@@ -2158,22 +2158,44 @@ answered `ERR WALWriter: write failed: No space left on device`, the row is not 
 keeps serving, and `SIGTERM` still exits 0. Measured, including a disk that stays full: every
 `INSERT` refused with the reason named, `PING` still answered.
 
-The WAL writes that are **not** on a session thread have no such handler — and the scope of that is
-wider than this item first said. **Eleven of eleven thread entry points in this engine have no
-exception boundary**, measured by locating each function used to construct a `std::thread` and
-walking its body: `Engine::flush_loop`, `MetricsServer::run_loop`, `FailoverManager::monitor_loop`,
-`PeerRegistry::watch_loop`, `PeerRegistry::lease_loop`, `MultiMasterManager::io_loop`,
-`MultiMasterManager::reconnect_loop`, `AntiEntropyManager::loop`, `ShardRouter::watch_loop`,
-`ShardCoordinator::watch_loop` and `OrderbookPool::health_check_loop`. Not one contains a `try`.
-Any exception escaping any of them ends the process, and this engine throws `std::runtime_error`
-from the WAL, the mmap store, the columnar store and several parsers.
+The WAL writes that are **not** on a session thread have no such handler — and the scope is wider
+than this item said twice before. **Sixteen of seventeen `std::thread` constructions in `src/` have
+no exception boundary.** Any exception escaping any of them ends the process, and this engine throws
+`std::runtime_error` from the WAL, the mmap store, the columnar store and several parsers.
 
-So the measured abort is one **reachable instance of a class**, which makes the fix a class fix: an
-exception boundary at every thread entry, each logging what happened and deciding what its own
-subsystem does next, plus a static test that refuses a twelfth thread without one — the shape #104's
-checker took. `src/async_snapshot.cpp` already reasons about exactly this in a comment ("a joinable
-`std::thread` calls `std::terminate`, and losing one snapshot beats losing the process"), in one
-place, for one thread.
+The number was wrong twice, and how it was wrong is the lesson. First it was "`flush_loop` has no
+`try`", which is one instance. Then it was "eleven of eleven thread entry points" — counted over a
+list of entry functions **I wrote by hand**, which silently omitted five threads: both `run_loop`
+threads in `replication.cpp`, `ShardCoordinator`'s migration thread, `coordinator.cpp`'s watch
+thread and `AsyncSnapshot`'s worker. Derived from the `std::thread` constructions instead, the set
+is seventeen. *A list you wrote yourself is not evidence about the code* — the rule #32 paid for,
+in a new place.
+
+The seventeenth is `src/async_snapshot.cpp:54`, and it is the only one that thought about this: its
+lambda wraps `produce()` in `try`/`catch (const std::exception&)`/`catch (...)`, under a comment
+saying that a joinable `std::thread` calls `std::terminate` and that losing one snapshot beats
+losing the process. **Its boundary still does not cover the whole body** — the statements before the
+`try` and, more to the point, the mutex taken after the `catch` to publish the result, from which a
+`std::system_error` would escape. So the one place that reasoned about it is also an argument for
+putting the boundary at the construction site rather than inside each body.
+
+So the measured abort is one **reachable instance of a class**, which makes the fix a class fix: a
+boundary wrapping every thread body at the point it is constructed, logging what escaped, plus a
+static test whose rule is one grep-able property — *every `std::thread` construction in `src/`
+passes its body through that boundary*. Chosen over "there is a `try` before the loop in the entry
+function" because the second needs a parser and the first needs a line. The rule's discrimination
+was checked before anything was written: it separates the seventeen constructions from the four
+moves and declarations (`std::thread stale = std::move(worker_);`, `std::thread victim;`) and from
+`std::hash<std::thread::id>`, and an early version of it misfiled `async_snapshot.cpp:54` as a move
+because `std::move` appears in that lambda's **capture list**. That case is a test of the checker
+now.
+
+An outer boundary alone is not the whole fix: it stops the process dying and leaves a subsystem that
+exits on its first exception, which is the "guarantee absent in production" shape. So each loop
+needs its own judgement about continuing, and the ones where stopping is not survivable —
+`flush_loop`, `lease_loop`, `monitor_loop`, `io_loop` — get a per-iteration boundary with a metric
+and a log that does not flood (#95's shape). Whatever is not done gets written down rather than
+left to be discovered.
 
 The instance that was measured: two records reach the WAL from `flush_loop`, a 24-byte checkpoint
 from `flush_write_and_merge()` and a 68-byte version vector from
