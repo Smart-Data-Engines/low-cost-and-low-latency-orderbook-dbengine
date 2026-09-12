@@ -53,8 +53,9 @@ static struct {
     unsigned long  skip;        // let this many matching calls succeed first
     unsigned long  count;       // fail this many, then let the rest through
     long           short_bytes; // write: return this many bytes instead of failing
+    long           size;        // only calls whose byte count equals this; -1 means any
     int            log_fd;
-} cfg = { NULL, OP_NONE, EIO, 0, ~0UL, -1, -1 };
+} cfg = { NULL, OP_NONE, EIO, 0, ~0UL, -1, -1, -1 };
 
 static atomic_ulong seen   = 0;   // matching calls for the configured op
 static atomic_ulong failed = 0;   // how many of those were made to fail
@@ -86,6 +87,9 @@ __attribute__((constructor)) static void obfault_init(void) {
 
     const char *skip  = getenv("OB_FAULT_SKIP");
     const char *count = getenv("OB_FAULT_COUNT");
+    const char *size = getenv("OB_FAULT_SIZE");
+    if (size) cfg.size = strtol(size, NULL, 10);
+
     const char *shortw = getenv("OB_FAULT_SHORT");
     if (skip)   cfg.skip  = strtoul(skip, NULL, 10);
     if (count)  cfg.count = strtoul(count, NULL, 10);
@@ -126,6 +130,13 @@ static int fd_matches(int fd, char *out, size_t out_len) {
 /// Returns 1 when this call has been chosen to fail, and records the decision either way.
 static int should_fail(enum fault_op op, const char *name, int fd, long arg) {
     if (cfg.op != op || !cfg.path) return 0;
+
+    // A size filter makes the injection point *nameable*: this engine's WAL writes a 136-byte
+    // delta record from the session thread and a 24-byte checkpoint plus a 68-byte version vector
+    // from the flush loop, so "the fourth write" is a different call on every run while "the
+    // 68-byte write" is the same one every time. Requirement 2.2 asks for a named point rather
+    // than an ordinal, and this is what makes one available.
+    if (cfg.size >= 0 && arg != cfg.size) return 0;
 
     char path[4096];
     if (!fd_matches(fd, path, sizeof path)) return 0;

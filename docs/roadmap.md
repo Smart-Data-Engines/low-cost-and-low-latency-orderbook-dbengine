@@ -2091,6 +2091,68 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 113. `fsync`'s return value is discarded, so the strongest durability policy acknowledges writes it did not sync
+
+Found by roadmap #54's fault injector, and visible by reading before it was measured: **all seven
+`::fsync()` calls in `src/wal.cpp` throw their result away.**
+
+Measured with `--fsync-policy every`, the strongest promise this engine makes — the one whose whole
+point is that a write is on disk before the client is told `OK`: **eleven `fsync` calls returned
+`EIO` and all three `INSERT`s were still answered `OK`.** The node stayed up and exited 0. A client
+cannot tell a durable write from one whose sync failed, which is the only thing that policy sells.
+
+**Why a retry is not the fix, and why this is worse than an unchecked return usually is.** On Linux
+a failed `fsync` **marks the affected pages clean**: the error is reported once, to whoever happened
+to call, and the next `fsync` on that descriptor returns 0 with the data gone. So the engine can
+neither learn about it later nor repair it by trying again. Whatever is done here has to be done at
+the first failure.
+
+What the fix is not allowed to be is an abort — that is #112, in the same file, from the other
+direction.
+
+- Effort: S for the reporting, M if the policy is to be honest about what it can still promise |
+  Impact: the durability guarantee the engine advertises is currently unverifiable by its client
+
+### 112. An ENOSPC on the flush thread's WAL write aborts the whole node
+
+Found by roadmap #54's fault injector. **The client-facing half of this is correct**, which is what
+makes the rest dangerous: an `ENOSPC` on a delta record written by a client's own session is
+answered `ERR WALWriter: write failed: No space left on device`, the row is not stored, the node
+keeps serving, and `SIGTERM` still exits 0. Measured, including a disk that stays full: every
+`INSERT` refused with the reason named, `PING` still answered.
+
+The WAL writes that are **not** on a session thread have no such handler. `Engine::flush_loop()`
+runs with no `try`, and two records reach the WAL from it: a 24-byte checkpoint from
+`flush_write_and_merge()` and a 68-byte version vector from `persist_version_vector_if_changed()`.
+Failing either one:
+
+```
+terminate called after throwing an instance of 'std::runtime_error'
+  what():  WALWriter: write failed: No space left on device
+exit -6
+```
+
+Measured by naming the call rather than counting calls — the injector can fail "the 68-byte write",
+which is the same call on every run, where "the fourth write" is not:
+
+- fail only the 68-byte write → **SIGABRT**, one injection fired
+- fail only the 24-byte write → **SIGABRT**, one injection fired
+- control, fail a size nothing writes → zero injections, three `OK`s, exit 0
+
+**It kills an idle node, and it does it in a loop.** With nobody connected at all the process died
+**0.5 s into idleness**, and across three consecutive restarts on a disk that stays full it came up
+every time and died unattended after 1.5–2.0 s. A supervisor restarts it for ever, and what the
+operator is handed is `SIGABRT` rather than "no space left on device". That is exactly the contrast
+#102 was about, one call site further in: a failed bind used to abort instead of refusing, and
+`load_secrets_or_exit()` was named there as the shape to copy.
+
+No acknowledged write is lost, which is worth stating because it bounds the damage: after the crash
+and a restart, replay returned every row that had been answered `OK` and none that had been refused.
+This is an availability defect, not a durability one.
+
+- Effort: S | Impact: the most ordinary disk condition there is turns a refusal into a crash loop on
+  a node that was still answering its clients correctly
+
 ### 111. A dial test's premise was a claim about the machine, and the machine changed ✅
 
 `PeerDial.AnUnreachablePeerAddressDoesNotStopTheNode` guards #97: a dial to an unreachable peer
@@ -4803,9 +4865,13 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**No recorded defect remains open after #111.** #108's build job closed the final gap in
-compilation coverage, without claiming runtime coverage of io_uring; #111 closed a test whose
-premise was a claim about the machine rather than about the engine. #110's first CI run also verified the
+**Two defects are open, and #54's fault injector found both.** #112 — an `ENOSPC` on the flush
+thread's WAL write aborts the node, in a crash loop, while the client-facing path handles the same
+condition correctly — and #113 — `fsync`'s result is discarded in all seven places, so
+`--fsync-policy every` acknowledges writes it did not sync. Everything recorded before them is
+closed: #108's build job closed the last gap in compilation coverage, without claiming runtime
+coverage of io_uring, and #111 closed a test whose premise was a claim about the machine rather
+than about the engine. #110's first CI run also verified the
 value of the skip gate: seven new CLI tests did not run until both integration jobs built the CLI
 and the fixture selected the same build as the server.
 
