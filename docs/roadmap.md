@@ -5146,9 +5146,9 @@ runners, not the machine-B performance baseline above.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1022 | all passing, 213 s with `ctest -j1` on the i3-7100U. CTest lists 1024: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtime is what this machine gave on the commit measured, not a budget: the same suite read 159 s earlier the same day on an idler machine |
-| Python integration | 234 | all passing in 13:37, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 234; count pytest's final result rather than the report plugin's progress characters |
-| Python integration under TSan | 234 | all passing in 15:13, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job |
+| C++ (GTest + RapidCheck) | 1029 | all passing with `ctest -j1` on the i3-7100U. CTest lists 1031: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtime is what this machine gave on the commit measured, not a budget: the same suite read 159 s earlier the same day on an idler machine |
+| Python integration | 235 | all passing in 13:29 on the i3-7100U, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 235; count pytest's final result rather than the report plugin's progress characters |
+| Python integration under TSan | 235 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. Last **timed** at 15:13 with 234 tests — that figure comes from CI rather than from this machine, so it is not restated for a count it did not measure |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than
