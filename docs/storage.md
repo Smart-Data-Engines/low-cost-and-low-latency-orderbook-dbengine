@@ -6,11 +6,13 @@ The engine uses three storage layers:
 
 1. **WAL (Write-Ahead Log)** — append-only journal for crash recovery
 2. **SoA Buffer** — in-memory orderbook state (not persisted directly)
-3. **Columnar Store** — time-partitioned segments on disk via MMAP
+3. **Columnar Store** — time-partitioned segments on disk, one file per column
 
 ## WAL Format
 
-WAL files are stored in the data directory as `wal_NNNN.wal`.
+WAL files are stored in the data directory as `wal_000000.bin` — `wal_%06u.bin` with the
+segment index. Alongside them sits `wal_identity`, the per-directory stream identity a
+replica compares before accepting a position (#101).
 
 Each record:
 
@@ -155,13 +157,21 @@ Quantities are packed using Simple8b bit-packing:
 - Up to 240 values per word for small integers
 - Values exceeding 2⁶⁰−1 fall back to raw uint64 storage
 
-## MMAP Store
+## How column files reach the disk
 
-Column files are memory-mapped using `mmap(MAP_SHARED)`:
+With ordinary buffered stream I/O, and it is worth saying plainly because this section used to say
+the opposite. A segment is a directory `<symbol>/<exchange>/<start_ns>_<end_ns>/` holding seven
+column files — `price`, `qty`, `cnt`, `ts`, `side`, `level`, `seq` — plus `meta.json`. Each is
+written in full with `std::ofstream` when a flush completes and read back with `std::ifstream`;
+there is no in-place update and no memory mapping on this path.
 
-- Initial size is configurable; files are extended with `ftruncate` + `mremap` when capacity is exceeded
-- `msync(MS_SYNC)` is called on flush for durability
-- Supports segment files up to 16 GB on 64-bit systems
+**There is an `MmapStore` in the tree and the engine does not use it.** `src/mmap_store.cpp`
+implements a mapped, growable store with its own tests and **no production caller** — `mmap(`
+appears nowhere else in `src/`. This section previously described it as how column files are
+stored, down to `mmap(MAP_SHARED)`, `ftruncate` + `mremap` and `msync(MS_SYNC)`, none of which
+happens here; the component does not even use `mremap`. Roadmap #114 carries the decision of
+whether it goes or gets adopted. It was found when the fault injector from #54 went looking for an
+mmap to make fail and there was none.
 
 ## SoA Buffer (In-Memory)
 

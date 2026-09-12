@@ -73,7 +73,8 @@ installs anything, and a containerised competitor would measure the container.
 - **SoA (Struct-of-Arrays) buffer** with seqlock for lock-free concurrent reads
 - **Write-Ahead Log (WAL)** with CRC32C checksums and crash recovery
 - **Columnar storage** with delta+zigzag price compression and Simple8b volume packing
-- **MMAP persistence** with segment-based time partitioning
+- **Columnar segments on disk** — time-partitioned, one file per column, written whole when a
+  flush completes
 - **Aggregation engine** (VWAP, spread, mid-price, imbalance, etc.) with optional AVX2/AVX-512 SIMD,
   reachable over the wire protocol: every result carries its scale factor and distinguishes an empty
   aggregate from a zero

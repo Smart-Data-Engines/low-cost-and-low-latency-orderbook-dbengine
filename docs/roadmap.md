@@ -2091,6 +2091,43 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 114. An `MmapStore` with tests and no caller, described by three documents as the storage path
+
+Found while #54's fault injector went looking for an mmap to fail, and found none.
+
+**Measured:** `mmap(` appears in all of `src/` only inside `src/mmap_store.cpp`. `MmapStore` is
+constructed only in `tests/test_mmap_store.cpp` — nothing in `src/`, `include/` or `tools/` uses it,
+beyond an `#include "orderbook/mmap_store.hpp"` in `columnar_store.hpp` that uses no name from it.
+`ColumnarStore` writes every `.col` with `std::ofstream` and reads with `std::ifstream`. A segment
+is a directory `<symbol>/<exchange>/<start_ns>_<end_ns>/` holding seven column files —
+`price`, `qty`, `cnt`, `ts`, `side`, `level`, `seq` — and a `meta.json`.
+
+So `orderbook_mmap` is a compiled library with a test suite and no production caller, which is the
+shape of #104 at component scale rather than field scale.
+
+**Three documents described it as how this engine stores data**, and they are corrected in the same
+change that files this, because a claim about the code is not a roadmap item:
+
+- `README.md` listed "MMAP persistence with segment-based time partitioning" as a feature
+- `docs/architecture.md` drew the columnar store as "segments on disk via MMAP"
+- `docs/storage.md` had a whole **MMAP Store** section claiming column files are memory-mapped with
+  `mmap(MAP_SHARED)`, extended with "`ftruncate` + `mremap`" and synced with `msync(MS_SYNC)` — and
+  even that is not what the unused component does, since it remaps with `munmap` + `ftruncate` +
+  `mmap` and never calls `mremap`
+
+The same document also named WAL files `wal_NNNN.wal`; they are `wal_%06u.bin`, which the injector's
+own decision log printed while nobody was looking for it.
+
+**What this item is, and it is a decision rather than a bug.** Either the component goes, or it gets
+the caller the documents assumed it had. Deleting it is the smaller change and loses a tested
+mapping layer that nothing needs; wiring it in is a storage change with its own benchmark, because
+the reason to memory-map a column file is a measurement nobody here has made. Until that is decided
+the tests stay: they pass, they cost 0.1 s, and they are the only thing keeping the component
+honest.
+
+- Effort: S to delete, L to adopt | Impact: the front page described a storage mechanism the engine
+  does not use, and nothing in CI could notice
+
 ### 113. `fsync`'s return value is discarded, so the strongest durability policy acknowledges writes it did not sync
 
 Found by roadmap #54's fault injector, and visible by reading before it was measured: **all seven
