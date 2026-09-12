@@ -1704,6 +1704,21 @@ Learned the hard way. Check here before debugging.
     `SELECT`, and die. When a mutation survives, ask whether a sentinel is doing the work the guard
     claims — and prefer the type that cannot express the accident (#107).
 
+210. **CodeQL cannot see a `static_assert` as a use, so a helper written only for one looks dead.**
+    `cpp/unused-static-function` flagged `grammar_is_indexed_by_type()` — correctly, from where it
+    stands: nothing calls it at run time. The check belongs inside the assertion anyway, so it is an
+    immediately-invoked constexpr lambda now and there is nothing left to mistake for dead code.
+    Worth knowing before writing the next compile-time completeness check, because this repository
+    writes a lot of them (#107).
+
+211. **Verifying a guard against the wrong build target is the worst place for a stale artefact.**
+    I swapped two table rows to prove the `static_assert` fires and built `orderbook_engine` — which
+    does not compile `command_parser.cpp`. The build passed, the guard looked dead, and the next
+    step would have been to "fix" something that works. Building `orderbook_tcp_server_lib` failed
+    the assertion twice, as it should. Fourth instance of the stale-artefact class in this
+    workspace, and the first one aimed at a mechanism rather than at a result: **when you mutate to
+    prove a guard fires, name the target that compiles the file** (#107).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

@@ -104,14 +104,17 @@ static constexpr CommandGrammar kGrammar[] = {
 static_assert(std::size(kGrammar) == static_cast<size_t>(CommandType::UNKNOWN),
               "every CommandType except UNKNOWN declares its arity - add a row above (#107)");
 
-/// The rows are the enum, so the assert above is about coverage rather than about count.
-static constexpr bool grammar_is_indexed_by_type() {
+// The rows *are* the enum, so the assert above is about coverage rather than about count. Written
+// as an immediately-invoked constexpr lambda rather than a named helper, because a named function
+// used only by a `static_assert` has no run-time caller and CodeQL's `cpp/unused-static-function`
+// says so - correctly, from where it is standing. The check belongs in the assertion anyway; this
+// way there is nothing to mistake for dead code.
+static_assert([] {
     for (size_t i = 0; i < std::size(kGrammar); ++i) {
         if (static_cast<size_t>(kGrammar[i].type) != i) return false;
     }
     return true;
-}
-static_assert(grammar_is_indexed_by_type(), "kGrammar rows must be in CommandType order");
+}(), "kGrammar rows must be in CommandType order");
 
 /// `<price> <qty> [count]` - the grammar of one line of a MINSERT payload.
 static constexpr size_t kMinsertLevelTokens = 3;
