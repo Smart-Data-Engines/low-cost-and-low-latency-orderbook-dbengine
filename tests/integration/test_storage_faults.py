@@ -40,6 +40,9 @@ class FaultNode:
     """
 
     def __init__(self, **fault: str):
+        # OB_FAULT_POLICY is this class's own argument, not the injector's: the fsync tests need a
+        # node started with `interval` so the failure lands where a client asked for it.
+        self.policy = fault.pop("OB_FAULT_POLICY", "every")
         injector = fault_injector_path()
         assert injector is not None, (
             "libobfault.so was not built. Failing rather than skipping: a fault-injection test "
@@ -64,7 +67,7 @@ class FaultNode:
         self.proc = subprocess.Popen(
             [SERVER, "--port", str(self.port), "--data-dir", self.data_dir,
              "--metrics-port", str(self.metrics_port), "--drain-timeout-ms", "2000",
-             "--fsync-policy", "every", "--flush-interval-ms", "500"],
+             "--fsync-policy", self.policy, "--flush-interval-ms", "500"],
             env=env, stdout=self._log, stderr=subprocess.STDOUT)
 
     def counter(self, name: str) -> int:
@@ -142,7 +145,7 @@ class FaultNode:
         self.proc = subprocess.Popen(
             [SERVER, "--port", str(self.port), "--data-dir", self.data_dir,
              "--metrics-port", str(self.metrics_port), "--drain-timeout-ms", "2000",
-             "--fsync-policy", "every", "--flush-interval-ms", "500"],
+             "--fsync-policy", self.policy, "--flush-interval-ms", "500"],
             env=env, stdout=self._log, stderr=subprocess.STDOUT)
         self.wait_until_answering()
 
@@ -287,5 +290,62 @@ def test_a_failing_flush_tick_does_not_take_the_node_with_it():
 
         assert node.talk("PING")[0] == "PONG", "the node stopped answering"
         assert node.stop() == 0, "a node whose flushes are failing did not shut down cleanly"
+    finally:
+        node.cleanup()
+
+
+def test_a_failed_fsync_is_not_answered_with_ok():
+    """#113: `--fsync-policy every` promises the record is on the disk before the client is told.
+
+    Measured before the fix: **eleven `fsync` calls returned `EIO` and all three `INSERT`s were
+    still answered `OK`**, because all seven `::fsync()` calls in src/wal.cpp discarded their
+    result. The node stayed up and exited 0 — from inside the process nothing was missing, which is
+    exactly why the return value has to be read.
+
+    A retry cannot repair it and the fix does not pretend otherwise: Linux reports the error once
+    and marks the pages clean, so the next `fsync` on that descriptor returns 0 with the data gone.
+    What the engine can honestly do is stop claiming the write is durable, which is what this
+    asserts.
+    """
+    node = FaultNode(OB_FAULT_PATH=WAL_SEGMENT, OB_FAULT_OP="fsync", OB_FAULT_ERRNO="EIO")
+    try:
+        node.wait_until_answering()
+        replies = node.talk("INSERT SYM EX bid 100 1 1", "INSERT SYM EX bid 200 2 1")
+        assert node.injections() >= 1, f"no fsync was made to fail: {replies}"
+        assert all(r.startswith("ERR") for r in replies), (
+            f"a write whose fsync failed was answered as durable under fsync-policy=every: {replies}")
+
+        # The node is still a node: a disk that cannot sync is a refusal, not a crash (#112's rule
+        # applied to the other half of the same file).
+        assert node.proc.poll() is None, "the node died on a failed fsync"
+        assert node.talk("PING")[0] == "PONG"
+
+        deadline = time.time() + patience(15)
+        while time.time() < deadline and node.counter("ob_wal_fsync_errors_total") < 1:
+            time.sleep(0.5)
+        assert node.counter("ob_wal_fsync_errors_total") >= 1, (
+            "the sync failed and nothing counted it, so an operator cannot tell a disk that is full "
+            "from one that is failing — and those ask for different actions")
+    finally:
+        node.cleanup()
+
+
+def test_a_flush_command_does_not_report_success_over_a_failed_sync():
+    """`FLUSH` answering `OK` over a failed fsync is the same lie as `INSERT` doing it.
+
+    Written with the interval policy, so the failure happens where a client asked for it rather
+    than on the write path — the two go through different call sites in src/wal.cpp and only one of
+    them was covered by the test above.
+    """
+    node = FaultNode(OB_FAULT_PATH=WAL_SEGMENT, OB_FAULT_OP="fsync", OB_FAULT_ERRNO="EIO",
+                     OB_FAULT_POLICY="interval")
+    try:
+        node.wait_until_answering()
+        replies = node.talk("INSERT SYM EX bid 100 1 1", "FLUSH")
+        assert replies[0] == "OK", f"the write itself should not be refused here: {replies}"
+        assert node.injections() >= 1, f"no fsync was made to fail: {replies}"
+        assert replies[1].startswith("ERR"), (
+            f"FLUSH reported success over a sync that failed: {replies}")
+        assert node.proc.poll() is None, "the node died on a failed fsync"
     finally:
         node.cleanup()

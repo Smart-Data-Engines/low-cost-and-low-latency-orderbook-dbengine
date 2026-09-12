@@ -256,7 +256,16 @@ void Engine::close() {
         {
             std::unique_lock<std::mutex> lock(mtx_);
             // Group commit: sync any remaining WAL records.
-            wal_.sync();
+            //
+            // Logged rather than thrown, and that is the difference between this call site and the
+            // four below: `close()` runs on the shutdown path, so throwing here is #112 again from
+            // the other end. What an operator gets instead is this line plus the counter, and the
+            // shutdown still completes - which is what makes the next replay start from a file
+            // rather than from nothing.
+            if (!wal_.sync()) {
+                OB_LOG_ERROR("engine", "close: the final WAL sync failed, so records this node "
+                                       "acknowledged may not be on the disk");
+            }
             flush_drain_pending();
         }
 
@@ -265,8 +274,10 @@ void Engine::close() {
         flush_write_and_merge();
     }
 
-    // Flush WAL to disk.
-    wal_.flush();
+    // Flush WAL to disk. Same reasoning as above: shutdown reports, it does not throw.
+    if (!wal_.flush()) {
+        OB_LOG_ERROR("engine", "close: the closing WAL flush failed");
+    }
 }
 
 std::size_t Engine::above_frontier_size(const std::string& key, uint16_t origin) {
@@ -1112,7 +1123,14 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
         std::unique_lock<std::mutex> lock(mtx_);
 
         // Flush all pending rows to columnar stores.
-        wal_.sync();
+        //
+        // Thrown rather than logged: a snapshot means "everything up to here is on the disk", and
+        // this is the call that establishes it. The async worker turns the exception into a failed
+        // snapshot, which is a peer that retries - where a snapshot taken anyway would be a peer
+        // bootstrapping from a premise nobody checked.
+        if (!wal_.sync()) {
+            throw std::runtime_error("Engine: WAL sync failed while taking a snapshot");
+        }
         flush_drain_pending();
 
         // Flush all per-symbol columnar store active segments. The returned metas
@@ -1444,8 +1462,11 @@ SnapshotManifest Engine::create_symbol_snapshot(const std::string& symbol_key) {
         std::lock_guard<std::mutex> flush_lock(flush_mtx_);
         std::unique_lock<std::mutex> lock(mtx_);
 
-        // Flush pending rows for this symbol to columnar stores.
-        wal_.sync();
+        // Flush pending rows for this symbol to columnar stores. Same reasoning as the
+        // whole-engine snapshot above.
+        if (!wal_.sync()) {
+            throw std::runtime_error("Engine: WAL sync failed while taking a symbol snapshot");
+        }
         flush_drain_pending();
 
         // Flush the per-symbol columnar store segment if it exists, merging the
@@ -1861,14 +1882,31 @@ void Engine::flush_loop() {
 }
 
 void Engine::flush_tick() {
+        // Publish the failed syncs **first**, as a delta, because everything below this can throw.
+        //
+        // This was after the WAL sync at first, with a comment saying a tick that throws would
+        // publish on the next one. That is true of a transient failure and false of the case that
+        // matters: with `fsync` failing every time, every tick throws at the same line, so the
+        // counter stayed at zero while the disk was reporting EIO on every write. The regression
+        // test for #113 found it - the writes were correctly refused and the number an operator
+        // reads was still flat.
+        if (const uint64_t total = wal_.fsync_failures(); total > published_fsync_failures_) {
+            registry_.increment_counter("ob_wal_fsync_errors_total",
+                                        total - published_fsync_failures_);
+            published_fsync_failures_ = total;
+        }
+
         // The whole tick is one flush, so a client FLUSH cannot interleave with it.
         std::lock_guard<std::mutex> flush_lock(flush_mtx_);
 
         // Phase A: drain pending rows under mutex.
         {
             std::unique_lock<std::mutex> lock(mtx_);
-            if (wal_.pending_sync_count() > 0) {
-                wal_.sync();
+            if (wal_.pending_sync_count() > 0 && !wal_.sync()) {
+                // #112's boundary catches this, counts it and runs the next tick. Throwing rather
+                // than continuing matters: draining pending rows after a failed sync would move
+                // them out of the only place that still knows they were never synced.
+                throw std::runtime_error("Engine: WAL sync failed during the flush tick");
             }
             flush_drain_pending();
         }
@@ -2160,7 +2198,11 @@ void Engine::flush_incremental() {
     // Phase A: lock → WAL sync → drain pending rows → unlock
     {
         std::unique_lock<std::mutex> lock(mtx_);
-        wal_.sync();
+        // A client asked for this one, so a client is told. `FLUSH` answering `OK` over a failed
+        // sync is the same lie as `INSERT` doing it.
+        if (!wal_.sync()) {
+            throw std::runtime_error("Engine: WAL sync failed during FLUSH");
+        }
         flush_drain_pending();
     }
     // Phase B: segment I/O + merge, outside mtx_ so writers are not blocked.

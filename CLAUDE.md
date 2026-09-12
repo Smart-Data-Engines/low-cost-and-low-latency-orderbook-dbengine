@@ -1858,6 +1858,56 @@ Learned the hard way. Check here before debugging.
     "the other thirteen are note-level tidiness" about CodeQL alerts — a word search would either
     fail on that sentence or be loosened until it failed on nothing (#38, #108).
 
+224. **When a result is being discarded at seven call sites, the fix is `[[nodiscard]]`, not seven
+    added `if`s.** Every `::fsync()` in `src/wal.cpp` threw its answer away, so `--fsync-policy
+    every` acknowledged writes it had not synced — measured: eleven `EIO` returns and three
+    `INSERT`s still answered `OK`. Making `flush()` and `sync()` return `bool` and marking them
+    `[[nodiscard]]` turns ignoring the answer into a **compile error**, and each site then had to
+    say what it does: the write paths and `FLUSH` throw, both snapshot paths throw, the flush tick
+    throws into #112's boundary, and `close()` logs and completes — because a shutdown that throws
+    is #112 from the other end. A comment asking callers to check would have been the same omission
+    one layer up. The attribute also found **sixteen** sites nobody had looked at, five test files
+    that flushed and dropped the result before reading the file back, so a failed flush made the
+    *next* assertion report the wrong thing (#113).
+225. **A failed `fsync` cannot be retried on Linux, so there is no recovery path to write.** The
+    kernel reports the error once, to whichever caller happened to be there, and **marks the
+    affected pages clean** — the next `fsync` on that descriptor returns 0 with the data gone. So
+    the engine refuses the write rather than retrying it, and the counter and the ERROR line are
+    sticky and monotone: they are the only lasting evidence that something acknowledged may not be
+    on the disk. The second-order defect was in the old code's *bookkeeping*: it set
+    `pending_sync_ = 0` after an unchecked `fsync`, so a writer coming out of a failed sync told
+    the flush loop there was nothing left to do (#113).
+226. **A counter published after the call that can throw stays flat in exactly the case it exists
+    for.** `ob_wal_fsync_errors_total` was published after the WAL sync in the flush tick, under a
+    comment reasoning that a tick which throws would publish on the next one. True of a transient
+    failure. With `fsync` failing *every* time, every tick throws at the same line, so the number an
+    operator reads never moved while the writes were being correctly refused. Publish before
+    anything that can throw — and note which test found it: the regression test for the item itself,
+    not review (#113).
+227. **A checker can scan an API that does not exist, and that branch never matches.**
+    `scripts/check_metrics.py` claims to prove every metric written by name is registered, and
+    looked for `add_to_counter` — `MetricsRegistry` has `increment_counter` — while not looking for
+    `increment_gauge`, which eight sites use. So a metric written only that way escaped the check
+    entirely. Same shape as searching for `-fsanitize=undefined` as a substring (pitfall 222): the
+    instrument answers "nothing wrong" in the same voice it uses when there is nothing wrong. A
+    deliberately unregistered `increment_gauge` now fails it, which it did not before (#113).
+228. **A document claiming a stronger default than the code is worse than one claiming a weaker
+    one, and `docs/architecture.md` claimed it about durability.** "With `FsyncPolicy::EVERY` (the
+    default)" stood in the paragraph headed *What the WAL guarantees after a crash*, while the code
+    says `INTERVAL` in all four places it states a default. `docs/cli.md` opened the same section
+    with an unqualified "is in a fsynced WAL record before the reply is sent" and put the caveat
+    thirty lines below — a caveat under the claim is a caveat nobody reads. Both now name the
+    policy in the sentence that makes the promise (#113).
+229. **A mechanism written for one instance leaves the class open, and the rot moves to the
+    document the mechanism does not read.** Pitfall 223 derived the required-check count so the
+    prose could not drift — in `docs/github-security.md` only. One item later this file said
+    "Thirteen" against a ruleset requiring fourteen: same rot, same week, in a file already in the
+    tree. `check_contexts.py` reads **every** document that states the count now. And extending it
+    hit use-versus-mention on the first run: the regex matched this file's own quotation of its
+    anchor, inside backticks, in a checker whose docstring warns about exactly that. Code spans come
+    out before matching, and the mutation table has a control that must **survive** — an added
+    backticked mention (#113).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -1870,9 +1920,13 @@ because commit messages and specs cite these numbers.
 [docs/roadmap.md](docs/roadmap.md). Both suites run in CI on every pull request, the whole integration
 battery a second time under ThreadSanitizer, with an unexpected skip failing the job. The CLI and
 C++ client harness are built alongside the selected server in both integration jobs. Clang builds
-and tests the tree too. Thirteen required checks protect `master` after #108 added `io-uring-build`:
-it compiles the optional transport and verifies its symbol in `ob_tcp_server_iouring`, without
-claiming runtime coverage. The exact contexts live in `.github/rulesets/master.json`.
+and tests the tree too. **Fourteen checks are required** on `master`: #108 added
+`io-uring-build`, which compiles the optional transport and verifies its symbol in
+`ob_tcp_server_iouring` without claiming runtime coverage, and #38 added `fuzz`. The exact contexts
+live in `.github/rulesets/master.json`, and `check_contexts.py` now derives that number and checks
+**this sentence** against it as well as the one in `docs/github-security.md` — it said "Thirteen"
+for one item, which is pitfall 223 happening in the second document its own mechanism did not
+read.
 
 Read the sanitizer claims with #83 in mind: until it landed, `OB_ENABLE_ASAN`, `OB_ENABLE_TSAN` and
 `OB_ENABLE_COVERAGE` instrumented the test binaries and the server but **none of the static
@@ -1935,6 +1989,35 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   `demote_to_replica()`** — it needs the primary's identity, which exists only after the connection,
   so it lives in `ReplicationClient::resolve_stream_identity()` and a static test pins that nothing
   about which of the four callers demoted the node reaches it.
+- **`--fsync-policy every` means what it says, and a failed `fsync` is refused rather than
+  acknowledged** (#113). `WALWriter::flush()` and `sync()` are `[[nodiscard]] bool`, so discarding
+  the answer is a compile error; the write paths, `FLUSH`, both snapshot paths and the flush tick
+  throw, and `close()` logs and completes. `ob_wal_fsync_errors_total` is separate from
+  `ob_flush_errors_total` because a full disk is freed while a disk returning `EIO` is replaced, and
+  it is **sticky**: a failed `fsync` cannot be retried on Linux, which reports the error once and
+  marks the pages clean. Two consequences to expect rather than file: a client that resends after
+  the refusal produces a **second row**, which nothing deduplicates (the sequence-number dedup is
+  about a second *delivery* of one record), and the columnar segment files are still buffered stream
+  I/O with no per-segment `fsync` — that is what WAL replay is for. See `docs/operations.md`, "When
+  an fsync fails".
+- **No thread in this engine can end the process by letting an exception escape** (#112). All
+  seventeen `std::thread` constructions in `src/` wrap their body in `run_thread_body()`
+  (`include/orderbook/thread_boundary.hpp`), and a test derives that count from the source rather
+  than from a list — hand-counting gave eleven. A joinable thread whose body throws calls
+  `std::terminate`, so an `ENOSPC` on the flush thread's WAL write used to abort the whole node in a
+  crash loop while the client-facing path handled the same condition correctly. `flush_loop()`
+  additionally guards **one tick**, counting `ob_flush_errors_total` and running the next one;
+  `lease_loop`, `monitor_loop` and `io_loop` have the thread-level boundary but not yet a
+  per-iteration one, and `io_loop` needs a bound first because its epoll timeout is zero whenever a
+  catch-up cursor has queue space (#93).
+- **Storage faults are injectable, and the instrument is `tests/fault/obfault.c`** (#54 stage A) —
+  an `LD_PRELOAD` shim over `write`, `pwrite`, `fsync`, `fdatasync` and `ftruncate`, armed by
+  `OB_FAULT_PATH` and friends, matching by the path behind the descriptor. It found #112, #113 and
+  #114 on its first run. Two things to know before using it: an empty `OB_FAULT_PATH` **disarms**
+  it, and both integration CI jobs build it and assert the shared object exists, because the twelve
+  tests across `test_fault_injector.py` and `test_storage_faults.py` **fail rather than skip** when
+  it is missing — deliberately, since everything they assert would otherwise pass without any fault
+  being injected (pitfall 57).
 - **A wire write can carry its event time** (#105). `INSERT` and `MINSERT` accept an optional
   trailing `event_time_ns`; absence asks for arrival time, while zero is refused. Both clients check
   the `insert_event_time` capability before sending a supplied time and refuse an older server

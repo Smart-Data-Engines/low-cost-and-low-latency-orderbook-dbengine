@@ -2128,7 +2128,7 @@ honest.
 - Effort: S to delete, L to adopt | Impact: the front page described a storage mechanism the engine
   does not use, and nothing in CI could notice
 
-### 113. `fsync`'s return value is discarded, so the strongest durability policy acknowledges writes it did not sync
+### 113. `fsync`'s return value is discarded, so the strongest durability policy acknowledges writes it did not sync ✅
 
 Found by roadmap #54's fault injector, and visible by reading before it was measured: **all seven
 `::fsync()` calls in `src/wal.cpp` throw their result away.**
@@ -2147,8 +2147,58 @@ the first failure.
 What the fix is not allowed to be is an abort — that is #112, in the same file, from the other
 direction.
 
-- Effort: S for the reporting, M if the policy is to be honest about what it can still promise |
-  Impact: the durability guarantee the engine advertises is currently unverifiable by its client
+**Done, and the shape of the fix is `[[nodiscard]]` rather than seven added `if`s.**
+`WALWriter::flush()` and `sync()` return `bool` and are marked `[[nodiscard]]`, so ignoring the
+answer is a **compile error**. A comment asking callers to check would have been the same omission
+one layer up; this made each of the seven call sites say what it does instead, and the answers are
+genuinely different:
+
+- the two write paths under `every` **throw**, which is how a failed `write` is already reported —
+  the client gets `ERR …` and the node keeps serving, measured and tested since #54's stage A
+- `FLUSH` throws, because answering `OK` over a failed sync is the same lie as `INSERT` doing it
+- both snapshot paths throw: a snapshot means "everything up to here is on the disk", and this is
+  the call that establishes it. The async worker turns that into a failed snapshot, so the peer
+  retries rather than bootstrapping from an unchecked premise
+- the flush tick throws, and #112's per-iteration boundary counts and retries it
+- **`close()` logs and completes**, because a shutdown path that throws is #112 from the other end,
+  and the records are in the WAL file either way
+
+`fsync_or_record()` is the one place that calls `::fsync`. It counts the failure, logs what the sync
+was *for* — "fsync failed" alone does not say whether a client was waiting — and says what Linux
+does next, because the obvious reaction is the one thing that cannot work. It deliberately **does
+not clear `pending_sync_`**: that was the second-order defect, since the old code zeroed the count
+after an unchecked `fsync`, so the writer came out of a failed sync telling the flush loop there was
+nothing left to do.
+
+`ob_wal_fsync_errors_total` is separate from `ob_flush_errors_total` on purpose: a full disk is
+freed, a disk returning `EIO` is replaced.
+
+**The attribute found sixteen sites nobody had looked at.** Five test files flushed the WAL and
+dropped the result, then read the file back expecting the record to be there — so a flush that
+failed would have made the *next* assertion report the wrong thing. All sixteen are assertions now,
+`ASSERT_TRUE` in test bodies, `RC_ASSERT` in a RapidCheck property, and `EXPECT_TRUE` in one helper
+that returns a value, because `ASSERT_*` expands to a bare `return`.
+
+**A defect in this change, found by its own regression test.** The counter was published *after* the
+WAL sync in the flush tick, under a comment saying a tick that throws would publish on the next one.
+True of a transient failure; false of the case that matters — with `fsync` failing every time, every
+tick throws at the same line, so the number an operator reads stayed flat while the writes were
+being correctly refused. It is published first now, before anything in the tick can throw.
+
+**Found along the way, and fixed here because it is a claim about the code rather than an item.**
+`scripts/check_metrics.py` says it proves every metric written by name is registered, and scanned
+`add_to_counter`, which `MetricsRegistry` does not have — a branch that could never match — while
+not scanning `increment_gauge`, which it does have and which eight sites use for
+`ob_active_sessions`. A metric written only that way escaped the check entirely. With the scan
+corrected it sees one more written name, and a deliberately unregistered `increment_gauge` now fails
+it, which it did not before.
+
+**What this does not cover, stated.** The columnar segment files are written with buffered stream
+I/O and are not fsynced per segment, so this policy is about the WAL — a segment lost to a power cut
+is rebuilt by replaying it, which is what the WAL is for.
+
+- Effort: M | Impact: `--fsync-policy every` now means what it says, and the failure is visible to
+  both the client that asked and the operator who has to replace the disk
 
 ### 112. An ENOSPC on the flush thread's WAL write aborts the whole node ✅
 
@@ -4977,9 +5027,10 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Two defects are open, and #54's fault injector found all three of them.** #113 — `fsync`'s result
-is discarded in all seven places, so `--fsync-policy every` acknowledges writes it did not sync —
-and #114, the `MmapStore` with tests and no caller. #112 is closed: an `ENOSPC` on the flush
+**One defect is open, and #54's fault injector found all three of them.** #114, the `MmapStore`
+with tests and no caller, which is a decision rather than a bug: delete it, or give it the caller
+three documents assumed it had. #113 is closed — `--fsync-policy every` no longer acknowledges
+writes it did not sync — and so is #112: an `ENOSPC` on the flush
 thread's WAL write used to abort the node in a crash loop while the client-facing path handled the
 same condition correctly, and all seventeen thread bodies now have an exception boundary.
 Everything recorded before them is closed: #108's build job closed the last gap in compilation coverage, without claiming runtime
@@ -5148,7 +5199,7 @@ runners, not the machine-B performance baseline above.
 |-------|-------|--------|
 | C++ (GTest + RapidCheck) | 1029 | all passing with `ctest -j1` on the i3-7100U. CTest lists 1031: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtime is what this machine gave on the commit measured, not a budget: the same suite read 159 s earlier the same day on an idler machine |
 | Python integration | 235 | all passing in 13:29 on the i3-7100U, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 235; count pytest's final result rather than the report plugin's progress characters |
-| Python integration under TSan | 235 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. Last **timed** at 15:13 with 234 tests — that figure comes from CI rather than from this machine, so it is not restated for a count it did not measure |
+| Python integration under TSan | 235 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. Timed at **14:54** on the GitHub runner for `1a95cee` — a CI figure, and it is labelled as one because it is not comparable with the 13:29 above: different machine, and instrumentation on |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than

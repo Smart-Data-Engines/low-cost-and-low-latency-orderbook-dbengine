@@ -165,6 +165,37 @@ Put the data directory on the fastest local device you have, and **not** on the 
 journal of a busy filesystem: the WAL is sequential and small-record, so it is exactly the workload
 that suffers from sharing a queue.
 
+### When an fsync fails
+
+Watch `ob_wal_fsync_errors_total`. It is separate from `ob_flush_errors_total` because the two ask
+for different actions: a flush failing on `ENOSPC` means free space, an `fsync` returning `EIO`
+means the device is failing and wants replacing.
+
+**The engine cannot recover a failed `fsync`, and does not pretend to.** Linux reports the error to
+whichever caller happened to be there and then **marks the affected pages clean**, so the next
+`fsync` on that descriptor returns success with the data already gone. There is nothing to retry.
+What the engine does instead:
+
+- under `--fsync-policy every`, the write that could not be synced is **refused**, so the client is
+  never told a record is durable when the sync for it failed
+- a `FLUSH` command over a failed sync is refused for the same reason
+- `close()` logs it and completes the shutdown anyway — refusing to shut down would leave a node
+  that cannot be restarted, and the records are in the WAL file either way
+- the counter and an `ERROR` line naming the reason are permanent; no later success takes them back
+
+**What a client should do with that refusal, and its cost.** The record is in this node's WAL
+regardless — the write succeeded, the sync did not — so a client that resends produces a **second
+row**, and **nothing deduplicates it**. The sequence-number dedup suppresses a second *delivery of
+one record* between nodes (#61); a retried client write arrives with no sequence number, is minted a
+fresh one, and is therefore a different record to every mechanism that looks — including the peers,
+which store both. Storage is append-only, so the duplicate is visible: `SELECT` returns the sequence
+number as its seventh column (#65), which is what tells the two rows apart. That is the honest
+trade — a duplicate you can see, against a write you were told was durable and was not.
+
+**What is not covered.** The columnar segment files are written with buffered stream I/O and are not
+fsynced per segment, so this policy is about the WAL. A segment lost to a power failure is rebuilt
+by replaying the WAL, which is what the WAL is for.
+
 ## Which build is running
 
 Three ways to ask, all reporting the same number:

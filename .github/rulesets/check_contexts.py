@@ -55,7 +55,10 @@ NOT_FROM_A_WORKFLOW = {
 
 _MATRIX_REF = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}")
 
-SECURITY_DOC = Path("docs/github-security.md")
+# Every document that states the count, because the rot is per document and the mechanism added in
+# #38 covered exactly one of them - `CLAUDE.md` then sat at "Thirteen" while the ruleset required
+# fourteen, one item later, in a file this script already had no reason not to read.
+COUNT_DOCS = (Path("docs/github-security.md"), Path("CLAUDE.md"))
 
 # Spelled out, because the document spells it out. The range is deliberately narrow: a count
 # outside it means either a very different repository or a parsing accident, and both should stop
@@ -66,6 +69,19 @@ NUMBER_WORDS = {
 }
 
 _PROSE_CLAIM = re.compile(r"\*\*([A-Za-z]+) checks are required\*\*")
+
+# A backticked span is a *mention* of the claim, not the claim. `CLAUDE.md` records the pitfall
+# behind this check and quotes its own anchor - `**N checks are required**` - so the first version
+# of the multi-document scan read that sentence as a document claiming "N" checks. Use versus
+# mention, in the checker written by somebody who had just written the warning about it. Code spans
+# come out before matching; the convention is read from the files rather than assumed, and both are
+# ordinary Markdown.
+_CODE_SPAN = re.compile(r"`[^`]*`")
+
+
+def prose_claims(text: str) -> list[str]:
+    """Counts of checks a document *asserts*, with mentions inside code spans removed."""
+    return _PROSE_CLAIM.findall(_CODE_SPAN.sub("", text))
 
 
 def triggers_on_pull_request(workflow: dict[str, Any]) -> bool:
@@ -177,6 +193,11 @@ def prose_claim_problems(count: int) -> list[str]:
     Absence is a failure here. A reworded sentence means the claim is no longer being checked, and
     a check that passes because it found nothing to look at is the failure mode this whole file
     exists to prevent.
+
+    Every document that makes the claim is checked, not one. The first version of this function
+    read `docs/github-security.md` alone, and one item later `CLAUDE.md` said "Thirteen" against a
+    ruleset requiring fourteen - the same rot, in a file already in the tree, uncovered because the
+    mechanism had been written for the instance rather than for the class.
     """
     problems: list[str] = []
     if count not in NUMBER_WORDS:
@@ -184,22 +205,24 @@ def prose_claim_problems(count: int) -> list[str]:
                 f"    Either the count is a parsing accident or NUMBER_WORDS needs extending."]
     expected = NUMBER_WORDS[count]
 
-    if not SECURITY_DOC.is_file():
-        return [f"  {SECURITY_DOC} does not exist, so its claim about the count is unchecked"]
+    for doc in COUNT_DOCS:
+        if not doc.is_file():
+            problems.append(f"  {doc} does not exist, so its claim about the count is unchecked")
+            continue
 
-    claims = _PROSE_CLAIM.findall(SECURITY_DOC.read_text())
-    if len(claims) != 1:
-        problems.append(
-            f"  {SECURITY_DOC} makes {len(claims)} claims matching '**N checks are required**', "
-            f"expected exactly one\n"
-            f"    Rewording that sentence switches this check off silently."
-        )
-    elif claims[0] != expected:
-        problems.append(
-            f"  {SECURITY_DOC} says {claims[0]!r} checks are required; {RULESET} lists {count} "
-            f"({expected})\n"
-            f"    The ruleset is the fact. Update the sentence."
-        )
+        claims = prose_claims(doc.read_text())
+        if len(claims) != 1:
+            problems.append(
+                f"  {doc} makes {len(claims)} claims matching '**N checks are required**', "
+                f"expected exactly one\n"
+                f"    Rewording that sentence switches this check off silently."
+            )
+        elif claims[0] != expected:
+            problems.append(
+                f"  {doc} says {claims[0]!r} checks are required; {RULESET} lists {count} "
+                f"({expected})\n"
+                f"    The ruleset is the fact. Update the sentence."
+            )
     return problems
 
 
@@ -240,7 +263,8 @@ def main() -> int:
     print(
         f"{len(from_workflows)} contexts produced, all required; "
         f"{len(NOT_FROM_A_WORKFLOW)} allowlisted as not coming from a workflow; "
-        f"{len(from_ruleset)} required in total, which is what {SECURITY_DOC} claims"
+        f"{len(from_ruleset)} required in total, which is what "
+        f"{', '.join(str(d) for d in COUNT_DOCS)} claim"
     )
     return 0
 

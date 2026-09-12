@@ -247,9 +247,13 @@ ob> quit
 
 ## Durability and crash recovery
 
-An acknowledged `INSERT` or `MINSERT` is in a fsynced WAL record before the reply is sent, and it
-survives a process kill or a power cut: on the next start, `Engine::open()` replays every WAL record
-written after the last checkpoint, applies it, and flushes it into a segment so queries can see it.
+An acknowledged `INSERT` or `MINSERT` is in a WAL record before the reply is sent, and it survives a
+process kill: on the next start, `Engine::open()` replays every WAL record written after the last
+checkpoint, applies it, and flushes it into a segment so queries can see it. Whether it also
+survives a **power cut** is `--fsync-policy`, described under Parameters below — the default,
+`interval`, syncs within the flush interval rather than before the reply, so that sentence is about
+a process ending, not about the platter. Under `every` the reply waits for the `fsync`, and since
+#113 a failed `fsync` is answered `ERR` rather than `OK`.
 The startup log states what happened, and it is worth reading after an unclean stop:
 
 ```

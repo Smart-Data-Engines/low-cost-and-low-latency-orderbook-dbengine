@@ -35,7 +35,7 @@ The engine is composed of six subsystems, each responsible for a specific concer
 
 ### Write Path (apply_delta)
 
-1. **WAL write** — The delta update is serialized and appended to the WAL file with a CRC32C checksum. `fsync` ensures durability before any state mutation.
+1. **WAL write** — The delta update is serialized and appended to the WAL file with a CRC32C checksum, before any state mutation. Whether that append is also `fsync`ed at this point is `--fsync-policy`: under `every` it is, and a failed `fsync` refuses the write (#113); under the default `interval` the sync follows within the flush interval.
 
 2. **SoA buffer update** — The seqlock writer protocol increments the version to odd, writes the new price levels, then increments to even. Readers spin-wait on even versions for consistent snapshots.
 
@@ -275,9 +275,14 @@ purpose: a zero in the second one means "checked, nothing to repair" only if the
 
 ### What the WAL guarantees after a crash
 
-With `FsyncPolicy::EVERY` (the default), a write that has been acknowledged is in a fsynced WAL
-record before the acknowledgement leaves the server, and it comes back after a `SIGKILL`, a power
-cut, or any other end that skips `close()`. That is the whole point of the log, and until August
+With `FsyncPolicy::EVERY` — **not** the default, which is `INTERVAL` — a write that has been
+acknowledged is in a fsynced WAL record before the acknowledgement leaves the server, and it comes
+back after a `SIGKILL`, a power cut, or any other end that skips `close()`. Since #113 that
+sentence is enforced rather than asserted: the `fsync` result is checked, and a write whose sync
+failed is refused instead of acknowledged. *(This paragraph said `EVERY` was the default for
+months. The default has been `INTERVAL` in every one of the four places the code states it, so the
+document claimed a stronger durability guarantee than the engine gives — the mirror image of the
+TLS caveat that outlived the feature.)* That is the whole point of the log, and until August
 2026 it did not hold: `Engine::open()` called replay with a callback that did nothing, so every
 acknowledged write not yet flushed to a segment was lost. Nothing in 585 tests noticed, because
 every one of them ended in `close()`, which drains and flushes.

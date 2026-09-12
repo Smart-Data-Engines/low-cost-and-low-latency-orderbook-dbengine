@@ -74,6 +74,10 @@ MetricsRegistry::MetricsRegistry() {
     // answers clients (#112).
     counters_.push_back(make_counter("ob_flush_errors_total",
                                      "Flush ticks that ended in an exception and were retried"));
+    // Failed `fsync` calls on the WAL (#113). Separate from ob_flush_errors_total because the
+    // two ask for different actions: a full disk is freed, a disk reporting EIO is replaced.
+    counters_.push_back(make_counter("ob_wal_fsync_errors_total",
+                                     "fsync calls on the WAL that failed"));
 
     // Gauges
     gauges_.push_back(make_gauge("ob_active_sessions", "Number of active TCP sessions"));

@@ -161,7 +161,7 @@ TEST(ReplCompress, TheDirectiveMarksTheSeamOfAnUnfinishedCatchup) {
         }
         wal.append(delta, lv.data());
     }
-    wal.flush();
+    ASSERT_TRUE(wal.flush());
 
     ob::ReplicationConfig cfg;
     cfg.port         = port;
@@ -203,7 +203,7 @@ TEST(ReplCompress, TheDirectiveMarksTheSeamOfAnUnfinishedCatchup) {
     // the position announced on the wire is the one that append returns. The append does not widen
     // the catch-up: the cursor's end was fixed when it was created.
     const ob::WalPosition marker_pos = wal.append(marker, &one);
-    wal.flush();
+    ASSERT_TRUE(wal.flush());
     mgr.broadcast(hdr, payload.data(), payload.size(), marker_pos);
 
     // Walk the stream: plain framed records, then the directive, then LZ4 frames.
