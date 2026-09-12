@@ -2118,6 +2118,30 @@ measurement is also what makes `SELECT` and `SUBSCRIBE` a genuine exemption from
 than an exemption from refusing. `AUTH`'s extra token is refused **without being repeated**: every
 refusal writes a log line, and a response echoed into a log is a response in a log.
 
+**Where this rule deliberately does not reach.** The replication and multi-master line parsers use
+`sscanf`, which ignores everything past the fields it names: `REPLICATE 0 0 0 junk` parses as
+`REPLICATE 0 0 0`, and eight call sites behave that way. That is not the same defect. On those links
+the **field count is the version negotiation**, and it is written down: `parsed >= 2`, `parsed == 3`
+and `parsed == 4` are three meanings of one line, which is exactly what keeps a pre-epoch primary
+readable (#103). Leniency there buys a compatibility that no client typo can buy. What it does not
+buy is the *next* field — a node too old to know it accepts the line and drops the value in silence,
+which is #105's shape one surface over, and the answer this repository has already chosen for that
+twice is negotiation rather than tolerance (`STREAMID?` in #101, `capabilities:` in #105's spec).
+Recorded here rather than filed as an item: there is no defect to reproduce today, and the fix for
+the future one is a handshake, not a token count.
+
+**Mutation corrected the design, not just the tests: fourteen mutations, thirteen killed, and the
+survivor is the control.** The one that mattered was mine. The first version wrote "no maximum" as
+`kFreeForm = size_t(-1)` and guarded with `max_tokens != kFreeForm && tokens.size() > max_tokens` —
+and **deleting that guard changed nothing**, because no line has `SIZE_MAX` tokens, so the
+comparison was already false. A guard that cannot fail is a guard nobody can check, and the next
+reader trusts it. The emptiness now lives in the type (`std::optional<size_t>`), so dropping the
+test compares against `nullopt`, refuses every `SELECT`, and dies. The rule worth keeping: when a
+mutation survives, ask whether a sentinel is quietly doing the work the guard claims to do.
+
+The survivor is the refusal's log line, which nothing asserts — it is for operators, and saying so
+is more honest than a table in which everything dies.
+
 Ten unit tests and three integration tests, every refusal with a control beside it — a parser that
 refuses everything passes every refusal test. The unit tests read the exported `command_grammar()`
 rather than a second list of the same facts, which is the shape that cost #32 a flag, a negation

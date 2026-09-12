@@ -8,6 +8,7 @@
 #include <charconv>
 #include <cctype>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -73,7 +74,7 @@ static bool iequals(std::string_view a, std::string_view b) {
 /// by nothing, which is a poor field to add in the same repository that spent an item on the fifth
 /// one (#104).
 static constexpr CommandGrammar kGrammar[] = {
-    {CommandType::SELECT,       "SELECT",       kFreeForm,
+    {CommandType::SELECT,       "SELECT",       std::nullopt,
      "SELECT <query>", true},
     {CommandType::INSERT,       "INSERT",       7,
      "INSERT <symbol> <exchange> <bid|ask> <price> <qty> [count]", true},
@@ -93,7 +94,7 @@ static constexpr CommandGrammar kGrammar[] = {
      true},
     {CommandType::MM_PEERS,     "MM_PEERS",     1, "MM_PEERS", true},
     {CommandType::MM_CONFLICTS, "MM_CONFLICTS", 2, "MM_CONFLICTS [limit]", true},
-    {CommandType::SUBSCRIBE,    "SUBSCRIBE",    kFreeForm, "SUBSCRIBE <query>", true},
+    {CommandType::SUBSCRIBE,    "SUBSCRIBE",    std::nullopt, "SUBSCRIBE <query>", true},
     {CommandType::UNSUBSCRIBE,  "UNSUBSCRIBE",  2,
      "UNSUBSCRIBE [id], where no id means every subscription of this session", true},
     {CommandType::AUTH,         "AUTH",         3,
@@ -115,7 +116,7 @@ static_assert(grammar_is_indexed_by_type(), "kGrammar rows must be in CommandTyp
 /// `<price> <qty> [count]` - the grammar of one line of a MINSERT payload.
 static constexpr size_t kMinsertLevelTokens = 3;
 
-// `kFreeForm` is an exemption from counting here, not an exemption from refusing: both free-form
+// An empty `max_tokens` is an exemption from counting here, not an exemption from refusing: both free-form
 // commands hand the whole line to the query parser, and that parser refuses a trailing token by
 // name (measured: `SELECT * FROM 'AAA'.'EX' garbage` ->
 // `ERR Parse error at line 1, col 26: unexpected token 'garbage'`). The message built below borrows
@@ -178,8 +179,8 @@ Command parse_command(std::string_view line) {
     // to remember it. An unrecognised keyword has no row and falls through to UNKNOWN, where the
     // honest answer is still `unknown command` (#107).
     if (const CommandGrammar* g = grammar_for_keyword(first)) {
-        if (g->max_tokens != kFreeForm && tokens.size() > g->max_tokens) {
-            return refuse(cmd, extra_token_message(*g, tokens[g->max_tokens]));
+        if (g->max_tokens && tokens.size() > *g->max_tokens) {
+            return refuse(cmd, extra_token_message(*g, tokens[*g->max_tokens]));
         }
     }
 
@@ -399,8 +400,8 @@ Command parse_minsert(std::string_view block) {
     // would otherwise be accepted with the time discarded, which is the defect #105 is about, one
     // layer out (#107).
     const CommandGrammar& g = grammar_of(CommandType::MINSERT);
-    if (header_tokens.size() > g.max_tokens) {
-        return refuse(cmd, extra_token_message(g, header_tokens[g.max_tokens]));
+    if (g.max_tokens && header_tokens.size() > *g.max_tokens) {
+        return refuse(cmd, extra_token_message(g, header_tokens[*g.max_tokens]));
     }
 
     MinsertArgs args{};

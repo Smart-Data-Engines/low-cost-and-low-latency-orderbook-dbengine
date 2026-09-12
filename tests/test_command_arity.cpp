@@ -24,7 +24,7 @@ namespace {
 /// A line with exactly one token more than the command's grammar allows.
 std::string one_token_too_many(const CommandGrammar& g) {
     std::string line(g.keyword);
-    for (size_t i = 1; i <= g.max_tokens; ++i) line += " x";
+    for (size_t i = 1; i <= *g.max_tokens; ++i) line += " x";
     return line;   // keyword + max_tokens tokens = max_tokens + 1 tokens
 }
 
@@ -87,12 +87,12 @@ constexpr Canonical kCanonical[] = {
 TEST(CommandArity, EveryBoundedCommandRefusesOneTokenTooMany) {
     size_t checked = 0;
     for (const auto& g : command_grammar()) {
-        if (g.max_tokens == kFreeForm) continue;
+        if (!g.max_tokens) continue;
         const std::string line = one_token_too_many(g);
         const Command cmd = parse_command(line);
 
         EXPECT_EQ(cmd.type, CommandType::UNKNOWN)
-            << g.keyword << " accepted a line with " << (g.max_tokens + 1) << " tokens: " << line;
+            << g.keyword << " accepted a line with " << (*g.max_tokens + 1) << " tokens: " << line;
         EXPECT_TRUE(mentions(cmd.error, "unexpected token"))
             << g.keyword << " was refused without saying why, so the sender reads `unknown "
             << "command` about a command that is known: " << cmd.error;

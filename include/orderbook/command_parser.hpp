@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -105,9 +106,6 @@ struct Command {
 
 // ── Command grammar ───────────────────────────────────────────────────────────
 
-/// A tail this layer does not count, because another parser owns it (`SELECT`, `SUBSCRIBE`).
-inline constexpr size_t kFreeForm = static_cast<size_t>(-1);
-
 /// The most tokens one command line may carry, keyword included, and what it accepts instead.
 ///
 /// Exported so that a test can be written against the parser's **own** table rather than against a
@@ -117,7 +115,19 @@ inline constexpr size_t kFreeForm = static_cast<size_t>(-1);
 struct CommandGrammar {
     CommandType      type;
     std::string_view keyword;
-    size_t           max_tokens;   ///< `kFreeForm` when the tail belongs to the query parser
+
+    /// Empty where the tail belongs to the query parser (`SELECT`, `SUBSCRIBE`), which refuses a
+    /// trailing token by name itself.
+    ///
+    /// An `optional` rather than a sentinel, and that is a correction made by a mutation. The first
+    /// version had `kFreeForm = size_t(-1)` and a guard reading
+    /// `max_tokens != kFreeForm && tokens.size() > max_tokens` — and **deleting that guard changed
+    /// nothing**, because no line has `SIZE_MAX` tokens, so the comparison was already false. A
+    /// guard that cannot fail is a guard that cannot be checked, and the next reader would trust it.
+    /// With the emptiness in the type, dropping the test compares against `nullopt`, refuses every
+    /// `SELECT`, and a test says so.
+    std::optional<size_t> max_tokens;
+
     std::string_view usage;        ///< quoted in the refusal, so the answer says what is accepted
 
     /// False where a token on this line can be a credential (`AUTH`). The refusal then says *that*

@@ -1695,6 +1695,15 @@ Learned the hard way. Check here before debugging.
     refused **without being repeated**, because a response echoed into a log is a response in a log
     (#107).
 
+205. **A sentinel that already makes the comparison false turns its own guard into something that
+    cannot fail.** "No maximum" was `kFreeForm = size_t(-1)`, guarded by
+    `max_tokens != kFreeForm && tokens.size() > max_tokens` — and deleting the guard **changed
+    nothing**, because no line carries `SIZE_MAX` tokens. The mutation survived, and the guard still
+    read like protection to anybody reviewing it. Moving the emptiness into the type
+    (`std::optional<size_t>`) makes the same deletion compare against `nullopt`, refuse every
+    `SELECT`, and die. When a mutation survives, ask whether a sentinel is doing the work the guard
+    claims — and prefer the type that cannot express the accident (#107).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
