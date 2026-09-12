@@ -5111,8 +5111,14 @@ runners, not the machine-B performance baseline above.
 | Suite | Count | Status |
 |-------|-------|--------|
 | C++ (GTest + RapidCheck) | 1022 | all passing, 213 s with `ctest -j1` on the i3-7100U. CTest lists 1024: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtime is what this machine gave on the commit measured, not a budget: the same suite read 159 s earlier the same day on an idler machine |
-| Python integration | 225 | all passing in 13:06, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 225; count pytest's final result rather than the report plugin's progress characters |
-| Python integration under TSan | 225 | all passing in 14:39, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job |
+| Python integration | 234 | all passing in 13:37, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 234; count pytest's final result rather than the report plugin's progress characters |
+| Python integration under TSan | 234 | all passing in 15:13, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job |
+
+#54's nine — six for the fault injector and three for what the engine does with a refused WAL
+write — run in both integration jobs, and both counts above are from the same CI run rather than
+from a local one. That the TSan job also reports 234 with zero skips is what establishes something
+the design left open: an injector compiled with ThreadSanitizer preloads cleanly into a server
+compiled with it, measured instead of argued.
 
 The seven CLI tests run in both integration jobs. Both build `ob_cli`, and the fixture selects the
 binary beside the server under test. No `xfail` remains.
