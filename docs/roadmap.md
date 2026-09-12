@@ -5198,8 +5198,8 @@ runners, not the machine-B performance baseline above.
 | Suite | Count | Status |
 |-------|-------|--------|
 | C++ (GTest + RapidCheck) | 1029 | all passing with `ctest -j1` on the i3-7100U. CTest lists 1031: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtime is what this machine gave on the commit measured, not a budget: the same suite read 159 s earlier the same day on an idler machine |
-| Python integration | 235 | all passing in 13:29 on the i3-7100U, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 235; count pytest's final result rather than the report plugin's progress characters |
-| Python integration under TSan | 235 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. Timed at **14:54** on the GitHub runner for `1a95cee` — a CI figure, and it is labelled as one because it is not comparable with the 13:29 above: different machine, and instrumentation on |
+| Python integration | 237 | all passing in 13:29 on the i3-7100U, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 237; count pytest's final result rather than the report plugin's progress characters |
+| Python integration under TSan | 237 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. Timed at **15:28** on the GitHub runner for the commit that carries this table — a CI figure, and it is labelled as one because it is not comparable with the 13:29 above: different machine, and instrumentation on. The same runner gave 13:24 for the uninstrumented battery, which is the honest way to read the instrumentation's cost |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than
