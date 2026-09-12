@@ -1628,6 +1628,42 @@ Learned the hard way. Check here before debugging.
     defect this repository has recorded four times; the cheap guard is to regenerate last and copy
     the numbers from the file that will be committed (#39 part two).
 
+197. **A drain with no bound is a shutdown decided by whoever happens to be connected.** On
+    `SIGTERM` the listener closed at once and the loop then waited for every session to end -
+    correct, and unbounded. Measured: **0.11 s** to exit with nothing connected and **still running
+    after 60 s** with one *idle* client attached, because an idle client never leaves and a
+    long-lived client is the normal case for a database (a pool, a `SUBSCRIBE` stream, a monitor).
+    A supervisor's answer to a process that will not stop is `SIGKILL`, so the flush and checkpoint
+    the graceful path exists for were exactly what did not run. Two rules fall out: **the default
+    bound must be shorter than the supervisor's timeout** (10 s against systemd's 90 s), and
+    "wait for ever" stays available but has to be asked for (#106).
+
+198. **A decision that needs a clock is a unit test when the clock is an argument, and a sleep when
+    it is not.** `drain_verdict(started, sessions, timeout, now)` has four cases - nothing
+    connected, inside the deadline, on the deadline, and "0 means for ever" - and all four are
+    microseconds of arithmetic instead of a test that waits. The other half of the same fix: the
+    io_uring loop asked the same question in **two** more places and **no CI job builds that
+    file**, so a bound written three times could not even be compiled on one of the two sides. One
+    function plus a static test refusing any line that pairs `draining_` with `active_sessions` is
+    what makes it a closed class rather than a fix applied where somebody looked (#106).
+
+199. **A harness that escalates silently hides the defect it is escalating around.** `_stop_node()`
+    is "SIGTERM, then SIGKILL after five seconds" with nothing said, so every integration node with
+    a client attached had been hard-killed for as long as that helper existed - which is why a node
+    that never exits went unnoticed by two hundred tests. And the server's new default of 10 s is
+    *longer* than that escalation, so shipping the fix without touching the harness would have kept
+    the whole battery on the killing path: the nodes now start with `--drain-timeout-ms 2000`, and
+    from that change on the suite exercises the graceful path on the way out (#106).
+
+200. **Assert that the connection ended, not that your own `send()` failed.** #101's ceiling test
+    required the *sender* to notice the drop, and on this machine the drop lands after the send loop
+    finishes: eight failures in a row against a binary identical to master's, in runs whose log said
+    `disconnecting replica fd=7: not draining its stream-identity answers`. A probe settled it in
+    one line — `replicas=0 hung_up=0`, the record gone and the sender unaware. `POLLRDHUP` is the
+    property and it costs nothing else: **reading the answers would make the socket a well-behaved
+    peer**, which is the one thing that test must not become. Pitfall 54's shape, in a test written
+    by someone who knew about pitfall 54.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -1636,7 +1672,7 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 991 C++ tests (`ctest -j1`, ~3.7 min) and 200 integration tests plus 2
+**Where the suites stand:** 995 C++ tests (`ctest -j1`, ~3.7 min) and 203 integration tests plus 2
 opt-in Binance skips (`pytest tests/integration/`, **13:03 measured** on i3-7100U), all green, and **no `xfail` left** —
 every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
 request, the **whole** integration battery a second time under ThreadSanitizer with a step that

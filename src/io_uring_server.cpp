@@ -571,11 +571,8 @@ void IoUringServer::run() {
         int ret = io_uring_wait_cqe_timeout(ring_, &cqe, &timeout);
 
         if (ret == -ETIME || ret == -EINTR) {
-            // Timeout or interrupted — check drain condition and continue
-            if (draining_.load(std::memory_order_relaxed) &&
-                stats_.active_sessions.load(std::memory_order_relaxed) <= 0) {
-                running_.store(false, std::memory_order_relaxed);
-            }
+            // Timeout or interrupted — check the drain and continue
+            check_drain();
             continue;
         }
 
@@ -615,10 +612,7 @@ void IoUringServer::run() {
         engine_->registry().increment_counter("ob_iouring_sqe_submitted", count);
 
         // Drain check
-        if (draining_.load(std::memory_order_relaxed) &&
-            stats_.active_sessions.load(std::memory_order_relaxed) <= 0) {
-            running_.store(false, std::memory_order_relaxed);
-        }
+        check_drain();
     }
 
     // Cleanup
@@ -644,6 +638,30 @@ void IoUringServer::run() {
 
 // ── shutdown() ───────────────────────────────────────────────────────────────
 
+void IoUringServer::check_drain() {
+    // Acquire, to pair with the release in `shutdown()`: it is what makes `drain_started_at_`
+    // visible here rather than merely written somewhere.
+    if (!draining_.load(std::memory_order_acquire)) return;
+
+    const int open = stats_.active_sessions.load(std::memory_order_relaxed);
+    switch (drain_verdict(drain_started_at_, open, config_.drain_timeout_ms,
+                          std::chrono::steady_clock::now())) {
+    case DrainVerdict::AllSessionsClosed:
+        running_.store(false, std::memory_order_relaxed);
+        break;
+    case DrainVerdict::DeadlineReached:
+        OB_LOG_WARN("io_uring_server",
+                    "Drain deadline of %llu ms reached with %d session(s) still open - closing "
+                    "them and exiting; raise --drain-timeout-ms, or set it to 0 to wait "
+                    "indefinitely",
+                    static_cast<unsigned long long>(config_.drain_timeout_ms), open);
+        running_.store(false, std::memory_order_relaxed);
+        break;
+    case DrainVerdict::KeepWaiting:
+        break;
+    }
+}
+
 void IoUringServer::shutdown() {
     // Stop MetricsServer if running.
     if (metrics_server_) {
@@ -651,7 +669,12 @@ void IoUringServer::shutdown() {
     }
 
     // Initiate graceful drain
-    draining_.store(true, std::memory_order_relaxed);
+    // The timestamp is written **before** the flag and the flag is stored with `release`, so a loop
+    // thread that sees `draining_` also sees the time the drain began. With the relaxed store this
+    // file used, the pair is a data race on a non-atomic member - and since **no CI job builds this
+    // file**, ThreadSanitizer would never have said so.
+    drain_started_at_ = std::chrono::steady_clock::now();
+    draining_.store(true, std::memory_order_release);
 
     // Close the listen socket so the OS rejects new TCP connections immediately.
     if (listen_fd_ >= 0) {

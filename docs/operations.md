@@ -342,6 +342,38 @@ ten-second timer; and within a process it lives in one place, so a role change k
 `repl_state.txt` written before #103 has no such line and simply leaves the epoch where the WAL put
 it.
 
+## Stopping a node
+
+`SIGTERM` (or `SIGINT`) closes the listening socket **immediately** — a new connection is refused
+from that instant — and then waits for the client sessions that are already open. What that wait
+costs is bounded by `--drain-timeout-ms`, default **10 s**, and the bound is the part worth knowing:
+
+```
+Shutdown requested — the epoll loop will drain and close
+Drain requested: closing the listen socket, fd=4
+Drain deadline of 10000 ms reached with 1 session(s) still open - closing them and exiting;
+raise --drain-timeout-ms, or set it to 0 to wait indefinitely
+```
+
+The third line is the one to read. It means the node left with sessions still attached, which is a
+statement about your clients rather than about the node: a connection pool, a `SUBSCRIBE` stream
+(#45) or a monitoring probe holds a session open indefinitely, and an idle session never ends by
+itself. Measured on an i3-7100U: **0.11 s** to exit with nothing connected, and — before this bound
+existed — **still running after 60 s** with one idle client attached (#106).
+
+Two consequences for whoever supervises the process:
+
+- **the exit code is 0 in both cases.** A node that cut sessions still shut down cleanly, flushed
+  and checkpointed; the count in that WARN line is how you tell the two apart, not the exit status.
+- **a bound shorter than your supervisor's is what keeps a stop graceful.** systemd's
+  `TimeoutStopSec` defaults to 90 s, so the 10 s default is comfortably inside it; if you raise
+  `--drain-timeout-ms` past your unit's timeout, systemd `SIGKILL`s the node and the flush this path
+  exists for does not run. `0` keeps the pre-#106 behaviour and has to be asked for.
+
+Clients see a session closed without a reply for whatever was in flight when the deadline passed.
+There is no protocol-level "shutting down" message on an established session — a client that needs
+one should treat a closed connection during a maintenance window as exactly that, and retry.
+
 ## Security
 
 **Everything is off by default, and a node nobody configured is plaintext and unauthenticated on

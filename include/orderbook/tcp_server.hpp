@@ -11,6 +11,7 @@
 #include "orderbook/tls.hpp"
 #include "orderbook/subscription_hub.hpp"
 
+#include <chrono>
 #include <atomic>
 #include <map>
 #include <set>
@@ -47,6 +48,20 @@ struct ServerConfig {
     /// recovery has to deal with — and because a test of that recovery needs to be
     /// able to widen the window instead of racing a hardcoded 100 ms.
     uint64_t    flush_interval_ms{100};   // --flush-interval-ms
+
+    /// How long a shutdown waits for open client sessions before closing them itself.
+    ///
+    /// Bounded by default, and the default is the point: on `SIGTERM` the listener closes at once
+    /// and the loop then waits for every existing session to end. Measured on this machine
+    /// (roadmap #106): **0.11 s** to exit with nothing connected, and **still running after 60 s**
+    /// with one *idle* client attached — because an idle client never leaves. A long-lived client
+    /// is the normal case for a database (a connection pool, a `SUBSCRIBE` stream, a monitor), so
+    /// with no bound a supervisor reaches its own timeout and sends `SIGKILL`, which is exactly
+    /// when the flush and checkpoint this path exists for do not run.
+    ///
+    /// `0` keeps the old behaviour — wait for ever — and has to be asked for, because the default
+    /// is what a supervisor meets.
+    uint64_t    drain_timeout_ms{10000};  // --drain-timeout-ms (0 = wait indefinitely)
 
     // Replication (primary)
     uint16_t replication_port{0};       // 0 = disabled
@@ -233,6 +248,29 @@ struct LoadedTlsContexts {
 LoadedTlsContexts load_tls_or_exit(const ServerConfig& config);
 
 // ── TcpServer ─────────────────────────────────────────────────────────────────
+
+/// What a draining loop should do this pass.
+enum class DrainVerdict {
+    KeepWaiting,       ///< sessions are still open and the deadline has not passed
+    AllSessionsClosed, ///< nothing is connected; stop cleanly
+    DeadlineReached,   ///< the bound expired with sessions still open; close them and stop
+};
+
+/// The drain decision, shared by both transports because it exists in both of them.
+///
+/// `io_uring_server.cpp` checks `draining_ && active_sessions <= 0` in **two** places and the epoll
+/// loop in one, none of which had a deadline (#106) — and **no CI job builds the io_uring file**, so
+/// a bound written three times could not even be compiled on one of the two sides. This repository
+/// has paid for "the fix exists and is used at one of two sites" in #91 (`c_api.cpp` beside the
+/// server), #101 (two wipe sites) and #102 (two entry points), so the decision lives here once and
+/// a static test refuses a drain check that does not come through it.
+///
+/// Pure: the caller logs, because only the caller knows which transport it is and how many sessions
+/// it is about to cut.
+DrainVerdict drain_verdict(std::chrono::steady_clock::time_point drain_started,
+                           int active_sessions,
+                           uint64_t drain_timeout_ms,
+                           std::chrono::steady_clock::time_point now);
 
 class TcpServer {
 public:

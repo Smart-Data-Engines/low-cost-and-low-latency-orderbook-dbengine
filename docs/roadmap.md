@@ -1975,6 +1975,144 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 108. No CI job builds the io_uring transport
+
+Named in the caveats for a while, and #106 turned it from a gap into a demonstration: the drain fix
+touched `src/io_uring_server.cpp`, and the first version of that change stored `draining_` with
+`memory_order_relaxed` after writing a **non-atomic** `drain_started_at_` — a data race, and the
+exact class `ThreadSanitizer` exists to report. It would not have reported it, because no job
+compiles that file, let alone instruments it. The defect was caught by building the transport by
+hand (`-DOB_USE_IO_URING=ON`) as part of finishing the item, which is a mechanism that works only
+when somebody remembers.
+
+What the gap costs today, measured rather than assumed: the file **does** compile
+(`cmake -DOB_USE_IO_URING=ON`, clean, no warnings) and its tests do not exist — so the honest claim
+is that nothing checks it changes, not that it is broken. Three things already lean on it:
+
+- `--tls-*` flags are **refused** on this transport partly because "no CI job builds that file", so
+  a surface that should work is one nobody has run (#30 part three);
+- the drain decision is shared with the epoll loop and pinned by a **static** test precisely because
+  a behavioural one cannot run here (#106);
+- `execute_command` is reachable from it, which #30 part one had to guard statically for the same
+  reason.
+
+A build-only job is the cheap half and would have caught today's defect. It is not free: a new
+required context means editing `.github/rulesets/master.json`, `PUT`ting it, **reading it back**,
+and fixing the count wherever prose states it — twelve becomes thirteen (pitfall 86). Running its
+tests is the larger half and needs a decision about which of them can bind a port on a runner that
+may not have `io_uring` available at all.
+
+- Effort: S for the build, M with tests | Impact: a transport whose changes nothing verifies, in a
+  repository whose whole argument is that the mechanisms are checked
+
+
+### 107. The wire parser accepts trailing tokens on `INSERT` and `MINSERT`
+
+Found while measuring what an older server would do with the extra field #105 needs.
+
+```
+INSERT AAA EX bid 100 5 1 1700000000000000000   -> OK
+INSERT AAA EX bid 100 5 1 notanumber            -> OK
+MINSERT AAA EX bid 1 1700000000000000000        -> OK
+```
+
+All four were accepted and all four stored a row. The parser reads the fields it knows and ignores
+the rest, which is **pitfall 27 on the wire protocol** — the same class #36 closed for command-line
+flags, where `--prot 5599` was silently skipped and `--port 99999` was cast down to 34463. The CLI
+got a parser that refuses what it does not understand; the wire never did.
+
+Two consequences, and the second is why this is filed on its own rather than inside #105:
+
+- an operator's typo is accepted. `INSERT SYM EX bid 100 5 1 extra` is a row stored with something
+  the sender meant to matter, discarded without a word.
+- **it decides #105's client design.** An upgraded client sending a timestamp to an older server
+  gets `OK` and the value is dropped — which is exactly the defect #105 is about, one layer out. So
+  the client cannot rely on the server refusing the extra field, and has to ask what it is talking
+  to. Refusing trailing tokens is what makes a future field's absence loud instead of silent.
+
+The refusal has to name the token rather than the count, because "too many arguments" sends an
+operator counting spaces.
+
+- Effort: S | Impact: a mistyped write is accepted in silence, and every future wire field inherits
+  the same silence
+
+
+### 106. A node with a connected client never exits on `SIGTERM` ✅
+
+Measured, i3-7100U, Release, and the two halves are one command apart:
+
+| | time to exit on `SIGTERM` |
+|---|---|
+| no client connected | **0.11 s**, code 0 |
+| one **idle** client connected | **still running after 60 s** |
+
+Not a hang, and the distinction is the item: on `SIGTERM` the listener closes at once — a new
+connection is refused immediately — and the process then waits for **every existing session to
+close**, exiting 0.00 s after the last client disconnects. The draining is deliberate and right; what
+is missing is a **bound**. As written, one long-lived client keeps a node alive for ever, and a
+long-lived client is the normal case for a database: a connection pool, a `SUBSCRIBE` stream (#45), a
+monitoring client.
+
+What that costs, in the order an operator meets it:
+
+- **systemd turns the graceful stop into a hard kill.** `TimeoutStopSec` defaults to 90 s, after
+  which the unit is `SIGKILL`ed — so the shutdown path that exists to flush and checkpoint is the
+  one thing that does not get to run. That is #102's argument about exit modes, arriving from the
+  other end: there the exit code lied about a configuration error, here the exit mode is decided by
+  whoever happens to be connected.
+- **the integration harness has been hiding it.** `_stop_node()` is "SIGTERM → wait 5 s → SIGKILL",
+  silently, so every node with a client attached has been hard-killed for as long as that helper has
+  existed. `scripts/bootstrap-cluster.sh` escalates too and at least says so (pitfall 88).
+- **a rolling upgrade (#56) cannot be graceful** while any client holds a connection.
+
+**The same defect is in both transports, which decides the shape of the fix.** `io_uring_server.cpp`
+checks `draining_ && active_sessions <= 0` in **two** places, neither with a deadline — and **no CI
+job builds that file**, so a fix written twice cannot even be compiled by CI on one of the two
+sides. This repository has paid for "the fix exists and is used at one of two sites" often enough to
+name it: `c_api.cpp` beside the server in #91, two wipe sites in #101, two entry points in #102. So
+the deadline belongs in **one helper both loops call**, with a static test refusing a drain check
+that does not go through it.
+
+The fix is a deadline rather than a mode switch: `--drain-timeout-ms`, default **10 s**, after which
+the loop closes what is left and exits — logging how long it waited and **how many sessions it
+cut**, because that count is the difference between "the clients left" and "the node left". `0`
+keeps the old behaviour and has to be asked for. PostgreSQL's three shutdown modes are the
+reference; ours implemented only "smart", with the timeout at infinity.
+
+**Measured after the fix**, same machine, same three cases:
+
+| | before | after |
+|---|---|---|
+| nothing connected | 0.11 s, code 0 | **0.11 s**, code 0 — unchanged, which is the control |
+| one idle client, default bound | still running after 60 s | **10.15 s**, code 0, `Drain deadline of 10000 ms reached with 1 session(s) still open` |
+| one idle client, `--drain-timeout-ms 2000` | — | **2.12 s**, code 0 |
+| one idle client, `--drain-timeout-ms 0` | — | still running after 4 s, and it leaves the moment the client does |
+
+The exit is a clean **0** in every case: a node that cut sessions still flushed and checkpointed, so
+the count in the WARN line is what tells the two apart rather than the exit status.
+
+**The decision lives in one function both transports call**, because the io_uring half is in a file
+no CI job builds and a bound written three times is a bound that drifts. `drain_verdict()` is pure
+and takes the clock as an argument, so its four cases are unit tests rather than sleeps; a static
+test over both sources requires each to consult it and refuses any line that pairs `draining_` with
+`active_sessions` on its own.
+
+**And the harness was hiding it, so the harness changed too.** `_stop_node()` is "SIGTERM, then
+SIGKILL after five seconds", silently — and the server's new default of 10 s is *longer* than that,
+so the default would have kept the whole battery on the killing path. Every node the integration
+suite starts now carries `--drain-timeout-ms 2000`, which puts the drain inside the escalation
+window: from this change on, two hundred tests exercise the graceful path on the way out instead of
+being killed.
+
+Three integration tests, each with its control: a node with a client attached leaves and **says what
+it cut** (2.2 s measured), an empty node leaves well inside its budget (0.2 s — if it took the whole
+budget the bound would be a sleep rather than a deadline), and `0` is still there for a deployment
+that would rather hang than cut a session.
+
+- Effort: S | Impact: every node with a client attached is `SIGKILL`ed by its supervisor instead of
+  shutting down, which is exactly when the flush and checkpoint matter
+
+
 ### 105. Nothing can be written with its own event time over the wire
 
 Found by #39 part two, in the only way it could be found: by loading the same dataset into three
@@ -2367,6 +2505,21 @@ after.
 - Effort: M | Impact: a restarted replica keeps its store, and the window in which it served
   incomplete reads reporting success is gone
 
+
+**Correction, 11 September, to the ceiling test this item added.**
+`APeerThatAsksAndNeverReadsIsDroppedRatherThanBuffered` asserted that the test's own `send()` fails
+— and that is a **symptom**, not the property. The property is that the connection ends, and from
+outside it shows three ways: a send that fails, a read that returns zero, or the peer's FIN arriving
+while nobody is reading. On this machine the drop lands *after* the send loop finishes, so the test
+failed **eight times in a row** against a binary byte-identical to master's, in runs whose own log
+said `disconnecting replica fd=7: not draining its stream-identity answers`. It had passed three
+times earlier the same day. A probe printed `replicas=0` with `hung_up=0`: the record was gone and
+the sender had not noticed, which is the whole defect in one line.
+
+It polls `POLLRDHUP` now, and that choice is load-bearing rather than stylistic: **reading the
+answers would make this socket a well-behaved peer**, which is the one thing this test must not
+become. Eight of eight afterwards. Same shape as pitfall 54 — an assertion on an ordering between
+two independent things — and the engine was right throughout.
 
 ### 100. A record broadcast between `accept()` and the handshake is delivered twice ✅
 
@@ -4194,9 +4347,14 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**One defect is open, and #39 part two is what found it.** #105 — nothing can be written with its
-own event time over the wire, so the engine's main query selects on arrival time; measured as 0 rows
-of 400 where two SQL systems returned 400. Before it, the last two closed in order. #103 had a behavioural symptom and its own
+**Three defects are open, and this session found all four of them** — one is already closed — the usual way here, by measuring the
+item before. #105: nothing can be written with its own event time over the wire, so the engine's
+main query selects on arrival time (0 rows of 400 where two SQL systems returned 400). #106 was the same shape in the other
+direction and is **closed**: a node with any client connected never exited on `SIGTERM`, so its
+supervisor killed it instead — 0.11 s against never, now 10.15 s with the cut named in the log.
+#107: the wire parser accepts trailing tokens, which is both an operator trap and
+the reason #105's client cannot tell an older server apart. Before them, the last two closed in
+order. #103 had a behavioural symptom and its own
 measurement moved the fix: seeding the client from the engine would have missed the commonest case,
 so the number moved out of the replication client altogether. #104 deliberately had none — a field
 written at one site and read at none, whose docstring claimed a guarantee that in fact comes from
@@ -4219,6 +4377,8 @@ performance claim is the reason this repo exists.
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
 | **P1** | Event time over the wire (#105) | M | The engine's central query is a time range, and every record written over a network carries arrival time instead — measured as 0 rows of 400 where ClickHouse and TimescaleDB returned 400. The argument that looks like the fix (`insert(timestamp_ns=…)`) is accepted and discarded |
+| **P2** | Build the io_uring transport in CI (#108) | S | Nothing compiles that file, and #106's own fix shipped a `relaxed` store beside a non-atomic write into it — caught by building it by hand, which is a mechanism that works when somebody remembers |
+| **P2** | The wire parser refuses trailing tokens (#107) | S | `INSERT AAA EX bid 100 5 1 notanumber` answers `OK`; pitfall 27's class on the protocol, and it is what decides whether #105's client can tell an older server apart |
 | **P2** | The unexplained node death behind #86's third occurrence | S | An `UNREACHABLE` that needs nothing listening, on a node whose epoll thread is merely busy; the OOM-kill hypothesis is untested and the harness should name an unexplained death |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
@@ -4364,8 +4524,8 @@ Measured on machine B, on the commit that carries this table, rather than carrie
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 991 | all passing, ~205 s with `ctest -j1` on machine B. `ctest -N` reports 993: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
-| Python integration | 200 | passing, plus 2 skipped, on i3-7100U in **13:03 measured**. The two skips are the Binance tests, opt-in on a live feed (`OB_BINANCE_TESTS=1`), and they are **collection-time** skips (`pytest.skip(allow_module_level=True)`) — so they are not in the 200, produce no progress character, and the suite's own report plugin says `0 skipped` while pytest says 2. This row read 190 until it was recounted; if you recompute it, count what pytest reports rather than what `--collect-only` does. **No xfails left**: #60's and #61's markers both fell with their fixes |
+| C++ (GTest + RapidCheck) | 995 | all passing, ~205 s with `ctest -j1` on machine B. `ctest -N` reports 997: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
+| Python integration | 203 | passing, plus 2 skipped, on i3-7100U in **13:03 measured**. The two skips are the Binance tests, opt-in on a live feed (`OB_BINANCE_TESTS=1`), and they are **collection-time** skips (`pytest.skip(allow_module_level=True)`) — so they are not in the 203, produce no progress character, and the suite's own report plugin says `0 skipped` while pytest says 2. This row read 190 until it was recounted; if you recompute it, count what pytest reports rather than what `--collect-only` does. **No xfails left**: #60's and #61's markers both fell with their fixes |
 
 `ctest -j1` is not a preference. The network tests bind ports, so a parallel run fails for a reason
 that has nothing to do with the code under test.
