@@ -2130,6 +2130,15 @@ twice is negotiation rather than tolerance (`STREAMID?` in #101, `capabilities:`
 Recorded here rather than filed as an item: there is no defect to reproduce today, and the fix for
 the future one is a handshake, not a token count.
 
+**The refusal's log line needed bounding, and that is part of the item rather than a footnote.** A
+refused command is reachable **before authentication** — `allowed_before_authentication()` lets an
+unparseable line through precisely because it is refused anyway — so a WARN per refused line is a
+flood any peer who can reach the port can drive at line rate, which is #95's shape (a permanent
+failure retried at loop frequency and logged with it). The halves are split by who knows what: the
+parser says *what* is wrong at DEBUG, being pure and having no fd to name; `execute_command` says
+*who* sent it at WARN, **once per connection**, naming the fd. Every refusal increments
+`ob_refused_commands_total`, which is the alertable half — a working client produces none of them.
+
 **Mutation corrected the design, not just the tests: fourteen mutations, thirteen killed, and the
 survivor is the control.** The one that mattered was mine. The first version wrote "no maximum" as
 `kFreeForm = size_t(-1)` and guarded with `max_tokens != kFreeForm && tokens.size() > max_tokens` —
