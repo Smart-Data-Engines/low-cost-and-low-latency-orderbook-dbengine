@@ -1975,6 +1975,53 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 110. The interactive CLI drops what it does not understand, and guesses the side
+
+Found while closing #107, on the surface where a human actually types. `tools/ob_cli.cpp` parses its
+own arguments with `istringstream >>` and embeds the engine directly, so the wire's new refusal does
+not reach it:
+
+```
+ob> insert AAA EX sideways 6500000 1500
+OK  seq=1  sideways AAA@EX  price=6500000 qty=1500      <- the word is echoed back
+ob> insert BBB EX bid 6400000 1400 1 1700000000000000000
+OK  seq=2  bid BBB@EX  price=6400000 qty=1400            <- the event time is dropped
+
+ob> query SELECT side, price, quantity FROM 'AAA'.'EX' ...
+  1789194659676840286  | bid  | 0 | 6500000 | 1500 | 1 | 1     <- stored as a bid
+```
+
+Measured, not read: the confirmation line echoes **`sideways`** as though it were a side, and the
+row is a **bid**. An echo that repeats the typo back is worse than silence, because it is the exact
+place a human looks to check that the tool understood. The second line drops the event time the same
+way the wire did before #107 — the row's `ts_ns` is arrival time.
+
+The side is the sharper half and it is not about trailing tokens at all:
+`side_str == "ask" || side_str == "ASK" ? SIDE_ASK : SIDE_BID` makes **every** word that is not
+exactly `ask` or `ASK` a bid. `Ask`, `asks`, `sell`, `sideways` and a typo all store the opposite
+side of the book from the one that was typed, with no message. The wire refuses that same word
+(`ERR unexpected token`… since #107, and an invalid side was already refused before it) — so the
+tool built for a human is the one that guesses. The same ternary appears three times, and two more
+handlers (`bulk`, and the loader at line 264) read arguments the same way.
+
+**A third silence in the same tool, found by running it:** `ob_cli --data-dir /tmp/x` prints
+`Data directory: --data-dir` and opens a store in a directory of that name, because the whole of
+argv handling is `if (argc > 1) data_dir = argv[1];`. An unknown flag becomes the data directory,
+which is #36's `--prot 5599` with a filesystem attached — and the reason it went unnoticed is that
+the tool's own usage line says `ob_cli [data_dir]`, so nobody who read the help would type a flag.
+
+Why this is filed rather than folded into #107: it is a different surface with a different testing
+question. Nothing in this repository exercises the interactive CLI — `tests/test_cli_args.cpp` and
+`tests/test_cli_config.cpp` are about the *server's* flags — so the fix needs somewhere to prove
+itself first, and inventing that is the larger half of the work. #36 is the precedent for what
+"refuses what it does not understand" should look like here, and it also warns what happens without
+a test: its own negation table was built on a premise read from a default rather than from the
+parser, and a static test deleted all three pieces.
+
+- Effort: S for the refusals, M with a harness that can drive the CLI | Impact: the tool a human
+  types into stores the wrong side of the book for a mistyped word, in silence
+
+
 ### 109. Tests bound fixed ports inside the range the kernel hands to anybody ✅
 
 Found while verifying #107, and the diagnosis is the point: **seven tests failed against a tree
@@ -4470,7 +4517,7 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**One defect is open, and this session found all four of them** — three are already closed — the
+**Two defects are open, and this session found all five of them** — three are already closed — the
 usual way here, by measuring the item before. #105: nothing can be written with its own event time over the wire, so the engine's
 main query selects on arrival time (0 rows of 400 where two SQL systems returned 400). #106 was the same shape in the other
 direction and is **closed**: a node with any client connected never exited on `SIGTERM`, so its
