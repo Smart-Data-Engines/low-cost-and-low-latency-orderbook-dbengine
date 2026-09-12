@@ -2158,10 +2158,26 @@ answered `ERR WALWriter: write failed: No space left on device`, the row is not 
 keeps serving, and `SIGTERM` still exits 0. Measured, including a disk that stays full: every
 `INSERT` refused with the reason named, `PING` still answered.
 
-The WAL writes that are **not** on a session thread have no such handler. `Engine::flush_loop()`
-runs with no `try`, and two records reach the WAL from it: a 24-byte checkpoint from
-`flush_write_and_merge()` and a 68-byte version vector from `persist_version_vector_if_changed()`.
-Failing either one:
+The WAL writes that are **not** on a session thread have no such handler — and the scope of that is
+wider than this item first said. **Eleven of eleven thread entry points in this engine have no
+exception boundary**, measured by locating each function used to construct a `std::thread` and
+walking its body: `Engine::flush_loop`, `MetricsServer::run_loop`, `FailoverManager::monitor_loop`,
+`PeerRegistry::watch_loop`, `PeerRegistry::lease_loop`, `MultiMasterManager::io_loop`,
+`MultiMasterManager::reconnect_loop`, `AntiEntropyManager::loop`, `ShardRouter::watch_loop`,
+`ShardCoordinator::watch_loop` and `OrderbookPool::health_check_loop`. Not one contains a `try`.
+Any exception escaping any of them ends the process, and this engine throws `std::runtime_error`
+from the WAL, the mmap store, the columnar store and several parsers.
+
+So the measured abort is one **reachable instance of a class**, which makes the fix a class fix: an
+exception boundary at every thread entry, each logging what happened and deciding what its own
+subsystem does next, plus a static test that refuses a twelfth thread without one — the shape #104's
+checker took. `src/async_snapshot.cpp` already reasons about exactly this in a comment ("a joinable
+`std::thread` calls `std::terminate`, and losing one snapshot beats losing the process"), in one
+place, for one thread.
+
+The instance that was measured: two records reach the WAL from `flush_loop`, a 24-byte checkpoint
+from `flush_write_and_merge()` and a 68-byte version vector from
+`persist_version_vector_if_changed()`. Failing either one:
 
 ```
 terminate called after throwing an instance of 'std::runtime_error'
@@ -2187,8 +2203,10 @@ No acknowledged write is lost, which is worth stating because it bounds the dama
 and a restart, replay returned every row that had been answered `OK` and none that had been refused.
 This is an availability defect, not a durability one.
 
-- Effort: S | Impact: the most ordinary disk condition there is turns a refusal into a crash loop on
-  a node that was still answering its clients correctly
+- Effort: M, once the scope is eleven threads rather than one loop | Impact: the most ordinary disk
+  condition there is turns a refusal into a crash loop on a node that was still answering its
+  clients correctly — and every other throwing path in the engine reaches the same exit through one
+  of the other ten threads
 
 ### 111. A dial test's premise was a claim about the machine, and the machine changed ✅
 
