@@ -1750,6 +1750,14 @@ Learned the hard way. Check here before debugging.
     workspace, and the first one aimed at a mechanism rather than at a result: **when you mutate to
     prove a guard fires, name the target that compiles the file** (#107).
 
+212. **A test that quotes a message pins the wording; the property is usually one clause of it.**
+    My own #107 integration test asserted `"unexpected token 'surprise'" in reply`. Two days later
+    #105 made the seventh token a field, so the same line is refused as an *invalid event time* —
+    same rule, different sentence, and the test went red for a change that strengthened the thing
+    it was guarding. It asserts `"'surprise'" in reply` now, which is the rule: **the refusal names
+    the token**. Quote a phrase only where the phrase is the contract (`ERR STALE_PRIMARY`), and
+    where it is prose, assert the clause that carries the guarantee (#105, #107).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
