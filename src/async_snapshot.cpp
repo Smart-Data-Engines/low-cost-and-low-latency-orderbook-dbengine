@@ -1,4 +1,5 @@
 #include "orderbook/async_snapshot.hpp"
+#include "orderbook/thread_boundary.hpp"
 
 #include "orderbook/logger.hpp"
 
@@ -51,7 +52,11 @@ bool AsyncSnapshotBuilder::start(uint64_t token, Producer produce) {
     result_  = Result{};
 
     try {
-        worker_ = std::thread([this, token, produce = std::move(produce)]() mutable {
+        // The inner try below catches what `produce()` throws and records it in the
+        // result. It does not cover the statements above it, nor the mutex taken after
+        // it to publish - a `std::system_error` from that lock would still have ended
+        // the process. Named and wrapped for the same reason as the diff size above.
+        auto work = [this, token, produce = std::move(produce)]() mutable {
             const auto t0 = std::chrono::steady_clock::now();
 
             Result r;
@@ -85,6 +90,9 @@ bool AsyncSnapshotBuilder::start(uint64_t token, Producer produce) {
             OB_LOG_INFO("async_snapshot", "Worker finished token %llu in %.1f ms",
                         static_cast<unsigned long long>(token), ms);
             if (notify_) notify_();
+        };
+        worker_ = std::thread([work = std::move(work)]() mutable {
+            run_thread_body("async_snapshot", "worker", work);
         });
     } catch (const std::system_error& e) {
         running_ = false;

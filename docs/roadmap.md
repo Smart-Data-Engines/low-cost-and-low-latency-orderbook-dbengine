@@ -2150,7 +2150,7 @@ direction.
 - Effort: S for the reporting, M if the policy is to be honest about what it can still promise |
   Impact: the durability guarantee the engine advertises is currently unverifiable by its client
 
-### 112. An ENOSPC on the flush thread's WAL write aborts the whole node
+### 112. An ENOSPC on the flush thread's WAL write aborts the whole node ✅
 
 Found by roadmap #54's fault injector. **The client-facing half of this is correct**, which is what
 makes the rest dangerous: an `ENOSPC` on a delta record written by a client's own session is
@@ -2225,10 +2225,45 @@ No acknowledged write is lost, which is worth stating because it bounds the dama
 and a restart, replay returned every row that had been answered `OK` and none that had been refused.
 This is an availability defect, not a durability one.
 
-- Effort: M, once the scope is eleven threads rather than one loop | Impact: the most ordinary disk
-  condition there is turns a refusal into a crash loop on a node that was still answering its
-  clients correctly — and every other throwing path in the engine reaches the same exit through one
-  of the other ten threads
+**Done in two layers, and the mutation table is what says both are needed.**
+
+`run_thread_body(component, name, body)` in `include/orderbook/thread_boundary.hpp` wraps **all
+seventeen** thread bodies at the point each is constructed. Fifteen were a one-line wrap; the two
+long lambdas — `coordinator.cpp`'s 54-line watch and `async_snapshot.cpp`'s 35-line worker — were
+named first and wrapped second, because indenting their bodies would have produced a diff in which
+the one changed thing is invisible. `tests/test_thread_boundaries.cpp` holds the rule: every
+`std::thread` construction in `src/` has `run_thread_body` inside its parentheses. It asserts the
+**count** of constructions as well, because a rule that stopped matching would report a clean tree.
+Six of its seven tests are the rule's own cases, each one a mistake it made before it shipped.
+
+An outer boundary alone stops the process dying and leaves a subsystem that ends on its first
+exception. So `flush_loop` also guards **one tick at a time**: the tick moved into
+`Engine::flush_tick()` (no `continue`, `break` or `return` in it, which is what made that
+mechanical), a failure increments `ob_flush_errors_total`, and the log is loud once and then quiet —
+a permanently full disk would otherwise write an ERROR every interval for the life of the process,
+which is #95's shape. The episode is closed by a recovery line, so silence never means the problem
+went away.
+
+| mutation | verdict |
+|---|---|
+| both boundaries present | the regression test passes |
+| the per-iteration boundary removed | fails: *the tick failed but nothing counted it, so an operator watching a full disk would see a node that looks healthy* |
+| both removed | fails: *the node died on a failing flush tick, exit -6*, `what(): WALWriter: write failed: No space left on device` |
+
+The middle row is the one worth having. The process survives on the outer boundary alone — and the
+flush thread is gone for the life of that process while every client-facing symptom looks fine.
+
+**What is not done, named rather than left to be found.** `lease_loop`, `monitor_loop` and
+`io_loop` have the outer boundary only, so an exception there ends that subsystem rather than the
+process: a node whose lease loop stopped disappears from the mesh when its registration expires,
+one whose monitor loop stopped never learns about a role change (#82's shape), and one whose io
+loop stopped is out of the mesh entirely. Each needs its own judgement about what continuing means
+— and `io_loop` additionally needs a bound, because its epoll timeout is zero whenever a catch-up
+cursor has queue space (#93), so a per-iteration throw there would spin rather than pace itself.
+Doing that without a measurement to drive it would be guesswork; it is a separate piece of work.
+
+- Effort: M | Impact: the most ordinary disk condition there is no longer turns a refusal into a
+  crash loop, and the sixteen other threads that shared the exit are closed by the same change
 
 ### 111. A dial test's premise was a claim about the machine, and the machine changed ✅
 
@@ -4942,11 +4977,12 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Two defects are open, and #54's fault injector found both.** #112 — an `ENOSPC` on the flush
-thread's WAL write aborts the node, in a crash loop, while the client-facing path handles the same
-condition correctly — and #113 — `fsync`'s result is discarded in all seven places, so
-`--fsync-policy every` acknowledges writes it did not sync. Everything recorded before them is
-closed: #108's build job closed the last gap in compilation coverage, without claiming runtime
+**Two defects are open, and #54's fault injector found all three of them.** #113 — `fsync`'s result
+is discarded in all seven places, so `--fsync-policy every` acknowledges writes it did not sync —
+and #114, the `MmapStore` with tests and no caller. #112 is closed: an `ENOSPC` on the flush
+thread's WAL write used to abort the node in a crash loop while the client-facing path handled the
+same condition correctly, and all seventeen thread bodies now have an exception boundary.
+Everything recorded before them is closed: #108's build job closed the last gap in compilation coverage, without claiming runtime
 coverage of io_uring, and #111 closed a test whose premise was a claim about the machine rather
 than about the engine. #110's first CI run also verified the
 value of the skip gate: seven new CLI tests did not run until both integration jobs built the CLI

@@ -4,6 +4,7 @@
 // Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6
 
 #include "orderbook/anti_entropy.hpp"
+#include "orderbook/thread_boundary.hpp"
 #include "orderbook/engine.hpp"
 #include "orderbook/logger.hpp"
 
@@ -38,7 +39,7 @@ void AntiEntropyManager::start() {
                 "Starting anti-entropy loop: interval=%u seconds",
                 config_.interval_seconds);
 
-    thread_ = std::thread([this] { loop(); });
+    thread_ = std::thread([this] { run_thread_body("anti_entropy", "loop", [this] { loop(); }); });
 }
 
 // ── stop ──────────────────────────────────────────────────────────────────────

@@ -8,6 +8,7 @@
 // close(): stop flush thread + final flush + flush_segment + WAL flush.
 
 #include "orderbook/engine.hpp"
+#include "orderbook/thread_boundary.hpp"
 #include "orderbook/crc32c.hpp"
 #include "orderbook/logger.hpp"
 
@@ -198,7 +199,9 @@ void Engine::open() {
 
     // Start background flush thread.
     stop_flush_.store(false, std::memory_order_relaxed);
-    flush_thread_ = std::thread([this]() { flush_loop(); });
+    flush_thread_ = std::thread([this]() {
+        run_thread_body("engine", "flush_loop", [this] { flush_loop(); });
+    });
 }
 
 void Engine::close() {
@@ -1832,6 +1835,32 @@ void Engine::flush_loop() {
             }
         }
 
+        try {
+            flush_tick();
+            if (consecutive_flush_failures_ > 0) {
+                OB_LOG_INFO("engine", "flush_loop: flushing again after %llu failed tick(s)",
+                            static_cast<unsigned long long>(consecutive_flush_failures_));
+                consecutive_flush_failures_ = 0;
+            }
+        } catch (const std::exception& e) {
+            registry_.increment_counter("ob_flush_errors_total");
+            ++consecutive_flush_failures_;
+            // Loud once, then quiet: a disk that stays full would otherwise write this every
+            // interval for the life of the process (#95's shape). The recovery line above is what
+            // closes the episode, so silence here never means the problem went away.
+            if (consecutive_flush_failures_ == 1) {
+                OB_LOG_ERROR("engine", "flush_loop: this tick failed and the next one will be "
+                                       "attempted: %s", e.what());
+            } else {
+                OB_LOG_DEBUG("engine", "flush_loop: tick failed again (%llu consecutive): %s",
+                             static_cast<unsigned long long>(consecutive_flush_failures_),
+                             e.what());
+            }
+        }
+    }
+}
+
+void Engine::flush_tick() {
         // The whole tick is one flush, so a client FLUSH cannot interleave with it.
         std::lock_guard<std::mutex> flush_lock(flush_mtx_);
 
@@ -1882,8 +1911,8 @@ void Engine::flush_loop() {
                 }
             }
         }
-    }
 }
+
 
 void Engine::flush_drain_pending() {
     // Phase A: drain pending_rows_ into per-symbol columnar stores.

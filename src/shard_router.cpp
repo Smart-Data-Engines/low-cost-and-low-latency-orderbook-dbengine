@@ -1,6 +1,7 @@
 // ── ShardRouter — client-side shard routing implementation ───────────────────
 
 #include "orderbook/shard_router.hpp"
+#include "orderbook/thread_boundary.hpp"
 #include "orderbook/logger.hpp"
 
 #include <algorithm>
@@ -46,7 +47,9 @@ Result<void> ShardRouter::initialize() {
 
     // Start background watch thread
     running_.store(true, std::memory_order_release);
-    watch_thread_ = std::thread(&ShardRouter::watch_loop, this);
+    watch_thread_ = std::thread([this] {
+        run_thread_body("shard_router", "watch_loop", [this] { watch_loop(); });
+    });
 
     return Result<void>::ok();
 }

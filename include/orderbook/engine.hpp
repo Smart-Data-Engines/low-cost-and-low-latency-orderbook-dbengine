@@ -564,6 +564,21 @@ private:
     ColumnarStore& get_or_create_store(const std::string& symbol, const std::string& exchange);
     void flush_loop();
 
+    /// One flush: drain, segment I/O, gauge, WAL truncation and the TTL scan.
+    ///
+    /// Separated from the loop so the loop can put an exception boundary **around one tick** and
+    /// run the next one. Without that, the first `ENOSPC` from the WAL ends the flush thread for
+    /// the life of the process - which stops the node dying (#112) and leaves it never flushing
+    /// again, a guarantee absent in production rather than a crash. The tick contains no
+    /// `continue`, `break` or `return`, which is what made moving it out of the loop mechanical.
+    void flush_tick();
+
+    /// Consecutive failed ticks, so the log reports an episode rather than one line per interval.
+    ///
+    /// A permanently full disk would otherwise write an ERROR every flush interval for ever -
+    /// #95's shape, where a reconnect failure logged at loop frequency until the process died.
+    uint64_t consecutive_flush_failures_{0};
+
     /// Apply a DELTA record read back from the WAL during open().
     ///
     /// Does two things from apply_delta(): the SoA update and the pending-row enqueue.

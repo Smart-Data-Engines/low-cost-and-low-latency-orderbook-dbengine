@@ -38,6 +38,7 @@
 // Requirements: 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 3.1, 3.2, 3.3, 3.4, 3.5, 4.1, 4.2, 4.3, 4.4, 4.5, 6.2, 6.3
 
 #include "orderbook/replication.hpp"
+#include "orderbook/thread_boundary.hpp"
 #include "orderbook/compression.hpp"
 #include "orderbook/crc32c.hpp"
 #include "orderbook/engine.hpp"
@@ -471,7 +472,9 @@ void ReplicationManager::start() {
 
     // 5. Start epoll thread.
     running_.store(true, std::memory_order_release);
-    thread_ = std::thread([this]() { run_loop(); });
+    thread_ = std::thread([this]() {
+        run_thread_body("repl_mgr", "run_loop", [this] { run_loop(); });
+    });
 }
 
 void ReplicationManager::stop() {
@@ -1854,7 +1857,9 @@ void ReplicationClient::start() {
                 cf, static_cast<unsigned long>(co));
 
     running_.store(true, std::memory_order_release);
-    thread_ = std::thread([this]() { run_loop(); });
+    thread_ = std::thread([this]() {
+        run_thread_body("repl_client", "run_loop", [this] { run_loop(); });
+    });
 }
 
 void ReplicationClient::stop() {

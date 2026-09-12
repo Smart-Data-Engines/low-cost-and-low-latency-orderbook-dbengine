@@ -1,4 +1,5 @@
 #include "orderbook/metrics_server.hpp"
+#include "orderbook/thread_boundary.hpp"
 #include "orderbook/logger.hpp"
 
 #include <arpa/inet.h>
@@ -60,7 +61,9 @@ void MetricsServer::start() {
     }
 
     running_.store(true, std::memory_order_release);
-    thread_ = std::thread([this] { run_loop(); });
+    thread_ = std::thread([this] {
+        run_thread_body("metrics", "run_loop", [this] { run_loop(); });
+    });
 
     OB_LOG_INFO("metrics", "MetricsServer started on port %u", port_);
 }

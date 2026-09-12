@@ -374,6 +374,16 @@ ob_add_engine_test(test_port_discipline
 )
 
 # ── Whole-engine static checks ─────────────────────────────────────────────────
+# Every thread body goes through an exception boundary (#112). Reads `src/` rather than naming
+# threads, because the list of threads is exactly what a hand-written check got wrong: counted by
+# hand it was eleven, derived from the `std::thread` constructions it is seventeen.
+ob_add_engine_test(test_thread_boundaries
+    test_thread_boundaries.cpp
+)
+target_compile_definitions(test_thread_boundaries
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
 # Reads every header and source rather than naming classes: the shape it looks for (#104) was found
 # five times in this workspace while looking for something else, so the subject has to be the tree.
 ob_add_engine_test(test_field_usage
