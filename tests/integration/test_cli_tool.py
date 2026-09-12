@@ -29,9 +29,13 @@ from pathlib import Path
 
 import pytest
 
+from conftest import server_binary_path
+
 pytestmark = pytest.mark.smoke
 
-CLI = Path(__file__).resolve().parents[2] / "build" / "ob_cli"
+# Use the selected build even when its CLI is missing: falling back to build/ would test an
+# uninstrumented binary while the job claims ThreadSanitizer coverage (#110).
+CLI = Path(server_binary_path()).resolve().with_name("ob_cli")
 
 WIDEST = "WHERE timestamp BETWEEN 0 AND 9999999999999999999"
 
@@ -43,6 +47,8 @@ def run_cli(script: str, data_dir: str | None = None) -> str:
     with tempfile.TemporaryDirectory(prefix="ob_cli_test_") as tmp:
         proc = subprocess.run([str(CLI), data_dir or tmp], input=script + "quit\n",
                               capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, (
+            f"the CLI exited with {proc.returncode}:\n{proc.stdout}{proc.stderr}")
         return proc.stdout + proc.stderr
 
 
@@ -98,7 +104,8 @@ def test_an_unknown_flag_is_not_taken_for_a_data_directory():
     # mutation run left one there — a test asserting on shared state, which is the same class of
     # defect as the fixed ports in #109.
     with tempfile.TemporaryDirectory(prefix="ob_cli_flag_") as cwd:
-        proc = subprocess.run([str(CLI), "--data-dir", "/tmp/ob_cli_should_not_exist"],
+        unwanted = Path(cwd) / "value-should-not-exist"
+        proc = subprocess.run([str(CLI), "--data-dir", str(unwanted)],
                               capture_output=True, text=True, timeout=60, cwd=cwd)
         assert proc.returncode == 2, (
             f"an unknown flag started the tool anyway (rc={proc.returncode}):\n"
@@ -106,7 +113,7 @@ def test_an_unknown_flag_is_not_taken_for_a_data_directory():
         assert "unknown argument '--data-dir'" in proc.stdout + proc.stderr
         assert not (Path(cwd) / "--data-dir").exists(), (
             "the tool created a data directory named after the flag, which is what it used to do")
-        assert not Path("/tmp/ob_cli_should_not_exist").exists(), (
+        assert not unwanted.exists(), (
             "the tool created the directory the flag's value named, so it parsed neither")
 
 

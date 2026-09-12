@@ -2049,6 +2049,13 @@ Measured after, by running it: `insert AAA EX sideways 6500000 1500` is refused 
 **the symbol does not exist afterwards** — which is a stronger statement than "it was not stored as a
 bid". `insert CCC EX Ask 6400000 1400` is accepted and the row comes back on the **ask** side.
 
+The first CI run exposed a missing half of this coverage: all seven CLI tests skipped because the
+integration job built only the server and C++ client harness. Both integration jobs now also build
+`ob_cli`, and its fixture derives the sibling binary from `OB_SERVER_BINARY`, so the TSan job cannot
+quietly test an uninstrumented CLI from `build/`. The existing skip gate caught the omission.
+The test helper also checks the process exit status, and the flag-refusal test owns both paths it
+asserts were never created.
+
 Seven integration tests, each refusal with a control beside it, driving the binary with a script on
 stdin. Six mutations, five killed, and the survivor is the control — but not on the first run: the
 control was killed for a reason that had nothing to do with what it changed, because **my own test
@@ -2057,9 +2064,6 @@ in an assertion, which is #109's class in a new place; the test owns its working
 
 - Effort: S for the refusals, M with a harness that can drive the CLI | Impact: the tool a human
   types into stored the wrong side of the book for a mistyped word, in silence
-
-- Effort: S for the refusals, M with a harness that can drive the CLI | Impact: the tool a human
-  types into stores the wrong side of the book for a mistyped word, in silence
 
 
 ### 109. Tests bound fixed ports inside the range the kernel hands to anybody ✅
