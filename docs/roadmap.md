@@ -1993,6 +1993,49 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 111. A dial test's premise was a claim about the machine, and the machine changed ✅
+
+`PeerDial.AnUnreachablePeerAddressDoesNotStopTheNode` guards #97: a dial to an unreachable peer
+must not be holding the mesh mutex, so an inbound connection and a client write both have to
+complete while one is outstanding. It dialled the literal `10.9.9.7:7100`, under a comment stating
+that the address "is not routed on this machine".
+
+**That is a claim about the machine, not about the engine, and it stopped being true.** The host has
+a default route whose gateway answers ICMP "network unreachable", so the dial returned in about a
+second instead of hanging for `MM_CONNECT_TIMEOUT_MS`. Measured in the failing run:
+`Dial to peer 7 at 10.9.9.7:7100 failed: Network is unreachable (attempt #1)` 1.1 s after start,
+where the test's arithmetic assumes five.
+
+The assertion that failed was several lines away from the premise that broke, which is the expensive
+part. The bound on claimed attempts was `1 + dialling_ms / MM_CONNECT_TIMEOUT_MS` — one attempt per
+connect deadline — and with the dial failing fast the attempts came at the **backoff's** pace
+instead. Two attempts in a 1.7 s window is `ReconnectBackoff` working exactly as designed
+(`initial_delay_s` 1.0 s, jitter ±25%, so the earliest a second attempt can be claimed is 750 ms).
+The test called it a redial storm. **Measured, this is not a regression**: ten interleaved runs of
+the test in isolation, five on `9c32464` and five on the fuzzing branch, all pass — the failure
+needs the gateway to answer *and* the test to be slowed by a full suite so the second attempt lands
+inside its window.
+
+**Done, in two parts.** The premise is now **constructed rather than assumed**: a listening socket
+whose accept queue is deliberately filled, which drops further SYNs while
+`net.ipv4.tcp_abort_on_overflow` is 0, its default. No routing table participates, the port comes
+from the kernel and is held for the whole test — an ephemeral port we own cannot be handed to
+anybody else, which is what #109 was about. And the test **states the premise instead of relying on
+it**: it probes its own blackhole first and fails with "this machine will not hold a TCP connection
+open" rather than failing an assertion about attempt counts.
+
+The bound is now derived from the backoff schedule, which is the mechanism that actually paces
+attempts, so it holds whether a dial hangs or is refused outright. A storm is a redial every 100 ms,
+an order of magnitude away either way.
+
+`PeerDial.ADialRefusedOutrightDoesNotBecomeARedialStorm` is new and makes the broken case
+deterministic: nothing can listen on port 1 without root, so the kernel refuses immediately and no
+network cooperates. Against the bound it replaced, that test fails; against the new one it passes.
+
+- Effort: S | Impact: a required check stops being intermittently red for a reason that has nothing
+  to do with the code it gates — the class of block this repository has already paid for twice, in
+  the CodeQL outage and in the unretried etcd download
+
 ### 110. The interactive CLI drops what it does not understand, and guesses the side ✅
 
 Found while closing #107, on the surface where a human actually types. `tools/ob_cli.cpp` parses its
@@ -4662,8 +4705,9 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**No recorded defect remains open after #108.** Its build job closes the final gap in compilation
-coverage; it does not claim runtime coverage of io_uring. #110's first CI run also verified the
+**No recorded defect remains open after #111.** #108's build job closed the final gap in
+compilation coverage, without claiming runtime coverage of io_uring; #111 closed a test whose
+premise was a claim about the machine rather than about the engine. #110's first CI run also verified the
 value of the skip gate: seven new CLI tests did not run until both integration jobs built the CLI
 and the fixture selected the same build as the server.
 
