@@ -373,6 +373,45 @@ flag with no value fell through, a non-numeric value threw an uncaught `std::inv
 on a port nobody had named. If you have scripts passing flags this binary does not know, they will now
 fail instead of starting a server with a configuration you did not intend.
 
+## Wire commands: the same rule, since #107
+
+The wire protocol now refuses a command line carrying a token its grammar has no place for, and the
+refusal names the token:
+
+```
+C: INSERT BTC-USD BINANCE bid 6500000 150 1 1700000000000000000
+S: ERR unexpected token '1700000000000000000'; INSERT takes: INSERT <symbol> <exchange> <bid|ask> <price> <qty> [count]
+
+C: MINSERT BTC-USD BINANCE bid 1 1700000000000000000
+S: ERR unexpected token '1700000000000000000'; MINSERT takes: MINSERT <symbol> <exchange> <bid|ask> <n_levels>, then one <price> <qty> [count] line per level
+
+C: PING please
+S: ERR unexpected token 'please'; PING takes: PING
+```
+
+**All of those used to answer `OK`** — and the first three stored a row for a value the server
+discarded. Measured before the change: fourteen command shapes accepted a token nobody reads, five
+of them wrote it away, and `MM_CONFLICTS notanumber` quietly became `MM_CONFLICTS 100`. It is the
+same defect as the flag section above, one layer out: the parser read the fields it knew and ignored
+the rest.
+
+Three things are worth knowing if you write against this protocol:
+
+- **the count is not in the message, the token is.** "Too many arguments" sends you counting spaces.
+- **`SELECT` and `SUBSCRIBE` are not counted here**, because their tail is a query and the query
+  parser already refuses a trailing token by name (`ERR Parse error at line 1, col 26: unexpected
+  token 'garbage'`). The exemption is from counting, not from refusing.
+- **an `AUTH` line's extra token is refused without being repeated.** Every refusal writes a log
+  line, and a response echoed into a log is a response in a log.
+
+A level line of a `MINSERT` batch follows the same rule and the refusal says which line:
+`ERR unexpected token 'x' on level line 2; a level line takes: <price> <qty> [count]`.
+
+If you have a client sending a field this server does not know, it will now be told so instead of
+being answered `OK`. That is the point: an upgraded client sending an event time to an older server
+used to get `OK` with the time dropped, so it could not tell the difference between a server that
+stored it and one that did not (#105).
+
 ## Configuration file
 
 Thirty-seven flags is past the point where a command line is a reasonable way to configure a

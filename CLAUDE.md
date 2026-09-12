@@ -1664,6 +1664,37 @@ Learned the hard way. Check here before debugging.
     peer**, which is the one thing that test must not become. Pitfall 54's shape, in a test written
     by someone who knew about pitfall 54.
 
+201. **A parser that reads the fields it knows and ignores the rest accepts typos forever.**
+    Measured over a live server: of sixteen command shapes, **fourteen accepted a token nobody
+    reads** and five stored a row for it — `INSERT AAA EX bid 100 5 1 notanumber` answered `OK`.
+    This is pitfall 27 on the wire, the same class #36 closed for command-line flags, and it is
+    worse here because the discarded token is sometimes the one that mattered: an upgraded client
+    sending an event time to an older server got `OK` with the time dropped, so it could not tell a
+    server that stored it from one that did not (#107, #105).
+
+202. **Correct behaviour in one branch out of eighteen is indistinguishable from nobody having
+    decided.** `AUTH` already refused a trailing token — an exact `tokens.size() != 3` written by
+    whoever happened to think of it there — while seventeen other commands did not. So the fix is
+    one table rather than eighteen habits, and it is **indexed by `CommandType`**, which makes a
+    nineteenth command a *compile* error until it declares its arity. That is the same mechanism as
+    the missing `default:` in `allowed_before_authentication()`: a static test can be forgotten in
+    review, a `static_assert` cannot (#107).
+
+203. **When you build the table, do not give it a field nothing reads.** The arity table carries
+    only the **maximum**; each branch keeps its own minimum, because a branch that reads `tokens[5]`
+    needs the guard that makes the read safe. A minimum in the table would have been read by
+    nothing — a poor field to add in the same repository that spent #104 on the fifth instance of
+    exactly that shape. Ask it while designing, not while auditing (#107).
+
+204. **Measure the words, not only the behaviour.** Before writing the refusal I ran the same shape
+    past the query parser, which has answered this situation for years:
+    `ERR Parse error at line 1, col 26: unexpected token 'garbage'`. Borrowing those words costs
+    nothing and stops one protocol from saying one thing two ways — and the same measurement is what
+    turned `SELECT` and `SUBSCRIBE` from "not checked" into a genuine exemption from *counting*.
+    The one place the rule inverts is `AUTH`: a refusal writes a log line, so its extra token is
+    refused **without being repeated**, because a response echoed into a log is a response in a log
+    (#107).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

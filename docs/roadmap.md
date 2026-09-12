@@ -1975,6 +1975,51 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 109. Tests bound fixed ports inside the range the kernel hands to anybody ✅
+
+Found while verifying #107, and the diagnosis is the point: **seven tests failed against a tree
+whose only change was the command parser**, and the same seven passed when re-run on their own.
+
+```
+{"component":"mm","msg":"bind() failed on port 55400: Address already in use"}
+C++ exception with description "connect to mesh port failed" thrown in the test body.
+```
+
+Not `TIME_WAIT` — the mesh listener does set `SO_REUSEADDR`, and that is the case it covers. The
+squatter was an **active socket belonging to somebody else**: measured,
+`/proc/sys/net/ipv4/ip_local_port_range` is **32768–60999** on this machine and on a GitHub runner,
+and four test files named 47821, 54900, 55100 and 55400 — every one inside it. Any outgoing
+connection on the machine may be given one of those numbers at any instant, and 25 ephemeral ports
+were in use while that run was going. The odds changed with the **machine**, not with the code:
+ClickHouse and PostgreSQL were installed here the day before for #39, and ClickHouse alone keeps
+about a thousand threads.
+
+**Why this is an item rather than a re-run.** A required check that goes red for a reason unrelated
+to the code is indistinguishable from a finding until somebody reads the log — a bill this
+repository has paid twice already, once for a CodeQL outage and once for an etcd download with no
+retry. And the habit it teaches is the expensive part: a suite that needs luck trains its readers to
+press re-run, which is exactly how the next real failure gets through. It also came within one step
+of costing more than time: the first reading of those seven failures was "my parser change broke the
+mesh", and the file it points at is the one #96 and #97 came out of.
+
+The fix is one header, `tests/test_ports.hpp`, with a 100-wide block per test binary, all **below**
+the ephemeral floor — so only our own tests can collide, and that collision is visible in one file
+rather than spread across eleven. Three files were already safe (19876, 21876, 21987) and were moved
+into it too, because a file that keeps its own base is the one the next author copies. `test_ports`
+is no place for a fixed port to hide: `test_port_discipline` reads the floor **back from the
+kernel** rather than trusting the constant beside it — the constant is precisely the thing that
+would be wrong on the machine where this matters — and it fails, rather than skips, if the range
+ever starts below our blocks.
+
+What this deliberately does not do is convert these tests to OS-assigned ports. They hand a number
+to a component that binds it later, so there is nothing to ask the OS on behalf of; the number has
+to exist before the socket does. `test_mm_port_isolation` uses port 0 where that *is* possible, and
+that stays.
+
+- Effort: S | Impact: every network test on the suite was one unrelated outgoing connection away
+  from a red required check, and the first reading of that red is always "my change broke it"
+
+
 ### 108. No CI job builds the io_uring transport
 
 Named in the caveats for a while, and #106 turned it from a gap into a demonstration: the drain fix
@@ -2006,7 +2051,7 @@ may not have `io_uring` available at all.
   repository whose whole argument is that the mechanisms are checked
 
 
-### 107. The wire parser accepts trailing tokens on `INSERT` and `MINSERT`
+### 107. The wire parser accepts trailing tokens on `INSERT` and `MINSERT` ✅
 
 Found while measuring what an older server would do with the extra field #105 needs.
 
@@ -2032,6 +2077,51 @@ Two consequences, and the second is why this is filed on its own rather than ins
 
 The refusal has to name the token rather than the count, because "too many arguments" sends an
 operator counting spaces.
+
+**The title undersold it: the scope was the whole command set.** Measured over a live server before
+the change, sixteen shapes tried and **fourteen accepted a token nobody reads** — five of them
+storing a row for it:
+
+| sent | answered | stored |
+|---|---|---|
+| `INSERT AAA EX bid 100 5 1 1700000000000000000` | `OK` | 1 row |
+| `INSERT AAA EX bid 100 5 1 notanumber` | `OK` | 1 row |
+| `MINSERT DDD EX bid 1 1700000000000000000` + one level | `OK` | 1 row |
+| `MINSERT EEE EX bid 1` + `100 5 1 notanumber` | `OK` | 1 row |
+| `PING please` / `FLUSH now` / `ROLE primary` | `PONG` / `OK` / `STANDALONE` | — |
+| `COMPRESS LZ4 level9` / `UNSUBSCRIBE 1 now` | `OK COMPRESS LZ4` / `OK 0` | — |
+| `MM_CONFLICTS notanumber` | the default limit of **100** | — |
+
+After the fix: all sixteen refuse, and **zero rows** where five were stored.
+
+**The fix is a table, not two branches, and that is the whole difference between this and a patch.**
+Seventeen of eighteen commands read the fields they knew and ignored the rest. `AUTH` was the
+exception, through an exact `tokens.size() != 3` written by whoever happened to think of it there —
+and correct behaviour present in one place out of eighteen is indistinguishable from nobody having
+decided. `kGrammar` is **indexed by `CommandType`**, so a nineteenth command is a *compile* error
+until it declares its arity: the same mechanism as the missing `default:` in
+`allowed_before_authentication()`, which is what makes `-Wswitch` tell us about the next command.
+Only the maximum lives there — each branch keeps its own minimum, because a branch that reads
+`tokens[5]` needs the guard that makes the read safe, and a minimum in the table would be read by
+nothing, which is a poor field to add in the repository that spent #104 on the fifth one.
+
+Two things came along, both the same silence in another shape. A **level line** of a batch accepted
+`100 5 1 notanumber` and stored the level; its refusal names the line number, because a batch is up
+to `MAX_LEVELS` lines and "somewhere in there" is not an answer. And `MM_CONFLICTS notanumber`
+**silently became 100**, four lines above an `UNSUBSCRIBE` branch that already refuses exactly this,
+having learnt it from #36.
+
+**Wording measured rather than chosen:** the query parser already refuses a trailing token by name
+(`SELECT * FROM 'AAA'.'EX' garbage` → `ERR Parse error at line 1, col 26: unexpected token
+'garbage'`), so the command layer borrows its words and the protocol says one thing one way. That
+measurement is also what makes `SELECT` and `SUBSCRIBE` a genuine exemption from *counting* rather
+than an exemption from refusing. `AUTH`'s extra token is refused **without being repeated**: every
+refusal writes a log line, and a response echoed into a log is a response in a log.
+
+Ten unit tests and three integration tests, every refusal with a control beside it — a parser that
+refuses everything passes every refusal test. The unit tests read the exported `command_grammar()`
+rather than a second list of the same facts, which is the shape that cost #32 a flag, a negation
+table and a test built on a premise read from a default instead of from the parser.
 
 - Effort: S | Impact: a mistyped write is accepted in silence, and every future wire field inherits
   the same silence
@@ -4347,13 +4437,14 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Three defects are open, and this session found all four of them** — one is already closed — the usual way here, by measuring the
-item before. #105: nothing can be written with its own event time over the wire, so the engine's
+**One defect is open, and this session found all four of them** — three are already closed — the
+usual way here, by measuring the item before. #105: nothing can be written with its own event time over the wire, so the engine's
 main query selects on arrival time (0 rows of 400 where two SQL systems returned 400). #106 was the same shape in the other
 direction and is **closed**: a node with any client connected never exited on `SIGTERM`, so its
 supervisor killed it instead — 0.11 s against never, now 10.15 s with the cut named in the log.
-#107: the wire parser accepts trailing tokens, which is both an operator trap and
-the reason #105's client cannot tell an older server apart. Before them, the last two closed in
+#107 is **closed** and was larger than its title: fourteen command shapes accepted a
+token nobody reads and five of them stored a row for it, so the fix is an arity table a nineteenth
+command cannot compile without — and it is what lets #105's client tell an older server apart. Before them, the last two closed in
 order. #103 had a behavioural symptom and its own
 measurement moved the fix: seeding the client from the engine would have missed the commonest case,
 so the number moved out of the replication client altogether. #104 deliberately had none — a field
@@ -4378,7 +4469,6 @@ performance claim is the reason this repo exists.
 |----------|------|--------|---------|
 | **P1** | Event time over the wire (#105) | M | The engine's central query is a time range, and every record written over a network carries arrival time instead — measured as 0 rows of 400 where ClickHouse and TimescaleDB returned 400. The argument that looks like the fix (`insert(timestamp_ns=…)`) is accepted and discarded |
 | **P2** | Build the io_uring transport in CI (#108) | S | Nothing compiles that file, and #106's own fix shipped a `relaxed` store beside a non-atomic write into it — caught by building it by hand, which is a mechanism that works when somebody remembers |
-| **P2** | The wire parser refuses trailing tokens (#107) | S | `INSERT AAA EX bid 100 5 1 notanumber` answers `OK`; pitfall 27's class on the protocol, and it is what decides whether #105's client can tell an older server apart |
 | **P2** | The unexplained node death behind #86's third occurrence | S | An `UNREACHABLE` that needs nothing listening, on a node whose epoll thread is merely busy; the OOM-kill hypothesis is untested and the harness should name an unexplained death |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
@@ -4524,8 +4614,8 @@ Measured on machine B, on the commit that carries this table, rather than carrie
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 995 | all passing, ~205 s with `ctest -j1` on machine B. `ctest -N` reports 997: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
-| Python integration | 203 | passing, plus 2 skipped, on i3-7100U in **13:03 measured**. The two skips are the Binance tests, opt-in on a live feed (`OB_BINANCE_TESTS=1`), and they are **collection-time** skips (`pytest.skip(allow_module_level=True)`) — so they are not in the 203, produce no progress character, and the suite's own report plugin says `0 skipped` while pytest says 2. This row read 190 until it was recounted; if you recompute it, count what pytest reports rather than what `--collect-only` does. **No xfails left**: #60's and #61's markers both fell with their fixes |
+| C++ (GTest + RapidCheck) | 1007 | all passing, ~205 s with `ctest -j1` on machine B. `ctest -N` reports 1009: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
+| Python integration | 206 | passing, plus 2 skipped, on i3-7100U in **13:03 measured**. The two skips are the Binance tests, opt-in on a live feed (`OB_BINANCE_TESTS=1`), and they are **collection-time** skips (`pytest.skip(allow_module_level=True)`) — so they are not in the 206, produce no progress character, and the suite's own report plugin says `0 skipped` while pytest says 2. This row read 190 until it was recounted; if you recompute it, count what pytest reports rather than what `--collect-only` does. **No xfails left**: #60's and #61's markers both fell with their fixes |
 
 `ctest -j1` is not a preference. The network tests bind ports, so a parallel run fails for a reason
 that has nothing to do with the code under test.
