@@ -1783,6 +1783,14 @@ Learned the hard way. Check here before debugging.
     machine refuses to set it. It exits **66**, and until the report named that, a node that never
     started was indistinguishable from one that crashed. Eleven integration errors in my first
     measurement attempt were this and nothing else (#86).
+
+216. **`git checkout <path>` deleted an uncommitted fix again — fourth time in this workspace, and
+    this time in the same session that wrote the rule down for somebody else.** I reverted
+    `tools/ob_cli.cpp` "to clean up" after a hand-applied mutation, and the #110 work went with it;
+    the giveaway was seven tests failing at baseline with the *old* output, which reads exactly like
+    a fix that does not work. Recovered because the patch was a script rather than an edit — which
+    is the practical lesson beside the old one: **commit before mutating**, and when you must patch
+    by hand, patch with something you can run twice.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

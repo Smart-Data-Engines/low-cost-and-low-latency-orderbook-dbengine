@@ -1993,7 +1993,7 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
-### 110. The interactive CLI drops what it does not understand, and guesses the side
+### 110. The interactive CLI drops what it does not understand, and guesses the side ✅
 
 Found while closing #107, on the surface where a human actually types. `tools/ob_cli.cpp` parses its
 own arguments with `istringstream >>` and embeds the engine directly, so the wire's new refusal does
@@ -2028,16 +2028,42 @@ argv handling is `if (argc > 1) data_dir = argv[1];`. An unknown flag becomes th
 which is #36's `--prot 5599` with a filesystem attached — and the reason it went unnoticed is that
 the tool's own usage line says `ob_cli [data_dir]`, so nobody who read the help would type a flag.
 
-Why this is filed rather than folded into #107: it is a different surface with a different testing
-question. Nothing in this repository exercises the interactive CLI — `tests/test_cli_args.cpp` and
-`tests/test_cli_config.cpp` are about the *server's* flags — so the fix needs somewhere to prove
-itself first, and inventing that is the larger half of the work. #36 is the precedent for what
-"refuses what it does not understand" should look like here, and it also warns what happens without
-a test: its own negation table was built on a premise read from a default rather than from the
-parser, and a static test deleted all three pieces.
+Why this was filed rather than folded into #107: it is a different surface with a different testing
+question. Nothing in this repository exercised the interactive CLI — `tests/test_cli_args.cpp` and
+`tests/test_cli_config.cpp` are about the *server's* flags — so the fix needed somewhere to prove
+itself first, and that was the larger half of the work. #36 is the precedent for what "refuses what
+it does not understand" should look like here, and it also warns what happens without a test: its
+own negation table was built on a premise read from a default rather than from the parser, and a
+static test deleted all three pieces.
+
+**Done.** One `parse_side()` accepting `bid`/`ask` in **any case** and nothing else — so the parser
+became *more* permissive about spelling while refusing nonsense — replacing the ternary at all three
+sites. One `nothing_follows()` refusing a token the grammar has no place for, naming it, which is
+#107's rule one layer in. Confirmations print the side that was **stored** rather than the word that
+was typed. The CSV loader **counts** a mistyped side as an error instead of loading it as a bid, so
+`Loaded 480 rows (20 errors)` is something an operator can act on. And argv refuses an unknown flag
+instead of opening a store in a directory named after it, with `--help` as the one dash argument
+that works — refusing every one of them would refuse the first thing a reader tries.
+
+Measured after, by running it: `insert AAA EX sideways 6500000 1500` is refused naming the word, and
+**the symbol does not exist afterwards** — which is a stronger statement than "it was not stored as a
+bid". `insert CCC EX Ask 6400000 1400` is accepted and the row comes back on the **ask** side.
+
+The first CI run exposed a missing half of this coverage: all seven CLI tests skipped because the
+integration job built only the server and C++ client harness. Both integration jobs now also build
+`ob_cli`, and its fixture derives the sibling binary from `OB_SERVER_BINARY`, so the TSan job cannot
+quietly test an uninstrumented CLI from `build/`. The existing skip gate caught the omission.
+The test helper also checks the process exit status, and the flag-refusal test owns both paths it
+asserts were never created.
+
+Seven integration tests, each refusal with a control beside it, driving the binary with a script on
+stdin. Six mutations, five killed, and the survivor is the control — but not on the first run: the
+control was killed for a reason that had nothing to do with what it changed, because **my own test
+asserted on a path in the repository root** and an earlier mutation run had created it. Shared state
+in an assertion, which is #109's class in a new place; the test owns its working directory now.
 
 - Effort: S for the refusals, M with a harness that can drive the CLI | Impact: the tool a human
-  types into stores the wrong side of the book for a mistyped word, in silence
+  types into stored the wrong side of the book for a mistyped word, in silence
 
 
 ### 109. Tests bound fixed ports inside the range the kernel hands to anybody ✅
@@ -4639,13 +4665,14 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**One defect is open, and this session found all five of them** — four are already closed, and the
-one that is left (#108, no CI job builds the io_uring transport) is a gap in the *checking* rather
-than in the engine — the
-usual way here, by measuring the item before. #105 is **closed** and was the largest of them: nothing could be written with its own
-event time over the wire, so the engine's main query selected on arrival time (0 rows of 400 where
-two SQL systems returned 400) — the field is optional and last, both clients ask before sending and
-refuse rather than drop, and the comparative table now compares the same question. #106 was the same shape in the other
+**Of the five defects this session found, four are closed and #108 is the one left** — and it is a
+gap in the *checking* rather than in the engine, since no CI job builds the io_uring transport. Each
+was found the usual way here, by measuring the item before. A sixth came out of closing them and is
+also closed: #110, where the interactive CLI stored the wrong side of the book for a mistyped word
+and echoed the word back as though it had been understood — nothing in this repository exercised
+that tool until the fix needed somewhere to prove itself. #105 is **closed** and was the largest:
+nothing could be written with its own event time over the wire, so the engine's main query selected
+on arrival time (0 rows of 400 where two SQL systems returned 400). #106 was the same shape in the other
 direction and is **closed**: a node with any client connected never exited on `SIGTERM`, so its
 supervisor killed it instead — 0.11 s against never, now 10.15 s with the cut named in the log.
 #107 is **closed** and was larger than its title: fourteen command shapes accepted a

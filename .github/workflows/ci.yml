@@ -148,10 +148,11 @@ jobs:
       # is absent, and the first run of this job skipped seven tests for exactly that reason while
       # reporting green on the rest. A test that skips itself because the harness did not build it
       # is the same failure mode as a check that runs and gates nothing.
-      - name: Build the server and the C++ client harness
+      # ob_cli is exercised by test_cli_tool.py; leaving it out skips that entire module (#110).
+      - name: Build the server, CLI and C++ client harness
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-          cmake --build build -j$(nproc) --target ob_tcp_server ob_integration_test
+          cmake --build build -j$(nproc) --target ob_tcp_server ob_cli ob_integration_test
 
       - name: Install Python package and test extras
         run: |
@@ -597,10 +598,11 @@ jobs:
       - name: Lower ASLR entropy for ThreadSanitizer
         run: sudo sysctl -w vm.mmap_rnd_bits=28
 
-      - name: Configure and build the server under TSan
+      # The CLI embeds the engine, so its tests must use this instrumented build too (#110).
+      - name: Configure and build the server, CLI and client harness under TSan
         run: |
           cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DOB_ENABLE_TSAN=ON -DOB_BUILD_TESTS=ON
-          cmake --build build-tsan -j$(nproc) --target ob_tcp_server ob_integration_test
+          cmake --build build-tsan -j$(nproc) --target ob_tcp_server ob_cli ob_integration_test
           # ob_integration_test as well as the server: test_cpp_client.py skips all seven of its
           # tests when that binary is absent, and a skipped integration test is indistinguishable
           # from a passing one in a summary line. Building it puts the C++ client's wire handling
