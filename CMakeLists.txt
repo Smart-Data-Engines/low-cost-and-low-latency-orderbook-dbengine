@@ -43,6 +43,11 @@ include(FetchContent)
 
 # Test/benchmark deps are only needed when building tests
 option(OB_BUILD_TESTS "Build tests and benchmarks (requires gtest, benchmark, rapidcheck)" ON)
+option(OB_BUILD_FUZZERS "Build libFuzzer harnesses (requires Clang and OB_ENABLE_ASAN)" OFF)
+
+if(OB_BUILD_FUZZERS AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "OB_BUILD_FUZZERS requires Clang. Configure a separate build with -DCMAKE_CXX_COMPILER=clang++.")
+endif()
 
 if(OB_BUILD_TESTS)
     # Google Test
@@ -159,6 +164,17 @@ if(OB_ENABLE_COVERAGE)
         message(WARNING "Coverage not supported for compiler: ${CMAKE_CXX_COMPILER_ID}")
     endif()
     message(STATUS "Coverage instrumentation enabled")
+endif()
+
+# libFuzzer instrumentation must reach the libraries, just like ASan/UBSan (#83, #38).
+# Only the harness executables link the fuzzer main; ordinary targets retain their own main.
+if(OB_BUILD_FUZZERS)
+    if(NOT OB_ENABLE_ASAN)
+        message(FATAL_ERROR "OB_BUILD_FUZZERS requires -DOB_ENABLE_ASAN=ON for ASan and UBSan coverage.")
+    endif()
+    add_compile_options(-fsanitize=fuzzer-no-link)
+    set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+    message(STATUS "libFuzzer instrumentation enabled for engine libraries and harnesses")
 endif()
 
 # ── Core library ───────────────────────────────────────────────────────────────
@@ -601,4 +617,9 @@ if(OB_BUILD_TESTS)
 
     # ── Benchmarks ─────────────────────────────────────────────────────────────
     add_subdirectory(benchmarks)
+endif()
+
+# ── Parser fuzzing (optional, separate from CTest) ──────────────────────────────
+if(OB_BUILD_FUZZERS)
+    add_subdirectory(fuzz)
 endif()
