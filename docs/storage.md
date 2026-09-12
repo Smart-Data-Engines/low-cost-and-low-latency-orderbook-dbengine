@@ -165,13 +165,29 @@ column files — `price`, `qty`, `cnt`, `ts`, `side`, `level`, `seq` — plus `m
 written in full with `std::ofstream` when a flush completes and read back with `std::ifstream`;
 there is no in-place update and no memory mapping on this path.
 
-**There is an `MmapStore` in the tree and the engine does not use it.** `src/mmap_store.cpp`
-implements a mapped, growable store with its own tests and **no production caller** — `mmap(`
-appears nowhere else in `src/`. This section previously described it as how column files are
-stored, down to `mmap(MAP_SHARED)`, `ftruncate` + `mremap` and `msync(MS_SYNC)`, none of which
-happens here; the component does not even use `mremap`. Roadmap #114 carries the decision of
-whether it goes or gets adopted. It was found when the fault injector from #54 went looking for an
-mmap to make fail and there was none.
+**Nothing here memory-maps a column file, and that is now a decision with a measurement behind
+it rather than an accident.** There used to be an `MmapStore` in the tree — a mapped, growable
+append store with its own tests and no production caller — and this section used to describe it as
+how column files are stored, down to `mmap(MAP_SHARED)`, `ftruncate` and `msync(MS_SYNC)`. It was
+removed under roadmap #114. The reason is the failure mode, not throughput:
+
+**On a full filesystem a growable mapping fails with `SIGBUS`, which is a signal and not an
+`errno`.** `ftruncate` extends a file *sparsely* and allocates no blocks, so it succeeds; the
+allocation happens when the page is first touched, where there is no return value to check.
+Measured on an 8 MB tmpfs: reserving 64 MB succeeded and left a file of 67 108 864 apparent bytes,
+and writing into it died with `Bus error` — **exit 135**, with a control reserving 2 MB on the same
+filesystem completing normally. There is nothing for a caller to test and nothing for
+`run_thread_body()` (#112) to catch, because a signal is not an exception. With stream I/O the same
+disk gives `ENOSPC` from `write`, which is how #112 and #113 made a failing disk into a refusal the
+client is told about — so mapping the write path would have reinstated process death for a full
+disk, in a form strictly harder to handle than the one those items closed.
+
+What this does **not** foreclose: three of the seven column files — `ts.col`, `cnt.col` and
+`side.col` — are raw fixed-width arrays read straight into vectors, so a mapped *reader* could in
+principle skip a copy and an allocation for those. `price.col`, `qty.col` and `seq.col` are
+delta+zigzag and Simple8b encoded and have to be decoded into a buffer however the bytes arrive.
+That is a question about a reader nobody has written and a benchmark nobody has run; the class that
+was removed was an **appender**, so deleting it says nothing either way.
 
 ## SoA Buffer (In-Memory)
 

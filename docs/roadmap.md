@@ -2091,7 +2091,7 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
-### 114. An `MmapStore` with tests and no caller, described by three documents as the storage path
+### 114. An `MmapStore` with tests and no caller, described by three documents as the storage path ✅
 
 Found while #54's fault injector went looking for an mmap to fail, and found none.
 
@@ -2118,12 +2118,64 @@ change that files this, because a claim about the code is not a roadmap item:
 The same document also named WAL files `wal_NNNN.wal`; they are `wal_%06u.bin`, which the injector's
 own decision log printed while nobody was looking for it.
 
-**What this item is, and it is a decision rather than a bug.** Either the component goes, or it gets
-the caller the documents assumed it had. Deleting it is the smaller change and loses a tested
-mapping layer that nothing needs; wiring it in is a storage change with its own benchmark, because
-the reason to memory-map a column file is a measurement nobody here has made. Until that is decided
-the tests stay: they pass, they cost 0.1 s, and they are the only thing keeping the component
-honest.
+**Decided: it goes. And the deciding fact is the failure mode, not the benchmark the item
+expected to need.**
+
+The question looked like "is mapping faster than `std::ofstream` for a write-once sequential file",
+which needs a measurement. It is not that question, because of what a *growable* mapping does when
+the filesystem fills. `ftruncate` extends a file **sparsely** and allocates no blocks, so it
+succeeds; the allocation happens when the page is first touched, and there is no return value
+there. **Measured on an 8 MB tmpfs**: reserving 64 MB succeeded, leaving a file of 67 108 864
+apparent bytes with 8 MB allocated, and writing into it died with `Bus error` — **exit 135**. The
+control, reserving 2 MB on the same filesystem, completed normally.
+
+A signal is not an exception. `run_thread_body()` cannot catch it, no `ERR` can carry it, and the
+node is gone. #112 and #113 spent this week making a failing disk into a refusal the client is told
+about; adopting this component on the segment write path would have reinstated **process death for
+a full disk**, in a form strictly harder to handle than the `ENOSPC` those two items closed. That
+is not a trade a benchmark can win.
+
+**Three more defects, measured with #54's injector making `ftruncate` fail, and they answer this
+spec's own task A4.1.** With the `ftruncate` inside `open()` skipped so the one inside `remap()`
+fails:
+
+- `size()` still reports **4000** bytes written into a mapping that no longer exists
+- `write_ptr()` returns **`0xfa0`** — `nullptr + 4000`, a pointer computed from a null base, so a
+  caller that catches the exception and retries writes to address 4000
+- the next `advance()` **never returns**: `remap()` zeroes `mapped_size_`, and the growth loop is
+  `new_size = mapped_size_ * 2` followed by `while (cur + bytes > new_size) new_size *= 2`, which
+  doubles zero for ever. Twenty-second timeout, exit 124
+
+So the component was not merely uncalled: its only growth path leaves the object unusable in three
+ways, and the test suite that was "keeping it honest" never reached that path. **A test suite that
+passes on a component nothing calls says what the component does on the paths somebody thought
+about.**
+
+**What the deletion does not foreclose, because the distinction matters.** This class is an
+**appender** (`write_ptr()`, `advance()`, `msync`) — not a reader. Three of the seven column files
+(`ts.col` uint64, `cnt.col` uint32, `side.col` uint8) are raw fixed-width arrays read straight into
+vectors, so a mapped *reader* could skip a copy and an allocation for those; `price.col`, `qty.col`
+and `seq.col` are delta+zigzag and Simple8b encoded and must be decoded into a buffer however the
+bytes arrive. That remains an open possibility about code nobody has written, and removing an
+appender says nothing about it. The first reading of this item had that argument backwards — "the
+columns are compressed, so there is nothing to map in place" — which is true of three of six and
+false of the other three.
+
+Gone: `include/orderbook/mmap_store.hpp`, `src/mmap_store.cpp`, `tests/test_mmap_store.cpp`, the
+`orderbook_mmap` library, the link dependency `orderbook_columnar` had on it and never used, the
+`ob_add_mmap_test` helper with its single caller, the entry in the Clang coverage list, and the
+`#include` in `columnar_store.hpp` that named nothing.
+
+**Said plainly because it is a shipped artefact: a public header went away.**
+`install(DIRECTORY include/orderbook)` shipped `mmap_store.hpp`, so the package carried 43 headers
+and now carries 42, and `#include <orderbook/columnar_store.hpp>` no longer pulls it in
+transitively. Nothing in the tree or in `scripts/verify_package.sh` named it, and
+`liborderbook_shared.so` exports no `MmapStore` symbol, so the only consumer this can reach is one
+who included a header for a class the engine never used.
+
+- Effort: S | Impact: 362 lines of a component nothing called, whose adoption would have undone
+  #112 and #113 — and `docs/storage.md` now says why the engine does not memory-map, with the
+  number behind it
 
 - Effort: S to delete, L to adopt | Impact: the front page described a storage mechanism the engine
   does not use, and nothing in CI could notice
@@ -5027,9 +5079,11 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**One defect is open, and #54's fault injector found all three of them.** #114, the `MmapStore`
-with tests and no caller, which is a decision rather than a bug: delete it, or give it the caller
-three documents assumed it had. #113 is closed — `--fsync-policy every` no longer acknowledges
+**No defect is open, and #54's fault injector found the last three of them.** #114 is closed by
+deletion, and the deciding fact was not the benchmark the item expected to need: on a full
+filesystem a growable mapping fails with **`SIGBUS`** (measured, exit 135 on an 8 MB tmpfs), which
+is a signal no thread boundary can catch and no client can be told about — so adopting it would have
+undone the two items beside it. #113 is closed — `--fsync-policy every` no longer acknowledges
 writes it did not sync — and so is #112: an `ENOSPC` on the flush
 thread's WAL write used to abort the node in a crash loop while the client-facing path handled the
 same condition correctly, and all seventeen thread bodies now have an exception boundary.
@@ -5197,8 +5251,8 @@ runners, not the machine-B performance baseline above.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1029 | all passing with `ctest -j1` on the i3-7100U. CTest lists 1031: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtime is what this machine gave on the commit measured, not a budget: the same suite read 159 s earlier the same day on an idler machine |
-| Python integration | 237 | all passing in 13:29 on the i3-7100U, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 237; count pytest's final result rather than the report plugin's progress characters |
+| C++ (GTest + RapidCheck) | 1024 | all passing with `ctest -j1` on the i3-7100U. **Five fewer than the previous commit, and that is #114 rather than a loss of coverage**: `test_mmap_store.cpp` held exactly five tests for a component with no production caller, deleted with it. CTest lists 1026: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtime is what this machine gave on the commit measured, not a budget: the same suite read 159 s earlier the same day on an idler machine |
+| Python integration | 237 | all passing in 14:11 on the i3-7100U, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 237; count pytest's final result rather than the report plugin's progress characters |
 | Python integration under TSan | 237 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. Timed at **15:28** on the GitHub runner for the commit that carries this table — a CI figure, and it is labelled as one because it is not comparable with the 13:29 above: different machine, and instrumentation on. The same runner gave 13:24 for the uninstrumented battery, which is the honest way to read the instrumentation's cost |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL

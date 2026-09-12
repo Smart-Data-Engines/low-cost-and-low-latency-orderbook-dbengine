@@ -190,24 +190,6 @@ ob_add_codec_test(test_codec
     test_codec.cpp
 )
 
-# ── Helper to register a test executable that needs the mmap library ──────────
-function(ob_add_mmap_test name)
-    add_executable(${name} ${ARGN})
-    target_link_libraries(${name}
-        PRIVATE
-            orderbook_mmap
-            GTest::gtest_main
-            rapidcheck
-            rapidcheck_gtest
-    )
-    gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
-endfunction()
-
-# ── Tasks 6.1–6.2: MmapStore unit tests ───────────────────────────────────────
-ob_add_mmap_test(test_mmap_store
-    test_mmap_store.cpp
-)
-
 # ── Helper to register a test executable that needs the columnar library ──────
 function(ob_add_columnar_test name)
     add_executable(${name} ${ARGN})
