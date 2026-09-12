@@ -276,3 +276,45 @@ def test_the_runner_reports_an_untuned_system_instead_of_stopping():
         "the refusal is caught and not recorded, so a system dropped for declaring no tuning would "
         "be a blank cell rather than a named row")
     assert "str(exc)" in body, "the reason is not carried into the report"
+
+
+# ── The event-time exclusion is gone, and cannot come back by accident (#105) ──
+#
+# `time_range` used to compare only price and size, because the engine could not be given an event
+# time at all: rows loaded with the dataset's timestamps came back at arrival time and the
+# dataset's own span selected 0 of 400 rows. #105 added the field, so the exclusion had to go from
+# three places at once — the adapter's predicate, the comparable-columns table, and the published
+# limitations. A published table that still carried the note would be describing a defect that no
+# longer exists, which is the same dishonesty as hiding one that does.
+
+def test_the_engine_adapter_uses_the_span_it_is_given():
+    source = (Path(__file__).resolve().parents[1] / "systems/orderbook.py").read_text()
+    body = source.split("def query_time_range", 1)[1].split("def ", 1)[0]
+    assert "BETWEEN {start_ns} AND {end_ns}" in body, (
+        "the time-range workload is not asking for the span it was handed, so the four systems are "
+        "not being asked the same question")
+    assert "WIDEST_RANGE" not in body, (
+        "the adapter still widens its own predicate; that was #105's workaround and #105 is closed")
+
+
+def test_no_workload_declares_an_incomparable_column_without_a_reason():
+    source = (Path(__file__).resolve().parents[1] / "run.py").read_text()
+    table = source.split("COMPARABLE_COLUMNS", 1)[1].split("def projected", 1)[0]
+    # Each entry is `"name": ((indices), "why")`. The rule is not "the table must be empty" - the
+    # next incomparable column belongs here - but that an entry must carry its reason, because the
+    # reason is what the report prints beside the number.
+    for workload in re.findall(r'"(\w+)":\s*\(\(', table):
+        entry = table.split(f'"{workload}":', 1)[1]
+        assert '"' in entry.split("),", 1)[0] or '"' in entry[:400], (
+            f"{workload} is excluded from comparison with no reason recorded")
+
+
+def test_the_published_limitations_do_not_claim_the_event_time_defect():
+    source = (Path(__file__).resolve().parents[1] / "run.py").read_text()
+    limitations = source.split("ENGINE_LIMITATIONS = [", 1)[1].split("]", 1)[0]
+    prose = "\n".join(line for line in limitations.splitlines()
+                      if not line.lstrip().startswith("#"))
+    assert "no timestamp" not in prose and "stamps arrival time" not in prose, (
+        "the limitation list still says records carry arrival time; `INSERT` takes an event time "
+        "since #105, and a published table describing a defect that is gone is as wrong as one "
+        "hiding a defect that is not")
