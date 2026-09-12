@@ -62,6 +62,9 @@
             "context": "integration-tests"
           },
           {
+            "context": "io-uring-build"
+          },
+          {
             "context": "package"
           },
           {

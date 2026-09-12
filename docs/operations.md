@@ -510,7 +510,7 @@ The start is **refused**, not degraded, on each of these:
 | the key does not match the certificate | otherwise every client's handshake fails with a message an operator reads as a client problem |
 | either file unreadable, empty, or not a regular file | there is nothing to serve |
 | a node-link surface without `--tls-ca-file` | a node link verifies its peer in both directions; without a trust anchor it would encrypt without authenticating, which leaves the relay below open and looks like protection |
-| any `--tls-*` flag on an io_uring build | for the client port, receive stays in userspace even with kernel TLS, so that transport needs a rewrite. The node links would work there — they have their own epoll loops — and are refused anyway because no CI job builds that transport, so a surface that "should work" is one nobody has run |
+| any `--tls-*` flag on an io_uring build | for the client port, receive stays in userspace even with kernel TLS, so that transport needs a rewrite. The node links have their own epoll loops but remain refused because TLS on this transport has no runtime tests. The `io-uring-build` CI job (#108) checks compilation and linking only |
 
 **TLS 1.3 is the floor and is not configurable.** A client offering only 1.2 is refused. That is
 deliberate: the version floor is the one setting where "configurable" means "misconfigurable".

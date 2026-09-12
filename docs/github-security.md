@@ -17,76 +17,43 @@ A ruleset named `master` is active on `refs/heads/master` with no bypass actors,
 - `non_fast_forward` — no force pushes
 - `pull_request` — direct pushes are blocked, changes go through a PR
 
-That covers accidental history destruction. The important gap is below.
+The required checks and the remaining branch protections are described below.
 
-### The rule that was missing, and now is not ✅
+### Required checks and how to update them ✅
 
-**A required status check.** Before 23 August 2026 a PR could be merged while CI was failing, or
-before CI had even run. This is the single most valuable rule in the whole document: it is what makes
-"the tests pass on master" a fact rather than a habit. It is now `required_status_checks` with four
-contexts and `strict: true`, so a stale branch has to be updated before merging.
+**Thirteen checks are required** after roadmap #108 added `io-uring-build`. The complete list lives
+in [`.github/rulesets/master.json`](../.github/rulesets/master.json), alongside the other branch
+protections. Strict checks require a PR to include the current base before merging. The same ruleset
+requires linear history and resolution of review threads; it permits squash and rebase merges.
 
-The check context only becomes selectable after `ci.yml` has run at least once, so push the workflow
-first, then add the rule.
+`required_approving_review_count` stays at `0` while there is one maintainer. Raise it when a second
+person has write access. `bypass_actors` stays empty so the checks apply to the maintainer too.
+`required_signatures` remains absent until a signing key is registered and verified (§6).
 
-Also worth adding to the same ruleset:
+Use the versioned file when updating ruleset `20841774`; PUT replaces the entire ruleset. An older
+example here listed four contexts and enabled signatures, so applying it would have removed checks
+and required signatures that current commits do not carry.
 
-- `required_signatures` — see §6
-- `required_linear_history` — keeps `git log` on master readable, and pairs well with squash merges
-- `pull_request.required_review_thread_resolution: true` — an unresolved comment cannot be merged past
-- `pull_request.required_approving_review_count` stays at `0` while you are the only maintainer;
-  raise it to `1` the moment a second person has write access
-
-Do **not** add yourself to `bypass_actors`. The point of the ruleset is that it catches your own
-mistakes, and `bypass_actors: []` is currently correct.
-
-Updating the existing ruleset (id `20841774`) rather than creating a second one:
+When adding a job, commit the workflow and its context in `master.json` in **one PR**. The drift
+checker reads that file, and rejects a job produced but not required. **Merge the PR before PUT**,
+and bring any other open branches up to date: a required context an old branch cannot produce is a
+permanent merge block. Then read the live ruleset back and verify both the names and the count:
 
 ```bash
 gh api -X PUT repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/rulesets/20841774 \
-  --input - <<'JSON'
-{
-  "name": "master",
-  "target": "branch",
-  "enforcement": "active",
-  "conditions": { "ref_name": { "include": ["refs/heads/master"], "exclude": [] } },
-  "bypass_actors": [],
-  "rules": [
-    { "type": "deletion" },
-    { "type": "non_fast_forward" },
-    { "type": "required_signatures" },
-    { "type": "required_linear_history" },
-    {
-      "type": "pull_request",
-      "parameters": {
-        "required_approving_review_count": 0,
-        "dismiss_stale_reviews_on_push": true,
-        "require_code_owner_review": false,
-        "require_last_push_approval": false,
-        "required_review_thread_resolution": true,
-        "allowed_merge_methods": ["squash", "rebase"]
-      }
-    },
-    {
-      "type": "required_status_checks",
-      "parameters": {
-        "strict_required_status_checks_policy": true,
-        "required_status_checks": [
-          { "context": "build-and-test" },
-          { "context": "release-build" },
-          { "context": "docs-integrity" },
-          { "context": "analyze (c-cpp)" }
-        ]
-      }
-    }
-  ]
-}
-JSON
+  --input .github/rulesets/master.json
+
+gh api repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/rulesets/20841774 \
+  --jq '{enforcement, bypass: .bypass_actors,
+         checks: ([.rules[] | select(.type == "required_status_checks")
+                   | .parameters.required_status_checks[].context]
+                  | {count: length, contexts: .})}'
 ```
 
-The list above is **twelve** checks as of 2 September 2026 — eleven, plus `package` from #33 — not
-the four the JSON block shows; see
-§1.1, which is about how it came to be wrong.
+`io-uring-build` compiles `ob_tcp_server_iouring` in Release with `OB_USE_IO_URING=ON` and
+`OB_BUILD_TESTS=OFF`. It also requires the linked binary to define `IoUringServer::run()`, because
+`ob_tcp_server` remains an epoll binary even when that option is enabled. This check proves
+compilation and linking. It does not run the transport or establish runtime or sanitizer coverage.
 
 `package` is the twelfth, from roadmap #33. It builds the `.deb`, the tarball and — where
 `rpmbuild` exists, which is CI and not the development machine — the `.rpm`, then checks the layout,
@@ -94,11 +61,11 @@ the metadata, the conffile mark, and that **the packaged binary accepts the pack
 It runs on pull requests as well as tags: a packaging job first exercised on a tag is first
 exercised at the moment it matters most.
 
-`coverage` came with roadmap #37. It gates three things and deliberately not a
-percentage: that the tree builds with coverage instrumentation, that the suite passes under it, and
-that the instrumentation **reaches the libraries** — which it did not for as long as the option
-existed (#83), while the number it printed looked like a number. No third-party service is involved;
-the figure lands in the job summary and the per-file report as an artifact.
+`coverage` came with roadmap #37. It requires a build with coverage instrumentation, a passing
+suite, instrumentation that **reaches the libraries**, and at least **58% line coverage**. Before
+#83 the libraries were not instrumented, while the reported percentage still looked plausible.
+No third-party service is involved; the figure lands in the job summary and the per-file report as
+an artifact. A coverage badge remains a separate decision about an external service.
 
 The tenth is `clang-build`, added with roadmap #37. It carries no infrastructure of its own beyond a
 compiler, so it is the cheapest of these to keep green — and it earned its place on the first run by
@@ -116,9 +83,9 @@ lock-order inversion on its first run, and a check that finds that class and gat
 more dangerous kind of green. Its known cost is the same as CodeQL's — **an infrastructure failure
 blocks merges exactly as effectively as a real finding**, and here the infrastructure is etcd, a
 three-node cluster and a TSan build. The escape hatch is the documented one:
-`gh pr merge --admin` with a note on the pull request saying why. The modules that kill nodes are
-deliberately outside that job, because their fixtures wait on timeouts that instrumentation makes
-unreliable and a flaky required check teaches people to ignore checks.
+`gh pr merge --admin` with a note on the pull request saying why. Since #85 the job runs the whole
+integration battery, including modules that kill nodes; only the opt-in live Binance modules are
+excluded. Any unexpected skip or ThreadSanitizer report fails the job.
 
 The seventh is `CodeQL`, and it is not a second analysis job: `analyze (c-cpp)` is ours and goes green when the *job* succeeds, while `CodeQL` is posted by the
 code scanning integration and fails when a pull request **introduces a new alert**. Pre-existing alerts
@@ -552,7 +519,7 @@ handles (c), and 2FA with signed commits and tag protection handle (d).
 ✅ CODEOWNERS
 ✅ pull_request_template.md
 ✅ branch ruleset on master: PR required, no force push, no deletion, no bypass actors
-✅ ruleset: required_status_checks — seven contexts, strict (incl. CodeQL, the findings gate)
+✅ ruleset: required_status_checks — every context in master.json, strict (incl. CodeQL, the findings gate)
 ✅ ruleset: required_linear_history, review thread resolution
 ✅ tag ruleset on refs/tags/v*
 ✅ secret scanning + push protection
@@ -570,8 +537,8 @@ handles (c), and 2FA with signed commits and tag protection handle (d).
    failover and crash recovery are gated rather than only run locally
 ✅ ruleset: clang-build required — added with #37, because the README claimed Clang support that
    nothing checked
-✅ ruleset: coverage required — added with #37; gates the instrumentation reaching the libraries, not
-   a percentage, until a measured baseline exists
+✅ ruleset: coverage required — added with #37; gates library instrumentation and a 58% line floor
+✅ ruleset: io-uring-build required — added with #108; compiles and verifies the linked transport
 ✅ .github/rulesets/master.json matches the live ruleset again, see §1.1
 ✅ the 30 vendored CodeQL alerts dismissed with a reason — paths-ignore does not work here, see §1
 ⚙️ triage the two own-code CodeQL alerts recorded in §1; the other thirteen are note-level tidiness

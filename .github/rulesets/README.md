@@ -8,6 +8,11 @@ These files are **not applied automatically**. GitHub does not read them; they a
 
 ## Apply
 
+When adding a required check, put the workflow job and its entry in `master.json` in the same PR:
+`check_contexts.py` rejects either half on its own. Merge that PR before applying the live ruleset,
+and update any other open branches so they can produce the new context. Requiring a context an open
+PR cannot produce blocks it indefinitely. After PUT, read back the contexts and their count.
+
 ```bash
 REPO=Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine
 
@@ -22,7 +27,11 @@ gh api -X POST "repos/$REPO/rulesets" --input .github/rulesets/tags.json
 
 ```bash
 gh api "repos/$REPO/rulesets" --jq '.[] | {id, name, target, enforcement}'
-gh api "repos/$REPO/rulesets/20841774" --jq '{rules: [.rules[].type], bypass: .bypass_actors}'
+gh api "repos/$REPO/rulesets/20841774" \
+  --jq '{enforcement, bypass: .bypass_actors,
+         checks: ([.rules[] | select(.type == "required_status_checks")
+                   | .parameters.required_status_checks[].context]
+                  | {count: length, contexts: .})}'
 ```
 
 ## Pushing a history rewrite

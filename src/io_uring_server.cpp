@@ -40,10 +40,9 @@ IoUringServer::IoUringServer(ServerConfig config)
     //
     // For the **node links** it is not technical, and saying so is the honest version. Replication
     // and the mesh have their own epoll loops, unchanged by this transport, so `--tls-replication`
-    // and `--tls-multi-master` would work in this build. They are refused anyway because **no CI job
-    // builds this file**: a surface that "should work" here is a surface nobody has run, and
-    // `--tls-*` must never be the flag that turns out to mean plaintext. Narrowing this refusal is a
-    // reasonable thing to do on the day this transport gets a job of its own.
+    // and `--tls-multi-master` use those same loops. They remain refused because node-link TLS has
+    // no runtime tests on this transport. The io-uring-build job (#108) verifies compilation and
+    // linking only; narrowing this refusal requires exercising the encrypted links on io_uring.
     //
     // Refusing beats ignoring by a wide margin either way: a `--tls-*` flag that quietly meant
     // plaintext would be the single worst outcome this feature can produce, and it would look
@@ -56,7 +55,7 @@ IoUringServer::IoUringServer(ServerConfig config)
                      "--tls-replication, --tls-multi-master, --tls-cert-file, --tls-key-file, "
                      "--tls-ca-file, --tls-peer-names). Receive stays in userspace even with "
                      "kernel TLS, so the client port needs a memory-BIO rewrite; the node links "
-                     "would work here and are refused because no CI job builds this transport. "
+                     "are refused because node-link TLS has no runtime tests on this transport. "
                      "See roadmap #30 part three. Build without OB_USE_IO_URING to use TLS.\n");
         std::exit(1);
     }

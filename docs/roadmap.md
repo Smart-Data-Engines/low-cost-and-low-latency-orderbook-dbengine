@@ -337,7 +337,7 @@ of an unknown peer.
   `default:`, so `-Wswitch` makes a new `CommandType` a build failure, and a test refuses a
   `default:` being added.
 - One seam covers both transports, because epoll and io_uring share `ob::Session` and
-  `execute_command`. No CI job builds the io_uring file, so a static test refuses an
+  `execute_command`. At the time no CI job built the io_uring file, so a static test refuses an
   `execute_command` call from a transport that passes no credential store.
 - The surface label (`client` / `replication` / `mm`) is inside the HMAC input. Replication and
   multi-master share one cluster secret, so without domain separation a response captured on one of
@@ -470,7 +470,7 @@ gives channel binding.
 - **TLS 1.3 minimum**, even though TLS 1.2 is what a full kernel data path would need: probed rather
   than assumed, this OpenSSL negotiates kTLS receive only on 1.2. A public database engine capped at
   1.2 in 2026 is a review finding, and the io_uring path that would protect is off by default and
-  built by no CI job.
+  had no CI build at the time (#108 later added compilation coverage).
 - Per-listener: client port, replication port, multi-master mesh, each enabled separately.
 - The io_uring path either gets TLS or a **named refusal** — `--tls` together with io_uring must not
   silently mean plaintext, and the process must not start. Receive is in userspace regardless of
@@ -539,9 +539,9 @@ gives channel binding.
   0.66 s. Pitfall 123 again: a probe that does not reproduce the shape says "no defect" in the same
   voice as one under which there is none.
 - **The io_uring refusal stays broad, and the reason is coverage rather than epoll.** The node links
-  have their own loops and would work in that build. No CI job builds that file, so a surface that
-  "should work" there is a surface nobody has run, and `--tls-*` must never turn out to mean
-  plaintext. Said in the refusal message rather than implied.
+  have their own loops, but encrypted links on this transport have no runtime tests. The
+  `io-uring-build` job (#108) proves compilation and linking only; it does not justify narrowing
+  the refusal. Said in the refusal message rather than implied.
 - Cost published with named hardware, a percentile, and the floor of the range.
 - Six things easy to miss because they are not about cryptography — starting with the TLS output
   buffer being a *second* place the 64 MB send cap has to hold — are in
@@ -2111,36 +2111,32 @@ that stays.
   from a red required check, and the first reading of that red is always "my change broke it"
 
 
-### 108. No CI job builds the io_uring transport
+### 108. The io_uring transport was never built in CI ✅
 
-Named in the caveats for a while, and #106 turned it from a gap into a demonstration: the drain fix
-touched `src/io_uring_server.cpp`, and the first version of that change stored `draining_` with
-`memory_order_relaxed` after writing a **non-atomic** `drain_started_at_` — a data race, and the
-exact class `ThreadSanitizer` exists to report. It would not have reported it, because no job
-compiles that file, let alone instruments it. The defect was caught by building the transport by
-hand (`-DOB_USE_IO_URING=ON`) as part of finishing the item, which is a mechanism that works only
-when somebody remembers.
+No CI job compiled `src/io_uring_server.cpp`. The gap became visible while finishing #106, when
+manual work on the drain fix exposed a problem in the second transport that the usual CI builds
+could not reach. An optional transport can stop compiling while every required check stays green.
 
-What the gap costs today, measured rather than assumed: the file **does** compile
-(`cmake -DOB_USE_IO_URING=ON`, clean, no warnings) and its tests do not exist — so the honest claim
-is that nothing checks it changes, not that it is broken. Three things already lean on it:
+**Done: `io-uring-build` compiles the separate `ob_tcp_server_iouring` target** in Release with
+`-DOB_USE_IO_URING=ON -DOB_BUILD_TESTS=OFF`. The option adds that target; it does not replace the
+ordinary `ob_tcp_server`, which still uses epoll. The job therefore checks the linked binary for a
+defined `ob::IoUringServer::run()` symbol as well as checking the build's exit status. Locally, the
+symbol check accepted a fresh io_uring build and rejected a freshly built epoll control.
 
-- `--tls-*` flags are **refused** on this transport partly because "no CI job builds that file", so
-  a surface that should work is one nobody has run (#30 part three);
-- the drain decision is shared with the epoll loop and pinned by a **static** test precisely because
-  a behavioural one cannot run here (#106);
-- `execute_command` is reachable from it, which #30 part one had to guard statically for the same
-  reason.
+**The scope is compilation and linking.** The job starts no server and needs no running etcd. It
+provides no evidence about io_uring runtime behaviour or data races. Those need execution on a
+kernel that supports the transport. In particular, node-link TLS remains refused: its own epoll
+loops do not establish that the encrypted links have been exercised on this transport. The refusal
+and the operations guide now name the missing runtime coverage rather than a missing build job.
 
-A build-only job is the cheap half and would have caught today's defect. It is not free: a new
-required context means editing `.github/rulesets/master.json`, `PUT`ting it, **reading it back**,
-and fixing the count wherever prose states it — twelve becomes thirteen (pitfall 86). Running its
-tests is the larger half and needs a decision about which of them can bind a port on a runner that
-may not have `io_uring` available at all.
+The workflow job and `{"context": "io-uring-build"}` in `.github/rulesets/master.json` enter in one
+PR, because `check_contexts.py` rejects a produced but unrequired context. The live ruleset is
+applied **after merge**, then read back to verify all thirteen contexts: requiring the new context
+before an open branch can produce it blocks that branch indefinitely. The apply instructions use
+the versioned JSON rather than an older, incomplete copy embedded in a document.
 
-- Effort: S for the build, M with tests | Impact: a transport whose changes nothing verifies, in a
-  repository whose whole argument is that the mechanisms are checked
-
+- Effort: S | Impact: every PR compiles and links the optional transport; runtime tests remain a
+  separate piece of verification
 
 ### 107. The wire parser accepts trailing tokens on `INSERT` and `MINSERT` ✅
 
@@ -2306,7 +2302,8 @@ The exit is a clean **0** in every case: a node that cut sessions still flushed 
 the count in the WARN line is what tells the two apart rather than the exit status.
 
 **The decision lives in one function both transports call**, because the io_uring half is in a file
-no CI job builds and a bound written three times is a bound that drifts. `drain_verdict()` is pure
+no CI job built at the time, and a bound written three times is a bound that drifts.
+`drain_verdict()` is pure
 and takes the clock as an argument, so its four cases are unit tests rather than sleeps; a static
 test over both sources requires each to consult it and refuses any line that pairs `draining_` with
 `active_sessions` on its own.
@@ -4665,43 +4662,20 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Of the five defects this session found, four are closed and #108 is the one left** — and it is a
-gap in the *checking* rather than in the engine, since no CI job builds the io_uring transport. Each
-was found the usual way here, by measuring the item before. A sixth came out of closing them and is
-also closed: #110, where the interactive CLI stored the wrong side of the book for a mistyped word
-and echoed the word back as though it had been understood — nothing in this repository exercised
-that tool until the fix needed somewhere to prove itself. #105 is **closed** and was the largest:
-nothing could be written with its own event time over the wire, so the engine's main query selected
-on arrival time (0 rows of 400 where two SQL systems returned 400). #106 was the same shape in the other
-direction and is **closed**: a node with any client connected never exited on `SIGTERM`, so its
-supervisor killed it instead — 0.11 s against never, now 10.15 s with the cut named in the log.
-#107 is **closed** and was larger than its title: fourteen command shapes accepted a
-token nobody reads and five of them stored a row for it, so the fix is an arity table a nineteenth
-command cannot compile without — and it is what lets #105's client tell an older server apart. Before them, the last two closed in
-order. #103 had a behavioural symptom and its own
-measurement moved the fix: seeding the client from the engine would have missed the commonest case,
-so the number moved out of the replication client altogether. #104 deliberately had none — a field
-written at one site and read at none, whose docstring claimed a guarantee that in fact comes from
-where its callers sit — so what closed it is a check over the whole tree rather than the deletion,
-and that check found exactly one instance before the fix and none after.
-That is a correction kept from an earlier revision: this paragraph used to say every remaining item
-was a capability or a proof. None of these came out of a bug report; each came out of measuring the
-item before it, which is the usual way here. #93's measurement produced #98 and #99; #98's own tests
-produced #100 (ten records broadcast before a handshake, twenty received) and #101; #99's own pull
-request produced #102, from a CI run in which a node whose port was still held reported
-`exited with -6`; #101's own tests produced #103, from an assertion that expected the engine's epoch
-on the wire and got a zero; and reading `failover.cpp` for #101's four demotion call sites produced
-#104. All of them are closed.
+**No recorded defect remains open after #108.** Its build job closes the final gap in compilation
+coverage; it does not claim runtime coverage of io_uring. #110's first CI run also verified the
+value of the skip gate: seven new CLI tests did not run until both integration jobs built the CLI
+and the fixture selected the same build as the server.
 
-Below the defects the ordering is about who we want to be able to say yes to. A reader can build the
-engine, read its tests and now deploy it from a package (#33), and still **cannot verify its
-numbers** against another system — which is why #39 part two sits where it does, given that the
-performance claim is the reason this repo exists.
+The current work sequence is **fuzzing (#38), then fault injection (#54)**. The coverage badge left
+from #37 needs a maintainer decision about an external reporting service. Existing coverage reports
+and the line-coverage floor continue to run inside GitHub Actions.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **P2** | Build the io_uring transport in CI (#108) | S | Nothing compiles that file, and #106's own fix shipped a `relaxed` store beside a non-atomic write into it — caught by building it by hand, which is a mechanism that works when somebody remembers |
-| **P2** | The unexplained node death behind #86's third occurrence | S | An `UNREACHABLE` that needs nothing listening, on a node whose epoll thread is merely busy; the OOM-kill hypothesis is untested and the harness should name an unexplained death |
+| **Next** | Fuzzing (#38) | M | Exercise malformed inputs across command parsing, multi-master framing and WAL deserialization |
+| **Then** | Chaos and fault injection (#54) | L | Verify recovery and refusal when storage, clocks and connectivity fail |
+| **Decision** | Coverage badge (#37) | S | Requires choosing an external service; the existing report and floor are already in CI |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
@@ -4709,9 +4683,7 @@ performance claim is the reason this repo exists.
 | **P3** | Time-bucketed aggregation (#44) | L | The most-requested analytical capability for this data |
 | **P3** | Arrow output (#46) | M | Near-zero integration cost for analytics teams |
 | **P3** | Backup and restore (#34) | M | Table stakes for a database |
-| **P3** | Fuzzing (#38) | M | Finds the class of bug property tests miss, in the three places that read untrusted bytes |
 | **P3** | Access control (#31) | M | Multi-tenant deployments and the compliance conversation; authentication landed with #30, authorisation did not |
-| **P4** | Chaos testing (#54) | L | Do this once there are users whose data can be lost |
 | **P4** | Rolling upgrade support (#56) | M | Required before anyone runs this longer than one release |
 | **P4** | Performance frontier (#49-53) | varies | Proves the bespoke-engine claim; pick one and write it up |
 
@@ -4728,20 +4700,19 @@ Things a reviewer will notice, listed here so they do not look like oversights:
   to off**, so a cluster that nobody configured is plaintext on all three surfaces and says so only
   in its startup log. **The io_uring transport refuses every `--tls-*` flag** — for the client port
   because receive stays in userspace even with kernel TLS, so that loop needs a memory-BIO rewrite;
-  for the node links because no CI job builds that file, and a surface that "should work" is one
-  nobody has run. So the faster transport is the plaintext-only one. **Certificate rotation needs a
-  restart**, one node at a time. And **`--tls-peer-names` empty means chain-only verification**,
+  for the node links because encrypted links on this transport have no runtime tests. The
+  `io-uring-build` job (#108) verifies compilation and linking only. The transport remains
+  plaintext-only. **Certificate rotation needs a restart**, one node at a time. And **`--tls-peer-names` empty means chain-only verification**,
   which under a company-wide CA means any host it signs may join the cluster — the list is the
   mechanism that narrows that, and the startup log names which mode is in force.
   *(This bullet used to say the replication link and the mesh were plaintext. That was true until
   #30 part three, series D — and a caveats section that understates the engine is the same defect as
   one that overstates it, in the document a reader checks for honesty.)*
-- **A record written over the wire carries the time it arrived, not the time it happened.** `INSERT`
-  and `MINSERT` have no timestamp field, so the server stamps its own clock and `timestamp BETWEEN`
-  selects on that. The Python client's `insert(timestamp_ns=…)` is honoured **embedded** and dropped
-  **over TCP**, silently. Measured by #39 part two: 0 rows of 400 where the same CSV in ClickHouse
-  and TimescaleDB returned 400. Filed as #105, with the fix named as a protocol change rather than a
-  client patch — a client that cannot send the value must refuse rather than drop it.
+- **Event time is optional on wire writes** (#105). Without `event_time_ns`, the server stamps
+  arrival time. Both clients refuse to send a supplied time to a server lacking the capability.
+  TTL uses stored event time, so old backfills can expire at the next retention sweep, while a
+  future-dated row keeps its entire segment alive. LWW conflict resolution still uses the node's
+  HLC, not the client's chosen event time.
 - **Process death is exercised in three modules, and nowhere else.** Until #62 no module killed
   anything, and that hid total loss of acknowledged writes on crash. Today `test_crash_recovery.py`,
   `test_failover.py` and `test_failover_dead_state.py` `SIGKILL` a server; the last of those also
@@ -4842,12 +4813,18 @@ absolute thresholds for a designated benchmark host.
 
 ### Test suite
 
-Measured on machine B, on the commit that carries this table, rather than carried forward:
+Verified by [the full CI run for PR #102](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/34687775376),
+on the combined tree containing #105 and #110. Runtimes below are from GitHub's `ubuntu-24.04`
+runners, not the machine-B performance baseline above.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1008 | all passing, ~207 s with `ctest -j1` on machine B. `ctest -N` reports 1010: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
-| Python integration | 207 | passing, plus 2 skipped, on i3-7100U in **13:03 measured**. The two skips are the Binance tests, opt-in on a live feed (`OB_BINANCE_TESTS=1`), and they are **collection-time** skips (`pytest.skip(allow_module_level=True)`) — so they are not in the 207, produce no progress character, and the suite's own report plugin says `0 skipped` while pytest says 2. This row read 190 until it was recounted; if you recompute it, count what pytest reports rather than what `--collect-only` does. **No xfails left**: #60's and #61's markers both fell with their fixes |
+| C++ (GTest + RapidCheck) | 1021 | all passing, 159 s with `ctest -j1`. CTest lists 1023: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them |
+| Python integration | 225 | all passing in 13:06, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 225; count pytest's final result rather than the report plugin's progress characters |
+| Python integration under TSan | 225 | all passing in 14:39, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job |
+
+The seven CLI tests run in both integration jobs. Both build `ob_cli`, and the fixture selects the
+binary beside the server under test. No `xfail` remains.
 
 `ctest -j1` is not a preference. The network tests bind ports, so a parallel run fails for a reason
 that has nothing to do with the code under test.
