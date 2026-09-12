@@ -297,6 +297,8 @@ class ClusterManager:
         # killed a node from a node that died on its own, and it silently restarts both — which is
         # how a crashing node stays invisible for as long as the tests around it pass.
         self._deliberately_killed: set = set()
+        # Processes this harness escalated from SIGTERM to SIGKILL, by `id(proc)` and when.
+        self._sigkilled_by_harness: dict = {}
         self.etcd_client_port: int = 0
         self.etcd_peer_port: int = 0
         self.etcd_data_dir: str = ""
@@ -728,6 +730,14 @@ class ClusterManager:
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
+            # Recorded, because this is the only `SIGKILL` this harness sends outside `kill_node()`
+            # and it used to be silent. That silence is what made #86's server thread unreadable:
+            # a node killed here is a node that closed its listener on `SIGTERM` and then did not
+            # exit, which reads from the outside as "nothing is listening" followed by `signal 9` -
+            # exactly the observation that item could not explain. The cause was #106 (a drain with
+            # no bound, so a node with any client attached never exited), and the bound makes the
+            # window 2 s; this note is what tells the next reader which of the two they are seeing.
+            self._sigkilled_by_harness[id(proc)] = time.time()
             proc.kill()
             proc.wait(timeout=5)
 
@@ -837,8 +847,53 @@ class ClusterManager:
             how = f"signal {-code}" if code < 0 else f"exit code {code}"
             deaths.append(
                 f"{node.node_id} (index {index}, port {node.tcp_port}) is not running and no test "
-                f"killed it: {how}.\n--- tail of its own log ---\n{tail_node_log(node)}")
+                f"killed it: {how}. {self._explain_death(node, code)}"
+                f"\n--- tail of its own log ---\n{tail_node_log(node)}")
         return deaths
+
+    @staticmethod
+    def _mem_available_mib() -> int:
+        """What the machine had left, for the one exit status that cannot say why by itself."""
+        try:
+            with open("/proc/meminfo", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) // 1024
+        except OSError:
+            pass
+        return -1
+
+    def _explain_death(self, node: "NodeInfo", code: int) -> str:
+        """Say which of the candidates this exit status is, instead of leaving one word.
+
+        `signal 9` had two very different producers and no way to tell them apart, which is why
+        #86's server thread stayed open for a week. One of them is **this harness**: `_stop_node()`
+        escalates `SIGTERM` to `SIGKILL` after five seconds, and until #106 a node with any client
+        attached never exited - so it closed its listener, kept running, and was killed. From the
+        outside that is "nothing is listening" and then `signal 9`, with no race report and only
+        sometimes. The other is an OOM kill, which arrives the same way and says nothing at all.
+
+        So: if the escalation happened here, say so. If it did not, print what the machine had left,
+        because that is the number the OOM hypothesis needs and nobody was recording it.
+        """
+        if code == -int(signal.SIGKILL):
+            when = self._sigkilled_by_harness.get(id(node.process))
+            if when is not None:
+                return (f"This harness escalated SIGTERM to SIGKILL {time.time() - when:.1f}s ago "
+                        f"because the node did not exit within five seconds - #106's shape, and it "
+                        f"is a harness-side explanation rather than a defect in the server.")
+            return (f"No SIGKILL came from this harness, so it came from outside it. "
+                    f"MemAvailable is now {self._mem_available_mib()} MiB; an OOM kill leaves a "
+                    f"line in `dmesg` and nothing in the process's own log. Measured on this "
+                    f"machine for scale: the whole battery's heaviest modules peak at about 250 MiB "
+                    f"resident across every node and etcd under ThreadSanitizer.")
+        if code == 66:
+            return ("Exit 66 under a sanitizer is the sanitizer refusing to start, not the engine "
+                    "failing: ThreadSanitizer aborts with `unexpected memory mapping` when the "
+                    "kernel's ASLR entropy is higher than it can map around, which happens at "
+                    "random on some kernels. Reproduced on this machine; `vm.mmap_rnd_bits=28` is "
+                    "the usual answer where it can be set.")
+        return ""
 
     def kill_node(self, node_index: int) -> None:
         """SIGKILL a node (simulate crash), and record that this was on purpose."""

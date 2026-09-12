@@ -3523,7 +3523,7 @@ created that symbol's buffer. Five reports in one run, all the same pair.
 - Effort: S | Impact: the first command an evaluator runs described 15% of the binary, and two
   installed documents named values that do not work
 
-### 86. A required check is flaky, and the assertion that flickers is asserting a race
+### 86. A required check is flaky, and the assertion that flickers is asserting a race ✅
 
 - `test_handover_lands_on_the_named_target` asserts that `FAILOVER <target>` answers `OK`. The
   handover is accepted, the node then stops being primary, and whether the acknowledgement reaches
@@ -3623,13 +3623,45 @@ created that symbol's buffer. Five reports in one run, all the same pair.
   and while `failover.cpp` contains **zero `catch`** — so an exception on the monitor thread would
   call `std::terminate` — the manual etcd parser guards `npos` at all five `substr` sites, so that
   trigger is not present.
-  **So the node was signalled or it died, and the likeliest producer is memory.** ThreadSanitizer
-  multiplies a process's footprint several times, this job runs three nodes plus etcd on one shared
-  runner, and an OOM kill arrives as `SIGKILL` with no report of any kind — which fits every
-  observation: only under TSan, only sometimes, no race report, and a refusal rather than a timeout.
-  The assertion now prints the exit status, so `signal 9` would settle it. Guessing beyond that is
-  not worth it: the next red run reports which, because the three layers above no longer discard the
-  answer.
+  **So the node was signalled or it died, and the memory hypothesis is now measured — and
+  refuted.** ThreadSanitizer multiplies a process's footprint, this job runs three nodes plus etcd
+  on one shared runner, and an OOM kill arrives as `SIGKILL` with no report of any kind, which fits
+  every observation. It was the likeliest producer until somebody sampled it. Measured on
+  12 September, TSan build, the battery's heaviest modules (`test_stress.py` and
+  `test_large_response.py`, a half-million-row load among them):
+
+  | | |
+  |---|---|
+  | peak resident, every node **and** every etcd at once | **246 MiB** |
+  | largest single node ever (`VmHWM`) | **92 MiB** |
+  | lowest `MemAvailable` seen during the run | **8.8 GiB** |
+
+  Against a runner with 16 GB that is not an out-of-memory condition, and three nodes rather than
+  two would add about 90 MiB. **The hypothesis stands refuted rather than unproven**, which is worth
+  more than the guess was.
+
+  **And the measurement pointed at something better, which is already closed: #106.** A node that
+  receives `SIGTERM` closes its listening socket **immediately** and then waits for its sessions —
+  and before #106 it waited forever if any client was attached. `_stop_node()` in the harness is
+  "`SIGTERM`, then `SIGKILL` after five seconds", **silently**. Compose those and the outside
+  observer sees: nothing listening (a refusal, not a timeout), the process alive for five more
+  seconds, then `signal 9`, no race report, and only sometimes — which is every observation this
+  item recorded, including the third occurrence's thirty seconds of `UNREACHABLE`. Since #106 the
+  harness starts nodes with `--drain-timeout-ms 2000`, so that window is bounded at two seconds.
+
+  **What keeps this readable next time**, because "the likeliest producer" is what cost a week here:
+  `unexplained_deaths()` no longer prints one word. A `signal 9` is now reported as *either* "this
+  harness escalated SIGTERM to SIGKILL 5.0s ago — #106's shape" — the harness knows, and it never
+  said so — *or* "no SIGKILL came from this harness, so it came from outside it; MemAvailable is now
+  N MiB", which is the number the OOM hypothesis needs and which nobody was recording. Four tests
+  pin both branches plus a control that refuses to invent a theory for an ordinary exit code.
+
+  **One more thing came out of measuring it, and it is an environment fact rather than a defect:**
+  a TSan-instrumented server aborts at startup with
+  `FATAL: ThreadSanitizer: unexpected memory mapping` **at random** on this kernel — the ASLR
+  entropy is higher than TSan can map around, `vm.mmap_rnd_bits=28` is the usual answer and this
+  machine will not let it be set. It exits **66**, so a node that never started reads as a node that
+  died; the report now names that too.
 - **After the diagnostic commit the check passed, and that is not evidence that it is fixed.** One
   green run is what this very item already recorded as an anecdote: it passed once on an empty
   commit off master while failing three times elsewhere, which is why the measurement was four
@@ -3647,9 +3679,14 @@ created that symbol's buffer. Five reports in one run, all the same pair.
   set — read from the environment, because that is what makes it true. It is scaling rather than
   silencing: a node that cannot start inside the scaled window is still a failure, and still says
   so. Applied to the shared fixture and to the two modules that start their own nodes.
-- Effort: S for the test half (done), S for the diagnostic half (done), M for the server half |
-  Impact: a required check that fails at random trains everyone to re-run it, which is how a real
-  failure gets re-run too
+**The server half is closed as an explanation rather than as a patch**, and the distinction is the
+point: nothing in the server had to change, because the producer was the harness's silent
+escalation meeting #106's unbounded drain. Both are fixed — the bound in the server, the silence in
+the report — and the memory theory is refuted by measurement rather than left hanging.
+
+- Effort: S for the test half (done), S for the diagnostic half (done), M for the server half
+  (**done**: measured, refuted, explained) | Impact: a required check that fails at random trains
+  everyone to re-run it, which is how a real failure gets re-run too
 
 ### 85. The WAL position was read from four threads without synchronisation, as an inconsistent pair ✅
 
