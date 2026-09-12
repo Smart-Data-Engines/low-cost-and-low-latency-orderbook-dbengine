@@ -4639,7 +4639,9 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Two defects are open, and this session found all five of them** — four are already closed — the
+**One defect is open, and this session found all five of them** — four are already closed, and the
+one that is left (#108, no CI job builds the io_uring transport) is a gap in the *checking* rather
+than in the engine — the
 usual way here, by measuring the item before. #105: nothing can be written with its own event time over the wire, so the engine's
 main query selects on arrival time (0 rows of 400 where two SQL systems returned 400). #106 was the same shape in the other
 direction and is **closed**: a node with any client connected never exited on `SIGTERM`, so its
