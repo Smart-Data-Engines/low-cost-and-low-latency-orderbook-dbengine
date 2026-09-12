@@ -320,9 +320,15 @@ target_link_libraries(orderbook_anti_entropy PUBLIC orderbook_peer_registry orde
 add_library(orderbook_async_snapshot STATIC src/async_snapshot.cpp)
 target_link_libraries(orderbook_async_snapshot PUBLIC orderbook_core orderbook_sequence orderbook_logger)
 
+# ── Multi-master wire framing ─────────────────────────────────────────────────
+# Kept separate from the manager so byte parsing can be fuzzed without pulling in Engine and the
+# networking state machine. The manager and the fuzzer link this same production implementation.
+add_library(orderbook_mm_framing STATIC src/mm_framing.cpp)
+target_link_libraries(orderbook_mm_framing PUBLIC orderbook_core)
+
 # ── Multi-master manager compiled library (peer networking, WAL broadcast) ─────
 add_library(orderbook_multi_master STATIC src/multi_master.cpp src/mm_snapshot.cpp)
-target_link_libraries(orderbook_multi_master PUBLIC orderbook_async_snapshot orderbook_peer_registry orderbook_conflict_resolver orderbook_anti_entropy orderbook_hlc orderbook_compression orderbook_logger)
+target_link_libraries(orderbook_multi_master PUBLIC orderbook_mm_framing orderbook_async_snapshot orderbook_peer_registry orderbook_conflict_resolver orderbook_anti_entropy orderbook_hlc orderbook_compression orderbook_logger)
 
 # ── Shard map compiled library ─────────────────────────────────────────────────
 add_library(orderbook_shard_map STATIC src/shard_map.cpp)
