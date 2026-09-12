@@ -4642,8 +4642,10 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 **One defect is open, and this session found all five of them** — four are already closed, and the
 one that is left (#108, no CI job builds the io_uring transport) is a gap in the *checking* rather
 than in the engine — the
-usual way here, by measuring the item before. #105: nothing can be written with its own event time over the wire, so the engine's
-main query selects on arrival time (0 rows of 400 where two SQL systems returned 400). #106 was the same shape in the other
+usual way here, by measuring the item before. #105 is **closed** and was the largest of them: nothing could be written with its own
+event time over the wire, so the engine's main query selected on arrival time (0 rows of 400 where
+two SQL systems returned 400) — the field is optional and last, both clients ask before sending and
+refuse rather than drop, and the comparative table now compares the same question. #106 was the same shape in the other
 direction and is **closed**: a node with any client connected never exited on `SIGTERM`, so its
 supervisor killed it instead — 0.11 s against never, now 10.15 s with the cut named in the log.
 #107 is **closed** and was larger than its title: fourteen command shapes accepted a
