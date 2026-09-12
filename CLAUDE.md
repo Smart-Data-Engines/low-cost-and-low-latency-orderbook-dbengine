@@ -1719,6 +1719,32 @@ Learned the hard way. Check here before debugging.
     workspace, and the first one aimed at a mechanism rather than at a result: **when you mutate to
     prove a guard fires, name the target that compiles the file** (#107).
 
+
+
+213. **"The likeliest producer" is a guess with a costume on — sample it.** #86's server thread
+    stayed open for a week on "an OOM kill fits every observation", which it did. Measured under
+    ThreadSanitizer: the heaviest modules peak at **246 MiB resident** across every node and etcd,
+    the largest single node ever at **92 MiB**, and `MemAvailable` never below **8.8 GiB** — against
+    a 16 GB runner, not an out-of-memory condition. The hypothesis is now **refuted rather than
+    unproven**, which is worth more than the guess was, and the sampling took twenty minutes
+    (#86).
+
+214. **Compose the harness with the defect before blaming the machine.** What actually fits every
+    observation in #86 is `_stop_node()`'s silent "SIGTERM, then SIGKILL after five seconds" meeting
+    #106's unbounded drain: a node closes its listener at once, never finishes draining while a
+    client is attached, and is killed. From outside that is *nothing listening*, then `signal 9`, no
+    race report, only sometimes — every line of the observation, and neither half is a defect in the
+    server's logic. The report now says which of the two it is, because **the harness knows and
+    never said so**: "this harness escalated SIGTERM to SIGKILL 5.0s ago" or "no SIGKILL came from
+    this harness; MemAvailable is now N MiB" (#86, #106).
+
+215. **A sanitizer that will not start reads as a node that died.** A TSan-instrumented server
+    aborts with `FATAL: ThreadSanitizer: unexpected memory mapping` **at random** on this kernel —
+    higher ASLR entropy than it can map around, `vm.mmap_rnd_bits=28` is the usual answer and this
+    machine refuses to set it. It exits **66**, and until the report named that, a node that never
+    started was indistinguishable from one that crashed. Eleven integration errors in my first
+    measurement attempt were this and nothing else (#86).
+
 216. **`git checkout <path>` deleted an uncommitted fix again — fourth time in this workspace, and
     this time in the same session that wrote the rule down for somebody else.** I reverted
     `tools/ob_cli.cpp` "to clean up" after a hand-applied mutation, and the #110 work went with it;
@@ -1726,7 +1752,6 @@ Learned the hard way. Check here before debugging.
     a fix that does not work. Recovered because the patch was a script rather than an edit — which
     is the practical lesson beside the old one: **commit before mutating**, and when you must patch
     by hand, patch with something you can run twice.
-
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
