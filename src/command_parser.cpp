@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cctype>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -50,6 +51,115 @@ static bool iequals(std::string_view a, std::string_view b) {
     return true;
 }
 
+// ── Command grammar ───────────────────────────────────────────────────────────
+
+/// The most tokens a command line may carry, keyword included, and what it accepts instead.
+///
+/// Indexed by `CommandType`, so a new enumerator **does not compile** until a row exists - the same
+/// mechanism as the missing `default:` in `allowed_before_authentication()`, and for the same
+/// reason. #107 was not one defect in the two commands the roadmap named: every branch read the
+/// fields it knew and ignored the rest. Measured before this table existed, against master:
+/// **fourteen command shapes accepted a token nobody reads**, and five of them stored a row for it
+/// (`INSERT AAA EX bid 100 5 1 notanumber` -> `OK`, one row). Fixing two would have left twelve and
+/// handed the silence to command nineteen.
+///
+/// `AUTH` is the one branch that already refused a trailing token, through an exact
+/// `tokens.size() != 3` written by whoever happened to think of it there. That is the argument for
+/// a table rather than eighteen habits: correct behaviour present in one place out of eighteen is
+/// indistinguishable from nobody having decided.
+///
+/// Only the **maximum** lives here. Each branch keeps its own minimum, because a branch that reads
+/// `tokens[5]` needs the guard that makes the read safe - and a minimum in this table would be read
+/// by nothing, which is a poor field to add in the same repository that spent an item on the fifth
+/// one (#104).
+static constexpr CommandGrammar kGrammar[] = {
+    {CommandType::SELECT,       "SELECT",       kFreeForm,
+     "SELECT <query>", true},
+    {CommandType::INSERT,       "INSERT",       7,
+     "INSERT <symbol> <exchange> <bid|ask> <price> <qty> [count]", true},
+    {CommandType::MINSERT,      "MINSERT",      5,
+     "MINSERT <symbol> <exchange> <bid|ask> <n_levels>, then one <price> <qty> [count] line per "
+     "level", true},
+    {CommandType::FLUSH,        "FLUSH",        1, "FLUSH", true},
+    {CommandType::PING,         "PING",         1, "PING", true},
+    {CommandType::STATUS,       "STATUS",       1, "STATUS", true},
+    {CommandType::ROLE,         "ROLE",         1, "ROLE", true},
+    {CommandType::FAILOVER,     "FAILOVER",     2, "FAILOVER <target_node_id>", true},
+    {CommandType::QUIT,         "QUIT",         1, "QUIT", true},
+    {CommandType::COMPRESS,     "COMPRESS",     2, "COMPRESS LZ4", true},
+    {CommandType::SHARD_MAP,    "SHARD_MAP",    1, "SHARD_MAP", true},
+    {CommandType::SHARD_INFO,   "SHARD_INFO",   1, "SHARD_INFO", true},
+    {CommandType::MIGRATE,      "MIGRATE",      3, "MIGRATE <symbol.exchange> <target_shard_id>",
+     true},
+    {CommandType::MM_PEERS,     "MM_PEERS",     1, "MM_PEERS", true},
+    {CommandType::MM_CONFLICTS, "MM_CONFLICTS", 2, "MM_CONFLICTS [limit]", true},
+    {CommandType::SUBSCRIBE,    "SUBSCRIBE",    kFreeForm, "SUBSCRIBE <query>", true},
+    {CommandType::UNSUBSCRIBE,  "UNSUBSCRIBE",  2,
+     "UNSUBSCRIBE [id], where no id means every subscription of this session", true},
+    {CommandType::AUTH,         "AUTH",         3,
+     "AUTH to ask for a challenge, or AUTH <identity> <response> to answer one", false},
+};
+
+static_assert(std::size(kGrammar) == static_cast<size_t>(CommandType::UNKNOWN),
+              "every CommandType except UNKNOWN declares its arity - add a row above (#107)");
+
+/// The rows are the enum, so the assert above is about coverage rather than about count.
+static constexpr bool grammar_is_indexed_by_type() {
+    for (size_t i = 0; i < std::size(kGrammar); ++i) {
+        if (static_cast<size_t>(kGrammar[i].type) != i) return false;
+    }
+    return true;
+}
+static_assert(grammar_is_indexed_by_type(), "kGrammar rows must be in CommandType order");
+
+/// `<price> <qty> [count]` - the grammar of one line of a MINSERT payload.
+static constexpr size_t kMinsertLevelTokens = 3;
+
+// `kFreeForm` is an exemption from counting here, not an exemption from refusing: both free-form
+// commands hand the whole line to the query parser, and that parser refuses a trailing token by
+// name (measured: `SELECT * FROM 'AAA'.'EX' garbage` ->
+// `ERR Parse error at line 1, col 26: unexpected token 'garbage'`). The message built below borrows
+// its words deliberately - one protocol that says "unexpected token" two ways is one protocol to
+// learn twice.
+
+std::span<const CommandGrammar> command_grammar() { return {kGrammar, std::size(kGrammar)}; }
+
+/// The row for a type, for the callers that already know which command they are parsing.
+static const CommandGrammar& grammar_of(CommandType type) {
+    return kGrammar[static_cast<size_t>(type)];
+}
+
+static const CommandGrammar* grammar_for_keyword(std::string_view keyword) {
+    for (const auto& g : kGrammar) {
+        if (iequals(keyword, g.keyword)) return &g;
+    }
+    return nullptr;
+}
+
+/// Refuse a line, recording what the sender will read and saying it once in the log.
+static Command& refuse(Command& cmd, std::string why) {
+    OB_LOG_WARN("cmd_parser", "Refusing a command line: %s", why.c_str());
+    cmd.type  = CommandType::UNKNOWN;
+    cmd.error = std::move(why);
+    return cmd;
+}
+
+/// The token first, because that is the word the sender has to look at; the grammar second, because
+/// that is what they can do about it.
+static std::string extra_token_message(const CommandGrammar& g, std::string_view token) {
+    std::string msg = "unexpected token ";
+    if (g.may_quote_token) {
+        msg += '\'';
+        msg.append(token);
+        msg += '\'';
+    }
+    msg += "; ";
+    msg.append(g.keyword);
+    msg += " takes: ";
+    msg.append(g.usage);
+    return msg;
+}
+
 // ── parse_command ──────────────────────────────────────────────────────────────
 
 Command parse_command(std::string_view line) {
@@ -63,6 +173,15 @@ Command parse_command(std::string_view line) {
     if (tokens.empty()) return cmd;
 
     std::string_view first = tokens[0];
+
+    // Arity before dispatch, so every branch below inherits the refusal instead of each one having
+    // to remember it. An unrecognised keyword has no row and falls through to UNKNOWN, where the
+    // honest answer is still `unknown command` (#107).
+    if (const CommandGrammar* g = grammar_for_keyword(first)) {
+        if (g->max_tokens != kFreeForm && tokens.size() > g->max_tokens) {
+            return refuse(cmd, extra_token_message(*g, tokens[g->max_tokens]));
+        }
+    }
 
     if (iequals(first, "SELECT")) {
         cmd.type = CommandType::SELECT;
@@ -195,10 +314,16 @@ Command parse_command(std::string_view line) {
             size_t limit_val = 0;
             auto sv = tokens[1];
             auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), limit_val);
-            if (ec == std::errc{} && ptr == sv.data() + sv.size()) {
-                cmd.mm_conflicts_limit = limit_val;
+            if (ec != std::errc{} || ptr != sv.data() + sv.size()) {
+                // Was: keep the default of 100. That is the trailing-token silence in its other
+                // shape - a token the sender meant to matter, replaced by a number they did not
+                // ask for - and `UNSUBSCRIBE` three cases below already refuses exactly this,
+                // having learnt it from #36. Answering 100 conflicts to `MM_CONFLICTS notanumber`
+                // is an answer to a question nobody asked (#107).
+                return refuse(cmd, "MM_CONFLICTS limit is not a number: '" + std::string(sv) +
+                                       "'; MM_CONFLICTS takes: MM_CONFLICTS [limit]");
             }
-            // else keep default 100
+            cmd.mm_conflicts_limit = limit_val;
         }
         OB_LOG_DEBUG("cmd_parser", "Parsed command: MM_CONFLICTS limit=%zu", cmd.mm_conflicts_limit);
         return cmd;
@@ -269,6 +394,15 @@ Command parse_minsert(std::string_view block) {
     if (header_tokens.size() < 5) return cmd;
     if (!iequals(header_tokens[0], "MINSERT")) return cmd;
 
+    // The header's arity comes from the same table as every single-line command, because the field
+    // #105 will add is a header field - and a batch that carried it to a server too old to know it
+    // would otherwise be accepted with the time discarded, which is the defect #105 is about, one
+    // layer out (#107).
+    const CommandGrammar& g = grammar_of(CommandType::MINSERT);
+    if (header_tokens.size() > g.max_tokens) {
+        return refuse(cmd, extra_token_message(g, header_tokens[g.max_tokens]));
+    }
+
     MinsertArgs args{};
     args.symbol   = std::string(header_tokens[1]);
     args.exchange = std::string(header_tokens[2]);
@@ -299,6 +433,15 @@ Command parse_minsert(std::string_view block) {
     for (uint16_t i = 0; i < args.n_levels; ++i) {
         auto toks = tokenize(lines[1 + i]);
         if (toks.size() < 2) return cmd;
+        // A level line is not a command and has no row, but it has the same grammar and the same
+        // silence: `100\t5\t1\tnotanumber` stored a level and answered `OK`. The refusal names the
+        // line number too, because a batch is up to MAX_LEVELS lines and "somewhere in there" is
+        // not an answer.
+        if (toks.size() > kMinsertLevelTokens) {
+            return refuse(cmd, "unexpected token '" + std::string(toks[kMinsertLevelTokens]) +
+                                   "' on level line " + std::to_string(i + 1) +
+                                   "; a level line takes: <price> <qty> [count]");
+        }
 
         MinsertArgs::Level lvl{0, 0, 1};
 

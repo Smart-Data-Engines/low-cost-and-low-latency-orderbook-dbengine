@@ -660,7 +660,11 @@ std::string execute_command(const Command& cmd,
     case CommandType::UNKNOWN:
     default:
         session.increment_commands();
-        return format_error("unknown command");
+        // The parser's own words when it has any: a recognised command with a token the grammar has
+        // no place for is not an unknown command, and saying so sends the reader looking for a
+        // feature that is not missing (#107). The gate above already says the parser owns this
+        // message - it just had none until now.
+        return format_error(cmd.error.empty() ? "unknown command" : cmd.error);
     }
 }
 

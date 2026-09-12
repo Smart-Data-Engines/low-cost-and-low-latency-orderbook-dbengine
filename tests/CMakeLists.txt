@@ -350,6 +350,13 @@ ob_add_tcp_test(test_cli_args
     test_cli_args.cpp
 )
 
+# The wire grammar (#107). Reads the parser's own table rather than a second list of the same
+# facts, and every refusal in it has a control: a parser that refuses everything passes every
+# refusal test.
+ob_add_tcp_test(test_command_arity
+    test_command_arity.cpp
+)
+
 ob_add_tcp_test(test_tcp_server
     test_tcp_server.cpp
 )

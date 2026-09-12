@@ -158,3 +158,91 @@ def test_write_to_replica_raises_through_the_client(cluster):
             engine.insert("EDGE-RO", "BINANCE", "bid", [100_000], [10])
     finally:
         engine.close()
+
+
+def _rows_for(conn: Conn, symbol: str) -> int:
+    """How many rows the store holds for a symbol, over the wire."""
+    reply = conn.send(f"SELECT * FROM '{symbol}'.'BINANCE' "
+                      f"WHERE timestamp BETWEEN 0 AND 9999999999999999999\n", settle=0.5)
+    return len([ln for ln in reply.strip().splitlines()
+                if ln and ln.split("\t")[0].isdigit()])
+
+
+def test_a_token_the_grammar_has_no_place_for_is_refused_and_stores_nothing(cluster):
+    """The defect this module's own docstring names, measured on the wire (#107).
+
+    Before the fix, on this cluster: `OK`, and one row. The parser read the fields it knew and
+    ignored the rest — pitfall 27 on the wire protocol, and the same class #36 closed for
+    command-line flags, where `--prot 5599` was silently skipped.
+
+    The row count is the assertion that matters. `OK` and *a row was stored* are different claims,
+    and an operator whose typo was discarded has the second one.
+    """
+    conn = Conn(cluster.primary().tcp_port)
+    try:
+        refused = conn.send("INSERT EDGE-EXTRA BINANCE bid 100000 10 1 notanumber\n")
+        assert "ERR" in refused.upper(), (
+            f"a token nobody reads was accepted: {refused!r}")
+
+        # The control, in the same session: the same line without the extra token is stored. Without
+        # it this test would pass against a server that refuses every INSERT there is.
+        accepted = conn.send("INSERT EDGE-EXTRA BINANCE bid 100000 10 1\n")
+        assert "ERR" not in accepted.upper(), f"the canonical form was refused too: {accepted!r}"
+
+        conn.send("FLUSH\n", settle=0.6)
+        assert _rows_for(conn, "EDGE-EXTRA") == 1, (
+            "the refused line left a row behind, or the accepted one did not - and either way the "
+            "count is what an operator would have to discover by querying")
+    finally:
+        conn.close()
+
+
+def test_the_refusal_names_the_token_rather_than_counting_arguments(cluster):
+    """`too many arguments` sends an operator counting spaces (#107).
+
+    The message also has to say what the command does accept, because the next thing the reader
+    needs is the grammar — and it borrows the query parser's own words for the same situation
+    (`unexpected token 'garbage'`), so the protocol says this one thing one way.
+    """
+    conn = Conn(cluster.primary().tcp_port)
+    try:
+        reply = conn.send("INSERT EDGE-NAME BINANCE bid 100000 10 1 surprise\n")
+        assert "unexpected token 'surprise'" in reply, (
+            f"the refusal does not name the token that caused it: {reply!r}")
+        assert "INSERT takes:" in reply, (
+            f"the refusal does not say what INSERT accepts: {reply!r}")
+
+        # And a word that is not a command stays `unknown command`: the parser has nothing specific
+        # to say about it, and inventing something would be worse than the truth.
+        unknown = conn.send("FROBNICATE surprise\n")
+        assert "unknown command" in unknown, f"expected the plain answer, got {unknown!r}"
+    finally:
+        conn.close()
+
+
+def test_a_batch_header_carrying_an_invented_time_field_is_refused(cluster):
+    """The shape #105 will add, sent to a server that does not know it yet.
+
+    This is why #107 is its own item rather than a paragraph inside #105: an upgraded client sending
+    a timestamp to an older server used to get `OK` with the value dropped, which is exactly the
+    defect #105 is about, one layer out. Somebody has already written this line by assumption —
+    `binance_live_bootstrap.py` once sent `MINSERT` with an invented time argument, and the only
+    reason that failed loudly was a second mistake on the same line.
+    """
+    conn = Conn(cluster.primary().tcp_port)
+    try:
+        refused = conn.send("MINSERT EDGE-TIME BINANCE bid 1 1700000000000000000\n"
+                            "100000\t10\t1\n")
+        assert "ERR" in refused.upper(), f"an invented header field was accepted: {refused!r}"
+        assert "1700000000000000000" in refused, (
+            f"the refusal does not name the field that is not understood: {refused!r}")
+
+        # The control: the same batch without it, and a level line with its optional count.
+        accepted = conn.send("MINSERT EDGE-TIME BINANCE bid 2\n100000\t10\t1\n99999\t11\t2\n")
+        assert "ERR" not in accepted.upper(), f"the canonical batch was refused: {accepted!r}"
+
+        conn.send("FLUSH\n", settle=0.6)
+        assert _rows_for(conn, "EDGE-TIME") == 2, (
+            "the refused batch stored levels, or the accepted one did not")
+    finally:
+        conn.close()
