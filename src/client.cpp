@@ -639,8 +639,11 @@ size_t OrderbookClient::format_insert(std::string_view symbol,
     // name - and it would make "stamp it on arrival" unsayable (#105).
     if (event_time_ns) {
         *p++ = ' ';
-        auto [p4, ec4] = std::to_chars(p, buf + send_buf_.size(), *event_time_ns);
-        p = p4;
+        // The status is dropped rather than named: `to_chars` can only fail for want of room, the
+        // buffer is 64 KB and this is at most twenty digits. Every other conversion in this
+        // function does the same - and naming a variable nobody reads is what CodeQL's
+        // `cpp/unused-local-variable` is for.
+        p = std::to_chars(p, buf + send_buf_.size(), *event_time_ns).ptr;
     }
     *p++ = '\n';
 
@@ -678,8 +681,7 @@ size_t OrderbookClient::format_minsert(std::string_view symbol,
     p = pn;
     if (event_time_ns) {
         *p++ = ' ';
-        auto [pt, ect] = std::to_chars(p, end, *event_time_ns);
-        p = pt;
+        p = std::to_chars(p, end, *event_time_ns).ptr;   // see format_insert on the dropped status
     }
     *p++ = '\n';
 
