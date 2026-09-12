@@ -2091,6 +2091,83 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 116. A node whose coordinator is unreachable writes two WARN lines a second for ever, and one of them names a consequence that did not happen
+
+Found by #54 stage B, which set out to check refusals and had to read the logs to do it.
+
+**Measured, default log level, a 30-second etcd outage on a two-node cluster (i3-7100U):**
+
+| Node | Lines | Per second | Of which the two repeating WARNs |
+|------|-------|-----------|----------------------------------|
+| the holder | 65 | **2.17** | 60 |
+| the replica | 67 | **2.23** | 60 |
+
+`publish_position_if_due()` rate-limits itself to once a second. Both of its failure paths log at
+**WARN** — `ensure_position_lease()` when the grant fails, and the publish itself — while its
+success path logs at **DEBUG**. So a healthy node is silent about publishing its position and a
+node that cannot reach the coordinator says the same two sentences every second until the outage
+ends. That is #95's shape (pitfall 144): a permanent failure retried at loop frequency and logged
+at loop frequency. Over an hour-long etcd outage it is about seven thousand lines carrying one
+fact.
+
+**And the wording of one of them is wrong in the case that produces it.** The line reads
+*"could not grant a lease for the published position — publishing without one, so this position
+will outlive this node and other nodes may defer to it after it dies"*, and the very next line is
+`publish_wal_position failed`. Nothing was published, so nothing will outlive anything: the
+sentence describes a consequence of a publish that did not occur, and sends an operator after a
+data-integrity problem that is not there. It is pitfall 112's shape — a log line announcing
+something the code did not do — with the polarity reversed, announcing a harm instead of a
+guarantee.
+
+**A third thing, reachable by reading and deliberately not claimed as measured.** When
+`grant_lease()` fails the code publishes with `lease = 0` anyway. With the coordinator unreachable
+that publish fails too, which is why the outage above is harmless. But if a coordinator refuses
+lease grants while still accepting puts — a lease quota, an overloaded server, auth on the Lease
+API — the position is written **without a lease and never expires**, and a dead node's position is
+deferred to for ever. That is what #72 closed by putting positions under leases. **No run has been
+observed in which grant fails and put succeeds**; the distinction between "reachable by reading"
+and "measured" is the point of saying so.
+
+The fix shape already exists in this tree: #113's flush loop logs the first failure of an episode
+loudly, the rest at DEBUG, and a line when it recovers. Applied here that is one WARN when the
+coordinator stops answering, silence while it stays that way, and one line when it comes back.
+
+- Effort: S | Impact: the log an operator reads during a coordinator outage is ~92% two repeated
+  sentences, one of which is describing something that did not happen
+
+### 115. The one decision an unreachable coordinator makes invisible is the decision that answers the operator's question
+
+Also found by #54 stage B, and it is the counterpart to #116: not that there is too little logging
+during an outage, but that the part which is missing is the part being asked for.
+
+A replica that cannot read the leader key **deliberately does not campaign** — that is #82's fix,
+and the whole reason the coordinator's answer has three states instead of two. It is logged with
+`OB_LOG_DEBUG`, and the server's default level is **INFO** (`TcpServerConfig::log_level`). So the
+decision never reaches an operator's log.
+
+**Measured on the same 30-second outage:** across 65 and 67 lines on the two nodes, the count of
+lines mentioning the campaign decision is **0** and **0**.
+
+What makes this a defect rather than a preference is the contrast on the *same* node in the *same*
+window. The holder's step-down is logged **four times, once each, at WARN and INFO, naming the
+mechanism**: `refresh_lease failed for lease=…`, `lease lost, demoting to REPLICA`, `no new primary
+is published yet — demoting anyway`, `demoted to REPLICA`. So this is not a general gap in the
+logging of coordinator faults. It is one decision, and it happens to be the one that answers the
+question an operator asks first: *etcd is down and nothing has failed over — is that the engine
+deciding, or the engine broken?* Today the honest answer is in the source, not in the log.
+
+Per-tick INFO would be #116 again, so the shape is the same as the fix there: say it once when the
+node starts declining, and once when it stops.
+
+**Not a defect, recorded because #54 stage B's test was written against the wrong branch first.**
+The holder does **not** wait out a TTL when the coordinator vanishes: its lease keepalive fails on
+the next tick and it demotes immediately. Measured: **2.28 s** from `stop_etcd()` to the node no
+longer answering `ROLE` with `PRIMARY`. The "could not confirm the leader key names us for N s"
+branch is for a different fault — a coordinator that answers keepalives but not reads.
+
+- Effort: S | Impact: during a coordinator outage the engine's correct refusal to fail over is
+  indistinguishable, from the log, from the engine failing to fail over
+
 ### 114. An `MmapStore` with tests and no caller, described by three documents as the storage path ✅
 
 Found while #54's fault injector went looking for an mmap to fail, and found none.
@@ -2248,6 +2325,18 @@ it, which it did not before.
 **What this does not cover, stated.** The columnar segment files are written with buffered stream
 I/O and are not fsynced per segment, so this policy is about the WAL — a segment lost to a power cut
 is rebuilt by replaying it, which is what the WAL is for.
+
+**A correction to this item's own commit message, recorded rather than rewritten because the
+history is pushed.** It says the verification included "the 63 tests that read
+`docs/operations.md` re-run after the doc edit, because the full `ctest` predated the edit and five
+test files read `docs/`". Both halves are wrong. **No C++ test reads `docs/operations.md`** — five
+of them *mention* the path in comments, and the grep that found them matched the comments, which is
+use-versus-mention in a new place. And the full `ctest` did **not** predate the edit: that document
+is inside commit `6930589`, which is the commit the verification ran on. Exactly one C++ test reads
+a document at all, `CliConfigStatic.EveryKnownFlagIsInTheCliReference` over `docs/cli.md`, and that
+file is in the same commit. So the verification was *stronger* than the message describes rather
+than weaker, and every figure it quotes is accurate; only the reason given for one extra run is
+not.
 
 - Effort: M | Impact: `--fsync-policy every` now means what it says, and the failure is visible to
   both the client that asked and the operator who has to replace the disk
@@ -5079,12 +5168,18 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**No defect is open, and #54's fault injector found the last three of them.** #114 is closed by
-deletion, and the deciding fact was not the benchmark the item expected to need: on a full
-filesystem a growable mapping fails with **`SIGBUS`** (measured, exit 135 on an 8 MB tmpfs), which
-is a signal no thread boundary can catch and no client can be told about — so adopting it would have
-undone the two items beside it. #113 is closed — `--fsync-policy every` no longer acknowledges
-writes it did not sync — and so is #112: an `ENOSPC` on the flush
+**Two defects are open and both are about what the log says, not about what the engine does.**
+#116 — a node whose coordinator is unreachable writes ~2.2 WARN lines a second for the whole
+outage, one of them describing a consequence of a publish that did not happen — and #115, the
+mirror image: the replica's *correct* refusal to campaign is logged at DEBUG, so the one decision
+that answers an operator's first question is the one thing absent from the default log. Both were
+found by #54 stage B, which set out to check refusals and had to read the logs to do it.
+
+Everything about storage faults is closed. #114 went by deletion, and the deciding fact was not
+the benchmark the item expected to need: on a full filesystem a growable mapping fails with
+**`SIGBUS`** (measured, exit 135 on an 8 MB tmpfs), which is a signal no thread boundary can catch
+and no client can be told about — so adopting it would have undone the two items beside it. #113 is
+closed — `--fsync-policy every` no longer acknowledges writes it did not sync — and so is #112: an `ENOSPC` on the flush
 thread's WAL write used to abort the node in a crash loop while the client-facing path handled the
 same condition correctly, and all seventeen thread bodies now have an exception boundary.
 Everything recorded before them is closed: #108's build job closed the last gap in compilation coverage, without claiming runtime
@@ -5252,8 +5347,8 @@ runners, not the machine-B performance baseline above.
 | Suite | Count | Status |
 |-------|-------|--------|
 | C++ (GTest + RapidCheck) | 1024 | all passing with `ctest -j1` on the i3-7100U. **Five fewer than the previous commit, and that is #114 rather than a loss of coverage**: `test_mmap_store.cpp` held exactly five tests for a component with no production caller, deleted with it. CTest lists 1026: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtime is what this machine gave on the commit measured, not a budget: the same suite read 159 s earlier the same day on an idler machine |
-| Python integration | 237 | all passing in 14:11 on the i3-7100U, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 237; count pytest's final result rather than the report plugin's progress characters |
-| Python integration under TSan | 237 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. Timed at **15:28** on the GitHub runner for the commit that carries this table — a CI figure, and it is labelled as one because it is not comparable with the 13:29 above: different machine, and instrumentation on. The same runner gave 13:24 for the uninstrumented battery, which is the honest way to read the instrumentation's cost |
+| Python integration | 244 | all passing in 16:23 on the i3-7100U, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 244; count pytest's final result rather than the report plugin's progress characters. Seven more than the previous commit: #54 stage B's four windows, which own their clusters and cost about 2:13 between them because each stops etcd and waits out a step-down, plus three pinning the death report's new coordinator annotation |
+| Python integration under TSan | 244 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. Timed at **15:28** on the GitHub runner for the commit before this one — the count is this commit's, the timing is not, and the stage B windows scale with `patience()` under instrumentation — a CI figure, and it is labelled as one because it is not comparable with the 13:29 above: different machine, and instrumentation on. The same runner gave 13:24 for the uninstrumented battery, which is the honest way to read the instrumentation's cost |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than

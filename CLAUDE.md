@@ -1938,6 +1938,42 @@ Learned the hard way. Check here before debugging.
     *control* too. The control failing is what said the probe was wrong rather than the code; a
     measurement whose control does not pass is not a measurement (#114).
 
+233. **A duration that comes out exactly `0.00` is a measurement taken after the event, not a fast
+    mechanism.** #54 stage B times how long a holder keeps the primary role after its coordinator
+    vanishes. The first version measured it in a loop that ran *after* the loop watching the
+    replica, so by the time it looked the step-down had happened twenty-five seconds earlier, and
+    it reported `primary_step_down_without_coordinator_sec: 0.0`. Both observations are about the
+    same window, so they belong in the same pass; the real figure is **2.28 s**, because the lease
+    keepalive fails on the next tick. The guard is cheap and worth having: assert the duration is
+    **greater than zero**, because a zero here can only mean the clock started too late.
+234. **Counting lines in a test's assertion message measures the truncation, not the log.** I put
+    `log[-2000:]` in a failure message — correct, a full node log in a traceback is unreadable —
+    and then derived a WARN rate from that same captured output: **0.42 lines/s**, which is a
+    property of the 2000 characters rather than of the engine. Measured properly, with a probe that
+    reads the node's own log across the outage, it is **2.17 and 2.23 lines/s** on the two nodes.
+    Five times the number. A rate computed from a buffer somebody chose the size of is not a rate
+    (#116).
+235. **An assertion on an `OB_LOG_DEBUG` line, against a server whose default level is INFO,
+    matches nothing — and here the failing assertion *was* the finding.** Two of #54 stage B's
+    three windows failed on `"rather than campaigning" in node_log`, the sentence in which a
+    replica records that it is declining to stand for election. It is a DEBUG line and the default
+    is INFO, which this file's own logging section warns about. The test was wrong; so is the
+    engine, and for the same reason: if the line is invisible to the test at the default level it
+    is invisible to an operator, which is #115. The fix on the test side is a harness that can ask
+    for the level it needs (`ClusterManager(log_level="DEBUG")`, affecting one module rather than a
+    shared session cluster), and on the engine side an item. **When an assertion cannot see
+    something, ask whether the operator can.**
+
+236. **Grepping for a path finds the comments that mention it, not the code that reads it.** Asking
+    "which tests read `docs/operations.md`" with `grep -l 'docs/'` over `tests/*.cpp` returned five
+    files, and I re-ran all 63 of their tests after editing that document — on the strength of a
+    match inside sentences like *"the way `docs/operations.md` tells an operator to make one"*.
+    **Exactly one** C++ test reads a document at runtime: `CliConfigStatic.`
+    `EveryKnownFlagIsInTheCliReference`, over `docs/cli.md`. The derivation that answers the
+    question is the file-reading call (`read_source(...)`, `OB_SOURCE_DIR`), not the string. Use
+    versus mention, fifth time in this workspace, and this time it put a false clause in a commit
+    message — corrected in #113's entry rather than rewritten, because the history was pushed.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2050,6 +2086,17 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   `lease_loop`, `monitor_loop` and `io_loop` have the thread-level boundary but not yet a
   per-iteration one, and `io_loop` needs a bound first because its epoll timeout is zero whenever a
   catch-up cursor has queue space (#93).
+- **An unreachable coordinator is injectable too, and the node's promise is a refusal** (#54 stage
+  B). `ClusterManager.stop_etcd()` / `start_etcd()` are public; the restart reuses the **same client
+  port and data directory**, because a node is handed `--etcd-endpoint` on its command line at
+  start, so a coordinator returning on a fresh port has not returned as far as that node is
+  concerned. What the engine promises, measured across three windows: a node that cannot read the
+  leader key **does not take the role** (#82's three-state answer), a holder whose lease keepalive
+  fails **gives the role up in 2.28 s** rather than waiting out a TTL, reads keep being served, and
+  nothing exits. Two things to know before reading a log from such an outage: the refusal to
+  campaign is **DEBUG-only** (#115) and the two position-publish failures repeat at ~2.2 lines/s for
+  the whole outage (#116). The intent is recorded to **annotate** `unexplained_deaths()`, not to
+  suppress it — a node that dies while the coordinator is away is the defect that stage hunts.
 - **Storage faults are injectable, and the instrument is `tests/fault/obfault.c`** (#54 stage A) —
   an `LD_PRELOAD` shim over `write`, `pwrite`, `fsync`, `fdatasync` and `ftruncate`, armed by
   `OB_FAULT_PATH` and friends, matching by the path behind the descriptor. It found #112, #113 and
