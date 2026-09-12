@@ -1,7 +1,6 @@
 #pragma once
 
 #include "orderbook/data_model.hpp"
-#include "orderbook/mmap_store.hpp"
 
 #include <cstdint>
 #include <functional>

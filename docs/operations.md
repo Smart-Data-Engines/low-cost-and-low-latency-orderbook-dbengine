@@ -196,6 +196,16 @@ trade — a duplicate you can see, against a write you were told was durable and
 fsynced per segment, so this policy is about the WAL. A segment lost to a power failure is rebuilt
 by replaying the WAL, which is what the WAL is for.
 
+**Every storage failure this engine can reach is an `errno`, so it is a refusal and a counter —
+never a signal.** That is worth stating because it is a property of a choice rather than of
+storage: nothing here memory-maps a file for writing, and a growable mapping is the one shape in
+which a full filesystem arrives as **`SIGBUS`** instead of `ENOSPC` — `ftruncate` extends sparsely
+and succeeds, and the allocation fails later, when the page is touched and there is no return value
+to check. Measured on an 8 MB tmpfs: reserving 64 MB succeeded and writing into it died with
+`Bus error`, exit 135. A signal is not an exception, so #112's thread boundary could not catch it
+and no client could be told. `docs/storage.md` records why the mapped store was removed rather than
+adopted (#114).
+
 ## Which build is running
 
 Three ways to ask, all reporting the same number:

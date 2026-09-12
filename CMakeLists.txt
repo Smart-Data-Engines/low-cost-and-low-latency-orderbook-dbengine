@@ -259,12 +259,10 @@ add_library(orderbook_codec STATIC src/codec.cpp)
 target_link_libraries(orderbook_codec PUBLIC orderbook_core)
 
 # ── MMAP store compiled library ────────────────────────────────────────────────
-add_library(orderbook_mmap STATIC src/mmap_store.cpp)
-target_link_libraries(orderbook_mmap PUBLIC orderbook_core)
 
 # ── Columnar store compiled library ────────────────────────────────────────────
 add_library(orderbook_columnar STATIC src/columnar_store.cpp)
-target_link_libraries(orderbook_columnar PUBLIC orderbook_codec orderbook_mmap orderbook_logger)
+target_link_libraries(orderbook_columnar PUBLIC orderbook_codec orderbook_logger)
 
 # ── LZ4 compression library ────────────────────────────────────────────────────
 find_package(PkgConfig)
@@ -399,7 +397,6 @@ if(OB_ENABLE_COVERAGE)
             tests/test_soa_buffer
             tests/test_wal
             tests/test_codec
-            tests/test_mmap_store
             tests/test_columnar_store
             tests/test_aggregation
             tests/test_query_engine

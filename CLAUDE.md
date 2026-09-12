@@ -1908,6 +1908,36 @@ Learned the hard way. Check here before debugging.
     out before matching, and the mutation table has a control that must **survive** — an added
     backticked mention (#113).
 
+230. **A full filesystem reaches a growable memory mapping as `SIGBUS`, not as an `errno`, and that
+    is why this engine does not memory-map a file for writing.** `ftruncate` extends a file
+    **sparsely** and allocates nothing, so it succeeds on a nearly full filesystem; the allocation
+    happens when the page is first touched, where there is no return value to check. Measured on an
+    8 MB tmpfs: reserving 64 MB succeeded and left 67 108 864 apparent bytes, and writing into it
+    died with `Bus error` — **exit 135**, against a control reserving 2 MB that completed. A signal
+    is not an exception, so `run_thread_body()` (#112) cannot catch it and no `ERR` can carry it.
+    #112 and #113 made a failing disk into a refusal the client is told about; adopting the mapped
+    store would have reinstated process death for a full disk, in a strictly harder form. **The
+    decision came from the failure mode, not from the throughput benchmark the item expected to
+    need** (#114).
+231. **A test suite on a component nothing calls describes the paths somebody thought about.**
+    `MmapStore` had 165 lines of passing tests and was named as "the only thing keeping the
+    component honest". Driven with #54's injector making the `ftruncate` inside `remap()` fail —
+    skipping the one inside `open()`, which is the first the injector sees — its only growth path
+    leaves the object broken three ways: `size()` still reports 4000 bytes into a mapping that is
+    gone, `write_ptr()` returns **`0xfa0`** (`nullptr + 4000`, a pointer from a null base), and the
+    next `advance()` **never returns**, because `remap()` zeroes `mapped_size_` and the growth loop
+    doubles zero for ever (exit 124 at a 20 s timeout). None of the three is reachable without
+    making a syscall fail, which is what the instrument is for (#114, #54 task A4.1).
+232. **My probe had the defect twice before the measurement was worth anything, both times in the
+    direction that reads like a finding.** First: the fault fired inside `open()` rather than
+    `remap()`, because `open()` calls `ftruncate` too — so all three stages reported the same abort
+    and none of them tested what they claimed (`OB_FAULT_SKIP=1` fixes it). Second, and worse:
+    `advance()` returns the offset where the reserved bytes **start** and leaves the cursor past
+    them, so `write_ptr()` afterwards points past the reservation — writing there is a **SIGSEGV**
+    that is one digit away from the SIGBUS being hunted (139 against 135), and it killed the
+    *control* too. The control failing is what said the probe was wrong rather than the code; a
+    measurement whose control does not pass is not a measurement (#114).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -1989,6 +2019,16 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   `demote_to_replica()`** — it needs the primary's identity, which exists only after the connection,
   so it lives in `ReplicationClient::resolve_stream_identity()` and a static test pins that nothing
   about which of the four callers demoted the node reaches it.
+- **Nothing in this engine memory-maps a file for writing, and that is load-bearing rather than
+  incidental** (#114). A growable mapping is the one shape in which a full filesystem arrives as
+  **`SIGBUS`** instead of `ENOSPC`: `ftruncate` extends sparsely and succeeds, and the allocation
+  fails later, on first touch, where there is no return value. Measured on an 8 MB tmpfs — 64 MB
+  reserved, `Bus error`, exit 135, against a passing 2 MB control. A signal is not an exception, so
+  `run_thread_body()` cannot catch it and no client can be told; mapping the segment write path
+  would undo #112 and #113. `MmapStore` was deleted for this reason rather than benchmarked. What
+  it does not settle: `ts.col`, `cnt.col` and `side.col` are raw fixed-width arrays, so a mapped
+  *reader* could still skip a copy — the deleted class was an appender, so that question is open,
+  and the argument "the columns are compressed so there is nothing to map" is false for those three.
 - **`--fsync-policy every` means what it says, and a failed `fsync` is refused rather than
   acknowledged** (#113). `WALWriter::flush()` and `sync()` are `[[nodiscard]] bool`, so discarding
   the answer is a compile error; the write paths, `FLUSH`, both snapshot paths and the flush tick
