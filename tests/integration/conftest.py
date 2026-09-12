@@ -257,6 +257,30 @@ def cpp_client_binary_path() -> Optional[str]:
     return None
 
 
+def fault_injector_path() -> Optional[str]:
+    """`libobfault.so`, from the same build tree as the server under test (#54).
+
+    Derived from `OB_SERVER_BINARY` for the reason `cpp_client_binary_path()` is: the injector sits
+    at `<build>/tests/libobfault.so` beside the server's `<build>/ob_tcp_server`, and a module that
+    built its own path would preload the **plain** build's shim into a sanitizer build's server -
+    or, worse, find a stale one and report a fault that was never injected.
+
+    Returns None when it was not built. Callers **fail** rather than skip: a fault-injection test
+    that quietly does not inject is indistinguishable from an engine that survives the fault, which
+    is the whole failure mode this instrument exists to avoid.
+    """
+    from_env = os.environ.get("OB_SERVER_BINARY")
+    if from_env:
+        derived = Path(from_env).resolve().parent / "tests" / "libobfault.so"
+        if derived.is_file():
+            return str(derived)
+    for candidate in (ClusterManager._PROJECT_ROOT / "build" / "tests" / "libobfault.so",
+                      ClusterManager._PROJECT_ROOT / "build-release" / "tests" / "libobfault.so"):
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 class ClusterManager:
     """Manage the full lifecycle of an integration-test cluster:
     a native etcd process + 2 ob_tcp_server nodes.

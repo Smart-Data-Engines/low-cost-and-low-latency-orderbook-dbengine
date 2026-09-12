@@ -2091,6 +2091,145 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 114. An `MmapStore` with tests and no caller, described by three documents as the storage path
+
+Found while #54's fault injector went looking for an mmap to fail, and found none.
+
+**Measured:** `mmap(` appears in all of `src/` only inside `src/mmap_store.cpp`. `MmapStore` is
+constructed only in `tests/test_mmap_store.cpp` — nothing in `src/`, `include/` or `tools/` uses it,
+beyond an `#include "orderbook/mmap_store.hpp"` in `columnar_store.hpp` that uses no name from it.
+`ColumnarStore` writes every `.col` with `std::ofstream` and reads with `std::ifstream`. A segment
+is a directory `<symbol>/<exchange>/<start_ns>_<end_ns>/` holding seven column files —
+`price`, `qty`, `cnt`, `ts`, `side`, `level`, `seq` — and a `meta.json`.
+
+So `orderbook_mmap` is a compiled library with a test suite and no production caller, which is the
+shape of #104 at component scale rather than field scale.
+
+**Three documents described it as how this engine stores data**, and they are corrected in the same
+change that files this, because a claim about the code is not a roadmap item:
+
+- `README.md` listed "MMAP persistence with segment-based time partitioning" as a feature
+- `docs/architecture.md` drew the columnar store as "segments on disk via MMAP"
+- `docs/storage.md` had a whole **MMAP Store** section claiming column files are memory-mapped with
+  `mmap(MAP_SHARED)`, extended with "`ftruncate` + `mremap`" and synced with `msync(MS_SYNC)` — and
+  even that is not what the unused component does, since it remaps with `munmap` + `ftruncate` +
+  `mmap` and never calls `mremap`
+
+The same document also named WAL files `wal_NNNN.wal`; they are `wal_%06u.bin`, which the injector's
+own decision log printed while nobody was looking for it.
+
+**What this item is, and it is a decision rather than a bug.** Either the component goes, or it gets
+the caller the documents assumed it had. Deleting it is the smaller change and loses a tested
+mapping layer that nothing needs; wiring it in is a storage change with its own benchmark, because
+the reason to memory-map a column file is a measurement nobody here has made. Until that is decided
+the tests stay: they pass, they cost 0.1 s, and they are the only thing keeping the component
+honest.
+
+- Effort: S to delete, L to adopt | Impact: the front page described a storage mechanism the engine
+  does not use, and nothing in CI could notice
+
+### 113. `fsync`'s return value is discarded, so the strongest durability policy acknowledges writes it did not sync
+
+Found by roadmap #54's fault injector, and visible by reading before it was measured: **all seven
+`::fsync()` calls in `src/wal.cpp` throw their result away.**
+
+Measured with `--fsync-policy every`, the strongest promise this engine makes — the one whose whole
+point is that a write is on disk before the client is told `OK`: **eleven `fsync` calls returned
+`EIO` and all three `INSERT`s were still answered `OK`.** The node stayed up and exited 0. A client
+cannot tell a durable write from one whose sync failed, which is the only thing that policy sells.
+
+**Why a retry is not the fix, and why this is worse than an unchecked return usually is.** On Linux
+a failed `fsync` **marks the affected pages clean**: the error is reported once, to whoever happened
+to call, and the next `fsync` on that descriptor returns 0 with the data gone. So the engine can
+neither learn about it later nor repair it by trying again. Whatever is done here has to be done at
+the first failure.
+
+What the fix is not allowed to be is an abort — that is #112, in the same file, from the other
+direction.
+
+- Effort: S for the reporting, M if the policy is to be honest about what it can still promise |
+  Impact: the durability guarantee the engine advertises is currently unverifiable by its client
+
+### 112. An ENOSPC on the flush thread's WAL write aborts the whole node
+
+Found by roadmap #54's fault injector. **The client-facing half of this is correct**, which is what
+makes the rest dangerous: an `ENOSPC` on a delta record written by a client's own session is
+answered `ERR WALWriter: write failed: No space left on device`, the row is not stored, the node
+keeps serving, and `SIGTERM` still exits 0. Measured, including a disk that stays full: every
+`INSERT` refused with the reason named, `PING` still answered.
+
+The WAL writes that are **not** on a session thread have no such handler — and the scope is wider
+than this item said twice before. **Sixteen of seventeen `std::thread` constructions in `src/` have
+no exception boundary.** Any exception escaping any of them ends the process, and this engine throws
+`std::runtime_error` from the WAL, the mmap store, the columnar store and several parsers.
+
+The number was wrong twice, and how it was wrong is the lesson. First it was "`flush_loop` has no
+`try`", which is one instance. Then it was "eleven of eleven thread entry points" — counted over a
+list of entry functions **I wrote by hand**, which silently omitted five threads: both `run_loop`
+threads in `replication.cpp`, `ShardCoordinator`'s migration thread, `coordinator.cpp`'s watch
+thread and `AsyncSnapshot`'s worker. Derived from the `std::thread` constructions instead, the set
+is seventeen. *A list you wrote yourself is not evidence about the code* — the rule #32 paid for,
+in a new place.
+
+The seventeenth is `src/async_snapshot.cpp:54`, and it is the only one that thought about this: its
+lambda wraps `produce()` in `try`/`catch (const std::exception&)`/`catch (...)`, under a comment
+saying that a joinable `std::thread` calls `std::terminate` and that losing one snapshot beats
+losing the process. **Its boundary still does not cover the whole body** — the statements before the
+`try` and, more to the point, the mutex taken after the `catch` to publish the result, from which a
+`std::system_error` would escape. So the one place that reasoned about it is also an argument for
+putting the boundary at the construction site rather than inside each body.
+
+So the measured abort is one **reachable instance of a class**, which makes the fix a class fix: a
+boundary wrapping every thread body at the point it is constructed, logging what escaped, plus a
+static test whose rule is one grep-able property — *every `std::thread` construction in `src/`
+passes its body through that boundary*. Chosen over "there is a `try` before the loop in the entry
+function" because the second needs a parser and the first needs a line. The rule's discrimination
+was checked before anything was written: it separates the seventeen constructions from the four
+moves and declarations (`std::thread stale = std::move(worker_);`, `std::thread victim;`) and from
+`std::hash<std::thread::id>`, and an early version of it misfiled `async_snapshot.cpp:54` as a move
+because `std::move` appears in that lambda's **capture list**. That case is a test of the checker
+now.
+
+An outer boundary alone is not the whole fix: it stops the process dying and leaves a subsystem that
+exits on its first exception, which is the "guarantee absent in production" shape. So each loop
+needs its own judgement about continuing, and the ones where stopping is not survivable —
+`flush_loop`, `lease_loop`, `monitor_loop`, `io_loop` — get a per-iteration boundary with a metric
+and a log that does not flood (#95's shape). Whatever is not done gets written down rather than
+left to be discovered.
+
+The instance that was measured: two records reach the WAL from `flush_loop`, a 24-byte checkpoint
+from `flush_write_and_merge()` and a 68-byte version vector from
+`persist_version_vector_if_changed()`. Failing either one:
+
+```
+terminate called after throwing an instance of 'std::runtime_error'
+  what():  WALWriter: write failed: No space left on device
+exit -6
+```
+
+Measured by naming the call rather than counting calls — the injector can fail "the 68-byte write",
+which is the same call on every run, where "the fourth write" is not:
+
+- fail only the 68-byte write → **SIGABRT**, one injection fired
+- fail only the 24-byte write → **SIGABRT**, one injection fired
+- control, fail a size nothing writes → zero injections, three `OK`s, exit 0
+
+**It kills an idle node, and it does it in a loop.** With nobody connected at all the process died
+**0.5 s into idleness**, and across three consecutive restarts on a disk that stays full it came up
+every time and died unattended after 1.5–2.0 s. A supervisor restarts it for ever, and what the
+operator is handed is `SIGABRT` rather than "no space left on device". That is exactly the contrast
+#102 was about, one call site further in: a failed bind used to abort instead of refusing, and
+`load_secrets_or_exit()` was named there as the shape to copy.
+
+No acknowledged write is lost, which is worth stating because it bounds the damage: after the crash
+and a restart, replay returned every row that had been answered `OK` and none that had been refused.
+This is an availability defect, not a durability one.
+
+- Effort: M, once the scope is eleven threads rather than one loop | Impact: the most ordinary disk
+  condition there is turns a refusal into a crash loop on a node that was still answering its
+  clients correctly — and every other throwing path in the engine reaches the same exit through one
+  of the other ten threads
+
 ### 111. A dial test's premise was a claim about the machine, and the machine changed ✅
 
 `PeerDial.AnUnreachablePeerAddressDoesNotStopTheNode` guards #97: a dial to an unreachable peer
@@ -4803,9 +4942,13 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**No recorded defect remains open after #111.** #108's build job closed the final gap in
-compilation coverage, without claiming runtime coverage of io_uring; #111 closed a test whose
-premise was a claim about the machine rather than about the engine. #110's first CI run also verified the
+**Two defects are open, and #54's fault injector found both.** #112 — an `ENOSPC` on the flush
+thread's WAL write aborts the node, in a crash loop, while the client-facing path handles the same
+condition correctly — and #113 — `fsync`'s result is discarded in all seven places, so
+`--fsync-policy every` acknowledges writes it did not sync. Everything recorded before them is
+closed: #108's build job closed the last gap in compilation coverage, without claiming runtime
+coverage of io_uring, and #111 closed a test whose premise was a claim about the machine rather
+than about the engine. #110's first CI run also verified the
 value of the skip gate: seven new CLI tests did not run until both integration jobs built the CLI
 and the fixture selected the same build as the server.
 
@@ -4968,8 +5111,14 @@ runners, not the machine-B performance baseline above.
 | Suite | Count | Status |
 |-------|-------|--------|
 | C++ (GTest + RapidCheck) | 1022 | all passing, 213 s with `ctest -j1` on the i3-7100U. CTest lists 1024: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtime is what this machine gave on the commit measured, not a budget: the same suite read 159 s earlier the same day on an idler machine |
-| Python integration | 225 | all passing in 13:06, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 225; count pytest's final result rather than the report plugin's progress characters |
-| Python integration under TSan | 225 | all passing in 14:39, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job |
+| Python integration | 234 | all passing in 13:37, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 234; count pytest's final result rather than the report plugin's progress characters |
+| Python integration under TSan | 234 | all passing in 15:13, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job |
+
+#54's nine — six for the fault injector and three for what the engine does with a refused WAL
+write — run in both integration jobs, and both counts above are from the same CI run rather than
+from a local one. That the TSan job also reports 234 with zero skips is what establishes something
+the design left open: an injector compiled with ThreadSanitizer preloads cleanly into a server
+compiled with it, measured instead of argued.
 
 The seven CLI tests run in both integration jobs. Both build `ob_cli`, and the fixture selects the
 binary beside the server under test. No `xfail` remains.

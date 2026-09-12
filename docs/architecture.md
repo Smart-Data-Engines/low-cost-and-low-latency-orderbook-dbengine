@@ -26,8 +26,8 @@ The engine is composed of six subsystems, each responsible for a specific concer
               ┌────────▼──────────┐
               │  Columnar Store   │
               │  (time-partitioned│
-              │   segments on     │
-              │   disk via MMAP)  │
+              │   segments, one   │
+              │   file per column)│
               └───────────────────┘
 ```
 
