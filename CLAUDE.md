@@ -33,7 +33,7 @@ cmake --build build -j$(nproc)
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release -j$(nproc)
 
-# Tests — 744 of them, ~2 minutes
+# Tests — counts and measured runtimes are in docs/roadmap.md
 ctest --test-dir build --output-on-failure -j1
 ```
 
@@ -626,8 +626,10 @@ Learned the hard way. Check here before debugging.
 86. **A new CI job is a ruleset change, and the repository checks that for you.** `docs-integrity`
     failed with `produced but not required: 'package'` twelve seconds into the run. A job nobody
     requires looks like coverage, so `check_contexts.py` refuses the drift in either direction.
-    Adding a job means: add the context to `.github/rulesets/master.json`, `PUT` it to the live
-    ruleset, and **read the ruleset back** — this API answers 200 for writes that change nothing.
+    Adding a job means: put the workflow and its context in `.github/rulesets/master.json` in one
+    PR, merge it, then `PUT` the live ruleset and **read it back**. Applying it before the branch
+    can produce the new context blocks that branch indefinitely (#108). This API can answer 200
+    for writes that change nothing.
     Then fix the count wherever prose states it; it was in two documents.
 
 87. **A readiness check that counts the wrong token always answers the same thing.** The bootstrap
@@ -1799,13 +1801,13 @@ the next free number wherever it sits on the page; `scripts/check_roadmap.py` (r
 references and ranges. The rule exists because three renumbering passes each broke something, and
 because commit messages and specs cite these numbers.
 
-**Where the suites stand:** 995 C++ tests (`ctest -j1`, ~3.7 min) and 203 integration tests plus 2
-opt-in Binance skips (`pytest tests/integration/`, **13:03 measured** on i3-7100U), all green, and **no `xfail` left** —
-every marker that recorded a known defect went with the defect. Both suites run in CI on every pull
-request, the **whole** integration battery a second time under ThreadSanitizer with a step that
-fails the job on any skip, and the tree also builds and tests under Clang. Twelve required checks on
-`master` since #33 added `package`, which builds the .deb, the tarball and the RPM and verifies them
-— including that the packaged binary accepts the packaged configuration.
+**Where the suites stand:** the measured counts and runtimes are in the test-suite table in
+[docs/roadmap.md](docs/roadmap.md). Both suites run in CI on every pull request, the whole integration
+battery a second time under ThreadSanitizer, with an unexpected skip failing the job. The CLI and
+C++ client harness are built alongside the selected server in both integration jobs. Clang builds
+and tests the tree too. Thirteen required checks protect `master` after #108 added `io-uring-build`:
+it compiles the optional transport and verifies its symbol in `ob_tcp_server_iouring`, without
+claiming runtime coverage. The exact contexts live in `.github/rulesets/master.json`.
 
 Read the sanitizer claims with #83 in mind: until it landed, `OB_ENABLE_ASAN`, `OB_ENABLE_TSAN` and
 `OB_ENABLE_COVERAGE` instrumented the test binaries and the server but **none of the static
@@ -1827,14 +1829,16 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   What is still true: **an unconfigured node is plaintext and unauthenticated on all three
   surfaces**, and the startup log WARNs for each disabled surface rather than leaving "default open"
   in a document. The io_uring transport **refuses** every `--tls-*` flag — the client port needs a
-  memory-BIO rewrite, and the node links would work there but no CI job builds that file.
+  memory-BIO rewrite, and node-link TLS has no runtime tests on this transport.
+  The `io-uring-build` job checks compilation and linking only (#108).
   Certificate rotation needs a restart. Three things to know before touching authentication: the
   client gate sits *before* `execute_command`'s switch and its classifier has no `default:` (pitfall
   109); the surface label is inside the HMAC input because replication and multi-master share one
   secret; and the two secret files must differ, which the start enforces, because a client holding
   the cluster secret can present itself as a replica and stream the whole write-ahead log.
-- **The whole integration battery runs under ThreadSanitizer**, not a subset — since #85. 146 tests,
-  **zero skips**, zero reports. Before that the job ran three multi-master modules, and the reason
+- **The whole integration battery runs under ThreadSanitizer**, not a subset — since #85.
+  Unexpected skips and sanitizer reports fail the job. Before that the job ran three multi-master
+  modules, and the reason
   given for the narrow scope was a hypothesis that turned out to be false (pitfall 75). Widening it
   also revealed that four modules built their own path to the server and ignored `OB_SERVER_BINARY`,
   so part of that job had been testing an *uninstrumented* binary since it was written (pitfall 77).
@@ -1866,12 +1870,11 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   `demote_to_replica()`** — it needs the primary's identity, which exists only after the connection,
   so it lives in `ReplicationClient::resolve_stream_identity()` and a static test pins that nothing
   about which of the four callers demoted the node reaches it.
-- **A record written over the wire carries the time it arrived, not the time it happened** (#105).
-  `INSERT` and `MINSERT` have no timestamp field, so the server stamps its own clock and
-  `timestamp BETWEEN` selects on that. `OrderbookEngine.insert(timestamp_ns=...)` is honoured
-  **embedded** and dropped **over TCP**, silently - four integration call sites pass it and none
-  asserts on it. Measured by #39 part two: 0 rows of 400 where the same CSV in ClickHouse and
-  TimescaleDB returned 400. Filed as a protocol change rather than a client patch.
+- **A wire write can carry its event time** (#105). `INSERT` and `MINSERT` accept an optional
+  trailing `event_time_ns`; absence asks for arrival time, while zero is refused. Both clients check
+  the `insert_event_time` capability before sending a supplied time and refuse an older server
+  rather than dropping the value. LWW still compares the node's HLC; TTL follows the stored event
+  time, so backfill arrives with its age. See `docs/operations.md`.
 - **Creating a snapshot happens on a worker thread, not on either io loop** (#79). One at a time; a
   second request during creation is refused as busy, and a finished snapshot whose requester has gone
   is discarded rather than sent — matched on `conn_id`, because the case that `node_id` cannot see is
@@ -1887,7 +1890,7 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   deliberate `kill_node()` from a crash, so a crashing node was repaired in silence. If you add a
   fixture that stops a node on purpose, record it the way `kill_node()` does, or
   `unexplained_deaths()` will report your own teardown as a defect.
-- `rapidcheck` is pinned to `master` rather than a commit SHA, unlike every other dependency.
+- Every FetchContent dependency, including `rapidcheck`, is pinned to a commit SHA.
 
 *Entries used to sit here and no longer describe the code, and the list is kept because the pattern
 matters more than any one of them.* "Deference on election cannot tell a further replica from a dead
