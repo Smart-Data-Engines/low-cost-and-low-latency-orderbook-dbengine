@@ -4967,7 +4967,7 @@ runners, not the machine-B performance baseline above.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1021 | all passing, 159 s with `ctest -j1`. CTest lists 1023: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them |
+| C++ (GTest + RapidCheck) | 1022 | all passing, 213 s with `ctest -j1` on the i3-7100U. CTest lists 1024: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtime is what this machine gave on the commit measured, not a budget: the same suite read 159 s earlier the same day on an idler machine |
 | Python integration | 225 | all passing in 13:06, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 225; count pytest's final result rather than the report plugin's progress characters |
 | Python integration under TSan | 225 | all passing in 14:39, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job |
 
