@@ -4576,11 +4576,14 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**One defect is open, and this session found all five of them** — four are already closed — the
-usual way here, by measuring the item before. #110 is **closed**: the interactive CLI stored the
-wrong side of the book for a mistyped word, echoing the word back as though it had been understood,
-and nothing in this repository exercised that tool until the fix needed somewhere to prove itself. #105: nothing can be written with its own event time over the wire, so the engine's
-main query selects on arrival time (0 rows of 400 where two SQL systems returned 400). #106 was the same shape in the other
+**Of the five defects this session found, four are closed and #108 is the one left** — and it is a
+gap in the *checking* rather than in the engine, since no CI job builds the io_uring transport. Each
+was found the usual way here, by measuring the item before. A sixth came out of closing them and is
+also closed: #110, where the interactive CLI stored the wrong side of the book for a mistyped word
+and echoed the word back as though it had been understood — nothing in this repository exercised
+that tool until the fix needed somewhere to prove itself. #105 is **closed** and was the largest:
+nothing could be written with its own event time over the wire, so the engine's main query selected
+on arrival time (0 rows of 400 where two SQL systems returned 400). #106 was the same shape in the other
 direction and is **closed**: a node with any client connected never exited on `SIGTERM`, so its
 supervisor killed it instead — 0.11 s against never, now 10.15 s with the cut named in the log.
 #107 is **closed** and was larger than its title: fourteen command shapes accepted a
