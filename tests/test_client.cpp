@@ -1,6 +1,13 @@
 // Tests for cpp-native-client: property-based tests (Properties 1–6) and unit tests.
 // Feature: cpp-native-client
 
+#include <algorithm>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <thread>
+#include <mutex>
+#include <atomic>
 #include <gtest/gtest.h>
 #include <rapidcheck/gtest.h>
 
@@ -502,4 +509,255 @@ TEST(ClientUnit, ParseAggResponseErrorIsPropagated) {
     auto result = client.parse_agg_response("ERR AGG_TIME_FILTER not supported\n");
     ASSERT_FALSE(result.has_value());
     EXPECT_NE(result.error_message().find("AGG_TIME_FILTER"), std::string::npos);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Event time on the wire (#105)
+//
+// The property is that the field survives the formatter this client writes and the parser the
+// server reads - in both directions, because the two halves are in different files and a field that
+// round-trips through one of them is a field with two meanings.
+
+RC_GTEST_PROP(ClientProperty, prop_event_time_survives_the_format_and_parse_round_trip, ()) {
+    auto symbol   = *genUpperAlpha(1, 31);
+    auto exchange = *genUpperAlpha(1, 31);
+    auto side     = *rc::gen::element(ob::Side::BID, ob::Side::ASK);
+    auto price    = *rc::gen::inRange<int64_t>(-1'000'000'000, 1'000'000'001);
+    auto qty      = *rc::gen::inRange<uint64_t>(1, 1'000'000'001);
+    auto count    = *rc::gen::inRange<uint32_t>(1, 100'001);
+    // 1 upwards: zero is refused on purpose, because it is how "unassigned" is spelled elsewhere.
+    auto event_ns = *rc::gen::inRange<uint64_t>(1, 2'000'000'000'000'000'000ULL);
+
+    ob::OrderbookClient client;
+    client.format_insert(symbol, exchange, side, price, qty, count, event_ns);
+    const auto cmd = ob::parse_command(std::string(client.send_buffer()));
+
+    RC_ASSERT(cmd.type == ob::CommandType::INSERT);
+    RC_ASSERT(cmd.insert_args.timestamp_ns.has_value());
+    RC_ASSERT(*cmd.insert_args.timestamp_ns == event_ns);
+    RC_ASSERT(cmd.insert_args.count == count);
+}
+
+RC_GTEST_PROP(ClientProperty, prop_a_batch_carries_one_event_time_for_all_its_levels, ()) {
+    auto symbol   = *genUpperAlpha(1, 31);
+    auto exchange = *genUpperAlpha(1, 31);
+    auto side     = *rc::gen::element(ob::Side::BID, ob::Side::ASK);
+    auto n_levels = *rc::gen::inRange<size_t>(1, 40);
+    auto event_ns = *rc::gen::inRange<uint64_t>(1, 2'000'000'000'000'000'000ULL);
+
+    std::vector<ob::Level> levels(n_levels);
+    for (size_t i = 0; i < n_levels; ++i) {
+        levels[i].price = static_cast<int64_t>(100 + i);
+        levels[i].qty   = 1 + i;
+        levels[i].count = 1;
+    }
+
+    ob::OrderbookClient client;
+    client.format_minsert(symbol, exchange, side, levels.data(), n_levels, event_ns);
+    const auto cmd = ob::parse_minsert(std::string(client.send_buffer()));
+
+    RC_ASSERT(cmd.type == ob::CommandType::MINSERT);
+    RC_ASSERT(cmd.minsert_args.timestamp_ns.has_value());
+    RC_ASSERT(*cmd.minsert_args.timestamp_ns == event_ns);
+    RC_ASSERT(cmd.minsert_args.levels.size() == n_levels);
+}
+
+TEST(ClientUnit, WithoutAnEventTimeTheCommandIsByteForByteWhatItAlwaysWas) {
+    // The control, and the compatibility claim in one test: a caller who passes no time must
+    // produce exactly the line an older client produced, or every existing deployment changed
+    // meaning on upgrade.
+    ob::OrderbookClient client;
+    client.format_insert("BTC-USD", "BINANCE", ob::Side::BID, 6500000, 150, 3);
+    EXPECT_EQ(std::string(client.send_buffer()), "INSERT BTC-USD BINANCE bid 6500000 150 3\n");
+
+    client.format_insert("BTC-USD", "BINANCE", ob::Side::BID, 6500000, 150, 3,
+                         1700000000000000000ULL);
+    EXPECT_EQ(std::string(client.send_buffer()),
+              "INSERT BTC-USD BINANCE bid 6500000 150 3 1700000000000000000\n");
+}
+
+TEST(ClientUnit, AnEventTimeOnAnUnconnectedClientFailsWithoutPretendingToAsk) {
+    // The gate reads the server's capabilities, so on a client that was never connected it has to
+    // fail as a connection error rather than as "this server cannot do it" - the difference
+    // matters, because one of those messages sends the reader to upgrade a server that is fine.
+    ob::OrderbookClient client;
+    auto r = client.insert("BTC-USD", "BINANCE", ob::Side::BID, 6500000, 150, 1,
+                           1700000000000000000ULL);
+    EXPECT_FALSE(r);
+    EXPECT_EQ(std::string(r.error_message()).find("does not accept an event time"),
+              std::string::npos)
+        << "an unconnected client blamed the server: " << r.error_message();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// The client asks before it sends, against a server that says it cannot (#105)
+//
+// Written because a mutation survived: deleting the capability gate from `insert()` broke nothing.
+// The unit test above could not tell — with the gate gone, an unconnected client fails at `send`
+// with a connection error, and "the message does not blame the server" is true either way. The only
+// thing that can tell is a server that **answers**, and answers without the capability. So this is
+// one: forty lines of stub rather than a real node, because what is under test is which bytes the
+// client sends, and to whom.
+
+namespace {
+
+/// A server that speaks just enough of the protocol to answer `STATUS` the way an older build does.
+class StubServer {
+public:
+    StubServer(bool announce_event_time) : announce_(announce_time_str(announce_event_time)) {
+        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        int opt = 1;
+        ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
+        addr.sin_port        = 0;                      // any free port: the OS picks, we read back
+        if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) return;
+        socklen_t len = sizeof(addr);
+        ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
+        port_ = ntohs(addr.sin_port);
+        ::listen(listen_fd_, 1);
+        thread_ = std::thread([this] { serve(); });
+    }
+
+    ~StubServer() {
+        stop_ = true;
+        if (listen_fd_ >= 0) ::shutdown(listen_fd_, SHUT_RDWR);
+        if (thread_.joinable()) thread_.join();
+        if (listen_fd_ >= 0) ::close(listen_fd_);
+    }
+
+    uint16_t port() const { return port_; }
+
+    /// Every line the client sent, in order. The assertion that matters is what is *not* here.
+    std::vector<std::string> lines() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return lines_;
+    }
+
+private:
+    static std::string announce_time_str(bool announce) {
+        return announce ? "capabilities: insert_event_time,strict_args\n" : "capabilities: \n";
+    }
+
+    void serve() {
+        const int fd = ::accept(listen_fd_, nullptr, nullptr);
+        if (fd < 0) return;
+        // The banner first: `connect()` reads the server's welcome before anything else, and a stub
+        // that skips it is a stub the client never finishes connecting to. Found by the tests below
+        // failing on `connect()` rather than on what they were written to check.
+        static constexpr std::string_view kWelcome = "OK ob_tcp_server v0.1.0\n\n";
+        (void)::send(fd, kWelcome.data(), kWelcome.size(), MSG_NOSIGNAL);
+        std::string pending;
+        char buf[4096];
+        while (!stop_) {
+            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            pending.append(buf, static_cast<size_t>(n));
+            size_t nl;
+            while ((nl = pending.find('\n')) != std::string::npos) {
+                std::string line = pending.substr(0, nl);
+                pending.erase(0, nl + 1);
+                {
+                    std::lock_guard<std::mutex> lock(mtx_);
+                    lines_.push_back(line);
+                }
+                const std::string reply = line.rfind("STATUS", 0) == 0
+                                              ? "OK\n" + announce_ + "replicas: 0\n\n"
+                                              : "OK\n\n";
+                (void)::send(fd, reply.data(), reply.size(), MSG_NOSIGNAL);
+            }
+        }
+        ::close(fd);
+    }
+
+    int         listen_fd_ = -1;
+    uint16_t    port_      = 0;
+    std::string announce_;
+    std::thread thread_;
+    std::atomic<bool> stop_{false};
+    std::mutex  mtx_;
+    std::vector<std::string> lines_;
+};
+
+} // namespace
+
+TEST(ClientEventTime, AServerThatCannotStoreOneIsAskedAndThenNothingIsSent) {
+    StubServer server(/*announce_event_time=*/false);
+    ASSERT_NE(server.port(), 0u) << "the stub could not bind";
+
+    ob::ClientConfig cfg;
+    cfg.port = server.port();
+    ob::OrderbookClient client(cfg);
+    ASSERT_TRUE(client.connect());
+
+    const auto r = client.insert("BTC-USD", "BINANCE", ob::Side::BID, 6500000, 150, 1,
+                                 1700000000000000000ULL);
+    EXPECT_FALSE(r) << "the client wrote an event time to a server that discards it";
+    EXPECT_NE(std::string(r.error_message()).find("does not accept an event time"),
+              std::string::npos)
+        << "the refusal does not say what is wrong: " << r.error_message();
+
+    // The whole claim: it **asked**, and then it sent nothing. A write that went out without the
+    // time its caller chose is a row nobody can find afterwards, so "nothing was sent" is the part
+    // worth asserting rather than the wording above.
+    const auto lines = server.lines();
+    ASSERT_FALSE(lines.empty()) << "the client did not ask anything at all";
+    EXPECT_EQ(lines.front().rfind("STATUS", 0), 0u)
+        << "the first thing on the wire was not the question: " << lines.front();
+    for (const auto& line : lines) {
+        EXPECT_EQ(line.rfind("INSERT", 0), std::string::npos)
+            << "an INSERT reached a server that cannot store an event time: " << line;
+    }
+}
+
+TEST(ClientEventTime, AServerThatCanStoreOneGetsTheFieldAndIsAskedOnlyOnce) {
+    // The control, and the second half of it is the cache: a question asked per write would double
+    // every round trip in a backfill, which is the workload this field exists for.
+    StubServer server(/*announce_event_time=*/true);
+    ASSERT_NE(server.port(), 0u);
+
+    ob::ClientConfig cfg;
+    cfg.port = server.port();
+    ob::OrderbookClient client(cfg);
+    ASSERT_TRUE(client.connect());
+
+    EXPECT_TRUE(client.insert("BTC-USD", "BINANCE", ob::Side::BID, 6500000, 150, 1,
+                              1700000000000000000ULL));
+    EXPECT_TRUE(client.insert("BTC-USD", "BINANCE", ob::Side::BID, 6500001, 151, 1,
+                              1700000000000000001ULL));
+
+    const auto lines = server.lines();
+    size_t statuses = 0, inserts = 0;
+    for (const auto& line : lines) {
+        if (line.rfind("STATUS", 0) == 0) ++statuses;
+        if (line.rfind("INSERT", 0) == 0) {
+            ++inserts;
+            // Eight tokens, the last being the event time. Asserted by shape rather than by value:
+            // the first version compared against one literal and failed on the second write, whose
+            // time differs by a nanosecond — a test looking for a value where the property is a
+            // field.
+            const size_t tokens = 1 + static_cast<size_t>(std::count(line.begin(), line.end(), ' '));
+            EXPECT_EQ(tokens, 8u) << "the INSERT carries no event time: " << line;
+        }
+    }
+    EXPECT_EQ(statuses, 1u) << "the capability question was asked " << statuses << " times";
+    EXPECT_EQ(inserts, 2u);
+}
+
+TEST(ClientEventTime, AWriteWithoutATimeAsksNothing) {
+    // A read-only or live-feed client must not pay a round trip for a capability it never uses.
+    StubServer server(/*announce_event_time=*/true);
+    ASSERT_NE(server.port(), 0u);
+
+    ob::ClientConfig cfg;
+    cfg.port = server.port();
+    ob::OrderbookClient client(cfg);
+    ASSERT_TRUE(client.connect());
+    EXPECT_TRUE(client.insert("BTC-USD", "BINANCE", ob::Side::BID, 6500000, 150));
+
+    for (const auto& line : server.lines()) {
+        EXPECT_EQ(line.rfind("STATUS", 0), std::string::npos)
+            << "a write with no event time asked the capability question anyway: " << line;
+    }
 }

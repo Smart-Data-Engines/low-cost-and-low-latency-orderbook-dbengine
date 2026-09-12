@@ -841,9 +841,9 @@ measurement and our own adapter. Part two installed ClickHouse and TimescaleDB n
 three competitor adapters, ran the multi-system checkpoint and published the table — and it found
 more in our own code than in theirs. Spec: `kiro-workspace/specs/reproducible-benchmarks/`.
 
-**The published answer is that this engine loses all four comparable workloads**, and the reasons
-are worth more than the numbers. i3-7100U, Release, 200 000 rows, twelve rounds, control floor
-**15.7%**:
+**The first published answer was that this engine loses all four comparable workloads**, and the
+reasons were worth more than the numbers. i3-7100U, Release, 200 000 rows, twelve rounds, control
+floor **15.7%** (`results/2026-09-11-a8b19196.md`):
 
 | system | ingest (rows/s) | 4000-row query | not like-for-like because |
 |---|---|---|---|
@@ -852,9 +852,27 @@ are worth more than the numbers. i3-7100U, Release, 200 000 rows, twelve rounds,
 | TimescaleDB 2.30.0 / PG 16.15 | 106,874 | 6.06 ms (5.44–14.85) | `\copy` of the whole CSV, `timescaledb-tune` applied |
 | kdb+ | NOT MEASURED | NOT MEASURED | a vendor registration, and a licence question about publishing its free edition's numbers |
 
-Both losses are limits of the **protocol** rather than of the storage engine, which is the useful
-finding: the same engine ingests **446,219 updates/s in process** here against **4,012 through the
-wire** — a factor of 111, all of it the round trip.
+**Recomputed on 12 September after #105 closed, by one run rather than by editing numbers** — and
+this is the first table that compares the *same question*, because until then the engine could not
+be given event time at all and the query column excluded the time column
+(`results/2026-09-12-ece487a1.md`, control floor **21.2%**):
+
+| system | ingest (rows/s) | time-range query (4000 rows) | verdict against orderbook |
+|---|---|---|---|
+| orderbook | 66,072 | 9.32 ms (8.46–13.28) | — |
+| ClickHouse 26.8.2.7 | 428,842 | 5.26 ms (4.78–6.85) | **loses both**: 84.6% and 43.6% apart |
+| TimescaleDB 2.30.0 / PG 16.15 | 116,438 | 8.67 ms (5.60–10.54) | **loses ingest** (43.3%); the query is **7% apart against a 21.2% floor**, so it is reported as indistinguishable rather than as a win |
+| kdb+ | NOT MEASURED | NOT MEASURED | unchanged: a vendor registration and a licence question |
+
+So the honest summary changed from "loses all four" to "**loses three, and one is inside the
+floor**" — and the reason is that the workload became comparable, not that the engine got faster.
+The ingest column reads 66,072 against the earlier 78,151, which is **15% apart against this run's
+own 21.2% floor**: not separable from noise, and the harness's own note is why it is not presented
+as a change — two consecutive runs of this table gave 9.69 ms and 10.97 ms for the same query.
+
+The remaining loss is a limit of the **protocol** rather than of the storage engine, which is the
+useful finding: the same engine ingests **446,219 updates/s in process** here against **4,012
+through the wire** — a factor of 111, all of it the round trip.
 
 **Five findings came out of running it, and four of them are about our own code.**
 
@@ -2305,7 +2323,7 @@ that would rather hang than cut a session.
   shutting down, which is exactly when the flush and checkpoint matter
 
 
-### 105. Nothing can be written with its own event time over the wire
+### 105. Nothing can be written with its own event time over the wire ✅
 
 Found by #39 part two, in the only way it could be found: by loading the same dataset into three
 systems and asking each of them the same time-range question. Two answered with 400 rows. Ours
@@ -2344,6 +2362,73 @@ The fix is a protocol change, which is why it is filed rather than patched insid
 an optional trailing field on `INSERT` and `MINSERT`, both clients, `docs/cli.md`, and a decision
 about what an older server should do with the extra token. The client must **refuse** rather than
 drop — silently dropping is what this item is.
+
+**Done, and measured in the shape the defect was measured in.** `INSERT … [event_time_ns]` and
+`MINSERT … [event_time_ns]` on the header, optional and last — the only shape in which an old client
+and a new server understand each other without negotiating, because six fields still mean exactly
+what they meant. Over a live server:
+
+| sent | rows inside the sender's own 2 ns window |
+|---|---|
+| `INSERT AAA EX bid 100 5 1 1700000000000000000` | **1 of 1** |
+| `MINSERT CCC EX bid 2 1700000000000000000` + two levels | **2 of 2** |
+| the same lines without the field (control) | **0**, and the rows are there at arrival time |
+
+One time per batch rather than one per level, because a batch **is** one book update at one instant —
+which is what `DeltaUpdate` already models, and why the comparative benchmark's generator groups its
+rows by `(ts, symbol, side)`.
+
+**Zero is refused rather than read as absence.** Zero is how "unassigned" is spelled everywhere else
+here (`DeltaUpdate::sequence_number` uses it for exactly that), so accepting it would make "I have
+no time for this row" and "stamp it on arrival" the same request — in the one place where telling
+them apart is the whole feature. A non-numeric value is refused naming the token. There is
+deliberately **no sanity window**: a server that refused a timestamp from 2019 would break backfill,
+which is the case this field exists for.
+
+**The client asks, and refuses rather than drops.** Sending the field is not a test for support —
+measured on the release before #107, a server answers `OK` to a trailing token and stores the row
+without it, so a client inferring support from a successful write would be inferring it from the
+very defect it is avoiding. So `STATUS` carries `capabilities: insert_event_time,strict_args`, read
+**once per connection and only by a caller who passes a time** (a read-only client pays no round
+trip for a question it never asks). Names rather than a version number: a number needs a semver
+parser in every client — two today, four planned — and the question is "can you take this field",
+not "what are you called". **The absence of the line is an answer**, not an error.
+
+Both shipped clients refuse before a byte goes out, and the proof is stronger than a row count: the
+symbol does not exist afterwards. The Python client also **refuses `seq` over the wire** — a
+sequence number belongs to the origin, and over TCP that is the server, which assigns one per symbol
+(pitfall 16). It had been accepted and discarded, which is this item's own defect wearing another
+argument's name; `python/stress_test.py` was passing it, which is how the assumption became visible.
+
+**What a client-chosen time does and does not move, checked in the code rather than assumed:** LWW
+in multi-master compares the **HLC**, which comes from the node's clock, so a client cannot decide
+which of two conflicting writes survives — that was the single real risk and the reason this was
+addable at all. Segment pruning is a range-intersection test, so out-of-order times cost scan
+efficiency, not correctness. TTL retention works on whole segments by their newest event time, so a
+**backfill arrives with its age** — a year of history into a node with a 24-hour TTL is expired on
+the next sweep, and one row dated in the future keeps its whole segment. All three are now in
+`docs/operations.md`, because the second and third are the kind of surprise an operator meets at
+3 a.m.
+
+**A capability nothing reads is the shape this workspace has paid for five times**, so a static test
+requires every announced name to have a declared reader, in both directions — `insert_event_time` is
+read by the Python client's gate, `strict_args` by the tests of the refusal it names. Adding a third
+name forces naming its reader.
+
+Tests: five unit tests over `execute_command` (each with the control that makes it mean something —
+a server stamping *every* row with the sender's time would pass the first and fail the second), four
+property and unit tests over the C++ client's formatter including a **byte-for-byte** check that a
+caller who passes no time produces exactly the line an older client produced, and four integration
+tests over the wire — the event time, the capability answer, the refusal against an older server
+(its capability set replaced with the empty one a pre-#105 server reports), and the `seq` refusal.
+
+**The comparative table was recomputed by one run rather than edited**, which is what #39's own
+entry now carries: with the field in place all three systems filter on the same range, so the table
+compares the same question for the first time. The published summary went from "loses all four
+comparable workloads" to **"loses three, one inside the floor"** — the time-range query against
+TimescaleDB is 9.32 ms against 8.67 ms, 7% apart against a measured floor of 21.2%, so the harness
+reports it as indistinguishable rather than as a win. The engine did not get faster; the comparison
+got honest.
 
 - Effort: M | Impact: the engine's main query selects on the wrong clock for every record written
   over a network, and the argument that looks like the fix is accepted and discarded
@@ -4611,7 +4696,6 @@ performance claim is the reason this repo exists.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **P1** | Event time over the wire (#105) | M | The engine's central query is a time range, and every record written over a network carries arrival time instead — measured as 0 rows of 400 where ClickHouse and TimescaleDB returned 400. The argument that looks like the fix (`insert(timestamp_ns=…)`) is accepted and discarded |
 | **P2** | Build the io_uring transport in CI (#108) | S | Nothing compiles that file, and #106's own fix shipped a `relaxed` store beside a non-atomic write into it — caught by building it by hand, which is a mechanism that works when somebody remembers |
 | **P2** | The unexplained node death behind #86's third occurrence | S | An `UNREACHABLE` that needs nothing listening, on a node whose epoll thread is merely busy; the OOM-kill hypothesis is untested and the harness should name an unexplained death |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |

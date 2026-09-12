@@ -1513,6 +1513,9 @@ class OrderbookEngine:
                  tls_verify: bool = True):
         self._seq = 0
         self._closed = False
+        # Filled by the first call to server_capabilities(), never at construction: a read-only
+        # client should not pay a round trip for a question it may never ask (#105).
+        self._capabilities: Optional[set] = None
         self._pool: Optional[_ClientPool] = None
 
         # Before any socket, and before the mode branch, so a contradictory configuration is
@@ -1581,6 +1584,37 @@ class OrderbookEngine:
         if self._pool:
             self._pool.close()
 
+    def server_capabilities(self) -> set:
+        """What the server says it can do, by name, read once per engine (#105).
+
+        Read at the first call that needs it rather than at ``connect()``: a client that only reads
+        should not pay a round trip for a capability it never asks about. Cached afterwards, because
+        a server does not grow a feature while it is running.
+
+        **Sending the field is not a test.** Measured: a server without #107 answers ``OK`` to
+        ``INSERT AAA EX bid 100 5 1 notanumber`` and stores the row with the token discarded — so a
+        client that inferred support from a successful write would infer it from the very defect it
+        is avoiding. Hence a separate question, asked before the first write that needs the answer.
+
+        In ``pool`` mode this is whichever node served the ``STATUS``. A cluster part-way through an
+        upgrade can therefore take the field on one node and refuse it on another — and the refusal
+        is the loud half, which is the point of #107 being a prerequisite here.
+
+        An empty set means a server that predates the list. That is an answer, not an error.
+        """
+        if self._closed:
+            raise OrderbookError(-1, "Engine is closed")
+        if self._mode == "local":
+            # The embedded path has honoured an event time since the first version; there is no
+            # protocol between the caller and the engine to ask about.
+            return {"insert_event_time", "strict_args"}
+        if self._capabilities is None:
+            line = self.status().get("capabilities", "")
+            self._capabilities = {name for name in str(line).split(",") if name}
+            logger.debug("server capabilities: %s",
+                         ",".join(sorted(self._capabilities)) or "(none reported)")
+        return self._capabilities
+
     def insert(self,
                symbol: str,
                exchange: str,
@@ -1607,6 +1641,22 @@ class OrderbookEngine:
         if len(counts) != n:
             raise ValueError("counts must have the same length as prices")
 
+        # Two arguments this method used to accept and then drop on the wire. Both refusals happen
+        # **before a single byte is sent**, because a write that went out without the value its
+        # caller asked for is a write nobody can find afterwards (#105).
+        if self._mode in ("tcp", "pool"):
+            if seq is not None:
+                raise OrderbookError(-1,
+                    "seq cannot be chosen over the wire: a sequence number belongs to the origin, "
+                    "and the origin here is the server, which assigns one per symbol. It was "
+                    "accepted and discarded before this release. Use local mode to choose it.")
+            if timestamp_ns is not None and "insert_event_time" not in self.server_capabilities():
+                raise OrderbookError(-1,
+                    "this server does not accept an event time on INSERT/MINSERT, so the value "
+                    "would be discarded and the row stored with its arrival time instead. Nothing "
+                    "was sent. Upgrade the server, or drop the timestamp_ns argument to accept "
+                    "arrival time deliberately.")
+
         if seq is None:
             self._seq += 1
             seq = self._seq
@@ -1614,6 +1664,10 @@ class OrderbookEngine:
             self._seq = max(self._seq, seq)
 
         ts = timestamp_ns if timestamp_ns is not None else int(time.time_ns())
+        # Appended only when the caller gave one. Sending a client-generated "now" instead would
+        # quietly move the clock that decides a row's time from the server to the caller, which is a
+        # different guarantee wearing the same name.
+        wire_ts = f" {timestamp_ns}" if timestamp_ns is not None else ""
         side_lower = side.lower()
         side_int = 1 if side_lower == "ask" else 0
 
@@ -1622,11 +1676,11 @@ class OrderbookEngine:
         elif self._mode == "pool":
             # Pool mode: route writes to primary or shard.
             if n > 1:
-                header = f"MINSERT {symbol} {exchange} {side_lower} {n}"
+                header = f"MINSERT {symbol} {exchange} {side_lower} {n}{wire_ts}"
                 payload_lines = [f"{prices[i]} {qtys[i]} {counts[i]}" for i in range(n)]
                 cmd = header + "\n" + "\n".join(payload_lines)
             else:
-                cmd = f"INSERT {symbol} {exchange} {side_lower} {prices[0]} {qtys[0]} {counts[0]}"
+                cmd = f"INSERT {symbol} {exchange} {side_lower} {prices[0]} {qtys[0]} {counts[0]}{wire_ts}"
             if self._pool.is_sharded:
                 raw = self._pool.execute_write_sharded(symbol, exchange, cmd)
             else:
@@ -1638,7 +1692,7 @@ class OrderbookEngine:
             # TCP mode
             if n > 1:
                 # MINSERT: single round-trip for multiple levels
-                header = f"MINSERT {symbol} {exchange} {side_lower} {n}"
+                header = f"MINSERT {symbol} {exchange} {side_lower} {n}{wire_ts}"
                 payload_lines = [f"{prices[i]} {qtys[i]} {counts[i]}" for i in range(n)]
                 cmd = header + "\n" + "\n".join(payload_lines)
                 raw = self._tcp.execute(cmd)
@@ -1647,7 +1701,7 @@ class OrderbookEngine:
                     raise OrderbookError(-1, f"TCP MINSERT failed: {msg}")
             else:
                 # INSERT: backward compat for single level
-                cmd = f"INSERT {symbol} {exchange} {side_lower} {prices[0]} {qtys[0]} {counts[0]}"
+                cmd = f"INSERT {symbol} {exchange} {side_lower} {prices[0]} {qtys[0]} {counts[0]}{wire_ts}"
                 raw = self._tcp.execute(cmd)
                 is_err, msg, _, _ = _parse_tcp_response(raw)
                 if is_err:

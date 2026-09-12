@@ -350,6 +350,24 @@ ten-second timer; and within a process it lives in one place, so a role change k
 `repl_state.txt` written before #103 has no such line and simply leaves the epoch where the WAL put
 it.
 
+## Loading history, and what its own timestamps change
+
+Since #105 a write can carry the time it happened (`INSERT … [event_time_ns]`), which is what makes
+a backfill land where it belongs instead of at the time of the import. Three consequences, each
+checked in the code rather than assumed:
+
+- **Retention counts by the record's own time, per segment.** `--ttl-hours` compares a segment's
+  newest event time against the cutoff, so history loaded with its real timestamps arrives **with
+  its age**: a backfill of last year into a node with a 24-hour TTL is expired on the next sweep.
+  The inverse is also true and stranger — one row dated in the future keeps its whole segment alive.
+- **Query pruning gets less effective, not wrong.** A segment is skipped when its `[start, end]`
+  range cannot intersect the query's, so rows arriving out of order widen segments and more of them
+  are read. Correctness does not depend on monotonic time; scan cost does.
+- **Conflict resolution is untouched.** Multi-master last-writer-wins compares the HLC, which comes
+  from the node's clock, not the record's `timestamp_ns` — so a client choosing a time **cannot**
+  decide which of two conflicting writes survives. That was the one real risk in the change, and it
+  is the reason the field could be added at all.
+
 ## Stopping a node
 
 `SIGTERM` (or `SIGINT`) closes the listening socket **immediately** — a new connection is refused

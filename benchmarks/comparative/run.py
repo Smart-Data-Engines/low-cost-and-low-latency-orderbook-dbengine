@@ -38,12 +38,13 @@ REPO = Path(__file__).resolve().parents[2]
 # engine beating general databases at its one workload is its whole thesis - and a number that does
 # not say what it gives up promises a replacement.
 ENGINE_LIMITATIONS = [
-    "orderbook: nothing can be written with its own event time over the wire - `INSERT` and "
-    "`MINSERT` carry no timestamp, so the server stamps arrival time and `timestamp BETWEEN` "
-    "selects on that. Measured: the dataset's own span selected 0 of 400 rows here while the same "
-    "load into ClickHouse and TimescaleDB selected 400 (roadmap #105). The time-range workload is "
-    "therefore compared on price and size, with the time column excluded rather than quietly "
-    "mismatched",
+    # The first entry of this list used to be the event-time limitation, and it is gone rather than
+    # softened: `INSERT` and `MINSERT` take a trailing `event_time_ns` since #105, the Python client
+    # sends it and refuses rather than dropping it when a server cannot store one, and the
+    # time-range workload therefore holds all four systems to every column of its rows. Kept as a
+    # comment for one release so that a reader comparing two published tables can see why the
+    # exclusion disappeared: the number changed because the engine did, not because the harness
+    # stopped looking.
     "orderbook: no bulk-load path over the wire, so the ingest row measures the protocol's shape "
     "as much as the engine's speed - this harness sends one MINSERT round trip per book update "
     "while the SQL systems receive the whole CSV in one request. Measured on this machine: the "
@@ -225,14 +226,16 @@ def main(argv: list[str] | None = None) -> int:
     # ask all four systems the same question.
     vwap_symbol = "SYM0000"
 
-    # Which columns of a workload's rows every system can be held to. `time_range` drops the
-    # timestamp because one of the four cannot be given event time at all (#105) - declared here,
-    # with the reason, rather than by an adapter quietly returning fewer columns.
-    COMPARABLE_COLUMNS = {
-        "time_range": ((1, 2), "the time column is excluded: the engine stamps arrival time "
-                               "because the wire protocol carries none (#105), so only price and "
-                               "size can be held to the same value"),
-    }
+    # Which columns of a workload's rows every system can be held to, when any of them has to be
+    # dropped. **Empty since #105**, and that is the point of keeping the mechanism: `time_range`
+    # used to drop the timestamp because the engine could not be given event time at all, so its
+    # rows carried arrival time and only price and size could be compared. The field exists now, all
+    # four systems answer the same question, and every column of it is held to the same value.
+    #
+    # The dictionary stays because the next incomparable column should be declared here with its
+    # reason rather than arranged by an adapter quietly returning fewer columns - and a test below
+    # refuses to publish a limitation row for a limitation nobody declared.
+    COMPARABLE_COLUMNS: dict[str, tuple[tuple[int, ...], str]] = {}
 
     def projected(workload: str, rows: list[tuple]) -> list[tuple]:
         keep = COMPARABLE_COLUMNS.get(workload)

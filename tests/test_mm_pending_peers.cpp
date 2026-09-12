@@ -564,6 +564,7 @@ TEST(PeerDial, AnUnreachablePeerAddressDoesNotStopTheNode) {
     ASSERT_NE(mm, nullptr);
 
     mm->install_peer_for_test(black_holed_peer_record(7));
+    const auto dialling_since = std::chrono::steady_clock::now();
     std::this_thread::sleep_for(std::chrono::milliseconds(400));  // let the dial start
 
     // The two things that were blocked, and the budget is **below** MM_CONNECT_TIMEOUT_MS on
@@ -599,18 +600,34 @@ TEST(PeerDial, AnUnreachablePeerAddressDoesNotStopTheNode) {
         << "a client write blocked for " << write_ms << " ms while one peer address was being "
            "dialled; it was 135.7 s before #97";
 
-    // One dial in flight, one attempt taken — pinned in both directions. Too low (0) means the
-    // attempt is claimed *after* the dial returns, so `next_reconnect_time` stays in the past and
-    // the loop starts a fresh connection every 100 ms to a peer it is already dialling. Too high
-    // means that storm is already happening. This is #95's rule applied to a dial that now spans a
-    // lock release: every failure branch has to move the next-attempt time, and here it has to move
-    // it *before* the branch can run again.
+    // One dial in flight at a time — pinned in both directions. Too low (0) means the attempt is
+    // claimed *after* the dial returns, so `next_reconnect_time` stays in the past and the loop
+    // starts a fresh connection every 100 ms to a peer it is already dialling. Too high means that
+    // storm is already happening. This is #95's rule applied to a dial that now spans a lock
+    // release: every failure branch has to move the next-attempt time, and here it has to move it
+    // *before* the branch can run again.
+    //
+    // The upper bound is **derived from the clock rather than fixed at one**, and that is a
+    // correction: the first version asserted `attempt == 1` after ~2 s, which is true only while
+    // the whole test fits inside one `MM_CONNECT_TIMEOUT_MS`. On a loaded machine it does not —
+    // measured on 12 September 2026, this test took 6.27 s and legitimately reached the second
+    // attempt, so a green suite went red for a reason that had nothing to do with the code it was
+    // testing. A storm would be twenty attempts in this window; the property is "one per connect
+    // timeout", so that is what is asserted (#109's class, with a clock instead of a port).
     std::this_thread::sleep_for(std::chrono::milliseconds(1600));
     const auto peers = mm->peer_states();
     const ob::PeerConnection* p = find_peer(peers, 7);
     ASSERT_NE(p, nullptr);
-    EXPECT_EQ(p->backoff.attempt, 1u)
-        << "after ~2 s with one 5 s dial outstanding, exactly one attempt should have been claimed";
+    const auto dialling_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - dialling_since).count();
+    const uint32_t allowed = 1 + static_cast<uint32_t>(dialling_ms / ob::MM_CONNECT_TIMEOUT_MS);
+    EXPECT_GE(p->backoff.attempt, 1u)
+        << "no attempt was claimed while a dial was outstanding, so the next one is due "
+           "immediately and the loop redials every 100 ms to a peer it is already dialling";
+    EXPECT_LE(p->backoff.attempt, allowed)
+        << "after " << dialling_ms << " ms with a " << ob::MM_CONNECT_TIMEOUT_MS
+        << " ms connect timeout, at most " << allowed << " attempt(s) can have been claimed; "
+        << p->backoff.attempt << " means a redial storm";
 
     client.close();
     engine.close();
