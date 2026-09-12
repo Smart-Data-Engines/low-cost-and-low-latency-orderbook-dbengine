@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -166,11 +168,34 @@ public:
     bool connected() const;
 
     // ── Data operations ──────────────────────────────────────────────
+    /// Write one level.
+    ///
+    /// `event_time_ns` is the time the update happened, in nanoseconds since the epoch; empty means
+    /// the server stamps arrival, which is what every release before #105 did with every write.
+    /// Given a value, this method **asks the server whether it can store one** and fails without
+    /// sending a byte if it cannot - because a write that went out without the time its caller
+    /// chose is a row nobody can find afterwards. The question is a `STATUS` round trip, asked once
+    /// per connection and only by a caller who passes a time.
     Result<void>        insert(std::string_view symbol, std::string_view exchange,
                                Side side, int64_t price, uint64_t qty,
-                               uint32_t count = 1);
+                               uint32_t count = 1,
+                               std::optional<uint64_t> event_time_ns = std::nullopt);
+
+    /// Write several levels of one book side as one update.
+    ///
+    /// One `event_time_ns` for the batch, not one per level: a batch **is** one book update at one
+    /// instant, which is what `DeltaUpdate` models on the other side.
     Result<void>        minsert(std::string_view symbol, std::string_view exchange,
-                                Side side, const Level* levels, size_t n_levels);
+                                Side side, const Level* levels, size_t n_levels,
+                                std::optional<uint64_t> event_time_ns = std::nullopt);
+
+    /// What the server says it can do, by name, read once per connection (#105).
+    ///
+    /// Empty means a server that predates the list, and that is an answer rather than an error.
+    /// Sending a field is not a test for it: a server without #107 answers `OK` to a trailing token
+    /// and stores the row without it, so a client that inferred support from a successful write
+    /// would infer it from the very defect it is avoiding.
+    Result<std::set<std::string>> capabilities();
     Result<void>        flush();
     Result<QueryResult> query(std::string_view sql);
 
@@ -188,9 +213,11 @@ public:
 
     // ── Command formatting (public for property-based testing) ───────
     size_t format_insert(std::string_view symbol, std::string_view exchange,
-                         Side side, int64_t price, uint64_t qty, uint32_t count);
+                         Side side, int64_t price, uint64_t qty, uint32_t count,
+                         std::optional<uint64_t> event_time_ns = std::nullopt);
     size_t format_minsert(std::string_view symbol, std::string_view exchange,
-                          Side side, const Level* levels, size_t n_levels);
+                          Side side, const Level* levels, size_t n_levels,
+                          std::optional<uint64_t> event_time_ns = std::nullopt);
     size_t format_simple(std::string_view cmd);
     size_t format_query(std::string_view sql);
 
@@ -206,6 +233,13 @@ public:
 private:
     ClientConfig config_;
     int          fd_ = -1;
+    /// Refuse a write whose event time this server would discard, before a byte goes out (#105).
+    Result<void> refuse_unsupported_event_time(const std::optional<uint64_t>& event_time_ns);
+
+    /// Filled by the first `capabilities()` call, never at connect: a caller who never asks about a
+    /// capability should not pay a round trip for one (#105).
+    std::optional<std::set<std::string>> capabilities_;
+
     std::string  send_buf_;   // pre-allocated 64KB
     std::string  recv_buf_;   // pre-allocated 64KB
     std::string  sock_buf_;   // socket read accumulation buffer
@@ -269,9 +303,11 @@ public:
     // ── Write operations (routed to PRIMARY) ─────────────────────────
     Result<void> insert(std::string_view symbol, std::string_view exchange,
                         Side side, int64_t price, uint64_t qty,
-                        uint32_t count = 1);
+                        uint32_t count = 1,
+                        std::optional<uint64_t> event_time_ns = std::nullopt);
     Result<void> minsert(std::string_view symbol, std::string_view exchange,
-                         Side side, const Level* levels, size_t n_levels);
+                         Side side, const Level* levels, size_t n_levels,
+                         std::optional<uint64_t> event_time_ns = std::nullopt);
     Result<void> flush();
 
     // ── Read operations (round-robin) ────────────────────────────────

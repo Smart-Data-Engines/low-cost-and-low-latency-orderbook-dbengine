@@ -1,7 +1,9 @@
 #include "orderbook/response_formatter.hpp"
+#include "orderbook/capabilities.hpp"
 #include "orderbook/version.hpp"
 
 #include <charconv>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -165,6 +167,17 @@ std::string format_status(const ServerStats& stats, std::string_view identity) {
     out += std::to_string(stats.engine_metrics.segment_count);
     out += '\t';
     out += std::to_string(stats.engine_metrics.symbol_count);
+    out += '\n';
+
+    // What this build can do, by name (#105). Unconditional and always in the same place, for the
+    // same reason the replica count below is unconditional: a consumer that cannot tell "none of
+    // them" from "the field is missing" is a consumer that has to guess, and here the guess decides
+    // whether a client sends an event time or refuses to.
+    out += "capabilities: ";
+    for (size_t i = 0; i < std::size(kCapabilities); ++i) {
+        if (i) out += ',';
+        out += kCapabilities[i];
+    }
     out += '\n';
 
     // Replication info (primary mode): per-replica lag.

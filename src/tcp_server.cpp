@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cinttypes>
 #include <chrono>
 #include <fstream>
 #include <map>
@@ -280,6 +281,29 @@ std::string handle_auth(const Command& cmd,
 
 } // namespace
 
+namespace {
+
+/// What a write is stamped with, and whether the sender chose it (#105).
+///
+/// One function for both commands, because the first question when a row's time looks wrong is
+/// "who put it there" and an answer that lives in two places eventually gives two answers. The
+/// engine has paid for that shape in `ob_mm_peers_connected` (incremented in three places, none of
+/// them `accept()`) and in the four copies of "which shapes are writes".
+struct StampedTime {
+    uint64_t ns;
+    bool     from_client;
+};
+
+StampedTime stamp_for(const std::optional<uint64_t>& given) {
+    if (given) return {*given, true};
+    return {static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::system_clock::now().time_since_epoch())
+                                      .count()),
+            false};
+}
+
+} // namespace
+
 std::string execute_command(const Command& cmd,
                             Engine& engine,
                             Session& session,
@@ -389,10 +413,11 @@ std::string execute_command(const Command& cmd,
             // number for its symbol. The comment here used to claim the engine handled
             // sequencing while nothing did, so every stored row carried a zero.
             delta.sequence_number = 0;
-            delta.timestamp_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::system_clock::now().time_since_epoch())
-                    .count());
+            const StampedTime stamp = stamp_for(a.timestamp_ns);
+            delta.timestamp_ns = stamp.ns;
+            OB_LOG_DEBUG("tcp_server", "INSERT %s.%s event time %" PRIu64 " (%s)",
+                         a.symbol.c_str(), a.exchange.c_str(), stamp.ns,
+                         stamp.from_client ? "given by the client" : "stamped on arrival");
             delta.side     = a.side;
             delta.n_levels = 1;
 
@@ -448,10 +473,11 @@ std::string execute_command(const Command& cmd,
             std::strncpy(delta.symbol,   a.symbol.c_str(),   sizeof(delta.symbol)   - 1);
             std::strncpy(delta.exchange, a.exchange.c_str(), sizeof(delta.exchange) - 1);
             delta.sequence_number = 0;   // unassigned; the engine numbers it (see INSERT above)
-            delta.timestamp_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::system_clock::now().time_since_epoch())
-                    .count());
+            const StampedTime stamp = stamp_for(a.timestamp_ns);
+            delta.timestamp_ns = stamp.ns;
+            OB_LOG_DEBUG("tcp_server", "MINSERT %s.%s levels=%u event time %" PRIu64 " (%s)",
+                         a.symbol.c_str(), a.exchange.c_str(), static_cast<unsigned>(a.n_levels),
+                         stamp.ns, stamp.from_client ? "given by the client" : "stamped on arrival");
             delta.side     = a.side;
             delta.n_levels = a.n_levels;
 

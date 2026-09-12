@@ -14,39 +14,56 @@ Built by [Smart Data Engines](https://smartdataengines.com), who build custom da
 ## How it compares
 
 Measured against natively installed competitors on one machine, by
-`python -m benchmarks.comparative.run --rows 200000 --rounds 12`. **Control floor 15.7%** over
+`python -m benchmarks.comparative.run --rows 200000 --rounds 12`. **Control floor 21.2%** over
 twelve interleaved rounds: this machine does not separate differences smaller than that, so anything
 below it is reported as indistinguishable rather than as a win.
 
 Intel i3-7100U, 4 cores, 15.9 GiB, NVMe behind LUKS, ext4, kernel 6.8, GCC 13.3, Release.
 200 000 rows, 50 symbols, 20 levels, seed 7.
 
-| System | Version | Ingest (rows/s) | 4000-row query | Why it is not a like-for-like number |
+| System | Version | Ingest (rows/s) | Time-range query (4000 rows) | Why it is not a like-for-like number |
 |---|---|---|---|---|
-| **orderbook-dbengine** | 0.1.0 | **78,151** | **10.09 ms** (8.98–16.42) | one `MINSERT` round trip per book update: there is no bulk-load path over the wire |
-| ClickHouse | 26.8.2.7 | 433,779 | 5.96 ms (5.10–7.69) | the whole CSV in one request |
-| TimescaleDB | 2.30.0 / PG 16.15 | 106,874 | 6.06 ms (5.44–14.85) | `\copy` of the whole CSV; `timescaledb-tune` applied |
+| **orderbook-dbengine** | 0.1.0 | **66,072** | **9.32 ms** (8.46–13.28) | one `MINSERT` round trip per book update: there is no bulk-load path over the wire |
+| ClickHouse | 26.8.2.7 | 428,842 | 5.26 ms (4.78–6.85) | the whole CSV in one request |
+| TimescaleDB | 2.30.0 / PG 16.15 | 116,438 | 8.67 ms (5.60–10.54) | `\copy` of the whole CSV; `timescaledb-tune` applied |
 | kdb+ | — | NOT MEASURED | NOT MEASURED | needs a vendor registration, and whether its free edition's numbers may be published here is a licence question rather than a technical one |
 
-**This engine loses all four comparable workloads, and the reasons are worth more than the
-numbers.** Both are limits of the *protocol* rather than of the storage engine, and both are named
-in the roadmap:
+**Three of the four comparable pairs are losses and one is inside the floor**, classified by the
+harness against its own measured floor rather than by inspection:
 
-- **Nothing can be written with its own event time over the wire.** `INSERT` and `MINSERT` carry no
-  timestamp, so the server stamps arrival time. Measured: the dataset's own span selected **0 of 400
-  rows** here while the same load into ClickHouse and TimescaleDB selected 400 — so the query above
-  is compared on price and size with the time column excluded (roadmap #105).
-- **There is no bulk-load path over the wire**, so the ingest column measures the protocol's shape
-  as much as the engine's speed. The same engine ingests **446,219 updates/s in process** on this
-  machine (`bench_engine BM_IngestionThroughput`, 2552 ns/op mean over 1,221,610 iterations) against
-  **4,012 updates/s** through the wire — a factor of 111, and the round trip is all of it.
+- **ingest** against ClickHouse — 84.6% apart, and against TimescaleDB — 43.3% apart. Both losses.
+- **the time-range query** against ClickHouse — 43.6% apart. A loss.
+- **the time-range query** against TimescaleDB — 9.32 ms against 8.67 ms, which is **7% apart
+  against a 21.2% floor**, so this machine cannot separate them and the harness reports it as
+  indistinguishable rather than as a win.
+
+**This table is the first one that compares the same question**, and that is the change worth more
+than the numbers. Until #105 the engine could not be given event time at all: a write's own
+timestamp was accepted by the client and dropped at the wire, so its rows carried arrival time and
+the dataset's own span selected **0 of 400 rows** where the SQL systems selected 400. The query
+column therefore used to compare price and size with the time column excluded. `INSERT` and
+`MINSERT` now take a trailing `event_time_ns`, all three systems filter on the same range, and every
+column of the result is held to the same value.
+
+The remaining protocol limit is the ingest column, and it is a limit of the *protocol* rather than of
+the storage engine: **there is no bulk-load path over the wire**, so this harness sends one round trip
+per book update while the SQL systems receive the whole CSV in one request. The same engine ingests
+**446,219 updates/s in process** on this machine (`bench_engine BM_IngestionThroughput`, 2552 ns/op
+mean over 1,221,610 iterations) against **4,012 updates/s** through the wire — a factor of 111, and
+the round trip is all of it.
 
 Every figure in the query column also includes about **4.8 ms of Python-side parsing** for 4000
 rows, identical for all three systems, because each adapter turns text into tuples. It is stated
 rather than subtracted.
 
+One number moved in a direction worth naming rather than explaining away: ingest reads 66,072 here
+against 78,151 in the previous run. That is **15% apart against this run's 21.2% floor**, so it is
+not separable from noise — and the harness's own note says why comparisons are only made within one
+run: two consecutive runs of this table gave 9.69 ms and 10.97 ms for the same query. The table is
+one run, recomputed rather than edited.
+
 Full run, with every tuning declaration and every refusal:
-[`benchmarks/comparative/results/2026-09-11-a8b19196.md`](benchmarks/comparative/results/2026-09-11-a8b19196.md).
+[`benchmarks/comparative/results/2026-09-12-ece487a1.md`](benchmarks/comparative/results/2026-09-12-ece487a1.md).
 To reproduce it, install the competitors natively first —
 [`benchmarks/install_competitors.md`](benchmarks/install_competitors.md); nothing in the harness
 installs anything, and a containerised competitor would measure the container.

@@ -220,35 +220,35 @@ class OrderbookSystem:
                      sizes: list[int]) -> None:
         ts_ns, symbol, side = key
         assert self._engine is not None
+        # Since #105 this timestamp reaches the server; before it, the client accepted the argument
+        # and the wire dropped it. The client now refuses rather than dropping, so a run against a
+        # server too old to store it fails here instead of producing a table whose time column means
+        # arrival.
         self._engine.insert(symbol, "EX", side, prices, sizes, timestamp_ns=ts_ns)
 
-    # The dataset's span cannot be used as a predicate here, and the reason is roadmap #105 rather
-    # than a choice: `insert(timestamp_ns=...)` is accepted by the Python client, used in embedded
-    # mode, and **silently dropped over TCP** - `INSERT` and `MINSERT` carry no timestamp field, so
-    # the server stamps arrival time. Measured: rows loaded with the dataset's timestamps came back
-    # at `1789153200757060030`, and the dataset's own span selected **0 of 400 rows** while the same
-    # load into ClickHouse and TimescaleDB selected 400.
+    # This method asked for everything the store held, because until #105 the predicate could not
+    # be honoured: `insert(timestamp_ns=...)` was accepted by the Python client, used in embedded
+    # mode, and **silently dropped over TCP**, so the server stamped arrival time. Measured then:
+    # rows loaded with the dataset's timestamps came back at `1789153200757060030`, and the
+    # dataset's own span selected **0 of 400 rows** while the same load into ClickHouse and
+    # TimescaleDB selected 400.
     #
-    # So this asks for everything the store holds for one symbol, which is the same *rows* the SQL
-    # systems select from their range - and the driver compares price and size, naming the time
-    # column as incomparable. Widening the predicate here rather than hiding the defect: the
-    # published table says the engine cannot be given event time, which is the most useful thing
-    # this comparison produced.
+    # #105 added the field, so the span is a real predicate here now and the four systems are asked
+    # the same question. `WIDEST_RANGE` stays for the aggregate path below, which is a different
+    # question for a different reason.
     WIDEST_RANGE = (0, 9_999_999_999_999_999_999)
 
     def query_time_range(self, start_ns: int, end_ns: int) -> QueryResult:
-        """`start_ns` and `end_ns` are accepted and **deliberately not used** - see above.
+        """The dataset's own span, as a predicate, since #105.
 
-        Accepted rather than removed from the signature because the interface is what makes the
-        four systems comparable, and because the day #105 lands this method has to start using
-        them. A parameter ignored in silence is what #105 *is*, so it is ignored in writing.
+        The returned row count is what makes this comparable rather than merely timed: an engine
+        that answered instantly with nothing would look fastest, and the driver compares the rows.
         """
         self._ensure_running()
         assert self._engine is not None
-        low, high = self.WIDEST_RANGE
         started = time.perf_counter()
         rows = self._raw_rows(
-            f"SELECT * FROM 'SYM0000'.'EX' WHERE timestamp BETWEEN {low} AND {high}")
+            f"SELECT * FROM 'SYM0000'.'EX' WHERE timestamp BETWEEN {start_ns} AND {end_ns}")
         elapsed = time.perf_counter() - started
         # The first version of this mapped `r.timestamp` and `r.size`, which do not exist -
         # `OrderbookRow` names them `timestamp_ns` and `quantity`. It raised `AttributeError` from
