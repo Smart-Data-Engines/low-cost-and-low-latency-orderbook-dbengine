@@ -1,6 +1,7 @@
 // ── ShardCoordinator — server-side shard management ──────────────────────────
 
 #include "orderbook/shard_coordinator.hpp"
+#include "orderbook/thread_boundary.hpp"
 #include "orderbook/engine.hpp"
 #include "orderbook/logger.hpp"
 
@@ -100,7 +101,9 @@ void ShardCoordinator::start() {
 
     // Start watch thread
     running_.store(true, std::memory_order_release);
-    watch_thread_ = std::thread([this]() { watch_loop(); });
+    watch_thread_ = std::thread([this]() {
+        run_thread_body("shard_coord", "watch_loop", [this] { watch_loop(); });
+    });
 
     OB_LOG_INFO("shard_coord", "Coordinator started for shard=%s, map version=%lu",
                 config_.shard_id.c_str(),
@@ -439,7 +442,9 @@ bool ShardCoordinator::initiate_migration(const std::string& symbol_key,
         migration_thread_.join();
     }
     migration_thread_ = std::thread([this, symbol_key, target_shard_id]() {
-        execute_migration(symbol_key, target_shard_id);
+        run_thread_body("shard_coord", "execute_migration", [&] {
+            execute_migration(symbol_key, target_shard_id);
+        });
     });
 
     return true;

@@ -6,6 +6,7 @@
 // Requirements: 4.1–4.8, 9.1–9.6
 
 #include "orderbook/multi_master.hpp"
+#include "orderbook/thread_boundary.hpp"
 
 #include "orderbook/crc32c.hpp"
 #include "orderbook/engine.hpp"
@@ -372,8 +373,12 @@ void MultiMasterManager::start() {
                           "coordinator endpoints configured)");
     }
 
-    io_thread_ = std::thread([this] { io_loop(); });
-    reconnect_thread_ = std::thread([this] { reconnect_loop(); });
+    io_thread_ = std::thread([this] {
+        run_thread_body("mm", "io_loop", [this] { io_loop(); });
+    });
+    reconnect_thread_ = std::thread([this] {
+        run_thread_body("mm", "reconnect_loop", [this] { reconnect_loop(); });
+    });
 
     OB_LOG_INFO("mm", "MultiMasterManager started: node_id=%u port=%u",
                 config_.node_id, config_.replication_port);

@@ -1,6 +1,7 @@
 // ── CoordinatorClient — etcd v3 REST integration ─────────────────────────────
 
 #include "orderbook/coordinator.hpp"
+#include "orderbook/thread_boundary.hpp"
 #include "orderbook/logger.hpp"
 
 #include <atomic>
@@ -781,7 +782,9 @@ void CoordinatorClient::watch_leader(LeaseEventCallback cb) {
     std::string prefix   = config_.cluster_prefix;
     auto* impl_ptr       = impl_.get();
 
-    impl_->watch_thread = std::thread([endpoint, prefix, impl_ptr]() {
+    // Named rather than passed inline so the boundary can wrap it without re-indenting
+    // fifty-four lines, which would hide the one thing that changed.
+    auto watch = [endpoint, prefix, impl_ptr]() {
         // The watch thread uses its own curl handle for the long-poll.
         CURL* watch_curl = curl_easy_init();
         if (!watch_curl) return;
@@ -834,6 +837,9 @@ void CoordinatorClient::watch_leader(LeaseEventCallback cb) {
         }
 
         curl_easy_cleanup(watch_curl);
+    };
+    impl_->watch_thread = std::thread([watch = std::move(watch)]() mutable {
+        run_thread_body("coordinator", "watch", watch);
     });
 }
 

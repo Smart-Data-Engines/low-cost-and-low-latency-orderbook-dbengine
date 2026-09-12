@@ -47,6 +47,7 @@ class FaultNode:
         )
         self.data_dir = tempfile.mkdtemp(prefix="ob_storage_fault_")
         self.port = free_port()
+        self.metrics_port = free_port()
         self.fault_log = os.path.join(self.data_dir, "fault.log")
         self._log_path = os.path.join(self.data_dir, "node.log")
         self._log = open(self._log_path, "a", encoding="utf-8", buffering=1)
@@ -62,8 +63,33 @@ class FaultNode:
 
         self.proc = subprocess.Popen(
             [SERVER, "--port", str(self.port), "--data-dir", self.data_dir,
-             "--metrics-port", "0", "--drain-timeout-ms", "2000", "--fsync-policy", "every"],
+             "--metrics-port", str(self.metrics_port), "--drain-timeout-ms", "2000",
+             "--fsync-policy", "every", "--flush-interval-ms", "500"],
             env=env, stdout=self._log, stderr=subprocess.STDOUT)
+
+    def counter(self, name: str) -> int:
+        """One counter from /metrics, or 0 if it has never been incremented.
+
+        The name is followed by a label set, not a space: this engine exposes
+        `ob_flush_errors_total{node_role="standalone"} 1`. A first version of this matched
+        `name + " "` and therefore read every counter as zero - which would have turned a working
+        fix into a failing test, and reading the raw exposition is what found it.
+        """
+        with socket.create_connection(("127.0.0.1", self.metrics_port), timeout=patience(10)) as s:
+            s.sendall(b"GET /metrics HTTP/1.0\r\n\r\n")
+            chunks = []
+            while True:
+                data = s.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+        for line in b"".join(chunks).decode(errors="replace").splitlines():
+            if line.startswith("#"):
+                continue
+            head = line.split()[0] if line.split() else ""
+            if head == name or head.startswith(name + "{"):
+                return int(float(line.split()[1]))
+        return 0
 
     def wait_until_answering(self, timeout: float = 20.0) -> None:
         deadline = time.time() + patience(timeout)
@@ -115,7 +141,8 @@ class FaultNode:
         env.pop("LD_PRELOAD", None)
         self.proc = subprocess.Popen(
             [SERVER, "--port", str(self.port), "--data-dir", self.data_dir,
-             "--metrics-port", "0", "--drain-timeout-ms", "2000", "--fsync-policy", "every"],
+             "--metrics-port", str(self.metrics_port), "--drain-timeout-ms", "2000",
+             "--fsync-policy", "every", "--flush-interval-ms", "500"],
             env=env, stdout=self._log, stderr=subprocess.STDOUT)
         self.wait_until_answering()
 
@@ -212,5 +239,53 @@ def test_no_acknowledged_write_survives_less_than_a_restart():
         prices = set(prices_in(node.talk(SELECT_ALL)[0]))
         assert acknowledged <= prices, f"an acknowledged write did not survive the restart: {prices}"
         assert 200 not in prices, f"a refused write appeared after the restart: {prices}"
+    finally:
+        node.cleanup()
+
+
+def test_a_failing_flush_tick_does_not_take_the_node_with_it():
+    """#112: an ENOSPC on the flush thread's own WAL write used to abort the process.
+
+    The 24-byte record is the checkpoint, and nothing but the flush loop writes it — which is why
+    the size filter is the whole instrument here. Measured before the fix, by naming that call:
+    SIGABRT with one injection fired, an **idle** node dead 0.5 s into idleness with nobody
+    connected, and three consecutive restarts on a disk that stays full each coming up and dying
+    unattended after 1.5–2.0 s. The client-facing path handled the same condition correctly the
+    whole time, which is what made it look survivable.
+
+    The counter is asserted as well as the node being alive. Alive alone would also pass if the
+    injection never fired, and "the fault did not happen" and "the fault was handled" are the two
+    outcomes this test exists to separate.
+    """
+    node = FaultNode(OB_FAULT_PATH=WAL_SEGMENT, OB_FAULT_OP="write", OB_FAULT_ERRNO="ENOSPC",
+                     OB_FAULT_SIZE="24")
+    try:
+        node.wait_until_answering()
+        assert node.talk("INSERT SYM EX bid 100 1 1")[0] == "OK", "the write path itself refused"
+
+        # Several flush intervals with nobody connected: the shape that killed an idle node.
+        deadline = time.time() + patience(25)
+        while time.time() < deadline and "flushing again" not in node.log():
+            if node.proc.poll() is not None:
+                pytest.fail(
+                    f"the node died on a failing flush tick, exit {node.proc.returncode}; "
+                    f"log tail:\n{node.log()[-900:]}")
+            time.sleep(0.5)
+
+        assert node.proc.poll() is None, "the node died on a failing flush tick"
+        assert node.injections() >= 1, "no fault fired, so this test measured nothing"
+        assert node.counter("ob_flush_errors_total") >= 1, (
+            "the tick failed but nothing counted it, so an operator watching a full disk would see "
+            "a node that looks healthy")
+
+        # That the *next* tick ran is the property, and the recovery line is where it is
+        # observable. Waiting for a second failure instead would be wrong: one insert produces one
+        # checkpoint, so the injector can only fire once - a count asserted rather than measured,
+        # which is how the first version of this test failed against a working fix.
+        assert "flushing again" in node.log(), (
+            f"no tick ran after the failing one; log tail:\n{node.log()[-900:]}")
+
+        assert node.talk("PING")[0] == "PONG", "the node stopped answering"
+        assert node.stop() == 0, "a node whose flushes are failing did not shut down cleanly"
     finally:
         node.cleanup()

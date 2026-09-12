@@ -3,6 +3,7 @@
 //         pool routing, health-check, failover.
 
 #include "orderbook/client.hpp"
+#include "orderbook/thread_boundary.hpp"
 
 #include "orderbook/auth.hpp"
 #include "orderbook/shard_router.hpp"
@@ -1034,7 +1035,9 @@ OrderbookPool::OrderbookPool(PoolConfig config)
 
     // Start health-check thread
     running_.store(true, std::memory_order_release);
-    health_thread_ = std::thread(&OrderbookPool::health_check_loop, this);
+    health_thread_ = std::thread([this] {
+        run_thread_body("pool", "health_check_loop", [this] { health_check_loop(); });
+    });
 }
 
 OrderbookPool::~OrderbookPool() {

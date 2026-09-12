@@ -1,4 +1,5 @@
 #include "orderbook/failover.hpp"
+#include "orderbook/thread_boundary.hpp"
 #include "orderbook/logger.hpp"
 
 #include <algorithm>
@@ -59,7 +60,9 @@ void FailoverManager::start() {
         OB_LOG_WARN("failover", "cannot reach the coordinator at startup — starting STANDALONE and "
                                 "retrying, this node will join once it answers");
         running_.store(true);
-        monitor_thread_ = std::thread([this] { monitor_loop(); });
+        monitor_thread_ = std::thread([this] {
+            run_thread_body("failover", "monitor_loop", [this] { monitor_loop(); });
+        });
         return;
     }
 
@@ -102,7 +105,9 @@ void FailoverManager::start() {
 
     // Start the background monitor thread.
     running_.store(true);
-    monitor_thread_ = std::thread([this] { monitor_loop(); });
+    monitor_thread_ = std::thread([this] {
+            run_thread_body("failover", "monitor_loop", [this] { monitor_loop(); });
+        });
 }
 
 // ── stop() ──────────────────────────────────────────────────────────────────

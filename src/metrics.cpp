@@ -68,6 +68,12 @@ MetricsRegistry::MetricsRegistry() {
                                      "time - the count is the alertable half."));
     counters_.push_back(make_counter("ob_wal_records_written",   "Total number of WAL records written"));
     counters_.push_back(make_counter("ob_repl_records_replayed", "Total number of replication records replayed"));
+    // A flush tick that threw. Registered in the same change that writes it, because an
+    // unregistered counter is discarded and reports a flat zero for ever - and this is the
+    // number that tells an operator a full disk is stopping flushes while the node still
+    // answers clients (#112).
+    counters_.push_back(make_counter("ob_flush_errors_total",
+                                     "Flush ticks that ended in an exception and were retried"));
 
     // Gauges
     gauges_.push_back(make_gauge("ob_active_sessions", "Number of active TCP sessions"));

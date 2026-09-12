@@ -1,4 +1,5 @@
 #include "orderbook/peer_registry.hpp"
+#include "orderbook/thread_boundary.hpp"
 #include "orderbook/logger.hpp"
 
 #include <nlohmann/json.hpp>
@@ -487,10 +488,14 @@ void PeerRegistry::start_watch(TopologyChangeCallback cb) {
     running_.store(true, std::memory_order_release);
 
     // Start watch thread that polls etcd for peer changes.
-    watch_thread_ = std::thread([this] { watch_loop(); });
+    watch_thread_ = std::thread([this] {
+        run_thread_body("peer_registry", "watch_loop", [this] { watch_loop(); });
+    });
 
     // Start lease keep-alive thread.
-    lease_thread_ = std::thread([this] { lease_loop(); });
+    lease_thread_ = std::thread([this] {
+        run_thread_body("peer_registry", "lease_loop", [this] { lease_loop(); });
+    });
 
     OB_LOG_INFO("peer_registry", "Started watch for node %u", local_node_id_);
 }
