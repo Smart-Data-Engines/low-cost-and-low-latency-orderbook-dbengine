@@ -36,6 +36,14 @@ ok "binary, config, unit, man page and headers are all in the package"
 echo "$CONTENTS" | grep -q "^./usr/etc/" && fail "configuration installed under /usr/etc; the conffile mark would name a path the package does not contain"
 ok "no /usr/etc — the conffile declaration names a path that exists"
 
+# The fault injector must not be here (#54). It is an LD_PRELOAD shim built with the tests, whose
+# whole purpose is to make writes and fsyncs fail on demand, so shipping it in a release artefact
+# would put a loaded gun on an operator's disk. CPack takes every install rule by default, so the
+# absence is asserted rather than assumed - `obfault` has no install rule today, and this line is
+# what notices the day somebody adds one.
+echo "$CONTENTS" | grep -q "obfault" && fail "the fault injector leaked into the package"
+ok "no fault injector"
+
 # The Python wheel's shared library must not be here. It is installed for scikit-build-core into a
 # directory that means nothing on a system, and CPack with component install off takes every rule.
 echo "$CONTENTS" | grep -q "orderbook_engine/" && fail "the wheel's shared library leaked into the package"

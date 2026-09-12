@@ -860,3 +860,29 @@ gtest_discover_tests(test_tls_client PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
 target_compile_definitions(test_tls_client
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
+
+# ── Storage fault injector (#54) ──────────────────────────────────────────────
+#
+# A shared library the integration battery LD_PRELOADs into a server under test, to make a chosen
+# write, fsync, fdatasync or ftruncate fail on a chosen file after a chosen number of successful
+# calls. The failure modes that lose data in production are the ones a healthy machine never
+# produces, so they have to be asked for.
+#
+# C rather than C++, and no CTest entry: it interposes libc symbols, it is loaded by pytest rather
+# than run, and it must carry no static initialisation that could execute before it is configured.
+# Deliberately **not installed** - `scripts/verify_package.sh` refuses a package that contains it,
+# because a library that can make writes fail has no business in a release artefact.
+# The project is CXX-only, so the C compiler has to be asked for - and it is asked for *here*
+# rather than in `project()` on purpose: C is needed by an instrument the tests load, not by the
+# engine, and this block only runs with OB_BUILD_TESTS on. Configuring without it fails at the
+# generate step with "Missing variable is: CMAKE_C_COMPILE_OBJECT", which is a clearer error than
+# anything a comment could have prevented.
+enable_language(C)
+
+add_library(obfault SHARED fault/obfault.c)
+set_target_properties(obfault PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON
+)
+target_compile_options(obfault PRIVATE -Wall -Wextra -Werror)
