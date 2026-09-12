@@ -58,7 +58,8 @@ ob_status_t ob_apply_delta(
 ```
 
 Insert one or more price levels. The update is:
-1. Written to the WAL (fsync'd)
+1. Written to the WAL, and `fsync`ed here only under `--fsync-policy every` — where a failed
+   `fsync` returns `OB_C_ERR_INTERNAL` rather than reporting success (#113)
 2. Applied to the in-memory SoA buffer
 3. Enqueued for background columnar flush
 

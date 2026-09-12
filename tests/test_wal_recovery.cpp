@@ -450,7 +450,7 @@ TEST(WalRecovery, ARecordWithAnOutOfOrderTimestampIsNotMistakenForOneAlreadyStor
         level.cnt   = 1;
         level._pad  = 0;
         writer.append(delta, &level);
-        writer.flush();
+        ASSERT_TRUE(writer.flush());
     }
 
     ob::Engine reopened(tmp.path, kNoAutoFlush, ob::FsyncPolicy::EVERY);
@@ -527,7 +527,7 @@ TEST(WalRecovery, APositionFromAnotherNodesWalIsNotUsedToSkipAnything) {
         level.cnt   = 1;
         level._pad  = 0;
         writer.append(delta, &level);
-        writer.flush();
+        ASSERT_TRUE(writer.flush());
     }
 
     ob::Engine reopened(tmp.path, kNoAutoFlush, ob::FsyncPolicy::EVERY);

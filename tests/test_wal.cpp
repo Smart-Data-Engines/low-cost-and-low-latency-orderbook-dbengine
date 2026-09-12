@@ -104,7 +104,9 @@ RC_GTEST_PROP(WALProperty, prop_wal_write_before_apply, ()) {
     {
         ob::WALWriter writer(tmp.str());
         writer.append(upd, &lv);
-        writer.flush();
+        // Asserted rather than cast away: this test then reads the file expecting the record to be
+        // there, so a flush that failed would make the next assertion report the wrong thing.
+        ASSERT_TRUE(writer.flush());
     }
 
     // Step 2: verify the WAL file contains the record BEFORE we apply to SoA.

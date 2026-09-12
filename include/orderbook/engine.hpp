@@ -573,6 +573,14 @@ private:
     /// `continue`, `break` or `return`, which is what made moving it out of the loop mechanical.
     void flush_tick();
 
+    /// Failed `fsync` counts already published, so the counter is fed a delta rather than a total.
+    ///
+    /// The registry's counter API takes an increment, and `WALWriter` keeps a running total - so
+    /// publishing the total each tick would count every past failure again. The writer owns the
+    /// number because the failure happens there; the engine owns the publishing because the writer
+    /// has no registry (#113).
+    uint64_t published_fsync_failures_{0};
+
     /// Consecutive failed ticks, so the log reports an episode rather than one line per interval.
     ///
     /// A permanently full disk would otherwise write an ERROR every flush interval for ever -

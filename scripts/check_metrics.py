@@ -12,8 +12,16 @@ invisible. Both were introduced with the mechanisms they measure, which is exact
 when nobody is looking at the dashboard yet.
 
 What this script proves: every string literal handed to increment_counter(),
-add_to_counter(), set_gauge() or observe_histogram() in src/ and tools/ appears in a
+increment_gauge(), set_gauge() or observe_histogram() in src/ and tools/ appears in a
 make_counter/make_gauge/make_histogram call in src/metrics.cpp.
+
+Two of those four were wrong until #113. It scanned `add_to_counter`, which
+`MetricsRegistry` does not have - a dead branch that could never match - and did **not**
+scan `increment_gauge`, which it does have and which eight sites use to move
+`ob_active_sessions`. So a metric written only through `increment_gauge` escaped the check
+entirely, and the claim in the sentence above was false for one of the four ways this
+engine writes a metric. Nothing was actually unregistered; the gap was found by using the
+script rather than by it firing.
 
 What it cannot prove: that a metric name is spelled the way the dashboard expects,
 or that a registered metric is ever written. Read those yourself.
@@ -31,7 +39,7 @@ REGISTRY = REPO / "src" / "metrics.cpp"
 
 REGISTERED = re.compile(r'make_(?:counter|gauge|histogram)\(\s*"([^"]+)"')
 WRITTEN = re.compile(
-    r'(?:increment_counter|add_to_counter|set_gauge|observe_histogram)\(\s*"([^"]+)"')
+    r'(?:increment_counter|increment_gauge|set_gauge|observe_histogram)\(\s*"([^"]+)"')
 
 
 def main() -> int:

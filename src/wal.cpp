@@ -80,9 +80,38 @@ WALWriter::WALWriter(std::string_view dir, size_t rotate_threshold_bytes,
     position_.store(WalPosition{highest, open_current(highest)}, std::memory_order_relaxed);
 }
 
+/// `fsync` the current descriptor, and never let the failure go unrecorded (#113).
+///
+/// Before this, all seven `fsync` calls in this file discarded their result, and the two on the
+/// write path then set `pending_sync_ = 0` regardless - so a writer whose sync had failed came out
+/// of it believing everything was on the disk. Measured with `--fsync-policy every`: eleven `EIO`
+/// returns and three `INSERT`s still answered `OK`.
+///
+/// `pending_sync_` is deliberately **not** cleared here. That belongs to the caller, and only on
+/// success: the count is how the flush loop decides whether a sync is owed, and zeroing it after a
+/// failure is what silenced the next attempt.
+///
+/// The log says what the sync was for, because "fsync failed" alone does not tell an operator
+/// whether a client was waiting on it - and it says what Linux does next, because the obvious
+/// reaction (try again) is the one thing that cannot work.
+int WALWriter::fsync_or_record(const char* why) {
+    if (fd_ < 0) return 0;
+    if (::fsync(fd_) == 0) return 0;
+    const int err = errno;
+    fsync_failures_.fetch_add(1, std::memory_order_relaxed);
+    OB_LOG_ERROR("wal",
+                 "fsync failed during %s: %s. Linux reports this once and marks the pages clean, "
+                 "so a later fsync will succeed with the data already gone - this node can no "
+                 "longer promise that what it acknowledged is on the disk",
+                 why, std::strerror(err));
+    return err;
+}
+
 WALWriter::~WALWriter() {
     if (fd_ >= 0) {
-        ::fsync(fd_);
+        // Nothing to report to: a destructor that throws during shutdown is #112 again. The
+        // counter and the log are the whole answer here.
+        (void)fsync_or_record("closing the WAL");
         ::close(fd_);
         fd_ = -1;
     }
@@ -90,7 +119,10 @@ WALWriter::~WALWriter() {
 
 uint32_t WALWriter::open_current(uint32_t index) {
     if (fd_ >= 0) {
-        ::fsync(fd_);
+        // A rotation whose sync failed leaves the file it is leaving behind possibly incomplete.
+        // Recorded rather than thrown: this runs from the constructor as well, where there is no
+        // caller to tell.
+        (void)fsync_or_record("rotating the WAL");
         ::close(fd_);
         fd_ = -1;
     }
@@ -143,7 +175,15 @@ WalPosition WALWriter::write_record(const WALRecord& hdr, const void* payload,
     ++pending_sync_;
 
     if (allow_fsync && fsync_policy_ == FsyncPolicy::EVERY) {
-        ::fsync(fd_);
+        // The whole promise of this policy is that `OK` means the record is on the disk, so a
+        // failure here is reported the same way a failed `write` is - which already answers the
+        // client `ERR ...` and leaves the node serving. What a retry costs is in the operations
+        // guide: the record is in this WAL either way, so a client that resends produces a second
+        // row, and that is the honest trade against being told a write is durable when it is not.
+        if (const int err = fsync_or_record("a write under fsync-policy=every"); err != 0) {
+            throw std::runtime_error(std::string("WALWriter: fsync failed: ") +
+                                     std::strerror(err));
+        }
         pending_sync_ = 0;
     }
     return written_at;
@@ -217,7 +257,10 @@ WalPosition WALWriter::write_record_v2(const WALRecordV2& hdr, const void* paylo
     ++pending_sync_;
 
     if (fsync_policy_ == FsyncPolicy::EVERY) {
-        ::fsync(fd_);
+        if (const int err = fsync_or_record("a write under fsync-policy=every"); err != 0) {
+            throw std::runtime_error(std::string("WALWriter: fsync failed: ") +
+                                     std::strerror(err));
+        }
         pending_sync_ = 0;
     }
     return written_at;
@@ -395,15 +438,22 @@ void WALWriter::rotate() {
     OB_LOG_DEBUG("wal", "rotated to file %u at offset %u", next_index, next_offset);
 }
 
-void WALWriter::flush() {
+bool WALWriter::flush() {
     if (fd_ >= 0 && fsync_policy_ != FsyncPolicy::NONE) {
-        ::fsync(fd_);
+        if (fsync_or_record("flush") != 0) {
+            // `pending_sync_` is left where it is, so the count still says a sync is owed. It
+            // cannot be paid - Linux has already dropped the error and cleaned the pages - but a
+            // writer that reports nothing pending after a failed sync is a writer telling the
+            // flush loop there is nothing left to do.
+            return false;
+        }
         pending_sync_ = 0;
     }
+    return true;
 }
 
-void WALWriter::sync() {
-    flush();
+bool WALWriter::sync() {
+    return flush();
 }
 
 size_t WALWriter::truncate_before(uint32_t before_index) {

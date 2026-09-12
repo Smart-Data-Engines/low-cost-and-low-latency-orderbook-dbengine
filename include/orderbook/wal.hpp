@@ -267,13 +267,29 @@ public:
     void rotate();
 
     /// fsync the current file (group commit boundary).
-    void flush();
+    /// `fsync` the current file if the policy asks for one. **False means it failed.**
+    ///
+    /// `[[nodiscard]]` deliberately: before #113 the result of every `fsync` in this file was
+    /// discarded, so `--fsync-policy every` answered `OK` to writes it had not synced. A comment
+    /// asking callers to check would have been the same thing one layer up; this makes ignoring it
+    /// a compile error, and each of the seven call sites then had to say what it does instead -
+    /// which is how `Engine::close()` ended up logging where the write path throws.
+    [[nodiscard]] bool flush();
 
     /// Sync the WAL to disk. Alias for flush() — explicit group commit point.
-    void sync();
+    [[nodiscard]] bool sync();
 
     /// Number of records written since last sync.
     size_t pending_sync_count() const { return pending_sync_; }
+
+    /// How many `fsync` calls on this WAL have failed, ever, in this process (#113).
+    ///
+    /// Sticky and monotone on purpose. **A failed `fsync` cannot be retried on Linux**: the kernel
+    /// reports the error once, to whichever caller happened to be there, and marks the affected
+    /// pages clean - so the next `fsync` on the same descriptor returns 0 with the data gone. This
+    /// number is therefore the only lasting evidence that something the engine acknowledged may
+    /// not be on the disk, and no later success takes it back.
+    uint64_t fsync_failures() const { return fsync_failures_.load(std::memory_order_relaxed); }
 
     /// Where the WAL is, in one atomic load. Cannot observe a rotation half-applied.
     ///
@@ -317,7 +333,21 @@ private:
     size_t      rotate_threshold_;
     FsyncPolicy fsync_policy_;
     std::string dir_;
+    /// `fsync` the current descriptor. Returns 0, or the `errno` it failed with.
+    ///
+    /// Returns the error rather than a bool because the caller needs the reason: the message a
+    /// client is handed has to say *why* its write is not durable, and logging inside here would
+    /// otherwise have clobbered `errno` before the caller could read it.
+    int fsync_or_record(const char* why);
+
     size_t      pending_sync_{0};
+
+    /// Failed `fsync` calls, read by the engine to publish `ob_wal_fsync_errors_total`.
+    ///
+    /// Atomic because the destructor and the rotation path can run on a different thread from the
+    /// one publishing it, and because a number an operator reads to decide whether to replace a
+    /// disk should not be a data race.
+    std::atomic<uint64_t> fsync_failures_{0};
     uint64_t    current_epoch_{0};
     uint16_t    origin_node_id_{0};  // 0 = legacy mode (no multi-master)
 

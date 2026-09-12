@@ -226,7 +226,10 @@ size_t fill_wal(ob::WALWriter& wal, int records, size_t levels) {
         }
         wal.append(delta, lv.data());
     }
-    wal.flush();
+    // EXPECT rather than ASSERT: this helper returns a size, and ASSERT_* expands to a bare
+    // `return`, which a non-void function cannot take. The flush still has to be checked -
+    // every caller then reads the file this builds.
+    EXPECT_TRUE(wal.flush());
     const size_t payload_len = sizeof(ob::DeltaUpdate) + levels * sizeof(ob::Level);
     return static_cast<size_t>(records) * (sizeof(ob::WALRecord) + payload_len);
 }
@@ -535,7 +538,7 @@ TEST_F(ReplicationProtocolTest, ALiveRecordDoesNotOvertakeAnUnfinishedCatchup) {
     hdr.checksum        = ob::crc32c(payload.data(), payload.size());
     hdr.record_type     = ob::WAL_RECORD_DELTA;
     const ob::WalPosition marker_pos = wal_->append(marker, lv.data());
-    wal_->flush();
+    ASSERT_TRUE(wal_->flush());
     mgr->broadcast(hdr, payload.data(), payload.size(), marker_pos);
 
     const auto seqs = recv_sequence_numbers(fd, static_cast<size_t>(kRecords) + 1);
@@ -726,7 +729,7 @@ TEST_F(ReplicationProtocolTest, ALiveRecordIsAnnouncedAtItsOwnWalPosition) {
         const ob::WalPosition pos = wal_->append(d, lv.data());
         mgr->broadcast(hdr, payload.data(), payload.size(), pos);
     }
-    wal_->flush();
+    ASSERT_TRUE(wal_->flush());
 
     const auto recs = recv_wire_records(fd, static_cast<size_t>(kRecords));
     ASSERT_EQ(recs.size(), static_cast<size_t>(kRecords));
@@ -797,7 +800,7 @@ TEST_F(ReplicationProtocolTest, ARotatingAppendAnnouncesTheFileTheRecordWentInto
         const ob::WalPosition pos = wal_->append(d, lv.data());
         mgr->broadcast(hdr, payload.data(), payload.size(), pos);
     }
-    wal_->flush();
+    ASSERT_TRUE(wal_->flush());
     ASSERT_GT(wal_->current_file_index(), 2u) << "the run has to rotate for this test to be about "
                                                  "anything";
 
@@ -887,7 +890,7 @@ TEST_F(ReplicationProtocolTest, ARecordBroadcastBeforeTheHandshakeArrivesOnce) {
     for (int i = 0; i < kRecords; ++i) {
         append_and_broadcast(*wal_, *mgr, static_cast<uint64_t>(i) + 1, kLevels);
     }
-    wal_->flush();
+    ASSERT_TRUE(wal_->flush());
 
     const char* handshake = "REPLICATE 0 0 0\n";
     ASSERT_GT(::send(fd, handshake, std::strlen(handshake), MSG_NOSIGNAL), 0);
@@ -930,7 +933,7 @@ TEST_F(ReplicationProtocolTest, ARecordBroadcastAfterTheHandshakeStillArrives) {
     for (int i = 0; i < kLive; ++i) {
         append_and_broadcast(*wal_, *mgr, static_cast<uint64_t>(i) + 1 + kPrefill, kLevels);
     }
-    wal_->flush();
+    ASSERT_TRUE(wal_->flush());
 
     const auto live = recv_wire_records(fd, static_cast<size_t>(kLive));
     ASSERT_EQ(live.size(), static_cast<size_t>(kLive))

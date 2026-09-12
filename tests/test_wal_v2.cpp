@@ -107,7 +107,9 @@ RC_GTEST_PROP(WALv2Property, prop_wal_record_roundtrip_origin_hlc, ()) {
     {
         ob::WALWriter writer(tmp.str());
         writer.append_with_origin(upd, &lv, origin, hlc_ts);
-        writer.flush();
+        // Asserted rather than cast away: each of these tests reads the file back, so a
+        // flush that failed would make the next assertion report something else (#113).
+        RC_ASSERT(writer.flush());
     }
 
     // Replay with replay_v2 and verify origin + HLC.
@@ -144,7 +146,7 @@ TEST(WALv2, BackwardCompatibility) {
         ob::Level lv = make_level(50000LL, 200ULL, 3U);
         writer.append(make_delta(1), &lv);
         writer.append(make_delta(2), &lv);
-        writer.flush();
+        ASSERT_TRUE(writer.flush());
     }
 
     // Replay with replay_v2.
@@ -195,7 +197,7 @@ TEST(WALv2, MixedRecords) {
         // Another extended record.
         writer.append_with_origin(make_delta(4), &lv, 12, hlc2);
 
-        writer.flush();
+        ASSERT_TRUE(writer.flush());
     }
 
     // Replay with replay_v2 and verify each record.
@@ -259,7 +261,7 @@ TEST(WALv2, CorruptedExtendedHeader) {
         // Write another valid legacy record after it.
         writer.append(make_delta(2), &lv);
 
-        writer.flush();
+        ASSERT_TRUE(writer.flush());
     }
 
     // Now corrupt the file: overwrite the first record's version byte to 1
@@ -322,7 +324,7 @@ TEST(WALv2, ReplayV2ReturnsLastSeq) {
         writer.append_with_origin(make_delta(10), &lv, 1, hlc1);
         writer.append_with_origin(make_delta(20), &lv, 2, hlc1);
         writer.append_with_origin(make_delta(30), &lv, 3, hlc1);
-        writer.flush();
+        ASSERT_TRUE(writer.flush());
     }
 
     ob::WALReplayer replayer(tmp.str());
