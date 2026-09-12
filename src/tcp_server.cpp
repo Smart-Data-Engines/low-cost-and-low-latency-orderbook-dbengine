@@ -658,13 +658,29 @@ std::string execute_command(const Command& cmd,
         return format_error("auth_disabled");
 
     case CommandType::UNKNOWN:
-    default:
+    default: {
         session.increment_commands();
         // The parser's own words when it has any: a recognised command with a token the grammar has
         // no place for is not an unknown command, and saying so sends the reader looking for a
         // feature that is not missing (#107). The gate above already says the parser owns this
         // message - it just had none until now.
-        return format_error(cmd.error.empty() ? "unknown command" : cmd.error);
+        const std::string why = cmd.error.empty() ? "unknown command" : cmd.error;
+        if (registry) registry->increment_counter("ob_refused_commands_total");
+        // Logged here rather than only in the parser, because *who sent it* is the operator's first
+        // question and the parser is pure - it has no fd to name. Once per connection, not once per
+        // line: a refusal is reachable before authentication, so a WARN per refused line is a flood
+        // any peer who can reach the port can drive at line rate (#95's shape). The counter above
+        // is what carries the volume, and it is alertable; this line carries the diagnosis.
+        if (session.first_refusal()) {
+            OB_LOG_WARN("tcp_server", "Refused a command from fd=%d: %s (further refusals on this "
+                                      "connection are counted in ob_refused_commands_total)",
+                        session.fd(), why.c_str());
+        } else {
+            OB_LOG_DEBUG("tcp_server", "Refused a command from fd=%d: %s", session.fd(),
+                         why.c_str());
+        }
+        return format_error(why);
+    }
     }
 }
 

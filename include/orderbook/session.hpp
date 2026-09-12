@@ -146,6 +146,16 @@ public:
     uint64_t commands_executed() const;
     void increment_commands();
 
+    /// True the first time this session has a command refused, false afterwards.
+    ///
+    /// Exists so the refusal can be logged once per connection rather than once per line. A
+    /// refusal is reachable **before authentication** - the gate lets an unparseable line through
+    /// precisely because it is refused anyway - so a WARN per refused line is a log flood any peer
+    /// who can reach the port can drive at line rate, which is #95's shape (a permanent failure
+    /// retried at loop frequency, logged with it). The first one is news; the rest is a pattern,
+    /// and `ob_refused_commands_total` is what an operator alerts on (#107).
+    bool first_refusal();
+
     // ── Authentication state (#30) ────────────────────────────────────────────
     //
     // The session holds *its own* authentication state and deliberately not the server's secret.
@@ -176,6 +186,7 @@ public:
 
 private:
     int         fd_;
+    bool        refusal_logged_{false};
     uint64_t    conn_id_;
     std::string read_buffer_;
 

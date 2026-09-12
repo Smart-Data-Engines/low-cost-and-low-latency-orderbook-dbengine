@@ -10,6 +10,7 @@
 // refusal test. The two directions are what make this file mean anything.
 
 #include "orderbook/command_parser.hpp"
+#include "orderbook/session.hpp"
 
 #include <gtest/gtest.h>
 
@@ -212,6 +213,24 @@ TEST(CommandArity, ALevelLineMayStillCarryItsOptionalCount) {
     ASSERT_EQ(cmd.minsert_args.levels.size(), 2u);
     EXPECT_EQ(cmd.minsert_args.levels[0].count, 9u);
     EXPECT_EQ(cmd.minsert_args.levels[1].count, 1u);   // the default
+}
+
+// ── How often a refusal is worth a log line ───────────────────────────────────
+
+TEST(CommandArity, ASessionAnnouncesOnlyItsFirstRefusal) {
+    // A refusal is reachable **before authentication** - the gate lets an unparseable line through
+    // precisely because it is refused anyway - so a WARN per refused line is a log flood any peer
+    // who can reach the port can drive at line rate. That is #95's shape (a permanent failure
+    // retried at loop frequency and logged with it), and the answer is the same: say it once, count
+    // the rest. `ob_refused_commands_total` is the half an operator alerts on.
+    ob::Session session(/*fd=*/7);
+    EXPECT_TRUE(session.first_refusal()) << "the first refusal on a connection is news";
+    EXPECT_FALSE(session.first_refusal());
+    EXPECT_FALSE(session.first_refusal()) << "the second one is a pattern, and the counter has it";
+
+    // And it is per connection, not per process: the next client starts with news of its own.
+    ob::Session other(/*fd=*/8);
+    EXPECT_TRUE(other.first_refusal());
 }
 
 // ── The other shape of the same silence ───────────────────────────────────────

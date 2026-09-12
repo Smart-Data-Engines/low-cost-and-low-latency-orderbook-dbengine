@@ -137,9 +137,14 @@ static const CommandGrammar* grammar_for_keyword(std::string_view keyword) {
     return nullptr;
 }
 
-/// Refuse a line, recording what the sender will read and saying it once in the log.
+/// Refuse a line, recording what the sender will read.
+///
+/// DEBUG rather than WARN, and that is a division of labour rather than a downgrade: this function
+/// knows *what* is wrong and nothing about *who* sent it, because the parser is pure and has no fd.
+/// The WARN with the fd is in `execute_command`, where both halves are available, so an operator
+/// reads one line instead of correlating two.
 static Command& refuse(Command& cmd, std::string why) {
-    OB_LOG_WARN("cmd_parser", "Refusing a command line: %s", why.c_str());
+    OB_LOG_DEBUG("cmd_parser", "Refusing a command line: %s", why.c_str());
     cmd.type  = CommandType::UNKNOWN;
     cmd.error = std::move(why);
     return cmd;
