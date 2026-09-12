@@ -21,6 +21,8 @@
 #include <exception>
 #include <iostream>
 #include <sstream>
+#include <optional>
+#include <cctype>
 #include <string>
 #include <vector>
 
@@ -86,6 +88,41 @@ Commands:
 )";
 }
 
+/// `bid` or `ask`, in any case, and nothing else (#110).
+///
+/// Every caller of this used to be
+/// `(side_str == "ask" || side_str == "ASK") ? SIDE_ASK : SIDE_BID`, written three times - which
+/// makes **every** word that is not exactly `ask` or `ASK` a bid. `Ask`, `asks`, `sell`, `sideways`
+/// and a typo all stored the opposite side of the book from the one that was typed, and the
+/// confirmation line echoed the typed word back as though it had been understood. The wire refuses
+/// that same word; the tool a human types into was the one that guessed.
+std::optional<uint8_t> parse_side(const std::string& word) {
+    std::string lowered;
+    lowered.reserve(word.size());
+    for (const char c : word) lowered += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lowered == "bid") return ob::SIDE_BID;
+    if (lowered == "ask") return ob::SIDE_ASK;
+    return std::nullopt;
+}
+
+/// The canonical spelling, for a confirmation line that must not repeat the caller's word.
+const char* side_name(uint8_t side) { return side == ob::SIDE_ASK ? "ask" : "bid"; }
+
+/// Refuse a line carrying a token the command's grammar has no place for (#110, #107's rule).
+///
+/// `istringstream >>` reads the fields it knows and leaves the rest, so
+/// `insert A EX bid 100 5 1 1700000000000000000` stored a row and discarded the timestamp - which is
+/// what the wire protocol did until #107, and the embedded API here has no event-time argument at
+/// all because it goes through `DeltaUpdate` rather than through a command line.
+bool nothing_follows(std::istringstream& args, const char* usage) {
+    std::string extra;
+    if (args >> extra) {
+        std::cerr << "unexpected token '" << extra << "'\n" << "Usage: " << usage << "\n";
+        return false;
+    }
+    return true;
+}
+
 void cmd_insert(ob::Engine& engine, std::istringstream& args) {
     std::string symbol, exchange, side_str;
     int64_t price = 0;
@@ -98,8 +135,17 @@ void cmd_insert(ob::Engine& engine, std::istringstream& args) {
         return;
     }
     args >> cnt; // optional
+    static constexpr const char* kUsage =
+        "insert <symbol> <exchange> <bid|ask> <price> <qty> [count]";
+    if (!nothing_follows(args, kUsage)) return;
 
-    uint8_t side = (side_str == "ask" || side_str == "ASK") ? ob::SIDE_ASK : ob::SIDE_BID;
+    const auto parsed_side = parse_side(side_str);
+    if (!parsed_side) {
+        std::cerr << "'" << side_str << "' is not a side; it must be bid or ask\n"
+                  << "Usage: " << kUsage << "\n";
+        return;
+    }
+    const uint8_t side = *parsed_side;
     ++g_seq;
 
     ob::DeltaUpdate du{};
@@ -118,8 +164,11 @@ void cmd_insert(ob::Engine& engine, std::istringstream& args) {
     ob::ob_status_t rc = engine.apply_delta(du, &lev);
     if (rc == ob::OB_OK) {
         ++g_inserts;
+        // `side_name(side)` rather than `side_str`: a confirmation that repeats the caller's word
+        // confirms the typing rather than the storing, and that is the line a human reads to check
+        // that the tool understood.
         std::cout << "OK  seq=" << g_seq
-                  << "  " << side_str << " " << symbol << "@" << exchange
+                  << "  " << side_name(side) << " " << symbol << "@" << exchange
                   << "  price=" << price << " qty=" << qty << "\n";
     } else {
         std::cerr << "ERROR: apply_delta returned " << rc << "\n";
@@ -139,7 +188,17 @@ void cmd_bulk(ob::Engine& engine, std::istringstream& args) {
         return;
     }
 
-    uint8_t side = (side_str == "ask" || side_str == "ASK") ? ob::SIDE_ASK : ob::SIDE_BID;
+    static constexpr const char* kUsage =
+        "bulk <symbol> <exchange> <bid|ask> <n_levels 1-1000> <base_price> <base_qty>";
+    if (!nothing_follows(args, kUsage)) return;
+
+    const auto parsed_side = parse_side(side_str);
+    if (!parsed_side) {
+        std::cerr << "'" << side_str << "' is not a side; it must be bid or ask\n"
+                  << "Usage: " << kUsage << "\n";
+        return;
+    }
+    const uint8_t side = *parsed_side;
     int64_t step = (side == ob::SIDE_BID) ? -100 : 100;
 
     std::vector<ob::Level> levels(n_levels);
@@ -162,7 +221,7 @@ void cmd_bulk(ob::Engine& engine, std::istringstream& args) {
     if (rc == ob::OB_OK) {
         ++g_inserts;
         std::cout << "OK  seq=" << g_seq
-                  << "  " << n_levels << " " << side_str << " levels for "
+                  << "  " << n_levels << " " << side_name(side) << " levels for "
                   << symbol << "@" << exchange
                   << "  base_price=" << base_price << "\n";
     } else {
@@ -227,7 +286,15 @@ void cmd_load(ob::Engine& engine, std::istringstream& args) {
             ++errors;
             continue;
         }
-        uint8_t side = (side_str == "ask" || side_str == "ASK") ? ob::SIDE_ASK : ob::SIDE_BID;
+        const auto parsed_side = parse_side(side_str);
+        if (!parsed_side) {
+            // Counted as an error rather than defaulted: a CSV row whose side is a typo used to
+            // load as a bid, and a loader that silently halves the book is worse than one that
+            // says which rows it refused.
+            ++errors;
+            continue;
+        }
+        const uint8_t side = *parsed_side;
 
         ++g_seq;
         ob::DeltaUpdate du{};
@@ -379,7 +446,24 @@ void cmd_status() {
 
 static int run_cli(int argc, char* argv[]) {
     std::string data_dir = "/tmp/ob_cli_data";
-    if (argc > 1) data_dir = argv[1];
+    if (argc > 1) {
+        // `ob_cli --data-dir /tmp/x` used to open a store in a directory **named** `--data-dir`,
+        // because the whole of argv handling was `argv[1]`. That is #36's `--prot 5599` with a
+        // filesystem attached, and the usage line below is what the reader gets instead (#110).
+        const std::string first = argv[1];
+        if (!first.empty() && first[0] == '-') {
+            if (first == "-h" || first == "--help") {
+                std::cout << "Usage: ob_cli [data_dir]\n"
+                          << "  data_dir defaults to /tmp/ob_cli_data. This tool embeds the engine "
+                             "rather than\n  speaking the wire protocol, so it takes no flags.\n";
+                return 0;
+            }
+            std::cerr << "unknown argument '" << first << "'\n"
+                      << "Usage: ob_cli [data_dir]   (this tool takes no flags)\n";
+            return 2;
+        }
+        data_dir = first;
+    }
 
     std::filesystem::create_directories(data_dir);
     std::cout << "orderbook-dbengine CLI v0.1.0\n";
