@@ -841,9 +841,9 @@ measurement and our own adapter. Part two installed ClickHouse and TimescaleDB n
 three competitor adapters, ran the multi-system checkpoint and published the table — and it found
 more in our own code than in theirs. Spec: `kiro-workspace/specs/reproducible-benchmarks/`.
 
-**The published answer is that this engine loses all four comparable workloads**, and the reasons
-are worth more than the numbers. i3-7100U, Release, 200 000 rows, twelve rounds, control floor
-**15.7%**:
+**The first published answer was that this engine loses all four comparable workloads**, and the
+reasons were worth more than the numbers. i3-7100U, Release, 200 000 rows, twelve rounds, control
+floor **15.7%** (`results/2026-09-11-a8b19196.md`):
 
 | system | ingest (rows/s) | 4000-row query | not like-for-like because |
 |---|---|---|---|
@@ -852,9 +852,27 @@ are worth more than the numbers. i3-7100U, Release, 200 000 rows, twelve rounds,
 | TimescaleDB 2.30.0 / PG 16.15 | 106,874 | 6.06 ms (5.44–14.85) | `\copy` of the whole CSV, `timescaledb-tune` applied |
 | kdb+ | NOT MEASURED | NOT MEASURED | a vendor registration, and a licence question about publishing its free edition's numbers |
 
-Both losses are limits of the **protocol** rather than of the storage engine, which is the useful
-finding: the same engine ingests **446,219 updates/s in process** here against **4,012 through the
-wire** — a factor of 111, all of it the round trip.
+**Recomputed on 12 September after #105 closed, by one run rather than by editing numbers** — and
+this is the first table that compares the *same question*, because until then the engine could not
+be given event time at all and the query column excluded the time column
+(`results/2026-09-12-ece487a1.md`, control floor **21.2%**):
+
+| system | ingest (rows/s) | time-range query (4000 rows) | verdict against orderbook |
+|---|---|---|---|
+| orderbook | 66,072 | 9.32 ms (8.46–13.28) | — |
+| ClickHouse 26.8.2.7 | 428,842 | 5.26 ms (4.78–6.85) | **loses both**: 84.6% and 43.6% apart |
+| TimescaleDB 2.30.0 / PG 16.15 | 116,438 | 8.67 ms (5.60–10.54) | **loses ingest** (43.3%); the query is **7% apart against a 21.2% floor**, so it is reported as indistinguishable rather than as a win |
+| kdb+ | NOT MEASURED | NOT MEASURED | unchanged: a vendor registration and a licence question |
+
+So the honest summary changed from "loses all four" to "**loses three, and one is inside the
+floor**" — and the reason is that the workload became comparable, not that the engine got faster.
+The ingest column reads 66,072 against the earlier 78,151, which is **15% apart against this run's
+own 21.2% floor**: not separable from noise, and the harness's own note is why it is not presented
+as a change — two consecutive runs of this table gave 9.69 ms and 10.97 ms for the same query.
+
+The remaining loss is a limit of the **protocol** rather than of the storage engine, which is the
+useful finding: the same engine ingests **446,219 updates/s in process** here against **4,012
+through the wire** — a factor of 111, all of it the round trip.
 
 **Five findings came out of running it, and four of them are about our own code.**
 
@@ -2382,9 +2400,13 @@ caller who passes no time produces exactly the line an older client produced, an
 tests over the wire — the event time, the capability answer, the refusal against an older server
 (its capability set replaced with the empty one a pre-#105 server reports), and the `seq` refusal.
 
-**The comparative table in `README.md` predates this and is left as measured.** Its query column
-excludes the time column because of this defect; re-running it is #39's business, and the caveat now
-says so rather than describing a limitation that is gone.
+**The comparative table was recomputed by one run rather than edited**, which is what #39's own
+entry now carries: with the field in place all three systems filter on the same range, so the table
+compares the same question for the first time. The published summary went from "loses all four
+comparable workloads" to **"loses three, one inside the floor"** — the time-range query against
+TimescaleDB is 9.32 ms against 8.67 ms, 7% apart against a measured floor of 21.2%, so the harness
+reports it as indistinguishable rather than as a win. The engine did not get faster; the comparison
+got honest.
 
 - Effort: M | Impact: the engine's main query selects on the wrong clock for every record written
   over a network, and the argument that looks like the fix is accepted and discarded
