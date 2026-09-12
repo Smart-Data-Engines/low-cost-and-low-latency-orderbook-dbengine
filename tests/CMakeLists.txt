@@ -366,6 +366,13 @@ target_compile_definitions(test_tcp_server
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 
+# ── Test-harness discipline ────────────────────────────────────────────────────
+# Fixed ports the tests bind have to sit below the range the kernel hands to outgoing connections,
+# or a required check goes red for a reason that has nothing to do with the engine (#109).
+ob_add_engine_test(test_port_discipline
+    test_port_discipline.cpp
+)
+
 # ── Whole-engine static checks ─────────────────────────────────────────────────
 # Reads every header and source rather than naming classes: the shape it looks for (#104) was found
 # five times in this workspace while looking for something else, so the subject has to be the tree.

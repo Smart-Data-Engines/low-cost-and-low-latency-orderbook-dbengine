@@ -7,6 +7,7 @@
 // nothing ever constructed it. A single STATUS command killed the node with SIGSEGV.
 
 #include "orderbook/engine.hpp"
+#include "test_ports.hpp"
 
 #include <gtest/gtest.h>
 
@@ -24,7 +25,7 @@ namespace fs = std::filesystem;
 namespace {
 
 static std::atomic<uint64_t> g_dir_counter{0};
-static std::atomic<uint16_t> g_port{55100};
+static std::atomic<uint16_t> g_port{ob::test::kPortsMmStats};
 
 struct TempDir {
     std::string path;
