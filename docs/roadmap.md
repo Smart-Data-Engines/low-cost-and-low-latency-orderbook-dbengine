@@ -2198,7 +2198,7 @@ mutation survives, ask whether a sentinel is quietly doing the work the guard cl
 The survivor is the refusal's log line, which nothing asserts — it is for operators, and saying so
 is more honest than a table in which everything dies.
 
-Ten unit tests and three integration tests, every refusal with a control beside it — a parser that
+Eleven unit tests and four integration tests, every refusal with a control beside it — a parser that
 refuses everything passes every refusal test. The unit tests read the exported `command_grammar()`
 rather than a second list of the same facts, which is the shape that cost #32 a flag, a negation
 table and a test built on a premise read from a default instead of from the parser.
@@ -4694,8 +4694,8 @@ Measured on machine B, on the commit that carries this table, rather than carrie
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1007 | all passing, ~205 s with `ctest -j1` on machine B. `ctest -N` reports 1009: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
-| Python integration | 206 | passing, plus 2 skipped, on i3-7100U in **13:03 measured**. The two skips are the Binance tests, opt-in on a live feed (`OB_BINANCE_TESTS=1`), and they are **collection-time** skips (`pytest.skip(allow_module_level=True)`) — so they are not in the 206, produce no progress character, and the suite's own report plugin says `0 skipped` while pytest says 2. This row read 190 until it was recounted; if you recompute it, count what pytest reports rather than what `--collect-only` does. **No xfails left**: #60's and #61's markers both fell with their fixes |
+| C++ (GTest + RapidCheck) | 1008 | all passing, ~207 s with `ctest -j1` on machine B. `ctest -N` reports 1010: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) which print numbers rather than assert them |
+| Python integration | 207 | passing, plus 2 skipped, on i3-7100U in **13:03 measured**. The two skips are the Binance tests, opt-in on a live feed (`OB_BINANCE_TESTS=1`), and they are **collection-time** skips (`pytest.skip(allow_module_level=True)`) — so they are not in the 207, produce no progress character, and the suite's own report plugin says `0 skipped` while pytest says 2. This row read 190 until it was recounted; if you recompute it, count what pytest reports rather than what `--collect-only` does. **No xfails left**: #60's and #61's markers both fell with their fixes |
 
 `ctest -j1` is not a preference. The network tests bind ports, so a parallel run fails for a reason
 that has nothing to do with the code under test.
