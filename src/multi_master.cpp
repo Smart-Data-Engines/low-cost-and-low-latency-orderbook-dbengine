@@ -224,60 +224,12 @@ uint32_t ReconnectBackoff::next_delay_ms() {
     return static_cast<uint32_t>(actual * 1000.0);
 }
 
-// ── Frame encode/decode implementation ─────────────────────────────────────────
-
-void encode_frame(const void* payload, size_t len, std::vector<uint8_t>& out) {
-    // Append 4-byte LE length header.
-    uint32_t length = static_cast<uint32_t>(len);
-    const auto* len_bytes = reinterpret_cast<const uint8_t*>(&length);
-    out.insert(out.end(), len_bytes, len_bytes + sizeof(uint32_t));
-
-    // Append payload bytes.
-    if (payload && len > 0) {
-        const auto* pl = static_cast<const uint8_t*>(payload);
-        out.insert(out.end(), pl, pl + len);
-    }
-}
-
 /// Monotonic milliseconds. Used for the version-vector grace window; steady_clock because a
 /// wall-clock step must not shorten or extend it.
 static uint64_t now_ms() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
-}
-
-int parse_frames(std::vector<uint8_t>& recv_buf,
-                 std::vector<std::pair<size_t, size_t>>& frames_out) {
-    frames_out.clear();
-
-    size_t offset = 0;
-    while (offset + MM_FRAME_HEADER_SIZE <= recv_buf.size()) {
-        // Read 4-byte LE length from current position.
-        uint32_t length = 0;
-        std::memcpy(&length, recv_buf.data() + offset, sizeof(uint32_t));
-
-        // Validate: length must not exceed MM_MAX_FRAME_PAYLOAD.
-        if (length > MM_MAX_FRAME_PAYLOAD) {
-            return -1;  // Protocol error: frame too large.
-        }
-
-        // Check if the full frame (header + payload) is available.
-        if (offset + MM_FRAME_HEADER_SIZE + length > recv_buf.size()) {
-            break;  // Incomplete frame — wait for more data.
-        }
-
-        // Record payload position: offset past the 4B header, with payload length.
-        frames_out.emplace_back(offset + MM_FRAME_HEADER_SIZE, static_cast<size_t>(length));
-        offset += MM_FRAME_HEADER_SIZE + length;
-    }
-
-    // Erase consumed bytes from recv_buf.
-    if (offset > 0) {
-        recv_buf.erase(recv_buf.begin(), recv_buf.begin() + static_cast<std::ptrdiff_t>(offset));
-    }
-
-    return 0;  // Success.
 }
 
 // ── Constructor / Destructor ──────────────────────────────────────────────────

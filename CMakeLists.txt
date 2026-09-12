@@ -43,6 +43,11 @@ include(FetchContent)
 
 # Test/benchmark deps are only needed when building tests
 option(OB_BUILD_TESTS "Build tests and benchmarks (requires gtest, benchmark, rapidcheck)" ON)
+option(OB_BUILD_FUZZERS "Build libFuzzer harnesses (requires Clang and OB_ENABLE_ASAN)" OFF)
+
+if(OB_BUILD_FUZZERS AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "OB_BUILD_FUZZERS requires Clang. Configure a separate build with -DCMAKE_CXX_COMPILER=clang++.")
+endif()
 
 if(OB_BUILD_TESTS)
     # Google Test
@@ -159,6 +164,17 @@ if(OB_ENABLE_COVERAGE)
         message(WARNING "Coverage not supported for compiler: ${CMAKE_CXX_COMPILER_ID}")
     endif()
     message(STATUS "Coverage instrumentation enabled")
+endif()
+
+# libFuzzer instrumentation must reach the libraries, just like ASan/UBSan (#83, #38).
+# Only the harness executables link the fuzzer main; ordinary targets retain their own main.
+if(OB_BUILD_FUZZERS)
+    if(NOT OB_ENABLE_ASAN)
+        message(FATAL_ERROR "OB_BUILD_FUZZERS requires -DOB_ENABLE_ASAN=ON for ASan and UBSan coverage.")
+    endif()
+    add_compile_options(-fsanitize=fuzzer-no-link)
+    set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+    message(STATUS "libFuzzer instrumentation enabled for engine libraries and harnesses")
 endif()
 
 # ── Core library ───────────────────────────────────────────────────────────────
@@ -304,9 +320,15 @@ target_link_libraries(orderbook_anti_entropy PUBLIC orderbook_peer_registry orde
 add_library(orderbook_async_snapshot STATIC src/async_snapshot.cpp)
 target_link_libraries(orderbook_async_snapshot PUBLIC orderbook_core orderbook_sequence orderbook_logger)
 
+# ── Multi-master wire framing ─────────────────────────────────────────────────
+# Kept separate from the manager so byte parsing can be fuzzed without pulling in Engine and the
+# networking state machine. The manager and the fuzzer link this same production implementation.
+add_library(orderbook_mm_framing STATIC src/mm_framing.cpp)
+target_link_libraries(orderbook_mm_framing PUBLIC orderbook_core)
+
 # ── Multi-master manager compiled library (peer networking, WAL broadcast) ─────
 add_library(orderbook_multi_master STATIC src/multi_master.cpp src/mm_snapshot.cpp)
-target_link_libraries(orderbook_multi_master PUBLIC orderbook_async_snapshot orderbook_peer_registry orderbook_conflict_resolver orderbook_anti_entropy orderbook_hlc orderbook_compression orderbook_logger)
+target_link_libraries(orderbook_multi_master PUBLIC orderbook_mm_framing orderbook_async_snapshot orderbook_peer_registry orderbook_conflict_resolver orderbook_anti_entropy orderbook_hlc orderbook_compression orderbook_logger)
 
 # ── Shard map compiled library ─────────────────────────────────────────────────
 add_library(orderbook_shard_map STATIC src/shard_map.cpp)
@@ -601,4 +623,9 @@ if(OB_BUILD_TESTS)
 
     # ── Benchmarks ─────────────────────────────────────────────────────────────
     add_subdirectory(benchmarks)
+endif()
+
+# ── Parser fuzzing (optional, separate from CTest) ──────────────────────────────
+if(OB_BUILD_FUZZERS)
+    add_subdirectory(fuzz)
 endif()

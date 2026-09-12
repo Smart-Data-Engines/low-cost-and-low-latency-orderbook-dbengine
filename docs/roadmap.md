@@ -828,11 +828,109 @@ the fix and what survives of the original claim.
   the qualification above until #83 made it true of the whole tree. Two defects found by turning them
   on, one of them undefined behaviour on the hot path's data type
 
-### 38. Fuzzing
-- libFuzzer harnesses for `command_parser`, the multi-master frame parser, and WAL record
-  deserialization. These are the three places that read untrusted bytes
-- Corpus in-repo, short fuzz run in CI, optional OSS-Fuzz submission
-- Effort: M | Impact: Finds the class of bug that property tests miss; also a credibility signal
+### 38. Fuzzing ✅
+
+Three libFuzzer harnesses, one for each place that reads bytes this engine did not produce: the wire
+command parser (`parse_command`, `parse_minsert`), the multi-master frame codec (`encode_frame`,
+`parse_frames`) and WAL record deserialisation (`replay_v2`, `replay_after_checkpoint`). Opt-in
+through `OB_BUILD_FUZZERS`, which refuses GCC and refuses to run without `OB_ENABLE_ASAN`, so an
+incomplete request fails at configure time rather than producing a harness that explores nothing.
+`-fsanitize=fuzzer-no-link` is added **before** the libraries are created, which is the whole of
+#83: `add_compile_options()` only reaches targets defined after the call, and the sanitizer blocks
+once sat below all twenty-eight of them.
+
+`src/mm_framing.cpp` is a pure move. `encode_frame` and `parse_frames` lived in `multi_master.cpp`
+next to the peer networking state machine, so linking them pulled in `Engine`, the snapshot
+machinery and the whole manager — a fuzz driver for a byte parser would have been fuzzing static
+initialisation. The manager links the same new library, so there is one implementation rather than a
+copy compiled twice.
+
+Forty-eight seeds are committed (25 commands, 10 frames, 13 WAL records) plus a command dictionary.
+Measured on an Intel i3-7100U, Debug with ASan and UBSan, 60 s per harness: **1,609,034 / 1,671,098 /
+136,285 executions** at **26,377 / 27,395 / 2,234 exec/s**, reaching 863 / 144 / 333 coverage points.
+No findings. The WAL harness is an order of magnitude slower because every input is written to a file
+and read back through a real `WALReplayer`, which is the point of it.
+
+**The result worth reporting is not the green run — it is what a mutation table said about these
+harnesses.** Nine defects were planted in the three parsers, with one control mutation that changes
+a log string and must survive:
+
+| mutation | first pass | after |
+|---|---|---|
+| `cmd_side_formatted_as_number` | killed by seed `binary_bytes` | killed |
+| `wal_checkpoint_replay_from_start` | killed by seed `checkpoint_tail` | killed |
+| `wal_context_payload_len_overstated` | killed by seed `checkpoint_tail` | killed |
+| `wal_accepts_a_bad_checksum` | did not compile | killed by seed `bad_checksum` |
+| `cmd_format_drops_event_time` | **survived** | killed by seed `event_time` |
+| `mm_oversize_length_accepted` | **survived** | killed by seed `above_max_length` |
+| `mm_payload_offset_off_by_one` | **survived** | killed by seed `above_max_length` |
+| `mm_erases_consumed_bytes_on_error` | **survived** | killed by seed `valid_then_invalid` |
+| `mm_encode_length_overstates` | — (encoder had no coverage) | killed by seed `above_max_length` |
+| `CONTROL_log_wording_only` | survived, as it must | survived |
+
+The frame harness had the most elegant-looking property of the three — splitting a stream into
+chunks must not change which frames come out — and **caught none of the three defects planted in its
+parser**. The corpus reached every one of those branches. What was missing was an oracle looking at
+them, which is the difference between coverage and a test. Fragmentation invariance cannot see a
+*systematic* decoding error: a parser that reports every payload one byte early shifts both sides of
+the comparison equally. And the refusal of an over-long frame had no assertion at all — an over-long
+payload can never be completed inside the fuzzer's input limit, so deleting the ceiling check merely
+turns −1 into 0 while every other property still holds.
+
+Four oracles closed it, each derived from the contract of the function under test rather than from a
+second implementation of it, which requirement 1 of the spec rules out:
+
+- a successful verdict never leaves an over-long frame pending, because the incomplete-frame break
+  is only reachable *after* the ceiling check
+- a refusal leaves the buffer untouched, which is what lets the caller drop the connection instead of
+  resynchronising onto a frame boundary that never existed
+- a payload survives `encode_frame` followed by `parse_frames`. **`encode_frame` had no coverage
+  whatsoever** until this was added: the stream harness only ever called the decoder. Frame coverage
+  went 144 → 177 points
+- a command means the same thing after `format_command` and a reparse, compared field by field. The
+  canonical-text comparison could not see a dropped field — removing the line that emits an INSERT's
+  event time round-trips cleanly, because the field is then absent from both sides, which is the
+  exact defect #105 existed to fix
+
+After that, **nine of nine planted defects are killed by committed seeds**, deterministically rather
+than by a lucky campaign, and the control still survives. Every kill names the seed that caught it,
+which is the evidence that the corpus is doing the work.
+
+`fuzz/verify_instrumentation.py` replaces reading CMakeLists.txt with reading the compiler's own
+command lines out of `compile_commands.json`, because what CMake says and what the compiler received
+are two different claims. Its own first version was blind: it tested for the substring
+`-fsanitize=undefined`, which never matches, because clang is handed `-fsanitize=address,undefined`
+as a single argument — it reported every parser as uninstrumented in a fully instrumented build. So
+sanitizer lists are parsed rather than searched, and absence is a failure: a missing file, an empty
+database or an empty corpus each fail loudly instead of finding no problems in nothing.
+
+**Scope, stated because each limit was measured rather than assumed:**
+
+- these are parser harnesses, not server tests. Nothing opens a socket, starts etcd, binds a port or
+  touches another process's data directory
+- over-acceptance is not what the command harness measures. A parser that accepts a trailing token
+  still round-trips cleanly, because `format_command` does not emit the token it ignored. The
+  mechanism that refuses those is the arity table indexed by `CommandType` (#107)
+- `parse_frames` cannot be shown to *accept* an over-long frame, only to refuse one: completing a
+  64 MiB payload is three orders of magnitude past the input limit. The oracle is therefore indirect
+- an unknown WAL header version is read as legacy rather than refused. Measured on the
+  `unknown_version` seed: `version = 255` takes the 24-byte path, and what stops a future format
+  from being misread into the engine is the checksum failing, not a version check
+- the WAL harness drives one file; rotation and the manifest stay with the C++ suite
+- **no OSS-Fuzz.** Submitting is an option and was never a condition of finishing this item; it
+  would mean sending builds of a public repository to a third-party service, which is the same kind
+  of decision as the coverage badge in #37
+
+The `fuzz` job and `{"context": "fuzz"}` in `.github/rulesets/master.json` enter in one PR, because
+`check_contexts.py` rejects a produced but unrequired context. The live ruleset is applied **after
+merge** and read back. That brings it to fourteen contexts — and the sentence in
+`docs/github-security.md` that states the number is no longer maintained by hand: the drift checker
+derives it from the ruleset and fails if the prose disagrees or stops making the claim. It had been
+wrong twice already, "eleven" against twelve and "twelve" against thirteen, and neither time was
+anybody careless: every change added a context and no change recounted the sentence.
+
+- Effort: M | Impact: finds the class of bug property tests miss, and the mutation table is the part
+  that makes the harnesses worth trusting
 
 ### 39. Reproducible comparative benchmarks ✅
 
@@ -4711,14 +4809,13 @@ premise was a claim about the machine rather than about the engine. #110's first
 value of the skip gate: seven new CLI tests did not run until both integration jobs built the CLI
 and the fixture selected the same build as the server.
 
-The current work sequence is **fuzzing (#38), then fault injection (#54)**. The coverage badge left
-from #37 needs a maintainer decision about an external reporting service. Existing coverage reports
-and the line-coverage floor continue to run inside GitHub Actions.
+The current work sequence is **fault injection (#54)**, now that fuzzing (#38) is in. The coverage
+badge left from #37 needs a maintainer decision about an external reporting service. Existing
+coverage reports and the line-coverage floor continue to run inside GitHub Actions.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **Next** | Fuzzing (#38) | M | Exercise malformed inputs across command parsing, multi-master framing and WAL deserialization |
-| **Then** | Chaos and fault injection (#54) | L | Verify recovery and refusal when storage, clocks and connectivity fail |
+| **Next** | Chaos and fault injection (#54) | L | Verify recovery and refusal when storage, clocks and connectivity fail |
 | **Decision** | Coverage badge (#37) | S | Requires choosing an external service; the existing report and floor are already in CI |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
@@ -4734,6 +4831,13 @@ and the line-coverage floor continue to run inside GitHub Actions.
 ## Known gaps and honest caveats
 
 Things a reviewer will notice, listed here so they do not look like oversights:
+
+- **Fuzzing covers three parsers, not the server.** #38 drives `parse_command`/`parse_minsert`, the
+  multi-master frame codec and WAL replay, with a committed corpus and a bounded run on every pull
+  request. Nothing in it opens a socket, starts etcd or binds a port, so a framing bug that needs
+  two live nodes belongs to the integration battery instead. There is no OSS-Fuzz submission, and
+  that was never a condition of the item: it would mean sending builds of a public repository to a
+  third-party service, the same class of decision as the coverage badge in #37.
 
 - **Every encrypted surface is off by default, and one transport cannot have it at all.** All
   three surfaces authenticate (`--auth-secret-file`, `--cluster-secret-file`) and all three can be
@@ -4863,7 +4967,7 @@ runners, not the machine-B performance baseline above.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1021 | all passing, 159 s with `ctest -j1`. CTest lists 1023: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them |
+| C++ (GTest + RapidCheck) | 1022 | all passing, 213 s with `ctest -j1` on the i3-7100U. CTest lists 1024: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtime is what this machine gave on the commit measured, not a budget: the same suite read 159 s earlier the same day on an idler machine |
 | Python integration | 225 | all passing in 13:06, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 225; count pytest's final result rather than the report plugin's progress characters |
 | Python integration under TSan | 225 | all passing in 14:39, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job |
 

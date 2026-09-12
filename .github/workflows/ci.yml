@@ -739,3 +739,115 @@ jobs:
             cat "$f"
           done
           exit 1
+
+  # Fuzzing the three places that read untrusted bytes: the wire command parser, the multi-master
+  # frame decoder and WAL record deserialisation (#38).
+  #
+  # Bounded on purpose. This is a regression gate, not a campaign: sixty seconds per harness catches
+  # what a mutated corpus reaches quickly and keeps the job inside the wall clock of every other one.
+  # A real campaign runs for hours and belongs on a developer's machine - `fuzz/README.md` says how.
+  # What makes the short run worth having is the committed corpus: every seed is executed on every
+  # pull request, so a parser that stops refusing one of them fails here deterministically.
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Install system dependencies
+        # libclang-rt-dev is named explicitly and that is not redundant: the sanitizer and
+        # libFuzzer runtime archives live there, and `libclang-common-N-dev` only *Recommends* it.
+        # Every other job here installs with --no-install-recommends and never needed it, because
+        # none of them links a sanitizer under Clang. Without this line the harnesses compile and
+        # fail at link on a missing libclang_rt.fuzzer-x86_64.a. The unversioned metapackage
+        # follows the runner's default Clang, the same way the `clang` metapackage does.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config clang libclang-rt-dev \
+            liblz4-dev libcurl4-openssl-dev libssl-dev liburing-dev
+          clang++ --version
+
+      - name: Configure the fuzzing tree (Clang, libFuzzer, ASan + UBSan)
+        # OB_BUILD_FUZZERS refuses GCC and refuses to run without OB_ENABLE_ASAN, so an incomplete
+        # request fails at configure time instead of producing harnesses that explore their own
+        # drivers. Debug with -O1 and frame pointers, matching the sanitizer trees: -O0 hides
+        # optimisation-dependent bugs and -O2 loses the stack detail that makes a report actionable.
+        run: >-
+          cmake -S . -B build-fuzz
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_BUILD_TYPE=Debug
+          -DOB_BUILD_FUZZERS=ON -DOB_ENABLE_ASAN=ON -DOB_BUILD_TESTS=OFF
+
+      - name: Build the three harnesses
+        run: >-
+          cmake --build build-fuzz -j$(nproc)
+          --target fuzz_command_parser fuzz_mm_frames fuzz_wal_replay
+
+      - name: Verify the instrumentation reached the production parsers
+        # A harness whose parser was compiled without coverage instrumentation explores the driver
+        # and reports nothing about the parser, while every step here stays green. That already
+        # happened in this repository's sanitizer build (#83), so this reads the compiler's own
+        # command lines rather than CMakeLists.txt, and fails on a missing file or an empty corpus
+        # instead of finding no problems in nothing.
+        run: python3 fuzz/verify_instrumentation.py build-fuzz
+
+      - name: Every binary is present
+        # Named separately from the build because "the target was up to date" and "the executable
+        # exists" are different claims, and the second one is what the next two steps need.
+        run: |
+          for harness in command_parser mm_frames wal_replay; do
+            test -x "build-fuzz/fuzz/fuzz_$harness"
+          done
+
+      - name: Run every versioned seed
+        # The deterministic half. There is no pipe anywhere in this job: the fuzzer's exit code is
+        # the result, and `| tee` or `| grep` would replace it with the exit code of the filter.
+        run: |
+          mkdir -p build-fuzz/fuzz-logs
+          for harness in command_parser mm_frames wal_replay; do
+            ./build-fuzz/fuzz/fuzz_$harness fuzz/corpus/$harness/* \
+              > "build-fuzz/fuzz-logs/seeds-$harness.log" 2>&1
+          done
+
+      - name: Bounded campaign, one harness at a time
+        # Sequential, because two fuzzers on one runner share its cores and each would then be
+        # measuring the other's RSS against its own limit. Budgets: 60 s per harness, 10 s per
+        # input, 1 GiB RSS. Maximum input 64 KiB for commands and frames; 128 KiB for the WAL,
+        # which has to hold a maximum payload plus its header.
+        run: |
+          mkdir -p build-fuzz/fuzz-logs build-fuzz/artifacts \
+                   build-fuzz/fuzz-corpus/command_parser \
+                   build-fuzz/fuzz-corpus/mm_frames \
+                   build-fuzz/fuzz-corpus/wal_replay
+          budget="-max_total_time=60 -timeout=10 -rss_limit_mb=1024 -print_final_stats=1"
+          ./build-fuzz/fuzz/fuzz_command_parser \
+            build-fuzz/fuzz-corpus/command_parser fuzz/corpus/command_parser \
+            -dict=fuzz/command_parser.dict -max_len=65536 $budget \
+            -artifact_prefix=build-fuzz/artifacts/command_parser- \
+            > build-fuzz/fuzz-logs/campaign-command_parser.log 2>&1
+          ./build-fuzz/fuzz/fuzz_mm_frames \
+            build-fuzz/fuzz-corpus/mm_frames fuzz/corpus/mm_frames \
+            -max_len=65536 $budget \
+            -artifact_prefix=build-fuzz/artifacts/mm_frames- \
+            > build-fuzz/fuzz-logs/campaign-mm_frames.log 2>&1
+          ./build-fuzz/fuzz/fuzz_wal_replay \
+            build-fuzz/fuzz-corpus/wal_replay fuzz/corpus/wal_replay \
+            -max_len=131072 $budget \
+            -artifact_prefix=build-fuzz/artifacts/wal_replay- \
+            > build-fuzz/fuzz-logs/campaign-wal_replay.log 2>&1
+
+      - name: Keep the logs and any reproducer
+        # `if: always()`, because the run that matters is the one that failed. A crash leaves the
+        # input under build-fuzz/artifacts/, and that file plus the log is everything needed to
+        # reproduce it with one command from fuzz/README.md.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: fuzz
+          path: |
+            build-fuzz/fuzz-logs/
+            build-fuzz/artifacts/
+          if-no-files-found: error

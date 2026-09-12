@@ -21,9 +21,14 @@ The required checks and the remaining branch protections are described below.
 
 ### Required checks and how to update them ✅
 
-**Thirteen checks are required** after roadmap #108 added `io-uring-build`. The complete list lives
-in [`.github/rulesets/master.json`](../.github/rulesets/master.json), alongside the other branch
-protections. Strict checks require a PR to include the current base before merging. The same ruleset
+**Fourteen checks are required** after roadmap #38 added `fuzz`, which followed #108 adding
+`io-uring-build`. The complete list lives in
+[`.github/rulesets/master.json`](../.github/rulesets/master.json), alongside the other branch
+protections. That sentence is no longer maintained by hand: the drift checker derives the count from
+the ruleset and fails if this paragraph disagrees with it, or if the paragraph stops making the
+claim at all. It had already been wrong twice — "eleven" against twelve, then "twelve" against
+thirteen — and neither time was anybody careless. Every change added a context; no change recounted
+the sentence. Strict checks require a PR to include the current base before merging. The same ruleset
 requires linear history and resolution of review threads; it permits squash and rebase merges.
 
 `required_approving_review_count` stays at `0` while there is one maintainer. Raise it when a second
@@ -54,6 +59,17 @@ gh api repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/rule
 `OB_BUILD_TESTS=OFF`. It also requires the linked binary to define `IoUringServer::run()`, because
 `ob_tcp_server` remains an epoll binary even when that option is enabled. This check proves
 compilation and linking. It does not run the transport or establish runtime or sanitizer coverage.
+
+`fuzz` came with roadmap #38. It builds three libFuzzer harnesses over the parsers that read
+untrusted bytes — wire commands, multi-master framing and WAL replay — under Clang with ASan and
+UBSan, **verifies from the compiler's own command lines** that the instrumentation reached the
+parsers rather than only the drivers, runs every committed seed, then gives each harness sixty
+seconds. Logs and any reproducer are uploaded whether it passed or failed, so a red job is
+reproducible from its artefact. What it does not claim: this is a regression gate and not a
+campaign, and the harnesses cover parsers rather than the server — nothing in the job opens a
+socket, starts etcd or binds a port. The measurement that makes the gate worth having is in the
+roadmap: nine defects planted in the three parsers, and the seeds catch all nine, with one control
+mutation that survives.
 
 `package` is the twelfth, from roadmap #33. It builds the `.deb`, the tarball and — where
 `rpmbuild` exists, which is CI and not the development machine — the `.rpm`, then checks the layout,

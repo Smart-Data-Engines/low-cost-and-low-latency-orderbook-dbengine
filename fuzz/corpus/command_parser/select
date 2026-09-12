@@ -1,0 +1,1 @@
+SELECT price FROM 'BTCUSD'.'EX' WHERE timestamp BETWEEN 0 AND 10
