@@ -446,9 +446,33 @@ void FailoverManager::publish_position_if_due() {
     const int64_t lease = ensure_position_lease();
     const auto [file_index, byte_offset] = handler_.get_wal_position();
     if (!coordinator_->publish_wal_position(file_index, byte_offset, lease)) {
-        OB_LOG_WARN("failover", "publish_wal_position failed: file=%u offset=%zu lease=%ld",
-                    file_index, byte_offset, static_cast<long>(lease));
+        if (publish_episode_.begin()) {
+            OB_LOG_WARN("failover",
+                        "cannot publish this node's WAL position (file=%u offset=%zu); it will be "
+                        "invisible to an election until the coordinator answers again, and this "
+                        "line will not repeat while that lasts",
+                        file_index, byte_offset);
+        } else {
+            OB_LOG_DEBUG("failover", "still cannot publish the WAL position: file=%u offset=%zu",
+                         file_index, byte_offset);
+        }
         return;
+    }
+    if (const uint64_t ticks = publish_episode_.end(); ticks > 0) {
+        OB_LOG_INFO("failover",
+                    "publishing this node's WAL position works again after %llu failed attempt(s)",
+                    static_cast<unsigned long long>(ticks));
+    }
+    // Here, and only here, is the place that sentence belongs: the position **was** written, and
+    // written without a lease, so it will not expire when this node dies and #70's deference may
+    // hand a promotion to a corpse. That is what #72 put positions under leases to prevent, so it
+    // is a WARN on the tick it happens rather than a clause on a failure path where it is false.
+    if (lease == 0) {
+        OB_LOG_WARN("failover",
+                    "published this node's WAL position (file=%u offset=%zu) WITHOUT a lease, so "
+                    "it will outlive this node and other nodes may defer to it after it dies "
+                    "(#72); this needs the coordinator's lease API looked at",
+                    file_index, byte_offset);
     }
     OB_LOG_DEBUG("failover", "Published WAL position: file=%u offset=%zu lease=%ld",
                  file_index, byte_offset, static_cast<long>(lease));
@@ -473,11 +497,28 @@ int64_t FailoverManager::ensure_position_lease() {
 
     lease = coordinator_->grant_lease();
     if (lease == 0) {
-        OB_LOG_WARN("failover",
-                    "could not grant a lease for the published position — publishing without one, "
-                    "so this position will outlive this node and other nodes may defer to it after "
-                    "it dies");
+        // Once per episode, not once per tick. This ran at the monitor's frequency for the whole
+        // of any coordinator outage: measured at about 2.2 lines a second per node (#116).
+        //
+        // And the consequence this line used to announce - "publishing without one, so this
+        // position will outlive this node" - is not a consequence of *failing to get a lease*. It
+        // is a consequence of the **publish afterwards succeeding** without one, which during an
+        // unreachable coordinator it does not: the next line said the publish had failed, so
+        // nothing was written and nothing outlived anything. The claim has moved to the one place
+        // it is true, in publish_position_if_due().
+        if (lease_grant_episode_.begin()) {
+            OB_LOG_WARN("failover",
+                        "the coordinator will not grant a lease for the published position; "
+                        "this node will keep trying once a second and will say so when it works");
+        } else {
+            OB_LOG_DEBUG("failover", "still no lease for the published position");
+        }
         return 0;
+    }
+    if (const uint64_t ticks = lease_grant_episode_.end(); ticks > 0) {
+        OB_LOG_INFO("failover",
+                    "the coordinator granted a position lease again after %llu failed attempt(s)",
+                    static_cast<unsigned long long>(ticks));
     }
     position_lease_id_.store(lease, std::memory_order_release);
     OB_LOG_INFO("failover", "position lease %ld granted, ttl=%lds",
@@ -648,6 +689,20 @@ void FailoverManager::monitor_loop() {
                     reconcile_epoch(state);
                 }
 
+                // The episode ends on any tick that produced an answer, whichever answer it was:
+                // a leader that is present and one that is confirmed absent are both information,
+                // and it is the *absence* of information this episode is about. Ending it only on
+                // `Present` would leave a node that recovers into a genuine election reporting the
+                // refusal for ever, and an episode counter nobody resets is a flag nobody clears.
+                if (verdict != CoordinatorClient::LeaderRead::Unavailable) {
+                    if (const uint64_t ticks = campaign_refusal_episode_.end(); ticks > 0) {
+                        OB_LOG_INFO("failover",
+                                    "the coordinator answers again after %llu tick(s) of declining "
+                                    "to campaign; this node will now act on what it reads",
+                                    static_cast<unsigned long long>(ticks));
+                    }
+                }
+
                 if (leader_present) {
                     note_leader_present();
                     // The address is recorded and **nothing else happens**, which is the whole of
@@ -664,9 +719,26 @@ void FailoverManager::monitor_loop() {
                     // because get_cluster_state() reported an unreachable coordinator and a vacant
                     // key with the same std::nullopt. Campaigning because we could not read is not
                     // the same as campaigning because there is no leader.
-                    OB_LOG_DEBUG("failover",
-                                 "cluster state unreadable — staying REPLICA rather than "
-                                 "campaigning on a read that failed");
+                    //
+                    // **INFO on the tick this starts, and that is #115.** This was DEBUG-only
+                    // while the server's default level is INFO, so during a coordinator outage the
+                    // count of lines an operator saw about this decision was zero - measured, 0 of
+                    // 65 and 0 of 67 across a thirty-second outage - while the same log carried
+                    // two WARN lines a second about a position that could not be published. The
+                    // decision is the answer to the first question anyone asks of that situation:
+                    // is the engine deciding, or is the engine stuck? Once per episode, because
+                    // once per tick is #116.
+                    if (campaign_refusal_episode_.begin()) {
+                        OB_LOG_INFO("failover",
+                                    "the coordinator is unreadable, so this node is staying REPLICA "
+                                    "rather than campaigning on a read that failed — this is a "
+                                    "decision, not a stall, and no primary will be elected until "
+                                    "the coordinator answers");
+                    } else {
+                        OB_LOG_DEBUG("failover",
+                                     "cluster state unreadable — staying REPLICA rather than "
+                                     "campaigning on a read that failed");
+                    }
                 } else if (config_.failover_enabled) {
                     note_leader_absent();
 

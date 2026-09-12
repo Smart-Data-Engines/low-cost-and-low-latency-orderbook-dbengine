@@ -2091,7 +2091,7 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
-### 116. A node whose coordinator is unreachable writes two WARN lines a second for ever, and one of them names a consequence that did not happen
+### 116. A node whose coordinator is unreachable writes two WARN lines a second for ever, and one of them names a consequence that did not happen ✅
 
 Found by #54 stage B, which set out to check refusals and had to read the logs to do it.
 
@@ -2132,10 +2132,34 @@ The fix shape already exists in this tree: #113's flush loop logs the first fail
 loudly, the rest at DEBUG, and a line when it recovers. Applied here that is one WARN when the
 coordinator stops answering, silence while it stays that way, and one line when it comes back.
 
-- Effort: S | Impact: the log an operator reads during a coordinator outage is ~92% two repeated
-  sentences, one of which is describing something that did not happen
+**Done. Measured before and after, and the rate is the comparable figure because the windows
+differ (30 s before, 20 s after):**
 
-### 115. The one decision an unreachable coordinator makes invisible is the decision that answers the operator's question
+| | Before | After |
+|---|---|---|
+| lines per second, per node | 2.17 and 2.23 | **0.40 and 0.45** |
+| lines in the window | 65 and 67 | 8 and 9 |
+
+A `LogEpisode` in `failover.hpp` gives each condition one line when it starts and one when it ends,
+with the number of ticks it lasted — the shape #113's flush loop already used. **The idea was
+already in this file, applied to one of the three places that needed it:** `standalone_polls_` was
+written for exactly this and guards the STANDALONE branch alone, which is pitfall 172 — a rule
+applied by hand is applied once too few.
+
+**The misleading sentence moved rather than being reworded.** "publishing without one, so this
+position will outlive this node and other nodes may defer to it after it dies" was on the *lease
+grant failure* path, where the very next line said the publish had failed — nothing was written, so
+nothing outlived anything. That harm happens only when the publish **succeeds** without a lease, so
+the WARN is now on that tick, naming #72, which is the item that put positions under leases. The
+third concern from this item's filing — a coordinator that refuses grants while accepting puts — is
+therefore now *reported when it happens* rather than guessed at: still not measured, but no longer
+silent.
+
+- Effort: S | Impact: the log an operator reads during a coordinator outage went from ~92% two
+  repeated sentences to one line per condition, and the one warning that was false where it stood
+  is now true where it stands
+
+### 115. The one decision an unreachable coordinator makes invisible is the decision that answers the operator's question ✅
 
 Also found by #54 stage B, and it is the counterpart to #116: not that there is too little logging
 during an outage, but that the part which is missing is the part being asked for.
@@ -2165,8 +2189,32 @@ the next tick and it demotes immediately. Measured: **2.28 s** from `stop_etcd()
 longer answering `ROLE` with `PRIMARY`. The "could not confirm the leader key names us for N s"
 branch is for a different fault — a coordinator that answers keepalives but not reads.
 
-- Effort: S | Impact: during a coordinator outage the engine's correct refusal to fail over is
-  indistinguishable, from the log, from the engine failing to fail over
+**Done, and the count is exact rather than "at least one".** The refusal is `OB_LOG_INFO` on the
+tick the episode opens and `OB_LOG_DEBUG` on every tick after, so a 20-second outage produces
+**one** line about it where a 30-second outage produced **zero**. The episode ends on *any* answer
+from the coordinator, not only on a leader being present: a confirmed absence is information too,
+and ending it only on `Present` would leave a node recovering into a genuine election reporting the
+refusal for ever — an episode counter nobody resets is a flag nobody clears.
+
+**The test for this found a defect in its own check, which is the part worth keeping.** The obvious
+phrase to count, `staying REPLICA rather than campaigning`, is in the INFO line *and* in the
+per-tick DEBUG line beside it — so a mutation rewording the INFO line **survived**, satisfied by
+the DEBUG one, while this item is entirely about the level. The counted phrase is now a clause
+belonging to the INFO line alone. A check a cross-reference satisfies is worse than no check,
+because the next reader trusts it.
+
+And what the fix did **not** change, which is the control: the holder still gives the role up
+**2.28 s** after the coordinator vanishes, the same figure as before. This item touched what the
+engine says, not what it does.
+
+**A consequence outside the engine.** #54 stage B had added `ClusterManager(log_level=...)` so a
+test could see the DEBUG line. With the line at INFO the module runs at the server's own default —
+a stronger statement, because it now asserts on what an operator gets — and the parameter became a
+knob nothing turns, so it is gone. Pitfall 31 running backwards: a workaround in the harness was a
+bug report, and fixing the bug deleted the workaround.
+
+- Effort: S | Impact: during a coordinator outage the engine's correct refusal to fail over is now
+  the first thing the log says about it, instead of being absent from it
 
 ### 114. An `MmapStore` with tests and no caller, described by three documents as the storage path ✅
 
@@ -5168,12 +5216,13 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Two defects are open and both are about what the log says, not about what the engine does.**
-#116 — a node whose coordinator is unreachable writes ~2.2 WARN lines a second for the whole
-outage, one of them describing a consequence of a publish that did not happen — and #115, the
-mirror image: the replica's *correct* refusal to campaign is logged at DEBUG, so the one decision
-that answers an operator's first question is the one thing absent from the default log. Both were
-found by #54 stage B, which set out to check refusals and had to read the logs to do it.
+**No defect is open.** #115 and #116 were the last two, both found by #54 stage B — which set out
+to check refusals and had to read the logs to do it — and both were about what the log says rather
+than what the engine does. Measured across a coordinator outage, before and after: **2.17 and 2.23
+lines per second per node became 0.40 and 0.45**, the replica's correct refusal to campaign went
+from **zero** mentions at the default level to exactly one, and the one warning that was false
+where it stood now stands where it is true. The holder still steps down in **2.28 s**, unchanged,
+which is the control saying this touched the log and not the mechanism.
 
 Everything about storage faults is closed. #114 went by deletion, and the deciding fact was not
 the benchmark the item expected to need: on a full filesystem a growable mapping fails with

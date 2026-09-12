@@ -378,8 +378,7 @@ class ClusterManager:
     _SERVER_BINARY = "build/ob_tcp_server"
 
     def __init__(self, server_binary: Optional[str] = None,
-                 etcd_binary: Optional[str] = None,
-                 log_level: str = "INFO"):
+                 etcd_binary: Optional[str] = None):
         # OB_SERVER_BINARY lets the whole suite run against a different build — a sanitizer
         # tree, most usefully. A lock-order inversion or a data race in the io loop only shows up
         # when real clients and real peers are driving it, which no unit test arranges.
@@ -391,13 +390,12 @@ class ClusterManager:
         self.etcd_binary: str = (
             etcd_binary or os.environ.get("OB_ETCD_BINARY") or "etcd"
         )
-        # Default INFO because that is the server's own default, and because the session cluster is
-        # shared by most of this battery: measured in #86, each client connection costs about 153
-        # bytes of log at INFO, and raising the level for every module to satisfy one of them is
-        # how a shared fixture grows a cost nobody asked for. A module that needs to assert on a
-        # DEBUG line asks for it here - #54 stage B does, because the replica's decision *not* to
-        # campaign is logged at DEBUG and that decision is the whole property under test.
-        self.log_level: str = log_level
+        # There was a `log_level` parameter here for one commit, added because #54 stage B needed to
+        # assert on the replica's decision not to campaign and that line was DEBUG-only. #115 made
+        # the line INFO, so the module asserting on it runs at the server's own default and the
+        # parameter became a knob nothing turns - the `provisional` / `basis` / `key_id` / #104
+        # shape, one layer up. Removed rather than kept for a future caller: adding it back is
+        # three lines, and the one place a node's command line is built is where it belongs.
         # Open log files, closed on shutdown. Held by the manager rather than by NodeInfo because a
         # restart replaces the NodeInfo and the old handle still needs closing.
         self._node_logs: list = []
@@ -780,7 +778,6 @@ class ClusterManager:
         etcd_url = f"http://127.0.0.1:{self.etcd_client_port}"
         cmd = [
             self.server_binary,
-            "--log-level", self.log_level,
             "--port", str(tcp_port),
             "--data-dir", data_dir,
             "--metrics-port", str(metrics_port),
