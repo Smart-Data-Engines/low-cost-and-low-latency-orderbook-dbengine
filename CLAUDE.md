@@ -49,6 +49,11 @@ instructions are in [tests/integration/README.md](tests/integration/README.md) a
 Property tests use RapidCheck with `RC_PARAMS=max_success=100` for multi-master networking and `=25`
 elsewhere, set in `tests/CMakeLists.txt`.
 
+Fuzzing is opt-in, separate from CTest, and needs Clang: `-DOB_BUILD_FUZZERS=ON -DOB_ENABLE_ASAN=ON`
+builds three libFuzzer harnesses over the parsers that read untrusted bytes. The build refuses GCC
+and refuses to run without ASan, so an incomplete request fails at configure time.
+[fuzz/README.md](fuzz/README.md) has the commands, the corpus layout and the measured limits.
+
 ## Architecture
 
 `Engine` (`src/engine.cpp`) is a facade delegating to WAL, SoA buffer, columnar store, replication and
@@ -1793,6 +1798,66 @@ Learned the hard way. Check here before debugging.
     a fix that does not work. Recovered because the patch was a script rather than an edit — which
     is the practical lesson beside the old one: **commit before mutating**, and when you must patch
     by hand, patch with something you can run twice.
+
+217. **Coverage is not an oracle, and a green fuzzing campaign cannot tell the difference.** The
+    multi-master frame harness reached the "frame longer than 64 MiB" branch on every single run —
+    `above_max_length` is a committed seed that exists for exactly that — and deleting the ceiling
+    check from the parser **survived 1.6 million executions**. Nothing asserted that the refusal had
+    to happen: the verdict changed from −1 to 0 and every other property still held. Three of three
+    planted defects in that file survived the first pass. The lesson is about order of work: **plant
+    a defect before calling a harness finished**, because "the corpus reaches this shape" and "this
+    shape is checked" are different claims and a fuzz run only demonstrates the first (#38).
+
+218. **Invariance under fragmentation is blind to a systematic decoding error.** The prettiest
+    property in that harness — one stream split into chunks yields the same frames — cannot see a
+    decoder that reports *every* payload one byte early, because it shifts both sides of the
+    comparison equally. The oracle that sees it needs no second parser: a round trip through the
+    production encoder (`encode_frame` → `parse_frames`). Which surfaced something else — a harness
+    named for frames had never once called the encoder, so `encode_frame` had no fuzz coverage at
+    all. Frame coverage went 144 → 177 points when it did (#38).
+
+219. **A canonical-text round trip cannot see a field the formatter does not emit.** Deleting the
+    line in `format_command` that writes an INSERT's event time **passes** "format, reparse, compare
+    the canonical text", because the field is then absent from both sides. That is precisely the
+    defect #105 existed to fix: a write that asked to carry its own time and a write that asked for
+    arrival time become the same write again. The property is `parse ∘ format == identity on
+    commands`, so compare the **structures field by field**, with a `switch` that has no `default:`
+    so a nineteenth command is a compile error rather than a silent pass (#38, #105, #107).
+
+220. **A fuzzer's `-max_len` decides which branches are reachable at all, not just how fast.** A
+    frame longer than 64 MiB cannot be *accepted* under a 64 KiB input limit — the payload never
+    completes — so that branch has no positive test and its oracle has to be indirect: after a
+    successful verdict, nothing left in the buffer may declare a length above the ceiling. Before
+    asserting anything about a boundary, check whether a run exists in which the boundary is crossed
+    the other way (#38).
+
+221. **A mutation that does not compile is not a verdict about the harness. Reshape the mutation,
+    never the code.** Turning `if (expected != base_hdr.checksum)` into `if (false)` leaves
+    `expected` unused, and `-Werror=unused-variable` makes that a build failure; the table reported
+    `DID_NOT_COMPILE`, which is honest and worth nothing. Appending `&& false` keeps the variable
+    used and mutates the program. A table with one entry that is not a verdict still looks like a
+    table (#38).
+
+222. **A check that searches for `-fsanitize=undefined` as a substring never matches**, because
+    clang is handed `-fsanitize=address,undefined` as a single argument. The first version of the
+    instrumentation verifier reported **every** parser as uninstrumented in a build that was
+    instrumented throughout — a failure that did not exist, and trusting it would have meant
+    "fixing" healthy CMake. Sanitizer lists are parsed, not searched, and `-fno-sanitize-recover`
+    has to be excluded: it changes what a finding does, not what is instrumented. The opposite
+    blindness is worse — a missing file or an empty `compile_commands.json` reads as "no problems
+    found" — so absence is a failure and the number of translation units actually inspected is
+    printed (#38, #83).
+
+223. **The count of required checks rotted for the third time, and only now has a mechanism.** The
+    prose said "eleven" while twelve were required, then "twelve" while thirteen were, and #38 makes
+    it fourteen. Nobody was careless on any of those days: **every** change added a context and
+    **no** change recounted the sentence, which is the same one-directional rot as a status
+    paragraph. `check_contexts.py` now derives the number from `master.json` and fails when the
+    prose disagrees **or stops making the claim**. Anchored on the claim
+    (`**N checks are required**`) rather than on the number word, because the same document says
+    "the other thirteen are note-level tidiness" about CodeQL alerts — a word search would either
+    fail on that sentence or be loosened until it failed on nothing (#38, #108).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

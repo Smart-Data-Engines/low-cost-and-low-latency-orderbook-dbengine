@@ -85,6 +85,10 @@ installs anything, and a containerised competitor would measure the container.
   `ob_subscribe()`) and from the Python client (`subscribe()` / `poll()`)
 - **TCP server** — connect remotely via telnet/nc, like PostgreSQL or ClickHouse
 - **Multi-master replication** — write to any node, automatic conflict resolution via HLC + LWW
+- **Fuzzed parsers** — libFuzzer harnesses over wire command parsing, multi-master framing and WAL
+  deserialization, with an in-repo corpus and a bounded run on every pull request. Each asserts a
+  property rather than merely surviving, and the harnesses themselves are checked by planting
+  defects in the parsers: see [fuzz/README.md](fuzz/README.md)
 - **C API** for FFI integration (Python, Rust, Go, etc.)
 - **Python bindings** — local (ctypes) or remote (TCP), same API
 
@@ -202,8 +206,11 @@ engine.close()
 ctest --test-dir build --output-on-failure -j1
 ```
 
-510 tests (GTest + RapidCheck), roughly 6 minutes. Integration tests additionally need a native
-`etcd` binary — see [tests/integration/README.md](tests/integration/README.md).
+GTest and RapidCheck. The suite's size and its measured runtime live in
+[docs/roadmap.md](docs/roadmap.md), recorded against the commit that measured them rather than
+repeated here — this page said "510 tests" for long enough that the number had halved against
+reality. Integration tests additionally need a native `etcd` binary — see
+[tests/integration/README.md](tests/integration/README.md).
 
 ### Run benchmarks
 
@@ -221,6 +228,7 @@ python python/benchmark.py --mode tcp --host 127.0.0.1 --port 5555
 | Option | Default | Description |
 |--------|---------|-------------|
 | `OB_BUILD_TESTS` | ON | Build tests and fetch gtest/rapidcheck |
+| `OB_BUILD_FUZZERS` | OFF | Build libFuzzer harnesses over the parsers. Requires Clang and `OB_ENABLE_ASAN`; see [fuzz/README.md](fuzz/README.md) |
 | `OB_ENABLE_AVX2` | OFF | Enable AVX2 SIMD for aggregation |
 | `OB_ENABLE_AVX512` | OFF | Enable AVX-512 SIMD for aggregation |
 | `OB_ENABLE_COVERAGE` | OFF | Enable gcov/llvm-cov instrumentation |
@@ -232,8 +240,9 @@ python python/benchmark.py --mode tcp --host 127.0.0.1 --port 5555
 ```
 include/orderbook/     C++ headers (public API)
 src/                   Implementation files
-tests/                 Unit + property-based tests (510 tests)
+tests/                 Unit + property-based tests
 benchmarks/            Google Benchmark suite
+fuzz/                  libFuzzer harnesses over the parsers, with their seed corpus
 tools/                 CLI tool (ob_cli) and TCP server (ob_tcp_server)
 python/                Python bindings and benchmark script
 docs/                  Documentation

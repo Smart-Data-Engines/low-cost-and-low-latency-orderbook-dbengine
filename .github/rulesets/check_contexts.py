@@ -55,6 +55,18 @@ NOT_FROM_A_WORKFLOW = {
 
 _MATRIX_REF = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}")
 
+SECURITY_DOC = Path("docs/github-security.md")
+
+# Spelled out, because the document spells it out. The range is deliberately narrow: a count
+# outside it means either a very different repository or a parsing accident, and both should stop
+# this check rather than be rendered as a digit the prose would never match.
+NUMBER_WORDS = {
+    10: "Ten", 11: "Eleven", 12: "Twelve", 13: "Thirteen", 14: "Fourteen", 15: "Fifteen",
+    16: "Sixteen", 17: "Seventeen", 18: "Eighteen", 19: "Nineteen", 20: "Twenty",
+}
+
+_PROSE_CLAIM = re.compile(r"\*\*([A-Za-z]+) checks are required\*\*")
+
 
 def triggers_on_pull_request(workflow: dict[str, Any]) -> bool:
     """Only a job that runs on pull requests can gate one.
@@ -149,11 +161,54 @@ def required() -> set[str]:
     )
 
 
+def prose_claim_problems(count: int) -> list[str]:
+    """Does the document still say how many checks there are?
+
+    This sentence has now been wrong twice. It read "eleven" while the ruleset required twelve, and
+    "twelve" while it required thirteen. Nobody was careless either time: every change *added* a
+    context, and no change recounted the sentence. That is the same one-directional rot as a status
+    paragraph, and it gets the same fix - the number is derived here instead of maintained there.
+
+    Anchored on the claim rather than on the number word, on purpose. The same document says "the
+    other thirteen are note-level tidiness" about CodeQL alerts, so a check that searched for the
+    word would either fail on that sentence or be loosened until it stopped failing on anything.
+    Use versus mention has cost this workspace four separate afternoons.
+
+    Absence is a failure here. A reworded sentence means the claim is no longer being checked, and
+    a check that passes because it found nothing to look at is the failure mode this whole file
+    exists to prevent.
+    """
+    problems: list[str] = []
+    if count not in NUMBER_WORDS:
+        return [f"  {count} required checks is outside the range this script can spell\n"
+                f"    Either the count is a parsing accident or NUMBER_WORDS needs extending."]
+    expected = NUMBER_WORDS[count]
+
+    if not SECURITY_DOC.is_file():
+        return [f"  {SECURITY_DOC} does not exist, so its claim about the count is unchecked"]
+
+    claims = _PROSE_CLAIM.findall(SECURITY_DOC.read_text())
+    if len(claims) != 1:
+        problems.append(
+            f"  {SECURITY_DOC} makes {len(claims)} claims matching '**N checks are required**', "
+            f"expected exactly one\n"
+            f"    Rewording that sentence switches this check off silently."
+        )
+    elif claims[0] != expected:
+        problems.append(
+            f"  {SECURITY_DOC} says {claims[0]!r} checks are required; {RULESET} lists {count} "
+            f"({expected})\n"
+            f"    The ruleset is the fact. Update the sentence."
+        )
+    return problems
+
+
 def main() -> int:
     from_workflows = produced()
     from_ruleset = required()
 
     problems: list[str] = []
+    problems.extend(prose_claim_problems(len(from_ruleset)))
 
     for context in sorted(from_ruleset - set(from_workflows) - set(NOT_FROM_A_WORKFLOW)):
         problems.append(
@@ -184,7 +239,8 @@ def main() -> int:
 
     print(
         f"{len(from_workflows)} contexts produced, all required; "
-        f"{len(NOT_FROM_A_WORKFLOW)} allowlisted as not coming from a workflow"
+        f"{len(NOT_FROM_A_WORKFLOW)} allowlisted as not coming from a workflow; "
+        f"{len(from_ruleset)} required in total, which is what {SECURITY_DOC} claims"
     )
     return 0
 

@@ -21,9 +21,14 @@ The required checks and the remaining branch protections are described below.
 
 ### Required checks and how to update them ✅
 
-**Thirteen checks are required** after roadmap #108 added `io-uring-build`. The complete list lives
-in [`.github/rulesets/master.json`](../.github/rulesets/master.json), alongside the other branch
-protections. Strict checks require a PR to include the current base before merging. The same ruleset
+**Fourteen checks are required** after roadmap #38 added `fuzz`, which followed #108 adding
+`io-uring-build`. The complete list lives in
+[`.github/rulesets/master.json`](../.github/rulesets/master.json), alongside the other branch
+protections. That sentence is no longer maintained by hand: the drift checker derives the count from
+the ruleset and fails if this paragraph disagrees with it, or if the paragraph stops making the
+claim at all. It had already been wrong twice — "eleven" against twelve, then "twelve" against
+thirteen — and neither time was anybody careless. Every change added a context; no change recounted
+the sentence. Strict checks require a PR to include the current base before merging. The same ruleset
 requires linear history and resolution of review threads; it permits squash and rebase merges.
 
 `required_approving_review_count` stays at `0` while there is one maintainer. Raise it when a second

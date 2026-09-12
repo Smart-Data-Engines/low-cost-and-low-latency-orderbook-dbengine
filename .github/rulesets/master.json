@@ -59,6 +59,9 @@
             "context": "docs-integrity"
           },
           {
+            "context": "fuzz"
+          },
+          {
             "context": "integration-tests"
           },
           {
