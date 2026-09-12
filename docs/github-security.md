@@ -60,6 +60,17 @@ gh api repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/rule
 `ob_tcp_server` remains an epoll binary even when that option is enabled. This check proves
 compilation and linking. It does not run the transport or establish runtime or sanitizer coverage.
 
+`fuzz` came with roadmap #38. It builds three libFuzzer harnesses over the parsers that read
+untrusted bytes — wire commands, multi-master framing and WAL replay — under Clang with ASan and
+UBSan, **verifies from the compiler's own command lines** that the instrumentation reached the
+parsers rather than only the drivers, runs every committed seed, then gives each harness sixty
+seconds. Logs and any reproducer are uploaded whether it passed or failed, so a red job is
+reproducible from its artefact. What it does not claim: this is a regression gate and not a
+campaign, and the harnesses cover parsers rather than the server — nothing in the job opens a
+socket, starts etcd or binds a port. The measurement that makes the gate worth having is in the
+roadmap: nine defects planted in the three parsers, and the seeds catch all nine, with one control
+mutation that survives.
+
 `package` is the twelfth, from roadmap #33. It builds the `.deb`, the tarball and — where
 `rpmbuild` exists, which is CI and not the development machine — the `.rpm`, then checks the layout,
 the metadata, the conffile mark, and that **the packaged binary accepts the packaged configuration**.
