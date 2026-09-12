@@ -601,7 +601,8 @@ RoleInfo OrderbookClient::parse_role_response(std::string_view resp) {
 size_t OrderbookClient::format_insert(std::string_view symbol,
                                        std::string_view exchange,
                                        Side side, int64_t price,
-                                       uint64_t qty, uint32_t count) {
+                                       uint64_t qty, uint32_t count,
+                                       std::optional<uint64_t> event_time_ns) {
     send_buf_.clear();
     // Worst case: "INSERT " + sym(31) + " " + exch(31) + " ask " + int64 + " " + uint64 + " " + uint32 + "\n"
     // Well under 256 bytes. Resize to capacity, write, then shrink.
@@ -632,6 +633,15 @@ size_t OrderbookClient::format_insert(std::string_view symbol,
 
     auto [p3, ec3] = std::to_chars(p, buf + send_buf_.size(), count);
     p = p3;
+
+    // Only when the caller gave one. Writing a client-side "now" instead would move the clock that
+    // decides a row's time from the server to the caller - a different guarantee wearing the same
+    // name - and it would make "stamp it on arrival" unsayable (#105).
+    if (event_time_ns) {
+        *p++ = ' ';
+        auto [p4, ec4] = std::to_chars(p, buf + send_buf_.size(), *event_time_ns);
+        p = p4;
+    }
     *p++ = '\n';
 
     size_t len = static_cast<size_t>(p - buf);
@@ -642,7 +652,8 @@ size_t OrderbookClient::format_insert(std::string_view symbol,
 size_t OrderbookClient::format_minsert(std::string_view symbol,
                                         std::string_view exchange,
                                         Side side, const Level* levels,
-                                        size_t n_levels) {
+                                        size_t n_levels,
+                                        std::optional<uint64_t> event_time_ns) {
     send_buf_.clear();
     send_buf_.resize(send_buf_.capacity());
     char* buf = send_buf_.data();
@@ -665,6 +676,11 @@ size_t OrderbookClient::format_minsert(std::string_view symbol,
 
     auto [pn, ecn] = std::to_chars(p, end, n_levels);
     p = pn;
+    if (event_time_ns) {
+        *p++ = ' ';
+        auto [pt, ect] = std::to_chars(p, end, *event_time_ns);
+        p = pt;
+    }
     *p++ = '\n';
 
     // Level lines: "<price> <qty> <count>\n"
@@ -716,14 +732,72 @@ size_t OrderbookClient::format_query(std::string_view sql) {
 
 // ── 5.2  Public methods ──────────────────────────────────────────────────────
 
+Result<std::set<std::string>> OrderbookClient::capabilities() {
+    if (capabilities_) return Result<std::set<std::string>>::ok(*capabilities_);
+
+    size_t len = format_simple("STATUS");
+    auto sr = send_all(len);
+    if (!sr) return Result<std::set<std::string>>::err(sr.error_code(), sr.error_message());
+
+    auto rr = recv_response();
+    if (!rr) return Result<std::set<std::string>>::err(rr.error_code(), rr.error_message());
+
+    // One `key: value` line among many, and its **absence is an answer**: a server that predates
+    // the list says nothing, and the caller reads that as "none of these" rather than as a failure.
+    std::set<std::string> names;
+    const std::string_view wire = rr.value();
+    static constexpr std::string_view kPrefix = "capabilities: ";
+    size_t at = wire.find(kPrefix);
+    if (at != std::string::npos) {
+        at += kPrefix.size();
+        const size_t eol = wire.find('\n', at);
+        std::string_view list(wire.data() + at,
+                              (eol == std::string::npos ? wire.size() : eol) - at);
+        while (!list.empty()) {
+            const size_t comma = list.find(',');
+            std::string_view name = list.substr(0, comma);
+            if (!name.empty()) names.emplace(name);
+            if (comma == std::string_view::npos) break;
+            list.remove_prefix(comma + 1);
+        }
+    }
+    OB_LOG_DEBUG("client", "server capabilities: %zu name(s)", names.size());
+    capabilities_ = names;
+    return Result<std::set<std::string>>::ok(names);
+}
+
+/// Refuse a write whose event time this server would discard, before a byte goes out (#105).
+///
+/// A caller who passed no time asks nothing and pays nothing - no round trip, no question. A caller
+/// who passed one gets an answer that cost one `STATUS` per connection, and a refusal rather than a
+/// row stored at the wrong instant.
+Result<void> OrderbookClient::refuse_unsupported_event_time(
+    const std::optional<uint64_t>& event_time_ns) {
+    if (!event_time_ns) return Result<void>::ok();
+
+    auto caps = capabilities();
+    if (!caps) return Result<void>::err(caps.error_code(), caps.error_message());
+    if (caps.value().count("insert_event_time") == 0) {
+        return Result<void>::err(
+            OB_ERR_INVALID_ARG,
+            "this server does not accept an event time on INSERT/MINSERT, so the value would be "
+            "discarded and the row stored with its arrival time instead. Nothing was sent.");
+    }
+    return Result<void>::ok();
+}
+
 Result<void> OrderbookClient::insert(std::string_view symbol,
                                       std::string_view exchange,
                                       Side side, int64_t price,
-                                      uint64_t qty, uint32_t count) {
+                                      uint64_t qty, uint32_t count,
+                                      std::optional<uint64_t> event_time_ns) {
     if (side != Side::BID && side != Side::ASK)
         return Result<void>::err(OB_ERR_INVALID_ARG, "invalid side");
 
-    size_t len = format_insert(symbol, exchange, side, price, qty, count);
+    if (auto refusal = refuse_unsupported_event_time(event_time_ns); !refusal) {
+        return refusal;
+    }
+    size_t len = format_insert(symbol, exchange, side, price, qty, count, event_time_ns);
     auto sr = send_all(len);
     if (!sr) return sr;
 
@@ -736,13 +810,17 @@ Result<void> OrderbookClient::insert(std::string_view symbol,
 Result<void> OrderbookClient::minsert(std::string_view symbol,
                                        std::string_view exchange,
                                        Side side, const Level* levels,
-                                       size_t n_levels) {
+                                       size_t n_levels,
+                                       std::optional<uint64_t> event_time_ns) {
     if (n_levels == 0)
         return Result<void>::err(OB_ERR_INVALID_ARG, "empty levels");
     if (n_levels > 1000)
         return Result<void>::err(OB_ERR_INVALID_ARG, "too many levels");
 
-    size_t len = format_minsert(symbol, exchange, side, levels, n_levels);
+    if (auto refusal = refuse_unsupported_event_time(event_time_ns); !refusal) {
+        return refusal;
+    }
+    size_t len = format_minsert(symbol, exchange, side, levels, n_levels, event_time_ns);
     auto sr = send_all(len);
     if (!sr) return sr;
 
@@ -1178,24 +1256,28 @@ auto OrderbookPool::execute_read(F&& fn) -> decltype(fn(std::declval<OrderbookCl
 Result<void> OrderbookPool::insert(std::string_view symbol,
                                     std::string_view exchange,
                                     Side side, int64_t price,
-                                    uint64_t qty, uint32_t count) {
+                                    uint64_t qty, uint32_t count,
+                                    std::optional<uint64_t> event_time_ns) {
     if (shard_router_)
-        return shard_router_->insert(symbol, exchange, side, price, qty, count);
+        return shard_router_->insert(symbol, exchange, side, price, qty, count, event_time_ns);
 
+    // Forwarded rather than decided here: the question "can you store an event time" is answered by
+    // the node that will store it, and in a pool that is not always the same node (#105).
     return execute_write([&](OrderbookClient& c) {
-        return c.insert(symbol, exchange, side, price, qty, count);
+        return c.insert(symbol, exchange, side, price, qty, count, event_time_ns);
     });
 }
 
 Result<void> OrderbookPool::minsert(std::string_view symbol,
                                      std::string_view exchange,
                                      Side side, const Level* levels,
-                                     size_t n_levels) {
+                                     size_t n_levels,
+                                     std::optional<uint64_t> event_time_ns) {
     if (shard_router_)
-        return shard_router_->minsert(symbol, exchange, side, levels, n_levels);
+        return shard_router_->minsert(symbol, exchange, side, levels, n_levels, event_time_ns);
 
     return execute_write([&](OrderbookClient& c) {
-        return c.minsert(symbol, exchange, side, levels, n_levels);
+        return c.minsert(symbol, exchange, side, levels, n_levels, event_time_ns);
     });
 }
 

@@ -9,6 +9,9 @@
 #include "orderbook/response_formatter.hpp"
 #include "orderbook/session.hpp"
 #include "orderbook/tcp_server.hpp"
+#include "orderbook/capabilities.hpp"
+
+#include <cctype>
 #include "orderbook/engine.hpp"
 #include "orderbook/data_model.hpp"
 #include "orderbook/types.hpp"
@@ -1196,5 +1199,144 @@ TEST(BoundedDrain, NeitherTransportDecidesForItself) {
                 << "\nThe bound lives in drain_verdict(); a second copy is a second thing to "
                    "forget, and one of the two transports is not built by any CI job";
         }
+    }
+}
+
+// ── Event time on the wire (#105) ─────────────────────────────────────────────
+//
+// Measured before this existed, by #39 part two: a dataset's own span selected **0 of 400 rows**
+// through this protocol while the same load into ClickHouse and TimescaleDB selected 400. The
+// embedded path had honoured `timestamp_ns` since the first version, so the value was accepted by
+// the client, dropped at the wire, and the row stored with its arrival time — which is a write
+// nobody can find by the time they were looking for.
+
+namespace {
+
+/// A moment far enough from now that arrival time cannot be mistaken for it.
+constexpr uint64_t kEventTime = 1700000000000000000ULL;   // 2023-11-14
+
+/// Rows a symbol has inside a two-nanosecond window around `kEventTime`.
+///
+/// The window is that narrow deliberately: a wide one would pass for a row stamped on arrival, and
+/// "the row is somewhere in the store" is the claim that was already true before this feature.
+size_t rows_at_event_time(ob::Engine& engine, ob::Session& session, ob::ServerStats& stats,
+                          const std::string& symbol) {
+    ob::Command flush{};
+    flush.type = ob::CommandType::FLUSH;
+    ob::execute_command(flush, engine, session, stats);
+
+    ob::Command select{};
+    select.type    = ob::CommandType::SELECT;
+    select.raw_sql = "SELECT * FROM '" + symbol + "'.'EX' WHERE timestamp BETWEEN " +
+                     std::to_string(kEventTime - 1) + " AND " + std::to_string(kEventTime + 1);
+    const std::string wire = ob::execute_command(select, engine, session, stats);
+
+    // Data rows are the lines that begin with a timestamp; the header names columns and the
+    // response ends with a blank line.
+    size_t rows = 0;
+    size_t pos = 0;
+    while (pos < wire.size()) {
+        const size_t nl = wire.find('\n', pos);
+        const std::string line = wire.substr(pos, nl == std::string::npos ? nl : nl - pos);
+        if (!line.empty() && std::isdigit(static_cast<unsigned char>(line[0]))) ++rows;
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+    return rows;
+}
+
+} // namespace
+
+TEST_F(ExecuteCommandTest, AnInsertKeepsTheEventTimeItWasGiven) {
+    ob::Session session(fd_server_);
+    const auto cmd = ob::parse_command("INSERT EVT-GIVEN EX bid 100 5 1 " +
+                                       std::to_string(kEventTime));
+    ASSERT_EQ(cmd.type, ob::CommandType::INSERT) << cmd.error;
+    ASSERT_TRUE(cmd.insert_args.timestamp_ns.has_value());
+    EXPECT_EQ(*cmd.insert_args.timestamp_ns, kEventTime);
+
+    EXPECT_EQ(ob::execute_command(cmd, *engine_, session, stats_).substr(0, 2), "OK");
+    EXPECT_EQ(rows_at_event_time(*engine_, session, stats_, "EVT-GIVEN"), 1u)
+        << "the row is not inside the span its sender named, so the time was discarded - which is "
+        << "the defect #105 is about, and it answered OK while doing it";
+}
+
+TEST_F(ExecuteCommandTest, AnInsertWithoutOneIsStampedOnArrival) {
+    // The control, and it is what makes the test above mean something: a server that stored every
+    // row at `kEventTime` regardless would pass that one.
+    ob::Session session(fd_server_);
+    const auto cmd = ob::parse_command("INSERT EVT-ARRIVAL EX bid 100 5 1");
+    ASSERT_EQ(cmd.type, ob::CommandType::INSERT) << cmd.error;
+    EXPECT_FALSE(cmd.insert_args.timestamp_ns.has_value())
+        << "an absent field became a value, so \"stamp it on arrival\" is no longer expressible";
+
+    EXPECT_EQ(ob::execute_command(cmd, *engine_, session, stats_).substr(0, 2), "OK");
+    EXPECT_EQ(rows_at_event_time(*engine_, session, stats_, "EVT-ARRIVAL"), 0u)
+        << "a row nobody gave a time to landed in 2023";
+}
+
+TEST_F(ExecuteCommandTest, ABatchCarriesOneEventTimeForEveryLevel) {
+    // One time per batch rather than one per level, because a batch is one book update at one
+    // instant - which is what `DeltaUpdate` already models.
+    ob::Session session(fd_server_);
+    const auto cmd = ob::parse_minsert("MINSERT EVT-BATCH EX bid 3 " + std::to_string(kEventTime) +
+                                       "\n100\t5\t1\n101\t6\t1\n102\t7\t1\n");
+    ASSERT_EQ(cmd.type, ob::CommandType::MINSERT) << cmd.error;
+    ASSERT_TRUE(cmd.minsert_args.timestamp_ns.has_value());
+
+    EXPECT_EQ(ob::execute_command(cmd, *engine_, session, stats_).substr(0, 2), "OK");
+    EXPECT_EQ(rows_at_event_time(*engine_, session, stats_, "EVT-BATCH"), 3u);
+}
+
+TEST_F(ExecuteCommandTest, AnEventTimeOfZeroIsRefusedRatherThanTreatedAsAbsent) {
+    // Zero is how "unassigned" is spelled everywhere else here - `DeltaUpdate::sequence_number`
+    // uses it for exactly that - so accepting it would make "I have no time for this row" and
+    // "stamp it on arrival" the same request, in the one place where telling them apart is the
+    // whole feature.
+    const auto zero = ob::parse_command("INSERT EVT-ZERO EX bid 100 5 1 0");
+    EXPECT_EQ(zero.type, ob::CommandType::UNKNOWN);
+    EXPECT_NE(zero.error.find("event time 0"), std::string::npos) << zero.error;
+
+    const auto garbage = ob::parse_command("INSERT EVT-BAD EX bid 100 5 1 yesterday");
+    EXPECT_EQ(garbage.type, ob::CommandType::UNKNOWN);
+    EXPECT_NE(garbage.error.find("'yesterday'"), std::string::npos)
+        << "the refusal does not name the token: " << garbage.error;
+
+    const auto trailing = ob::parse_command("INSERT EVT-EXTRA EX bid 100 5 1 " +
+                                            std::to_string(kEventTime) + " extra");
+    EXPECT_EQ(trailing.type, ob::CommandType::UNKNOWN);
+    EXPECT_NE(trailing.error.find("'extra'"), std::string::npos) << trailing.error;
+}
+
+TEST_F(ExecuteCommandTest, TheEventTimeSurvivesARoundTripThroughFormatCommand) {
+    // And an absent one stays absent: a formatter that filled the field in would turn "stamp it on
+    // arrival" into a fixed instant the first time anything replayed a command.
+    const auto with_time = ob::parse_command("INSERT EVT-RT EX bid 100 5 1 " +
+                                             std::to_string(kEventTime));
+    const auto again = ob::parse_command(ob::format_command(with_time));
+    ASSERT_EQ(again.type, ob::CommandType::INSERT) << again.error;
+    ASSERT_TRUE(again.insert_args.timestamp_ns.has_value());
+    EXPECT_EQ(*again.insert_args.timestamp_ns, kEventTime);
+
+    const auto without = ob::parse_command("INSERT EVT-RT2 EX bid 100 5 1");
+    const auto without_again = ob::parse_command(ob::format_command(without));
+    ASSERT_EQ(without_again.type, ob::CommandType::INSERT);
+    EXPECT_FALSE(without_again.insert_args.timestamp_ns.has_value());
+}
+
+TEST_F(ExecuteCommandTest, StatusNamesWhatThisBuildCanDo) {
+    // Sending the field is not a test for it: measured, a server without #107 answers `OK` to a
+    // trailing token and stores the row without it. So the question has to be separate, and the
+    // answer has to be in a place a client reads before its first write.
+    ob::Session session(fd_server_);
+    ob::Command cmd{};
+    cmd.type = ob::CommandType::STATUS;
+    const std::string wire = ob::execute_command(cmd, *engine_, session, stats_);
+
+    ASSERT_NE(wire.find("capabilities: "), std::string::npos)
+        << "STATUS says nothing about what this build can do:\n" << wire;
+    for (const auto& name : ob::kCapabilities) {
+        EXPECT_NE(wire.find(std::string(name)), std::string::npos)
+            << "the list in capabilities.hpp names " << name << " and STATUS does not:\n" << wire;
     }
 }

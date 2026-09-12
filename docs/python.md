@@ -65,11 +65,27 @@ engine.insert(
     prices=[6_500_000, 6_499_000],
     qtys=[150, 200],
     counts=[3, 5],           # optional, default: [1, 1, ...]
-    timestamp_ns=None,       # optional, default: now
+    timestamp_ns=None,       # optional; None means the server stamps arrival time
 )
 ```
 
 Returns the sequence number used.
+
+**`timestamp_ns` is the time the update happened**, and since #105 it reaches the server over TCP as
+well as in embedded mode. Before that it was honoured embedded and **silently dropped on the wire** —
+measured: a dataset's own span selected 0 of 400 rows through TCP while the same load into ClickHouse
+and TimescaleDB selected 400.
+
+Two things follow, and both are refusals rather than surprises:
+
+- **against a server that cannot store one, this raises and sends nothing.** The client asks
+  `STATUS` once per connection (`engine.server_capabilities()` → `{"insert_event_time", ...}`) and
+  fails before a byte goes out, because a write that went out without the time its caller chose is a
+  row nobody can find afterwards. Sending the field is not a test for support: a server that predates
+  the field answers `OK` and discards it.
+- **`seq` cannot be chosen over the wire.** A sequence number belongs to the origin, and over TCP
+  that is the server, which assigns one per symbol. The argument used to be accepted and discarded;
+  it is now refused. In embedded mode you still choose it.
 
 #### engine.flush()
 

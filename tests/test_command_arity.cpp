@@ -135,20 +135,33 @@ TEST(CommandArity, EveryRowOfTheTableHasACanonicalLine) {
 // ── The exact lines the item was filed with ───────────────────────────────────
 
 TEST(CommandArity, TheLinesFromTheItemAreRefusedRatherThanStored) {
-    // All three answered `OK` and stored a row. The first is the shape that matters most: it is
-    // what an upgraded client would send to a server that does not know #105's field yet, and `OK`
-    // with the time discarded is the defect #105 is about, one layer out.
-    const Command with_time = parse_command("INSERT AAA EX bid 100 5 1 1700000000000000000");
-    EXPECT_EQ(with_time.type, CommandType::UNKNOWN);
-    EXPECT_TRUE(mentions(with_time.error, "1700000000000000000")) << with_time.error;
-
+    // All three answered `OK` and stored a row when #107 was filed. **Two of the three have since
+    // become legal**, and that is the arc rather than a regression: the trailing timestamp the item
+    // measured being discarded is exactly the field #105 then added, and it could only be added
+    // once an unknown token was refused — a client cannot tell a server that stores its event time
+    // from one that drops it unless the second one says so.
+    //
+    // So what is asserted here is the line that is still outside the grammar, and the two that are
+    // inside it are asserted by `ExecuteCommandTest.AnInsertKeepsTheEventTimeItWasGiven`.
     const Command with_garbage = parse_command("INSERT AAA EX bid 100 5 1 notanumber");
     EXPECT_EQ(with_garbage.type, CommandType::UNKNOWN);
     EXPECT_TRUE(mentions(with_garbage.error, "'notanumber'")) << with_garbage.error;
 
-    const Command minsert = parse_minsert("MINSERT AAA EX bid 1 1700000000000000000\n100\t5\t1\n");
+    const Command one_past_the_field = parse_command("INSERT AAA EX bid 100 5 1 "
+                                                     "1700000000000000000 extra");
+    EXPECT_EQ(one_past_the_field.type, CommandType::UNKNOWN);
+    EXPECT_TRUE(mentions(one_past_the_field.error, "'extra'")) << one_past_the_field.error;
+
+    const Command minsert = parse_minsert("MINSERT AAA EX bid 1 1700000000000000000 extra"
+                                          "\n100\t5\t1\n");
     EXPECT_EQ(minsert.type, CommandType::UNKNOWN);
-    EXPECT_TRUE(mentions(minsert.error, "1700000000000000000")) << minsert.error;
+    EXPECT_TRUE(mentions(minsert.error, "'extra'")) << minsert.error;
+
+    // And the field itself is accepted, which is what makes the three refusals above a grammar
+    // rather than a wall.
+    const Command with_time = parse_command("INSERT AAA EX bid 100 5 1 1700000000000000000");
+    EXPECT_EQ(with_time.type, CommandType::INSERT) << with_time.error;
+    EXPECT_TRUE(with_time.insert_args.timestamp_ns.has_value());
 }
 
 // ── Free-form tails, and why they are exempt from counting only ───────────────

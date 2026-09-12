@@ -32,10 +32,14 @@ Intel i3-7100U, 4 cores, 15.9 GiB, NVMe behind LUKS, ext4, kernel 6.8, GCC 13.3,
 numbers.** Both are limits of the *protocol* rather than of the storage engine, and both are named
 in the roadmap:
 
-- **Nothing can be written with its own event time over the wire.** `INSERT` and `MINSERT` carry no
-  timestamp, so the server stamps arrival time. Measured: the dataset's own span selected **0 of 400
-  rows** here while the same load into ClickHouse and TimescaleDB selected 400 — so the query above
-  is compared on price and size with the time column excluded (roadmap #105).
+- **Nothing could be written with its own event time over the wire**, so the server stamped arrival
+  time. Measured at the time of this run: the dataset's own span selected **0 of 400 rows** here
+  while the same load into ClickHouse and TimescaleDB selected 400 — which is why the query above is
+  compared on price and size with the time column excluded. **Closed since (#105):** `INSERT` and
+  `MINSERT` take an optional trailing `event_time_ns`, and both shipped clients ask the server
+  whether it can store one and refuse rather than drop it. The numbers in the table predate that
+  change and are left as they were measured; the comparison is worth re-running before they are
+  quoted again.
 - **There is no bulk-load path over the wire**, so the ingest column measures the protocol's shape
   as much as the engine's speed. The same engine ingests **446,219 updates/s in process** on this
   machine (`bench_engine BM_IngestionThroughput`, 2552 ns/op mean over 1,221,610 iterations) against

@@ -76,11 +76,11 @@ static bool iequals(std::string_view a, std::string_view b) {
 static constexpr CommandGrammar kGrammar[] = {
     {CommandType::SELECT,       "SELECT",       std::nullopt,
      "SELECT <query>", true},
-    {CommandType::INSERT,       "INSERT",       7,
-     "INSERT <symbol> <exchange> <bid|ask> <price> <qty> [count]", true},
-    {CommandType::MINSERT,      "MINSERT",      5,
-     "MINSERT <symbol> <exchange> <bid|ask> <n_levels>, then one <price> <qty> [count] line per "
-     "level", true},
+    {CommandType::INSERT,       "INSERT",       8,
+     "INSERT <symbol> <exchange> <bid|ask> <price> <qty> [count] [event_time_ns]", true},
+    {CommandType::MINSERT,      "MINSERT",      6,
+     "MINSERT <symbol> <exchange> <bid|ask> <n_levels> [event_time_ns], then one "
+     "<price> <qty> [count] line per level", true},
     {CommandType::FLUSH,        "FLUSH",        1, "FLUSH", true},
     {CommandType::PING,         "PING",         1, "PING", true},
     {CommandType::STATUS,       "STATUS",       1, "STATUS", true},
@@ -169,6 +169,33 @@ static std::string extra_token_message(const CommandGrammar& g, std::string_view
     return msg;
 }
 
+/// Read the optional event-time field, or say why it is not one (#105).
+///
+/// Returns false having filled `cmd` with the refusal. Shared by `INSERT` and `MINSERT` because one
+/// field spelled two ways is one field that drifts - the engine has paid for that in
+/// `ob_mm_peers_connected` (counted in three places, none of them `accept()`) and in the four copies
+/// of "which shapes are writes".
+static bool read_event_time(Command& cmd, std::string_view token, std::string_view what,
+                            std::optional<uint64_t>& out) {
+    uint64_t value = 0;
+    auto [ptr, ec] = std::from_chars(token.data(), token.data() + token.size(), value);
+    if (ec != std::errc{} || ptr != token.data() + token.size()) {
+        refuse(cmd, "invalid event time '" + std::string(token) + "'; " + std::string(what) +
+                        " takes nanoseconds since the epoch");
+        return false;
+    }
+    if (value == 0) {
+        // Zero is how "unassigned" is spelled everywhere else here - `DeltaUpdate::sequence_number`
+        // uses it for exactly that - so accepting it would make "I have no time for this row" and
+        // "stamp it on arrival" the same request, in the one place where telling them apart is the
+        // feature.
+        refuse(cmd, "event time 0 means \"unassigned\"; omit the field to get arrival time");
+        return false;
+    }
+    out = value;
+    return true;
+}
+
 // ── parse_command ──────────────────────────────────────────────────────────────
 
 Command parse_command(std::string_view line) {
@@ -236,6 +263,13 @@ Command parse_command(std::string_view line) {
             auto sv = tokens[6];
             auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), args.count);
             if (ec != std::errc{} || ptr != sv.data() + sv.size()) return cmd;
+        }
+
+        // optional event time (#105). Last and optional is the only shape in which an old client
+        // and a new server understand each other without negotiating: six fields still mean exactly
+        // what they meant.
+        if (tokens.size() >= 8 && !read_event_time(cmd, tokens[7], "INSERT", args.timestamp_ns)) {
+            return cmd;
         }
 
         cmd.type = CommandType::INSERT;
@@ -435,6 +469,12 @@ Command parse_minsert(std::string_view block) {
         args.n_levels = nl_val;
     }
 
+    // optional event time for the whole batch (#105)
+    if (header_tokens.size() >= 6 &&
+        !read_event_time(cmd, header_tokens[5], "MINSERT", args.timestamp_ns)) {
+        return cmd;
+    }
+
     // ── Parse payload lines ───────────────────────────────────────────────
     if (lines.size() < static_cast<size_t>(1 + args.n_levels)) return cmd;
 
@@ -502,6 +542,13 @@ std::string format_command(const Command& cmd) {
         out += std::to_string(a.qty);
         out += ' ';
         out += std::to_string(a.count);
+        // Emitted only when the sender gave one, so a round trip through this function does not
+        // turn "stamp it on arrival" into a fixed instant - which is what a formatter that filled
+        // the field in would do the first time anything replayed a command (#105).
+        if (a.timestamp_ns) {
+            out += ' ';
+            out += std::to_string(*a.timestamp_ns);
+        }
         out += '\n';
         return out;
     }
@@ -516,6 +563,10 @@ std::string format_command(const Command& cmd) {
         out += (a.side == 0) ? "bid" : "ask";
         out += ' ';
         out += std::to_string(a.n_levels);
+        if (a.timestamp_ns) {
+            out += ' ';
+            out += std::to_string(*a.timestamp_ns);
+        }
         out += '\n';
         for (const auto& lvl : a.levels) {
             out += std::to_string(lvl.price);

@@ -476,7 +476,8 @@ std::string ShardRouter::assign_unknown_symbol(const std::string& symbol_key) {
 Result<void> ShardRouter::insert(std::string_view symbol,
                                   std::string_view exchange,
                                   Side side, int64_t price, uint64_t qty,
-                                  uint32_t count) {
+                                  uint32_t count,
+                                  std::optional<uint64_t> event_time_ns) {
     std::string key = build_symbol_key(symbol, exchange);
 
     // Check if the shard has mm_nodes — use round-robin routing
@@ -494,7 +495,7 @@ Result<void> ShardRouter::insert(std::string_view symbol,
         if (shard_it != shard_map_.shards.end() && !shard_it->second.mm_nodes.empty()) {
             OrderbookClient* mm_client = get_client_mm(shard_id);
             if (mm_client) {
-                return mm_client->insert(symbol, exchange, side, price, qty, count);
+                return mm_client->insert(symbol, exchange, side, price, qty, count, event_time_ns);
             }
             // Fall through to normal routing if mm_client unavailable
         }
@@ -502,7 +503,7 @@ Result<void> ShardRouter::insert(std::string_view symbol,
 
     return execute_with_migration_retry(key,
         [&](OrderbookClient& c) {
-            return c.insert(symbol, exchange, side, price, qty, count);
+            return c.insert(symbol, exchange, side, price, qty, count, event_time_ns);
         });
 }
 
@@ -511,7 +512,8 @@ Result<void> ShardRouter::insert(std::string_view symbol,
 Result<void> ShardRouter::minsert(std::string_view symbol,
                                    std::string_view exchange,
                                    Side side, const Level* levels,
-                                   size_t n_levels) {
+                                   size_t n_levels,
+                                   std::optional<uint64_t> event_time_ns) {
     std::string key = build_symbol_key(symbol, exchange);
 
     // Check if the shard has mm_nodes — use round-robin routing
@@ -529,7 +531,7 @@ Result<void> ShardRouter::minsert(std::string_view symbol,
         if (shard_it != shard_map_.shards.end() && !shard_it->second.mm_nodes.empty()) {
             OrderbookClient* mm_client = get_client_mm(shard_id);
             if (mm_client) {
-                return mm_client->minsert(symbol, exchange, side, levels, n_levels);
+                return mm_client->minsert(symbol, exchange, side, levels, n_levels, event_time_ns);
             }
             // Fall through to normal routing if mm_client unavailable
         }
@@ -537,7 +539,7 @@ Result<void> ShardRouter::minsert(std::string_view symbol,
 
     return execute_with_migration_retry(key,
         [&](OrderbookClient& c) {
-            return c.minsert(symbol, exchange, side, levels, n_levels);
+            return c.minsert(symbol, exchange, side, levels, n_levels, event_time_ns);
         });
 }
 

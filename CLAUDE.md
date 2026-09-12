@@ -1704,6 +1704,37 @@ Learned the hard way. Check here before debugging.
     `SELECT`, and die. When a mutation survives, ask whether a sentinel is doing the work the guard
     claims — and prefer the type that cannot express the accident (#107).
 
+206. **An argument accepted and discarded is worse than one refused, because the caller has no way
+    to find out.** `insert(timestamp_ns=…)` was honoured embedded and dropped on the wire, so the
+    same call meant two things depending on the mode — measured as **0 of 400 rows** inside the
+    dataset's own span where two SQL systems returned 400. The fix is half protocol and half
+    refusal: the field is optional and last (six fields still mean what they meant), and both
+    clients **ask** whether the server can store one and fail before sending a byte. Sending the
+    field is not a test for support: a server that predates it answers `OK` and drops the value,
+    which is why #107 had to come first (#105).
+
+207. **Zero is not absence when zero already means something.** `DeltaUpdate::sequence_number` uses
+    0 for "unassigned", so accepting `event_time 0` as "stamp it on arrival" would have made "I have
+    no time for this row" and "use yours" the same request — in the one place where telling them
+    apart is the feature. Refused, naming the field. And deliberately **no sanity window**: a server
+    refusing a timestamp from 2019 breaks backfill, which is the case the field exists for (#105).
+
+208. **Before adding a field a client can choose, find what already reads the one it resembles.**
+    Three mechanisms read a record's time and only one would have been a real risk: multi-master LWW
+    compares the **HLC** (node clock), so a client cannot decide which conflicting write survives;
+    segment pruning is a range-intersection test, so out-of-order times cost scan efficiency rather
+    than correctness; TTL retention works on whole segments by their newest event time, so a
+    **backfill arrives with its age** and one row dated in the future keeps its segment alive. The
+    first made the change possible, the third is what an operator meets at 3 a.m. and is now in
+    `docs/operations.md` (#105).
+
+209. **A capability list is a published vocabulary, so a name in it is a promise — and a promise
+    nothing reads is the shape this workspace has paid for five times.** `capabilities:` uses names
+    rather than a version number (a number needs a semver parser in every client, and the question
+    is "can you take this field", not "what are you called"), the absence of the line is an answer
+    rather than an error, and a static test requires every announced name to have a **declared
+    reader** in both directions. Adding a third name forces naming its reader (#105).
+
 210. **CodeQL cannot see a `static_assert` as a use, so a helper written only for one looks dead.**
     `cpp/unused-static-function` flagged `grammar_is_indexed_by_type()` — correctly, from where it
     stands: nothing calls it at run time. The check belongs inside the assertion anyway, so it is an

@@ -72,12 +72,16 @@ public:
 
     // ── Routed operations ─────────────────────────────────────────────
 
+    /// `event_time_ns` is forwarded to the owning shard's client, which asks that node whether it
+    /// can store one and refuses without sending if it cannot (#105).
     Result<void> insert(std::string_view symbol, std::string_view exchange,
                         Side side, int64_t price, uint64_t qty,
-                        uint32_t count = 1);
+                        uint32_t count = 1,
+                        std::optional<uint64_t> event_time_ns = std::nullopt);
 
     Result<void> minsert(std::string_view symbol, std::string_view exchange,
-                         Side side, const Level* levels, size_t n_levels);
+                         Side side, const Level* levels, size_t n_levels,
+                         std::optional<uint64_t> event_time_ns = std::nullopt);
 
     Result<void> flush();
 

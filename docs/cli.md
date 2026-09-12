@@ -18,6 +18,10 @@ Insert a single price level.
 insert <symbol> <exchange> <bid|ask> <price> <qty> [count]
 ```
 
+The interactive CLI has no event-time argument: it embeds the engine rather than speaking the wire
+protocol, and the embedded API has taken `timestamp_ns` since the first release (see
+`docs/c-api.md`). The wire field documented below is what closed the gap between the two (#105).
+
 - `price` — integer in smallest sub-units (e.g. cents: 6500000 = $65,000.00)
 - `qty` — quantity (unsigned integer)
 - `count` — order count (optional, default: 1)
@@ -345,7 +349,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--tls-multi-master` | — (boolean) | TLS with mutual certificate verification on the multi-master mesh; needs `--tls-ca-file` |
 | `--tls-peer-names` | `<NAMES>` | Comma-separated identities an accepted peer's certificate may carry; empty accepts any name this CA signed |
 | `--tls-replication` | — (boolean) | TLS with mutual certificate verification on the replication link, in both roles; needs `--tls-ca-file` |
-| `--ttl-hours` | `<N>` | Retention in hours; 0 keeps everything |
+| `--ttl-hours` | `<N>` | Retention in hours; 0 keeps everything. Counted from **the record's own event time**, per segment — so a backfill written with `[event_time_ns]` arrives with its age, and a batch whose oldest row is past the window is expired on the next sweep. One row dated in the future keeps its whole segment |
 | `--ttl-scan-interval-seconds` | `<N>` | How often retention scans for expired rows |
 | `--workers` | `<N>` | Number of worker threads (default: 4) |
 
@@ -379,17 +383,17 @@ The wire protocol now refuses a command line carrying a token its grammar has no
 refusal names the token:
 
 ```
-C: INSERT BTC-USD BINANCE bid 6500000 150 1 1700000000000000000
-S: ERR unexpected token '1700000000000000000'; INSERT takes: INSERT <symbol> <exchange> <bid|ask> <price> <qty> [count]
+C: INSERT BTC-USD BINANCE bid 6500000 150 1 surprise
+S: ERR unexpected token 'surprise'; INSERT takes: INSERT <symbol> <exchange> <bid|ask> <price> <qty> [count] [event_time_ns]
 
-C: MINSERT BTC-USD BINANCE bid 1 1700000000000000000
-S: ERR unexpected token '1700000000000000000'; MINSERT takes: MINSERT <symbol> <exchange> <bid|ask> <n_levels>, then one <price> <qty> [count] line per level
+C: MINSERT BTC-USD BINANCE bid 1 yesterday
+S: ERR invalid event time 'yesterday'; MINSERT takes nanoseconds since the epoch
 
 C: PING please
 S: ERR unexpected token 'please'; PING takes: PING
 ```
 
-**All of those used to answer `OK`** — and the first three stored a row for a value the server
+**All of those used to answer `OK`** — and the first two stored a row for a value the server
 discarded. Measured before the change: fourteen command shapes accepted a token nobody reads, five
 of them wrote it away, and `MM_CONFLICTS notanumber` quietly became `MM_CONFLICTS 100`. It is the
 same defect as the flag section above, one layer out: the parser read the fields it knew and ignored
@@ -408,9 +412,62 @@ A level line of a `MINSERT` batch follows the same rule and the refusal says whi
 `ERR unexpected token 'x' on level line 2; a level line takes: <price> <qty> [count]`.
 
 If you have a client sending a field this server does not know, it will now be told so instead of
-being answered `OK`. That is the point: an upgraded client sending an event time to an older server
-used to get `OK` with the time dropped, so it could not tell the difference between a server that
-stored it and one that did not (#105).
+being answered `OK`. That is the point, and it is what made the event time below expressible: an
+upgraded client sending one to an older server used to get `OK` with the time dropped, so it could
+not tell a server that stored it from one that did not.
+
+## Writing with your own event time
+
+`INSERT` and `MINSERT` take an **optional last field**: the time the update happened, in nanoseconds
+since the epoch.
+
+```
+C: INSERT BTC-USD BINANCE bid 6500000 150 1 1700000000000000000
+S: OK
+
+C: MINSERT BTC-USD BINANCE bid 2 1700000000000000000
+C: 6500000 150 1
+C: 6499900 200 1
+S: OK
+```
+
+Omit it and the server stamps arrival time, which is what every release before this one did with
+every write. That is still the right answer for a live feed; the field is for **backfill**, where
+arrival time is the time of the import rather than the time of the market.
+
+```
+C: STATUS
+S: ...
+S: capabilities: insert_event_time,strict_args
+```
+
+**Ask before you send.** A server that predates this field answers `OK` and stores the row with
+arrival time — measured, on the release before it — so a client cannot infer support from a
+successful write. Both shipped clients ask once per connection and **refuse rather than drop**:
+`OrderbookEngine.insert(..., timestamp_ns=T)` raises, and `OrderbookClient::insert(..., T)` returns
+an error, before a byte goes out. The absence of the `capabilities:` line is an answer too, not a
+failure.
+
+Three refusals, each naming the token rather than counting arguments:
+
+```
+C: INSERT BTC-USD BINANCE bid 6500000 150 1 0
+S: ERR event time 0 means "unassigned"; omit the field to get arrival time
+
+C: INSERT BTC-USD BINANCE bid 6500000 150 1 yesterday
+S: ERR invalid event time 'yesterday'; INSERT takes nanoseconds since the epoch
+
+C: INSERT BTC-USD BINANCE bid 6500000 150 1 1700000000000000000 extra
+S: ERR unexpected token 'extra'; INSERT takes: ...
+```
+
+There is **no sanity window** and that is deliberate: a server that refused a timestamp from 2019
+would break backfill, which is the case this field exists for. What the time does affect is written
+down in `docs/operations.md` — retention counts by the record's own time, so loading history loads
+its age along with it.
+
+One field per batch, not per level: a batch **is** one book update at one instant, which is what the
+engine's own `DeltaUpdate` models.
 
 ## Configuration file
 

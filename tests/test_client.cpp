@@ -503,3 +503,81 @@ TEST(ClientUnit, ParseAggResponseErrorIsPropagated) {
     ASSERT_FALSE(result.has_value());
     EXPECT_NE(result.error_message().find("AGG_TIME_FILTER"), std::string::npos);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Event time on the wire (#105)
+//
+// The property is that the field survives the formatter this client writes and the parser the
+// server reads - in both directions, because the two halves are in different files and a field that
+// round-trips through one of them is a field with two meanings.
+
+RC_GTEST_PROP(ClientProperty, prop_event_time_survives_the_format_and_parse_round_trip, ()) {
+    auto symbol   = *genUpperAlpha(1, 31);
+    auto exchange = *genUpperAlpha(1, 31);
+    auto side     = *rc::gen::element(ob::Side::BID, ob::Side::ASK);
+    auto price    = *rc::gen::inRange<int64_t>(-1'000'000'000, 1'000'000'001);
+    auto qty      = *rc::gen::inRange<uint64_t>(1, 1'000'000'001);
+    auto count    = *rc::gen::inRange<uint32_t>(1, 100'001);
+    // 1 upwards: zero is refused on purpose, because it is how "unassigned" is spelled elsewhere.
+    auto event_ns = *rc::gen::inRange<uint64_t>(1, 2'000'000'000'000'000'000ULL);
+
+    ob::OrderbookClient client;
+    client.format_insert(symbol, exchange, side, price, qty, count, event_ns);
+    const auto cmd = ob::parse_command(std::string(client.send_buffer()));
+
+    RC_ASSERT(cmd.type == ob::CommandType::INSERT);
+    RC_ASSERT(cmd.insert_args.timestamp_ns.has_value());
+    RC_ASSERT(*cmd.insert_args.timestamp_ns == event_ns);
+    RC_ASSERT(cmd.insert_args.count == count);
+}
+
+RC_GTEST_PROP(ClientProperty, prop_a_batch_carries_one_event_time_for_all_its_levels, ()) {
+    auto symbol   = *genUpperAlpha(1, 31);
+    auto exchange = *genUpperAlpha(1, 31);
+    auto side     = *rc::gen::element(ob::Side::BID, ob::Side::ASK);
+    auto n_levels = *rc::gen::inRange<size_t>(1, 40);
+    auto event_ns = *rc::gen::inRange<uint64_t>(1, 2'000'000'000'000'000'000ULL);
+
+    std::vector<ob::Level> levels(n_levels);
+    for (size_t i = 0; i < n_levels; ++i) {
+        levels[i].price = static_cast<int64_t>(100 + i);
+        levels[i].qty   = 1 + i;
+        levels[i].count = 1;
+    }
+
+    ob::OrderbookClient client;
+    client.format_minsert(symbol, exchange, side, levels.data(), n_levels, event_ns);
+    const auto cmd = ob::parse_minsert(std::string(client.send_buffer()));
+
+    RC_ASSERT(cmd.type == ob::CommandType::MINSERT);
+    RC_ASSERT(cmd.minsert_args.timestamp_ns.has_value());
+    RC_ASSERT(*cmd.minsert_args.timestamp_ns == event_ns);
+    RC_ASSERT(cmd.minsert_args.levels.size() == n_levels);
+}
+
+TEST(ClientUnit, WithoutAnEventTimeTheCommandIsByteForByteWhatItAlwaysWas) {
+    // The control, and the compatibility claim in one test: a caller who passes no time must
+    // produce exactly the line an older client produced, or every existing deployment changed
+    // meaning on upgrade.
+    ob::OrderbookClient client;
+    client.format_insert("BTC-USD", "BINANCE", ob::Side::BID, 6500000, 150, 3);
+    EXPECT_EQ(std::string(client.send_buffer()), "INSERT BTC-USD BINANCE bid 6500000 150 3\n");
+
+    client.format_insert("BTC-USD", "BINANCE", ob::Side::BID, 6500000, 150, 3,
+                         1700000000000000000ULL);
+    EXPECT_EQ(std::string(client.send_buffer()),
+              "INSERT BTC-USD BINANCE bid 6500000 150 3 1700000000000000000\n");
+}
+
+TEST(ClientUnit, AnEventTimeOnAnUnconnectedClientFailsWithoutPretendingToAsk) {
+    // The gate reads the server's capabilities, so on a client that was never connected it has to
+    // fail as a connection error rather than as "this server cannot do it" - the difference
+    // matters, because one of those messages sends the reader to upgrade a server that is fine.
+    ob::OrderbookClient client;
+    auto r = client.insert("BTC-USD", "BINANCE", ob::Side::BID, 6500000, 150, 1,
+                           1700000000000000000ULL);
+    EXPECT_FALSE(r);
+    EXPECT_EQ(std::string(r.error_message()).find("does not accept an event time"),
+              std::string::npos)
+        << "an unconnected client blamed the server: " << r.error_message();
+}

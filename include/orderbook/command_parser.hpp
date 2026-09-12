@@ -42,6 +42,14 @@ struct InsertArgs {
     int64_t     price;
     uint64_t    qty;
     uint32_t    count{1};
+
+    /// The event time the sender gave, in nanoseconds, or empty for "stamp it on arrival" (#105).
+    ///
+    /// Empty is not zero: zero is how "unassigned" is spelled everywhere else in this engine, so a
+    /// zero on the wire is refused rather than treated as absence. The distinction is the whole
+    /// point of the field - a write whose time was dropped and a write that asked for arrival time
+    /// used to be the same write, and the first one is the defect.
+    std::optional<uint64_t> timestamp_ns;
 };
 
 // ── MINSERT arguments ─────────────────────────────────────────────────────────
@@ -51,6 +59,13 @@ struct MinsertArgs {
     std::string exchange;
     uint8_t     side;        // 0=bid, 1=ask
     uint16_t    n_levels;    // number of levels in the batch
+
+    /// One event time for the whole batch, or empty for arrival time (#105).
+    ///
+    /// One per batch rather than one per level, because a batch **is** one book update at one
+    /// instant - that is what `DeltaUpdate` already models, and it is why the comparative
+    /// benchmark's generator groups its rows by `(ts, symbol, side)`.
+    std::optional<uint64_t> timestamp_ns;
     struct Level {
         int64_t  price;
         uint64_t qty;

@@ -125,6 +125,10 @@ class StressTestTCP(unittest.TestCase):
             deadline = start_time + STRESS_DURATION_S
 
             while time.perf_counter() < deadline:
+                # `seq` is not passed to insert(): over the wire the sequence number belongs to the
+                # server, which assigns one per symbol. This script used to pass it and the client
+                # used to drop it silently; since #105 that is refused, which is how the assumption
+                # became visible. The counter still drives the prices below.
                 seq += 1
                 price = 5_000_00 + (seq % 500)
                 qty = 1000 + (seq % 500)
@@ -134,7 +138,6 @@ class StressTestTCP(unittest.TestCase):
                     symbol, exchange, "bid",
                     prices=[price], qtys=[qty], counts=[1],
                     timestamp_ns=int(time.time_ns()),
-                    seq=seq,
                 )
                 t1 = time.perf_counter()
 
@@ -207,7 +210,6 @@ class StressTestTCP(unittest.TestCase):
                     symbol, exchange, "bid",
                     prices=prices, qtys=base_qtys, counts=base_counts,
                     timestamp_ns=int(time.time_ns()),
-                    seq=seq,
                 )
                 t1 = time.perf_counter()
 
