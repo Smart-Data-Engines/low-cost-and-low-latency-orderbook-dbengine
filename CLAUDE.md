@@ -1664,6 +1664,61 @@ Learned the hard way. Check here before debugging.
     peer**, which is the one thing that test must not become. Pitfall 54's shape, in a test written
     by someone who knew about pitfall 54.
 
+201. **A parser that reads the fields it knows and ignores the rest accepts typos forever.**
+    Measured over a live server: of sixteen command shapes, **fourteen accepted a token nobody
+    reads** and five stored a row for it — `INSERT AAA EX bid 100 5 1 notanumber` answered `OK`.
+    This is pitfall 27 on the wire, the same class #36 closed for command-line flags, and it is
+    worse here because the discarded token is sometimes the one that mattered: an upgraded client
+    sending an event time to an older server got `OK` with the time dropped, so it could not tell a
+    server that stored it from one that did not (#107, #105).
+
+202. **Correct behaviour in one branch out of eighteen is indistinguishable from nobody having
+    decided.** `AUTH` already refused a trailing token — an exact `tokens.size() != 3` written by
+    whoever happened to think of it there — while seventeen other commands did not. So the fix is
+    one table rather than eighteen habits, and it is **indexed by `CommandType`**, which makes a
+    nineteenth command a *compile* error until it declares its arity. That is the same mechanism as
+    the missing `default:` in `allowed_before_authentication()`: a static test can be forgotten in
+    review, a `static_assert` cannot (#107).
+
+203. **When you build the table, do not give it a field nothing reads.** The arity table carries
+    only the **maximum**; each branch keeps its own minimum, because a branch that reads `tokens[5]`
+    needs the guard that makes the read safe. A minimum in the table would have been read by
+    nothing — a poor field to add in the same repository that spent #104 on the fifth instance of
+    exactly that shape. Ask it while designing, not while auditing (#107).
+
+204. **Measure the words, not only the behaviour.** Before writing the refusal I ran the same shape
+    past the query parser, which has answered this situation for years:
+    `ERR Parse error at line 1, col 26: unexpected token 'garbage'`. Borrowing those words costs
+    nothing and stops one protocol from saying one thing two ways — and the same measurement is what
+    turned `SELECT` and `SUBSCRIBE` from "not checked" into a genuine exemption from *counting*.
+    The one place the rule inverts is `AUTH`: a refusal writes a log line, so its extra token is
+    refused **without being repeated**, because a response echoed into a log is a response in a log
+    (#107).
+
+205. **A sentinel that already makes the comparison false turns its own guard into something that
+    cannot fail.** "No maximum" was `kFreeForm = size_t(-1)`, guarded by
+    `max_tokens != kFreeForm && tokens.size() > max_tokens` — and deleting the guard **changed
+    nothing**, because no line carries `SIZE_MAX` tokens. The mutation survived, and the guard still
+    read like protection to anybody reviewing it. Moving the emptiness into the type
+    (`std::optional<size_t>`) makes the same deletion compare against `nullopt`, refuse every
+    `SELECT`, and die. When a mutation survives, ask whether a sentinel is doing the work the guard
+    claims — and prefer the type that cannot express the accident (#107).
+
+210. **CodeQL cannot see a `static_assert` as a use, so a helper written only for one looks dead.**
+    `cpp/unused-static-function` flagged `grammar_is_indexed_by_type()` — correctly, from where it
+    stands: nothing calls it at run time. The check belongs inside the assertion anyway, so it is an
+    immediately-invoked constexpr lambda now and there is nothing left to mistake for dead code.
+    Worth knowing before writing the next compile-time completeness check, because this repository
+    writes a lot of them (#107).
+
+211. **Verifying a guard against the wrong build target is the worst place for a stale artefact.**
+    I swapped two table rows to prove the `static_assert` fires and built `orderbook_engine` — which
+    does not compile `command_parser.cpp`. The build passed, the guard looked dead, and the next
+    step would have been to "fix" something that works. Building `orderbook_tcp_server_lib` failed
+    the assertion twice, as it should. Fourth instance of the stale-artefact class in this
+    workspace, and the first one aimed at a mechanism rather than at a result: **when you mutate to
+    prove a guard fires, name the target that compiles the file** (#107).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

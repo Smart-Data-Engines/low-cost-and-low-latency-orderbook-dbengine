@@ -11,6 +11,7 @@
 // irrelevant to apply_remote_delta(), and it keeps this a unit test instead of a cluster.
 
 #include "orderbook/engine.hpp"
+#include "test_ports.hpp"
 #include "orderbook/data_model.hpp"
 #include "orderbook/types.hpp"
 
@@ -26,7 +27,7 @@ namespace fs = std::filesystem;
 namespace {
 
 static std::atomic<uint64_t> g_dir_counter{0};
-static std::atomic<uint16_t> g_port{54900};
+static std::atomic<uint16_t> g_port{ob::test::kPortsMmDedup};
 
 struct TempDir {
     std::string path;

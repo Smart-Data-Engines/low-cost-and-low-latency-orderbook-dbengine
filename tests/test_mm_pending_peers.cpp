@@ -20,6 +20,7 @@
 // held structurally rather than by a `node_id == 0` test).
 
 #include "orderbook/engine.hpp"
+#include "test_ports.hpp"
 #include "orderbook/multi_master.hpp"
 
 #include <gtest/gtest.h>
@@ -45,7 +46,7 @@ namespace fs = std::filesystem;
 namespace {
 
 std::atomic<uint64_t> g_dir_counter{0};
-std::atomic<uint16_t> g_port{55400};
+std::atomic<uint16_t> g_port{ob::test::kPortsMmPendingPeers};
 
 struct TempDir {
     std::string path;

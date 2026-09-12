@@ -59,6 +59,13 @@ MetricsRegistry::MetricsRegistry() {
     counters_.push_back(make_counter("ob_auth_failures_total",
                                      "Failed client authentication attempts. Each one also closed "
                                      "a session, so a rising number means someone is trying."));
+    counters_.push_back(make_counter("ob_refused_commands_total",
+                                     "Command lines the parser refused: an unknown word, or a known "
+                                     "command carrying a token its grammar has no place for. A "
+                                     "client that is working does not produce these, so any rate "
+                                     "at all is a client sending something it thinks is being "
+                                     "stored (#107). Logged once per connection, counted every "
+                                     "time - the count is the alertable half."));
     counters_.push_back(make_counter("ob_wal_records_written",   "Total number of WAL records written"));
     counters_.push_back(make_counter("ob_repl_records_replayed", "Total number of replication records replayed"));
 

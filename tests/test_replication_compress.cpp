@@ -3,6 +3,7 @@
 // Requirements: 2.2, 2.4
 
 #include <gtest/gtest.h>
+#include "test_ports.hpp"
 
 #include "orderbook/replication.hpp"
 #include "orderbook/wal.hpp"
@@ -46,7 +47,7 @@ struct TempDir {
     std::string str() const { return path.string(); }
 };
 
-static std::atomic<uint16_t> next_port{21876};
+static std::atomic<uint16_t> next_port{ob::test::kPortsReplicationCompress};
 
 static uint16_t alloc_port() {
     return next_port.fetch_add(1, std::memory_order_relaxed);

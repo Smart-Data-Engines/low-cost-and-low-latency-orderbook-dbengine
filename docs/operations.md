@@ -201,6 +201,14 @@ logger, to confirm a start.
 - `ob_pending_rows` — rows waiting for a flush. Growing steadily means the flush interval is longer
   than the write rate can afford.
 
+One counter is worth watching for a different reason: **`ob_refused_commands_total`** is the number
+of command lines the parser would not accept — an unknown word, or a known command carrying a token
+its grammar has no place for (#107). A client that is working produces none of them, so any rate at
+all means somebody is sending something they believe is being stored. The matching log line is
+written **once per connection** (`Refused a command from fd=9: unexpected token 'x'; …`) rather than
+once per line, because a refusal is reachable before authentication and a line per refusal is a
+flood anyone who can reach the port can drive; the counter is the half that carries the volume.
+
 A metric written under a name nobody registered is dropped in silence, so `scripts/check_metrics.py`
 fails CI for the class rather than trusting the reader to notice a flat zero.
 

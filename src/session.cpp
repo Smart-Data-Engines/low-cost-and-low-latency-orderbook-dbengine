@@ -390,6 +390,12 @@ bool Session::is_compressed() const { return compressed_; }
 uint64_t Session::commands_executed() const { return command_count_; }
 void Session::increment_commands() { ++command_count_; }
 
+bool Session::first_refusal() {
+    if (refusal_logged_) return false;
+    refusal_logged_ = true;
+    return true;
+}
+
 uint64_t Session::compress_bytes_in() const { return compress_bytes_in_; }
 uint64_t Session::compress_bytes_out() const { return compress_bytes_out_; }
 

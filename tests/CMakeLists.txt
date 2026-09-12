@@ -350,6 +350,13 @@ ob_add_tcp_test(test_cli_args
     test_cli_args.cpp
 )
 
+# The wire grammar (#107). Reads the parser's own table rather than a second list of the same
+# facts, and every refusal in it has a control: a parser that refuses everything passes every
+# refusal test.
+ob_add_tcp_test(test_command_arity
+    test_command_arity.cpp
+)
+
 ob_add_tcp_test(test_tcp_server
     test_tcp_server.cpp
 )
@@ -357,6 +364,13 @@ ob_add_tcp_test(test_tcp_server
 # place, and the io_uring half is in a file no CI job builds.
 target_compile_definitions(test_tcp_server
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
+# ── Test-harness discipline ────────────────────────────────────────────────────
+# Fixed ports the tests bind have to sit below the range the kernel hands to outgoing connections,
+# or a required check goes red for a reason that has nothing to do with the engine (#109).
+ob_add_engine_test(test_port_discipline
+    test_port_discipline.cpp
 )
 
 # ── Whole-engine static checks ─────────────────────────────────────────────────

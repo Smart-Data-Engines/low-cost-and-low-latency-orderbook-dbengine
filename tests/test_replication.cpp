@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "test_ports.hpp"
 #include "orderbook/replication.hpp"
 
 #include <set>
@@ -136,7 +137,7 @@ static std::string recv_line(int fd, int timeout_ms = 3000) {
 }
 
 // Use a base port that's unlikely to conflict. Each test fixture picks a unique port.
-static std::atomic<uint16_t> next_port{19876};
+static std::atomic<uint16_t> next_port{ob::test::kPortsReplication};
 
 static uint16_t alloc_port() {
     return next_port.fetch_add(1, std::memory_order_relaxed);

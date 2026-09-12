@@ -6,6 +6,7 @@
 // Property 16: STATUS includes role and epoch.
 
 #include "orderbook/engine.hpp"
+#include "test_ports.hpp"
 
 #include <gtest/gtest.h>
 #include <rapidcheck.h>
@@ -238,7 +239,7 @@ TEST(FailoverRoles, ConcurrentDemotionsLeaveOneNodeAndNoWreckage) {
     // to bind, and it is what made a CI run fail with `bind() failed: Address already in use` (the
     // reason `test_mm_stats.py` uses one shared allocator). A distinct base keeps this out of the
     // range `test_replication.cpp` allocates from.
-    static std::atomic<uint16_t> next_port{21987};
+    static std::atomic<uint16_t> next_port{ob::test::kPortsFailoverRoles};
     ob::ReplicationConfig repl{};
     repl.port = next_port.fetch_add(1, std::memory_order_relaxed);
     repl.max_replicas = 4;

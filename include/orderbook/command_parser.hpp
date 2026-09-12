@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -80,6 +82,18 @@ struct Command {
     /// The id for UNSUBSCRIBE, or 0 meaning "every subscription of this session".
     uint64_t    unsubscribe_id{0};
 
+    /// Why the line was refused, when the parser has something specific to say about it.
+    ///
+    /// Empty for a line whose first token is not a command at all - that one is `unknown command`
+    /// and nothing more can honestly be said. Non-empty when the command *was* recognised and the
+    /// line still is not it: a trailing token, or an argument the grammar has no place for. Those
+    /// two answers used to be the same answer, and the difference matters to whoever typed it -
+    /// `unknown command` about `INSERT ... typo` sends the reader looking for a missing feature.
+    ///
+    /// The message names the offending **token**, not how many there were: "too many arguments"
+    /// sends an operator counting spaces (#107).
+    std::string error;
+
     /// AUTH: the claimed identity, and the response to the outstanding challenge.
     ///
     /// Both empty for a bare `AUTH`, which is the request for a challenge. Parsed here rather than
@@ -89,6 +103,42 @@ struct Command {
     std::string auth_identity;
     std::string auth_response;
 };
+
+// ── Command grammar ───────────────────────────────────────────────────────────
+
+/// The most tokens one command line may carry, keyword included, and what it accepts instead.
+///
+/// Exported so that a test can be written against the parser's **own** table rather than against a
+/// second list of the same facts. That shape has cost this repository once already: #32 grew a flag,
+/// a negation table and a test from a list of value-less flags I wrote by reading a default instead
+/// of the parser, and all three were wrong. A list you wrote yourself is not evidence about code.
+struct CommandGrammar {
+    CommandType      type;
+    std::string_view keyword;
+
+    /// Empty where the tail belongs to the query parser (`SELECT`, `SUBSCRIBE`), which refuses a
+    /// trailing token by name itself.
+    ///
+    /// An `optional` rather than a sentinel, and that is a correction made by a mutation. The first
+    /// version had `kFreeForm = size_t(-1)` and a guard reading
+    /// `max_tokens != kFreeForm && tokens.size() > max_tokens` — and **deleting that guard changed
+    /// nothing**, because no line has `SIZE_MAX` tokens, so the comparison was already false. A
+    /// guard that cannot fail is a guard that cannot be checked, and the next reader would trust it.
+    /// With the emptiness in the type, dropping the test compares against `nullopt`, refuses every
+    /// `SELECT`, and a test says so.
+    std::optional<size_t> max_tokens;
+
+    std::string_view usage;        ///< quoted in the refusal, so the answer says what is accepted
+
+    /// False where a token on this line can be a credential (`AUTH`). The refusal then says *that*
+    /// there is an extra token without repeating it, because a refusal writes a log line and a
+    /// response echoed into a log is a response in a log.
+    bool             may_quote_token;
+};
+
+/// Every command's grammar, in `CommandType` order. One row per enumerator except `UNKNOWN`, which
+/// the implementation enforces at compile time.
+std::span<const CommandGrammar> command_grammar();
 
 // ── Free functions ────────────────────────────────────────────────────────────
 

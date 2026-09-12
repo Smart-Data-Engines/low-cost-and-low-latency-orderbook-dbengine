@@ -2,6 +2,7 @@
 // Feature: multi-master-replication
 
 #include <gtest/gtest.h>
+#include "test_ports.hpp"
 #include <rapidcheck/gtest.h>
 
 #include <cstdint>
@@ -236,7 +237,7 @@ TEST(MultiMasterUnit, DisconnectPeerRemovesFromStates) {
 // which is the distinction a weaker version of this test would miss.
 
 TEST(MultiMasterUnit, MmPeersDoesNotListAConnectionThatHasNotIdentifiedItself) {
-    TestContext ctx(1, 47821);
+    TestContext ctx(1, ob::test::kPortsMultiMaster);
     ob::MultiMasterManager mgr(ctx.config, *ctx.engine, *ctx.wal, *ctx.hlc);
     mgr.start();
 
@@ -245,7 +246,7 @@ TEST(MultiMasterUnit, MmPeersDoesNotListAConnectionThatHasNotIdentifiedItself) {
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port   = htons(47821);
+    addr.sin_port   = htons(ob::test::kPortsMultiMaster);
     addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
     bool connected = false;

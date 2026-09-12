@@ -140,3 +140,45 @@ def test_status_reports_no_refused_segment_merges(primary_client: OrderbookEngin
         "STATUS no longer reports segment_merge_refused; the flush race guard is "
         "invisible to operators")
     assert refused == 0, f"segment_merge_refused={refused}"
+
+
+def test_refused_commands_are_counted_even_though_they_are_logged_once(cluster):
+    """The volume half of #107's refusal, and why it exists.
+
+    A refused line is logged **once per connection**: the refusal is reachable before
+    authentication — the gate lets an unparseable line through precisely because it is refused
+    anyway — so a WARN per refused line is a flood any peer who can reach the port can drive at
+    line rate, which is #95's shape. The counter is what carries the volume, and it is the thing an
+    operator can alert on.
+
+    A working client produces none of these, so any rate at all means somebody is sending something
+    they believe is being stored.
+    """
+    import socket
+    import time
+
+    port = cluster.primary().metrics_port
+    before = metric_value(scrape(port), "ob_refused_commands_total")
+    assert before is not None, "ob_refused_commands_total is not exported at all"
+
+    with socket.create_connection(("127.0.0.1", cluster.primary().tcp_port), timeout=6) as sock:
+        sock.settimeout(6.0)
+        sock.recv(4096)                     # banner
+        for line in ("INSERT MET-REF BINANCE bid 100 5 1 surprise\n",
+                     "PING please\n",
+                     "FROBNICATE\n"):
+            sock.sendall(line.encode())
+            time.sleep(0.15)
+            reply = sock.recv(4096).decode(errors="replace")
+            assert "ERR" in reply.upper(), f"{line.strip()!r} was not refused: {reply!r}"
+
+        # The control, on the same connection: a command that works does not count.
+        sock.sendall(b"PING\n")
+        time.sleep(0.15)
+        assert "PONG" in sock.recv(4096).decode(errors="replace").upper()
+
+    after = metric_value(scrape(port), "ob_refused_commands_total")
+    assert after == before + 3, (
+        f"three refusals and one good command moved the counter from {before} to {after}; "
+        f"a counter that logs once per connection has to count every time, or the volume is "
+        f"invisible")
