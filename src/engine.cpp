@@ -1096,13 +1096,16 @@ Engine::Stats Engine::stats() {
             s.mm_hlc_logical = cur.logical;
             s.mm_hlc_drift_ns = hlc_->max_drift_ns();
         }
-        // Per-peer replication lag, against the WAL offset as of this call.
-        const size_t current_offset = wal_.current_offset();
-        for (const auto& peer : mm_peers) {
-            size_t lag = (current_offset > peer.confirmed_offset)
-                             ? (current_offset - peer.confirmed_offset) : 0;
-            s.mm_replication_lag_per_peer.emplace_back(peer.node_id, lag);
-        }
+        // No per-peer byte lag here, and that is #118 rather than an omission. A mesh peer's
+        // `confirmed_offset` is a position in its **own** WAL, written once in
+        // `process_handshake()` and never updated - the header that declares those fields says so
+        // and says that comparing them with ours was #61. Subtracting it from our offset produced
+        // our own WAL size, measured to the byte on a converged mesh.
+        //
+        // The identical expression for a *replica* survives a few lines above, because a replica
+        // streams our WAL and acknowledges into that field on every ACK. Same arithmetic, one of
+        // them meaningful: a difference of positions is a lag only when both index the same log
+        // **and** the subtrahend is kept current.
     }
 
     return s;

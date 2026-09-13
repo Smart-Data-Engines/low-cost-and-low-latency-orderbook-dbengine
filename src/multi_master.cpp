@@ -635,7 +635,12 @@ std::string MultiMasterManager::handle_mm_peers_command() const {
     std::lock_guard<std::mutex> lock(mtx_);
 
     std::ostringstream oss;
-    oss << "node_id\taddress\tstatus\thlc_timestamp\tlag_bytes\n";
+    // `send_queue_bytes`, not `lag_bytes`. The value has always been `peer.send_buf.size()` -
+    // what this node has queued to send that peer - and the old name had every reader of
+    // `docs/python.md` writing the alert the word "lag" implies. It is a real backpressure signal
+    // and it is zero on a healthy link right up to the 4 MB the sender's socket buffer holds
+    // (#117), so as a lag it was wrong in the direction that looks healthy (#118).
+    oss << "node_id\taddress\tstatus\thlc_timestamp\tsend_queue_bytes\n";
 
     // Only peers appear here, and that is now a property of the container rather than a test in
     // this loop: a connection accepted and not yet named by its handshake lives in `pending_`
@@ -2020,6 +2025,15 @@ ReconcileReport MultiMasterManager::reconcile_with_peers() {
         report.we_lack.insert(report.we_lack.end(), diff.we_lack.begin(), diff.we_lack.end());
         report.peer_lacks.insert(report.peer_lacks.end(),
                                  diff.peer_lacks.begin(), diff.peer_lacks.end());
+
+        // A peer that has not stated its vector, or stated that it cannot, is not a peer that is
+        // behind — it is a peer we know nothing about, and those are different answers. The gaps
+        // above still go into the report because they drive the repair, which is right: sending
+        // everything to a peer that has said nothing is the safe direction. What must not happen
+        // is counting them as lag (#118).
+        if (peer.peer_vector.wants_everything()) {
+            report.peers_position_unknown.push_back(peer.node_id);
+        }
 
         // Send ours again and let the peer's returning vector re-run our filter, so both
         // directions get closed by one exchange.

@@ -359,13 +359,17 @@ std::string format_status(const ServerStats& stats, std::string_view identity) {
         out += "hlc_drift_ns: ";
         out += std::to_string(stats.mm_hlc_drift_ns);
         out += '\n';
-        for (const auto& [peer_id, lag] : stats.mm_replication_lag_per_peer) {
-            out += "replication_lag_peer_";
-            out += std::to_string(peer_id);
-            out += ": ";
-            out += std::to_string(lag);
-            out += '\n';
-        }
+        // `replication_lag_peer_<id>` used to be printed here, and it was not a lag: it was this
+        // node's own WAL offset minus a byte position in the peer's **own** WAL, recorded once at
+        // handshake and never updated. On a mesh converged by row content it therefore equalled
+        // this node's WAL size to the byte, which is to say the engine reported a peer holding
+        // every row as sitting at byte zero (#118).
+        //
+        // Removed rather than re-pointed at the honest number. The honest number is in **records**
+        // and comes from a different mechanism at a different freshness, so keeping the field name
+        // and changing what it means would leave every existing reader parsing the same line and
+        // silently changing subject. `ob_mm_replication_lag_records` is the replacement and it is
+        // a metric, because a number an operator has to read by hand cannot be alerted on (#94).
     }
 
     out += '\n'; // empty line terminator

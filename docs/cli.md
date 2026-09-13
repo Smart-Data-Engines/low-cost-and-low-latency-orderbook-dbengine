@@ -630,14 +630,25 @@ echo "MM_CONFLICTS" | nc localhost 5555
 ```
 
 `MM_PEERS` answers a header line and then one line per peer: `node_id`, `address`, `status`,
-`hlc_timestamp`, `lag_bytes`. Two of those need their names read with care. `status` is
+`hlc_timestamp`, `send_queue_bytes`. Two of those are worth reading carefully. `status` is
 `connected` or `disconnected` — the state of the link, not the `active`/`joining`/`leaving` a node
-publishes about itself in the peer registry. And `lag_bytes` is **not a replication lag**: it is
-what this node has queued to send that peer, so it is zero on a healthy link and stays zero until
-the sender's socket buffer fills. `STATUS`'s `replication_lag_peer_<id>` is not one either — it
-subtracts a position in the peer's own WAL, recorded once at handshake, from this node's offset,
-which on a converged mesh makes it equal to this node's own WAL size. Roadmap #118 carries the
-measurement and the fix; neither number should be alerted on as a lag today.
+publishes about itself in the peer registry. And `send_queue_bytes` is what this node has queued to
+send that peer: zero on a healthy link, and still zero through the few megabytes the sender's
+socket buffer absorbs, so it is a backpressure signal rather than a measure of how far behind the
+peer is.
+
+That column was called `lag_bytes` until #118 and the value has not changed — only the name, which
+was the whole problem: it invited the alert the word "lag" implies on a number that is zero exactly
+when a node has accepted writes it has not yet handed to the kernel. `STATUS` also printed
+`replication_lag_peer_<id>`, which subtracted a position in the peer's **own** WAL, recorded once
+at handshake, from this node's offset — on a converged mesh that equals this node's own WAL size,
+which is to say it reported a peer holding every row as sitting at byte zero. Those lines are
+**gone**, not renamed: the honest number is in records and comes from a different mechanism, so
+keeping the field would have left every reader parsing the same line about a different subject.
+
+**How far behind a mesh peer is, today:** `ob_mm_replication_lag_records` in `/metrics`, read
+beside `ob_mm_peers_position_unknown`. See "When a mesh peer falls behind" in
+[operations.md](operations.md), which says what the pair means and how stale it is.
 
 The command lists **peers**, meaning connections whose handshake has said who they are — an
 inbound connection that has not got that far is not listed, because it used to appear as

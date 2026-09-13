@@ -24,7 +24,7 @@ def client_for(node, timeout: float = 20.0) -> OrderbookEngine:
 
 
 def peers_of(cluster, node) -> list[list[str]]:
-    """MM_PEERS rows as split columns: node_id, address, status, hlc, lag."""
+    """MM_PEERS rows as split columns: node_id, address, status, hlc, send_queue_bytes."""
     return cluster.mm_peer_rows(node)
 
 

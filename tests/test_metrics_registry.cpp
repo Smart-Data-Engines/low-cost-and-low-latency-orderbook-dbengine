@@ -386,35 +386,23 @@ TEST(MetricsRegistry, CorrectlyNamedWritesAreNotReportedAsUnknown) {
     EXPECT_EQ(registry.gauge_value("ob_pending_rows"), 5);
 }
 
-TEST(MetricsRegistry, EveryMetricTheEngineWritesIsRegistered) {
-    // Names the engine and multi-master layer write to. Kept as a list rather than
-    // scanning the sources, so adding a metric means adding it here too.
-    const char* gauges[] = {
-        "ob_pending_rows", "ob_segment_count", "ob_symbol_count", "ob_wal_file_index",
-        "ob_current_epoch", "ob_segment_merge_refused", "ob_active_sessions",
-        "ob_session_pending_bytes",
-        "ob_mm_peers_connected", "ob_mm_replication_lag_bytes", "ob_mm_hlc_drift_ns",
-    };
-    const char* counters[] = {
-        "ob_total_inserts", "ob_total_queries", "ob_total_flushes",
-        "ob_wal_records_written", "ob_repl_records_replayed", "ob_mm_conflicts_total",
-        "ob_mm_anti_entropy_runs_total", "ob_mm_anti_entropy_repairs_total",
-        "ob_mm_backpressure_snapshot_total",
-    };
-    const char* histograms[] = {
-        "ob_insert_latency_seconds", "ob_query_latency_seconds",
-        "ob_flush_latency_seconds",
-    };
+// `EveryMetricTheEngineWritesIsRegistered` used to stand here, and it was a hand-written list of
+// the names the engine writes, with a comment saying the list-ness was the point: "kept as a list
+// rather than scanning the sources, so adding a metric means adding it here too". Nothing enforced
+// that second half, and the list proved it — #118 removed `ob_mm_replication_lag_bytes` from the
+// registry and this test kept writing to it, which is the *easy* direction of the failure. The
+// other direction is silent: a metric the engine writes and nobody adds here would never be
+// noticed.
+//
+// It is deleted rather than repaired, because the job it was doing is done mechanically and in
+// both directions by `scripts/check_metrics.py`, which runs in the required `docs-integrity` job:
+// every name handed to `increment_counter` and friends must be registered, and every registration
+// must be written by something. A list you wrote yourself is not evidence about the code (#32),
+// and a second copy of a guarantee cannot be mutated separately from the first.
+//
+// What this file still pins is the **mechanism** the deleted test depended on, in the two tests
+// above: an unregistered write is counted and logged, and a correctly named one is not.
 
-    ob::MetricsRegistry registry;
-    for (const char* name : gauges)     registry.set_gauge(name, 1);
-    for (const char* name : counters)   registry.increment_counter(name, 1);
-    for (const char* name : histograms) registry.observe_histogram(name, 0.001);
-
-    EXPECT_EQ(registry.unknown_metric_writes(), 0u)
-        << "at least one name written by the engine is not registered, so its value "
-           "is discarded and /metrics reports zero for it";
-}
 
 // ── Arithmetic that belongs to metrics rather than to its callers (#117) ──────
 //

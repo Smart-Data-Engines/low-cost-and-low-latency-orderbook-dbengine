@@ -57,13 +57,12 @@ ANY_LITERAL = re.compile(r'"(ob_[a-z0-9_]+)"')
 # Registered, fed by nothing, and known. Each line is a claim that the gap is understood rather
 # than unnoticed; #117 carries the work. Removing a name from here without feeding the metric puts
 # this check back to red, which is the point.
-NOT_YET_WRITTEN = {
-    # One left, and it is the one that cannot be fed honestly rather than the one nobody got to.
-    # #118 measured why: the only per-peer position the mesh has is a byte offset into the peer's
-    # own WAL, frozen at handshake, so subtracting it from ours yields this node's own WAL size.
-    # The honest mesh answer is in records, from compare_vectors(), which is a different metric
-    # with a different name - so this entry is waiting to be *removed*, not filled.
-    "ob_mm_replication_lag_bytes": "#118 - a byte lag the mesh cannot state; the fix renames it",
+NOT_YET_WRITTEN: dict[str, str] = {
+    # Empty, and that is the state to keep it in. The last entry was
+    # `ob_mm_replication_lag_bytes`, removed from the registry by #118 rather than fed, because
+    # the mesh has no byte position two nodes can compare. An entry here is a promise with an
+    # item number on it; the `stale_allowlist` branch below is what stops one outliving its
+    # reason, and removing that metric is the first thing that exercised it.
 }
 
 
@@ -123,8 +122,9 @@ def main() -> int:
 
     print(f"src/metrics.cpp: {len(registered)} metrics registered, "
           f"{len(written)} written by name, all resolve; "
-          f"{len(NOT_YET_WRITTEN)} registered and knowingly fed by nothing "
-          f"({', '.join(sorted(NOT_YET_WRITTEN))})")
+          + (f"{len(NOT_YET_WRITTEN)} registered and knowingly fed by nothing "
+             f"({', '.join(sorted(NOT_YET_WRITTEN))})"
+             if NOT_YET_WRITTEN else "and none is registered and fed by nothing"))
     return 0
 
 

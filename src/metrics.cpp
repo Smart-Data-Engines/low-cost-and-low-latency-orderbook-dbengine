@@ -145,7 +145,26 @@ MetricsRegistry::MetricsRegistry() {
     counters_.push_back(make_counter("ob_replication_duplicates_dropped",
                                      "Replicated records refused because this node had already applied them"));
     counters_.push_back(make_counter("ob_sequence_gaps_detected",  "Gaps detected in an origin's sequence numbering"));
-    gauges_.push_back(make_gauge("ob_mm_replication_lag_bytes",    "Replication lag in bytes (max across peers)"));
+    // `ob_mm_replication_lag_bytes` used to be registered here and was never written, which is
+    // how #117 found it. It is **removed** rather than fed, because #118 measured that the mesh
+    // has no byte position to compute it from: a peer's `confirmed_offset` is an offset into that
+    // peer's own WAL, recorded once at handshake. The two gauges below are the replacement, and
+    // they are a different question with a different unit - which is exactly why the old name
+    // could not be reused.
+    gauges_.push_back(make_gauge("ob_mm_replication_lag_records",
+                                 "Records the furthest-behind mesh peer is known to be missing, "
+                                 "from the per-origin sequence vectors - the one position two "
+                                 "nodes can compare. Peers that have not stated what they hold "
+                                 "are excluded and counted in ob_mm_peers_position_unknown, "
+                                 "because a peer that has said nothing is reported by the "
+                                 "comparison as holding nothing. Recomputed once per "
+                                 "anti-entropy pass, so it is as stale as "
+                                 "--anti-entropy-interval-seconds allows"));
+    gauges_.push_back(make_gauge("ob_mm_peers_position_unknown",
+                                 "Connected peers that have not said what they hold. Read it "
+                                 "beside ob_mm_replication_lag_records: zero lag with a nonzero "
+                                 "count here means 'we do not know', which is a different answer "
+                                 "from 'converged' and would otherwise share its number"));
     counters_.push_back(make_counter("ob_mm_anti_entropy_runs_total",    "Total number of anti-entropy runs"));
     counters_.push_back(make_counter("ob_mm_anti_entropy_repairs_total", "Total number of anti-entropy repairs"));
     gauges_.push_back(make_gauge("ob_mm_reconcile_gaps_detected",
