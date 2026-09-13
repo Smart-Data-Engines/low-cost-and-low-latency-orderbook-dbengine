@@ -2134,6 +2134,25 @@ Learned the hard way. Check here before debugging.
     already written down and the guard implements only half of it; the other half is asserting the
     *behaviour* changed, which no textual check can do for you.
 
+254. **"Filed rather than fixed" stops being available once your own change makes the defect
+    reachable.** Reading the code showed `repl_client_` read under `mtx_` by `stats()` and written
+    without it by `promote_to_primary()`, and filing it (#122) was defensible on the grounds that a
+    change about metrics should not touch a failover path. Then
+    `sanitizers-integration (tsan)` went red on that very PR, naming
+    `unique_ptr<ReplicationClient>::reset` **and** `operator delete` — so it is a use-after-free
+    window rather than a torn read, which reading had not established, and the new publisher is
+    what exposed it: `stats()` runs on a `STATUS` command, the flush tick runs every interval. The
+    general form: when you add a **reader** to shared state, the frequency you add it at is part of
+    the change, and a latent race is a race whose probability you just multiplied.
+
+255. **Before deferring a fix, look for the same operation done correctly elsewhere in the file.**
+    The answer to #122 was ten lines further down: `demote_to_replica()` already took ownership
+    under the lock and destroyed through a local, with a comment saying "for the reason above" —
+    about a reason the other site was breaking. Two call sites of one idiom, one of them wrong, and
+    the correct one carrying the explanation. That is the same asymmetry as #79's
+    `shutdown()`/`take_result()` pair and as #118's two subtractions, and it means the cheap first
+    question is not "how do I fix this" but "does this file already do it right somewhere".
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2263,6 +2282,13 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   What the engine promises, measured: after `heal()` the mesh converges **by row content**; a frame
   cut at byte 20 of a 38-byte header is **not applied in part**; and a reconnect's catch-up
   re-delivers records without storing any twice. What it does **not** promise today is #117.
+- **A new reader of shared state changes how often a latent race fires, and that is part of the
+  change** (#122, closed). `repl_client_` was read under `mtx_` by `stats()` and written without it
+  by `promote_to_primary()`; the fix is the idiom `demote_to_replica()` ten lines down already
+  used — take ownership under the lock, join and destroy through a local. It was filed rather than
+  fixed until TSan went red on the PR that added a publisher reading that pointer **every flush
+  interval** instead of on a `STATUS` command, and the report named `operator delete` as well as
+  `reset`, so it is a use-after-free window rather than a torn pointer.
 - **Four of #117's five dead metrics are fed; the fifth is #118's to rename, not ours to fill.**
   `ob_wal_records_written` counts **every** record type in one shared `advance_after_write()` —
   both write paths had the identical five-line accounting block, which is #94's shape, and a

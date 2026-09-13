@@ -2175,46 +2175,64 @@ question is recorded as #121 rather than settled quietly here.
   nothing in the engine would notice — anti-entropy compares what each side holds, and two sides
   each holding a different winner look consistent to it. Never observed in the wild
 
-### 122. The replication client's pointer is written without the lock every reader holds
+### 122. The replication client's pointer was written without the lock every reader holds ✅
 
 Found while giving `ob_repl_records_replayed` a publisher (#117), because the number to publish
-lives behind that pointer.
+lives behind that pointer — and then **confirmed by TSan in the same PR**, because that publisher
+is what made it fire.
 
-`Engine::stats()` reads `repl_client_` with `mtx_` held — it takes the lock and then tests the
-pointer forty lines later. `Engine::promote_to_primary()` **releases** `mtx_` and then does
-`repl_client_.reset()`:
+`Engine::stats()` reads `repl_client_` with `mtx_` held. `Engine::promote_to_primary()` released
+`mtx_` and *then* wrote the member:
 
 ```cpp
 std::unique_lock<std::mutex> lock(mtx_);
-...
 if (repl_client_) {
     lock.unlock();
     repl_client_->stop();
-    repl_client_.reset();      // the pointer is written here, unlocked
+    repl_client_.reset();      // the member is written here, unlocked
     lock.lock();
 }
 ```
 
-The unlock is there for a reason — `stop()` joins a thread that may need `mtx_`, so holding it
-across the join is #79's deadlock — but the `reset()` after the join does not need to be outside.
-So the reader is disciplined and the writer is not, which is the shape #41, #49 and #83 all were:
-**the thread that owns an object is the thread that destroys it**, and the destruction has to be
-visible to whoever is allowed to look.
+The unlock is not the defect and has to stay: `stop()` joins the client's threads, and holding
+`mtx_` across a join the joined thread may need is #79's deadlock. What was wrong is only *when
+the member is written*.
 
-Reachable on the ordinary promotion path, with `STATUS` and every `/metrics` scrape as the reader.
-Not observed: the window is a few instructions wide and a promotion is rare, so the integration
-battery under TSan has not caught it — which is an argument about probability rather than about
-safety, and #91 is the item where "only a sanitizer would see it" turned out to mean five failures
-out of five once measured.
+**The fix is the idiom already in this file, ten lines further down.** `demote_to_replica()` takes
+ownership **under** the lock and destroys through a local, with a comment saying "for the reason
+above" — about a reason this site was breaking:
 
-Filed rather than fixed by #117, deliberately: moving the `reset()` back inside the lock changes a
-failover path, and a change about metrics is the wrong place to do that. What #117 did instead was
-read the pointer under `mtx_` the way `stats()` does, so the new reader is no worse than the
-existing one.
+```cpp
+if (std::unique_ptr<ReplicationClient> client = std::move(repl_client_)) {
+    lock.unlock();
+    client->stop();
+    client.reset();
+    lock.lock();
+}
+```
 
-- Effort: S | Impact: a torn read of a `unique_ptr` on the promotion path, with the status command
-  as the reader. Undefined behaviour rather than a wrong number, so the symptom is whatever the
-  compiler chose
+The member write happens with the lock held; the join and the destruction happen on a local no
+other thread can reach. The ordering `promote_to_primary()` depends on further down is unchanged —
+`stop()` and the destructor still run before `discard_saved_replication_position()`, which matters
+because `stop()` ends with `save_state()`.
+
+**How it was found is the part worth keeping.** Reading the code said the reader was disciplined
+and the writer was not, which is the shape #41, #49 and #83 all were. It was filed rather than
+fixed on the argument that a change about metrics is the wrong place to touch a failover path —
+and then `sanitizers-integration (tsan)` went red on that very PR, naming
+`std::__uniq_ptr_impl<ob::ReplicationClient>::reset` and, separately, `operator delete`. Two things
+follow. The race is a **use-after-free window** rather than a torn pointer read, which reading it
+had not established. And the new publisher is what made it reachable: `stats()` runs on a `STATUS`
+command or a scrape, while the flush tick runs every interval — so the frequency changed by orders
+of magnitude even though the new reader took the correct lock.
+
+Which retires the argument for deferring it. **"Filed rather than fixed" stops being available
+once your own change makes a defect reachable**, and a PR that leaves a required check red is not
+a PR.
+
+- Effort: S | Impact: a use-after-free window on the ordinary promotion path, with `STATUS` and
+  every `/metrics` scrape as the reader. Present since the replica path existed; reported the first
+  time anything read that pointer often enough
 
 ### 121. Nothing bounds how far a peer's clock can move ours, and the move is permanent
 
@@ -5547,7 +5565,7 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Two defects are open and one question is recorded for a decision.** **#117** is closed by the
+**One defect is open and one question is recorded for a decision.** **#117** and **#122** are closed by the
 commit that carries this line: four of its five metrics are fed, and the fifth is not because #118
 measured that it cannot be — the mesh has no byte position to compare, so the entry moved to that
 item and is waiting to be **removed** rather than filled. Making the io_uring pair honest found
@@ -5555,10 +5573,12 @@ three defects in six lines of a loop no CI job runs, the worst of them a counter
 number rather than none: `ob_iouring_sqe_submitted` carried the completion count, so comparing it
 against `ob_iouring_cqe_processed` to find a backlog compared a number with itself.
 
-**#122** came out of that work and is the shape #41, #49 and #83 all were: `repl_client_` is read
-under `mtx_` by `stats()` and written **without** it by `promote_to_primary()`. Filed rather than
-fixed, because moving the reset back inside the lock changes a failover path and a change about
-metrics is the wrong place for it.
+**#122** came out of that work, is the shape #41, #49 and #83 all were — `repl_client_` read under
+`mtx_` by `stats()` and written **without** it by `promote_to_primary()` — and is closed by the
+same commit. It was filed rather than fixed on the argument that a change about metrics should not
+touch a failover path, and then TSan went red on that PR naming `unique_ptr::reset` and
+`operator delete`: the new publisher runs every flush interval where `stats()` runs on demand, so
+the change made a latent race reachable. That argument does not survive its own consequence.
 
 **#121** is the question stage D left behind, filed rather than answered because a ceiling on the
 drift a peer may introduce costs causal order against that peer.

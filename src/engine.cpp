@@ -1552,10 +1552,24 @@ void Engine::promote_to_primary(const EpochValue& new_epoch) {
     std::unique_lock<std::mutex> lock(mtx_);
 
     // Stop ReplicationClient if running.
-    if (repl_client_) {
+    //
+    // Ownership is taken **under** the lock and the object is destroyed through the local, which
+    // is the same shape `demote_to_replica()` uses ten lines further down — and whose comment
+    // there says "for the reason above" about a reason this site used to break. It wrote
+    // `repl_client_.reset()` with `mtx_` released while every reader of that pointer holds it, so
+    // the member was written unlocked: #122.
+    //
+    // The unlock is still needed and is not the defect. `stop()` joins the client's threads, and
+    // holding `mtx_` across a join that the joined thread may need is #79's deadlock. What moves
+    // is only *when the member is written*: the move happens with the lock held, and the
+    // destruction happens on a local nobody else can reach.
+    //
+    // The ordering the paragraph below depends on is unchanged: `stop()` and the destructor both
+    // run before `discard_saved_replication_position()`.
+    if (std::unique_ptr<ReplicationClient> client = std::move(repl_client_)) {
         lock.unlock();
-        repl_client_->stop();
-        repl_client_.reset();
+        client->stop();
+        client.reset();
         lock.lock();
     }
 
@@ -1919,13 +1933,14 @@ void Engine::flush_tick() {
         publish_counter_delta("ob_wal_records_written", wal_.records_written(),
                               published_wal_records_);
 
-        // `repl_client_` is read under `mtx_` because that is the discipline `stats()` uses for
-        // the same pointer, and the write side does **not** hold it — `promote_to_primary()`
-        // releases `mtx_` before `repl_client_.reset()`, so the pointer is written unlocked while
-        // a reader holds the lock. That is #122, filed rather than fixed here: moving the reset
-        // back inside the lock changes a failover path, which does not belong in a change about
-        // metrics. Copying the total out under the lock and publishing outside it keeps this new
-        // reader no worse than the existing one.
+        // Read under `mtx_`, which is the discipline `stats()` uses for the same pointer — and
+        // which the write side did not: `promote_to_primary()` released `mtx_` before
+        // `repl_client_.reset()`. That was #122, and this publication is what made it fire.
+        // `stats()` runs on a STATUS command or a scrape; this runs every flush interval, so the
+        // race went from theoretical to reported by TSan in the integration battery, as a race on
+        // `unique_ptr::reset` **and on `operator delete`** — a use-after-free window rather than a
+        // torn pointer. It is fixed in the same change, because "filed rather than fixed" stops
+        // being available once your own change makes a defect reachable.
         uint64_t replayed = 0;
         bool have_replica = false;
         {
