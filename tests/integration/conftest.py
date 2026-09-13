@@ -12,6 +12,8 @@ Provides:
 from __future__ import annotations
 
 import atexit
+import base64
+import json
 import os
 import shutil
 import signal
@@ -416,6 +418,11 @@ class ClusterManager:
         # suppression list: a node that dies while etcd is gone is the defect that stage
         # hunts, so the report stays and gains the sentence that makes it readable.
         self._etcd_stopped_at: Optional[float] = None
+        # Peer keys this harness overwrote to insert a proxy (#54 stage C). Overwriting
+        # drops the engine's lease from the key, so the entry is permanent and must be
+        # deleted on teardown - otherwise a module-scoped cluster leaves the next test
+        # looking at a peer that no longer exists.
+        self._redirected_peer_keys: set = set()
         # Processes this harness escalated from SIGTERM to SIGKILL, by `id(proc)` and when.
         self._sigkilled_by_harness: dict = {}
         self.etcd_client_port: int = 0
@@ -479,6 +486,13 @@ class ClusterManager:
             except Exception:
                 pass
         self._node_logs = []
+
+        # Before etcd stops, because afterwards there is nothing to delete from - and these keys
+        # have no lease to expire them (#54 stage C).
+        try:
+            self._remove_redirected_peers()
+        except Exception:
+            pass
 
         try:
             self._stop_etcd()
@@ -586,6 +600,81 @@ class ClusterManager:
         raise RuntimeError(
             f"etcd not ready after {timeout}s: {last_err}"
         )
+
+    def _etcd_call(self, path: str, payload: dict) -> dict:
+        """One JSON call to etcd's HTTP gateway, the same door the engine uses.
+
+        Raises on anything but a 200, because a coordinator that answers 404 with a JSON error body
+        is the shape that cost #74 a week: `http_post()` handed that body back as though it were a
+        result. A helper whose failure looks like an empty answer is worse than one that raises.
+        """
+        url = f"http://127.0.0.1:{self.etcd_client_port}{path}"
+        request = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST")
+        request.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            if response.status != 200:
+                raise RuntimeError(f"etcd {path} answered {response.status}")
+            body = response.read().decode()
+        return json.loads(body) if body.strip() else {}
+
+    def redirect_peer(self, node_index: int, address: str) -> None:
+        """Point every peer that dials node `node_index` at `address` instead (#54 stage C).
+
+        **This needs no change in the engine, and that is why it is the insertion point.**
+        `PeerRegistry::register_self()` runs exactly once, at start (`src/multi_master.cpp:350`),
+        publishing `127.0.0.1:<mm-replication-port>` under `<prefix>mm_peers/<node_id>`. There is
+        no re-publication and nothing re-reads its own entry, so overwriting the value after the
+        node is up makes every peer dial whatever is written there.
+
+        **Read-modify-write rather than composing the document, and the reason is not tidiness.**
+        The engine writes six fields (`address`, `last_hlc`, `node_id`, `status`,
+        `wal_byte_offset`, `wal_file_index`) and parses them back with `PeerInfo::from_json`. A
+        harness that built that JSON would hold a second copy of the format, which is how four
+        modules came to hold their own path to the server binary (pitfall 77) and how two languages
+        came to disagree about a default in the flagship product. Patching one field leaves the
+        format where its owner is.
+
+        **The cost, named because it is also the point.** `register_self` PUTs under a lease;
+        overwriting without one detaches the key from that lease, so the engine's keepalive will
+        not restore the value (it refreshes a TTL, not a value) and the lease expiring will not
+        remove the key. The entry therefore outlives the node — which is exactly the #97 shape a
+        test may want, a peer address pointing nowhere — and is why teardown deletes it.
+        """
+        node_id = node_index + 1
+        key = f"/ob/mm_peers/{node_id}"
+        key_b64 = base64.b64encode(key.encode()).decode()
+
+        found = self._etcd_call("/v3/kv/range", {"key": key_b64})
+        kvs = found.get("kvs") or []
+        if not kvs:
+            raise RuntimeError(
+                f"no peer entry at {key} to redirect. The node must be up and registered first: "
+                f"this is a one-shot registration, so a redirect issued before it lands writes a "
+                f"key the engine then overwrites")
+
+        value = json.loads(base64.b64decode(kvs[0]["value"]).decode())
+        was = value.get("address")
+        value["address"] = address
+        self._etcd_call("/v3/kv/put", {
+            "key": key_b64,
+            "value": base64.b64encode(json.dumps(value).encode()).decode(),
+        })
+        self._redirected_peer_keys.add(key_b64)
+        print(f"    redirected peer {node_id}: {was} -> {address}")
+
+    def _remove_redirected_peers(self) -> None:
+        """Delete the keys this harness overwrote, because they have no lease to expire.
+
+        Deleted rather than restored to the node's own address: the node's registration was leased
+        and dies with it, so "no such peer" is the truthful state for a torn-down cluster, while a
+        restored value would be a permanent key describing a node that is gone.
+        """
+        for key_b64 in list(self._redirected_peer_keys):
+            try:
+                self._etcd_call("/v3/kv/deleterange", {"key": key_b64})
+            except Exception:
+                pass
+        self._redirected_peer_keys.clear()
 
     def _stop_etcd(self) -> None:
         proc = self.etcd_process

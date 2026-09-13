@@ -2091,6 +2091,58 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 117. Five metrics are registered and fed by nothing, and one of them is the only signal a partitioned mesh could give
+
+Found by #54 stage C, which needed a "replication lag" number for requirement 1.4 and went looking
+for the gauge already named after it.
+
+**`ob_mm_replication_lag_bytes` is registered, documented as "Replication lag in bytes (max across
+peers)", and written nowhere.** It appears in `src/metrics.cpp` and in no other file in the tree, so
+`/metrics` has always reported **0** for it. An operator alerting on replication lag would be
+alerting on a constant.
+
+Four more are in the same state: `ob_wal_records_written`, `ob_repl_records_replayed`,
+`ob_iouring_cq_overflows`, `ob_iouring_sq_utilization`. The last two are consistent with #108 —
+nothing built that transport until this month, and it still publishes neither of its own metrics.
+
+**Why the existing check could not see this, and what now does.**
+`scripts/check_metrics.py` walks from writes to registrations: every name handed to
+`increment_counter` and friends must be registered. A registration with no write is invisible to
+that direction, and the script's own docstring said so — *"What it cannot prove: … or that a
+registered metric is ever written. Read those yourself."* A gauge nobody sets reads as **zero**,
+which is the one value an operator cannot distinguish from good news: #23's lesson about a counter
+meaning two things, one level up.
+
+The reverse direction is in that script now, with an allowlist naming this item, so removing a name
+from the allowlist without feeding the metric puts the check back to red. Two mutations, both
+caught: a dead metric taken off the allowlist, and a live metric put on it.
+
+**The reverse scan is deliberately looser than the forward one**, and the reason is a false
+positive it produced first. Three subscription counters are written through a local `publish(name,
+…)` lambda in `tcp_server.cpp`, so the literal sits next to `publish` rather than next to
+`increment_counter` — a strict scan called them dead. For finding *dead* metrics, "the name appears
+as a literal anywhere in `src/` or `tools/`" is the right direction to be wrong in: it can miss a
+name that is only mentioned, never a name that is genuinely fed. Worth knowing for the forward
+direction too, which has the same blind spot and would miss an **unregistered** metric written
+through a wrapper.
+
+**What this costs #54 stage C, measured.** Requirement 1.4 says no node may accept writes it cannot
+replicate without saying so. The first clause — after healing the mesh converges by row content —
+is tested and passing. The second has no passing test, because the only signal the engine feeds is
+`ob_mm_peer_send_buf_bytes`, its **own** queue, taken from `peer.send_buf.size()`. That grows only
+once `send()` has returned `EAGAIN`, which needs the *sender's* socket buffer full first — and the
+engine sets no `SO_SNDBUF`, so it is `tcp_wmem`'s maximum: **4 MB on this machine**. So up to four
+megabytes of writes a node has accepted and cannot replicate are reported by nothing at all.
+
+Narrowing the proxy's receive buffer does not shorten that, and finding out why was the useful
+part: TCP accumulates unsent data in the **sender's** buffer, which belongs to the engine, not to
+anything a test can reach.
+
+- Effort: S for the WAL and replication counters, M for the mesh lag gauge (it needs each peer's
+  acknowledged position, which `PeerInfo` already carries) | Impact: an operator watching for
+  replication lag watches a constant, and a mesh node can hold 4 MB of unreplicated writes without
+  a single number moving
+
 ### 116. A node whose coordinator is unreachable writes two WARN lines a second for ever, and one of them names a consequence that did not happen ✅
 
 Found by #54 stage B, which set out to check refusals and had to read the logs to do it.
@@ -5216,9 +5268,15 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**No defect is open.** #115 and #116 were the last two, both found by #54 stage B — which set out
-to check refusals and had to read the logs to do it — and both were about what the log says rather
-than what the engine does. Measured across a coordinator outage, before and after: **2.17 and 2.23
+**One defect is open: #117**, five registered metrics that nothing feeds — found by #54 stage C
+going to look for the "replication lag" gauge it needed and finding it had always read zero. The
+same measurement says a mesh node can hold **4 MB** of unreplicated writes without a single number
+moving, because the only signal it feeds is its own queue and that begins after the sender's socket
+buffer is full.
+
+#115 and #116 before it were also about what the log says rather than what the engine does, and
+were found the same way — by #54 stage B, which set out to check refusals and had to read the logs
+to do it. Measured across a coordinator outage, before and after: **2.17 and 2.23
 lines per second per node became 0.40 and 0.45**, the replica's correct refusal to campaign went
 from **zero** mentions at the default level to exactly one, and the one warning that was false
 where it stood now stands where it is true. The holder still steps down in **2.28 s**, unchanged,
