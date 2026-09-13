@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
-"""Do the two mesh fields named after a replication lag report one? Measured, not argued.
+"""What the mesh reports about how far behind its peers are — before and after #118.
 
-Written for roadmap #118. Two places answer the question "how far behind is this peer", and
-neither of them is asked by any test:
+Written to answer the question #117 needed and could not get: `ob_mm_replication_lag_bytes` was
+registered and written nowhere, and the two fields that *were* fed turned out not to be lags.
 
-  * `STATUS` prints `replication_lag_peer_<id>`, computed in `Engine::stats()` as
-    `wal_.current_offset() - peer.confirmed_offset`.
-  * `MM_PEERS` prints a column literally named `lag_bytes`, whose value is
-    `peer.send_buf.size()` — this node's own outbound queue for that peer.
+`STATUS` printed `replication_lag_peer_<id>` as this node's WAL offset minus a mesh peer's
+`confirmed_offset`, which `include/orderbook/multi_master.hpp` says is a position in the peer's
+**own** WAL, written once in `process_handshake()`. On a converged mesh that made the printed lag
+equal this node's own WAL offset to the byte — the engine reporting a peer that held every row as
+sitting at byte zero. `MM_PEERS`' column was named `lag_bytes` and held `peer.send_buf.size()`,
+this node's send queue, flat through the 4 MB the sender's socket buffer holds.
 
-`include/orderbook/multi_master.hpp` says what `confirmed_offset` is, in the file that declares
-it: a position in the *peer's own* WAL, kept for the MM_PEERS view only, and not to be compared
-with ours because "#61 was the consequence of comparing them with ours". It is written in exactly
-one place, `process_handshake()`, so it is also frozen at connect time.
-
-So the prediction this script exists to check is specific: on a mesh where every node holds every
-row, `replication_lag_peer_<id>` should equal this node's own WAL offset, because the subtrahend
-never moves off the value it had when the peer connected. Convergence is established by comparing
-row *content*, not by sleeping — storage is append-only, so a count alone would accept duplicates
-in place of the rows it is looking for.
+Neither field exists in that form any more. This script now measures the replacement, and the
+acceptance is the pair: on a converged mesh `ob_mm_replication_lag_records` is **0** with
+`ob_mm_peers_position_unknown` also 0 — the second half matters, because a peer that has not
+stated what it holds is reported by the comparison as holding nothing, so a lag of zero alone
+cannot tell "converged" from "no idea".
 
 Needs a built build/ob_tcp_server and a native etcd on PATH (or ETCD env var). Two nodes rather
-than three on purpose: the claim is about one link, and this machine has better things to do.
+than three: the claim is about one link.
 
     python3 scripts/measure_mesh_lag.py
 """
@@ -29,6 +26,7 @@ from __future__ import annotations
 
 import glob
 import os
+import urllib.request
 import shutil
 import sys
 import time
@@ -46,20 +44,25 @@ BATCH = int(os.environ.get("MESHLAG_BATCH", "120"))
 PHASES = int(os.environ.get("MESHLAG_PHASES", "3"))
 
 
-def status_lags(port: int) -> dict[int, int]:
-    """Every `replication_lag_peer_<id>` line STATUS prints.
-
-    An empty dict means "no peer record yet", which is a different statement from "lag zero" —
-    the distinction that made an earlier mesh defect invisible (#84).
-    """
-    reply = H.command(port, "STATUS\n", settle=0.6)
-    out: dict[int, int] = {}
-    for line in reply.splitlines():
-        line = line.strip()
-        if line.startswith("replication_lag_peer_"):
-            name, _, raw = line.partition(":")
-            out[int(name[len("replication_lag_peer_"):])] = int(raw.strip())
+def metrics(port: int) -> dict[str, float]:
+    """The metrics endpoint as a name -> value map, comments dropped."""
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5) as fh:
+        body = fh.read().decode()
+    out: dict[str, float] = {}
+    for line in body.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        name, _, value = line.partition(" ")
+        try:
+            out[name.split("{")[0]] = float(value)
+        except ValueError:
+            continue
     return out
+
+
+def status_has_byte_lag(port: int) -> bool:
+    """Whether STATUS still prints a per-peer byte lag, which it must not (#118)."""
+    return "replication_lag_peer_" in H.command(port, "STATUS\n", settle=0.6)
 
 
 def mm_peers(port: int) -> list[dict[str, str]]:
@@ -101,57 +104,64 @@ def main() -> int:
         for node in nodes:
             node.start()
         a, b = nodes[0].tcp, nodes[1].tcp
+        ma, mb = nodes[0].ports[1], nodes[1].ports[1]
 
+        # Wait for the single mesh link to finish its handshake. MM_PEERS lists peers, meaning
+        # connections whose handshake has named them, so an empty answer is "not connected yet"
+        # rather than "no lag".
         deadline = time.time() + 30
-        while time.time() < deadline and not (status_lags(a) and status_lags(b)):
+        while time.time() < deadline and not (mm_peers(a) and mm_peers(b)):
             time.sleep(0.5)
-        if not status_lags(a):
+        if not mm_peers(a):
             raise RuntimeError("the mesh link never finished its handshake")
 
-        print(f"handshake: node0 STATUS={status_lags(a)}  node1 STATUS={status_lags(b)}  "
-              f"wal={wal_offset(nodes[0])}/{wal_offset(nodes[1])}")
-        print(f"           node0 MM_PEERS={mm_peers(a)}")
+        # The two fields #118 removed must be gone, and this is the cheap half of the check.
+        for port, name in ((a, "node0"), (b, "node1")):
+            if status_has_byte_lag(port):
+                print(f"REGRESSION: {name} STATUS still prints replication_lag_peer_")
+            columns = set(mm_peers(port)[0])
+            if "lag_bytes" in columns:
+                print(f"REGRESSION: {name} MM_PEERS still has a lag_bytes column")
+        print(f"MM_PEERS columns: {sorted(set(mm_peers(a)[0]))}")
         print()
-        # `implied` is the decisive column, and it is arithmetic on the two beside it rather
-        # than a new measurement: the engine computes lag as `our offset - peer.confirmed_offset`,
-        # so `our offset - lag` is the position it believes that peer holds. Printed because
-        # "the lag equals our WAL size" can be read as a coincidence of two similar numbers,
-        # while "the engine believes a peer holding every row is at byte 0" cannot.
-        print(f"{'phase':>5}  {'rows 0':>7} {'rows 1':>7}  {'wal 0':>8} {'lag@0':>8} "
-              f"{'implied':>8}  {'wal 1':>8} {'lag@1':>8}  {'queued@0':>9}")
+        print(f"{'phase':>5}  {'rows 0':>7} {'rows 1':>7}  {'wal 0':>8}  "
+              f"{'lag_records':>11} {'unknown':>8}  {'queue_bytes':>11}")
 
         base = 1_700_000_000_000_000_000
+        worst_lag = 0.0
         for phase in range(1, PHASES + 1):
             write_batch(a, BATCH, base + phase * 1_000_000)
 
             # Converge on row content. Append-only storage means a count would also be satisfied
             # by duplicates, which is how the first attempt at fixing #61 read as a pass.
-            convergence = time.time() + 30
+            convergence = time.time() + 40
             while time.time() < convergence and H.prices(a, SYMBOL) != H.prices(b, SYMBOL):
                 time.sleep(0.5)
             rows_a, rows_b = H.prices(a, SYMBOL), H.prices(b, SYMBOL)
 
-            lag_a = status_lags(a).get(2, -1)
-            lag_b = status_lags(b).get(1, -1)
-            queued = ",".join(r.get("lag_bytes", "?") for r in mm_peers(a))
-            implied = wal_offset(nodes[0]) - lag_a
+            # The anti-entropy pass is what recomputes the records lag, so give it one interval
+            # to run before reading — a gauge that is only as fresh as that pass has to be read
+            # that way, and reading it sooner would measure the interval rather than the mesh.
+            time.sleep(float(os.environ.get("MMH_AE_INTERVAL", "3")) + 1.0)
+            m = metrics(mb)
+            lag = m.get("ob_mm_replication_lag_records", -1.0)
+            unknown = m.get("ob_mm_peers_position_unknown", -1.0)
+            worst_lag = max(worst_lag, lag)
+            queue = ",".join(r.get("send_queue_bytes", "?") for r in mm_peers(a))
+
             print(f"{phase:>5}  {len(rows_a):>7} {len(rows_b):>7}  "
-                  f"{wal_offset(nodes[0]):>8} {lag_a:>8} {implied:>8}  "
-                  f"{wal_offset(nodes[1]):>8} {lag_b:>8}  {queued:>9}"
+                  f"{wal_offset(nodes[0]):>8}  {lag:>11.0f} {unknown:>8.0f}  {queue:>11}"
                   f"{'' if rows_a == rows_b else '   NOT CONVERGED'}")
 
         print()
-        print("Read three things off the columns above:")
-        print("  * rows 0 == rows 1 in every phase: the mesh is converged, by content.")
-        print("  * implied == 0 in every phase: the position this node believes its peer holds")
-        print("    is byte zero, while that peer's own WAL is thousands of bytes long and holds")
-        print("    every row. The subtrahend was written once, at handshake, and nothing has")
-        print("    touched it since — so the 'lag' is this node's own WAL size wearing a name.")
-        print("  * MM_PEERS lag_bytes stays 0: it is send_buf.size(), which only leaves zero")
-        print("    once the sender's socket buffer is full — 4 MB here, measured under #117.")
-        print("  MM_PEERS status also reads 'connected', not the 'active'/'joining'/'leaving'")
-        print("  that docs/python.md documents for that field; that vocabulary is the peer")
-        print("  registry's, not this column's.")
+        print("Read the pair, not either half:")
+        print("  * lag_records 0 with unknown 0 is the only reading that means converged. A lag of")
+        print("    zero on its own cannot tell that from a peer that has not said what it holds,")
+        print("    because the comparison reports silence as holding nothing.")
+        print("  * queue_bytes is the old `lag_bytes` column under the name of what it holds —")
+        print("    this node's send queue, zero on a healthy link and zero through the 4 MB the")
+        print("    sender's socket buffer absorbs (#117). It was never a lag.")
+        print(f"  * worst lag_records seen across the run: {worst_lag:.0f}")
         return 0
     finally:
         for node in nodes:

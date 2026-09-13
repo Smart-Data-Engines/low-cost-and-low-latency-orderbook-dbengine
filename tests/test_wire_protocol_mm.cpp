@@ -228,7 +228,6 @@ TEST(StatusResponseMM, ContainsMultiMasterSection) {
     stats.mm_hlc_physical_ns = 1700000000000000000ULL;
     stats.mm_hlc_logical = 17;
     stats.mm_hlc_drift_ns = 500000;
-    stats.mm_replication_lag_per_peer = {{2, 1024}, {5, 2048}};
 
     std::string response = ob::format_status(stats);
 
@@ -245,8 +244,6 @@ TEST(StatusResponseMM, ContainsMultiMasterSection) {
     EXPECT_NE(response.find("hlc_physical_ns: 1700000000000000000"), std::string::npos);
     EXPECT_NE(response.find("hlc_logical: 17"), std::string::npos);
     EXPECT_NE(response.find("hlc_drift_ns: 500000"), std::string::npos);
-    EXPECT_NE(response.find("replication_lag_peer_2: 1024"), std::string::npos);
-    EXPECT_NE(response.find("replication_lag_peer_5: 2048"), std::string::npos);
 }
 
 TEST(StatusResponseMM, NoMultiMasterSectionForStandalone) {
@@ -279,16 +276,33 @@ TEST(StatusResponseMM, NoMultiMasterSectionForReplica) {
     EXPECT_EQ(response.find("[multi_master]"), std::string::npos);
 }
 
-TEST(StatusResponseMM, EmptyReplicationLagList) {
+// #118: STATUS must not print a per-peer byte lag for the mesh, ever. The only per-peer position
+// the mesh has is a byte offset into that peer's *own* WAL, written once at handshake, so the
+// number this field used to carry was this node's own WAL size — measured to the byte on a
+// converged mesh, which is to say the engine reported a peer holding every row as sitting at byte
+// zero.
+//
+// The two assertions above the absence are the control, and they are the reason this test means
+// anything: an assertion that a string is missing passes against a formatter that prints nothing
+// at all, and the section it should be missing *from* has to be shown to exist first. That trap
+// has been paid for in this repo twice — a snapshot test that passed by installing nothing, and a
+// check satisfied by a DEBUG line beside the INFO line it was about.
+TEST(StatusResponseMM, TheMeshSectionCarriesNoPerPeerByteLag) {
     ob::ServerStats stats{};
     stats.mm_node_role = 3;  // MULTI_MASTER
     stats.mm_node_id = 1;
-    // No peers → empty lag list
+    stats.mm_peer_count = 2;
 
     std::string response = ob::format_status(stats);
 
-    EXPECT_NE(response.find("[multi_master]"), std::string::npos);
-    EXPECT_NE(response.find("node_id: 1"), std::string::npos);
-    // No replication_lag_peer_ lines
-    EXPECT_EQ(response.find("replication_lag_peer_"), std::string::npos);
+    ASSERT_NE(response.find("[multi_master]"), std::string::npos)
+        << "the section is absent, so the assertion below would pass against an empty string";
+    ASSERT_NE(response.find("peer_count: 2"), std::string::npos)
+        << "the section is not describing peers, so the assertion below proves nothing";
+
+    EXPECT_EQ(response.find("replication_lag_peer_"), std::string::npos)
+        << "a per-peer byte lag is back in STATUS; the mesh has no byte position to compute it "
+           "from (#118)";
+    EXPECT_EQ(response.find("lag_bytes"), std::string::npos)
+        << "the mesh section is printing a byte lag under another name";
 }

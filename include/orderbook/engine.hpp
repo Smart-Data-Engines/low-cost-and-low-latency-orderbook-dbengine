@@ -191,7 +191,6 @@ public:
         uint64_t    mm_hlc_physical_ns{0};
         uint16_t    mm_hlc_logical{0};
         int64_t     mm_hlc_drift_ns{0};
-        std::vector<std::pair<uint16_t, size_t>> mm_replication_lag_per_peer;
     };
 
     /// Collect current engine statistics (thread-safe, acquires mtx_).

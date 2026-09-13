@@ -311,7 +311,13 @@ TEST(MultiMasterUnit, MmPeersCommandTsvFormat) {
     EXPECT_NE(result.find("address"), std::string::npos);
     EXPECT_NE(result.find("status"), std::string::npos);
     EXPECT_NE(result.find("hlc_timestamp"), std::string::npos);
-    EXPECT_NE(result.find("lag_bytes"), std::string::npos);
+    // `send_queue_bytes`, and the rename is the assertion: the column has always held
+    // `peer.send_buf.size()` and was called `lag_bytes`, which invited the alert that word implies
+    // on a number that is zero exactly when a node has accepted writes it has not handed to the
+    // kernel yet (#118).
+    EXPECT_NE(result.find("send_queue_bytes"), std::string::npos);
+    EXPECT_EQ(result.find("lag_bytes"), std::string::npos)
+        << "the header still offers a column named after a lag this value is not";
 
     // Header should be tab-separated.
     auto first_line_end = result.find('\n');

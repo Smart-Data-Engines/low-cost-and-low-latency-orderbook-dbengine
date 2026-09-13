@@ -8,11 +8,32 @@
 #include "orderbook/engine.hpp"
 #include "orderbook/logger.hpp"
 
+#include <unordered_map>
+#include <algorithm>
 #include <chrono>
 
 namespace ob {
 
 // ── Constructor / Destructor ──────────────────────────────────────────────────
+
+uint64_t max_records_behind(const std::vector<VectorGap>& peer_lacks,
+                            const std::vector<uint16_t>& unknown) {
+    std::unordered_map<uint16_t, uint64_t> behind;
+    for (const auto& gap : peer_lacks) {
+        if (std::find(unknown.begin(), unknown.end(), gap.peer_node_id) != unknown.end()) continue;
+        // Inclusive on both ends: `from_seq` is the first sequence number the lagging side is
+        // missing and `to_seq` is the last one the other side holds, so a peer missing exactly
+        // record 7 has from == to == 7 and is one record behind, not zero.
+        if (gap.to_seq < gap.from_seq) continue;   // an empty range says nothing is missing
+        behind[gap.peer_node_id] += gap.to_seq - gap.from_seq + 1;
+    }
+    uint64_t worst = 0;
+    for (const auto& [peer_id, records] : behind) {
+        (void)peer_id;
+        if (records > worst) worst = records;
+    }
+    return worst;
+}
 
 AntiEntropyManager::AntiEntropyManager(AntiEntropyConfig config,
                                        Engine& engine,
@@ -174,6 +195,23 @@ AntiEntropyResult AntiEntropyManager::execute_run() {
                                  static_cast<int64_t>(result.gaps_detected));
     engine_.registry().set_gauge("ob_mm_reconcile_we_lack",
                                  static_cast<int64_t>(result.we_lack));
+
+    // The mesh's replication lag, in records, and the count of peers it had to leave out. The
+    // pair is the point and it is not tidiness: a zero lag with a nonzero unknown count means
+    // "we do not know", and reporting only the lag would make that indistinguishable from
+    // "converged" — #84's defect, where a connection mid-handshake read as a peer that had
+    // fallen over.
+    //
+    // Recomputed once per anti-entropy pass, not per write, so its staleness is
+    // `--anti-entropy-interval-seconds` (30 s by default). `docs/operations.md` says so, because
+    // a gauge whose staleness is undocumented is a gauge an operator reads as live.
+    engine_.registry().set_gauge(
+        "ob_mm_replication_lag_records",
+        static_cast<int64_t>(max_records_behind(report.peer_lacks,
+                                                report.peers_position_unknown)));
+    engine_.registry().set_gauge(
+        "ob_mm_peers_position_unknown",
+        static_cast<int64_t>(report.peers_position_unknown.size()));
 
     OB_LOG_INFO("anti_entropy",
                 "Run #%llu: peers=%zu vectors_sent=%zu gaps=%zu (we_lack=%zu) closed_since_last=%zu",

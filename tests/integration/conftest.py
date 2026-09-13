@@ -407,6 +407,15 @@ class ClusterManager:
         # back without the secret would be refused by its peers, and the test would read that as a
         # replication defect.
         self.cluster_secret_file: Optional[str] = None
+
+        # Flags every node in this cluster gets, on top of the ones built below.
+        #
+        # On the manager rather than a parameter on the start methods, and that is the point:
+        # `restart_node()` goes through the same one argv builder, so a node that comes back gets
+        # them too. A parameter would be forgotten by exactly the path that builder's docstring is
+        # about — the one where a restarted node lost the cluster secret and the failure read as a
+        # replication defect.
+        self.extra_node_args: list = []
         # TLS on the node links, or None. Same placement and the same reason as the secret file
         # above: it must survive a restart.
         self.node_tls: Optional[NodeTls] = None
@@ -825,7 +834,7 @@ class ClusterManager:
                 return ""
 
     def mm_peer_rows(self, node: NodeInfo) -> list:
-        """MM_PEERS rows as split columns: node_id, address, status, hlc, lag_bytes.
+        """MM_PEERS rows as split columns: node_id, address, status, hlc, send_queue_bytes.
 
         The one place these rows are parsed. Two modules had their own copy before, which is
         how the substring below survived in a third.
@@ -881,6 +890,7 @@ class ClusterManager:
             # path; two seconds puts the drain inside it.
             "--drain-timeout-ms", "2000",
         ]
+        cmd += self.extra_node_args
         if read_only:
             cmd.append("--read-only")
         if self.cluster_secret_file:

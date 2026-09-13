@@ -181,3 +181,85 @@ TEST(AntiEntropy, GapsWeAreAheadOnDoNotCountAsOurRepairs) {
     // work seen through a stale vector.
     EXPECT_EQ(second.gaps_closed, 0u);
 }
+
+// ── The mesh's lag, in records (#118) ────────────────────────────────────────
+//
+// `ob_mm_replication_lag_bytes` was registered and never written (#117), and #118 measured why it
+// could not be: the only per-peer position the mesh has is a byte offset into that peer's *own*
+// WAL, written once at handshake, so subtracting it from ours produced this node's own WAL size.
+// Records are comparable where bytes are not, because sequence numbers are per-origin and
+// origin-stamped — the mechanism #61's fix introduced.
+//
+// `max_records_behind()` is a free function on the report's own vectors so that these properties
+// can be stated without a mesh, which is the answer #117 gave for arithmetic whose caller is hard
+// to reach.
+
+namespace {
+
+ob::VectorGap gap(uint16_t peer, const char* key, uint16_t origin,
+                  uint64_t from_seq, uint64_t to_seq) {
+    ob::VectorGap g{};
+    g.peer_node_id = peer;
+    g.key = key;
+    g.origin = origin;
+    g.from_seq = from_seq;
+    g.to_seq = to_seq;
+    return g;
+}
+
+} // namespace
+
+TEST(MeshRecordsLag, NoGapsIsZero) {
+    EXPECT_EQ(ob::max_records_behind({}, {}), 0u);
+}
+
+// Inclusive on both ends. `from_seq` is the first sequence number the peer is missing and `to_seq`
+// is the last one we hold, so a peer missing exactly record 7 is **one** record behind. Off by one
+// here would understate every lag in the mesh by one record per gap.
+TEST(MeshRecordsLag, ASingleMissingRecordCountsAsOne) {
+    EXPECT_EQ(ob::max_records_behind({gap(2, "BTC.EX", 1, 7, 7)}, {}), 1u);
+    EXPECT_EQ(ob::max_records_behind({gap(2, "BTC.EX", 1, 7, 9)}, {}), 3u);
+}
+
+// Gaps for one peer add up across (symbol, origin) pairs — that is what "how far behind is this
+// peer" means.
+TEST(MeshRecordsLag, GapsForOnePeerAreSummedAcrossPairs) {
+    EXPECT_EQ(ob::max_records_behind({gap(2, "BTC.EX", 1, 1, 2),
+                                      gap(2, "ETH.EX", 1, 5, 5),
+                                      gap(2, "BTC.EX", 3, 10, 12)}, {}), 6u);
+}
+
+// Max across peers, not a sum. The question is "is anybody behind", and a sum lets two peers each
+// missing one record read the same as one peer missing two — which are different situations for an
+// operator deciding whether to wait or to intervene.
+TEST(MeshRecordsLag, ItIsTheWorstPeerRatherThanTheTotal) {
+    const uint64_t worst = ob::max_records_behind({gap(2, "BTC.EX", 1, 1, 1),
+                                                   gap(3, "BTC.EX", 1, 1, 4)}, {});
+    EXPECT_EQ(worst, 4u) << "two peers were summed instead of compared";
+}
+
+// The property this function exists for. `compare_vectors()` reports a peer that has said nothing
+// as lacking **everything** — deliberately, because sending it everything is the safe direction
+// for the repair — so counting that as lag would make silence the largest lag in the mesh. A peer
+// whose position is unknown is a peer we know nothing about, which is a different answer from a
+// peer that is behind.
+TEST(MeshRecordsLag, APeerWhosePositionIsUnknownContributesNothing) {
+    const std::vector<ob::VectorGap> gaps = {gap(2, "BTC.EX", 1, 1, 1000),
+                                             gap(3, "BTC.EX", 1, 1, 2)};
+    EXPECT_EQ(ob::max_records_behind(gaps, {}), 1000u) << "the control: with nothing excluded, "
+                                                          "the silent peer dominates";
+    EXPECT_EQ(ob::max_records_behind(gaps, {2}), 2u)
+        << "the peer that has not stated its position was counted as the furthest behind";
+}
+
+// And excluding every peer leaves zero rather than the largest excluded value — which is only
+// meaningful beside ob_mm_peers_position_unknown, and that pairing is why both gauges exist.
+TEST(MeshRecordsLag, ExcludingEveryPeerIsZeroNotTheLargest) {
+    EXPECT_EQ(ob::max_records_behind({gap(2, "BTC.EX", 1, 1, 9)}, {2}), 0u);
+}
+
+// An inverted range says nothing is missing rather than wrapping a uint64. Reachable only from a
+// malformed vector on the wire, which is exactly where a subtraction should not be trusted.
+TEST(MeshRecordsLag, AnInvertedRangeCountsAsNothingRatherThanWrapping) {
+    EXPECT_EQ(ob::max_records_behind({gap(2, "BTC.EX", 1, 9, 3)}, {}), 0u);
+}

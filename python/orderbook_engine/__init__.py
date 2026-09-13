@@ -1435,7 +1435,11 @@ def _parse_status_multi_master(raw: str) -> Optional[dict]:
 def _parse_mm_peers_tsv(header: List[str], data_rows: List[List[str]]) -> List[dict]:
     """Parse MM_PEERS TSV response into list of peer dicts.
 
-    Expected columns: node_id, address, status, hlc_timestamp, lag_bytes
+    Expected columns: node_id, address, status, hlc_timestamp, send_queue_bytes
+
+    Driven by the answer's own header rather than by position, so a server that renames a column
+    surfaces it as a changed key instead of a silently shifted value. That is what happened to
+    `lag_bytes`, which was never a lag (#118) and is `send_queue_bytes` from that release on.
     """
     peers = []
     for row in data_rows:
@@ -1444,7 +1448,7 @@ def _parse_mm_peers_tsv(header: List[str], data_rows: List[List[str]]) -> List[d
             if i < len(row):
                 val = row[i]
                 # Try to parse numeric fields
-                if col in ("node_id", "lag_bytes"):
+                if col in ("node_id", "lag_bytes", "send_queue_bytes"):
                     try:
                         peer[col] = int(val)
                     except ValueError:
@@ -1926,7 +1930,7 @@ class OrderbookEngine:
 
         Sends MM_PEERS command and parses the TSV response.
         Returns a list of dicts with keys: node_id, address, status,
-        hlc_timestamp, lag_bytes.
+        hlc_timestamp, send_queue_bytes.
         """
         if self._closed:
             raise OrderbookError(-1, "Engine is closed")

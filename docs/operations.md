@@ -391,6 +391,53 @@ ten-second timer; and within a process it lives in one place, so a role change k
 `repl_state.txt` written before #103 has no such line and simply leaves the epoch where the WAL put
 it.
 
+## When a mesh peer falls behind
+
+Two gauges, and reading either one alone is the mistake this section exists to prevent.
+
+```
+curl -s localhost:9091/metrics | grep -E 'ob_mm_(replication_lag_records|peers_position_unknown)'
+# ob_mm_replication_lag_records 0
+# ob_mm_peers_position_unknown 0
+```
+
+`ob_mm_replication_lag_records` is **how many records the furthest-behind peer is known to be
+missing**. Records and not bytes: sequence numbers in this engine are per-origin and
+origin-stamped, so two nodes can compare them, and byte offsets cannot be compared at all because
+each node's WAL holds its own client writes as well as everything it replicated.
+
+`ob_mm_peers_position_unknown` is **how many connected peers have not said what they hold**. Those
+peers are excluded from the gauge above, because the comparison reports a peer that has said
+nothing as holding *nothing* — deliberately, since sending it everything is the safe direction for
+a repair — and counting that would make silence the largest lag in the mesh.
+
+So the readings are:
+
+| lag_records | position_unknown | what it means |
+|-------------|------------------|---------------|
+| 0 | 0 | converged, as far as the last comparison could see |
+| > 0 | 0 | a peer is behind by that many records |
+| 0 | > 0 | **we do not know**, which is not the same as converged |
+| > 0 | > 0 | a peer is behind, and separately there is a peer we cannot assess |
+
+**Both are recomputed once per anti-entropy pass and nowhere else**, so their freshness is
+`--anti-entropy-interval-seconds` — thirty seconds by default. They are not per-write numbers and a
+scrape a second after a partition starts will still read the previous pass.
+
+**What replaced what, if you have a dashboard from before this release.**
+`ob_mm_replication_lag_bytes` was registered and never written, so it read a flat zero for its
+whole life (#117); it is now **removed from the registry** rather than fed, because the mesh has no
+byte position to compute it from (#118). `STATUS`'s `replication_lag_peer_<id>` lines are gone for
+the same reason — they carried this node's own WAL offset minus a byte position in the peer's own
+WAL frozen at handshake, which on a converged mesh equals this node's WAL size. And `MM_PEERS`'
+`lag_bytes` column is now `send_queue_bytes`, which is what it always held.
+
+**What the engine still does not tell you here.** How far behind a **replica** is, as a metric.
+That number exists, is correct, and is computed per replica in `STATUS`'s `[replicas]` block — and
+it is not published, which is #123: the same expression that is wrong for a mesh peer is right for
+a replica, but it ignores the WAL file index, so a replica more than one file behind reports zero.
+Publishing it before that is fixed would repeat the defect this section is about.
+
 ## When a peer's clock is wrong
 
 Two numbers answer this, and you need both.

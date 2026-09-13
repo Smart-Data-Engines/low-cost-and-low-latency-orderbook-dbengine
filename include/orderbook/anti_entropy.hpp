@@ -60,11 +60,41 @@ struct AntiEntropyResult {
 // Gaps are (symbol, origin, sequence range), not WAL offsets: a sequence number minted by an
 // origin means the same thing on every node that received it, and a byte offset does not.
 
+/// The largest number of records any single peer is known to be missing, ignoring peers whose
+/// position is unknown.
+///
+/// The mesh's honest lag, and the reason it is in **records** rather than bytes: sequence numbers
+/// are per-origin and origin-stamped, which is the mechanism #61's fix introduced, so they are
+/// comparable across nodes. Byte offsets are not — each node's WAL holds its own client writes as
+/// well as what it replicated — and #118 is the item where subtracting them produced this node's
+/// own WAL size.
+///
+/// Max across peers rather than a sum, because the question an operator asks is "is anybody
+/// behind", and a sum lets two peers each missing one record read the same as one peer missing
+/// two. Peers listed in `unknown` contribute nothing at all: `compare_vectors()` reports a peer
+/// that has said nothing as lacking everything, on purpose, so counting it would make silence the
+/// largest lag in the mesh.
+///
+/// A free function on the report's own vectors so that the ordinary suite can state these
+/// properties without a mesh — the same answer #117 gave for arithmetic whose caller is hard to
+/// reach.
+uint64_t max_records_behind(const std::vector<VectorGap>& peer_lacks,
+                            const std::vector<uint16_t>& unknown);
+
 struct ReconcileReport {
     size_t peers_contacted{0};
     size_t vectors_sent{0};
     std::vector<VectorGap> we_lack;
     std::vector<VectorGap> peer_lacks;
+
+    /// Peers that have not said what they hold, by node id.
+    ///
+    /// Carried as ids rather than as a count because the records lag has to **exclude** them and
+    /// a count cannot say which gaps to skip. `compare_vectors()` treats a peer that has said
+    /// nothing as holding nothing — deliberately, since that is the safe direction for the repair
+    /// — so its `peer_lacks` is everything this node holds. Counting that as lag would report a
+    /// peer which has merely not spoken yet as the furthest behind in the mesh (#118).
+    std::vector<uint16_t> peers_position_unknown;
 };
 
 /// Performs one reconciliation pass and reports what it saw. Supplied by MultiMasterManager.

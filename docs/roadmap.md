@@ -2175,6 +2175,41 @@ question is recorded as #121 rather than settled quietly here.
   nothing in the engine would notice — anti-entropy compares what each side holds, and two sides
   each holding a different winner look consistent to it. Never observed in the wild
 
+### 123. The replica lag that is genuine ignores the WAL file index, so a replica a file behind reads zero
+
+Found while fixing #118, in the number that item called "the lag that *is* real".
+
+`Engine::stats()` computes each replica's lag as `current_offset - r.confirmed_offset`, and that is
+right in the part #118 was about: a replica streams **our** WAL and refreshes `confirmed_offset` on
+every `ACK <file> <offset>`, so the two positions index the same log and the subtrahend is kept
+current. What it does not do is look at `confirmed_file`.
+
+`rotate()` publishes `{next_index, next_offset}`, so `current_offset` **resets** when our WAL
+rotates. A replica still acknowledging into the previous file therefore has a `confirmed_offset`
+larger than ours, the expression clamps at zero, and the lag reads **0 exactly when a replica is
+more than a file behind** — the state that matters most, and the one a 512 MB rotation threshold
+makes ordinary during catch-up.
+
+**Established by reading, not measured, and the difference is stated on purpose.** The arithmetic
+is two lines and the reset is one; what is not measured is how often a real cluster sits in that
+state, which is the question a fix should answer first.
+
+This is why #118 did **not** publish `ob_replication_lag_bytes` while it was removing the mesh's
+byte lag. Publishing a number that reads zero when a replica is a file behind, in the change whose
+whole subject is a lag that reads the wrong thing, would have been the same defect wearing a new
+name.
+
+A fix needs a decision rather than an expression. `(current_file - confirmed_file) * threshold`
+is an estimate that overstates whenever a file ended early — and files do end early, because a
+restart opens a new one. An exact answer means asking the WAL for the byte distance between two
+positions, which means the sizes of the files in between, which means deciding what to report when
+retention has removed one. That third state is the interesting part: "unknown" is an honest answer
+that a single gauge cannot express.
+
+- Effort: M, most of it the decision about the third state | Impact: the only genuine replication
+  lag in the engine reads zero in the case an operator cares about, and it is currently visible
+  only by reading `STATUS` by hand — so nothing alerts on it either way
+
 ### 122. The replication client's pointer was written without the lock every reader holds ✅
 
 Found while giving `ob_repl_records_replayed` a publisher (#117), because the number to publish
@@ -2272,7 +2307,8 @@ the current behaviour so that changing it shows up as a failing test.
 - Effort: M, most of it the decision | Impact: one misconfigured node's clock becomes the whole
   mesh's clock, permanently, and the only visible sign is a drift gauge that never returns to zero
 
-### 118. Two mesh fields are named after a replication lag, neither is one, and the lag that is real is published nowhere
+### 118. Two mesh fields are named after a replication lag, neither is one, and the lag that is real is published nowhere ✅
+
 
 Found while planning #117: the gauge nothing feeds turned out to have two siblings that something
 does feed, carrying numbers that cannot mean what they are called.
@@ -2344,10 +2380,47 @@ peers, publish the replica lag that is genuine, and give the mesh the lag it can
 so the honest mesh answer is in **records** — which is what requirement 1.4 of #54 asks for, and
 what #117's plan line asked for in bytes and could not have had.
 
-- Effort: S to stop reporting the two wrong numbers, M for the two honest ones | Impact: an
-  operator watching a converged mesh reads a lag that grows all day, a client reading
-  `peer["lag_bytes"]` reads a queue depth under a different name, and `peer["status"] == "active"`
-  is never true
+**What the fix turned out to be, and it is not "feed the gauge".**
+
+`STATUS`'s `replication_lag_peer_<id>` lines are **removed**, not re-pointed at the honest number:
+that number is in a different unit from a different mechanism at a different freshness, so keeping
+the field would have left every existing reader parsing the same line about a different subject.
+The field disappeared from both structs rather than being zeroed, which is how the compiler found
+the third copy site in `tcp_server.cpp` that a grep would have missed.
+
+`MM_PEERS`' column is `send_queue_bytes` now. The value never changed — `peer.send_buf.size()` —
+and only the name was wrong, which was the whole problem: it invited the alert the word "lag"
+implies on a number that is zero precisely when a node has accepted writes it has not handed to
+the kernel yet. The Python client builds its dicts from the answer's own header, so a client
+written against the old key gets a `KeyError` rather than a silently different number.
+
+**The mesh's honest lag is `ob_mm_replication_lag_records`, and it is a pair.** Records because
+sequence numbers are per-origin and origin-stamped — the mechanism #61's fix introduced, and the
+one position two nodes can compare. `AntiEntropyManager` already had the answer: its pass calls
+`compare_vectors()` per peer and holds gaps carrying `from_seq` and `to_seq`. The second gauge,
+`ob_mm_peers_position_unknown`, is not decoration: `compare_vectors()` reports a peer that has said
+nothing as holding **nothing**, deliberately, because sending it everything is the safe direction
+for a repair — so counting that as lag would make silence the largest lag in the mesh. Those peers
+are excluded and counted separately, and the honest reading is the pair. Zero lag with a nonzero
+unknown count means "we do not know", which is #84's defect again if the two share one number.
+
+`ob_mm_replication_lag_bytes` is **removed from the registry** rather than fed, so #117's allowlist
+is now empty and the checker's stale-allowlist branch got its first real exercise.
+
+**Measured on the probe that found the defect** (`scripts/measure_mesh_lag.py`, two-node mesh,
+convergence by row content): `lag_records` **0** with `unknown` **0** in all three phases, beside a
+`wal 0` column reading 20 300 / 40 692 / 61 084 — the numbers the old field carried. And the
+partitioned case is the half a converged mesh cannot show, so it is an integration test rather than
+a probe reading: **it closes the second clause of #54's C3**, which stage C recorded as having no
+passing test *because of #117*. Six writes across a partitioned link, the lag goes above zero with
+the unknown count still zero, and it returns to zero on heal — three readings, the first of which
+is the control, because a gauge only ever observed as zero is what #117 was about.
+
+- Effort: S to stop reporting the two wrong numbers, M for the honest one | Impact: an operator
+  watching a converged mesh read a lag that grew all day, a client reading `peer["lag_bytes"]` read
+  a queue depth under a different name, and `peer["status"] == "active"` was never true. The
+  replica lag is **still** unpublished and that is #123, not an omission: it ignores the WAL file
+  index, so publishing it here would have repeated this defect in a new metric
 
 ### 117. Five metrics are registered and fed by nothing, and one of them is the only signal a partitioned mesh could give ✅
 
@@ -5572,32 +5645,31 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**One defect is open and one question is recorded for a decision.** **#117** and **#122** are closed by the
-commit that carries this line: four of its five metrics are fed, and the fifth is not because #118
-measured that it cannot be — the mesh has no byte position to compare, so the entry moved to that
-item and is waiting to be **removed** rather than filled. Making the io_uring pair honest found
-three defects in six lines of a loop no CI job runs, the worst of them a counter fed the *wrong*
-number rather than none: `ob_iouring_sqe_submitted` carried the completion count, so comparing it
-against `ob_iouring_cqe_processed` to find a backlog compared a number with itself.
+**One defect is open and one question is recorded for a decision.** **#117**, **#118** and
+**#122** are closed by the commits that carry this line, and together they are one investigation
+that started with five registered metrics nothing wrote.
 
-**#122** came out of that work, is the shape #41, #49 and #83 all were — `repl_client_` read under
-`mtx_` by `stats()` and written **without** it by `promote_to_primary()` — and is closed by the
-same commit. It was filed rather than fixed on the argument that a change about metrics should not
-touch a failover path, and then TSan went red on that PR naming `unique_ptr::reset` and
-`operator delete`: the new publisher runs every flush interval where `stats()` runs on demand, so
-the change made a latent race reachable. That argument does not survive its own consequence.
+Four of those five are fed. The fifth could not be: **#118** measured that the mesh has no byte
+position two nodes can compare — `STATUS`'s `replication_lag_peer_<id>` equalled this node's own
+WAL offset to the byte on a converged mesh, which is to say it reported a peer holding every row as
+sitting at byte zero, and `MM_PEERS`' `lag_bytes` column was this node's send queue. Both are gone;
+the mesh's lag is `ob_mm_replication_lag_records`, read beside `ob_mm_peers_position_unknown`
+because the comparison reports a peer that has said nothing as holding nothing. That also **closed
+the second clause of #54's C3**, which stage C had recorded as untestable *because* of #117.
 
-**#121** is the question stage D left behind, filed rather than answered because a ceiling on the
-drift a peer may introduce costs causal order against that peer.
+**#122** is the one worth remembering for its own sake. Reading the code found `repl_client_` read
+under `mtx_` by `stats()` and written without it by `promote_to_primary()`; it was filed rather than
+fixed, on the argument that a change about metrics should not touch a failover path. Then TSan went
+red on that PR, naming `unique_ptr::reset` **and** `operator delete` — a use-after-free window
+rather than a torn read — because the new publisher reads that pointer every flush interval where
+`stats()` reads it on demand. Adding a reader means adding it at a frequency, and that frequency is
+part of the change.
 
-The remaining open defect is **#118**, and it is the sharper half of the same investigation: going
-to plan #117's mesh gauge found the two fields that *are* fed, and neither is a lag. On a mesh
-converged by row content, `STATUS`'s `replication_lag_peer_<id>` equals this node's own WAL offset
-**to the byte** over three phases — which is to say the engine believes a peer holding every row
-sits at byte **zero**, because the subtrahend is a position in the peer's own WAL frozen at
-handshake. `MM_PEERS`'s `lag_bytes` column is this node's send queue under the same word, flat
-through the 4 MB #117 measured. The lag that *is* real — per replica, live, already computed — is
-published to no metric at all.
+The open defect is **#123**, and #118 is why it is filed rather than fixed: the replica lag that is
+genuine ignores the WAL file index, so a replica more than one file behind reads **zero**.
+Publishing it in the change that removed a lag for reading the wrong thing would have been the same
+defect in a new name. **#121** remains the question stage D left behind, filed rather than answered
+because a ceiling on the drift a peer may introduce costs causal order against that peer.
 
 #115 and #116 before it were also about what the log says rather than what the engine does, and
 were found the same way — by #54 stage B, which set out to check refusals and had to read the logs
@@ -5778,9 +5850,9 @@ runners, not the machine-B performance baseline above.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1052 | all passing with `ctest -j1` on the i3-7100U, run in three `-I` ranges because this machine's memory guard stops a single long run (350 + 350 + 352). **Thirteen more than the previous commit, all of #117**: four pin `queue_utilization_percent` and three `counter_delta`, both moved into `metrics.hpp` so that the ordinary suite executes arithmetic whose caller no CI job runs; two pin the WAL's record count. `tests/test_iouring_instrumentation.cpp` adds four more that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists 1054: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
-| Python integration | 256 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 256; count pytest's final result rather than the report plugin's progress characters. `256 passed, 2 skipped in 18:58` on the GitHub runner for this commit; the same suite read `19:18` on the runner and `19:25` on the development machine (i3-7100U, native etcd) two commits ago, which is the spread to expect rather than a change. Ten more than the previous commit, all of #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content, and the same ten cost 2:37 locally |
-| Python integration under TSan | 256 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `256 passed in 24:37` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **19:18** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
+| C++ (GTest + RapidCheck) | 1058 | all passing with `ctest -j1` on the i3-7100U, run in three `-I` ranges because this machine's memory guard stops a single long run (353 + 353 + 352). **Six more than the previous commit**: seven pin `max_records_behind`, the mesh's honest lag, and one went away — a hand-written list of the metric names the engine writes, which #118's removal of a registration broke and which `scripts/check_metrics.py` already checks mechanically in both directions. **All of #117**: four pin `queue_utilization_percent` and three `counter_delta`, both moved into `metrics.hpp` so that the ordinary suite executes arithmetic whose caller no CI job runs; two pin the WAL's record count. `tests/test_iouring_instrumentation.cpp` adds four more that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists 1060: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
+| Python integration | 257 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 256; count pytest's final result rather than the report plugin's progress characters. `256 passed, 2 skipped in 18:58` on the GitHub runner for this commit; the same suite read `19:18` on the runner and `19:25` on the development machine (i3-7100U, native etcd) two commits ago, which is the spread to expect rather than a change. Ten more than the previous commit, all of #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content, and the same ten cost 2:37 locally |
+| Python integration under TSan | 257 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `256 passed in 24:37` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **19:18** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than

@@ -2153,6 +2153,31 @@ Learned the hard way. Check here before debugging.
     `shutdown()`/`take_result()` pair and as #118's two subtractions, and it means the cheap first
     question is not "how do I fix this" but "does this file already do it right somewhere".
 
+256. **A list of names you maintain by hand is a check in one direction only, and the silent
+    direction is the one that matters.** `MetricsRegistry.EveryMetricTheEngineWritesIsRegistered`
+    held the names the engine writes, with a comment saying the list-ness was deliberate: "so
+    adding a metric means adding it here too". Nothing enforced that. #118 removed a registration
+    and the test broke loudly, which is the easy direction; a metric the engine writes and nobody
+    added would never have been noticed. Deleted rather than repaired, because
+    `scripts/check_metrics.py` does the same job mechanically **in both directions** in a required
+    job, and a second copy of a guarantee cannot be mutated separately from the first. Same lesson
+    as #32, where a hand-written list of value-less flags produced a feature built on a false
+    premise.
+
+257. **Removing a field beats zeroing it, because the compiler finds the copy sites a grep
+    misses.** Taking `mm_replication_lag_per_peer` out of both structs rather than leaving it empty
+    turned the third assignment — in `tcp_server.cpp`, a file this change had no reason to open —
+    into a build error. Two sites were where the search said they would be; the third was a copy
+    between two structs of the same shape, which is exactly what a name-based search reads past.
+
+258. **Before publishing a number, check whether *your own* new number has the defect you are
+    removing.** #118's fix was three parts, and the third — publishing the replica lag, the one
+    genuine number in the area — stopped at reading the expression: it ignores the WAL file index,
+    and `rotate()` resets `current_offset`, so a replica more than a file behind reports **zero**.
+    Publishing that in the change whose subject is a lag that reads the wrong thing would have been
+    the same defect in a new name, so it is #123 and the gauge stayed unpublished. The general
+    form: a fix that adds a metric should ask the question it just asked of the old one.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2314,8 +2339,21 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   timestamp keeps the clock meaningful and breaks causal order against exactly the peer whose clock
   is wrong, so it is a decision. Current behaviour is pinned by a test so that changing it has to be
   one. LWW still converges under opposite drift, measured from both sides.
-- **The mesh has two fields named after a replication lag and neither is one; the lag that is real
-  is published to no metric** (#118, found while planning #117). `STATUS`'s
+- **The mesh reports its lag in records now, as a pair, and the replica lag is still unpublished
+  on purpose** (#118 closed, #123 open). `STATUS`'s `replication_lag_peer_<id>` and `MM_PEERS`'
+  `lag_bytes` are gone and renamed respectively — the first removed because the honest number is a
+  different unit from a different mechanism, so keeping the field would have left readers parsing
+  one line about another subject; the second is `send_queue_bytes`, which is what it always held.
+  `ob_mm_replication_lag_records` comes from `compare_vectors()` in the anti-entropy pass, so it is
+  as stale as `--anti-entropy-interval-seconds`, and it is **useless without
+  `ob_mm_peers_position_unknown`**: the comparison reports a peer that has said nothing as holding
+  nothing, so those peers are excluded and counted, and zero lag with a nonzero unknown count means
+  "we do not know". That pair closed the second clause of #54's C3, which stage C had recorded as
+  untestable because of #117. What is **not** published is the replica lag (#123): it is the one
+  genuine number here and it ignores the WAL file index, so a replica more than a file behind reads
+  zero.
+- **The mesh had two fields named after a replication lag and neither was one** (#118, found while
+  planning #117). `STATUS`'s
   `replication_lag_peer_<id>` subtracts a mesh peer's `confirmed_offset` — a position in the
   peer's **own** WAL, written once in `process_handshake()` — from ours, so on a mesh converged by
   row content it equals this node's own WAL offset **to the byte** — which is to say the engine

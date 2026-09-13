@@ -173,6 +173,28 @@ def narrow_proxied_mesh():
 
 
 @pytest.fixture
+def reconciling_proxied_mesh():
+    """A proxied mesh whose anti-entropy pass runs every two seconds instead of every thirty.
+
+    `ob_mm_replication_lag_records` is recomputed by that pass and nowhere else, so its freshness
+    **is** the interval — and a test that waited out the production default would spend half a
+    minute per assertion. The flag goes on `ClusterManager.extra_node_args` rather than into a
+    start-method parameter so that a restarted node keeps it, which is the same reason
+    `cluster_secret_file` lives there.
+    """
+    mgr = ClusterManager()
+    mgr.extra_node_args = ["--anti-entropy-interval-seconds", "2"]
+    proxies: list = []
+    try:
+        _build_proxied_mesh(mgr, proxies)
+        yield mgr, proxies
+    finally:
+        for proxy in proxies:
+            proxy.stop()
+        mgr.shutdown()
+
+
+@pytest.fixture
 def proxied_mesh():
     """Two multi-master nodes whose link runs through proxies, with that established, not hoped for.
 
@@ -259,24 +281,105 @@ def test_a_partitioned_peer_is_not_replicated_to_and_the_mesh_converges_on_heal(
 
 
 # The second clause of requirement 1.4 — "no node accepts writes it cannot replicate **without
-# saying so in STATUS/metrics**" — has **no passing test here, and that is roadmap #117 rather
-# than an omission.** Measured while trying to write one:
+# saying so in STATUS/metrics**" — has a passing test now, and getting there took closing two
+# roadmap items rather than writing an assertion.
 #
-#   * `ob_mm_peer_send_buf_bytes` is the engine's own queue, set from `peer.send_buf.size()`. It
-#     grows only once `send()` has returned `EAGAIN`, which needs the **sender's** socket buffer
-#     full first — and the engine sets no `SO_SNDBUF`, so that is `tcp_wmem`'s maximum: **4 MB** on
-#     this machine. Up to 4 MB of writes a node has accepted and cannot replicate are reported by
-#     nothing.
-#   * Narrowing the proxy's receive buffer does not help, and finding that out was the useful part:
-#     TCP accumulates the unsent data in the **sender's** buffer, which belongs to the engine.
-#   * `ob_mm_replication_lag_bytes` — registered, described as "Replication lag in bytes (max
-#     across peers)", which is exactly the signal this clause wants — is **fed by nothing**. It is
-#     one of five such metrics; `scripts/check_metrics.py` now checks that direction too.
+# What it looked like from here first (#117): `ob_mm_peer_send_buf_bytes` is the engine's own
+# queue, taken from `peer.send_buf.size()`, and it grows only once `send()` has returned `EAGAIN` —
+# which needs the **sender's** socket buffer full first, and the engine sets no `SO_SNDBUF`, so
+# that is `tcp_wmem`'s maximum: 4 MB on this machine. Narrowing the proxy's receive buffer does not
+# shorten it, and finding that out was the useful part: TCP accumulates unsent data in the
+# *sender's* buffer, which belongs to the engine and not to anything a test can reach.
 #
-# The convergence test above records `small_partition_send_buf_bytes` so the number is in the run's
-# report rather than only in this comment. A test asserting the defect would have to be an xfail,
-# and this battery's zero-xfail property is worth more than pinning a gauge that reads zero for two
-# different reasons.
+# `ob_mm_replication_lag_bytes` was registered, described as exactly the signal this clause wants,
+# and fed by nothing. Then #118 measured why it could not be fed: the only per-peer position the
+# mesh has is a byte offset into that peer's **own** WAL, recorded once at handshake, so the
+# subtraction produced this node's own WAL size. The replacement is in **records**, from the
+# per-origin sequence vectors — the one position two nodes can compare — and the test below is the
+# first thing in this battery able to assert it.
+
+
+def test_a_partition_is_visible_in_the_records_lag_and_clears_on_heal(reconciling_proxied_mesh):
+    """C3, second clause: a node that cannot replicate its writes says so in a metric.
+
+    Three readings, and the first is the control that makes the other two mean anything. A gauge
+    only ever observed as zero is what #117 was about, so a test that only checked the partitioned
+    case would be pinning a number it never saw move; one that only checked the converged case
+    would pass against a gauge hard-wired to zero.
+
+    The pair is asserted throughout, never the lag alone. `compare_vectors()` reports a peer that
+    has said nothing as holding nothing, on purpose — sending it everything is the safe direction
+    for a repair — so `ob_mm_replication_lag_records` excludes those peers and
+    `ob_mm_peers_position_unknown` counts them. Zero lag with a nonzero unknown count means "we do
+    not know", which is a different answer from "converged" and would otherwise share its number
+    (#84's defect, where a connection mid-handshake read as a peer that had fallen over).
+
+    A partition rather than a disconnect, and that is load-bearing: `MeshProxy.partition()`
+    buffers and stops reading without closing, so the engine still has the peer's **last** vector.
+    A closed link would eventually leave the peer's position unknown, which is honest and is a
+    different test.
+    """
+    mgr, proxies = reconciling_proxied_mesh
+    writer, follower = mgr.nodes[0], mgr.nodes[1]
+
+    def lag_pair(node) -> tuple:
+        return (metric(node.metrics_port, "ob_mm_replication_lag_records"),
+                metric(node.metrics_port, "ob_mm_peers_position_unknown"))
+
+    # ── Reading one: converged. The control. ──
+    assert raw(writer.tcp_port, f"INSERT {SYMBOL} {EXCHANGE} bid 10000 2 1").startswith("OK")
+    _wait_for_rows(follower.tcp_port, 1, timeout=patience(30))
+
+    converged = _await_lag(writer, lag_pair, want_zero=True, timeout=patience(30))
+    assert converged == (0.0, 0.0), (
+        f"a converged mesh reports lag_records={converged[0]} with "
+        f"{converged[1]} peer(s) of unknown position; the second number is why the first is not "
+        f"enough on its own")
+
+    # ── Reading two: partitioned, and the writes cannot cross. ──
+    for proxy in proxies:
+        proxy.partition()
+
+    for price in (20_000, 20_001, 20_002, 20_003, 20_004, 20_005):
+        assert raw(writer.tcp_port,
+                   f"INSERT {SYMBOL} {EXCHANGE} bid {price} 2 1").startswith("OK")
+
+    behind = _await_lag(writer, lag_pair, want_zero=False, timeout=patience(40))
+    assert behind[0] > 0, (
+        "the writer accepted six writes its peer cannot have and reported a lag of zero — which "
+        "is the whole of requirement 1.4's second clause")
+    assert behind[1] == 0.0, (
+        f"the peer's position became unknown ({behind[1]} peers), so the lag above excluded it and "
+        f"the assertion measured the wrong thing: partition() must buffer, not close")
+
+    # ── Reading three: healed, and the number comes back down. ──
+    for proxy in proxies:
+        proxy.heal()
+    _wait_for_rows(follower.tcp_port, 7, timeout=patience(60))
+
+    healed = _await_lag(writer, lag_pair, want_zero=True, timeout=patience(60))
+    assert healed == (0.0, 0.0), (
+        f"the mesh converged by row content and the lag stayed at {healed[0]} with "
+        f"{healed[1]} unknown — a gauge that goes up and never comes down is a gauge that gets "
+        f"ignored")
+
+
+def _await_lag(node, read, *, want_zero: bool, timeout: float) -> tuple:
+    """Poll the (lag, unknown) pair until it is zero, or is not, or time runs out.
+
+    Polling rather than sleeping a fixed interval: the pass that recomputes this runs every two
+    seconds in this fixture and the node decides when, so a single sleep would be asserting on
+    scheduling. Returns the last pair either way, so the assertion can report what it actually saw
+    — which is the difference between "the lag stayed at 4" and "the lag was wrong".
+    """
+    deadline = time.monotonic() + timeout
+    pair = read(node)
+    while time.monotonic() < deadline:
+        pair = read(node)
+        if (pair[0] == 0.0) == want_zero:
+            return pair
+        time.sleep(0.5)
+    return pair
 
 
 def _wait_for_rows(port: int, count: int, timeout: float) -> list:

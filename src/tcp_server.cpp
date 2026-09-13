@@ -594,7 +594,6 @@ std::string execute_command(const Command& cmd,
             stats.mm_hlc_physical_ns   = es.mm_hlc_physical_ns;
             stats.mm_hlc_logical       = es.mm_hlc_logical;
             stats.mm_hlc_drift_ns      = es.mm_hlc_drift_ns;
-            stats.mm_replication_lag_per_peer = es.mm_replication_lag_per_peer;
         }
 
         return format_status(stats, session.identity());

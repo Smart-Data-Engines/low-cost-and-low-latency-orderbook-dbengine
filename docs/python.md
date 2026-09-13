@@ -301,7 +301,7 @@ Query the list of known multi-master peers.
 peers = engine.mm_peers()
 for peer in peers:
     print(f"Node {peer['node_id']}: {peer['address']} "
-          f"status={peer['status']} lag={peer['lag_bytes']}B")
+          f"status={peer['status']} queued={peer['send_queue_bytes']}B")
 ```
 
 Returns a list of dicts with keys:
@@ -312,11 +312,17 @@ Returns a list of dicts with keys:
   registry's vocabulary in etcd and this column has never carried it, so a test for `"active"` is
   a test for a value the server does not send (#118)
 - `hlc_timestamp` (str) — last known HLC timestamp
-- `lag_bytes` (int) — **not a replication lag**, despite the name: it is the number of bytes this
-  node currently has queued to send to that peer. On a healthy link it is zero, and it stays zero
-  until the sender's socket buffer is full (4 MB on a default Linux), so it is a backpressure
-  signal and not a measure of how far behind the peer is. Roadmap #118 is the item that renames it
-  and gives the mesh a lag it can state honestly; until then, do not alert on it as a lag
+- `send_queue_bytes` (int) — bytes this node currently has queued to send to that peer. Zero on a
+  healthy link, and still zero through the few megabytes the sender's socket buffer absorbs, so it
+  is a backpressure signal rather than a measure of how far behind the peer is. **This key was
+  called `lag_bytes` before #118**; the value is unchanged and only the name was wrong. A client
+  written against the old name gets a `KeyError` rather than a silently different number, because
+  this method builds its dicts from the server's own header row
+
+**How far behind a mesh peer is** is not in this answer and deliberately so: the mesh's honest lag
+is in **records**, from the per-origin sequence vectors, and it is a metric —
+`ob_mm_replication_lag_records`, read beside `ob_mm_peers_position_unknown`. A number an operator
+has to read by hand cannot be alerted on.
 
 #### engine.mm_conflicts(limit=100) → List[dict]
 
