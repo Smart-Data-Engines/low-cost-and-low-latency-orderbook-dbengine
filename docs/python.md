@@ -307,9 +307,16 @@ for peer in peers:
 Returns a list of dicts with keys:
 - `node_id` (int) — peer node identifier
 - `address` (str) — replication address (host:port)
-- `status` (str) — "active", "joining", or "leaving"
+- `status` (str) — `"connected"` or `"disconnected"`, the state of the link to that peer. Earlier
+  releases of this page documented `"active"`, `"joining"` and `"leaving"` here; that is the peer
+  registry's vocabulary in etcd and this column has never carried it, so a test for `"active"` is
+  a test for a value the server does not send (#118)
 - `hlc_timestamp` (str) — last known HLC timestamp
-- `lag_bytes` (int) — replication lag in bytes
+- `lag_bytes` (int) — **not a replication lag**, despite the name: it is the number of bytes this
+  node currently has queued to send to that peer. On a healthy link it is zero, and it stays zero
+  until the sender's socket buffer is full (4 MB on a default Linux), so it is a backpressure
+  signal and not a measure of how far behind the peer is. Roadmap #118 is the item that renames it
+  and gives the mesh a lag it can state honestly; until then, do not alert on it as a lag
 
 #### engine.mm_conflicts(limit=100) → List[dict]
 

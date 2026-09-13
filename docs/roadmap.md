@@ -2091,6 +2091,83 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 118. Two mesh fields are named after a replication lag, neither is one, and the lag that is real is published nowhere
+
+Found while planning #117: the gauge nothing feeds turned out to have two siblings that something
+does feed, carrying numbers that cannot mean what they are called.
+
+`Engine::stats()` computes a per-peer mesh lag as `wal_.current_offset() - peer.confirmed_offset`,
+and `STATUS` prints it as `replication_lag_peer_<id>`. `include/orderbook/multi_master.hpp` says
+what those fields are, in the file that declares them:
+
+> Reported by the peer in its handshake, kept for the MM_PEERS view only. Catch-up must not use
+> them: they are positions in the peer's own WAL, and #61 was the consequence of comparing them
+> with ours.
+
+Two facts make the printed number meaningless rather than approximate. The offsets count
+**different bytes** — every mesh node writes its own client writes as well as everything it
+replicates — and the subtrahend is **written once**, in `process_handshake()`, which is the only
+place in the tree that assigns it for a mesh peer. It is frozen at connect time.
+
+**Measured** (`scripts/measure_mesh_lag.py`, i3-7100U, two-node mesh, native etcd, 120 writes per
+phase, convergence established by row content rather than by a sleep):
+
+| phase | rows node 0 | rows node 1 | node 0 WAL offset | `replication_lag_peer_2` | implied peer offset | `MM_PEERS` `lag_bytes` |
+|-------|-------------|-------------|-------------------|--------------------------|---------------------|------------------------|
+| 1 | 120 | 120 | 20 392 | **20 392** | **0** | 0 |
+| 2 | 240 | 240 | 40 692 | **40 692** | **0** | 0 |
+| 3 | 360 | 360 | 60 992 | **60 992** | **0** | 0 |
+
+The reported lag equals this node's own WAL offset **to the byte**, in every phase, on a mesh
+converged by content. The "implied peer offset" column is arithmetic on the two beside it rather
+than a fourth measurement — the engine computes the lag as `ours - peer.confirmed_offset`, so
+`ours - lag` is the position it believes that peer holds — and it is the decisive one: **zero,
+while that peer's own WAL is 60 992 bytes long and holds all 360 rows.** Two numbers being equal
+can be a coincidence of similar magnitudes; a node believing a fully caught-up peer sits at byte
+zero cannot.
+
+The absolute offsets move by 92 bytes between runs depending on whether an epoch record was
+written, which is why the claim here is the **equality and the zero**, not the byte counts. The
+expression also clamps at zero, so the number would fall back to zero when **our** WAL rotates.
+
+**`MM_PEERS` carries a second field with the same name and a different wrong answer.** Its
+`lag_bytes` column is `peer.send_buf.size()` — this node's own outbound queue, which #117 measured
+as staying at zero until the *sender's* socket buffer fills, 4 MB on this machine. So the two
+numbers an operator can read disagree with each other: one grows without bound on a healthy mesh,
+the other stays flat through four megabytes of writes that have not left.
+
+**The contrast is the lesson, and it is in the same function.** The identical expression for a
+*replica* — `current_offset - r.confirmed_offset` — is correct, because a replica streams **our**
+WAL and its `confirmed_offset` is refreshed on every `ACK <file> <offset>`. Same arithmetic, same
+word in the output, one of them valid. So the rule cannot be "subtract the confirmed offset": a
+difference of positions is a lag only when both index the same log **and** the subtrahend is kept
+current. This is #79's shape — `shutdown()` and `take_result()` had the same shape and one of them
+deadlocked — so the rule has to be unconditional rather than a note beside one call site.
+
+**And the registry has it exactly the wrong way round.** `src/metrics.cpp` holds one metric with
+"lag" in its name: `ob_mm_replication_lag_bytes`, the mesh one, which nothing writes (#117). The lag
+that *is* real — per replica, live, already computed — reaches an operator only by reading `STATUS`
+by hand, and a number a human has to read cannot be alerted on. That is #94's lesson about
+`ob_replicas_connected`, which is the reason that gauge exists at all.
+
+**Two client documents state the wrong thing as a consequence.** `docs/python.md` documents
+`mm_peers()[i]["lag_bytes"]` as "replication lag in bytes", and `docs/cli.md` lists the column
+without saying what it holds. The same list documents `status` as `"active"`, `"joining"` or
+`"leaving"`, which is the **peer registry's** vocabulary (`include/orderbook/peer_registry.hpp`);
+the column emits `connected` or `disconnected`, so a client testing for `"active"` is testing for a
+value the server never sends.
+
+The fix has three parts and none of them is "feed the gauge": stop reporting a byte lag for mesh
+peers, publish the replica lag that is genuine, and give the mesh the lag it can state honestly.
+`compare_vectors()` already returns `VectorDiff::peer_lacks` as (symbol, origin, from_seq, to_seq),
+so the honest mesh answer is in **records** — which is what requirement 1.4 of #54 asks for, and
+what #117's plan line asked for in bytes and could not have had.
+
+- Effort: S to stop reporting the two wrong numbers, M for the two honest ones | Impact: an
+  operator watching a converged mesh reads a lag that grows all day, a client reading
+  `peer["lag_bytes"]` reads a queue depth under a different name, and `peer["status"] == "active"`
+  is never true
+
 ### 117. Five metrics are registered and fed by nothing, and one of them is the only signal a partitioned mesh could give
 
 Found by #54 stage C, which needed a "replication lag" number for requirement 1.4 and went looking
@@ -2138,10 +2215,15 @@ Narrowing the proxy's receive buffer does not shorten that, and finding out why 
 part: TCP accumulates unsent data in the **sender's** buffer, which belongs to the engine, not to
 anything a test can reach.
 
-- Effort: S for the WAL and replication counters, M for the mesh lag gauge (it needs each peer's
-  acknowledged position, which `PeerInfo` already carries) | Impact: an operator watching for
-  replication lag watches a constant, and a mesh node can hold 4 MB of unreplicated writes without
-  a single number moving
+- Effort: S for the WAL and replication counters. **M for the mesh lag gauge, and not in the shape
+  this line first proposed:** it said the gauge "needs each peer's acknowledged position, which
+  `PeerInfo` already carries", which is the comparison #61 was. Those fields are positions in the
+  peer's own WAL and are frozen at handshake — measured under #118, where the resulting number
+  equals this node's own WAL offset to the byte. The mesh can state its lag in **records**, from
+  `compare_vectors()`, or not at all. Corrected here rather than rewritten, because the wrong plan
+  is the more useful half: it is the plan anyone would write from the metric's name.
+  | Impact: an operator watching for replication lag watches a constant, and a mesh node can hold
+  4 MB of unreplicated writes without a single number moving
 
 ### 116. A node whose coordinator is unreachable writes two WARN lines a second for ever, and one of them names a consequence that did not happen ✅
 
@@ -5268,11 +5350,17 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**One defect is open: #117**, five registered metrics that nothing feeds — found by #54 stage C
-going to look for the "replication lag" gauge it needed and finding it had always read zero. The
-same measurement says a mesh node can hold **4 MB** of unreplicated writes without a single number
-moving, because the only signal it feeds is its own queue and that begins after the sender's socket
-buffer is full.
+**Two defects are open, and they are the same investigation.** **#117**: five registered metrics
+that nothing feeds — found by #54 stage C going to look for the "replication lag" gauge it needed
+and finding it had always read zero. The same measurement says a mesh node can hold **4 MB** of
+unreplicated writes without a single number moving, because the only signal it feeds is its own
+queue and that begins after the sender's socket buffer is full. **#118**: going to plan that gauge
+found the two fields that *are* fed, and neither is a lag — on a mesh converged by row content,
+`STATUS`'s `replication_lag_peer_<id>` equals this node's own WAL offset **to the byte** over three
+phases, which is to say the engine believes a peer holding every row sits at byte **zero** — the
+subtrahend is a position in the peer's own WAL, frozen at handshake. `MM_PEERS`'s `lag_bytes` column
+is this node's send queue under the same word. The lag
+that is real — per replica, live, already computed — is published to no metric at all.
 
 #115 and #116 before it were also about what the log says rather than what the engine does, and
 were found the same way — by #54 stage B, which set out to check refusals and had to read the logs
@@ -5454,8 +5542,8 @@ runners, not the machine-B performance baseline above.
 | Suite | Count | Status |
 |-------|-------|--------|
 | C++ (GTest + RapidCheck) | 1024 | all passing with `ctest -j1` on the i3-7100U. **Five fewer than the previous commit, and that is #114 rather than a loss of coverage**: `test_mmap_store.cpp` held exactly five tests for a component with no production caller, deleted with it. CTest lists 1026: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtime is what this machine gave on the commit measured, not a budget: the same suite read 159 s earlier the same day on an idler machine |
-| Python integration | 246 | all passing in **16:24 on the GitHub runner**, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 246; count pytest's final result rather than the report plugin's progress characters. **A CI figure rather than this machine's, and labelled because the reason matters:** the battery would not complete on the development machine for #115 and #116, which had ~2 GB genuinely free and a guard that stopped it at 48 tests. `ctest` was verified there in five `-I` ranges; the battery's verification is CI's. Two more than the previous commit — the episode test and the phrase check that keeps its list honest |
-| Python integration under TSan | 246 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. Timed at **20:17** on the GitHub runner for this commit — up from 15:28 two commits ago, and #54 stage B's windows are most of the difference: each stops etcd and waits out a step-down, and every wait in them scales with `patience()` under instrumentation — a CI figure, and it is labelled as one because it is not comparable with the 13:29 above: different machine, and instrumentation on. The same runner gave 13:24 for the uninstrumented battery, which is the honest way to read the instrumentation's cost |
+| Python integration | 256 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 256; count pytest's final result rather than the report plugin's progress characters. **Measured twice on this commit's suite and the two figures agree:** `256 passed, 2 skipped in 19:18` on the GitHub runner, and `19:25` on the development machine (i3-7100U, native etcd) — the first battery since #115 that this machine would finish, which is why both are here. Ten more than the previous commit, all of #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content, and the same ten cost 2:37 locally |
+| Python integration under TSan | 256 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `256 passed in 24:09` on the GitHub runner for this commit, up from 20:17 one commit ago. Read it against the **19:18** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than

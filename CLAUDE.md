@@ -2037,6 +2037,28 @@ Learned the hard way. Check here before debugging.
     than hidden: a heartbeat going the other way spends it too, so the cut arrives sooner than
     asked, which is the safe direction for a fault to be wrong in.
 
+244. **A difference of two positions is a lag only when both index the same log and the subtrahend
+    is kept current — and the same expression is correct one call site away.** `Engine::stats()`
+    computes a replica's lag as `wal_.current_offset() - r.confirmed_offset`, which is right: the
+    replica streams *our* WAL and acknowledges into that field on every `ACK`. Six lines later it
+    computes a mesh peer's the same way, and `multi_master.hpp` says in the file that declares the
+    field that those are positions in the peer's **own** WAL and that comparing them with ours was
+    #61. It is also written in exactly one place, `process_handshake()`, so it is frozen at connect
+    time. Measured (`scripts/measure_mesh_lag.py`): on a mesh converged by row content the printed
+    `replication_lag_peer_<id>` equals this node's own WAL offset **to the byte**, three phases
+    running. This is #79's `shutdown()`/`take_result()` shape — two functions, one shape, one of
+    them broken — so the rule has to be unconditional rather than a note beside the good one.
+
+245. **A field whose name states a quantity will be read as that quantity, and the name is the part
+    that ships.** `MM_PEERS`' column is called `lag_bytes` and holds `peer.send_buf.size()`; the
+    Python client parses it to an int and `docs/python.md` called it "replication lag in bytes".
+    Nothing is wrong with the number — it is a correct queue depth, and a useful one — but every
+    reader of that page writes the alert its name implies, and on a healthy link it reads zero
+    right up to 4 MB of writes that have not left (#117). The same list documented `status` as
+    `"active"/"joining"/"leaving"`, which is the peer **registry's** vocabulary; the column emits
+    `connected`/`disconnected`, so a client testing for `"active"` tested for a value the server
+    never sends. Both found by reading the code that fills the columns, not the page (#118).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2166,6 +2188,19 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   What the engine promises, measured: after `heal()` the mesh converges **by row content**; a frame
   cut at byte 20 of a 38-byte header is **not applied in part**; and a reconnect's catch-up
   re-delivers records without storing any twice. What it does **not** promise today is #117.
+- **The mesh has two fields named after a replication lag and neither is one; the lag that is real
+  is published to no metric** (#118, found while planning #117). `STATUS`'s
+  `replication_lag_peer_<id>` subtracts a mesh peer's `confirmed_offset` — a position in the
+  peer's **own** WAL, written once in `process_handshake()` — from ours, so on a mesh converged by
+  row content it equals this node's own WAL offset **to the byte** — which is to say the engine
+  believes a peer holding every row is at byte **zero** (`scripts/measure_mesh_lag.py` prints that
+  subtraction as its own column, because two equal numbers read as a coincidence and a peer
+  believed to be at zero does not). `MM_PEERS`'
+  `lag_bytes` is `send_buf.size()`, which #117 measured as flat through 4 MB. The per-replica lag
+  is genuine — live, refreshed on every `ACK` — and reaches an operator only by reading `STATUS`
+  by hand. So before adding a lag number anywhere, ask the two questions in pitfall 244: same log,
+  and is the subtrahend refreshed. The honest mesh answer is in **records**, from
+  `compare_vectors()`, which is also what #54's requirement 1.4 asks for.
 - **An unreachable coordinator is injectable too, and the node's promise is a refusal** (#54 stage
   B). `ClusterManager.stop_etcd()` / `start_etcd()` are public; the restart reuses the **same client
   port and data directory**, because a node is handed `--etcd-endpoint` on its command line at
