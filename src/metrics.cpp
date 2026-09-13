@@ -174,6 +174,16 @@ MetricsRegistry::MetricsRegistry() {
                                  "Milliseconds from a snapshot request to its result being "
                                  "collected by the io loop (#79)"));
     gauges_.push_back(make_gauge("ob_mm_hlc_drift_ns",             "Maximum HLC drift in nanoseconds"));
+    // How often the clock has been over the drift boundary, beside how far it went. Registered in
+    // the same change that writes it, because a registration nobody feeds reads as zero and that
+    // is the one value an operator cannot tell from good news (#117). The pair matters: a single
+    // ten-second excursion and a clock that is permanently an hour out give the same peak, and
+    // ob_mm_hlc_drift_ns never comes down because nothing lowers the HLC's physical component.
+    counters_.push_back(make_counter("ob_mm_hlc_drift_excursions_total",
+                                     "Ticks that found the HLC more than a second ahead of the "
+                                     "wall clock. The log says this twice per excursion, at its "
+                                     "edges (#120); this counts every occurrence, so it is the "
+                                     "alertable half"));
 
 #ifdef OB_USE_IO_URING
     // io_uring metrics

@@ -13,6 +13,7 @@
 //
 // Requirements: 1.2, 1.6, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6
 
+#include "orderbook/log_episode.hpp"
 #include "orderbook/logger.hpp"
 
 #include <cstddef>
@@ -173,11 +174,53 @@ public:
     /// Reset the drift tracker (after logging a warning).
     void reset_drift();
 
+    /// How many ticks have found the drift over `DRIFT_WARN_NS`, counting every one.
+    ///
+    /// The log collapses an excursion into two lines (#120); this does not collapse anything,
+    /// because a count is the half that can be alerted on and a peak is not a rate. Published as
+    /// `ob_mm_hlc_drift_excursions_total`. `max_drift_ns()` answers "how far", this answers
+    /// "how often", and an operator needs both: a single 10-second excursion and a clock that is
+    /// permanently off give the same peak.
+    uint64_t drift_excursions() const;
+
+    /// How many drift episodes have been *opened*, which is how many loud WARN lines this clock
+    /// has written about drift.
+    ///
+    /// The pair is the point: `drift_excursions()` counts occurrences and this counts lines, so
+    /// a test can state the thing #120 is about — many events, two lines — instead of asserting
+    /// on a log C++ tests have no sink to read. It is also the number an operator wants when
+    /// asking whether a quiet log means a healthy clock or a collapsed episode.
+    uint64_t drift_episodes() const;
+
+    /// Drift above which a tick counts as an excursion and opens a log episode. One second,
+    /// unchanged from the threshold this class has warned at since it was written — moved into a
+    /// named constant because a test now asserts behaviour on both sides of it, and a boundary
+    /// spelled twice is a boundary that will be changed once.
+    static constexpr int64_t DRIFT_WARN_NS = 1'000'000'000LL;
+
 private:
     uint16_t node_id_;
     mutable std::mutex mtx_;
     HLCTimestamp last_{};
     int64_t max_drift_ns_{0};
+    uint64_t drift_excursions_{0};
+    uint64_t drift_episodes_{0};
+    /// Open while the drift is over the boundary, so the WARN is written on the tick it starts
+    /// and once more when it clears, instead of on every write (#120).
+    LogEpisode drift_episode_{};
+
+    /// Record `drift` against the trackers and log the episode's edges. Called by both ticks
+    /// under `mtx_`; it is one function because the two call sites had six identical lines each,
+    /// and #45 was a fix applied to one copy of exactly this arithmetic while the other kept
+    /// failing.
+    void note_drift_locked(int64_t drift);
+
+    /// The next logical counter for a tick whose physical component is `physical`, carrying an
+    /// overflow into `physical` rather than wrapping (#119).
+    ///
+    /// `wanted` is computed as a uint32 by the caller precisely so the overflow is visible here
+    /// instead of having already happened in a cast.
+    static uint16_t resolve_logical(uint32_t wanted, uint64_t& physical);
 
     /// Get the current physical time (wall clock) in nanoseconds.
     static uint64_t wall_clock_ns();

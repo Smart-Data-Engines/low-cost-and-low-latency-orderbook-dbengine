@@ -7,6 +7,7 @@
 // promotion/demotion as needed.  The Engine implements RoleTransitionHandler
 // to perform the actual state changes.
 
+#include "orderbook/log_episode.hpp"
 #include "orderbook/coordinator.hpp"
 #include "orderbook/epoch.hpp"
 
@@ -255,26 +256,6 @@ private:
     /// repeated once a second.
     ///
     /// Touched only from the monitor thread, like the counter above, so no lock.
-    struct LogEpisode {
-        /// Note the condition holding on this tick. True only on the tick that opens an episode,
-        /// which is the tick that should log loudly.
-        bool begin() {
-            ++ticks_;
-            return ticks_ == 1;
-        }
-
-        /// Note the condition absent. Returns how many ticks the episode lasted, or 0 if none was
-        /// open - so `if (const uint64_t n = e.end())` is both the test and the number to report.
-        uint64_t end() {
-            const uint64_t held = ticks_;
-            ticks_ = 0;
-            return held;
-        }
-
-    private:
-        uint64_t ticks_{0};
-    };
-
     /// The coordinator would not grant a lease for the published position (#116).
     LogEpisode              lease_grant_episode_{};
     /// The published position could not be written at all (#116).

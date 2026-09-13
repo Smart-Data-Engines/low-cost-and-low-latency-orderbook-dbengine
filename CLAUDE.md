@@ -2059,6 +2059,36 @@ Learned the hard way. Check here before debugging.
     `connected`/`disconnected`, so a client testing for `"active"` tested for a value the server
     never sends. Both found by reading the code that fills the columns, not the page (#118).
 
+246. **A sixteen-bit counter that breaks ties wraps, and wrapping it makes the clock go
+    backwards.** The HLC's `logical` field is `uint16` because the wire format says so — three
+    `static_assert`s pin that layout — and `static_cast<uint16_t>(last_.logical + 1)` was silent
+    about it. Measured: with the physical component pinned an hour ahead, three regressions per
+    200 000 local ticks, the first at tick 65 533, against a control of **zero** over the same
+    200 000 on an unskewed clock (#119). The answer is to carry the overflow into the physical
+    component, not to saturate the counter: saturating stops the reversal and **silently stops
+    breaking ties**, which a mutation demonstrates — it kills the strict-inequality test and leaves
+    the monotonicity test green. That pair of tests is the whole defence, and only the mutation
+    shows the second one is load-bearing.
+
+247. **`max()` over a value that arrives from the network is a value the network chooses, and
+    `max()` is never undone.** `tick_receive()` stores `max({now, last_, remote})` and
+    `src/multi_master.cpp` hands it the frame's timestamp **ten lines** after deserialising it,
+    with nothing in between. So one record from a peer whose clock is ahead pins this node's clock
+    ahead for the life of the process — and since `apply_delta_mm()` stamps our own writes from
+    that clock, the value leaves on our records and every peer adopts it too. Consistent, and
+    permanently wrong about real time (#121). The general form: when a remote value feeds a
+    monotonic accumulator, ask what bounds it, and if the answer is nothing, ask whether the
+    accumulator is supposed to mean anything.
+
+248. **A guarantee whose state cannot be read from outside is a guarantee on someone's word, and a
+    log line is not readable state.** #120's fix collapses a per-write WARN into two lines per
+    excursion, and C++ tests have no log sink — so the property "many events, two lines" was not
+    assertable at all until the clock exposed both numbers (`drift_excursions()` counts
+    occurrences, `drift_episodes()` counts loud lines). The pair is also what an operator needs:
+    `ob_mm_hlc_drift_ns` is a peak that never comes down, so a ten-second blip and an hour of skew
+    read identically once the blip is over. When the fix is "say it less", the number of times you
+    said it becomes part of the contract.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2188,6 +2218,19 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   What the engine promises, measured: after `heal()` the mesh converges **by row content**; a frame
   cut at byte 20 of a 38-byte header is **not applied in part**; and a reconnect's catch-up
   re-delivers records without storing any twice. What it does **not** promise today is #117.
+- **The hybrid logical clock never goes backwards now, and one peer's wrong clock is still the
+  whole mesh's clock for ever** (#119 and #120 closed by #54 stage D, #121 open). The reversal was
+  the `uint16` `logical` counter wrapping while the physical component was pinned above the wall
+  clock — measured at tick 65 533, against a control of zero regressions over the same 200 000
+  ticks — and the overflow now carries into the physical component, which is why
+  `HLCSkew.CrossingTheLogicalPeriodProducesAStrictlyGreaterTimestamp` exists beside the
+  monotonicity test: saturating the counter would keep the second green and stop breaking ties.
+  Two numbers now describe drift, and you need both, because `ob_mm_hlc_drift_ns` is a **peak that
+  never comes down**: `ob_mm_hlc_drift_excursions_total` says how often. What is **not** bounded is
+  how far a peer may move our clock, and that is #121 rather than an oversight — declining a
+  timestamp keeps the clock meaningful and breaks causal order against exactly the peer whose clock
+  is wrong, so it is a decision. Current behaviour is pinned by a test so that changing it has to be
+  one. LWW still converges under opposite drift, measured from both sides.
 - **The mesh has two fields named after a replication lag and neither is one; the lag that is real
   is published to no metric** (#118, found while planning #117). `STATUS`'s
   `replication_lag_peer_<id>` subtracts a mesh peer's `confirmed_offset` — a position in the

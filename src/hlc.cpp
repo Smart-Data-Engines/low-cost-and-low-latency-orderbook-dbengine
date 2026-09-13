@@ -197,12 +197,13 @@ HLCTimestamp HybridLogicalClock::tick_local() {
     uint64_t now = wall_clock_ns();
     uint64_t new_physical = std::max(now, last_.physical_ns);
 
-    uint16_t new_logical{0};
-    if (new_physical > last_.physical_ns) {
-        new_logical = 0;
-    } else {
-        new_logical = static_cast<uint16_t>(last_.logical + 1);
-    }
+    // Computed as a uint32 so the overflow is a value this code can see rather than something a
+    // narrowing cast has already done. `resolve_logical` carries it into the physical component;
+    // wrapping it made the clock go **backwards** on tick 65 533 of a pinned run (#119).
+    const uint32_t wanted = (new_physical > last_.physical_ns)
+                                ? 0u
+                                : static_cast<uint32_t>(last_.logical) + 1u;
+    const uint16_t new_logical = resolve_logical(wanted, new_physical);
 
     last_ = HLCTimestamp{new_physical, new_logical, node_id_};
 
@@ -213,15 +214,7 @@ HLCTimestamp HybridLogicalClock::tick_local() {
     // nonsense timestamp **poisons the state** and this line trips over it on the next local tick.
     // That is why fixing the arithmetic in `update()` alone was not enough: it sanitised the
     // computation at the point of arrival and left the poisoned value behind.
-    const int64_t drift = drift_between(new_physical, now);
-    if (drift > max_drift_ns_) {
-        max_drift_ns_ = drift;
-    }
-
-    // Warn if drift exceeds 1 second
-    if (drift > 1'000'000'000LL) {
-        OB_LOG_WARN("hlc", "HLC drift exceeds 1s: drift_ns=%ld", drift);
-    }
+    note_drift_locked(drift_between(new_physical, now));
 
     OB_LOG_DEBUG("hlc", "tick_local: physical=%" PRIu64 " logical=%u node=%u",
                  last_.physical_ns, last_.logical, last_.node_id);
@@ -235,22 +228,25 @@ HLCTimestamp HybridLogicalClock::tick_receive(const HLCTimestamp& remote) {
     uint64_t now = wall_clock_ns();
     uint64_t new_physical = std::max({now, last_.physical_ns, remote.physical_ns});
 
-    uint16_t new_logical{0};
+    // Each branch answers "which side's counter is this tick a successor of", in uint32 so the
+    // overflow stays visible; `resolve_logical` then carries it into the physical component
+    // rather than wrapping it (#119). The branches themselves are unchanged.
+    uint32_t wanted = 0u;
     if (new_physical > last_.physical_ns && new_physical > remote.physical_ns) {
         // Wall clock advanced past both — reset logical
-        new_logical = 0;
+        wanted = 0u;
     } else if (new_physical == last_.physical_ns &&
                new_physical == remote.physical_ns) {
         // All three equal — take max logical and increment
-        new_logical = static_cast<uint16_t>(
-            std::max(last_.logical, remote.logical) + 1);
+        wanted = static_cast<uint32_t>(std::max(last_.logical, remote.logical)) + 1u;
     } else if (new_physical == last_.physical_ns) {
         // Local physical matches — increment local logical
-        new_logical = static_cast<uint16_t>(last_.logical + 1);
+        wanted = static_cast<uint32_t>(last_.logical) + 1u;
     } else if (new_physical == remote.physical_ns) {
         // Remote physical matches — increment remote logical
-        new_logical = static_cast<uint16_t>(remote.logical + 1);
+        wanted = static_cast<uint32_t>(remote.logical) + 1u;
     }
+    const uint16_t new_logical = resolve_logical(wanted, new_physical);
 
     last_ = HLCTimestamp{new_physical, new_logical, node_id_};
 
@@ -259,15 +255,7 @@ HLCTimestamp HybridLogicalClock::tick_receive(const HLCTimestamp& remote) {
     // node sending a nonsense value caused undefined behaviour on every node that received it
     // rather than merely a wrong number. UBSan reported it as
     // "-7914833802811814732 - 1788012145016597349 cannot be represented in type 'long int'".
-    const int64_t drift = drift_between(new_physical, now);
-    if (drift > max_drift_ns_) {
-        max_drift_ns_ = drift;
-    }
-
-    // Warn if drift exceeds 1 second
-    if (drift > 1'000'000'000LL) {
-        OB_LOG_WARN("hlc", "HLC drift exceeds 1s: drift_ns=%ld", drift);
-    }
+    note_drift_locked(drift_between(new_physical, now));
 
     OB_LOG_DEBUG("hlc", "tick_receive: remote={%" PRIu64 ",%u,%u} result={%" PRIu64 ",%u,%u}",
                  remote.physical_ns, remote.logical, remote.node_id,
@@ -284,6 +272,78 @@ HLCTimestamp HybridLogicalClock::current() const {
 int64_t HybridLogicalClock::max_drift_ns() const {
     std::lock_guard<std::mutex> lock(mtx_);
     return max_drift_ns_;
+}
+
+uint64_t HybridLogicalClock::drift_excursions() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return drift_excursions_;
+}
+
+uint64_t HybridLogicalClock::drift_episodes() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return drift_episodes_;
+}
+
+uint16_t HybridLogicalClock::resolve_logical(uint32_t wanted, uint64_t& physical) {
+    if (wanted <= UINT16_MAX) {
+        return static_cast<uint16_t>(wanted);
+    }
+
+    // The logical counter breaks ties between events sharing a physical nanosecond, and it is 16
+    // bits on the wire (see the static_asserts on HLCTimestamp's layout). Wrapping it made
+    // `current()` smaller than the tick before, which is the one property a hybrid logical clock
+    // exists to provide — measured, three regressions per 200 000 ticks against a control of zero,
+    // the first at tick 65 533 (#119).
+    //
+    // Carrying the overflow into the physical component keeps the order total for ever and costs
+    // one nanosecond per 65 536 events, which is below the resolution of anything that reads this
+    // clock. Saturating instead would stop the reversal and *silently* stop breaking ties, which
+    // is worse: nothing would show it.
+    //
+    // Reachable only while the physical component is pinned above the wall clock, which needs a
+    // remote timestamp ahead of ours to start it — and then at this engine's published native
+    // ingestion rate a pinned window of 100 ms is some 135 000 events, so the period is crossed
+    // twice inside a tenth of a second.
+    //
+    // `physical` cannot be UINT64_MAX here in any reachable state: it is
+    // `max(wall clock, previous, remote)`, and a remote that large is a 585-year-old
+    // timestamp no real clock produces. If one ever arrives the increment saturates the type
+    // rather than wrapping to zero, which is the direction that keeps this function's promise.
+    if (physical != UINT64_MAX) {
+        ++physical;
+    }
+    return 0;
+}
+
+void HybridLogicalClock::note_drift_locked(int64_t drift) {
+    if (drift > max_drift_ns_) {
+        max_drift_ns_ = drift;
+    }
+
+    if (drift > DRIFT_WARN_NS) {
+        ++drift_excursions_;
+        // One line when it starts, one when it clears. Before this the warning was emitted on
+        // every tick, and `tick_local()` is on the client write path — measured at 200 002 lines
+        // for 200 000 ticks, 22.9 MB from a single probe run (#120). The count above is what stays
+        // per-occurrence, because a rate is what an operator alerts on and a log is what a human
+        // reads.
+        if (drift_episode_.begin()) {
+            ++drift_episodes_;
+            OB_LOG_WARN("hlc",
+                        "HLC drift exceeds %lds: drift_ns=%ld — this clock is ahead of the wall "
+                        "clock, which a peer's timestamp can do and nothing undoes; further ticks "
+                        "are counted in ob_mm_hlc_drift_excursions_total, not logged",
+                        static_cast<long>(DRIFT_WARN_NS / 1'000'000'000LL), drift);
+        }
+        return;
+    }
+
+    if (const uint64_t ticks = drift_episode_.end(); ticks > 0) {
+        OB_LOG_WARN("hlc",
+                    "HLC drift is back within %lds after %llu tick(s): drift_ns=%ld",
+                    static_cast<long>(DRIFT_WARN_NS / 1'000'000'000LL),
+                    static_cast<unsigned long long>(ticks), drift);
+    }
 }
 
 void HybridLogicalClock::reset_drift() {

@@ -2091,6 +2091,121 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 120. A clock that is off writes one warning per write, not one per excursion ✅
+
+Found by #54 stage D, in the same probe run as #119 — the log of one 200 000-tick run was **22.9 MB**.
+
+`tick_local()` and `tick_receive()` both ended with an unconditional
+`if (drift > 1s) OB_LOG_WARN(...)`, and `tick_local()` is on the client write path
+(`apply_delta_mm`). **Measured: 200 002 lines for 200 000 ticks.** That is #95's shape — a permanent
+condition retried at loop frequency and logged at loop frequency — at write frequency rather than
+loop frequency, which is three orders of magnitude worse than the case #116 fixed.
+
+The fix is #116's, applied at this site: one line when the excursion opens, one when it clears,
+with the duration on the closing line. `LogEpisode` moved out of `FailoverManager` into
+`include/orderbook/log_episode.hpp` to do it — **the second user is what turns a pattern into a
+mechanism**, and two copies of "have I already said this" drift apart until the two log shapes an
+operator greps for disagree.
+
+**Every occurrence is still counted**, in `ob_mm_hlc_drift_excursions_total`, registered in the
+same change that writes it (#117's discipline). The pair is the point and it is not tidiness:
+`ob_mm_hlc_drift_ns` is a **peak that never comes down**, because nothing lowers the HLC's physical
+component, so a single ten-second excursion and a clock that is permanently an hour out give the
+same gauge for ever. The counter is what separates them, and it is the half that can be alerted on
+(#94's lesson about `ob_replicas_connected`).
+
+Two tests state the property in the only form a C++ test can, because these tests have no log sink
+to read: an excursion lasting a thousand ticks is **one** episode with more than a thousand
+occurrences, and an excursion that clears and returns is **two** episodes. The second one exists
+because "one line per episode" is otherwise indistinguishable from "one line, ever" — the failure
+mode of an episode whose `end()` is never reached, which a mutation confirms is a live risk.
+
+- Effort: S | Impact: an hour of skew on one node's clock was megabytes of log per node and the one
+  number that could have been alerted on did not exist
+
+### 119. The HLC went backwards, which is the one property it exists to provide ✅
+
+Found by #54 stage D. `tests/test_hlc_skew.cpp` presents the timestamps a **broken** cluster
+produces; `tests/test_hlc.cpp` had always presented the ones a working cluster produces, and the
+difference is where this was hiding.
+
+`tick_local()` increments the logical counter on every tick whose physical component has not
+moved, and that counter is **16 bits** — fixed by the wire format, which three `static_assert`s on
+`HLCTimestamp`'s layout pin. `static_cast<uint16_t>(last_.logical + 1)` wraps silently.
+
+**Measured** (probe against `liborderbook_hlc.a`, i3-7100U):
+
+| run | ticks | regressions | first at |
+|-----|-------|-------------|----------|
+| control, no remote frame | 200 000 | **0** | — |
+| after one remote frame an hour ahead | 200 000 | **3** | tick **65 533**, `…816.65535.1` → `…816.0.1` |
+
+Three regressions per 200 000 ticks is one per 65 536, which is the arithmetic saying the same
+thing. The control matters as much as the finding: without it a green skew test cannot be told
+from a probe that is not looking.
+
+**Reachable, and not slowly.** `Engine::apply_remote_delta()` hands every replicated record's
+timestamp to `tick_receive()`, which stores `max({now, last_, remote})` with no ceiling — and
+`src/multi_master.cpp` deserialises that timestamp from the frame header and passes it on **ten
+lines later**, with nothing in between. So one frame from a peer whose clock is ahead pins our
+physical component above the wall clock, and from then on every local tick increments the counter.
+At this engine's published native ingestion rate a pinned window of 100 ms is some 135 000 events,
+so the period is crossed twice inside a tenth of a second.
+
+**The fix carries the overflow into the physical component** rather than wrapping it: the order
+stays total for ever, and the cost is one nanosecond per 65 536 events, below the resolution of
+anything that reads this clock. The alternative — saturating the counter — would stop the reversal
+and **silently stop breaking ties**, which is worse than the reversal because nothing would show
+it. A separate test therefore asserts that crossing the period produces a **strictly** greater
+timestamp, and a mutation confirms that test is load-bearing: saturating kills that test and
+**leaves the monotonicity test green**.
+
+**What this deliberately does not do is put a ceiling on the drift a remote may introduce.** With
+the counter fixed, a poisoned clock is wrong about real time but not incorrect: every node that
+receives such a record adopts the same value, timestamps stay monotonic, and LWW still converges —
+which stage D's other measurement confirms from the other side (two nodes with **opposite** drift
+agree on the winner of the same conflict, and still agree after merging each other's clocks). A
+ceiling would buy a clock that means something in exchange for losing causal order against a peer
+we would be refusing to believe. That is a policy decision with a named cost rather than a bug fix,
+so the current behaviour is **pinned by a test** — changing it has to be a decision, and the
+question is recorded as #121 rather than settled quietly here.
+
+- Effort: S | Impact: P0 by consequence. LWW conflict resolution is built on HLC ordering, so a
+  clock that goes backwards is two nodes able to disagree permanently about a row's content, and
+  nothing in the engine would notice — anti-entropy compares what each side holds, and two sides
+  each holding a different winner look consistent to it. Never observed in the wild
+
+### 121. Nothing bounds how far a peer's clock can move ours, and the move is permanent
+
+Named while fixing #119, and left open on purpose: the honest answer is a decision, not a patch.
+
+`tick_receive()` stores `max({now, last_, remote})`, `src/multi_master.cpp` passes the frame's
+timestamp to it unfiltered, and no code path lowers the physical component again. So one record
+from a peer an hour ahead moves this node an hour ahead for the rest of its life, and because
+`apply_delta_mm()` stamps **our** writes with `tick_local()`, our records then carry that value out
+to every peer. One broken clock migrates into every node and stays. Measured as part of #119: after
+one such frame, twenty local ticks later the clock is still an hour past the wall clock.
+
+With #119 fixed this is **wrong about real time rather than incorrect** — the mesh agrees with
+itself, ordering is total, LWW converges — so the cost is that timestamps stop being times, that
+`ob_mm_hlc_drift_ns` never comes down, and that a node whose own clock is fine carries another
+node's error for ever.
+
+Why a ceiling is not obviously right: refusing the **record** loses data, and clamping the **clock**
+loses causal order against that peer — `HybridLogicalClock`'s documented guarantee is that
+A → B implies HLC(A) < HLC(B), and a timestamp we decline to adopt breaks it for exactly the pair
+where the peer's clock was wrong. Either choice needs a threshold, and this repo's own rule is that
+a threshold above ordinary variation is not a justification. Whether we want a clock that means
+something or a clock that never lies about causality is a product decision.
+
+What exists today so the decision can be made with numbers rather than taste:
+`ob_mm_hlc_drift_excursions_total` counts occurrences, `ob_mm_hlc_drift_ns` holds the peak, the log
+says it twice per excursion (#120), and `HLCSkew.ARemoteTimestampAheadOfUsIsAdoptedAndKept` pins
+the current behaviour so that changing it shows up as a failing test.
+
+- Effort: M, most of it the decision | Impact: one misconfigured node's clock becomes the whole
+  mesh's clock, permanently, and the only visible sign is a drift gauge that never returns to zero
+
 ### 118. Two mesh fields are named after a replication lag, neither is one, and the lag that is real is published nowhere
 
 Found while planning #117: the gauge nothing feeds turned out to have two siblings that something
@@ -5350,7 +5465,15 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Two defects are open, and they are the same investigation.** **#117**: five registered metrics
+**Three defects are open and one question is recorded for a decision.** **#119** and **#120** are
+closed by the commit that carries this line, and both were found by #54 stage D going to test clock
+skew: the hybrid logical clock **went backwards** after a peer's clock pushed it into the future —
+measured at tick 65 533 against a control of zero regressions over the same 200 000 ticks — and a
+clock that was off wrote one WARN line per **write**, 200 002 lines for 200 000 ticks. **#121** is
+the question those two left behind, and it is filed rather than answered because a ceiling on the
+drift a peer may introduce costs causal order against that peer.
+
+Of the open three, two are the same investigation. **#117**: five registered metrics
 that nothing feeds — found by #54 stage C going to look for the "replication lag" gauge it needed
 and finding it had always read zero. The same measurement says a mesh node can hold **4 MB** of
 unreplicated writes without a single number moving, because the only signal it feeds is its own
@@ -5541,7 +5664,7 @@ runners, not the machine-B performance baseline above.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1024 | all passing with `ctest -j1` on the i3-7100U. **Five fewer than the previous commit, and that is #114 rather than a loss of coverage**: `test_mmap_store.cpp` held exactly five tests for a component with no production caller, deleted with it. CTest lists 1026: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtime is what this machine gave on the commit measured, not a budget: the same suite read 159 s earlier the same day on an idler machine |
+| C++ (GTest + RapidCheck) | 1039 | all passing with `ctest -j1` on the i3-7100U, run in three `-I` ranges because this machine's memory guard stops a single long run (349 + 349 + 341). **Fifteen more than the previous commit, all of `test_hlc_skew.cpp`** — #54 stage D, which is how #119 and #120 were found; twelve are the clock itself and three are the two-node convergence check that says LWW still agrees under opposite drift. CTest lists 1041: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
 | Python integration | 256 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 256; count pytest's final result rather than the report plugin's progress characters. **Measured twice on this commit's suite and the two figures agree:** `256 passed, 2 skipped in 19:18` on the GitHub runner, and `19:25` on the development machine (i3-7100U, native etcd) — the first battery since #115 that this machine would finish, which is why both are here. Ten more than the previous commit, all of #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content, and the same ten cost 2:37 locally |
 | Python integration under TSan | 256 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `256 passed in 24:09` on the GitHub runner for this commit, up from 20:17 one commit ago. Read it against the **19:18** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 

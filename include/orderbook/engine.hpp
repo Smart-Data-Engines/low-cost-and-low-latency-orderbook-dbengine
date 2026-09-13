@@ -581,6 +581,12 @@ private:
     /// has no registry (#113).
     uint64_t published_fsync_failures_{0};
 
+    /// HLC drift excursions already published, for the same reason and by the same shape as the
+    /// field above: the clock keeps a running total and the registry's counters take an increment.
+    /// The clock owns the number because the excursion is observed there, and it has no registry
+    /// to publish to — `liborderbook_hlc` links nothing, deliberately (#120).
+    uint64_t published_drift_excursions_{0};
+
     /// Consecutive failed ticks, so the log reports an episode rather than one line per interval.
     ///
     /// A permanently full disk would otherwise write an ERROR every flush interval for ever -

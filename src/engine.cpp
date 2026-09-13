@@ -855,6 +855,14 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
 
     // Update HLC drift metric.
     registry_.set_gauge("ob_mm_hlc_drift_ns", hlc_->max_drift_ns());
+    // A delta rather than the total, because the registry's counters accumulate. Published from
+    // the same place as the gauge beside it: this is the remote-record path, and an excursion that
+    // matters starts with a remote timestamp.
+    if (const uint64_t total = hlc_->drift_excursions(); total > published_drift_excursions_) {
+        registry_.increment_counter("ob_mm_hlc_drift_excursions_total",
+                                    total - published_drift_excursions_);
+        published_drift_excursions_ = total;
+    }
 
     // 3. Per-level conflict resolution.
     auto& resolver = const_cast<ConflictResolver&>(mm_mgr_->conflict_resolver());

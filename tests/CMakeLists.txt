@@ -674,6 +674,16 @@ target_link_libraries(test_hlc
 )
 gtest_discover_tests(test_hlc PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
 
+# ── HLC under clock skew (fault-injection stage D, #54; defects #119 and #120) ─
+add_executable(test_hlc_skew test_hlc_skew.cpp)
+target_link_libraries(test_hlc_skew
+    PRIVATE
+        orderbook_hlc
+        orderbook_conflict_resolver
+        GTest::gtest_main
+)
+gtest_discover_tests(test_hlc_skew PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
+
 # ── ConflictResolver property-based and unit tests (multi-master-replication, Tasks 5.4–5.5) ─
 add_executable(test_conflict_resolver test_conflict_resolver.cpp)
 target_link_libraries(test_conflict_resolver
