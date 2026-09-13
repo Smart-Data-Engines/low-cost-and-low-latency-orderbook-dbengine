@@ -630,11 +630,20 @@ echo "MM_CONFLICTS" | nc localhost 5555
 ```
 
 `MM_PEERS` answers a header line and then one line per peer: `node_id`, `address`, `status`,
-`hlc_timestamp`, `lag_bytes`. It lists **peers**, meaning connections whose handshake has said who
-they are — an inbound connection that has not got that far is not listed, because it used to appear
-as `0  (no address)  disconnected`, which reads as a peer that has fallen over and counts as one node
-too many. The number of such connections is logged at DEBUG rather than put on the wire, since these
-rows are parsed.
+`hlc_timestamp`, `lag_bytes`. Two of those need their names read with care. `status` is
+`connected` or `disconnected` — the state of the link, not the `active`/`joining`/`leaving` a node
+publishes about itself in the peer registry. And `lag_bytes` is **not a replication lag**: it is
+what this node has queued to send that peer, so it is zero on a healthy link and stays zero until
+the sender's socket buffer fills. `STATUS`'s `replication_lag_peer_<id>` is not one either — it
+subtracts a position in the peer's own WAL, recorded once at handshake, from this node's offset,
+which on a converged mesh makes it equal to this node's own WAL size. Roadmap #118 carries the
+measurement and the fix; neither number should be alerted on as a lag today.
+
+The command lists **peers**, meaning connections whose handshake has said who they are — an
+inbound connection that has not got that far is not listed, because it used to appear as
+`0  (no address)  disconnected`, which reads as a peer that has fallen over and counts as one
+node too many. The number of such connections is logged at DEBUG rather than put on the wire,
+since these rows are parsed.
 
 ## High Availability: graceful failover
 
