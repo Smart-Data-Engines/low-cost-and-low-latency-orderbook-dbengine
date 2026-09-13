@@ -858,11 +858,8 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
     // A delta rather than the total, because the registry's counters accumulate. Published from
     // the same place as the gauge beside it: this is the remote-record path, and an excursion that
     // matters starts with a remote timestamp.
-    if (const uint64_t total = hlc_->drift_excursions(); total > published_drift_excursions_) {
-        registry_.increment_counter("ob_mm_hlc_drift_excursions_total",
-                                    total - published_drift_excursions_);
-        published_drift_excursions_ = total;
-    }
+    publish_counter_delta("ob_mm_hlc_drift_excursions_total", hlc_->drift_excursions(),
+                          published_drift_excursions_);
 
     // 3. Per-level conflict resolution.
     auto& resolver = const_cast<ConflictResolver&>(mm_mgr_->conflict_resolver());
@@ -1555,10 +1552,24 @@ void Engine::promote_to_primary(const EpochValue& new_epoch) {
     std::unique_lock<std::mutex> lock(mtx_);
 
     // Stop ReplicationClient if running.
-    if (repl_client_) {
+    //
+    // Ownership is taken **under** the lock and the object is destroyed through the local, which
+    // is the same shape `demote_to_replica()` uses ten lines further down — and whose comment
+    // there says "for the reason above" about a reason this site used to break. It wrote
+    // `repl_client_.reset()` with `mtx_` released while every reader of that pointer holds it, so
+    // the member was written unlocked: #122.
+    //
+    // The unlock is still needed and is not the defect. `stop()` joins the client's threads, and
+    // holding `mtx_` across a join that the joined thread may need is #79's deadlock. What moves
+    // is only *when the member is written*: the move happens with the lock held, and the
+    // destruction happens on a local nobody else can reach.
+    //
+    // The ordering the paragraph below depends on is unchanged: `stop()` and the destructor both
+    // run before `discard_saved_replication_position()`.
+    if (std::unique_ptr<ReplicationClient> client = std::move(repl_client_)) {
         lock.unlock();
-        repl_client_->stop();
-        repl_client_.reset();
+        client->stop();
+        client.reset();
         lock.lock();
     }
 
@@ -1889,6 +1900,19 @@ void Engine::flush_loop() {
     }
 }
 
+void Engine::publish_counter_delta(const char* name, uint64_t total, uint64_t& published) {
+    // A source that restarts is the case this exists for. `repl_client_` is constructed fresh on
+    // every role change, so `total` can be *smaller* than what has already been published — and
+    // then the whole of it is new, because the registry's counter keeps the history this object
+    // no longer has. Reading it as "nothing happened" would freeze the metric exactly when a node
+    // has become a replica and started catching up (#117).
+    const uint64_t delta = counter_delta(total, published);
+    published = total;
+    if (delta > 0) {
+        registry_.increment_counter(name, delta);
+    }
+}
+
 void Engine::flush_tick() {
         // Publish the failed syncs **first**, as a delta, because everything below this can throw.
         //
@@ -1898,10 +1922,37 @@ void Engine::flush_tick() {
         // counter stayed at zero while the disk was reporting EIO on every write. The regression
         // test for #113 found it - the writes were correctly refused and the number an operator
         // reads was still flat.
-        if (const uint64_t total = wal_.fsync_failures(); total > published_fsync_failures_) {
-            registry_.increment_counter("ob_wal_fsync_errors_total",
-                                        total - published_fsync_failures_);
-            published_fsync_failures_ = total;
+        publish_counter_delta("ob_wal_fsync_errors_total", wal_.fsync_failures(),
+                              published_fsync_failures_);
+
+        // Two counters owned by objects with no registry of their own, published here because this
+        // is the engine's periodic tick and both readings are cheap. The WAL's total counts every
+        // record type, which is what makes it worth having beside `ob_inserts_total` rather than a
+        // duplicate of it; the replica's is the number `STATUS` has always shown as `replayed=`
+        // and that `/metrics` reported as a flat zero until now (#117).
+        publish_counter_delta("ob_wal_records_written", wal_.records_written(),
+                              published_wal_records_);
+
+        // Read under `mtx_`, which is the discipline `stats()` uses for the same pointer — and
+        // which the write side did not: `promote_to_primary()` released `mtx_` before
+        // `repl_client_.reset()`. That was #122, and this publication is what made it fire.
+        // `stats()` runs on a STATUS command or a scrape; this runs every flush interval, so the
+        // race went from theoretical to reported by TSan in the integration battery, as a race on
+        // `unique_ptr::reset` **and on `operator delete`** — a use-after-free window rather than a
+        // torn pointer. It is fixed in the same change, because "filed rather than fixed" stops
+        // being available once your own change makes a defect reachable.
+        uint64_t replayed = 0;
+        bool have_replica = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (repl_client_) {
+                replayed = repl_client_->state().records_replayed;
+                have_replica = true;
+            }
+        }
+        if (have_replica) {
+            publish_counter_delta("ob_repl_records_replayed", replayed,
+                                  published_repl_replayed_);
         }
 
         // The whole tick is one flush, so a client FLUSH cannot interleave with it.

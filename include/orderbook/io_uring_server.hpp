@@ -2,6 +2,7 @@
 
 #ifdef OB_USE_IO_URING
 
+#include "orderbook/log_episode.hpp"
 #include "orderbook/tcp_server.hpp"  // for ServerConfig, ServerStats, execute_command, etc.
 
 #include <chrono>
@@ -75,6 +76,15 @@ private:
     struct io_uring* ring_{nullptr};
     bool sqpoll_enabled_{false};
     bool buffers_registered_{false};
+
+    /// Completion-queue overflow, as an episode rather than a poll.
+    ///
+    /// `io_uring_cq_has_overflow()` is a **state flag**, not an event count, so a counter fed from
+    /// it on every loop pass would count loop passes — which is a number about this loop's speed
+    /// and not about the ring. One increment per episode is what the metric's own name claims
+    /// ("Number of Completion Queue overflows"), and it is #120's mechanism reused rather than
+    /// reinvented (#117).
+    LogEpisode cq_overflow_episode_{};
 
     // Buffer pool: max_sessions buforów po 4KB
     std::vector<char>    buffer_pool_;       // ciągły blok: max_sessions * 4096

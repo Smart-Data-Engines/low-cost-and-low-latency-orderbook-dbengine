@@ -581,6 +581,24 @@ private:
     /// has no registry (#113).
     uint64_t published_fsync_failures_{0};
 
+    /// WAL records already published, and replayed records already published.
+    ///
+    /// Two more of the shape above, and the second one is why they all go through
+    /// `publish_counter_delta()` rather than three copies of a subtraction: `repl_client_` is
+    /// **rebuilt on every role change** (`demote_to_replica()` constructs a new one), so its total
+    /// restarts at zero while the registry's counter must not. A bare `total - published` freezes
+    /// the metric from that moment until the new client passes the old total — which is precisely
+    /// the window an operator is watching, a node that has just become a replica and is catching
+    /// up. `WALWriter` and `HybridLogicalClock` live as long as the engine, so the naive form
+    /// happens to be correct for them; that is a property of those two objects and not of the
+    /// pattern (#117).
+    uint64_t published_wal_records_{0};
+    uint64_t published_repl_replayed_{0};
+
+    /// Feed `name` the difference between a counter owned elsewhere and what has been published,
+    /// tolerating the source restarting from zero.
+    void publish_counter_delta(const char* name, uint64_t total, uint64_t& published);
+
     /// HLC drift excursions already published, for the same reason and by the same shape as the
     /// field above: the clock keeps a running total and the registry's counters take an increment.
     /// The clock owns the number because the excursion is observed there, and it has no registry

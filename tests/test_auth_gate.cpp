@@ -160,8 +160,8 @@ TEST(AuthGateStatic, EveryTransportPassesACredentialStoreToExecuteCommand) {
     // takes it as a defaulted argument - which every unit test relies on - so a transport that
     // forgets it compiles, runs, and authenticates nobody.
     //
-    // io_uring is the case this exists for: `OB_USE_IO_URING` is off by default and **no CI job
-    // builds that file**, so nothing else would notice. Same shape as the four integration modules
+    // io_uring is the case this exists for: `OB_USE_IO_URING` is off by default, and since #108 a
+    // CI job **builds** that file without running anything in it — so nothing else would notice. Same shape as the four integration modules
     // that built their own path to the server binary (#85) - a mechanism whose scope can shrink in
     // silence.
     for (const char* rel : {"/src/tcp_server.cpp", "/src/io_uring_server.cpp"}) {

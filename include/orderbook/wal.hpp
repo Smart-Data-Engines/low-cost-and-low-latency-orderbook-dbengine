@@ -291,6 +291,15 @@ public:
     /// not be on the disk, and no later success takes it back.
     uint64_t fsync_failures() const { return fsync_failures_.load(std::memory_order_relaxed); }
 
+    /// Records this writer has appended, of every type.
+    ///
+    /// Every type on purpose, because that is what the name says and because the difference
+    /// against the client-facing insert counters is the bookkeeping this WAL does on its own
+    /// behalf — checkpoints, epochs, version vectors, gaps. An operator watching write rate wants
+    /// `ob_inserts_total`; an operator asking why the WAL grows faster than the inserts wants
+    /// this one, and the two are only useful together (#117).
+    uint64_t records_written() const { return records_written_.load(std::memory_order_relaxed); }
+
     /// Where the WAL is, in one atomic load. Cannot observe a rotation half-applied.
     ///
     /// `relaxed`, and that is a decision rather than an omission. A reader wants a coherent *pair*,
@@ -348,6 +357,14 @@ private:
     /// one publishing it, and because a number an operator reads to decide whether to replace a
     /// disk should not be a data race.
     std::atomic<uint64_t> fsync_failures_{0};
+
+    /// Atomic for the same reason as `position_` and `fsync_failures_`: the writer's own thread
+    /// increments it and the engine's flush tick reads it, so a plain `uint64_t` would be a data
+    /// race whatever the arithmetic looks like. Relaxed load plus relaxed store rather than
+    /// `fetch_add`, because the engine's mutexes serialise writers — so this costs two plain moves
+    /// and no lock-prefixed instruction on the write path, which `scripts/mnemonic_diff.py`
+    /// confirms rather than this comment.
+    std::atomic<uint64_t> records_written_{0};
     uint64_t    current_epoch_{0};
     uint16_t    origin_node_id_{0};  // 0 = legacy mode (no multi-master)
 
@@ -368,6 +385,37 @@ private:
     /// allow_fsync=false writes the record without honouring FsyncPolicy::EVERY. Only
     /// for records whose loss is harmless: a lost CHECKPOINT costs a redundant replay,
     /// never a lost row, so paying an fsync for it would slow every flush for nothing.
+    /// Advance the published position past a record of `total` bytes and count it, returning the
+    /// position of its first byte.
+    ///
+    /// One function rather than a copy in each of the two write paths. The two copies it replaces
+    /// were identical down to their comment, which is the shape #94 was: a quantity maintained at
+    /// N call sites is a quantity the N+1st call site will not maintain. A third record format
+    /// added later gets the counter by calling this, or does not compile.
+    ///
+    /// Defined here rather than in the .cpp because this is the write path and the difference was
+    /// measured, not assumed: out of line it became a real 16-instruction call and `write_record`
+    /// went 220 → 212, so the drop was relocation and the true cost was **+8 instructions per
+    /// record**. Inline it costs the counter and nothing else, and the `lock`-prefixed instruction
+    /// count of the whole archive is unchanged either way — which is the number that mattered
+    /// (#117).
+    WalPosition advance_after_write(size_t total) {
+        // One load, one store, on the writer's own thread - the engine's mutexes serialise
+        // writers, so no compare-exchange is needed. On x86-64 a relaxed load and store of an
+        // aligned eight-byte value are plain moves.
+        WalPosition pos = position_.load(std::memory_order_relaxed);
+        const WalPosition written_at = pos;   // the first byte of the record just written
+        pos.offset += static_cast<uint32_t>(total);
+        position_.store(pos, std::memory_order_relaxed);
+
+        // Same shape, same reasoning, and it is here rather than in the two callers because a
+        // count kept in two places is a count the third writer will not keep (#94, #117).
+        records_written_.store(records_written_.load(std::memory_order_relaxed) + 1,
+                               std::memory_order_relaxed);
+        ++pending_sync_;
+        return written_at;
+    }
+
     WalPosition write_record(const WALRecord& hdr, const void* payload, size_t payload_len,
                              bool allow_fsync = true);
 

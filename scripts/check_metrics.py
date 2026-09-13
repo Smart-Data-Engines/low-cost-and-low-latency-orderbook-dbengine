@@ -58,11 +58,12 @@ ANY_LITERAL = re.compile(r'"(ob_[a-z0-9_]+)"')
 # than unnoticed; #117 carries the work. Removing a name from here without feeding the metric puts
 # this check back to red, which is the point.
 NOT_YET_WRITTEN = {
-    "ob_wal_records_written": "#117 - the WAL has never published its own record count",
-    "ob_repl_records_replayed": "#117 - the replica applies records and reports none",
-    "ob_mm_replication_lag_bytes": "#117 - the signal requirement 1.4 of #54 needs, fed by nothing",
-    "ob_iouring_cq_overflows": "#117 - the io_uring transport publishes neither of its two metrics",
-    "ob_iouring_sq_utilization": "#117 - as above; no CI job builds that file either (#108)",
+    # One left, and it is the one that cannot be fed honestly rather than the one nobody got to.
+    # #118 measured why: the only per-peer position the mesh has is a byte offset into the peer's
+    # own WAL, frozen at handshake, so subtracting it from ours yields this node's own WAL size.
+    # The honest mesh answer is in records, from compare_vectors(), which is a different metric
+    # with a different name - so this entry is waiting to be *removed*, not filled.
+    "ob_mm_replication_lag_bytes": "#118 - a byte lag the mesh cannot state; the fix renames it",
 }
 
 
@@ -122,7 +123,8 @@ def main() -> int:
 
     print(f"src/metrics.cpp: {len(registered)} metrics registered, "
           f"{len(written)} written by name, all resolve; "
-          f"{len(NOT_YET_WRITTEN)} registered and knowingly fed by nothing (#117)")
+          f"{len(NOT_YET_WRITTEN)} registered and knowingly fed by nothing "
+          f"({', '.join(sorted(NOT_YET_WRITTEN))})")
     return 0
 
 

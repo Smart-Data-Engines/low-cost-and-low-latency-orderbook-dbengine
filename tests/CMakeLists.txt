@@ -674,6 +674,14 @@ target_link_libraries(test_hlc
 )
 gtest_discover_tests(test_hlc PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
 
+# ── What the io_uring transport publishes, read from its source (#117) ───────
+# Not behind OB_USE_IO_URING on purpose: the point is to check a file this build does not compile,
+# because the build that does compile it runs no tests.
+ob_add_test(test_iouring_instrumentation test_iouring_instrumentation.cpp)
+target_compile_definitions(test_iouring_instrumentation
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
 # ── HLC under clock skew (fault-injection stage D, #54; defects #119 and #120) ─
 add_executable(test_hlc_skew test_hlc_skew.cpp)
 target_link_libraries(test_hlc_skew
