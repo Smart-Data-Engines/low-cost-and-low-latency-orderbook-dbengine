@@ -2416,6 +2416,19 @@ passing test *because of #117*. Six writes across a partitioned link, the lag go
 the unknown count still zero, and it returns to zero on heal — three readings, the first of which
 is the control, because a gauge only ever observed as zero is what #117 was about.
 
+**Nine mutations, each with the verdict it was expected to give**, tree restored byte-identically.
+Two of them are the interesting ones. The deliberate survivor is *"the reconciler never reports an
+unknown position"*: the exclusion arithmetic is pinned by unit tests that pass an `unknown` list
+directly, but nothing behavioural watches the reconciler **fill** that list, because a peer with no
+vector exists only in the window between handshake and the first exchange and no test can land on
+it deterministically. Recorded rather than dropped — a surviving mutation without a note is one the
+next reader assumes was missed. And *"the records lag is always zero"* was run a second time
+against the **integration** test, which failed in 1:12: that is what says the test closing C3 is
+load-bearing rather than a test of a gauge that happens to read zero.
+
+One mutation did not build at first, because removing the exclusion left a parameter unused under
+`-Werror`. The **mutation** was transformed, not the code.
+
 - Effort: S to stop reporting the two wrong numbers, M for the honest one | Impact: an operator
   watching a converged mesh read a lag that grew all day, a client reading `peer["lag_bytes"]` read
   a queue depth under a different name, and `peer["status"] == "active"` was never true. The
