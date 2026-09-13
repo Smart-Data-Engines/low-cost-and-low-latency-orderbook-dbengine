@@ -391,6 +391,56 @@ ten-second timer; and within a process it lives in one place, so a role change k
 `repl_state.txt` written before #103 has no such line and simply leaves the epoch where the WAL put
 it.
 
+## When a peer's clock is wrong
+
+Two numbers answer this, and you need both.
+
+```
+curl -s localhost:9091/metrics | grep ob_mm_hlc_drift
+# ob_mm_hlc_drift_ns 3599999999788
+# ob_mm_hlc_drift_excursions_total 1042
+```
+
+`ob_mm_hlc_drift_ns` is **how far** the hybrid logical clock's physical component is ahead of this
+node's wall clock, and it is a **peak that never comes down** — nothing lowers that component, so
+the gauge records the worst moment for the life of the process.
+`ob_mm_hlc_drift_excursions_total` is **how often** a tick has found the drift over a second, so
+the two together separate a single excursion from a clock that is permanently out. The gauge alone
+cannot: a ten-second blip and an hour of skew read identically once the blip is over.
+
+In the log you get two lines per excursion and not one per write (#120):
+
+```
+WARN hlc HLC drift exceeds 1s: drift_ns=3599999999788 — this clock is ahead of the wall clock,
+         which a peer's timestamp can do and nothing undoes; further ticks are counted in
+         ob_mm_hlc_drift_excursions_total, not logged
+WARN hlc HLC drift is back within 1s after 1042 tick(s): drift_ns=812443
+```
+
+**What the engine promises.** The clock never goes backwards, whatever a peer sends — that is #119,
+and it is the property everything else here rests on, because last-writer-wins compares these
+timestamps. Two nodes whose clocks drift in **opposite** directions still agree on the winner of
+the same conflict, and still agree after each has merged the other's timestamp.
+
+**What it does not promise, and this is the part worth knowing before you need it.** A record from a
+peer whose clock is ahead moves this node's clock forward, and **nothing moves it back** — not a
+restart of the peer, not fixing the peer's clock, not a restart of this node once the value is in
+its WAL. Because this node then stamps its own writes with that clock, the value spreads to every
+peer that receives one. So a single misconfigured clock becomes the cluster's clock and stays.
+
+The mesh stays consistent while that is true: every node adopts the same value, so ordering is
+total and conflicts resolve the same way everywhere. What you lose is the timestamps meaning a
+time. The practical consequence is that `ob_mm_hlc_drift_ns` on a healthy node tells you a peer's
+clock was wrong **at some point**, not that anything is wrong now — and the only way back to
+timestamps that track real time is to restart the cluster with the offending clock fixed and the
+WAL rotated past the poisoned records.
+
+Whether the engine should refuse such a timestamp is recorded as roadmap #121 rather than decided:
+declining it would keep the clock meaningful and break the guarantee that a record which caused
+another has an earlier timestamp than it, for exactly the peer whose clock is wrong.
+
+Run NTP on every node in a mesh. This is not advice the engine can enforce for you.
+
 ## When etcd is unreachable
 
 Measured on a two-node cluster, i3-7100U, with the coordinator stopped for 30 s (#54 stage B):

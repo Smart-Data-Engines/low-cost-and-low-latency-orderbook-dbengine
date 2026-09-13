@@ -679,6 +679,7 @@ add_executable(test_hlc_skew test_hlc_skew.cpp)
 target_link_libraries(test_hlc_skew
     PRIVATE
         orderbook_hlc
+        orderbook_conflict_resolver
         GTest::gtest_main
 )
 gtest_discover_tests(test_hlc_skew PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})

@@ -21,6 +21,7 @@
 #include <thread>
 #include <vector>
 
+#include "orderbook/conflict_resolver.hpp"
 #include "orderbook/hlc.hpp"
 
 namespace {
@@ -253,4 +254,115 @@ TEST(HLCSkew, AnExcursionThatClearsAndReturnsIsTwoLines) {
         0, 2});
     EXPECT_EQ(hlc.drift_episodes(), 2u)
         << "a second excursion after the first cleared is a second line, not a suppressed one";
+}
+
+// ── D2: two nodes, opposite drift, the same conflict ────────────────────────
+//
+// This is the property the stage exists for. Divergence here is not a wrong number in a log: it
+// is two nodes permanently disagreeing about the content of a row, with no mechanism that would
+// ever notice. Anti-entropy compares what each side *holds*, so two sides each holding a
+// different winner look consistent to it.
+
+namespace {
+
+/// One node's view: its own clock, and the resolver that decides for it.
+struct NodeView {
+    ob::HybridLogicalClock clock;
+    ob::ConflictResolver   resolver{};
+
+    explicit NodeView(uint16_t id) : clock(id) {}
+};
+
+ob::ConflictKey key() { return ob::ConflictKey{"BTC-USD", "BINANCE", 0, 5000000}; }
+
+} // namespace
+
+TEST(HLCSkew, TwoNodesWithOppositeDriftAgreeOnTheWinnerOfTheSameConflict) {
+    // Node 1's clock runs ahead of real time, node 2's behind it. Both directions on purpose:
+    // a rule that only looked at one side would pass a test that only skewed one side.
+    NodeView one(1);
+    NodeView two(2);
+    one.clock.tick_receive(ob::HLCTimestamp{wall_clock_ns() + 30 * kSecond, 0, 9});
+
+    // Each node stamps its own write with its own clock. These are the two records that will meet.
+    const ob::HLCTimestamp from_one = one.clock.tick_local();
+    const ob::HLCTimestamp from_two = two.clock.tick_local();
+
+    // Node 1 applied its own write first, then node 2's arrives.
+    one.resolver.update_hlc(key(), from_one, 1);
+    const ob::ConflictResolution on_one = one.resolver.resolve(key(), from_two, 2);
+
+    // Node 2 applied its own write first, then node 1's arrives.
+    two.resolver.update_hlc(key(), from_two, 2);
+    const ob::ConflictResolution on_two = two.resolver.resolve(key(), from_one, 1);
+
+    // The two nodes are answering mirrored questions, so agreement means opposite verdicts about
+    // "the remote": exactly one of them must end up holding node 1's write. Stating it as the
+    // winner rather than as the verdict is what makes the assertion readable — and a test that
+    // compared the two enum values directly would demand they be *equal*, which would be the
+    // definition of divergence.
+    const bool one_keeps_its_own = (on_one == ob::ConflictResolution::REJECT_REMOTE);
+    const bool two_takes_ones    = (on_two == ob::ConflictResolution::APPLY_REMOTE);
+    EXPECT_EQ(one_keeps_its_own, two_takes_ones)
+        << "the two nodes disagree about which write wins, which is permanent divergence";
+
+    // And the winner is the node whose clock is ahead. That is LWW working as designed rather
+    // than a defect — worth asserting so that a change to the tie-break has to be deliberate.
+    EXPECT_TRUE(one_keeps_its_own)
+        << "the write stamped by the clock that is ahead did not win";
+}
+
+TEST(HLCSkew, AgreementSurvivesTheClocksMergingInOppositeOrders) {
+    // The same pair, but each node has already merged the other's timestamp — which is what
+    // `apply_remote_delta` does on the way in, and it happens in a different order on each side.
+    // If merging could change a verdict, the two nodes would diverge on the *third* write rather
+    // than the second, which is harder to see and no less permanent.
+    NodeView one(1);
+    NodeView two(2);
+    one.clock.tick_receive(ob::HLCTimestamp{wall_clock_ns() + 30 * kSecond, 0, 9});
+
+    const ob::HLCTimestamp from_one = one.clock.tick_local();
+    const ob::HLCTimestamp from_two = two.clock.tick_local();
+
+    one.clock.tick_receive(from_two);
+    two.clock.tick_receive(from_one);
+
+    const ob::HLCTimestamp next_one = one.clock.tick_local();
+    const ob::HLCTimestamp next_two = two.clock.tick_local();
+
+    one.resolver.update_hlc(key(), next_one, 1);
+    two.resolver.update_hlc(key(), next_two, 2);
+
+    const ob::ConflictResolution on_one = one.resolver.resolve(key(), next_two, 2);
+    const ob::ConflictResolution on_two = two.resolver.resolve(key(), next_one, 1);
+
+    const bool one_keeps_its_own = (on_one == ob::ConflictResolution::REJECT_REMOTE);
+    const bool two_takes_ones    = (on_two == ob::ConflictResolution::APPLY_REMOTE);
+    EXPECT_EQ(one_keeps_its_own, two_takes_ones)
+        << "after merging each other's clocks the two nodes chose different winners";
+}
+
+// The control for both of the above: with no skew at all the same pair still has to reach one
+// answer, decided by the node id. Without it, a resolver that always said REJECT_REMOTE would
+// pass every assertion above.
+TEST(HLCSkew, TwoNodesWithNoSkewStillAgreeAndTheTieBreakIsTheNodeId) {
+    NodeView one(1);
+    NodeView two(2);
+
+    // Same physical nanosecond on both sides, which is the case the node id exists for.
+    const uint64_t shared = wall_clock_ns();
+    const ob::HLCTimestamp from_one{shared, 0, 1};
+    const ob::HLCTimestamp from_two{shared, 0, 2};
+
+    one.resolver.update_hlc(key(), from_one, 1);
+    two.resolver.update_hlc(key(), from_two, 2);
+
+    const ob::ConflictResolution on_one = one.resolver.resolve(key(), from_two, 2);
+    const ob::ConflictResolution on_two = two.resolver.resolve(key(), from_one, 1);
+
+    const bool one_keeps_its_own = (on_one == ob::ConflictResolution::REJECT_REMOTE);
+    const bool two_takes_ones    = (on_two == ob::ConflictResolution::APPLY_REMOTE);
+    EXPECT_EQ(one_keeps_its_own, two_takes_ones);
+    EXPECT_FALSE(one_keeps_its_own)
+        << "with physical and logical equal the higher node id must win, on both sides";
 }
