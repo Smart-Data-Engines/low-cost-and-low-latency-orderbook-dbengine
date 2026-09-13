@@ -2002,6 +2002,41 @@ Learned the hard way. Check here before debugging.
     plainly what did **not** run locally rather than leaving it to be inferred — the integration
     battery's verification for #115 and #116 is CI's, and the PR says so.
 
+240. **A registered metric nobody writes reads as zero, and the check that exists walks the other
+    way.** `scripts/check_metrics.py` proves every name handed to `increment_counter` and friends is
+    registered; a registration with no write is invisible to that direction, and the script's own
+    docstring said so. Five metrics were in that state, one of them
+    `ob_mm_replication_lag_bytes` — described as "Replication lag in bytes (max across peers)",
+    which is exactly the signal #54 stage C went looking for. An operator alerting on replication
+    lag was alerting on a constant. The reverse scan is in that script now, with an allowlist
+    naming #117. **It is deliberately looser than the forward one**: three subscription counters
+    are written through a local `publish(name, …)` lambda, so a strict scan called them dead — for
+    finding *dead* metrics, "the name appears as a literal anywhere in `src/`" is the right
+    direction to be wrong in, because it can miss a mention but never a real write.
+241. **`SELECT`'s column header is a line, and a filter that drops only the `OK` counts it as a
+    row.** `rows()` in the stage C tests stripped the `OK` and kept
+    `timestamp_ns<tab>price<tab>…` — so a node holding **nothing** returned a one-element list,
+    which is truthy, so `assert rows(peer)` ("the mesh replicated something") could never fail, and
+    every row count in the file was one too many. An `assert len(rows) >= 4` meant to check four
+    writes was satisfied by three. Pitfall 110's shape in a new place, and the header is now pinned
+    against `src/response_formatter.cpp` — **in the source's own spelling**, because a tab there is
+    two characters and the first version of that check compared real tabs against a file with none.
+242. **A fault injector's own control tests are what make the tests behind it mean anything, and
+    mine found two defects before a single engine test ran.** The mesh proxy forwarded bytes across
+    a partition, because the fault was checked **before** `recv` and the pump was already inside a
+    0.25 s call when the partition arrived. And it delivered a byte-budget remainder on the very
+    next iteration, because the flush condition asked only "not partitioned". Both are
+    unexpressible now rather than fixed: everything read goes into the withheld buffer and only an
+    allowance leaves it, so order is preserved by construction and one function decides how much
+    may pass. Five mutations, four killed, one control surviving.
+243. **A fault that depends on which end dialled is a fault a test cannot aim.** The proxy's byte
+    budget was spent only on the client-to-target direction, and in a symmetric mesh the surviving
+    link is whichever end connected first (#96), so the writes under test travelled the direction
+    the budget did not cover and `held_bytes()` came back 0 — which reads as "the budget let
+    everything through". The budget is a property of the **link** now. The cost is named rather
+    than hidden: a heartbeat going the other way spends it too, so the cut arrives sooner than
+    asked, which is the safe direction for a fault to be wrong in.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2114,6 +2149,23 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   `lease_loop`, `monitor_loop` and `io_loop` have the thread-level boundary but not yet a
   per-iteration one, and `io_loop` needs a bound first because its epoll timeout is zero whenever a
   catch-up cursor has queue space (#93).
+- **A mesh link is breakable from the harness, and the proxy that does it needs no engine change**
+  (#54 stage C). `tests/integration/mesh_proxy.py` sits between two peers;
+  `ClusterManager.redirect_peer()` puts it there by overwriting the address
+  `PeerRegistry::register_self()` published, which works because that call happens **once**, at
+  start. Four things to know before using it, each of which cost a wrong test first.
+  **`partition()` buffers and stops reading** — buffers because a real partition delays bytes
+  rather than deleting them (deleting them is `close_connections()`), and stops reading because a
+  proxy that kept draining would hide the fault from the sender, which is the half that has to be
+  visible. **`stall_after(n)` is a property of the link, not of a direction**: which way the writes
+  travel depends on who dialled, and a symmetric mesh does not let a test choose.
+  **Both peers must be redirected**, because the surviving link is whichever was dialled first
+  (#96 measured zero double links), so redirecting one leaves the other direct — and the fixture
+  therefore **asserts that a proxy carried bytes** before any test trusts it.
+  **A restart undoes a redirect**, because registration is part of starting.
+  What the engine promises, measured: after `heal()` the mesh converges **by row content**; a frame
+  cut at byte 20 of a 38-byte header is **not applied in part**; and a reconnect's catch-up
+  re-delivers records without storing any twice. What it does **not** promise today is #117.
 - **An unreachable coordinator is injectable too, and the node's promise is a refusal** (#54 stage
   B). `ClusterManager.stop_etcd()` / `start_etcd()` are public; the restart reuses the **same client
   port and data directory**, because a node is handed `--etcd-endpoint` on its command line at

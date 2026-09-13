@@ -41,6 +41,30 @@ REGISTERED = re.compile(r'make_(?:counter|gauge|histogram)\(\s*"([^"]+)"')
 WRITTEN = re.compile(
     r'(?:increment_counter|increment_gauge|set_gauge|observe_histogram)\(\s*"([^"]+)"')
 
+# The reverse direction, added by #54 stage C, which needed a "replication lag" gauge and found one
+# that is registered and fed by nothing. The check above cannot see that: it walks from writes to
+# registrations, so a registration with no write is invisible to it, and the docstring above says
+# so in as many words. A gauge nobody sets reads as **zero**, which is the one value an operator
+# cannot tell from good news - #23's lesson about a counter that means two things, one level up.
+#
+# "Written" is deliberately looser here than above: the name appearing as a string literal anywhere
+# in src/ or tools/ counts. The three subscription counters are written through a local `publish()`
+# lambda, so the literal sits next to `publish` rather than `increment_counter`, and a strict scan
+# calls them dead. For finding *dead* metrics a loose test is the right direction to be wrong in:
+# it can miss a name that is only mentioned, never a name that is genuinely fed.
+ANY_LITERAL = re.compile(r'"(ob_[a-z0-9_]+)"')
+
+# Registered, fed by nothing, and known. Each line is a claim that the gap is understood rather
+# than unnoticed; #117 carries the work. Removing a name from here without feeding the metric puts
+# this check back to red, which is the point.
+NOT_YET_WRITTEN = {
+    "ob_wal_records_written": "#117 - the WAL has never published its own record count",
+    "ob_repl_records_replayed": "#117 - the replica applies records and reports none",
+    "ob_mm_replication_lag_bytes": "#117 - the signal requirement 1.4 of #54 needs, fed by nothing",
+    "ob_iouring_cq_overflows": "#117 - the io_uring transport publishes neither of its two metrics",
+    "ob_iouring_sq_utilization": "#117 - as above; no CI job builds that file either (#108)",
+}
+
 
 def main() -> int:
     if not REGISTRY.is_file():
@@ -55,6 +79,33 @@ def main() -> int:
             for name in WRITTEN.findall(path.read_text(encoding="utf-8")):
                 written.setdefault(name, set()).add(f"{directory}/{path.name}")
 
+    mentioned: set = set()
+    for directory in ("src", "tools"):
+        for path in sorted((REPO / directory).rglob("*.cpp")):
+            if path == REGISTRY:
+                continue
+            mentioned |= set(ANY_LITERAL.findall(path.read_text(encoding="utf-8")))
+
+    dead = sorted(name for name in registered
+                  if name not in mentioned and name not in NOT_YET_WRITTEN)
+    stale_allowlist = sorted(name for name in NOT_YET_WRITTEN
+                             if name in mentioned or name not in registered)
+
+    problems = False
+    if dead:
+        print("Metrics registered but fed by nothing, so they report zero for ever:",
+              file=sys.stderr)
+        for name in dead:
+            print(f"  {name}", file=sys.stderr)
+        print("  Feed it, or add it to NOT_YET_WRITTEN with the item that will.", file=sys.stderr)
+        problems = True
+    if stale_allowlist:
+        print("NOT_YET_WRITTEN names that are no longer accurate:", file=sys.stderr)
+        for name in stale_allowlist:
+            why = "now written" if name in mentioned else "no longer registered"
+            print(f"  {name}: {why} - remove the entry", file=sys.stderr)
+        problems = True
+
     missing = {name: files for name, files in written.items() if name not in registered}
     if missing:
         print("Metrics written by name but never registered:", file=sys.stderr)
@@ -64,10 +115,14 @@ def main() -> int:
               file=sys.stderr)
         print("Register it in MetricsRegistry::MetricsRegistry() in src/metrics.cpp.",
               file=sys.stderr)
+        problems = True
+
+    if problems:
         return 1
 
     print(f"src/metrics.cpp: {len(registered)} metrics registered, "
-          f"{len(written)} written by name, all resolve")
+          f"{len(written)} written by name, all resolve; "
+          f"{len(NOT_YET_WRITTEN)} registered and knowingly fed by nothing (#117)")
     return 0
 
 
