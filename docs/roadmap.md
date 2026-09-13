@@ -2230,6 +2230,13 @@ Which retires the argument for deferring it. **"Filed rather than fixed" stops b
 once your own change makes a defect reachable**, and a PR that leaves a required check red is not
 a PR.
 
+**Measured on both sides by the same job, which is the cleanest form this kind of claim gets.**
+Before, on the commit that added the publisher and filed the defect: `sanitizers-integration (tsan)`
+red, naming `std::__uniq_ptr_impl<ob::ReplicationClient>::reset` and `operator delete`. After, on
+the commit that carries this line: **256 integration tests passed under TSan in 24:37 with zero
+data-race reports**, and 256 passed in 18:58 uninstrumented. Same runner, same job, one commit
+apart.
+
 - Effort: S | Impact: a use-after-free window on the ordinary promotion path, with `STATUS` and
   every `/metrics` scrape as the reader. Present since the replica path existed; reported the first
   time anything read that pointer often enough
@@ -5772,8 +5779,8 @@ runners, not the machine-B performance baseline above.
 | Suite | Count | Status |
 |-------|-------|--------|
 | C++ (GTest + RapidCheck) | 1052 | all passing with `ctest -j1` on the i3-7100U, run in three `-I` ranges because this machine's memory guard stops a single long run (350 + 350 + 352). **Thirteen more than the previous commit, all of #117**: four pin `queue_utilization_percent` and three `counter_delta`, both moved into `metrics.hpp` so that the ordinary suite executes arithmetic whose caller no CI job runs; two pin the WAL's record count. `tests/test_iouring_instrumentation.cpp` adds four more that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists 1054: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
-| Python integration | 256 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 256; count pytest's final result rather than the report plugin's progress characters. **Measured twice on this commit's suite and the two figures agree:** `256 passed, 2 skipped in 19:18` on the GitHub runner, and `19:25` on the development machine (i3-7100U, native etcd) — the first battery since #115 that this machine would finish, which is why both are here. Ten more than the previous commit, all of #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content, and the same ten cost 2:37 locally |
-| Python integration under TSan | 256 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `256 passed in 24:09` on the GitHub runner for this commit, up from 20:17 one commit ago. Read it against the **19:18** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
+| Python integration | 256 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 256; count pytest's final result rather than the report plugin's progress characters. `256 passed, 2 skipped in 18:58` on the GitHub runner for this commit; the same suite read `19:18` on the runner and `19:25` on the development machine (i3-7100U, native etcd) two commits ago, which is the spread to expect rather than a change. Ten more than the previous commit, all of #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content, and the same ten cost 2:37 locally |
+| Python integration under TSan | 256 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `256 passed in 24:37` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **19:18** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than
