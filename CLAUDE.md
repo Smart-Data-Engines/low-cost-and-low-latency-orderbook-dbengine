@@ -2089,6 +2089,51 @@ Learned the hard way. Check here before debugging.
     read identically once the blip is over. When the fix is "say it less", the number of times you
     said it becomes part of the contract.
 
+249. **A metric fed the wrong number is worse than one fed nothing, because a flat zero is visibly
+    broken and a plausible number is a second opinion.** The io_uring loop incremented
+    `ob_iouring_sqe_submitted` by the **completion** count, so it equalled
+    `ob_iouring_cqe_processed` by construction: an operator comparing the two to find a backlog
+    compared a number with itself, and both moved, and neither was wrong-looking. The real number
+    was two lines away in a return value nobody captured — `io_uring_submit()`'s, whose negative
+    case also means the prepared entries stayed in the ring and this transport made no progress
+    (#113's shape, different file). When a metric has an obvious partner, check they cannot be the
+    same expression.
+
+250. **`total - published` is correct only while the source outlives the publisher, and that is a
+    property of the object rather than of the pattern.** Three engine counters are owned by
+    objects with no registry — the WAL writer, the hybrid logical clock, the replication client.
+    The first two live as long as the engine, which is the only reason the subtraction was ever
+    right; `repl_client_` is **rebuilt on every role change**, so its total restarts at zero and a
+    bare subtraction reads that as "nothing happened". The metric then freezes from the restart
+    until the new object passes the old total — the exact window an operator is watching, a node
+    that has just become a replica and is catching up. One `counter_delta()` in `metrics.hpp` now,
+    where a unit test can state the restart case without a cluster.
+
+251. **When the instruction count of the function you changed goes *down*, look for the new
+    symbol before you report a saving.** Extracting the WAL's accounting made `write_record` read
+    220 → **212**, eight fewer, while the extracted function was a real 16-instruction call — so
+    the true cost was **+8**, and the drop was relocation. Defining it in the header removed the
+    call and left **+3**, which is the counter itself (a relaxed load, an add, a relaxed store),
+    with the archive's `lock`-prefixed instruction count unchanged at 19. Second instance in this
+    repo: `apply_delta` reads 503 → 3 because its body moved to `apply_delta_impl`. The tool warns
+    about this in its own docstring and the warning is not enough — the check is
+    `nm | grep <new symbol>`.
+
+252. **A text assertion about a call site must read the arguments, not the statement, because the
+    callee's name contains the words you are looking for.** The static test that stops
+    `ob_iouring_sqe_submitted` being fed the completion count asked whether the statement mentioned
+    `count` — and matched `increment_counter`. Same family as a denylist finding `rds` inside
+    `records` and as `"disconnected".count("connected") == 1`, committed here **in the check
+    written to catch it**. Take the text after the first comma, not the text of the call.
+
+253. **A harness that refuses a mutation whose source did not move cannot see one whose output did
+    not.** Proving that the WAL's record count belongs in the shared accounting needed a mutation
+    that gives one write path its own copy without the counter. The first attempt guarded the
+    counter on `total != sizeof(WALRecordV2)`, which is **always true** because `total` is header
+    plus payload — a non-mutation that survived and read as a gap in the tests. The rule was
+    already written down and the guard implements only half of it; the other half is asserting the
+    *behaviour* changed, which no textual check can do for you.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2218,6 +2263,18 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   What the engine promises, measured: after `heal()` the mesh converges **by row content**; a frame
   cut at byte 20 of a 38-byte header is **not applied in part**; and a reconnect's catch-up
   re-delivers records without storing any twice. What it does **not** promise today is #117.
+- **Four of #117's five dead metrics are fed; the fifth is #118's to rename, not ours to fill.**
+  `ob_wal_records_written` counts **every** record type in one shared `advance_after_write()` —
+  both write paths had the identical five-line accounting block, which is #94's shape, and a
+  mutation giving the v2 path its own copy without the counter kills the record-type test while
+  leaving the rotation test green. It reads higher than the append count on purpose: each rotation
+  writes a `ROTATE` record, which is how the rotation test found out (it asserted forty and read
+  fifty). Cost measured, not argued: **+3 instructions** per record in both write paths, no new
+  `lock`-prefixed instruction, `apply_delta_mm` unchanged. `ob_repl_records_replayed` needed only a
+  publisher — and pitfall 250 — because `STATUS` has printed it as `replayed=` all along. The
+  io_uring pair is fed in a loop **no CI job runs**, so the arithmetic moved to `metrics.hpp` where
+  the suite executes it and the rest is asserted against the source text in
+  `tests/test_iouring_instrumentation.cpp`, which is deliberately not behind `OB_USE_IO_URING`.
 - **The hybrid logical clock never goes backwards now, and one peer's wrong clock is still the
   whole mesh's clock for ever** (#119 and #120 closed by #54 stage D, #121 open). The reversal was
   the `uint16` `logical` counter wrapping while the physical component was pinned above the wall

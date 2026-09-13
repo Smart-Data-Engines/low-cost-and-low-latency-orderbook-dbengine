@@ -858,11 +858,8 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
     // A delta rather than the total, because the registry's counters accumulate. Published from
     // the same place as the gauge beside it: this is the remote-record path, and an excursion that
     // matters starts with a remote timestamp.
-    if (const uint64_t total = hlc_->drift_excursions(); total > published_drift_excursions_) {
-        registry_.increment_counter("ob_mm_hlc_drift_excursions_total",
-                                    total - published_drift_excursions_);
-        published_drift_excursions_ = total;
-    }
+    publish_counter_delta("ob_mm_hlc_drift_excursions_total", hlc_->drift_excursions(),
+                          published_drift_excursions_);
 
     // 3. Per-level conflict resolution.
     auto& resolver = const_cast<ConflictResolver&>(mm_mgr_->conflict_resolver());
@@ -1889,6 +1886,19 @@ void Engine::flush_loop() {
     }
 }
 
+void Engine::publish_counter_delta(const char* name, uint64_t total, uint64_t& published) {
+    // A source that restarts is the case this exists for. `repl_client_` is constructed fresh on
+    // every role change, so `total` can be *smaller* than what has already been published — and
+    // then the whole of it is new, because the registry's counter keeps the history this object
+    // no longer has. Reading it as "nothing happened" would freeze the metric exactly when a node
+    // has become a replica and started catching up (#117).
+    const uint64_t delta = counter_delta(total, published);
+    published = total;
+    if (delta > 0) {
+        registry_.increment_counter(name, delta);
+    }
+}
+
 void Engine::flush_tick() {
         // Publish the failed syncs **first**, as a delta, because everything below this can throw.
         //
@@ -1898,10 +1908,36 @@ void Engine::flush_tick() {
         // counter stayed at zero while the disk was reporting EIO on every write. The regression
         // test for #113 found it - the writes were correctly refused and the number an operator
         // reads was still flat.
-        if (const uint64_t total = wal_.fsync_failures(); total > published_fsync_failures_) {
-            registry_.increment_counter("ob_wal_fsync_errors_total",
-                                        total - published_fsync_failures_);
-            published_fsync_failures_ = total;
+        publish_counter_delta("ob_wal_fsync_errors_total", wal_.fsync_failures(),
+                              published_fsync_failures_);
+
+        // Two counters owned by objects with no registry of their own, published here because this
+        // is the engine's periodic tick and both readings are cheap. The WAL's total counts every
+        // record type, which is what makes it worth having beside `ob_inserts_total` rather than a
+        // duplicate of it; the replica's is the number `STATUS` has always shown as `replayed=`
+        // and that `/metrics` reported as a flat zero until now (#117).
+        publish_counter_delta("ob_wal_records_written", wal_.records_written(),
+                              published_wal_records_);
+
+        // `repl_client_` is read under `mtx_` because that is the discipline `stats()` uses for
+        // the same pointer, and the write side does **not** hold it — `promote_to_primary()`
+        // releases `mtx_` before `repl_client_.reset()`, so the pointer is written unlocked while
+        // a reader holds the lock. That is #122, filed rather than fixed here: moving the reset
+        // back inside the lock changes a failover path, which does not belong in a change about
+        // metrics. Copying the total out under the lock and publishing outside it keeps this new
+        // reader no worse than the existing one.
+        uint64_t replayed = 0;
+        bool have_replica = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (repl_client_) {
+                replayed = repl_client_->state().records_replayed;
+                have_replica = true;
+            }
+        }
+        if (have_replica) {
+            publish_counter_delta("ob_repl_records_replayed", replayed,
+                                  published_repl_replayed_);
         }
 
         // The whole tick is one flush, so a client FLUSH cannot interleave with it.

@@ -165,14 +165,7 @@ WalPosition WALWriter::write_record(const WALRecord& hdr, const void* payload,
 
     // No fsync here — caller is responsible for calling sync() at group commit boundaries.
     // Exception: FsyncPolicy::EVERY fsyncs after every record.
-    // One load, one store, on the writer's own thread - the engine's mutexes serialise writers, so
-    // no compare-exchange is needed. On x86-64 a relaxed load and store of an aligned eight-byte
-    // value are plain moves.
-    WalPosition pos = position_.load(std::memory_order_relaxed);
-    const WalPosition written_at = pos;   // the first byte of the record just written
-    pos.offset += static_cast<uint32_t>(total);
-    position_.store(pos, std::memory_order_relaxed);
-    ++pending_sync_;
+    const WalPosition written_at = advance_after_write(total);
 
     if (allow_fsync && fsync_policy_ == FsyncPolicy::EVERY) {
         // The whole promise of this policy is that `OK` means the record is on the disk, so a
@@ -247,14 +240,7 @@ WalPosition WALWriter::write_record_v2(const WALRecordV2& hdr, const void* paylo
         remaining -= static_cast<size_t>(n);
     }
 
-    // One load, one store, on the writer's own thread - the engine's mutexes serialise writers, so
-    // no compare-exchange is needed. On x86-64 a relaxed load and store of an aligned eight-byte
-    // value are plain moves.
-    WalPosition pos = position_.load(std::memory_order_relaxed);
-    const WalPosition written_at = pos;   // the first byte of the record just written
-    pos.offset += static_cast<uint32_t>(total);
-    position_.store(pos, std::memory_order_relaxed);
-    ++pending_sync_;
+    const WalPosition written_at = advance_after_write(total);
 
     if (fsync_policy_ == FsyncPolicy::EVERY) {
         if (const int err = fsync_or_record("a write under fsync-policy=every"); err != 0) {

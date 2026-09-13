@@ -497,3 +497,76 @@ TEST(WAL, TruncateBeforeZeroRemovesNothing) {
         EXPECT_EQ(count_wal_files(tmp.path), files_before);
     }
 }
+
+// ── The WAL's own record count (#117) ────────────────────────────────────────
+//
+// `ob_wal_records_written` was registered from the beginning and written nowhere, so `/metrics`
+// reported a flat zero for it while the WAL filled up. The counter lives in the one function both
+// write paths now share, which is the part worth testing: a count kept in each path separately is
+// a count the third path will not keep, and that is what #94 was.
+
+TEST(WAL, EveryRecordTypeIsCounted) {
+    TempDir tmp("rec_count");
+    ob::DeltaUpdate upd = make_delta(1);
+    const ob::Level lvl = make_level();
+
+    ob::WALWriter writer(tmp.str());
+    EXPECT_EQ(writer.records_written(), 0u) << "a fresh writer has written nothing";
+
+    writer.append(upd, &lvl);
+    EXPECT_EQ(writer.records_written(), 1u);
+
+    // The bookkeeping records go through the other code paths — a v1 header without a payload, a
+    // v1 header with one, and the v2 header the multi-master path uses. Each is one record, and
+    // the point of asserting them individually is that they are separate functions: a count added
+    // to `append()` alone would read 1 here and for ever.
+    writer.append_gap(7, 1234);
+    EXPECT_EQ(writer.records_written(), 2u);
+
+    writer.append_checkpoint(2345);
+    EXPECT_EQ(writer.records_written(), 3u);
+
+    const uint8_t payload[] = {1, 2, 3, 4};
+    writer.append_version_vector(payload, sizeof(payload));
+    EXPECT_EQ(writer.records_written(), 4u);
+
+    writer.append_held_sequences(payload, sizeof(payload));
+    EXPECT_EQ(writer.records_written(), 5u);
+
+    ob::DeltaUpdate remote = make_delta(2);
+    writer.append_with_origin(remote, &lvl, /*origin_node_id=*/3, ob::HLCTimestamp{9, 0, 3});
+    EXPECT_EQ(writer.records_written(), 6u)
+        << "the v2 write path is a second function and must count through the same one";
+}
+
+// Rotation must not restart the count. The position does — it is a position *within a file* — and
+// before this change the two were maintained by the same three lines in each write path, so the
+// obvious way to write the counter leaves it sharing that reset.
+//
+// The exact total is asserted rather than a bound, and it is **not** the number of appends: each
+// rotation writes a ROTATE record of its own, through the same function, so it is counted. That is
+// the documented meaning of this metric and the reason it is worth having beside
+// `ob_inserts_total` rather than being a duplicate of it — the difference is the bookkeeping the
+// WAL does on its own behalf. The first version of this test asserted 40 and read 50, which is how
+// the ROTATE records got into the description.
+TEST(WAL, RotationDoesNotResetTheRecordCount) {
+    TempDir tmp("rec_rotate");
+    const ob::Level lvl = make_level();
+    constexpr int kAppends = 40;
+
+    // A threshold small enough that the file rotates several times inside the loop.
+    ob::WALWriter writer(tmp.str(), /*rotate_threshold=*/512);
+    uint64_t previous = 0;
+    for (int i = 0; i < kAppends; ++i) {
+        ob::DeltaUpdate upd = make_delta(static_cast<uint64_t>(i + 1));
+        writer.append(upd, &lvl);
+        const uint64_t now = writer.records_written();
+        ASSERT_GT(now, previous) << "the count went backwards or stood still at append " << i;
+        previous = now;
+    }
+
+    const uint32_t rotations = writer.current_file_index();
+    ASSERT_GT(rotations, 0u) << "the threshold was too high for this test to have rotated at all";
+    EXPECT_EQ(writer.records_written(), static_cast<uint64_t>(kAppends) + rotations)
+        << "expected one record per append plus one ROTATE record per rotation";
+}
