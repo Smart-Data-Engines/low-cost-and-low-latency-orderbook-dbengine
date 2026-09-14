@@ -2425,6 +2425,12 @@ Learned the hard way. Check here before debugging.
     taking three seconds to stop was inside the harness's tolerance and outside the published figure,
     and neither number was wrong. Go and measure the configuration that falls between them.
 
+289. **A measured count and the run that measured it have to name the same tree.** The test-suite
+    table cited PR #124's CI run beside a C++ count of **1083**, and #124's tree had **1082** — the
+    count came in with #129 and the citation did not move with it. Nothing was wrong with either
+    number; what was wrong is that together they describe a tree that never existed. The row exists
+    to be a measurement, so the citation moves in the same commit as the count or the row is prose.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
