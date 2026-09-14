@@ -7,6 +7,8 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -375,4 +377,39 @@ TEST(PeerRegistryUnit, PeerInfoRoundTrip) {
     std::string error;
     ASSERT_TRUE(ob::PeerInfo::from_json(json_str, parsed, error)) << error;
     EXPECT_EQ(parsed, original);
+}
+
+// ── Shutdown is not paced by the lease interval — roadmap #129 ───────────────
+
+TEST(PeerRegistryShutdown, StoppingDoesNotWaitOutTheLeaseInterval) {
+    // `lease_loop()` slept `max(1, lease_ttl/3)` **seconds** in a plain `sleep_for()`, and
+    // `stop_watch()` joins that thread — so shutdown waited out whatever remained of the current
+    // sleep. Measured with a real node against native etcd, nothing connected: 0.22 s standalone,
+    // 2.94 s for a mesh node at the default 10 s TTL, and 4.02 s at a 30 s TTL, which is the
+    // remainder of a 10 s sleep entered six seconds earlier.
+    //
+    // The gate here is not a tight one and is not meant to be. The interval is **1200 seconds**, so
+    // a stop that waits for it and a stop that does not are three orders of magnitude apart: this
+    // asserts a property, not a duration, which is what keeps it from being the kind of clock gate
+    // that teaches people to re-run until green.
+    ob::CoordinatorConfig config{};
+    config.endpoints        = {"http://127.0.0.1:1"};  // refused at once; nothing to wait for
+    config.lease_ttl_seconds = 3600;                   // interval: 1200 s
+    config.node_id          = "shutdown-probe";
+
+    ob::PeerRegistry registry(config, 1, "127.0.0.1:7100");
+    registry.start_watch([](const std::vector<ob::PeerInfo>&) {});
+
+    // Long enough for the lease loop to have made its first refresh attempt and entered the wait,
+    // which is the state this test is about. A stop before it sleeps would pass for free.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    const auto before = std::chrono::steady_clock::now();
+    registry.stop_watch();
+    const auto elapsed = std::chrono::steady_clock::now() - before;
+
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+    EXPECT_LT(ms, 2000) << "stop_watch() took " << ms << " ms with a 1200-second lease interval, so "
+                           "it waited for the sleep rather than ending it. `join()` cannot interrupt "
+                           "a sleeping thread — the wait has to be one that can be woken (#129)";
 }

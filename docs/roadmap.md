@@ -2152,6 +2152,59 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 129. A mesh node's shutdown waits out the lease loop's sleep ✅
+
+Found while reading `PeerRegistry::lease_loop()` for #112's remaining half, and then measured,
+because the two numbers that bracket it were already published and disagreed: #106 measured `SIGTERM`
+at **0.11 s** for a node with nobody connected, and the integration harness escalates to `SIGKILL`
+after five seconds — a window wide enough to hide seconds of waiting without anything ever saying so.
+
+That loop slept `max(1, lease_ttl/3)` **seconds** in a plain `std::this_thread::sleep_for`, and
+`stop_watch()` joins it. `join()` cannot interrupt a sleeping thread, so shutdown waited.
+
+**Measured before the fix** (`build/ob_tcp_server` against native etcd, i3-7100U, node up ~6 s,
+nothing connected):
+
+| configuration | SIGTERM → exit | lease interval |
+|---|---|---|
+| standalone, no coordinator (**control**) | **0.22 s** | — |
+| mesh node, `--coordinator-lease-ttl 3` | **1.05 s** | 1 s |
+| mesh node, default `--coordinator-lease-ttl 10` | **2.94 s** | 3 s |
+| mesh node, `--coordinator-lease-ttl 30` | **4.02 s** | 10 s |
+
+The 30-second row is the one that establishes the mechanism rather than the default one. Ten seconds
+of sleep, entered about six seconds before the signal, leaves about four — which is what was
+measured. So the cost is **the remainder of the current sleep**, and only its bound is a function of
+the TTL. A model that said "ttl/3" would have predicted 10 s and been wrong in the direction that
+looks conservative.
+
+**After**, same probe, same machine: **0.33 s** at the default TTL and **0.24 s** at 30 s, against a
+standalone control that stayed at **0.24 s**. The number to read is not the drop; it is that a mesh
+node now exits as fast as a node with no lease loop at all, which is the property.
+
+**The fix was already in this tree, with a comment explaining it.** `Engine::flush_loop()` waits on a
+condition variable with the stop flag as its predicate, under: *"A plain `sleep_for()` here made
+`close()` block until the current interval elapsed, because `join()` cannot interrupt a sleeping
+thread: shutdown took up to `flush_interval_ns_` for no reason, and tests that open and close an
+Engine per case paid it every time."* This is the **third** place with the shape — the mesh's
+`wakeup_fd_` comment records the second, where `stop()` used to wait out a 500 ms `epoll_wait`. The
+notification is sent after the flag is stored and before either join, because the predicate reads the
+flag: a notification that arrives first is one the waiter sleeps through.
+
+`watch_loop()` was checked and left alone: it sleeps 100 ms per pass, so its contribution is bounded
+at a tenth of a second and there is nothing to fix.
+
+**The test is a property, not a duration, and that is deliberate.** It gives the registry a 3600-second
+TTL — a 1200-second interval — and requires `stop_watch()` to return inside two seconds. Three orders
+of magnitude, so it cannot fail on load; a gate that could is the kind that teaches people to re-run
+until green (#10.7's own docstring). The control was run at a shortened interval so that it fails in
+ten seconds rather than twenty minutes: with `sleep_for` restored the test fails at **10 000 ms**, and
+with the fix back it passes in **305 ms**.
+
+- Effort: S | Impact: every mesh node's shutdown paid up to `lease_ttl/3` seconds after the drain
+  timeout #106 exists to bound, and a supervisor's stop timeout or a harness's `SIGKILL` escalation
+  absorbed it silently
+
 ### 128. The mesh io loop closes descriptors by number, and a number it no longer owns can belong to anything ✅
 
 Found by `sanitizers-integration (tsan)` on PR #123 — on a branch whose diff does not contain one

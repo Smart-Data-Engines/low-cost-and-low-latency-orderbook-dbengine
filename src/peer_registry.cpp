@@ -504,6 +504,9 @@ void PeerRegistry::stop_watch() {
     if (running_.exchange(false, std::memory_order_acq_rel)) {
         OB_LOG_INFO("peer_registry", "Stopped watch for node %u",
                     local_node_id_);
+        // Notified after the flag is stored and before either join, because the predicate reads the
+        // flag: a notification that arrives first is a notification the waiter sleeps through.
+        lease_stop_cv_.notify_all();
         if (watch_thread_.joinable()) watch_thread_.join();
         if (lease_thread_.joinable()) lease_thread_.join();
     }
@@ -644,10 +647,19 @@ void PeerRegistry::lease_loop() {
                  local_node_id_);
     while (running_.load(std::memory_order_acquire)) {
         refresh_lease();
-        // Refresh every TTL/3 seconds.
-        auto interval = std::chrono::seconds(
+        // Refresh every TTL/3 seconds, on a wait `stop_watch()` can end. A plain `sleep_for()` here
+        // made shutdown wait out the rest of the current interval, because `join()` cannot
+        // interrupt a sleeping thread — measured at 2.94 s for the default TTL against 0.22 s for a
+        // node with no lease loop at all (#129).
+        const auto interval = std::chrono::seconds(
             std::max<int64_t>(1, config_.lease_ttl_seconds / 3));
-        std::this_thread::sleep_for(interval);
+        std::unique_lock<std::mutex> lock(lease_stop_mtx_);
+        if (lease_stop_cv_.wait_for(lock, interval, [this] {
+                return !running_.load(std::memory_order_acquire);
+            })) {
+            OB_LOG_DEBUG("peer_registry", "Lease loop woken to stop for node %u", local_node_id_);
+            break;
+        }
     }
     OB_LOG_DEBUG("peer_registry", "Lease loop exited for node %u",
                  local_node_id_);
