@@ -321,6 +321,17 @@ std::string SnapshotManifest::to_json() const {
     return out;
 }
 
+uint32_t SnapshotManifest::transferred_digest() const {
+    // Through `to_json()` with the two untransferred fields zeroed, rather than a second
+    // serialiser: one format, one place it is spelled. The copy costs one vector of file entries,
+    // once per snapshot, on a path that has just read every segment file from disk.
+    SnapshotManifest wire = *this;
+    wire.created_at_ns = 0;
+    wire.total_rows    = 0;
+    const std::string json = wire.to_json();
+    return ob::crc32c(json.data(), json.size());
+}
+
 bool SnapshotManifest::from_json(std::string_view json, SnapshotManifest& out) {
     out = {};
 
@@ -1819,9 +1830,13 @@ bool ReplicationManager::continue_snapshot_transfer(ReplicaInfo& replica) {
         st.header_sent = false;
     }
 
-    // All files sent — send SNAPSHOT_END.
-    std::string manifest_json = st.manifest.to_json();
-    uint32_t manifest_crc = ob::crc32c(manifest_json.data(), manifest_json.size());
+    // All files sent — send SNAPSHOT_END, naming the digest of what was sent.
+    //
+    // `transferred_digest()` and not `crc32c(to_json())`: this manifest carries `created_at_ns` and
+    // `total_rows`, which `Engine::create_snapshot()` fills in and nothing puts on the wire, so the
+    // receiver's reconstruction differed by construction and **no** bootstrap on this path ever
+    // verified (#125).
+    uint32_t manifest_crc = st.manifest.transferred_digest();
 
     char line[128];
     int line_len = std::snprintf(line, sizeof(line), "SNAPSHOT_END %u\n", manifest_crc);
@@ -2836,9 +2851,10 @@ void ReplicationClient::request_and_receive_snapshot() {
         return;
     }
 
-    // Verify manifest CRC32C.
-    std::string manifest_json = manifest.to_json();
-    uint32_t computed_manifest_crc = ob::crc32c(manifest_json.data(), manifest_json.size());
+    // Verify the digest of what arrived against the one the primary named. The same function on
+    // both ends, so the question is whether the files and the position agree rather than whether
+    // two serialisers happen to.
+    uint32_t computed_manifest_crc = manifest.transferred_digest();
     if (computed_manifest_crc != manifest_crc) {
         OB_LOG_ERROR("repl_client",
                      "snapshot bootstrap abandoned: manifest CRC32C mismatch, primary said %u and "

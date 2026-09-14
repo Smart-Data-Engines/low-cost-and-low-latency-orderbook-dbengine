@@ -39,6 +39,21 @@ struct SnapshotManifest {
 
     /// Parse from JSON string. Returns true on success.
     static bool from_json(std::string_view json, SnapshotManifest& out);
+
+    /// CRC32C over the part of this manifest that **travels**, for both ends to compare.
+    ///
+    /// The snapshot protocol does not send this document. `SNAPSHOT_BEGIN` carries the total size,
+    /// the WAL position and the file count; one `SNAPSHOT_FILE` header per file carries a path, a
+    /// size and a CRC. `created_at_ns` and `total_rows` are never sent — so a receiver **cannot**
+    /// reconstruct them, and a digest over a document the receiver cannot reconstruct is a digest
+    /// that can only fail. It did, every time, for as long as `SNAPSHOT_END` named
+    /// `crc32c(to_json())`: a replica whose position retention had removed could never bootstrap
+    /// (#125).
+    ///
+    /// Both ends call this one function rather than each choosing which fields to include, because
+    /// two such choices is how the two definitions came to disagree. A field added to this struct
+    /// later is excluded here by construction and has to be put on the wire to be checked.
+    uint32_t transferred_digest() const;
     // Both are implemented in src/replication.cpp, where they were written.
 };
 

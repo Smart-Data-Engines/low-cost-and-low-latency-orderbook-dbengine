@@ -294,14 +294,12 @@ def test_retention_keeps_the_files_a_stopped_replica_still_needs(rotating_cluste
     watched actually freeing a file in this cluster, with the replica keeping up. Without it, "the
     file is still here" also passes for a node whose retention never runs at all.
 
-    **This test deliberately stops at the resume, and the reason is a defect it found.** A pause long
-    enough to observe anything outlives the replica's socket timeout, so the replica reconnects; in
-    that window it is not connected, retention advances, and its saved position is refused with
-    `ERR WAL_TRUNCATED` — correct, and documented in `docs/operations.md`. What is not correct is
-    what happens next: the snapshot bootstrap that refusal sends it to **cannot succeed**, because
-    the manifest CRC covers two fields the wire does not carry. That is **#125**, and the test that
-    a truncated replica comes back with every row belongs to it. What this one asserts instead is
-    that the primary is unharmed, which is the other half of the promise.
+    **This test stops at the resume, and what happens after it is the next test's subject.** A pause
+    long enough to observe anything outlives the replica's socket timeout, so the replica
+    reconnects; in that window it is not connected, retention advances, and its saved position is
+    refused with `ERR WAL_TRUNCATED` — correct, and documented in `docs/operations.md`. Where that
+    refusal sends it, and whether it arrives, is #125. What this one asserts instead is that the
+    primary is unharmed, which is the other half of the promise.
     """
     primary = rotating_cluster.primary()
     replica = rotating_cluster.replica()          # taken before the pause: a stopped node answers
@@ -366,6 +364,99 @@ def test_retention_keeps_the_files_a_stopped_replica_still_needs(rotating_cluste
     on_primary = len(data_rows(primary.tcp_port, symbol))
     assert on_primary == 600 + RECORDS, (
         f"the primary holds {on_primary} of {600 + RECORDS} rows it acknowledged")
+
+
+def test_a_replica_whose_position_was_truncated_is_bootstrapped(rotating_cluster):
+    """The documented recovery for "your position is gone" has to complete (#125).
+
+    Retention keeps WAL files back to the slowest **connected** replica, so a replica that is away
+    long enough loses its place: the primary answers `ERR WAL_TRUNCATED` and it asks for a snapshot
+    instead. That refusal is correct — `docs/operations.md` has the table of the two halves. What was
+    not is that the bootstrap it leads to could never finish: `SNAPSHOT_END` named
+    `crc32c(manifest.to_json())`, and that document carries `created_at_ns` and `total_rows`, which a
+    primary fills in and the wire never sends, so the receiver's reconstruction differed **by
+    construction**. Measured before the fix: 24 of 24 files arrived with every per-file CRC verified,
+    the manifest CRC disagreed, and the replica asked again every five seconds holding zero rows,
+    against a primary that had every one of them.
+
+    **Killed rather than stopped, and that is the difference between a precondition and a race.** A
+    `SIGSTOP`ped replica stays connected — the process is frozen, so it closes nothing — which is why
+    it is the right instrument for the retention test above and the wrong one here: retention cannot
+    advance past a replica the primary still counts, so the refusal would depend on the primary
+    running a flush tick in the gap between the resume and the reconnect. A killed replica leaves
+    `replicas_` at once, and every step of the state this test needs is then **observed** rather than
+    waited out: the primary reports zero replicas connected, and the file the replica had confirmed
+    is gone from its directory before the replica is allowed back.
+
+    It also checks a row written **before** the outage. A snapshot replaces the replica's whole
+    store, and the rows the primary had not yet flushed when it took one are not in it: they arrive
+    afterwards as WAL records, from the position the snapshot carries. "Everything, not just what
+    came after" is the part of that handover worth pinning.
+    """
+    primary = rotating_cluster.primary()
+    replica = rotating_cluster.replica()
+    early, late = "ROT-BOOT-EARLY", "ROT-BOOT-LATE"
+    log_path = os.path.join(primary.data_dir, "node.log")
+
+    client = OrderbookEngine(host="127.0.0.1", port=primary.tcp_port, timeout=60.0)
+    try:
+        insert_records(client, early, 100, base=900_000)
+        client.flush()
+        assert wait_for_rows(replica.tcp_port, early, 100, timeout=patience(60)) == 100, (
+            "the replica did not have the earlier rows before the outage, so it cannot be asked "
+            "whether it still has them after one")
+
+        # The position it will come back with has to be on disk: `save_state()` runs on a ten-second
+        # timer, and a replica killed before its first save asks from zero, which the primary can
+        # still serve.
+        state_path = os.path.join(replica.data_dir, "repl_state.txt")
+        assert wait_until(lambda: os.path.exists(state_path), timeout=patience(30)), (
+            f"the replica never wrote {state_path}, so it would not be asking for a position that "
+            f"retention can remove")
+        held = f"wal_{replica_confirmed_file(primary.tcp_port):06d}.bin"
+
+        before = os.path.getsize(log_path)
+        rotating_cluster.kill_node(replica.index)
+
+        insert_records(client, late, RECORDS, base=1_000_000)
+        client.flush()
+    finally:
+        client.close()
+
+    # Precondition one: the primary no longer counts it, so `safe_truncate` is free to advance.
+    assert wait_until(lambda: metric(primary.metrics_port, "ob_replicas_connected") == 0,
+                      timeout=patience(60)), (
+        "the primary still counts the killed replica as connected, so retention cannot pass its "
+        "position and this test would be measuring the catch-up scan instead")
+
+    # Precondition two: it has advanced past the file the replica will ask for.
+    assert wait_until(lambda: held not in wal_files(primary.data_dir), timeout=patience(60)), (
+        f"{held} is still on disk, so the replica's saved position is still servable and the "
+        f"bootstrap this test is about would never be reached. Files: "
+        f"{wal_files(primary.data_dir)}")
+
+    rotating_cluster.restart_node(replica.index)
+    replica = rotating_cluster.nodes[replica.index]
+
+    got_late = wait_for_rows(replica.tcp_port, late, RECORDS, timeout=patience(120))
+
+    with open(log_path, encoding="utf-8", errors="replace") as handle:
+        handle.seek(before)
+        window = handle.read()
+    assert "ERR WAL_TRUNCATED" in window, (
+        "the primary never refused the replica's position in this test's window, so what arrived "
+        f"came through the catch-up scan and not a bootstrap:\n{window[-1500:]}")
+
+    assert got_late == RECORDS, (
+        f"the replica holds {got_late} of {RECORDS} rows written while it was away. The WAL file "
+        f"its position named is gone, so the only way they reach it is a snapshot:\n"
+        f"{tail_node_log(replica, 25)}")
+
+    got_early = len(data_rows(replica.tcp_port, early))
+    assert got_early == 100, (
+        f"the replica holds {got_early} of the 100 rows it had before the outage; a bootstrap "
+        f"replaces its whole store, so losing these means the snapshot was incomplete rather than "
+        f"the stream")
 
 
 def test_a_reconnecting_replica_is_caught_up_across_file_boundaries(held_cluster):
