@@ -30,6 +30,10 @@ SERVER = server_binary_path()
 WAL_SEGMENT = "wal_000000.bin"   # what the first WAL file is called; the delta records go here
 DELTA_BYTES = "136"              # one INSERT of one level, header included
 
+# Read by the report plugin out of `sys.modules`, so the numbers a fault measures are printed with
+# the run rather than living in a comment.
+custom_metrics: dict = {}
+
 
 class FaultNode:
     """A standalone node with the storage fault injector preloaded.
@@ -43,6 +47,12 @@ class FaultNode:
         # OB_FAULT_POLICY is this class's own argument, not the injector's: the fsync tests need a
         # node started with `interval` so the failure lands where a client asked for it.
         self.policy = fault.pop("OB_FAULT_POLICY", "every")
+        # And so is OB_FAULT_FLUSH_MS. A test about what **replay** can reach needs the flush tick
+        # out of the way: a tick writes the rows into segments and a checkpoint into the WAL, and
+        # replay starts *after* the last checkpoint. The torn-record test measured [500] stranded
+        # instead of [400, 500] on its first run for exactly that reason - a flush had rescued the
+        # row before the kill, so the number was about timing rather than about the WAL.
+        self.flush_ms = fault.pop("OB_FAULT_FLUSH_MS", "500")
         injector = fault_injector_path()
         assert injector is not None, (
             "libobfault.so was not built. Failing rather than skipping: a fault-injection test "
@@ -67,7 +77,7 @@ class FaultNode:
         self.proc = subprocess.Popen(
             [SERVER, "--port", str(self.port), "--data-dir", self.data_dir,
              "--metrics-port", str(self.metrics_port), "--drain-timeout-ms", "2000",
-             "--fsync-policy", self.policy, "--flush-interval-ms", "500"],
+             "--fsync-policy", self.policy, "--flush-interval-ms", self.flush_ms],
             env=env, stdout=self._log, stderr=subprocess.STDOUT)
 
     def counter(self, name: str) -> int:
@@ -132,20 +142,42 @@ class FaultNode:
         with open(self.fault_log, encoding="utf-8", errors="replace") as handle:
             return sum(line.count("action=fail") + line.count("action=short") for line in handle)
 
+    def fault_log_text(self) -> str:
+        """The injector's own log, which is where a composite fault says both halves happened."""
+        if not os.path.exists(self.fault_log):
+            return "(no fault log)"
+        with open(self.fault_log, encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+
     def log(self) -> str:
         self._log.flush()
         with open(self._log_path, encoding="utf-8", errors="replace") as handle:
             return handle.read()
 
+    def kill_and_restart_without_faults(self) -> None:
+        """`SIGKILL`, then restart with no injector — for what **replay** can reach.
+
+        A clean stop ends in a checkpoint, which is the whole point of a clean stop and the wrong
+        thing entirely for a test about a WAL the engine has to read back: after a checkpoint there
+        is nothing to replay. So this one does not ask politely.
+        """
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait(timeout=10)
+        self._restart_clean()
+
     def restart_without_faults(self) -> None:
         self.stop()
+        self._restart_clean()
+
+    def _restart_clean(self) -> None:
         self._log = open(self._log_path, "a", encoding="utf-8", buffering=1)
         env = {k: v for k, v in os.environ.items() if not k.startswith("OB_FAULT_")}
         env.pop("LD_PRELOAD", None)
         self.proc = subprocess.Popen(
             [SERVER, "--port", str(self.port), "--data-dir", self.data_dir,
              "--metrics-port", str(self.metrics_port), "--drain-timeout-ms", "2000",
-             "--fsync-policy", self.policy, "--flush-interval-ms", "500"],
+             "--fsync-policy", self.policy, "--flush-interval-ms", self.flush_ms],
             env=env, stdout=self._log, stderr=subprocess.STDOUT)
         self.wait_until_answering()
 
@@ -347,5 +379,80 @@ def test_a_flush_command_does_not_report_success_over_a_failed_sync():
         assert replies[1].startswith("ERR"), (
             f"FLUSH reported success over a sync that failed: {replies}")
         assert node.proc.poll() is None, "the node died on a failed fsync"
+    finally:
+        node.cleanup()
+
+
+def test_a_torn_record_strands_every_acknowledged_write_behind_it():
+    """#54 A2.2: what a short write followed by an error costs, measured rather than reasoned about.
+
+    The shape needs both halves and that is the first finding. `WALWriter::write_record()` loops
+    `while (remaining > 0)`, so a short write on its own is **resumed** and the record completes —
+    correctly. It takes a short write plus a failed retry to leave a partial record in the file, and
+    the injector grew `OB_FAULT_SHORT_THEN_FAIL` for exactly that: the chosen write is cut and the
+    remainder fails, whatever its size, because a size filter that names a 136-byte record cannot
+    name the 116-byte retry.
+
+    The question the spec asked was how many records **after** the torn one stop being readable. The
+    answer is measured here, and the client's side of it is the part that matters: the write that
+    was cut is refused, so nobody is misled about it — but the writes that follow are answered `OK`,
+    land in the file behind the stranded bytes, and replay cannot reach them. Whatever this test
+    measures, it states as a fact about this build rather than as a promise.
+    """
+    node = FaultNode(OB_FAULT_PATH=WAL_SEGMENT, OB_FAULT_OP="write", OB_FAULT_ERRNO="ENOSPC",
+                     OB_FAULT_SIZE=DELTA_BYTES, OB_FAULT_SKIP="2", OB_FAULT_COUNT="1",
+                     OB_FAULT_SHORT="20", OB_FAULT_SHORT_THEN_FAIL="1",
+                     # An hour, so no flush tick runs during this test. What a tick does is
+                     # exactly what this test must not measure: it moves rows into segments and
+                     # writes a checkpoint, and replay begins after the last checkpoint. With the
+                     # 500 ms default the first run of this test read one stranded record instead
+                     # of two, because a tick had rescued the other one.
+                     OB_FAULT_FLUSH_MS="3600000")
+    try:
+        node.wait_until_answering()
+        replies = node.talk("INSERT SYM EX bid 100 1 1",   # before the tear
+                            "INSERT SYM EX bid 200 2 1",   # before the tear
+                            "INSERT SYM EX bid 300 3 1",   # cut at 20 bytes, remainder refused
+                            "INSERT SYM EX bid 400 4 1",   # after the tear, acknowledged
+                            "INSERT SYM EX bid 500 5 1")   # after the tear, acknowledged
+        # Two, not one: the cut and the refused remainder are the two halves of one fault, and
+        # `injections()` counts `action=` lines. Asserting one was the first version of this test
+        # and it failed on its own instrument rather than on the engine.
+        assert node.injections() == 2, f"the record was not cut and left cut: {replies}"
+        assert "action=fail-remainder" in node.fault_log_text(), (
+            f"the short write was not followed by a failed retry, so no record was torn:\n"
+            f"{node.fault_log_text()}")
+
+        assert replies[2].startswith("ERR"), (
+            f"the write whose record was cut was acknowledged: {replies}")
+        acknowledged = {100, 200, 400, 500}
+        for i, price in ((0, 100), (1, 200), (3, 400), (4, 500)):
+            assert replies[i].startswith("OK"), f"the write of {price} was refused: {replies}"
+
+        # No FLUSH: this is about what **replay** can reach, and a flush would move the rows into
+        # segments where the WAL no longer matters. That is also why the node is killed rather than
+        # stopped - a clean stop ends in a checkpoint.
+        node.kill_and_restart_without_faults()
+        prices = set(prices_in(node.talk(SELECT_ALL)[0]))
+
+        assert 300 not in prices, (
+            f"the refused write came back after the restart, which would make the refusal a lie: "
+            f"{sorted(prices)}")
+        stranded = sorted(p for p in acknowledged if p not in prices)
+        survived = sorted(p for p in acknowledged if p in prices)
+        custom_metrics["records_stranded_behind_a_torn_one"] = len(stranded)
+        assert survived, (
+            f"not one acknowledged write survived, so replay stopped before the tear rather than "
+            f"at it: {sorted(prices)}\n{node.log()}")
+        # The measurement, asserted as the shape it is rather than as a number: everything written
+        # before the tear has to come back, and what was written after it is what the WAL cannot
+        # reach. If a later build strands nothing, this assertion is what will say so.
+        assert {100, 200} <= prices, (
+            f"a write acknowledged *before* the tear was lost, which is worse than the item "
+            f"describes: {sorted(prices)}")
+        assert stranded == [400, 500], (
+            f"the records behind the torn one behaved differently from the measurement this test "
+            f"records: stranded={stranded}, survived={survived}. If they now survive, the engine "
+            f"has gained something and this test should say so; the number is not a promise")
     finally:
         node.cleanup()

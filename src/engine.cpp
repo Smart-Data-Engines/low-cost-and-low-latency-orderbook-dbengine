@@ -9,6 +9,7 @@
 
 #include "orderbook/engine.hpp"
 #include "orderbook/thread_boundary.hpp"
+#include "orderbook/level_payload.hpp"
 #include "orderbook/crc32c.hpp"
 #include "orderbook/logger.hpp"
 
@@ -2234,8 +2235,10 @@ uint64_t Engine::replay_wal_tail() {
             }
         }
 
-        const auto* levels = reinterpret_cast<const Level*>(
-            ctx.payload + sizeof(DeltaUpdate));
+        // Copied, not cast: see level_payload.hpp and #127. A local scratch buffer here rather
+        // than a member, because this runs once per record at startup and never again.
+        std::vector<Level> level_scratch;
+        const Level* levels = levels_from_payload(ctx.payload, delta.n_levels, level_scratch);
 
         std::unique_lock<std::mutex> lock(mtx_);
         apply_delta_replayed(delta, levels);

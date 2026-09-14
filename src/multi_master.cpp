@@ -5,6 +5,7 @@
 //
 // Requirements: 4.1–4.8, 9.1–9.6
 
+#include "orderbook/level_payload.hpp"
 #include "orderbook/multi_master.hpp"
 #include "orderbook/thread_boundary.hpp"
 
@@ -551,8 +552,11 @@ bool MultiMasterManager::handle_remote_record(uint16_t /*peer_node_id*/,
         return false;
     }
 
-    const auto* levels = reinterpret_cast<const Level*>(
-        static_cast<const uint8_t*>(payload) + sizeof(DeltaUpdate));
+    // Copied out rather than pointed at: the payload sits 42 bytes into the receive buffer (a
+    // 4-byte length and a 38-byte header), so the levels are at 130 - and a `Level*` to an address
+    // that is not eight-byte aligned is undefined behaviour, which UBSan reports and x86 executes
+    // anyway (#127). The scratch buffer is a member, so this allocates once per process.
+    const Level* levels = levels_from_payload(payload, delta.n_levels, level_scratch_);
 
     // Extract HLC timestamp from WAL header.
     HLCTimestamp remote_hlc = HLCTimestamp::deserialize(hdr.hlc_data);

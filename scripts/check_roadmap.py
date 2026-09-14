@@ -56,7 +56,17 @@ def main() -> int:
         problems.append(f"item number {number} is used more than once")
 
     lines = text.splitlines()
+    # A fenced block is code, for the same reason a backtick span is: `#0 ob::Engine::…` in a quoted
+    # sanitizer stack trace is a frame number, not a reference to item zero. The inline rule was
+    # already here; this is the same rule at block scale, and it arrived the day an item quoted a
+    # UBSan report (#127).
+    in_fence = False
     for line_no, line in enumerate(lines, start=1):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
         if line.startswith("### "):
             continue  # the item's own heading
         # Blank out code spans, keeping the line length so reported columns and the

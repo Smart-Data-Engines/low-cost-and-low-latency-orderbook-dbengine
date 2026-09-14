@@ -1159,10 +1159,71 @@ codebase. Each item is also a story we can sell as bespoke work.
 
 ## Phase 11 — Reliability Engineering
 
-### 54. Chaos and fault injection
+### 54. Chaos and fault injection ✅
 - Network partitions between multi-master peers, packet loss and reorder, disk-full, fsync failure,
   clock skew (HLC correctness under skew is untested), etcd unavailability
 - Effort: L | Impact: The failure modes that lose data in production
+
+**Four stages are in, and the item stays open with what is left named.** Stage A injects storage
+faults with an `LD_PRELOAD` shim and found #112, #113 and #114 in its first run; stage B takes the
+coordinator away and found #115 and #116; stage C breaks mesh links through a proxy and found #117
+and #118; stage D skews clocks and found #119, #120 and the question that is #121.
+
+**The last clause of stage C is closed, and the number is the interesting part.** "A peer that
+stopped reading is dropped rather than buffered for ever" was recorded as blocked by **volume, not
+visibility**, and that was right about the mechanism and pessimistic about the cost.
+`ob_mm_peer_send_buf_bytes` is the engine's own queue and cannot grow until `send()` returns
+`EAGAIN`, which needs the **sender's** socket buffer full — the engine sets no `SO_SNDBUF`, so that
+is `tcp_wmem`'s maximum, and narrowing the *receiver's* buffer does not shorten it because TCP holds
+unsent data on the sender's side. Measured: **3 015 750 bytes** of accepted writes before the queue
+passed a 256 kB ceiling, so about 2.9 MB sits where no gauge can see it. The test costs **9.0 s**,
+because a 1000-level `MINSERT` is one ~24 kB mesh frame and three megabytes is ~125 round trips. Its
+control is a **draining** link: the same writes leave the drop counter at zero and the queue at 0
+bytes, without which "the partition caused the drop" would be a claim about volume. Convergence
+afterwards is read from `ob_mm_replication_lag_records` returning to zero rather than by comparing
+half a million rows.
+
+A fixture went with it: `narrow_proxied_mesh` put a 4 kB receive buffer on the accepted sockets on
+the expectation that it would shorten that wait, the same session measured that it does not, and it
+was left behind **with no users** — a fixture built for a test nobody then wrote, which is the shape
+of a knob nothing turns.
+
+`docs/operations.md` now has the mesh-link section that stage C left for last, because writing it
+earlier would have meant describing the two numbers #117 and #118 were about to change: for the
+first ~2.9 MB the engine reports nothing, then the records lag moves, then the peer is dropped.
+
+**The last three are in, and two of them produced something.** The wire-level HLC test
+(`tests/test_mm_wire_clock.cpp`) frames a DELTA record whose timestamp is an hour ahead and requires
+it to become this node's clock and **stay** — which is what turns "those ten lines parse an HLC and
+hand it on" from a claim about code into a measurement. It is paired with the other half, that the
+record carrying the skew is still **applied**: a node that dropped it would keep its clock and lose a
+write, which is the trade #121 would have to make explicit.
+
+"A short write, then an error" was a hypothesis and is now **#126**: the write that is cut is
+refused, the writes after it are acknowledged, and **none of them survives a restart** — measured 2
+of 2, because `WALReplayer::replay()` returns at the first CRC mismatch rather than breaking out of
+one file. That is the central durability sentence in `docs/cli.md` with an exception nobody can see
+from outside. Getting the number right needed the flush tick an hour out and a `SIGKILL` rather than
+a stop: the first run read 1 of 2 because a tick had written a checkpoint and rescued a row, which
+is timing rather than the WAL.
+
+And the reproduction guide is `tests/fault/README.md`: the four failures worth reproducing, each as
+one command line plus its environment, with the log that says the injection happened — because an
+injector that matched nothing looks exactly like code that survives the fault.
+
+**Mutations for the closing three: four for C4 and five for D3 and the injector, each with the
+verdict it had to give.** For C4: the ceiling never firing, the ceiling ignoring its flag and using
+the default, the drop going uncounted, and a reworded warning that survives. For D3: the wire's HLC
+replaced by a zero one, and a clock that ignores the remote timestamp — both killed by the wire test,
+which is what says it measures the path rather than the class. Two more are about the *instrument*,
+because a composite fault that only does one half proves nothing: letting the torn record's remainder
+through, and a short write that reports bytes it did not write. One did not build on the first
+attempt (`false` in a C file with no `<stdbool.h>`), so the **mutation** was transformed rather than
+the code.
+
+**#54 is therefore closed.** What it leaves behind is the list of items it found: #112, #113, #114
+from stage A, #115 and #116 from stage B, #117 and #118 from stage C, #119 and #120 from stage D,
+#121 as a question for a maintainer, and #126 from its own last measurement.
 
 ### 55. Multi-node cluster tests in CI ✅
 - Three native nodes plus etcd started by a script, multi-master convergence and failover verified
@@ -2174,6 +2235,107 @@ question is recorded as #121 rather than settled quietly here.
   clock that goes backwards is two nodes able to disagree permanently about a row's content, and
   nothing in the engine would notice — anti-entropy compares what each side holds, and two sides
   each holding a different winner look consistent to it. Never observed in the wild
+
+### 127. Every receive path cast a pointer into a byte buffer to `const Level*`, which is undefined behaviour when that buffer is not aligned ✅
+
+Found by #54's D3 on its first CI run, in the `sanitizers (asan)` job — the one place that builds
+this suite with UBSan. Not by the test failing on what it asserts: the assertions passed, and UBSan
+reported the engine underneath them.
+
+```
+src/engine.cpp:878:76: runtime error: member access within misaligned address 0x50e000007282
+for type 'const struct Level', which requires 8 byte alignment
+    #0 ob::Engine::apply_remote_delta(…) engine.cpp:878
+    #1 ob::MultiMasterManager::handle_remote_record(…) multi_master.cpp:568
+    #2 ob::MultiMasterManager::handle_frame(…) multi_master.cpp:1720
+    #3 ob::MultiMasterManager::process_recv_buf(…) multi_master.cpp:1560
+    #4 ob::MultiMasterManager::io_loop() multi_master.cpp:909
+```
+
+**The arithmetic is the whole defect.** A mesh frame is a 4-byte length and a 38-byte `WALRecordV2`,
+so the payload starts **42** bytes into the receive buffer and the levels 42 + 88 = **130** bytes in.
+Neither is a multiple of `alignof(Level)`, which is 8. `reinterpret_cast<const Level*>(payload +
+sizeof(DeltaUpdate))` therefore produces a pointer the standard says may not be dereferenced, and
+`levels[i].price` is the dereference. On x86 it compiles to an unaligned load and works, which is
+exactly why it survived every mesh test this repository has: the machine forgives it and the standard
+does not, and a compiler is entitled to assume the alignment it was promised.
+
+**Why nothing caught it before, which is the reusable part.** Four layers had to line up. The unit
+tests call `apply_remote_delta()` with a real `Level` array, so they are aligned by construction. The
+integration battery drives real frames through real sockets, but the battery's sanitizer job is
+**TSan**, and TSan does not check alignment. The ASan/UBSan job builds the C++ suite, and until D3
+nothing in that suite took a delta **off a socket**. And the one harness that does read arbitrary
+bytes under UBSan — the fuzzer — drives `parse_frames`, not the apply path behind it. The defect sat
+in the gap between four things that each cover most of it.
+
+**Fixed as a class, in one place.** `include/orderbook/level_payload.hpp` copies the levels into a
+caller-owned scratch buffer and hands back an aligned pointer; the two hot receive paths keep that
+buffer as a member, so it allocates once per process rather than once per record, and WAL replay uses
+a local because it runs once per record at startup and never again. All **four** sites that had this
+shape now go through it: the mesh, the two in the replication client, and WAL replay. Only the mesh
+one was *observed* misaligned — the other three are the same construction and are said to be, rather
+than claimed to have been measured.
+
+**Cost, measured rather than argued** (`scripts/mnemonic_diff.py`, Release, against `origin/master`):
+`handle_remote_record` **188 → 393** instructions, `ReplicationClient::receive_and_replay`
+**732 → 743**, and the apply paths behind both — `apply_remote_delta` (800 plus a 47-instruction cold
+clone) and `apply_delta_replicated` — **identical, instruction for instruction**. So the whole cost
+is one `memcpy` of `n_levels × 24` bytes per received record, in the function that parses it, and
+nothing changed in the function that applies it. No claim about time: the copy is one more pass over
+bytes the same record already walks three times (the CRC over the payload, conflict resolution per
+level, the WAL append).
+
+One thing in that number is worth keeping. The first version called `scratch.resize(n_levels)` per
+record, which **value-initialises** the new elements, because `Level` has a default member
+initialiser (`_pad{}`) — zero-filling bytes the `memcpy` immediately overwrites. Growing only when
+the buffer is too small saved **three** instructions of the 205, so the resize was not the cost; the
+copy is. Measuring said that, and reading the code would have guessed wrong in both directions.
+
+- Effort: S | Impact: undefined behaviour on every record the mesh and the replication stream
+  receive. It works on x86 today, which is the only reason this is an S rather than a P0 — and the
+  reason it needed a sanitizer to find rather than a bug report
+
+### 126. An acknowledged write that lands behind a torn WAL record does not survive a restart
+
+Measured by #54's A2.2, which existed to settle a hypothesis from reading the code. It is confirmed.
+
+**The shape.** `WALWriter::write_record()` loops `while (remaining > 0)`, so a short write is
+resumed and the record completes — correct, and it means a torn record needs a short write **and** a
+failed retry. Injected exactly that (`OB_FAULT_SHORT=20 OB_FAULT_SHORT_THEN_FAIL=1` with `ENOSPC`),
+the file ends up as `[record][record][20 stranded bytes][record][record]`: the write that was cut is
+**refused**, so nobody is misled about it, and the two writes after it are answered **`OK`**.
+
+**What comes back after a `SIGKILL`: the two before the tear, and neither of the two after it.**
+`WALReplayer::replay()` returns at the first CRC mismatch — `return last_good_seq`, not `break` — so
+it stops for the whole *directory*, not for the file it is in. The 20 stranded bytes are a header's
+first 20 bytes (sequence, timestamp, checksum), the next four are read from the following record, and
+the payload that describes fails its checksum. Everything past that point is unreachable, however
+many files it spans.
+
+So the durability sentence in `docs/cli.md` — an acknowledged `INSERT` is in a WAL record before the
+reply and survives a process kill — is **false for every write that follows a torn record**, and
+nothing tells the client which of its writes those are.
+
+**The measurement, and why the first run of it was wrong.** Five writes, the third cut: stranded
+**2 of 2**. The first run read **1**, because `FaultNode` starts a node with
+`--flush-interval-ms 500` and a tick had moved one row into a segment and written a checkpoint —
+replay begins after the last checkpoint, so the row was rescued by timing rather than by the WAL.
+The test now runs with the tick an hour out and kills the node rather than stopping it, because a
+clean stop ends in a checkpoint too. A test of what replay can reach has to keep everything that
+writes a checkpoint away from it.
+
+**Three ways out, and the cheapest is not enough on its own.** Rotating to a new WAL file after a
+failed write puts the tear at the end of a closed file — but replay would still stop there, because
+it stops globally, so it would also need "a mismatch inside a file that is not the last one is a
+tear: continue with the next file". Alternatively the writer could record the tear (its own record
+type, or a length-prefixed skip) so replay can step over exactly the bytes that were abandoned;
+that is a format change. Or the engine could refuse writes to a file it has torn, which turns a lost
+tail into an outage and is worse. **Any of them is a decision about the WAL format or about
+replay's contract**, which is why this is an item rather than a patch in the test's own commit.
+
+- Effort: M | Impact: the engine's central durability claim has an exception nobody can see from
+  outside. The window is narrow — it needs a write that fails *after* writing part of a record —
+  but inside it every later acknowledgement is a promise the restart breaks
 
 ### 125. A replica sent to the snapshot path could never bootstrap: the manifest checksum covered two fields the wire does not carry ✅
 
@@ -5948,13 +6110,16 @@ than about the engine. #110's first CI run also verified the
 value of the skip gate: seven new CLI tests did not run until both integration jobs built the CLI
 and the fixture selected the same build as the server.
 
-The current work sequence is the rest of **fault injection (#54)**, now that fuzzing (#38) is in. The coverage
-badge left from #37 needs a maintainer decision about an external reporting service. Existing
-coverage reports and the line-coverage floor continue to run inside GitHub Actions.
+The current work sequence is **#126**, which #54's last measurement found: an acknowledged write
+that lands behind a torn WAL record does not survive a restart, and the fix is a decision about the
+WAL format or about replay's contract rather than a patch. The coverage badge left from #37 needs a
+maintainer decision about an external reporting service. Existing coverage reports and the
+line-coverage floor continue to run inside GitHub Actions.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **Next** | Chaos and fault injection (#54) | L | Verify recovery and refusal when storage, clocks and connectivity fail |
+| **Next** | A write behind a torn WAL record is lost (#126) | M | The durability claim has an exception nobody can see from outside: the write that tore is refused, the ones after it are acknowledged and gone |
+| **Decision** | Bound the drift a peer may introduce (#121) | S | Measured and filed rather than answered: a ceiling costs causal order against exactly the peer whose clock is wrong |
 | **Decision** | Coverage badge (#37) | S | Requires choosing an external service; the existing report and floor are already in CI |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
@@ -6100,15 +6265,15 @@ absolute thresholds for a designated benchmark host.
 
 ### Test suite
 
-Verified by [the full CI run for PR #120](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/34825922538),
-on the tree containing #124 and #125. Runtimes below are from GitHub's `ubuntu-24.04` runners
+Verified by [the full CI run for PR #121](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/34840845142),
+on the tree containing #54's closing stage, #126 and #127. Runtimes below are from GitHub's `ubuntu-24.04` runners
 except where a row says otherwise, not the machine-B performance baseline above.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1074 | all passing with `ctest -j1` on the i3-7100U, **210 s in a single run**. **Three more than the previous commit**, all of #125 and all about the digest a snapshot transfer compares: one requires what a receiver rebuilds to agree with what a primary sent, with a control that the two documents really do differ — without it the test passes against the defect; one requires the digest to still notice everything that travels and to be unmoved by the two fields it excludes, which is stated rather than inferred; one pins that arrival order does not matter, because the receiver appends in wire order and `to_json()` sorts by path. A fourth test changed rather than arrived: the mock primary in `tests/test_replication.cpp` now fills in the two fields a real primary fills in, which makes it a regression test for #125 — confirmed by a mutation. **Earlier**: six were #124's, seven #123's, six #118's, seven #117's. CTest lists 1076: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
-| Python integration | 261 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 261; count pytest's final result rather than the report plugin's progress characters. `261 passed, 2 skipped in 19:58` on the GitHub runner for this commit, against `20:07` on the development machine (i3-7100U, native etcd) — the spread to expect between the two rather than a change. One more than the previous commit, #125's: a killed replica whose confirmed WAL file retention has removed comes back with every row. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
-| Python integration under TSan | 261 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `261 passed in 25:42` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **19:58** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
+| C++ (GTest + RapidCheck) | 1076 | all passing with `ctest -j1` on the i3-7100U, **213 s in a single run**. **Two more than the previous commit**, both #54's D3: a socket on the mesh port frames one DELTA record whose HLC says an hour ahead, and requires that it becomes this node's clock and **stays** — the next local tick is stamped from the moved clock, not from the wall clock the node can still read. That turns "`multi_master.cpp` parses an HLC from the frame and hands it on ten lines later" from a claim about code into a measurement; the drift the node reports is 3 599 999 386 597 ns. Its pair requires the record carrying the skew to be **applied**, because a node that dropped it would keep its clock and lose a write. **Earlier**: three were #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists 1078: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
+| Python integration | 263 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 263; count pytest's final result rather than the report plugin's progress characters. `263 passed, 2 skipped in 20:42` on the GitHub runner for this commit, against `20:37` on the development machine (i3-7100U, native etcd) — the spread to expect between the two rather than a change. Three more than the previous commit: #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
+| Python integration under TSan | 263 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `263 passed in 26:08` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **20:42** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than
