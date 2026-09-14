@@ -2057,20 +2057,23 @@ SnapshotBootstrapOutcome run_snapshot_bootstrap(const std::string& dir, uint16_t
                   b_body.size(), b_crc);
     EXPECT_TRUE(send_str(header));
     EXPECT_TRUE(send_str(b_body));
-    // SNAPSHOT_END carries the CRC32C of the manifest the replica assembles from the headers it
-    // received, so the mock primary has to build the same manifest to name it. Getting this wrong
-    // is what the control test caught: a bare `SNAPSHOT_END` fails `sscanf` and the bootstrap is
-    // abandoned for a reason that has nothing to do with what the test is about.
+    // SNAPSHOT_END names the digest of what was sent, and this manifest is built the way a
+    // **primary** builds one rather than the way the receiver reconstructs one. That distinction
+    // is #125: the first version of this mock filled in exactly the four fields the wire carries
+    // and left `created_at_ns` and `total_rows` at zero - which is what the receiver ends up with,
+    // so the two agreed, the test passed, and against a real primary (which fills both in) the
+    // comparison could never succeed. A stub stands in for the sender, so it has to be built like
+    // the sender; one built to agree with the code under test proves that code agrees with itself.
     ob::SnapshotManifest expected;
     expected.wal_file_index  = 3;
     expected.wal_byte_offset = 4096;
     expected.total_bytes     = a_body.size() + b_body.size();
+    expected.total_rows      = 512;                       // a primary counts rows
+    expected.created_at_ns   = 1'700'000'000'000'000'000ULL;  // and stamps the clock
     expected.files.push_back(ob::SnapshotFileEntry{"SNAPA/EXCH/seg/a.col", a_body.size(), a_crc});
     expected.files.push_back(ob::SnapshotFileEntry{"SNAPB/EXCH/seg/b.col", b_body.size(), b_crc});
-    const std::string manifest_json = expected.to_json();
     char end[64];
-    std::snprintf(end, sizeof(end), "SNAPSHOT_END %u\n",
-                  ob::crc32c(manifest_json.data(), manifest_json.size()));
+    std::snprintf(end, sizeof(end), "SNAPSHOT_END %u\n", expected.transferred_digest());
     EXPECT_TRUE(send_str(end));
 
     // Long enough for the install, and the assertion is on the filesystem rather than on a timer:
@@ -2493,6 +2496,94 @@ TEST(SnapshotManifest, RoundTrip) {
         }
         EXPECT_TRUE(found) << "File not found: " << parsed.files[i].path;
     }
+}
+
+// ── #125: the digest both ends of a snapshot transfer compare ────────────────
+//
+// `SNAPSHOT_END` used to name `crc32c(manifest.to_json())`, and that document carries two fields
+// the wire never sends. The receiver rebuilds the manifest from `SNAPSHOT_BEGIN` and one header per
+// file, so it cannot know them - and a digest over a document the receiver cannot reconstruct is a
+// digest that can only fail. It did, for every bootstrap on this path.
+
+namespace {
+
+/// What a primary produces: every field, including the two that never travel.
+ob::SnapshotManifest primary_side_manifest() {
+    ob::SnapshotManifest m;
+    m.wal_file_index  = 3;
+    m.wal_byte_offset = 4096;
+    m.total_bytes     = 6144;
+    m.total_rows      = 5000;                          // Engine::create_snapshot() counts these
+    m.created_at_ns   = 1'700'000'000'000'000'000ULL;   // and stamps the clock
+    m.files.push_back({"BTC/BINANCE/1000_2000/price.col", 4096, 12345});
+    m.files.push_back({"BTC/BINANCE/1000_2000/qty.col", 2048, 67890});
+    return m;
+}
+
+/// What a receiver can rebuild: the four numbers in `SNAPSHOT_BEGIN` and one header per file.
+ob::SnapshotManifest receiver_side_manifest(const ob::SnapshotManifest& sent) {
+    ob::SnapshotManifest m;
+    m.wal_file_index  = sent.wal_file_index;
+    m.wal_byte_offset = sent.wal_byte_offset;
+    m.total_bytes     = sent.total_bytes;
+    m.files           = sent.files;
+    return m;   // created_at_ns and total_rows stay zero: nothing sends them
+}
+
+}  // namespace
+
+TEST(SnapshotManifestDigest, WhatTheReceiverRebuildsAgreesWithWhatThePrimarySent) {
+    const auto sent     = primary_side_manifest();
+    const auto received = receiver_side_manifest(sent);
+
+    EXPECT_EQ(received.transferred_digest(), sent.transferred_digest())
+        << "a replica cannot bootstrap unless these agree, and it could not until #125";
+
+    // The control, and without it this test would pass against the defect: the two documents
+    // really do differ, so the digest is doing the work rather than the two happening to match.
+    const std::string sent_json     = sent.to_json();
+    const std::string received_json = received.to_json();
+    EXPECT_NE(ob::crc32c(sent_json.data(), sent_json.size()),
+              ob::crc32c(received_json.data(), received_json.size()))
+        << "the two manifests are identical, so this test cannot say anything about which fields "
+           "the digest covers";
+}
+
+TEST(SnapshotManifestDigest, ItStillNoticesEverythingThatTravels) {
+    const auto base = primary_side_manifest();
+    const uint32_t expected = base.transferred_digest();
+
+    // A digest that excludes two fields must still cover the rest, and each of these is a way a
+    // transfer can go wrong: a corrupted or truncated file, a file that arrived under the wrong
+    // name, one that did not arrive at all, and a snapshot attributed to the wrong WAL position -
+    // which decides where the replica resumes.
+    auto changed = [&](void (*mutate)(ob::SnapshotManifest&)) {
+        ob::SnapshotManifest m = base;
+        mutate(m);
+        return m.transferred_digest();
+    };
+
+    EXPECT_NE(changed([](ob::SnapshotManifest& m) { m.files[0].crc32c += 1; }), expected);
+    EXPECT_NE(changed([](ob::SnapshotManifest& m) { m.files[0].size += 1; }), expected);
+    EXPECT_NE(changed([](ob::SnapshotManifest& m) { m.files[0].path += "x"; }), expected);
+    EXPECT_NE(changed([](ob::SnapshotManifest& m) { m.files.pop_back(); }), expected);
+    EXPECT_NE(changed([](ob::SnapshotManifest& m) { m.total_bytes += 1; }), expected);
+    EXPECT_NE(changed([](ob::SnapshotManifest& m) { m.wal_file_index += 1; }), expected);
+    EXPECT_NE(changed([](ob::SnapshotManifest& m) { m.wal_byte_offset += 1; }), expected);
+
+    // And the two it deliberately excludes, stated rather than left to be inferred from the test
+    // above: they are not sent, so they cannot be checked, and pretending otherwise is the defect.
+    EXPECT_EQ(changed([](ob::SnapshotManifest& m) { m.total_rows += 1; }), expected);
+    EXPECT_EQ(changed([](ob::SnapshotManifest& m) { m.created_at_ns += 1; }), expected);
+}
+
+TEST(SnapshotManifestDigest, TheFileOrderOnTheWireDoesNotChangeIt) {
+    // The receiver appends file entries in the order the headers arrive; `to_json()` sorts by path.
+    // A digest that depended on arrival order would fail for a transfer that lost nothing.
+    auto forward = primary_side_manifest();
+    auto reversed = forward;
+    std::reverse(reversed.files.begin(), reversed.files.end());
+    EXPECT_EQ(forward.transferred_digest(), reversed.transferred_digest());
 }
 
 // ── Test: SnapshotManifest deterministic output ──────────────────────────────

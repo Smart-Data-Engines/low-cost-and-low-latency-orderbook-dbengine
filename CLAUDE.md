@@ -2261,11 +2261,13 @@ Learned the hard way. Check here before debugging.
     wrong in the direction of "not paused" costs exactly the five seconds this avoids.
 
 269. **A checksum over a document the receiver cannot reconstruct is a checksum that can only
-    fail.** `SNAPSHOT_END` carries `crc32c(manifest.to_json())`, and `to_json()` serialises
+    fail.** `SNAPSHOT_END` carried `crc32c(manifest.to_json())`, and `to_json()` serialises
     `created_at_ns` and `total_rows` — two fields the wire never sends. The receiver rebuilds the
-    manifest with both at zero, so against a real primary the comparison fails **every time**, and
-    the replica retries for ever (#125). The direction of the rule matters: before comparing two
-    digests, ask whether both sides can produce the same bytes.
+    manifest with both at zero, so against a real primary the comparison failed **every time** and
+    the replica retried for ever (#125, fixed). The direction of the rule matters: before comparing
+    two digests, ask whether both sides can produce the same bytes. The fix is one
+    `transferred_digest()` both ends call, rather than two call sites each choosing which fields to
+    include — which is how the two definitions came to disagree in the first place.
 
 270. **A stub built to agree with the code under test proves that the code agrees with itself.**
     The only test of that bootstrap path uses a mock primary that constructs its manifest from
@@ -2291,6 +2293,17 @@ Learned the hard way. Check here before debugging.
     `touch` afterwards. **What caught it was the control**: the one mutation in the table that had
     to survive came back KILLED, which is the whole argument for having it — a table where
     everything dies reports a broken instrument as diligence.
+
+273. **A safety net registered after the thing it protects is not a safety net.**
+    `ClusterManager.start()` ended with `atexit.register(self.shutdown)`, and `shutdown()` began
+    with `if not self._started: return` — both halves conditional on the start having finished. So a
+    cluster whose start failed halfway (a node refusing its arguments, a port taken, etcd slow to
+    answer) leaked everything it had already launched. Measured twice: #124's mutation run left
+    **four** orphan etcds holding ports and memory, and three more were found on 7 September with
+    uptimes over a day, blamed then on a killed run rather than on this. Registered in the
+    constructor now, and the guard is "is there anything here" rather than "did it start". Checked
+    both ways with a probe that starts a cluster whose flags are refused: one leaked etcd before,
+    none after.
 
 ## Current state and open problems
 
@@ -2436,14 +2449,16 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   — connected, counted, acknowledging nothing — and requires a lag bigger than a whole file beside
   a zero unknown count, which is the same fact from two sides, since the distance is measurable
   precisely because retention kept the files.
-- **A replica sent to the snapshot path cannot bootstrap, and the checksum that stops it is
-  unsatisfiable rather than unlucky** (#125, open). `SNAPSHOT_END` carries
-  `crc32c(manifest.to_json())`, and that document includes `created_at_ns` and `total_rows`, which
-  the primary fills and the wire never sends — so the receiver's reconstruction differs by
-  construction. Measured on a live pair: 24 of 24 files arrived with every per-file CRC verified,
-  the manifest CRC disagreed, and the replica asked again every five seconds holding zero rows.
-  Reachable only since #124, because retention removes a file the replica needs only after a
-  rotation, and the only unit test of the path uses a mock primary built to agree with the receiver.
+- **A snapshot's checksum covers what the wire carries, and before #125 it covered two fields the
+  wire has never sent** (closed). `SNAPSHOT_END` named `crc32c(manifest.to_json())`, and that
+  document includes `created_at_ns` and `total_rows`, which the primary fills and nothing
+  transmits — so the receiver's reconstruction differed by construction and **no** bootstrap on the
+  replication path ever verified. Measured on a live pair: 24 of 24 files arrived with every
+  per-file CRC verified, the manifest CRC disagreed, and the replica asked again every five seconds
+  holding zero rows. `SnapshotManifest::transferred_digest()` is now called by both ends. Reachable
+  only since #124, because retention removes a file a replica needs only after a rotation — and the
+  only unit test of the path used a mock primary built to agree with the **receiver**, which is why
+  nothing caught it; that mock now fills in both fields, as a primary does.
 - **A new reader of shared state changes how often a latent race fires, and that is part of the
   change** (#122, closed). `repl_client_` was read under `mtx_` by `stats()` and written without it
   by `promote_to_primary()`; the fix is the idiom `demote_to_replica()` ten lines down already
