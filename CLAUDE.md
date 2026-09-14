@@ -2431,6 +2431,31 @@ Learned the hard way. Check here before debugging.
     number; what was wrong is that together they describe a tree that never existed. The row exists
     to be a measurement, so the citation moves in the same commit as the count or the row is prose.
 
+290. **An exception boundary belongs where the unit of work is, and for an epoll loop that is one
+    event, not one pass.** Every mesh registration is `EPOLLET`, so an event the loop abandons is
+    **not re-delivered** — taking the whole pass down on a throw would silently drop the rest of a
+    batch that can hold 64 (#112).
+
+291. **A "loud once" episode that closes in the same pass it opened is not an episode.** The
+    recovery line ran after the event loop, so a pass containing a throw reported the failure and
+    then announced recovery immediately: the log alternated ERROR / "handled again" for three
+    failing records. Gate the recovery on a pass that had events **and** none of which threw. And
+    do not over-suppress while fixing it: #95's shape is a line per *loop iteration* carrying no
+    new information, whereas one line per failed record is information.
+
+292. **Wrapping a long loop body in `try` is a whitespace commit, and it can be proved.** The mesh
+    event body is 248 lines with five `continue`s and four `break`s, and the breaks belong to
+    *nested* loops — so extracting a function would need each one classified by hand. Wrapping in
+    place with a `catch` that rethrows makes `git diff -w` show **only** the lines added, which is
+    a proof rather than an assurance; the handling then arrives as its own readable diff.
+
+293. **Before writing a boundary, measure which thread actually does the work.** #112 predicted
+    that an `ENOSPC` during promotion would end the monitor thread. For the **startup** promotion
+    it does not: that runs on the main thread inside `TcpServer::run()`, so the throw reaches
+    `main` and the process exits with the reason named — already the right shape. Only the
+    promotion after a failover runs on the monitor thread, and that one leaves the node reporting
+    `REPLICA <its own replication port>` for ever.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

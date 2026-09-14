@@ -3587,14 +3587,98 @@ went away.
 The middle row is the one worth having. The process survives on the outer boundary alone — and the
 flush thread is gone for the life of that process while every client-facing symptom looks fine.
 
-**What is not done, named rather than left to be found.** `lease_loop`, `monitor_loop` and
-`io_loop` have the outer boundary only, so an exception there ends that subsystem rather than the
+**What was not done, named rather than left to be found.** `lease_loop`, `monitor_loop` and
+`io_loop` had the outer boundary only, so an exception there ends that subsystem rather than the
 process: a node whose lease loop stopped disappears from the mesh when its registration expires,
 one whose monitor loop stopped never learns about a role change (#82's shape), and one whose io
-loop stopped is out of the mesh entirely. Each needs its own judgement about what continuing means
-— and `io_loop` additionally needs a bound, because its epoll timeout is zero whenever a catch-up
-cursor has queue space (#93), so a per-iteration throw there would spin rather than pace itself.
-Doing that without a measurement to drive it would be guesswork; it is a separate piece of work.
+loop stopped is out of the mesh entirely.
+
+**The three loops it named are measured now, and one of the three sentences above was wrong.**
+`io_loop` is done, in this item rather than a new one, because it is the same defect in a second
+place. The other two are measured and open, and the correction matters more than it looks: the
+loop whose epoll timeout is **zero** whenever a catch-up cursor has queue space is
+`ReplicationManager::run_loop()` (`src/replication.cpp:846`), not the mesh `io_loop`, which waits
+**500 ms** (`src/multi_master.cpp:712`). So the bound belongs to the replication loop, the scope is
+**four** loops rather than three, and the note above was sending the next reader to the wrong
+function.
+
+Three probes with #54's injector, each with a control, and the first one ruled a path out.
+
+**The startup promotion already refuses correctly, so it needed nothing.** A single node with a
+coordinator promotes itself on the **main thread**, inside `TcpServer::run()`, so an `ENOSPC` on
+the 32-byte `EPOCH` record (24-byte header, 8-byte payload) reaches `main`: the process prints
+`Error: WALWriter: write failed: No space left on device` and exits. One injection, zero
+thread-boundary lines — a named refusal, which is #102's and #113's shape rather than a silent
+thread death. "I checked and it does not apply" is a different sentence from "I did not check."
+
+**`monitor_loop` is worse than this item predicted.** Two nodes on one etcd, the injector on the
+second only. B is a healthy replica, A is killed, B waits out #82's election delay, stands, and the
+`EPOCH` write is refused:
+
+```
+"msg":"monitor_loop ended on an exception and that thread is gone: WALWriter: write failed: No space left on device"
+```
+
+The process **lives**, answers `PONG`, and `ROLE` reports **`REPLICA 127.0.0.1:44613 2`** — 44613
+is B's **own** replication port. A half-finished promotion left the node a replica of itself, and
+the loop that would fix that is gone: across the 40 seconds observed the role never changes. The
+control, the same run at a size nothing writes, reports zero injections and `PRIMARY 2` at twenty
+seconds.
+
+**`io_loop`, now fixed, was the quieter of the two.** A two-node mesh, the injector on the
+receiver, an `ENOSPC` on the 150-byte record a mesh delta writes (a 38-byte V2 header and 112 bytes
+of payload — the same payload a client's `INSERT` puts behind the 24-byte legacy header):
+
+```
+"msg":"io_loop ended on an exception and that thread is gone: WALWriter: write failed: No space left on device"
+```
+
+Three records written on the peer afterwards **never arrived** (A had two rows, B still one), while
+B answered `PONG` and its own `MM_PEERS` called the link **`connected`**, with a fresh HLC and
+`send_queue_bytes 0`. A node out of the mesh whose every outward signal says the mesh is fine.
+
+The boundary is **inside** the event loop rather than around the pass, and that is not tidiness:
+every registration here is `EPOLLET`, so an abandoned event is not re-delivered and taking the pass
+down would silently drop the rest of a batch that can hold 64. `ob_mm_io_errors_total` is
+registered in the same change that writes it, and it is the **only** outward sign — which is the
+flush half's own argument for a counter over a log line.
+
+**Two things the first version of that boundary got wrong, both from running it rather than reading
+it.** The recovery line fired in the **same pass** as the ERROR it was meant to close, because
+`end()` runs after the loop that opened the episode — measured as a log alternating ERROR /
+"handled again" / ERROR for three failing records. It is gated now on a pass that had events and
+none of which threw. And the episode deliberately does **not** suppress one line per failed record:
+#95's shape is a line per *loop iteration* carrying no new information, while three lines for three
+records a full disk refused is information, and the counter beside them is the thing to alarm on.
+
+The test asserts on records arriving **after** the refusal rather than on the thread being alive,
+because alive is exactly what the node looked like when the thread was gone. Its control is a
+second test, because a fault-injection test that quietly failed to inject reads identically to an
+engine that survived the fault. The mutation that says both carry weight: leaving the report and
+the counter in place and letting the thread die anyway fails with the message the test was written
+for — *"the second node holds 2 rows, so records written after the refused one never arrived"*.
+
+**Asked while the probe was running, and answered: no record is lost.** `apply_remote_delta()`
+applies to memory at step 4 and writes the WAL at step 5, so a refused write leaves the record
+visible and absent from the log. Measured with the flush tick an hour out and `SIGKILL`, which is
+the only way to see the window: after the restart the receiver replayed `records=1 applied=1` and
+the refused record was gone — and so was its place in the dedup frontier, because the frontier is
+derived from what persisted. Either exit therefore restores it: the next flush writes it to a
+segment, or a crash forgets it was ever seen and anti-entropy asks the peer again. What is **not**
+measured is that last leg — the anti-entropy pass itself — and it is named here rather than
+implied.
+
+**Still open, with the judgement each one needs written down.** `monitor_loop` gets its boundary
+next, and it carries three things that would hide each other in one diff: seven byte-identical nap
+blocks collapsing into one (verified by script — six `continue`s, each preceded by exactly that
+nap, plus the one at the bottom, so `continue` → `return` is a property of the code rather than a
+reading of it), the tick extraction, and a `MetricsRegistry&` constructor argument, because
+`FailoverManager` has no registry and a defaulted argument would let every test leave the counter
+unfed, which is #117 exactly. `lease_loop` has **no** throwing path today, so its boundary is a
+ratchet and will say so. `run_loop` needs the floor, and the floor is not a new threshold: 100 ms
+is what that loop already waits when it has nothing in hand, so a failing pass is paced like an
+idle one.
+
 
 - Effort: M | Impact: the most ordinary disk condition there is no longer turns a refusal into a
   crash loop, and the sixteen other threads that shared the exit are closed by the same change
@@ -6552,9 +6636,9 @@ measurement — and this row's whole purpose is to be one.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1083 | all passing with `ctest -j1` on the i3-7100U, **236-256 s in a single run** — two consecutive runs of the same suite on the same machine, which is the spread to read the next number against rather than a change. **One more than the previous commit**, #129's: a registry given a 1200-second lease interval has to stop inside two seconds, which is a property stated three orders of magnitude clear of load rather than a duration. **Before it**, four were #128's, and they divide the way that defect does: three in `tests/test_mm_epoll_identity.cpp` are about the shape — that the two reserved event keys cannot collide with a connection, that closing a descriptor takes its registration with it (measured against `dup2`, which forces the reuse the defect needs instead of hoping for it), and that no registration in `src/multi_master.cpp` carries a bare descriptor number. The fourth is behavioural: a connection landing on the descriptor its predecessor gave back is its own connection, with both numbers read back so a run where the kernel did not recycle the number says so rather than passing quietly. Three of the six mutations in that item's table are killed by the static test **and by nothing else**, which is what says it carries weight. **Before them**, two were #126's, and they pin the replayer's rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. **Earlier**: two were #54's D3, three #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists **1085**: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The count that passes and the count CTest lists differ by exactly those two harnesses, always; a row two commits back gave one number for both. The runtimes are what this machine gave on the commit measured, not a budget |
-| Python integration | 263 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 263; count pytest's final result rather than the report plugin's progress characters. `263 passed, 2 skipped in 20:14` on the GitHub runner for this commit, against `20:37` on the development machine (i3-7100U, native etcd) — the spread to expect between the two rather than a change. Three more than the previous commit: #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
-| Python integration under TSan | 263 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `263 passed in 25:05` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **20:14** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
+| C++ (GTest + RapidCheck) | 1083 | all passing with `ctest -j1` on the i3-7100U, **236-256 s in a single run** — two consecutive runs of the same suite on the same machine, which is the spread to read the next number against rather than a change. **Unchanged by this commit**, which adds integration tests only; the most recent addition was #129's: a registry given a 1200-second lease interval has to stop inside two seconds, which is a property stated three orders of magnitude clear of load rather than a duration. **Before it**, four were #128's, and they divide the way that defect does: three in `tests/test_mm_epoll_identity.cpp` are about the shape — that the two reserved event keys cannot collide with a connection, that closing a descriptor takes its registration with it (measured against `dup2`, which forces the reuse the defect needs instead of hoping for it), and that no registration in `src/multi_master.cpp` carries a bare descriptor number. The fourth is behavioural: a connection landing on the descriptor its predecessor gave back is its own connection, with both numbers read back so a run where the kernel did not recycle the number says so rather than passing quietly. Three of the six mutations in that item's table are killed by the static test **and by nothing else**, which is what says it carries weight. **Before them**, two were #126's, and they pin the replayer's rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. **Earlier**: two were #54's D3, three #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists **1085**: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The count that passes and the count CTest lists differ by exactly those two harnesses, always; a row two commits back gave one number for both. The runtimes are what this machine gave on the commit measured, not a budget |
+| Python integration | 265 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 263; count pytest's final result rather than the report plugin's progress characters. `263 passed, 2 skipped in 20:14` on the GitHub runner for this commit, against `20:37` on the development machine (i3-7100U, native etcd) — the spread to expect between the two rather than a change. Two more than the previous commit, both #112's `io_loop` half and both in the new `test_mesh_storage_faults.py`: a mesh receiver whose WAL refuses one record still receives the ones after it (**38.6 s**, because it waits for a mesh to form and for four records to cross it), and its control at a size nothing writes, which must inject nothing (**28.2 s**). The pair costs **67 s** locally. **Before them**: three were #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
+| Python integration under TSan | 265 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `263 passed in 25:05` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **20:14** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than
