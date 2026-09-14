@@ -1211,6 +1211,16 @@ And the reproduction guide is `tests/fault/README.md`: the four failures worth r
 one command line plus its environment, with the log that says the injection happened — because an
 injector that matched nothing looks exactly like code that survives the fault.
 
+**Mutations for the closing three: four for C4 and five for D3 and the injector, each with the
+verdict it had to give.** For C4: the ceiling never firing, the ceiling ignoring its flag and using
+the default, the drop going uncounted, and a reworded warning that survives. For D3: the wire's HLC
+replaced by a zero one, and a clock that ignores the remote timestamp — both killed by the wire test,
+which is what says it measures the path rather than the class. Two more are about the *instrument*,
+because a composite fault that only does one half proves nothing: letting the torn record's remainder
+through, and a short write that reports bytes it did not write. One did not build on the first
+attempt (`false` in a C file with no `<stdbool.h>`), so the **mutation** was transformed rather than
+the code.
+
 **#54 is therefore closed.** What it leaves behind is the list of items it found: #112, #113, #114
 from stage A, #115 and #116 from stage B, #117 and #118 from stage C, #119 and #120 from stage D,
 #121 as a question for a maintainer, and #126 from its own last measurement.
