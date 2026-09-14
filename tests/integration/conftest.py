@@ -682,6 +682,49 @@ class ClusterManager:
         self._redirected_peer_keys.add(key_b64)
         print(f"    redirected peer {node_id}: {was} -> {address}")
 
+    def peer_registration(self, node_index: int) -> Optional[dict]:
+        """The raw etcd key/value for a node's mesh registration, or None if there is none.
+
+        Public rather than a test reaching for `_etcd_call`, for the reason four modules once each
+        grew their own path to the server binary: the second test that needs this would write its
+        own copy of the key layout, and then the layout lives in two places. It is the same
+        argument `redirect_peer()` above is built on, and it shares that method's key shape.
+
+        The `lease` field is the one worth having: it is what ties the entry's lifetime to
+        `PeerRegistry::lease_loop()`, so a test can take that lease away without touching the key.
+        """
+        key = f"/ob/mm_peers/{node_index + 1}"
+        found = self._etcd_call("/v3/kv/range", {"key": base64.b64encode(key.encode()).decode()})
+        kvs = found.get("kvs") or []
+        return kvs[0] if kvs else None
+
+    def revoke_peer_lease(self, node_index: int) -> str:
+        """Take away the lease that keeps a node's mesh registration alive. Returns the lease id.
+
+        **Constructed rather than waited for, and that is the point of doing it this way.** The same
+        state arrives on its own if etcd is unreachable for longer than the TTL, but then the
+        coordinator is unreachable too and every other mechanism in the node reacts at the same
+        time. Revoking one lease isolates one thing.
+
+        Asserts its own premise, because the interesting half is what happens *after* the key goes:
+        a registration that was not there, or one with no lease behind it, would make the whole
+        measurement vacuous. Needs no change in the engine, like `redirect_peer()`.
+        """
+        entry = self.peer_registration(node_index)
+        if entry is None:
+            raise RuntimeError(
+                f"no registration for node {node_index + 1} to revoke. The node must be up and "
+                f"registered first; this is a one-shot registration, so there is nothing to take "
+                f"away before it lands")
+        lease = entry.get("lease")
+        if not lease or lease == "0":
+            raise RuntimeError(
+                f"node {node_index + 1}'s registration carries no lease ({lease!r}), so revoking "
+                f"one would prove nothing about what keeps that key alive")
+        self._etcd_call("/v3/lease/revoke", {"ID": int(lease)})
+        print(f"    revoked node {node_index + 1}'s registration lease {lease}")
+        return str(lease)
+
     def _remove_redirected_peers(self) -> None:
         """Delete the keys this harness overwrote, because they have no lease to expire.
 

@@ -26,8 +26,6 @@ only happened once.
 
 from __future__ import annotations
 
-import base64
-import json
 import time
 
 import pytest
@@ -39,20 +37,6 @@ pytestmark = pytest.mark.multi_master
 # Long enough to cover at least four refresh intervals at the default 10 s TTL (TTL/3, floored at
 # one second), so "one line" is a claim about a repeating condition rather than about a single tick.
 WATCH_SECONDS = 14.0
-
-
-def _b64(text: str) -> str:
-    return base64.b64encode(text.encode()).decode()
-
-
-def _peer_key(mgr: ClusterManager, node_index: int) -> str:
-    return f"/ob/mm_peers/{node_index + 1}"
-
-
-def _registration(mgr: ClusterManager, node_index: int) -> dict | None:
-    key = _b64(_peer_key(mgr, node_index))
-    kvs = (mgr._etcd_call("/v3/kv/range", {"key": key}).get("kvs")) or []
-    return kvs[0] if kvs else None
 
 
 @pytest.fixture
@@ -72,17 +56,12 @@ def mesh_with_a_revoked_lease():
                 break
             time.sleep(0.5)
 
-        entry = _registration(mgr, 1)
-        assert entry is not None, (
-            f"no registration at {_peer_key(mgr, 1)} to revoke. The node must be up and registered "
-            f"first; this is a one-shot registration, so there is nothing to take away before it")
-        lease = entry.get("lease")
-        assert lease and lease != "0", (
-            f"{_peer_key(mgr, 1)} carries no lease ({lease!r}), so revoking one would prove "
-            f"nothing about what keeps that key alive")
-
+        # The offset first, so every assertion below is about what this test caused rather than
+        # about the node's whole history. `revoke_peer_lease()` asserts its own premise - a
+        # registration that was not there, or one with no lease behind it, would make the whole
+        # measurement vacuous.
         offset = node_log_size(mgr.nodes[1])
-        mgr._etcd_call("/v3/lease/revoke", {"ID": int(lease)})
+        mgr.revoke_peer_lease(1)
         yield mgr, mgr.nodes[1], offset
     finally:
         mgr.shutdown()
@@ -97,7 +76,7 @@ def test_the_registration_does_not_come_back_and_the_node_keeps_serving(mesh_wit
     deadline = time.monotonic() + patience(WATCH_SECONDS)
     while time.monotonic() < deadline:
         samples += 1
-        if _registration(mgr, 1) is None:
+        if mgr.peer_registration(1) is None:
             absent += 1
         assert send_command(node.tcp_port, "PING").strip() == "PONG", (
             "the node stopped answering after its registration lease was revoked. That would be a "
@@ -123,7 +102,7 @@ def test_a_lease_that_is_gone_for_good_is_reported_once_not_once_per_interval(
     deadline = time.monotonic() + patience(WATCH_SECONDS)
     while time.monotonic() < deadline:
         checks += 1
-        assert _registration(mgr, 1) is None, (
+        assert mgr.peer_registration(1) is None, (
             "the registration reappeared mid-window, so this test no longer measures a permanent "
             "condition and its line count means nothing")
         time.sleep(1.0)
