@@ -47,7 +47,9 @@ struct Fixture {
     // The registry is constructed but never contacted: in this design the peers come from the
     // injected pass, not from etcd. It stays in the constructor signature because the manager
     // still owns the reference.
-    ob::PeerRegistry registry{ob::CoordinatorConfig{}, /*local_node_id=*/1, "127.0.0.1:1"};
+    ob::MetricsRegistry metrics;
+    ob::PeerRegistry registry{ob::CoordinatorConfig{}, /*local_node_id=*/1, "127.0.0.1:1",
+                              metrics};
     ob::AntiEntropyManager manager;
 
     Fixture() : manager(ob::AntiEntropyConfig{3600}, engine, registry) { engine.open(); }

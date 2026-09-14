@@ -345,7 +345,8 @@ void MultiMasterManager::start() {
     if (!config_.coordinator_config.endpoints.empty()) {
         std::string repl_addr = "127.0.0.1:" + std::to_string(config_.replication_port);
         peer_registry_ = std::make_unique<PeerRegistry>(
-            config_.coordinator_config, config_.node_id, repl_addr, config_.shard_id);
+            config_.coordinator_config, config_.node_id, repl_addr, engine_.registry(),
+            config_.shard_id);
 
         // Register this node in etcd and start watching for peers.
         peer_registry_->register_self("active");

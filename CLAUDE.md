@@ -2487,6 +2487,38 @@ Learned the hard way. Check here before debugging.
     guarantee: *no tick ran after the one that threw*. Place the mutation so that only the property
     under test changes.
 
+298. **A per-iteration boundary can create a busy-spin that the missing boundary hid.** The
+    replication run loop's `epoll_wait` timeout is a variable that outlives one pass and is **zero**
+    whenever a catch-up cursor has queue space. While an exception took the thread with it there was
+    no second pass to spin; add a boundary and a repeatedly throwing pass becomes
+    `epoll_wait(..., 0)` in a loop. Measured with a constructed throw, i3-7100U, two 5-second
+    windows: **172 000–195 000 passes/s and a whole core** without the floor, **10/s and 0.01 s of
+    CPU** with it. Ask what the loop's *pacing* inherits from the pass that failed, and make the
+    failure path go through the same function as the idle path so it cannot inherit anything else.
+
+299. **The list of loops that "cannot survive stopping" is not evidence about the code either.** A
+    mutation deleting one row from that hand-written list survived: the rule covered less and stayed
+    green. Derived from the tree, `src/` has thirteen loop functions and six of them guard an
+    iteration — #112 had named four. Same shape as the thread-entry count that was wrong twice in
+    the same item. Derive the set, keep the list only for what each member *is*, and check both
+    directions so a row naming a function the tree no longer has fails too.
+
+300. **Two components logging the same condition each look reasonable alone.** A lease etcd had
+    forgotten produced eleven WARN lines from the peer registry and eleven from the coordinator
+    client in 33 s — one per refresh interval each, and neither component was writing more than one
+    line per attempt. Count the lines the *condition* produces, not the lines a function produces.
+
+301. **`LogEpisode` is not thread-safe, and the fix is to hold a lock, not to write a second
+    mechanism.** Its own header says it expects its users to already hold a lock over the decision
+    that consults it. `CoordinatorClient` is used from more than one thread by design (#71), so its
+    episode has its own mutex — deliberately not the one held across the HTTP round trip.
+
+302. **Before filing "no measured throwing path", go and read every call the loop can reach.** For
+    `run_loop` that was: every `throw` in the file is on the startup path or in the other class,
+    `pread` short reads are handled by moving to the next file, the one allocation sized from disk
+    is bounded by a `uint16_t`, and the TLS context is built before the thread starts. Four
+    sentences, each checkable — which is a different claim from "I did not find one".
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2594,11 +2626,18 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   (`include/orderbook/thread_boundary.hpp`), and a test derives that count from the source rather
   than from a list — hand-counting gave eleven. A joinable thread whose body throws calls
   `std::terminate`, so an `ENOSPC` on the flush thread's WAL write used to abort the whole node in a
-  crash loop while the client-facing path handled the same condition correctly. `flush_loop()`
-  additionally guards **one tick**, counting `ob_flush_errors_total` and running the next one;
-  `lease_loop`, `monitor_loop` and `io_loop` have the thread-level boundary but not yet a
-  per-iteration one, and `io_loop` needs a bound first because its epoll timeout is zero whenever a
-  catch-up cursor has queue space (#93).
+  crash loop while the client-facing path handled the same condition correctly.
+- **Six loops also guard one iteration at a time, and the set is derived rather than listed**
+  (#112). `Engine::flush_loop`, `FailoverManager::monitor_loop`, `MultiMasterManager::io_loop`,
+  `ReplicationManager::run_loop`, `PeerRegistry::lease_loop` and `ReplicationClient::run_loop`; the
+  first five each count what they caught and log loud-once. `src/` has **thirteen** loop functions,
+  so **seven** still end on their first exception and are #131 with what each one's death costs —
+  a hand-written list of four survived a mutation that deleted a row from it, which is why
+  `tests/test_thread_boundaries.cpp` now derives the set from the tree and checks both directions.
+  Two things worth knowing before adding the eighth: the loop whose epoll timeout is **zero** while
+  a catch-up cursor has queue space is `ReplicationManager::run_loop` and not the mesh `io_loop`
+  (which waits 500 ms), and giving that loop a boundary **created** a spin — `wait_ms` outlives a
+  pass, so the failure path has to go through `replication_wait_ms()` like the idle path.
 - **A mesh link is breakable from the harness, and the proxy that does it needs no engine change**
   (#54 stage C). `tests/integration/mesh_proxy.py` sits between two peers;
   `ClusterManager.redirect_peer()` puts it there by overwriting the address

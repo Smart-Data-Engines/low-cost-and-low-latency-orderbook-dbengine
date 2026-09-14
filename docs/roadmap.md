@@ -2152,6 +2152,131 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 133. A lease that etcd has forgotten is reported once per refresh interval, for ever ✅
+
+Found while giving `lease_loop` its per-iteration boundary (#112), by revoking the lease that holds
+a node's mesh registration open and reading what the node then says about it.
+
+**Measured on a two-node mesh, before**: eleven `Lease refresh failed` and eleven
+`keepalive returned no TTL` in 33 s — one of each per refresh interval, at the default TTL/3, for
+the life of the process. The condition is permanent: a lease etcd has forgotten fails every
+keepalive, and nothing re-registers (#132). **After**: one of each. Run against the commit before
+the fix, the test that pins it counts **4 lines in its 14-second window where the fix gives 1**.
+
+This is #95's shape — a permanent condition retried at loop frequency and logged at loop frequency
+— and the third time this repository has answered it with `LogEpisode`, after #116's WAL-position
+publisher (2.17 lines/s → 0.40) and #120's hybrid logical clock (one line per *write*).
+
+**Two halves, because the two lines have different owners, and the second is the interesting one.**
+
+`PeerRegistry::refresh_lease()` gets this object's own episode. The line that opens it now carries
+the consequence — *"this node's mesh registration expires with the lease and nothing re-registers
+it"* — which is what makes one line enough where a hundred were not information, and it names which
+of the two failures it is, because they ask for different things: no lease at all means
+`register_self()` failed or never ran; a refused keepalive means the lease existed and is gone.
+
+`CoordinatorClient::refresh_lease()` gets one too, and it covers **all four owners** of that class
+rather than this one caller — `FailoverManager`, `PeerRegistry`, `ShardRouter` and
+`ShardCoordinator`. Under its own mutex, because `LogEpisode` is not thread-safe and says so in its
+own header: it asks its users to hold a lock over the decision that consults it, and this class is
+used from more than one thread by design, which is exactly what #71 was about. Deliberately **not**
+`http_mtx`, which is held across a network round trip while this decision is taken after it is
+released. One episode per client rather than per lease id: every owner in this tree keeps exactly
+one lease, and the opening line names the id, so two leases sharing a client would be visible
+rather than silently merged.
+
+**The alternative that was considered and rejected**: give `refresh_lease()` three answers instead
+of two, the way #82 gave `read_leader()` `Present` / `Absent` / `Unavailable` one function away in
+the same class, and let each caller decide what to say. That is the better design and it is not this
+change: it needs a decision per caller, and one of the four — `ShardCoordinator::watch_loop()` —
+**discards the result entirely today**, so the line this change keeps is the only thing it emits
+about a lost lease. Recorded here rather than quietly done differently.
+
+**The control is inside the test, and it has to be.** "One line" is satisfied by a condition that
+only happened once, so the registration's absence is asserted on each of fourteen seconds — four
+refresh intervals and more — before the lines are counted.
+
+- Effort: S | Impact: the log an operator greps during an etcd incident is the one that buries the
+  finding under its own repetition, and the two lines came from two different components so neither
+  looked like a flood on its own
+
+### 132. A node whose registration lease is lost never comes back to the mesh registry
+
+Found by the same probe as #133, and it is the more serious half.
+
+`PeerRegistry::register_self()` runs **once**, at start (`src/multi_master.cpp:351`), and is the
+only writer of `lease_id_`. `lease_loop()` refreshes that lease every TTL/3 and **discards the
+answer** — which since #74 is an answer worth having, because a keepalive for a lease etcd has
+forgotten now fails rather than silently succeeding.
+
+**Measured**: revoke the lease under a running two-node mesh and `<prefix>mm_peers/2` is gone at
+once and **still gone 22.5 s later**, seven refresh intervals, while the node answers `PONG` on
+every sample. `Registered node` appears exactly once in its log, at start. Recovery is a restart.
+
+**What survives, measured rather than assumed, and it narrows the defect usefully.** The mesh does
+not fall apart: the existing TCP link was dialled before the key went away and keeps carrying
+writes, and a node that joins *after* the revoke still ends up connected to the unregistered one —
+because that node's own topology watch sees the newcomer's registration and dials **out**. A third
+node started after the revoke received both records. So this is not a partition; it is a node that
+is permanently absent from the one place the cluster's addresses are published, and whose row in
+every peer's `MM_PEERS` carries an **empty address** for the rest of its life.
+
+**Three answers, and the cheap one is wrong.** Re-registering from the lease loop is the obvious fix
+and it has a cost this repository can name: `register_self()` running more than once would overwrite
+the entry `ClusterManager.redirect_peer()` writes, and **ten integration tests** in #54's stage C
+depend on that entry staying where the harness put it — a fixture whose insertion point is "this
+registration happens exactly once" (its own docstring says so). The alternatives are to report the
+condition and let an operator act (a gauge; the WARN from #133 is already the human half), or to
+re-register only when the key is **absent** rather than on every refusal, which keeps the one-shot
+property for a key that exists.
+
+Today's behaviour is pinned by a test, so whichever is chosen cannot land unnoticed.
+
+- Effort: M, mostly the decision | Impact: a node that keeps serving and keeps its existing links
+  while being invisible to the registry — so the cluster works until the day something needs to
+  look an address up, and then does not
+
+### 131. Seven more loops end on their first exception
+
+Found by a mutation that **survived** while #112's last loop was being closed, which is the part
+worth recording.
+
+#112's per-iteration rule was first written as a hand-list of the four loops that item names.
+Deleting a row from that list survived: the rule covered less and stayed green. That is the
+**third** time inside #112 that a list written by hand turned out not to be evidence about the code
+— the count of thread entry points was wrong the same way twice, one then eleven then seventeen — so
+the set is derived from the tree now and the list only says what each member *is*.
+
+Derived: fourteen functions in `src/` match `void Class::…loop()`. One is a notifier with no loop in
+it (`MultiMasterManager::wake_io_loop`) and is named, so a real loop cannot hide by having its
+`while` rewritten. Of the thirteen that remain, **six** guard one iteration at a time — #112's four
+plus `ReplicationClient::run_loop()`, which has done so since before that item, and
+`ReplicationManager::run_loop()` — and **seven do not**:
+
+| loop | what its death costs |
+|---|---|
+| `PeerRegistry::watch_loop()` | no new or moved peer is ever learned; the mesh stops growing. It also **calls the topology callback**, so `handle_topology_change()` — which dials peers — runs inside it |
+| `MultiMasterManager::reconnect_loop()` | a dropped mesh link is never re-dialled; #95's and #97's work all lives here |
+| `AntiEntropyManager::loop()` | reconciliation stops, so divergence between masters is never repaired (#57's whole mechanism) |
+| `ShardRouter::watch_loop()` | the shard map goes stale and this client keeps routing by it |
+| `ShardCoordinator::watch_loop()` | shard ownership is never re-read; it also discards `refresh_lease()`'s answer, which is #133's rejected alternative |
+| `MetricsServer::run_loop()` | `/metrics` stops answering: monitoring goes dark while the engine is fine, which is the same "every outward signal disagrees with reality" problem from the other side |
+| `OrderbookPool::health_check_loop()` | a client pool stops noticing dead connections; the only one of the seven outside the server |
+
+**Not fixed here, and the reason is #112's own rule**: each loop needs its own judgement about
+whether to continue, and seven judgements taken in one change are seven judgements nobody reviewed.
+Two of the seven are also not obviously the same answer — `MetricsServer` serves HTTP and could
+reasonably end a *connection* rather than an iteration, and the client pool is a library in somebody
+else's process.
+
+What this item buys immediately is that the eighth is not invisible: the checker requires every loop
+in `src/` to be classified, in both directions, so a new loop has to join a list or explain itself
+and a row naming a function the tree no longer has fails too.
+
+- Effort: M | Impact: seven subsystems that end quietly on their first exception, each leaving a
+  node that answers health checks. Cheaper per loop than #112's four were, because the mechanism and
+  the metric shape already exist
+
 ### 130. A promotion that stops halfway leaves the node a replica of itself
 
 Found while measuring #112's `monitor_loop` half, and left open on purpose: the boundary that made
@@ -3752,10 +3877,69 @@ exception and that thread is gone`, which is the pre-fix line. Counting, logging
 rethrowing kills it on the assertion that matters: *no tick ran after the one that threw*. Restored
 from a copy kept alongside both times, green after.
 
-**Still open: `lease_loop` and `run_loop`.** `lease_loop` has **no** throwing path today, so its
-boundary is a ratchet and will say so rather than pretending to fix something measured. `run_loop`
-needs the floor, and the floor is not a new threshold: 100 ms is what that loop already waits when
-it has nothing in hand, so a failing pass is paced like an idle one.
+**`lease_loop` and `run_loop` are done, and both are ratchets — the prediction above was right
+about the first and half wrong about the second.**
+
+Neither has a throwing path in this tree, and that was established rather than assumed.
+`src/coordinator.cpp` contains **no `throw` at all** and `refresh_lease()` answers failure with
+`false`, so what is left under `lease_loop` is `std::bad_alloc` from the string building and
+`std::system_error` from the wait. Under `run_loop`, every `throw` in `src/replication.cpp` is
+either on the startup path or in `ReplicationClient`; `continue_catchup()` reads with `pread` and
+answers a short read by moving to the next file; `payload_len` is a `uint16_t`, so the one
+allocation sized from a byte on disk cannot ask for more than 64 KiB; and
+`ReplicationConfig::tls_server` is built before `start()`, so no certificate is loaded from that
+thread. Both counters are registered with that caveat in their own comment, because an increment
+nobody registered is discarded in silence (#77) and the first such exception should not also be the
+first thing nobody can alarm on.
+
+**`run_loop` gets two boundaries, and the second one is what makes it different from the mesh.**
+Per event, for the same reason: every replica registration is `EPOLLIN | EPOLLOUT | EPOLLET`, so an
+abandoned event is not re-delivered and taking the pass down would strand whatever the other
+descriptors of a batch of 32 had ready. **And per pass**, because unlike `io_loop` this one does
+real work outside the dispatch — the snapshot poll, both replica gauges, every catch-up cursor's
+next batch, the five-second heartbeat — all four of which are re-attempted next pass, so the pass
+is a safe unit to abandon where the thread is not.
+
+**The floor is needed because the boundary creates the hazard, not because anything throws today.**
+That is the correction to the sentence above. `wait_ms` outlives one pass, so a pass that throws
+before reaching the recompute keeps the previous pass's value — and that value is **zero** whenever
+a catch-up had queue space. While an exception took the thread with it there was no second pass to
+spin at all.
+
+**Measured, because a bound argued for is a bound somebody will remove.** The premise is
+constructed — nothing here throws, which is the whole point — so the probe makes every pass throw
+and starts `wait_ms` at what a catch-up with queue space leaves behind. The pass count is exact,
+because the boundary's own counter is incremented once per abandoned pass. i3-7100U, Debug, one
+node with no replica and no client, two 5-second windows each:
+
+| | passes/s | CPU in a 5.0 s window |
+|---|---|---|
+| without the floor | **172 000–195 000** | **5.01 s and 5.04 s** — one whole core |
+| with the floor | **10.0** and 10.0 | 0.01 s and 0.00 s |
+
+100 ms is not a new threshold — it is what this loop already waits with nothing in hand, so ten
+passes a second is a failing loop paced exactly like an idle one. `replication_wait_ms()` is a free
+pure function for the reason `drain_verdict()` is (#106), so the `catch` says "no work in hand" by
+its argument rather than carrying a second copy of the number, and a static test refuses any other
+way of assigning `wait_ms`.
+
+**What measuring `lease_loop` found is worth more than its boundary**, and both halves are separate
+items. Revoking the lease that holds a node's mesh registration open: the key is gone at once and
+**still gone 22.5 s later** while the node answers `PONG`, because `register_self()` runs once and
+is the only writer of `lease_id_` — that is **#132**. And the node says so eleven times in 33 s,
+one line per refresh interval from each of two components — **#133**, fixed.
+
+**The loop count was a hand-written list too, and a mutation said so.** The first version of the
+per-iteration rule listed this item's four loops by hand, and deleting a row from it **survived**:
+the rule covered less and stayed green — the third time inside this one item that a list written by
+hand turned out not to be evidence about the code. Derived from the tree instead: fourteen
+`void Class::…loop()` definitions in `src/`, one of them a notifier with no loop in it, **six** of
+the remaining thirteen guarding one iteration at a time and **seven not**. Those seven are **#131**,
+with what each one's death costs. Four is what somebody counted; thirteen is what the tree has.
+
+The mechanism is in `tests/test_thread_boundaries.cpp` beside the outer rule, checked in both
+directions as the metrics checker is: a loop in neither list fails, and a row naming a function the
+tree no longer has fails too.
 
 
 - Effort: M | Impact: the most ordinary disk condition there is no longer turns a refusal into a

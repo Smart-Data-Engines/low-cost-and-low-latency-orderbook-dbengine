@@ -397,7 +397,8 @@ TEST(PeerRegistryShutdown, StoppingDoesNotWaitOutTheLeaseInterval) {
     config.lease_ttl_seconds = 3600;                   // interval: 1200 s
     config.node_id          = "shutdown-probe";
 
-    ob::PeerRegistry registry(config, 1, "127.0.0.1:7100");
+    ob::MetricsRegistry metrics;
+    ob::PeerRegistry registry(config, 1, "127.0.0.1:7100", metrics);
     registry.start_watch([](const std::vector<ob::PeerInfo>&) {});
 
     // Long enough for the lease loop to have made its first refresh attempt and entered the wait,
