@@ -1,6 +1,7 @@
 // ── CoordinatorClient — etcd v3 REST integration ─────────────────────────────
 
 #include "orderbook/coordinator.hpp"
+#include "orderbook/log_episode.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/logger.hpp"
 
@@ -355,6 +356,26 @@ struct CoordinatorClient::Impl {
     std::atomic<bool>   watching{false};
     LeaseEventCallback  watch_cb;
 
+    /// "etcd does not know this lease", said once when it starts and once when it stops (#133).
+    ///
+    /// A keepalive for a forgotten lease fails on every call, and every caller retries on a timer
+    /// — so this line used to arrive at loop frequency for the life of the process. Measured on a
+    /// two-node mesh with the peer registry's lease revoked: eleven of these in 33 s, one per
+    /// refresh interval, for ever. That is #95's shape, and `LogEpisode` is the answer this
+    /// repository already has for it (#116, #120).
+    ///
+    /// Under its own mutex because `LogEpisode` is not thread-safe and says so, asking its users
+    /// to hold a lock over the decision that consults it. This class is used from more than one
+    /// thread by design — `FailoverManager` keeps a lease alive from its monitor loop and revokes
+    /// one from a session thread, which is what #71 was about. Not `http_mtx`: that one is held
+    /// across a network round trip, and this decision is taken after it is released.
+    ///
+    /// One episode per client rather than per lease id. Every owner in this tree keeps exactly one
+    /// lease, and the opening line names the id, so two leases sharing a client would be visible
+    /// rather than silently merged.
+    std::mutex          lease_gone_mtx;
+    LogEpisode          lease_gone;
+
     /// libcurl write callback — appends data to a std::string.
     static size_t write_callback(char* ptr, size_t size, size_t nmemb,
                                  void* userdata) {
@@ -500,10 +521,29 @@ bool CoordinatorClient::refresh_lease(int64_t lease_id) {
     // writes while a replica took the leader key it had lost (#74).
     const int64_t ttl = json_extract_int64(resp, "TTL");
     if (ttl <= 0) {
-        OB_LOG_WARN("coordinator",
-                    "lease %ld is gone: keepalive returned no TTL, so etcd does not know it any "
-                    "more", static_cast<long>(lease_id));
+        std::lock_guard<std::mutex> lock(impl_->lease_gone_mtx);
+        if (impl_->lease_gone.begin()) {
+            OB_LOG_WARN("coordinator",
+                        "lease %ld is gone: keepalive returned no TTL, so etcd does not know it "
+                        "any more", static_cast<long>(lease_id));
+        } else {
+            OB_LOG_DEBUG("coordinator",
+                         "lease %ld is still gone (%llu keepalives)", static_cast<long>(lease_id),
+                         static_cast<unsigned long long>(impl_->lease_gone.ticks()));
+        }
         return false;
+    }
+    {
+        // The other half of "loud once": silence after the WARN cannot be told from the condition
+        // having gone away, and a lease *can* come back — a caller that re-registers gets a new
+        // id, and this line is what says the keepalives started working again.
+        std::lock_guard<std::mutex> lock(impl_->lease_gone_mtx);
+        if (const uint64_t held = impl_->lease_gone.end()) {
+            OB_LOG_INFO("coordinator",
+                        "lease %ld is being kept alive again after %llu keepalive(s) that found "
+                        "no lease", static_cast<long>(lease_id),
+                        static_cast<unsigned long long>(held));
+        }
     }
     OB_LOG_DEBUG("coordinator", "lease %ld refreshed, ttl=%lds",
                  static_cast<long>(lease_id), static_cast<long>(ttl));

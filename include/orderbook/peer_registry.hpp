@@ -203,6 +203,13 @@ private:
     /// Touched only by the lease thread, which is what `LogEpisode` asks of its users.
     LogEpisode lease_errors_;
 
+    /// Whether the lease is currently *refusing* to refresh, which is a different condition from
+    /// the one above: it threw, against it said no. Both need loud-once, because both are usually
+    /// permanent — a lease etcd has forgotten is forgotten for ever, and `register_self()` runs
+    /// once (#132). Measured before this existed: eleven WARN lines in 33 s, one per interval,
+    /// unbounded (#133).
+    LogEpisode lease_refusals_;
+
     void watch_loop();
     void lease_loop();
     std::string build_key() const;

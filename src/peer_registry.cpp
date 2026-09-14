@@ -515,18 +515,41 @@ void PeerRegistry::stop_watch() {
 }
 
 bool PeerRegistry::refresh_lease() {
-    if (lease_id_ == 0 || !coordinator_) {
-        OB_LOG_WARN("peer_registry",
-                    "Lease refresh failed for node %u: no active lease",
-                    local_node_id_);
+    // Loud once and then quiet, for both ways this can fail. The lease loop calls this every
+    // TTL/3 and neither failure is transient in practice: a lease etcd has forgotten stays
+    // forgotten, and a registration that never happened leaves `lease_id_` at 0 for the life of
+    // the process. Measured before this episode existed, with the lease revoked under a running
+    // two-node mesh: eleven of these in 33 s, one per interval, for ever - #95's shape, and the
+    // same defect #116 closed for the position publisher and #120 for the clock (#133).
+    //
+    // The episode is this object's, so a caller other than the lease loop still gets the first
+    // line. It is not atomic because the lease thread is the only caller in this tree, which is
+    // what `LogEpisode` asks of its users.
+    const bool ok = (lease_id_ != 0 && coordinator_) && coordinator_->refresh_lease(lease_id_);
+    if (!ok) {
+        // Which of the two it is, in the line that opens the episode - they ask for different
+        // things. No lease at all means `register_self()` failed or was never called; a refused
+        // keepalive means the lease existed and is gone, and the node is out of the mesh registry
+        // until something re-registers it, which nothing does (#132).
+        if (lease_refusals_.begin()) {
+            OB_LOG_WARN("peer_registry",
+                        "Lease refresh failed for node %u%s - this node's mesh registration "
+                        "expires with the lease and nothing re-registers it", local_node_id_,
+                        lease_id_ == 0 ? ": no active lease" : "");
+        } else {
+            OB_LOG_DEBUG("peer_registry",
+                         "Lease refresh for node %u still failing (%llu consecutive)",
+                         local_node_id_,
+                         static_cast<unsigned long long>(lease_refusals_.ticks()));
+        }
         return false;
     }
-    bool ok = coordinator_->refresh_lease(lease_id_);
-    if (!ok) {
-        OB_LOG_WARN("peer_registry",
-                    "Lease refresh failed for node %u", local_node_id_);
+    if (const uint64_t held = lease_refusals_.end()) {
+        OB_LOG_INFO("peer_registry",
+                    "node %u's lease is being refreshed again after %llu refusal(s)",
+                    local_node_id_, static_cast<unsigned long long>(held));
     }
-    return ok;
+    return true;
 }
 
 int64_t PeerRegistry::lease_ttl_remaining() const {
