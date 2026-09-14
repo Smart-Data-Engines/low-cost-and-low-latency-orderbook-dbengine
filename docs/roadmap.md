@@ -2357,6 +2357,32 @@ write to the file that just refused one*, so the fix would depend on the thing t
 all further writes to a torn file turns a lost tail into an outage. Doing nothing was what the
 measurement was against.
 
+**The replayer's half is a migration path, and finding that out took a failing assertion.** A file
+the *new* writer abandons ends mid-record — 20 bytes of a 24-byte header — and every reader here has
+always treated a short header as the end of that file, without comparing a checksum at all. So the
+mismatch rule cannot be reached by anything this build writes. What it is for is a directory an
+**older build** left behind, where records sit *behind* the tear and the reader assembles a parseable
+header out of the stranded bytes and the record following them. That is now said out loud rather than
+implied: `WALReplayer::tears_skipped()` counts those files, `Engine::open()` logs a line naming what
+it means, and the integration test asserts the replay is **silent** about a checksum — because with
+the writer's half in place, a compared checksum would mean something was written behind the tear.
+
+**Six mutations, each with the verdict it had to give — and two of them rewrote the fix.**
+
+*"The last file is identified by the wrong end of the list"* survived the first table, and chasing it
+found the unit test passing for the wrong reason **twice**. With the file ending in the 20 stranded
+bytes, the reader's header read is short and the replayer has always continued past that; with 136
+bytes of `0x5A` behind them, the assembled header claims a 23 130-byte payload and the *payload* read
+is short, which is the same path again. It takes a **real** record behind the tear — its first four
+bytes are a small sequence number, so the garbled header claims a four-byte payload, the read
+succeeds, and the checksum is finally compared. A synthetic corruption is not the corruption you get.
+
+*"Replay reads past a mismatch in the last file too"* survived because it was **not a mutation**:
+returning from the whole replay and ending the current file differ only when a later file exists, and
+in the last file there is none. The `is_last` branch was therefore one guarantee stated twice, which
+is the shape that cannot be mutated separately — so it is now one branch, and the distinction lives
+where it is real: in `tears_skipped()` and in the message an operator reads.
+
 - Effort: M | Impact: the engine's central durability claim had an exception nobody could see from
   outside. The window is narrow — it needs a write that fails *after* writing part of a record —
   but inside it every later acknowledgement was a promise the restart broke

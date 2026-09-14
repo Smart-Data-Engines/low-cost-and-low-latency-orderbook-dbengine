@@ -551,6 +551,7 @@ uint64_t WALReplayer::replay(
 {
     // Reset epoch tracking for this replay.
     last_epoch_ = 0;
+    tears_skipped_ = 0;
 
     // Collect all wal_*.bin files and sort them by index.
     std::vector<std::pair<uint32_t, std::string>> files;
@@ -604,20 +605,24 @@ uint64_t WALReplayer::replay(
             // Verify CRC32C.
             const uint32_t expected = crc32c(payload.data(), hdr.payload_len);
             if (expected != hdr.checksum) {
-                // A mismatch in the **last** file is the crash tail: the record was being written
-                // when the process died, and there is nothing after it. A mismatch in any earlier
-                // file is a torn record the writer abandoned the file for (#126), and everything in
-                // the files after it is intact - so stopping here would lose writes that were
-                // acknowledged. Measured before this rule: 2 of 2 lost.
-                if (!is_last) {
+                // A mismatch ends this file. In the **last** file it is the crash tail - the
+                // record was being written when the process died - and in any earlier file it is a
+                // torn record the writer abandoned that file for (#126), whose successors are
+                // intact: stopping the whole replay there lost writes that had been acknowledged,
+                // measured at 2 of 2. One branch for the same reason as in `replay_v2()` below.
+                if (is_last) {
+                    OB_LOG_WARN("wal",
+                                "checksum mismatch in %s, the last WAL file: this is the tail of a "
+                                "record that was being written when the process stopped",
+                                path.c_str());
+                } else {
+                    ++tears_skipped_;
                     OB_LOG_WARN("wal",
                                 "checksum mismatch in %s, which is not the last WAL file: treating "
                                 "it as a torn record and continuing with the next file",
                                 path.c_str());
-                    goto done_file;
                 }
-                ::close(fd);
-                return last_good_seq;
+                goto done_file;
             }
 
             // ROTATE record signals end of this file's useful content.
@@ -686,6 +691,7 @@ uint64_t WALReplayer::replay_v2(WALReplayCallbackV2 cb)
 {
     // Reset epoch tracking for this replay.
     last_epoch_ = 0;
+    tears_skipped_ = 0;
 
     // Collect all wal_*.bin files and sort them by index.
     std::vector<std::pair<uint32_t, std::string>> files;
@@ -775,18 +781,25 @@ uint64_t WALReplayer::replay_v2(WALReplayCallbackV2 cb)
             {
                 const uint32_t expected = crc32c(payload.data(), base_hdr.payload_len);
                 if (expected != base_hdr.checksum) {
-                    // See the same decision in `replay()` above: the last file's mismatch is a
-                    // crash tail and stops replay, an earlier file's is a torn record the writer
-                    // abandoned that file for, and the files behind it are intact (#126).
-                    if (!is_last) {
+                    // The same decision as in `replay()` above, and one branch for the same
+                    // reason: ending this file and returning from the whole replay differ only
+                    // when a later file exists, and in the last file there is none. A mutation
+                    // that made the last file behave like the others survived, because it is the
+                    // same behaviour. What differs is which case it is, and that is observable in
+                    // `tears_skipped()` and in the message rather than in the control flow (#126).
+                    if (is_last) {
+                        OB_LOG_WARN("wal",
+                                    "checksum mismatch in %s, the last WAL file: this is the tail "
+                                    "of a record that was being written when the process stopped",
+                                    path.c_str());
+                    } else {
+                        ++tears_skipped_;
                         OB_LOG_WARN("wal",
                                     "checksum mismatch in %s, which is not the last WAL file: "
                                     "treating it as a torn record and continuing with the next",
                                     path.c_str());
-                        goto done_file_v2;
                     }
-                    ::close(fd);
-                    return last_good_seq;
+                    goto done_file_v2;
                 }
             }
 

@@ -522,9 +522,22 @@ public:
     /// Return the highest epoch found during the last replay (0 if none).
     uint64_t last_epoch() const { return last_epoch_; }
 
+    /// Files whose checksum mismatch the last replay stepped over as a **torn record** (#126).
+    ///
+    /// Not a curiosity: a torn file the current writer produced ends mid-record, which every reader
+    /// here has always tolerated, so this can only be non-zero for a WAL written **before** the
+    /// writer learned to abandon a file it tore. It is therefore the count of files an older build
+    /// stranded and this replay recovered past - which is worth a line at startup, and is what
+    /// makes the difference between a tear and a crash tail observable rather than inferred from a
+    /// log message.
+    ///
+    /// Reset at the start of every replay, so a caller that replays twice reads the second pass.
+    size_t tears_skipped() const { return tears_skipped_; }
+
 private:
     std::string dir_;
     uint64_t    last_epoch_{0};
+    size_t      tears_skipped_{0};
 };
 
 } // namespace ob

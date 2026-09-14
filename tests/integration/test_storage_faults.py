@@ -476,5 +476,15 @@ def test_a_torn_record_costs_only_the_write_that_tore():
         assert "torn record in" in node.log(), (
             f"nothing in the node's log names the torn record, so an operator would have no way to "
             f"know one happened:\n{node.log()}")
+        # And the replay is **silent** about the tear, which is worth asserting because an earlier
+        # version of this test expected the opposite. Once the writer abandons the file, that file
+        # ends mid-record - 20 bytes of a 24-byte header - and every reader here has always treated
+        # a short header as the end of that file, so no checksum is ever compared. The replayer's
+        # half of #126 exists for a WAL an **older build** left behind, where records sit *behind*
+        # the tear and a garbled header does parse; `WalTornRecord.*` covers that, and
+        # `tears_skipped()` is how the engine reports it.
+        assert "checksum mismatch" not in node.log(), (
+            f"the replay compared a checksum inside the abandoned file, which means the writer left "
+            f"something behind the tear:\n{node.log()}")
     finally:
         node.cleanup()
