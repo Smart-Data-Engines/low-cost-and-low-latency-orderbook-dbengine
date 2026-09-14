@@ -205,6 +205,15 @@ const ob::PeerConnection* find_peer(const std::vector<ob::PeerConnection>& peers
     return nullptr;
 }
 
+/// Refused at compile time, because `peer_states()` returns by value.
+///
+/// `find_peer(mm->peer_states(), 2)` reads perfectly well and hands back a pointer into a vector
+/// that dies at the end of the expression. It even passes: the freed memory still holds the right
+/// values, so the first version of the recycled-descriptor test below was green here and a
+/// **heap-use-after-free** under `sanitizers (tsan)`. A deleted rvalue overload turns that from
+/// something a sanitizer catches into something the compiler does.
+const ob::PeerConnection* find_peer(std::vector<ob::PeerConnection>&&, uint16_t) = delete;
+
 }  // namespace
 
 // ── The defect ──────────────────────────────────────────────────────────────────
@@ -492,10 +501,16 @@ TEST(PendingPeers, AConnectionOnARecycledDescriptorIsItsOwnConnection) {
         ASSERT_TRUE(first.wait_for_bytes());
         first.send_handshake(2);
         ASSERT_TRUE(eventually([&] {
-            const ob::PeerConnection* p = find_peer(mm->peer_states(), 2);
+            // `peer_states()` returns by value, so the vector has to outlive the pointer into it.
+            // The first version of this read `find_peer(mm->peer_states(), 2)` directly and passed
+            // on freed memory that still held the right values; `sanitizers (tsan)` called it a
+            // heap-use-after-free, which it was.
+            const auto peers = mm->peer_states();
+            const ob::PeerConnection* p = find_peer(peers, 2);
             return p != nullptr && p->connected && p->handshake_done;
         })) << "the first connection was never adopted, so there is no descriptor to recycle";
-        const ob::PeerConnection* p = find_peer(mm->peer_states(), 2);
+        const auto peers = mm->peer_states();
+        const ob::PeerConnection* p = find_peer(peers, 2);
         ASSERT_NE(p, nullptr);
         first_fd = p->fd;
         ASSERT_GE(first_fd, 0);
@@ -503,7 +518,8 @@ TEST(PendingPeers, AConnectionOnARecycledDescriptorIsItsOwnConnection) {
 
     // Closed by the client, so the node reaches `connection_lost` and gives the descriptor back.
     ASSERT_TRUE(eventually([&] {
-        const ob::PeerConnection* p = find_peer(mm->peer_states(), 2);
+        const auto peers = mm->peer_states();
+        const ob::PeerConnection* p = find_peer(peers, 2);
         return p != nullptr && !p->connected;
     })) << "node 2 is still marked connected after its client went away, so its descriptor has not "
            "been released and the rest of this test would measure nothing";
@@ -512,11 +528,13 @@ TEST(PendingPeers, AConnectionOnARecycledDescriptorIsItsOwnConnection) {
     ASSERT_TRUE(second.wait_for_bytes());
     second.send_handshake(3);
     ASSERT_TRUE(eventually([&] {
-        const ob::PeerConnection* p = find_peer(mm->peer_states(), 3);
+        const auto peers = mm->peer_states();
+        const ob::PeerConnection* p = find_peer(peers, 3);
         return p != nullptr && p->connected && p->handshake_done;
     })) << "the second connection was not adopted as node 3";
 
-    const ob::PeerConnection* second_peer = find_peer(mm->peer_states(), 3);
+    const auto adopted = mm->peer_states();
+    const ob::PeerConnection* second_peer = find_peer(adopted, 3);
     ASSERT_NE(second_peer, nullptr);
     ASSERT_EQ(second_peer->fd, first_fd)
         << "the kernel did not hand descriptor " << first_fd << " back — the second connection "
@@ -529,7 +547,8 @@ TEST(PendingPeers, AConnectionOnARecycledDescriptorIsItsOwnConnection) {
     // stale event, and a single sample can land before that arrives.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
     while (std::chrono::steady_clock::now() < deadline) {
-        const ob::PeerConnection* p = find_peer(mm->peer_states(), 3);
+        const auto watched = mm->peer_states();
+        const ob::PeerConnection* p = find_peer(watched, 3);
         ASSERT_NE(p, nullptr) << "node 3's record disappeared while the test was watching it";
         ASSERT_TRUE(p->connected)
             << "node 3 was disconnected while nothing was wrong with it. Its descriptor is the one "

@@ -2291,6 +2291,20 @@ A check anchored on prose makes the prose load-bearing and hands the next person
 wording a failure with no explanation. It anchors on the branch's condition now, and the control —
 rewording that message — survives, as a control must.
 
+**And the first version of that guard was itself a use-after-free, caught by a required check on
+this very PR.** `mm->peer_states()` returns the vector **by value**, and the helper beside it takes a
+reference and hands back a pointer into it — so `find_peer(mm->peer_states(), 2)` reads perfectly
+well and points into a vector that dies at the end of the expression. It passed locally, four times
+in a row and five out of five under repetition, because the freed memory still held the right values;
+`sanitizers (tsan)` called it a **heap-use-after-free** at four lines of that one test, and nothing
+else in the job reported anything.
+
+The repair is not "hold the vector in a local", though it is that too. The rvalue overload of the
+helper is now **deleted**, so the shape is a compile error rather than something a sanitizer has to
+be running to catch — verified in both directions: the bad form fails to build with *use of deleted
+function*, and the file builds and passes again once restored. That is the same move as #127's
+`levels_from_payload()` and #92's `shared_ptr`: the class becomes impossible rather than fixed once.
+
 **What no test here can do, said plainly.** `PendingPeers.AConnectionOnARecycledDescriptorIsItsOwnConnection`
 is a regression guard, not a reproduction: it establishes that the second connection really does land
 on the first one's descriptor number — read back and compared, so a run where the kernel did not hand

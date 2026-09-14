@@ -2400,6 +2400,15 @@ Learned the hard way. Check here before debugging.
     leak protection. Removing the close trades a leak nobody has measured for a close of another
     subsystem's descriptor that has been.
 
+286. **A helper that returns a pointer into a reference parameter is a trap the moment something
+    nearby returns by value.** `MultiMasterManager::peer_states()` hands back a vector; the test
+    helper beside it takes `const std::vector<PeerConnection>&` and returns a pointer into it. So
+    `find_peer(mm->peer_states(), 2)` compiles, reads well, points into a vector that dies at the end
+    of the expression — and **passes**, because the freed memory still holds the right values. Four
+    local runs and five repetitions were green; `sanitizers (tsan)` called it a heap-use-after-free.
+    The rvalue overload is deleted now, so the shape is a **compile error** instead of something a
+    sanitizer has to be running to see.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
