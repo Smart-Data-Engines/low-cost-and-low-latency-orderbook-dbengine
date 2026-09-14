@@ -205,6 +205,15 @@ const ob::PeerConnection* find_peer(const std::vector<ob::PeerConnection>& peers
     return nullptr;
 }
 
+/// Refused at compile time, because `peer_states()` returns by value.
+///
+/// `find_peer(mm->peer_states(), 2)` reads perfectly well and hands back a pointer into a vector
+/// that dies at the end of the expression. It even passes: the freed memory still holds the right
+/// values, so the first version of the recycled-descriptor test below was green here and a
+/// **heap-use-after-free** under `sanitizers (tsan)`. A deleted rvalue overload turns that from
+/// something a sanitizer catches into something the compiler does.
+const ob::PeerConnection* find_peer(std::vector<ob::PeerConnection>&&, uint16_t) = delete;
+
 }  // namespace
 
 // ── The defect ──────────────────────────────────────────────────────────────────
@@ -458,6 +467,96 @@ TEST(PendingPeers, AConnectionThatClosesBeforeItsHandshakeLeavesNothingBehind) {
     }
     EXPECT_EQ(rows, 1u) << "MM_PEERS should be a header and nothing else:\n" << view;
 
+    engine.close();
+}
+
+TEST(PendingPeers, AConnectionOnARecycledDescriptorIsItsOwnConnection) {
+    // #128, from the other end: the io loop used to key its epoll registrations by descriptor
+    // number, so the moment the kernel handed a closed connection's number to the next accepted
+    // socket, one connection's events were indistinguishable from the other's. The measured harm
+    // was worse than a mix-up — the loop closed a number it no longer owned, and once that number
+    // belonged to the client port's epoll instance — but the mix-up is the half a test can hold.
+    //
+    // The premise is *measured rather than assumed*: the second connection's descriptor is read
+    // back and compared with the first's, so a run where the kernel did not hand the number back
+    // says so instead of passing quietly.
+    const uint16_t port = g_port.fetch_add(1, std::memory_order_relaxed);
+    TempDir tmp("mm_pending_recycled_");
+    ob::Engine engine(tmp.path, kNoAutoFlush, ob::FsyncPolicy::NONE, {}, {}, {}, {},
+                      mm_config(1, port));
+    engine.open();
+    auto* mm = engine.multi_master_manager();
+    ASSERT_NE(mm, nullptr);
+
+    // Addresses that do not parse, on purpose. Losing a connection schedules a reconnect with
+    // backoff, and a dial opens a descriptor — which would take the number this test is about
+    // before the second connection can be accepted. `dial_address()` refuses an unparseable
+    // address *before* creating a socket, which is what keeps the numbering still.
+    mm->install_peer_for_test(dialled_peer_record(2, "no-address-here"));
+    mm->install_peer_for_test(dialled_peer_record(3, "no-address-here"));
+
+    int first_fd = -1;
+    {
+        MeshClient first(port);
+        ASSERT_TRUE(first.wait_for_bytes());
+        first.send_handshake(2);
+        ASSERT_TRUE(eventually([&] {
+            // `peer_states()` returns by value, so the vector has to outlive the pointer into it.
+            // The first version of this read `find_peer(mm->peer_states(), 2)` directly and passed
+            // on freed memory that still held the right values; `sanitizers (tsan)` called it a
+            // heap-use-after-free, which it was.
+            const auto peers = mm->peer_states();
+            const ob::PeerConnection* p = find_peer(peers, 2);
+            return p != nullptr && p->connected && p->handshake_done;
+        })) << "the first connection was never adopted, so there is no descriptor to recycle";
+        const auto peers = mm->peer_states();
+        const ob::PeerConnection* p = find_peer(peers, 2);
+        ASSERT_NE(p, nullptr);
+        first_fd = p->fd;
+        ASSERT_GE(first_fd, 0);
+    }
+
+    // Closed by the client, so the node reaches `connection_lost` and gives the descriptor back.
+    ASSERT_TRUE(eventually([&] {
+        const auto peers = mm->peer_states();
+        const ob::PeerConnection* p = find_peer(peers, 2);
+        return p != nullptr && !p->connected;
+    })) << "node 2 is still marked connected after its client went away, so its descriptor has not "
+           "been released and the rest of this test would measure nothing";
+
+    MeshClient second(port);
+    ASSERT_TRUE(second.wait_for_bytes());
+    second.send_handshake(3);
+    ASSERT_TRUE(eventually([&] {
+        const auto peers = mm->peer_states();
+        const ob::PeerConnection* p = find_peer(peers, 3);
+        return p != nullptr && p->connected && p->handshake_done;
+    })) << "the second connection was not adopted as node 3";
+
+    const auto adopted = mm->peer_states();
+    const ob::PeerConnection* second_peer = find_peer(adopted, 3);
+    ASSERT_NE(second_peer, nullptr);
+    ASSERT_EQ(second_peer->fd, first_fd)
+        << "the kernel did not hand descriptor " << first_fd << " back — the second connection "
+        << "landed on " << second_peer->fd << ", so this run did not exercise the collision this "
+        << "test is about. Read the numbers before treating it as a regression";
+    EXPECT_NE(second_peer->conn_id, 0u);
+
+    // The property: nothing left over from the first connection reaches the second. Held for a
+    // window rather than sampled once, because what the old shape would do is drop this link on a
+    // stale event, and a single sample can land before that arrives.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto watched = mm->peer_states();
+        const ob::PeerConnection* p = find_peer(watched, 3);
+        ASSERT_NE(p, nullptr) << "node 3's record disappeared while the test was watching it";
+        ASSERT_TRUE(p->connected)
+            << "node 3 was disconnected while nothing was wrong with it. Its descriptor is the one "
+               "node 2 gave back, so an event belonging to node 2 was applied to it (#128)";
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+
+    second.close();
     engine.close();
 }
 

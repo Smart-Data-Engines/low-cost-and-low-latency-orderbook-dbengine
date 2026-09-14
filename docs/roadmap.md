@@ -2152,6 +2152,171 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 128. The mesh io loop closes descriptors by number, and a number it no longer owns can belong to anything ✅
+
+Found by `sanitizers-integration (tsan)` on PR #123 — on a branch whose diff does not contain one
+line of `src/multi_master.cpp`. The required check asked the question; the report answered it,
+because it names the descriptor's **creation site**:
+
+```
+WARNING: ThreadSanitizer: data race (pid=6039)
+  Write of size 8 at 0x72b000000160 by thread T5 (mutexes: write M0):
+    #0 close
+    #1 ob::MultiMasterManager::io_loop() src/multi_master.cpp:820
+  Previous read of size 8 at 0x72b000000160 by main thread:
+    #0 epoll_ctl
+    #1 ob::TcpServer::run() src/tcp_server.cpp:1773
+  Location is file descriptor 11 created by main thread at:
+    #0 epoll_create1
+    #1 ob::TcpServer::run() src/tcp_server.cpp:1743
+```
+
+Descriptor 11 was **the client port's epoll instance**, and the mesh closed it. Not a torn read of a
+shared variable: one subsystem destroyed another subsystem's object, and the only reason it surfaces
+as a race at all is that ThreadSanitizer tracks descriptors.
+
+**The cost, measured in the same run.** `TcpServer::run()` does `break` on a failed `epoll_wait()`
+under the comment "fatal epoll error", so the client-facing loop ends. Nine integration tests failed
+with `Node node-2 (port 60727) not ready after 60.0s: [Errno 111] Connection refused` — a node whose
+mesh was up and whose client port never served one connection. The read TSan caught is at line 1773,
+the subscription hub's registration, so the close landed **while the client port was still assembling
+its epoll set**: the node did not lose the ability to accept clients, it never had it.
+
+**The mechanism, and every step is a line rather than a hypothesis.** `io_loop()` harvests events
+with `epoll_wait()` and takes `mtx_` afterwards, per event. The registrations carried `ev.data.fd` —
+a descriptor number. Between the harvest and the dispatch, three threads other than the loop close
+peer sockets, each under the same `mtx_`, which orders nothing about descriptor numbers:
+`handle_topology_change()` → `disconnect_peer()` on the peer-registry watch thread (its lock at
+`src/multi_master.cpp:2359` is the M0 the report names), `check_backpressure()` on the **client write
+path** through `broadcast_local()`, and the reconnect loop. A closed number goes to the first taker
+in the whole process — and `TcpServer::run()` calls `epoll_create1()` at line 1743, *after*
+`Engine::open()` at line 1675 has started the mesh threads. The startup window is therefore exactly
+the window in which a mesh drops a duplicate link and a client port opens its epoll set.
+
+The loop then reached its own defensive branch for "a descriptor in the epoll set with no record
+behind it", wrote the warning that branch exists to write, and ran `epoll_ctl(DEL)` + `close(ev_fd)`
+on a number that was no longer its own.
+
+**The rule was already known, written down twice, and applied to a container both times.**
+`include/orderbook/multi_master.hpp`, about `pending_`: *"Keyed by `conn_id` rather than by the
+descriptor. Descriptor numbers are reused by the kernel and mean something to the epoll set; a
+`conn_id` is minted once and means nothing to anyone else, which is the property a key needs."* And
+`src/tcp_server.cpp`, about subscriptions: *"Descriptor numbers are reused, so a subscription pinned
+to `fd` alone would outlive its connection and push rows to whoever inherits the number."* Both are
+right and both came out of real defects (#96, #45). Neither reached the one place where a descriptor
+number is not only a key but also the argument to `close()`. It is the **third** appearance of this
+class in this file: the `wakeup_fd_` comment records a shutdown that called `epoll_wait()` on a
+number the kernel had already reassigned, reported by TSan as a race on file descriptor 4.
+
+**The fix is what an event says, and the second half is not the one the report is about.**
+`ev.data.u64` carries the connection's `conn_id`, and the dispatch resolves that —
+`find_connection_by_fd()` became `find_connection_by_conn_id()`, a lookup rather than a scan for
+`pending_`, which #96 had already keyed that way. Two values are reserved for the two descriptors
+the loop owns for its whole life and never closes mid-iteration, `listen_fd_` and `wakeup_fd_`, where
+the number *is* the identity; `conn_id` is minted from 1 upwards, so neither can collide with a
+connection. Every read of a descriptor inside the peer branch now comes from the **record**
+(`peer_ptr->fd`) rather than from the event.
+
+The half that is about correctness rather than about crashes: a stale event carrying only a number
+can be attributed to a **live** connection that inherited it, and an `EPOLLHUP` from a peer that is
+already gone would then drop a healthy link with nothing in the log. That is #96's shape, one layer
+out, and `PendingPeers.AConnectionOnARecycledDescriptorIsItsOwnConnection` is what holds it — with
+the descriptor number read back from both connections, so a run where the kernel did not hand the
+number back says so instead of passing quietly.
+
+**And the branch closes nothing now, which is the fix rather than an omission.** An event about a
+connection that is gone is routine — the harvest precedes the lock — and closing the socket already
+removed its registration, so there is nothing left to disarm. Nor can a skipped event repeat: every
+registration in the mesh is `EPOLLET`, so ignoring one is not the busy loop that would make silence
+expensive. What the old branch was defending against is an armed descriptor whose record was dropped
+without closing its socket; against that, closing by number was never reliable either, because under
+edge triggering there may be no next event at all. The trade is a descriptor leak that has never been
+measured, against a close of another subsystem's descriptor that has.
+
+**Accepting a connection now records it before arming it**, because the registration has to carry an
+identity and the identity is minted under `mtx_`. That also closes a window this path used to open on
+purpose: for a few instructions the descriptor was armed with no record behind it, which is the exact
+state the old branch was written to complain about.
+
+**Asked and answered about the neighbours, because "I did not check" and "I checked, it does not
+apply" read the same afterwards.** In `src/tcp_server.cpp` every `close_session()` and `::close()` is
+on the loop thread or after the loop has ended, so nothing else can free a number under it — today.
+In `src/replication.cpp` the premise does not hold: `ReplicationManager::broadcast()` runs on the
+client write path and calls `remove_replica_locked()`, which closes the socket, so stale events exist
+there too. What is absent is this defect's teeth — that loop never closes a descriptor it cannot find
+a record for, and the worst a stale event can do is a spurious drain or read on a new replica that
+inherited the number, both of which the next real event would have done anyway. Named here rather
+than filed, and rather than fixed in a change about the mesh.
+
+**Cost on the write path, measured rather than argued.** The mesh write path reaches
+`arm_epollout()` and `disarm_epollout()` through `broadcast_local()`, so the key is built on the path
+a client write takes. `scripts/mnemonic_diff.py`, Release, master `c82f01e` against this commit:
+
+| function | base | head | |
+|---|---|---|---|
+| `MultiMasterManager::arm_epollout` | 23 | 23 | one instruction chosen differently |
+| `MultiMasterManager::disarm_epollout` | 23 | 23 | the same |
+| `MultiMasterManager::broadcast_local` | 92 | 92 | identical |
+| `Engine::apply_delta_mm` | 602 | 602 | identical |
+| `WALWriter::append` | 90 | 90 | identical |
+
+The one difference is worth reading, because it is smaller than "the same count" suggests. The old
+form wrote a descriptor into the union and then cleared the padding — `mov %edx,0x10(%rsp)` followed
+by `movl $0x0,0x14(%rsp)`. The new one loads the identity and stores all eight bytes at once —
+`mov 0x30(%rsi),%rax` … `mov %rax,0x10(%rsp)`. Two four-byte stores became a load and one eight-byte
+store, so the count is unchanged and there is no claim about time here: fewer or equal instructions
+is not a speed-up, it is only not more work.
+
+**Seven mutations, each with the verdict it had to give, and which test kills which is the point.**
+
+| mutation | verdict | killed by |
+|---|---|---|
+| `arm_epollout` carries the descriptor again | KILLED | the static test alone |
+| the accepted connection is armed with its descriptor | KILLED | the static test alone |
+| the gone-connection branch closes the number again | KILLED | the static test alone |
+| the lookup matches the descriptor instead of the identity | KILLED | the behavioural test alone |
+| the listen sentinel collides with the first `conn_id` | KILLED | both |
+| the wakeup sentinel collides with a `conn_id` | KILLED | both |
+| control: the note about a connection that is gone is reworded | **SURVIVED** | — |
+
+Three of the six are killed by the static test and by nothing else, which is what says that test
+carries weight rather than decoration: reintroducing `data.fd` at one of six registration sites is
+invisible to every behavioural test in this repository, because the harm needs a descriptor number to
+be recycled *and* an event to be in flight across it. One is killed only by the behavioural test,
+which is the other half — that the dispatch resolves an identity and not a number.
+
+The control had to be moved to get here, and the reason is a rule in its own right: the static test's
+first version anchored on the branch's **log phrase**, so rewording the message failed the test.
+A check anchored on prose makes the prose load-bearing and hands the next person to improve the
+wording a failure with no explanation. It anchors on the branch's condition now, and the control —
+rewording that message — survives, as a control must.
+
+**And the first version of that guard was itself a use-after-free, caught by a required check on
+this very PR.** `mm->peer_states()` returns the vector **by value**, and the helper beside it takes a
+reference and hands back a pointer into it — so `find_peer(mm->peer_states(), 2)` reads perfectly
+well and points into a vector that dies at the end of the expression. It passed locally, four times
+in a row and five out of five under repetition, because the freed memory still held the right values;
+`sanitizers (tsan)` called it a **heap-use-after-free** at four lines of that one test, and nothing
+else in the job reported anything.
+
+The repair is not "hold the vector in a local", though it is that too. The rvalue overload of the
+helper is now **deleted**, so the shape is a compile error rather than something a sanitizer has to
+be running to catch — verified in both directions: the bad form fails to build with *use of deleted
+function*, and the file builds and passes again once restored. That is the same move as #127's
+`levels_from_payload()` and #92's `shared_ptr`: the class becomes impossible rather than fixed once.
+
+**What no test here can do, said plainly.** `PendingPeers.AConnectionOnARecycledDescriptorIsItsOwnConnection`
+is a regression guard, not a reproduction: it establishes that the second connection really does land
+on the first one's descriptor number — read back and compared, so a run where the kernel did not hand
+it back says so — but the harm needed an event in flight across that moment, and a test cannot
+schedule the kernel. The evidence that the defect was real is the TSan report; the evidence that it
+is gone is the absence of the shape, which is what the static test is for.
+
+- Effort: M | Impact: a mesh node could destroy its own client port's epoll instance during startup
+  and then refuse every client connection, with nothing in its log but a mesh warning about an
+  unrecognised descriptor. Present since the mesh had a reconnect path; reachable whenever a
+  duplicate link is resolved while the client port is still starting
+
 ### 120. A clock that is off writes one warning per write, not one per excursion ✅
 
 Found by #54 stage D, in the same probe run as #119 — the log of one 200 000-tick run was **22.9 MB**.
@@ -6323,15 +6488,15 @@ absolute thresholds for a designated benchmark host.
 
 ### Test suite
 
-Verified by [the full CI run for PR #121](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/34840845142),
-on the tree containing #54's closing stage, #126 and #127. Runtimes below are from GitHub's `ubuntu-24.04` runners
+Verified by [the full CI run for PR #124](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/34865039762),
+on the tree containing #126, #127 and #128. Runtimes below are from GitHub's `ubuntu-24.04` runners
 except where a row says otherwise, not the machine-B performance baseline above.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1078 | all passing with `ctest -j1` on the i3-7100U, **228 s in a single run**. **Two more than the previous commit**, both #126's, and they pin the replayer's new rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. The control is the second of the two. **Before them**, two were #54's D3: a socket on the mesh port frames one DELTA record whose HLC says an hour ahead, and requires that it becomes this node's clock and **stays** — the next local tick is stamped from the moved clock, not from the wall clock the node can still read. That turns "`multi_master.cpp` parses an HLC from the frame and hands it on ten lines later" from a claim about code into a measurement; the drift the node reports is 3 599 999 386 597 ns. Its pair requires the record carrying the skew to be **applied**, because a node that dropped it would keep its clock and lose a write. **Earlier**: three were #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists 1078: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
-| Python integration | 263 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 263; count pytest's final result rather than the report plugin's progress characters. `263 passed, 2 skipped in 20:42` on the GitHub runner for this commit, against `20:37` on the development machine (i3-7100U, native etcd) — the spread to expect between the two rather than a change. Three more than the previous commit: #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
-| Python integration under TSan | 263 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `263 passed in 26:08` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **20:42** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
+| C++ (GTest + RapidCheck) | 1082 | all passing with `ctest -j1` on the i3-7100U, **210 s in a single run**. **Four more than the previous commit**, all #128's, and they divide the way that defect does: three in `tests/test_mm_epoll_identity.cpp` are about the shape — that the two reserved event keys cannot collide with a connection, that closing a descriptor takes its registration with it (measured against `dup2`, which forces the reuse the defect needs instead of hoping for it), and that no registration in `src/multi_master.cpp` carries a bare descriptor number. The fourth is behavioural: a connection landing on the descriptor its predecessor gave back is its own connection, with both numbers read back so a run where the kernel did not recycle the number says so rather than passing quietly. Three of the six mutations in that item's table are killed by the static test **and by nothing else**, which is what says it carries weight. **Before them**, two were #126's, and they pin the replayer's rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. **Earlier**: two were #54's D3, three #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists **1084**: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The previous row gave 1078 for both figures, which was two short on the listed one — the count that passes and the count CTest lists differ by exactly those two harnesses, always. The runtimes are what this machine gave on the commit measured, not a budget |
+| Python integration | 263 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 263; count pytest's final result rather than the report plugin's progress characters. `263 passed, 2 skipped in 20:52` on the GitHub runner for this commit, against `20:37` on the development machine (i3-7100U, native etcd) — the spread to expect between the two rather than a change. Three more than the previous commit: #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
+| Python integration under TSan | 263 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `263 passed in 25:32` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **20:52** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than
