@@ -70,5 +70,5 @@ TEST(PortDiscipline, NoTwoBlocksOverlap) {
             << "blocks " << blocks[i - 1] << " and " << blocks[i] << " are closer than "
             << ob::test::kPortBlockWidth << " ports apart";
     }
-    EXPECT_EQ(blocks.size(), 7u) << "a block was added or removed without this count being read";
+    EXPECT_EQ(blocks.size(), 8u) << "a block was added or removed without this count being read";
 }
