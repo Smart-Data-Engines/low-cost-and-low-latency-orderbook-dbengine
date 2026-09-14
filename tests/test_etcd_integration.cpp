@@ -479,7 +479,7 @@ TEST_F(EtcdTestFixture, FullFailoverCycle) {
     fc_a.failover_enabled = true;
     fc_a.replication_address = "127.0.0.1:19001";
 
-    ob::FailoverManager fm_a(fc_a, *engine_a);
+    ob::FailoverManager fm_a(fc_a, *engine_a, engine_a->registry());
     fm_a.start();
 
     // Wait for A to become PRIMARY.
@@ -501,7 +501,7 @@ TEST_F(EtcdTestFixture, FullFailoverCycle) {
     fc_b.failover_enabled = true;
     fc_b.replication_address = "127.0.0.1:19002";
 
-    ob::FailoverManager fm_b(fc_b, *engine_b);
+    ob::FailoverManager fm_b(fc_b, *engine_b, engine_b->registry());
     fm_b.start();
 
     // Wait for B to see itself as REPLICA.
@@ -641,14 +641,14 @@ TEST_F(EtcdTestFixture, GracefulFailoverHandsRoleToTarget) {
         p.engine_b->open();
 
         p.fm_a = std::make_unique<ob::FailoverManager>(
-            make_failover_config("node_A", "127.0.0.1:19031"), *p.engine_a);
+            make_failover_config("node_A", "127.0.0.1:19031"), *p.engine_a, p.engine_a->registry());
         p.fm_a->start();
         ASSERT_TRUE(wait_for_role(*p.fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)))
             << "iteration " << iter << ": node_A should start as primary";
         const uint64_t epoch_before = p.fm_a->epoch().term;
 
         p.fm_b = std::make_unique<ob::FailoverManager>(
-            make_failover_config("node_B", "127.0.0.1:19032"), *p.engine_b);
+            make_failover_config("node_B", "127.0.0.1:19032"), *p.engine_b, p.engine_b->registry());
         p.fm_b->start();
         ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)))
             << "iteration " << iter << ": node_B should start as replica";
@@ -694,7 +694,7 @@ TEST_F(EtcdTestFixture, GracefulFailoverTargetWinsOverOtherReplicas) {
     engine_c->open();
 
     auto cfg_a = make_failover_config("node_A", "127.0.0.1:19041");
-    ob::FailoverManager fm_a(cfg_a, *engine_a);
+    ob::FailoverManager fm_a(cfg_a, *engine_a, engine_a->registry());
     fm_a.start();
     ASSERT_TRUE(wait_for_role(fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
     const uint64_t epoch_before = fm_a.epoch().term;
@@ -703,11 +703,11 @@ TEST_F(EtcdTestFixture, GracefulFailoverTargetWinsOverOtherReplicas) {
     // therefore reaches the empty leader key first, so without the intent it
     // wins the race. That is what makes this test sensitive to the deferral
     // logic rather than to startup order.
-    ob::FailoverManager fm_c(make_failover_config("node_C", "127.0.0.1:19043"), *engine_c);
+    ob::FailoverManager fm_c(make_failover_config("node_C", "127.0.0.1:19043"), *engine_c, engine_c->registry());
     fm_c.start();
     ASSERT_TRUE(wait_for_role(fm_c, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
 
-    ob::FailoverManager fm_b(make_failover_config("node_B", "127.0.0.1:19042"), *engine_b);
+    ob::FailoverManager fm_b(make_failover_config("node_B", "127.0.0.1:19042"), *engine_b, engine_b->registry());
     fm_b.start();
     ASSERT_TRUE(wait_for_role(fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
 
@@ -744,12 +744,12 @@ TEST_F(EtcdTestFixture, GracefulFailoverOutgoingPrimaryDoesNotReacquire) {
     p.engine_b->open();
 
     auto cfg_a = make_failover_config("node_A", "127.0.0.1:19033");
-    p.fm_a = std::make_unique<ob::FailoverManager>(cfg_a, *p.engine_a);
+    p.fm_a = std::make_unique<ob::FailoverManager>(cfg_a, *p.engine_a, p.engine_a->registry());
     p.fm_a->start();
     ASSERT_TRUE(wait_for_role(*p.fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
 
     p.fm_b = std::make_unique<ob::FailoverManager>(
-        make_failover_config("node_B", "127.0.0.1:19034"), *p.engine_b);
+        make_failover_config("node_B", "127.0.0.1:19034"), *p.engine_b, p.engine_b->registry());
     p.fm_b->start();
     ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
 
@@ -783,7 +783,7 @@ TEST_F(EtcdTestFixture, GracefulFailoverUnknownTargetIsRejected) {
     p.engine_a->open();
 
     p.fm_a = std::make_unique<ob::FailoverManager>(
-        make_failover_config("node_A", "127.0.0.1:19035"), *p.engine_a);
+        make_failover_config("node_A", "127.0.0.1:19035"), *p.engine_a, p.engine_a->registry());
     p.fm_a->start();
     ASSERT_TRUE(wait_for_role(*p.fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
     const uint64_t epoch_before = p.fm_a->epoch().term;
@@ -813,12 +813,12 @@ TEST_F(EtcdTestFixture, GracefulFailoverTargetGoneFallsBackToElection) {
     p.engine_b->open();
 
     auto cfg_a = make_failover_config("node_A", "127.0.0.1:19037");
-    p.fm_a = std::make_unique<ob::FailoverManager>(cfg_a, *p.engine_a);
+    p.fm_a = std::make_unique<ob::FailoverManager>(cfg_a, *p.engine_a, p.engine_a->registry());
     p.fm_a->start();
     ASSERT_TRUE(wait_for_role(*p.fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
 
     p.fm_b = std::make_unique<ob::FailoverManager>(
-        make_failover_config("node_B", "127.0.0.1:19038"), *p.engine_b);
+        make_failover_config("node_B", "127.0.0.1:19038"), *p.engine_b, p.engine_b->registry());
     p.fm_b->start();
     ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
 
@@ -849,12 +849,12 @@ TEST_F(EtcdTestFixture, UngracefulFailoverStillImmediate) {
     p.engine_b->open();
 
     p.fm_a = std::make_unique<ob::FailoverManager>(
-        make_failover_config("node_A", "127.0.0.1:19039"), *p.engine_a);
+        make_failover_config("node_A", "127.0.0.1:19039"), *p.engine_a, p.engine_a->registry());
     p.fm_a->start();
     ASSERT_TRUE(wait_for_role(*p.fm_a, ob::NodeRole::PRIMARY, std::chrono::seconds(5)));
 
     p.fm_b = std::make_unique<ob::FailoverManager>(
-        make_failover_config("node_B", "127.0.0.1:19040"), *p.engine_b);
+        make_failover_config("node_B", "127.0.0.1:19040"), *p.engine_b, p.engine_b->registry());
     p.fm_b->start();
     ASSERT_TRUE(wait_for_role(*p.fm_b, ob::NodeRole::REPLICA, std::chrono::seconds(5)));
 
@@ -893,7 +893,7 @@ TEST_F(EtcdTestFixture, GracefulFailover) {
     fc_a.failover_enabled = true;
     fc_a.replication_address = "127.0.0.1:19011";
 
-    ob::FailoverManager fm_a(fc_a, *engine_a);
+    ob::FailoverManager fm_a(fc_a, *engine_a, engine_a->registry());
     fm_a.start();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -913,7 +913,7 @@ TEST_F(EtcdTestFixture, GracefulFailover) {
     fc_b.failover_enabled = true;
     fc_b.replication_address = "127.0.0.1:19012";
 
-    ob::FailoverManager fm_b(fc_b, *engine_b);
+    ob::FailoverManager fm_b(fc_b, *engine_b, engine_b->registry());
     fm_b.start();
 
     deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -984,7 +984,7 @@ TEST_F(EtcdTestFixture, SplitBrainRecovery) {
     fc_a.failover_enabled = true;
     fc_a.replication_address = "127.0.0.1:19021";
 
-    ob::FailoverManager fm_a(fc_a, *engine_a);
+    ob::FailoverManager fm_a(fc_a, *engine_a, engine_a->registry());
     fm_a.start();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1004,7 +1004,7 @@ TEST_F(EtcdTestFixture, SplitBrainRecovery) {
     fc_b.failover_enabled = true;
     fc_b.replication_address = "127.0.0.1:19022";
 
-    ob::FailoverManager fm_b(fc_b, *engine_b);
+    ob::FailoverManager fm_b(fc_b, *engine_b, engine_b->registry());
     fm_b.start();
 
     deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1029,7 +1029,7 @@ TEST_F(EtcdTestFixture, SplitBrainRecovery) {
     ASSERT_GT(epoch_n1, epoch_n);
 
     // Restart A — it should read cluster state, detect higher epoch, demote to REPLICA.
-    ob::FailoverManager fm_a2(fc_a, *engine_a);
+    ob::FailoverManager fm_a2(fc_a, *engine_a, engine_a->registry());
     fm_a2.start();
 
     deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1071,7 +1071,7 @@ TEST_F(EtcdTestFixture, LeaseExpiry) {
     fc_a.failover_enabled = true;
     fc_a.replication_address = "127.0.0.1:19031";
 
-    ob::FailoverManager fm_a(fc_a, *engine_a);
+    ob::FailoverManager fm_a(fc_a, *engine_a, engine_a->registry());
     fm_a.start();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1090,7 +1090,7 @@ TEST_F(EtcdTestFixture, LeaseExpiry) {
     fc_b.failover_enabled = true;
     fc_b.replication_address = "127.0.0.1:19032";
 
-    ob::FailoverManager fm_b(fc_b, *engine_b);
+    ob::FailoverManager fm_b(fc_b, *engine_b, engine_b->registry());
     fm_b.start();
 
     deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1163,7 +1163,7 @@ TEST_F(EtcdTestFixture, EpochFencing) {
     fc_a.failover_enabled = true;
     fc_a.replication_address = "127.0.0.1:19041";
 
-    ob::FailoverManager fm_a(fc_a, *engine_a);
+    ob::FailoverManager fm_a(fc_a, *engine_a, engine_a->registry());
     fm_a.start();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1183,7 +1183,7 @@ TEST_F(EtcdTestFixture, EpochFencing) {
     fc_b.failover_enabled = true;
     fc_b.replication_address = "127.0.0.1:19042";
 
-    ob::FailoverManager fm_b(fc_b, *engine_b);
+    ob::FailoverManager fm_b(fc_b, *engine_b, engine_b->registry());
     fm_b.start();
 
     deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1266,7 +1266,7 @@ TEST_F(EtcdTestFixture, EpochMonotonicity) {
             const char* pri_addr = a_is_primary ? "127.0.0.1:19051" : "127.0.0.1:19052";
             const char* rep_addr = a_is_primary ? "127.0.0.1:19052" : "127.0.0.1:19051";
 
-            ob::FailoverManager fm_pri(make_failover_config(pri_id, pri_addr), *engine_pri);
+            ob::FailoverManager fm_pri(make_failover_config(pri_id, pri_addr), *engine_pri, engine_pri->registry());
             fm_pri.start();
             ASSERT_TRUE(wait_for_role(fm_pri, ob::NodeRole::PRIMARY, std::chrono::seconds(8)))
                 << "cycles=" << num_cycles << " cycle=" << cycle
@@ -1277,7 +1277,7 @@ TEST_F(EtcdTestFixture, EpochMonotonicity) {
                 << "cycles=" << num_cycles << " cycle=" << cycle
                 << ": epoch must advance on promotion";
 
-            ob::FailoverManager fm_rep(make_failover_config(rep_id, rep_addr), *engine_rep);
+            ob::FailoverManager fm_rep(make_failover_config(rep_id, rep_addr), *engine_rep, engine_rep->registry());
             fm_rep.start();
             ASSERT_TRUE(wait_for_role(fm_rep, ob::NodeRole::REPLICA, std::chrono::seconds(5)))
                 << "cycles=" << num_cycles << " cycle=" << cycle

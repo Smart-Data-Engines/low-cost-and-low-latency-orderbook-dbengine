@@ -30,9 +30,11 @@ uint64_t wall_clock_ns() {
 // ── Construction / destruction ───────────────────────────────────────────────
 
 FailoverManager::FailoverManager(FailoverConfig config,
-                                 RoleTransitionHandler& handler)
+                                 RoleTransitionHandler& handler,
+                                 MetricsRegistry& registry)
     : config_(std::move(config))
     , handler_(handler)
+    , registry_(registry)
 {}
 
 FailoverManager::~FailoverManager() {
@@ -541,283 +543,311 @@ void FailoverManager::nap_between_iterations() {
     }
 }
 
+/// One pass of the failover monitor, so that a throw costs one pass rather than the thread.
+///
+/// Every `continue` in the loop this came out of is a `return` here, and that substitution is
+/// safe because a script established the property it rests on: the seven naps this body held
+/// were byte-identical and every path through it napped exactly once, so the nap belongs to the
+/// caller and nothing else changes (#112).
+void FailoverManager::monitor_tick() {
+    NodeRole current = role_.load();
+
+    // Both roles publish: a handover target is a replica, and FAILOVER <target> validates the
+    // name against the published positions. Before this call existed, that list was empty on
+    // every real cluster and every graceful handover was refused (#60).
+    if (current != NodeRole::MULTI_MASTER) {
+        publish_position_if_due();
+    }
+
+    // Multi-master nodes do not participate in primary/replica election.
+    if (current == NodeRole::MULTI_MASTER) {
+        OB_LOG_DEBUG("failover", "Node role: MULTI_MASTER — skipping election");
+        // Sleep and continue — no lease management needed.
+        return;
+    }
+
+    if (current == NodeRole::PRIMARY) {
+        // Refresh lease every TTL/3 seconds.
+        auto now = std::chrono::steady_clock::now();
+        auto since_refresh = std::chrono::duration_cast<std::chrono::seconds>(
+            now - last_lease_refresh_);
+        int64_t refresh_interval = config_.coordinator.lease_ttl_seconds / 3;
+        if (refresh_interval < 1) refresh_interval = 1;
+
+        // A lease that is alive is not proof that the role still belongs to us: the key can be
+        // gone while the lease lives, and before #74 a keepalive could not fail at all, so this
+        // is the second and independent guard. Demote on the first sighting of a leader key that
+        // is not ours — a spurious demotion costs seconds of unavailability, two primaries cost
+        // divergent data.
+        //
+        // Three answers, not two. Until #82 this asked get_cluster_state(), whose std::nullopt
+        // meant "not connected" or "empty response" or "the key is not there" or "the body would
+        // not parse" — so an absent key could not be acted on without also stepping down on
+        // every transient etcd error. That is why the holder used to learn only from a failed
+        // refresh, up to lease_ttl/3 later, while a candidate could take the vacated key at once.
+        if (coordinator_) {
+            ClusterState state;
+            const auto verdict = coordinator_->read_leader(state);
+
+            if (verdict == CoordinatorClient::LeaderRead::Present) {
+                reconcile_epoch(state);
+                const std::string& holder = state.leader_node_id;
+                if (holder != config_.coordinator.node_id) {
+                    OB_LOG_WARN("failover",
+                                "we hold the PRIMARY role but the leader key says '%s' — "
+                                "stepping down",
+                                holder.empty() ? "(empty)" : holder.c_str());
+                    handle_primary_lease_lost();
+                    return;
+                }
+                // The one moment at which ownership is established rather than assumed.
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    last_ownership_confirmed_ = std::chrono::steady_clock::now();
+                }
+            } else if (verdict == CoordinatorClient::LeaderRead::Absent) {
+                // `current` was read at the top of this iteration and the key read above took a
+                // network round trip, so both the role and a handover may have moved underneath
+                // us. The decision is `decide_on_absent_key()` — pure, so its six combinations
+                // are tested without a cluster, which matters because the race it rules out
+                // reproduces about one run in three (#89).
+                const AbsentKeyAction action = decide_on_absent_key(
+                    role_.load(std::memory_order_acquire),
+                    handing_over_.load(std::memory_order_acquire));
+
+                if (action != AbsentKeyAction::StepDown) {
+                    if (action == AbsentKeyAction::HandoverInFlight) {
+                        OB_LOG_INFO("failover",
+                                    "the leader key is gone because we are handing the role "
+                                    "over; the handover demotes this node itself");
+                    } else {
+                        OB_LOG_INFO("failover",
+                                    "the leader key is gone and this node is no longer PRIMARY "
+                                    "— the role changed while we were reading the key, so "
+                                    "there is nothing to step down from");
+                    }
+                    return;
+                }
+
+                OB_LOG_WARN("failover",
+                            "we hold the PRIMARY role but the leader key is gone — stepping "
+                            "down. Its lease expired or was revoked, so the role is not ours "
+                            "and a candidate may already be taking it");
+                handle_primary_lease_lost();
+                return;
+            }
+            // Unavailable: no information. Leave the role alone — but not for ever; the clock
+            // rule below is what bounds that.
+
+            // A holder that has not been able to confirm ownership for a whole TTL is holding a
+            // claim it cannot support: whatever the reason, its lease has had time to expire.
+            // Never fires on a healthy node, which confirms every second — ten times more often
+            // than this threshold at the default TTL.
+            const auto ttl = std::chrono::seconds(config_.coordinator.lease_ttl_seconds);
+            std::chrono::steady_clock::time_point confirmed;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                confirmed = last_ownership_confirmed_;
+            }
+            if (confirmed.time_since_epoch().count() != 0 &&
+                std::chrono::steady_clock::now() - confirmed >= ttl) {
+                OB_LOG_WARN("failover",
+                            "could not confirm the leader key names us for %lld s (TTL %lld s) "
+                            "— stepping down rather than holding a claim we cannot support",
+                            static_cast<long long>(
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::steady_clock::now() - confirmed).count()),
+                            static_cast<long long>(config_.coordinator.lease_ttl_seconds));
+                handle_primary_lease_lost();
+                return;
+            }
+        }
+
+        if (since_refresh.count() >= refresh_interval) {
+            if (coordinator_ && lease_id_.load() != 0) {
+                int64_t lid = lease_id_.load();
+                bool ok = coordinator_->refresh_lease(lid);
+                if (ok) {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    last_lease_refresh_ = std::chrono::steady_clock::now();
+                } else {
+                    OB_LOG_WARN("failover", "refresh_lease failed for lease=%ld, demoting",
+                                static_cast<long>(lid));
+                    handle_primary_lease_lost();
+                }
+            }
+        }
+    } else if (current == NodeRole::REPLICA) {
+        // Poll cluster state every 2 seconds to detect leader changes.
+        if (coordinator_) {
+            ClusterState state;
+            const auto verdict = coordinator_->read_leader(state);
+
+            // A key that is present with an empty node id means the same thing as an absent
+            // one — nobody holds the role — and both must go through the same path: the first
+            // is what a lease revocation produces, so handling only the second would leave the
+            // common case unprotected.
+            const bool leader_present =
+                verdict == CoordinatorClient::LeaderRead::Present &&
+                !state.leader_node_id.empty();
+
+            if (verdict == CoordinatorClient::LeaderRead::Present) {
+                reconcile_epoch(state);
+            }
+
+            // The episode ends on any tick that produced an answer, whichever answer it was:
+            // a leader that is present and one that is confirmed absent are both information,
+            // and it is the *absence* of information this episode is about. Ending it only on
+            // `Present` would leave a node that recovers into a genuine election reporting the
+            // refusal for ever, and an episode counter nobody resets is a flag nobody clears.
+            if (verdict != CoordinatorClient::LeaderRead::Unavailable) {
+                if (const uint64_t ticks = campaign_refusal_episode_.end(); ticks > 0) {
+                    OB_LOG_INFO("failover",
+                                "the coordinator answers again after %llu tick(s) of declining "
+                                "to campaign; this node will now act on what it reads",
+                                static_cast<unsigned long long>(ticks));
+                }
+            }
+
+            if (leader_present) {
+                note_leader_present();
+                // The address is recorded and **nothing else happens**, which is the whole of
+                // "an unchanged leader does not restart replication every second" (#104). No
+                // comparison against a remembered address is needed to get that, and the field
+                // that claimed to provide it was written once and read nowhere. Adoption -
+                // `demote_to_replica()`, a fresh replication client, and since #101 a
+                // `STREAMID?` round trip - happens in `adopt_leader_if_present()`, which this
+                // branch is not.
+                std::lock_guard<std::mutex> lk(mtx_);
+                primary_address_ = state.leader_address;
+            } else if (verdict == CoordinatorClient::LeaderRead::Unavailable) {
+                // No information. Standing for election here is what this branch used to do,
+                // because get_cluster_state() reported an unreachable coordinator and a vacant
+                // key with the same std::nullopt. Campaigning because we could not read is not
+                // the same as campaigning because there is no leader.
+                //
+                // **INFO on the tick this starts, and that is #115.** This was DEBUG-only
+                // while the server's default level is INFO, so during a coordinator outage the
+                // count of lines an operator saw about this decision was zero - measured, 0 of
+                // 65 and 0 of 67 across a thirty-second outage - while the same log carried
+                // two WARN lines a second about a position that could not be published. The
+                // decision is the answer to the first question anyone asks of that situation:
+                // is the engine deciding, or is the engine stuck? Once per episode, because
+                // once per tick is #116.
+                if (campaign_refusal_episode_.begin()) {
+                    OB_LOG_INFO("failover",
+                                "the coordinator is unreadable, so this node is staying REPLICA "
+                                "rather than campaigning on a read that failed — this is a "
+                                "decision, not a stall, and no primary will be elected until "
+                                "the coordinator answers");
+                } else {
+                    OB_LOG_DEBUG("failover",
+                                 "cluster state unreadable — staying REPLICA rather than "
+                                 "campaigning on a read that failed");
+                }
+            } else if (config_.failover_enabled) {
+                note_leader_absent();
+
+                // Wait out the previous holder's step-down bound before competing (#82).
+                // Without this, the vacated key can be claimed while the old holder still
+                // believes it is primary — and both accept writes while both believe it.
+                if (!leader_absence_settled()) {
+                    OB_LOG_DEBUG("failover",
+                                 "leader key absent but the election wait has not elapsed — "
+                                 "not campaigning yet");
+                } else if (!should_defer_to_handover_target()) {
+                    // A graceful handover with a named successor: only that node should
+                    // campaign, so the role goes where the operator sent it rather than to
+                    // whoever is quickest.
+                    handle_lease_expiry();
+                }
+                // Otherwise: not our turn, re-check on the next pass.
+            }
+        }
+    } else if (current == NodeRole::STANDALONE) {
+        // No dead states. Before #73 this role matched neither branch above, so a node that
+        // lost the startup CAS, or booted while the coordinator was briefly unreachable, sat
+        // here for the rest of its life: no lease, no leader poll, no campaign, no replication
+        // — and no takeover when the primary died.
+        ++standalone_polls_;
+        if (coordinator_ && !coordinator_->is_connected()) {
+            if (coordinator_->connect()) {
+                OB_LOG_INFO("failover", "coordinator reachable again after %llu attempts, "
+                                        "rejoining the cluster",
+                            static_cast<unsigned long long>(standalone_polls_));
+            } else if (standalone_polls_ % 30 == 1) {
+                // Once per 30 s, not once per second: an unreachable coordinator is a
+                // condition, not an event.
+                OB_LOG_WARN("failover", "coordinator still unreachable after %llu attempts, "
+                                        "this node holds no cluster role",
+                            static_cast<unsigned long long>(standalone_polls_));
+            }
+        }
+        if (coordinator_ && coordinator_->is_connected() && !adopt_leader_if_present() &&
+            config_.failover_enabled) {
+            // The same wait as the REPLICA branch, but only once we know a leader has existed
+            // (#82). A cold start has no previous holder to wait for, and making every cluster
+            // spend a lease TTL before it has a primary would be a real cost for no safety.
+            //
+            // "A leader has existed" is read from the epoch, which is persisted: a node that
+            // was ever part of this cluster comes back with a non-zero one. The residual hole is
+            // a brand-new node that has never seen this cluster's epoch and reconnects during
+            // the vacancy — narrower than the window this closes, and named here rather than
+            // left to be discovered.
+            EpochValue known_epoch = handler_.get_current_epoch();
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (epoch_.term > known_epoch.term) known_epoch = epoch_;
+            }
+
+            if (known_epoch.term > 0) {
+                note_leader_absent();
+                if (!leader_absence_settled()) {
+                    OB_LOG_DEBUG("failover",
+                                 "no leader published, but epoch %llu says one existed — "
+                                 "waiting out the election delay before standing",
+                                 static_cast<unsigned long long>(known_epoch.term));
+                    // Fall through to the sleep at the bottom of the loop.
+                    return;
+                }
+            }
+
+            OB_LOG_INFO("failover", "no leader published and no role held — standing for "
+                                    "election");
+            attempt_promotion();
+        }
+    }
+}
+
 void FailoverManager::monitor_loop() {
     while (running_.load(std::memory_order_acquire)) {
-        NodeRole current = role_.load();
-
-        // Both roles publish: a handover target is a replica, and FAILOVER <target> validates the
-        // name against the published positions. Before this call existed, that list was empty on
-        // every real cluster and every graceful handover was refused (#60).
-        if (current != NodeRole::MULTI_MASTER) {
-            publish_position_if_due();
-        }
-
-        // Multi-master nodes do not participate in primary/replica election.
-        if (current == NodeRole::MULTI_MASTER) {
-            OB_LOG_DEBUG("failover", "Node role: MULTI_MASTER — skipping election");
-            // Sleep and continue — no lease management needed.
-            nap_between_iterations();
-            continue;
-        }
-
-        if (current == NodeRole::PRIMARY) {
-            // Refresh lease every TTL/3 seconds.
-            auto now = std::chrono::steady_clock::now();
-            auto since_refresh = std::chrono::duration_cast<std::chrono::seconds>(
-                now - last_lease_refresh_);
-            int64_t refresh_interval = config_.coordinator.lease_ttl_seconds / 3;
-            if (refresh_interval < 1) refresh_interval = 1;
-
-            // A lease that is alive is not proof that the role still belongs to us: the key can be
-            // gone while the lease lives, and before #74 a keepalive could not fail at all, so this
-            // is the second and independent guard. Demote on the first sighting of a leader key that
-            // is not ours — a spurious demotion costs seconds of unavailability, two primaries cost
-            // divergent data.
-            //
-            // Three answers, not two. Until #82 this asked get_cluster_state(), whose std::nullopt
-            // meant "not connected" or "empty response" or "the key is not there" or "the body would
-            // not parse" — so an absent key could not be acted on without also stepping down on
-            // every transient etcd error. That is why the holder used to learn only from a failed
-            // refresh, up to lease_ttl/3 later, while a candidate could take the vacated key at once.
-            if (coordinator_) {
-                ClusterState state;
-                const auto verdict = coordinator_->read_leader(state);
-
-                if (verdict == CoordinatorClient::LeaderRead::Present) {
-                    reconcile_epoch(state);
-                    const std::string& holder = state.leader_node_id;
-                    if (holder != config_.coordinator.node_id) {
-                        OB_LOG_WARN("failover",
-                                    "we hold the PRIMARY role but the leader key says '%s' — "
-                                    "stepping down",
-                                    holder.empty() ? "(empty)" : holder.c_str());
-                        handle_primary_lease_lost();
-                        nap_between_iterations();
-                        continue;
-                    }
-                    // The one moment at which ownership is established rather than assumed.
-                    {
-                        std::lock_guard<std::mutex> lk(mtx_);
-                        last_ownership_confirmed_ = std::chrono::steady_clock::now();
-                    }
-                } else if (verdict == CoordinatorClient::LeaderRead::Absent) {
-                    // `current` was read at the top of this iteration and the key read above took a
-                    // network round trip, so both the role and a handover may have moved underneath
-                    // us. The decision is `decide_on_absent_key()` — pure, so its six combinations
-                    // are tested without a cluster, which matters because the race it rules out
-                    // reproduces about one run in three (#89).
-                    const AbsentKeyAction action = decide_on_absent_key(
-                        role_.load(std::memory_order_acquire),
-                        handing_over_.load(std::memory_order_acquire));
-
-                    if (action != AbsentKeyAction::StepDown) {
-                        if (action == AbsentKeyAction::HandoverInFlight) {
-                            OB_LOG_INFO("failover",
-                                        "the leader key is gone because we are handing the role "
-                                        "over; the handover demotes this node itself");
-                        } else {
-                            OB_LOG_INFO("failover",
-                                        "the leader key is gone and this node is no longer PRIMARY "
-                                        "— the role changed while we were reading the key, so "
-                                        "there is nothing to step down from");
-                        }
-                        nap_between_iterations();
-                        continue;
-                    }
-
-                    OB_LOG_WARN("failover",
-                                "we hold the PRIMARY role but the leader key is gone — stepping "
-                                "down. Its lease expired or was revoked, so the role is not ours "
-                                "and a candidate may already be taking it");
-                    handle_primary_lease_lost();
-                    nap_between_iterations();
-                    continue;
-                }
-                // Unavailable: no information. Leave the role alone — but not for ever; the clock
-                // rule below is what bounds that.
-
-                // A holder that has not been able to confirm ownership for a whole TTL is holding a
-                // claim it cannot support: whatever the reason, its lease has had time to expire.
-                // Never fires on a healthy node, which confirms every second — ten times more often
-                // than this threshold at the default TTL.
-                const auto ttl = std::chrono::seconds(config_.coordinator.lease_ttl_seconds);
-                std::chrono::steady_clock::time_point confirmed;
-                {
-                    std::lock_guard<std::mutex> lk(mtx_);
-                    confirmed = last_ownership_confirmed_;
-                }
-                if (confirmed.time_since_epoch().count() != 0 &&
-                    std::chrono::steady_clock::now() - confirmed >= ttl) {
-                    OB_LOG_WARN("failover",
-                                "could not confirm the leader key names us for %lld s (TTL %lld s) "
-                                "— stepping down rather than holding a claim we cannot support",
-                                static_cast<long long>(
-                                    std::chrono::duration_cast<std::chrono::seconds>(
-                                        std::chrono::steady_clock::now() - confirmed).count()),
-                                static_cast<long long>(config_.coordinator.lease_ttl_seconds));
-                    handle_primary_lease_lost();
-                    nap_between_iterations();
-                    continue;
-                }
+        try {
+            monitor_tick();
+            // The line that closes the episode. Without it, silence after the first ERROR is
+            // indistinguishable from the condition having gone away - and it sits inside the
+            // `try` on purpose, so a tick that threw cannot claim its own recovery, which is the
+            // mistake the mesh loop's first boundary made (#112).
+            if (const uint64_t held = monitor_errors_.end()) {
+                OB_LOG_INFO("failover",
+                            "the monitor loop is running again after %llu tick(s) that threw",
+                            static_cast<unsigned long long>(held));
             }
-
-            if (since_refresh.count() >= refresh_interval) {
-                if (coordinator_ && lease_id_.load() != 0) {
-                    int64_t lid = lease_id_.load();
-                    bool ok = coordinator_->refresh_lease(lid);
-                    if (ok) {
-                        std::lock_guard<std::mutex> lk(mtx_);
-                        last_lease_refresh_ = std::chrono::steady_clock::now();
-                    } else {
-                        OB_LOG_WARN("failover", "refresh_lease failed for lease=%ld, demoting",
-                                    static_cast<long>(lid));
-                        handle_primary_lease_lost();
-                    }
-                }
-            }
-        } else if (current == NodeRole::REPLICA) {
-            // Poll cluster state every 2 seconds to detect leader changes.
-            if (coordinator_) {
-                ClusterState state;
-                const auto verdict = coordinator_->read_leader(state);
-
-                // A key that is present with an empty node id means the same thing as an absent
-                // one — nobody holds the role — and both must go through the same path: the first
-                // is what a lease revocation produces, so handling only the second would leave the
-                // common case unprotected.
-                const bool leader_present =
-                    verdict == CoordinatorClient::LeaderRead::Present &&
-                    !state.leader_node_id.empty();
-
-                if (verdict == CoordinatorClient::LeaderRead::Present) {
-                    reconcile_epoch(state);
-                }
-
-                // The episode ends on any tick that produced an answer, whichever answer it was:
-                // a leader that is present and one that is confirmed absent are both information,
-                // and it is the *absence* of information this episode is about. Ending it only on
-                // `Present` would leave a node that recovers into a genuine election reporting the
-                // refusal for ever, and an episode counter nobody resets is a flag nobody clears.
-                if (verdict != CoordinatorClient::LeaderRead::Unavailable) {
-                    if (const uint64_t ticks = campaign_refusal_episode_.end(); ticks > 0) {
-                        OB_LOG_INFO("failover",
-                                    "the coordinator answers again after %llu tick(s) of declining "
-                                    "to campaign; this node will now act on what it reads",
-                                    static_cast<unsigned long long>(ticks));
-                    }
-                }
-
-                if (leader_present) {
-                    note_leader_present();
-                    // The address is recorded and **nothing else happens**, which is the whole of
-                    // "an unchanged leader does not restart replication every second" (#104). No
-                    // comparison against a remembered address is needed to get that, and the field
-                    // that claimed to provide it was written once and read nowhere. Adoption -
-                    // `demote_to_replica()`, a fresh replication client, and since #101 a
-                    // `STREAMID?` round trip - happens in `adopt_leader_if_present()`, which this
-                    // branch is not.
-                    std::lock_guard<std::mutex> lk(mtx_);
-                    primary_address_ = state.leader_address;
-                } else if (verdict == CoordinatorClient::LeaderRead::Unavailable) {
-                    // No information. Standing for election here is what this branch used to do,
-                    // because get_cluster_state() reported an unreachable coordinator and a vacant
-                    // key with the same std::nullopt. Campaigning because we could not read is not
-                    // the same as campaigning because there is no leader.
-                    //
-                    // **INFO on the tick this starts, and that is #115.** This was DEBUG-only
-                    // while the server's default level is INFO, so during a coordinator outage the
-                    // count of lines an operator saw about this decision was zero - measured, 0 of
-                    // 65 and 0 of 67 across a thirty-second outage - while the same log carried
-                    // two WARN lines a second about a position that could not be published. The
-                    // decision is the answer to the first question anyone asks of that situation:
-                    // is the engine deciding, or is the engine stuck? Once per episode, because
-                    // once per tick is #116.
-                    if (campaign_refusal_episode_.begin()) {
-                        OB_LOG_INFO("failover",
-                                    "the coordinator is unreadable, so this node is staying REPLICA "
-                                    "rather than campaigning on a read that failed — this is a "
-                                    "decision, not a stall, and no primary will be elected until "
-                                    "the coordinator answers");
-                    } else {
-                        OB_LOG_DEBUG("failover",
-                                     "cluster state unreadable — staying REPLICA rather than "
-                                     "campaigning on a read that failed");
-                    }
-                } else if (config_.failover_enabled) {
-                    note_leader_absent();
-
-                    // Wait out the previous holder's step-down bound before competing (#82).
-                    // Without this, the vacated key can be claimed while the old holder still
-                    // believes it is primary — and both accept writes while both believe it.
-                    if (!leader_absence_settled()) {
-                        OB_LOG_DEBUG("failover",
-                                     "leader key absent but the election wait has not elapsed — "
-                                     "not campaigning yet");
-                    } else if (!should_defer_to_handover_target()) {
-                        // A graceful handover with a named successor: only that node should
-                        // campaign, so the role goes where the operator sent it rather than to
-                        // whoever is quickest.
-                        handle_lease_expiry();
-                    }
-                    // Otherwise: not our turn, re-check on the next pass.
-                }
-            }
-        } else if (current == NodeRole::STANDALONE) {
-            // No dead states. Before #73 this role matched neither branch above, so a node that
-            // lost the startup CAS, or booted while the coordinator was briefly unreachable, sat
-            // here for the rest of its life: no lease, no leader poll, no campaign, no replication
-            // — and no takeover when the primary died.
-            ++standalone_polls_;
-            if (coordinator_ && !coordinator_->is_connected()) {
-                if (coordinator_->connect()) {
-                    OB_LOG_INFO("failover", "coordinator reachable again after %llu attempts, "
-                                            "rejoining the cluster",
-                                static_cast<unsigned long long>(standalone_polls_));
-                } else if (standalone_polls_ % 30 == 1) {
-                    // Once per 30 s, not once per second: an unreachable coordinator is a
-                    // condition, not an event.
-                    OB_LOG_WARN("failover", "coordinator still unreachable after %llu attempts, "
-                                            "this node holds no cluster role",
-                                static_cast<unsigned long long>(standalone_polls_));
-                }
-            }
-            if (coordinator_ && coordinator_->is_connected() && !adopt_leader_if_present() &&
-                config_.failover_enabled) {
-                // The same wait as the REPLICA branch, but only once we know a leader has existed
-                // (#82). A cold start has no previous holder to wait for, and making every cluster
-                // spend a lease TTL before it has a primary would be a real cost for no safety.
-                //
-                // "A leader has existed" is read from the epoch, which is persisted: a node that
-                // was ever part of this cluster comes back with a non-zero one. The residual hole is
-                // a brand-new node that has never seen this cluster's epoch and reconnects during
-                // the vacancy — narrower than the window this closes, and named here rather than
-                // left to be discovered.
-                EpochValue known_epoch = handler_.get_current_epoch();
-                {
-                    std::lock_guard<std::mutex> lk(mtx_);
-                    if (epoch_.term > known_epoch.term) known_epoch = epoch_;
-                }
-
-                if (known_epoch.term > 0) {
-                    note_leader_absent();
-                    if (!leader_absence_settled()) {
-                        OB_LOG_DEBUG("failover",
-                                     "no leader published, but epoch %llu says one existed — "
-                                     "waiting out the election delay before standing",
-                                     static_cast<unsigned long long>(known_epoch.term));
-                        // Fall through to the sleep at the bottom of the loop.
-                        nap_between_iterations();
-                        continue;
-                    }
-                }
-
-                OB_LOG_INFO("failover", "no leader published and no role held — standing for "
-                                        "election");
-                attempt_promotion();
+        } catch (const std::exception& e) {
+            // What this buys, measured: without it an `ENOSPC` on the `EPOCH` record a promotion
+            // writes ended this thread mid-promotion, and the node then reported
+            // `REPLICA <its own replication port>` for ever while answering `PING`. Nothing else
+            // in the process would have promoted it, learned about a role change, or said so.
+            registry_.increment_counter("ob_monitor_errors_total");
+            if (monitor_errors_.begin()) {
+                OB_LOG_ERROR("failover",
+                             "this monitor tick failed and the next one will be attempted; the "
+                             "role this node reports may be mid-transition until it succeeds: %s",
+                             e.what());
+            } else {
+                OB_LOG_DEBUG("failover", "monitor tick failed again (%llu consecutive): %s",
+                             static_cast<unsigned long long>(monitor_errors_.ticks()), e.what());
             }
         }
-
-        // Sleep 1 second between iterations.
         nap_between_iterations();
     }
 }

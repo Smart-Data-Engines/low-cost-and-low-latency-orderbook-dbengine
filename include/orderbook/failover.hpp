@@ -8,6 +8,7 @@
 // to perform the actual state changes.
 
 #include "orderbook/log_episode.hpp"
+#include "orderbook/metrics.hpp"
 #include "orderbook/coordinator.hpp"
 #include "orderbook/epoch.hpp"
 
@@ -113,7 +114,14 @@ struct RoleTransitionHandler {
 
 class FailoverManager {
 public:
-    explicit FailoverManager(FailoverConfig config, RoleTransitionHandler& handler);
+    /// `registry` is not decoration: once `monitor_loop()` survives a throwing tick, the thread
+    /// staying alive means every outward signal keeps looking healthy, and a counter is the only
+    /// thing an operator can alarm on. Passed here rather than reached through
+    /// `RoleTransitionHandler` because incrementing a counter is not a role transition, and not
+    /// defaulted because a default would let every test leave the counter unfed - which is #117
+    /// exactly, and #117 is why this counter exists (#112).
+    explicit FailoverManager(FailoverConfig config, RoleTransitionHandler& handler,
+                             MetricsRegistry& registry);
     ~FailoverManager();
 
     FailoverManager(const FailoverManager&) = delete;
@@ -268,8 +276,21 @@ private:
 
     void monitor_loop();
 
+    /// One pass of monitor_loop(), so a throw costs a pass rather than the thread (#112).
+    void monitor_tick();
+
     /// One second between iterations of monitor_loop(), in ten interruptible pieces.
     void nap_between_iterations();
+
+    MetricsRegistry& registry_;
+
+    /// One condition, one pair of log lines: a monitor tick that threw.
+    ///
+    /// Measured before the boundary existed (#112, #54's injector): an `ENOSPC` on the `EPOCH`
+    /// record a promotion writes ended this thread, and the node then reported
+    /// `REPLICA <its own replication port>` for the forty seconds observed, answering `PING`. A
+    /// full disk throws on every tick, so the log says it once - #95's shape.
+    LogEpisode monitor_errors_;
 
     /// Should this node take the role now, or is a better-placed replica expected to?
     ///

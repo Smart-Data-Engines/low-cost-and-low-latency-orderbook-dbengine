@@ -199,7 +199,7 @@ void Engine::open() {
     if (!failover_config_.coordinator.endpoints.empty() && !mm_config_.enabled) {
         OB_LOG_INFO("engine", "starting FailoverManager, node_id=%s",
                     failover_config_.coordinator.node_id.c_str());
-        failover_mgr_ = std::make_unique<FailoverManager>(failover_config_, *this);
+        failover_mgr_ = std::make_unique<FailoverManager>(failover_config_, *this, registry_);
         failover_mgr_->start();
         node_role_.store(failover_mgr_->role(), std::memory_order_relaxed);
     }

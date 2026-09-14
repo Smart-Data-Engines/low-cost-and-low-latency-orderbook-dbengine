@@ -94,6 +94,13 @@ MetricsRegistry::MetricsRegistry() {
     // healthy while the node received nothing. This is the number that contradicts them.
     counters_.push_back(make_counter("ob_mm_io_errors_total",
                                      "Mesh events abandoned because handling them threw"));
+    // Monitor ticks that threw and were retried (#112). The counter exists because the boundary
+    // makes the thread survive: measured without it, an ENOSPC on the EPOCH record a promotion
+    // writes ended that thread and left the node reporting REPLICA <its own replication port> for
+    // ever, answering PING the whole time. Nothing outward changes when a tick fails, so this is
+    // the only thing to alarm on.
+    counters_.push_back(make_counter("ob_monitor_errors_total",
+                                     "Failover monitor ticks that ended in an exception"));
 
     // Gauges
     gauges_.push_back(make_gauge("ob_active_sessions", "Number of active TCP sessions"));
