@@ -110,6 +110,13 @@ MetricsRegistry::MetricsRegistry() {
     counters_.push_back(make_counter("ob_repl_io_errors_total",
                                      "Replication io loop events or passes abandoned because "
                                      "they threw"));
+    // Lease refreshes that threw (#112). A ratchet like the one above and for the same reason -
+    // `CoordinatorClient` contains no `throw` and `refresh_lease()` answers failure with `false`
+    // - but the thing behind it is the least recoverable of the four loops: the lease this thread
+    // holds open is what keeps this node in the mesh registry, and `register_self()` runs once, at
+    // start. Measured: revoke that lease and the key never comes back while the node answers PING.
+    counters_.push_back(make_counter("ob_peer_lease_errors_total",
+                                     "Peer registry lease refreshes that ended in an exception"));
 
     // Gauges
     gauges_.push_back(make_gauge("ob_active_sessions", "Number of active TCP sessions"));

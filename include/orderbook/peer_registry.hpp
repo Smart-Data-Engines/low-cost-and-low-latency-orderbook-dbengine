@@ -13,6 +13,8 @@
 
 #include "orderbook/coordinator.hpp"
 #include "orderbook/hlc.hpp"
+#include "orderbook/log_episode.hpp"
+#include "orderbook/metrics.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -120,8 +122,13 @@ std::string mm_peers_range_end(const std::string& prefix,
 
 class PeerRegistry {
 public:
+    /// The registry is taken by reference and is **not** defaulted, for the reason
+    /// `FailoverManager`'s is (#112): a default would let every construction site leave the
+    /// counter below unfed, which is #117 exactly - and #117 is why the counter is here at all.
+    /// Three sites, one of them production.
     explicit PeerRegistry(CoordinatorConfig config, uint16_t local_node_id,
                           const std::string& replication_address,
+                          MetricsRegistry& registry,
                           const std::string& shard_id = "");
     ~PeerRegistry();
 
@@ -166,6 +173,7 @@ private:
     std::string shard_id_;
 
     std::unique_ptr<CoordinatorClient> coordinator_;
+    MetricsRegistry& registry_;
     int64_t lease_id_{0};
 
     mutable std::mutex mtx_;
@@ -189,6 +197,11 @@ private:
     std::mutex              lease_stop_mtx_;
     std::condition_variable lease_stop_cv_;
     TopologyChangeCallback change_cb_;
+
+    /// Whether the lease loop is in an episode of caught exceptions.
+    ///
+    /// Touched only by the lease thread, which is what `LogEpisode` asks of its users.
+    LogEpisode lease_errors_;
 
     void watch_loop();
     void lease_loop();

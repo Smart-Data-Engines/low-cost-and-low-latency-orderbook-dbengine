@@ -13,17 +13,25 @@
 // parser and this needs a paren match - and because the one place that had put a `try` inside its
 // body still left the statements before it and the mutex after it outside the guard.
 //
-// **What it therefore does not cover**, named rather than left to be discovered: it does not check
-// that the boundary is the *outermost* thing in the body, that a loop inside survives its own
-// failures (that is a per-iteration boundary, a judgement per loop, recorded in #112), or that a
-// thread started outside `src/` - in a test, or in `tools/` - has one. A `std::thread` handed a
-// `std::function` filled in elsewhere would also pass, because the body is not here to read.
+// **The second rule, added when #112's last loop was closed.** The outer boundary stops the
+// process dying and leaves a subsystem that ends on its first exception, so the five loops where
+// stopping is not survivable each guard **one iteration at a time**. That set is named here, and
+// naming it is the point: a sixth such loop has to join the list or explain itself, where five
+// scattered `try`s say nothing about the one nobody wrote.
+//
+// **What this file therefore does not cover**, named rather than left to be discovered: it does not
+// check that the boundary is the *outermost* thing in the body, that the per-iteration `try` covers
+// the whole iteration rather than part of it, or that a thread started outside `src/` - in a test,
+// or in `tools/` - has one. A `std::thread` handed a `std::function` filled in elsewhere would also
+// pass, because the body is not here to read.
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <regex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -162,4 +170,148 @@ TEST(ThreadBoundaries, EveryThreadBodyGoesThroughTheBoundary) {
     EXPECT_TRUE(unguarded.empty())
         << unguarded.size() << " of " << total << " thread constructions let an exception reach "
         << "the runtime, which ends the process rather than the thread:" << report;
+}
+
+// ── Every loop in src/, classified ───────────────────────────────────────────
+//
+// The first version of this was a hand-written list of the four loops #112 names, and a mutation
+// deleting one row **survived**: the rule covered less and stayed green. That is the third time
+// inside this one item that a list written by hand turned out not to be evidence about the code -
+// the count of thread entry points was wrong twice the same way, one then eleven then seventeen -
+// so the set is derived from the tree and the list only says what each member *is*.
+//
+// Both directions, for the same reason the metrics checker runs both: a loop in neither list fails
+// here, and a list entry naming a function the tree no longer has fails too.
+namespace {
+
+struct LoopFn {
+    std::string file;
+    std::string name;   // Class::function
+    std::string body;
+    bool        has_loop_statement;
+    bool        guarded;
+};
+
+/// Every `void Class::something_loop()` definition in `src/`, plus `AntiEntropyManager::loop`.
+///
+/// Sliced from the signature to the next line that is a lone `}` in column zero, which is this
+/// tree's layout for a free-standing definition. A neighbour's `try` therefore cannot satisfy a
+/// row: `replication.cpp` holds two functions called `run_loop`.
+std::vector<LoopFn> loop_functions() {
+    std::vector<std::filesystem::path> files;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(std::filesystem::path(OB_SOURCE_DIR) / "src")) {
+        if (entry.is_regular_file() && entry.path().extension() == ".cpp") files.push_back(entry.path());
+    }
+    std::sort(files.begin(), files.end());
+
+    std::vector<LoopFn> out;
+    const std::regex sig(R"(^void ([A-Za-z_]+::[a-z_]*loop)\(\) \{$)");
+    for (const auto& file : files) {
+        const std::string text = read_file(file);
+        std::size_t at = 0;
+        while (at < text.size()) {
+            const std::size_t eol = text.find('\n', at);
+            const std::string line = text.substr(at, (eol == std::string::npos ? text.size() : eol) - at);
+            std::smatch m;
+            if (std::regex_match(line, m, sig)) {
+                const std::size_t end = text.find("\n}\n", at);
+                const std::string body = text.substr(at, (end == std::string::npos ? text.size() : end) - at);
+                const std::size_t loop_at = std::min(body.find("while ("), body.find("for (;;)"));
+                const bool has_loop = loop_at != std::string::npos;
+                out.push_back(LoopFn{file.filename().string(), m[1].str(), body, has_loop,
+                                     has_loop && body.find("try {", loop_at) != std::string::npos});
+            }
+            if (eol == std::string::npos) break;
+            at = eol + 1;
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(ThreadBoundaries, EveryLoopInTheTreeIsEitherGuardedPerIterationOrRecorded) {
+    // Guarded: a `try` inside the loop, so one iteration is what a failure costs. What each one's
+    // death would cost is written beside it, because that is the judgement being reviewed.
+    const std::vector<std::pair<std::string, std::string>> guarded = {
+        {"Engine::flush_loop",
+         "rows stay in memory and the WAL grows without bound while clients are answered OK"},
+        {"FailoverManager::monitor_loop",
+         "the node never learns about a role change (#82's shape), and a half-finished promotion "
+         "leaves it a replica of itself (#130)"},
+        {"MultiMasterManager::io_loop",
+         "the node is out of the mesh while PING, MM_PEERS and the peer's connected row all still "
+         "look healthy"},
+        {"ReplicationManager::run_loop",
+         "no replica is accepted, no catch-up advances and no heartbeat goes out"},
+        {"PeerRegistry::lease_loop",
+         "the lease expires, the mesh registration is gone from etcd and nothing puts it back "
+         "(#132)"},
+        {"ReplicationClient::run_loop",
+         "this replica stops following its primary; guarded since before #112, around the connect "
+         "and replay it retries"},
+    };
+
+    // Not guarded, and each one recorded rather than excused. #112 named four loops; derived from
+    // the tree the set whose death is not survivable is larger, and these seven are #131.
+    const std::vector<std::pair<std::string, std::string>> recorded = {
+        {"PeerRegistry::watch_loop",      "#131"},
+        {"MultiMasterManager::reconnect_loop", "#131"},
+        {"AntiEntropyManager::loop",      "#131"},
+        {"ShardRouter::watch_loop",       "#131"},
+        {"ShardCoordinator::watch_loop",  "#131"},
+        {"MetricsServer::run_loop",       "#131"},
+        {"OrderbookPool::health_check_loop", "#131"},
+    };
+
+    const std::vector<LoopFn> found = loop_functions();
+    ASSERT_GE(found.size(), guarded.size() + recorded.size())
+        << "found " << found.size() << " loop functions in src/, fewer than the "
+        << (guarded.size() + recorded.size()) << " already classified - the scan has stopped "
+        << "matching and would report a clean tree";
+
+    auto named_in = [](const std::vector<std::pair<std::string, std::string>>& list,
+                       const std::string& name) {
+        return std::any_of(list.begin(), list.end(),
+                           [&](const auto& row) { return row.first == name; });
+    };
+
+    // Forward: every loop the tree has is classified, and classified correctly.
+    for (const auto& fn : found) {
+        if (!fn.has_loop_statement) {
+            // A function whose name ends in `loop` and which contains none is a notifier, not a
+            // loop. Exactly one of those exists and it is named, so a real loop cannot hide here
+            // by having its `while` rewritten into something this scan does not know.
+            EXPECT_EQ(fn.name, "MultiMasterManager::wake_io_loop")
+                << fn.file << ": " << fn.name << " has no loop statement this scan recognises";
+            continue;
+        }
+        const bool g = named_in(guarded, fn.name);
+        const bool r = named_in(recorded, fn.name);
+        EXPECT_TRUE(g || r) << fn.file << ": " << fn.name << " is a loop this test has never "
+                            << "heard of. Classify it: either it guards one iteration at a time, "
+                            << "or its death is recorded on the roadmap (#131)";
+        if (g) {
+            EXPECT_TRUE(fn.guarded)
+                << fn.file << ": " << fn.name << " is listed as guarding one iteration at a time "
+                << "and has no `try` inside its loop. The outer thread boundary keeps the process "
+                << "alive and lets this thread end (#112)";
+        }
+        if (r) {
+            EXPECT_FALSE(fn.guarded)
+                << fn.file << ": " << fn.name << " has a per-iteration boundary now. Move it to "
+                << "the guarded list with what its death would cost, and close its line in #131";
+        }
+    }
+
+    // Backward: a row naming a function the tree no longer has is a row that stopped checking.
+    for (const auto& list : {guarded, recorded}) {
+        for (const auto& row : list) {
+            EXPECT_TRUE(std::any_of(found.begin(), found.end(),
+                                    [&](const LoopFn& fn) { return fn.name == row.first; }))
+                << row.first << " is classified here and is not in src/ any more, so this row is "
+                << "asserting about nothing. Fix the row rather than leaving it";
+        }
+    }
 }

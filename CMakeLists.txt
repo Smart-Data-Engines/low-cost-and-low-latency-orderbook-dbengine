@@ -312,7 +312,9 @@ target_link_libraries(orderbook_conflict_resolver PUBLIC orderbook_hlc orderbook
 
 # ── Peer registry compiled library (multi-master peer discovery) ───────────────
 add_library(orderbook_peer_registry STATIC src/peer_registry.cpp)
-target_link_libraries(orderbook_peer_registry PUBLIC orderbook_hlc orderbook_coordinator orderbook_logger nlohmann_json::nlohmann_json)
+# `orderbook_metrics` since #112: the lease loop's boundary counts what it caught, and the
+# linker is what said so.
+target_link_libraries(orderbook_peer_registry PUBLIC orderbook_hlc orderbook_coordinator orderbook_logger orderbook_metrics nlohmann_json::nlohmann_json)
 
 # ── Anti-entropy compiled library (multi-master gap detection and repair) ──────
 add_library(orderbook_anti_entropy STATIC src/anti_entropy.cpp)

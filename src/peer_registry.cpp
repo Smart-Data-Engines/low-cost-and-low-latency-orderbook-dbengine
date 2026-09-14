@@ -327,12 +327,14 @@ std::string mm_peers_range_end(const std::string& prefix,
 
 PeerRegistry::PeerRegistry(CoordinatorConfig config, uint16_t local_node_id,
                            const std::string& replication_address,
+                           MetricsRegistry& registry,
                            const std::string& shard_id)
     : config_(std::move(config))
     , local_node_id_(local_node_id)
     , replication_address_(replication_address)
     , shard_id_(shard_id)
     , coordinator_(std::make_unique<CoordinatorClient>(config_))
+    , registry_(registry)
 {
     OB_LOG_DEBUG("peer_registry",
                  "PeerRegistry created: node_id=%u address=%s shard=%s",
@@ -646,7 +648,43 @@ void PeerRegistry::lease_loop() {
     OB_LOG_DEBUG("peer_registry", "Lease loop started for node %u",
                  local_node_id_);
     while (running_.load(std::memory_order_acquire)) {
-        refresh_lease();
+        // One refresh at a time under its own boundary (#112). The outer `run_thread_body` keeps
+        // the *process* alive; without this, one exception here ends the thread that holds this
+        // node's mesh registration open, and what follows is measured rather than argued: the
+        // registration expires with its lease, the key is gone from etcd for good, and nothing
+        // ever puts it back — `register_self()` runs once, at start, and is the only writer of
+        // `lease_id_`. The node keeps answering `PING` throughout.
+        //
+        // A **ratchet**, and it says so rather than pretending to close something measured. No
+        // path in this tree throws here: `CoordinatorClient` contains no `throw` at all and
+        // `refresh_lease()` answers failure with `false`, so what is left is `std::bad_alloc`
+        // from the string building underneath and `std::system_error` from the wait below.
+        try {
+            refresh_lease();
+        } catch (const std::exception& e) {
+            registry_.increment_counter("ob_peer_lease_errors_total");
+            if (lease_errors_.begin()) {
+                OB_LOG_ERROR("peer_registry",
+                             "refreshing node %u's lease threw and the next interval will be "
+                             "attempted; if this keeps failing the lease expires and this node "
+                             "leaves the mesh registry: %s", local_node_id_, e.what());
+            } else {
+                OB_LOG_DEBUG("peer_registry",
+                             "refreshing node %u's lease threw again (%llu consecutive): %s",
+                             local_node_id_,
+                             static_cast<unsigned long long>(lease_errors_.ticks()), e.what());
+            }
+        }
+
+        // Inside the loop and after the boundary, so a refresh that threw cannot claim its own
+        // recovery — the mistake the mesh boundary made one commit earlier, where `end()` ran
+        // after the code that opened the episode and the log alternated ERROR / "again".
+        if (const uint64_t held = lease_errors_.end()) {
+            OB_LOG_INFO("peer_registry",
+                        "node %u's lease is being refreshed again after %llu attempt(s) that "
+                        "threw", local_node_id_, static_cast<unsigned long long>(held));
+        }
+
         // Refresh every TTL/3 seconds, on a wait `stop_watch()` can end. A plain `sleep_for()` here
         // made shutdown wait out the rest of the current interval, because `join()` cannot
         // interrupt a sleeping thread — measured at 2.94 s for the default TTL against 0.22 s for a
