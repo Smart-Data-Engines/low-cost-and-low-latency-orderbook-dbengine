@@ -852,127 +852,135 @@ void ReplicationManager::run_loop() {
             break; // fatal epoll error
         }
 
-        // Has a snapshot worker finished? Before dispatching events, and on the timeout path too.
-        poll_snapshot_preparation();
+        // One pass at a time under its own boundary, plus one per event inside it (#112). This
+        // commit only wraps and re-indents: both `catch`es rethrow, so behaviour is unchanged
+        // and `git diff -w` shows nothing but the lines added here. The handling arrives in
+        // the commit after it, where it is the whole diff.
+        try {
+            // Has a snapshot worker finished? Before dispatching events, and on the timeout path too.
+            poll_snapshot_preparation();
 
-        // Both replica gauges, once per pass. This tick is the mechanism: publishing them only
-        // where a link is established - which is what the verified count did - leaves a dropped
-        // replica counted until the next handshake, so the gauge could claim more verified links
-        // than there were links at all.
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            publish_replica_gauges();
-        }
-
-        for (int i = 0; i < nfds; ++i) {
-            int fd = events[i].data.fd;
-
-            if (fd == listen_fd_) {
-                accept_replica();
-                continue;
-            }
-
-            // A handshake in progress consumes this event and nothing else. Not one byte of
-            // application data may be read before it finishes: a frame arriving earlier would be a
-            // frame from a transport that has not proved who it is, and the cluster-secret gate is a
-            // different mechanism that knows nothing about TLS.
+            // Both replica gauges, once per pass. This tick is the mechanism: publishing them only
+            // where a link is established - which is what the verified count did - leaves a dropped
+            // replica counted until the next handshake, so the gauge could claim more verified links
+            // than there were links at all.
             {
                 std::lock_guard<std::mutex> lock(mtx_);
-                ReplicaInfo* r = find_replica_locked(fd);
-                if (r != nullptr && r->tls != nullptr && r->tls->handshaking()) {
-                    if (!advance_tls_handshake(*r)) {
-                        disconnect_replica_locked(fd, "tls handshake failed");
-                    }
-                    continue;
-                }
+                publish_replica_gauges();
             }
 
-            // Handle EPOLLOUT: drain send buffer and continue snapshot transfer.
-            if (events[i].events & EPOLLOUT) {
-                std::lock_guard<std::mutex> lock(mtx_);
-                for (auto it = replicas_.begin(); it != replicas_.end(); ++it) {
-                    if (it->fd == fd) {
-                        if (!drain_send_buffer(*it)) {
-                            remove_replica_locked(fd);
-                            replicas_.erase(it);
-                            break;
+            for (int i = 0; i < nfds; ++i) {
+            try {
+                    int fd = events[i].data.fd;
+
+                    if (fd == listen_fd_) {
+                        accept_replica();
+                        continue;
+                    }
+
+                    // A handshake in progress consumes this event and nothing else. Not one byte of
+                    // application data may be read before it finishes: a frame arriving earlier would be a
+                    // frame from a transport that has not proved who it is, and the cluster-secret gate is a
+                    // different mechanism that knows nothing about TLS.
+                    {
+                        std::lock_guard<std::mutex> lock(mtx_);
+                        ReplicaInfo* r = find_replica_locked(fd);
+                        if (r != nullptr && r->tls != nullptr && r->tls->handshaking()) {
+                            if (!advance_tls_handshake(*r)) {
+                                disconnect_replica_locked(fd, "tls handshake failed");
+                            }
+                            continue;
                         }
-                        // If snapshot transfer is active and send buffer has room,
-                        // enqueue the next chunk.
-                        if (it->snapshot_transfer.active &&
-                            it->send_buf.size() < MAX_SEND_BUF_SIZE / 2) {
-                            if (!continue_snapshot_transfer(*it)) {
-                                remove_replica_locked(fd);
-                                replicas_.erase(it);
+                    }
+
+                    // Handle EPOLLOUT: drain send buffer and continue snapshot transfer.
+                    if (events[i].events & EPOLLOUT) {
+                        std::lock_guard<std::mutex> lock(mtx_);
+                        for (auto it = replicas_.begin(); it != replicas_.end(); ++it) {
+                            if (it->fd == fd) {
+                                if (!drain_send_buffer(*it)) {
+                                    remove_replica_locked(fd);
+                                    replicas_.erase(it);
+                                    break;
+                                }
+                                // If snapshot transfer is active and send buffer has room,
+                                // enqueue the next chunk.
+                                if (it->snapshot_transfer.active &&
+                                    it->send_buf.size() < MAX_SEND_BUF_SIZE / 2) {
+                                    if (!continue_snapshot_transfer(*it)) {
+                                        remove_replica_locked(fd);
+                                        replicas_.erase(it);
+                                    }
+                                }
+                                break;
                             }
                         }
-                        break;
+                    }
+
+                    // Handle EPOLLIN: read replica data (ACK, REPLICATE, etc.).
+                    if (events[i].events & EPOLLIN) {
+                        handle_replica_data(fd);
+                    }
+            } catch (...) { throw; }
+            }
+
+            // Advance every catch-up that has room, once per pass and *after* this pass's EPOLLOUT
+            // drains have made that room (#93).
+            //
+            // One site, and not also inside the EPOLLOUT branch beside the snapshot transfer's: the
+            // cursor has to be resumed from three different situations - the socket drained, the batch
+            // budget ran out with the queue already empty, and the first batch was queued by
+            // `handle_catchup()` - and only one of those arrives as an event. Two places advancing one
+            // cursor is the shape series C shipped a comment about.
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                for (auto& r : replicas_) {
+                    if (r.fd >= 0 && r.catchup.active) continue_catchup(r);
+                }
+                wait_ms = catchup_can_progress_locked() ? 0 : 100;
+            }
+
+            // Send heartbeat every 5 seconds when idle.
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_heartbeat).count() >= 5) {
+                last_heartbeat = now;
+                const uint64_t epoch = wal_.current_epoch();
+                char hb[64];
+                int hb_len = std::snprintf(hb, sizeof(hb), "HEARTBEAT %" PRIu64 "\n", epoch);
+
+                std::lock_guard<std::mutex> lock(mtx_);
+                for (auto it = replicas_.begin(); it != replicas_.end(); ) {
+                    // A connection that has not sent `REPLICATE` is not a replica yet, and this is the
+                    // third sender to learn it: `broadcast()` gates on the same flag since #100, and
+                    // `queue_to_replica()` holds bytes back during a transfer since #99. This loop
+                    // walked every entry, so an accepted connection still finishing its handshake got
+                    // a `HEARTBEAT` in the middle of it - a line the other side reads where it expects
+                    // `AUTH`, or since #101 where it expects `STREAM`. Not hypothetical on either
+                    // side: the wait for an answer is five seconds and so is this timer.
+                    if (!it->asked_for_stream) { ++it; continue; }
+                    if (it->compress) {
+                        // Compress heartbeat as a single LZ4 frame with length prefix.
+                        auto compressed = ob::lz4_compress(hb, static_cast<size_t>(hb_len));
+                        uint32_t comp_len = static_cast<uint32_t>(compressed.size());
+                        uint8_t len_prefix[4];
+                        len_prefix[0] = static_cast<uint8_t>((comp_len >> 24) & 0xFF);
+                        len_prefix[1] = static_cast<uint8_t>((comp_len >> 16) & 0xFF);
+                        len_prefix[2] = static_cast<uint8_t>((comp_len >> 8) & 0xFF);
+                        len_prefix[3] = static_cast<uint8_t>(comp_len & 0xFF);
+                        queue_to_replica(*it, len_prefix, 4);
+                        queue_to_replica(*it, compressed.data(), compressed.size());
+                    } else {
+                        queue_to_replica(*it, hb, static_cast<size_t>(hb_len));
+                    }
+                    if (queued_bytes(*it) > MAX_SEND_BUF_SIZE) {
+                        remove_replica_locked(it->fd);
+                        it = replicas_.erase(it);
+                    } else {
+                        ++it;
                     }
                 }
             }
-
-            // Handle EPOLLIN: read replica data (ACK, REPLICATE, etc.).
-            if (events[i].events & EPOLLIN) {
-                handle_replica_data(fd);
-            }
-        }
-
-        // Advance every catch-up that has room, once per pass and *after* this pass's EPOLLOUT
-        // drains have made that room (#93).
-        //
-        // One site, and not also inside the EPOLLOUT branch beside the snapshot transfer's: the
-        // cursor has to be resumed from three different situations - the socket drained, the batch
-        // budget ran out with the queue already empty, and the first batch was queued by
-        // `handle_catchup()` - and only one of those arrives as an event. Two places advancing one
-        // cursor is the shape series C shipped a comment about.
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            for (auto& r : replicas_) {
-                if (r.fd >= 0 && r.catchup.active) continue_catchup(r);
-            }
-            wait_ms = catchup_can_progress_locked() ? 0 : 100;
-        }
-
-        // Send heartbeat every 5 seconds when idle.
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_heartbeat).count() >= 5) {
-            last_heartbeat = now;
-            const uint64_t epoch = wal_.current_epoch();
-            char hb[64];
-            int hb_len = std::snprintf(hb, sizeof(hb), "HEARTBEAT %" PRIu64 "\n", epoch);
-
-            std::lock_guard<std::mutex> lock(mtx_);
-            for (auto it = replicas_.begin(); it != replicas_.end(); ) {
-                // A connection that has not sent `REPLICATE` is not a replica yet, and this is the
-                // third sender to learn it: `broadcast()` gates on the same flag since #100, and
-                // `queue_to_replica()` holds bytes back during a transfer since #99. This loop
-                // walked every entry, so an accepted connection still finishing its handshake got
-                // a `HEARTBEAT` in the middle of it - a line the other side reads where it expects
-                // `AUTH`, or since #101 where it expects `STREAM`. Not hypothetical on either
-                // side: the wait for an answer is five seconds and so is this timer.
-                if (!it->asked_for_stream) { ++it; continue; }
-                if (it->compress) {
-                    // Compress heartbeat as a single LZ4 frame with length prefix.
-                    auto compressed = ob::lz4_compress(hb, static_cast<size_t>(hb_len));
-                    uint32_t comp_len = static_cast<uint32_t>(compressed.size());
-                    uint8_t len_prefix[4];
-                    len_prefix[0] = static_cast<uint8_t>((comp_len >> 24) & 0xFF);
-                    len_prefix[1] = static_cast<uint8_t>((comp_len >> 16) & 0xFF);
-                    len_prefix[2] = static_cast<uint8_t>((comp_len >> 8) & 0xFF);
-                    len_prefix[3] = static_cast<uint8_t>(comp_len & 0xFF);
-                    queue_to_replica(*it, len_prefix, 4);
-                    queue_to_replica(*it, compressed.data(), compressed.size());
-                } else {
-                    queue_to_replica(*it, hb, static_cast<size_t>(hb_len));
-                }
-                if (queued_bytes(*it) > MAX_SEND_BUF_SIZE) {
-                    remove_replica_locked(it->fd);
-                    it = replicas_.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-        }
+        } catch (...) { throw; }
     }
 }
 
