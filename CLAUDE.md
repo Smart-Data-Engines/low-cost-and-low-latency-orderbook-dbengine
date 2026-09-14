@@ -2409,6 +2409,22 @@ Learned the hard way. Check here before debugging.
     The rvalue overload is deleted now, so the shape is a **compile error** instead of something a
     sanitizer has to be running to see.
 
+287. **A `sleep_for` in a loop a `stop()` joins is shutdown latency, and it is the third time in
+    this tree.** `PeerRegistry::lease_loop()` slept `max(1, lease_ttl/3)` **seconds** in one call, so
+    shutdown waited out whatever remained of it: measured **2.94 s** at the default TTL and
+    **4.02 s** at a 30 s one, against **0.22 s** for a node with no lease loop. The fix and its
+    explanation were already in the tree — `Engine::flush_loop()` waits on a condition variable with
+    the stop flag as the predicate, under a comment saying `join()` cannot interrupt a sleeping
+    thread — and the mesh's `wakeup_fd_` comment records the second occurrence. Notify **after**
+    storing the flag and **before** the join: the predicate reads the flag, so a notification that
+    arrives first is one the waiter sleeps through.
+
+288. **When two published numbers about the same thing disagree, the gap is the defect.** #106
+    measured `SIGTERM` at 0.11 s for a node with nobody connected, and the integration harness
+    escalates to `SIGKILL` after five seconds. Anything between those two is invisible: a mesh node
+    taking three seconds to stop was inside the harness's tolerance and outside the published figure,
+    and neither number was wrong. Go and measure the configuration that falls between them.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

@@ -15,6 +15,7 @@
 #include "orderbook/hlc.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -173,6 +174,20 @@ private:
     std::thread watch_thread_;
     std::thread lease_thread_;
     std::atomic<bool> running_{false};
+
+    /// What makes the lease loop's wait interruptible.
+    ///
+    /// That loop slept `max(1, lease_ttl/3)` **seconds** in a plain `sleep_for`, and
+    /// `stop_watch()` joins it — so shutdown waited out whatever remained of the current sleep.
+    /// Measured on this machine with nothing connected: a standalone node exits in 0.22 s, a mesh
+    /// node with the default 10 s TTL in 2.94 s, and one with a 30 s TTL in 4.02 s, which is the
+    /// remainder of a 10 s sleep entered six seconds earlier — so the cost is the rest of the
+    /// current sleep and only its bound is a function of the TTL (#129).
+    ///
+    /// The same shape as `Engine::flush_loop()`, whose comment says why a `sleep_for` cannot be
+    /// interrupted by `join()`, and as the mesh's `wakeup_fd_`. Third place, same answer.
+    std::mutex              lease_stop_mtx_;
+    std::condition_variable lease_stop_cv_;
     TopologyChangeCallback change_cb_;
 
     void watch_loop();

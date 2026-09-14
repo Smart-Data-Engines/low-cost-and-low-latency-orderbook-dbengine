@@ -2152,6 +2152,59 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 129. A mesh node's shutdown waits out the lease loop's sleep ✅
+
+Found while reading `PeerRegistry::lease_loop()` for #112's remaining half, and then measured,
+because the two numbers that bracket it were already published and disagreed: #106 measured `SIGTERM`
+at **0.11 s** for a node with nobody connected, and the integration harness escalates to `SIGKILL`
+after five seconds — a window wide enough to hide seconds of waiting without anything ever saying so.
+
+That loop slept `max(1, lease_ttl/3)` **seconds** in a plain `std::this_thread::sleep_for`, and
+`stop_watch()` joins it. `join()` cannot interrupt a sleeping thread, so shutdown waited.
+
+**Measured before the fix** (`build/ob_tcp_server` against native etcd, i3-7100U, node up ~6 s,
+nothing connected):
+
+| configuration | SIGTERM → exit | lease interval |
+|---|---|---|
+| standalone, no coordinator (**control**) | **0.22 s** | — |
+| mesh node, `--coordinator-lease-ttl 3` | **1.05 s** | 1 s |
+| mesh node, default `--coordinator-lease-ttl 10` | **2.94 s** | 3 s |
+| mesh node, `--coordinator-lease-ttl 30` | **4.02 s** | 10 s |
+
+The 30-second row is the one that establishes the mechanism rather than the default one. Ten seconds
+of sleep, entered about six seconds before the signal, leaves about four — which is what was
+measured. So the cost is **the remainder of the current sleep**, and only its bound is a function of
+the TTL. A model that said "ttl/3" would have predicted 10 s and been wrong in the direction that
+looks conservative.
+
+**After**, same probe, same machine: **0.33 s** at the default TTL and **0.24 s** at 30 s, against a
+standalone control that stayed at **0.24 s**. The number to read is not the drop; it is that a mesh
+node now exits as fast as a node with no lease loop at all, which is the property.
+
+**The fix was already in this tree, with a comment explaining it.** `Engine::flush_loop()` waits on a
+condition variable with the stop flag as its predicate, under: *"A plain `sleep_for()` here made
+`close()` block until the current interval elapsed, because `join()` cannot interrupt a sleeping
+thread: shutdown took up to `flush_interval_ns_` for no reason, and tests that open and close an
+Engine per case paid it every time."* This is the **third** place with the shape — the mesh's
+`wakeup_fd_` comment records the second, where `stop()` used to wait out a 500 ms `epoll_wait`. The
+notification is sent after the flag is stored and before either join, because the predicate reads the
+flag: a notification that arrives first is one the waiter sleeps through.
+
+`watch_loop()` was checked and left alone: it sleeps 100 ms per pass, so its contribution is bounded
+at a tenth of a second and there is nothing to fix.
+
+**The test is a property, not a duration, and that is deliberate.** It gives the registry a 3600-second
+TTL — a 1200-second interval — and requires `stop_watch()` to return inside two seconds. Three orders
+of magnitude, so it cannot fail on load; a gate that could is the kind that teaches people to re-run
+until green (#10.7's own docstring). The control was run at a shortened interval so that it fails in
+ten seconds rather than twenty minutes: with `sleep_for` restored the test fails at **10 000 ms**, and
+with the fix back it passes in **305 ms**.
+
+- Effort: S | Impact: every mesh node's shutdown paid up to `lease_ttl/3` seconds after the drain
+  timeout #106 exists to bound, and a supervisor's stop timeout or a harness's `SIGKILL` escalation
+  absorbed it silently
+
 ### 128. The mesh io loop closes descriptors by number, and a number it no longer owns can belong to anything ✅
 
 Found by `sanitizers-integration (tsan)` on PR #123 — on a branch whose diff does not contain one
@@ -6494,7 +6547,7 @@ except where a row says otherwise, not the machine-B performance baseline above.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1082 | all passing with `ctest -j1` on the i3-7100U, **210 s in a single run**. **Four more than the previous commit**, all #128's, and they divide the way that defect does: three in `tests/test_mm_epoll_identity.cpp` are about the shape — that the two reserved event keys cannot collide with a connection, that closing a descriptor takes its registration with it (measured against `dup2`, which forces the reuse the defect needs instead of hoping for it), and that no registration in `src/multi_master.cpp` carries a bare descriptor number. The fourth is behavioural: a connection landing on the descriptor its predecessor gave back is its own connection, with both numbers read back so a run where the kernel did not recycle the number says so rather than passing quietly. Three of the six mutations in that item's table are killed by the static test **and by nothing else**, which is what says it carries weight. **Before them**, two were #126's, and they pin the replayer's rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. **Earlier**: two were #54's D3, three #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists **1084**: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The previous row gave 1078 for both figures, which was two short on the listed one — the count that passes and the count CTest lists differ by exactly those two harnesses, always. The runtimes are what this machine gave on the commit measured, not a budget |
+| C++ (GTest + RapidCheck) | 1083 | all passing with `ctest -j1` on the i3-7100U, **236-256 s in a single run** — two consecutive runs of the same suite on the same machine, which is the spread to read the next number against rather than a change. **One more than the previous commit**, #129's: a registry given a 1200-second lease interval has to stop inside two seconds, which is a property stated three orders of magnitude clear of load rather than a duration. **Before it**, four were #128's, and they divide the way that defect does: three in `tests/test_mm_epoll_identity.cpp` are about the shape — that the two reserved event keys cannot collide with a connection, that closing a descriptor takes its registration with it (measured against `dup2`, which forces the reuse the defect needs instead of hoping for it), and that no registration in `src/multi_master.cpp` carries a bare descriptor number. The fourth is behavioural: a connection landing on the descriptor its predecessor gave back is its own connection, with both numbers read back so a run where the kernel did not recycle the number says so rather than passing quietly. Three of the six mutations in that item's table are killed by the static test **and by nothing else**, which is what says it carries weight. **Before them**, two were #126's, and they pin the replayer's rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. **Earlier**: two were #54's D3, three #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists **1085**: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The count that passes and the count CTest lists differ by exactly those two harnesses, always; a row two commits back gave one number for both. The runtimes are what this machine gave on the commit measured, not a budget |
 | Python integration | 263 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 263; count pytest's final result rather than the report plugin's progress characters. `263 passed, 2 skipped in 20:52` on the GitHub runner for this commit, against `20:37` on the development machine (i3-7100U, native etcd) — the spread to expect between the two rather than a change. Three more than the previous commit: #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
 | Python integration under TSan | 263 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `263 passed in 25:32` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **20:52** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 
