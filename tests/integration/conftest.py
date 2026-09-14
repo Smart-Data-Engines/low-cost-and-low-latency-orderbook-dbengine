@@ -781,6 +781,39 @@ class ClusterManager:
         self._wait_for_node(node, timeout=timeout)
         return node
 
+    def add_replica(self, timeout: float = 20.0) -> NodeInfo:
+        """Add one more replica to a running primary/replica cluster (#124).
+
+        `start()` starts exactly two nodes, so until now every test in this battery had one replica
+        and no way to ask what the primary does with **two** — which is where WAL retention lives:
+        `safe_truncate` is the *minimum* `confirmed_file` across connected replicas, and a minimum
+        over one element is not a minimum. A third node also makes retention controllable from the
+        harness rather than from a timer, which is what a test of catch-up across WAL files needs:
+        one replica held still keeps the files, while the other is free to be killed and resumed.
+
+        Its role comes from etcd like any other node's, so there is nothing to pass: the primary
+        holds the leader key, and this node reads it and demotes itself. Polled for `REPLICA` rather
+        than only for `PONG`, because a node that is up and has not yet decided what it is will
+        answer a query and hold nothing.
+        """
+        index = len(self.nodes)
+        node = self._start_node(index)
+        self.nodes.append(node)
+        self._wait_for_node(node, timeout=timeout)
+
+        deadline = time.monotonic() + timeout
+        last = ""
+        while time.monotonic() < deadline:
+            try:
+                last = self._query_role(node).strip()
+                if "REPLICA" in last.upper():
+                    return node
+            except Exception:
+                pass
+            time.sleep(0.3)
+        raise RuntimeError(
+            f"{node.node_id} did not become a REPLICA within {timeout}s. Last ROLE: {last!r}")
+
     def wait_for_mm_mesh(self, timeout: float = 30.0) -> None:
         """Wait until every node is **connected** to all the others in MM_PEERS.
 
@@ -1000,6 +1033,15 @@ class ClusterManager:
         if proc is None or proc.poll() is not None:
             return
 
+        # `SIGCONT` first, unconditionally. A stopped process does not act on `SIGTERM` until it
+        # runs again, so a test that left a node paused - including one that failed between
+        # `pause_node()` and its `finally` - would burn the five seconds below and take the
+        # `SIGKILL` path. That is the #106 shape from the other side: teardown silently stops
+        # exercising the graceful exit, and the report gains a `signal 9` nobody asked for.
+        # Unconditional, with no record of which nodes are paused: `SIGCONT` to a running process
+        # is a no-op, and a set that is wrong in the direction of "not paused" costs exactly the
+        # five seconds this avoids. A set nothing reads is also the #104 shape, one language over.
+        proc.send_signal(signal.SIGCONT)
         proc.send_signal(signal.SIGTERM)
         try:
             proc.wait(timeout=5)
@@ -1183,6 +1225,40 @@ class ClusterManager:
                     "random on some kernels. Reproduced on this machine; `vm.mmap_rnd_bits=28` is "
                     "the usual answer where it can be set.")
         return coordinator
+
+    def pause_node(self, node_index: int) -> None:
+        """`SIGSTOP` a node: it keeps its connections and stops answering (#124).
+
+        A replica that has stopped reading is a different fault from one that has died, and the
+        difference is what the primary can observe. A killed replica leaves `replicas_` - so
+        `safe_truncate` becomes the current file index and retention frees everything below it. A
+        **stopped** replica is still connected and still counted, its `confirmed_file` frozen where
+        it was, so it is the only way to ask from the outside whether retention really holds WAL
+        files back to the slowest connected replica, and whether a lag bigger than a whole file is
+        reported as one.
+
+        `SIGSTOP` rather than a proxy on the link, and that is a decision about where the fault
+        belongs. The replica does not dial an address this harness chooses - it learns the primary's
+        replication address from etcd, and re-reads it only on a role transition - so inserting a
+        proxy would mean a second `redirect_peer` for a key that is re-read at a different time.
+        Stopping the process needs nothing from the engine and models the intended condition
+        exactly: the socket stays open, the kernel keeps acknowledging bytes, and not one
+        application-level `ACK` comes back.
+
+        Remember that a paused node answers nothing, so `replica()` and `primary()` cannot find it:
+        take the `NodeInfo` before pausing. Always resume in a `finally` - `_stop_node()` continues
+        a paused process before `SIGTERM` for the same reason, because a stopped process does not
+        act on `SIGTERM` until it runs again.
+        """
+        node = self.nodes[node_index]
+        if node.process and node.process.poll() is None:
+            node.process.send_signal(signal.SIGSTOP)
+
+    def resume_node(self, node_index: int) -> None:
+        """`SIGCONT` a node paused by `pause_node()`. Idempotent."""
+        node = self.nodes[node_index]
+        if node.process and node.process.poll() is None:
+            node.process.send_signal(signal.SIGCONT)
 
     def kill_node(self, node_index: int) -> None:
         """SIGKILL a node (simulate crash), and record that this was on purpose."""

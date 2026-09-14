@@ -331,3 +331,64 @@ TEST(EngineIntegration, WalWrittenBeforeApply) {
     engine.close();
     fs::remove_all(dir);
 }
+
+// ── #124: the rotation threshold is a value, and it reaches the WAL ───────────
+//
+// The flag was worth adding on its own merits, but the failure it had to be checked against is the
+// one this repository has now met six times: a value that is parsed, carried and read by nothing.
+// `Engine` built its writer with `WALWriter(base_dir, 512ULL << 20, fsync_policy)` - a literal - so
+// a threshold that arrived in `ServerConfig` and went no further would leave every test in the
+// battery inside one WAL file exactly as before, with a flag in `--print-config` to say otherwise.
+//
+// Behavioural, through `get_wal_position()`, and it needs its control: on its own, "the file index
+// advanced" also passes for a writer that rotates on every write regardless of what it was asked
+// for. The second half writes the same records with the default threshold and requires the index to
+// stay at zero, which is what makes the first half evidence about the argument.
+TEST(EngineIntegration, TheWalRotationThresholdIsTheOneItWasConstructedWith) {
+    const std::string small   = make_temp_dir("engine_rotate_small_");
+    const std::string standard = make_temp_dir("engine_rotate_default_");
+
+    // 4 KB: below MIN_WAL_ROTATE_THRESHOLD on purpose. The floor is a refusal `--wal-rotate-bytes`
+    // makes because one file per record is not a thing an operator wants; a component test that
+    // wants rotation without writing megabytes may ask for it, and that split is documented next to
+    // the constant.
+    const size_t kSmall = 4096;
+
+    auto write_forty = [](ob::Engine& engine) {
+        for (int i = 0; i < 40; ++i) {
+            ob::DeltaUpdate delta{};
+            std::strncpy(delta.symbol,   "ROT",  sizeof(delta.symbol)   - 1);
+            std::strncpy(delta.exchange, "TEST", sizeof(delta.exchange) - 1);
+            delta.sequence_number = static_cast<uint64_t>(i + 1);
+            delta.timestamp_ns    = 1'000'000'000ULL + static_cast<uint64_t>(i);
+            delta.side            = ob::SIDE_BID;
+            delta.n_levels        = 1;
+            ob::Level level{10000 + i, 5, 1, 0};
+            ASSERT_EQ(engine.apply_delta(delta, &level), ob::OB_OK);
+        }
+    };
+
+    {
+        ob::Engine engine(small, 60'000'000'000ULL, ob::FsyncPolicy::NONE, {}, {}, {}, {}, {},
+                          kSmall);
+        engine.open();
+        write_forty(engine);
+        // Forty 136-byte records is about 5.4 KB, so a 4 KB threshold has to have been crossed.
+        EXPECT_GT(engine.get_wal_position().first, 0u)
+            << "the threshold the engine was constructed with did not reach the WAL";
+        engine.close();
+    }
+
+    {
+        ob::Engine engine(standard, 60'000'000'000ULL, ob::FsyncPolicy::NONE);
+        engine.open();
+        write_forty(engine);
+        EXPECT_EQ(engine.get_wal_position().first, 0u)
+            << "control: 5.4 KB must not rotate a 512 MB file, or the test above proves nothing "
+               "about the argument";
+        engine.close();
+    }
+
+    fs::remove_all(small);
+    fs::remove_all(standard);
+}

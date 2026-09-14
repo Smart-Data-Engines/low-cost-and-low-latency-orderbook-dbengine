@@ -51,7 +51,8 @@ public:
                     ReplicationClientConfig repl_client_config = {},
                     FailoverConfig failover_config = {},
                     TTLConfig ttl_config = {},
-                    MultiMasterConfig mm_config = {});
+                    MultiMasterConfig mm_config = {},
+                    size_t wal_rotate_bytes = 512ULL << 20);
 
     ~Engine();
 

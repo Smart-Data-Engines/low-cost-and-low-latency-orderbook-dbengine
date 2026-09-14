@@ -177,3 +177,50 @@ TEST(CliArgs, EachFsyncPolicyNameMaps) {
     // The default, stated so a change to it fails a test rather than surprising an operator.
     EXPECT_EQ(parse({}).fsync_policy, ob::FsyncPolicy::INTERVAL);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// #124: the WAL rotation threshold, and both ends of its refusal
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(CliArgs, ParsesTheWalRotationThreshold) {
+    EXPECT_EQ(parse({"--wal-rotate-bytes", "1048576"}).wal_rotate_bytes, 1048576u);
+    // The default, stated so a change to it fails a test rather than surprising an operator: it
+    // decides what a crash replays, what a reconnecting replica may have to scan, and the
+    // granularity retention can free.
+    EXPECT_EQ(parse({}).wal_rotate_bytes, 512ULL << 20);
+}
+
+TEST(CliArgs, BothEndsOfTheWalRotationRangeAreAccepted) {
+    // The boundary values themselves, because a refusal that also refuses the boundary is a
+    // different refusal from the one documented - and `docs/cli.md` prints these two numbers.
+    EXPECT_EQ(parse({"--wal-rotate-bytes", std::to_string(ob::MIN_WAL_ROTATE_THRESHOLD)})
+                  .wal_rotate_bytes,
+              ob::MIN_WAL_ROTATE_THRESHOLD);
+    EXPECT_EQ(parse({"--wal-rotate-bytes", std::to_string(ob::MAX_WAL_ROTATE_THRESHOLD)})
+                  .wal_rotate_bytes,
+              ob::MAX_WAL_ROTATE_THRESHOLD);
+}
+
+TEST(CliArgsDeath, AWalRotationThresholdBelowOneRecordIsRefused) {
+    // Below one maximal record a single write fills a file on its own, so every write rotates: one
+    // WAL file per record, and a retention pass that walks all of them every flush tick. The
+    // engine's own unit tests do use a 512-byte threshold - on a `WALWriter` built directly, which
+    // is the distinction this refusal draws rather than contradicts.
+    EXPECT_EXIT(parse({"--wal-rotate-bytes", "512"}), ::testing::ExitedWithCode(1),
+                "must be between");
+}
+
+TEST(CliArgsDeath, AWalRotationThresholdOneByteUnderTheFloorIsRefused) {
+    // One below, so the comparison is pinned rather than the order of magnitude.
+    EXPECT_EXIT(parse({"--wal-rotate-bytes", std::to_string(ob::MIN_WAL_ROTATE_THRESHOLD - 1)}),
+                ::testing::ExitedWithCode(1), "one maximal record");
+}
+
+TEST(CliArgsDeath, AWalRotationThresholdAboveTheCeilingIsRefused) {
+    // The offset half of a WAL position is 32 bits so the pair reads as one coherent value (#85).
+    // `WALWriter` throws for this too; this is the refusal an operator sees, naming the flag they
+    // typed. Refused rather than clamped: an operator who asked for eight gigabyte files should not
+    // silently get two and find out during a recovery.
+    EXPECT_EXIT(parse({"--wal-rotate-bytes", std::to_string(ob::MAX_WAL_ROTATE_THRESHOLD + 1)}),
+                ::testing::ExitedWithCode(1), "2 GiB");
+}

@@ -42,6 +42,22 @@ struct ServerConfig {
     /// fsynced is a write you can lose.
     FsyncPolicy fsync_policy{FsyncPolicy::INTERVAL};
 
+    /// --wal-rotate-bytes: how large a WAL file grows before the writer opens the next one.
+    ///
+    /// An operator knob on its own merits — it decides how much a crash has to replay, how much a
+    /// replica may have to scan to catch up, and the granularity retention can free, since WAL
+    /// files are deleted whole and only below the slowest connected replica's file.
+    ///
+    /// It was a literal in `Engine`'s constructor, and the cost was not the missing knob: **no
+    /// integration test had ever crossed a WAL file boundary**, because a real node would have had
+    /// to write 512 MB to reach one. Rotation's interaction with retention, with a replica catching
+    /// up across files (#98) and with the replica lag (#123) was therefore covered only by unit
+    /// tests driving a `WALWriter` directly, which cannot express a reconnect or a retention pass.
+    ///
+    /// Documented as a *trigger*, not a file size: rotation is checked after a write, so a file may
+    /// exceed this by one record.
+    size_t      wal_rotate_bytes{512ULL << 20};   // 512 MB
+
     /// Background flush interval. Shorter means less unflushed data at any moment and
     /// more segment writes; longer means the opposite. Configurable because it decides
     /// how much sits in the WAL rather than in a segment, which is exactly what crash

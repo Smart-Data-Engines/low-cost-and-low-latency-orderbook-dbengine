@@ -864,6 +864,7 @@ const std::vector<std::string>& known_flags() {
         "tls-replication",
         "ttl-hours",
         "ttl-scan-interval-seconds",
+        "wal-rotate-bytes",
         "workers",
     };
     return flags;
@@ -942,6 +943,8 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
                                  "link, in both roles; needs --tls-ca-file"}},
         {"ttl-hours", {"<N>", "Retention in hours; 0 keeps everything"}},
         {"ttl-scan-interval-seconds", {"<N>", "How often retention scans for expired rows"}},
+        {"wal-rotate-bytes", {"<N>", "WAL bytes before the next file is opened; a file may "
+                                     "exceed it by one record (default: 536870912)"}},
         {"workers", {"<N>", "Number of worker threads (default: 4)"}},
     };
     return help;
@@ -1321,12 +1324,46 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.mm_max_peer_send_buf_bytes = cursor.value_as<size_t>();
         } else if (arg == "--mm-max-catchup-bytes") {
             config.mm_max_catchup_bytes = cursor.value_as<size_t>();
+        } else if (arg == "--wal-rotate-bytes") {
+            config.wal_rotate_bytes = cursor.value_as<size_t>();
         } else {
             // Previously ignored in silence, which meant a typo started a server on the default
             // port: `--prot 5599` was accepted, and so was `--port` with no value at all.
             std::fprintf(stderr, "Error: unknown argument '%s'\n", arg.c_str());
             std::exit(1);
         }
+    }
+
+    // Validation: the WAL rotation threshold, refused at both ends rather than clamped.
+    //
+    // Both bounds are the constants the WAL itself declares, so there is one definition of each and
+    // the message can quote the arithmetic. The ceiling exists because the offset half of
+    // `WalPosition` is 32 bits so that the file index and the offset can be read as one coherent
+    // value (#85); `WALWriter` throws for it too, and this refusal is the one an operator sees,
+    // naming the flag they typed rather than a constructor argument.
+    //
+    // The floor is one maximal record. Below it a single write can fill a file on its own, so every
+    // write rotates: one WAL file per record, a `file_size` call per intervening file in
+    // `bytes_since()`, and a retention pass that walks the lot every flush tick. `WALWriter`
+    // deliberately does *not* enforce this - its unit tests drive a 512-byte threshold to reach
+    // rotation without writing megabytes, which is a reasonable thing for a component test to do.
+    // The difference is who chose the number: a test that wants one file per record gets it, an
+    // operator who typed a plausible-looking small number is told why it is not.
+    if (config.wal_rotate_bytes < MIN_WAL_ROTATE_THRESHOLD ||
+        config.wal_rotate_bytes > MAX_WAL_ROTATE_THRESHOLD) {
+        std::fprintf(stderr,
+                     "Error: --wal-rotate-bytes (%zu) must be between %zu and %zu bytes. The floor "
+                     "is one maximal record (a %zu-byte header plus the %zu-byte payload limit), "
+                     "below which a single write fills a file and every write rotates. The ceiling "
+                     "is 2 GiB, because a WAL position is a file index and a 32-bit offset read as "
+                     "one value, and a larger file would let the offset wrap and report a position "
+                     "inside the wrong part of the file.\n",
+                     config.wal_rotate_bytes,
+                     MIN_WAL_ROTATE_THRESHOLD,
+                     MAX_WAL_ROTATE_THRESHOLD,
+                     sizeof(WALRecordV2),
+                     WAL_MAX_PAYLOAD_LEN);
+        std::exit(1);
     }
 
     // Validation: handover windows must be sane. A cooldown shorter than the
@@ -1540,6 +1577,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("tls-replication", c.tls_replication ? "true" : "false");
     line("ttl-hours", std::to_string(c.ttl_hours));
     line("ttl-scan-interval-seconds", std::to_string(c.ttl_scan_interval_seconds));
+    line("wal-rotate-bytes", std::to_string(c.wal_rotate_bytes));
     line("workers", std::to_string(c.worker_threads));
     out += "\n";
     out += "# workers is parsed and not used: client commands run inline on the epoll loop. It is\n";
@@ -1620,7 +1658,8 @@ TcpServer::TcpServer(ServerConfig config)
                                            .cluster_secret = secrets_.cluster,
                                            .tls_server = tls_.mesh_server,
                                            .tls_client = tls_.mesh_client
-                                       });
+                                       },
+                                       config_.wal_rotate_bytes);
 }
 
 TcpServer::~TcpServer() {

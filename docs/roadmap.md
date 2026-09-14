@@ -2175,38 +2175,142 @@ question is recorded as #121 rather than settled quietly here.
   nothing in the engine would notice — anti-entropy compares what each side holds, and two sides
   each holding a different winner look consistent to it. Never observed in the wild
 
-### 124. Nothing in the integration battery can cross a WAL file boundary, because the threshold is hardcoded
+### 125. A replica sent to the snapshot path can never bootstrap: the manifest checksum covers two fields the wire does not carry
 
-Named while closing #123, which could only be pinned at the unit level for this reason.
+Found by #124's retention test, on the first run that ever reached this path.
 
-`src/engine.cpp` constructs the writer with `WALWriter(base_dir, 512ULL << 20, fsync_policy)` — a
-literal, not a value from `ServerConfig`. So a test that wanted a real node to rotate a WAL file
-would have to write **512 MB**, which is two orders of magnitude past anything the battery does in
-its nineteen minutes. Every test that has ever looked at a WAL position has therefore stayed inside
-one file, and that is exactly why #123 survived: the subtraction it used is *correct* within a
-file, and correct is what every test saw.
+`SNAPSHOT_BEGIN` carries four numbers — total bytes, the WAL file index, the WAL byte offset and the
+file count — and then one `SNAPSHOT_FILE <path> <size> <crc>` header per file. The replica rebuilds a
+`SnapshotManifest` from exactly that, and `SNAPSHOT_END <crc>` is checked against
+`crc32c(manifest.to_json())`. But `to_json()` also serialises **`created_at_ns`** and
+**`total_rows`**, which `Engine::create_snapshot()` fills in and **nothing puts on the wire**. The
+replica's reconstruction leaves both at zero, so the two documents differ by construction and the
+checksum cannot match — not sometimes, not under load: **never**.
 
-Three things have unit coverage only as a result, and they are not small: how rotation interacts
-with **retention** (`safe_truncate` is computed from replica file indices), with **replica
-catch-up across files** (#98 was a defect in precisely that arithmetic), and with the lag #123
-fixed. The unit tests are good — they drive a `WALWriter` with a 512-byte threshold — and a
-`WALWriter` on its own cannot show a replica reconnecting, a retention pass running, or a snapshot
-being chosen over a scan.
+**Measured on a live pair** (i3-7100U, two nodes, `--wal-rotate-bytes 65573`): all 24 files arrived,
+every per-file CRC verified — the receiver checks each file against its own header, and no
+mismatch was logged for any of them — and the bootstrap was abandoned with
+`primary said 2070107884 and the 24 file(s) received make 3121752028`. The replica then reconnected,
+was refused again, asked for another snapshot and abandoned it again, **every five seconds, holding
+zero rows**, against a primary that was healthy and had every row.
 
-The obvious fix is a flag, and the reason it is an item rather than a line in #123 is that it is
-**independently justifiable**: a WAL rotation threshold is an operator knob that comparable systems
-expose, so adding it is not "moving production code so a test can reach it" — which this repository
-has refused before, and should keep refusing. It does carry the usual costs of a new flag: a row in
-the arity table (#107, where the table is indexed by `CommandType` so a missing row does not
-compile), `--print-config`, `docs/cli.md`, the config file, and a refusal for values below one
-record.
+**Why nothing caught it, which is the more useful half.** Two reasons, and they compound.
 
-Worth deciding together with what to test once it exists, because a flag added for coverage that
-nobody then uses is the shape of a job nobody requires (#108).
+The path is **unreachable in the battery without #124**: a replica is only sent here when the WAL
+file its position names has been removed, retention only removes files *below* the current one, and
+reaching a second file needed 512 MB of writes. So no integration test has ever seen
+`ERR WAL_TRUNCATED` on the replication link.
 
-- Effort: S for the flag, M for the tests it unlocks | Impact: no integration test has ever crossed
-  a WAL file boundary, so three behaviours that only happen at a rotation are covered by unit tests
-  that cannot express them
+And the one unit test of the receiving side is a **mock primary that was built to agree with it**.
+`tests/test_replication.cpp` constructs `ob::SnapshotManifest expected;` and fills precisely the
+four fields the wire carries, leaving `created_at_ns` and `total_rows` at their default zero —
+which is exactly what the receiver reconstructs. Its own comment says why it does that ("the mock
+primary has to build the same manifest to name it"), and that is the defect: the stub was made to
+match the code under test rather than the sender it stands in for. A stub that agrees with the
+receiver proves the receiver agrees with itself.
+
+**The shape of the fix, and why it is not "put the two fields on the wire".** A checksum over a
+document the receiver **cannot** reconstruct is a checksum that can only fail, so the digest has to
+cover what was *transferred*: the file list, each file's size and CRC, the total, and the WAL
+position. One function on `SnapshotManifest` that both sides call, so a field added later cannot
+quietly leave the two definitions disagreeing again — the alternative, two call sites each choosing
+which fields to include, is how this arose. `created_at_ns` and `total_rows` stay in the manifest
+document (the primary writes it to disk) and stay out of the digest, with the reason written next to
+them. Adding them to `SNAPSHOT_BEGIN` would work and is worse: it is a protocol change that makes a
+new replica refuse an older primary, for two numbers no receiver uses.
+
+Wants its own test on both levels: a unit test that gives the mock a manifest a **real** primary
+would produce, and the integration test #124 could not finish — a replica whose position retention
+has removed comes back with every row.
+
+- Effort: S | Impact: the documented recovery path for "your position is gone" cannot complete, so a
+  replica that falls behind far enough never returns. It retries for ever, which is the failure mode
+  that looks like a slow replica rather than a broken one
+
+### 124. Nothing in the integration battery could cross a WAL file boundary, because the threshold was hardcoded ✅
+
+`--wal-rotate-bytes` now decides where the WAL rotates, default 512 MB, and the battery crosses
+boundaries: `tests/integration/test_wal_rotation.py` is the first thing in this repository to do it.
+
+**The flag is defensible on its own merits and that was the condition for doing it at all.** A WAL
+rotation threshold is an operator knob comparable systems expose, and it decides three things an
+operator has to reason about: what a crash replays, what a reconnecting replica may have to scan,
+and what retention can free — files are deleted whole, and only below the file the slowest
+**connected** replica has acknowledged. `docs/operations.md` has the section and the table of those
+two halves. Had the only argument been "a test cannot reach a rotation", the answer would have been
+no; this repository has refused that trade before (pitfall 168 in `CLAUDE.md`) and should keep
+refusing it.
+
+**Refused at both ends rather than clamped**, from the constants the WAL itself declares so there is
+one definition of each. Above `MAX_WAL_ROTATE_THRESHOLD` (2 GiB) because a WAL position is a file
+index and a 32-bit offset read as one value (#85). Below `MIN_WAL_ROTATE_THRESHOLD` — 65573 bytes, a
+38-byte header plus the 64 KiB payload limit — because a single write can then fill a file on its
+own, so every write rotates and the directory grows one file per record. **The floor belongs to the
+flag and deliberately not to `WALWriter`**: the unit tests drive that class with a 512-byte threshold
+precisely so rotation is reachable without writing megabytes, which is a reasonable thing for a
+component test to do. The distinction is who chose the number.
+
+**The wiring has its own behavioural test, because a flag that goes nowhere is this workspace's
+most-repeated defect** (`provisional`, `basis`, `in_use`, `key_id`, `partition_by`, #104). Measured:
+forty 136-byte records against a 4096-byte threshold leave `get_wal_position().first` above zero,
+and the control — the same records at the default — leaves it at zero. Without the control the test
+also passes for a writer that rotates on every write regardless of its argument.
+
+**Three integration tests, and what each one had to establish rather than assume.**
+
+*A replica follows the primary across rotations.* Fifteen hundred single-level records, 136 bytes
+each, against the 65573-byte floor: three rotations, every row on the replica. The control is the
+rotation itself, read from the primary's directory **and** from `ob_wal_file_index`, because "the
+replica has 1500 rows" passes just as well against a WAL that never rotated — which is what every
+replication test in this battery measured until now.
+
+*Retention keeps the file a stopped replica still needs.* `SIGSTOP` is the instrument, and it is the
+right one: a killed replica leaves `replicas_`, so `safe_truncate` becomes the current file index and
+everything below it is freed, while a **stopped** one is still connected and still counted with its
+`confirmed_file` frozen. Three claims share that state — the file is kept, the lag reads **more than
+a whole file** (the number the arithmetic before #123 could not produce), and
+`ob_replicas_lag_unknown` is zero, which is the same fact from the other side since the distance is
+measurable precisely because the files are there. The control is taken **before** the fault:
+retention is watched actually freeing a file, with the replica keeping up.
+
+*A reconnecting replica is caught up across file boundaries*, which is #98's arithmetic end to end.
+Asserted on the line `handle_catchup()` writes — `from_file=0 … through_file=3` — and not only on the
+row count, because a row count is also satisfied by a snapshot, by a scan that stayed inside one
+file, and by a replica that never lost anything.
+
+**Two things the first version of that module got wrong, both worth keeping.** *How many WAL files
+are on disk is a retention fact, not a rotation fact*: after fifteen hundred records the primary had
+rotated three times and held `['wal_000002.bin', 'wal_000003.bin']`, because the replica had
+confirmed into file 2 while the writing was still going on. And *a replica refuses `FLUSH`* — it is
+read-only — so a flush interval long enough to stop retention also stops the replica's rows from
+ever becoming queryable: the first version read **zero** rows out of a replica that had received
+every one of them. What holds the files for the catch-up test instead is a third replica, stopped —
+`ClusterManager.add_replica()` exists for it, and until now no test in this battery had two
+replicas, so `safe_truncate` had never been a minimum over more than one element.
+
+**What it found, and why the retention test stops where it does.** A pause long enough to observe
+anything outlives the replica's socket timeout, so it reconnects; in that window it is not connected,
+retention advances, and its saved position is refused with `ERR WAL_TRUNCATED` — correct, and now
+documented. What happens next is **#125**: the snapshot bootstrap that refusal sends it to cannot
+succeed. The test asserts the other half of the promise instead — the primary still holds every row
+it acknowledged — and #125 owns the assertion that the replica comes back.
+
+**Eight mutations, each with the verdict it was expected to give, and the first run of the table
+found a defect in the table.** The control — a reworded log line, which must **survive** — came back
+KILLED, and the restored tree was reported as not green. The cause was `shutil.copy2` in the
+harness's restore: it preserves the mtime, so a source put back from the pristine copy is *older*
+than the object file built from the mutant and the build rebuilds nothing. Every verdict after the
+first restore had been measured against a binary still carrying an earlier mutation. `copyfile` plus
+an explicit `utime` fixes it, and the reason to keep a control in every such table is exactly this:
+one that dies is the only thing that tells you the instrument is broken rather than the code
+diligent. After the fix, all eight — two joints of the flag's plumbing (the engine's argument, and
+the CLI call site, which different suites catch), three refusals, retention ignoring what replicas
+have confirmed, retention deleting nothing, and the control.
+
+- Effort: S for the flag, M for the tests | Impact: three behaviours that only happen at a rotation
+  were covered by unit tests that cannot express a reconnect or a retention pass. Two of them are
+  now covered by a running cluster, and reaching the third found a defect that made a replica
+  unrecoverable
 
 ### 123. The replica lag that is genuine ignored the WAL file index, so a replica a file behind read zero ✅
 
@@ -2259,11 +2363,13 @@ is counted there too. `Engine::stats()` and that publisher both call one
 `WALWriter::bytes_since()`: two ways of computing one quantity is how #118 produced a lag that was
 not one.
 
-**What is not covered, and why it cannot be here.** No integration test crosses a WAL file
-boundary, because the rotation threshold is a literal in `src/engine.cpp` and a real node would
-have to write 512 MB to rotate. That is **#124**, filed rather than worked around: making
-production code configurable so a test can reach it is a test deciding the shape of the program,
-and the flag is worth adding on its own merits or not at all.
+**What was not covered here, and is now.** When this item closed, no integration test crossed a WAL
+file boundary: the rotation threshold was a literal in `src/engine.cpp` and a real node would have
+had to write 512 MB. That was filed as **#124** rather than worked around — making production code
+configurable so a test can reach it is a test deciding the shape of the program, and the flag was
+worth adding on its own merits or not at all. It was, and it is in; this number's cross-file
+behaviour is pinned by a running cluster, which found that a lag bigger than a whole file is
+reported as one.
 
 **Ten mutations, each with the verdict it was expected to give — and the table paid for itself
 twice before it got there.** Two of the ten survived the first run against real gaps in the tests,
@@ -5761,12 +5867,22 @@ a number, because zero is a real answer here and a missing file says something w
 lag: retention keeps files back to the slowest connected replica, so that replica can no longer
 catch up from this log.
 
-The open defect is **#124**, named while closing #123 and the reason #123 could only be pinned at
-the unit level: the WAL rotation threshold is a literal in `src/engine.cpp`, so **no integration
-test has ever crossed a WAL file boundary** — a real node would have to write 512 MB. Rotation's
-interaction with retention, with replica catch-up across files and with that lag is covered by unit
-tests that cannot express a reconnect or a retention pass. Filed rather than worked around: making
-production code configurable so a test can reach it is a test deciding the shape of the program.
+**#124** is closed, and it is why #123 could finally be pinned by a running cluster rather than by
+unit tests. The WAL rotation threshold was a literal in `src/engine.cpp`, so **no integration test
+had ever crossed a WAL file boundary** — a real node would have had to write 512 MB.
+`--wal-rotate-bytes` is an operator knob on its own merits, which was the condition for adding it,
+and the battery now crosses boundaries in three tests: a replica streaming through three rotations,
+retention keeping the file a stopped replica still needs while reporting a lag bigger than a whole
+file, and a reconnecting replica caught up **across** files with the primary's own
+`from_file=0 … through_file=3` as the evidence.
+
+The open defect is **#125**, which that third state found on the first run that ever reached it: a
+replica sent to the snapshot path — the documented recovery for "your position is gone" — **can
+never bootstrap**, because the manifest checksum covers `created_at_ns` and `total_rows`, two fields
+the wire does not carry. Measured: 24 of 24 files arrived with every per-file CRC verified, the
+manifest CRC disagreed, and the replica asked again every five seconds holding zero rows. The one
+unit test of that path uses a mock primary built to agree with the receiver, which is why nothing
+caught it, and the path itself was unreachable in the battery until #124.
 
 **#121** remains the question stage D left behind, filed rather than answered because a ceiling on
 the drift a peer may introduce costs causal order against that peer.
@@ -5792,12 +5908,14 @@ than about the engine. #110's first CI run also verified the
 value of the skip gate: seven new CLI tests did not run until both integration jobs built the CLI
 and the fixture selected the same build as the server.
 
-The current work sequence is **fault injection (#54)**, now that fuzzing (#38) is in. The coverage
+The current work sequence is **#125** — a replica that cannot be bootstrapped is worth more than any
+new capability — and then the rest of **fault injection (#54)**, now that fuzzing (#38) is in. The coverage
 badge left from #37 needs a maintainer decision about an external reporting service. Existing
 coverage reports and the line-coverage floor continue to run inside GitHub Actions.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
+| **Next** | A replica sent to the snapshot path cannot bootstrap (#125) | S | The documented recovery for a truncated position never completes, so a replica that falls behind far enough never returns |
 | **Next** | Chaos and fault injection (#54) | L | Verify recovery and refusal when storage, clocks and connectivity fail |
 | **Decision** | Coverage badge (#37) | S | Requires choosing an external service; the existing report and floor are already in CI |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
@@ -5950,9 +6068,9 @@ runners, not the machine-B performance baseline above.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1065 | all passing with `ctest -j1` on the i3-7100U, run in three `-I` ranges because this machine's memory guard stops a single long run (355 + 356 + 354). **Seven more than the previous commit**: six pin `WALWriter::bytes_since()` across files, including one that computes the old expression beside the new answer and asserts the old one says zero, and one that exists because a mutation showed the error path for the first file had no test; one more pins `lag=unknown` on the wire. Six before that were #118's. **Earlier**: seven pin `max_records_behind`, the mesh's honest lag, and one went away — a hand-written list of the metric names the engine writes, which #118's removal of a registration broke and which `scripts/check_metrics.py` already checks mechanically in both directions. **All of #117**: four pin `queue_utilization_percent` and three `counter_delta`, both moved into `metrics.hpp` so that the ordinary suite executes arithmetic whose caller no CI job runs; two pin the WAL's record count. `tests/test_iouring_instrumentation.cpp` adds four more that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists 1067: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
-| Python integration | 257 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 256; count pytest's final result rather than the report plugin's progress characters. `256 passed, 2 skipped in 18:58` on the GitHub runner for this commit; the same suite read `19:18` on the runner and `19:25` on the development machine (i3-7100U, native etcd) two commits ago, which is the spread to expect rather than a change. Ten more than the previous commit, all of #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content, and the same ten cost 2:37 locally |
-| Python integration under TSan | 257 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `256 passed in 24:37` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **19:18** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
+| C++ (GTest + RapidCheck) | 1071 | all passing with `ctest -j1` on the i3-7100U, **206 s in a single run** — this machine had the memory for one this time, where the previous commit needed three `-I` ranges. **Six more than the previous commit**, all of #124: five pin `--wal-rotate-bytes` (the value, both ends of its range **accepted**, and three refusals — below one record, one byte under the floor, above the ceiling) and one is behavioural over `Engine`, because a flag that is parsed and goes nowhere is this workspace's most-repeated defect: forty 136-byte records against a 4096-byte threshold rotate, and the control at the default does not. **Earlier**: seven were #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists 1073: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
+| Python integration | 260 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 256; count pytest's final result rather than the report plugin's progress characters. `256 passed, 2 skipped in 18:58` on the GitHub runner for this commit; the same suite read `19:18` on the runner and `19:25` on the development machine (i3-7100U, native etcd) two commits ago, which is the spread to expect rather than a change. Three more than the previous commit, all of #124 — the first tests in this battery to cross a WAL file boundary — and they cost **11 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
+| Python integration under TSan | 260 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `256 passed in 24:37` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **19:18** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than
