@@ -268,6 +268,9 @@ private:
 
     void monitor_loop();
 
+    /// One second between iterations of monitor_loop(), in ten interruptible pieces.
+    void nap_between_iterations();
+
     /// Should this node take the role now, or is a better-placed replica expected to?
     ///
     /// Returns true when the published positions name this node as the most advanced, when there

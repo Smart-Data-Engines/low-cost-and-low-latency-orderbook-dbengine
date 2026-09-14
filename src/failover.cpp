@@ -527,6 +527,20 @@ int64_t FailoverManager::ensure_position_lease() {
     return lease;
 }
 
+/// One second between iterations, in ten pieces so that `stop()` is not waited out.
+///
+/// Seven byte-identical copies of this stood in `monitor_loop()` - one before each of its six
+/// `continue`s and one at the bottom - which a script confirmed before this collapse rather than a
+/// reading: every path through that body napped exactly once, so the loop is
+/// `while (running_) { monitor_tick(); nap_between_iterations(); }` and every `continue` becomes a
+/// `return`. Seven copies of a wait is how one of them learns to be interruptible and the others do
+/// not; this file already paid that with `sleep_for` in `PeerRegistry::lease_loop()` (#129).
+void FailoverManager::nap_between_iterations() {
+    for (int i = 0; i < 10 && running_.load(std::memory_order_relaxed); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
 void FailoverManager::monitor_loop() {
     while (running_.load(std::memory_order_acquire)) {
         NodeRole current = role_.load();
@@ -542,9 +556,7 @@ void FailoverManager::monitor_loop() {
         if (current == NodeRole::MULTI_MASTER) {
             OB_LOG_DEBUG("failover", "Node role: MULTI_MASTER — skipping election");
             // Sleep and continue — no lease management needed.
-            for (int i = 0; i < 10 && running_.load(std::memory_order_relaxed); ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
+            nap_between_iterations();
             continue;
         }
 
@@ -580,9 +592,7 @@ void FailoverManager::monitor_loop() {
                                     "stepping down",
                                     holder.empty() ? "(empty)" : holder.c_str());
                         handle_primary_lease_lost();
-                        for (int i = 0; i < 10 && running_.load(std::memory_order_relaxed); ++i) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                        }
+                        nap_between_iterations();
                         continue;
                     }
                     // The one moment at which ownership is established rather than assumed.
@@ -611,9 +621,7 @@ void FailoverManager::monitor_loop() {
                                         "— the role changed while we were reading the key, so "
                                         "there is nothing to step down from");
                         }
-                        for (int i = 0; i < 10 && running_.load(std::memory_order_relaxed); ++i) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                        }
+                        nap_between_iterations();
                         continue;
                     }
 
@@ -622,9 +630,7 @@ void FailoverManager::monitor_loop() {
                                 "down. Its lease expired or was revoked, so the role is not ours "
                                 "and a candidate may already be taking it");
                     handle_primary_lease_lost();
-                    for (int i = 0; i < 10 && running_.load(std::memory_order_relaxed); ++i) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    }
+                    nap_between_iterations();
                     continue;
                 }
                 // Unavailable: no information. Leave the role alone — but not for ever; the clock
@@ -650,9 +656,7 @@ void FailoverManager::monitor_loop() {
                                         std::chrono::steady_clock::now() - confirmed).count()),
                                 static_cast<long long>(config_.coordinator.lease_ttl_seconds));
                     handle_primary_lease_lost();
-                    for (int i = 0; i < 10 && running_.load(std::memory_order_relaxed); ++i) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    }
+                    nap_between_iterations();
                     continue;
                 }
             }
@@ -802,9 +806,7 @@ void FailoverManager::monitor_loop() {
                                      "waiting out the election delay before standing",
                                      static_cast<unsigned long long>(known_epoch.term));
                         // Fall through to the sleep at the bottom of the loop.
-                        for (int i = 0; i < 10 && running_.load(std::memory_order_relaxed); ++i) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                        }
+                        nap_between_iterations();
                         continue;
                     }
                 }
@@ -816,9 +818,7 @@ void FailoverManager::monitor_loop() {
         }
 
         // Sleep 1 second between iterations.
-        for (int i = 0; i < 10 && running_.load(std::memory_order_relaxed); ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
+        nap_between_iterations();
     }
 }
 
