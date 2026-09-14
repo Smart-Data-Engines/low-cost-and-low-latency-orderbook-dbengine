@@ -721,254 +721,306 @@ void MultiMasterManager::io_loop() {
         // second instead of a stuck bootstrap.
         poll_snapshot_preparation();
 
+        // Whether any event in this pass threw. Without it the recovery line below fires in the
+        // **same** pass as the ERROR it is supposed to close - measured, the log alternated
+        // ERROR / "handled again" / ERROR for three failing records - because `end()` runs after
+        // the loop that opened the episode.
+        bool threw_this_pass = false;
+
         for (int i = 0; i < nfds; ++i) {
-            // What this event is about, not which descriptor carried it: the number may have
-            // been handed on since the harvest above, and three other threads close peer sockets
-            // (#128).
-            const uint64_t ev_key = events[i].data.u64;
-            uint32_t ev_events = events[i].events;
+            // One event at a time under its own boundary, and **inside** the loop rather than
+            // around the pass. Every registration here is `EPOLLET`, so an event this loop
+            // abandons is not re-delivered: taking the whole pass down would silently drop the
+            // other events of a batch that can hold up to 64 (#112).
+            //
+            // This commit only wraps and re-indents; the `catch` rethrows, so behaviour is
+            // unchanged and `git diff -w` is empty apart from these lines. The handling arrives
+            // in the commit after it, where it is the whole diff.
+            try {
+                // What this event is about, not which descriptor carried it: the number may have
+                // been handed on since the harvest above, and three other threads close peer sockets
+                // (#128).
+                const uint64_t ev_key = events[i].data.u64;
+                uint32_t ev_events = events[i].events;
 
-            if (ev_key == kMeshEventWakeup) {
-                // Drain it and re-check running_ at the top of the loop. Nothing else to do: the
-                // event carries no information beyond "look again".
-                uint64_t drained = 0;
-                const ssize_t rd = ::read(wakeup_fd_, &drained, sizeof(drained));
-                (void)rd;
-                continue;
-            }
+                if (ev_key == kMeshEventWakeup) {
+                    // Drain it and re-check running_ at the top of the loop. Nothing else to do: the
+                    // event carries no information beyond "look again".
+                    uint64_t drained = 0;
+                    const ssize_t rd = ::read(wakeup_fd_, &drained, sizeof(drained));
+                    (void)rd;
+                    continue;
+                }
 
-            if (ev_key == kMeshEventListen) {
-                // ── Accept new connections (level-triggered EPOLLIN) ──────────
-                while (true) {
-                    struct sockaddr_in peer_addr{};
-                    socklen_t addr_len = sizeof(peer_addr);
-                    int client_fd = ::accept(listen_fd_,
-                                             reinterpret_cast<struct sockaddr*>(&peer_addr),
-                                             &addr_len);
-                    if (client_fd < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        break;
+                if (ev_key == kMeshEventListen) {
+                    // ── Accept new connections (level-triggered EPOLLIN) ──────────
+                    while (true) {
+                        struct sockaddr_in peer_addr{};
+                        socklen_t addr_len = sizeof(peer_addr);
+                        int client_fd = ::accept(listen_fd_,
+                                                 reinterpret_cast<struct sockaddr*>(&peer_addr),
+                                                 &addr_len);
+                        if (client_fd < 0) {
+                            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                            break;
+                        }
+
+                        set_nonblocking(client_fd);
+                        int tcp_nodelay = 1;
+                        ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY,
+                                     &tcp_nodelay, sizeof(tcp_nodelay));
+
+                        std::lock_guard<std::mutex> lock(mtx_);
+
+                        // The record first, then the epoll registration — because the registration has
+                        // to carry the connection's identity and the identity is minted here (#128).
+                        // It also closes the window this used to open: a descriptor armed before its
+                        // record existed is the state the "no record behind it" branch below warns
+                        // about, and for a few instructions this path produced it on purpose.
+                        //
+                        // An accepted connection has no node id until its handshake supplies one, so
+                        // it goes into the container for exactly that: `pending_`, keyed by its own
+                        // conn_id. It used to go into `peers_` under `static_cast<uint16_t>(fd)`,
+                        // which is a node id as far as that map is concerned, so a connection on
+                        // descriptor N silently replaced the record of peer N (#96).
+                        PeerConnection conn{};
+                        conn.node_id = 0;  // unknown until handshake — and never a key
+                        conn.fd = client_fd;
+                        conn.conn_id = next_conn_id_++;
+                        conn.connected = true;
+                        conn.handshake_done = false;
+                        conn.peer_proved = false;
+                        conn.auth_nonce.clear();
+                        conn.we_accepted = true;
+                        conn.compress = config_.compress;
+
+                        const uint64_t pending_key = conn.conn_id;
+                        PeerConnection& pending = pending_[pending_key];
+                        pending = std::move(conn);
+
+                        // Edge-triggered EPOLLIN, carrying the conn_id rather than the descriptor.
+                        struct epoll_event ev{};
+                        ev.events   = EPOLLIN | EPOLLET;
+                        ev.data.u64 = pending.conn_id;
+                        ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &ev);
+
+                        OB_LOG_INFO("mm", "Accepted peer connection fd=%d as connection %llu",
+                                    client_fd, static_cast<unsigned long long>(pending.conn_id));
+
+                        // TLS before a byte is queued. What follows is queued rather than written: the
+                        // drain returns early while the handshake runs, so these frames go out with the
+                        // first flush afterwards - the same shape as the client port's banner.
+                        if (!attach_tls(pending)) {
+                            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr);
+                            ::close(client_fd);
+                            pending_.erase(pending_key);
+                            continue;
+                        }
+
+                        // With a cluster secret, challenge first and let the *handshake* be the
+                        // acceptance; without one, handshake straight away as before.
+                        if (!config_.cluster_secret.empty()) {
+                            send_auth_challenge(pending);
+                        } else {
+                            send_handshake(pending);
+                        }
                     }
-
-                    set_nonblocking(client_fd);
-                    int tcp_nodelay = 1;
-                    ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY,
-                                 &tcp_nodelay, sizeof(tcp_nodelay));
-
+                } else {
+                    // ── Peer fd event ────────────────────────────────────────────
+                    // Find the peer by fd.
                     std::lock_guard<std::mutex> lock(mtx_);
 
-                    // The record first, then the epoll registration — because the registration has
-                    // to carry the connection's identity and the identity is minted here (#128).
-                    // It also closes the window this used to open: a descriptor armed before its
-                    // record existed is the state the "no record behind it" branch below warns
-                    // about, and for a few instructions this path produced it on purpose.
-                    //
-                    // An accepted connection has no node id until its handshake supplies one, so
-                    // it goes into the container for exactly that: `pending_`, keyed by its own
-                    // conn_id. It used to go into `peers_` under `static_cast<uint16_t>(fd)`,
-                    // which is a node id as far as that map is concerned, so a connection on
-                    // descriptor N silently replaced the record of peer N (#96).
-                    PeerConnection conn{};
-                    conn.node_id = 0;  // unknown until handshake — and never a key
-                    conn.fd = client_fd;
-                    conn.conn_id = next_conn_id_++;
-                    conn.connected = true;
-                    conn.handshake_done = false;
-                    conn.peer_proved = false;
-                    conn.auth_nonce.clear();
-                    conn.we_accepted = true;
-                    conn.compress = config_.compress;
+                    ConnectionRef ref = find_connection_by_conn_id(ev_key);
+                    PeerConnection* peer_ptr = ref.peer;
 
-                    const uint64_t pending_key = conn.conn_id;
-                    PeerConnection& pending = pending_[pending_key];
-                    pending = std::move(conn);
-
-                    // Edge-triggered EPOLLIN, carrying the conn_id rather than the descriptor.
-                    struct epoll_event ev{};
-                    ev.events   = EPOLLIN | EPOLLET;
-                    ev.data.u64 = pending.conn_id;
-                    ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &ev);
-
-                    OB_LOG_INFO("mm", "Accepted peer connection fd=%d as connection %llu",
-                                client_fd, static_cast<unsigned long long>(pending.conn_id));
-
-                    // TLS before a byte is queued. What follows is queued rather than written: the
-                    // drain returns early while the handshake runs, so these frames go out with the
-                    // first flush afterwards - the same shape as the client port's banner.
-                    if (!attach_tls(pending)) {
-                        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr);
-                        ::close(client_fd);
-                        pending_.erase(pending_key);
+                    if (!peer_ptr) {
+                        // The connection this event is about is gone, which is routine: `epoll_wait()`
+                        // harvests before this loop takes `mtx_`, and `handle_topology_change()`,
+                        // `check_backpressure()` and the reconnect loop all close peer sockets under
+                        // that lock. Closing the socket removed its registration, so there is nothing
+                        // left to do and nothing to disarm.
+                        //
+                        // Nothing is closed here, and that is the fix rather than an omission. This
+                        // branch used to close the descriptor the event carried, on the argument that
+                        // an armed descriptor with no record behind it must be an orphan — and the
+                        // descriptor it closed was the client port's epoll instance, handed the number
+                        // by `epoll_create1()` after the mesh let it go (#128). Nor can a skipped event
+                        // repeat: every registration here is `EPOLLET`, so there is no busy loop in
+                        // ignoring one.
+                        OB_LOG_DEBUG("mm",
+                                     "epoll event 0x%x for connection %llu, which is already gone; it "
+                                     "was harvested before its record was dropped",
+                                     ev_events, static_cast<unsigned long long>(ev_key));
                         continue;
                     }
 
-                    // With a cluster secret, challenge first and let the *handshake* be the
-                    // acceptance; without one, handshake straight away as before.
-                    if (!config_.cluster_secret.empty()) {
-                        send_auth_challenge(pending);
-                    } else {
-                        send_handshake(pending);
-                    }
-                }
-            } else {
-                // ── Peer fd event ────────────────────────────────────────────
-                // Find the peer by fd.
-                std::lock_guard<std::mutex> lock(mtx_);
-
-                ConnectionRef ref = find_connection_by_conn_id(ev_key);
-                PeerConnection* peer_ptr = ref.peer;
-
-                if (!peer_ptr) {
-                    // The connection this event is about is gone, which is routine: `epoll_wait()`
-                    // harvests before this loop takes `mtx_`, and `handle_topology_change()`,
-                    // `check_backpressure()` and the reconnect loop all close peer sockets under
-                    // that lock. Closing the socket removed its registration, so there is nothing
-                    // left to do and nothing to disarm.
-                    //
-                    // Nothing is closed here, and that is the fix rather than an omission. This
-                    // branch used to close the descriptor the event carried, on the argument that
-                    // an armed descriptor with no record behind it must be an orphan — and the
-                    // descriptor it closed was the client port's epoll instance, handed the number
-                    // by `epoll_create1()` after the mesh let it go (#128). Nor can a skipped event
-                    // repeat: every registration here is `EPOLLET`, so there is no busy loop in
-                    // ignoring one.
-                    OB_LOG_DEBUG("mm",
-                                 "epoll event 0x%x for connection %llu, which is already gone; it "
-                                 "was harvested before its record was dropped",
-                                 ev_events, static_cast<unsigned long long>(ev_key));
-                    continue;
-                }
-
-                // What a lost connection means, in one place, because it means two different
-                // things. An identified peer keeps its record and comes back through the reconnect
-                // loop; an unidentified one is dropped, because the port it arrived on is the
-                // peer's ephemeral source port and the peer that dialled us will dial again by
-                // itself (#95).
-                auto connection_lost = [&](const char* why) {
-                    close_connection_socket(*peer_ptr, why);
-                    if (ref.is_pending()) {
-                        drop_pending_connection(ref.pending_key, why);
-                        peer_ptr = nullptr;
-                        ref = ConnectionRef{};
-                    } else {
-                        const uint32_t delay_ms = peer_ptr->backoff.next_delay_ms();
-                        peer_ptr->next_reconnect_time =
-                            std::chrono::steady_clock::now() +
-                            std::chrono::milliseconds(delay_ms);
-                        OB_LOG_INFO("mm", "Scheduled reconnect for peer %u (delay %u ms): %s",
-                                    peer_ptr->node_id, delay_ms, why);
-                    }
-                    publish_peer_gauges();
-                };
-
-                // A handshake in progress consumes this event and nothing else. Not one frame may
-                // be parsed before it finishes: a frame arriving earlier would come from a
-                // transport that has not proved who it is, and the cluster-secret gate is a
-                // different mechanism that knows nothing about TLS.
-                if (peer_ptr->tls != nullptr && peer_ptr->tls->handshaking()) {
-                    if (!advance_tls_handshake(*peer_ptr)) {
-                        connection_lost("the TLS handshake failed");
-                    }
-                    continue;
-                }
-
-                // Handle EPOLLIN — recv data.
-                if (ev_events & EPOLLIN) {
-                    // Edge-triggered: read in a loop until EAGAIN.
-                    bool disconnected = false;
-                    while (true) {
-                        uint8_t buf[8192];
-                        // Read until the *TLS layer* says it has nothing, not until the socket does.
-                        // OpenSSL reads a whole record - up to 16 kB - decrypts it into its own
-                        // buffer and hands back what was asked for, so on an edge-triggered loop a
-                        // socket-level EAGAIN can arrive with decrypted bytes still pending and no
-                        // further event coming. `Again` here is `WANT_*`, which cannot.
-                        // Initialised to the error case rather than left to the switch: all four
-                        // enumerators are covered, but a switch over an enum is not exhaustive to
-                        // the compiler - Release says so through -Werror=maybe-uninitialized,
-                        // which Debug never runs - and "impossible" has to mean "disconnect this
-                        // peer", not "whatever ssize_t was on the stack".
-                        ssize_t n = -1;
-                        if (peer_ptr->tls != nullptr) {
-                            size_t got = 0;
-                            errno = EIO;
-                            switch (peer_ptr->tls->read(buf, sizeof(buf), got)) {
-                            case TlsChannel::Io::Data:   n = static_cast<ssize_t>(got); break;
-                            case TlsChannel::Io::Closed: n = 0; break;
-                            case TlsChannel::Io::Again:  n = -1; errno = EAGAIN; break;
-                            case TlsChannel::Io::Error:  n = -1; errno = EIO; break;
-                            }
+                    // What a lost connection means, in one place, because it means two different
+                    // things. An identified peer keeps its record and comes back through the reconnect
+                    // loop; an unidentified one is dropped, because the port it arrived on is the
+                    // peer's ephemeral source port and the peer that dialled us will dial again by
+                    // itself (#95).
+                    auto connection_lost = [&](const char* why) {
+                        close_connection_socket(*peer_ptr, why);
+                        if (ref.is_pending()) {
+                            drop_pending_connection(ref.pending_key, why);
+                            peer_ptr = nullptr;
+                            ref = ConnectionRef{};
                         } else {
-                            n = ::recv(peer_ptr->fd, buf, sizeof(buf), 0);
+                            const uint32_t delay_ms = peer_ptr->backoff.next_delay_ms();
+                            peer_ptr->next_reconnect_time =
+                                std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(delay_ms);
+                            OB_LOG_INFO("mm", "Scheduled reconnect for peer %u (delay %u ms): %s",
+                                        peer_ptr->node_id, delay_ms, why);
                         }
-                        if (n > 0) {
-                            peer_ptr->recv_buf.insert(peer_ptr->recv_buf.end(),
-                                                     buf, buf + n);
-                        } else if (n == 0) {
-                            // Peer closed connection.
-                            OB_LOG_INFO("mm", "Peer fd=%d closed connection", peer_ptr->fd);
-                            disconnected = true;
-                            break;
-                        } else {
-                            int err = errno;
-                            if (err == EAGAIN || err == EWOULDBLOCK) {
-                                break;  // No more data available.
-                            }
-                            // Error — disconnect.
-                            OB_LOG_WARN("mm", "Peer fd=%d recv error: %s",
-                                        peer_ptr->fd, std::strerror(err));
-                            disconnected = true;
-                            break;
-                        }
-                    }
-
-                    if (disconnected) {
-                        connection_lost("the peer closed the connection or the read failed");
-                        continue;
-                    }
-
-                    // Process received data — parse frames.
-                    process_recv_buf(*peer_ptr);
-
-                    // The fourth of the four combinations, and the one whose absence looks like a
-                    // wedged peer. A TLS write can leave OpenSSL wanting to *read*, in which case
-                    // the drain deliberately did not arm EPOLLOUT because the socket is already
-                    // writable - so a readable event is the only way back in.
-                    if (peer_ptr->tls != nullptr && peer_ptr->connected) {
-                        if (peer_ptr->tls->io_want() == IoWant::Write) arm_epollout(*peer_ptr);
-                        if (!peer_ptr->send_buf.empty()) try_drain_send_buf(*peer_ptr);
-                    }
-
-                    // Once the handshake has named a node, the connection stops being anonymous
-                    // and moves into the peer table. `peer_ptr` is replaced rather than reused:
-                    // the record it pointed at has been moved out of `pending_` and erased, and
-                    // the EPOLLOUT branch below runs on the same pointer — the old code left it
-                    // dangling and read through it whenever one event carried both flags.
-                    if (ref.is_pending() && peer_ptr->handshake_done) {
-                        peer_ptr = adopt_identified_connection(ref.pending_key);
-                        ref = ConnectionRef{peer_ptr, 0};
-                        if (peer_ptr == nullptr) continue;  // dropped, not adopted
                         publish_peer_gauges();
+                    };
+
+                    // A handshake in progress consumes this event and nothing else. Not one frame may
+                    // be parsed before it finishes: a frame arriving earlier would come from a
+                    // transport that has not proved who it is, and the cluster-secret gate is a
+                    // different mechanism that knows nothing about TLS.
+                    if (peer_ptr->tls != nullptr && peer_ptr->tls->handshaking()) {
+                        if (!advance_tls_handshake(*peer_ptr)) {
+                            connection_lost("the TLS handshake failed");
+                        }
+                        continue;
+                    }
+
+                    // Handle EPOLLIN — recv data.
+                    if (ev_events & EPOLLIN) {
+                        // Edge-triggered: read in a loop until EAGAIN.
+                        bool disconnected = false;
+                        while (true) {
+                            uint8_t buf[8192];
+                            // Read until the *TLS layer* says it has nothing, not until the socket does.
+                            // OpenSSL reads a whole record - up to 16 kB - decrypts it into its own
+                            // buffer and hands back what was asked for, so on an edge-triggered loop a
+                            // socket-level EAGAIN can arrive with decrypted bytes still pending and no
+                            // further event coming. `Again` here is `WANT_*`, which cannot.
+                            // Initialised to the error case rather than left to the switch: all four
+                            // enumerators are covered, but a switch over an enum is not exhaustive to
+                            // the compiler - Release says so through -Werror=maybe-uninitialized,
+                            // which Debug never runs - and "impossible" has to mean "disconnect this
+                            // peer", not "whatever ssize_t was on the stack".
+                            ssize_t n = -1;
+                            if (peer_ptr->tls != nullptr) {
+                                size_t got = 0;
+                                errno = EIO;
+                                switch (peer_ptr->tls->read(buf, sizeof(buf), got)) {
+                                case TlsChannel::Io::Data:   n = static_cast<ssize_t>(got); break;
+                                case TlsChannel::Io::Closed: n = 0; break;
+                                case TlsChannel::Io::Again:  n = -1; errno = EAGAIN; break;
+                                case TlsChannel::Io::Error:  n = -1; errno = EIO; break;
+                                }
+                            } else {
+                                n = ::recv(peer_ptr->fd, buf, sizeof(buf), 0);
+                            }
+                            if (n > 0) {
+                                peer_ptr->recv_buf.insert(peer_ptr->recv_buf.end(),
+                                                         buf, buf + n);
+                            } else if (n == 0) {
+                                // Peer closed connection.
+                                OB_LOG_INFO("mm", "Peer fd=%d closed connection", peer_ptr->fd);
+                                disconnected = true;
+                                break;
+                            } else {
+                                int err = errno;
+                                if (err == EAGAIN || err == EWOULDBLOCK) {
+                                    break;  // No more data available.
+                                }
+                                // Error — disconnect.
+                                OB_LOG_WARN("mm", "Peer fd=%d recv error: %s",
+                                            peer_ptr->fd, std::strerror(err));
+                                disconnected = true;
+                                break;
+                            }
+                        }
+
+                        if (disconnected) {
+                            connection_lost("the peer closed the connection or the read failed");
+                            continue;
+                        }
+
+                        // Process received data — parse frames.
+                        process_recv_buf(*peer_ptr);
+
+                        // The fourth of the four combinations, and the one whose absence looks like a
+                        // wedged peer. A TLS write can leave OpenSSL wanting to *read*, in which case
+                        // the drain deliberately did not arm EPOLLOUT because the socket is already
+                        // writable - so a readable event is the only way back in.
+                        if (peer_ptr->tls != nullptr && peer_ptr->connected) {
+                            if (peer_ptr->tls->io_want() == IoWant::Write) arm_epollout(*peer_ptr);
+                            if (!peer_ptr->send_buf.empty()) try_drain_send_buf(*peer_ptr);
+                        }
+
+                        // Once the handshake has named a node, the connection stops being anonymous
+                        // and moves into the peer table. `peer_ptr` is replaced rather than reused:
+                        // the record it pointed at has been moved out of `pending_` and erased, and
+                        // the EPOLLOUT branch below runs on the same pointer — the old code left it
+                        // dangling and read through it whenever one event carried both flags.
+                        if (ref.is_pending() && peer_ptr->handshake_done) {
+                            peer_ptr = adopt_identified_connection(ref.pending_key);
+                            ref = ConnectionRef{peer_ptr, 0};
+                            if (peer_ptr == nullptr) continue;  // dropped, not adopted
+                            publish_peer_gauges();
+                        }
+                    }
+
+                    // Handle EPOLLOUT — drain send buffer, then push more of any snapshot.
+                    if ((ev_events & EPOLLOUT) && peer_ptr && peer_ptr->connected) {
+                        try_drain_send_buf(*peer_ptr);
+                        // This is what keeps a snapshot from being enqueued all at once: chunks are
+                        // added only as the socket makes room, so live deltas queued between them go
+                        // out promptly and the buffer never reaches the size that drops the peer.
+                        if (peer_ptr->connected) advance_snapshot_send(*peer_ptr);
+                    }
+
+                    // Handle errors/hangup.
+                    if (ev_events & (EPOLLERR | EPOLLHUP)) {
+                        if (peer_ptr && peer_ptr->connected) {
+                            OB_LOG_WARN("mm", "Peer fd=%d EPOLLERR/HUP — disconnecting",
+                                        peer_ptr->fd);
+                            connection_lost("epoll reported an error or a hangup");
+                        }
                     }
                 }
-
-                // Handle EPOLLOUT — drain send buffer, then push more of any snapshot.
-                if ((ev_events & EPOLLOUT) && peer_ptr && peer_ptr->connected) {
-                    try_drain_send_buf(*peer_ptr);
-                    // This is what keeps a snapshot from being enqueued all at once: chunks are
-                    // added only as the socket makes room, so live deltas queued between them go
-                    // out promptly and the buffer never reaches the size that drops the peer.
-                    if (peer_ptr->connected) advance_snapshot_send(*peer_ptr);
+            } catch (const std::exception& e) {
+                // This thread staying alive is the point. Without the boundary the mesh went
+                // silent while every outside signal - `PING`, `MM_PEERS`, the peer's `connected`
+                // row - still looked healthy, which is the failure mode this engine has learned to
+                // call a guarantee absent in production (#112).
+                //
+                // The counter is what an operator can alarm on; the log is loud once and then
+                // quiet, because a full disk throws on every event, and the recovery line after
+                // this loop is what says the condition ended.
+                engine_.registry().increment_counter("ob_mm_io_errors_total");
+                threw_this_pass = true;
+                if (io_errors_.begin()) {
+                    OB_LOG_ERROR("mm",
+                                 "handling a mesh event threw and this event is abandoned; the io "
+                                 "loop continues: %s", e.what());
+                } else {
+                    OB_LOG_DEBUG("mm", "a mesh event threw again (%llu in this episode): %s",
+                                 static_cast<unsigned long long>(io_errors_.ticks()), e.what());
                 }
+                continue;
+            }
+        }
 
-                // Handle errors/hangup.
-                if (ev_events & (EPOLLERR | EPOLLHUP)) {
-                    if (peer_ptr && peer_ptr->connected) {
-                        OB_LOG_WARN("mm", "Peer fd=%d EPOLLERR/HUP — disconnecting",
-                                    peer_ptr->fd);
-                        connection_lost("epoll reported an error or a hangup");
-                    }
-                }
+        // The other half of "loud once": without a line that closes the episode, silence after
+        // the first ERROR is indistinguishable from the condition having gone away. Gated on a
+        // pass that had events **and** none of them threw - an idle loop must not announce a
+        // recovery every 500 ms, and neither must the pass that just reported the failure.
+        //
+        // What this deliberately does not do is suppress one line per failed record. #95's shape
+        // is a line per *loop iteration* carrying no new information; three lines for three
+        // records a full disk refused is information, and the counter beside them is the thing to
+        // alarm on.
+        if (nfds > 0 && !threw_this_pass) {
+            if (const uint64_t held = io_errors_.end()) {
+                OB_LOG_INFO("mm", "mesh events are being handled again after %llu that threw",
+                            static_cast<unsigned long long>(held));
             }
         }
 

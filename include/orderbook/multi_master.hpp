@@ -14,6 +14,7 @@
 #include "orderbook/async_snapshot.hpp"
 #include "orderbook/conflict_resolver.hpp"
 #include "orderbook/hlc.hpp"
+#include "orderbook/log_episode.hpp"
 #include "orderbook/peer_registry.hpp"
 #include "orderbook/replication.hpp"
 #include "orderbook/tls.hpp"
@@ -699,6 +700,17 @@ private:
 
     /// Source of PeerConnection::conn_id. Read and bumped under mtx_, like peers_ itself.
     uint64_t next_conn_id_{1};
+
+    /// One condition, one pair of log lines, however long it holds: an event whose handling threw.
+    ///
+    /// Measured before this existed (#112, with #54's injector): an `ENOSPC` on the WAL write that
+    /// a peer's delta makes ended this thread outright, and then the node received nothing more
+    /// while its own `MM_PEERS` still called the link `connected`, with a fresh HLC and an empty
+    /// queue. A full disk produces that on **every** subsequent event, so the log has to say it
+    /// once - #95's shape, through the mechanism #116 and #120 already paid for.
+    ///
+    /// Touched only from `io_loop()`, which is the single thread `LogEpisode` is safe for.
+    LogEpisode io_errors_;
     std::thread io_thread_;
     std::thread reconnect_thread_;
     std::atomic<bool> running_{false};
