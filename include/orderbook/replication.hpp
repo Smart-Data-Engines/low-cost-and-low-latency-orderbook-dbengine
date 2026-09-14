@@ -4,6 +4,7 @@
 #include "orderbook/tls.hpp"
 
 #include "orderbook/async_snapshot.hpp"
+#include "orderbook/log_episode.hpp"
 #include "orderbook/snapshot.hpp"
 #include "orderbook/wal.hpp"
 
@@ -397,6 +398,29 @@ struct ReplicaSnapshotPrepare {
     std::chrono::steady_clock::time_point started_at{};
 };
 
+/// How long the replication run loop may sleep next. The only place that number is decided.
+///
+/// Zero while a catch-up has room to queue more, because that cursor is work the loop thread
+/// already owns and sleeping on it would cap a catch-up at one batch per pass;
+/// `kReplicationIdleWaitMs` otherwise. A cursor whose queue is *full* is not work in hand -
+/// polling that would be the busy-spin of pitfall 5, and EPOLLOUT is what says the socket drained.
+///
+/// A function rather than two literals because the **failure** path needs the same answer, and
+/// that is not obvious. `wait_ms` outlives one pass, so a pass that throws before reaching the
+/// recompute keeps the previous pass's value - which is zero whenever a catch-up had queue space.
+/// A per-iteration boundary without this therefore turns a throwing pass into
+/// `epoll_wait(..., 0)` in a loop: a spin at the cost of a core for as long as the condition
+/// lasts. The boundary creates that hazard; it did not exist while an exception took the thread
+/// with it. So the `catch` calls this with `false` - "no work in hand", which is exactly what a
+/// failed pass knows - rather than carrying its own copy of 100.
+///
+/// Free and pure, for the reason `drain_verdict()` is (#106): a decision written at more than one
+/// site is a decision that drifts, and a pure one can be asserted without driving the loop.
+inline constexpr int kReplicationIdleWaitMs = 100;
+constexpr int replication_wait_ms(bool catchup_can_progress) {
+    return catchup_can_progress ? 0 : kReplicationIdleWaitMs;
+}
+
 // ── ReplicationManager (primary side) ─────────────────────────────────────────
 
 class ReplicationManager {
@@ -629,6 +653,19 @@ private:
     /// handle_replica_data() before this existed, and forgetting the erase leaves a record pointing
     /// at a closed descriptor - which the broadcast path then writes to.
     void disconnect_replica_locked(int fd, const char* reason);
+
+    /// Count and report one exception the run loop caught, loud once and then quiet.
+    ///
+    /// Shared by both `catch` sites because they differ only in what they abandon - one event, or
+    /// the rest of one pass - and two copies of "have I already said this" are how one of them
+    /// learns to report the count and the other does not (`LogEpisode`'s own reason for existing).
+    void note_io_error(const char* what, const char* detail);
+
+    /// Whether the run loop is currently in an episode of caught exceptions.
+    ///
+    /// Touched only by the run loop thread, which is why it is not atomic: `LogEpisode` says so of
+    /// itself, and every caller here is that one thread.
+    LogEpisode io_errors_;
 };
 
 // ── ReplicationClient (replica side) ──────────────────────────────────────────

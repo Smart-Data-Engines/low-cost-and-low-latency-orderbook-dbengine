@@ -680,6 +680,25 @@ bool ReplicationManager::advance_tls_handshake(ReplicaInfo& replica) {
     return drain_send_buffer(replica);
 }
 
+void ReplicationManager::note_io_error(const char* what, const char* detail) {
+    // The counter is what an operator can alarm on; the log is loud once and then quiet, because
+    // whatever made one pass throw will usually make the next one throw too.
+    //
+    // Guarded on the engine because that is the only route this class has to the registry, and
+    // `set_engine()` is called before `start()` at both production sites (#99 measured that). An
+    // engine-less manager exists in tests only, and there the log line is the whole report.
+    if (engine_ != nullptr) {
+        engine_->registry().increment_counter("ob_repl_io_errors_total");
+    }
+    if (io_errors_.begin()) {
+        OB_LOG_ERROR("repl_mgr", "%s threw and the replication io loop continues: %s",
+                     what, detail);
+    } else {
+        OB_LOG_DEBUG("repl_mgr", "%s threw again (%llu in this episode): %s",
+                     what, static_cast<unsigned long long>(io_errors_.ticks()), detail);
+    }
+}
+
 void ReplicationManager::publish_replica_gauges() {
     if (engine_ == nullptr) return;
     size_t connected = 0;
@@ -838,12 +857,12 @@ void ReplicationManager::run_loop() {
 
     auto last_heartbeat = std::chrono::steady_clock::now();
 
-    // How long this loop is allowed to sleep. 100 ms when there is nothing in hand; zero while a
-    // catch-up has room to queue more, because that cursor is work this thread already owns and
-    // sleeping on it would cap a catch-up at one batch per tick. A cursor whose queue is *full* is
-    // not work in hand - waiting on that would be the busy-spin of pitfall 5, and EPOLLOUT is what
-    // says the socket drained. Recomputed at the end of every pass, after this pass's drains.
-    int wait_ms = 100;
+    // How long this loop is allowed to sleep. The rule, and the reason the failure path needs the
+    // same answer, is on `replication_wait_ms()`; it is stated once there rather than here as
+    // well, or the two copies drift and one of them stops being the one the loop reads.
+    // Recomputed at the end of every pass, after this pass's drains - so it starts out as
+    // "nothing in hand".
+    int wait_ms = replication_wait_ms(false);
 
     while (running_.load(std::memory_order_acquire)) {
         int nfds = ::epoll_wait(epoll_fd_, events, MAX_EVENTS, wait_ms);
@@ -852,10 +871,13 @@ void ReplicationManager::run_loop() {
             break; // fatal epoll error
         }
 
-        // One pass at a time under its own boundary, plus one per event inside it (#112). This
-        // commit only wraps and re-indents: both `catch`es rethrow, so behaviour is unchanged
-        // and `git diff -w` shows nothing but the lines added here. The handling arrives in
-        // the commit after it, where it is the whole diff.
+        // Whether anything in this pass threw. Without it the recovery line below fires in the
+        // **same** pass as the ERROR it is meant to close, because `end()` runs after the code
+        // that opened the episode - measured on the mesh loop one item earlier, where the log
+        // alternated ERROR / "handled again" / ERROR for three failing records.
+        bool threw_this_pass = false;
+
+        // One pass at a time under its own boundary, and one event at a time inside it (#112).
         try {
             // Has a snapshot worker finished? Before dispatching events, and on the timeout path too.
             poll_snapshot_preparation();
@@ -870,7 +892,7 @@ void ReplicationManager::run_loop() {
             }
 
             for (int i = 0; i < nfds; ++i) {
-            try {
+                try {
                     int fd = events[i].data.fd;
 
                     if (fd == listen_fd_) {
@@ -921,7 +943,15 @@ void ReplicationManager::run_loop() {
                     if (events[i].events & EPOLLIN) {
                         handle_replica_data(fd);
                     }
-            } catch (...) { throw; }
+                } catch (const std::exception& e) {
+                    // This event is abandoned and the loop goes on to the next one. Inside the
+                    // dispatch rather than around the pass because every replica registration here
+                    // is `EPOLLET`: an event dropped now is not re-delivered, so taking the pass
+                    // down would strand whatever the other descriptors of a batch of 32 had ready.
+                    note_io_error("handling a replication event", e.what());
+                    threw_this_pass = true;
+                    continue;
+                }
             }
 
             // Advance every catch-up that has room, once per pass and *after* this pass's EPOLLOUT
@@ -937,7 +967,7 @@ void ReplicationManager::run_loop() {
                 for (auto& r : replicas_) {
                     if (r.fd >= 0 && r.catchup.active) continue_catchup(r);
                 }
-                wait_ms = catchup_can_progress_locked() ? 0 : 100;
+                wait_ms = replication_wait_ms(catchup_can_progress_locked());
             }
 
             // Send heartbeat every 5 seconds when idle.
@@ -980,7 +1010,33 @@ void ReplicationManager::run_loop() {
                     }
                 }
             }
-        } catch (...) { throw; }
+        } catch (const std::exception& e) {
+            // Everything this loop does outside the dispatch lands here: the snapshot poll, both
+            // replica gauges, every catch-up cursor's next batch and the heartbeat. All four are
+            // re-attempted on the next pass, so abandoning this one costs a pass rather than a
+            // subsystem - which is the whole difference the outer thread boundary cannot make.
+            note_io_error("a pass of the replication io loop", e.what());
+            threw_this_pass = true;
+
+            // The floor, and the reason `replication_wait_ms` is a function. A pass that threw
+            // before it could recompute this keeps the previous pass's value, and that is zero
+            // whenever a catch-up had queue space: `epoll_wait(..., 0)` in a loop that throws
+            // every time is a spin at the cost of a core. `false` says "no work in hand", which
+            // is exactly what a failed pass knows.
+            wait_ms = replication_wait_ms(false);
+        }
+
+        // The other half of "loud once": without a line that closes the episode, silence after
+        // the first ERROR cannot be told from the condition having gone away. Gated on a pass that
+        // had events **and** none of which threw, so an idle loop does not announce a recovery
+        // every 100 ms and neither does the pass that just reported the failure.
+        if (nfds > 0 && !threw_this_pass) {
+            if (const uint64_t held = io_errors_.end()) {
+                OB_LOG_INFO("repl_mgr",
+                            "the replication io loop is working again after %llu failure(s)",
+                            static_cast<unsigned long long>(held));
+            }
+        }
     }
 }
 

@@ -101,6 +101,15 @@ MetricsRegistry::MetricsRegistry() {
     // the only thing to alarm on.
     counters_.push_back(make_counter("ob_monitor_errors_total",
                                      "Failover monitor ticks that ended in an exception"));
+    // Replication io loop failures, per event abandoned and per pass abandoned (#112). Registered
+    // in the same change that writes it, and honest about what it is: no path in this tree is
+    // known to reach it - unlike the three counters above, each of which was measured firing - so
+    // it is a ratchet. What makes it worth registering anyway is that the boundary under it turns
+    // the first such exception from "this node stops serving replicas" into one line and one
+    // increment, and an increment nobody registered is discarded in silence (#77).
+    counters_.push_back(make_counter("ob_repl_io_errors_total",
+                                     "Replication io loop events or passes abandoned because "
+                                     "they threw"));
 
     // Gauges
     gauges_.push_back(make_gauge("ob_active_sessions", "Number of active TCP sessions"));
