@@ -2175,57 +2175,94 @@ question is recorded as #121 rather than settled quietly here.
   nothing in the engine would notice — anti-entropy compares what each side holds, and two sides
   each holding a different winner look consistent to it. Never observed in the wild
 
-### 125. A replica sent to the snapshot path can never bootstrap: the manifest checksum covers two fields the wire does not carry
+### 125. A replica sent to the snapshot path could never bootstrap: the manifest checksum covered two fields the wire does not carry ✅
 
 Found by #124's retention test, on the first run that ever reached this path.
 
 `SNAPSHOT_BEGIN` carries four numbers — total bytes, the WAL file index, the WAL byte offset and the
 file count — and then one `SNAPSHOT_FILE <path> <size> <crc>` header per file. The replica rebuilds a
-`SnapshotManifest` from exactly that, and `SNAPSHOT_END <crc>` is checked against
+`SnapshotManifest` from exactly that, and `SNAPSHOT_END <crc>` was checked against
 `crc32c(manifest.to_json())`. But `to_json()` also serialises **`created_at_ns`** and
 **`total_rows`**, which `Engine::create_snapshot()` fills in and **nothing puts on the wire**. The
-replica's reconstruction leaves both at zero, so the two documents differ by construction and the
-checksum cannot match — not sometimes, not under load: **never**.
+replica's reconstruction leaves both at zero, so the two documents differed by construction and the
+checksum could not match — not sometimes, not under load: **never**.
 
 **Measured on a live pair** (i3-7100U, two nodes, `--wal-rotate-bytes 65573`): all 24 files arrived,
-every per-file CRC verified — the receiver checks each file against its own header, and no
-mismatch was logged for any of them — and the bootstrap was abandoned with
+every per-file CRC verified — the receiver checks each file against its own header, and no mismatch
+was logged for any of them — and the bootstrap was abandoned with
 `primary said 2070107884 and the 24 file(s) received make 3121752028`. The replica then reconnected,
 was refused again, asked for another snapshot and abandoned it again, **every five seconds, holding
 zero rows**, against a primary that was healthy and had every row.
 
 **Why nothing caught it, which is the more useful half.** Two reasons, and they compound.
 
-The path is **unreachable in the battery without #124**: a replica is only sent here when the WAL
+The path was **unreachable in the battery without #124**: a replica is only sent here when the WAL
 file its position names has been removed, retention only removes files *below* the current one, and
-reaching a second file needed 512 MB of writes. So no integration test has ever seen
+reaching a second file needed 512 MB of writes. So no integration test had ever seen
 `ERR WAL_TRUNCATED` on the replication link.
 
-And the one unit test of the receiving side is a **mock primary that was built to agree with it**.
-`tests/test_replication.cpp` constructs `ob::SnapshotManifest expected;` and fills precisely the
-four fields the wire carries, leaving `created_at_ns` and `total_rows` at their default zero —
-which is exactly what the receiver reconstructs. Its own comment says why it does that ("the mock
-primary has to build the same manifest to name it"), and that is the defect: the stub was made to
-match the code under test rather than the sender it stands in for. A stub that agrees with the
-receiver proves the receiver agrees with itself.
+And the one unit test of the receiving side was a **mock primary built to agree with it**.
+`tests/test_replication.cpp` constructed `ob::SnapshotManifest expected;` and filled precisely the
+four fields the wire carries, leaving `created_at_ns` and `total_rows` at their default zero — which
+is exactly what the receiver reconstructs. Its own comment said why ("the mock primary has to build
+the same manifest to name it"), and that was the defect: the stub was made to match the code under
+test rather than the sender it stands in for. A stub that agrees with the receiver proves the
+receiver agrees with itself. It now fills both fields in, as a primary does, which makes that test a
+regression test for this item — and a mutation confirms it: with the old comparison restored, it
+fails.
 
-**The shape of the fix, and why it is not "put the two fields on the wire".** A checksum over a
-document the receiver **cannot** reconstruct is a checksum that can only fail, so the digest has to
-cover what was *transferred*: the file list, each file's size and CRC, the total, and the WAL
-position. One function on `SnapshotManifest` that both sides call, so a field added later cannot
-quietly leave the two definitions disagreeing again — the alternative, two call sites each choosing
-which fields to include, is how this arose. `created_at_ns` and `total_rows` stay in the manifest
-document (the primary writes it to disk) and stay out of the digest, with the reason written next to
-them. Adding them to `SNAPSHOT_BEGIN` would work and is worse: it is a protocol change that makes a
-new replica refuse an older primary, for two numbers no receiver uses.
+**The fix is a digest over what was transferred, not two more fields on the wire.**
+`SnapshotManifest::transferred_digest()` renders the document with those two fields zeroed and
+checksums that; both ends call **the same function**, so a field added to the struct later is
+excluded by construction and has to be put on the wire to be checked. The alternative — extending
+`SNAPSHOT_BEGIN` — is a protocol change that makes a new replica refuse an older primary, for two
+numbers no receiver uses. And the general rule is worth stating in one line, because it is
+direction-sensitive: **a checksum over a document the receiver cannot reconstruct is a checksum that
+can only fail.**
 
-Wants its own test on both levels: a unit test that gives the mock a manifest a **real** primary
-would produce, and the integration test #124 could not finish — a replica whose position retention
-has removed comes back with every row.
+**Four unit tests and one integration test.** The unit tests build the manifest a **primary**
+produces and the one a receiver can rebuild, and require the digests to agree — with a control that
+the two documents really do differ, or the test would pass against the defect. A second one requires
+the digest to still notice everything that does travel (a file's CRC, its size, its name, a file
+missing, the total, the WAL position) and to be unmoved by the two fields it excludes, which is
+stated rather than left to be inferred. A third pins that arrival order does not matter, since the
+receiver appends in wire order and `to_json()` sorts by path.
 
-- Effort: S | Impact: the documented recovery path for "your position is gone" cannot complete, so a
-  replica that falls behind far enough never returns. It retries for ever, which is the failure mode
-  that looks like a slow replica rather than a broken one
+The integration test is the one #124 could not finish: a replica is killed, the primary writes past
+three rotations, and only when the primary **reports zero replicas connected** and the file the
+replica had confirmed is **gone from its directory** is the replica allowed back. Both preconditions
+are observed rather than waited out, and that is why it kills rather than stops: a `SIGSTOP`ped
+replica stays connected — the process is frozen, so it closes nothing — and retention cannot pass a
+replica the primary still counts, which would leave the refusal depending on a flush tick landing in
+the gap between the resume and the reconnect. It asserts `ERR WAL_TRUNCATED` in the primary's log
+**window** (the log accumulates across the module), every row written during the outage, and a row
+written **before** it — because a snapshot replaces the whole store while the rows the primary had
+not yet flushed arrive afterwards as WAL records, from the position the snapshot carries.
+
+**Seven mutations, and the one that survived says something about the fix.** Restoring the old
+comparison on the **sender** is killed, including by the repaired mock, which is what makes that mock
+a regression test. Keeping either excluded field in the digest is killed; so is a digest that stops
+covering the file list, and a receiver that ignores the WAL position it was told. The control — a
+reworded abandonment message — survives. And *"the receiver checks the whole document again"*
+survives **because on that side the two expressions are the same value**: the receiver's manifest
+carries those two fields at zero by construction, so zeroing them changes nothing. The defect was
+entirely on the sender. The receiver calls the shared function anyway, so that the two definitions
+cannot drift when a field is added to the struct — a mechanism no mutation can distinguish today,
+recorded rather than removed, because a surviving mutation without a note is one the next reader
+assumes was missed.
+
+**Found on the way, and fixed in the same branch: a cluster whose `start()` failed leaked etcd.**
+`ClusterManager.start()` ended with `atexit.register(self.shutdown)` and `shutdown()` began with
+`if not self._started: return` — both halves of the protection conditional on the start having
+finished. #124's mutation run, which deliberately makes a node refuse its arguments, left **four**
+orphan etcds holding ports and memory; the three found on 7 September with uptimes over a day were
+the same leak, blamed then on a killed run. The net is registered in the constructor now and the
+guard asks whether there is anything to clean up. Verified both ways with a probe whose flags the
+parser refuses: one leaked etcd before, none after.
+
+- Effort: S | Impact: the documented recovery path for "your position is gone" could not complete,
+  so a replica that fell behind far enough never returned. It retried for ever, which reads like a
+  slow replica rather than a broken one
 
 ### 124. Nothing in the integration battery could cross a WAL file boundary, because the threshold was hardcoded ✅
 
@@ -5876,13 +5913,16 @@ retention keeping the file a stopped replica still needs while reporting a lag b
 file, and a reconnecting replica caught up **across** files with the primary's own
 `from_file=0 … through_file=3` as the evidence.
 
-The open defect is **#125**, which that third state found on the first run that ever reached it: a
-replica sent to the snapshot path — the documented recovery for "your position is gone" — **can
-never bootstrap**, because the manifest checksum covers `created_at_ns` and `total_rows`, two fields
-the wire does not carry. Measured: 24 of 24 files arrived with every per-file CRC verified, the
-manifest CRC disagreed, and the replica asked again every five seconds holding zero rows. The one
-unit test of that path uses a mock primary built to agree with the receiver, which is why nothing
-caught it, and the path itself was unreachable in the battery until #124.
+**#125** is closed, and that third state found it on the first run that ever reached it: a replica
+sent to the snapshot path — the documented recovery for "your position is gone" — **could never
+bootstrap**, because the manifest checksum covered `created_at_ns` and `total_rows`, two fields the
+wire does not carry. Measured: 24 of 24 files arrived with every per-file CRC verified, the manifest
+CRC disagreed, and the replica asked again every five seconds holding zero rows. The digest is now
+one function both ends call, over what was transferred. Two things about how it hid are worth more
+than the fix: the path was unreachable in the battery until #124, and the only unit test of it used a
+**mock primary built to agree with the receiver** — four fields filled in, the other two left at the
+zero the receiver reconstructs — so the stub proved the receiver agreed with itself. There is **no
+open defect** on this page.
 
 **#121** remains the question stage D left behind, filed rather than answered because a ceiling on
 the drift a peer may introduce costs causal order against that peer.
@@ -5908,14 +5948,12 @@ than about the engine. #110's first CI run also verified the
 value of the skip gate: seven new CLI tests did not run until both integration jobs built the CLI
 and the fixture selected the same build as the server.
 
-The current work sequence is **#125** — a replica that cannot be bootstrapped is worth more than any
-new capability — and then the rest of **fault injection (#54)**, now that fuzzing (#38) is in. The coverage
+The current work sequence is the rest of **fault injection (#54)**, now that fuzzing (#38) is in. The coverage
 badge left from #37 needs a maintainer decision about an external reporting service. Existing
 coverage reports and the line-coverage floor continue to run inside GitHub Actions.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **Next** | A replica sent to the snapshot path cannot bootstrap (#125) | S | The documented recovery for a truncated position never completes, so a replica that falls behind far enough never returns |
 | **Next** | Chaos and fault injection (#54) | L | Verify recovery and refusal when storage, clocks and connectivity fail |
 | **Decision** | Coverage badge (#37) | S | Requires choosing an external service; the existing report and floor are already in CI |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
@@ -6068,9 +6106,9 @@ runners, not the machine-B performance baseline above.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1071 | all passing with `ctest -j1` on the i3-7100U, **206 s in a single run** — this machine had the memory for one this time, where the previous commit needed three `-I` ranges. **Six more than the previous commit**, all of #124: five pin `--wal-rotate-bytes` (the value, both ends of its range **accepted**, and three refusals — below one record, one byte under the floor, above the ceiling) and one is behavioural over `Engine`, because a flag that is parsed and goes nowhere is this workspace's most-repeated defect: forty 136-byte records against a 4096-byte threshold rotate, and the control at the default does not. **Earlier**: seven were #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists 1073: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
-| Python integration | 260 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 256; count pytest's final result rather than the report plugin's progress characters. `256 passed, 2 skipped in 18:58` on the GitHub runner for this commit; the same suite read `19:18` on the runner and `19:25` on the development machine (i3-7100U, native etcd) two commits ago, which is the spread to expect rather than a change. Three more than the previous commit, all of #124 — the first tests in this battery to cross a WAL file boundary — and they cost **11 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
-| Python integration under TSan | 260 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `256 passed in 24:37` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **19:18** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
+| C++ (GTest + RapidCheck) | 1074 | all passing with `ctest -j1` on the i3-7100U, **210 s in a single run**. **Three more than the previous commit**, all of #125 and all about the digest a snapshot transfer compares: one requires what a receiver rebuilds to agree with what a primary sent, with a control that the two documents really do differ — without it the test passes against the defect; one requires the digest to still notice everything that travels and to be unmoved by the two fields it excludes, which is stated rather than inferred; one pins that arrival order does not matter, because the receiver appends in wire order and `to_json()` sorts by path. A fourth test changed rather than arrived: the mock primary in `tests/test_replication.cpp` now fills in the two fields a real primary fills in, which makes it a regression test for #125 — confirmed by a mutation. **Earlier**: six were #124's, seven #123's, six #118's, seven #117's. CTest lists 1076: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
+| Python integration | 261 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 256; count pytest's final result rather than the report plugin's progress characters. `256 passed, 2 skipped in 18:58` on the GitHub runner for this commit; the same suite read `19:18` on the runner and `19:25` on the development machine (i3-7100U, native etcd) two commits ago, which is the spread to expect rather than a change. One more than the previous commit, #125's: a killed replica whose confirmed WAL file retention has removed comes back with every row. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
+| Python integration under TSan | 261 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `256 passed in 24:37` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **19:18** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than

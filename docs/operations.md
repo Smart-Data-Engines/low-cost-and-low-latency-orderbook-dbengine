@@ -194,6 +194,22 @@ snapshot when it comes back. Neither is a defect; the failure would be a third c
 a connected replica still needs, which is what `ob_replicas_lag_unknown` counts and what the
 retention test in `tests/integration/test_wal_rotation.py` exists to catch.
 
+What the second case looks like in the logs, and it is worth recognising because until #125 it did
+not finish. On the primary:
+
+```
+{"component":"repl_mgr","msg":"catchup: cannot open WAL file .../wal_000000.bin: No such file or directory"}
+{"component":"repl_mgr","msg":"sent ERR WAL_TRUNCATED to replica fd=14"}
+{"component":"repl_mgr","msg":"snapshot for replica fd=14 (connection 14) is being created on a worker thread"}
+```
+
+and on the replica, `snapshot bootstrap` lines ending in an install. **An `ERROR` reading
+`snapshot bootstrap abandoned: manifest CRC32C mismatch` meant the bootstrap could never complete**
+— every file arrived and verified, and the comparison at the end was unsatisfiable, so the replica
+asked again every five seconds for ever. If you are running a build from before #125 and a replica
+is stuck in that loop, the way out is to stop it, delete its data directory and start it again: it
+then bootstraps as a new node rather than asking for a position.
+
 The value is refused at both ends rather than clamped. Above 2 GiB: a WAL position is a file index
 and a 32-bit offset read as one value, and a larger file would let the offset wrap and report a
 position inside the wrong part of the file (#85). Below 65573 bytes — a 38-byte header plus the
