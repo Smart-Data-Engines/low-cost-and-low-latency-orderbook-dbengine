@@ -2305,6 +2305,37 @@ Learned the hard way. Check here before debugging.
     both ways with a probe that starts a cluster whose flags are refused: one leaked etcd before,
     none after.
 
+274. **A fixture built for a test nobody then writes is a knob nothing turns.** `narrow_proxied_mesh`
+    put a 4 kB `SO_RCVBUF` on the accepted sockets, on the expectation that it would bring the
+    engine's own send queue within reach in kilobytes. It does not — TCP holds unsent data in the
+    **sender's** buffer, which is the engine's socket and not anything a proxy can narrow — and the
+    same session measured that. The fixture stayed for two more items with **no users**. Deleted
+    with the measurement written where it was, because the next reader would otherwise reach for it
+    for exactly the reason it does not work.
+
+275. **A test whose precondition is a race is a flaky test, even when the race is usually won.**
+    The #125 bootstrap test first paused its replica with `SIGSTOP`, which leaves it *connected* —
+    so retention cannot pass its position, and the refusal the test needs depends on a flush tick
+    landing in the gap between the resume and the reconnect. It passed, and it would have failed on
+    a loaded runner. `kill_node` makes every step observable instead: the primary reports zero
+    replicas connected, the file the replica confirmed is gone from the directory, and only then is
+    the replica allowed back.
+
+276. **A response here ends with a blank line, so reading one line per command reads the next
+    command's reply as its own.** `format_ok()` returns `"OK\n\n"` and the banner is
+    `"OK ob_tcp_server v0.1.0\n\n"`. A write helper that read a single line got `''` for its first
+    `MINSERT` and reported it as a refused write. And the reason it was reading lines at all is
+    worth keeping: the module's `raw()` reads until the socket goes **quiet**, which costs its full
+    3 s read timeout per call — right for one command, and 129 s for the forty-three a volume test
+    needs, which is how it hit pytest's limit before injecting any fault.
+
+277. **A test about what replay can reach has to keep everything that writes a checkpoint away from
+    it.** #126's measurement read **1** stranded record instead of 2 on its first run, because the
+    node ran with `--flush-interval-ms 500` and a tick had moved a row into a segment and written a
+    checkpoint — and replay begins after the last checkpoint, so the row was rescued by timing
+    rather than by the WAL. The flush interval goes an hour out and the node is `SIGKILL`ed rather
+    than stopped, because a clean stop ends in a checkpoint too.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2449,6 +2480,16 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   — connected, counted, acknowledging nothing — and requires a lag bigger than a whole file beside
   a zero unknown count, which is the same fact from two sides, since the distance is measurable
   precisely because retention kept the files.
+- **Fault injection (#54) is closed, and its last measurement is #126, still open.** An
+  acknowledged write that lands behind a **torn** WAL record does not survive a restart: the write
+  that tore is refused, the ones after it are answered `OK`, and `WALReplayer::replay()` returns at
+  the first CRC mismatch rather than breaking out of one file — so replay stops for the whole
+  directory. Measured 2 of 2 stranded. The fix is a decision about the WAL format or about replay's
+  contract (rotate on a failed write *and* teach replay that a mismatch inside a non-final file is
+  a tear; or record the tear; or refuse writes to a file already torn, which is worse), which is why
+  it is an item rather than a patch. The stage that found it needed a composite fault the injector
+  could not express — `OB_FAULT_SHORT_THEN_FAIL`, because a short write alone cannot tear a record
+  `write_record()` resumes.
 - **A snapshot's checksum covers what the wire carries, and before #125 it covered two fields the
   wire has never sent** (closed). `SNAPSHOT_END` named `crc32c(manifest.to_json())`, and that
   document includes `created_at_ns` and `total_rows`, which the primary fills and nothing
