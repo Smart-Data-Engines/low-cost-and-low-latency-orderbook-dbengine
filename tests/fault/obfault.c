@@ -5,6 +5,11 @@
 // data in production are the ones a healthy machine never produces: ENOSPC mid-record, EIO from
 // fsync, a short write that leaves a torn record behind.
 //
+// `OB_FAULT_SHORT_THEN_FAIL=1` is the composite: the chosen write is short and the caller's retry
+// fails. It exists because a short write on its own cannot tear a record this engine wrote -
+// `write_record()` loops until the remainder is written, which is correct - so the shape that
+// strands a WAL tail needs both halves.
+//
 // Three decisions in here are worth more than the code:
 //
 // **The path comes from /proc/self/fd, not from an fd table.** The obvious design intercepts
@@ -54,11 +59,22 @@ static struct {
     unsigned long  count;       // fail this many, then let the rest through
     long           short_bytes; // write: return this many bytes instead of failing
     long           size;        // only calls whose byte count equals this; -1 means any
+    int            short_then_fail; // write: after the short one, fail the remainder
     int            log_fd;
-} cfg = { NULL, OP_NONE, EIO, 0, ~0UL, -1, -1, -1 };
+} cfg = { NULL, OP_NONE, EIO, 0, ~0UL, -1, -1, 0, -1 };
 
 static atomic_ulong seen   = 0;   // matching calls for the configured op
 static atomic_ulong failed = 0;   // how many of those were made to fail
+/// Set by a short write when OB_FAULT_SHORT_THEN_FAIL is on: the caller's retry has to fail.
+///
+/// **A short write alone cannot tear this engine's record.** `WALWriter::write_record()` loops
+/// `while (remaining > 0)`, so a partial write is resumed and the record completes - which is
+/// correct, and means the torn-record shape needs a short write *followed by* an error. That
+/// composite is one fault, not two, so it is one flag.
+///
+/// The remainder is failed **whatever its size**, because the size filter that named the first
+/// call cannot name the second: cutting a 136-byte record at 20 leaves a 116-byte retry.
+static atomic_int cut_open = 0;
 
 static enum fault_op parse_op(const char *s) {
     if (!s) return OP_NONE;
@@ -90,6 +106,8 @@ __attribute__((constructor)) static void obfault_init(void) {
     const char *size = getenv("OB_FAULT_SIZE");
     if (size) cfg.size = strtol(size, NULL, 10);
 
+    const char *stf = getenv("OB_FAULT_SHORT_THEN_FAIL");
+    cfg.short_then_fail = stf && *stf && strcmp(stf, "0") != 0;
     const char *shortw = getenv("OB_FAULT_SHORT");
     if (skip)   cfg.skip  = strtoul(skip, NULL, 10);
     if (count)  cfg.count = strtoul(count, NULL, 10);
@@ -158,11 +176,24 @@ static int should_fail(enum fault_op op, const char *name, int fd, long arg) {
 // ── Interposed calls ──────────────────────────────────────────────────────────
 
 ssize_t write(int fd, const void *buf, size_t count) {
+    // The retry after a short write, when the test asked for the record to stay torn. Checked
+    // before `should_fail()` so it is not subject to the size filter or to the budget: this call is
+    // the second half of a fault that was already chosen.
+    if (cfg.short_then_fail && cfg.path && atomic_load(&cut_open)) {
+        char path[4096];
+        if (fd_matches(fd, path, sizeof path)) {
+            atomic_store(&cut_open, 0);
+            note("write", fd, path, (long)count, atomic_load(&seen), "fail-remainder");
+            errno = cfg.err;
+            return -1;
+        }
+    }
     if (should_fail(OP_WRITE, "write", fd, (long)count)) {
         if (cfg.short_bytes >= 0) {
             // A genuine short write: the bytes it claims really do reach the file, which is what
             // leaves a torn record behind. Returning a count without writing would model nothing.
             const size_t n = (size_t)cfg.short_bytes < count ? (size_t)cfg.short_bytes : count;
+            if (cfg.short_then_fail) atomic_store(&cut_open, 1);
             return (ssize_t)syscall(SYS_write, fd, buf, n);
         }
         errno = cfg.err;
