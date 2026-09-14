@@ -570,3 +570,188 @@ TEST(WAL, RotationDoesNotResetTheRecordCount) {
     EXPECT_EQ(writer.records_written(), static_cast<uint64_t>(kAppends) + rotations)
         << "expected one record per append plus one ROTATE record per rotation";
 }
+
+// ── How far behind a position is, across files (#123) ───────────────────────
+//
+// `Engine::stats()` reported each replica's lag as `current_offset - confirmed_offset`. For a
+// replica that is genuine arithmetic — a replica streams *our* WAL and refreshes its confirmed
+// position on every ACK, so the two index the same log — and it ignores the file index. `rotate()`
+// publishes `{next_index, next_offset}`, so the current offset **resets**: a replica still
+// acknowledging into the previous file has the larger number, the expression clamps, and the lag
+// reads **zero exactly when a replica is more than a file behind**.
+//
+// These tests measure that rather than describing it: each one computes the old expression beside
+// the new answer, so the contrast is in the assertion instead of in a comment.
+
+namespace {
+
+/// What `Engine::stats()` used to report, kept here so the defect is a value rather than prose.
+size_t old_lag_expression(size_t current_offset, size_t confirmed_offset) {
+    return current_offset > confirmed_offset ? current_offset - confirmed_offset : 0;
+}
+
+} // namespace
+
+TEST(WalDistance, WithinOneFileItIsTheDifference) {
+    TempDir tmp("dist_same");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), /*rotate_threshold=*/1 << 20);
+
+    ob::DeltaUpdate first = make_delta(1);
+    const ob::WalPosition at = writer.append(first, &lvl);
+    for (int i = 0; i < 5; ++i) {
+        ob::DeltaUpdate upd = make_delta(static_cast<uint64_t>(i + 2));
+        writer.append(upd, &lvl);
+    }
+
+    const auto distance = writer.bytes_since(at);
+    ASSERT_TRUE(distance.has_value());
+    EXPECT_EQ(*distance, writer.current_offset() - at.offset);
+    // The control for the tests below: inside one file the old expression was right, which is why
+    // the defect survived — every test that ever looked at this number stayed in one file.
+    EXPECT_EQ(*distance, old_lag_expression(writer.current_offset(), at.offset));
+}
+
+// The defect, as a number.
+//
+// The position has to be **near the end** of the earlier file for the old expression to clamp,
+// and that is the whole mechanism: after a rotation the current offset is small, so it is smaller
+// than a confirmed offset from late in the previous file and the clamp answers zero. A position at
+// the *start* of the earlier file does not reproduce it — the first version of this test used the
+// first record, read 136 instead of 0, and its own control caught that it was proving nothing.
+TEST(WalDistance, APositionLateInTheEarlierFileReadsAsZeroBehindTheOldWay) {
+    TempDir tmp("dist_rotate");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), /*rotate_threshold=*/512);
+
+    // Write until the last position still in file 0 is as late as it gets.
+    ob::WalPosition late_in_first{};
+    uint64_t seq = 1;
+    while (writer.current_position().file_index == 0) {
+        ob::DeltaUpdate upd = make_delta(seq++);
+        const ob::WalPosition at = writer.append(upd, &lvl);
+        if (at.file_index == 0) late_in_first = at;
+    }
+    ASSERT_GT(late_in_first.offset, 0u) << "no record landed late in the first file";
+
+    // One more, so the current file has something in it and is clearly a different file.
+    ob::DeltaUpdate upd = make_delta(seq++);
+    writer.append(upd, &lvl);
+    ASSERT_GT(writer.current_position().file_index, late_in_first.file_index);
+
+    // The old expression, on exactly these two positions.
+    const size_t old_answer = old_lag_expression(writer.current_offset(), late_in_first.offset);
+    ASSERT_EQ(old_answer, 0u)
+        << "this test no longer reproduces the defect it was written for, so the assertion below "
+           "proves less than it claims: current_offset=" << writer.current_offset()
+        << " confirmed_offset=" << late_in_first.offset;
+
+    // And the answer.
+    const auto distance = writer.bytes_since(late_in_first);
+    ASSERT_TRUE(distance.has_value());
+    EXPECT_GT(*distance, 0u) << "a position a whole file back is not zero bytes behind";
+}
+
+TEST(WalDistance, ItAccumulatesAcrossSeveralFiles) {
+    TempDir tmp("dist_many");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), /*rotate_threshold=*/512);
+
+    const ob::WalPosition start = writer.current_position();
+    uint64_t seq = 1;
+    for (int i = 0; i < 40; ++i) {
+        ob::DeltaUpdate upd = make_delta(seq++);
+        writer.append(upd, &lvl);
+    }
+    ASSERT_GT(writer.current_position().file_index, 2u) << "not enough rotations to be a test";
+
+    // The current file must hold something, and this is asserted rather than assumed because the
+    // first version of this test did not: forty 136-byte records against a 512-byte threshold
+    // rotate on the last one, so the run ended with `now.offset == 0` and dropping the current
+    // file's bytes from the sum changed **nothing**. A mutation doing exactly that survived, which
+    // is how the gap was found.
+    while (writer.current_position().offset == 0) {
+        ob::DeltaUpdate upd = make_delta(seq++);
+        writer.append(upd, &lvl);
+    }
+    ASSERT_GT(writer.current_position().offset, 0u);
+
+    const auto distance = writer.bytes_since(start);
+    ASSERT_TRUE(distance.has_value());
+
+    // Checked against the files on disk rather than against the same arithmetic: summing the
+    // sizes here the way the implementation does would make this a test of nothing.
+    uint64_t on_disk = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(tmp.path)) {
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("wal_", 0) == 0) on_disk += std::filesystem::file_size(entry.path());
+    }
+    EXPECT_EQ(*distance, on_disk) << "the distance from the beginning is the whole log";
+}
+
+// A position ahead of ours is not a negative distance. An ACK can be read after the value it
+// acknowledges has been superseded, and a replica cannot be ahead of the log it follows.
+TEST(WalDistance, APositionAheadOfUsIsZeroRatherThanUnderflow) {
+    TempDir tmp("dist_ahead");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str());
+    ob::DeltaUpdate upd = make_delta(1);
+    writer.append(upd, &lvl);
+
+    const ob::WalPosition current = writer.current_position();
+    EXPECT_EQ(writer.bytes_since(ob::WalPosition{current.file_index + 1, 0}).value_or(1u), 0u);
+    EXPECT_EQ(writer.bytes_since(ob::WalPosition{current.file_index,
+                                                 current.offset + 100}).value_or(1u), 0u);
+}
+
+// A file that is gone makes the distance unknown, and that is a stronger statement than a large
+// number: retention keeps files back to the slowest connected replica, so a missing one says that
+// replica cannot catch up from this WAL any more.
+TEST(WalDistance, AMissingFileIsUnknownRatherThanAGuess) {
+    TempDir tmp("dist_gone");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), /*rotate_threshold=*/512);
+
+    const ob::WalPosition start = writer.current_position();
+    for (int i = 0; i < 40; ++i) {
+        ob::DeltaUpdate upd = make_delta(static_cast<uint64_t>(i + 1));
+        writer.append(upd, &lvl);
+    }
+    ASSERT_TRUE(writer.bytes_since(start).has_value()) << "the control: measurable before removal";
+
+    // Remove one file in the middle, which is what retention would do if it ran past a replica.
+    std::filesystem::remove(tmp.path / "wal_000001.bin");
+    EXPECT_FALSE(writer.bytes_since(start).has_value());
+
+    // And a position after the hole is still measurable, so "unknown" is about the span rather
+    // than about the writer having given up.
+    const ob::WalPosition after_hole{writer.current_position().file_index, 0};
+    EXPECT_TRUE(writer.bytes_since(after_hole).has_value());
+}
+
+// The file the position itself sits in, which is a **different** code path from the files in
+// between: the tail of the first one is measured before the loop starts. A mutation that made the
+// first file's error path return zero instead of `nullopt` survived the test above, because that
+// test removes an intervening file and never exercises the tail.
+TEST(WalDistance, AMissingFirstFileIsUnknownToo) {
+    TempDir tmp("dist_gone_first");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), /*rotate_threshold=*/512);
+
+    ob::WalPosition in_first{};
+    uint64_t seq = 1;
+    while (writer.current_position().file_index == 0) {
+        ob::DeltaUpdate upd = make_delta(seq++);
+        const ob::WalPosition at = writer.append(upd, &lvl);
+        if (at.file_index == 0) in_first = at;
+    }
+    for (int i = 0; i < 8; ++i) {
+        ob::DeltaUpdate upd = make_delta(seq++);
+        writer.append(upd, &lvl);
+    }
+    ASSERT_TRUE(writer.bytes_since(in_first).has_value()) << "the control: measurable before removal";
+
+    std::filesystem::remove(tmp.path / "wal_000000.bin");
+    EXPECT_FALSE(writer.bytes_since(in_first).has_value())
+        << "the file the position sits in is gone and the distance was answered anyway";
+}

@@ -32,7 +32,9 @@ struct ServerStats {
         std::string address;
         uint32_t    confirmed_file;
         size_t      confirmed_offset;
-        size_t      lag_bytes;
+        /// Valid only when `lag_known`; see the note on `Engine::Stats::ReplicaMetrics`.
+        uint64_t    lag_bytes;
+        bool        lag_known;
     };
     std::vector<ReplicaMetrics> replicas;
 

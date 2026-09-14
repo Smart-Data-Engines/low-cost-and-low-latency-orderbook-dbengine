@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -299,6 +300,29 @@ public:
     /// `ob_inserts_total`; an operator asking why the WAL grows faster than the inserts wants
     /// this one, and the two are only useful together (#117).
     uint64_t records_written() const { return records_written_.load(std::memory_order_relaxed); }
+
+    /// Bytes written since `from`, across file boundaries, or `nullopt` when it cannot be known.
+    ///
+    /// The obvious `current_offset() - from.offset` is wrong for any position in an earlier file,
+    /// and wrong in the direction that looks healthy: `rotate()` publishes
+    /// `{next_index, next_offset}`, so the current offset **resets**, and a subtrahend from the
+    /// previous file is larger than it — leaving a clamp at zero exactly when a replica is more
+    /// than a file behind. That was #123, and it is the same shape as #118 one layer down: a
+    /// difference of positions is a distance only when the positions are compared in full.
+    ///
+    /// Exact rather than estimated. Closed files are at least `rotate_threshold_` bytes because
+    /// that is what rotation waits for, and a restart appends (`O_APPEND`, continuing from the
+    /// highest existing index) rather than starting a short one — so an estimate of
+    /// `files * threshold` would be good at production thresholds and badly wrong at the small
+    /// ones tests use, where a 512-byte threshold and 136-byte records give files up to a quarter
+    /// over. Asking the filesystem costs one `file_size` per **intervening** file, and there are
+    /// normally none.
+    ///
+    /// `nullopt` means a file between the two positions is gone, which is not merely an
+    /// unmeasurable distance: retention keeps files back to the slowest connected replica, so a
+    /// missing one says that replica can no longer catch up from this WAL and needs a snapshot.
+    /// Reporting zero for it, or guessing, would hide the more serious of the two conditions.
+    std::optional<uint64_t> bytes_since(WalPosition from) const;
 
     /// Where the WAL is, in one atomic load. Cannot observe a rotation half-applied.
     ///

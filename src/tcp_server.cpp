@@ -541,7 +541,8 @@ std::string execute_command(const Command& cmd,
         // Copy replication metrics
         stats.replicas.clear();
         for (const auto& r : es.replicas) {
-            stats.replicas.push_back({r.address, r.confirmed_file, r.confirmed_offset, r.lag_bytes});
+            stats.replicas.push_back({r.address, r.confirmed_file, r.confirmed_offset,
+                                      r.lag_bytes, r.lag_known});
         }
         stats.is_replica            = es.is_replica;
         stats.repl_confirmed_file   = es.repl_confirmed_file;

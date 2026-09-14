@@ -1023,14 +1023,20 @@ Engine::Stats Engine::stats() {
 
     // Replication (primary): populate per-replica metrics (Requirements 5.1, 5.2).
     if (repl_mgr_) {
-        const size_t current_offset = wal_.current_offset();
         for (const auto& r : repl_mgr_->replica_states()) {
             Stats::ReplicaMetrics rm;
             rm.address          = r.address;
             rm.confirmed_file   = r.confirmed_file;
             rm.confirmed_offset = r.confirmed_offset;
-            rm.lag_bytes        = (current_offset > r.confirmed_offset)
-                                    ? (current_offset - r.confirmed_offset) : 0;
+            // Through the WAL, because only the WAL knows how big the files in between are.
+            // The subtraction this replaces ignored the file index, and `rotate()` resets the
+            // current offset — so a replica more than a file behind read as zero bytes behind,
+            // which is the case an operator most needs the number for (#123).
+            const std::optional<uint64_t> behind =
+                wal_.bytes_since(WalPosition{r.confirmed_file,
+                                             static_cast<uint32_t>(r.confirmed_offset)});
+            rm.lag_bytes        = behind.value_or(0);
+            rm.lag_known        = behind.has_value();
             s.replicas.push_back(std::move(rm));
         }
     }

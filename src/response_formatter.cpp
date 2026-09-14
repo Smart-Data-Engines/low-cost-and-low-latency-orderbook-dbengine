@@ -200,7 +200,15 @@ std::string format_status(const ServerStats& stats, std::string_view identity) {
             out += " offset=";
             out += std::to_string(r.confirmed_offset);
             out += " lag=";
-            out += std::to_string(r.lag_bytes);
+            // `unknown` rather than a number, because zero is a real answer here: a replica that
+            // is caught up is zero bytes behind. Printing zero for "cannot be measured" is the
+            // defect #123 was, said a second way — and this case means something worse than a
+            // large lag, since a WAL file the replica still needs is gone.
+            if (r.lag_known) {
+                out += std::to_string(r.lag_bytes);
+            } else {
+                out += "unknown";
+            }
             out += '\n';
         }
     }
