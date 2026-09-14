@@ -2383,6 +2383,13 @@ in the last file there is none. The `is_last` branch was therefore one guarantee
 is the shape that cannot be mutated separately — so it is now one branch, and the distinction lives
 where it is real: in `tears_skipped()` and in the message an operator reads.
 
+The test for that case had the **same** defect as its neighbour and it took finding one to see the
+other: `AMismatchInTheLastFileStillStopsTheReplay` appended 136 bytes of plausible garbage, so its
+two assertions held whatever this rule did. It now appends a real record too, and a control says the
+rewrite is load-bearing: with `is_last` forced to `false` in `replay_v2()`, so that nothing is ever
+the last file, it fails — where before the rewrite it passed. Each test's output now carries the WARN
+line for its own case, which is the cheapest proof that a checksum was compared at all.
+
 - Effort: M | Impact: the engine's central durability claim had an exception nobody could see from
   outside. The window is narrow — it needs a write that fails *after* writing part of a record —
   but inside it every later acknowledgement was a promise the restart broke
