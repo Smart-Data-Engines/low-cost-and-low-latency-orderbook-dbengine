@@ -373,6 +373,22 @@ public:
     size_t truncate_before(uint32_t before_index);
 
 private:
+    /// Stop writing to the current file after a partial write failed, without a ROTATE record.
+    ///
+    /// The one case where the current file cannot be written to at all: some bytes of a record
+    /// reached it and the rest failed, so no reader can parse past them and anything appended
+    /// behind them is unreachable on replay (#126). `rotate()` cannot be used - its first act is to
+    /// write a ROTATE record into that same file - and the marker is replaced by the replayer's
+    /// rule: a checksum mismatch in a file that is **not** the last one is a tear, and replay
+    /// continues with the next file.
+    ///
+    /// `noexcept`: the caller is about to report the write's own error, which is the one that says
+    /// why the disk refused, and it must not be replaced by a second error about the recovery.
+    void abandon_torn_file(size_t stranded_bytes, int write_errno) noexcept;
+
+public:
+
+private:
     int         fd_;
 
     /// The only storage for the position. Not a copy published beside `written_` and `file_index_`:
@@ -506,9 +522,22 @@ public:
     /// Return the highest epoch found during the last replay (0 if none).
     uint64_t last_epoch() const { return last_epoch_; }
 
+    /// Files whose checksum mismatch the last replay stepped over as a **torn record** (#126).
+    ///
+    /// Not a curiosity: a torn file the current writer produced ends mid-record, which every reader
+    /// here has always tolerated, so this can only be non-zero for a WAL written **before** the
+    /// writer learned to abandon a file it tore. It is therefore the count of files an older build
+    /// stranded and this replay recovered past - which is worth a line at startup, and is what
+    /// makes the difference between a tear and a crash tail observable rather than inferred from a
+    /// log message.
+    ///
+    /// Reset at the start of every replay, so a caller that replays twice reads the second pass.
+    size_t tears_skipped() const { return tears_skipped_; }
+
 private:
     std::string dir_;
     uint64_t    last_epoch_{0};
+    size_t      tears_skipped_{0};
 };
 
 } // namespace ob

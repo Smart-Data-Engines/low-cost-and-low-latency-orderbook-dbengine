@@ -192,8 +192,16 @@ WalPosition WALWriter::write_record(const WALRecord& hdr, const void* payload,
     while (remaining > 0) {
         ssize_t n = ::write(fd_, ptr, remaining);
         if (n < 0) {
+            const int err = errno;
+            // A write that failed **after** writing part of the record leaves bytes no reader can
+            // parse past, and everything appended behind them is unreachable on replay: measured
+            // 2 of 2 acknowledged writes lost (#126). So the file is abandoned here rather than
+            // written to again. A write that failed atomically - nothing of this record reached
+            // the file - leaves it intact, and abandoning it would make a full disk produce one
+            // empty WAL file per refused write.
+            if (remaining < total) abandon_torn_file(total - remaining, err);
             throw std::runtime_error(std::string("WALWriter: write failed: ") +
-                                     std::strerror(errno));
+                                     std::strerror(err));
         }
         ptr += n;
         remaining -= static_cast<size_t>(n);
@@ -269,8 +277,16 @@ WalPosition WALWriter::write_record_v2(const WALRecordV2& hdr, const void* paylo
     while (remaining > 0) {
         ssize_t n = ::write(fd_, ptr, remaining);
         if (n < 0) {
+            const int err = errno;
+            // A write that failed **after** writing part of the record leaves bytes no reader can
+            // parse past, and everything appended behind them is unreachable on replay: measured
+            // 2 of 2 acknowledged writes lost (#126). So the file is abandoned here rather than
+            // written to again. A write that failed atomically - nothing of this record reached
+            // the file - leaves it intact, and abandoning it would make a full disk produce one
+            // empty WAL file per refused write.
+            if (remaining < total) abandon_torn_file(total - remaining, err);
             throw std::runtime_error(std::string("WALWriter: write failed: ") +
-                                     std::strerror(errno));
+                                     std::strerror(err));
         }
         ptr += n;
         remaining -= static_cast<size_t>(n);
@@ -460,6 +476,33 @@ void WALWriter::rotate() {
     OB_LOG_DEBUG("wal", "rotated to file %u at offset %u", next_index, next_offset);
 }
 
+void WALWriter::abandon_torn_file(size_t stranded_bytes, int write_errno) noexcept {
+    const WalPosition at = current_position();
+    OB_LOG_ERROR("wal",
+                 "torn record in %s at offset %u: %zu byte(s) reached the file and the rest failed "
+                 "with %s. Opening the next file: everything appended behind those bytes would be "
+                 "unreachable on replay",
+                 wal_filename(dir_, at.file_index).c_str(), at.offset, stranded_bytes,
+                 std::strerror(write_errno));
+
+    // No ROTATE record, which is the whole reason this is not `rotate()`: that function's first act
+    // is to write a record into the file we have just established cannot be written to. What
+    // replaces the marker is the replayer's rule - a checksum mismatch in a file that is not the
+    // last one is a tear, so replay continues with the next file (#126).
+    try {
+        const uint32_t next_index  = at.file_index + 1;
+        const uint32_t next_offset = open_current(next_index);
+        position_.store(WalPosition{next_index, next_offset}, std::memory_order_relaxed);
+        OB_LOG_INFO("wal", "abandoned file %u after a torn record; writing to %u at offset %u",
+                    at.file_index, next_index, next_offset);
+    } catch (const std::exception& e) {
+        // The tail stays stranded, which is what happened before this existed, and the operator is
+        // told so. Throwing here would replace the write's own error - the one that says why the
+        // disk refused - with a second one about the recovery.
+        OB_LOG_ERROR("wal", "could not open the next WAL file after a torn record: %s", e.what());
+    }
+}
+
 bool WALWriter::flush() {
     if (fd_ >= 0 && fsync_policy_ != FsyncPolicy::NONE) {
         if (fsync_or_record("flush") != 0) {
@@ -508,6 +551,7 @@ uint64_t WALReplayer::replay(
 {
     // Reset epoch tracking for this replay.
     last_epoch_ = 0;
+    tears_skipped_ = 0;
 
     // Collect all wal_*.bin files and sort them by index.
     std::vector<std::pair<uint32_t, std::string>> files;
@@ -532,6 +576,10 @@ uint64_t WALReplayer::replay(
     uint64_t last_good_seq = 0;
 
     for (auto& [idx, path] : files) {
+        // Whether this is the highest-numbered file, which is what separates a crash tail from a
+        // torn record. Taken from the sorted list rather than from the writer's current position:
+        // a replay reads a directory, and the writer that produced it is gone.
+        const bool is_last = (idx == files.back().first);
         int fd = ::open(path.c_str(), O_RDONLY);
         if (fd < 0) continue;
 
@@ -557,9 +605,24 @@ uint64_t WALReplayer::replay(
             // Verify CRC32C.
             const uint32_t expected = crc32c(payload.data(), hdr.payload_len);
             if (expected != hdr.checksum) {
-                // Checksum mismatch — stop replay.
-                ::close(fd);
-                return last_good_seq;
+                // A mismatch ends this file. In the **last** file it is the crash tail - the
+                // record was being written when the process died - and in any earlier file it is a
+                // torn record the writer abandoned that file for (#126), whose successors are
+                // intact: stopping the whole replay there lost writes that had been acknowledged,
+                // measured at 2 of 2. One branch for the same reason as in `replay_v2()` below.
+                if (is_last) {
+                    OB_LOG_WARN("wal",
+                                "checksum mismatch in %s, the last WAL file: this is the tail of a "
+                                "record that was being written when the process stopped",
+                                path.c_str());
+                } else {
+                    ++tears_skipped_;
+                    OB_LOG_WARN("wal",
+                                "checksum mismatch in %s, which is not the last WAL file: treating "
+                                "it as a torn record and continuing with the next file",
+                                path.c_str());
+                }
+                goto done_file;
             }
 
             // ROTATE record signals end of this file's useful content.
@@ -628,6 +691,7 @@ uint64_t WALReplayer::replay_v2(WALReplayCallbackV2 cb)
 {
     // Reset epoch tracking for this replay.
     last_epoch_ = 0;
+    tears_skipped_ = 0;
 
     // Collect all wal_*.bin files and sort them by index.
     std::vector<std::pair<uint32_t, std::string>> files;
@@ -652,6 +716,10 @@ uint64_t WALReplayer::replay_v2(WALReplayCallbackV2 cb)
     uint64_t last_good_seq = 0;
 
     for (auto& [idx, path] : files) {
+        // Whether this is the highest-numbered file, which is what separates a crash tail from a
+        // torn record. Taken from the sorted list rather than from the writer's current position:
+        // a replay reads a directory, and the writer that produced it is gone.
+        const bool is_last = (idx == files.back().first);
         int fd = ::open(path.c_str(), O_RDONLY);
         if (fd < 0) continue;
 
@@ -713,9 +781,25 @@ uint64_t WALReplayer::replay_v2(WALReplayCallbackV2 cb)
             {
                 const uint32_t expected = crc32c(payload.data(), base_hdr.payload_len);
                 if (expected != base_hdr.checksum) {
-                    // Checksum mismatch — stop replay.
-                    ::close(fd);
-                    return last_good_seq;
+                    // The same decision as in `replay()` above, and one branch for the same
+                    // reason: ending this file and returning from the whole replay differ only
+                    // when a later file exists, and in the last file there is none. A mutation
+                    // that made the last file behave like the others survived, because it is the
+                    // same behaviour. What differs is which case it is, and that is observable in
+                    // `tears_skipped()` and in the message rather than in the control flow (#126).
+                    if (is_last) {
+                        OB_LOG_WARN("wal",
+                                    "checksum mismatch in %s, the last WAL file: this is the tail "
+                                    "of a record that was being written when the process stopped",
+                                    path.c_str());
+                    } else {
+                        ++tears_skipped_;
+                        OB_LOG_WARN("wal",
+                                    "checksum mismatch in %s, which is not the last WAL file: "
+                                    "treating it as a torn record and continuing with the next",
+                                    path.c_str());
+                    }
+                    goto done_file_v2;
                 }
             }
 
