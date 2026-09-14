@@ -721,6 +721,12 @@ void MultiMasterManager::io_loop() {
         // second instead of a stuck bootstrap.
         poll_snapshot_preparation();
 
+        // Whether any event in this pass threw. Without it the recovery line below fires in the
+        // **same** pass as the ERROR it is supposed to close - measured, the log alternated
+        // ERROR / "handled again" / ERROR for three failing records - because `end()` runs after
+        // the loop that opened the episode.
+        bool threw_this_pass = false;
+
         for (int i = 0; i < nfds; ++i) {
             // One event at a time under its own boundary, and **inside** the loop rather than
             // around the pass. Every registration here is `EPOLLET`, so an event this loop
@@ -979,8 +985,42 @@ void MultiMasterManager::io_loop() {
                         }
                     }
                 }
-            } catch (...) {
-                throw;
+            } catch (const std::exception& e) {
+                // This thread staying alive is the point. Without the boundary the mesh went
+                // silent while every outside signal - `PING`, `MM_PEERS`, the peer's `connected`
+                // row - still looked healthy, which is the failure mode this engine has learned to
+                // call a guarantee absent in production (#112).
+                //
+                // The counter is what an operator can alarm on; the log is loud once and then
+                // quiet, because a full disk throws on every event, and the recovery line after
+                // this loop is what says the condition ended.
+                engine_.registry().increment_counter("ob_mm_io_errors_total");
+                threw_this_pass = true;
+                if (io_errors_.begin()) {
+                    OB_LOG_ERROR("mm",
+                                 "handling a mesh event threw and this event is abandoned; the io "
+                                 "loop continues: %s", e.what());
+                } else {
+                    OB_LOG_DEBUG("mm", "a mesh event threw again (%llu in this episode): %s",
+                                 static_cast<unsigned long long>(io_errors_.ticks()), e.what());
+                }
+                continue;
+            }
+        }
+
+        // The other half of "loud once": without a line that closes the episode, silence after
+        // the first ERROR is indistinguishable from the condition having gone away. Gated on a
+        // pass that had events **and** none of them threw - an idle loop must not announce a
+        // recovery every 500 ms, and neither must the pass that just reported the failure.
+        //
+        // What this deliberately does not do is suppress one line per failed record. #95's shape
+        // is a line per *loop iteration* carrying no new information; three lines for three
+        // records a full disk refused is information, and the counter beside them is the thing to
+        // alarm on.
+        if (nfds > 0 && !threw_this_pass) {
+            if (const uint64_t held = io_errors_.end()) {
+                OB_LOG_INFO("mm", "mesh events are being handled again after %llu that threw",
+                            static_cast<unsigned long long>(held));
             }
         }
 

@@ -88,6 +88,12 @@ MetricsRegistry::MetricsRegistry() {
     // two ask for different actions: a full disk is freed, a disk reporting EIO is replaced.
     counters_.push_back(make_counter("ob_wal_fsync_errors_total",
                                      "fsync calls on the WAL that failed"));
+    // Mesh events whose handling threw and which the io loop abandoned (#112). Registered in the
+    // same change that writes it: measured, an ENOSPC on a peer's delta used to end that thread
+    // outright, and every outside signal - PING, MM_PEERS, the peer's `connected` row - stayed
+    // healthy while the node received nothing. This is the number that contradicts them.
+    counters_.push_back(make_counter("ob_mm_io_errors_total",
+                                     "Mesh events abandoned because handling them threw"));
 
     // Gauges
     gauges_.push_back(make_gauge("ob_active_sessions", "Number of active TCP sessions"));
