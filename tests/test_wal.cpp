@@ -755,3 +755,105 @@ TEST(WalDistance, AMissingFirstFileIsUnknownToo) {
     EXPECT_FALSE(writer.bytes_since(in_first).has_value())
         << "the file the position sits in is gone and the distance was answered anyway";
 }
+
+// ── #126: a torn record in one file does not cost the files behind it ────────
+//
+// The writer abandons a file whose record it tore, without a ROTATE marker - it has just
+// established that the file cannot be written to. What replaces the marker is the rule these tests
+// pin: a checksum mismatch in a file that is **not** the last one is a tear, and replay continues
+// with the next file; in the last file it is a crash tail, and replay stops.
+//
+// Both directions matter and the second is the control. Before this rule, `replay()` returned at
+// the first mismatch **for the whole directory**, so the two writes acknowledged after a torn
+// record did not survive a restart (measured 2 of 2). After it, a mismatch that really is a crash
+// tail must still stop - a replayer that reads past one would hand the engine a record the process
+// never finished writing.
+
+namespace {
+
+/// Append bytes to a WAL file by hand, which is the only way to produce a torn one on demand.
+void append_raw(const std::string& dir, uint32_t index, const std::string& bytes) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "wal_%06u.bin", index);
+    std::ofstream out(dir + "/" + name, std::ios::binary | std::ios::app);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+/// The first twenty bytes of a record: a sequence number, a timestamp and a checksum, and then
+/// nothing. Exactly what a write that failed after `20` bytes leaves behind, which is what the
+/// fault injector produces and what #126 measured.
+std::string twenty_stranded_bytes() {
+    std::string bytes(20, '\0');
+    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<char>(0xA5);
+    return bytes;
+}
+
+size_t replay_count(const std::string& dir) {
+    size_t seen = 0;
+    ob::WALReplayer replayer(dir);
+    replayer.replay_v2([&](const ob::WALReplayContext& ctx) {
+        if (ctx.header.record_type == ob::WAL_RECORD_DELTA) ++seen;
+    });
+    return seen;
+}
+
+}  // namespace
+
+TEST(WalTornRecord, AMismatchInAnEarlierFileDoesNotStopTheReplay) {
+    TempDir tmp("torn_earlier");
+    const ob::Level lvl = make_level();
+
+    // File 0: two records, then the bytes a torn write leaves.
+    {
+        ob::WALWriter writer(tmp.str());
+        ob::DeltaUpdate a = make_delta(1);
+        ob::DeltaUpdate b = make_delta(2);
+        writer.append(a, &lvl);
+        writer.append(b, &lvl);
+        ASSERT_TRUE(writer.flush());
+    }
+    append_raw(tmp.str(), 0, twenty_stranded_bytes());
+
+    // File 1: the records the writer appended after abandoning file 0, produced the way the engine
+    // produces them rather than fabricated. A `WALWriter` continues from the **highest existing
+    // index**, so an empty `wal_000001.bin` is all it takes to put the next records there - and
+    // deliberately no ROTATE record in file 0, because `rotate()` would write one and the replayer
+    // would then stop at the marker rather than at the mismatch, which is a different case from the
+    // one this test is about.
+    append_raw(tmp.str(), 1, "");
+    {
+        ob::WALWriter writer(tmp.str());
+        ob::DeltaUpdate c = make_delta(3);
+        ob::DeltaUpdate d = make_delta(4);
+        writer.append(c, &lvl);
+        writer.append(d, &lvl);
+        ASSERT_TRUE(writer.flush());
+    }
+
+    EXPECT_EQ(replay_count(tmp.str()), 4u)
+        << "replay stopped at the torn record in file 0, so the two records in file 1 - which were "
+           "acknowledged - did not come back";
+}
+
+TEST(WalTornRecord, AMismatchInTheLastFileStillStopsTheReplay) {
+    // The control. Without it the rule above could be "ignore every mismatch", which would hand the
+    // engine the tail of a record the process never finished writing.
+    TempDir tmp("torn_last");
+    const ob::Level lvl = make_level();
+    {
+        ob::WALWriter writer(tmp.str());
+        ob::DeltaUpdate a = make_delta(1);
+        ob::DeltaUpdate b = make_delta(2);
+        writer.append(a, &lvl);
+        writer.append(b, &lvl);
+        ASSERT_TRUE(writer.flush());
+    }
+    append_raw(tmp.str(), 0, twenty_stranded_bytes());
+    // And a full record's worth of plausible garbage behind it, so that "stopped" is distinguishable
+    // from "ran out of bytes": a replayer that skipped the mismatch would read this next.
+    append_raw(tmp.str(), 0, std::string(136, '\x5A'));
+
+    EXPECT_EQ(replay_count(tmp.str()), 2u)
+        << "replay read past a checksum mismatch in the last WAL file, which is the crash tail: "
+           "the record was being written when the process died";
+}

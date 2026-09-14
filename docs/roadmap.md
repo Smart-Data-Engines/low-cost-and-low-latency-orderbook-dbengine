@@ -1199,13 +1199,13 @@ hand it on" from a claim about code into a measurement. It is paired with the ot
 record carrying the skew is still **applied**: a node that dropped it would keep its clock and lose a
 write, which is the trade #121 would have to make explicit.
 
-"A short write, then an error" was a hypothesis and is now **#126**: the write that is cut is
-refused, the writes after it are acknowledged, and **none of them survives a restart** — measured 2
-of 2, because `WALReplayer::replay()` returns at the first CRC mismatch rather than breaking out of
-one file. That is the central durability sentence in `docs/cli.md` with an exception nobody can see
-from outside. Getting the number right needed the flush tick an hour out and a `SIGKILL` rather than
-a stop: the first run read 1 of 2 because a tick had written a checkpoint and rescued a row, which
-is timing rather than the WAL.
+"A short write, then an error" was a hypothesis and became **#126**, since fixed: the write that is
+cut is refused, the writes after it were acknowledged, and **none of them survived a restart** —
+measured 2 of 2, because `WALReplayer::replay()` returned at the first CRC mismatch rather than
+breaking out of one file. That was the central durability sentence in `docs/cli.md` with an exception
+nobody could see from outside. Getting the number right needed the flush tick an hour out and a
+`SIGKILL` rather than a stop: the first run read 1 of 2 because a tick had written a checkpoint and
+rescued a row, which is timing rather than the WAL.
 
 And the reproduction guide is `tests/fault/README.md`: the four failures worth reproducing, each as
 one command line plus its environment, with the log that says the injection happened — because an
@@ -2295,7 +2295,7 @@ copy is. Measuring said that, and reading the code would have guessed wrong in b
   receive. It works on x86 today, which is the only reason this is an S rather than a P0 — and the
   reason it needed a sanitizer to find rather than a bug report
 
-### 126. An acknowledged write that lands behind a torn WAL record does not survive a restart
+### 126. An acknowledged write that landed behind a torn WAL record did not survive a restart ✅
 
 Measured by #54's A2.2, which existed to settle a hypothesis from reading the code. It is confirmed.
 
@@ -2324,18 +2324,42 @@ The test now runs with the tick an hour out and kills the node rather than stopp
 clean stop ends in a checkpoint too. A test of what replay can reach has to keep everything that
 writes a checkpoint away from it.
 
-**Three ways out, and the cheapest is not enough on its own.** Rotating to a new WAL file after a
-failed write puts the tear at the end of a closed file — but replay would still stop there, because
-it stops globally, so it would also need "a mismatch inside a file that is not the last one is a
-tear: continue with the next file". Alternatively the writer could record the tear (its own record
-type, or a length-prefixed skip) so replay can step over exactly the bytes that were abandoned;
-that is a format change. Or the engine could refuse writes to a file it has torn, which turns a lost
-tail into an outage and is worse. **Any of them is a decision about the WAL format or about
-replay's contract**, which is why this is an item rather than a patch in the test's own commit.
+**Fixed with the two halves, because neither is any use alone.** The writer **abandons** a file
+whose record it tore — opening the next one and publishing that position — and replay treats a
+checksum mismatch in a file that is **not the last** as a tear and continues with the next file. Do
+only the first and replay still stops at the tear, because it stopped for the whole directory. Do
+only the second and there is nothing behind the tear to find, because the writer kept appending into
+the abandoned region.
 
-- Effort: M | Impact: the engine's central durability claim has an exception nobody can see from
+**Two details in the writer's half are the whole of its correctness.** It is *not* `rotate()`: that
+function's first act is to write a ROTATE record **into the file just established as unwritable**.
+So there is no marker, and the replayer's rule is what replaces it. And it fires only when the write
+left bytes behind — `remaining < total` — not on every failed write: a disk that stays full fails
+atomically, and abandoning the file each time would produce **one empty WAL file per refused
+write**, a pathology the fix would have introduced rather than removed. That condition now has its
+own assertion in the disk-stays-full test.
+
+`abandon_torn_file()` is `noexcept` and logs rather than throws if it cannot open the next file,
+because the caller is about to report the write's own error — the one that says why the disk refused
+— and it must not be replaced by a second error about the recovery.
+
+**Measured after, by the test that measured before:** the same five writes with the third cut leave
+**0** stranded where they left 2 of 2, everything else acknowledged comes back, and the evidence
+that this is the new path is `wal_000001.bin` — the node's rotation threshold is 512 MB and the test
+writes five records, so a second file exists only because the torn one was abandoned. Two unit tests
+pin the replayer's rule from both sides: a mismatch in an earlier file yields the records from the
+file behind it, and a mismatch in the **last** file still stops, because that one is a crash tail and
+reading past it would hand the engine a record the process never finished writing.
+
+**Alternatives, named because they were considered.** A tear record (its own type, or a
+length-prefixed skip) would let replay step over exactly the abandoned bytes — and it needs *another
+write to the file that just refused one*, so the fix would depend on the thing that broke. Refusing
+all further writes to a torn file turns a lost tail into an outage. Doing nothing was what the
+measurement was against.
+
+- Effort: M | Impact: the engine's central durability claim had an exception nobody could see from
   outside. The window is narrow — it needs a write that fails *after* writing part of a record —
-  but inside it every later acknowledgement is a promise the restart breaks
+  but inside it every later acknowledgement was a promise the restart broke
 
 ### 125. A replica sent to the snapshot path could never bootstrap: the manifest checksum covered two fields the wire does not carry ✅
 
@@ -6110,15 +6134,15 @@ than about the engine. #110's first CI run also verified the
 value of the skip gate: seven new CLI tests did not run until both integration jobs built the CLI
 and the fixture selected the same build as the server.
 
-The current work sequence is **#126**, which #54's last measurement found: an acknowledged write
-that lands behind a torn WAL record does not survive a restart, and the fix is a decision about the
-WAL format or about replay's contract rather than a patch. The coverage badge left from #37 needs a
+**There is no open defect on this page.** #126 — the last one, which #54's own closing measurement
+found — is fixed: a file whose record was torn is abandoned, and replay treats a mismatch in any
+file but the last as a tear rather than as the end of the log. What is left are two maintainer
+decisions (#121, #37) and the capability items below. The coverage badge left from #37 needs a
 maintainer decision about an external reporting service. Existing coverage reports and the
 line-coverage floor continue to run inside GitHub Actions.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **Next** | A write behind a torn WAL record is lost (#126) | M | The durability claim has an exception nobody can see from outside: the write that tore is refused, the ones after it are acknowledged and gone |
 | **Decision** | Bound the drift a peer may introduce (#121) | S | Measured and filed rather than answered: a ceiling costs causal order against exactly the peer whose clock is wrong |
 | **Decision** | Coverage badge (#37) | S | Requires choosing an external service; the existing report and floor are already in CI |
 | **P2** | Comparative numbers from a larger machine (#39) | S | Everything but the box is in place: the harness recomputes all four numbers in one run, the competitors install natively, and `benchmarks/before-a-bigger-machine.md` is the survey of what would otherwise make it a number about our defaults |
@@ -6272,7 +6296,7 @@ except where a row says otherwise, not the machine-B performance baseline above.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1076 | all passing with `ctest -j1` on the i3-7100U, **213 s in a single run**. **Two more than the previous commit**, both #54's D3: a socket on the mesh port frames one DELTA record whose HLC says an hour ahead, and requires that it becomes this node's clock and **stays** — the next local tick is stamped from the moved clock, not from the wall clock the node can still read. That turns "`multi_master.cpp` parses an HLC from the frame and hands it on ten lines later" from a claim about code into a measurement; the drift the node reports is 3 599 999 386 597 ns. Its pair requires the record carrying the skew to be **applied**, because a node that dropped it would keep its clock and lose a write. **Earlier**: three were #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists 1078: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
+| C++ (GTest + RapidCheck) | 1078 | all passing with `ctest -j1` on the i3-7100U, **228 s in a single run**. **Two more than the previous commit**, both #126's, and they pin the replayer's new rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. The control is the second of the two. **Before them**, two were #54's D3: a socket on the mesh port frames one DELTA record whose HLC says an hour ahead, and requires that it becomes this node's clock and **stays** — the next local tick is stamped from the moved clock, not from the wall clock the node can still read. That turns "`multi_master.cpp` parses an HLC from the frame and hands it on ten lines later" from a claim about code into a measurement; the drift the node reports is 3 599 999 386 597 ns. Its pair requires the record carrying the skew to be **applied**, because a node that dropped it would keep its clock and lose a write. **Earlier**: three were #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists 1078: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
 | Python integration | 263 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 263; count pytest's final result rather than the report plugin's progress characters. `263 passed, 2 skipped in 20:42` on the GitHub runner for this commit, against `20:37` on the development machine (i3-7100U, native etcd) — the spread to expect between the two rather than a change. Three more than the previous commit: #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
 | Python integration under TSan | 263 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `263 passed in 26:08` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **20:42** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 

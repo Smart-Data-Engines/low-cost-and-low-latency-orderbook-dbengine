@@ -247,6 +247,17 @@ def test_a_disk_that_stays_full_refuses_every_write_and_keeps_answering():
         assert node.injections() >= 3, f"fewer faults fired than writes attempted: {replies}"
         assert all(r.startswith("ERR") for r in replies), replies
         assert node.talk("PING")[0] == "PONG", "a full disk left the node unable to answer at all"
+
+        # And it must not have started a new WAL file per refusal. #126 abandons a file whose record
+        # was **torn** - some bytes written, the rest failed - and these writes fail atomically, so
+        # nothing was stranded and there is nothing to abandon. Without that condition a disk that
+        # stays full would produce one empty WAL file per refused write, which is a pathology the
+        # fix would have introduced rather than removed.
+        files = sorted(f for f in os.listdir(node.data_dir)
+                       if f.startswith("wal_") and f.endswith(".bin"))
+        assert files == ["wal_000000.bin"], (
+            f"a write that failed atomically abandoned its file anyway; WAL files are {files}")
+
         assert node.stop() == 0, "a node on a full disk did not shut down cleanly"
     finally:
         node.cleanup()
@@ -383,8 +394,8 @@ def test_a_flush_command_does_not_report_success_over_a_failed_sync():
         node.cleanup()
 
 
-def test_a_torn_record_strands_every_acknowledged_write_behind_it():
-    """#54 A2.2: what a short write followed by an error costs, measured rather than reasoned about.
+def test_a_torn_record_costs_only_the_write_that_tore():
+    """#126: the write that tore is refused, and every other acknowledged write survives.
 
     The shape needs both halves and that is the first finding. `WALWriter::write_record()` loops
     `while (remaining > 0)`, so a short write on its own is **resumed** and the record completes —
@@ -393,11 +404,19 @@ def test_a_torn_record_strands_every_acknowledged_write_behind_it():
     remainder fails, whatever its size, because a size filter that names a 136-byte record cannot
     name the 116-byte retry.
 
-    The question the spec asked was how many records **after** the torn one stop being readable. The
-    answer is measured here, and the client's side of it is the part that matters: the write that
-    was cut is refused, so nobody is misled about it — but the writes that follow are answered `OK`,
-    land in the file behind the stranded bytes, and replay cannot reach them. Whatever this test
-    measures, it states as a fact about this build rather than as a promise.
+    **This test measured the defect before it asserted the guarantee**, which is why it reads the
+    way it does. #54's A2.2 asked how many records *after* the torn one stop being readable: the
+    answer was **2 of 2**, because the writes that follow are answered `OK`, land behind the
+    stranded bytes, and `WALReplayer::replay()` returned at the first checksum mismatch — for the
+    whole directory rather than for one file. #126 fixed both halves, and neither is useful alone:
+    the writer abandons a file whose record it tore (without a ROTATE marker, since it has just
+    established the file cannot be written to), and replay treats a mismatch in a file that is not
+    the last one as a tear and continues with the next.
+
+    So the assertion is now the guarantee: the cut write is refused, and **everything else that was
+    acknowledged comes back**. The evidence that this is the new path rather than luck is the second
+    WAL file: the node was configured never to rotate on size, so `wal_000001.bin` exists only
+    because the tear put it there.
     """
     node = FaultNode(OB_FAULT_PATH=WAL_SEGMENT, OB_FAULT_OP="write", OB_FAULT_ERRNO="ENOSPC",
                      OB_FAULT_SIZE=DELTA_BYTES, OB_FAULT_SKIP="2", OB_FAULT_COUNT="1",
@@ -439,20 +458,23 @@ def test_a_torn_record_strands_every_acknowledged_write_behind_it():
             f"the refused write came back after the restart, which would make the refusal a lie: "
             f"{sorted(prices)}")
         stranded = sorted(p for p in acknowledged if p not in prices)
-        survived = sorted(p for p in acknowledged if p in prices)
         custom_metrics["records_stranded_behind_a_torn_one"] = len(stranded)
-        assert survived, (
-            f"not one acknowledged write survived, so replay stopped before the tear rather than "
-            f"at it: {sorted(prices)}\n{node.log()}")
-        # The measurement, asserted as the shape it is rather than as a number: everything written
-        # before the tear has to come back, and what was written after it is what the WAL cannot
-        # reach. If a later build strands nothing, this assertion is what will say so.
-        assert {100, 200} <= prices, (
-            f"a write acknowledged *before* the tear was lost, which is worse than the item "
-            f"describes: {sorted(prices)}")
-        assert stranded == [400, 500], (
-            f"the records behind the torn one behaved differently from the measurement this test "
-            f"records: stranded={stranded}, survived={survived}. If they now survive, the engine "
-            f"has gained something and this test should say so; the number is not a promise")
+        assert not stranded, (
+            f"{len(stranded)} acknowledged write(s) did not survive the restart: {stranded}. "
+            f"Before #126 this was 2 of 2, because the writer kept appending behind the stranded "
+            f"bytes and replay stopped at the first checksum mismatch in the directory:\n"
+            f"{node.log()}")
+
+        # And the tear really did move the writer on, which is what makes the assertion above about
+        # the fix rather than about a fault that failed to fire. The node never rotates on size
+        # here - the default threshold is 512 MB and this test writes five records - so a second
+        # WAL file exists only because the torn one was abandoned.
+        files = sorted(f for f in os.listdir(node.data_dir)
+                       if f.startswith("wal_") and f.endswith(".bin"))
+        assert files == ["wal_000000.bin", "wal_000001.bin"], (
+            f"the writer did not abandon the file it tore; WAL files are {files}")
+        assert "torn record in" in node.log(), (
+            f"nothing in the node's log names the torn record, so an operator would have no way to "
+            f"know one happened:\n{node.log()}")
     finally:
         node.cleanup()

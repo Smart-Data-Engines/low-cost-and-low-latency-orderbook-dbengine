@@ -2361,6 +2361,19 @@ Learned the hard way. Check here before debugging.
     of 205. The resize was not the cost; the copy was. And the apply path, which is where the reading
     expected a difference, came out **identical instruction for instruction**.
 
+281. **A recovery that needs the thing that just broke is not a recovery.** #126's obvious fix was a
+    "tear" record so replay could step over the abandoned bytes — and writing it means *another
+    write to the file that just refused one*. The same objection killed it twice over: `rotate()`
+    could not be reused either, because its first act is a ROTATE record **into the file just
+    established as unwritable**. What works is the pair that needs nothing from the broken file: open
+    the next one, and teach the reader that a mismatch in any file but the last is a tear.
+
+282. **A fix's condition is as much of the fix as its action.** Abandoning a file on **every** failed
+    write would give a disk that stays full one empty WAL file per refused write — a pathology the
+    fix would have introduced. The tear condition is exactly `remaining < total` at the failure
+    site, which the writer already knows, and the disk-stays-full test now asserts the file count so
+    the condition is a tested property rather than a comment.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2510,14 +2523,15 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   buffer to `const Level*`; a mesh frame puts the levels 130 bytes in, which is not a multiple of
   eight. Fixed as a class through one `levels_from_payload()`, with the cost measured: the parsing
   function grows 188 → 393 instructions for one `memcpy`, and both apply paths are identical.
-- **Fault injection (#54) is closed, and its last measurement is #126, still open.** An
-  acknowledged write that lands behind a **torn** WAL record does not survive a restart: the write
-  that tore is refused, the ones after it are answered `OK`, and `WALReplayer::replay()` returns at
-  the first CRC mismatch rather than breaking out of one file — so replay stops for the whole
-  directory. Measured 2 of 2 stranded. The fix is a decision about the WAL format or about replay's
-  contract (rotate on a failed write *and* teach replay that a mismatch inside a non-final file is
-  a tear; or record the tear; or refuse writes to a file already torn, which is worse), which is why
-  it is an item rather than a patch. The stage that found it needed a composite fault the injector
+- **Fault injection (#54) is closed, and so is its last measurement, #126.** An acknowledged write
+  that landed behind a **torn** WAL record did not survive a restart: the write that tore is
+  refused, the ones after it were answered `OK`, and `WALReplayer::replay()` returned at the first
+  CRC mismatch rather than breaking out of one file. Measured 2 of 2 stranded, then **0** after the
+  fix — which is two halves, neither useful alone: the writer **abandons** a file whose record it
+  tore (no ROTATE marker: its first act would be a write into the file just established as
+  unwritable) and replay treats a mismatch in any file but the **last** as a tear. It fires only
+  when the write left bytes behind, because abandoning on every failed write would give a full disk
+  one empty WAL file per refusal. The stage that found it needed a composite fault the injector
   could not express — `OB_FAULT_SHORT_THEN_FAIL`, because a short write alone cannot tear a record
   `write_record()` resumes.
 - **A snapshot's checksum covers what the wire carries, and before #125 it covered two fields the

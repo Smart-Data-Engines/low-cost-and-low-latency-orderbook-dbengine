@@ -373,6 +373,22 @@ public:
     size_t truncate_before(uint32_t before_index);
 
 private:
+    /// Stop writing to the current file after a partial write failed, without a ROTATE record.
+    ///
+    /// The one case where the current file cannot be written to at all: some bytes of a record
+    /// reached it and the rest failed, so no reader can parse past them and anything appended
+    /// behind them is unreachable on replay (#126). `rotate()` cannot be used - its first act is to
+    /// write a ROTATE record into that same file - and the marker is replaced by the replayer's
+    /// rule: a checksum mismatch in a file that is **not** the last one is a tear, and replay
+    /// continues with the next file.
+    ///
+    /// `noexcept`: the caller is about to report the write's own error, which is the one that says
+    /// why the disk refused, and it must not be replaced by a second error about the recovery.
+    void abandon_torn_file(size_t stranded_bytes, int write_errno) noexcept;
+
+public:
+
+private:
     int         fd_;
 
     /// The only storage for the position. Not a copy published beside `written_` and `file_index_`:
