@@ -2465,6 +2465,28 @@ Learned the hard way. Check here before debugging.
     `scripts/test_table.py <pr>`. Whose own first version printed `17 in 0:00` for a job that ran
     265 tests, because `re.search` returns the **first** match and pytest's verdict is the last.
 
+295. **A boundary that saves a thread does not save the state the thread was halfway through
+    changing.** #112's per-iteration boundary made the failover monitor survive a refused `EPOCH`
+    write — counter, one ERROR, a recovery line — and the node still answered `ROLE` with
+    `REPLICA <its own replication port>`, because the promotion had already taken the leader key
+    when the write was refused. Fixing the thread and fixing the half-finished transition are two
+    defects; the second is #130, and writing failover semantics inside a `catch` would have hidden
+    it in the least-reviewed code in the subsystem.
+
+296. **A rewriting script must assert its own postcondition, not report its match count.** A regex
+    pass over nine `make_unique<FailoverManager>` sites printed *rewrote 8* and changed none of
+    them; the link error found it two builds later. Counting `->registry())` occurrences before and
+    after, and then re-scanning for sites that still lack the argument, is what caught it. Same
+    family as "assert the source **and** the output changed" from the mutation harness: a tool's
+    own report of what it did is not evidence that it did it.
+
+297. **Mutate past the logging, not before it, or the mutation kills the wrong assertion.** Putting
+    `throw;` right after the counter made the boundary skip its own log lines, so the test failed on
+    "the failed tick was not reported" — true, but it says nothing about whether the *thread*
+    survived. Counting, logging and **then** rethrowing kills the assertion that carries the
+    guarantee: *no tick ran after the one that threw*. Place the mutation so that only the property
+    under test changes.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

@@ -252,7 +252,11 @@ target_link_libraries(orderbook_tls PUBLIC orderbook_logger orderbook_auth OpenS
 
 # ── Failover compiled library (role transitions and monitoring) ────────────────
 add_library(orderbook_failover STATIC src/failover.cpp)
-target_link_libraries(orderbook_failover PUBLIC orderbook_coordinator orderbook_epoch orderbook_logger)
+# `orderbook_metrics` since #112: the monitor loop's per-iteration boundary counts the ticks it
+# survives, and that counter is the only outward sign a tick failed - PING, ROLE and the log's
+# silence all look the same either way.
+target_link_libraries(orderbook_failover PUBLIC orderbook_coordinator orderbook_epoch
+                                                orderbook_logger orderbook_metrics)
 
 # ── Codec compiled library ─────────────────────────────────────────────────────
 add_library(orderbook_codec STATIC src/codec.cpp)

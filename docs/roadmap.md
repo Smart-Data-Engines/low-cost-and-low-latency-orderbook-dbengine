@@ -2152,6 +2152,58 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 130. A promotion that stops halfway leaves the node a replica of itself
+
+Found while measuring #112's `monitor_loop` half, and left open on purpose: the boundary that made
+the thread survive turned "the thread is gone and the node is stuck" into "the thread is fine and
+the node is still stuck", and the second half is a different defect.
+
+**Measured**, with #54's injector refusing the 32-byte `EPOCH` record a promotion writes. Two nodes
+on one etcd, the fault on the replica only. The primary is killed, the replica waits out #82's
+election delay, takes the leader key, and then the `EPOCH` write is refused — so
+`promote_to_primary()` throws **after** the key is taken and **before** `role_` becomes `PRIMARY`.
+From then on `ROLE` answers:
+
+```
+REPLICA 127.0.0.1:44613 2
+```
+
+44613 is that node's **own** replication port. The next monitor tick reads the leader key, finds
+this node's address in it, and adopts it — so the node is a replica of itself, in epoch 2, for as
+long as it runs. Measured across the forty seconds observed; `PING` answers throughout, and with
+#112's boundary in place `ob_monitor_errors_total` is 1 and the episode opens and closes normally.
+The control, the same run at a size nothing writes, reaches `PRIMARY 2` in twenty seconds.
+
+**Why the boundary is not the fix and was not made into one.** #112 is about an exception ending a
+thread. This is about a promotion having two durable effects — the leader key in etcd and the epoch
+record in the WAL — with no rule about what the node is when it has done the first and not the
+second. Making the boundary roll the promotion back would be writing failover semantics inside a
+`catch`, which is where the least-reviewed code in any subsystem lives.
+
+**The shape is #73's, one layer along.** There, losing the startup race left a node in a role that
+was not a role (`STANDALONE` for ever, because `monitor_loop()` had no branch for it). Here,
+half-winning a promotion leaves it in a role that contradicts itself. Both are a state machine
+missing the arm for an outcome that can happen.
+
+Three candidate answers, none chosen yet, and the cost of each is the interesting part:
+
+- **Refuse to adopt our own address.** Narrow and unconditionally correct — a node is never its own
+  primary — and cheap. It does not unstick the node: it would then hold the leader key while being
+  neither primary nor a replica of anyone, which is honest and still broken.
+- **Release the key when the promotion fails.** Lets another node take the role, which is what the
+  operator wants, and needs care about the epoch: the key was taken at epoch 2, and a node that
+  releases it must not leave a peer able to win epoch 2 again.
+- **Finish the promotion on a later tick.** The most useful outcome and the most state to reason
+  about — `current_epoch_` and `wal_.set_epoch()` have already run, so a retry has to be idempotent
+  in the WAL as well as in etcd.
+
+The first is a precondition of the other two rather than an alternative to them, since both leave a
+window in which the key is ours and the role is not.
+
+- Effort: M, mostly the decision | Impact: a node whose disk refused one 32-byte record answers
+  every health check while reporting a role that cannot exist, and the cluster has a leader key held
+  by a node that will never act as leader. No data is lost; availability is, silently
+
 ### 129. A mesh node's shutdown waits out the lease loop's sleep ✅
 
 Found while reading `PeerRegistry::lease_loop()` for #112's remaining half, and then measured,
@@ -3668,16 +3720,42 @@ segment, or a crash forgets it was ever seen and anti-entropy asks the peer agai
 measured is that last leg — the anti-entropy pass itself — and it is named here rather than
 implied.
 
-**Still open, with the judgement each one needs written down.** `monitor_loop` gets its boundary
-next, and it carries three things that would hide each other in one diff: seven byte-identical nap
-blocks collapsing into one (verified by script — six `continue`s, each preceded by exactly that
-nap, plus the one at the bottom, so `continue` → `return` is a property of the code rather than a
-reading of it), the tick extraction, and a `MetricsRegistry&` constructor argument, because
-`FailoverManager` has no registry and a defaulted argument would let every test leave the counter
-unfed, which is #117 exactly. `lease_loop` has **no** throwing path today, so its boundary is a
-ratchet and will say so. `run_loop` needs the floor, and the floor is not a new threshold: 100 ms
-is what that loop already waits when it has nothing in hand, so a failing pass is paced like an
-idle one.
+**`monitor_loop` is done too, in three commits that would have hidden each other in one.** The
+seven byte-identical nap blocks collapsed first, on a property a script established rather than a
+reading: six `continue`s each immediately preceded by exactly that nap, plus the one at the bottom,
+so every path napped exactly once and `while (running_) { monitor_tick(); nap(); }` with
+`continue` → `return` changes nothing. Then the tick extraction, 267 lines and no `continue` left in
+it. Then the boundary, which is the whole of the third diff.
+
+`FailoverManager` takes a `MetricsRegistry&` — nine `make_unique` sites and sixteen direct ones in
+`tests/test_etcd_integration.cpp`, each already holding an engine, plus the one in `Engine::open()`.
+Passed rather than reached through `RoleTransitionHandler`, because incrementing a counter is not a
+role transition; not defaulted, because a default would let every test leave the counter unfed,
+which is #117 exactly and #117 is why the counter is here at all. `orderbook_failover` links
+`orderbook_metrics` now, which is what the linker said about it.
+
+The recovery line sits **inside** the `try`, so a tick that threw cannot claim its own recovery —
+the mistake the mesh boundary made one commit earlier, paid once rather than twice.
+
+**And this is the part worth reading: the boundary fixed the thread and the node is still stuck.**
+After the fix, the same probe reports the thread alive, `ob_monitor_errors_total` at 1, the episode
+opening and closing — and `ROLE` still answering `REPLICA 127.0.0.1:44613 2`, that node's own
+replication port, for the forty seconds observed. The promotion took the leader key before the
+`EPOCH` write was refused, and the next tick adopts what it finds in the key. That is **#130**, a
+separate defect with its own decision to make, and the test for this change deliberately asserts the
+**thread** rather than the role: the recovery line can only be written by a tick after the one that
+threw, while "the process is alive" was true when the thread was gone.
+
+Two mutations, and the second is the one worth having. Rethrowing straight after the counter kills
+the test on its first assertion — the failure output carries the old `monitor_loop ended on an
+exception and that thread is gone`, which is the pre-fix line. Counting, logging **and then**
+rethrowing kills it on the assertion that matters: *no tick ran after the one that threw*. Restored
+from a copy kept alongside both times, green after.
+
+**Still open: `lease_loop` and `run_loop`.** `lease_loop` has **no** throwing path today, so its
+boundary is a ratchet and will say so rather than pretending to fix something measured. `run_loop`
+needs the floor, and the floor is not a new threshold: 100 ms is what that loop already waits when
+it has nothing in hand, so a failing pass is paced like an idle one.
 
 
 - Effort: M | Impact: the most ordinary disk condition there is no longer turns a refusal into a
@@ -6625,10 +6703,10 @@ absolute thresholds for a designated benchmark host.
 
 ### Test suite
 
-Verified by [the full CI run for PR #127](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/34881404041),
-on the tree containing #126, #127, #128, #129 and #112's `io_loop` half. Runtimes below are from
-GitHub's `ubuntu-24.04` runners except where a row says otherwise, not the machine-B performance
-baseline above.
+Verified by [the full CI run for PR #129](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/34892839145),
+on the tree containing #126, #127, #128, #129 and both of #112's halves written so far — the
+`io_loop` and `monitor_loop` boundaries. Runtimes below are from GitHub's `ubuntu-24.04` runners
+except where a row says otherwise, not the machine-B performance baseline above.
 
 **Both halves of this block come out of `scripts/test_table.py <pr>`, and that is the second
 attempt at keeping them together.** The citation and the counts have to name the same tree, and
@@ -6643,15 +6721,17 @@ ran 265 tests, because `re.search` returns the *first* match and pytest's verdic
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1083 | all passing with `ctest -j1` on the i3-7100U, **236-390 s in a single run** — three runs of the same suite on the same machine, the slowest with another session's containers resident and ~1 GB actually free. That spread, not any one of its ends, is what the next number is read against: it is wider than anything a commit in this repository has changed. **Unchanged by this commit**, which adds integration tests only; the most recent addition was #129's: a registry given a 1200-second lease interval has to stop inside two seconds, which is a property stated three orders of magnitude clear of load rather than a duration. **Before it**, four were #128's, and they divide the way that defect does: three in `tests/test_mm_epoll_identity.cpp` are about the shape — that the two reserved event keys cannot collide with a connection, that closing a descriptor takes its registration with it (measured against `dup2`, which forces the reuse the defect needs instead of hoping for it), and that no registration in `src/multi_master.cpp` carries a bare descriptor number. The fourth is behavioural: a connection landing on the descriptor its predecessor gave back is its own connection, with both numbers read back so a run where the kernel did not recycle the number says so rather than passing quietly. Three of the six mutations in that item's table are killed by the static test **and by nothing else**, which is what says it carries weight. **Before them**, two were #126's, and they pin the replayer's rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. **Earlier**: two were #54's D3, three #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists **1085**: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The count that passes and the count CTest lists differ by exactly those two harnesses, always; a row two commits back gave one number for both. The runtimes are what this machine gave on the commit measured, not a budget |
-| Python integration | 265 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 265; count pytest's final result rather than the report plugin's progress characters. `265 passed, 2 skipped in 20:54` on the GitHub runner for this commit, against `20:37` on the development machine (i3-7100U, native etcd) **for the 263-test tree two commits back** — the figure is kept as the spread to expect between the two machines, and labelled with the tree it came from rather than silently paired with a count it never measured. This tree's battery ran locally only as the new module (67 s for its two tests); the whole battery on this commit is CI's. Two more than the previous commit, both #112's `io_loop` half and both in the new `test_mesh_storage_faults.py`: a mesh receiver whose WAL refuses one record still receives the ones after it (**38.6 s**, because it waits for a mesh to form and for four records to cross it), and its control at a size nothing writes, which must inject nothing (**28.2 s**). The pair costs **67 s** locally. **Before them**: three were #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
-| Python integration under TSan | 265 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `265 passed in 26:38` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **20:54** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
+| C++ (GTest + RapidCheck) | 1083 | all passing with `ctest -j1` on the i3-7100U, **236-390 s in a single run** — three runs of the same suite on the same machine, the slowest with another session's containers resident and ~1 GB actually free. That spread, not any one of its ends, is what the next number is read against: it is wider than anything a commit in this repository has changed. **Unchanged by this commit and by the one before it**, both of which add integration tests only; the most recent addition was #129's: a registry given a 1200-second lease interval has to stop inside two seconds, which is a property stated three orders of magnitude clear of load rather than a duration. **Before it**, four were #128's, and they divide the way that defect does: three in `tests/test_mm_epoll_identity.cpp` are about the shape — that the two reserved event keys cannot collide with a connection, that closing a descriptor takes its registration with it (measured against `dup2`, which forces the reuse the defect needs instead of hoping for it), and that no registration in `src/multi_master.cpp` carries a bare descriptor number. The fourth is behavioural: a connection landing on the descriptor its predecessor gave back is its own connection, with both numbers read back so a run where the kernel did not recycle the number says so rather than passing quietly. Three of the six mutations in that item's table are killed by the static test **and by nothing else**, which is what says it carries weight. **Before them**, two were #126's, and they pin the replayer's rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. **Earlier**: two were #54's D3, three #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists **1085**: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The count that passes and the count CTest lists differ by exactly those two harnesses, always; a row two commits back gave one number for both. The runtimes are what this machine gave on the commit measured, not a budget |
+| Python integration | 267 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 267; count pytest's final result rather than the report plugin's progress characters. `267 passed, 2 skipped in 21:32` on the GitHub runner for this commit, against `20:37` on the development machine (i3-7100U, native etcd) **for the 263-test tree four commits back** — the figure is kept as the spread to expect between the two machines, and labelled with the tree it came from rather than silently paired with a count it never measured. This tree's battery ran locally only as the new module (**45.7 s** for its two tests); the whole battery on this commit is CI's. Two more than the previous commit, both #112's `monitor_loop` half and both in the new `test_failover_storage_faults.py`: a replica whose data directory refuses the `EPOCH` record a role transition writes loses that monitor tick and not the thread, and its control at a size nothing writes, which must inject nothing. The assertion that carries the guarantee in the first of the two is the **recovery** line rather than the error line — only a later tick can write it, so a run in which the thread died would report the error and then say nothing, which is what a boundary is for. The pair costs **45.7 s** locally, and the module asserts its own premise: `OB_FAULT_PATH=ob_node1_` names the replica's data directory only because `ClusterManager.start()` waits for node-0 to hold PRIMARY before it starts node-1, and a change to that ordering would aim the injector at the **primary's** startup promotion, which exits the process. **Before them**, two were #112's `io_loop` half and both in the new `test_mesh_storage_faults.py`: a mesh receiver whose WAL refuses one record still receives the ones after it (**38.6 s**, because it waits for a mesh to form and for four records to cross it), and its control at a size nothing writes, which must inject nothing (**28.2 s**); that pair costs **67 s** locally. **Before those**: three were #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
+| Python integration under TSan | 267 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `267 passed in 27:18` on the GitHub runner for this commit — and this job is what closed #122: it turned **red** on the pull request for #117 with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **21:32** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than
-from a local one. That the TSan job also reports 234 with zero skips is what establishes something
-the design left open: an injector compiled with ThreadSanitizer preloads cleanly into a server
-compiled with it, measured instead of argued.
+from a local one. That the TSan job reports **the same count as the row above it**, with zero
+skips, is what establishes something the design left open: an injector compiled with
+ThreadSanitizer preloads cleanly into a server compiled with it, measured instead of argued. The
+count is not repeated here on purpose — a second copy of a number is the drift this section already
+has two entries about.
 
 The seven CLI tests run in both integration jobs. Both build `ob_cli`, and the fixture selects the
 binary beside the server under test. No `xfail` remains.
