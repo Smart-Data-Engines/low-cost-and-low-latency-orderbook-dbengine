@@ -2282,6 +2282,16 @@ Learned the hard way. Check here before debugging.
     shorten the pause to fit under the timeout — the margin is against a number you do not control,
     on a runner three times slower under a sanitizer.
 
+272. **`shutil.copy2` preserves the mtime, so a source restored with it is older than the object
+    file built from the mutant — and the build rebuilds nothing.** #124's mutation harness kept a
+    pristine copy alongside (the rule that exists because `git checkout <path>` has eaten
+    uncommitted work here four times) and restored with `copy2`. Every verdict after the first
+    restore was therefore measured against a binary that still carried an earlier mutation, and the
+    restored tree was reported as not green. Restore with `copyfile` plus an explicit `utime`, or
+    `touch` afterwards. **What caught it was the control**: the one mutation in the table that had
+    to survive came back KILLED, which is the whole argument for having it — a table where
+    everything dies reports a broken instrument as diligence.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

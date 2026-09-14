@@ -2295,6 +2295,18 @@ documented. What happens next is **#125**: the snapshot bootstrap that refusal s
 succeed. The test asserts the other half of the promise instead — the primary still holds every row
 it acknowledged — and #125 owns the assertion that the replica comes back.
 
+**Eight mutations, each with the verdict it was expected to give, and the first run of the table
+found a defect in the table.** The control — a reworded log line, which must **survive** — came back
+KILLED, and the restored tree was reported as not green. The cause was `shutil.copy2` in the
+harness's restore: it preserves the mtime, so a source put back from the pristine copy is *older*
+than the object file built from the mutant and the build rebuilds nothing. Every verdict after the
+first restore had been measured against a binary still carrying an earlier mutation. `copyfile` plus
+an explicit `utime` fixes it, and the reason to keep a control in every such table is exactly this:
+one that dies is the only thing that tells you the instrument is broken rather than the code
+diligent. After the fix, all eight — two joints of the flag's plumbing (the engine's argument, and
+the CLI call site, which different suites catch), three refusals, retention ignoring what replicas
+have confirmed, retention deleting nothing, and the control.
+
 - Effort: S for the flag, M for the tests | Impact: three behaviours that only happen at a rotation
   were covered by unit tests that cannot express a reconnect or a retention pass. Two of them are
   now covered by a running cluster, and reaching the third found a defect that made a replica
