@@ -6657,8 +6657,10 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open defects: #130, #131, #132.** One question is recorded for a decision (**#121**) and one
-waits on an external service (**#37**). **#117**, **#118**, **#122** and **#123** are closed, and
+**Open: #121, #130, #131, #132.** Every item above #58 is either marked closed or named on that
+line — `scripts/check_roadmap.py` holds both directions — and items #1 to #58 are planned work
+nobody has built, not defects. Of the four, #121 is a question recorded for a decision rather than
+a defect, and **#37**'s remaining half waits on an external service. **#117**, **#118**, **#122** and **#123** are closed, and
 together they are one investigation that started with five registered
 metrics nothing wrote and ended four items later in the WAL's own arithmetic. Every lag this engine
 reports is now measured against a position it can actually compare, and every one of them is a
