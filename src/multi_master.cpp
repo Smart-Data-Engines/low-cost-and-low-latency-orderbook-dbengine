@@ -290,7 +290,7 @@ void MultiMasterManager::start() {
     {
         struct epoll_event ev{};
         ev.events  = EPOLLIN;
-        ev.data.fd = wakeup_fd_;
+        ev.data.u64 = kMeshEventWakeup;
         if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wakeup_fd_, &ev) < 0) {
             OB_LOG_ERROR("mm", "epoll_ctl(wakeup) failed: %s", std::strerror(errno));
             ::close(wakeup_fd_);
@@ -334,7 +334,7 @@ void MultiMasterManager::start() {
             // Add listen_fd to epoll.
             struct epoll_event ev{};
             ev.events = EPOLLIN;
-            ev.data.fd = listen_fd_;
+            ev.data.u64 = kMeshEventListen;
             ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &ev);
         }
     }
@@ -722,10 +722,13 @@ void MultiMasterManager::io_loop() {
         poll_snapshot_preparation();
 
         for (int i = 0; i < nfds; ++i) {
-            int ev_fd = events[i].data.fd;
+            // What this event is about, not which descriptor carried it: the number may have
+            // been handed on since the harvest above, and three other threads close peer sockets
+            // (#128).
+            const uint64_t ev_key = events[i].data.u64;
             uint32_t ev_events = events[i].events;
 
-            if (ev_fd == wakeup_fd_) {
+            if (ev_key == kMeshEventWakeup) {
                 // Drain it and re-check running_ at the top of the loop. Nothing else to do: the
                 // event carries no information beyond "look again".
                 uint64_t drained = 0;
@@ -734,7 +737,7 @@ void MultiMasterManager::io_loop() {
                 continue;
             }
 
-            if (ev_fd == listen_fd_) {
+            if (ev_key == kMeshEventListen) {
                 // ── Accept new connections (level-triggered EPOLLIN) ──────────
                 while (true) {
                     struct sockaddr_in peer_addr{};
@@ -752,16 +755,14 @@ void MultiMasterManager::io_loop() {
                     ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY,
                                  &tcp_nodelay, sizeof(tcp_nodelay));
 
-                    // Add to epoll with edge-triggered EPOLLIN.
-                    struct epoll_event ev{};
-                    ev.events = EPOLLIN | EPOLLET;
-                    ev.data.fd = client_fd;
-                    ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &ev);
-
-                    OB_LOG_INFO("mm", "Accepted peer connection fd=%d", client_fd);
-
                     std::lock_guard<std::mutex> lock(mtx_);
 
+                    // The record first, then the epoll registration — because the registration has
+                    // to carry the connection's identity and the identity is minted here (#128).
+                    // It also closes the window this used to open: a descriptor armed before its
+                    // record existed is the state the "no record behind it" branch below warns
+                    // about, and for a few instructions this path produced it on purpose.
+                    //
                     // An accepted connection has no node id until its handshake supplies one, so
                     // it goes into the container for exactly that: `pending_`, keyed by its own
                     // conn_id. It used to go into `peers_` under `static_cast<uint16_t>(fd)`,
@@ -781,6 +782,15 @@ void MultiMasterManager::io_loop() {
                     const uint64_t pending_key = conn.conn_id;
                     PeerConnection& pending = pending_[pending_key];
                     pending = std::move(conn);
+
+                    // Edge-triggered EPOLLIN, carrying the conn_id rather than the descriptor.
+                    struct epoll_event ev{};
+                    ev.events   = EPOLLIN | EPOLLET;
+                    ev.data.u64 = pending.conn_id;
+                    ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &ev);
+
+                    OB_LOG_INFO("mm", "Accepted peer connection fd=%d as connection %llu",
+                                client_fd, static_cast<unsigned long long>(pending.conn_id));
 
                     // TLS before a byte is queued. What follows is queued rather than written: the
                     // drain returns early while the handshake runs, so these frames go out with the
@@ -805,19 +815,27 @@ void MultiMasterManager::io_loop() {
                 // Find the peer by fd.
                 std::lock_guard<std::mutex> lock(mtx_);
 
-                ConnectionRef ref = find_connection_by_fd(ev_fd);
+                ConnectionRef ref = find_connection_by_conn_id(ev_key);
                 PeerConnection* peer_ptr = ref.peer;
 
                 if (!peer_ptr) {
-                    // A descriptor in the epoll set with no record behind it. This is not a
-                    // routine case: every close removes the registration, so reaching it means
-                    // some path dropped a record while its socket was still armed, and the peer
-                    // at the other end sees a truncation rather than a close. #96 was one such
-                    // path and said nothing on either side.
-                    OB_LOG_WARN("mm", "epoll event on fd=%d with no connection behind it — closing "
-                                      "it; the peer will see a truncated stream", ev_fd);
-                    ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, ev_fd, nullptr);
-                    ::close(ev_fd);
+                    // The connection this event is about is gone, which is routine: `epoll_wait()`
+                    // harvests before this loop takes `mtx_`, and `handle_topology_change()`,
+                    // `check_backpressure()` and the reconnect loop all close peer sockets under
+                    // that lock. Closing the socket removed its registration, so there is nothing
+                    // left to do and nothing to disarm.
+                    //
+                    // Nothing is closed here, and that is the fix rather than an omission. This
+                    // branch used to close the descriptor the event carried, on the argument that
+                    // an armed descriptor with no record behind it must be an orphan — and the
+                    // descriptor it closed was the client port's epoll instance, handed the number
+                    // by `epoll_create1()` after the mesh let it go (#128). Nor can a skipped event
+                    // repeat: every registration here is `EPOLLET`, so there is no busy loop in
+                    // ignoring one.
+                    OB_LOG_DEBUG("mm",
+                                 "epoll event 0x%x for connection %llu, which is already gone; it "
+                                 "was harvested before its record was dropped",
+                                 ev_events, static_cast<unsigned long long>(ev_key));
                     continue;
                 }
 
@@ -881,14 +899,14 @@ void MultiMasterManager::io_loop() {
                             case TlsChannel::Io::Error:  n = -1; errno = EIO; break;
                             }
                         } else {
-                            n = ::recv(ev_fd, buf, sizeof(buf), 0);
+                            n = ::recv(peer_ptr->fd, buf, sizeof(buf), 0);
                         }
                         if (n > 0) {
                             peer_ptr->recv_buf.insert(peer_ptr->recv_buf.end(),
                                                      buf, buf + n);
                         } else if (n == 0) {
                             // Peer closed connection.
-                            OB_LOG_INFO("mm", "Peer fd=%d closed connection", ev_fd);
+                            OB_LOG_INFO("mm", "Peer fd=%d closed connection", peer_ptr->fd);
                             disconnected = true;
                             break;
                         } else {
@@ -898,7 +916,7 @@ void MultiMasterManager::io_loop() {
                             }
                             // Error — disconnect.
                             OB_LOG_WARN("mm", "Peer fd=%d recv error: %s",
-                                        ev_fd, std::strerror(err));
+                                        peer_ptr->fd, std::strerror(err));
                             disconnected = true;
                             break;
                         }
@@ -946,7 +964,8 @@ void MultiMasterManager::io_loop() {
                 // Handle errors/hangup.
                 if (ev_events & (EPOLLERR | EPOLLHUP)) {
                     if (peer_ptr && peer_ptr->connected) {
-                        OB_LOG_WARN("mm", "Peer fd=%d EPOLLERR/HUP — disconnecting", ev_fd);
+                        OB_LOG_WARN("mm", "Peer fd=%d EPOLLERR/HUP — disconnecting",
+                                    peer_ptr->fd);
                         connection_lost("epoll reported an error or a hangup");
                     }
                 }
@@ -967,15 +986,17 @@ void MultiMasterManager::io_loop() {
 
 // ── Connection records ────────────────────────────────────────────────────────
 
-MultiMasterManager::ConnectionRef MultiMasterManager::find_connection_by_fd(int fd) {
-    // Pending first: the container is small — one entry per inbound connection still in its
-    // handshake — and a descriptor cannot be in both.
-    for (auto& [key, conn] : pending_) {
-        if (conn.fd == fd) return ConnectionRef{&conn, key};
+MultiMasterManager::ConnectionRef MultiMasterManager::find_connection_by_conn_id(uint64_t conn_id) {
+    // `pending_` is keyed by conn_id, so this half is a lookup rather than a scan (#96 chose that
+    // key for the reason this function now applies to the epoll set as well).
+    if (auto it = pending_.find(conn_id); it != pending_.end()) {
+        return ConnectionRef{&it->second, it->first};
     }
+    // `peers_` is keyed by node id and holds one entry per configured peer, so a scan is the
+    // cheapest thing that is also correct.
     for (auto& [node_id, peer] : peers_) {
         (void)node_id;
-        if (peer.fd == fd) return ConnectionRef{&peer, 0};
+        if (peer.conn_id == conn_id) return ConnectionRef{&peer, 0};
     }
     return ConnectionRef{};
 }
@@ -1165,8 +1186,8 @@ void MultiMasterManager::finish_dial(uint16_t node_id, int fd, const std::string
 
     if (epoll_fd_ >= 0) {
         struct epoll_event ev{};
-        ev.events  = EPOLLIN | EPOLLET;
-        ev.data.fd = fd;
+        ev.events   = EPOLLIN | EPOLLET;
+        ev.data.u64 = peer.conn_id;
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
     }
 
@@ -1331,8 +1352,8 @@ bool MultiMasterManager::attach_tls(PeerConnection& peer) {
     // to read, and the loop that steps the handshake needs to be woken either way.
     if (epoll_fd_ >= 0 && peer.fd >= 0) {
         struct epoll_event ev{};
-        ev.events  = EPOLLIN | EPOLLOUT | EPOLLET;
-        ev.data.fd = peer.fd;
+        ev.events   = EPOLLIN | EPOLLOUT | EPOLLET;
+        ev.data.u64 = peer.conn_id;
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, peer.fd, &ev);
     }
     OB_LOG_DEBUG("mm", "tls handshake started on fd=%d (%s, %s)", peer.fd,
@@ -1513,8 +1534,8 @@ void MultiMasterManager::arm_epollout(PeerConnection& peer) {
     if (epoll_fd_ < 0 || peer.fd < 0) return;
 
     struct epoll_event ev{};
-    ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-    ev.data.fd = peer.fd;
+    ev.events   = EPOLLIN | EPOLLOUT | EPOLLET;
+    ev.data.u64 = peer.conn_id;
     ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, peer.fd, &ev);
 }
 
@@ -1522,8 +1543,8 @@ void MultiMasterManager::disarm_epollout(PeerConnection& peer) {
     if (epoll_fd_ < 0 || peer.fd < 0) return;
 
     struct epoll_event ev{};
-    ev.events = EPOLLIN | EPOLLET;
-    ev.data.fd = peer.fd;
+    ev.events   = EPOLLIN | EPOLLET;
+    ev.data.u64 = peer.conn_id;
     ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, peer.fd, &ev);
 }
 

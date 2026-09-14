@@ -2152,6 +2152,107 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 128. The mesh io loop closes descriptors by number, and a number it no longer owns can belong to anything ✅
+
+Found by `sanitizers-integration (tsan)` on PR #123 — on a branch whose diff does not contain one
+line of `src/multi_master.cpp`. The required check asked the question; the report answered it,
+because it names the descriptor's **creation site**:
+
+```
+WARNING: ThreadSanitizer: data race (pid=6039)
+  Write of size 8 at 0x72b000000160 by thread T5 (mutexes: write M0):
+    #0 close
+    #1 ob::MultiMasterManager::io_loop() src/multi_master.cpp:820
+  Previous read of size 8 at 0x72b000000160 by main thread:
+    #0 epoll_ctl
+    #1 ob::TcpServer::run() src/tcp_server.cpp:1773
+  Location is file descriptor 11 created by main thread at:
+    #0 epoll_create1
+    #1 ob::TcpServer::run() src/tcp_server.cpp:1743
+```
+
+Descriptor 11 was **the client port's epoll instance**, and the mesh closed it. Not a torn read of a
+shared variable: one subsystem destroyed another subsystem's object, and the only reason it surfaces
+as a race at all is that ThreadSanitizer tracks descriptors.
+
+**The cost, measured in the same run.** `TcpServer::run()` does `break` on a failed `epoll_wait()`
+under the comment "fatal epoll error", so the client-facing loop ends. Nine integration tests failed
+with `Node node-2 (port 60727) not ready after 60.0s: [Errno 111] Connection refused` — a node whose
+mesh was up and whose client port never served one connection. The read TSan caught is at line 1773,
+the subscription hub's registration, so the close landed **while the client port was still assembling
+its epoll set**: the node did not lose the ability to accept clients, it never had it.
+
+**The mechanism, and every step is a line rather than a hypothesis.** `io_loop()` harvests events
+with `epoll_wait()` and takes `mtx_` afterwards, per event. The registrations carried `ev.data.fd` —
+a descriptor number. Between the harvest and the dispatch, three threads other than the loop close
+peer sockets, each under the same `mtx_`, which orders nothing about descriptor numbers:
+`handle_topology_change()` → `disconnect_peer()` on the peer-registry watch thread (its lock at
+`src/multi_master.cpp:2359` is the M0 the report names), `check_backpressure()` on the **client write
+path** through `broadcast_local()`, and the reconnect loop. A closed number goes to the first taker
+in the whole process — and `TcpServer::run()` calls `epoll_create1()` at line 1743, *after*
+`Engine::open()` at line 1675 has started the mesh threads. The startup window is therefore exactly
+the window in which a mesh drops a duplicate link and a client port opens its epoll set.
+
+The loop then reached its own defensive branch for "a descriptor in the epoll set with no record
+behind it", wrote the warning that branch exists to write, and ran `epoll_ctl(DEL)` + `close(ev_fd)`
+on a number that was no longer its own.
+
+**The rule was already known, written down twice, and applied to a container both times.**
+`include/orderbook/multi_master.hpp`, about `pending_`: *"Keyed by `conn_id` rather than by the
+descriptor. Descriptor numbers are reused by the kernel and mean something to the epoll set; a
+`conn_id` is minted once and means nothing to anyone else, which is the property a key needs."* And
+`src/tcp_server.cpp`, about subscriptions: *"Descriptor numbers are reused, so a subscription pinned
+to `fd` alone would outlive its connection and push rows to whoever inherits the number."* Both are
+right and both came out of real defects (#96, #45). Neither reached the one place where a descriptor
+number is not only a key but also the argument to `close()`. It is the **third** appearance of this
+class in this file: the `wakeup_fd_` comment records a shutdown that called `epoll_wait()` on a
+number the kernel had already reassigned, reported by TSan as a race on file descriptor 4.
+
+**The fix is what an event says, and the second half is not the one the report is about.**
+`ev.data.u64` carries the connection's `conn_id`, and the dispatch resolves that —
+`find_connection_by_fd()` became `find_connection_by_conn_id()`, a lookup rather than a scan for
+`pending_`, which #96 had already keyed that way. Two values are reserved for the two descriptors
+the loop owns for its whole life and never closes mid-iteration, `listen_fd_` and `wakeup_fd_`, where
+the number *is* the identity; `conn_id` is minted from 1 upwards, so neither can collide with a
+connection. Every read of a descriptor inside the peer branch now comes from the **record**
+(`peer_ptr->fd`) rather than from the event.
+
+The half that is about correctness rather than about crashes: a stale event carrying only a number
+can be attributed to a **live** connection that inherited it, and an `EPOLLHUP` from a peer that is
+already gone would then drop a healthy link with nothing in the log. That is #96's shape, one layer
+out, and `PendingPeers.AConnectionOnARecycledDescriptorIsItsOwnConnection` is what holds it — with
+the descriptor number read back from both connections, so a run where the kernel did not hand the
+number back says so instead of passing quietly.
+
+**And the branch closes nothing now, which is the fix rather than an omission.** An event about a
+connection that is gone is routine — the harvest precedes the lock — and closing the socket already
+removed its registration, so there is nothing left to disarm. Nor can a skipped event repeat: every
+registration in the mesh is `EPOLLET`, so ignoring one is not the busy loop that would make silence
+expensive. What the old branch was defending against is an armed descriptor whose record was dropped
+without closing its socket; against that, closing by number was never reliable either, because under
+edge triggering there may be no next event at all. The trade is a descriptor leak that has never been
+measured, against a close of another subsystem's descriptor that has.
+
+**Accepting a connection now records it before arming it**, because the registration has to carry an
+identity and the identity is minted under `mtx_`. That also closes a window this path used to open on
+purpose: for a few instructions the descriptor was armed with no record behind it, which is the exact
+state the old branch was written to complain about.
+
+**Asked and answered about the neighbours, because "I did not check" and "I checked, it does not
+apply" read the same afterwards.** In `src/tcp_server.cpp` every `close_session()` and `::close()` is
+on the loop thread or after the loop has ended, so nothing else can free a number under it — today.
+In `src/replication.cpp` the premise does not hold: `ReplicationManager::broadcast()` runs on the
+client write path and calls `remove_replica_locked()`, which closes the socket, so stale events exist
+there too. What is absent is this defect's teeth — that loop never closes a descriptor it cannot find
+a record for, and the worst a stale event can do is a spurious drain or read on a new replica that
+inherited the number, both of which the next real event would have done anyway. Named here rather
+than filed, and rather than fixed in a change about the mesh.
+
+- Effort: M | Impact: a mesh node could destroy its own client port's epoll instance during startup
+  and then refuse every client connection, with nothing in its log but a mesh warning about an
+  unrecognised descriptor. Present since the mesh had a reconnect path; reachable whenever a
+  duplicate link is resolved while the client port is still starting
+
 ### 120. A clock that is off writes one warning per write, not one per excursion ✅
 
 Found by #54 stage D, in the same probe run as #119 — the log of one 200 000-tick run was **22.9 MB**.

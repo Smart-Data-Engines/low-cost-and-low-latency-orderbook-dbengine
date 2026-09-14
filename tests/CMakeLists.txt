@@ -310,6 +310,13 @@ target_compile_definitions(test_mm_pending_peers
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 
+ob_add_engine_test(test_mm_epoll_identity
+    test_mm_epoll_identity.cpp
+)
+target_compile_definitions(test_mm_epoll_identity
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
 ob_add_engine_test(test_mm_wire_clock
     test_mm_wire_clock.cpp
 )

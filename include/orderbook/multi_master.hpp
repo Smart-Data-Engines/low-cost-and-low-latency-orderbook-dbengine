@@ -405,6 +405,27 @@ bool decode_snapshot_end(const uint8_t* data, size_t len);
 std::vector<uint8_t> encode_snapshot_abort(std::string_view reason);
 std::string          decode_snapshot_abort(const uint8_t* data, size_t len);
 
+// ── What an epoll event is about (#128) ───────────────────────────────────────
+
+/// What the mesh arms its epoll registrations with: the connection's `conn_id`, in
+/// `epoll_event::data.u64`.
+///
+/// Not the descriptor. A descriptor number is the kernel's to hand on the moment it is closed, and
+/// three threads other than the io loop close peer sockets — so an event carrying a number cannot
+/// be told apart from an event about whatever now holds that number. Measured: the mesh io loop
+/// closed the client port's epoll instance, which `epoll_create1()` had been handed right after the
+/// mesh let the number go (#128).
+///
+/// It is the same argument `pending_` is keyed by, and the third appearance of this class in this
+/// file: #96 put a descriptor number where a node id belonged, and the `wakeup_fd_` comment below
+/// records a shutdown that called `epoll_wait()` on a number the kernel had already reassigned.
+///
+/// Two values are reserved for the descriptors the loop owns for its whole life and never closes
+/// mid-iteration, where the number *is* the identity. `conn_id` is minted from `next_conn_id_`
+/// starting at 1 and only ever increments, so neither can collide with a connection.
+inline constexpr uint64_t kMeshEventWakeup = 0;
+inline constexpr uint64_t kMeshEventListen = ~uint64_t{0};
+
 // ── MultiMasterManager ────────────────────────────────────────────────────────
 
 class MultiMasterManager {
@@ -614,14 +635,20 @@ private:
         bool is_pending() const { return pending_key != 0; }
     };
 
-    /// Find the connection a descriptor belongs to, in either container.
+    /// Find a connection by the identity its epoll registration carries, in either container.
     ///
-    /// A null `peer` means the descriptor belongs to neither, which the io loop treats as an fd it
-    /// must close. Which container it came from decides what losing the connection means: an
-    /// identified peer keeps its record and takes backoff, an unidentified one is gone for good —
-    /// the port it arrived on was the peer's ephemeral source port, so there is nothing to dial
-    /// and nothing for it to become (#95).
-    ConnectionRef find_connection_by_fd(int fd);
+    /// Keyed by `conn_id` and not by descriptor: the number an event carries may since have been
+    /// handed to another connection, and answering "whose event is this" with it attributes a dead
+    /// peer's `EPOLLHUP` to a live link (#128). A null `peer` means the connection is gone, which
+    /// is routine — the event was harvested before the record went away.
+    ///
+    /// Which container it came from decides what losing the connection means: an identified peer
+    /// keeps its record and takes backoff, an unidentified one is gone for good — the port it
+    /// arrived on was the peer's ephemeral source port, so there is nothing to dial and nothing for
+    /// it to become (#95).
+    ConnectionRef find_connection_by_conn_id(uint64_t conn_id);
+
+
 
     /// Move a connection from `pending_` into `peers_` under the node id its handshake gave.
     ///
