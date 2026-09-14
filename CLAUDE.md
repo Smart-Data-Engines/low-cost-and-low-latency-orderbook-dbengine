@@ -2336,6 +2336,31 @@ Learned the hard way. Check here before debugging.
     rather than by the WAL. The flush interval goes an hour out and the node is `SIGKILL`ed rather
     than stopped, because a clean stop ends in a checkpoint too.
 
+278. **A pointer into a byte buffer is not a `const Level*`, and the difference is invisible until a
+    sanitizer sees it.** Every receive path had
+    `reinterpret_cast<const Level*>(payload + sizeof(DeltaUpdate))`, and a mesh frame puts the
+    payload **42** bytes into the receive buffer (a 4-byte length, a 38-byte header) and the levels
+    **130** bytes in — neither a multiple of `alignof(Level)`. UBSan: *member access within
+    misaligned address … for type 'const struct Level'*. It works on x86, which is why it survived
+    every mesh test this repository has; the standard lets a compiler assume the alignment it was
+    promised. Fixed as a class through one `levels_from_payload()` that copies into a caller-owned
+    scratch buffer (#127).
+
+279. **Four sanitizer regimes can each cover most of a path and leave a hole between them.** The unit
+    tests call the apply path with a real `Level` array, aligned by construction. The integration
+    battery drives real frames through real sockets, but its sanitizer job is **TSan**, which does
+    not check alignment. The ASan/UBSan job builds the C++ suite, and until #54's D3 nothing in that
+    suite took a delta **off a socket**. The fuzzer reads arbitrary bytes under UBSan, but drives
+    `parse_frames` rather than the apply path behind it. When asking whether something is covered,
+    ask which *build* covers it, not which test.
+
+280. **Measuring a fix's cost can contradict the reading of it in both directions at once.** The
+    first version of #127's copy called `scratch.resize(n_levels)` per record, which
+    value-initialises — `Level` has a `_pad{}` member initialiser — so it zero-fills bytes the
+    `memcpy` overwrites. Growing only when the buffer is too small saved **three** instructions out
+    of 205. The resize was not the cost; the copy was. And the apply path, which is where the reading
+    expected a difference, came out **identical instruction for instruction**.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2480,6 +2505,11 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   — connected, counted, acknowledging nothing — and requires a lag bigger than a whole file beside
   a zero unknown count, which is the same fact from two sides, since the distance is measurable
   precisely because retention kept the files.
+- **UBSan found undefined behaviour older than the mesh, and it took a test that reads a frame off
+  a socket in that build to see it** (#127, closed). Every receive path cast a pointer into its byte
+  buffer to `const Level*`; a mesh frame puts the levels 130 bytes in, which is not a multiple of
+  eight. Fixed as a class through one `levels_from_payload()`, with the cost measured: the parsing
+  function grows 188 → 393 instructions for one `memcpy`, and both apply paths are identical.
 - **Fault injection (#54) is closed, and its last measurement is #126, still open.** An
   acknowledged write that lands behind a **torn** WAL record does not survive a restart: the write
   that tore is refused, the ones after it are answered `OK`, and `WALReplayer::replay()` returns at

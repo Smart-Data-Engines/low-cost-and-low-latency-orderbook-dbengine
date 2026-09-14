@@ -2236,6 +2236,65 @@ question is recorded as #121 rather than settled quietly here.
   nothing in the engine would notice — anti-entropy compares what each side holds, and two sides
   each holding a different winner look consistent to it. Never observed in the wild
 
+### 127. Every receive path cast a pointer into a byte buffer to `const Level*`, which is undefined behaviour when that buffer is not aligned ✅
+
+Found by #54's D3 on its first CI run, in the `sanitizers (asan)` job — the one place that builds
+this suite with UBSan. Not by the test failing on what it asserts: the assertions passed, and UBSan
+reported the engine underneath them.
+
+```
+src/engine.cpp:878:76: runtime error: member access within misaligned address 0x50e000007282
+for type 'const struct Level', which requires 8 byte alignment
+    #0 ob::Engine::apply_remote_delta(…) engine.cpp:878
+    #1 ob::MultiMasterManager::handle_remote_record(…) multi_master.cpp:568
+    #2 ob::MultiMasterManager::handle_frame(…) multi_master.cpp:1720
+    #3 ob::MultiMasterManager::process_recv_buf(…) multi_master.cpp:1560
+    #4 ob::MultiMasterManager::io_loop() multi_master.cpp:909
+```
+
+**The arithmetic is the whole defect.** A mesh frame is a 4-byte length and a 38-byte `WALRecordV2`,
+so the payload starts **42** bytes into the receive buffer and the levels 42 + 88 = **130** bytes in.
+Neither is a multiple of `alignof(Level)`, which is 8. `reinterpret_cast<const Level*>(payload +
+sizeof(DeltaUpdate))` therefore produces a pointer the standard says may not be dereferenced, and
+`levels[i].price` is the dereference. On x86 it compiles to an unaligned load and works, which is
+exactly why it survived every mesh test this repository has: the machine forgives it and the standard
+does not, and a compiler is entitled to assume the alignment it was promised.
+
+**Why nothing caught it before, which is the reusable part.** Four layers had to line up. The unit
+tests call `apply_remote_delta()` with a real `Level` array, so they are aligned by construction. The
+integration battery drives real frames through real sockets, but the battery's sanitizer job is
+**TSan**, and TSan does not check alignment. The ASan/UBSan job builds the C++ suite, and until D3
+nothing in that suite took a delta **off a socket**. And the one harness that does read arbitrary
+bytes under UBSan — the fuzzer — drives `parse_frames`, not the apply path behind it. The defect sat
+in the gap between four things that each cover most of it.
+
+**Fixed as a class, in one place.** `include/orderbook/level_payload.hpp` copies the levels into a
+caller-owned scratch buffer and hands back an aligned pointer; the two hot receive paths keep that
+buffer as a member, so it allocates once per process rather than once per record, and WAL replay uses
+a local because it runs once per record at startup and never again. All **four** sites that had this
+shape now go through it: the mesh, the two in the replication client, and WAL replay. Only the mesh
+one was *observed* misaligned — the other three are the same construction and are said to be, rather
+than claimed to have been measured.
+
+**Cost, measured rather than argued** (`scripts/mnemonic_diff.py`, Release, against `origin/master`):
+`handle_remote_record` **188 → 393** instructions, `ReplicationClient::receive_and_replay`
+**732 → 743**, and the apply paths behind both — `apply_remote_delta` (800 plus a 47-instruction cold
+clone) and `apply_delta_replicated` — **identical, instruction for instruction**. So the whole cost
+is one `memcpy` of `n_levels × 24` bytes per received record, in the function that parses it, and
+nothing changed in the function that applies it. No claim about time: the copy is one more pass over
+bytes the same record already walks three times (the CRC over the payload, conflict resolution per
+level, the WAL append).
+
+One thing in that number is worth keeping. The first version called `scratch.resize(n_levels)` per
+record, which **value-initialises** the new elements, because `Level` has a default member
+initialiser (`_pad{}`) — zero-filling bytes the `memcpy` immediately overwrites. Growing only when
+the buffer is too small saved **three** instructions of the 205, so the resize was not the cost; the
+copy is. Measuring said that, and reading the code would have guessed wrong in both directions.
+
+- Effort: S | Impact: undefined behaviour on every record the mesh and the replication stream
+  receive. It works on x86 today, which is the only reason this is an S rather than a P0 — and the
+  reason it needed a sanitizer to find rather than a bug report
+
 ### 126. An acknowledged write that lands behind a torn WAL record does not survive a restart
 
 Measured by #54's A2.2, which existed to settle a hypothesis from reading the code. It is confirmed.

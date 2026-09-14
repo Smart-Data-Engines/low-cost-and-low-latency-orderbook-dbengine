@@ -575,6 +575,14 @@ private:
     std::unique_ptr<ConflictResolver> conflict_resolver_;
     std::unique_ptr<AntiEntropyManager> anti_entropy_;
 
+    /// Levels copied out of a received payload, so the apply path is handed an aligned array.
+    ///
+    /// A member rather than a local: this is the receive path, and a vector that keeps its capacity
+    /// allocates once per process instead of once per record. Owned by the one thread that parses
+    /// frames, which is why it needs no lock. See `level_payload.hpp` and #127 for why the obvious
+    /// pointer into the buffer is undefined behaviour.
+    std::vector<Level> level_scratch_;
+
     mutable std::mutex mtx_;
     std::unordered_map<uint16_t, PeerConnection> peers_;
 

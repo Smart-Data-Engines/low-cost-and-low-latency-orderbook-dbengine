@@ -40,6 +40,7 @@
 #include "orderbook/replication.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/compression.hpp"
+#include "orderbook/level_payload.hpp"
 #include "orderbook/crc32c.hpp"
 #include "orderbook/engine.hpp"
 #include "orderbook/logger.hpp"
@@ -2386,8 +2387,10 @@ void ReplicationClient::receive_and_replay() {
 
                     const size_t levels_bytes = delta.n_levels * sizeof(Level);
                     if (sizeof(DeltaUpdate) + levels_bytes <= payload_len) {
-                        const auto* levels = reinterpret_cast<const Level*>(
-                            payload + sizeof(DeltaUpdate));
+                        // Copied, not cast: see level_payload.hpp and #127. This site has not been
+                        // observed misaligned, and it is the same shape as the one that was.
+                        const Level* levels =
+                            levels_from_payload(payload, delta.n_levels, level_scratch_);
                         engine_.apply_delta_replicated(delta, levels);
                     }
                 }
@@ -2500,8 +2503,9 @@ void ReplicationClient::receive_and_replay() {
 
                 const size_t levels_bytes = delta.n_levels * sizeof(Level);
                 if (sizeof(DeltaUpdate) + levels_bytes <= payload_len) {
-                    const auto* levels = reinterpret_cast<const Level*>(
-                        payload + sizeof(DeltaUpdate));
+                    // Copied, not cast: see level_payload.hpp and #127.
+                    const Level* levels =
+                        levels_from_payload(payload, delta.n_levels, level_scratch_);
 
                     // Replay via Engine::apply_delta() (Requirement 2.1).
                     engine_.apply_delta_replicated(delta, levels);

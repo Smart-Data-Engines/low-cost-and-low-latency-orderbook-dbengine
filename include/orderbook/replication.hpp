@@ -668,6 +668,15 @@ private:
     std::thread             thread_;
     std::atomic<bool>       running_{false};
 
+    /// Levels copied out of a received payload, so the apply path is handed an aligned array.
+    ///
+    /// A member rather than a local: this is the receive path, and a vector that keeps its capacity
+    /// allocates once per process instead of once per record. Owned by the one thread that parses
+    /// frames, which is why it needs no lock. See `level_payload.hpp` and #127 for why the obvious
+    /// pointer into the buffer is undefined behaviour.
+    std::vector<Level> level_scratch_;
+
+
     /// The socket to the primary. Atomic because two threads read it and one writes it: the receive
     /// thread owns its lifecycle, while `stop()` and `state()` are called from elsewhere.
     ///
