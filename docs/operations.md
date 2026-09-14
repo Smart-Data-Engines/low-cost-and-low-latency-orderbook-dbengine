@@ -678,6 +678,58 @@ publish had failed — nothing was written, so nothing outlived anything. That w
 only where it is true: on a tick where the position **was** published and published without a
 lease, which is the case in which it will not expire when this node dies (#72).
 
+### When a node is serving but is not in the registry
+
+A node keeps its place in the mesh registry by refreshing an etcd lease every TTL/3 (default: every
+3.3 s at a 10 s TTL). If that lease is lost — etcd forgot it, or the refreshes failed for longer
+than the TTL — the key under `<prefix>mm_peers/<node_id>` expires, and **nothing puts it back**:
+registration happens once, at start. Measured by revoking the lease under a running two-node mesh:
+the key is gone at once and still gone 22.5 s later while the node answers `PING` on every sample.
+
+What survives, and it is more than you would expect. Links that were already dialled keep carrying
+writes, and a node that starts *later* still ends up connected, because the unregistered node's own
+topology watch sees the newcomer and dials **out**. So this is not a partition. What is lost is the
+node's address as published to the cluster: its row in every peer's `MM_PEERS` has an **empty
+address**, and anything that needs to look it up cannot.
+
+The log says it **once**, with the consequence in the line:
+
+```
+WARN  peer_registry  Lease refresh failed for node 2 - this node's mesh registration expires with
+                     the lease and nothing re-registers it
+WARN  coordinator    lease 328... is gone: keepalive returned no TTL, so etcd does not know it any
+                     more
+```
+
+One line each, not one per interval — before #133 this was eleven of each in 33 s, from two
+components neither of which was writing more than one line per attempt. **Recovery is a restart**
+of that node; this is roadmap #132 and the fix has a decision attached, because re-registering from
+that loop would also overwrite the entry the test harness writes there.
+
+### When a subsystem's loop keeps failing
+
+Six loops guard one iteration at a time, so an exception costs an iteration rather than the thread
+(#112). Five of them count what they caught, and the counter is the thing to alarm on, because
+nothing else outside the process changes when one of these fails:
+
+| counter | what stopped working while the node stayed up |
+|---|---|
+| `ob_flush_errors_total` | rows are not reaching segments and the WAL is growing |
+| `ob_monitor_errors_total` | role changes are not being acted on |
+| `ob_mm_io_errors_total` | mesh events are being dropped — a peer's row can still say `connected` |
+| `ob_repl_io_errors_total` | replica connections, catch-ups or heartbeats are being dropped |
+| `ob_peer_lease_errors_total` | the lease above is not being refreshed |
+
+Each one's log is an **episode**: one `ERROR` when it starts, one `INFO` when it ends, and the
+repeats at `DEBUG`. Silence after the `ERROR` therefore means the condition is still there; the
+`INFO` is what says it went away. The last two have no path in this engine that is known to reach
+them — they are there so that the first one is visible rather than silent.
+
+Seven other loops in the engine do **not** have this yet, and what each one's death costs is listed
+in roadmap #131. Until they do, the symptom of one of them ending is the absence of something:
+no new peer learned, no dropped link re-dialled, no reconciliation, or `/metrics` not answering
+while everything else works.
+
 ## Loading history, and what its own timestamps change
 
 Since #105 a write can carry the time it happened (`INSERT … [event_time_ns]`), which is what makes
