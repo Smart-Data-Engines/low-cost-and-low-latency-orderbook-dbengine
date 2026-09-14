@@ -93,6 +93,15 @@ def _cluster_with_faulted_replica(size: str, tmp_path):
     mgr = ClusterManager()
     with _armed(fault_log, size):
         mgr.start()
+    # The premise, asserted rather than relied on: `OB_FAULT_PATH=ob_node1_` is the right filter
+    # only because `start()` waits for node-0 to hold PRIMARY *before* it starts node-1, so the
+    # faulted node is the replica by construction. If that ordering ever changes, the injector
+    # would refuse the **primary's** startup promotion instead — which exits the process, as
+    # measured — and this module would fail somewhere downstream of the reason.
+    assert mgr.replica().index == 1, (
+        f"the faulted node is not the replica: replica is index {mgr.replica().index}. Read "
+        f"`ClusterManager.start()` before changing OB_FAULT_PATH — the filter names a data "
+        f"directory, and which node gets it is the fixture's ordering, not this test's choice")
     return mgr, fault_log
 
 
