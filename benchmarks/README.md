@@ -265,6 +265,7 @@ for an identical function**.
 ```bash
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release && cmake --build build-release -j$(nproc)
 # Competitors first: benchmarks/install_competitors.md, commands to read before pasting.
+# A bigger machine first: benchmarks/before-a-bigger-machine.md, the survey a larger box needs.
 PYTHONPATH=$PWD/python python -m benchmarks.comparative.run --rows 200000 --rounds 12
 ```
 

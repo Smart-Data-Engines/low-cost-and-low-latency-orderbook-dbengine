@@ -6121,6 +6121,7 @@ line-coverage floor continue to run inside GitHub Actions.
 | **Next** | A write behind a torn WAL record is lost (#126) | M | The durability claim has an exception nobody can see from outside: the write that tore is refused, the ones after it are acknowledged and gone |
 | **Decision** | Bound the drift a peer may introduce (#121) | S | Measured and filed rather than answered: a ceiling costs causal order against exactly the peer whose clock is wrong |
 | **Decision** | Coverage badge (#37) | S | Requires choosing an external service; the existing report and floor are already in CI |
+| **P2** | Comparative numbers from a larger machine (#39) | S | Everything but the box is in place: the harness recomputes all four numbers in one run, the competitors install natively, and `benchmarks/before-a-bigger-machine.md` is the survey of what would otherwise make it a number about our defaults |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
