@@ -42,6 +42,18 @@ custom_metrics: dict = {}
 SYMBOL = "MESH"
 EXCHANGE = "PROXY"
 
+# The per-peer queue ceiling `small_queue_proxied_mesh` runs with, and the shape of the writes the
+# test behind it uses. A `MINSERT` of 1000 levels is one mesh frame of about 24 kB (an 88-byte
+# `DeltaUpdate` plus 1000 levels of 24 bytes, behind a 38-byte header), so the volume needed arrives
+# in a few hundred round trips instead of tens of thousands.
+QUEUE_CEILING = 256 * 1024
+LEVELS_PER_WRITE = 1000
+# The cap is a statement about Linux, not about the engine: the queue cannot grow until the sender's
+# own socket buffer is full, and that is `tcp_wmem`'s maximum - 4 MB on this machine. Twelve
+# megabytes leaves room for it and for the ceiling above, and reaching the cap means the kernel
+# absorbed more than that, which the failure message says rather than blaming the engine.
+VOLUME_CAP_BYTES = 12 * 1024 * 1024
+
 
 def raw(port: int, payload: str, settle: float = 0.25) -> str:
     """One command on a fresh connection, read until the socket goes quiet."""
@@ -152,19 +164,34 @@ def _build_proxied_mesh(mgr: ClusterManager, proxies: list, recv_buffer=None):
         f"direct and nothing would be testing the engine: {carried}")
 
 
-@pytest.fixture
-def narrow_proxied_mesh():
-    """A proxied mesh whose accepted sockets have a 4 kB receive buffer.
+# There was a `narrow_proxied_mesh` fixture here, with a 4 kB receive buffer on the accepted
+# sockets, added on the expectation that it would bring the engine's own send queue within reach in
+# kilobytes instead of megabytes. **It does not, and the same session measured why**: TCP
+# accumulates unsent data in the *sender's* buffer, which is the engine's socket and not anything a
+# proxy can narrow, so the queue only starts growing after that buffer is full. The fixture was left
+# behind with no users — a fixture built for a test nobody then wrote, which is the shape of a knob
+# nothing turns. `small_queue_proxied_mesh` below is what the test that needed it uses instead: it
+# shortens the engine's half of the wait, which is the half a flag can reach.
 
-    So a partition reaches the engine's own send queue in kilobytes instead of the 2.6 MB the
-    default buffers absorb. Separate from `proxied_mesh` rather than a parameter on it: the
-    convergence test must run through ordinary buffers, because a narrowed window changes what it
-    is measuring.
+
+@pytest.fixture
+def small_queue_proxied_mesh():
+    """A proxied mesh whose per-peer send queue is capped at 256 kB instead of 64 MB.
+
+    `--mm-max-peer-send-buffer` is the ceiling #69 added, and this is the flag its own field comment
+    in `ServerConfig` recommends lowering in tests. It shortens the **engine's** half of what a
+    "peer that stopped reading" test has to push; the kernel's half cannot be shortened from here
+    and is measured by the test rather than assumed.
     """
     mgr = ClusterManager()
+    mgr.extra_node_args = ["--mm-max-peer-send-buffer", str(QUEUE_CEILING),
+                           # The records lag is recomputed by the anti-entropy pass and nowhere
+                           # else, so its freshness *is* this interval - the same reason
+                           # `reconciling_proxied_mesh` lowers it.
+                           "--anti-entropy-interval-seconds", "2"]
     proxies: list = []
     try:
-        _build_proxied_mesh(mgr, proxies, recv_buffer=4096)
+        _build_proxied_mesh(mgr, proxies)
         yield mgr, proxies
     finally:
         for proxy in proxies:
@@ -487,4 +514,151 @@ def test_a_reconnect_redelivers_records_and_none_are_stored_twice(proxied_mesh):
         f"a record was stored twice, so dedup did not hold across the reconnect: "
         f"{len(b_rows)} rows, {len(set(b_rows))} distinct")
     custom_metrics["rows_after_reconnect"] = len(b_rows)
+    assert not mgr.unexplained_deaths(), mgr.unexplained_deaths()
+
+
+class _Writer:
+    """One connection, one reply line per write — because `raw()` cannot be used in a loop.
+
+    `raw()` reads until the socket goes **quiet**, which costs its full 3 s read timeout per call.
+    That is right for a one-off command and wrong for a few hundred: the first version of the test
+    below spent 3 s per `MINSERT` and hit pytest's 120 s limit inside the control phase, before it
+    had injected any fault at all.
+    """
+
+    def __init__(self, port: int):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=30)
+        self.sock.settimeout(30)
+        self.buf = b""
+        self._response()                  # the banner
+
+    def _line(self) -> str:
+        while b"\n" not in self.buf:
+            chunk = self.sock.recv(1 << 16)
+            if not chunk:
+                raise AssertionError("the server closed the connection mid-write")
+            self.buf += chunk
+        line, _, self.buf = self.buf.partition(b"\n")
+        return line.decode(errors="replace")
+
+    def _response(self) -> str:
+        """One response: its lines up to the blank one that ends it.
+
+        A response here is **terminated by an empty line** - `format_ok()` returns `"OK\n\n"` and
+        the banner is `"OK ob_tcp_server v0.1.0\n\n"`. Reading one line per command left that blank
+        line in the stream, so the *next* write read it as its own reply and saw `''`. That is what
+        the first run of this helper reported as "the write was refused".
+        """
+        lines = []
+        while True:
+            line = self._line()
+            if line == "":
+                return "\n".join(lines)
+            lines.append(line)
+
+    def minsert(self, first_price: int, levels: int = LEVELS_PER_WRITE) -> int:
+        """One `MINSERT`. Returns the mesh bytes it is worth, by the format rather than by guess."""
+        body = "\n".join(f"{first_price + i} {1 + (i % 97)} 1" for i in range(levels))
+        self.sock.sendall(f"MINSERT {SYMBOL} {EXCHANGE} bid {levels}\n{body}\n".encode())
+        reply = self._response()
+        assert reply.startswith("OK"), f"the write was refused: {reply!r}"
+        # 38-byte WALRecordV2 header, an 88-byte DeltaUpdate and 24 bytes per level.
+        return 38 + 88 + levels * 24
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def test_a_peer_that_stops_reading_is_dropped_rather_than_buffered_for_ever(small_queue_proxied_mesh):
+    """C4, the last clause: the queue ceiling #69 added has to **drop** the peer.
+
+    Before that ceiling existed one unreachable peer grew the writer at about 113 MB/s with nothing
+    to stop it, because `check_backpressure()` only ever ran inside the catch-up loop. The ceiling
+    is a flag and the drop is a counter, and neither had a test that reached them: this is the clause
+    C4 recorded as blocked, and what blocked it was **volume, not visibility**.
+
+    **Why the volume is what it is, measured rather than argued.** `ob_mm_peer_send_buf_bytes` is
+    the engine's own queue — `peer.send_buf.size()` — and it cannot grow until `send()` returns
+    `EAGAIN`, which needs the **sender's** socket buffer full. The engine sets no `SO_SNDBUF`, so
+    that is `tcp_wmem`'s maximum, 4 MB on this machine, and narrowing the proxy's receive buffer does
+    not shorten it: TCP holds unsent data on the sender's side. The kernel's half of the wait is
+    therefore out of a test's reach and the engine's half is not, which is why this runs with
+    `--mm-max-peer-send-buffer` at 256 kB. The test writes until the drop counter moves, records how
+    much that took, and fails against a cap that says what hitting it would mean.
+
+    Three claims, and the first is the control: with the link **healthy**, the same shape of writes
+    must leave the counter at zero, or "the partition caused the drop" would be a claim about volume.
+    Then the drop. Then the recovery, because the ceiling's whole point is that dropping is *cheaper*
+    than buffering — the peer reconnects and catches up.
+
+    **Convergence is read from `ob_mm_replication_lag_records` here rather than by comparing rows**,
+    and this is the one place in this module where that is the right trade: half a million rows means
+    pulling tens of megabytes through two `SELECT`s. That gauge is the mesh's honest lag in records
+    from the per-origin version vectors (#118), it is recomputed by the anti-entropy pass this
+    fixture runs every two seconds, and zero means node B holds every record node A has. Convergence
+    **by content** is asserted by the first test in this file, at three rows, where it costs nothing.
+    """
+    mgr, proxies = small_queue_proxied_mesh
+    node_a, node_b = mgr.nodes[0], mgr.nodes[1]
+
+    def dropped():
+        return metric(node_a.metrics_port, "ob_mm_peer_dropped_slow_total")
+
+    def queued():
+        return metric(node_a.metrics_port, "ob_mm_peer_send_buf_bytes")
+
+    assert dropped() == 0, "a peer was already dropped before this test wrote anything"
+
+    writer = _Writer(node_a.tcp_port)
+    try:
+        # ── The control: a healthy link drains, so the queue never reaches the ceiling ─────────
+        healthy_bytes = 0
+        while healthy_bytes < QUEUE_CEILING * 4:
+            healthy_bytes += writer.minsert(100_000 + healthy_bytes)
+        assert dropped() == 0, (
+            f"the peer was dropped over {healthy_bytes} bytes through a link that was draining, so "
+            f"the ceiling is reacting to volume rather than to a peer that stopped reading")
+        custom_metrics["healthy_link_queue_bytes"] = queued()
+
+        assert _wait_for_rows(node_b.tcp_port, 1, patience(60)), (
+            "nothing crossed the healthy link, so the fault below has no live path to break")
+
+        # ── The fault: the peer stops reading, and the queue has nowhere to go ────────────────
+        for proxy in proxies:
+            proxy.partition()
+
+        pushed = 0
+        while pushed < VOLUME_CAP_BYTES and dropped() == 0:
+            pushed += writer.minsert(500_000 + pushed)
+    finally:
+        writer.close()
+
+    assert dropped() >= 1, (
+        f"{pushed} bytes went to a peer that stopped reading and it was never dropped; the engine's "
+        f"queue reads {queued()} against a {QUEUE_CEILING}-byte ceiling. If that queue is still near "
+        f"zero the kernel absorbed more than the cap — a fact about `tcp_wmem` rather than about the "
+        f"engine — and the cap is what needs raising")
+    custom_metrics["bytes_to_drop_a_stalled_peer"] = pushed
+    assert not mgr.unexplained_deaths(), mgr.unexplained_deaths()
+
+    # ── The recovery: dropping is cheaper than buffering only if the peer comes back ──────────
+    for proxy in proxies:
+        proxy.close_connections()
+        proxy.heal()
+
+    lag, unknown = -1.0, -1.0
+    deadline = time.monotonic() + patience(240)
+    while time.monotonic() < deadline:
+        lag = metric(node_a.metrics_port, "ob_mm_replication_lag_records")
+        unknown = metric(node_a.metrics_port, "ob_mm_peers_position_unknown")
+        if lag == 0 and unknown == 0:
+            break
+        time.sleep(2.0)
+    assert lag == 0 and unknown == 0, (
+        f"after the drop and the heal, node A still reports {lag} record(s) of lag with {unknown} "
+        f"peer(s) whose position it cannot tell. Dropping a peer is only the right answer if the "
+        f"catch-up that follows is complete:\n{tail_node_log(node_b, 20)}")
     assert not mgr.unexplained_deaths(), mgr.unexplained_deaths()

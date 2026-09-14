@@ -328,6 +328,55 @@ Backoff applies to every failure, including this one, so the log rate falls away
 repeating at loop frequency (#95). `ob_mm_peers_connected` beside `ob_mm_peers_tls_verified` is the
 pair to alert on — alert on the *difference*, not on either number.
 
+### A mesh link that is up and carrying nothing
+
+A peer that cannot be dialled is the section above. This one is worse to diagnose, because the
+connection is **established** and the bytes are not arriving: a partition that drops segments
+without resetting anything, a middlebox holding the stream, a peer whose process is stopped. The
+node keeps accepting writes throughout — there is no quorum in this mesh, which is the trade
+multi-master makes — so what you need to know is what it will tell you, and when.
+
+**For the first few megabytes it will tell you nothing, and that is a property of TCP rather than of
+the engine.** `ob_mm_peer_send_buf_bytes` is the engine's own queue for a peer, and it cannot grow
+until `send()` returns `EAGAIN`, which needs the **sender's** socket buffer full first. The engine
+sets no `SO_SNDBUF`, so that is `tcp_wmem`'s maximum. Measured on this machine (i3-7100U, loopback,
+a peer that stopped reading): **3 015 750 bytes** of accepted writes before the queue passed a
+256 kB ceiling — about 2.9 MB held by the kernel where no gauge can see it.
+
+**What does move in that window is the records lag.**
+
+```
+curl -s localhost:9091/metrics | grep -E 'ob_mm_(replication_lag_records|peers_position_unknown)'
+```
+
+`ob_mm_replication_lag_records` is how many records the furthest-behind peer is missing, counted
+from the per-origin version vectors — the one position two nodes can compare (#118). It is
+recomputed by the **anti-entropy pass** and nowhere else, so its freshness is
+`--anti-entropy-interval-seconds` (default 30) and a scrape right after a burst reads the previous
+pass's number. Read it beside `ob_mm_peers_position_unknown`, which counts peers whose position
+cannot be compared at all — a peer that has said nothing looks identical to a peer holding nothing,
+and the pair is what separates them.
+
+**Past the ceiling the peer is dropped, and that is the repair rather than the failure.**
+
+```
+{"component":"mm","msg":"Peer 2 is not draining: send_buf=262264 > 262144 — dropping the connection so it reconnects and catches up"}
+```
+
+`ob_mm_peer_dropped_slow_total` counts it. Dropping is deliberate: the alternative measured before
+this ceiling existed (#69) was one unreachable peer growing the writer at about **113 MB/s** with
+nothing to stop it. The connection is closed **without** clearing the queued bytes, because a buffer
+that starts mid-frame would desynchronise the peer's parser; the peer reconnects and catch-up
+streams from the position it acknowledged. `--mm-max-peer-send-buffer` is the ceiling (64 MB by
+default) and lowering it makes the drop happen sooner, not the buffering safer.
+
+**What the engine does not promise here.** Nothing is refused while a peer is unreachable, so the
+writes accepted during a partition exist on one node until the link returns — the mesh converges
+afterwards, by anti-entropy or by catch-up, and `docs/architecture.md` has the conflict rules that
+decide what convergence means when both sides wrote. And the first few megabytes of that divergence
+are invisible in the per-peer queue gauge, as measured above: the records lag is the number to alert
+on, not `ob_mm_peer_send_buf_bytes`.
+
 ### A replica that is slow, rather than one that is behind
 
 `replica fd=9 is not draining: queued=16780544 > 16777216 - dropping the connection` means this
