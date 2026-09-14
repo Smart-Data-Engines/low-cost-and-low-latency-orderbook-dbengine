@@ -123,7 +123,11 @@ TEST(MeshEventKey, NoMeshRegistrationCarriesABareDescriptor) {
     // old branch ended in `::close(ev_fd)`, and what it closed once was another subsystem's epoll
     // instance. Read between the branch's own words and the `continue` that ends it, so that the
     // check is about that branch rather than about the file.
-    const size_t branch = src.find("which is already gone");
+    // Anchored on the branch's condition rather than on anything it says. A check anchored on a
+    // log phrase makes that phrase load-bearing, so the next person to improve the wording gets a
+    // failing test and no idea why — and the control in this change's mutation table is exactly
+    // such a rewording.
+    const size_t branch = src.find("if (!peer_ptr) {");
     ASSERT_NE(branch, std::string::npos)
         << "the branch for an event about a connection that is gone is not where this test expects "
            "it; re-read the io loop before trusting the assertion below, because a search that "

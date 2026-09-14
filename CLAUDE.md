@@ -2374,6 +2374,32 @@ Learned the hard way. Check here before debugging.
     site, which the writer already knows, and the disk-stays-full test now asserts the file count so
     the condition is a tested property rather than a comment.
 
+283. **A descriptor number is an identity only until it is closed, and an epoll set hands it back to
+    you afterwards.** `MultiMasterManager::io_loop()` armed its registrations with `ev.data.fd` and
+    dispatched on that number. `epoll_wait()` harvests before the loop takes `mtx_`, and three other
+    threads close peer sockets under that lock — `handle_topology_change()`, `check_backpressure()`
+    on the client write path, and the reconnect loop — so a harvested number can belong to anything
+    by the time it is dispatched. It belonged, once, to **the client port's epoll instance**, created
+    by `epoll_create1()` in `TcpServer::run()` right after `Engine::open()` started the mesh threads;
+    the loop's branch for "a descriptor with no record behind it" closed it, and the node then refused
+    every client connection. Registrations carry `conn_id` now (#128). The rule was already written
+    down twice in this tree — about `pending_` and about subscriptions — and applied to a container
+    both times.
+
+284. **When a subsystem dies for no reason it can explain, ask who else could have closed its
+    descriptors.** The symptom was nine integration tests failing with `Connection refused` against
+    nodes whose mesh was up, and nothing in any node's log but a mesh warning about an unrecognised
+    descriptor. The only reason it was diagnosable at all is that ThreadSanitizer tracks file
+    descriptors and reports the **creation site**: without that line the report reads as a race on an
+    address in a subsystem that never touches the other one's memory.
+
+285. **A defensive close is a bet that the thing you cannot identify is still yours.** The branch
+    closed an armed descriptor with no record behind it, on the argument that such a descriptor must
+    be an orphan. Both halves of the argument were wrong: the number may not be ours any more, and
+    under `EPOLLET` an orphan may produce no further event to be closed on — so it never was reliable
+    leak protection. Removing the close trades a leak nobody has measured for a close of another
+    subsystem's descriptor that has been.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

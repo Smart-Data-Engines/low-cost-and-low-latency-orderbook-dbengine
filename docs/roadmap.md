@@ -2248,6 +2248,56 @@ a record for, and the worst a stale event can do is a spurious drain or read on 
 inherited the number, both of which the next real event would have done anyway. Named here rather
 than filed, and rather than fixed in a change about the mesh.
 
+**Cost on the write path, measured rather than argued.** The mesh write path reaches
+`arm_epollout()` and `disarm_epollout()` through `broadcast_local()`, so the key is built on the path
+a client write takes. `scripts/mnemonic_diff.py`, Release, master `c82f01e` against this commit:
+
+| function | base | head | |
+|---|---|---|---|
+| `MultiMasterManager::arm_epollout` | 23 | 23 | one instruction chosen differently |
+| `MultiMasterManager::disarm_epollout` | 23 | 23 | the same |
+| `MultiMasterManager::broadcast_local` | 92 | 92 | identical |
+| `Engine::apply_delta_mm` | 602 | 602 | identical |
+| `WALWriter::append` | 90 | 90 | identical |
+
+The one difference is worth reading, because it is smaller than "the same count" suggests. The old
+form wrote a descriptor into the union and then cleared the padding — `mov %edx,0x10(%rsp)` followed
+by `movl $0x0,0x14(%rsp)`. The new one loads the identity and stores all eight bytes at once —
+`mov 0x30(%rsi),%rax` … `mov %rax,0x10(%rsp)`. Two four-byte stores became a load and one eight-byte
+store, so the count is unchanged and there is no claim about time here: fewer or equal instructions
+is not a speed-up, it is only not more work.
+
+**Seven mutations, each with the verdict it had to give, and which test kills which is the point.**
+
+| mutation | verdict | killed by |
+|---|---|---|
+| `arm_epollout` carries the descriptor again | KILLED | the static test alone |
+| the accepted connection is armed with its descriptor | KILLED | the static test alone |
+| the gone-connection branch closes the number again | KILLED | the static test alone |
+| the lookup matches the descriptor instead of the identity | KILLED | the behavioural test alone |
+| the listen sentinel collides with the first `conn_id` | KILLED | both |
+| the wakeup sentinel collides with a `conn_id` | KILLED | both |
+| control: the note about a connection that is gone is reworded | **SURVIVED** | — |
+
+Three of the six are killed by the static test and by nothing else, which is what says that test
+carries weight rather than decoration: reintroducing `data.fd` at one of six registration sites is
+invisible to every behavioural test in this repository, because the harm needs a descriptor number to
+be recycled *and* an event to be in flight across it. One is killed only by the behavioural test,
+which is the other half — that the dispatch resolves an identity and not a number.
+
+The control had to be moved to get here, and the reason is a rule in its own right: the static test's
+first version anchored on the branch's **log phrase**, so rewording the message failed the test.
+A check anchored on prose makes the prose load-bearing and hands the next person to improve the
+wording a failure with no explanation. It anchors on the branch's condition now, and the control —
+rewording that message — survives, as a control must.
+
+**What no test here can do, said plainly.** `PendingPeers.AConnectionOnARecycledDescriptorIsItsOwnConnection`
+is a regression guard, not a reproduction: it establishes that the second connection really does land
+on the first one's descriptor number — read back and compared, so a run where the kernel did not hand
+it back says so — but the harm needed an event in flight across that moment, and a test cannot
+schedule the kernel. The evidence that the defect was real is the TSan report; the evidence that it
+is gone is the absence of the shape, which is what the static test is for.
+
 - Effort: M | Impact: a mesh node could destroy its own client port's epoll instance during startup
   and then refuse every client connection, with nothing in its log but a mesh warning about an
   unrecognised descriptor. Present since the mesh had a reconnect path; reachable whenever a
@@ -6430,7 +6480,7 @@ except where a row says otherwise, not the machine-B performance baseline above.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1078 | all passing with `ctest -j1` on the i3-7100U, **228 s in a single run**. **Two more than the previous commit**, both #126's, and they pin the replayer's new rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. The control is the second of the two. **Before them**, two were #54's D3: a socket on the mesh port frames one DELTA record whose HLC says an hour ahead, and requires that it becomes this node's clock and **stays** — the next local tick is stamped from the moved clock, not from the wall clock the node can still read. That turns "`multi_master.cpp` parses an HLC from the frame and hands it on ten lines later" from a claim about code into a measurement; the drift the node reports is 3 599 999 386 597 ns. Its pair requires the record carrying the skew to be **applied**, because a node that dropped it would keep its clock and lose a write. **Earlier**: three were #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists 1078: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
+| C++ (GTest + RapidCheck) | 1082 | all passing with `ctest -j1` on the i3-7100U, **210 s in a single run**. **Four more than the previous commit**, all #128's, and they divide the way that defect does: three in `tests/test_mm_epoll_identity.cpp` are about the shape — that the two reserved event keys cannot collide with a connection, that closing a descriptor takes its registration with it (measured against `dup2`, which forces the reuse the defect needs instead of hoping for it), and that no registration in `src/multi_master.cpp` carries a bare descriptor number. The fourth is behavioural: a connection landing on the descriptor its predecessor gave back is its own connection, with both numbers read back so a run where the kernel did not recycle the number says so rather than passing quietly. Three of the six mutations in that item's table are killed by the static test **and by nothing else**, which is what says it carries weight. **Before them**, two were #126's, and they pin the replayer's rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. **Earlier**: two were #54's D3, three #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists **1084**: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The previous row gave 1078 for both figures, which was two short on the listed one — the count that passes and the count CTest lists differ by exactly those two harnesses, always. The runtimes are what this machine gave on the commit measured, not a budget |
 | Python integration | 263 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 263; count pytest's final result rather than the report plugin's progress characters. `263 passed, 2 skipped in 20:42` on the GitHub runner for this commit, against `20:37` on the development machine (i3-7100U, native etcd) — the spread to expect between the two rather than a change. Three more than the previous commit: #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
 | Python integration under TSan | 263 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `263 passed in 26:08` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **20:42** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 
