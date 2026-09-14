@@ -2152,6 +2152,58 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 130. A promotion that stops halfway leaves the node a replica of itself
+
+Found while measuring #112's `monitor_loop` half, and left open on purpose: the boundary that made
+the thread survive turned "the thread is gone and the node is stuck" into "the thread is fine and
+the node is still stuck", and the second half is a different defect.
+
+**Measured**, with #54's injector refusing the 32-byte `EPOCH` record a promotion writes. Two nodes
+on one etcd, the fault on the replica only. The primary is killed, the replica waits out #82's
+election delay, takes the leader key, and then the `EPOCH` write is refused — so
+`promote_to_primary()` throws **after** the key is taken and **before** `role_` becomes `PRIMARY`.
+From then on `ROLE` answers:
+
+```
+REPLICA 127.0.0.1:44613 2
+```
+
+44613 is that node's **own** replication port. The next monitor tick reads the leader key, finds
+this node's address in it, and adopts it — so the node is a replica of itself, in epoch 2, for as
+long as it runs. Measured across the forty seconds observed; `PING` answers throughout, and with
+#112's boundary in place `ob_monitor_errors_total` is 1 and the episode opens and closes normally.
+The control, the same run at a size nothing writes, reaches `PRIMARY 2` in twenty seconds.
+
+**Why the boundary is not the fix and was not made into one.** #112 is about an exception ending a
+thread. This is about a promotion having two durable effects — the leader key in etcd and the epoch
+record in the WAL — with no rule about what the node is when it has done the first and not the
+second. Making the boundary roll the promotion back would be writing failover semantics inside a
+`catch`, which is where the least-reviewed code in any subsystem lives.
+
+**The shape is #73's, one layer along.** There, losing the startup race left a node in a role that
+was not a role (`STANDALONE` for ever, because `monitor_loop()` had no branch for it). Here,
+half-winning a promotion leaves it in a role that contradicts itself. Both are a state machine
+missing the arm for an outcome that can happen.
+
+Three candidate answers, none chosen yet, and the cost of each is the interesting part:
+
+- **Refuse to adopt our own address.** Narrow and unconditionally correct — a node is never its own
+  primary — and cheap. It does not unstick the node: it would then hold the leader key while being
+  neither primary nor a replica of anyone, which is honest and still broken.
+- **Release the key when the promotion fails.** Lets another node take the role, which is what the
+  operator wants, and needs care about the epoch: the key was taken at epoch 2, and a node that
+  releases it must not leave a peer able to win epoch 2 again.
+- **Finish the promotion on a later tick.** The most useful outcome and the most state to reason
+  about — `current_epoch_` and `wal_.set_epoch()` have already run, so a retry has to be idempotent
+  in the WAL as well as in etcd.
+
+The first is a precondition of the other two rather than an alternative to them, since both leave a
+window in which the key is ours and the role is not.
+
+- Effort: M, mostly the decision | Impact: a node whose disk refused one 32-byte record answers
+  every health check while reporting a role that cannot exist, and the cluster has a leader key held
+  by a node that will never act as leader. No data is lost; availability is, silently
+
 ### 129. A mesh node's shutdown waits out the lease loop's sleep ✅
 
 Found while reading `PeerRegistry::lease_loop()` for #112's remaining half, and then measured,
@@ -3668,16 +3720,42 @@ segment, or a crash forgets it was ever seen and anti-entropy asks the peer agai
 measured is that last leg — the anti-entropy pass itself — and it is named here rather than
 implied.
 
-**Still open, with the judgement each one needs written down.** `monitor_loop` gets its boundary
-next, and it carries three things that would hide each other in one diff: seven byte-identical nap
-blocks collapsing into one (verified by script — six `continue`s, each preceded by exactly that
-nap, plus the one at the bottom, so `continue` → `return` is a property of the code rather than a
-reading of it), the tick extraction, and a `MetricsRegistry&` constructor argument, because
-`FailoverManager` has no registry and a defaulted argument would let every test leave the counter
-unfed, which is #117 exactly. `lease_loop` has **no** throwing path today, so its boundary is a
-ratchet and will say so. `run_loop` needs the floor, and the floor is not a new threshold: 100 ms
-is what that loop already waits when it has nothing in hand, so a failing pass is paced like an
-idle one.
+**`monitor_loop` is done too, in three commits that would have hidden each other in one.** The
+seven byte-identical nap blocks collapsed first, on a property a script established rather than a
+reading: six `continue`s each immediately preceded by exactly that nap, plus the one at the bottom,
+so every path napped exactly once and `while (running_) { monitor_tick(); nap(); }` with
+`continue` → `return` changes nothing. Then the tick extraction, 267 lines and no `continue` left in
+it. Then the boundary, which is the whole of the third diff.
+
+`FailoverManager` takes a `MetricsRegistry&` — nine `make_unique` sites and sixteen direct ones in
+`tests/test_etcd_integration.cpp`, each already holding an engine, plus the one in `Engine::open()`.
+Passed rather than reached through `RoleTransitionHandler`, because incrementing a counter is not a
+role transition; not defaulted, because a default would let every test leave the counter unfed,
+which is #117 exactly and #117 is why the counter is here at all. `orderbook_failover` links
+`orderbook_metrics` now, which is what the linker said about it.
+
+The recovery line sits **inside** the `try`, so a tick that threw cannot claim its own recovery —
+the mistake the mesh boundary made one commit earlier, paid once rather than twice.
+
+**And this is the part worth reading: the boundary fixed the thread and the node is still stuck.**
+After the fix, the same probe reports the thread alive, `ob_monitor_errors_total` at 1, the episode
+opening and closing — and `ROLE` still answering `REPLICA 127.0.0.1:44613 2`, that node's own
+replication port, for the forty seconds observed. The promotion took the leader key before the
+`EPOCH` write was refused, and the next tick adopts what it finds in the key. That is **#130**, a
+separate defect with its own decision to make, and the test for this change deliberately asserts the
+**thread** rather than the role: the recovery line can only be written by a tick after the one that
+threw, while "the process is alive" was true when the thread was gone.
+
+Two mutations, and the second is the one worth having. Rethrowing straight after the counter kills
+the test on its first assertion — the failure output carries the old `monitor_loop ended on an
+exception and that thread is gone`, which is the pre-fix line. Counting, logging **and then**
+rethrowing kills it on the assertion that matters: *no tick ran after the one that threw*. Restored
+from a copy kept alongside both times, green after.
+
+**Still open: `lease_loop` and `run_loop`.** `lease_loop` has **no** throwing path today, so its
+boundary is a ratchet and will say so rather than pretending to fix something measured. `run_loop`
+needs the floor, and the floor is not a new threshold: 100 ms is what that loop already waits when
+it has nothing in hand, so a failing pass is paced like an idle one.
 
 
 - Effort: M | Impact: the most ordinary disk condition there is no longer turns a refusal into a
