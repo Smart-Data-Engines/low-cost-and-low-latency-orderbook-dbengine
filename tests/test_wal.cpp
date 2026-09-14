@@ -658,11 +658,23 @@ TEST(WalDistance, ItAccumulatesAcrossSeveralFiles) {
     ob::WALWriter writer(tmp.str(), /*rotate_threshold=*/512);
 
     const ob::WalPosition start = writer.current_position();
+    uint64_t seq = 1;
     for (int i = 0; i < 40; ++i) {
-        ob::DeltaUpdate upd = make_delta(static_cast<uint64_t>(i + 1));
+        ob::DeltaUpdate upd = make_delta(seq++);
         writer.append(upd, &lvl);
     }
     ASSERT_GT(writer.current_position().file_index, 2u) << "not enough rotations to be a test";
+
+    // The current file must hold something, and this is asserted rather than assumed because the
+    // first version of this test did not: forty 136-byte records against a 512-byte threshold
+    // rotate on the last one, so the run ended with `now.offset == 0` and dropping the current
+    // file's bytes from the sum changed **nothing**. A mutation doing exactly that survived, which
+    // is how the gap was found.
+    while (writer.current_position().offset == 0) {
+        ob::DeltaUpdate upd = make_delta(seq++);
+        writer.append(upd, &lvl);
+    }
+    ASSERT_GT(writer.current_position().offset, 0u);
 
     const auto distance = writer.bytes_since(start);
     ASSERT_TRUE(distance.has_value());
@@ -715,4 +727,31 @@ TEST(WalDistance, AMissingFileIsUnknownRatherThanAGuess) {
     // than about the writer having given up.
     const ob::WalPosition after_hole{writer.current_position().file_index, 0};
     EXPECT_TRUE(writer.bytes_since(after_hole).has_value());
+}
+
+// The file the position itself sits in, which is a **different** code path from the files in
+// between: the tail of the first one is measured before the loop starts. A mutation that made the
+// first file's error path return zero instead of `nullopt` survived the test above, because that
+// test removes an intervening file and never exercises the tail.
+TEST(WalDistance, AMissingFirstFileIsUnknownToo) {
+    TempDir tmp("dist_gone_first");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), /*rotate_threshold=*/512);
+
+    ob::WalPosition in_first{};
+    uint64_t seq = 1;
+    while (writer.current_position().file_index == 0) {
+        ob::DeltaUpdate upd = make_delta(seq++);
+        const ob::WalPosition at = writer.append(upd, &lvl);
+        if (at.file_index == 0) in_first = at;
+    }
+    for (int i = 0; i < 8; ++i) {
+        ob::DeltaUpdate upd = make_delta(seq++);
+        writer.append(upd, &lvl);
+    }
+    ASSERT_TRUE(writer.bytes_since(in_first).has_value()) << "the control: measurable before removal";
+
+    std::filesystem::remove(tmp.path / "wal_000000.bin");
+    EXPECT_FALSE(writer.bytes_since(in_first).has_value())
+        << "the file the position sits in is gone and the distance was answered anyway";
 }

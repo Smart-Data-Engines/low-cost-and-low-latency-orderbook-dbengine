@@ -2204,6 +2204,23 @@ Learned the hard way. Check here before debugging.
     passing its real assertion. The clamp needs a position **late** in the earlier file. Without
     the control the test would have been green, named after a defect, and blind to it.
 
+262. **`str.replace()` without asserting the match count is a silent no-op, and in a script that
+    edits a mutation harness it produces a verdict about code you never wrote.** Two "corrections"
+    to #123's table did nothing, so the table kept reporting `DID_NOT_BUILD` for a mutation whose
+    text was still the original — and the original really did leave a variable unused under
+    `-Werror`, so the message was true about a mutation I thought I had replaced. Half an hour went
+    into reconciling that with a manual run that built cleanly, because the manual run used the
+    replacement text and the harness used the old one. It is the same family as a mutation that
+    does not change the program, one level up: **the tool that edits the tool needs the same
+    assertion the tool has.**
+
+263. **A harness that refuses a verdict has to print why, or the refusal costs more than it
+    saves.** `DID_NOT_BUILD` with no compiler line is indistinguishable between a real `-Werror`
+    and a transient failure this repository has hit before (two `cmake --build` in one directory,
+    `Text file busy`). Adding four lines of the build output to the refusal turned the case above
+    from a guess into a fact in one run. Same rule as the earlier lock-file guard: an assertion
+    that declines to answer must name the evidence.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

@@ -2265,6 +2265,21 @@ have to write 512 MB to rotate. That is **#124**, filed rather than worked aroun
 production code configurable so a test can reach it is a test deciding the shape of the program,
 and the flag is worth adding on its own merits or not at all.
 
+**Ten mutations, each with the verdict it was expected to give — and the table paid for itself
+twice before it got there.** Two of the ten survived the first run against real gaps in the tests,
+not against the code. *"The current file's bytes are dropped"* survived because forty 136-byte
+records against a 512-byte threshold rotate on the last one, so that test ended with
+`now.offset == 0` and dropping it changed nothing; the test asserts the current file is non-empty
+now, as a stated precondition. And *"a missing file is guessed at instead of unknown"* survived
+because the only test for it removed an **intervening** file, so the error path for the file the
+position itself sits in had no test at all — which is now `AMissingFirstFileIsUnknownToo`.
+
+The deliberate survivor is *"stats reports every lag as known"*: the formatter's half is pinned by
+a test that builds `ServerStats` directly, and nothing behavioural covers `stats()` wiring the flag,
+because that needs a replica whose confirmed file has been removed. Same shape as #118's survivor,
+recorded for the same reason — a surviving mutation without a note is one the next reader assumes
+was missed.
+
 - Effort: S | Impact: the only genuine replication lag in the engine read zero in the case an
   operator cares about, and it was visible only by reading `STATUS` by hand. It is now two gauges,
   and the second one names a condition the first cannot express
@@ -5935,7 +5950,7 @@ runners, not the machine-B performance baseline above.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1064 | all passing with `ctest -j1` on the i3-7100U, run in three `-I` ranges because this machine's memory guard stops a single long run (355 + 355 + 354). **Six more than the previous commit**: five pin `WALWriter::bytes_since()` across files, including one that computes the old expression beside the new answer and asserts the old one says zero, and one pins `lag=unknown` on the wire. Six before that were #118's. **Earlier**: seven pin `max_records_behind`, the mesh's honest lag, and one went away — a hand-written list of the metric names the engine writes, which #118's removal of a registration broke and which `scripts/check_metrics.py` already checks mechanically in both directions. **All of #117**: four pin `queue_utilization_percent` and three `counter_delta`, both moved into `metrics.hpp` so that the ordinary suite executes arithmetic whose caller no CI job runs; two pin the WAL's record count. `tests/test_iouring_instrumentation.cpp` adds four more that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists 1066: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
+| C++ (GTest + RapidCheck) | 1065 | all passing with `ctest -j1` on the i3-7100U, run in three `-I` ranges because this machine's memory guard stops a single long run (355 + 356 + 354). **Seven more than the previous commit**: six pin `WALWriter::bytes_since()` across files, including one that computes the old expression beside the new answer and asserts the old one says zero, and one that exists because a mutation showed the error path for the first file had no test; one more pins `lag=unknown` on the wire. Six before that were #118's. **Earlier**: seven pin `max_records_behind`, the mesh's honest lag, and one went away — a hand-written list of the metric names the engine writes, which #118's removal of a registration broke and which `scripts/check_metrics.py` already checks mechanically in both directions. **All of #117**: four pin `queue_utilization_percent` and three `counter_delta`, both moved into `metrics.hpp` so that the ordinary suite executes arithmetic whose caller no CI job runs; two pin the WAL's record count. `tests/test_iouring_instrumentation.cpp` adds four more that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists 1067: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
 | Python integration | 257 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 256; count pytest's final result rather than the report plugin's progress characters. `256 passed, 2 skipped in 18:58` on the GitHub runner for this commit; the same suite read `19:18` on the runner and `19:25` on the development machine (i3-7100U, native etcd) two commits ago, which is the spread to expect rather than a change. Ten more than the previous commit, all of #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content, and the same ten cost 2:37 locally |
 | Python integration under TSan | 257 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `256 passed in 24:37` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **19:18** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 
