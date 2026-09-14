@@ -143,30 +143,43 @@ def metric(port: int, name: str) -> float:
     raise AssertionError(f"{name} is not in /metrics at all, which is not the same as zero")
 
 
-def replica_confirmed_file(port: int) -> int:
+def replica_confirmed_file(port: int, timeout: float = 30.0) -> int:
     """The WAL file the primary's first replica has acknowledged into.
 
     The file to watch has to be **this** one rather than the oldest file on disk. Retention runs
     every flush tick, so the oldest file present at any moment may simply be one the pass has not
     reached yet, and a test watching it would fail for a reason that is not a defect. The file the
     slowest connected replica is in is exactly the one `safe_truncate` promises to keep.
+
+    Waits for the line rather than demanding it at an instant. The primary's replica list is
+    per-**connection**, so a replica that is reconnecting is briefly absent from it — and a replica
+    reconnects after a snapshot bootstrap, which the test before this one leaves behind. Measured:
+    `replicas: 0` from a `STATUS` issued moments after the same replica had answered a query with
+    every row, in one run out of several.
     """
-    line = replica_line(port)
+    line = replica_line(port, timeout=timeout)
     return int(line.split("file=")[1].split()[0])
 
 
-def replica_line(port: int, index: int = 0) -> str:
+def replica_line(port: int, index: int = 0, timeout: float = 30.0) -> str:
     """The primary's `replica[i]:` line from STATUS, which carries `file=`, `offset=` and `lag=`."""
-    with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
-        sock.settimeout(10)
-        sock.recv(4096)
-        sock.sendall(b"STATUS\n")
-        time.sleep(0.4)
-        reply = sock.recv(1 << 20).decode(errors="replace")
-    for line in reply.splitlines():
-        if line.startswith(f"replica[{index}]:"):
-            return line
-    raise AssertionError(f"STATUS on the primary has no replica[{index}] line:\n{reply}")
+    deadline = time.monotonic() + patience(timeout)
+    reply = ""
+    while True:
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+            sock.settimeout(10)
+            sock.recv(4096)
+            sock.sendall(b"STATUS\n")
+            time.sleep(0.4)
+            reply = sock.recv(1 << 20).decode(errors="replace")
+        for line in reply.splitlines():
+            if line.startswith(f"replica[{index}]:"):
+                return line
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"STATUS on the primary had no replica[{index}] line for {patience(timeout):.0f}s, "
+                f"so no replica is connected to it at all:\n{reply}")
+        time.sleep(0.5)
 
 
 
