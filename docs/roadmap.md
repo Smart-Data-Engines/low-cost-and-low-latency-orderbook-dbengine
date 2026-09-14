@@ -1164,6 +1164,42 @@ codebase. Each item is also a story we can sell as bespoke work.
   clock skew (HLC correctness under skew is untested), etcd unavailability
 - Effort: L | Impact: The failure modes that lose data in production
 
+**Four stages are in, and the item stays open with what is left named.** Stage A injects storage
+faults with an `LD_PRELOAD` shim and found #112, #113 and #114 in its first run; stage B takes the
+coordinator away and found #115 and #116; stage C breaks mesh links through a proxy and found #117
+and #118; stage D skews clocks and found #119, #120 and the question that is #121.
+
+**The last clause of stage C is closed, and the number is the interesting part.** "A peer that
+stopped reading is dropped rather than buffered for ever" was recorded as blocked by **volume, not
+visibility**, and that was right about the mechanism and pessimistic about the cost.
+`ob_mm_peer_send_buf_bytes` is the engine's own queue and cannot grow until `send()` returns
+`EAGAIN`, which needs the **sender's** socket buffer full — the engine sets no `SO_SNDBUF`, so that
+is `tcp_wmem`'s maximum, and narrowing the *receiver's* buffer does not shorten it because TCP holds
+unsent data on the sender's side. Measured: **3 015 750 bytes** of accepted writes before the queue
+passed a 256 kB ceiling, so about 2.9 MB sits where no gauge can see it. The test costs **9.0 s**,
+because a 1000-level `MINSERT` is one ~24 kB mesh frame and three megabytes is ~125 round trips. Its
+control is a **draining** link: the same writes leave the drop counter at zero and the queue at 0
+bytes, without which "the partition caused the drop" would be a claim about volume. Convergence
+afterwards is read from `ob_mm_replication_lag_records` returning to zero rather than by comparing
+half a million rows.
+
+A fixture went with it: `narrow_proxied_mesh` put a 4 kB receive buffer on the accepted sockets on
+the expectation that it would shorten that wait, the same session measured that it does not, and it
+was left behind **with no users** — a fixture built for a test nobody then wrote, which is the shape
+of a knob nothing turns.
+
+`docs/operations.md` now has the mesh-link section that stage C left for last, because writing it
+earlier would have meant describing the two numbers #117 and #118 were about to change: for the
+first ~2.9 MB the engine reports nothing, then the records lag moves, then the peer is dropped.
+
+**What is left, all of it named rather than implied**: a wire-level test that a crafted HLC in a
+frame reaches the clock (the substance is established by reading — `multi_master.cpp:558` parses it
+and `:568` hands it on, with nothing between — and the behaviour is pinned at the unit level, so
+this adds that those ten lines do what they look like); the engine-side half of "a short write, then
+an error" (how many records *after* the torn one stop being readable on replay — the injector can
+produce it and the measurement has not been taken); and a one-command reproduction guide for the
+injector.
+
 ### 55. Multi-node cluster tests in CI ✅
 - Three native nodes plus etcd started by a script, multi-master convergence and failover verified
   on every PR
@@ -6107,8 +6143,8 @@ except where a row says otherwise, not the machine-B performance baseline above.
 | Suite | Count | Status |
 |-------|-------|--------|
 | C++ (GTest + RapidCheck) | 1074 | all passing with `ctest -j1` on the i3-7100U, **210 s in a single run**. **Three more than the previous commit**, all of #125 and all about the digest a snapshot transfer compares: one requires what a receiver rebuilds to agree with what a primary sent, with a control that the two documents really do differ — without it the test passes against the defect; one requires the digest to still notice everything that travels and to be unmoved by the two fields it excludes, which is stated rather than inferred; one pins that arrival order does not matter, because the receiver appends in wire order and `to_json()` sorts by path. A fourth test changed rather than arrived: the mock primary in `tests/test_replication.cpp` now fills in the two fields a real primary fills in, which makes it a regression test for #125 — confirmed by a mutation. **Earlier**: six were #124's, seven #123's, six #118's, seven #117's. CTest lists 1076: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
-| Python integration | 261 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 261; count pytest's final result rather than the report plugin's progress characters. `261 passed, 2 skipped in 19:58` on the GitHub runner for this commit, against `20:07` on the development machine (i3-7100U, native etcd) — the spread to expect between the two rather than a change. One more than the previous commit, #125's: a killed replica whose confirmed WAL file retention has removed comes back with every row. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
-| Python integration under TSan | 261 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `261 passed in 25:42` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **19:58** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
+| Python integration | 262 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 262; count pytest's final result rather than the report plugin's progress characters. `261 passed, 2 skipped in 19:58` on the GitHub runner for this commit, against `20:07` on the development machine (i3-7100U, native etcd) — the spread to expect between the two rather than a change. Two more than the previous commit: #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
+| Python integration under TSan | 262 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `261 passed in 25:42` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **19:58** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than
