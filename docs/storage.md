@@ -32,7 +32,12 @@ Each record:
 - Records are written sequentially, never modified
 - CRC32C checksum covers the payload bytes
 - Replay stops at the first checksum mismatch (torn write detection)
-- Rotation: when file size exceeds 512 MB, a new WAL file is opened
+- Rotation: when the offset reaches `--wal-rotate-bytes` (default 512 MB) a new WAL file is opened.
+  The threshold is a **trigger, not a file size**: it is checked after a write, so a closed file is
+  at least the threshold and may exceed it by one record. That asymmetry is why distances across
+  files are measured by asking the filesystem rather than multiplying the threshold by a file count
+  (#123), and the flag is refused below one maximal record and above 2 GiB — see
+  `docs/operations.md`, "WAL rotation, and what frees WAL files"
 
 ## Columnar Store Layout
 

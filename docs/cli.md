@@ -285,6 +285,24 @@ Durability of the WAL write itself is `--fsync-policy`, which takes `every`, `in
 default. With anything other than `every`, an acknowledged write can be lost on a power cut: the
 replay described above cannot recover a record that never reached the platter.
 
+How large the WAL grows before it starts a new file is `--wal-rotate-bytes`, and it is a **trigger
+rather than a file size**: rotation is checked after a write, so a file may exceed the threshold by
+one record. Three things follow from the number, which is why it is a knob at all. It bounds what a
+crash replays, together with `--flush-interval-ms`. It bounds what a reconnecting replica may have
+to scan before the primary decides a snapshot is cheaper. And it is the granularity retention frees,
+because WAL files are deleted whole and only below the file the slowest **connected** replica has
+confirmed — so a large threshold means a lagging replica pins more bytes on disk, and a small one
+means more files to walk.
+
+It is refused at both ends rather than clamped. The ceiling is 2 GiB: a WAL position is a file index
+and a 32-bit offset read as one value, and a larger file would let the offset wrap and report a
+position inside the wrong part of the file. The floor is 65573 bytes — a 38-byte header plus the
+64 KiB payload limit — because below one maximal record a single write can fill a file on its own
+and every write rotates, which costs a WAL file per record. The engine's own unit tests do use a
+512-byte threshold, on a `WALWriter` constructed directly, and that is the difference the refusal
+draws: a component test that wants one file per record may ask for it, an operator who typed a
+plausible small number is told what it would do.
+
 This paragraph used to say the policy was set "at build/config level" and name the values `EVERY`,
 `INTERVAL` and `NEVER`. Roadmap #33 made it a flag, and two of those three spellings are refused by
 the parser — so the installed CLI reference told an operator that the most consequential setting in
@@ -355,6 +373,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--tls-replication` | — (boolean) | TLS with mutual certificate verification on the replication link, in both roles; needs `--tls-ca-file` |
 | `--ttl-hours` | `<N>` | Retention in hours; 0 keeps everything. Counted from **the record's own event time**, per segment — so a backfill written with `[event_time_ns]` arrives with its age, and a batch whose oldest row is past the window is expired on the next sweep. One row dated in the future keeps its whole segment |
 | `--ttl-scan-interval-seconds` | `<N>` | How often retention scans for expired rows |
+| `--wal-rotate-bytes` | `<N>` | WAL bytes before the next file is opened (default: 536870912). A **trigger**, not a file size: rotation is checked after a write, so a file may exceed it by one record. Refused below 65573 (one maximal record) and above 2 GiB |
 | `--workers` | `<N>` | Number of worker threads (default: 4) |
 
 ## Argument handling

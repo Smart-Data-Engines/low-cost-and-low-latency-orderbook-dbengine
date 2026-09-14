@@ -36,10 +36,11 @@ Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
                ReplicationClientConfig repl_client_config,
                FailoverConfig failover_config,
                TTLConfig ttl_config,
-               MultiMasterConfig mm_config)
+               MultiMasterConfig mm_config,
+               size_t wal_rotate_bytes)
     : base_dir_(base_dir)
     , flush_interval_ns_(flush_interval_ns)
-    , wal_(base_dir, 512ULL << 20, fsync_policy)
+    , wal_(base_dir, wal_rotate_bytes, fsync_policy)
     , combined_store_(base_dir)
     // The lookup takes mtx_ for one map read and releases it before the query runs. Handing
     // QueryEngine a reference to the buffer map instead was a data race: every write path inserts
@@ -70,6 +71,11 @@ void Engine::open() {
     // is no other way to tell from outside whether this binary found the instruction.
     OB_LOG_INFO("engine", "CRC32C implementation: %s",
                 crc32c_has_hardware() ? "SSE4.2 instruction" : "lookup table");
+
+    // One line, because two behaviours an operator debugs are functions of this number and nothing
+    // else reveals it: how much a crash replays, and what a retention pass can free - WAL files are
+    // deleted whole, and only below the slowest connected replica's file.
+    OB_LOG_INFO("engine", "WAL rotation threshold: %zu bytes", wal_.rotate_threshold());
 
     // Rebuild the columnar segment index first: the replay below needs it to tell
     // which records are already durable.

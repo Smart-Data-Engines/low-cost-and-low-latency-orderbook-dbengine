@@ -190,6 +190,22 @@ static_assert(std::atomic<WalPosition>::is_always_lock_free,
 /// record is bounded by the payload limit, far below the two gigabytes of headroom this leaves.
 inline constexpr size_t MAX_WAL_ROTATE_THRESHOLD = 2ULL << 30;
 
+/// Smallest rotate threshold worth offering an operator: one maximal record.
+///
+/// Rotation is checked *after* a write, so a threshold below this lets a single record fill a whole
+/// file on its own — and since a 1000-level delta is 24 KB and the header limit allows 64 KB, that
+/// is not a hypothetical shape. The result is one file per write: a directory with as many entries
+/// as there are records, a `file_size` call per intervening file in `bytes_since()`, and a
+/// retention pass that walks all of them every flush tick.
+///
+/// **`WALWriter` does not enforce this, and that is deliberate.** The unit tests drive this class
+/// with a 512-byte threshold precisely so that rotation is reachable without writing megabytes, and
+/// that is a legitimate thing for a component test to do. The floor belongs to the *operator knob*
+/// — `--wal-rotate-bytes` refuses below it — because the failure it prevents is an operator
+/// choosing a number whose consequence is invisible until the directory has a million files in it.
+inline constexpr size_t MIN_WAL_ROTATE_THRESHOLD =
+    sizeof(WALRecordV2) + WAL_MAX_PAYLOAD_LEN;
+
 class WALWriter {
 public:
     explicit WALWriter(std::string_view dir,
@@ -335,6 +351,11 @@ public:
 
     /// Index of the WAL file currently being written to.
     uint32_t current_file_index() const { return current_position().file_index; }
+
+    /// The threshold this writer rotates at. Read by the startup log line, because how much a
+    /// crash has to replay and how much WAL retention can free are both functions of this number
+    /// and there is no other way to tell from outside which one a process is running with.
+    size_t rotate_threshold() const { return rotate_threshold_; }
 
     /// Current byte offset within the active WAL file.
     ///

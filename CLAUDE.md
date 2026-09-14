@@ -1417,7 +1417,9 @@ Learned the hard way. Check here before debugging.
     for it would need `Engine`'s hardcoded 512 MB rotate threshold to become configurable for a
     test's sake, which is the wrong trade. A static test over `Engine::apply_delta` is the mechanism
     instead, and for this claim it is stronger: the engine may not *compute* a position at all
-    (#98).
+    (#98). The threshold **is** configurable since #124, and that does not change this entry: the
+    flag was added because an operator wants it, and the static test is still the stronger mechanism
+    for this claim. A knob arriving later does not retroactively justify adding one for a test.
 
 169. **A test whose premise is wrong can pass for a reason unrelated to its name, and the node's
     log is where you find out.** An integration test asserting that a restarted replica resumes
@@ -2221,6 +2223,65 @@ Learned the hard way. Check here before debugging.
     from a guess into a fact in one run. Same rule as the earlier lock-file guard: an assertion
     that declines to answer must name the evidence.
 
+264. **How many WAL files are on disk is a retention fact, not a rotation fact.** The first
+    assertion in #124's integration module was "fifteen hundred records must leave at least three
+    WAL files", and it failed against a primary that had rotated three times: it held
+    `['wal_000002.bin', 'wal_000003.bin']`, because the replica confirmed into file 2 while the
+    writing was still going on and the flush tick freed what was below. For "did it rotate", read
+    the highest index or `ob_wal_file_index`; for "which files are still here", list the directory.
+    Two questions, two instruments.
+
+265. **A replica refuses `FLUSH`, so its own flush interval decides when what replication delivered
+    becomes queryable.** `FLUSH` is answered `ERR read-only replica`, and rows reach a `SELECT`
+    through segments, so a replica's tick is the only thing that materialises them. The first
+    version of #124's catch-up test set a ten-minute interval to stop retention from freeing the
+    files it needed — and read **zero** rows out of a replica that had received every one of them.
+    The fix was to stop retention with a mechanism instead of a timer: a second replica, stopped,
+    pins `safe_truncate` in place. A configuration chosen to disable one thing in the flush tick
+    disables everything in it.
+
+266. **A floor that protects an operator does not belong in the component the operator is not
+    typing at.** `--wal-rotate-bytes` refuses anything below one maximal record, because below that
+    a single write fills a file and the directory grows one file per record. `WALWriter` deliberately
+    does **not** enforce it: its unit tests drive a 512-byte threshold so rotation is reachable
+    without writing megabytes, which is a reasonable thing for a component test to do. The
+    distinction is who chose the number, and it is written next to both.
+
+267. **A refusal is only the documented one if the boundary itself is accepted.** The floor and the
+    ceiling are tested from both sides — one byte under refuses, the value itself parses — because a
+    refusal that is off by one is a different refusal from the one `docs/cli.md` prints, and the
+    error message quotes those two numbers.
+
+268. **A stopped process does not act on `SIGTERM` until it runs again.** A test that leaves a node
+    under `SIGSTOP` — including one that fails between the pause and its `finally` — would make
+    teardown wait out its five-second grace and take the `SIGKILL` path, which is #106's shape from
+    the other side: the harness silently stops exercising the graceful exit and the report gains a
+    `signal 9` nobody asked for. `_stop_node()` sends `SIGCONT` first, unconditionally and with no
+    record of which nodes are paused: `SIGCONT` to a running process is a no-op, and a set that is
+    wrong in the direction of "not paused" costs exactly the five seconds this avoids.
+
+269. **A checksum over a document the receiver cannot reconstruct is a checksum that can only
+    fail.** `SNAPSHOT_END` carries `crc32c(manifest.to_json())`, and `to_json()` serialises
+    `created_at_ns` and `total_rows` — two fields the wire never sends. The receiver rebuilds the
+    manifest with both at zero, so against a real primary the comparison fails **every time**, and
+    the replica retries for ever (#125). The direction of the rule matters: before comparing two
+    digests, ask whether both sides can produce the same bytes.
+
+270. **A stub built to agree with the code under test proves that the code agrees with itself.**
+    The only test of that bootstrap path uses a mock primary that constructs its manifest from
+    exactly the four fields the wire carries, leaving the other two at their default zero — which is
+    what the receiver reconstructs. Its own comment says it has to "build the same manifest to name
+    it". It stands in for the *sender*, so it has to be built like the sender; the fields a real
+    primary fills in are the whole defect.
+
+271. **A pause long enough to observe anything outlives the socket timeout, so a `SIGSTOP` test is
+    a disconnect test whether it means to be or not.** #124's retention test needed a flush tick and
+    four scrapes while the replica was stopped; by the time it resumed, the replica's `read_line`
+    had timed out, it reconnected, and in that window retention advanced past its saved position.
+    Every clause the test was written for passed; what followed belonged to a different item. Do not
+    shorten the pause to fit under the timeout — the margin is against a number you do not control,
+    on a runner three times slower under a sanitizer.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2351,7 +2412,7 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   cut at byte 20 of a 38-byte header is **not applied in part**; and a reconnect's catch-up
   re-delivers records without storing any twice. What it does **not** promise today is #117.
 - **Every lag this engine reports is a pair now, and the second half names what the first cannot
-  say** (#123 closed, #124 open). The replica lag was the last one wrong: `stats()` computed
+  say** (#123 and #124 closed). The replica lag was the last one wrong: `stats()` computed
   `current_offset - confirmed_offset` with the **file index ignored**, and `rotate()` resets the
   current offset, so a replica more than a file behind read **zero bytes behind**. It goes through
   one `WALWriter::bytes_since()` now — exact, across files, asking the filesystem for each
@@ -2359,9 +2420,20 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   excellent at 512 MB and out by a quarter at the thresholds tests use. A missing file in between
   answers `nullopt`, which reaches an operator as `lag=unknown` in `STATUS` and as
   `ob_replicas_lag_unknown` — and that condition is **worse** than a large lag, because retention
-  keeps files back to the slowest connected replica. What is not covered is the cross-file path
-  end to end: the rotation threshold is a literal in `src/engine.cpp`, so **no integration test
-  has ever crossed a WAL file boundary** (#124).
+  keeps files back to the slowest connected replica. The cross-file path **is** covered end to end
+  since #124 made the rotation threshold a flag (`--wal-rotate-bytes`, refused below one maximal
+  record and above 2 GiB): `tests/integration/test_wal_rotation.py` stops a replica with `SIGSTOP`
+  — connected, counted, acknowledging nothing — and requires a lag bigger than a whole file beside
+  a zero unknown count, which is the same fact from two sides, since the distance is measurable
+  precisely because retention kept the files.
+- **A replica sent to the snapshot path cannot bootstrap, and the checksum that stops it is
+  unsatisfiable rather than unlucky** (#125, open). `SNAPSHOT_END` carries
+  `crc32c(manifest.to_json())`, and that document includes `created_at_ns` and `total_rows`, which
+  the primary fills and the wire never sends — so the receiver's reconstruction differs by
+  construction. Measured on a live pair: 24 of 24 files arrived with every per-file CRC verified,
+  the manifest CRC disagreed, and the replica asked again every five seconds holding zero rows.
+  Reachable only since #124, because retention removes a file the replica needs only after a
+  rotation, and the only unit test of the path uses a mock primary built to agree with the receiver.
 - **A new reader of shared state changes how often a latent race fires, and that is part of the
   change** (#122, closed). `repl_client_` was read under `mtx_` by `stats()` and written without it
   by `promote_to_primary()`; the fix is the idiom `demote_to_replica()` ten lines down already

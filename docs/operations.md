@@ -165,6 +165,45 @@ Put the data directory on the fastest local device you have, and **not** on the 
 journal of a busy filesystem: the WAL is sequential and small-record, so it is exactly the workload
 that suffers from sharing a queue.
 
+### WAL rotation, and what frees WAL files
+
+`--wal-rotate-bytes` decides how large a WAL file grows before the writer opens the next one. It
+defaults to 512 MB and it is a **trigger, not a file size**: rotation is checked after a write, so a
+file may exceed it by one record.
+
+Three things follow from it, which is why it is worth a section rather than a row in a table:
+
+- **What a crash replays.** Together with `--flush-interval-ms`, it bounds the work between the last
+  checkpoint and the end of the log.
+- **What a reconnecting replica may have to scan.** A replica resumes from the position it saved and
+  the primary streams forward from there, across files.
+- **What retention can free, and when.** WAL files are deleted **whole**, and only below the file
+  the slowest **connected** replica has acknowledged. So a large threshold means a lagging replica
+  pins more bytes on disk; a small one means more files for every retention pass to walk.
+
+That last point is the one that surprises people, and it is worth being concrete about the two
+halves, because they differ in a way that matters during an incident:
+
+| The replica is | `safe_truncate` is | What happens to old files |
+|---|---|---|
+| connected and behind (slow, or stopped) | its acknowledged file | **kept** — it can still catch up from the log |
+| gone (crashed, killed, network down) | the current file | **freed** — a reconnect from an old position is answered `ERR WAL_TRUNCATED` and needs a snapshot |
+
+A replica that is merely slow therefore costs disk, and a replica that is **absent** costs a
+snapshot when it comes back. Neither is a defect; the failure would be a third case, freeing a file
+a connected replica still needs, which is what `ob_replicas_lag_unknown` counts and what the
+retention test in `tests/integration/test_wal_rotation.py` exists to catch.
+
+The value is refused at both ends rather than clamped. Above 2 GiB: a WAL position is a file index
+and a 32-bit offset read as one value, and a larger file would let the offset wrap and report a
+position inside the wrong part of the file (#85). Below 65573 bytes — a 38-byte header plus the
+64 KiB payload limit — a single write can fill a file on its own, so every write rotates and the
+directory grows one file per record. The engine's own unit tests do use a 512-byte threshold, on a
+`WALWriter` constructed directly; the floor belongs to the flag, because the number an operator
+types has consequences nothing shows until the directory is unmanageable.
+
+The file a node is writing is a gauge: `ob_wal_file_index`, published from the flush tick.
+
 ### When an fsync fails
 
 Watch `ob_wal_fsync_errors_total`. It is separate from `ob_flush_errors_total` because the two ask
@@ -472,10 +511,15 @@ with the **file index ignored**, and a WAL rotation resets the current offset, s
 than one file behind reported **zero bytes behind**.
 
 **What it does not promise.** The distance is exact, but it is sampled once per replication loop
-pass, so a scrape immediately after a burst of writes can read the previous pass's value. And no
-integration test crosses a WAL file boundary, because the rotation threshold is compiled in — that
-is #124, and it means this number's cross-file behaviour is pinned by unit tests rather than by a
-running cluster.
+pass, so a scrape immediately after a burst of writes can read the previous pass's value.
+
+The cross-file behaviour is pinned by a running cluster since #124 made the rotation threshold a
+flag: `tests/integration/test_wal_rotation.py` stops a replica with `SIGSTOP` — connected, counted,
+acknowledging nothing — writes past three rotations, and requires this gauge to read **more than a
+whole file**. That is the number the arithmetic before #123 could not produce. It requires
+`ob_replicas_lag_unknown` to be zero in the same breath, because the two are one fact from two
+sides: the distance is measurable precisely because retention kept the files the stopped replica
+still needs.
 
 ## When a peer's clock is wrong
 
