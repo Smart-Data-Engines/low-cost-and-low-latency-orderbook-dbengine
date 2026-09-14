@@ -12,9 +12,26 @@ What this script can prove:
   - every `#N` reference points at an item that exists
   - every reference in a range `#N-M` has both bounds pointing at existing items
   - a new item took the next free number rather than displacing an existing one
+  - the `**Open: …**` line in "Recommended order" names *exactly* the items above
+    its stated floor that are not marked closed - both directions
+
+The last one exists because the same sentence went false twice in two days. "There
+is no open defect on this page" was true when it was written and stayed on the page
+while three items were filed under it; before that, a count and the CI run that
+measured it drifted onto different trees. A status claim with nothing over it is the
+shape this repository keeps finding rotten.
+
+The floor is read from that same line rather than written here, because this script
+cannot tell a defect from a feature nobody has built: every item from #1 to #58 is
+unticked and always will be until somebody builds it. The first version of this rule
+only pinned the *highest*-numbered item, on the argument that a filed item takes the
+next free number - and that was wrong the moment an item was filed closed above an
+open one, which had already happened (#133 above #132). Dropping #132 from the line
+would have survived. The rule compares sets now.
 
 What it cannot prove, and no script can: that a reference points at the item the
-author *meant*. Read those yourself when you touch them.
+author *meant*, or that the prose around the line describes the four honestly. Read
+those yourself when you touch them.
 
 Exit status 0 if clean, 1 otherwise.
 """
@@ -30,6 +47,13 @@ HEADER_RE = re.compile(r"^### (\d+)\. (.+)$", re.M)
 # A range must be matched before a bare reference, or the second bound is missed.
 RANGE_RE = re.compile(r"#(\d+)-(\d+)")
 REF_RE = re.compile(r"#(\d+)")
+# The one status claim on this page that a script can hold: which items are open.
+# Anchored on the literal label rather than on prose around it, because the prose is
+# rewritten every session and an anchor that moves with it checks nothing.
+OPEN_LINE_RE = re.compile(r"^\*\*Open: (.+?)\*\*", re.M)
+# The floor comes from the document, next to the claim it bounds.
+FLOOR_RE = re.compile(r"above #(\d+)")
+CLOSED_MARK = "\u2705"  # the tick an item's heading carries once it is closed
 # Real references are written bare (#27). Anything inside backticks is an example
 # being discussed — including this file's own note about a mangled `#48-48` range,
 # which the checker flagged as a live defect the first time it ran.
@@ -98,6 +122,40 @@ def main() -> int:
                 problems.append(
                     f"line {line_no}: reference #{number} does not resolve to an item")
 
+    # ── The status line ───────────────────────────────────────────────────────
+    open_match = OPEN_LINE_RE.search(text)
+    floor_match = FLOOR_RE.search(text) if open_match is None else FLOOR_RE.search(
+        text[open_match.start():open_match.start() + 400])
+    if open_match is None:
+        problems.append(
+            'no "**Open: …**" line in docs/roadmap.md. It is the one status claim on this page '
+            'with a check over it; write "none" there rather than deleting it')
+    elif floor_match is None:
+        problems.append(
+            'the open-items line does not say "above #N", so this check has no floor and '
+            'cannot tell an open defect from a feature nobody has built')
+    else:
+        floor = int(floor_match.group(1))
+        claimed = {int(n) for n in re.findall(r"#(\d+)", open_match.group(1))}
+        actually_open = {n for n, title in items.items()
+                         if n > floor and CLOSED_MARK not in title}
+        for number in sorted(claimed - actually_open):
+            if number not in items:
+                problems.append(f"the open-items line names #{number}, which is not an item")
+            elif number <= floor:
+                problems.append(
+                    f"the open-items line names #{number}, which is at or below the floor "
+                    f"#{floor} it declares")
+            else:
+                problems.append(
+                    f"the open-items line names #{number}, whose heading is marked closed. "
+                    f"Closing an item means taking it off that line in the same commit")
+        for number in sorted(actually_open - claimed):
+            problems.append(
+                f"#{number} is above #{floor} and is not marked closed, so the open-items line "
+                f"has to name it. A filed item takes the next free number, which is how that "
+                f"line goes stale")
+
     if problems:
         print(f"docs/roadmap.md: {len(problems)} problem(s)")
         for problem in problems:
@@ -105,8 +163,10 @@ def main() -> int:
         return 1
 
     numbers = sorted(items)
+    open_items = sorted(int(n) for n in re.findall(r"#(\d+)", open_match.group(1)))
+    listed = ", ".join(f"#{n}" for n in open_items) if open_items else "none"
     print(f"docs/roadmap.md: {len(items)} items, ids {numbers[0]}-{numbers[-1]}, "
-          f"all cross-references resolve")
+          f"all cross-references resolve; open above #{int(floor_match.group(1))}: {listed}")
     return 0
 
 
