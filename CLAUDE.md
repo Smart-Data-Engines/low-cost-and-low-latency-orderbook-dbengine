@@ -2456,6 +2456,15 @@ Learned the hard way. Check here before debugging.
     promotion after a failover runs on the monitor thread, and that one leaves the node reporting
     `REPLICA <its own replication port>` for ever.
 
+294. **A paragraph asking the next person to keep two numbers in step is not a mechanism — and I
+    proved it in the commit that added one.** Pitfall 289 was written because the test-suite table
+    cited one CI run beside a count from another. The commit that recorded that lesson then left
+    the citation on PR #125's run beside an integration count of **265**, which #125's tree did not
+    have. Nothing offline can verify counts measured on someone else's machine; what can be removed
+    is the possibility of updating one half without the other, so both halves now come out of
+    `scripts/test_table.py <pr>`. Whose own first version printed `17 in 0:00` for a job that ran
+    265 tests, because `re.search` returns the **first** match and pytest's verdict is the last.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
