@@ -423,6 +423,14 @@ class ClusterManager:
         # killed a node from a node that died on its own, and it silently restarts both — which is
         # how a crashing node stays invisible for as long as the tests around it pass.
         self._deliberately_killed: set = set()
+        # The safety net, registered **here** rather than at the end of `start()`. It used to be
+        # the last line of both start methods, so a `start()` that raised registered nothing - and
+        # `shutdown()` returned early because `_started` was still false. Both halves of the
+        # protection were conditional on the thing that failed, and the cost was measured twice: a
+        # mutation run that made a node refuse to start left **four** orphan etcds holding ports and
+        # memory, and three more were found on 7 September with uptimes of over a day. Cleanup
+        # belongs to whatever exists, so it is armed before anything is launched.
+        atexit.register(self.shutdown)
         # When this harness last took the coordinator away on purpose (#54 stage B). Not a
         # suppression list: a node that dies while etcd is gone is the defect that stage
         # hunts, so the report stays and gains the sentence that makes it readable.
@@ -471,13 +479,16 @@ class ClusterManager:
         self._wait_for_election(timeout=patience(15))
         self._started = True
 
-        # Safety net — clean up even on unhandled exit
-        atexit.register(self.shutdown)
-
     def shutdown(self) -> None:
-        """Stop nodes, remove etcd container, clean temp dirs.
-        Each step is wrapped in try/except so one failure doesn't block the rest."""
-        if not self._started:
+        """Stop nodes, stop etcd, clean temp dirs.
+
+        Each step is wrapped in try/except so one failure does not block the rest, and the guard is
+        "is there anything here" rather than "did `start()` finish". Keying it on `_started` meant a
+        cluster whose start failed halfway - a node refusing its arguments, a port taken, etcd slow
+        to answer - leaked everything it had already launched, because the flag is set on the last
+        line of `start()`. Idempotent: every step is a no-op the second time.
+        """
+        if self.etcd_process is None and not self.nodes and not self.temp_dirs:
             return
         self._started = False
 
@@ -764,7 +775,6 @@ class ClusterManager:
             self._wait_for_node(node, timeout=20)
 
         self._started = True
-        atexit.register(self.shutdown)
 
     def add_multi_master_node(self, timeout: float = 20.0) -> NodeInfo:
         """Add one fresh multi-master node to a cluster that is already running.
