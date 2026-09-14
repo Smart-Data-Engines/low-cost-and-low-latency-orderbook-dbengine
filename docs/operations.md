@@ -432,11 +432,50 @@ the same reason — they carried this node's own WAL offset minus a byte positio
 WAL frozen at handshake, which on a converged mesh equals this node's WAL size. And `MM_PEERS`'
 `lag_bytes` column is now `send_queue_bytes`, which is what it always held.
 
-**What the engine still does not tell you here.** How far behind a **replica** is, as a metric.
-That number exists, is correct, and is computed per replica in `STATUS`'s `[replicas]` block — and
-it is not published, which is #123: the same expression that is wrong for a mesh peer is right for
-a replica, but it ignores the WAL file index, so a replica more than one file behind reports zero.
-Publishing it before that is fixed would repeat the defect this section is about.
+**How far behind a replica is** is a different question with a different answer, in the section
+below.
+
+## When a replica falls behind
+
+Two gauges again, and the same rule: read the pair.
+
+```
+curl -s localhost:9091/metrics | grep -E 'ob_repl(ication_lag_bytes|icas_lag_unknown)'
+# ob_replication_lag_bytes 4096
+# ob_replicas_lag_unknown 0
+```
+
+`ob_replication_lag_bytes` is **bytes the furthest-behind replica has yet to acknowledge**, counted
+across WAL files. Bytes are meaningful here where they are not for the mesh, and the difference is
+worth knowing: a replica streams *this* node's WAL and acknowledges into it, so the two positions
+index the same log. A mesh peer's position is in its own WAL, which is why the mesh reports records
+instead (see the section above, and #118).
+
+`ob_replicas_lag_unknown` is **connected replicas whose lag cannot be measured**, because a WAL file
+between their position and ours is gone. That is not merely an unmeasured distance. Retention keeps
+files back to the slowest connected replica, so a missing one says **that replica can no longer
+catch up from this log** and will need a snapshot. A nonzero value here is more urgent than a large
+value in the gauge beside it.
+
+`STATUS`'s `[replicas]` block says the same thing per replica, and prints `lag=unknown` rather than
+a number for that case:
+
+```
+replica[0]: 10.0.0.1:7000 file=3 offset=128 lag=4096
+replica[1]: 10.0.0.2:7000 file=1 offset=64 lag=unknown
+```
+
+**Why it is not zero.** Zero is a real answer — a replica that is caught up is zero bytes behind —
+so a zero standing in for "cannot be measured" would say the opposite of the truth. That is exactly
+the defect this number had until #123: the lag was computed as the difference of two byte offsets
+with the **file index ignored**, and a WAL rotation resets the current offset, so a replica more
+than one file behind reported **zero bytes behind**.
+
+**What it does not promise.** The distance is exact, but it is sampled once per replication loop
+pass, so a scrape immediately after a burst of writes can read the previous pass's value. And no
+integration test crosses a WAL file boundary, because the rotation threshold is compiled in — that
+is #124, and it means this number's cross-file behaviour is pinned by unit tests rather than by a
+running cluster.
 
 ## When a peer's clock is wrong
 

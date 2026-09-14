@@ -113,6 +113,19 @@ MetricsRegistry::MetricsRegistry() {
     // them: `set_gauge()` on an unregistered name is dropped in silence, which is how five gauges
     // served a flat zero while the engine worked (#77), and `scripts/check_metrics.py` fails CI for
     // a written-but-unregistered name.
+    gauges_.push_back(make_gauge("ob_replication_lag_bytes",
+                                 "Bytes the furthest-behind replica has yet to acknowledge, "
+                                 "counted across WAL files. Unlike the mesh, a replica streams "
+                                 "*this* node's WAL and acknowledges into it, so bytes are a "
+                                 "quantity two sides can compare - which is the distinction #118 "
+                                 "measured. Read it beside ob_replicas_lag_unknown"));
+    gauges_.push_back(make_gauge("ob_replicas_lag_unknown",
+                                 "Connected replicas whose lag cannot be measured because a WAL "
+                                 "file between their position and ours is gone. Worse than a "
+                                 "large lag rather than merely unmeasured: retention keeps files "
+                                 "back to the slowest connected replica, so a missing one says "
+                                 "that replica can no longer catch up from this log and needs a "
+                                 "snapshot"));
     gauges_.push_back(make_gauge("ob_replicas_connected",
                                  "Replicas currently connected to this primary. Exported next to "
                                  "the verified count because the guarantee is the comparison, and "

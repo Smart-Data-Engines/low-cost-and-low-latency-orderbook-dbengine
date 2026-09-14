@@ -2178,6 +2178,32 @@ Learned the hard way. Check here before debugging.
     the same defect in a new name, so it is #123 and the gauge stayed unpublished. The general
     form: a fix that adds a metric should ask the question it just asked of the old one.
 
+259. **When zero is a real answer, "cannot be measured" needs its own number — a sentinel says the
+    opposite of the truth.** A replica that is caught up is zero bytes behind, so the same zero
+    cannot also mean "a WAL file between its position and ours is gone". Three lags in this engine
+    now report as a **pair** for that reason: `ob_mm_replication_lag_records` with
+    `ob_mm_peers_position_unknown`, `ob_replication_lag_bytes` with `ob_replicas_lag_unknown`, and
+    the drift gauge with its excursion count. In each case the second number names a condition the
+    first cannot express, and in the replica case it is the **more urgent** of the two: retention
+    keeps files back to the slowest connected replica, so a missing one means that replica cannot
+    catch up from this log at all.
+
+260. **A formula that is accurate only at production settings is a formula no test can check.**
+    The cross-file WAL distance could have been estimated as `files * rotate_threshold`, and closed
+    files really are at least the threshold — rotation waits for it, and a restart appends rather
+    than starting a short file. At 512 MB the error is one record, 0.005%. At the 512-byte
+    thresholds the tests use it is a quarter of a file. Asking the filesystem for each
+    **intervening** file size is exact, costs nothing because there are normally none, and is the
+    same answer at every threshold, which is what makes the unit tests mean something.
+
+261. **A test written to reproduce a defect needs an assertion that it still does.**
+    `WalDistance.APositionLateInTheEarlierFileReadsAsZeroBehindTheOldWay` computes the old
+    expression beside the new answer and asserts **the old one says zero**. Its first version took
+    the position of the *first* record in the earlier file, whose offset is 0 — the smallest
+    possible subtrahend — so the old expression answered 136 and the test proved nothing while
+    passing its real assertion. The clamp needs a position **late** in the earlier file. Without
+    the control the test would have been green, named after a defect, and blind to it.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2307,6 +2333,18 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   What the engine promises, measured: after `heal()` the mesh converges **by row content**; a frame
   cut at byte 20 of a 38-byte header is **not applied in part**; and a reconnect's catch-up
   re-delivers records without storing any twice. What it does **not** promise today is #117.
+- **Every lag this engine reports is a pair now, and the second half names what the first cannot
+  say** (#123 closed, #124 open). The replica lag was the last one wrong: `stats()` computed
+  `current_offset - confirmed_offset` with the **file index ignored**, and `rotate()` resets the
+  current offset, so a replica more than a file behind read **zero bytes behind**. It goes through
+  one `WALWriter::bytes_since()` now — exact, across files, asking the filesystem for each
+  intervening size rather than estimating from the rotation threshold, because an estimate is
+  excellent at 512 MB and out by a quarter at the thresholds tests use. A missing file in between
+  answers `nullopt`, which reaches an operator as `lag=unknown` in `STATUS` and as
+  `ob_replicas_lag_unknown` — and that condition is **worse** than a large lag, because retention
+  keeps files back to the slowest connected replica. What is not covered is the cross-file path
+  end to end: the rotation threshold is a literal in `src/engine.cpp`, so **no integration test
+  has ever crossed a WAL file boundary** (#124).
 - **A new reader of shared state changes how often a latent race fires, and that is part of the
   change** (#122, closed). `repl_client_` was read under `mtx_` by `stats()` and written without it
   by `promote_to_primary()`; the fix is the idiom `demote_to_replica()` ten lines down already

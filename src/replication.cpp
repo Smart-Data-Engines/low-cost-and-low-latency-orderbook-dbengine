@@ -679,6 +679,30 @@ void ReplicationManager::publish_replica_gauges() {
     }
     engine_->registry().set_gauge("ob_replicas_connected",    static_cast<int64_t>(connected));
     engine_->registry().set_gauge("ob_replicas_tls_verified", static_cast<int64_t>(verified));
+
+    // How far behind the furthest-behind replica is, and how many replicas that question cannot
+    // be answered for. The pair, for the same reason the mesh has one (#118): zero is a real
+    // answer — a replica that is caught up is zero bytes behind — so a zero standing in for
+    // "cannot be measured" would say the opposite of the truth. Here the unmeasurable case is the
+    // more serious of the two: retention keeps WAL files back to the slowest connected replica,
+    // so a missing one says that replica can no longer catch up from this log.
+    //
+    // Recomputed once per loop pass over the replicas that exist, rather than maintained at the
+    // places a lag changes — #94's lesson, and the reason `connected` above is counted here too.
+    uint64_t worst_lag = 0;
+    size_t   unknown   = 0;
+    for (const auto& r : replicas_) {
+        if (r.fd < 0) continue;
+        const std::optional<uint64_t> behind = engine_->wal_bytes_since(
+            WalPosition{r.confirmed_file, static_cast<uint32_t>(r.confirmed_offset)});
+        if (!behind.has_value()) {
+            ++unknown;
+        } else if (*behind > worst_lag) {
+            worst_lag = *behind;
+        }
+    }
+    engine_->registry().set_gauge("ob_replication_lag_bytes", static_cast<int64_t>(worst_lag));
+    engine_->registry().set_gauge("ob_replicas_lag_unknown",  static_cast<int64_t>(unknown));
 }
 
 void ReplicationManager::enqueue_and_flush(ReplicaInfo& replica, const void* data, size_t len) {

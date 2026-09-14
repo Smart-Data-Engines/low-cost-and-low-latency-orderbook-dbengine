@@ -16,6 +16,7 @@
 #include "orderbook/version_vector.hpp"
 #include "orderbook/wal.hpp"
 
+#include <optional>
 #include <atomic>
 #include <condition_variable>
 #include <memory>
@@ -127,7 +128,16 @@ public:
             std::string address;
             uint32_t    confirmed_file;
             size_t      confirmed_offset;
-            size_t      lag_bytes;
+            /// Bytes this replica is behind, valid only when `lag_known`.
+            ///
+            /// The pair rather than a sentinel: zero is a real answer here — a replica that is
+            /// caught up is zero bytes behind — so a zero standing in for "cannot be measured"
+            /// would be the defect #123 is about, said a second way. `bytes_since()` cannot
+            /// answer when a WAL file between the two positions is gone, which retention should
+            /// never allow for a connected replica and which therefore means that replica can no
+            /// longer catch up from this log.
+            uint64_t    lag_bytes;
+            bool        lag_known;
         };
         std::vector<ReplicaMetrics> replicas;
 
@@ -194,6 +204,15 @@ public:
     };
 
     /// Collect current engine statistics (thread-safe, acquires mtx_).
+    /// Bytes the WAL has written since `from`, or `nullopt` when a file in between is gone.
+    ///
+    /// Exposed so that `ReplicationManager` can publish the same number `stats()` reports rather
+    /// than keeping a second answer beside it — two ways of computing one quantity is how #118
+    /// produced a lag that was not one, and #123 is the same question one layer down.
+    std::optional<uint64_t> wal_bytes_since(WalPosition from) const {
+        return wal_.bytes_since(from);
+    }
+
     Stats stats();
 
     /// Create a consistent snapshot: flush pending rows, capture WAL position,

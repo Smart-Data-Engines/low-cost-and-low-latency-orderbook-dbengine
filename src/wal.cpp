@@ -141,6 +141,42 @@ uint32_t WALWriter::open_current(uint32_t index) {
     return (pos >= 0) ? static_cast<uint32_t>(pos) : 0;
 }
 
+std::optional<uint64_t> WALWriter::bytes_since(WalPosition from) const {
+    const WalPosition now = position_.load(std::memory_order_relaxed);
+
+    // A position ahead of ours is not an error and not a negative distance: an ACK can be read
+    // after the value it acknowledges has been superseded, and a replica cannot be ahead of the
+    // log it follows. Zero is the honest answer to "how far behind".
+    if (from.file_index > now.file_index) return uint64_t{0};
+
+    if (from.file_index == now.file_index) {
+        return now.offset > from.offset ? static_cast<uint64_t>(now.offset - from.offset)
+                                        : uint64_t{0};
+    }
+
+    std::error_code ec;
+    uint64_t total = 0;
+
+    // The tail of the file `from` sits in. `file_size` rather than the rotation threshold: a
+    // rotated file is *at least* the threshold and overshoots by up to one record, which is
+    // nothing at 512 MB and a quarter of the file at the thresholds tests use.
+    const auto first = std::filesystem::file_size(wal_filename(dir_, from.file_index), ec);
+    if (ec) return std::nullopt;
+    total += first > from.offset ? first - from.offset : 0;
+
+    for (uint32_t index = from.file_index + 1; index < now.file_index; ++index) {
+        const auto size = std::filesystem::file_size(wal_filename(dir_, index), ec);
+        if (ec) return std::nullopt;
+        total += size;
+    }
+
+    // The current file is measured by the published offset, not by `file_size`: the offset is the
+    // byte count this writer has accounted for, and asking the filesystem here would race a write
+    // that has landed but not yet been published.
+    total += now.offset;
+    return total;
+}
+
 WalPosition WALWriter::write_record(const WALRecord& hdr, const void* payload,
                                      size_t payload_len, bool allow_fsync) {
     // Combine header + payload into a single write to minimize syscalls.

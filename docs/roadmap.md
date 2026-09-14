@@ -2175,41 +2175,99 @@ question is recorded as #121 rather than settled quietly here.
   nothing in the engine would notice — anti-entropy compares what each side holds, and two sides
   each holding a different winner look consistent to it. Never observed in the wild
 
-### 123. The replica lag that is genuine ignores the WAL file index, so a replica a file behind reads zero
+### 124. Nothing in the integration battery can cross a WAL file boundary, because the threshold is hardcoded
 
-Found while fixing #118, in the number that item called "the lag that *is* real".
+Named while closing #123, which could only be pinned at the unit level for this reason.
 
-`Engine::stats()` computes each replica's lag as `current_offset - r.confirmed_offset`, and that is
-right in the part #118 was about: a replica streams **our** WAL and refreshes `confirmed_offset` on
-every `ACK <file> <offset>`, so the two positions index the same log and the subtrahend is kept
-current. What it does not do is look at `confirmed_file`.
+`src/engine.cpp` constructs the writer with `WALWriter(base_dir, 512ULL << 20, fsync_policy)` — a
+literal, not a value from `ServerConfig`. So a test that wanted a real node to rotate a WAL file
+would have to write **512 MB**, which is two orders of magnitude past anything the battery does in
+its nineteen minutes. Every test that has ever looked at a WAL position has therefore stayed inside
+one file, and that is exactly why #123 survived: the subtraction it used is *correct* within a
+file, and correct is what every test saw.
 
-`rotate()` publishes `{next_index, next_offset}`, so `current_offset` **resets** when our WAL
-rotates. A replica still acknowledging into the previous file therefore has a `confirmed_offset`
-larger than ours, the expression clamps at zero, and the lag reads **0 exactly when a replica is
-more than a file behind** — the state that matters most, and the one a 512 MB rotation threshold
-makes ordinary during catch-up.
+Three things have unit coverage only as a result, and they are not small: how rotation interacts
+with **retention** (`safe_truncate` is computed from replica file indices), with **replica
+catch-up across files** (#98 was a defect in precisely that arithmetic), and with the lag #123
+fixed. The unit tests are good — they drive a `WALWriter` with a 512-byte threshold — and a
+`WALWriter` on its own cannot show a replica reconnecting, a retention pass running, or a snapshot
+being chosen over a scan.
 
-**Established by reading, not measured, and the difference is stated on purpose.** The arithmetic
-is two lines and the reset is one; what is not measured is how often a real cluster sits in that
-state, which is the question a fix should answer first.
+The obvious fix is a flag, and the reason it is an item rather than a line in #123 is that it is
+**independently justifiable**: a WAL rotation threshold is an operator knob that comparable systems
+expose, so adding it is not "moving production code so a test can reach it" — which this repository
+has refused before, and should keep refusing. It does carry the usual costs of a new flag: a row in
+the arity table (#107, where the table is indexed by `CommandType` so a missing row does not
+compile), `--print-config`, `docs/cli.md`, the config file, and a refusal for values below one
+record.
 
-This is why #118 did **not** publish `ob_replication_lag_bytes` while it was removing the mesh's
-byte lag. Publishing a number that reads zero when a replica is a file behind, in the change whose
-whole subject is a lag that reads the wrong thing, would have been the same defect wearing a new
-name.
+Worth deciding together with what to test once it exists, because a flag added for coverage that
+nobody then uses is the shape of a job nobody requires (#108).
 
-A fix needs a decision rather than an expression. `(current_file - confirmed_file) * threshold`
-is an estimate that overstates whenever a file ended early — and files do end early, because a
-restart opens a new one. An exact answer means asking the WAL for the byte distance between two
-positions, which means the sizes of the files in between, which means deciding what to report when
-retention has removed one. That third state is the interesting part: "unknown" is an honest answer
-that a single gauge cannot express.
+- Effort: S for the flag, M for the tests it unlocks | Impact: no integration test has ever crossed
+  a WAL file boundary, so three behaviours that only happen at a rotation are covered by unit tests
+  that cannot express them
 
-- Effort: M, most of it the decision about the third state | Impact: the only genuine replication
-  lag in the engine reads zero in the case an operator cares about, and it is currently visible
-  only by reading `STATUS` by hand — so nothing alerts on it either way
+### 123. The replica lag that is genuine ignored the WAL file index, so a replica a file behind read zero ✅
 
+Found while fixing #118, in the number that item called "the lag that *is* real" — and left open
+there deliberately, because publishing a number that reads zero in the case it exists for, inside
+the change whose subject was a lag that read the wrong thing, would have been the same defect in a
+new name.
+
+`Engine::stats()` computed each replica's lag as `current_offset - r.confirmed_offset`. The part
+#118 was about is fine: a replica streams **our** WAL and refreshes `confirmed_offset` on every
+`ACK <file> <offset>`, so the two positions index the same log and the subtrahend is kept current.
+What the expression did not do is look at `confirmed_file`. `rotate()` publishes
+`{next_index, next_offset}`, so the current offset **resets** — and a replica still acknowledging
+into the previous file has the larger number, the clamp answers **zero**, and the lag reads zero
+exactly when a replica is more than a file behind.
+
+**Measured, and the measurement is in the test rather than in this paragraph.**
+`WalDistance.APositionLateInTheEarlierFileReadsAsZeroBehindTheOldWay` computes the old expression
+beside the new answer on the same two positions and **asserts the old one says zero**. That
+assertion earned its place immediately: the first version of the test took the position of the
+*first* record in the earlier file, whose offset is 0 — the smallest possible subtrahend — so the
+old expression answered 136 and the test proved nothing. The clamp needs a position **late** in the
+earlier file, which is the mechanism stated as a value.
+
+**The decision the item was left open for: what to report when a file in between is gone.**
+
+The distance is computed **exactly**, by asking the filesystem for the size of each intervening
+file, and not estimated from the rotation threshold. Estimating was tempting and is wrong in a way
+that would have been invisible in production: closed files are *at least* the threshold, because
+that is what rotation waits for, and a restart appends (`O_APPEND`, continuing from the highest
+existing index) rather than starting a short one — so `files * threshold` is excellent at 512 MB
+and out by a quarter at the 512-byte thresholds the tests use. A formula that is accurate only at
+production settings is a formula no test can check. Exactness costs one `file_size` per
+**intervening** file, and there are normally none.
+
+When a file is missing the answer is **`nullopt`**, and it reaches an operator as two distinct
+things rather than a number: `lag=unknown` in `STATUS`'s `[replicas]` block, and a separate gauge
+`ob_replicas_lag_unknown` counting the replicas it happened to. The alternatives were both worse.
+Zero is a **real answer** here — a replica that is caught up is zero bytes behind — so a zero
+standing in for "cannot be measured" says the opposite of the truth, which is #123 restated. And a
+guess would hide the more serious of the two conditions: retention keeps WAL files back to the
+slowest connected replica, so **a missing file says that replica can no longer catch up from this
+log and needs a snapshot**. That is worse than a large lag, and it deserves its own number rather
+than being averaged into one.
+
+`ob_replication_lag_bytes` is the max across replicas whose distance is known, published from
+`publish_replica_gauges()` — recomputed once per loop pass over the replicas that exist, rather
+than maintained wherever a lag changes, which is #94's lesson and the reason `ob_replicas_connected`
+is counted there too. `Engine::stats()` and that publisher both call one
+`WALWriter::bytes_since()`: two ways of computing one quantity is how #118 produced a lag that was
+not one.
+
+**What is not covered, and why it cannot be here.** No integration test crosses a WAL file
+boundary, because the rotation threshold is a literal in `src/engine.cpp` and a real node would
+have to write 512 MB to rotate. That is **#124**, filed rather than worked around: making
+production code configurable so a test can reach it is a test deciding the shape of the program,
+and the flag is worth adding on its own merits or not at all.
+
+- Effort: S | Impact: the only genuine replication lag in the engine read zero in the case an
+  operator cares about, and it was visible only by reading `STATUS` by hand. It is now two gauges,
+  and the second one names a condition the first cannot express
 ### 122. The replication client's pointer was written without the lock every reader holds ✅
 
 Found while giving `ob_repl_records_replayed` a publisher (#117), because the number to publish
@@ -5658,9 +5716,12 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**One defect is open and one question is recorded for a decision.** **#117**, **#118** and
-**#122** are closed by the commits that carry this line, and together they are one investigation
-that started with five registered metrics nothing wrote.
+**One defect is open and one question is recorded for a decision.** **#117**, **#118**, **#122**
+and **#123** are closed, and together they are one investigation that started with five registered
+metrics nothing wrote and ended four items later in the WAL's own arithmetic. Every lag this engine
+reports is now measured against a position it can actually compare, and every one of them is a
+**pair** — a value beside a count of the cases the value cannot describe — because in all three
+places zero was a real answer that a sentinel would have contradicted.
 
 Four of those five are fed. The fifth could not be: **#118** measured that the mesh has no byte
 position two nodes can compare — `STATUS`'s `replication_lag_peer_<id>` equalled this node's own
@@ -5678,11 +5739,22 @@ rather than a torn read — because the new publisher reads that pointer every f
 `stats()` reads it on demand. Adding a reader means adding it at a frequency, and that frequency is
 part of the change.
 
-The open defect is **#123**, and #118 is why it is filed rather than fixed: the replica lag that is
-genuine ignores the WAL file index, so a replica more than one file behind reads **zero**.
-Publishing it in the change that removed a lag for reading the wrong thing would have been the same
-defect in a new name. **#121** remains the question stage D left behind, filed rather than answered
-because a ceiling on the drift a peer may introduce costs causal order against that peer.
+**#123** is closed too, and it was the last of that chain: the replica lag — the one genuine number
+in the area — ignored the WAL file index, so a replica more than a file behind read **zero**. It is
+exact now, across files, and when a file in between is gone the answer is **`unknown`** rather than
+a number, because zero is a real answer here and a missing file says something worse than a large
+lag: retention keeps files back to the slowest connected replica, so that replica can no longer
+catch up from this log.
+
+The open defect is **#124**, named while closing #123 and the reason #123 could only be pinned at
+the unit level: the WAL rotation threshold is a literal in `src/engine.cpp`, so **no integration
+test has ever crossed a WAL file boundary** — a real node would have to write 512 MB. Rotation's
+interaction with retention, with replica catch-up across files and with that lag is covered by unit
+tests that cannot express a reconnect or a retention pass. Filed rather than worked around: making
+production code configurable so a test can reach it is a test deciding the shape of the program.
+
+**#121** remains the question stage D left behind, filed rather than answered because a ceiling on
+the drift a peer may introduce costs causal order against that peer.
 
 #115 and #116 before it were also about what the log says rather than what the engine does, and
 were found the same way — by #54 stage B, which set out to check refusals and had to read the logs
@@ -5863,7 +5935,7 @@ runners, not the machine-B performance baseline above.
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1058 | all passing with `ctest -j1` on the i3-7100U, run in three `-I` ranges because this machine's memory guard stops a single long run (353 + 353 + 352). **Six more than the previous commit**: seven pin `max_records_behind`, the mesh's honest lag, and one went away — a hand-written list of the metric names the engine writes, which #118's removal of a registration broke and which `scripts/check_metrics.py` already checks mechanically in both directions. **All of #117**: four pin `queue_utilization_percent` and three `counter_delta`, both moved into `metrics.hpp` so that the ordinary suite executes arithmetic whose caller no CI job runs; two pin the WAL's record count. `tests/test_iouring_instrumentation.cpp` adds four more that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists 1060: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
+| C++ (GTest + RapidCheck) | 1064 | all passing with `ctest -j1` on the i3-7100U, run in three `-I` ranges because this machine's memory guard stops a single long run (355 + 355 + 354). **Six more than the previous commit**: five pin `WALWriter::bytes_since()` across files, including one that computes the old expression beside the new answer and asserts the old one says zero, and one pins `lag=unknown` on the wire. Six before that were #118's. **Earlier**: seven pin `max_records_behind`, the mesh's honest lag, and one went away — a hand-written list of the metric names the engine writes, which #118's removal of a registration broke and which `scripts/check_metrics.py` already checks mechanically in both directions. **All of #117**: four pin `queue_utilization_percent` and three `counter_delta`, both moved into `metrics.hpp` so that the ordinary suite executes arithmetic whose caller no CI job runs; two pin the WAL's record count. `tests/test_iouring_instrumentation.cpp` adds four more that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists 1066: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The runtimes are what this machine gave on the commit measured, not a budget |
 | Python integration | 257 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 256; count pytest's final result rather than the report plugin's progress characters. `256 passed, 2 skipped in 18:58` on the GitHub runner for this commit; the same suite read `19:18` on the runner and `19:25` on the development machine (i3-7100U, native etcd) two commits ago, which is the spread to expect rather than a change. Ten more than the previous commit, all of #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content, and the same ten cost 2:37 locally |
 | Python integration under TSan | 257 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `256 passed in 24:37` on the GitHub runner for this commit — and this row is the one that closed #122: the commit before it turned this job **red** with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **19:18** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 

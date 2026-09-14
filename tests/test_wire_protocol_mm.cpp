@@ -306,3 +306,36 @@ TEST(StatusResponseMM, TheMeshSectionCarriesNoPerPeerByteLag) {
     EXPECT_EQ(response.find("lag_bytes"), std::string::npos)
         << "the mesh section is printing a byte lag under another name";
 }
+
+// ── A replica lag that cannot be measured says so (#123) ────────────────────
+//
+// `STATUS`'s `[replicas]` block used to print `lag=` followed by
+// `current_offset - confirmed_offset`, which ignores the WAL file index. `rotate()` resets the
+// current offset, so a replica still acknowledging into an earlier file has the larger number and
+// the clamp answered **zero** — exactly when a replica is more than a file behind. The engine asks
+// the WAL now, and the WAL cannot answer when a file between the two positions is gone.
+//
+// Zero is a real answer here: a replica that is caught up is zero bytes behind. So the two cases
+// cannot share a number, and this is the wire half of that decision.
+
+TEST(StatusResponseReplicas, AKnownLagIsPrintedAndAnUnknownOneSaysSo) {
+    ob::ServerStats stats{};
+    stats.replicas.push_back({"10.0.0.1:7000", /*confirmed_file=*/3, /*confirmed_offset=*/128,
+                              /*lag_bytes=*/4096, /*lag_known=*/true});
+    stats.replicas.push_back({"10.0.0.2:7000", /*confirmed_file=*/1, /*confirmed_offset=*/64,
+                              /*lag_bytes=*/0, /*lag_known=*/false});
+
+    const std::string response = ob::format_status(stats);
+
+    ASSERT_NE(response.find("10.0.0.1:7000"), std::string::npos)
+        << "the block is absent, so the assertions below would pass against an empty string";
+    EXPECT_NE(response.find("lag=4096"), std::string::npos);
+    EXPECT_NE(response.find("lag=unknown"), std::string::npos)
+        << "a replica whose lag cannot be measured was printed as a number";
+
+    // And the number it must **not** have printed for the second replica. Zero is what the old
+    // expression answered for a replica a file behind, so a zero here would be the defect wearing
+    // the new field's clothes.
+    EXPECT_EQ(response.find("lag=0"), std::string::npos)
+        << "an unmeasurable lag was printed as zero, which is what a caught-up replica reports";
+}
