@@ -2612,6 +2612,17 @@ Learned the hard way. Check here before debugging.
     that). So this class is caught by reading here, and #134 records that rather than papering
     over it with a checker that would need an allowlist longer than the rule.
 
+315. **A rule that passes by coincidence is indistinguishable from one that works — until the
+    coincidence ends.** `scripts/check_roadmap.py` read every `#N` in the file as a reference to a
+    roadmap item, including the `#N` inside the test table's citation of a **pull request**. Every
+    such citation resolved to an unrelated item and the checker was satisfied, because PR numbers
+    had always been *below* the item count. The first PR numbered above the last item is the first
+    one that fails, which is how this was found: a legitimate citation reported as a broken
+    reference. The rule now blanks markdown links whose target is `github.com`, with the pair that
+    says it is load-bearing — a bare bogus `#9999` still fails, and a high-numbered PR citation
+    passes. When two different kinds of thing share a notation, ask which one your checker is
+    actually reading, and whether it has ever had to tell them apart.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
