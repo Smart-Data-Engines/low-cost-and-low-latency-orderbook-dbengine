@@ -213,6 +213,26 @@ repeated here — this page said "510 tests" for long enough that the number had
 reality. Integration tests additionally need a native `etcd` binary — see
 [tests/integration/README.md](tests/integration/README.md).
 
+### Coverage
+
+The required `coverage` job builds the tree with instrumentation, runs the whole suite under it and
+**fails below a 58% line floor** — so the green CI badge at the top of this page already asserts
+that floor. It also gates three things that are not percentages: that the tree builds with
+coverage, that the suite passes under it, and that the instrumentation still **reaches the
+libraries**, which is the check that failed silently for as long as the option existed.
+
+Last measured: **66.2% of 14,562 lines (9,640 covered)**, functions 78.5%, branches 36.3%, on
+commit `d2929e4` —
+[run 34953853236](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/34953853236).
+The per-file breakdown is in that job's summary and attached to it as an artifact.
+
+**There is deliberately no coverage badge**, and the reasoning is in
+[docs/roadmap.md](docs/roadmap.md) under item 37: a percentage badge needs either a third-party
+account with this repository's reports flowing to it or write access for CI to push the number
+somewhere, and neither buys anything the floor above does not already assert. The figure is quoted
+with its denominator for the same reason: before the instrumentation was fixed this repository could
+have published "59.0%" truthfully while measuring 6 of 34 source files.
+
 ### Run benchmarks
 
 ```bash

@@ -81,7 +81,11 @@ exercised at the moment it matters most.
 suite, instrumentation that **reaches the libraries**, and at least **58% line coverage**. Before
 #83 the libraries were not instrumented, while the reported percentage still looked plausible.
 No third-party service is involved; the figure lands in the job summary and the per-file report as
-an artifact. A coverage badge remains a separate decision about an external service.
+an artifact. **A coverage badge was decided against** — every one of them needs a third-party
+account with our reports flowing to it, or write access for CI to push the number into the
+repository, and the floor this job enforces is already asserted by the CI badge. The number
+with its denominator is in `README.md` instead, checked against this job by
+`scripts/check_coverage_claim.py`.
 
 The tenth is `clang-build`, added with roadmap #37. It carries no infrastructure of its own beyond a
 compiler, so it is the cheapest of these to keep green — and it earned its place on the first run by
