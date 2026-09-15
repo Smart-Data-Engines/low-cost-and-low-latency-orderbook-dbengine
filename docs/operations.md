@@ -682,29 +682,42 @@ lease, which is the case in which it will not expire when this node dies (#72).
 
 A node keeps its place in the mesh registry by refreshing an etcd lease every TTL/3 (default: every
 3.3 s at a 10 s TTL). If that lease is lost — etcd forgot it, or the refreshes failed for longer
-than the TTL — the key under `<prefix>mm_peers/<node_id>` expires, and **nothing puts it back**:
-registration happens once, at start. Measured by revoking the lease under a running two-node mesh:
-the key is gone at once and still gone 22.5 s later while the node answers `PING` on every sample.
+than the TTL — the key under `<prefix>mm_peers/<node_id>` expires. **Since #132 the node writes it
+again**, but only after reading the key back and finding it gone; measured by revoking the lease
+under a running two-node mesh, the key is absent at 0 s and 2.5 s and **present again from 5.0 s
+onward**, one refresh interval later. Before that fix it was gone for the life of the process — the
+same measurement said still gone 22.5 s later, while the node answered `PING` on every sample, and
+the only recovery was a restart.
 
-What survives, and it is more than you would expect. Links that were already dialled keep carrying
-writes, and a node that starts *later* still ends up connected, because the unregistered node's own
-topology watch sees the newcomer and dials **out**. So this is not a partition. What is lost is the
-node's address as published to the cluster: its row in every peer's `MM_PEERS` has an **empty
-address**, and anything that needs to look it up cannot.
+What survives the window, and it is more than you would expect. Links that were already dialled keep
+carrying writes, and a node that starts *later* still ends up connected, because the unregistered
+node's own topology watch sees the newcomer and dials **out**. So this is not a partition. What is
+lost until the key returns is the node's address as published to the cluster: its row in every
+peer's `MM_PEERS` has an **empty address**, and anything that needs to look it up cannot.
 
-The log says it **once**, with the consequence in the line:
+The log says it **once**, with the consequence in the line, and then says the repair:
 
 ```
 WARN  peer_registry  Lease refresh failed for node 2 - this node's mesh registration expires with
-                     the lease and nothing re-registers it
+                     the lease, and it will be written again once the key is confirmed gone
 WARN  coordinator    lease 328... is gone: keepalive returned no TTL, so etcd does not know it any
                      more
+INFO  peer_registry  node 2 was missing from the registry and has registered again
 ```
 
 One line each, not one per interval — before #133 this was eleven of each in 33 s, from two
-components neither of which was writing more than one line per attempt. **Recovery is a restart**
-of that node; this is roadmap #132 and the fix has a decision attached, because re-registering from
-that loop would also overwrite the entry the test harness writes there.
+components neither of which was writing more than one line per attempt. The third line is the one
+to grep for: without it, the two WARNs above mean the repair has not happened yet.
+
+**Two cases where the repair deliberately does not run**, and both are quiet on purpose:
+
+- **etcd is unreachable.** The read cannot tell an absent key from a failed read, so it answers
+  neither and the entry is left alone. Nothing is written at `INFO`; the condition is already
+  reported by the WARN above, and a second line per interval saying "still cannot tell" is what
+  #133 was. Recovery here is recovery of etcd, which is what the rest of this section is about.
+- **someone deleted the key while the lease is still alive.** The node is invisible, but its
+  refresh still succeeds, so this path never runs. Eviction by deleting the key therefore still
+  works, which is why it is left this way; if you did not do it deliberately, restart that node.
 
 ### When a subsystem's loop keeps failing
 

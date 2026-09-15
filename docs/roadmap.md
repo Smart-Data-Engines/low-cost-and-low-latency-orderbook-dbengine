@@ -2152,6 +2152,135 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 135. The mesh registry writes to `endpoints[0]` while its coordinator client talks to whichever endpoint answered
+
+Found while writing #132's `read_self_key()`, which became the **second** of three places to
+hardcode the same index — and asking why there was an index at all.
+
+`--coordinator-endpoints` takes a **comma-separated list**; `--help` says so, the parser splits it,
+and `CliArgs.SplitsCoordinatorEndpointsAndDropsEmptyOnes` pins three endpoints plus the empties it
+drops. `CoordinatorClient::connect()` then probes them **in order** and keeps the first that answers
+`/v3/maintenance/status` as `active_endpoint`, which every lease call goes through.
+
+`PeerRegistry` does not. All three of its own etcd calls address `config_.endpoints[0]` directly:
+
+| line | call | what it is for |
+|---|---|---|
+| `src/peer_registry.cpp:393` | `PUT /v3/kv/put` | publishing this node's address (`register_self`) |
+| `src/peer_registry.cpp:532` | `POST /v3/kv/range` | reading its own key back (#132) |
+| `src/peer_registry.cpp:647` | `POST /v3/kv/range` | the **topology watch** — how every peer is learned |
+
+**Measured, and the control is the same run with the order reversed.** A node given
+`--coordinator-endpoints http://127.0.0.1:1,<live etcd>`:
+
+| | dead first | live first (control) |
+|---|---|---|
+| registered within 25 s | **no** | **yes, in 0.5 s** |
+| `Registered node` lines | 0 | 1 |
+| `Failed to PUT PeerInfo` | **1** | 0 |
+| published address | none | `127.0.0.1:48255` |
+
+Reversing the order is what makes this a claim about **order** rather than about a dead endpoint
+merely being configured. And three counts say exactly how far the node got: **zero** `Failed to
+connect`, **zero** `Failed to grant`, so `connect()` and `grant_lease()` both succeeded through the
+live endpoint — only the PUT to `endpoints[0]` failed. `Started watch` appears once, so the node
+goes on serving, and its topology watch queries the dead endpoint too, so it never learns a peer
+either. The mesh does not form.
+
+**#132's recovery does not help here, and the measurement says why: zero `Lease refresh failed`
+lines.** The lease is alive, because it was granted through the endpoint that answers — so the
+failure path that re-registers is never entered. An unregistered node in this configuration stays
+unregistered for the life of the process, which is the state #132 removed everywhere else.
+
+Two halves of one subsystem disagreeing about which server they are talking to, and the half that
+works is the one an operator would check first: leader election, lease keepalive and failover are
+all fine, because those go through the client that failed over correctly.
+
+**The reason the index exists is that there is nothing else to ask.** `active_endpoint` is private
+to `CoordinatorClient::Impl` and the header exposes no accessor, so a class holding a client cannot
+find out which endpoint answered. That is also why the fix is not a one-line change of subscript:
+either the client grows a way to say where it is connected, or these three calls go **through** it
+the way the lease calls already do. The second is better and is the same argument
+`redirect_peer()`'s docstring makes about formats — a second copy of "how we talk to etcd" is how
+the two of them come to disagree, and this item is what that looks like after it has happened.
+
+**Why nobody has hit it**: every test and every document in this repository runs a single endpoint.
+`ClusterManager` passes one URL, `test_cli_args.cpp` proves the *parser* splits a list and then
+nothing starts a node with two. A configuration that is documented, parsed, and pinned by a test,
+but never once exercised end to end — which is the same gap `sanitizers-integration (tsan)` was in
+before #85 widened it.
+
+Related but not the same, and worth recording next to it: `impl_->connected` is set false **only by
+`disconnect()`**, so once a client has chosen an endpoint it never re-probes the others. A node
+whose `active_endpoint` dies keeps trying that one for the life of the process even with two healthy
+endpoints configured. Same root — the client's endpoint choice is made once and is invisible from
+outside. That half is **read from the code, not measured**, and is stated that way.
+
+**Not pinned by a test yet, and the reason is worth stating rather than leaving as an omission.**
+The integration harness gives every node exactly one endpoint, and `--coordinator-endpoints`
+**appends** rather than replaces, so `extra_node_args` cannot put the dead one first — the
+harness's own flag is already ahead of it. Expressing this needs either a knob whose only user is
+one test (the shape `narrow_proxied_mesh` was deleted for) or a test that starts its own node
+outside `ClusterManager` (the shape pitfall 77 is about). Choosing between those two is part of
+fixing this item, not part of filing it. The measurement above is reproducible from
+`scripts/`-free scratch: two runs, two endpoint orders, one live etcd each.
+
+- Effort: M | Impact: measured — a documented multi-endpoint HA configuration in which the mesh
+  **never** forms if the *first* endpoint is the one that is down, while every other etcd-backed
+  mechanism in the node behaves correctly and #132's recovery cannot see the condition
+
+### 134. Two registry methods claim to write to etcd, write nothing, and return success
+
+Found while giving #132 its `registered_status_`, by asking the narrow question "what else ever
+writes this node's status?" and getting the answer **nothing**.
+
+```cpp
+bool PeerRegistry::update_status(const std::string& new_status) {
+    OB_LOG_INFO("peer_registry", "Updating status for node %u to '%s'", …);
+    // In a full implementation this would PUT the updated PeerInfo to etcd.
+    return true;
+}
+```
+
+`update_position(hlc, wal_file, wal_offset)` has the same shape one function below, `return true`
+and no etcd, and — worse — **no comment saying so**. Neither has a caller anywhere in the tree, and
+neither has a test.
+
+**The header is where this does its damage**, because that is what a caller reads: *"Update this
+node's status in etcd"* and *"Update this node's HLC and WAL position in etcd"*, sitting directly
+under `register_self()`, which says "with lease" and means it. Three promises, one kept.
+
+**Why it is worse than an absent method, and this is the part worth keeping.** `update_status()`
+**logs at INFO that it did the thing**. The first caller therefore gets a line confirming a change
+that did not happen — and this repository has already paid for that exact shape once, in #30's
+series B, where `cluster authentication enabled` was printed by a path that enforced nothing: an
+operator greps for precisely that line to confirm precisely that guarantee. A method that returned
+`false`, or did not exist, would be found on the first attempt to use it.
+
+**And `update_position()` is the one somebody will reach for.** #72 wants peer positions published
+under a lease so election deference can tell a lagging replica from a dead one, and #118 measured
+what the registry actually holds: `wal_file_index` and `wal_byte_offset` are written **once**, by
+`register_self()`, so every peer's view of every other peer's position is frozen at handshake. A
+future implementer asking "is there a place to publish positions?" finds a method whose name, whose
+signature and whose documentation all say yes, and which returns `true` without doing it.
+
+This is the **seventh** instance in this workspace of a thing whose value never reaches anybody —
+after `provisional`, `basis`, `in_use`, `key_id`, `partition_by` and #104's
+`adopted_primary_address_` — and the second with no behavioural symptom at all, because there is no
+caller to have a symptom. `tests/test_field_usage.cpp` from #104 catches the *field* shape; it
+cannot see this one, because these are functions and the unread thing is their effect.
+
+**Three answers.** Delete both, and let the day someone needs one be the day it is written — which
+is the answer #104 took for its field, and which costs nothing today. Implement them, which is real
+work in `update_position()`'s case and is #72's, not this item's. Or make them **refuse**, which
+keeps the name findable and is the only option that leaves a caller better off than deleting does —
+at the price of a method whose whole body is an apology. Whichever is chosen, the header's claim
+about etcd has to go with it.
+
+- Effort: S to delete, M to refuse with tests, L to implement | Impact: latent — nothing calls
+  either today, so this costs the first caller rather than the cluster, and it costs them a log line
+  that says the write happened
+
 ### 133. A lease that etcd has forgotten is reported once per refresh interval, for ever ✅
 
 Found while giving `lease_loop` its per-iteration boundary (#112), by revoking the lease that holds
@@ -2200,41 +2329,135 @@ refresh intervals and more — before the lines are counted.
   finding under its own repetition, and the two lines came from two different components so neither
   looked like a flood on its own
 
-### 132. A node whose registration lease is lost never comes back to the mesh registry
+### 132. A node whose registration lease is lost never comes back to the mesh registry ✅
 
 Found by the same probe as #133, and it is the more serious half.
 
-`PeerRegistry::register_self()` runs **once**, at start (`src/multi_master.cpp:351`), and is the
-only writer of `lease_id_`. `lease_loop()` refreshes that lease every TTL/3 and **discards the
+`PeerRegistry::register_self()` ran **once**, at start (`src/multi_master.cpp:351`), and was the
+only writer of `lease_id_`. `lease_loop()` refreshes that lease every TTL/3 and **discarded the
 answer** — which since #74 is an answer worth having, because a keepalive for a lease etcd has
 forgotten now fails rather than silently succeeding.
 
-**Measured**: revoke the lease under a running two-node mesh and `<prefix>mm_peers/2` is gone at
-once and **still gone 22.5 s later**, seven refresh intervals, while the node answers `PONG` on
-every sample. `Registered node` appears exactly once in its log, at start. Recovery is a restart.
+**Measured before**: revoke the lease under a running two-node mesh and `<prefix>mm_peers/2` is
+gone at once and **still gone 22.5 s later**, seven refresh intervals, while the node answers
+`PONG` on every sample. `Registered node` appears exactly once in its log, at start. Recovery is a
+restart.
 
 **What survives, measured rather than assumed, and it narrows the defect usefully.** The mesh does
 not fall apart: the existing TCP link was dialled before the key went away and keeps carrying
 writes, and a node that joins *after* the revoke still ends up connected to the unregistered one —
 because that node's own topology watch sees the newcomer's registration and dials **out**. A third
-node started after the revoke received both records. So this is not a partition; it is a node that
-is permanently absent from the one place the cluster's addresses are published, and whose row in
-every peer's `MM_PEERS` carries an **empty address** for the rest of its life.
+node started after the revoke received both records. So this was not a partition; it was a node
+permanently absent from the one place the cluster's addresses are published, and whose row in every
+peer's `MM_PEERS` carried an **empty address** for the rest of its life.
 
-**Three answers, and the cheap one is wrong.** Re-registering from the lease loop is the obvious fix
-and it has a cost this repository can name: `register_self()` running more than once would overwrite
-the entry `ClusterManager.redirect_peer()` writes, and **ten integration tests** in #54's stage C
-depend on that entry staying where the harness put it — a fixture whose insertion point is "this
-registration happens exactly once" (its own docstring says so). The alternatives are to report the
-condition and let an operator act (a gauge; the WARN from #133 is already the human half), or to
-re-register only when the key is **absent** rather than on every refusal, which keeps the one-shot
-property for a key that exists.
+**Three answers were on the table, and the cheap one was wrong.** Re-registering on every refused
+refresh has a cost this repository can name: `register_self()` running more than once would
+overwrite the entry `ClusterManager.redirect_peer()` writes, and **ten integration tests** in #54's
+stage C depend on that entry staying where the harness put it — a fixture whose insertion point is
+"this registration happens exactly once", as its own docstring says. The second was to report the
+condition and let an operator act. The third, taken here, is to write the entry again **only when
+the key is confirmed absent**, which keeps the one-shot property for a key that exists.
 
-Today's behaviour is pinned by a test, so whichever is chosen cannot land unnoticed.
+**The read has three answers, not two, for the reason #82 gave `read_leader()` the same shape one
+class away**: a read that failed and a key that is gone ask for opposite things, and a `bool` makes
+them the same answer. `PeerRegistry::read_self_key()` returns `Absent` only when etcd's range
+response carries no `kvs` member at all — an empty body is a transport that said nothing, which is
+`Unavailable`. Gating on `Absent` rather than on the refusal buys three separate things:
 
-- Effort: M, mostly the decision | Impact: a node that keeps serving and keeps its existing links
-  while being invisible to the registry — so the cluster works until the day something needs to
-  look an address up, and then does not
+- the entry the harness overwrites to redirect a peer is **not** overwritten back, so stage C's
+  ten tests keep their premise (checked: `test_mesh_link_faults.py` + `test_mesh_proxy.py`,
+  **12 passed in 217 s** with the fix in place);
+- two nodes sharing a `node_id` cannot start a war over the key, because whichever wrote it last
+  leaves it `Present` for both;
+- while etcd is unreachable the answer is `Unavailable`, so nothing is attempted and **nothing is
+  written at INFO** — the quiet branch is what keeps this recovery from becoming #133 in a new
+  place. The loud WARN one branch up already carries the operator-facing sentence, which now says
+  the entry will be written again once the key is confirmed gone instead of "nothing re-registers
+  it".
+
+**What it deliberately does not cover, and this is a decision rather than a gap**: a key an
+operator **deleted** while the lease is still alive. That node is invisible too, but its refresh
+still succeeds, so this branch never runs — and eviction by deleting the key is a thing someone may
+be relying on.
+
+`etcd_post()` came out of this because `read_self_key()` needed a third copy of the same twenty
+lines of curl setup, and the two it replaced differed only in their timeout; a third copy is how the
+three of them would have come to disagree about anything else. `registered_status_` is remembered so
+the second registration says what the first one said rather than a hardcoded default —
+`update_status()` writes nothing to etcd, so that string is the only status the registry has ever
+held for this node.
+
+**Measured after**, same harness: the key is absent at 0 s and 2.5 s and **present from 5.0 s
+onward**, `Registered node` appears twice, the recovery line once, one WARN of each kind, and the
+peer's `MM_PEERS` row carries a real address again instead of an empty one.
+
+**The module has three tests now, and the third is the one that says the gate is real.** The two
+that existed are green against the *cheap* version of this fix — rewrite on every refused refresh —
+because with etcd reachable the key really is gone, and with etcd stopped the grant fails so no
+line is written either. The state that tells the two apart is a refusal over a key that **exists**,
+and nothing else in this battery produces it: `redirect_peer()` writes without a lease, which
+detaches the key, so the test captures the lease id *before* redirecting and revokes it by id
+afterwards. From then on every refresh fails while the entry sits where the harness put it, and the
+address has to stay there. Its control is the **premise** rather than the outcome — without
+asserting that a refusal reached the log, the test passes against a node whose refresh is
+succeeding, in which case the branch under test never ran at all.
+
+Both other tests gained a rate bound that is **independent of wording**: the count of registry
+lines above `DEBUG` across the window, measured at one and two. That is what catches the flood a
+*different* wrong answer would cause — reading the unreachable case as `Absent` attempts a grant
+every interval, and each failure is its own WARN from a function neither test names. A count is
+also the right shape for it, because #133 is about a rate, and anchoring on a phrase makes the
+phrase load-bearing (#128's static test paid for that and had to be re-anchored on its condition).
+
+**Both older tests were rewritten, and one of them could never have passed.** The #132 test
+was written to fail on the day of the fix, so it flipped; it now polls *both* halves — the key and
+the log line — because the key lands in etcd before the line lands in the log, and reading the log
+once at the moment the key appears is a race the first version of the rewrite lost. The #133 test
+needed a **new premise** (`stop_etcd()` instead of a revoke, which also exercises the `Unavailable`
+branch), because after this fix a revoked lease is no longer a permanent condition. Its first
+version then asserted on the `Unavailable` branch's own log line — which is **DEBUG**, while the
+nodes run at the default level, so the assertion could not pass at any point. That branch is quiet
+by design; what is observable about it is the **absence** of the rewrite, and that is what the test
+states.
+
+One red run in the rewrite paid for a lesson of its own: the #132 test read node 1's `MM_PEERS`
+**once**, at the moment the key came back, and found no row for peer 2 at all. That list is per
+*peer record*, and the re-registration moves node 1 through learning the address again — the same
+shape as asking for `replicas[0]` in one instant while a replica reconnects, which this repository
+has now hit three times. The property is that the address comes back, so the test waits for it.
+
+**Mutation table: eight, seven with the verdict they were supposed to give, and the eighth is
+recorded as surviving because the reason is worth more than the row.**
+
+| mutation | wanted | verdict |
+|---|---|---|
+| the unreachable case reads as `Absent` | KILLED | KILLED — the flood the quiet branch prevents |
+| rewrite on every refusal, not only on `Absent` | KILLED | KILLED — **by the third test alone** |
+| the `kvs` test inverted | KILLED | KILLED |
+| the `Present` branch logs at INFO | KILLED | KILLED — by the rate bound |
+| the `Unavailable` branch logs at WARN | KILLED | KILLED — by the rate bound |
+| `etcd_post()` returns success on a curl error | KILLED | **SURVIVED** |
+| the status is never remembered | SURVIVES | SURVIVED |
+| the WARN's wording is changed (control) | SURVIVES | SURVIVED |
+
+**The survivor is a real gap and it is narrow in a way worth writing down.** The simple path is
+masked by `read_self_key()`'s own `response.empty()` guard: with etcd unreachable the transport
+fails, the body is empty either way, and the answer is still `Unavailable`. The only state where the
+mutation changes behaviour is one where etcd answers the **range** and then fails the **PUT** — and
+then `register_self()` would return `true` without having written anything, so the node would log
+`has registered again` about a key that is still gone. That is the worst kind of wrong: the log
+would be the thing that lies.
+
+That state is constructible and **#135 is the item that constructs it** — measured there, a node
+given a dead endpoint *first* has `connect()` and `grant_lease()` succeed through the live one while
+the PUT to `endpoints[0]` fails. This battery cannot express it today because every node it starts
+gets exactly one endpoint, so the row stays recorded rather than closed, and the shape needed to
+close it is named.
+
+- Effort: M, mostly the decision | Impact: a node that kept serving and kept its existing links
+  while being invisible to the registry — so the cluster worked until the day something needed to
+  look an address up
 
 ### 131. Seven more loops end on their first exception ✅
 
@@ -6706,7 +6929,7 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #121, #130, #132.** Every item above #58 is either marked closed or named on that
+**Open: #121, #130, #134, #135.** Every item above #58 is either marked closed or named on that
 line — `scripts/check_roadmap.py` holds both directions — and items #1 to #58 are planned work
 nobody has built, not defects. Of the four, #121 is a question recorded for a decision rather than
 a defect, and **#37**'s remaining half waits on an external service. **#117**, **#118**, **#122** and **#123** are closed, and
@@ -6758,13 +6981,31 @@ than the fix: the path was unreachable in the battery until #124, and the only u
 **mock primary built to agree with the receiver** — four fields filled in, the other two left at the
 zero the receiver reconstructs — so the stub proved the receiver agreed with itself.
 
-**#126** and **#127** are closed, and **#128**, **#129** and **#133** with them. **#112** is closed
+**#126** and **#127** are closed, and **#128**, **#129**, **#132** and **#133** with them. **#132**
+is the one with the most behind it for its size: a node whose registration lease etcd had forgotten
+was out of the mesh registry for the life of the process, and the fix is a **three-state** read of
+its own key rather than a rewrite on failure — because the cheap version passes both tests the
+measurement produced and would quietly take ten of #54 stage C's tests away from the fixture they
+stand on. **#112** is closed
 too: all four of the loops it named now guard one iteration at a time, and closing it produced the
 three defects listed above. #131 is the one to read first, because it is not a defect anybody
 observed — it is a mutation that **survived**: the rule holding the other three loops honest was a
 hand-written list, and deleting a row from it left the rule covering less while staying green.
 Derived from the tree, `src/` has thirteen loop functions and **seven** still end on their first
 exception.
+
+**#134** was filed while #132 was being written, by asking the narrow question "what else ever
+writes this node's status?" and getting the answer **nothing**: two `PeerRegistry` methods whose
+headers promise etcd write nothing, return `true`, and in one case **log at INFO that they did it**.
+Nothing calls either, so it costs the first caller rather than the cluster — the seventh instance in
+this workspace of a value that never reaches anybody, and the second with no behavioural symptom,
+because there is no caller to have one.
+
+**#135** came out of the same question one step further on: #132's read was the **second** of three
+places in `PeerRegistry` to hardcode `endpoints[0]`, while the coordinator client beside it talks to
+whichever endpoint answered. **Measured**, with the reversed order as its control: dead endpoint
+first and the node never registers; live first and it registers in 0.5 s. Election and failover work
+throughout, and #132's recovery cannot see the condition because the lease never fails.
 
 **#121** remains the question stage D left behind, filed rather than answered because a ceiling on
 the drift a peer may introduce costs causal order against that peer.
@@ -6790,12 +7031,23 @@ than about the engine. #110's first CI run also verified the
 value of the skip gate: seven new CLI tests did not run until both integration jobs built the CLI
 and the fixture selected the same build as the server.
 
-**There is no open defect on this page.** #126 — the last one, which #54's own closing measurement
-found — is fixed: a file whose record was torn is abandoned, and replay treats a mismatch in any
-file but the last as a tear rather than as the end of the log. What is left are two maintainer
-decisions (#121, #37) and the capability items below. The coverage badge left from #37 needs a
-maintainer decision about an external reporting service. Existing coverage reports and the
-line-coverage floor continue to run inside GitHub Actions.
+**#126 is fixed** — the last defect #54's own closing measurement found: a file whose record was
+torn is abandoned, and replay treats a mismatch in any file but the last as a tear rather than as
+the end of the log.
+
+**Which defects are open is stated in exactly one place on this page — the `Open:` line above**,
+which `scripts/check_roadmap.py` holds in **both** directions. This paragraph used to say "there is
+no open defect on this page" and was **bold and false** within two days of being written — the same
+session that added the checker filed three items under it. A second sentence about a set the
+checker already owns is a second sentence to keep true, and it is the one that rots, because
+nothing fails when it stops being accurate. So this one points rather than restates, which is the
+answer `docs/requirements.md` in the flagship product took for the same shape: a document that is
+never meant to speak about status is easier to keep true than one meant to be current.
+
+Two of the open items are **maintainer decisions rather than work** — #121, whose ceiling costs
+causal order against the peer whose clock is wrong, and the coverage badge left from #37, which
+needs a choice of external reporting service. Existing coverage reports and the line-coverage floor
+continue to run inside GitHub Actions. The capability items are in the table below.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|

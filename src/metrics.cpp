@@ -113,8 +113,10 @@ MetricsRegistry::MetricsRegistry() {
     // Lease refreshes that threw (#112). A ratchet like the one above and for the same reason -
     // `CoordinatorClient` contains no `throw` and `refresh_lease()` answers failure with `false`
     // - but the thing behind it is the least recoverable of the four loops: the lease this thread
-    // holds open is what keeps this node in the mesh registry, and `register_self()` runs once, at
-    // start. Measured: revoke that lease and the key never comes back while the node answers PING.
+    // holds open is what keeps this node in the mesh registry, and since #132 the repair for a
+    // lost registration lives in **this same loop**. Measured before that fix: revoke the lease
+    // and the key never comes back while the node answers PING. A thread that ends now takes the
+    // repair with it, which is the same condition reached a different way.
     counters_.push_back(make_counter("ob_peer_lease_errors_total",
                                      "Peer registry lease refreshes that ended in an exception"));
     // The other seven loops, together (#131). One counter rather than seven, and that is a

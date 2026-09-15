@@ -2550,6 +2550,49 @@ Learned the hard way. Check here before debugging.
     a header writing an unregistered name is caught, and the same mutation with `include/` dropped
     from that scan survives.
 
+308. **A test that asserts on a `DEBUG` line asserts on a line the process will never write.** The
+    rewritten #133 test required the `Unavailable` branch's own sentence in the log, and that branch
+    logs at `DEBUG` while the nodes run at the default `INFO` — so no amount of waiting could make
+    it pass. The branch is quiet **by design**, which is the whole reason it does not become #133 in
+    a new place; what is observable about it is the **absence** of the repair, and that is what the
+    test states now. Before asserting a line is present, check the level it is written at against
+    the level the process runs at.
+
+309. **Two halves of one repair become true at different times, so poll both rather than sampling
+    one at the moment the other fires.** #132's recovery writes the etcd key and *then* logs that it
+    did; the first version of its test waited for the key and read the log window once, which lost
+    the race and reported "the key is back but the node did not say it wrote it, so something else
+    did" — a diagnosis pointing at a defect that does not exist. The loop waits for `key AND line`
+    now. Same family as pitfall 302: an instrument that samples one side of a two-step change
+    answers with the same voice it would use if the change were wrong.
+
+310. **When a repair is added to a loop, the boundary around that loop becomes load-bearing for a
+    second reason, and the comment justifying it goes stale in the direction that reads fine.**
+    `lease_loop()`'s boundary was justified by "the registration expires with its lease and nothing
+    ever puts it back — `register_self()` runs once, at start". #132 made the second clause false
+    while making the conclusion *stronger*: the repair lives inside that loop, so a thread that ends
+    takes the repair with it. A justification that has become wrong while its conclusion stayed
+    right is the hardest kind to notice, because nothing it claims will ever fail.
+
+311. **`MM_PEERS` and `replicas` list *connections*, so either can be one row short for a moment
+    while a peer is being re-learned — assert the property, not the instant.** Third time in this
+    repository: `replica_confirmed_file()` asked for `replicas[0]` while a replica reconnected
+    after bootstrap and got `replicas: 0` seconds after that same replica answered a query with
+    every row; #132's first test read `MM_PEERS` once at the moment the registry key returned and
+    found no row for peer 2 at all. Neither was a defect, and both read exactly like one. What
+    those tables promise is that the row **comes back**, so poll until it does and put the last
+    read in the failure message.
+
+312. **Two sentences about one set, only one of them checked, and the unchecked one is the one that
+    rots.** `docs/roadmap.md` gained a mechanical `Open:` line — held in both directions by
+    `scripts/check_roadmap.py` — while a **bold** paragraph five hundred lines below still said
+    "there is no open defect on this page". That sentence was false **within two days**, falsified by
+    the same session that wrote the checker, and nothing failed, because nothing was watching it.
+    Adding a mechanism does not retire the prose it duplicates: go and find the other statements of
+    the same fact and turn them into **pointers**. A document that never restates the set cannot
+    disagree with it, which is the answer the flagship product's `docs/requirements.md` took for the
+    same shape.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2678,8 +2721,11 @@ Things a newcomer should know, because they are real limits rather than bugs to 
 - **A mesh link is breakable from the harness, and the proxy that does it needs no engine change**
   (#54 stage C). `tests/integration/mesh_proxy.py` sits between two peers;
   `ClusterManager.redirect_peer()` puts it there by overwriting the address
-  `PeerRegistry::register_self()` published, which works because that call happens **once**, at
-  start. Four things to know before using it, each of which cost a wrong test first.
+  `PeerRegistry::register_self()` published, which works because nothing writes that key again
+  while it **exists** — since #132 a node does re-register, but only on a key it has read back and
+  found **absent**, which is why that fix keeps the one-shot property this fixture stands on rather
+  than just being cheap. Four things to know before using it, each of which cost a wrong test
+  first.
   **`partition()` buffers and stops reading** — buffers because a real partition delays bytes
   rather than deleting them (deleting them is `close_connections()`), and stops reading because a
   proxy that kept draining would hide the fault from the sender, which is the half that has to be
