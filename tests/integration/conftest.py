@@ -641,10 +641,19 @@ class ClusterManager:
         """Point every peer that dials node `node_index` at `address` instead (#54 stage C).
 
         **This needs no change in the engine, and that is why it is the insertion point.**
-        `PeerRegistry::register_self()` runs exactly once, at start (`src/multi_master.cpp:350`),
-        publishing `127.0.0.1:<mm-replication-port>` under `<prefix>mm_peers/<node_id>`. There is
-        no re-publication and nothing re-reads its own entry, so overwriting the value after the
-        node is up makes every peer dial whatever is written there.
+        `PeerRegistry::register_self()` publishes `127.0.0.1:<mm-replication-port>` under
+        `<prefix>mm_peers/<node_id>` at start, and nothing writes that key again while it
+        **exists**, so overwriting the value after the node is up makes every peer dial whatever is
+        written there.
+
+        Since #132 a node does re-register itself, so "runs exactly once" — which is what this
+        docstring used to say — is no longer the reason this works. The reason is narrower and is
+        the reason that fix was chosen: the rewrite fires only on a key the node has read back and
+        found **absent**, so a key this method has written is left alone. A refused refresh over an
+        existing key takes the `Present` branch and logs at `DEBUG`;
+        `test_peer_lease_lost.py::test_a_registration_this_harness_wrote_is_not_written_back` pins
+        that, because a version of #132 that rewrote on every refusal would silently take this
+        fixture's insertion point away from ten tests in #54's stage C.
 
         **Read-modify-write rather than composing the document, and the reason is not tidiness.**
         The engine writes six fields (`address`, `last_hlc`, `node_id`, `status`,
@@ -669,8 +678,8 @@ class ClusterManager:
         if not kvs:
             raise RuntimeError(
                 f"no peer entry at {key} to redirect. The node must be up and registered first: "
-                f"this is a one-shot registration, so a redirect issued before it lands writes a "
-                f"key the engine then overwrites")
+                f"a redirect issued before that lands writes a key the node's own registration "
+                f"then overwrites")
 
         value = json.loads(base64.b64decode(kvs[0]["value"]).decode())
         was = value.get("address")
@@ -698,8 +707,14 @@ class ClusterManager:
         kvs = found.get("kvs") or []
         return kvs[0] if kvs else None
 
-    def revoke_peer_lease(self, node_index: int) -> str:
+    def revoke_peer_lease(self, node_index: int, lease: Optional[str] = None) -> str:
         """Take away the lease that keeps a node's mesh registration alive. Returns the lease id.
+
+        `lease` overrides the id read from the key, for the one case where the key can no longer
+        name it: `redirect_peer()` above rewrites the value **without** a lease, which detaches the
+        key, so a test that wants both a redirected address and a failing refresh has to capture
+        the id before redirecting. Without the override the premise check below would refuse, and
+        it would be right to — the key's own answer is then `0`.
 
         **Constructed rather than waited for, and that is the point of doing it this way.** The same
         state arrives on its own if etcd is unreachable for longer than the TTL, but then the
@@ -710,13 +725,13 @@ class ClusterManager:
         a registration that was not there, or one with no lease behind it, would make the whole
         measurement vacuous. Needs no change in the engine, like `redirect_peer()`.
         """
-        entry = self.peer_registration(node_index)
-        if entry is None:
-            raise RuntimeError(
-                f"no registration for node {node_index + 1} to revoke. The node must be up and "
-                f"registered first; this is a one-shot registration, so there is nothing to take "
-                f"away before it lands")
-        lease = entry.get("lease")
+        if lease is None:
+            entry = self.peer_registration(node_index)
+            if entry is None:
+                raise RuntimeError(
+                    f"no registration for node {node_index + 1} to revoke. The node must be up "
+                    f"and registered first; there is nothing to take away before it lands")
+            lease = entry.get("lease")
         if not lease or lease == "0":
             raise RuntimeError(
                 f"node {node_index + 1}'s registration carries no lease ({lease!r}), so revoking "

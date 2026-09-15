@@ -136,6 +136,10 @@ public:
     PeerRegistry& operator=(const PeerRegistry&) = delete;
 
     /// Register this node in etcd (with lease).
+    ///
+    /// Called once at start, and again by `lease_loop()` only when the lease is gone **and** the
+    /// key is confirmed absent (#132). The status is remembered so the second call says what the
+    /// first one said.
     bool register_self(const std::string& status = "active");
 
     /// Update this node's status in etcd.
@@ -176,6 +180,12 @@ private:
     MetricsRegistry& registry_;
     int64_t lease_id_{0};
 
+    /// What `register_self()` last wrote as this node's status, so a re-registration says the same
+    /// thing rather than a hardcoded default. `update_status()` is a stub that writes nothing to
+    /// etcd, so this is the only status the registry has ever held for us - which is why it is one
+    /// string and not a pair.
+    std::string registered_status_{"active"};
+
     mutable std::mutex mtx_;
     std::unordered_map<uint16_t, PeerInfo> peers_;
 
@@ -209,6 +219,24 @@ private:
     /// once (#132). Measured before this existed: eleven WARN lines in 33 s, one per interval,
     /// unbounded (#133).
     LogEpisode lease_refusals_;
+
+    /// Whether this node's own entry is in the registry. **Three answers, not two**, for the
+    /// reason #82 gave `read_leader()` the same shape one class away: a read that failed and a key
+    /// that is gone ask for opposite things, and a `bool` makes them the same answer.
+    ///
+    /// `Unavailable` is what keeps the recovery below from flooding. While etcd is unreachable the
+    /// answer is never `Absent`, so no grant is attempted and no line is written - the condition
+    /// is already reported once by the episode above.
+    enum class SelfKey { Present, Absent, Unavailable };
+    SelfKey read_self_key() const;
+
+    /// One POST to etcd's HTTP gateway, which is the only door this class uses.
+    ///
+    /// Extracted when `read_self_key()` needed a third copy of the same twenty lines; the two it
+    /// replaced differed only in their timeout, and a third copy is how the three of them would
+    /// have come to disagree about anything else.
+    bool etcd_post(const std::string& url, const std::string& body, long timeout_seconds,
+                   std::string& out) const;
 
     void watch_loop();
     void lease_loop();
