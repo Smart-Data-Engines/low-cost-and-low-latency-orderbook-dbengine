@@ -416,6 +416,16 @@ class ClusterManager:
         # about — the one where a restarted node lost the cluster secret and the failure read as a
         # replication defect.
         self.extra_node_args: list = []
+        # Unreachable coordinator endpoints to place before / after the live one. Set before
+        # `start()` or `start_multi_master()`, because both are read while the command line is
+        # built; they name no port of their own, so they can be set before etcd exists.
+        #
+        # `_before` is the interesting one and is why this exists: `connect()` probes the list in
+        # order, so a dead first entry used to leave the peer registry addressing it while the
+        # lease went through the live one (#135). `_after` is the control - the same configuration
+        # in the harmless order, which passed before that fix and has to keep passing.
+        self.extra_endpoints_before: list = []
+        self.extra_endpoints_after: list = []
         # TLS on the node links, or None. Same placement and the same reason as the secret file
         # above: it must survive a restart.
         self.node_tls: Optional[NodeTls] = None
@@ -975,13 +985,22 @@ class ClusterManager:
         as pitfall 77, where four modules built their own path to the server binary.
         """
         etcd_url = f"http://127.0.0.1:{self.etcd_client_port}"
+        # `coordinator_endpoints` is a **comma-separated list** the server probes in order, and
+        # `extra_endpoints_before` / `_after` let a test put an unreachable one on either side of
+        # the live one. It feeds `_node_argv`, which is the only place a node's command line is
+        # built, rather than adding a second builder - pitfall 77 is about duplicating this list,
+        # so a parameter to the one builder is its opposite. Repeating the flag would not do:
+        # the parser **appends**, so a second `--coordinator-endpoints` can only add endpoints
+        # after the harness's own, which is the harmless order (#135).
+        endpoints = ",".join(
+            [*self.extra_endpoints_before, etcd_url, *self.extra_endpoints_after])
         cmd = [
             self.server_binary,
             "--port", str(tcp_port),
             "--data-dir", data_dir,
             "--metrics-port", str(metrics_port),
             "--replication-port", str(replication_port),
-            "--coordinator-endpoints", etcd_url,
+            "--coordinator-endpoints", endpoints,
             "--node-id", node_id,
             # Short, so a stop in this battery exercises the **graceful** path instead of the
             # escalation. `_stop_node()` is SIGTERM then SIGKILL after five seconds, and until #106

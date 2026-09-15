@@ -390,7 +390,11 @@ bool PeerRegistry::register_self(const std::string& status) {
     std::string key_b64 = base64_encode(key);
     std::string value_b64 = base64_encode(value);
 
-    std::string url = config_.endpoints[0] + "/v3/kv/put";
+    // The endpoint that answered, not `endpoints[0]`: `connect()` above probes the list in order
+    // and keeps the first that responds, so with the first of two down this PUT used to go to the
+    // dead one while the lease it carries was granted through the live one (#135). Non-empty here
+    // by construction - `connect()` returned true a few lines up.
+    std::string url = coordinator_->endpoint() + "/v3/kv/put";
     std::string body = "{\"key\":\"" + key_b64 +
                        "\",\"value\":\"" + value_b64 +
                        "\",\"lease\":\"" + std::to_string(lease_id_) + "\"}";
@@ -509,9 +513,12 @@ bool PeerRegistry::etcd_post(const std::string& url, const std::string& body,
 }
 
 PeerRegistry::SelfKey PeerRegistry::read_self_key() const {
-    if (config_.endpoints.empty()) return SelfKey::Unavailable;
+    // No endpoint means this client has never connected, which is `Unavailable` and not `Absent` -
+    // the same distinction the three answers exist for. Addressing `config_.endpoints[0]` instead
+    // would ask the endpoint that may well be the dead one (#135).
+    if (coordinator_->endpoint().empty()) return SelfKey::Unavailable;
 
-    const std::string url  = config_.endpoints[0] + "/v3/kv/range";
+    const std::string url  = coordinator_->endpoint() + "/v3/kv/range";
     const std::string body = "{\"key\":\"" + base64_encode(build_key()) + "\"}";
 
     std::string response;
@@ -626,7 +633,36 @@ void PeerRegistry::watch_loop() {
             std::string key_b64 = base64_encode(prefix);
             std::string end_b64 = base64_encode(range_end);
 
-            std::string url = config_.endpoints[0] + "/v3/kv/range";
+            // Same endpoint the lease calls use. A poll against `endpoints[0]` while the client
+            // was talking to another one is how a mesh configured with two endpoints and the
+            // first one down learned no peers at all (#135).
+            const std::string& active = coordinator_->endpoint();
+            if (active.empty()) {
+                // Reported once rather than once per second: the condition is a coordinator that
+                // has never answered, which #54's stage B covers loudly elsewhere, and a line per
+                // poll here would be #133 in a new place.
+                if (no_endpoint_.begin()) {
+                    OB_LOG_WARN("peer_registry",
+                                "node %u cannot poll for peers: no coordinator endpoint has "
+                                "answered yet, so no peer will be learned until one does",
+                                local_node_id_);
+                } else {
+                    OB_LOG_DEBUG("peer_registry",
+                                 "node %u still has no coordinator endpoint (%llu consecutive "
+                                 "polls)", local_node_id_,
+                                 static_cast<unsigned long long>(no_endpoint_.ticks()));
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            if (const uint64_t held = no_endpoint_.end()) {
+                OB_LOG_INFO("peer_registry",
+                            "node %u can poll for peers again after %llu poll(s) with no "
+                            "coordinator endpoint", local_node_id_,
+                            static_cast<unsigned long long>(held));
+            }
+
+            std::string url = active + "/v3/kv/range";
             std::string body = "{\"key\":\"" + key_b64 +
                                "\",\"range_end\":\"" + end_b64 + "\"}";
 

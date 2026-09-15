@@ -134,6 +134,21 @@ public:
     /// Check if connected to etcd.
     bool is_connected() const;
 
+    /// The endpoint that answered `/v3/maintenance/status`, or empty if this client has never
+    /// connected.
+    ///
+    /// Exposed because `connect()` probes `config_.endpoints` **in order** and keeps the first that
+    /// answers, and a holder of this client had no way to ask which one that was — so
+    /// `PeerRegistry` addressed `endpoints[0]` for all three of its own etcd calls while every
+    /// lease call went through whichever endpoint was alive. Measured: with the first of two
+    /// endpoints down, `connect()` and `grant_lease()` succeed and the PUT fails, so the node runs
+    /// unregistered for the life of the process while election and failover work (#135).
+    ///
+    /// Empty means **not connected**, and callers treat it as a refusal rather than falling back to
+    /// an index: a fallback here would restore exactly the behaviour this replaced, and would do it
+    /// silently.
+    const std::string& endpoint() const;
+
     /// Grant a lease with the configured TTL.  Returns lease_id or 0 on failure.
     int64_t grant_lease();
 

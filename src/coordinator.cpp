@@ -486,6 +486,10 @@ bool CoordinatorClient::is_connected() const {
     return impl_->connected;
 }
 
+const std::string& CoordinatorClient::endpoint() const {
+    return impl_->active_endpoint;
+}
+
 // ── Lease operations ─────────────────────────────────────────────────────────
 
 int64_t CoordinatorClient::grant_lease() {
