@@ -215,6 +215,13 @@ private:
     /// (#133).
     LogEpisode lease_refusals_;
 
+    /// Whether the topology poll is currently unable to run because no coordinator endpoint has
+    /// answered. Loud once, for the reason the two above are: the condition lasts as long as the
+    /// coordinator is unreachable, and this loop polls every 100 ms (#133).
+    ///
+    /// Touched only by the watch thread.
+    LogEpisode no_endpoint_;
+
     /// Whether this node's own entry is in the registry. **Three answers, not two**, for the
     /// reason #82 gave `read_leader()` the same shape one class away: a read that failed and a key
     /// that is gone ask for opposite things, and a `bool` makes them the same answer.

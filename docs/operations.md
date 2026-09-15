@@ -678,6 +678,31 @@ publish had failed — nothing was written, so nothing outlived anything. That w
 only where it is true: on a tick where the position **was** published and published without a
 lease, which is the case in which it will not expire when this node dies (#72).
 
+### With more than one coordinator endpoint, the registry follows the one that answered
+
+`--coordinator-endpoints` takes a comma-separated list and the node probes it **in order**, keeping
+the first that answers `/v3/maintenance/status`. Everything a node does with etcd goes through that
+one endpoint — the lease, the leader key, and since #135 the three calls the peer registry makes:
+publishing this node's address, reading its own key back, and the topology poll that learns peers.
+
+Before that fix the registry addressed the **first configured** endpoint regardless, so a list whose
+first entry was down produced a node that looked healthy in every way an operator checks — election,
+keepalive and failover all working through the live endpoint — and was never in the registry at all.
+Measured: registered in 0.5 s with the order reversed, never within 25 s with the dead entry first,
+and **no** `Lease refresh failed` line, so the recovery from #132 could not see it either.
+
+One line is worth knowing, because it belongs to a state no other message covers:
+
+```
+WARN  peer_registry  node 2 cannot poll for peers: no coordinator endpoint has answered yet, so no
+                     peer will be learned until one does
+```
+
+That is **none** of the configured endpoints answering, not one of them — the topology watch starts
+whether or not the initial registration succeeded. It arrives **once** rather than every 100 ms, and
+a matching `INFO` says how many polls it covered when an endpoint finally answers. If you see it,
+the thing to fix is etcd or the endpoint list, and the rest of this section applies.
+
 ### When a node is serving but is not in the registry
 
 A node keeps its place in the mesh registry by refreshing an etcd lease every TTL/3 (default: every

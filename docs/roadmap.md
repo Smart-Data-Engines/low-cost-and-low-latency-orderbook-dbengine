@@ -2152,7 +2152,7 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
-### 135. The mesh registry writes to `endpoints[0]` while its coordinator client talks to whichever endpoint answered
+### 135. The mesh registry writes to `endpoints[0]` while its coordinator client talks to whichever endpoint answered ✅
 
 Found while writing #132's `read_self_key()`, which became the **second** of three places to
 hardcode the same index — and asking why there was an index at all.
@@ -2216,18 +2216,43 @@ whose `active_endpoint` dies keeps trying that one for the life of the process e
 endpoints configured. Same root — the client's endpoint choice is made once and is invisible from
 outside. That half is **read from the code, not measured**, and is stated that way.
 
-**Not pinned by a test yet, and the reason is worth stating rather than leaving as an omission.**
-The integration harness gives every node exactly one endpoint, and `--coordinator-endpoints`
-**appends** rather than replaces, so `extra_node_args` cannot put the dead one first — the
-harness's own flag is already ahead of it. Expressing this needs either a knob whose only user is
-one test (the shape `narrow_proxied_mesh` was deleted for) or a test that starts its own node
-outside `ClusterManager` (the shape pitfall 77 is about). Choosing between those two is part of
-fixing this item, not part of filing it. The measurement above is reproducible from
-`scripts/`-free scratch: two runs, two endpoint orders, one live etcd each.
+**Fixed by making the client answer the question instead of guessing it.**
+`CoordinatorClient::endpoint()` returns the endpoint that answered, and all three call sites ask it.
+Empty means **not connected** and is treated as a refusal rather than as a reason to fall back to an
+index: a fallback there would restore exactly this defect, silently. The third site — the topology
+watch — needed one more thing, because it runs whether or not `register_self()` succeeded: with no
+endpoint it now says so **once** and keeps polling, rather than either going quiet or writing a line
+every 100 ms (#133's shape, in the loop most able to produce it).
 
-- Effort: M | Impact: measured — a documented multi-endpoint HA configuration in which the mesh
-  **never** forms if the *first* endpoint is the one that is down, while every other etcd-backed
-  mechanism in the node behaves correctly and #132's recovery cannot see the condition
+**The test was the part that needed a decision, and it was deferred to here on purpose.** The
+harness gave every node exactly one endpoint, and `--coordinator-endpoints` **appends** rather than
+replaces, so `extra_node_args` cannot put the dead one first — the harness's own flag is already
+ahead of it. The two ways out were a knob whose only user is one test (the shape
+`narrow_proxied_mesh` was deleted for) and a test that starts its own node (the shape pitfall 77 is
+about). Taken: two attributes feeding `_node_argv`, which is the **only** place a node's command
+line is built — pitfall 77 is about *duplicating* that list, so a parameter to the single builder is
+its opposite, and `restart_node()` inherits the order for free because it goes through the same
+function.
+
+`tests/integration/test_coordinator_endpoint_order.py` is two tests, and the second is a **control
+rather than a second case**: the same unreachable endpoint in the harmless position, which passed
+before this fix and has to keep passing. Without it, a harness that quietly stopped prepending
+anything would leave the first test green and meaningless. Both assert their own premise from
+`Popen.args` — the command line the node actually got — rather than from the attribute that put it
+there, because an attribute is what the harness *meant* to say. And the first asserts the mesh forms
+on top of both registrations, because that is the only assertion that reaches the third call site:
+two registered nodes that never see each other is a topology watch still reading the wrong endpoint.
+
+Measured: **2 passed in 4.6-5.1 s**. Against the **four** source files from the commit before the
+fix — the two headers and the two units, reverted together so they stay consistent, with the harness
+and both tests unchanged — the run is **1 failed, 1 passed in 50.1 s**: the regression test names
+both nodes as never registered, the control passes, and the extra 45 s is its own patience window.
+Restored from a copy kept alongside and **rebuilt**, because a restore without a rebuild leaves the
+next consumer of that build directory running the previous tree.
+
+- Effort: M | Impact: was measured — a documented multi-endpoint HA configuration in which the mesh
+  **never** formed if the *first* endpoint was the one that was down, while every other etcd-backed
+  mechanism in the node behaved correctly and #132's recovery could not see the condition
 
 ### 134. Two registry methods claim to write to etcd, write nothing, and return success ✅
 
@@ -6956,9 +6981,9 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #121, #130, #135.** Every item above #58 is either marked closed or named on that
+**Open: #121, #130.** Every item above #58 is either marked closed or named on that
 line — `scripts/check_roadmap.py` holds both directions — and items #1 to #58 are planned work
-nobody has built, not defects. Of the three, #121 is a question recorded for a decision rather than
+nobody has built, not defects. Of the two, #121 is a question recorded for a decision rather than
 a defect, and **#37**'s remaining half waits on an external service. **#117**, **#118**, **#122** and **#123** are closed, and
 together they are one investigation that started with five registered
 metrics nothing wrote and ended four items later in the WAL's own arithmetic. Every lag this engine
@@ -7028,11 +7053,12 @@ they had done it**. Both are deleted — the answer #104 took for its field — 
 why no checker guards the shape: one would need a hand-written list of what counts as internal
 rather than public API, and a list written by hand is not evidence about the code.
 
-**#135** came out of the same question one step further on: #132's read was the **second** of three
-places in `PeerRegistry` to hardcode `endpoints[0]`, while the coordinator client beside it talks to
-whichever endpoint answered. **Measured**, with the reversed order as its control: dead endpoint
-first and the node never registers; live first and it registers in 0.5 s. Election and failover work
-throughout, and #132's recovery cannot see the condition because the lease never fails.
+**#135 is closed**, and it came out of the same question one step further on: #132's read was the
+**second** of three places in `PeerRegistry` to hardcode `endpoints[0]`, while the coordinator client
+beside it talked to whichever endpoint answered. Measured with the reversed order as its control —
+dead endpoint first and the node never registered; live first and it registered in 0.5 s — and the
+client now answers the question instead, with empty treated as a refusal rather than as a reason to
+fall back to an index.
 
 **#121** remains the question stage D left behind, filed rather than answered because a ceiling on
 the drift a peer may introduce costs causal order against that peer.
