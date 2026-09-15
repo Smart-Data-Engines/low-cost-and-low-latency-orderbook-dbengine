@@ -395,36 +395,14 @@ bool PeerRegistry::register_self(const std::string& status) {
                        "\",\"value\":\"" + value_b64 +
                        "\",\"lease\":\"" + std::to_string(lease_id_) + "\"}";
 
-    // Use a simple curl request to PUT.
-    CURL* curl = curl_easy_init();
-    if (curl) {
-        std::string response;
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
-            +[](char* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
-                auto* resp = static_cast<std::string*>(userdata);
-                resp->append(ptr, size * nmemb);
-                return size * nmemb;
-            });
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
-        struct curl_slist* headers = nullptr;
-        headers = curl_slist_append(headers, "Content-Type: application/json");
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-        CURLcode res = curl_easy_perform(curl);
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-
-        if (res != CURLE_OK) {
-            OB_LOG_WARN("peer_registry",
-                        "Failed to PUT PeerInfo to etcd for node %u: %s",
-                        local_node_id_, curl_easy_strerror(res));
-            return false;
-        }
+    std::string response;
+    if (!etcd_post(url, body, /*timeout_seconds=*/5, response)) {
+        OB_LOG_WARN("peer_registry",
+                    "Failed to PUT PeerInfo to etcd for node %u", local_node_id_);
+        return false;
     }
+
+    registered_status_ = status;
 
     // Store self in local peers map.
     {
@@ -515,6 +493,56 @@ void PeerRegistry::stop_watch() {
     }
 }
 
+bool PeerRegistry::etcd_post(const std::string& url, const std::string& body,
+                             long timeout_seconds, std::string& out) const {
+    out.clear();
+    CURL* curl = curl_easy_init();
+    if (curl == nullptr) return false;
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+        +[](char* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
+            auto* resp = static_cast<std::string*>(userdata);
+            resp->append(ptr, size * nmemb);
+            return size * nmemb;
+        });
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_seconds);
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    const CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) {
+        OB_LOG_DEBUG("peer_registry", "etcd POST to %s failed: %s", url.c_str(),
+                     curl_easy_strerror(res));
+        return false;
+    }
+    return true;
+}
+
+PeerRegistry::SelfKey PeerRegistry::read_self_key() const {
+    if (config_.endpoints.empty()) return SelfKey::Unavailable;
+
+    const std::string url  = config_.endpoints[0] + "/v3/kv/range";
+    const std::string body = "{\"key\":\"" + base64_encode(build_key()) + "\"}";
+
+    std::string response;
+    if (!etcd_post(url, body, /*timeout_seconds=*/3, response) || response.empty()) {
+        return SelfKey::Unavailable;
+    }
+
+    // etcd answers a range that matched nothing with the envelope and **no `kvs` member at all**,
+    // so the absence of that key is the answer. An empty body is not: that is a transport that
+    // said nothing, which is `Unavailable` above.
+    return response.find("\"kvs\"") == std::string::npos ? SelfKey::Absent : SelfKey::Present;
+}
+
 bool PeerRegistry::refresh_lease() {
     // Loud once and then quiet, for both ways this can fail. The lease loop calls this every
     // TTL/3 and neither failure is transient in practice: a lease etcd has forgotten stays
@@ -535,13 +563,51 @@ bool PeerRegistry::refresh_lease() {
         if (lease_refusals_.begin()) {
             OB_LOG_WARN("peer_registry",
                         "Lease refresh failed for node %u%s - this node's mesh registration "
-                        "expires with the lease and nothing re-registers it", local_node_id_,
+                        "expires with the lease, and it will be written again once the key is "
+                        "confirmed gone", local_node_id_,
                         lease_id_ == 0 ? ": no active lease" : "");
         } else {
             OB_LOG_DEBUG("peer_registry",
                          "Lease refresh for node %u still failing (%llu consecutive)",
                          local_node_id_,
                          static_cast<unsigned long long>(lease_refusals_.ticks()));
+        }
+
+        // The registration used to be written exactly once, at start, so a lease etcd had
+        // forgotten took this node out of the registry for the life of the process: measured, the
+        // key was gone at once and still gone 22.5 s later while the node answered PING, and the
+        // only recovery was a restart (#132).
+        //
+        // **Only on a key confirmed absent**, which is what makes this safe in three separate
+        // ways. It keeps the one-shot property for a key that *exists*, so the entry the test
+        // harness overwrites to redirect a peer is not overwritten back - ten tests in #54's
+        // stage C stand on that, and their fixture's insertion point is "this registration happens
+        // exactly once". It cannot start a war between two nodes sharing a node_id, because
+        // whichever wrote the key last leaves it Present for both. And while etcd is unreachable
+        // the answer is `Unavailable` rather than `Absent`, so nothing is attempted and nothing is
+        // logged - the three-state read is what keeps this path from becoming #133 in a new place.
+        //
+        // What it deliberately does not cover: a key an operator **deleted** while the lease is
+        // still alive. That node is invisible too, but its refresh still succeeds, so this branch
+        // never runs - and eviction by deleting the key is a thing someone may be relying on.
+        switch (read_self_key()) {
+        case SelfKey::Absent:
+            if (register_self(registered_status_)) {
+                OB_LOG_INFO("peer_registry",
+                            "node %u was missing from the registry and has registered again",
+                            local_node_id_);
+            }
+            break;
+        case SelfKey::Present:
+            OB_LOG_DEBUG("peer_registry",
+                         "node %u's registration is still in etcd, so the refused refresh is "
+                         "about the lease and not the entry", local_node_id_);
+            break;
+        case SelfKey::Unavailable:
+            OB_LOG_DEBUG("peer_registry",
+                         "cannot tell whether node %u is still registered; not writing the entry "
+                         "on a read that failed", local_node_id_);
+            break;
         }
         return false;
     }
@@ -685,9 +751,10 @@ void PeerRegistry::lease_loop() {
         // One refresh at a time under its own boundary (#112). The outer `run_thread_body` keeps
         // the *process* alive; without this, one exception here ends the thread that holds this
         // node's mesh registration open, and what follows is measured rather than argued: the
-        // registration expires with its lease, the key is gone from etcd for good, and nothing
-        // ever puts it back — `register_self()` runs once, at start, and is the only writer of
-        // `lease_id_`. The node keeps answering `PING` throughout.
+        // registration expires with its lease and the key is gone from etcd for good. #132 gave
+        // that condition a recovery, and the recovery lives **inside this loop** - so a thread
+        // that ends takes the repair with it, which makes this boundary load-bearing where before
+        // it only kept the process alive. The node keeps answering `PING` throughout.
         //
         // A **ratchet**, and it says so rather than pretending to close something measured. No
         // path in this tree throws here: `CoordinatorClient` contains no `throw` at all and
