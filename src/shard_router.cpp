@@ -1,6 +1,7 @@
 // ── ShardRouter — client-side shard routing implementation ───────────────────
 
 #include "orderbook/shard_router.hpp"
+#include "orderbook/loop_guard.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/logger.hpp"
 
@@ -227,6 +228,13 @@ void ShardRouter::update_connections(const ShardMap& new_map) {
 // ── 11.3  watch_loop() ──────────────────────────────────────────────────────
 
 void ShardRouter::watch_loop() {
+    // One refresh is the unit, and an abandoned one costs an interval: the cached map keeps
+    // serving, which is what this loop already does on a failed refresh. Without this the thread
+    // ends and the map goes stale for ever while this client keeps routing by it.
+    //
+    // No registry: this runs in the caller's process and the one that owns a metrics registry is
+    // the server, so the log line is the whole report.
+    LoopGuard guard{"shard_router", "a shard-map refresh", nullptr};
     using clock = std::chrono::steady_clock;
     auto interval = std::chrono::milliseconds(
         static_cast<int64_t>(config_.health_check_interval_sec * 1000));
@@ -241,7 +249,10 @@ void ShardRouter::watch_loop() {
         try {
             OB_LOG_DEBUG("shard_router", "Watch loop: checking for shard map updates");
             refresh_shard_map();  // ignore errors — keep using cached map
-        } catch (...) { throw; }
+            guard.ok();
+        } catch (const std::exception& e) {
+            guard.caught(e);
+        }
     }
 }
 

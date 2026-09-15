@@ -4,6 +4,7 @@
 // Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6
 
 #include "orderbook/anti_entropy.hpp"
+#include "orderbook/loop_guard.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/engine.hpp"
 #include "orderbook/logger.hpp"
@@ -104,6 +105,11 @@ AntiEntropyResult AntiEntropyManager::last_result() const {
 
 void AntiEntropyManager::loop() {
     OB_LOG_DEBUG("anti_entropy", "Anti-entropy loop thread started");
+    // One reconciliation pass is the unit, and an abandoned one costs an interval: the next pass
+    // compares the same version vectors again. Without this the thread ends and divergence between
+    // masters is never repaired - the mechanism #57 exists for - while every node keeps serving.
+    // `registry_` here is the *peer* registry; the metrics one comes through the engine.
+    LoopGuard guard{"anti_entropy", "a reconciliation pass", &engine_.registry()};
 
     while (running_.load(std::memory_order_relaxed)) {
         // Sleep for interval_seconds, but wake immediately on stop().
@@ -120,7 +126,10 @@ void AntiEntropyManager::loop() {
 
         try {
             execute_run();
-        } catch (...) { throw; }
+            guard.ok();
+        } catch (const std::exception& e) {
+            guard.caught(e);
+        }
     }
 
     OB_LOG_DEBUG("anti_entropy", "Anti-entropy loop thread exiting");

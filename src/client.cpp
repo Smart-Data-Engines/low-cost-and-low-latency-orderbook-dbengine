@@ -3,6 +3,7 @@
 //         pool routing, health-check, failover.
 
 #include "orderbook/client.hpp"
+#include "orderbook/loop_guard.hpp"
 #include "orderbook/thread_boundary.hpp"
 
 #include "orderbook/auth.hpp"
@@ -1110,6 +1111,11 @@ void OrderbookPool::discover_primary() {
 // ── 7.2  Health-check loop ───────────────────────────────────────────────────
 
 void OrderbookPool::health_check_loop() {
+    // One sweep of every node is the unit, and an abandoned one costs an interval: `primary_idx_`
+    // stays where the last sweep left it and the next sweep recomputes it from scratch. Without
+    // this the thread ends and the pool stops noticing dead connections - in the caller's process,
+    // which is why there is no registry here and the log is the whole report.
+    LoopGuard guard{"pool", "a health-check sweep", nullptr};
     using clock = std::chrono::steady_clock;
     auto interval = std::chrono::milliseconds(
         static_cast<int64_t>(config_.health_check_interval_sec * 1000));
@@ -1163,7 +1169,10 @@ void OrderbookPool::health_check_loop() {
                     }
                 }
             }
-        } catch (...) { throw; }
+            guard.ok();
+        } catch (const std::exception& e) {
+            guard.caught(e);
+        }
     }
 }
 

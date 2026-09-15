@@ -7,6 +7,7 @@
 
 #include "orderbook/level_payload.hpp"
 #include "orderbook/multi_master.hpp"
+#include "orderbook/loop_guard.hpp"
 #include "orderbook/thread_boundary.hpp"
 
 #include "orderbook/crc32c.hpp"
@@ -2178,6 +2179,11 @@ void MultiMasterManager::schedule_reconnect(uint16_t node_id) {
 
 void MultiMasterManager::reconnect_loop() {
     OB_LOG_DEBUG("mm", "reconnect_loop started");
+    // One pass is the unit, and an abandoned one costs 100 ms plus whatever backoff it had already
+    // claimed under the lock - so a dial lost here is a dial the next pass makes, not one nobody
+    // makes. Without this the thread ends and a dropped mesh link is never re-dialled: #95's and
+    // #97's work all lives in this loop.
+    LoopGuard guard{"mm", "a reconnect pass", &engine_.registry()};
 
     while (running_.load(std::memory_order_acquire)) {
         try {
@@ -2254,7 +2260,10 @@ void MultiMasterManager::reconnect_loop() {
                 std::lock_guard<std::mutex> lock(mtx_);
                 finish_dial(node_id, fd, why);
             }
-        } catch (...) { throw; }
+            guard.ok();
+        } catch (const std::exception& e) {
+            guard.caught(e);
+        }
 
         // Sleep 100ms between iterations.
         std::this_thread::sleep_for(std::chrono::milliseconds(100));

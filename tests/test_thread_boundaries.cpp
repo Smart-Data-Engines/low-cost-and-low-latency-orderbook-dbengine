@@ -13,11 +13,13 @@
 // parser and this needs a paren match - and because the one place that had put a `try` inside its
 // body still left the statements before it and the mutex after it outside the guard.
 //
-// **The second rule, added when #112's last loop was closed.** The outer boundary stops the
-// process dying and leaves a subsystem that ends on its first exception, so the five loops where
-// stopping is not survivable each guard **one iteration at a time**. That set is named here, and
-// naming it is the point: a sixth such loop has to join the list or explain itself, where five
-// scattered `try`s say nothing about the one nobody wrote.
+// **The second rule, added when #112's last loop was closed and completed by #131.** The outer
+// boundary stops the process dying and leaves a subsystem that ends on its first exception, so
+// every loop in `src/` where stopping is not survivable guards **one iteration at a time** - four
+// closed one at a time in #112, one that had done so since before it, and the other seven together
+// through `LoopGuard`. The set is named here, and naming it is the point: a fourteenth such loop
+// has to join a list or explain itself, where thirteen scattered `try`s say nothing about the one
+// nobody wrote.
 //
 // **What this file therefore does not cover**, named rather than left to be discovered: it does not
 // check that the boundary is the *outermost* thing in the body, that the per-iteration `try` covers
@@ -251,19 +253,30 @@ TEST(ThreadBoundaries, EveryLoopInTheTreeIsEitherGuardedPerIterationOrRecorded) 
         {"ReplicationClient::run_loop",
          "this replica stops following its primary; guarded since before #112, around the connect "
          "and replay it retries"},
+        {"PeerRegistry::watch_loop",
+         "no new or moved peer is ever learned again, and this is the loop that runs the topology "
+         "callback, which in the mesh dials peers (#131)"},
+        {"MultiMasterManager::reconnect_loop",
+         "a dropped mesh link is never re-dialled; #95's and #97's work all lives here (#131)"},
+        {"AntiEntropyManager::loop",
+         "reconciliation stops, so divergence between masters is never repaired - the mechanism "
+         "#57 exists for (#131)"},
+        {"ShardRouter::watch_loop",
+         "the shard map goes stale and this client keeps routing by it (#131)"},
+        {"ShardCoordinator::watch_loop",
+         "shard ownership is never re-read (#131)"},
+        {"MetricsServer::run_loop",
+         "/metrics stops answering: monitoring goes dark while the engine is fine, which is the "
+         "same problem as the others from the other side (#131)"},
+        {"OrderbookPool::health_check_loop",
+         "a client pool stops noticing dead connections; the only one outside the server (#131)"},
     };
 
-    // Not guarded, and each one recorded rather than excused. #112 named four loops; derived from
-    // the tree the set whose death is not survivable is larger, and these seven are #131.
-    const std::vector<std::pair<std::string, std::string>> recorded = {
-        {"PeerRegistry::watch_loop",      "#131"},
-        {"MultiMasterManager::reconnect_loop", "#131"},
-        {"AntiEntropyManager::loop",      "#131"},
-        {"ShardRouter::watch_loop",       "#131"},
-        {"ShardCoordinator::watch_loop",  "#131"},
-        {"MetricsServer::run_loop",       "#131"},
-        {"OrderbookPool::health_check_loop", "#131"},
-    };
+    // Empty since #131, and it stays in the test rather than being deleted: this is where the next
+    // loop whose death is not survivable gets recorded if it is not guarded on the day it is
+    // written, and an empty list is a claim the forward direction below still checks - every loop
+    // in the tree has to appear in one of the two.
+    const std::vector<std::pair<std::string, std::string>> recorded = {};
 
     const std::vector<LoopFn> found = loop_functions();
     ASSERT_GE(found.size(), guarded.size() + recorded.size())

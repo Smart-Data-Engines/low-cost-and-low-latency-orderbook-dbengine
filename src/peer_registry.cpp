@@ -1,4 +1,5 @@
 #include "orderbook/peer_registry.hpp"
+#include "orderbook/loop_guard.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/logger.hpp"
 
@@ -559,6 +560,11 @@ int64_t PeerRegistry::lease_ttl_remaining() const {
 void PeerRegistry::watch_loop() {
     OB_LOG_DEBUG("peer_registry", "Watch loop started for node %u",
                  local_node_id_);
+    // One poll is the unit, and an abandoned one costs a second: the next poll reads the same
+    // prefix. Without this the thread ends and no new or moved peer is ever learned again - and
+    // this is the loop that runs `change_cb_`, which in the mesh dials peers, so the body reaches
+    // well past etcd.
+    LoopGuard guard{"peer_registry", "a topology poll", &registry_};
 
     while (running_.load(std::memory_order_acquire)) {
         try {
@@ -657,7 +663,10 @@ void PeerRegistry::watch_loop() {
                     change_cb_(peer_list);
                 }
             }
-        } catch (...) { throw; }
+            guard.ok();
+        } catch (const std::exception& e) {
+            guard.caught(e);
+        }
 
         // Poll every 1 second.
         for (int i = 0; i < 10 && running_.load(std::memory_order_acquire); ++i) {

@@ -340,7 +340,15 @@ target_link_libraries(orderbook_shard_map PUBLIC orderbook_core orderbook_logger
 
 # ── Shard router compiled library (client-side routing) ────────────────────────
 add_library(orderbook_shard_router STATIC src/shard_router.cpp)
-target_link_libraries(orderbook_shard_router PUBLIC orderbook_shard_map orderbook_coordinator orderbook_logger)
+# `orderbook_metrics` since #131, and it is the stated cost of one mechanism instead of two.
+# `LoopGuard` is header-only, so `caught()` is inlined here and names
+# `MetricsRegistry::increment_counter` even though this loop always passes a null registry -
+# it runs in the caller's process and the one that owns a registry is the server. The
+# alternative was a second hand-written boundary for the two client-side loops, which is the
+# drift `log_episode.hpp` exists to prevent. `orderbook_metrics` depends only on
+# `orderbook_core` and `orderbook_logger`, both of which this library already links, so the
+# dependency graph does not grow.
+target_link_libraries(orderbook_shard_router PUBLIC orderbook_shard_map orderbook_coordinator orderbook_logger orderbook_metrics)
 
 # ── Shard coordinator compiled library ──────────────────────────────────────────
 add_library(orderbook_shard_coordinator STATIC src/shard_coordinator.cpp)
@@ -451,7 +459,10 @@ target_link_libraries(orderbook_tcp_server_lib PUBLIC orderbook_engine orderbook
 
 # ── Native C++ client library ──────────────────────────────────────────────────
 add_library(orderbook_client STATIC src/client.cpp)
-target_link_libraries(orderbook_client PUBLIC orderbook_core orderbook_shard_router orderbook_auth orderbook_tls)
+# `orderbook_metrics` for the reason given above `orderbook_shard_router`: the pool's
+# health-check loop is guarded by the same header the server's loops use, and it passes a
+# null registry.
+target_link_libraries(orderbook_client PUBLIC orderbook_core orderbook_shard_router orderbook_auth orderbook_tls orderbook_metrics)
 
 option(OB_CLIENT_LZ4 "Enable optional LZ4 compression in orderbook_client" OFF)
 if(OB_CLIENT_LZ4)

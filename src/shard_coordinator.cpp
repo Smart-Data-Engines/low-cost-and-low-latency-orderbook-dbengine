@@ -1,6 +1,7 @@
 // ── ShardCoordinator — server-side shard management ──────────────────────────
 
 #include "orderbook/shard_coordinator.hpp"
+#include "orderbook/loop_guard.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/engine.hpp"
 #include "orderbook/logger.hpp"
@@ -264,6 +265,11 @@ void ShardCoordinator::deregister_shard() {
 void ShardCoordinator::watch_loop() {
     OB_LOG_INFO("shard_coord", "Watch loop started for shard=%s",
                 config_.shard_id.c_str());
+    // One pass is the unit, and it is the only one of the seven whose wait sits *inside* the guard:
+    // this loop naps between its two halves - the lease keepalive and the topology propagation -
+    // so a failing pass is still paced at two seconds. Without this the thread ends and shard
+    // ownership is never re-read.
+    LoopGuard guard{"shard_coord", "a shard-map poll", &engine_.registry()};
 
     while (running_.load(std::memory_order_acquire)) {
         try {
@@ -288,7 +294,10 @@ void ShardCoordinator::watch_loop() {
 
             // Read mm_peers for this shard from etcd and propagate to ShardMap
             propagate_mm_topology();
-        } catch (...) { throw; }
+            guard.ok();
+        } catch (const std::exception& e) {
+            guard.caught(e);
+        }
     }
 
     OB_LOG_INFO("shard_coord", "Watch loop stopped for shard=%s",

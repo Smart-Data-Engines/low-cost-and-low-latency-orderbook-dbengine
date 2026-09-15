@@ -1,4 +1,5 @@
 #include "orderbook/metrics_server.hpp"
+#include "orderbook/loop_guard.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/logger.hpp"
 
@@ -116,6 +117,22 @@ void MetricsServer::run_loop() {
     constexpr int kMaxEvents = 8;
     epoll_event events[kMaxEvents];
 
+    // Two things about this loop, and they are its own judgement rather than the shape the other
+    // six got (#131).
+    //
+    // The pass is safe to abandon: the only registration here is the listen socket and it is
+    // **level-triggered**, so a connection this pass drops is offered again on the next one - the
+    // opposite of the mesh and replication loops, whose `EPOLLET` registrations made an abandoned
+    // event unrecoverable. And there is no nap: the 200 ms `epoll_wait` timeout *is* the pacing, so
+    // a pass that throws every time retries five times a second rather than spinning.
+    //
+    // But the unit inside the pass is one **request**, and that is where the descriptor lives. See
+    // `handle_request`: it closed the socket on both of its own exits and on neither of the two
+    // paths that throw, so a failure there leaked a descriptor per request until EMFILE - and
+    // EMFILE on this thread is a metrics endpoint that stops answering, which is the failure this
+    // whole item is about arriving by a second road.
+    LoopGuard guard{"metrics", "serving a metrics request", &registry_};
+
     while (running_.load(std::memory_order_acquire)) {
         try {
             int n = ::epoll_wait(epoll_fd_, events, kMaxEvents, 200 /*ms timeout*/);
@@ -139,15 +156,28 @@ void MetricsServer::run_loop() {
                     handle_request(client_fd);
                 }
             }
-        } catch (...) { throw; }
+            guard.ok();
+        } catch (const std::exception& e) {
+            guard.caught(e);
+        }
     }
 }
 
 void MetricsServer::handle_request(int client_fd) {
+    // The descriptor is closed by leaving this function, however it is left. It used to be closed
+    // at the two `return`s below and nowhere else, which is correct for every exit the author
+    // wrote and wrong for the two that throw: `registry_.serialize()` builds a string of every
+    // metric, and the response concatenation builds another. On a box short of memory either is a
+    // `std::bad_alloc` through a function holding an open socket, and the leak is one descriptor
+    // per request until EMFILE. RAII makes that class impossible rather than caught once.
+    struct FdGuard {
+        int fd;
+        ~FdGuard() { if (fd >= 0) ::close(fd); }
+    } closer{client_fd};
+
     char buf[4096];
     ssize_t nread = ::recv(client_fd, buf, sizeof(buf) - 1, 0);
     if (nread <= 0) {
-        ::close(client_fd);
         return;
     }
     buf[nread] = '\0';
@@ -174,7 +204,6 @@ void MetricsServer::handle_request(int client_fd) {
 
     // Best-effort send — metrics endpoint is non-critical
     ::send(client_fd, response.data(), response.size(), MSG_NOSIGNAL);
-    ::close(client_fd);
 }
 
 bool MetricsServer::parse_http_request(const char* buf, size_t len, bool& is_metrics) {
