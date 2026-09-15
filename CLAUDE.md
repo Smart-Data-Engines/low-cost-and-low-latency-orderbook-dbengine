@@ -2593,6 +2593,25 @@ Learned the hard way. Check here before debugging.
     disagree with it, which is the answer the flagship product's `docs/requirements.md` took for the
     same shape.
 
+313. **A method that promises a side effect, does nothing, returns success and *logs that it
+    succeeded* is worse than an absent one.** `PeerRegistry::update_status()` said "Update this
+    node's status in etcd" in the header, wrote nothing, returned `true`, and emitted `Updating
+    status for node N to 'x'` at INFO — so the first caller would have got the line they were going
+    to grep for. Same family as #30's `cluster authentication enabled`, printed by a path that
+    enforced nothing. An absent method fails on the first attempt to use it; this one would have
+    failed silently and confirmed itself in the log. `update_position()` beside it was the one
+    somebody would reach for, because #72 wants exactly that. Both deleted (#134).
+
+314. **The checker that catches a dead *field* cannot catch a dead *function*, and the reason is
+    why one was not written.** `tests/test_field_usage.cpp` compares every member declared in
+    `include/orderbook/` against every occurrence, which works because a data member that nothing
+    mentions is unambiguously dead. For methods it would need a hand-written list of what counts as
+    internal rather than public API — `include/orderbook/` also holds the client API and the C API,
+    where a callerless public method is entirely legitimate — and a list written by hand is not
+    evidence about the code (#112's loops, #32's valueless flags, #117's metrics each paid for
+    that). So this class is caught by reading here, and #134 records that rather than papering
+    over it with a checker that would need an allowlist longer than the rule.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

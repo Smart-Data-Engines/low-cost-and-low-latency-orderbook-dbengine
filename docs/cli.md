@@ -650,8 +650,11 @@ echo "MM_CONFLICTS" | nc localhost 5555
 
 `MM_PEERS` answers a header line and then one line per peer: `node_id`, `address`, `status`,
 `hlc_timestamp`, `send_queue_bytes`. Two of those are worth reading carefully. `status` is
-`connected` or `disconnected` — the state of the link, not the `active`/`joining`/`leaving` a node
-publishes about itself in the peer registry. And `send_queue_bytes` is what this node has queued to
+`connected` or `disconnected` — the state of the link, not the `status` a node publishes about
+itself in the peer registry. That registry field only ever holds **`active`**: `register_self()` is
+its only writer and is called with that one string. Earlier revisions of this page named
+`joining` and `leaving` beside it; nothing has ever written either, and since the two stub methods
+that looked as though they might were deleted (#134), nothing can. And `send_queue_bytes` is what this node has queued to
 send that peer: zero on a healthy link, and still zero through the few megabytes the sender's
 socket buffer absorbs, so it is a backpressure signal rather than a measure of how far behind the
 peer is.

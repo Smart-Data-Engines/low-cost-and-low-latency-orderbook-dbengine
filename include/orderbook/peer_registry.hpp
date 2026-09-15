@@ -142,13 +142,6 @@ public:
     /// first one said.
     bool register_self(const std::string& status = "active");
 
-    /// Update this node's status in etcd.
-    bool update_status(const std::string& new_status);
-
-    /// Update this node's HLC and WAL position in etcd.
-    bool update_position(const HLCTimestamp& hlc, uint32_t wal_file,
-                         size_t wal_offset);
-
     /// Deregister this node from etcd.
     bool deregister_self();
 
@@ -181,9 +174,9 @@ private:
     int64_t lease_id_{0};
 
     /// What `register_self()` last wrote as this node's status, so a re-registration says the same
-    /// thing rather than a hardcoded default. `update_status()` is a stub that writes nothing to
-    /// etcd, so this is the only status the registry has ever held for us - which is why it is one
-    /// string and not a pair.
+    /// thing rather than a hardcoded default. `register_self()` is the only writer of this key
+    /// there has ever been, so this is the only status the registry has ever held for us - which is
+    /// why it is one string and not a pair.
     std::string registered_status_{"active"};
 
     mutable std::mutex mtx_;
@@ -214,10 +207,12 @@ private:
     LogEpisode lease_errors_;
 
     /// Whether the lease is currently *refusing* to refresh, which is a different condition from
-    /// the one above: it threw, against it said no. Both need loud-once, because both are usually
-    /// permanent — a lease etcd has forgotten is forgotten for ever, and `register_self()` runs
-    /// once (#132). Measured before this existed: eleven WARN lines in 33 s, one per interval,
-    /// unbounded (#133).
+    /// the one above: it threw, against it said no. Loud-once is still right, and the reason
+    /// changed with #132 rather than going away: of the three answers `read_self_key()` can give,
+    /// two leave the refusal **permanent** (the key is still there, or etcd cannot be reached) and
+    /// only `Absent` ends it — by granting a new lease, which is what the recovery line reports.
+    /// Measured before this existed: eleven WARN lines in 33 s, one per interval, unbounded
+    /// (#133).
     LogEpisode lease_refusals_;
 
     /// Whether this node's own entry is in the registry. **Three answers, not two**, for the
