@@ -2675,6 +2675,34 @@ Learned the hard way. Check here before debugging.
     exists to prevent. When a comment says a state is unreachable, find the input that would reach
     it and check that something bounds it.
 
+322. **A build directory that is behind under-reports the test count, and that count gets
+    published.** A full local `ctest -j1` printed `1094/1094` for a tree whose suite is **1098**:
+    the build had not registered four new tests, the run was green, and the number went into a
+    sentence about the tree. Three measurements reconcile it — CI's 1098, `ctest -N` listing 1100
+    (the two extra are the `DISABLED_` measurement harnesses, always), and a local rerun giving 1098
+    in 218.95 s. Pitfall 149 says to read the build's exit status rather than its output; this is the
+    case where the status is **zero** and the answer is still short. Any count that feeds the test
+    table comes from the run that measured the tree carrying it, which is what
+    `scripts/test_table.py` is for.
+
+323. **A verdict that lives in an exit code does not survive a pipe.** A check-polling loop run as
+    `watch.sh | head -3` died on SIGPIPE after three lines and the task reported **exit 0**, which
+    reads as "the checks settled"; `python3 scripts/check_roadmap.py | tail -1` reported `rc=0`
+    while the checker was in fact refusing a bare `#139` in new prose. Read the tool's own status
+    (`${PIPESTATUS[0]}`) or do not pipe it. This has now cost a `ctest` verdict, a roadmap checker
+    and a CI monitor, in that order.
+
+324. **A policy constant nothing pins is not the same as one pinned to a literal — bound it from
+    both sides instead.** Every expectation about #121's five-minute bound is written in terms of
+    `MM_MAX_CLOCK_SKEW_NS` on purpose: pinning the number itself would fail on any legitimate
+    retuning and teach a reader that the test is noise. What the fixtures do instead is bound it
+    from both ends — a `static_assert` requires `4 min < bound < 6 min` because the test's two skews
+    have to straddle it or it asserts nothing, two runtime guards require `1 min < bound < 1 h`, and
+    a unit expectation puts it under a year. So a widening large enough to change an answer **does
+    not compile**, and one small enough to compile changes nothing observable. That is why the
+    mutation table carries "widened to five and a half minutes" as a control that must **survive**:
+    a surviving mutation nobody explained is one the next reader assumes you missed.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

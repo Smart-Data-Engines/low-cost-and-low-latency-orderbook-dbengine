@@ -797,8 +797,7 @@ guarded on `CMAKE_CXX_COMPILER_ID STREQUAL "GNU"` now.
 `OB_ENABLE_COVERAGE`, runs the suite, and prints line, function and branch coverage into the job
 summary with a per-file breakdown attached as an artifact. Nothing leaves the repository: every badge
 on offer means sending reports from a public repository to a third-party service and holding an
-account there, which is a decision with an owner rather than a task, and it was decided against for
-now.
+account there, which is a decision with an owner rather than a task. It is answered below.
 
 **The first honest number**, and it is instructive next to the one it replaced:
 
@@ -816,6 +815,57 @@ drop does. Branches are deliberately not gated: 33% is too far from anything to 
 and a floor nobody can raise is a floor nobody respects. The job also gates three things that are not
 percentages — the tree builds with coverage, the suite passes under it, and the instrumentation still
 reaches the libraries, which is the part that failed silently for as long as the option existed.
+
+**The badge question, answered: no badge.** There are exactly two ways to put a percentage on
+this page and both were rejected on what they cost rather than on taste.
+
+A **third-party service** — Codecov, Coveralls, or any of them — means this repository uploading its
+reports to somebody else's account on every push, a token for that account living in a public
+repository's CI, and a badge on our front page that goes red when *their* infrastructure has a bad
+day. This tree has already paid that bill twice with CodeQL, where an infrastructure failure blocked
+merges exactly as effectively as a real finding. The second way is **CI writing the number itself**,
+through a shields.io endpoint backed by a gist or an orphan branch, which needs a workflow with
+write access — the one thing `docs/github-security.md` refuses everywhere else, and for a number
+rather than for a capability.
+
+What a badge would add is one figure. What already asserts the floor is the `coverage` job being
+**required**: it fails below its **58% line floor**, so the green CI badge at the top of `README.md`
+cannot be green on a tree below that floor. A percentage badge would therefore say *less* that is checkable than the
+badge already there, and more that is decorative.
+
+So the number is on the page instead, **with its denominator and a citation of the run that measured
+it** — 66.2% of 14,562 lines, from run 34953853236 on `d2929e4`. The denominator is not
+presentation: the table above is the argument for it, because "59.0%" was true of a tree where the
+instrumentation reached 6 of 34 source files, and a badge renders exactly the half of that sentence
+which was not the defect.
+
+**And the claim has a mechanism, because otherwise it is the kind that rots in one direction.**
+`scripts/check_coverage_claim.py` reads `FLOOR` out of the workflow and holds every floor stated in
+prose against it — `README.md`, `docs/github-security.md`, this page and `CLAUDE.md` — in the same
+both-directions shape as `check_contexts.py`, because a mechanism guarding one document is how the
+second one quietly learns a different number. It also holds the quoted figure to its own arithmetic:
+the percentage has to follow from the covered and total counts printed beside it, and it has to sit
+at or above the floor, since a citation of a run that would have failed the gate cannot be the run
+we cite. What it cannot prove is that the figure is current or that the cited run measured the cited
+tree; both are facts about a GitHub runner, which is why the run is named rather than summarised.
+
+Using it found two things reading it would not have. Anchored on the word "floor", its first run
+reported `README.md`'s **noise** floor for the comparative benchmark — "7% apart against a 21.2%
+floor" — as a false claim about coverage: two unrelated floors on one page, the same shape as `rds`
+matching "records". And skipping fenced blocks, which is right for a pasted job log, made the one
+page whose job is to be audited the one page not audited: `docs/github-security.md` states the floor
+inside its **Checklist**, fenced for monospace rather than because it quotes anything. Floors are
+therefore scanned everywhere and measured figures only outside fences, which is safe because neither
+floor shape is a shape the gate itself prints.
+
+Ten mutations, each with the verdict it is meant to give, and nine of them are refusals: the floor
+raised in the workflow only; changed in one document only; changed inside the fenced checklist; a
+percentage that no longer follows from its counts; a figure below the floor; the denominator
+dropped, leaving a bare percentage; `README.md` no longer stating the floor while other pages still
+do — the front page carries the CI badge, so it is the page that has to say what the badge refuses;
+the floor phrase removed from every document; and every phrasing of it removed, which is the row
+that proves the check cannot pass by finding nothing. The tenth is the control, and it survives: the
+prose around the number reworded.
 
 **Correction, from #83.** The line below said "697 tests clean under ASan+UBSan and under TSan", and
 this entry said so from the day the jobs went in. It was true of the test binaries and the server and

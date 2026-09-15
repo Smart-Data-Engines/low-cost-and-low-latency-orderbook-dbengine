@@ -30,6 +30,9 @@ jobs:
       - name: Check every metric written by name is registered
         run: python3 scripts/check_metrics.py
 
+      - name: What the documents say about coverage is what this workflow enforces
+        run: python3 scripts/check_coverage_claim.py
+
       - name: The ruleset still gates what the workflows produce
         # A warning in docs/github-security.md until this step, and the warning was already being
         # ignored: sanitizers (asan) and sanitizers (tsan) ran on every PR and gated nothing, and
