@@ -270,6 +270,57 @@ TEST(MmWireClock, AnHourInTheFutureOnTheWireIsRefusedAndTheClockDoesNotMove) {
     engine.close();
 }
 
+TEST(MmWireClock, TheVerdictIsTakenAgainstTheWallClockAndNotAgainstOurOwnHlc) {
+    // Which clock judges is the property that makes the outcome **stable across nodes**, and it is
+    // invisible to the two tests above because in both of them our HLC and our wall clock are the
+    // same number. This one separates them first.
+    //
+    // Written because the mutation "compare against `hlc()->current()`" survived on paper: absorb
+    // four minutes (inside the bound), then send six. Against the wall clock that is six minutes
+    // ahead and refused; against our freshly-moved HLC it is two, and accepted — and a rule that
+    // reads a value each node has its own copy of gives each node its own answer, which is how a
+    // clamp would have diverged the data.
+    const uint16_t port = g_port.fetch_add(1, std::memory_order_relaxed);
+    TempDir tmp("mm_wire_clock_which_");
+    ob::Engine engine(tmp.path, kNoAutoFlush, ob::FsyncPolicy::NONE, {}, {}, {}, {},
+                      mm_config(1, port));
+    engine.open();
+
+    MeshClient peer(port);
+    ASSERT_TRUE(peer.wait_for_bytes());
+    peer.send_handshake(7);
+    ASSERT_TRUE(eventually([&] {
+        for (const auto& p : engine.multi_master_manager()->peer_states()) {
+            if (p.node_id == 7 && p.handshake_done) return true;
+        }
+        return false;
+    }));
+
+    const uint64_t inside  = ob::wall_clock_ns() + 4 * 60'000'000'000ULL;   // four minutes
+    const uint64_t outside = ob::wall_clock_ns() + 6 * 60'000'000'000ULL;   // six
+    static_assert(ob::MM_MAX_CLOCK_SKEW_NS > 4 * 60'000'000'000ULL &&
+                  ob::MM_MAX_CLOCK_SKEW_NS < 6 * 60'000'000'000ULL,
+                  "this test's two skews must straddle the bound, or it asserts nothing");
+
+    peer.send_delta(7, 1, ob::HLCTimestamp{inside, 0, 7}, "WIRECLK", "EX", 111);
+    ASSERT_TRUE(eventually([&] { return engine.hlc()->current().physical_ns >= inside; }))
+        << "the four-minute record was refused, so the premise of this test does not hold";
+
+    const uint64_t refused_before =
+        engine.registry().counter_value("ob_mm_peer_dropped_clock_total");
+    peer.send_delta(7, 2, ob::HLCTimestamp{outside, 0, 7}, "WIRECLK", "EX", 222);
+
+    EXPECT_TRUE(eventually([&] {
+        return engine.registry().counter_value("ob_mm_peer_dropped_clock_total") > refused_before;
+    })) << "six minutes was accepted after four had been absorbed, so the verdict is being taken "
+        << "against this node's own HLC rather than against its wall clock — which would make the "
+        << "bound depend on what each node happened to absorb first";
+    EXPECT_LT(engine.hlc()->current().physical_ns, outside)
+        << "the six-minute value reached the clock anyway";
+
+    engine.close();
+}
+
 TEST(MmWireClock, AClockInsideTheBoundIsStillAbsorbedAndItsRecordApplied) {
     // The control, and it is what stops the bound above from being a blanket refusal. A node that
     // dropped every peer whose clock differed at all would pass the first test and be useless:
