@@ -317,6 +317,10 @@ target_compile_definitions(test_mm_epoll_identity
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 
+ob_add_engine_test(test_loop_guard
+    test_loop_guard.cpp
+)
+
 ob_add_engine_test(test_replication_io_boundary
     test_replication_io_boundary.cpp
 )
@@ -580,6 +584,9 @@ target_link_libraries(test_metrics_server
         GTest::gtest_main
         rapidcheck
         rapidcheck_gtest
+)
+target_compile_definitions(test_metrics_server
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 gtest_discover_tests(test_metrics_server PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 

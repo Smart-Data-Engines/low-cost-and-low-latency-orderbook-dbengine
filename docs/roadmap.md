@@ -2236,7 +2236,7 @@ Today's behaviour is pinned by a test, so whichever is chosen cannot land unnoti
   while being invisible to the registry — so the cluster works until the day something needs to
   look an address up, and then does not
 
-### 131. Seven more loops end on their first exception
+### 131. Seven more loops end on their first exception ✅
 
 Found by a mutation that **survived** while #112's last loop was being closed, which is the part
 worth recording.
@@ -2263,19 +2263,68 @@ plus `ReplicationClient::run_loop()`, which has done so since before that item, 
 | `MetricsServer::run_loop()` | `/metrics` stops answering: monitoring goes dark while the engine is fine, which is the same "every outward signal disagrees with reality" problem from the other side |
 | `OrderbookPool::health_check_loop()` | a client pool stops noticing dead connections; the only one of the seven outside the server |
 
-**Not fixed here, and the reason is #112's own rule**: each loop needs its own judgement about
-whether to continue, and seven judgements taken in one change are seven judgements nobody reviewed.
-Two of the seven are also not obviously the same answer — `MetricsServer` serves HTTP and could
-reasonably end a *connection* rather than an iteration, and the client pool is a library in somebody
-else's process.
+**Closed, and the seven judgements came out as one shape plus one exception.** Reading all seven
+gave the same answer six times: **one pass is the unit**, because none of them loses anything a
+later iteration will not redo. That is the difference from #112's mesh and replication loops, whose
+`EPOLLET` registrations made an abandoned event unrecoverable and forced a boundary per *event*.
+Here the topology watch re-polls the same prefix, the reconnect loop re-dials with the backoff it
+already claimed under the lock, anti-entropy re-compares the same version vectors, both shard
+watches re-read, and the client pool recomputes `primary_idx_` from scratch. An abandoned pass costs
+one interval, and that number is written beside each guard.
 
-What this item buys immediately is that the eighth is not invisible: the checker requires every loop
-in `src/` to be classified, in both directions, so a new loop has to join a list or explain itself
-and a row naming a function the tree no longer has fails too.
+**`MetricsServer` was the exception this item predicted, and it found a leak.** Its *pass* is the
+safest of the seven to abandon — the only registration is the listen socket and it is
+**level-triggered**, so a dropped connection is offered again — and it has no nap at all, because
+the 200 ms `epoll_wait` timeout is its pacing. But the unit *inside* the pass is one request, and
+that is where the descriptor lives: `handle_request` closed the socket at its two `return`s and on
+neither of the two paths that throw. `registry_.serialize()` builds a string of every metric and the
+response concatenation builds another; on a box short of memory either is a `std::bad_alloc` through
+a function holding an open socket, so the leak is one descriptor per failed request until EMFILE —
+**which is a metrics endpoint that stops answering, this item's own failure arriving by a second
+road**. Closed by scope now, which makes the class impossible rather than caught once.
 
-- Effort: M | Impact: seven subsystems that end quietly on their first exception, each leaving a
-  node that answers health checks. Cheaper per loop than #112's four were, because the mechanism and
-  the metric shape already exist
+**None of the seven has a throwing path today either, and that is established rather than assumed.**
+`anti_entropy.cpp`, `shard_router.cpp`, `shard_coordinator.cpp` and `metrics_server.cpp` contain no
+`throw` at all; the four in `multi_master.cpp` are all in `start()`; `PeerInfo::from_json` catches
+nlohmann's `parse_error` and type-checks **every** field before `get<>`; and both `std::stoi` calls
+in `shard_router.cpp` — the one place in the seven that parses a number out of an address the
+registry handed it — already sit inside `try`/`catch (...)`. What is left is `std::bad_alloc` from
+string growth and `std::system_error` from a mutex.
+
+**One mechanism, not seven copies, and one counter, not seven.** `include/orderbook/loop_guard.hpp`
+is the shape: `caught()` counts and says so loudly once, `ok()` closes the episode — and `ok()` is
+**unreachable from an iteration that threw**, which is what the mesh loop paid for with a log
+alternating ERROR / "handled again" for three failing records. Pacing stays with the caller, because
+these seven wait in three different ways and because #112 measured that a boundary can *create* a
+busy-spin. The four existing counters stay as they are: three were measured firing, and each asks an
+operator for a different thing. These seven all ask for the same thing — read the line, it names the
+loop — so `ob_loop_errors_total` covers them, and seven registered counters nothing can reach would
+have been seven flat zeros dressed as coverage (#117).
+
+**The registry is a pointer, and the two client-side loops pass null.** `ShardRouter` and
+`OrderbookPool` run in the caller's process; the one that owns a metrics registry is the server. The
+stated cost is that both libraries now link `orderbook_metrics`, because a header-only `caught()`
+names `increment_counter` even where it never calls it — taken against a second hand-written
+boundary, which is the drift `log_episode.hpp` exists to prevent. `orderbook_metrics` depends only
+on `orderbook_core` and `orderbook_logger`, which both of those already link, so the graph does not
+grow.
+
+**The eighth is not invisible**: the checker requires every loop in `src/` to be classified, in both
+directions, so a new loop has to join a list or explain itself and a row naming a function the tree
+no longer has fails too. The `recorded` list is empty now and **stays in the file** — it is where
+the next unguarded loop goes if it is not guarded on the day it is written.
+
+**Two of this item's own instruments were wrong first, and both cost real time.** The script that
+wrapped the seven bodies was given each region as its first and *last* line; the end of a loop body
+is a run of closing braces, so it matched the wrong `}` and wrapped six lines of a ninety-five-line
+poll while reporting success. It takes the line that *follows* the region now, which is unique prose
+in every one of the seven. And the first version of the descriptor test read to EOF — with the leak
+planted, the server never closed, so the test **hung** rather than failed: past ten minutes with no
+deadline, 250 s once the client had one. It reads a single response now and the same mutation dies
+in 6 s.
+
+- Effort: M | Impact: seven subsystems that ended quietly on their first exception, each leaving a
+  node that answers health checks — plus one descriptor leak the reading found on the way
 
 ### 130. A promotion that stops halfway leaves the node a replica of itself
 
@@ -6657,7 +6706,7 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #121, #130, #131, #132.** Every item above #58 is either marked closed or named on that
+**Open: #121, #130, #132.** Every item above #58 is either marked closed or named on that
 line — `scripts/check_roadmap.py` holds both directions — and items #1 to #58 are planned work
 nobody has built, not defects. Of the four, #121 is a question recorded for a decision rather than
 a defect, and **#37**'s remaining half waits on an external service. **#117**, **#118**, **#122** and **#123** are closed, and

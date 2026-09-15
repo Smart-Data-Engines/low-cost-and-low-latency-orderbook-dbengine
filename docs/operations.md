@@ -708,9 +708,9 @@ that loop would also overwrite the entry the test harness writes there.
 
 ### When a subsystem's loop keeps failing
 
-Six loops guard one iteration at a time, so an exception costs an iteration rather than the thread
-(#112). Five of them count what they caught, and the counter is the thing to alarm on, because
-nothing else outside the process changes when one of these fails:
+**Every loop in the engine guards one iteration at a time** (#112, #131), so an exception costs an
+iteration rather than the thread. The counter is the thing to alarm on, because nothing else outside
+the process changes when one of these fails:
 
 | counter | what stopped working while the node stayed up |
 |---|---|
@@ -719,16 +719,18 @@ nothing else outside the process changes when one of these fails:
 | `ob_mm_io_errors_total` | mesh events are being dropped — a peer's row can still say `connected` |
 | `ob_repl_io_errors_total` | replica connections, catch-ups or heartbeats are being dropped |
 | `ob_peer_lease_errors_total` | the lease above is not being refreshed |
+| `ob_loop_errors_total` | one of the other seven: the topology watch, the mesh reconnect loop, anti-entropy, either shard watch, the metrics server, or a client pool's health check. **The log line names which** — one counter rather than seven because all seven ask for the same thing, where each of the five above asks for something different |
 
 Each one's log is an **episode**: one `ERROR` when it starts, one `INFO` when it ends, and the
 repeats at `DEBUG`. Silence after the `ERROR` therefore means the condition is still there; the
-`INFO` is what says it went away. The last two have no path in this engine that is known to reach
-them — they are there so that the first one is visible rather than silent.
+`INFO` is what says it went away.
 
-Seven other loops in the engine do **not** have this yet, and what each one's death costs is listed
-in roadmap #131. Until they do, the symptom of one of them ending is the absence of something:
-no new peer learned, no dropped link re-dialled, no reconciliation, or `/metrics` not answering
-while everything else works.
+**The last two counters have no path in this engine that is known to reach them, and neither does
+`ob_loop_errors_total`.** They are there so that the *first* occurrence is visible rather than
+silent: before these boundaries existed, a thread that ended took its subsystem with it and nothing
+outside the process changed at all. Two of the seven — the shard router's watch and a client pool's
+health check — run in **your** process rather than the engine's, so they have no counter to feed and
+the log line is the whole report there.
 
 ## Loading history, and what its own timestamps change
 

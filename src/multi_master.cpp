@@ -7,6 +7,7 @@
 
 #include "orderbook/level_payload.hpp"
 #include "orderbook/multi_master.hpp"
+#include "orderbook/loop_guard.hpp"
 #include "orderbook/thread_boundary.hpp"
 
 #include "orderbook/crc32c.hpp"
@@ -2178,80 +2179,90 @@ void MultiMasterManager::schedule_reconnect(uint16_t node_id) {
 
 void MultiMasterManager::reconnect_loop() {
     OB_LOG_DEBUG("mm", "reconnect_loop started");
+    // One pass is the unit, and an abandoned one costs 100 ms plus whatever backoff it had already
+    // claimed under the lock - so a dial lost here is a dial the next pass makes, not one nobody
+    // makes. Without this the thread ends and a dropped mesh link is never re-dialled: #95's and
+    // #97's work all lives in this loop.
+    LoopGuard guard{"mm", "a reconnect pass", &engine_.registry()};
 
     while (running_.load(std::memory_order_acquire)) {
-        // Which peers are due, decided under the lock. The dials happen below it: the loop used to
-        // hold `mtx_` across a blocking `::connect()`, so one peer address that black-holes SYNs
-        // stopped the io loop and every client write on this node for the whole TCP timeout —
-        // measured at 135.7 s (#97).
-        std::vector<std::pair<uint16_t, std::string>> due;
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            auto now = std::chrono::steady_clock::now();
+        try {
+            // Which peers are due, decided under the lock. The dials happen below it: the loop used to
+            // hold `mtx_` across a blocking `::connect()`, so one peer address that black-holes SYNs
+            // stopped the io loop and every client write on this node for the whole TCP timeout —
+            // measured at 135.7 s (#97).
+            std::vector<std::pair<uint16_t, std::string>> due;
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                auto now = std::chrono::steady_clock::now();
 
-            // A connection we accepted and never identified is not a peer, and once it is down it
-            // cannot become one: the port it arrived on is the peer's ephemeral source port, so
-            // there is no address to dial and no node behind the record yet. Keeping it left one
-            // dead entry per refused inbound connection - and, because the dial below then had
-            // nothing to parse, put `Reconnect: invalid peer address:` in the log ten times a
-            // second for the rest of the process's life (#95). The peer that dialled us will dial
-            // again by itself; that is the only way this connection can come back.
-            //
-            // The io loop drops such a connection as soon as it sees the close. This pass is for
-            // the ones it cannot see - a handshake refused inside process_handshake() closes the
-            // descriptor without an event to follow.
-            for (auto it = pending_.begin(); it != pending_.end();) {
-                const PeerConnection& dead = it->second;
-                if (!dead.connected && dead.fd < 0) {
-                    OB_LOG_DEBUG("mm", "Dropping the record of inbound connection %llu, which "
-                                       "closed before its handshake named a node",
-                                 static_cast<unsigned long long>(it->first));
-                    it = pending_.erase(it);
-                } else {
-                    ++it;
+                // A connection we accepted and never identified is not a peer, and once it is down it
+                // cannot become one: the port it arrived on is the peer's ephemeral source port, so
+                // there is no address to dial and no node behind the record yet. Keeping it left one
+                // dead entry per refused inbound connection - and, because the dial below then had
+                // nothing to parse, put `Reconnect: invalid peer address:` in the log ten times a
+                // second for the rest of the process's life (#95). The peer that dialled us will dial
+                // again by itself; that is the only way this connection can come back.
+                //
+                // The io loop drops such a connection as soon as it sees the close. This pass is for
+                // the ones it cannot see - a handshake refused inside process_handshake() closes the
+                // descriptor without an event to follow.
+                for (auto it = pending_.begin(); it != pending_.end();) {
+                    const PeerConnection& dead = it->second;
+                    if (!dead.connected && dead.fd < 0) {
+                        OB_LOG_DEBUG("mm", "Dropping the record of inbound connection %llu, which "
+                                           "closed before its handshake named a node",
+                                     static_cast<unsigned long long>(it->first));
+                        it = pending_.erase(it);
+                    } else {
+                        ++it;
+                    }
                 }
-            }
 
-            for (auto& [nid, peer] : peers_) {
-                if (peer.connected) continue;
-                if (now < peer.next_reconnect_time) continue;
+                for (auto& [nid, peer] : peers_) {
+                    if (peer.connected) continue;
+                    if (now < peer.next_reconnect_time) continue;
 
-                // Every failure branch in this loop has to move next_reconnect_time. This one did
-                // not, so a permanent failure was retried at loop frequency and said so in the log
-                // at the same rate; backoff is what makes a failure that will not clear legible.
-                if (peer.address.empty()) {
+                    // Every failure branch in this loop has to move next_reconnect_time. This one did
+                    // not, so a permanent failure was retried at loop frequency and said so in the log
+                    // at the same rate; backoff is what makes a failure that will not clear legible.
+                    if (peer.address.empty()) {
+                        const uint32_t delay_ms = peer.backoff.next_delay_ms();
+                        peer.next_reconnect_time = now + std::chrono::milliseconds(delay_ms);
+                        OB_LOG_DEBUG("mm", "Reconnect: peer %u advertises no address (it is not in the "
+                                           "registry), so it has to dial us; next look in %u ms",
+                                     nid, delay_ms);
+                        continue;
+                    }
+
+                    // The attempt is claimed here rather than after the dial, because the lock is about
+                    // to be released: without this the next pass, 100 ms later, would start a second
+                    // connection to a peer this one is still dialling.
                     const uint32_t delay_ms = peer.backoff.next_delay_ms();
                     peer.next_reconnect_time = now + std::chrono::milliseconds(delay_ms);
-                    OB_LOG_DEBUG("mm", "Reconnect: peer %u advertises no address (it is not in the "
-                                       "registry), so it has to dial us; next look in %u ms",
-                                 nid, delay_ms);
-                    continue;
+                    due.emplace_back(nid, peer.address);
                 }
 
-                // The attempt is claimed here rather than after the dial, because the lock is about
-                // to be released: without this the next pass, 100 ms later, would start a second
-                // connection to a peer this one is still dialling.
-                const uint32_t delay_ms = peer.backoff.next_delay_ms();
-                peer.next_reconnect_time = now + std::chrono::milliseconds(delay_ms);
-                due.emplace_back(nid, peer.address);
+                // Both mesh peer gauges, recomputed from the peer table once per pass rather than at
+                // the places that change a peer's state. That is what makes them right: the tick is the
+                // mechanism and the call sites are only latency: whichever of the twenty-odd places
+                // that move a peer's state ran since the last pass - including accept(), which none of
+                // the old inline copies covered - the gauges are right again within 100 ms.
+                publish_peer_gauges();
             }
 
-            // Both mesh peer gauges, recomputed from the peer table once per pass rather than at
-            // the places that change a peer's state. That is what makes them right: the tick is the
-            // mechanism and the call sites are only latency: whichever of the twenty-odd places
-            // that move a peer's state ran since the last pass - including accept(), which none of
-            // the old inline copies covered - the gauges are right again within 100 ms.
-            publish_peer_gauges();
-        }
+            for (const auto& [node_id, address] : due) {
+                if (!running_.load(std::memory_order_acquire)) break;
 
-        for (const auto& [node_id, address] : due) {
-            if (!running_.load(std::memory_order_acquire)) break;
+                std::string why;
+                const int fd = dial_address(address, MM_CONNECT_TIMEOUT_MS, why);
 
-            std::string why;
-            const int fd = dial_address(address, MM_CONNECT_TIMEOUT_MS, why);
-
-            std::lock_guard<std::mutex> lock(mtx_);
-            finish_dial(node_id, fd, why);
+                std::lock_guard<std::mutex> lock(mtx_);
+                finish_dial(node_id, fd, why);
+            }
+            guard.ok();
+        } catch (const std::exception& e) {
+            guard.caught(e);
         }
 
         // Sleep 100ms between iterations.

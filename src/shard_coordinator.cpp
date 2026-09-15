@@ -1,6 +1,7 @@
 // ── ShardCoordinator — server-side shard management ──────────────────────────
 
 #include "orderbook/shard_coordinator.hpp"
+#include "orderbook/loop_guard.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/engine.hpp"
 #include "orderbook/logger.hpp"
@@ -264,29 +265,39 @@ void ShardCoordinator::deregister_shard() {
 void ShardCoordinator::watch_loop() {
     OB_LOG_INFO("shard_coord", "Watch loop started for shard=%s",
                 config_.shard_id.c_str());
+    // One pass is the unit, and it is the only one of the seven whose wait sits *inside* the guard:
+    // this loop naps between its two halves - the lease keepalive and the topology propagation -
+    // so a failing pass is still paced at two seconds. Without this the thread ends and shard
+    // ownership is never re-read.
+    LoopGuard guard{"shard_coord", "a shard-map poll", &engine_.registry()};
 
     while (running_.load(std::memory_order_acquire)) {
-        // Keep-alive for the lease
-        if (coordinator_ && lease_id_ != 0) {
-            coordinator_->refresh_lease(lease_id_);
+        try {
+            // Keep-alive for the lease
+            if (coordinator_ && lease_id_ != 0) {
+                coordinator_->refresh_lease(lease_id_);
+            }
+
+            // Poll for shard map changes
+            // In a production system, this would use etcd watch API.
+            // Here we use periodic polling with sleep.
+            // The watch interval is ~2 seconds.
+            for (int i = 0; i < 20 && running_.load(std::memory_order_acquire); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+
+            if (!running_.load(std::memory_order_acquire)) break;
+
+            // Try to read updated shard map from etcd and propagate mm_peers topology
+            OB_LOG_DEBUG("shard_coord", "Watch loop: checking for shard map updates, shard=%s",
+                         config_.shard_id.c_str());
+
+            // Read mm_peers for this shard from etcd and propagate to ShardMap
+            propagate_mm_topology();
+            guard.ok();
+        } catch (const std::exception& e) {
+            guard.caught(e);
         }
-
-        // Poll for shard map changes
-        // In a production system, this would use etcd watch API.
-        // Here we use periodic polling with sleep.
-        // The watch interval is ~2 seconds.
-        for (int i = 0; i < 20 && running_.load(std::memory_order_acquire); ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-
-        if (!running_.load(std::memory_order_acquire)) break;
-
-        // Try to read updated shard map from etcd and propagate mm_peers topology
-        OB_LOG_DEBUG("shard_coord", "Watch loop: checking for shard map updates, shard=%s",
-                     config_.shard_id.c_str());
-
-        // Read mm_peers for this shard from etcd and propagate to ShardMap
-        propagate_mm_topology();
     }
 
     OB_LOG_INFO("shard_coord", "Watch loop stopped for shard=%s",

@@ -7,6 +7,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <system_error>
+#include <sstream>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -48,6 +51,15 @@ static int connect_to(uint16_t port) {
         ::close(fd);
         return -1;
     }
+
+    // A receive deadline, because `http_exchange` below reads until EOF and the server closing its
+    // end is the *thing under test* in `FiftyRequestsDoNotLeakDescriptors`. Without this, a server
+    // that keeps the socket open makes that test **hang** rather than fail — measured: the leak
+    // mutation ran past ten minutes instead of reporting fifty stranded descriptors. A test that
+    // loses what it guards has to fail, not wait (#131).
+    timeval deadline{};
+    deadline.tv_sec = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &deadline, sizeof(deadline));
     return fd;
 }
 
@@ -295,4 +307,123 @@ TEST(MetricsServerHttp, GetOtherPathReturns404) {
     server.stop();
 
     EXPECT_NE(response.find("HTTP/1.1 404 Not Found"), std::string::npos);
+}
+
+// ── The accepted descriptor, which is where #131 found a leak ────────────────
+//
+// `handle_request` closed the socket at each of its own two exits and on neither of the two paths
+// that throw: `registry_.serialize()` builds a string of every metric and the response
+// concatenation builds another, so on a box short of memory either is a `std::bad_alloc` through a
+// function holding an open socket. One descriptor per request until EMFILE, and EMFILE on this
+// thread is a metrics endpoint that stops answering - the failure #131 is about, arriving by a
+// second road.
+//
+// The two tests below are what can be checked from outside and what cannot. **The throwing path
+// cannot be driven**: nothing in this process can make `serialize()` fail on demand, and a knob to
+// make it fail would be a knob nothing turns in production. So the behavioural test pins the paths
+// a test can reach, and the static one pins the mechanism that extends the guarantee to the paths
+// it cannot: a scope guard rather than a `close()` at each exit.
+
+namespace {
+
+/// How many descriptors this process holds. `/proc/self/fd` is the only answer that counts the
+/// ones nobody is tracking, which is the point of the question.
+size_t open_descriptors() {
+    size_t n = 0;
+    std::error_code ec;
+    for (auto it = std::filesystem::directory_iterator("/proc/self/fd", ec);
+         !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+        ++n;
+    }
+    return n;
+}
+
+std::string read_file_text(const std::string& path) {
+    std::ifstream in(path);
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+}  // namespace
+
+TEST(MetricsServerHttp, FiftyRequestsDoNotLeakDescriptors) {
+    ob::MetricsRegistry registry;
+    registry.increment_counter("ob_total_inserts", 1);
+
+    uint16_t port = find_free_port();
+    ASSERT_GT(port, 0);
+
+    ob::MetricsServer server(port, registry);
+    server.start();
+    ASSERT_TRUE(server.is_running());
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // One request first, so the count below is taken after every lazy allocation this path makes:
+    // measuring from a cold server would attribute the epoll instance and the listen socket to the
+    // requests.
+    {
+        int fd = connect_to(port);
+        ASSERT_GE(fd, 0);
+        (void)http_exchange(fd, "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        ::close(fd);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const size_t before = open_descriptors();
+
+    // One `recv` per request rather than `http_exchange`'s read-to-EOF, and that is the whole
+    // reason this loop is fast. A server that keeps the socket open is exactly the defect here, so
+    // waiting for it to close would make this test measure its own patience: with the leak planted
+    // and a five-second client deadline it took **250 s to fail** instead of reporting fifty
+    // stranded descriptors. The status line is enough to know the request was served, and the
+    // descriptor count below is what knows about the leak.
+    const std::string request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    for (int i = 0; i < 50; ++i) {
+        int fd = connect_to(port);
+        ASSERT_GE(fd, 0) << "connect failed on request " << i
+                         << ", which is what running out of descriptors looks like from here";
+        ASSERT_GT(::send(fd, request.data(), request.size(), 0), 0);
+        char head[64] = {};
+        const ssize_t n = ::recv(fd, head, sizeof(head) - 1, 0);
+        ::close(fd);
+        ASSERT_GT(n, 0) << "request " << i << " went unanswered";
+        ASSERT_NE(std::string(head, static_cast<size_t>(n)).find("HTTP/1.1 200 OK"),
+                  std::string::npos)
+            << "request " << i << " was not answered with 200";
+    }
+
+    // The server closes its end after answering, so its descriptors have to be back where they
+    // were. A leak of one per request would be fifty here.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const size_t after = open_descriptors();
+    server.stop();
+
+    EXPECT_LE(after, before) << "the process holds " << after << " descriptors after fifty "
+                             << "requests against " << before << " before them, so the metrics "
+                             << "server is keeping the sockets it answered on";
+}
+
+TEST(MetricsServerHttp, TheAcceptedDescriptorIsClosedByScopeNotByEachExit) {
+    const std::string src = read_file_text(std::string(OB_SOURCE_DIR) + "/src/metrics_server.cpp");
+    ASSERT_FALSE(src.empty()) << "could not read src/metrics_server.cpp; this check would pass by "
+                                 "finding nothing";
+
+    // No bare close of the accepted descriptor anywhere: every `return` that used to carry one is
+    // a path the author remembered, and the two that throw are the paths nobody writes.
+    EXPECT_EQ(src.find("::close(client_fd)"), std::string::npos)
+        << "src/metrics_server.cpp closes the accepted descriptor explicitly. That is correct for "
+           "every exit somebody wrote and wrong for the two that throw; the leak is one descriptor "
+           "per failed request until EMFILE (#131)";
+
+    // And something owns it. Anchored on the destructor rather than on a name or a comment, because
+    // a check anchored on prose makes the prose load-bearing (#128).
+    const std::size_t at = src.find("void MetricsServer::handle_request(int client_fd) {");
+    ASSERT_NE(at, std::string::npos) << "handle_request has moved; fix this row rather than "
+                                        "deleting it";
+    const std::size_t end = src.find("\n}\n", at);
+    ASSERT_NE(end, std::string::npos);
+    const std::string body = src.substr(at, end - at);
+    EXPECT_NE(body.find("~"), std::string::npos)
+        << "nothing in handle_request has a destructor, so the accepted descriptor is owned by "
+           "nobody and leaks on any path that throws";
 }
