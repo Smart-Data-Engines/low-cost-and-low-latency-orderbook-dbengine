@@ -2519,6 +2519,37 @@ Learned the hard way. Check here before debugging.
     is bounded by a `uint16_t`, and the TLS context is built before the thread starts. Four
     sentences, each checkable — which is a different claim from "I did not find one".
 
+303. **A script that wraps a code region must be given the line *after* it, not its last line.** The
+    end of a loop body is a run of closing braces, so an anchor on one of those matched the wrong
+    `}`: the wrapper reported success after wrapping six lines of a ninety-five-line poll. The line
+    that follows a region is unique prose; the line that ends it is punctuation shared with every
+    other block in the file.
+
+304. **A boundary is not a substitute for owning a resource.** `MetricsServer::handle_request`
+    closed its accepted socket at each of its two `return`s and at neither of the two paths that
+    throw, so wrapping the loop around it would have *counted* a descriptor leak rather than
+    prevented one — one fd per failed request until EMFILE, which is the same metrics endpoint going
+    dark that the boundary was being added to prevent. Ask what the abandoned iteration was holding.
+
+305. **A test whose premise is "the server might not close the socket" must not read to EOF.** The
+    first version of the leak test hung instead of failing: past ten minutes with no client
+    deadline, then 250 s to fail with a five-second one. Reading a single response instead kills the
+    same mutation in 6 s. Same family as the alarm on the SDK's silent-socket tests — a test that
+    loses what it guards has to fail, not wait.
+
+306. **A mutation harness must restore the sources *and rebuild*, or the next thing to use that
+    build directory runs the last mutant.** The harness restored seven files and left the mutated
+    `test_thread_boundaries` binary in place; the full `ctest` after it reported a failure naming a
+    loop the source classifies correctly. Third variant of the stale-artefact pitfall in this
+    repository, and the tell was the same: the message described a tree that does not exist.
+
+307. **A metric written from a header is invisible to a checker that scans `.cpp` files.**
+    `check_metrics.py` called `ob_loop_errors_total` dead because `LoopGuard` is header-only — its
+    premise, "a write lives in a translation unit", was true of every writer until one of them was
+    shared by seven. It scans `include/` now. The pair that says the forward half is load-bearing:
+    a header writing an unregistered name is caught, and the same mutation with `include/` dropped
+    from that scan survives.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2627,17 +2658,23 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   than from a list — hand-counting gave eleven. A joinable thread whose body throws calls
   `std::terminate`, so an `ENOSPC` on the flush thread's WAL write used to abort the whole node in a
   crash loop while the client-facing path handled the same condition correctly.
-- **Six loops also guard one iteration at a time, and the set is derived rather than listed**
-  (#112). `Engine::flush_loop`, `FailoverManager::monitor_loop`, `MultiMasterManager::io_loop`,
-  `ReplicationManager::run_loop`, `PeerRegistry::lease_loop` and `ReplicationClient::run_loop`; the
-  first five each count what they caught and log loud-once. `src/` has **thirteen** loop functions,
-  so **seven** still end on their first exception and are #131 with what each one's death costs —
-  a hand-written list of four survived a mutation that deleted a row from it, which is why
-  `tests/test_thread_boundaries.cpp` now derives the set from the tree and checks both directions.
-  Two things worth knowing before adding the eighth: the loop whose epoll timeout is **zero** while
+- **Every loop in `src/` guards one iteration at a time, and the set is derived rather than listed**
+  (#112, #131). Thirteen loop functions: six were closed one at a time — `Engine::flush_loop`,
+  `FailoverManager::monitor_loop`, `MultiMasterManager::io_loop`, `ReplicationManager::run_loop`,
+  `PeerRegistry::lease_loop`, and `ReplicationClient::run_loop` which had done so since before
+  #112 — and the other seven together through `LoopGuard`
+  (`include/orderbook/loop_guard.hpp`). A hand-written list of four survived a mutation that
+  deleted a row from it, which is why `tests/test_thread_boundaries.cpp` derives the set from the
+  tree and checks both directions; a fourteenth loop has to join a list or explain itself.
+  Four things worth knowing before writing that loop. The unit is **one pass** unless an abandoned
+  iteration loses something no later one redoes — which in this tree means `EPOLLET`, and is why
+  the mesh and replication loops guard per *event*. The loop whose epoll timeout is **zero** while
   a catch-up cursor has queue space is `ReplicationManager::run_loop` and not the mesh `io_loop`
-  (which waits 500 ms), and giving that loop a boundary **created** a spin — `wait_ms` outlives a
-  pass, so the failure path has to go through `replication_wait_ms()` like the idle path.
+  (which waits 500 ms). Giving that loop a boundary **created** a spin — `wait_ms` outlives a pass,
+  so the failure path goes through `replication_wait_ms()` like the idle path. And a boundary is not
+  a substitute for owning a resource: `MetricsServer::handle_request` closed its socket at each
+  `return` and at neither path that throws, so the guard around it would have counted a leak rather
+  than prevented one; the descriptor is closed by scope now.
 - **A mesh link is breakable from the harness, and the proxy that does it needs no engine change**
   (#54 stage C). `tests/integration/mesh_proxy.py` sits between two peers;
   `ClusterManager.redirect_peer()` puts it there by overwriting the address
