@@ -417,24 +417,6 @@ bool PeerRegistry::register_self(const std::string& status) {
     return true;
 }
 
-bool PeerRegistry::update_status(const std::string& new_status) {
-    OB_LOG_INFO("peer_registry", "Updating status for node %u to '%s'",
-                local_node_id_, new_status.c_str());
-    // In a full implementation this would PUT the updated PeerInfo to etcd.
-    return true;
-}
-
-bool PeerRegistry::update_position(const HLCTimestamp& hlc, uint32_t wal_file,
-                                   size_t wal_offset) {
-    OB_LOG_DEBUG("peer_registry",
-                 "Updating position for node %u: hlc={%lu,%u,%u} wal={%u,%zu}",
-                 local_node_id_,
-                 static_cast<unsigned long>(hlc.physical_ns),
-                 hlc.logical, hlc.node_id,
-                 wal_file, wal_offset);
-    return true;
-}
-
 bool PeerRegistry::deregister_self() {
     OB_LOG_INFO("peer_registry", "Deregistering node %u", local_node_id_);
     stop_watch();

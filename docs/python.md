@@ -308,9 +308,11 @@ Returns a list of dicts with keys:
 - `node_id` (int) — peer node identifier
 - `address` (str) — replication address (host:port)
 - `status` (str) — `"connected"` or `"disconnected"`, the state of the link to that peer. Earlier
-  releases of this page documented `"active"`, `"joining"` and `"leaving"` here; that is the peer
-  registry's vocabulary in etcd and this column has never carried it, so a test for `"active"` is
-  a test for a value the server does not send (#118)
+  releases of this page documented `"active"`, `"joining"` and `"leaving"` here; those belong to the
+  peer registry in etcd and this column has never carried them, so a test for `"active"` is a test
+  for a value the server does not send (#118). And of those three the registry only ever holds
+  `"active"` — the two methods that looked as though they could set the others wrote nothing and
+  are deleted (#134)
 - `hlc_timestamp` (str) — last known HLC timestamp
 - `send_queue_bytes` (int) — bytes this node currently has queued to send to that peer. Zero on a
   healthy link, and still zero through the few megabytes the sender's socket buffer absorbs, so it

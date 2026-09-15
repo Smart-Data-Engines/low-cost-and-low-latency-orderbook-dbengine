@@ -2229,7 +2229,7 @@ fixing this item, not part of filing it. The measurement above is reproducible f
   **never** forms if the *first* endpoint is the one that is down, while every other etcd-backed
   mechanism in the node behaves correctly and #132's recovery cannot see the condition
 
-### 134. Two registry methods claim to write to etcd, write nothing, and return success
+### 134. Two registry methods claim to write to etcd, write nothing, and return success ✅
 
 Found while giving #132 its `registered_status_`, by asking the narrow question "what else ever
 writes this node's status?" and getting the answer **nothing**.
@@ -2242,44 +2242,71 @@ bool PeerRegistry::update_status(const std::string& new_status) {
 }
 ```
 
-`update_position(hlc, wal_file, wal_offset)` has the same shape one function below, `return true`
-and no etcd, and — worse — **no comment saying so**. Neither has a caller anywhere in the tree, and
-neither has a test.
+`update_position(hlc, wal_file, wal_offset)` had the same shape one function below, `return true`
+and no etcd, and — worse — **no comment saying so**. Neither had a caller anywhere in the tree,
+neither had a test, and neither was mentioned in any document (checked across every file, not three
+extensions).
 
-**The header is where this does its damage**, because that is what a caller reads: *"Update this
+**The header is where this did its damage**, because that is what a caller reads: *"Update this
 node's status in etcd"* and *"Update this node's HLC and WAL position in etcd"*, sitting directly
 under `register_self()`, which says "with lease" and means it. Three promises, one kept.
 
-**Why it is worse than an absent method, and this is the part worth keeping.** `update_status()`
-**logs at INFO that it did the thing**. The first caller therefore gets a line confirming a change
-that did not happen — and this repository has already paid for that exact shape once, in #30's
-series B, where `cluster authentication enabled` was printed by a path that enforced nothing: an
-operator greps for precisely that line to confirm precisely that guarantee. A method that returned
-`false`, or did not exist, would be found on the first attempt to use it.
+**Why it was worse than an absent method, and this is the part worth keeping.** `update_status()`
+**logged at INFO that it did the thing**. The first caller would therefore have got a line
+confirming a change that did not happen — and this repository has already paid for that exact shape
+once, in #30's series B, where `cluster authentication enabled` was printed by a path that enforced
+nothing: an operator greps for precisely that line to confirm precisely that guarantee. A method
+that returned `false`, or did not exist, is found on the first attempt to use it.
 
-**And `update_position()` is the one somebody will reach for.** #72 wants peer positions published
-under a lease so election deference can tell a lagging replica from a dead one, and #118 measured
-what the registry actually holds: `wal_file_index` and `wal_byte_offset` are written **once**, by
-`register_self()`, so every peer's view of every other peer's position is frozen at handshake. A
-future implementer asking "is there a place to publish positions?" finds a method whose name, whose
-signature and whose documentation all say yes, and which returns `true` without doing it.
+**And `update_position()` was the one somebody would have reached for.** #72 wants peer positions
+published under a lease so election deference can tell a lagging replica from a dead one, and #118
+measured what the registry actually holds: `wal_file_index` and `wal_byte_offset` are written
+**once**, by `register_self()`, so every peer's view of every other peer's position is frozen at
+handshake. A future implementer asking "is there a place to publish positions?" would have found a
+method whose name, whose signature and whose documentation all said yes, and which returned `true`
+without doing it.
 
-This is the **seventh** instance in this workspace of a thing whose value never reaches anybody —
+This was the **seventh** instance in this workspace of a thing whose value never reaches anybody —
 after `provisional`, `basis`, `in_use`, `key_id`, `partition_by` and #104's
-`adopted_primary_address_` — and the second with no behavioural symptom at all, because there is no
-caller to have a symptom. `tests/test_field_usage.cpp` from #104 catches the *field* shape; it
-cannot see this one, because these are functions and the unread thing is their effect.
+`adopted_primary_address_` — and the second with no behavioural symptom at all, because there was no
+caller to have one.
 
-**Three answers.** Delete both, and let the day someone needs one be the day it is written — which
-is the answer #104 took for its field, and which costs nothing today. Implement them, which is real
-work in `update_position()`'s case and is #72's, not this item's. Or make them **refuse**, which
-keeps the name findable and is the only option that leaves a caller better off than deleting does —
-at the price of a method whose whole body is an apology. Whichever is chosen, the header's claim
-about etcd has to go with it.
+**Both are deleted, which is the answer #104 took for its field**: the day someone needs one is the
+day it is written, and writing `update_position()` is #72's work rather than this item's. The
+header's claim about etcd went with them, and so did the sentence in `registered_status_`'s comment
+that cited `update_status()` as the reason one string is enough — the reason is now simply that
+`register_self()` is the only writer there has ever been.
 
-- Effort: S to delete, M to refuse with tests, L to implement | Impact: latent — nothing calls
-  either today, so this costs the first caller rather than the cluster, and it costs them a log line
-  that says the write happened
+**No mutation table, and the reason is the interesting half: this change is a deletion, and the
+mechanism that would catch a re-introduction is worse than the gap.** `tests/test_field_usage.cpp`
+from #104 catches the *field* shape by comparing every member against every occurrence; it cannot
+see this one, because these are functions and the unread thing was their **effect**. A checker for
+"a method with no caller" cannot be turned on here without a hand-written list of what counts as
+internal rather than public API — `include/orderbook/` also holds the client API and the C API,
+where a callerless public method is entirely legitimate. A list written by hand is not evidence
+about the code, which this repository has now paid for three times (#112's loops, #32's valueless
+flags, #117's metrics), so the honest state is: **this class of defect is caught by reading here,
+and that is recorded rather than papered over.**
+
+**Two more things came out of the deletion, and the second is a fourth instance of the same shape
+as the three #132 corrected.** First, `PeerInfo::status` can now hold exactly one value: `active`.
+`register_self()` is its only writer and its only call site passes that string, so two client
+documents naming `joining` and `leaving` beside it were describing a vocabulary nothing has ever
+written and nothing can now — both say so. The field itself is **left alone deliberately**:
+`PeerInfo::from_json` requires the key, so dropping it is a change to a document two nodes exchange,
+for a constant that costs nothing. Written down so the next reader does not "finish the job"
+unsafely.
+
+Second, a comment beside `lease_refusals_` still argued that both loud-once conditions are usually
+permanent "and `register_self()` runs once (#132)" — a sentence #132's own fix had made false, in the
+file that fix edited. The reason changed rather than going away, which is why the comment is worth
+having: of the three answers `read_self_key()` gives, two leave the refusal permanent and only
+`Absent` ends it. **Four stale justifications from one change, every one of them naming a fact that
+became false while its conclusion stayed right** — which is the whole difficulty, because nothing
+they claim will ever fail.
+
+- Effort: S | Impact: was latent — nothing called either, so it would have cost the first caller
+  rather than the cluster, and it would have cost them a log line saying the write happened
 
 ### 133. A lease that etcd has forgotten is reported once per refresh interval, for ever ✅
 
@@ -6929,9 +6956,9 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #121, #130, #134, #135.** Every item above #58 is either marked closed or named on that
+**Open: #121, #130, #135.** Every item above #58 is either marked closed or named on that
 line — `scripts/check_roadmap.py` holds both directions — and items #1 to #58 are planned work
-nobody has built, not defects. Of the four, #121 is a question recorded for a decision rather than
+nobody has built, not defects. Of the three, #121 is a question recorded for a decision rather than
 a defect, and **#37**'s remaining half waits on an external service. **#117**, **#118**, **#122** and **#123** are closed, and
 together they are one investigation that started with five registered
 metrics nothing wrote and ended four items later in the WAL's own arithmetic. Every lag this engine
@@ -6994,12 +7021,12 @@ hand-written list, and deleting a row from it left the rule covering less while 
 Derived from the tree, `src/` has thirteen loop functions and **seven** still end on their first
 exception.
 
-**#134** was filed while #132 was being written, by asking the narrow question "what else ever
-writes this node's status?" and getting the answer **nothing**: two `PeerRegistry` methods whose
-headers promise etcd write nothing, return `true`, and in one case **log at INFO that they did it**.
-Nothing calls either, so it costs the first caller rather than the cluster — the seventh instance in
-this workspace of a value that never reaches anybody, and the second with no behavioural symptom,
-because there is no caller to have one.
+**#134 is closed.** It was filed while #132 was being written, by asking the narrow question "what
+else ever writes this node's status?" and getting the answer **nothing**: two `PeerRegistry` methods
+whose headers promised etcd wrote nothing, returned `true`, and in one case **logged at INFO that
+they had done it**. Both are deleted — the answer #104 took for its field — and the write-up records
+why no checker guards the shape: one would need a hand-written list of what counts as internal
+rather than public API, and a list written by hand is not evidence about the code.
 
 **#135** came out of the same question one step further on: #132's read was the **second** of three
 places in `PeerRegistry` to hardcode `endpoints[0]`, while the coordinator client beside it talks to
