@@ -14,6 +14,7 @@
 // Requirements: 1.2, 1.6, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6
 
 #include "orderbook/log_episode.hpp"
+#include "orderbook/wall_clock.hpp"
 #include "orderbook/logger.hpp"
 
 #include <cstddef>
@@ -33,6 +34,37 @@ namespace ob {
 /// Bytes an HLCTimestamp occupies on the wire. Not `sizeof(HLCTimestamp)`: the struct is laid out
 /// for the CPU and written to the wire field by field, which are two different jobs.
 inline constexpr size_t HLC_WIRE_SIZE = 12;
+
+/// How far ahead of this node's wall clock a peer's physical component may be and still be
+/// absorbed (#121).
+///
+/// **Five minutes, and the number is a judgement rather than a measurement — said so rather than
+/// dressed up.** What it separates is not two magnitudes but two *kinds* of clock: one that is
+/// merely unsynchronised, which lands in milliseconds under working NTP and in seconds after a VM
+/// suspend, and one that is **wrong** — a hand-set date, a dead RTC, a host that never had NTP.
+/// The first heals; the second does not, because absorption makes the mesh's clock the *maximum*
+/// of its members' clocks and keeps it there for as long as that member keeps writing. Four orders
+/// of magnitude above the first class and far below the second is the whole of the choice, and the
+/// exact value is not load-bearing: what is load-bearing is that a bound exists.
+///
+/// Compared against the **wall clock**, deliberately, not against our HLC. Every healthy node
+/// agrees about wall time to within its own skew, so every healthy node reaches the same verdict
+/// about the same peer — which is what makes the outcome stable rather than a race between who
+/// absorbed first.
+inline constexpr uint64_t MM_MAX_CLOCK_SKEW_NS = 5ULL * 60 * 1'000'000'000ULL;
+
+/// Whether a peer's physical component is a time a working clock could report.
+///
+/// Only *ahead* can do harm: `tick_receive()` takes a maximum, so a peer behind us is ignored by
+/// arithmetic and needs no rule. The subtraction is therefore guarded by the first clause and
+/// cannot wrap.
+///
+/// Pure and free-standing so the decision can be tested without a clock, a socket or a peer - the
+/// shape `replication_wait_ms()` and `decide_on_absent_key()` already have in this tree.
+constexpr bool remote_clock_is_plausible(uint64_t remote_physical_ns, uint64_t local_wall_ns) {
+    return remote_physical_ns <= local_wall_ns ||
+           (remote_physical_ns - local_wall_ns) <= MM_MAX_CLOCK_SKEW_NS;
+}
 
 struct HLCTimestamp {
     uint64_t physical_ns{0};   // physical time in nanoseconds (wall clock)
@@ -223,7 +255,6 @@ private:
     static uint16_t resolve_logical(uint32_t wanted, uint64_t& physical);
 
     /// Get the current physical time (wall clock) in nanoseconds.
-    static uint64_t wall_clock_ns();
 };
 
 } // namespace ob

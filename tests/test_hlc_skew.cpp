@@ -28,11 +28,6 @@ namespace {
 
 constexpr uint64_t kSecond = 1'000'000'000ULL;
 
-uint64_t wall_clock_ns() {
-    struct timespec ts{};
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * kSecond + static_cast<uint64_t>(ts.tv_nsec);
-}
 
 /// How many local ticks it takes for the 16-bit logical counter to come back to where it started.
 /// Spelled as the arithmetic rather than as 65536 so the reason is visible at the call site.
@@ -68,7 +63,7 @@ TEST(HLCSkew, TheClockDoesNotRegressWhenTheLogicalCounterOverflows) {
     ob::HybridLogicalClock hlc(1);
 
     // Pin the physical component an hour ahead, which is what a peer with a wrong clock does.
-    hlc.tick_receive(ob::HLCTimestamp{wall_clock_ns() + 3600 * kSecond, 0, 2});
+    hlc.tick_receive(ob::HLCTimestamp{ob::wall_clock_ns() + 3600 * kSecond, 0, 2});
 
     ob::HLCTimestamp prev = hlc.tick_local();
     const uint64_t pinned_physical = prev.physical_ns;
@@ -91,7 +86,7 @@ TEST(HLCSkew, TheClockDoesNotRegressWhenTheLogicalCounterOverflows) {
 // would keep the test above green and silently stop breaking ties.
 TEST(HLCSkew, CrossingTheLogicalPeriodProducesAStrictlyGreaterTimestamp) {
     ob::HybridLogicalClock hlc(1);
-    hlc.tick_receive(ob::HLCTimestamp{wall_clock_ns() + 3600 * kSecond, 0, 2});
+    hlc.tick_receive(ob::HLCTimestamp{ob::wall_clock_ns() + 3600 * kSecond, 0, 2});
 
     ob::HLCTimestamp prev = hlc.tick_local();
     for (long i = 0; i < kLogicalPeriod + 8; ++i) {
@@ -111,7 +106,7 @@ TEST(HLCSkew, ARemoteTimestampAnHourBehindDoesNotMoveTheClockBack) {
     const ob::HLCTimestamp before = hlc.tick_local();
 
     const ob::HLCTimestamp after =
-        hlc.tick_receive(ob::HLCTimestamp{wall_clock_ns() - 3600 * kSecond, 0, 2});
+        hlc.tick_receive(ob::HLCTimestamp{ob::wall_clock_ns() - 3600 * kSecond, 0, 2});
 
     EXPECT_GE(after, before);
     EXPECT_GE(after.physical_ns, before.physical_ns);
@@ -125,27 +120,73 @@ TEST(HLCSkew, ARemoteTimestampBehindUsDoesNotImportItsLogicalCounter) {
     hlc.tick_local();
 
     const ob::HLCTimestamp after =
-        hlc.tick_receive(ob::HLCTimestamp{wall_clock_ns() - 3600 * kSecond, 60000, 2});
+        hlc.tick_receive(ob::HLCTimestamp{ob::wall_clock_ns() - 3600 * kSecond, 60000, 2});
 
     EXPECT_LT(after.logical, 60000)
         << "a logical counter from a physical nanosecond we are not in was adopted";
 }
 
+// ── The bound itself, with no clock, no socket and no peer (#121) ────────────
+
+// `remote_clock_is_plausible` is the whole policy, so it is tested as arithmetic. Five cases, and
+// the two at the boundary are the ones that matter: a rule tested only far from its edge is a rule
+// whose edge nobody has read.
+TEST(HLCSkew, TheBoundAcceptsUpToItAndRefusesPastIt) {
+    const uint64_t now = 1'700'000'000'000'000'000ULL;   // a fixed "now"; no clock is read here
+
+    EXPECT_TRUE(ob::remote_clock_is_plausible(now, now)) << "a peer agreeing with us is refused";
+    EXPECT_TRUE(ob::remote_clock_is_plausible(now + ob::MM_MAX_CLOCK_SKEW_NS, now))
+        << "the bound is exclusive, so a peer exactly at it is refused - the boundary has to belong "
+           "to one side and the accepting side is the one that keeps a working cluster working";
+    EXPECT_FALSE(ob::remote_clock_is_plausible(now + ob::MM_MAX_CLOCK_SKEW_NS + 1, now))
+        << "one nanosecond past the bound is accepted, so the bound is not a bound";
+}
+
+// Behind us needs no rule and must not get one: `tick_receive` takes a maximum, so a peer behind is
+// ignored by arithmetic. A node with a dead RTC comes up in 1970 and is harmless; refusing it would
+// cost its data for nothing.
+TEST(HLCSkew, APeerBehindUsIsAlwaysPlausibleHoweverFarBehind) {
+    const uint64_t now = 1'700'000'000'000'000'000ULL;
+    EXPECT_TRUE(ob::remote_clock_is_plausible(now - 3600 * kSecond, now));
+    EXPECT_TRUE(ob::remote_clock_is_plausible(0, now)) << "the epoch itself is refused";
+}
+
+// The tail this bound exists to make unreachable. `resolve_logical` carries a logical overflow into
+// the physical component and cannot carry past UINT64_MAX; at that value the next tick returns
+// logical 0 after 65535, so the clock goes **backwards** by the whole counter and then oscillates
+// there. The comment in that function used to claim saturating "keeps this function's promise" — it
+// does not. Making the state unreachable is the fix, and this is the assertion that it is.
+TEST(HLCSkew, AnAbsurdRemoteValueIsRefusedSoTheCarryCanNeverSaturate) {
+    const uint64_t now = 1'700'000'000'000'000'000ULL;
+    EXPECT_FALSE(ob::remote_clock_is_plausible(UINT64_MAX, now));
+    EXPECT_FALSE(ob::remote_clock_is_plausible(now + 365ULL * 24 * 3600 * kSecond, now))
+        << "a year ahead is accepted, which is the class of wrong clock - a hand-set date, a dead "
+           "RTC - that the bound is drawn to exclude";
+}
+
 // ── A peer whose clock is ahead: what the engine does, and what it says about it ──
 
-// Current and deliberate behaviour, pinned so that changing it is a decision rather than a drift.
-// `tick_receive` takes `max({now, last_, remote})` with no ceiling, so one frame from a peer an
-// hour ahead moves this node an hour ahead and nothing ever moves it back.
+// The clock itself is **still uncapped, and that is the decision rather than the absence of one**
+// (#121). `tick_receive` takes `max({now, last_, remote})` with no ceiling, so a value an hour
+// ahead handed straight to this class moves it an hour ahead and nothing moves it back — which is
+// exactly what this test requires, because the bound lives one layer out.
 //
-// With #119 fixed this is wrong-about-real-time rather than incorrect: every node that receives
-// such a record adopts the same value, timestamps stay monotonic, and LWW still converges. What it
-// costs is that the clock stops being a time — and that a node whose own clock is fine carries the
-// other one's error for the rest of the cluster's life. Whether to bound it is a policy question
-// with a real cost (causal order against a peer we would be refusing to believe), which is why it
-// is filed for a decision and not quietly capped here.
+// Why there and not here. A clock that silently refused part of what it was told would break the
+// one invariant it exists for: if we accept a record we must stamp our later writes above it, or a
+// causally later write can lose an LWW conflict to the record it followed. So the layer that can
+// say no is the layer that can also decline the **record** — and, since a record refused while the
+// link stays up is a silent hole, the layer that can decline the *peer*. That is
+// `MultiMasterManager::drop_peer_if_clock_is_implausible()`, and `tests/test_mm_wire_clock.cpp`
+// holds both halves of it: an hour is refused, a minute is absorbed.
+//
+// With #119 fixed, what absorption costs is being wrong about real time rather than being
+// incorrect: every node that receives such a record adopts the same value, timestamps stay
+// monotonic, and LWW still converges. The bound is not there to make the clock a time; it is there
+// because the mesh's clock is the **maximum** of its members' clocks and nothing bounded the
+// maximum.
 TEST(HLCSkew, ARemoteTimestampAheadOfUsIsAdoptedAndKept) {
     ob::HybridLogicalClock hlc(1);
-    const uint64_t ahead = wall_clock_ns() + 3600 * kSecond;
+    const uint64_t ahead = ob::wall_clock_ns() + 3600 * kSecond;
 
     hlc.tick_receive(ob::HLCTimestamp{ahead, 0, 2});
     EXPECT_GE(hlc.current().physical_ns, ahead);
@@ -153,7 +194,7 @@ TEST(HLCSkew, ARemoteTimestampAheadOfUsIsAdoptedAndKept) {
     // Not a transient: the next twenty local ticks still carry it, with the wall clock far below.
     for (int i = 0; i < 20; ++i) hlc.tick_local();
     EXPECT_GE(hlc.current().physical_ns, ahead);
-    EXPECT_GT(hlc.current().physical_ns, wall_clock_ns());
+    EXPECT_GT(hlc.current().physical_ns, ob::wall_clock_ns());
 }
 
 // The observation half. `max_drift_ns()` is the distance between the HLC's physical component and
@@ -163,7 +204,7 @@ TEST(HLCSkew, DriftIsObservedOnBothSidesOfTheOneSecondBoundary) {
     // because a gauge that only moves once something is already wrong cannot show it approaching.
     {
         ob::HybridLogicalClock hlc(1);
-        hlc.tick_receive(ob::HLCTimestamp{wall_clock_ns() + kSecond / 2, 0, 2});
+        hlc.tick_receive(ob::HLCTimestamp{ob::wall_clock_ns() + kSecond / 2, 0, 2});
         const int64_t drift = hlc.max_drift_ns();
         EXPECT_GT(drift, 0);
         EXPECT_LT(drift, static_cast<int64_t>(kSecond));
@@ -171,7 +212,7 @@ TEST(HLCSkew, DriftIsObservedOnBothSidesOfTheOneSecondBoundary) {
     // Over it.
     {
         ob::HybridLogicalClock hlc(1);
-        hlc.tick_receive(ob::HLCTimestamp{wall_clock_ns() + 10 * kSecond, 0, 2});
+        hlc.tick_receive(ob::HLCTimestamp{ob::wall_clock_ns() + 10 * kSecond, 0, 2});
         EXPECT_GT(hlc.max_drift_ns(), static_cast<int64_t>(kSecond));
     }
 }
@@ -189,7 +230,7 @@ TEST(HLCSkew, EveryDriftExcursionIsCountedNotJustTheFirst) {
     ob::HybridLogicalClock hlc(1);
     EXPECT_EQ(hlc.drift_excursions(), 0u);
 
-    hlc.tick_receive(ob::HLCTimestamp{wall_clock_ns() + 10 * kSecond, 0, 2});
+    hlc.tick_receive(ob::HLCTimestamp{ob::wall_clock_ns() + 10 * kSecond, 0, 2});
     const uint64_t after_first = hlc.drift_excursions();
     EXPECT_GT(after_first, 0u);
 
@@ -210,7 +251,7 @@ TEST(HLCSkew, AHealthyClockCountsNoDriftExcursions) {
 // both directions, or the counter degenerates into "a remote record arrived".
 TEST(HLCSkew, SkewInsideTheBoundaryIsNotCountedAsAnExcursion) {
     ob::HybridLogicalClock hlc(1);
-    hlc.tick_receive(ob::HLCTimestamp{wall_clock_ns() + kSecond / 2, 0, 2});
+    hlc.tick_receive(ob::HLCTimestamp{ob::wall_clock_ns() + kSecond / 2, 0, 2});
     EXPECT_EQ(hlc.drift_excursions(), 0u);
 }
 
@@ -220,7 +261,7 @@ TEST(HLCSkew, SkewInsideTheBoundaryIsNotCountedAsAnExcursion) {
 // have, which is why the pair exists rather than a log matcher.
 TEST(HLCSkew, AnExcursionThatLastsAThousandTicksIsOneLine) {
     ob::HybridLogicalClock hlc(1);
-    hlc.tick_receive(ob::HLCTimestamp{wall_clock_ns() + 10 * kSecond, 0, 2});
+    hlc.tick_receive(ob::HLCTimestamp{ob::wall_clock_ns() + 10 * kSecond, 0, 2});
     for (int i = 0; i < 1000; ++i) hlc.tick_local();
 
     EXPECT_GT(hlc.drift_excursions(), 1000u)
@@ -241,7 +282,7 @@ TEST(HLCSkew, AnExcursionThatClearsAndReturnsIsTwoLines) {
 
     ob::HybridLogicalClock hlc(1);
     hlc.tick_receive(ob::HLCTimestamp{
-        wall_clock_ns() + static_cast<uint64_t>(ob::HybridLogicalClock::DRIFT_WARN_NS) + kJustOver,
+        ob::wall_clock_ns() + static_cast<uint64_t>(ob::HybridLogicalClock::DRIFT_WARN_NS) + kJustOver,
         0, 2});
     ASSERT_EQ(hlc.drift_episodes(), 1u);
 
@@ -250,7 +291,7 @@ TEST(HLCSkew, AnExcursionThatClearsAndReturnsIsTwoLines) {
     EXPECT_EQ(hlc.drift_episodes(), 1u) << "closing an episode must not write another loud line";
 
     hlc.tick_receive(ob::HLCTimestamp{
-        wall_clock_ns() + static_cast<uint64_t>(ob::HybridLogicalClock::DRIFT_WARN_NS) + kJustOver,
+        ob::wall_clock_ns() + static_cast<uint64_t>(ob::HybridLogicalClock::DRIFT_WARN_NS) + kJustOver,
         0, 2});
     EXPECT_EQ(hlc.drift_episodes(), 2u)
         << "a second excursion after the first cleared is a second line, not a suppressed one";
@@ -282,7 +323,7 @@ TEST(HLCSkew, TwoNodesWithOppositeDriftAgreeOnTheWinnerOfTheSameConflict) {
     // a rule that only looked at one side would pass a test that only skewed one side.
     NodeView one(1);
     NodeView two(2);
-    one.clock.tick_receive(ob::HLCTimestamp{wall_clock_ns() + 30 * kSecond, 0, 9});
+    one.clock.tick_receive(ob::HLCTimestamp{ob::wall_clock_ns() + 30 * kSecond, 0, 9});
 
     // Each node stamps its own write with its own clock. These are the two records that will meet.
     const ob::HLCTimestamp from_one = one.clock.tick_local();
@@ -319,7 +360,7 @@ TEST(HLCSkew, AgreementSurvivesTheClocksMergingInOppositeOrders) {
     // than the second, which is harder to see and no less permanent.
     NodeView one(1);
     NodeView two(2);
-    one.clock.tick_receive(ob::HLCTimestamp{wall_clock_ns() + 30 * kSecond, 0, 9});
+    one.clock.tick_receive(ob::HLCTimestamp{ob::wall_clock_ns() + 30 * kSecond, 0, 9});
 
     const ob::HLCTimestamp from_one = one.clock.tick_local();
     const ob::HLCTimestamp from_two = two.clock.tick_local();
@@ -350,7 +391,7 @@ TEST(HLCSkew, TwoNodesWithNoSkewStillAgreeAndTheTieBreakIsTheNodeId) {
     NodeView two(2);
 
     // Same physical nanosecond on both sides, which is the case the node id exists for.
-    const uint64_t shared = wall_clock_ns();
+    const uint64_t shared = ob::wall_clock_ns();
     const ob::HLCTimestamp from_one{shared, 0, 1};
     const ob::HLCTimestamp from_two{shared, 0, 2};
 

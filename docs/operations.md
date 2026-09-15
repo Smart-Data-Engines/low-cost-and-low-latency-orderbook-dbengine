@@ -744,6 +744,40 @@ to grep for: without it, the two WARNs above mean the repair has not happened ye
   refresh still succeeds, so this path never runs. Eviction by deleting the key therefore still
   works, which is why it is left this way; if you did not do it deliberately, restart that node.
 
+### When a peer is refused for its clock
+
+Since #121 a mesh node refuses a peer whose HLC physical component is more than **five minutes**
+ahead of its own wall clock, and drops the connection rather than taking that time:
+
+```
+WARN  mm  peer 2 says its clock is 3600 s ahead of ours, over the 300 s bound — dropping the
+          connection rather than taking that time. Absorbing it would make it this whole mesh's
+          clock for as long as that node keeps writing, and nothing brings it back. Its data will
+          not arrive until its clock is fixed; MM_PEERS still shows what it claims
+INFO  mm  peer 2's clock is back inside the bound after 41 refused record(s); its records are
+          being applied again
+```
+
+One line per episode, `ob_mm_peer_dropped_clock_total` on every refused record — so the counter is
+the rate and the log is the condition. `MM_PEERS` keeps the peer's claimed `hlc_timestamp`, which is
+recorded before the verdict on purpose: the number that got it dropped is the number you need.
+
+**What to do.** Fix that node's clock — this is NTP's job — and the link returns on its own; nothing
+has to be restarted. Until then that peer's writes do not reach this node, which is the price and it
+is deliberate: absorbing the time would make the whole mesh run at the broken clock for as long as
+that node kept writing, and no restart of *that* node brings the others back.
+
+**Why the bound is loose.** Five minutes is four orders of magnitude above what working NTP holds
+and above a VM suspend, and far below the class it is drawn to exclude — a hand-set date, a dead
+RTC, a host that never had NTP. A peer four minutes ahead is still absorbed and still pins the mesh
+four minutes ahead; that is what `ob_mm_hlc_drift_ns` is for, and it is still a peak that never
+falls. The bound is not there to make the clock a wall clock. It is there because the mesh's clock is
+the **maximum** of its members' clocks and nothing bounded the maximum.
+
+**What is not affected, so you can stop looking:** row timestamps. A row carries the client's
+`event_time_ns` since #105, or this node's `system_clock` when the client did not send one — never
+the HLC. Retention and time-range queries read those, so a drifted mesh clock never moved them.
+
 ### When a node holds the leader key and serves nothing
 
 A promotion has two durable effects: the leader key in etcd and an epoch record in the WAL. If the

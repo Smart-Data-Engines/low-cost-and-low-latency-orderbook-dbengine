@@ -1,3 +1,4 @@
+#include "orderbook/wall_clock.hpp"
 #include "orderbook/failover.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/logger.hpp"
@@ -18,11 +19,6 @@ namespace {
 /// etcd and read by other nodes, so it has to mean something across processes.
 /// Clock skew only widens or narrows the preference window; promotion still goes
 /// through a CAS, so it cannot cause two primaries.
-uint64_t wall_clock_ns() {
-    const auto now = std::chrono::system_clock::now().time_since_epoch();
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
-}
 
 } // namespace
 

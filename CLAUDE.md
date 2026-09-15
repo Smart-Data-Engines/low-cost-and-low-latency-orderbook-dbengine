@@ -2649,6 +2649,32 @@ Learned the hard way. Check here before debugging.
     be true of anything, and none of the three fields was corrupt. When a status string is built
     from more than one owner, ask which of them a partial transition has already touched.
 
+319. **Where a bound goes is decided by which layer can also refuse the thing the bound is about.**
+    #121 needed to stop a peer's clock becoming the mesh's clock. Putting the ceiling in
+    `HybridLogicalClock` looks natural and is wrong: a clock that declines part of what it is told
+    breaks the invariant it exists for, because if we accept a record we must stamp later writes
+    above it or a causally later write can lose an LWW conflict to the record it followed. So the
+    ceiling belongs where the **record** can be declined — and since a record refused under a live
+    link is a silent hole, where the **peer** can be declined. The class is still uncapped on
+    purpose, with the reason written beside the test that requires it.
+
+320. **A rule decided per node against per-node state is not a rule, it is a divergence generator.**
+    The obvious answer to #121 was to clamp what we absorb from a peer. Each node would clamp
+    against *its own* wall clock, so two nodes stamp their later writes differently and
+    `ConflictResolver::resolve()` picks different winners for the same pair — the divergence lands
+    in the **data**. An untrue clock beats divergent values, and it is not close. Before adding a
+    policy to a replicated system, ask what the policy reads: if it reads something each node has
+    its own copy of, every node gets its own answer.
+
+321. **"Unreachable in any reachable state" is a claim with a lifetime, and the lifetime ends where
+    an input is unbounded.** `resolve_logical()` argued that the physical component cannot be
+    `UINT64_MAX` because no real clock produces a 585-year-old timestamp — true of clocks, not of
+    peers, and nothing bounded what a peer could send. Worse, the same comment said saturating
+    there "keeps this function's promise"; it does not, because `{UINT64_MAX, 0}` follows
+    `{UINT64_MAX, 65535}` and the clock runs **backwards by the whole counter**, which is what #119
+    exists to prevent. When a comment says a state is unreachable, find the input that would reach
+    it and check that something bounds it.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2854,19 +2880,28 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   io_uring pair is fed in a loop **no CI job runs**, so the arithmetic moved to `metrics.hpp` where
   the suite executes it and the rest is asserted against the source text in
   `tests/test_iouring_instrumentation.cpp`, which is deliberately not behind `OB_USE_IO_URING`.
-- **The hybrid logical clock never goes backwards now, and one peer's wrong clock is still the
-  whole mesh's clock for ever** (#119 and #120 closed by #54 stage D, #121 open). The reversal was
-  the `uint16` `logical` counter wrapping while the physical component was pinned above the wall
-  clock — measured at tick 65 533, against a control of zero regressions over the same 200 000
-  ticks — and the overflow now carries into the physical component, which is why
+- **The hybrid logical clock never goes backwards, and a peer's clock can no longer become the
+  mesh's clock without limit** (#119, #120, #121 closed). The reversal was the `uint16` `logical`
+  counter wrapping while the physical component was pinned above the wall clock — measured at tick
+  65 533, against a control of zero regressions over the same 200 000 ticks — and the overflow now
+  carries into the physical component, which is why
   `HLCSkew.CrossingTheLogicalPeriodProducesAStrictlyGreaterTimestamp` exists beside the
   monotonicity test: saturating the counter would keep the second green and stop breaking ties.
-  Two numbers now describe drift, and you need both, because `ob_mm_hlc_drift_ns` is a **peak that
-  never comes down**: `ob_mm_hlc_drift_excursions_total` says how often. What is **not** bounded is
-  how far a peer may move our clock, and that is #121 rather than an oversight — declining a
-  timestamp keeps the clock meaningful and breaks causal order against exactly the peer whose clock
-  is wrong, so it is a decision. Current behaviour is pinned by a test so that changing it has to be
-  one. LWW still converges under opposite drift, measured from both sides.
+  Two numbers describe drift and you need both, because `ob_mm_hlc_drift_ns` is a **peak that never
+  comes down**: `ob_mm_hlc_drift_excursions_total` says how often.
+  The bound from #121 is **five minutes, at the mesh door, against the wall clock**, and it refuses
+  the **peer** — `MultiMasterManager::drop_peer_if_clock_is_implausible()`. Not the record (a
+  refused record under a live link is a silent hole), not a clamp (decided per node against that
+  node's wall clock, so two nodes pick different LWW winners and the **data** diverges), and not in
+  the clock class, which is still uncapped on purpose: a clock that declines part of what it is told
+  breaks the invariant it exists for. The right way to say what the bound is for: the mesh's clock
+  is the **maximum** of its members' clocks and nothing bounded the maximum. It does not buy a clock
+  that means wall time — four minutes of skew is still absorbed — and it makes
+  `resolve_logical()`'s saturation branch unreachable, which matters because that branch runs the
+  clock backwards by the whole counter and its comment used to claim otherwise.
+  A row's `timestamp_ns` was never this clock: it is the client's `event_time_ns` (#105) or the
+  receiving node's `system_clock`, so retention and time-range queries are untouched by mesh skew.
+  LWW still converges under opposite drift, measured from both sides.
 - **The mesh reports its lag in records now, as a pair, and the replica lag is still unpublished
   on purpose** (#118 closed, #123 open). `STATUS`'s `replication_lag_peer_<id>` and `MM_PEERS`'
   `lag_bytes` are gone and renamed respectively — the first removed because the honest number is a

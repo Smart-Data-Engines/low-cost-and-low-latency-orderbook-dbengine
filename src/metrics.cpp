@@ -263,6 +263,13 @@ MetricsRegistry::MetricsRegistry() {
     // is the one value an operator cannot tell from good news (#117). The pair matters: a single
     // ten-second excursion and a clock that is permanently an hour out give the same peak, and
     // ob_mm_hlc_drift_ns never comes down because nothing lowers the HLC's physical component.
+    // Peers refused for an implausible clock (#121). One per record refused, not one per peer, so
+    // a node whose clock is wrong and which keeps writing is visible as a rate - while the log
+    // line is one per episode. The pair is the same shape the drift metrics already have: this
+    // counts occurrences, `ob_mm_hlc_drift_ns` says how far.
+    counters_.push_back(make_counter("ob_mm_peer_dropped_clock_total",
+                                     "Remote records refused, and their peer dropped, because "
+                                     "the peer's clock was too far ahead of ours"));
     counters_.push_back(make_counter("ob_mm_hlc_drift_excursions_total",
                                      "Ticks that found the HLC more than a second ahead of the "
                                      "wall clock. The log says this twice per excursion, at its "
