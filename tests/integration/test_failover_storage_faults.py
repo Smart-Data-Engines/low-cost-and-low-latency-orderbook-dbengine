@@ -31,8 +31,8 @@ import time
 
 import pytest
 
-from conftest import (ClusterManager, fault_injector_path, patience, tail_node_log,
-                      wait_for_role)
+from conftest import (ClusterManager, fault_injector_path, patience, send_command,
+                      tail_node_log, wait_for_role)
 
 pytestmark = pytest.mark.failover
 
@@ -146,6 +146,70 @@ def test_a_refused_epoch_record_costs_a_tick_and_not_the_monitor_thread(tmp_path
         assert _metric(replica.metrics_port, "ob_monitor_errors_total") >= 1, (
             "ob_monitor_errors_total is zero, so an operator watching a full disk would have "
             "nothing to alarm on: the node answers PING, and ROLE reports a role it half took")
+    finally:
+        mgr.shutdown()
+
+
+def test_a_won_promotion_that_cannot_finish_never_claims_to_be_following_itself(tmp_path):
+    """#130: what the node *says* while it holds a leader key it cannot act on.
+
+    Before the fix `ROLE` answered `REPLICA <this node's own replication port>` — a sentence that
+    cannot be true of anything — and it did so for as long as the process ran. It was assembled from
+    three views of one half-finished act: the role from the engine (still REPLICA, because
+    `promote_to_primary()` threw), the address from the failover manager (already this node's own,
+    set before the handler was called) and the epoch from the engine (already raised). Nothing
+    adopted anything, which is what the item first claimed and what
+    `adopt_leader_if_present()` has refused since #73.
+
+    Two assertions, and the first is the one with teeth. The address is **empty** while the
+    promotion is unfinished, because there is no primary to name: not the node we stopped following,
+    and not ourselves. The second is that the condition is reported **once** with what an operator
+    can do about it, rather than once per tick, because this loop runs every second and the storage
+    that refused the record usually goes on refusing it.
+    """
+    mgr, fault_log = _cluster_with_faulted_replica(EPOCH_RECORD_BYTES, tmp_path)
+    try:
+        replica = mgr.replica()
+        own_port = str(replica.mm_replication_port or replica.replication_port)
+        mgr.kill_node(mgr.primary().index)
+
+        deadline = time.monotonic() + patience(60)
+        while time.monotonic() < deadline and not _injections(fault_log):
+            time.sleep(0.5)
+        assert any("action=fail" in line for line in _injections(fault_log)), (
+            "nothing was refused, so this test measured an engine with no fault to survive")
+
+        # Sampled rather than read once at the end: the claim is that the node never answers with
+        # its own address, and "never" is only worth asserting across the window in which the old
+        # code answered it on every sample.
+        roles = []
+        checks = 0
+        deadline = time.monotonic() + patience(20)
+        while time.monotonic() < deadline:
+            checks += 1
+            assert send_command(replica.tcp_port, "PING").strip() == "PONG", (
+                "the node stopped answering while its promotion was stuck, which would be a worse "
+                "defect than the one this test is about")
+            answer = send_command(replica.tcp_port, "ROLE").strip()
+            roles.append(answer)
+            assert own_port not in answer, (
+                f"after {checks} samples ROLE answers {answer!r}, which names this node's own "
+                f"replication port as the primary it follows. That is #130's symptom: the address "
+                f"is claimed before the promotion is real")
+            time.sleep(1.0)
+        assert checks >= 4, f"only {checks} samples; this measured almost nothing"
+
+        log = tail_node_log(replica, 800)
+        loud = log.count("cannot finish becoming primary")
+        assert loud == 1, (
+            f"the stalled promotion was reported {loud} times across {checks} seconds; one line "
+            f"per episode is the rule (#95, #133), and the counter is what grows. Log:\n"
+            f"{log[-2000:]}")
+        assert "kill it to let a peer take the role at a higher epoch" in log, (
+            "the line does not say what an operator can do, which is the half that makes a refusal "
+            f"useful:\n{log[-1500:]}")
+        assert _metric(replica.metrics_port, "ob_monitor_errors_total") >= 1, (
+            "nothing to alarm on while a node holds the leader key and serves nothing")
     finally:
         mgr.shutdown()
 

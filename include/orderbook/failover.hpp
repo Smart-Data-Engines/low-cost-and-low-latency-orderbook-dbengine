@@ -321,6 +321,13 @@ private:
     /// (roadmap #73).
     bool adopt_leader_if_present();
 
+    /// Whether this node is currently holding a leader key it won and could not act on — the
+    /// state #130 is about. Loud once and then quiet, because the condition repeats at the tick
+    /// rate for as long as the storage that refused the epoch record goes on refusing it.
+    ///
+    /// Touched only by the monitor thread.
+    LogEpisode stalled_promotion_;
+
     /// Publish this node's WAL position to the coordinator, at most once per second.
     ///
     /// Nothing did this before: `publish_wal_position()` was called from tests and from one
