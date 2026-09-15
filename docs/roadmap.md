@@ -3572,6 +3572,37 @@ and one definition. `Engine::stamp_for()` keeps its own expression on purpose: i
 different question — *whose* time a row carries — and #105 gave that one function of its own for the
 same reason this one exists.
 
+**The mutation table says one thing the tests do not say out loud: the policy number is pinned from
+both sides without being pinned to a literal.** Eleven rows, each with the verdict it is meant to
+give. **Eight are killed by a test** — the bound removed, moved by one nanosecond, the behind-us
+clause dropped, the verdict taken against our own HLC, the peer refused but not dropped, the check
+moved after dispatch, the counter not incremented, and the peer's claim stored only after the
+verdict. **One is refused by the compiler.** And **two are controls that survive**: the WARN
+reworded, and the bound widened from five minutes to five and a half.
+
+That last one is the row worth having. Every expectation in both test files is written in terms of
+`MM_MAX_CLOCK_SKEW_NS` rather than against a literal, deliberately — pinning the number itself would
+fail on any legitimate retuning and teach a reader that the test is noise. What the fixtures do
+instead is bound the constant from **both** sides: `tests/test_mm_wire_clock.cpp` carries a
+`static_assert` requiring `4 min < bound < 6 min`, because its two skews have to straddle it or the
+test asserts nothing, and two runtime guards in the same file require `1 min < bound < 1 h`, each
+with its reason beside it; `tests/test_hlc_skew.cpp` puts it under a year. So a widening large enough
+to change an answer **does not compile**, and one small enough to compile changes nothing anybody can
+observe. The row that establishes the first half is `bound_widened_to_an_hour`, and its verdict is
+DID-NOT-BUILD — a kill by the tightest mechanism available rather than an escape.
+
+**Two rows had to be re-expressed rather than have the code changed for them**, which is this
+repository's rule and was applied twice here. `return true;` leaves both parameters unused under
+`-Werror=unused-parameter`, so the bound-removed row is a tautology that still reads them
+(`remote_physical_ns >= local_wall_ns || remote_physical_ns < local_wall_ns`). And the
+claim-stored-late row first introduced a local nothing read
+(`-Werror=unused-but-set-variable`); it now leaves the verdict reading the true remote value — so the
+refusal behaviour is untouched — and moves only *when* the peer's claim is stored, which leaves a
+refused peer's `last_hlc` at zero. That is what makes it a kill rather than a restatement of the
+refusal rows: what it breaks is the assertion keeping `MM_PEERS` showing what a refused peer claimed,
+and since that assertion sits inside an `if` over the peer record, the row also establishes that the
+record survives the drop and the `if` is entered.
+
 - Effort: M, most of it the decision | Impact: one misconfigured node's clock was the whole mesh's
   clock, permanently, and a value no real clock produces could push the physical component into the
   one state where this clock runs backwards
