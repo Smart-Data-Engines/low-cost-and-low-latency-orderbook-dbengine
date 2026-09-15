@@ -585,6 +585,9 @@ target_link_libraries(test_metrics_server
         rapidcheck
         rapidcheck_gtest
 )
+target_compile_definitions(test_metrics_server
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
 gtest_discover_tests(test_metrics_server PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── StructuredLogger property and unit tests (observability, Tasks 3.3–3.7) ───
