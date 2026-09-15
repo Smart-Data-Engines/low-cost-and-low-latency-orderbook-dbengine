@@ -2623,6 +2623,32 @@ Learned the hard way. Check here before debugging.
     passes. When two different kinds of thing share a notation, ask which one your checker is
     actually reading, and whether it has ever had to tell them apart.
 
+316. **A mechanism written into a filed item is a hypothesis until it names the line, and #130's
+    named a function that did the opposite.** The item said the monitor tick "reads the leader key,
+    finds this node's address in it, and adopts it". `adopt_leader_if_present()` refuses a key
+    naming this node and had done so for three weeks before the item was filed — so its first
+    candidate answer was already in the tree, and three weeks of reasoning rested on a symptom
+    explained backwards. The real cause was `attempt_promotion()` setting `role_` and
+    `primary_address_` **before** calling the handler that throws. Before designing a fix, go and
+    read the function the item blames; the cost of not doing it is choosing between candidates for
+    a defect that does not exist.
+
+317. **The condition to act on is the resource you hold, not the role you believe you have.**
+    `FailoverManager::stop()` revoked the lease `if (role_ == PRIMARY && lid != 0)`, where the role
+    was a proxy for holding a lease. #130's fix moves `role_` to after the promotion's handler
+    returns, which breaks exactly that proxy: a shutdown in the new window finds `role_ == REPLICA`
+    with a live lease and leaves the leader key alive until its TTL — a failover made *slower* by
+    the change meant to make one honest. It revokes on `lid != 0` now. Same family as #131's
+    descriptor guard: a guard around something you do not own counts the leak instead of preventing
+    it.
+
+318. **An answer assembled from several components' views can be false while every field in it is
+    individually plausible.** `ROLE` prints the role from the engine, the address from the failover
+    manager and the epoch from the engine. A half-finished promotion had already moved two of the
+    three, so the reply was `REPLICA <this node's own replication port> 2` — a sentence that cannot
+    be true of anything, and none of the three fields was corrupt. When a status string is built
+    from more than one owner, ask which of them a partial transition has already touched.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

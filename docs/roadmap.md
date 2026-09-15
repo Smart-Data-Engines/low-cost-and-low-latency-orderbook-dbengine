@@ -2601,57 +2601,97 @@ in 6 s.
 - Effort: M | Impact: seven subsystems that ended quietly on their first exception, each leaving a
   node that answers health checks — plus one descriptor leak the reading found on the way
 
-### 130. A promotion that stops halfway leaves the node a replica of itself
+### 130. A promotion that stops halfway leaves the node holding a leader key it cannot act on ✅
 
-Found while measuring #112's `monitor_loop` half, and left open on purpose: the boundary that made
-the thread survive turned "the thread is gone and the node is stuck" into "the thread is fine and
-the node is still stuck", and the second half is a different defect.
+Found while measuring #112's `monitor_loop` half. The heading changed with the fix, and so did most
+of this entry, because **the mechanism it was filed with was wrong** — that correction is worth more
+than the fix.
 
-**Measured**, with #54's injector refusing the 32-byte `EPOCH` record a promotion writes. Two nodes
-on one etcd, the fault on the replica only. The primary is killed, the replica waits out #82's
-election delay, takes the leader key, and then the `EPOCH` write is refused — so
-`promote_to_primary()` throws **after** the key is taken and **before** `role_` becomes `PRIMARY`.
-From then on `ROLE` answers:
+**What it said, and why it was wrong.** "The next monitor tick reads the leader key, finds this
+node's address in it, and adopts it — so the node is a replica of itself."
+`FailoverManager::adopt_leader_if_present()` **refuses** a key that names us, and has since
+**23 August 2026** (`183531e`, #73's fix), three weeks before this item was filed. So the first of
+its three candidate answers — "refuse to adopt our own address" — was **already in the tree**, and
+the sentence describing the defect pointed at a function that does the opposite. A mechanism in a
+filed item is a hypothesis until it names the line; this one named a line that disproved it.
 
+**The real one, read from the code and then measured.** `attempt_promotion()` ran, in order:
+`lease_id_`, then `epoch_` and `primary_address_ = config_.replication_address` under the lock, then
+`role_.store(PRIMARY)`, and **then** `handler_.promote_to_primary()` — which throws. So one
+half-finished act was visible as three fields:
+
+| | before the fix | after |
+|---|---|---|
+| `FailoverManager::role_` | **PRIMARY** — so the monitor's PRIMARY branch **renewed the lease** | REPLICA until the handler returns |
+| `FailoverManager::primary_address_` | this node's own address | empty while unfinished |
+| `Engine::node_role_` | REPLICA, read-only | unchanged |
+| `Engine::current_epoch_` | 2, with no `EPOCH` record on disk | unchanged |
+| `repl_client_`, `repl_state.txt` | destroyed, deleted | unchanged |
+
+`ROLE` answered `REPLICA <this node's own replication port> 2` because
+`Engine::handle_role_command()` assembles it from **three views**: the role from the engine, the
+address from the failover manager, the epoch from the engine — and the promotion had already moved
+two of them. Nothing adopted anything.
+
+**And the consequence was worse than the item claimed.** Because `role_` said PRIMARY, the monitor
+went on refreshing the lease, so the leader key stayed alive and **no peer would ever take the
+role** — while the engine refused every write and had no replication manager. Having already
+deleted `repl_state.txt`, the node could not fall back to following anyone either. A leader that
+accepts nothing and never lets go, answering `PING` throughout.
+
+**The second candidate is unsafe as it was written, and naming that is the other half of this
+item.** "Release the key when the promotion fails" reads as obviously right. Epoch selection is
+
+```cpp
+EpochValue current = (fm_epoch.term > local_epoch.term) ? fm_epoch : local_epoch;
+EpochValue new_epoch = current.incremented();
 ```
-REPLICA 127.0.0.1:44613 2
-```
 
-44613 is that node's **own** replication port. The next monitor tick reads the leader key, finds
-this node's address in it, and adopts it — so the node is a replica of itself, in epoch 2, for as
-long as it runs. Measured across the forty seconds observed; `PING` answers throughout, and with
-#112's boundary in place `ob_monitor_errors_total` is 1 and the episode opens and closes normally.
-The control, the same run at a size nothing writes, reaches `PRIMARY 2` in twenty seconds.
+— `max(epoch known from etcd, engine epoch) + 1`. A node that took the key at epoch 2, stamped
+`wal_.set_epoch(2)` and then released it leaves a peer which **never observed that key** computing
+`max(1, 1) + 1 = 2` and winning the same epoch, against a node that already has it in its WAL.
+Releasing the key erases the only record that epoch 2 was consumed, because etcd is where epochs are
+agreed. Making it safe would mean adding a *third* durable artefact to an act that already fails on
+the inconsistency of two. Rejected, with the cost of rejecting it written down: a permanently
+refusing disk means the node holds the key and retries for ever, so the cluster has no primary —
+but loudly and with a counter, rather than silently as before.
 
-**Why the boundary is not the fix and was not made into one.** #112 is about an exception ending a
-thread. This is about a promotion having two durable effects — the leader key in etcd and the epoch
-record in the WAL — with no rule about what the node is when it has done the first and not the
-second. Making the boundary roll the promotion back would be writing failover semantics inside a
-`catch`, which is where the least-reviewed code in any subsystem lives.
+**The fix is the third candidate plus the two things it needs to be safe.**
 
-**The shape is #73's, one layer along.** There, losing the startup race left a node in a role that
-was not a role (`STANDALONE` for ever, because `monitor_loop()` had no branch for it). Here,
-half-winning a promotion leaves it in a role that contradicts itself. Both are a state machine
-missing the arm for an outcome that can happen.
+- `role_` and `primary_address_` are set **after** `handler_.promote_to_primary()` returns. A
+  promotion has two durable effects and this announced the second before it happened.
+- The REPLICA arm of `monitor_tick()` gains the arm the state machine was missing: a node holding a
+  key that **names it** while not being primary finishes the promotion on a later tick, **with the
+  epoch from the key**. Not by re-running the CAS — that is create-only and the key exists, so it
+  would fail for ever against our own entry. Idempotent by construction rather than by care:
+  `repl_client_` is already gone, `repl_state.txt` already deleted, `current_epoch_` and
+  `wal_.set_epoch()` receive the same value, and a second `EPOCH` record for the same epoch is
+  harmless because replay only ever **raises** the epoch it reads.
+- `stop()` revokes the lease when it **holds a lease**, not when it believes it is PRIMARY. The role
+  was a proxy for holding one, and moving `role_` breaks exactly that proxy: a shutdown in the new
+  window would have left the leader key alive until its TTL — a failover made slower by the change
+  meant to make one honest. *The condition to act on is the resource you hold, not the role you
+  think you have* — the same lesson as #131's descriptor guard, one subsystem along.
 
-Three candidate answers, none chosen yet, and the cost of each is the interesting part:
+Rolling the promotion back inside the `catch` is still rejected, for the reason the item was filed
+with: that is failover semantics in the least-reviewed code of any subsystem.
 
-- **Refuse to adopt our own address.** Narrow and unconditionally correct — a node is never its own
-  primary — and cheap. It does not unstick the node: it would then hold the leader key while being
-  neither primary nor a replica of anyone, which is honest and still broken.
-- **Release the key when the promotion fails.** Lets another node take the role, which is what the
-  operator wants, and needs care about the epoch: the key was taken at epoch 2, and a node that
-  releases it must not leave a peer able to win epoch 2 again.
-- **Finish the promotion on a later tick.** The most useful outcome and the most state to reason
-  about — `current_epoch_` and `wal_.set_epoch()` have already run, so a retry has to be idempotent
-  in the WAL as well as in etcd.
+**What `ROLE` still cannot say, stated rather than left to be discovered.** There is no word in its
+vocabulary for "holds the leader key and serves nothing". The address is **empty** while a won
+promotion is unfinished, which is the only truthful thing available — not the node we stopped
+following, and not ourselves — and the log carries the rest. Giving it a word is a protocol change
+and is not smuggled in here.
 
-The first is a precondition of the other two rather than an alternative to them, since both leave a
-window in which the key is ours and the role is not.
+**Measured**, with #54's injector refusing the 32-byte `EPOCH` record on the replica only, two nodes
+on one etcd: across a twenty-second window at one sample a second, `ROLE` never names this node's
+own port, the stalled promotion is reported **once** with what an operator can do about it,
+`ob_monitor_errors_total` moves, and `PING` answers on every sample. The control in the same module,
+at a size nothing writes, still reaches `PRIMARY`. **3 passed in 86.5 s**; against the two source
+files from the commit before the fix, the new test fails and the other two pass.
 
-- Effort: M, mostly the decision | Impact: a node whose disk refused one 32-byte record answers
-  every health check while reporting a role that cannot exist, and the cluster has a leader key held
-  by a node that will never act as leader. No data is lost; availability is, silently
+- Effort: M, mostly the decision | Impact: was a node whose disk refused one 32-byte record holding
+  and renewing the cluster's leader key while refusing every write, reporting a role that cannot
+  exist. No data lost; availability lost, silently, with no counter moving after the first tick
 
 ### 129. A mesh node's shutdown waits out the lease loop's sleep ✅
 
@@ -4189,11 +4229,18 @@ the mistake the mesh boundary made one commit earlier, paid once rather than twi
 **And this is the part worth reading: the boundary fixed the thread and the node is still stuck.**
 After the fix, the same probe reports the thread alive, `ob_monitor_errors_total` at 1, the episode
 opening and closing — and `ROLE` still answering `REPLICA 127.0.0.1:44613 2`, that node's own
-replication port, for the forty seconds observed. The promotion took the leader key before the
-`EPOCH` write was refused, and the next tick adopts what it finds in the key. That is **#130**, a
-separate defect with its own decision to make, and the test for this change deliberately asserts the
-**thread** rather than the role: the recovery line can only be written by a tick after the one that
-threw, while "the process is alive" was true when the thread was gone.
+replication port, for the forty seconds observed. That is **#130**, a separate defect with its own
+decision to make, and the test for this change deliberately asserts the **thread** rather than the
+role: the recovery line can only be written by a tick after the one that threw, while "the process
+is alive" was true when the thread was gone.
+
+The explanation offered here for that answer — "the next tick adopts what it finds in the key" —
+was **wrong**, and #130 records the correction: `adopt_leader_if_present()` refuses a key naming
+this node and has since #73. The string came from `attempt_promotion()` setting `role_` and
+`primary_address_` before calling the handler, so one half-finished act was visible through three
+fields at once. The wrong explanation is left standing here with this paragraph beside it, because
+it is the observation this item actually made and the correction belongs where the investigation
+happened.
 
 Two mutations, and the second is the one worth having. Rethrowing straight after the counter kills
 the test on its first assertion — the failure output carries the old `monitor_loop ended on an
@@ -6981,9 +7028,9 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #121, #130.** Every item above #58 is either marked closed or named on that
+**Open: #121.** Every item above #58 is either marked closed or named on that
 line — `scripts/check_roadmap.py` holds both directions — and items #1 to #58 are planned work
-nobody has built, not defects. Of the two, #121 is a question recorded for a decision rather than
+nobody has built, not defects. The one that is left, #121, is a question recorded for a decision rather than
 a defect, and **#37**'s remaining half waits on an external service. **#117**, **#118**, **#122** and **#123** are closed, and
 together they are one investigation that started with five registered
 metrics nothing wrote and ended four items later in the WAL's own arithmetic. Every lag this engine

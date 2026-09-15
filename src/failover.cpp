@@ -127,8 +127,13 @@ void FailoverManager::stop() {
     // If we are PRIMARY, revoke our lease immediately using a separate
     // coordinator connection. The monitor thread might be blocking on an
     // HTTP call, so we can't wait for it before revoking.
+    // On the **lease**, not on the role. The role was a proxy for holding one, and #130 broke
+    // exactly that proxy: `role_` now becomes PRIMARY only after the promotion's handler returns,
+    // so a shutdown in between would have found `role_ == REPLICA` with a live lease and left the
+    // leader key alive until its TTL - a failover made slower by the fix meant to make one
+    // honest. The condition to act on is the resource you hold.
     int64_t lid = lease_id_.load(std::memory_order_acquire);
-    if (role_.load(std::memory_order_acquire) == NodeRole::PRIMARY && lid != 0) {
+    if (lid != 0) {
         // Create a temporary coordinator client for the revoke call.
         OB_LOG_INFO("failover", "revoking lease %ld via separate connection...",
                     static_cast<long>(lid));
@@ -709,7 +714,66 @@ void FailoverManager::monitor_tick() {
                 }
             }
 
-            if (leader_present) {
+            if (leader_present && state.leader_node_id == config_.coordinator.node_id) {
+                // The key names us and we are not PRIMARY, so a promotion got as far as the CAS
+                // and no further (#130). Finish it, with the epoch **from the key** rather than a
+                // fresh one: that epoch is already in this node's WAL header and in
+                // `current_epoch_`, and re-running the CAS is not an option either - it is
+                // create-only and the key exists, so it would fail for ever against our own entry.
+                //
+                // Idempotent by construction rather than by care: `repl_client_` is already gone,
+                // `repl_state.txt` is already deleted, `current_epoch_` and `wal_.set_epoch()`
+                // receive the same value, and a second `EPOCH` record for the same epoch is
+                // harmless because replay only ever **raises** the epoch it reads.
+                note_leader_present();
+                {
+                    // Empty, deliberately. `ROLE` prints this beside `REPLICA`, and while a won
+                    // promotion is unfinished there is no primary to name - not the dead one we
+                    // stopped following, and certainly not ourselves. An empty address is the only
+                    // truthful thing this vocabulary can say; `ROLE` has no word for "holds the
+                    // leader key and serves nothing", and giving it one is a protocol change.
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    primary_address_.clear();
+                }
+                try {
+                    handler_.promote_to_primary(state.epoch);
+                    {
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        primary_address_ = config_.replication_address;
+                    }
+                    role_.store(NodeRole::PRIMARY, std::memory_order_release);
+                    if (const uint64_t held = stalled_promotion_.end()) {
+                        OB_LOG_INFO("failover",
+                                    "finished the promotion this node had already won, epoch=%lu, "
+                                    "after %llu tick(s)",
+                                    static_cast<unsigned long>(state.epoch.term),
+                                    static_cast<unsigned long long>(held));
+                    } else {
+                        OB_LOG_INFO("failover", "promoted to PRIMARY, epoch=%lu",
+                                    static_cast<unsigned long>(state.epoch.term));
+                    }
+                } catch (const std::exception& e) {
+                    // One line per episode, not one per tick: a disk that refuses this record
+                    // usually refuses it again, and the loop runs every second (#95, #133). The
+                    // counter moves every time, which is what an operator alarms on.
+                    registry_.increment_counter("ob_monitor_errors_total");
+                    if (stalled_promotion_.begin()) {
+                        OB_LOG_ERROR("failover",
+                                     "this node holds the leader key at epoch %lu and cannot "
+                                     "finish becoming primary: %s. It accepts no writes while "
+                                     "this lasts, and it will keep the key and keep trying; kill "
+                                     "it to let a peer take the role at a higher epoch",
+                                     static_cast<unsigned long>(state.epoch.term), e.what());
+                    } else {
+                        OB_LOG_DEBUG("failover",
+                                     "still cannot finish the promotion at epoch %lu (%llu "
+                                     "consecutive ticks): %s",
+                                     static_cast<unsigned long>(state.epoch.term),
+                                     static_cast<unsigned long long>(stalled_promotion_.ticks()),
+                                     e.what());
+                    }
+                }
+            } else if (leader_present) {
                 note_leader_present();
                 // The address is recorded and **nothing else happens**, which is the whole of
                 // "an unchanged leader does not restart replication every second" (#104). No
@@ -1045,7 +1109,12 @@ void FailoverManager::attempt_promotion() {
     {
         std::lock_guard<std::mutex> lk(mtx_);
         epoch_ = new_epoch;
-        primary_address_ = config_.replication_address;
+        // `primary_address_` is **not** set here, and that is part of #130 rather than tidiness.
+        // `ROLE` prints this field whenever the engine's role is REPLICA, so claiming our own
+        // address before the promotion is real is how a half-finished one came to answer
+        // `REPLICA <our own replication port>` - a sentence that cannot be true of anything. It
+        // moves down beside `role_`, and the stalled arm in `monitor_tick()` clears it, which is
+        // the closest this vocabulary comes to "following nobody".
         last_lease_refresh_ = std::chrono::steady_clock::now();
         // A create-only CAS that succeeded is a confirmation: at this instant the leader key names
         // us. Without seeding it here, the clock rule in monitor_loop() would have nothing to
@@ -1055,8 +1124,23 @@ void FailoverManager::attempt_promotion() {
         leader_absent_since_.reset();
     }
 
-    role_.store(NodeRole::PRIMARY, std::memory_order_release);
+    // The handler first, the role second, and the order is the whole of #130. A promotion has two
+    // durable effects - the leader key in etcd and the epoch record in the WAL - and this line used
+    // to announce the second before it happened. Measured: with the `EPOCH` write refused,
+    // `promote_to_primary()` threw here and left `role_` at PRIMARY, so the monitor's PRIMARY
+    // branch went on **renewing the lease** while the engine stayed read-only with no replication
+    // manager. A leader that accepts nothing and never lets go.
+    //
+    // Failing with the role untouched leaves the node holding a key that names it while it is not
+    // primary, which the REPLICA arm of `monitor_tick()` now has an arm for: it finishes the
+    // promotion on a later tick, with the same epoch. Rolling back here instead would put failover
+    // semantics inside a `catch`, which is where the least-reviewed code in any subsystem lives.
     handler_.promote_to_primary(new_epoch);
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        primary_address_ = config_.replication_address;
+    }
+    role_.store(NodeRole::PRIMARY, std::memory_order_release);
 
     OB_LOG_INFO("failover", "promoted to PRIMARY, epoch=%lu",
                 static_cast<unsigned long>(new_epoch.term));

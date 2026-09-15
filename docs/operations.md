@@ -744,6 +744,35 @@ to grep for: without it, the two WARNs above mean the repair has not happened ye
   refresh still succeeds, so this path never runs. Eviction by deleting the key therefore still
   works, which is why it is left this way; if you did not do it deliberately, restart that node.
 
+### When a node holds the leader key and serves nothing
+
+A promotion has two durable effects: the leader key in etcd and an epoch record in the WAL. If the
+second is refused — a full disk is the measured case — the node has won the role and cannot act on
+it. Since #130 it says so, once, and keeps trying:
+
+```
+ERROR failover  this node holds the leader key at epoch 2 and cannot finish becoming primary:
+                <reason>. It accepts no writes while this lasts, and it will keep the key and keep
+                trying; kill it to let a peer take the role at a higher epoch
+INFO  failover  finished the promotion this node had already won, epoch=2, after 7 tick(s)
+```
+
+The second line is the one to wait for: the retry uses **the epoch already in the key**, so a disk
+that recovers finishes the promotion without another election. `ob_monitor_errors_total` moves on
+every failed attempt while the `ERROR` arrives once, so the counter is what to alarm on.
+
+**What the node looks like meanwhile.** `PING` answers. `ROLE` reports `REPLICA` with an **empty**
+address, which is the truthful answer available — there is no primary to name, neither the node it
+stopped following nor itself — and writes are refused because the engine is still read-only. Before
+#130 this state reported `REPLICA <its own replication port>` and, worse, **renewed the lease**, so
+the key stayed alive and no peer ever took over.
+
+**If the disk will not recover, kill the node.** That is not a workaround: the lease then expires,
+the key goes, and a peer wins the role at a **higher** epoch, which is exactly what the node holding
+the key at the lower one makes safe. Releasing the key from inside the failed promotion would not
+be — a peer that never saw that key computes the same epoch again, and the record that it was
+consumed would be gone.
+
 ### When a subsystem's loop keeps failing
 
 **Every loop in the engine guards one iteration at a time** (#112, #131), so an exception costs an
