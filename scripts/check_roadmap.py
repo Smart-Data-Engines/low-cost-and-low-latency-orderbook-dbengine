@@ -58,6 +58,15 @@ CLOSED_MARK = "\u2705"  # the tick an item's heading carries once it is closed
 # being discussed — including this file's own note about a mangled `#48-48` range,
 # which the checker flagged as a live defect the first time it ran.
 CODE_SPAN_RE = re.compile(r"`[^`]*`")
+# A markdown link pointing at github.com cites a **GitHub object** - a pull request, a workflow
+# run, a commit - and `#137` inside one is that PR's number, not a reference to item 137.
+#
+# This rule arrived the day it was needed and not before, which is the part worth recording: every
+# earlier citation in this file names a PR whose number happened to be **below** the item count, so
+# it resolved to an unrelated item and the checker was satisfied for the wrong reason. The first PR
+# numbered above the last item is the first one that fails. A rule that passes by coincidence is
+# indistinguishable from one that works until the coincidence ends.
+GITHUB_LINK_RE = re.compile(r"\[[^\]]*\]\(https://(?:www\.)?github\.com/[^)]*\)")
 
 
 def main() -> int:
@@ -96,6 +105,7 @@ def main() -> int:
         # Blank out code spans, keeping the line length so reported columns and the
         # range/reference overlap logic below still line up.
         line = CODE_SPAN_RE.sub(lambda m: " " * len(m.group(0)), line)
+        line = GITHUB_LINK_RE.sub(lambda m: " " * len(m.group(0)), line)
         checked_spans = []
         for match in RANGE_RE.finditer(line):
             checked_spans.append(match.span())
