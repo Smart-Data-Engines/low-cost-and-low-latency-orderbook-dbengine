@@ -117,6 +117,17 @@ MetricsRegistry::MetricsRegistry() {
     // start. Measured: revoke that lease and the key never comes back while the node answers PING.
     counters_.push_back(make_counter("ob_peer_lease_errors_total",
                                      "Peer registry lease refreshes that ended in an exception"));
+    // The other seven loops, together (#131). One counter rather than seven, and that is a
+    // decision: each of the four above asks an operator for a different thing - free the disk,
+    // replace the device, look at why a promotion stopped, look at why a lease will not refresh -
+    // and three of them were measured firing. None of the seven has a known trigger, so all seven
+    // ask for the same thing: read the line, it names the loop. Seven registered counters nothing
+    // can reach would be seven flat zeros dressed as coverage (#117). Two of the seven cannot feed
+    // it at all - the shard router and the client pool run in somebody else's process and have no
+    // registry - and `LoopGuard` takes a null registry rather than pretending otherwise.
+    counters_.push_back(make_counter("ob_loop_errors_total",
+                                     "Iterations abandoned because they threw, across the loops "
+                                     "guarded by LoopGuard"));
 
     // Gauges
     gauges_.push_back(make_gauge("ob_active_sessions", "Number of active TCP sessions"));

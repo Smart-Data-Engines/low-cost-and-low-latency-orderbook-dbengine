@@ -317,6 +317,10 @@ target_compile_definitions(test_mm_epoll_identity
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 
+ob_add_engine_test(test_loop_guard
+    test_loop_guard.cpp
+)
+
 ob_add_engine_test(test_replication_io_boundary
     test_replication_io_boundary.cpp
 )

@@ -12,8 +12,8 @@ invisible. Both were introduced with the mechanisms they measure, which is exact
 when nobody is looking at the dashboard yet.
 
 What this script proves: every string literal handed to increment_counter(),
-increment_gauge(), set_gauge() or observe_histogram() in src/ and tools/ appears in a
-make_counter/make_gauge/make_histogram call in src/metrics.cpp.
+increment_gauge(), set_gauge() or observe_histogram() in src/, include/ and tools/
+appears in a make_counter/make_gauge/make_histogram call in src/metrics.cpp.
 
 Two of those four were wrong until #113. It scanned `add_to_counter`, which
 `MetricsRegistry` does not have - a dead branch that could never match - and did **not**
@@ -47,8 +47,13 @@ WRITTEN = re.compile(
 # so in as many words. A gauge nobody sets reads as **zero**, which is the one value an operator
 # cannot tell from good news - #23's lesson about a counter that means two things, one level up.
 #
+# `include/` is scanned as well as `src/` and `tools/`, and that arrived the day it was needed:
+# `ob_loop_errors_total` is written by `LoopGuard`, which is header-only because seven translation
+# units share it, and this check called it dead (#131). The premise was "a write lives in a .cpp",
+# which was true of every writer until one of them was a header.
+#
 # "Written" is deliberately looser here than above: the name appearing as a string literal anywhere
-# in src/ or tools/ counts. The three subscription counters are written through a local `publish()`
+# in the scanned tree counts. The three subscription counters are written through a local `publish()`
 # lambda, so the literal sits next to `publish` rather than `increment_counter`, and a strict scan
 # calls them dead. For finding *dead* metrics a loose test is the right direction to be wrong in:
 # it can miss a name that is only mentioned, never a name that is genuinely fed.
@@ -74,17 +79,22 @@ def main() -> int:
     registered = set(REGISTERED.findall(REGISTRY.read_text(encoding="utf-8")))
 
     written: dict[str, set[str]] = {}
-    for directory in ("src", "tools"):
-        for path in sorted((REPO / directory).glob("*.cpp")):
-            for name in WRITTEN.findall(path.read_text(encoding="utf-8")):
-                written.setdefault(name, set()).add(f"{directory}/{path.name}")
+    for directory, patterns in (("src", ("*.cpp",)), ("tools", ("*.cpp",)),
+                                ("include", ("**/*.hpp",))):
+        for pattern in patterns:
+            for path in sorted((REPO / directory).glob(pattern)):
+                for name in WRITTEN.findall(path.read_text(encoding="utf-8")):
+                    written.setdefault(name, set()).add(
+                        str(path.relative_to(REPO)))
 
     mentioned: set = set()
-    for directory in ("src", "tools"):
-        for path in sorted((REPO / directory).rglob("*.cpp")):
-            if path == REGISTRY:
-                continue
-            mentioned |= set(ANY_LITERAL.findall(path.read_text(encoding="utf-8")))
+    for directory, patterns in (("src", ("*.cpp",)), ("tools", ("*.cpp",)),
+                                ("include", ("**/*.hpp",))):
+        for pattern in patterns:
+            for path in sorted((REPO / directory).rglob(pattern)):
+                if path == REGISTRY:
+                    continue
+                mentioned |= set(ANY_LITERAL.findall(path.read_text(encoding="utf-8")))
 
     dead = sorted(name for name in registered
                   if name not in mentioned and name not in NOT_YET_WRITTEN)
