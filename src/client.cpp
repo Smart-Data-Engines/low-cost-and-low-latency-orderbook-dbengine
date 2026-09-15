@@ -1122,46 +1122,48 @@ void OrderbookPool::health_check_loop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
 
-        std::lock_guard<std::mutex> lock(mtx_);
-        int new_primary = -1;
+        try {
+            std::lock_guard<std::mutex> lock(mtx_);
+            int new_primary = -1;
 
-        for (size_t i = 0; i < clients_.size(); ++i) {
-            // Attempt reconnect for disconnected nodes
-            if (!nodes_[i].connected) {
-                auto cr = clients_[i]->connect();
-                nodes_[i].connected = cr.has_value();
-                if (!nodes_[i].connected) continue;
-            }
+            for (size_t i = 0; i < clients_.size(); ++i) {
+                // Attempt reconnect for disconnected nodes
+                if (!nodes_[i].connected) {
+                    auto cr = clients_[i]->connect();
+                    nodes_[i].connected = cr.has_value();
+                    if (!nodes_[i].connected) continue;
+                }
 
-            // Send ROLE to each connected node
-            auto rr = clients_[i]->role();
-            if (!rr) {
-                // Node became unreachable
-                nodes_[i].connected = false;
-                continue;
-            }
+                // Send ROLE to each connected node
+                auto rr = clients_[i]->role();
+                if (!rr) {
+                    // Node became unreachable
+                    nodes_[i].connected = false;
+                    continue;
+                }
 
-            const auto& info = rr.value();
-            nodes_[i].role  = info.role;
-            nodes_[i].epoch = info.epoch;
+                const auto& info = rr.value();
+                nodes_[i].role  = info.role;
+                nodes_[i].epoch = info.epoch;
 
-            if (info.role == NodeRole::PRIMARY) {
-                new_primary = static_cast<int>(i);
-            }
-        }
-
-        // Update primary — prefer PRIMARY, fall back to STANDALONE
-        if (new_primary >= 0) {
-            primary_idx_ = new_primary;
-        } else {
-            primary_idx_ = -1;
-            for (size_t i = 0; i < nodes_.size(); ++i) {
-                if (nodes_[i].connected && nodes_[i].role == NodeRole::STANDALONE) {
-                    primary_idx_ = static_cast<int>(i);
-                    break;
+                if (info.role == NodeRole::PRIMARY) {
+                    new_primary = static_cast<int>(i);
                 }
             }
-        }
+
+            // Update primary — prefer PRIMARY, fall back to STANDALONE
+            if (new_primary >= 0) {
+                primary_idx_ = new_primary;
+            } else {
+                primary_idx_ = -1;
+                for (size_t i = 0; i < nodes_.size(); ++i) {
+                    if (nodes_[i].connected && nodes_[i].role == NodeRole::STANDALONE) {
+                        primary_idx_ = static_cast<int>(i);
+                        break;
+                    }
+                }
+            }
+        } catch (...) { throw; }
     }
 }
 

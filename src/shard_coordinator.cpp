@@ -266,27 +266,29 @@ void ShardCoordinator::watch_loop() {
                 config_.shard_id.c_str());
 
     while (running_.load(std::memory_order_acquire)) {
-        // Keep-alive for the lease
-        if (coordinator_ && lease_id_ != 0) {
-            coordinator_->refresh_lease(lease_id_);
-        }
+        try {
+            // Keep-alive for the lease
+            if (coordinator_ && lease_id_ != 0) {
+                coordinator_->refresh_lease(lease_id_);
+            }
 
-        // Poll for shard map changes
-        // In a production system, this would use etcd watch API.
-        // Here we use periodic polling with sleep.
-        // The watch interval is ~2 seconds.
-        for (int i = 0; i < 20 && running_.load(std::memory_order_acquire); ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
+            // Poll for shard map changes
+            // In a production system, this would use etcd watch API.
+            // Here we use periodic polling with sleep.
+            // The watch interval is ~2 seconds.
+            for (int i = 0; i < 20 && running_.load(std::memory_order_acquire); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
 
-        if (!running_.load(std::memory_order_acquire)) break;
+            if (!running_.load(std::memory_order_acquire)) break;
 
-        // Try to read updated shard map from etcd and propagate mm_peers topology
-        OB_LOG_DEBUG("shard_coord", "Watch loop: checking for shard map updates, shard=%s",
-                     config_.shard_id.c_str());
+            // Try to read updated shard map from etcd and propagate mm_peers topology
+            OB_LOG_DEBUG("shard_coord", "Watch loop: checking for shard map updates, shard=%s",
+                         config_.shard_id.c_str());
 
-        // Read mm_peers for this shard from etcd and propagate to ShardMap
-        propagate_mm_topology();
+            // Read mm_peers for this shard from etcd and propagate to ShardMap
+            propagate_mm_topology();
+        } catch (...) { throw; }
     }
 
     OB_LOG_INFO("shard_coord", "Watch loop stopped for shard=%s",

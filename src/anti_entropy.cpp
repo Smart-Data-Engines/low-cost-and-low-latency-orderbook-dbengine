@@ -118,7 +118,9 @@ void AntiEntropyManager::loop() {
             break;
         }
 
-        execute_run();
+        try {
+            execute_run();
+        } catch (...) { throw; }
     }
 
     OB_LOG_DEBUG("anti_entropy", "Anti-entropy loop thread exiting");

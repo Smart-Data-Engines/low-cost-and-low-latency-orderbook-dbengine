@@ -117,27 +117,29 @@ void MetricsServer::run_loop() {
     epoll_event events[kMaxEvents];
 
     while (running_.load(std::memory_order_acquire)) {
-        int n = ::epoll_wait(epoll_fd_, events, kMaxEvents, 200 /*ms timeout*/);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-
-        for (int i = 0; i < n; ++i) {
-            if (events[i].data.fd == listen_fd_) {
-                // Accept new connection
-                int client_fd = ::accept4(listen_fd_, nullptr, nullptr,
-                                          SOCK_CLOEXEC);
-                if (client_fd < 0) {
-                    if (errno == EMFILE || errno == ENFILE) {
-                        OB_LOG_WARN("metrics", "accept() EMFILE/ENFILE: %s",
-                                    std::strerror(errno));
-                    }
-                    continue;
-                }
-                handle_request(client_fd);
+        try {
+            int n = ::epoll_wait(epoll_fd_, events, kMaxEvents, 200 /*ms timeout*/);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                break;
             }
-        }
+
+            for (int i = 0; i < n; ++i) {
+                if (events[i].data.fd == listen_fd_) {
+                    // Accept new connection
+                    int client_fd = ::accept4(listen_fd_, nullptr, nullptr,
+                                              SOCK_CLOEXEC);
+                    if (client_fd < 0) {
+                        if (errno == EMFILE || errno == ENFILE) {
+                            OB_LOG_WARN("metrics", "accept() EMFILE/ENFILE: %s",
+                                        std::strerror(errno));
+                        }
+                        continue;
+                    }
+                    handle_request(client_fd);
+                }
+            }
+        } catch (...) { throw; }
     }
 }
 

@@ -238,8 +238,10 @@ void ShardRouter::watch_loop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
 
-        OB_LOG_DEBUG("shard_router", "Watch loop: checking for shard map updates");
-        refresh_shard_map();  // ignore errors — keep using cached map
+        try {
+            OB_LOG_DEBUG("shard_router", "Watch loop: checking for shard map updates");
+            refresh_shard_map();  // ignore errors — keep using cached map
+        } catch (...) { throw; }
     }
 }
 
