@@ -305,10 +305,19 @@ uint16_t HybridLogicalClock::resolve_logical(uint32_t wanted, uint64_t& physical
     // ingestion rate a pinned window of 100 ms is some 135 000 events, so the period is crossed
     // twice inside a tenth of a second.
     //
-    // `physical` cannot be UINT64_MAX here in any reachable state: it is
-    // `max(wall clock, previous, remote)`, and a remote that large is a 585-year-old
-    // timestamp no real clock produces. If one ever arrives the increment saturates the type
-    // rather than wrapping to zero, which is the direction that keeps this function's promise.
+    // `physical` cannot be UINT64_MAX here, and since #121 that is enforced rather than argued.
+    // It is `max(wall clock, previous, remote)`, and the mesh now refuses a peer whose physical
+    // component is more than `MM_MAX_CLOCK_SKEW_NS` ahead of the wall clock, so no remote value
+    // can push it there.
+    //
+    // **The previous version of this comment was wrong about the saturation branch**, and the
+    // correction is why the bound exists. It said the increment "saturates the type rather than
+    // wrapping to zero, which is the direction that keeps this function's promise". It does not:
+    // at `{UINT64_MAX, 65535}` the next tick wants 65536, leaves `physical` alone and returns 0,
+    // so `{UINT64_MAX, 0}` follows `{UINT64_MAX, 65535}` and the clock goes **backwards** by the
+    // whole counter - the one property #119 exists to prevent - and then oscillates there for
+    // ever. Saturating is the least-bad thing to do once you are in that state; the fix is to make
+    // the state unreachable, which is what the bound at the door does.
     if (physical != UINT64_MAX) {
         ++physical;
     }
@@ -351,11 +360,5 @@ void HybridLogicalClock::reset_drift() {
     max_drift_ns_ = 0;
 }
 
-uint64_t HybridLogicalClock::wall_clock_ns() {
-    struct timespec ts{};
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL +
-           static_cast<uint64_t>(ts.tv_nsec);
-}
 
 } // namespace ob

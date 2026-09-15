@@ -300,6 +300,14 @@ struct PeerConnection {
     bool         catchup_started{false};
     HLCTimestamp last_hlc;           // last HLC received from this peer
 
+    /// Open while this peer is being refused for an implausible clock (#121). Per peer, because
+    /// two peers with wrong clocks are two conditions an operator has to fix separately - and it
+    /// lives on the record rather than on the connection because the peer reconnects at backoff
+    /// pace and is refused again, which is one episode and not one per attempt.
+    ///
+    /// Touched only by the io loop.
+    LogEpisode clock_refusals;
+
     // Send buffer (non-blocking)
     std::vector<uint8_t> send_buf;
 
@@ -828,6 +836,26 @@ private:
     /// that frame's tail. A closed connection is the only honest answer, and the reconnect path
     /// already knows how to catch up afterwards.
     bool drop_peer_if_send_buf_too_large(PeerConnection& peer);
+
+    /// Refuse a peer whose physical clock is further ahead than `MM_MAX_CLOCK_SKEW_NS` (#121).
+    /// Returns true when the peer was dropped, in which case the record is **not** applied and its
+    /// timestamp never reaches this node's clock.
+    ///
+    /// The peer rather than the record, and neither the clock nor a clamp, because those are the
+    /// only two of the four options that leave every participating node holding the same clock:
+    ///
+    /// - **clamping what we absorb** is decided per node against *that node's* wall clock, so two
+    ///   nodes resolve the same LWW conflict differently and the values diverge. An untrue clock is
+    ///   better than divergent data.
+    /// - **refusing the record and keeping the link** loses the write while the peer believes it
+    ///   replicated: a silent hole, the worst outcome on the list.
+    /// - **absorbing anything** is what #121 measured: the mesh's clock becomes the maximum of its
+    ///   members' clocks and stays there, and a peer years ahead poisons it for years.
+    ///
+    /// Dropping is visible on both sides (`MM_PEERS`, the counter, one line), reversible - fix the
+    /// clock and the link returns - and leaves the healthy set sharing one clock, because the
+    /// verdict is taken against the wall clock that every healthy node agrees about.
+    bool drop_peer_if_clock_is_implausible(PeerConnection& peer, const HLCTimestamp& remote_hlc);
 
     /// Send this node's version vector as a WAL_RECORD_VERSION_VECTOR frame.
     ///

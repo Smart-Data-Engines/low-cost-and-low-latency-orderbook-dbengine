@@ -178,14 +178,23 @@ bool eventually(F&& pred, std::chrono::milliseconds budget = std::chrono::millis
     return pred();
 }
 
-uint64_t wall_clock_ns() {
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count());
-}
-
 }  // namespace
 
-TEST(MmWireClock, AnHourInTheFutureOnTheWireBecomesThisNodesClockAndStays) {
+TEST(MmWireClock, AnHourInTheFutureOnTheWireIsRefusedAndTheClockDoesNotMove) {
+    // #121's decision, on the wire. Until it was taken, this test asserted the opposite - that an
+    // hour off the wire *became* this node's clock and stayed - because that was what the engine
+    // did and a measurement is worth pinning even when the behaviour is wrong.
+    //
+    // Four answers were available and three of them are worse, which is why this one is a refusal
+    // of the **peer** rather than of the record, the clock or the value:
+    //
+    //  * clamping what we absorb is decided per node against *that node's* wall clock, so two
+    //    nodes resolve the same LWW conflict differently and the values diverge. An untrue clock
+    //    beats divergent data.
+    //  * refusing the record and keeping the link loses the write while the peer believes it
+    //    replicated, which is a silent hole.
+    //  * absorbing anything is what #121 measured: the mesh's clock becomes the maximum of its
+    //    members' clocks and stays there for as long as that member keeps writing.
     const uint16_t port = g_port.fetch_add(1, std::memory_order_relaxed);
     TempDir tmp("mm_wire_clock_");
     ob::Engine engine(tmp.path, kNoAutoFlush, ob::FsyncPolicy::NONE, {}, {}, {}, {},
@@ -194,9 +203,12 @@ TEST(MmWireClock, AnHourInTheFutureOnTheWireBecomesThisNodesClockAndStays) {
     ASSERT_NE(engine.multi_master_manager(), nullptr);
     ASSERT_NE(engine.hlc(), nullptr);
 
-    const uint64_t before = engine.hlc()->current().physical_ns;
-    const uint64_t skewed = wall_clock_ns() + 3'600'000'000'000ULL;   // one hour ahead
-    ASSERT_GT(skewed, before);
+    const uint64_t skewed = ob::wall_clock_ns() + 3'600'000'000'000ULL;   // one hour ahead
+    ASSERT_GT(skewed, ob::wall_clock_ns() + ob::MM_MAX_CLOCK_SKEW_NS)
+        << "the skew this test sends is inside the bound, so it would be absorbed and this test "
+        << "would assert nothing";
+    const uint64_t refused_before =
+        engine.registry().counter_value("ob_mm_peer_dropped_clock_total");
 
     MeshClient peer(port);
     ASSERT_TRUE(peer.wait_for_bytes()) << "the node did not answer an accepted mesh connection";
@@ -212,38 +224,61 @@ TEST(MmWireClock, AnHourInTheFutureOnTheWireBecomesThisNodesClockAndStays) {
     const ob::HLCTimestamp remote{skewed, 0, 7};
     peer.send_delta(7, 1, remote, "WIRECLK", "EX", 100'000);
 
-    // The clock moves, and that is the whole claim: nothing but `tick_receive()` can move it, and
-    // nothing but `handle_remote_record()` calls that with a value off the wire.
-    EXPECT_TRUE(eventually([&] { return engine.hlc()->current().physical_ns >= skewed; }))
-        << "a peer's timestamp an hour in the future did not reach this node's clock: it reads "
-        << engine.hlc()->current().physical_ns << ", the frame said " << skewed;
+    // The counter is the assertion that the record *arrived* and was refused, rather than never
+    // having been parsed at all - which would make everything below true for the wrong reason.
+    ASSERT_TRUE(eventually([&] {
+        return engine.registry().counter_value("ob_mm_peer_dropped_clock_total") > refused_before;
+    })) << "nothing was refused, so this test is measuring a frame that never landed";
 
-    // And it **stays**, which is the part an operator has to know: the next local write is stamped
-    // from the moved clock, not from the wall clock this node can still read. That is why
-    // `docs/operations.md` says one skewed peer becomes the cluster's clock until every node
-    // restarts, and why bounding it is a decision (#121) rather than an omission.
-    const ob::HLCTimestamp local_after = engine.hlc()->tick_local();
-    EXPECT_GE(local_after.physical_ns, skewed)
-        << "the clock went back to the wall clock between the remote record and the next local "
-        << "write, which would make the merge in tick_receive() pointless";
-    EXPECT_LT(wall_clock_ns(), skewed)
-        << "the wall clock has caught up with the skew, so this test proves nothing about a moved "
-        << "clock - pick a larger skew";
+    EXPECT_LT(engine.hlc()->current().physical_ns, skewed)
+        << "the hour off the wire reached this node's clock anyway: it reads "
+        << engine.hlc()->current().physical_ns;
+    EXPECT_LE(engine.hlc()->tick_local().physical_ns,
+              ob::wall_clock_ns() + ob::MM_MAX_CLOCK_SKEW_NS)
+        << "the next local write is stamped outside the bound, so the refusal did not keep the "
+        << "clock - which is the only thing it was for";
 
-    // The drift gauge's source, so the pair #119 and #120 built is fed from the wire too rather
-    // than only from a unit test's direct call.
-    EXPECT_GE(engine.hlc()->max_drift_ns(), 3'500'000'000'000LL)
-        << "the drift a peer introduced is not what the node reports: "
-        << engine.hlc()->max_drift_ns();
+    // The peer is gone, and its claim is **not**: `last_hlc` is recorded before the verdict on
+    // purpose, so an operator reading MM_PEERS sees the number that got it dropped instead of
+    // having to take the log's word for it.
+    EXPECT_TRUE(eventually([&] {
+        for (const auto& p : engine.multi_master_manager()->peer_states()) {
+            if (p.node_id == 7) return !p.connected;
+        }
+        return true;   // the record may be gone entirely, which is also "not connected"
+    })) << "the peer whose clock is wrong is still connected, so its next frame moves the clock";
+    for (const auto& p : engine.multi_master_manager()->peer_states()) {
+        if (p.node_id == 7) {
+            EXPECT_EQ(p.last_hlc.physical_ns, skewed)
+                << "the peer's claimed timestamp was not kept, so the evidence for the drop is "
+                << "only in the log";
+        }
+    }
+
+    // The cost, asserted rather than described: the record did not arrive. That is the half of
+    // this decision an operator pays for, and a test that only checked the clock would let someone
+    // believe the data came too.
+    engine.flush_incremental();
+    size_t rows = 0;
+    const std::string err = engine.execute(
+        "SELECT timestamp, price, quantity FROM 'WIRECLK'.'EX' "
+        "WHERE timestamp BETWEEN 0 AND 9999999999999999999",
+        [&](const ob::QueryResult&) { ++rows; });
+    EXPECT_TRUE(err.empty() || rows == 0) << err;
+    EXPECT_EQ(rows, 0u) << "the refused record was stored, so the peer was dropped for nothing";
 
     engine.close();
 }
 
-TEST(MmWireClock, ARecordFromAPeerWhoseClockIsWrongIsStillApplied) {
-    // The other half, and it is the one that makes the first half matter: the engine does not
-    // refuse the record, so the skew arrives *with* data rather than instead of it. A node that
-    // dropped such a record would keep its clock and lose a write, which is the trade #121 would
-    // have to make explicit.
+TEST(MmWireClock, AClockInsideTheBoundIsStillAbsorbedAndItsRecordApplied) {
+    // The control, and it is what stops the bound above from being a blanket refusal. A node that
+    // dropped every peer whose clock differed at all would pass the first test and be useless:
+    // clocks always differ. This one sends a minute - four orders of magnitude above working NTP,
+    // inside the five-minute bound - and requires both halves to happen: the clock moves *and* the
+    // data lands.
+    //
+    // Same shape as the SDK's `migration/020` beside `errors/038`: two positives are what make a
+    // refusal mean something narrower than "no".
     const uint16_t port = g_port.fetch_add(1, std::memory_order_relaxed);
     TempDir tmp("mm_wire_clock_applied_");
     ob::Engine engine(tmp.path, kNoAutoFlush, ob::FsyncPolicy::NONE, {}, {}, {}, {},
@@ -260,11 +295,17 @@ TEST(MmWireClock, ARecordFromAPeerWhoseClockIsWrongIsStillApplied) {
         return false;
     }));
 
-    const ob::HLCTimestamp remote{wall_clock_ns() + 3'600'000'000'000ULL, 0, 7};
+    const uint64_t inside = ob::wall_clock_ns() + 60'000'000'000ULL;   // one minute ahead
+    ASSERT_LT(inside, ob::wall_clock_ns() + ob::MM_MAX_CLOCK_SKEW_NS)
+        << "this test's skew is outside the bound, so it would be refused and the control would "
+        << "assert the wrong thing";
+    const ob::HLCTimestamp remote{inside, 0, 7};
     peer.send_delta(7, 1, remote, "WIRECLK", "EX", 123'456);
 
-    ASSERT_TRUE(eventually([&] { return engine.hlc()->current().physical_ns >= remote.physical_ns; }))
-        << "the frame never arrived, so nothing below is about the record";
+    ASSERT_TRUE(eventually([&] { return engine.hlc()->current().physical_ns >= inside; }))
+        << "a minute of skew was refused, so the bound is not a bound but a blanket";
+    EXPECT_EQ(engine.registry().counter_value("ob_mm_peer_dropped_clock_total"), 0u)
+        << "the peer was dropped for a clock inside the bound";
 
     engine.flush_incremental();
     std::vector<int64_t> prices;

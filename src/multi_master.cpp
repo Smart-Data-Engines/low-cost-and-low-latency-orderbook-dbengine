@@ -1364,6 +1364,60 @@ bool MultiMasterManager::drop_peer_if_send_buf_too_large(PeerConnection& peer) {
     return true;
 }
 
+bool MultiMasterManager::drop_peer_if_clock_is_implausible(PeerConnection& peer,
+                                                           const HLCTimestamp& remote_hlc) {
+    const uint64_t now = wall_clock_ns();
+    if (remote_clock_is_plausible(remote_hlc.physical_ns, now)) {
+        if (const uint64_t held = peer.clock_refusals.end()) {
+            OB_LOG_INFO("mm",
+                        "peer %u's clock is back inside the bound after %llu refused record(s); "
+                        "its records are being applied again", peer.node_id,
+                        static_cast<unsigned long long>(held));
+        }
+        return false;
+    }
+
+    // Plain subtraction, not the clock's saturating `drift_between()`: that one answers "how far
+    // apart, either way" for the drift gauge, and here the verdict above has already established
+    // that the remote value is the larger of the two, so this cannot wrap.
+    const uint64_t ahead_ns = remote_hlc.physical_ns - now;
+    engine_.registry().increment_counter("ob_mm_peer_dropped_clock_total");
+    if (peer.clock_refusals.begin()) {
+        OB_LOG_WARN("mm",
+                    "peer %u says its clock is %llu s ahead of ours, over the %llu s bound — "
+                    "dropping the connection rather than taking that time. Absorbing it would "
+                    "make it this whole mesh's clock for as long as that node keeps writing, and "
+                    "nothing brings it back. Its data will not arrive until its clock is fixed; "
+                    "MM_PEERS still shows what it claims",
+                    peer.node_id, static_cast<unsigned long long>(ahead_ns / 1'000'000'000ULL),
+                    static_cast<unsigned long long>(MM_MAX_CLOCK_SKEW_NS / 1'000'000'000));
+    } else {
+        OB_LOG_DEBUG("mm",
+                     "peer %u's clock is still %llu s ahead (%llu refused record(s))",
+                     peer.node_id, static_cast<unsigned long long>(ahead_ns / 1'000'000'000ULL),
+                     static_cast<unsigned long long>(peer.clock_refusals.ticks()));
+    }
+
+    if (peer.fd >= 0) {
+        release_tls(peer);
+        ::close(peer.fd);
+        peer.fd = -1;
+    }
+    peer.connected      = false;
+    peer.handshake_done = false;
+    peer.peer_proved    = false;
+    peer.auth_nonce.clear();
+    peer.we_accepted    = false;
+    peer.catching_up    = false;
+    peer.needs_snapshot = true;
+    // Both buffers go, for the reason the slow-peer drop gives: after a partial write the send
+    // buffer can start mid-frame, and this socket is closed, so nobody is reading either one.
+    peer.send_buf.clear();
+    peer.recv_buf.clear();
+    on_peer_disconnected(peer);
+    return true;
+}
+
 bool MultiMasterManager::attach_tls(PeerConnection& peer) {
     if (peer.we_accepted) {
         if (config_.tls_server == nullptr) return true;
@@ -1794,6 +1848,12 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
     // one read site, zero write sites, so the hlc_timestamp column showed 0.0.0 for
     // every peer no matter how much data had flowed.
     peer.last_hlc = HLCTimestamp::deserialize(hdr.hlc_data);
+
+    // Before dispatch, and that order is the whole of #121: the check has to happen while the peer
+    // record is in hand and before the timestamp reaches `Engine::apply_remote_delta()`, which is
+    // the only place in this tree that feeds the clock. `last_hlc` is recorded first on purpose, so
+    // `MM_PEERS` shows what a refused peer claims rather than hiding the evidence.
+    if (drop_peer_if_clock_is_implausible(peer, peer.last_hlc)) return;
 
     // Dispatch to handle_remote_record.
     handle_remote_record(peer.node_id, hdr, payload_ptr, expected_payload_len);

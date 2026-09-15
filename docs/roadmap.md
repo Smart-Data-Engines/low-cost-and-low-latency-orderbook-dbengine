@@ -3470,36 +3470,111 @@ apart.
   every `/metrics` scrape as the reader. Present since the replica path existed; reported the first
   time anything read that pointer often enough
 
-### 121. Nothing bounds how far a peer's clock can move ours, and the move is permanent
+### 121. Nothing bounds how far a peer's clock can move ours, and the move is permanent ✅
 
-Named while fixing #119, and left open on purpose: the honest answer is a decision, not a patch.
+Named while fixing #119 and left open on purpose, because the honest answer was a decision. Taken
+now: **the mesh refuses a peer whose physical clock is more than five minutes ahead of this node's
+wall clock.** Not the record, not the clock, and not a clamp — and the three it is not are the
+content of the decision.
 
-`tick_receive()` stores `max({now, last_, remote})`, `src/multi_master.cpp` passes the frame's
-timestamp to it unfiltered, and no code path lowers the physical component again. So one record
-from a peer an hour ahead moves this node an hour ahead for the rest of its life, and because
-`apply_delta_mm()` stamps **our** writes with `tick_local()`, our records then carry that value out
-to every peer. One broken clock migrates into every node and stays. Measured as part of #119: after
-one such frame, twenty local ticks later the clock is still an hour past the wall clock.
+`tick_receive()` stores `max({now, last_, remote})`, `src/multi_master.cpp` passed the frame's
+timestamp to it unfiltered, and no code path lowers the physical component again. The right way to
+say what that means is not "a peer can move our clock" but **the mesh's clock is the maximum of its
+members' clocks, and it stays there for as long as that member keeps writing.** Nothing bounded the
+maximum.
 
-With #119 fixed this is **wrong about real time rather than incorrect** — the mesh agrees with
-itself, ordering is total, LWW converges — so the cost is that timestamps stop being times, that
-`ob_mm_hlc_drift_ns` never comes down, and that a node whose own clock is fine carries another
-node's error for ever.
+**First, the blast radius, measured rather than assumed — and it is smaller than the item was
+filed with.** The filed text said `apply_delta_mm()` stamps our writes from that clock so the value
+goes out on our records. It stamps the **record's HLC**; a row's `timestamp_ns` comes from
+`Engine::stamp_for()`, which reads `system_clock` directly, or from the client since #105. So a
+drifted clock does **not** corrupt row timestamps, TTL retention or time-range queries. It reaches
+exactly two things: the order of records, and LWW's choice between concurrent writes. That
+narrowing is what made the rest of the decision tractable, and it took reading one line
+(`row.timestamp_ns = delta.timestamp_ns`) rather than reasoning about the design.
 
-Why a ceiling is not obviously right: refusing the **record** loses data, and clamping the **clock**
-loses causal order against that peer — `HybridLogicalClock`'s documented guarantee is that
-A → B implies HLC(A) < HLC(B), and a timestamp we decline to adopt breaks it for exactly the pair
-where the peer's clock was wrong. Either choice needs a threshold, and this repo's own rule is that
-a threshold above ordinary variation is not a justification. Whether we want a clock that means
-something or a clock that never lies about causality is a product decision.
+**Then the tail, which is the reason a bound had to exist at all rather than being a matter of
+taste.** `resolve_logical()` carries a logical overflow into the physical component and its comment
+said `physical` "cannot be UINT64_MAX here in any reachable state … If one ever arrives the
+increment saturates the type rather than wrapping to zero, which is the direction that keeps this
+function's promise." **That last clause is false.** At `{UINT64_MAX, 65535}` the next tick wants
+65536, leaves `physical` alone and returns 0 — so `{UINT64_MAX, 0}` follows `{UINT64_MAX, 65535}`,
+the clock goes **backwards by the whole counter**, which is the one property #119 exists to prevent,
+and then oscillates there for ever. Unreachable from any real clock; reachable from a peer, because
+nothing bounded what a peer could say. Saturating is the least-bad thing to do once you are in that
+state. The fix is to make the state unreachable, and a bound at the door does that.
 
-What exists today so the decision can be made with numbers rather than taste:
-`ob_mm_hlc_drift_excursions_total` counts occurrences, `ob_mm_hlc_drift_ns` holds the peak, the log
-says it twice per excursion (#120), and `HLCSkew.ARemoteTimestampAheadOfUsIsAdoptedAndKept` pins
-the current behaviour so that changing it shows up as a failing test.
+**Why the peer and not the record, the clock or a clamp.** Four answers were available and only two
+of them leave every participating node holding the *same* clock, which is the property a
+multi-master mesh cannot trade:
 
-- Effort: M, most of it the decision | Impact: one misconfigured node's clock becomes the whole
-  mesh's clock, permanently, and the only visible sign is a drift gauge that never returns to zero
+- **Clamp what we absorb.** The obvious answer, and it is the worst one. The verdict is taken
+  per node against *that node's* wall clock, so two nodes clamp differently, stamp their later
+  writes differently, and resolve the same LWW conflict differently — `ConflictResolver::resolve()`
+  compares the record's HLC against the stored one, so the divergence lands in the **data**. An
+  untrue clock beats divergent values, and it is not close.
+- **Refuse the record, keep the link.** The write is lost while the peer believes it replicated: a
+  silent hole, and the worst outcome on any list this repository keeps.
+- **Absorb anything.** What the item measured. Correct today, and one misconfigured node owns the
+  cluster's clock for as long as it runs.
+- **Refuse the peer.** Every node still in the mesh shares one clock; the condition is visible on
+  both sides (`MM_PEERS` keeps what the peer claimed, a counter moves, one line says what to do);
+  and it is reversible — fix the clock and the link returns. Taken.
+
+The verdict is against the **wall clock**, deliberately, not against our HLC. Every healthy node
+agrees about wall time to within its own skew, so every healthy node reaches the same verdict about
+the same peer, and the outcome is stable rather than a race between who absorbed first.
+
+**Five minutes, and it is a judgement rather than a measurement — said so rather than dressed up.**
+What the bound separates is not two magnitudes but two *kinds* of clock: one that is merely
+unsynchronised, which lands in milliseconds under working NTP and in seconds after a VM suspend or a
+long pause, and one that is **wrong** — a hand-set date, a dead RTC, a host that never had NTP. The
+first heals as wall time catches up; the second does not, for the reason at the top of this entry.
+Four orders of magnitude above the first class and far below the second is the whole of the choice,
+and the exact value is not load-bearing: what is load-bearing is that a bound exists. A **constant
+rather than a flag**, because the only thing an operator could tune is how badly a peer's clock may
+lie, and tuning it *tighter* would start dropping peers that are merely unsynchronised — which is
+the cost this decision exists to refuse. The mechanism is there if a user ever asks; a flag added
+now would be a knob nothing turns, and one of those was deleted two items ago.
+
+**What this deliberately does not buy: a clock that means wall time.** A peer four minutes ahead is
+still absorbed and still pins the mesh four minutes ahead. That is accepted, because rows carry
+their own time and because refusing at four minutes would cost data for a clock that is merely
+unsynchronised. `ob_mm_hlc_drift_ns` is still a peak that never falls, and still the thing to alarm
+on.
+
+**And what it costs, asserted rather than described.** The refused peer's data does not arrive.
+`MmWireClock.AnHourInTheFutureOnTheWireIsRefusedAndTheClockDoesNotMove` requires the record to be
+absent from storage as well as absent from the clock — a test that checked only the clock would let
+the next reader believe the data came too.
+
+**The clock class is still uncapped, and that is the decision rather than the absence of one.** A
+clock that silently declined part of what it was told would break the invariant it exists for: if
+we accept a record we must stamp later writes above it, or a causally later write can lose an LWW
+conflict to the record it followed. So the layer that says no must be the layer that can also
+decline the record — and, since a record refused under a live link is a silent hole, the layer that
+can decline the peer. `tests/test_hlc_skew.cpp` still requires the class to absorb an hour handed
+to it directly, with the reason written beside it.
+
+**No integration test, and the reason is the instrument rather than the effort.** Producing a real
+node whose clock is five minutes off needs the host clock moved or a time namespace, which is not
+something this battery can do to the machine it runs on. The wire test is the right instrument and
+was already built for #54's stage D: a fake peer that frames one DELTA whose HLC says what no real
+clock would. That is also what makes this measurable at all — the engine's own clock is never
+skewed, only what arrives on the wire.
+
+Five copies of one fact came out of this: `wall_clock_ns()` existed as a private static in
+`HybridLogicalClock`, a free function in `src/failover.cpp`, and one in each of two test files —
+written two different ways, `clock_gettime(CLOCK_REALTIME)` in two and `system_clock::now()` in the
+other two. They agree on Linux, so this was never a defect; it was the shape that produces one
+(#118 had two fields named after the same quantity and neither held it). #121 needed the wall clock
+in a third production place, so instead of a fifth copy there is `include/orderbook/wall_clock.hpp`
+and one definition. `Engine::stamp_for()` keeps its own expression on purpose: it answers a
+different question — *whose* time a row carries — and #105 gave that one function of its own for the
+same reason this one exists.
+
+- Effort: M, most of it the decision | Impact: one misconfigured node's clock was the whole mesh's
+  clock, permanently, and a value no real clock produces could push the physical component into the
+  one state where this clock runs backwards
 
 ### 118. Two mesh fields are named after a replication lag, neither is one, and the lag that is real is published nowhere ✅
 
@@ -7028,10 +7103,18 @@ No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #121.** Every item above #58 is either marked closed or named on that
-line — `scripts/check_roadmap.py` holds both directions — and items #1 to #58 are planned work
-nobody has built, not defects. The one that is left, #121, is a question recorded for a decision rather than
-a defect, and **#37**'s remaining half waits on an external service. **#117**, **#118**, **#122** and **#123** are closed, and
+**Open: none.** Every item above #58 is marked closed, and
+`scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
+to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
+#58 are planned work nobody has built, not defects, which is what the floor in this line is for.
+
+Read that as narrowly as it is written. It says every defect **that has been filed** above #58 is
+closed, and #121, the last of them, was a question rather than a defect — answered by bounding how
+far a peer's clock may move this one, refusing the peer rather than the record, the clock or a
+clamp. It does not say the engine is finished; the capability table below is the list of what it is
+not. And **#37**'s remaining half — a coverage badge — is below the floor and still a decision.
+
+**#117**, **#118**, **#122** and **#123** are closed, and
 together they are one investigation that started with five registered
 metrics nothing wrote and ended four items later in the WAL's own arithmetic. Every lag this engine
 reports is now measured against a position it can actually compare, and every one of them is a

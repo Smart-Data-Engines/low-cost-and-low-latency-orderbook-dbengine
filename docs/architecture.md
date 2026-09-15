@@ -381,7 +381,12 @@ Multi-master replication extends the engine to accept writes on multiple nodes s
 
 ### Core Concepts
 
-**Hybrid Logical Clock (HLC)** — Each write is stamped with a 12-byte HLC timestamp combining physical wall-clock time (uint64 nanoseconds), a logical counter (uint16), and the node ID (uint16). HLC preserves causal ordering without requiring synchronized clocks across nodes.
+**Hybrid Logical Clock (HLC)** — Each write is stamped with a 12-byte HLC timestamp combining physical wall-clock time (uint64 nanoseconds), a logical counter (uint16), and the node ID (uint16). HLC preserves causal ordering without requiring *synchronized* clocks across nodes — but since
+#121 it does require them to be **roughly** right: a peer whose physical component is more than five
+minutes ahead of a node's wall clock is refused and its connection dropped, because absorbing that
+value would make it the whole mesh's clock for as long as that peer kept writing. A row's
+`timestamp_ns` is not this clock: it is the client's `event_time_ns` or the receiving node's
+`system_clock`, so retention and time-range queries are untouched by mesh clock skew.
 
 **Last-Writer-Wins (LWW)** — Conflicts (concurrent writes to the same price level on different nodes) are resolved deterministically: the write with the higher HLC timestamp wins. For orderbook L2 data, this is semantically correct — the most recent price level update is always the most current.
 
