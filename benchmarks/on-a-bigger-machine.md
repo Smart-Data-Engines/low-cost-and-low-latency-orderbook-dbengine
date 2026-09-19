@@ -6,9 +6,10 @@ prediction and including the parts this run contradicted: a prediction rewritten
 not a prediction.
 
 The short version is that the machine was worth it, and not for the reason it was asked for. The
-noise floor fell from 21.2% to **2.26%** in the published run, and to 0.89% at best, which is what it was for. What it bought was **eight
-defects**, none of them found by reading code — each one found by the tree being on a machine it had
-never been on — and a published claim that turned out to be wrong in both of its halves.
+noise floor fell from 21.2% to **2.26%** in the published run, and to 0.89% at best — which is what
+it was asked for. What it bought was **eight defects**, none of them found by reading code (each was
+found by the tree being on a machine it had never been on) and a published claim that turned out to
+be wrong in both of its halves.
 
 ## The machine
 
@@ -16,7 +17,7 @@ never been on — and a published claim that turned out to be wrong in both of i
 |---|---|
 | Instance | Amazon EC2 **m9g.xlarge**, eu-central-1 |
 | CPU | aarch64, ARM implementer `0x41` part `0xd84` r0p1, 4 vCPU |
-| Cache | L1d 64 KiB/core, L2 2 MiB/core, **L3 48 MiB** |
+| Cache | L1d 64 KiB/core, L2 2 MiB/core, **L3 48 MiB shared by all four** (`/sys/devices/system/cpu/cpu0/cache`) |
 | Memory | 15,640 MiB, **no swap** |
 | Storage | 100 GB gp3, 6000 IOPS, 500 MB/s, **xfs** on `nvme0n1p1` |
 | Clock | **not published**: no `cpu MHz` line and no cpufreq driver, so the platform is fixed-performance at the hardware level |
@@ -80,9 +81,10 @@ They are **not** the same count in the section after it, and that difference was
 **Control noise floor: 2.26%**, against 21.2% on the development machine. That is the number this
 machine was for, and everything below is a difference the run can now resolve.
 
-The floor is itself a measurement and it moved: **six runs on this box gave 2.31%, 1.41%, 3.06%, 5.37%, 2.26% and 0.89%**. So the honest claim is a range — this machine resolves
-somewhere between about 0.9% and 5.4%, and the run being published resolved 2.26% — rather than the
-best of four. Every pair below is outside the worst of them as well as the published one.
+The floor is itself a measurement and it moved: **six runs on this box gave 2.31%, 1.41%, 3.06%,
+5.37%, 2.26% and 0.89%**. So the honest claim is a range — this machine resolves somewhere between
+about 0.9% and 5.4%, and the run being published resolved 2.26% — rather than the best of six.
+Every pair below is outside the worst of them as well as the published one.
 
 - **ingest** against ClickHouse — **69.6% apart**. A loss.
 - **ingest** against TimescaleDB — **15.9% apart**. A loss.
@@ -188,11 +190,12 @@ ClickHouse is doing **more** work per level — parsing text and building compre
 engine receives binary frames and appends — so parity per CPU-second is not a flattering result for
 us.
 
-**Our client burns four times what our server burns**, and the C++ probe above did the same 2,000,000
-levels with **0.44 s** of client CPU against this harness's 4.537. So the ingest column measures the
-harness's Python at least as much as it measures the protocol: with an efficient client the same
-server reaches 1,319,261 levels/s where the harness reads 358,829. The loss to ClickHouse is real
-either way — 4.1× rather than 11.9× — and the smaller number is the honest one to argue against.
+**Our client burns four times what our server burns**, and the C++ probe above did the same
+2,000,000 levels with **0.44 s** of client CPU against this harness's 4.537. So the ingest column
+measures the harness's Python at least as much as it measures the protocol: with an efficient
+client the same server reaches 1,319,261 levels/s where the harness reads 358,829. The loss to
+ClickHouse is real either way — 4.1× rather than 11.9× — and the smaller number is the honest one
+to argue against.
 
 And the two CPU figures being one tick apart is the measurement's resolution, not a coincidence:
 `/proc` reports these in 10 ms units, which at 1.13 s is 0.9%. Two numbers that agree to within
@@ -319,10 +322,10 @@ because the failure it replaced was a `SIGABRT`: a second node on a taken port p
 
 **Not for the engine's own numbers.** The one thing the previous machine could not do was resolve
 small differences, and that is fixed: the control floor went from 21.2% to **2.26%** in the
-published run and 0.89% at best, the benchmark
-suite's round-to-round variation is hundredths of a percent, and every pair in the comparative table
-is now classified rather than swallowed. Nothing bigger is needed to publish this table, and a
-faster box would not make any of these numbers more trustworthy.
+published run and 0.89% at best, the benchmark suite's round-to-round variation is hundredths of a
+percent, and every pair in the comparative table is now classified rather than swallowed. Nothing
+bigger is needed to publish this table, and a faster box would not make any of these numbers more
+trustworthy.
 
 **One more machine is worth having, and it is one machine rather than two.** Two questions are open
 and a single box answers both if it is booted twice:
@@ -353,20 +356,21 @@ ClickHouse wins the clock by spending **2.39 cores** where the engine spends **0
 whole of the wall-clock difference on this box, and the section above shows that the round trip is
 not: at equal volume the engine's wall-clock ingest is within 4% of its own in-process figure.
 
-`grep -rn 'hardware_concurrency\|_SC_NPROCESSORS\|sched_getaffinity' src include` returns **nothing**:
-every thread in this engine has a fixed role, and none of them is a pool sized to the machine.
-ClickHouse sizes itself to the cores it can see, and `timescaledb-tune` sizes PostgreSQL to the
-machine. So the prediction, registered here before any such box exists: **on 8 or 16 cores the
-engine's ingest wall clock stays roughly where it is, ClickHouse's grows with the cores, and the
-per-CPU-second parity holds.** If per-CPU-second parity *breaks* in our favour on a bigger box, the
-engine scales better per unit of work; if it breaks against us, the fixed thread count is costing
-something a pool would not. Either answer is worth more than the wall-clock number it explains.
+`grep -rn 'hardware_concurrency\|_SC_NPROCESSORS\|sched_getaffinity' src include` returns
+**nothing**: every thread in this engine has a fixed role, and none of them is a pool sized to the
+machine. ClickHouse sizes itself to the cores it can see, and `timescaledb-tune` sizes PostgreSQL
+to the machine. So the prediction, registered here before any such box exists: **on 8 or 16 cores
+the engine's ingest wall clock stays roughly where it is, ClickHouse's grows with the cores, and
+the per-CPU-second parity holds.** If per-CPU-second parity *breaks* in our favour on a bigger
+box, the engine scales better per unit of work; if it breaks against us, the fixed thread count is
+costing something a pool would not. Either answer is worth more than the wall-clock number it
+explains.
 
 ### The machine, and how to boot it twice
 
-One **x86_64, non-burstable, general-purpose or compute instance with at least 8 vCPU**, same storage
-as this one (100 GB gp3, 6000 IOPS, 500 MB/s), Amazon Linux 2023. The `c7i`/`m7i` families fit and
-were current when this was written - check the console rather than trusting that sentence.
+One **x86_64, non-burstable, general-purpose or compute instance with at least 8 vCPU**, same
+storage as this one (100 GB gp3, 6000 IOPS, 500 MB/s), Amazon Linux 2023. The `c7i`/`m7i` families
+fit and were current when this was written - check the console rather than trusting that sentence.
 
 Then measure it **twice**, and the second boot is the point:
 
