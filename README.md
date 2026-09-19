@@ -102,7 +102,7 @@ smallest query median in the same table, because the constant had been measured 
 machine and written into the report as prose.
 
 Full run, with every tuning declaration and every refusal: [`benchmarks/comparative/results/2026-09-19-55fc0e74-5.md`](benchmarks/comparative/results/2026-09-19-55fc0e74-5.md). The write-up of
-what this machine found, including the eight defects it exposed and the prediction registered before
+what this machine found, including the nine defects it exposed and the prediction registered before
 it booted: [`benchmarks/on-a-bigger-machine.md`](benchmarks/on-a-bigger-machine.md).
 To reproduce it, install the competitors natively first —
 [`benchmarks/install_competitors.md`](benchmarks/install_competitors.md); nothing in the harness

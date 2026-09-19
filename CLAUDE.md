@@ -2847,7 +2847,7 @@ Read the sanitizer claims with #83 in mind: until it landed, `OB_ENABLE_ASAN`, `
 libraries**, because `add_compile_options()` only affects targets declared after it and those blocks
 sat below all of them.
 
-**One P0 is open, and it is the first thing to know: #136.** Writing the same event-time span
+**Two P0s are open, and they are the first thing to know: #136 and #137.** Writing the same event-time span
 twice for one symbol — which is what re-running a backfill is, and #105 put event time on the wire
 so that backfills are expressible — destroys that symbol's segment. Both writes are acknowledged;
 the first write's values are silently replaced, or, when the second write has fewer rows, the
@@ -2855,6 +2855,15 @@ symbol returns **nothing at all**. A segment's identity is its time range, so th
 writes to a directory already in the index, and the guard that refuses it was written for #26's
 flush race and still says so in its message. Filed rather than fixed because the three candidate
 answers differ in what they cost; the measurements and the candidates are on the roadmap.
+
+**#137** is the other one and it stops the whole node. `apply_delta_impl()` blocks a writer once
+`pending_rows_` reaches `MAX_PENDING_ROWS` (1,000,000) and waits for a flush to drain it — and
+nothing signals the flush loop because a writer is waiting, so the wait is for
+`--flush-interval-ms` to elapse. That writer is the **epoll thread**, so the node stops accepting,
+stops answering, logs nothing, and does not observe `SIGTERM`: measured, still blocked **273 s**
+after it, both threads in `futex_do_wait` with 0.5 s of CPU between them. The default 100 ms is out
+of reach at any rate this hardware sustains; at the **1000 ms** the comparative harness sets and
+`tuning_applied()` recommends for bulk loads, one interval is one ceiling.
 
 Things a newcomer should know, because they are real limits rather than bugs to file again:
 

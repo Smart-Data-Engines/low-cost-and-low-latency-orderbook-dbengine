@@ -7,7 +7,7 @@ not a prediction.
 
 The short version is that the machine was worth it, and not for the reason it was asked for. The
 noise floor fell from 21.2% to **2.26%** in the published run, and to 0.89% at best — which is what
-it was asked for. What it bought was **eight defects**, none of them found by reading code (each was
+it was asked for. What it bought was **nine defects**, none of them found by reading code (each was
 found by the tree being on a machine it had never been on) and a published claim that turned out to
 be wrong in both of its halves.
 
@@ -299,6 +299,15 @@ never been on.
    after two acknowledged writes. Filed rather than fixed, because the three candidate answers
    differ in what they cost and one of them changes an on-disk layout the snapshot manifest and
    retention both address.
+
+9. **A writer that hits the pending-row ceiling waits for a flush nothing asks for, and the writer
+   is the epoll thread** (#137, open). `MAX_PENDING_ROWS` is 1,000,000 and `apply_delta_impl()`
+   blocks there until a flush drains it; the flush runs on `--flush-interval-ms` and nothing
+   signals it because a writer is waiting. So the node stops accepting, stops answering, logs
+   nothing, and — measured — does not observe `SIGTERM` either: still in the same two futexes
+   **273 seconds** after it, with 0.5 s of CPU between both threads, killed with `SIGKILL`. At the
+   1000 ms this project's own tuning note recommends for a bulk load, one interval is one ceiling
+   on this hardware.
 
 One thing worked exactly as designed on a machine it had never run on, and it is worth the line
 because the failure it replaced was a `SIGABRT`: a second node on a taken port printed

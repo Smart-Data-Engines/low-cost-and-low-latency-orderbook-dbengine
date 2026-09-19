@@ -2212,6 +2212,78 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 137. A writer that hits the pending-row ceiling waits for a flush nothing asks for, and the writer is the epoll thread
+
+Found on the aarch64 benchmark box while measuring the wire, by a probe that ran a node with
+`--flush-interval-ms 3600000` so that no flush would perturb the timing. The node accepted 50,000
+twenty-level updates and then stopped: no reply, **no line in its log**, and a new connection could
+not read the banner. The process was alive.
+
+**The arithmetic names it exactly.** `MAX_PENDING_ROWS` is `1'000'000`
+(`include/orderbook/engine.hpp:498`) and 50,000 updates of twenty levels is 1,000,000 rows.
+`apply_delta_impl()` blocks there:
+
+```cpp
+// Backpressure: wait until pending queue has room.
+// This blocks the writer if the flush thread can't keep up.
+pending_cv_.wait(lock, [this]() {
+    return pending_rows_.size() < MAX_PENDING_ROWS || stop_flush_.load(...);
+});
+```
+
+The only thing that empties `pending_rows_` is the flush, and `pending_cv_` is notified in exactly
+two places: at the end of a flush, and in shutdown. **Nothing asks the flush loop to run because a
+writer is waiting.** So the writer waits for the timer, and the timer is an operator's flag.
+
+**Confirmed with a backtrace rather than inferred.** Both threads in `futex_do_wait`, 0.5 s of CPU
+between them:
+
+```
+Thread 1  ob::Engine::apply_delta_impl  <- std::condition_variable::wait
+          ob::execute_command <- ob::TcpServer::run <- main
+Thread 2  ob::Engine::flush_loop        <- pthread_cond_clockwait
+```
+
+Thread 1 is the **epoll loop**. That is what turns a stalled writer into a stopped node: while it
+sits in `apply_delta`, nothing accepts a connection, nothing answers `PING`, nothing writes a log
+line, and — measured — **`SIGTERM` is not observed either**. The node logged `Shutdown requested`
+(that line comes from the signal handler) and was still in the same two futexes **273 seconds
+later**, at which point it had to be killed with `SIGKILL`. A supervisor does exactly that, and
+whatever was pending is lost.
+
+**How close the shipped defaults are.** At 100 ms, the default, a million rows would have to arrive
+in one interval, which needs about ten million rows a second — out of reach here. At the **1000 ms**
+the comparative harness sets, and which `tuning_applied()` recommends for a bulk load, this machine
+ingests around one million levels a second: one interval is one ceiling. The margin is a factor of
+one.
+
+**Three candidate answers.**
+
+1. **Let the writer ask.** A flush-now signal beside `flush_stop_cv_`, which already exists so that
+   `join()` does not wait out the interval — the writer's wait becomes bounded by how long a flush
+   takes rather than by the interval. Smallest change, and it keeps backpressure meaning what it
+   says.
+2. **Refuse instead of waiting.** Bound the wait and answer `ERR`, which is the answer this engine
+   takes elsewhere: #113 refuses a write it cannot sync rather than acknowledging it. It turns a
+   silent stop into a named refusal and does not make the writes land.
+3. **Refuse the configuration.** Unavailable: whether an interval is long enough to reach the
+   ceiling depends on the write rate, which is not knowable at startup.
+
+Whichever is chosen, the log has nothing to say today and should: a writer that has been blocked on
+backpressure for longer than an interval is the one line an operator needs, and this node emitted
+none.
+
+**Reproduction.** Start a node with `--flush-interval-ms 3600000`, send more than 1,000,000 rows —
+50,000 `MINSERT`s of twenty levels will do — and then try `PING` from a second connection, and
+`SIGTERM`. Note what the probe got wrong, because it matters for anyone repeating it: a crude
+`/dev/tcp` banner check reported "stopped answering" two seconds in, while the node was still
+starting and holding 7.5 MB. The evidence here is the backtrace and the 273 seconds, not that line.
+
+- Effort: M | Impact: **P0 by consequence.** A node stops serving every client, logs nothing, and
+  cannot be shut down gracefully, from a documented flag set to a value the project's own tuning
+  note recommends for bulk loads. The margin at that recommended value is a factor of one on this
+  hardware
+
 ### 136. Writing the same event-time span twice destroys a symbol's segment, and the only diagnosis names a race that did not happen
 
 Found on the aarch64 benchmark box, by a wire probe that replayed the same twenty-level updates
@@ -7274,13 +7346,15 @@ measures the harness.
 
 ## Recommended order
 
-**One P0 is open: #136**, filed rather than fixed because the three candidate answers differ in
-what they cost and one of them changes the on-disk segment layout. Every P0 raised before it —
+**Two P0s are open: #136 and #137**, both found by the same afternoon on a machine this tree
+had never run on, and both filed rather than fixed because each has candidate answers that
+differ in what they cost. #136 changes an on-disk layout the snapshot manifest and retention
+both address; #137 changes what backpressure means. Every P0 raised before it —
 #60, #61, #62, #64, #68, #73, #74, #80, #88 and #97 — is closed, and several were found by running a real cluster rather than by reading the code
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #136.** Every other item above #58 is marked closed, and
+**Open: #136 and #137.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
