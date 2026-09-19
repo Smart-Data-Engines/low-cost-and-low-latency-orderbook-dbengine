@@ -240,6 +240,21 @@ private:
     /// `std::shared_mutex` is not recursive, so taking it here would deadlock the second one.
     void rebuild_index_locked();
 
+    /// Create a segment directory for this span that no other segment is using, and return it.
+    ///
+    /// A segment's identity **was** its event-time range, so two flushes covering the same span
+    /// wrote to one directory and the second destroyed the first (#136). The first segment of a
+    /// span still gets `<start>_<end>` character for character — the name only changes where the
+    /// engine used to lose data — and a collision appends `_1`, `_2`, and so on.
+    ///
+    /// `create_directory()` is the arbiter rather than a preceding `exists()`: it reports whether
+    /// it created the directory or found one, so two flushers racing for the same free name
+    /// cannot both win it. That holds without any claim about which lock the caller holds, which
+    /// is worth more here than the claim would be — the guard this replaces asserted a locking
+    /// fact about its callers and was wrong about it for a year.
+    std::string create_unique_segment_dir(const std::string& symbol, const std::string& exchange,
+                                          uint64_t start_ts, uint64_t end_ts) const;
+
     std::string segment_dir(const std::string& symbol, const std::string& exchange,
                             uint64_t start_ts, uint64_t end_ts) const;
     void ensure_dirs(const std::string& path) const;

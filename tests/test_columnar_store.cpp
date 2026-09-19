@@ -9,7 +9,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "orderbook/columnar_store.hpp"
@@ -1059,4 +1061,105 @@ TEST(ColumnarStoreReplace, AMissingStagedFileRefusesAndLeavesACoherentIndex) {
     EXPECT_EQ(store.segment_count(), 0u)
         << "the index still names the directory the clear removed, so a scan would open files "
            "that are gone and answer short";
+}
+
+// ── #136: a directory belongs to one segment, not to one event-time span ──────────────────────
+
+namespace {
+
+/// Write `rows` rows into the span starting at `start_ts` and flush them, returning the segment.
+static ob::SegmentMeta flush_span(ob::ColumnarStore& store, uint64_t start_ts, int rows,
+                                  int64_t price) {
+    store.set_symbol_exchange("SYM", "EX");
+    for (int i = 0; i < rows; ++i) {
+        store.append(make_row(start_ts + static_cast<uint64_t>(i), price + i));
+    }
+    auto meta = store.flush_segment();
+    EXPECT_TRUE(meta.has_value()) << "nothing was flushed, so this test has no segment to talk "
+                                     "about";
+    return meta.value();
+}
+
+} // namespace
+
+// The common case has to be byte-for-byte what it was, or this change is a migration rather than
+// a fix: the name only differs where the engine used to lose data.
+TEST(SegmentIdentity, TheFirstSegmentOfASpanKeepsTheNameItAlwaysHad) {
+    TempDir tmp("ident_first");
+    ob::ColumnarStore store(tmp.str(), 1000ULL);
+
+    const auto meta = flush_span(store, 1000, 4, 500);
+
+    const std::string expected = tmp.str() + "/SYM/EX/1000_1003";
+    EXPECT_EQ(meta.dir_path, expected)
+        << "the unchanged case changed, which would make every existing directory a special case";
+}
+
+// The defect: two flushes covering one span wrote to one directory, and the second destroyed the
+// first. Both are readable now, and the second is named for being second.
+TEST(SegmentIdentity, ASecondFlushOfTheSameSpanIsASecondSegment) {
+    TempDir tmp("ident_second");
+    ob::ColumnarStore store(tmp.str(), 1000ULL);
+
+    const auto first  = flush_span(store, 1000, 4, 500);
+    const auto second = flush_span(store, 1000, 4, 900);
+
+    EXPECT_NE(first.dir_path, second.dir_path)
+        << "both flushes claimed one directory, which is the whole of #136";
+    EXPECT_EQ(second.dir_path, first.dir_path + "_1");
+    EXPECT_TRUE(fs::exists(first.dir_path + "/meta.json"));
+    EXPECT_TRUE(fs::exists(second.dir_path + "/meta.json"));
+
+    // `flush_segment()` indexes what it wrote, so the question is whether the index holds both.
+    // Before #136 the second flush reused the first's directory and the index held one entry
+    // whose row count described bytes that were no longer there.
+    EXPECT_EQ(store.segment_count(), 2u)
+        << "the index holds one entry for two flushes, so one flush's rows are unreachable";
+    EXPECT_EQ(store.merge_segments({second}), 1u)
+        << "a segment already indexed by the flush that wrote it must still be refused a second "
+           "time — that guard is what this change narrows, not what it removes";
+}
+
+// The worse half of #136, and the one that returned **nothing**: a shorter second write left the
+// index claiming the first write's row count over the second write's bytes, and the reader
+// refused the whole segment.
+TEST(SegmentIdentity, AShorterSecondWriteDoesNotStrandTheFirst) {
+    TempDir tmp("ident_shorter");
+    ob::ColumnarStore store(tmp.str(), 1000ULL);
+
+    const auto first  = flush_span(store, 2000, 8, 500);
+    const auto second = flush_span(store, 2000, 2, 900);
+
+    ASSERT_NE(first.dir_path, second.dir_path);
+    EXPECT_EQ(first.row_count, 8u);
+    EXPECT_EQ(second.row_count, 2u);
+
+    // Re-read from disk: what the index says and what the bytes hold have to agree for both, and
+    // before #136 the shorter write made them disagree for the surviving entry.
+    ob::ColumnarStore reopened(tmp.str(), 1000ULL);
+    reopened.open_existing();
+    EXPECT_EQ(reopened.segment_count(), 2u)
+        << "a segment was dropped on re-open, which is how this defect returned zero rows";
+}
+
+// `create_directory()` is the arbiter rather than an `exists()` before it, so this holds without
+// any claim about which lock the caller holds — which matters, because the guard this replaces
+// asserted a locking fact about its callers and was wrong about it.
+TEST(SegmentIdentity, TwoStoresRacingForOneSpanGetDifferentDirectories) {
+    TempDir tmp("ident_race");
+
+    constexpr int kThreads = 4;
+    std::vector<std::string> dirs(kThreads);
+    std::vector<std::thread> threads;
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&, i] {
+            ob::ColumnarStore store(tmp.str(), 1000ULL);
+            dirs[static_cast<size_t>(i)] = flush_span(store, 3000, 3, 100 * (i + 1)).dir_path;
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    std::set<std::string> unique(dirs.begin(), dirs.end());
+    EXPECT_EQ(unique.size(), static_cast<size_t>(kThreads))
+        << "two flushers were handed the same directory, so one overwrote the other";
 }
