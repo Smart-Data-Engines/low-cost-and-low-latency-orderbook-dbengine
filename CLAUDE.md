@@ -2703,6 +2703,125 @@ Learned the hard way. Check here before debugging.
     mutation table carries "widened to five and a half minutes" as a control that must **survive**:
     a surviving mutation nobody explained is one the next reader assumes you missed.
 
+325. **A machine's answer about itself can be absent rather than wrong, and a reader with a default
+     turns that into a blank.** `/proc/cpuinfo` has no `model name` line and no `cpu MHz` line on
+     aarch64, so `hardware.py` reported `cpu_model=unknown` and `mhz=0.0` on the first non-x86 run —
+     in the module whose docstring says every field is read from the machine so that a reader can
+     compare theirs to ours. The machine was willing to answer: implementer, part, variant and
+     revision from MIDR_EL1, and `Amazon EC2 m9g.xlarge` from DMI. `BogoMIPS` is in the same file and
+     is the architected timer's frequency, not the clock — a field holding a number that means
+     something else is worse than an empty one. Google Benchmark makes the same mistake in its own
+     context block: it reported `mhz_per_cpu: 2000` on this instance, which is the BogoMIPS value.
+
+326. **`/tmp` is a tmpfs on a good share of machines, and a benchmark that puts one system's storage
+     there has handed itself a win.** The comparative harness used `tempfile.mkdtemp()` for the
+     engine's data directory and described the disk under the *build* directory. On the workstation
+     it was written on, `/tmp` is part of an ext4 root, so the engine and both servers shared a disk
+     and the published numbers are sound — by luck. On the first machine whose `/tmp` is a tmpfs the
+     engine's WAL would have gone to memory while ClickHouse and PostgreSQL wrote to NVMe, and the
+     report would have printed the NVMe next to all three numbers. Measured, same binary and core:
+     989.62 ns/op with storage on tmpfs against 1061.04 ns/op on xfs.
+
+327. **A "measured" figure written into generated prose is measured on whichever machine wrote the
+     prose, and it travels.** `run.py` carried "Measured on this machine: the engine ingests 446,219
+     updates/s in process (2552 ns/op)" as a string literal; the first aarch64 report printed it
+     inside a header reading `Amazon EC2 m9g.xlarge`, where the same benchmark measures 995 ns/op.
+     The same list claimed "about 4.8 ms of Python-side parsing is included in every figure in the
+     query column" in a report whose fastest query median was 1.47 ms — a constant declared to be
+     inside every figure while exceeding the smallest of them. Measure it in the run, or name the
+     machine it came from; the third option is a contradiction a reader can see and the harness
+     cannot.
+
+328. **Two numbers in one sentence can be in different units and still read as a ratio.** "446,219
+     updates/s in process against 4,012 updates/s through the wire — a factor of 111" compared
+     `BM_IngestionThroughput`, which applies **one** level per call, with a harness that sends
+     **twenty** levels per round trip. Most of the 111 was the 20. In one unit, on one machine:
+     946,000 levels/s in process against 361,466 over the wire, a factor of 2.6 — and even that is
+     an upper bound, because the harness's Python client spent 3.73 CPU-seconds of that run against
+     the server's 1.11.
+
+329. **A micro-benchmark of a component overstates what removing it buys on the path that contains
+     it.** The 112-byte CRC32C fold costs 193.66 ns with the table and 6.68 ns with the ARMv8
+     instruction — 187 ns apart in isolation. Inside `apply_delta` the same substitution is worth
+     **25 ns**, measured over six interleaved rounds with non-overlapping ranges: the core overlaps
+     the table's dependent-load chain with the rest of the operation. Publishing the isolated figure
+     as an ingest improvement would have overstated it eightfold. Measure the path you claim about.
+
+330. **`git cherry-pick <branch>` takes the tip commit only.** Assembling a measurement tree from two
+     feature branches picked one commit from a two-commit branch and produced a tree that looked
+     assembled and was missing the first half. It was caught by `argparse` refusing an unrecognised
+     `--data-dir`, which is the behaviour to be grateful for. Use `origin/master..origin/<branch>`.
+
+331. **`grep -c` exits 1 when it finds nothing.** A build step ending in `grep -c "error:"` reports
+     **failure on success**, and the background task that ran it was summarised as "failed with exit
+     code 1" over a clean build. The mirror image is worse: a step ending in a grep that *matches*
+     reports success when it found the thing you were checking for.
+
+332. **When two instruments disagree and the cause is not found, the number is not published.** Two
+     binaries with materially identical timed loops measured single-level `apply_delta` at 646 ns and
+     2690 ns on the same core, seconds apart. A third instrument agreed with the first, byte counts
+     confirmed the same work in both, and the one hypothesis tested — a memory clobber in a sibling
+     branch of the loop — was wrong. The twenty-level figure agreed across all three instruments, so
+     that is the one on the page. 646 ns was the flattering number, which is the reason to be
+     careful rather than the reason to pick it.
+
+333. **`-Wno-error` in `CMAKE_CXX_FLAGS` loses to the project's own `-Werror`,** because CMake puts
+     the cache variable first and GCC takes the last flag. To enumerate every diagnostic in one pass
+     instead of fixing them one build at a time, keep `-Werror` and use `cmake --build . -- -k 0`:
+     ninja carries on after a failed object and the full list arrives at once. One object out of 312
+     failed on the first GCC 14 build of this tree.
+
+334. **A guard's premise can be true when it is written and falsified by a feature added later, and
+     nothing fails when it is.** `merge_segments()` refuses a segment directory it already holds,
+     with a comment naming the cause — *"Two flush paths raced"*, #26 — and *"Defence in depth, not
+     the fix."* A segment's directory name is its event-time range, and before #105 the wire dropped
+     the client's timestamp, so two client writes could never produce the same range: the comment was
+     correct. #105 put event time on the wire, which made a backfill re-run produce exactly that
+     state from one client, sequentially. Measured: the first write's values silently replaced, or —
+     when the second write has fewer rows — **zero rows for that symbol** after two acknowledged
+     writes (#136). When adding a feature, grep for the guards whose reasoning your feature makes
+     reachable; they will not fail, because their conclusion is still right.
+
+335. **`getrusage(RUSAGE_SELF)` excludes subprocesses, so a "client CPU" column reads about zero for
+     any adapter that shells out.** The comparative harness's three adapters do not agree about
+     this and the difference is invisible in the code that times them: the engine's and
+     ClickHouse's are in-process Python (a socket and `http.client`), and the PostgreSQL one drives
+     `psql`. So TimescaleDB's client cost read **0.003 s** where the engine's read 3.731 — a
+     comparison wrong in the direction that makes *us* look worse, which is not a reason to have
+     left it. And the first version of the docstring explaining the fix claimed ClickHouse shelled
+     out too; it does not. Check which of them actually forks before writing the sentence about why.
+     `/proc/<pid>/stat`'s `cutime`/`cstime` are the same question for the **server** side, and they
+     are what makes the number right for PostgreSQL, which forks a backend per connection.
+
+336. **A probe linked against the project's libraries must use the compiler that built them.**
+     `g++` on Amazon Linux 2023 is GCC 11 and the tree is built with `gcc14-g++`; linking a probe
+     with the default compiler fails on `std::__cxx11::basic_string::_M_replace_cold`, a GCC 12+
+     symbol. The error names a string function and says nothing about a version, so it reads as a
+     mystery in the project's own code rather than as a toolchain mismatch.
+
+337. **A cleanup step whose success is not checked is not a cleanup step, and the measurement
+     afterwards is against whatever survived.** A probe runner began with
+     `pkill -f 'ob_tcp_server --port 9191'` and went straight on; the old server — configured
+     differently, and unresponsive — was still there, so the new one could not bind and the probe
+     connected to the old one and hung. Assert the port is free before measuring against it. The
+     consolation is that the engine said so precisely: `Error: bind() failed on port 9191: Address
+     already in use`, which is #102's named refusal rather than the `SIGABRT` it used to be, on a
+     machine that code had never run on.
+
+338. **A service unit name is a fact about the distribution, not about the software.** A runbook
+     written against Ubuntu says `postgresql@16-main`; on Amazon Linux the unit is `postgresql`, and
+     `systemctl start postgresql@16-main` **creates a failed instance of a template** rather than
+     failing to find anything. So the step reported `failed` for PostgreSQL while PostgreSQL was
+     running the whole time, and the two comparative runs after it failed for an unrelated reason.
+     Read `systemctl list-units` on the machine before writing the command that starts something.
+
+339. **A number whose wall time is fifteen times its CPU time is a question, not a result.**
+     `BM_IngestionThroughputBatched` reported 20,264 ns wall against 1,345 ns CPU per twenty-level
+     update, and taken at face value the in-process figure would have been *slower* than the same
+     work over a socket — which cannot be true and is exactly the shape that gets published when
+     one number is read without its neighbour. Google Benchmark prints both columns for this
+     reason. Find where the wall time goes before quoting either.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -2727,6 +2846,15 @@ Read the sanitizer claims with #83 in mind: until it landed, `OB_ENABLE_ASAN`, `
 `OB_ENABLE_COVERAGE` instrumented the test binaries and the server but **none of the static
 libraries**, because `add_compile_options()` only affects targets declared after it and those blocks
 sat below all of them.
+
+**One P0 is open, and it is the first thing to know: #136.** Writing the same event-time span
+twice for one symbol — which is what re-running a backfill is, and #105 put event time on the wire
+so that backfills are expressible — destroys that symbol's segment. Both writes are acknowledged;
+the first write's values are silently replaced, or, when the second write has fewer rows, the
+symbol returns **nothing at all**. A segment's identity is its time range, so the second flush
+writes to a directory already in the index, and the guard that refuses it was written for #26's
+flush race and still says so in its message. Filed rather than fixed because the three candidate
+answers differ in what they cost; the measurements and the candidates are on the roadmap.
 
 Things a newcomer should know, because they are real limits rather than bugs to file again:
 
@@ -2997,6 +3125,20 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   deliberate `kill_node()` from a crash, so a crashing node was repaired in silence. If you add a
   fixture that stops a node on purpose, record it the way `kill_node()` does, or
   `unexplained_deaths()` will report your own teardown as a defect.
+- **CRC32C folds with a hardware instruction on x86_64 *and* on aarch64**, chosen at run time
+  (`getauxval(AT_HWCAP) & HWCAP_CRC32`), with the table as the fallback for an ARMv8.0 part — one
+  binary either way, and the startup log names which one is running rather than asserting SSE4.2
+  as it used to. The ARM path was added because the first run on aarch64 measured the table:
+  193.66 ns against 6.68 ns for a 112-byte WAL record, which is **2.4%** on the whole ingest path,
+  not the 29× the isolated fold suggests. GCC 14 and clang 15 on this architecture disagree about
+  every spelling of the intrinsic except inline asm carrying `.arch_extension crc`, which is
+  measured to be no slower than either.
+- **The whole suite has run on a weakly-ordered memory model**, which it never had before
+  19 September 2026: 1102 tests pass on aarch64 in Release, again under ThreadSanitizer with zero
+  reports, and again under AddressSanitizer + UBSan with zero findings. That is the strongest
+  evidence available and it is not proof — a race is probabilistic and TSan reasons about
+  synchronisation rather than about the hardware — but until that day every seqlock and every
+  atomic in this engine had only ever executed on x86, which is TSO.
 - Every FetchContent dependency, including `rapidcheck`, is pinned to a commit SHA.
 
 *Entries used to sit here and no longer describe the code, and the list is kept because the pattern
