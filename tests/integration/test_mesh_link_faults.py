@@ -109,25 +109,30 @@ def rows(port: int) -> list:
 
 
 def test_the_query_header_this_module_drops_is_the_one_the_engine_prints():
-    """A constant copied out of `src/response_formatter.cpp`, so it is checked against it.
+    """A constant checked against the table the engine builds the header from.
 
     If the header gains a column, `rows()` stops recognising it, every list here grows a phantom
     entry, and the assertions that count rows go quietly wrong in the lenient direction. Cheap to
     pin, and the alternative — dropping "the second line" by position — would break the moment a
     response gains or loses a line for any other reason.
+
+    It used to look for the literal in `src/response_formatter.cpp`, which was right until #139
+    replaced that literal with a loop over the column table and #152 deleted the leftover — so the
+    string this test wanted stopped existing anywhere, and the test said so. **An anchor has to
+    move to whatever decides the value**, and for the header that is now the spellings table in
+    `src/query_columns.cpp`, read in its own order. That is the stronger of the two: the old check
+    would have passed against a dead literal that agreed with a header nothing printed.
     """
     source = (pathlib.Path(__file__).resolve().parents[2]
-              / "src" / "response_formatter.cpp").read_text()
-    assert len(source) > 1000, "response_formatter.cpp was not read, so this checked nothing"
-    # Compared in the source's own spelling: a tab is `\t` there, two characters, and the first
-    # version of this check compared a string with real tabs against a file that has none. Same
-    # class as the phrase that does not exist contiguously because of implicit concatenation
-    # (pitfall 238) - the source is not the runtime value, and a check has to say which it wants.
-    as_written = QUERY_HEADER.replace("\t", "\\t")
-    joined = re.sub(r'"\s*"', "", source)
-    assert as_written in joined, (
+              / "src" / "query_columns.cpp").read_text()
+    assert len(source) > 500, "query_columns.cpp was not read, so this checked nothing"
+    table = re.search(r"kSpellings\{\{(.*?)\}\};", source, re.S)
+    assert table, "the spellings table is not where this test looks for it any more"
+    names = re.findall(r'\{\s*"([^"]+)"', table.group(1))
+    assert len(names) == 7, f"expected seven columns in the table, read {names}"
+    assert "\t".join(names) == QUERY_HEADER, (
         "the column header this module drops is not the one the engine prints any more, so every "
-        f"row list here has a phantom entry in it. Looking for: {as_written!r}")
+        f"row list here has a phantom entry in it. The table says: {names}")
 
 
 def _build_proxied_mesh(mgr: ClusterManager, proxies: list, recv_buffer=None):

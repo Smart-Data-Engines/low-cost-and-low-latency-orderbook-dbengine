@@ -2908,6 +2908,29 @@ Learned the hard way. Check here before debugging.
      its baseline **without building first**, so that check described whatever the previous run
      had left in `build/` rather than the tree it was about to mutate.
 
+349. **An anchor on a literal dies with the literal, and the thing that replaced it is the new
+     anchor.** `test_mesh_link_faults.py` pins the seven-column header it strips out of every
+     query answer, and pinned it by looking for that string in `src/response_formatter.cpp` —
+     right until #139 replaced the literal with a loop over the column table and the clang fix
+     deleted the leftover. The test then failed saying the string no longer exists, which is the
+     correct report from an anchor pointing at nothing. Two things follow. The replacement anchor
+     is `src/query_columns.cpp`'s spellings table, **which is stronger than what it replaces**: a
+     literal can agree with a header nothing prints, and a mutation swapping two rows of the table
+     now fails the test where before it would not have. And the commit that removed the literal
+     was verified with a **C++ build and `ctest`** — the only reader of that source text is a
+     Python integration test, so the local verification could not have seen it. When a change
+     deletes a string, grep the whole tree for it, tests in other languages included.
+
+350. **A function-scoped fixture writing to one symbol on a session-scoped cluster turns every
+     count assertion into an assertion about test order.** Storage is append-only, so
+     `test_column_projection.py`'s `book` fixture added a row per test to one shared symbol: six
+     of its seven tests read `lines[2]`, where the first row is the same however many follow it,
+     and the seventh asserted `len(rows) == 1` and read **seven**. It is the order that decides,
+     not the code, and it had never run to completion in CI before — the branch's previous run was
+     cancelled, so the first completion was the first report. Give each test its own symbol; the
+     count then says what it looks like it says, and the six that passed become exact rather than
+     merely satisfied.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

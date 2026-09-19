@@ -9,6 +9,7 @@ read a narrowed answer, and the tests for that are the refusals at the bottom of
 """
 from __future__ import annotations
 
+import hashlib
 import socket
 import time
 
@@ -43,11 +44,19 @@ def raw_query(port: int, sql: str, timeout: float = 6.0) -> list[str]:
 
 
 @pytest.fixture
-def book(cluster, primary_client: OrderbookEngine) -> str:
-    """One flushed row, so the answer comes from the columnar store rather than a live buffer."""
-    primary_client.insert(SYMBOL, EXCHANGE, "bid", [PRICE], [QTY])
+def book(cluster, primary_client: OrderbookEngine, request) -> str:
+    """One flushed row, in a book of this test's own.
+
+    Flushed, so the answer comes from the columnar store rather than a live buffer. Of its own,
+    because storage is append-only and `cluster` is session-scoped: a shared symbol gains a row
+    per test, and then every assertion about a row *count* is really an assertion about test
+    order. The seventh test in this module read seven rows where it had written one, and the six
+    before it passed because they look at `lines[2]` and the first row is the same either way.
+    """
+    symbol = f"{SYMBOL}-{hashlib.sha1(request.node.name.encode()).hexdigest()[:8]}"
+    primary_client.insert(symbol, EXCHANGE, "bid", [PRICE], [QTY])
     primary_client.flush()
-    return SYMBOL
+    return symbol
 
 
 WHERE = "WHERE timestamp BETWEEN 0 AND 9999999999999999999"
