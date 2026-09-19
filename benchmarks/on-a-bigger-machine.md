@@ -62,11 +62,11 @@ vary by hundredths of a percent.
 
 ClickHouse **26.8.2.7** and TimescaleDB **2.30.0 on PostgreSQL 16.15** — the same versions as the
 previous published run, so the architecture is the only thing that moved. Both installed natively,
-no Docker. TimescaleDB has **no aarch64 RPM packages** (the same repository serves 33 for x86_64 and
-0 for aarch64, while shipping arm64 for Ubuntu), so it was built from source at that tag, and its
-own tuner — which has no published arm64 binary either — was built from source and run, so the
-tuning is still the vendor's decision rather than ours. That is a difference in the competitor and
-it is the first reason a second machine is worth having.
+no Docker. TimescaleDB is **not installed from a package here** — `rpm -q
+timescaledb-2-postgresql-16` reports none — because the vendor's repository had no aarch64 build
+to install, so it was built from source at that tag, and its own tuner was built from source and
+run as well, so the tuning is still the vendor's decision rather than ours. That is a difference
+in the competitor and it is the first reason a second machine is worth having.
 
 One row of this dataset is one book level, so rows and levels are the same count in this section.
 They are **not** the same count in the section after it, and that difference was a published claim.
