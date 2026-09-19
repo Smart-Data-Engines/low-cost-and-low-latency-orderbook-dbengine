@@ -34,11 +34,18 @@ FLUSH_INTERVAL_MS = 1000
 class OrderbookSystem:
     name = "orderbook"
 
-    def __init__(self, binary: Path, port: int):
+    def __init__(self, binary: Path, port: int, data_parent: Path):
+        """`data_parent` is where the engine's storage goes, and the caller picks it.
+
+        This was `tempfile.mkdtemp()` with no argument, which means `/tmp`. Where `/tmp` is a tmpfs
+        the engine writes to RAM while both competitors write to disk, and nothing in the run says
+        so - see hardware.VolatileStorage. The caller now names the filesystem, and the same path is
+        what the report describes.
+        """
         self._binary = binary
         self._port = port
         self._proc: subprocess.Popen | None = None
-        self._data_dir = tempfile.mkdtemp(prefix="ob_bench_")
+        self._data_dir = tempfile.mkdtemp(prefix="ob_bench_", dir=str(data_parent))
         self._log = open(os.path.join(self._data_dir, "node.log"), "a",
                          encoding="utf-8", buffering=1)
         self._engine = None

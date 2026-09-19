@@ -195,15 +195,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--build-dir", type=Path, default=REPO / "build-release")
     parser.add_argument("--results", type=Path, default=Path(__file__).parent / "results")
+    # Where the engine keeps its WAL and segments. Defaults under the build directory rather than
+    # /tmp, because /tmp is a tmpfs on a good share of machines and the servers this is compared
+    # against always write to a disk. hardware.require_durable_storage() refuses the rest.
+    parser.add_argument("--data-dir", type=Path, default=None,
+                        help="engine storage location (default: <build-dir>/bench-data)")
     args = parser.parse_args(argv)
+    data_dir = args.data_dir or (args.build_dir / "bench-data")
+    data_dir.mkdir(parents=True, exist_ok=True)
 
     # Refuse before doing any work: a two-hour run that turns out to have measured Debug is worse
     # than a message.
     build_type = hardware.require_release(args.build_dir)
-    hw = hardware.describe(args.build_dir)
+    engine_fs = hardware.require_durable_storage(data_dir)
+    hw = hardware.describe(data_dir, args.build_dir)
+    print(f"Platform: {hw.platform}")
     print(f"Hardware: {hw.cpu_model}, {hw.cores} cores, {hw.ram_mib} MiB, {hw.filesystem}, "
-          f"kernel {hw.kernel} (digest {hw.digest()})")
+          f"clock {hw.mhz:.0f} MHz from {hw.clock_source}, kernel {hw.kernel} "
+          f"(digest {hw.digest()})")
     print(f"Build: {build_type} from {args.build_dir}")
+    print(f"Engine storage: {data_dir} on {engine_fs}")
 
     csv_path = args.results / f"dataset-{args.rows}-{args.seed}.csv"
     manifest = dataset.generate(csv_path, rows=args.rows, symbols=args.symbols,
@@ -214,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
     # Ours first, and that position is load-bearing: it is the reference every other system's rows
     # are compared against, and the control the noise floor is measured on.
     systems = [
-        OrderbookSystem(args.build_dir / "ob_tcp_server", free_port()),
+        OrderbookSystem(args.build_dir / "ob_tcp_server", free_port(), data_dir),
         ClickHouseSystem(),
         TimescaleDbSystem(),
         KdbSystem(),
