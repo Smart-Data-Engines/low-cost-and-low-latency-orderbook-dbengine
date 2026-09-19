@@ -77,6 +77,26 @@ def _insert_command(symbol: str, exchange: str, side_lower: str,
             f"{prices[0]} {qtys[0]} {counts[0]}{wire_ts}")
 
 
+def _normalise_levels(prices: List[int], qtys: List[int], counts: Optional[List[int]],
+                      where: str) -> List[int]:
+    """Check the three parallel lists agree and fill in the default counts.
+
+    Shared by `insert()` and `insert_batch()` because it is one rule, and two copies of one rule
+    is how the same call becomes legal in one method and not in the other. `where` names the
+    update inside a batch; for a single write it is empty and the message reads as it always did.
+    """
+    n = len(prices)
+    if n == 0:
+        raise ValueError(f"{where}no levels")
+    if len(qtys) != n:
+        raise ValueError(f"{where}prices and qtys must have the same length")
+    if counts is None:
+        return [1] * n
+    if len(counts) != n:
+        raise ValueError(f"{where}counts must have the same length as prices")
+    return counts
+
+
 # ── Data types ─────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -1721,13 +1741,8 @@ class OrderbookEngine:
         if self._closed:
             raise OrderbookError(-1, "Engine is closed")
 
+        counts = _normalise_levels(prices, qtys, counts, "")
         n = len(prices)
-        if len(qtys) != n:
-            raise ValueError("prices and qtys must have the same length")
-        if counts is None:
-            counts = [1] * n
-        if len(counts) != n:
-            raise ValueError("counts must have the same length as prices")
 
         # Two arguments this method used to accept and then drop on the wire. Both refusals happen
         # **before a single byte is sent**, because a write that went out without the value its
@@ -1738,12 +1753,7 @@ class OrderbookEngine:
                     "seq cannot be chosen over the wire: a sequence number belongs to the origin, "
                     "and the origin here is the server, which assigns one per symbol. It was "
                     "accepted and discarded before this release. Use local mode to choose it.")
-            if timestamp_ns is not None and "insert_event_time" not in self.server_capabilities():
-                raise OrderbookError(-1,
-                    "this server does not accept an event time on INSERT/MINSERT, so the value "
-                    "would be discarded and the row stored with its arrival time instead. Nothing "
-                    "was sent. Upgrade the server, or drop the timestamp_ns argument to accept "
-                    "arrival time deliberately.")
+            self._refuse_unstorable_event_time(timestamp_ns is not None)
 
         if seq is None:
             self._seq += 1
@@ -1780,6 +1790,19 @@ class OrderbookEngine:
 
         return seq
 
+    def _refuse_unstorable_event_time(self, any_given: bool) -> None:
+        """Refuse before sending if the caller chose a time this server would drop (#105).
+
+        One definition for `insert()` and `insert_batch()`: a rule about what the wire can carry,
+        stated twice, is the shape where one writer keeps honouring an argument the other has
+        quietly started discarding.
+        """
+        if any_given and "insert_event_time" not in self.server_capabilities():
+            raise OrderbookError(-1,
+                "this server does not accept an event time on INSERT/MINSERT, so the value would "
+                "be discarded and the row stored with its arrival time instead. Nothing was sent. "
+                "Upgrade the server, or drop timestamp_ns to accept arrival time deliberately.")
+
     #: Bytes of one batch's request, before it is sent.
     #:
     #: Not a server limit. The server queues **responses** against a 64 MB per-session cap, and a
@@ -1814,17 +1837,8 @@ class OrderbookEngine:
 
         # Validated in full first: see the docstring. `insert()` performs the same refusals, and
         # they are the ones that must happen before a byte goes out (#105).
-        normalised = []
-        for i, u in enumerate(updates):
-            n = len(u.prices)
-            if len(u.qtys) != n:
-                raise ValueError(f"update {i}: prices and qtys must have the same length")
-            if n == 0:
-                raise ValueError(f"update {i}: no levels")
-            counts = u.counts if u.counts is not None else [1] * n
-            if len(counts) != n:
-                raise ValueError(f"update {i}: counts must have the same length as prices")
-            normalised.append((u, counts))
+        normalised = [(u, _normalise_levels(u.prices, u.qtys, u.counts, f"update {i}: "))
+                      for i, u in enumerate(updates)]
 
         if self._mode == "local":
             out = []
@@ -1844,13 +1858,7 @@ class OrderbookEngine:
                 "and which of them is one round trip is a decision nobody has measured. Nothing "
                 "was sent. Use insert(), or open a direct connection to the node you mean.")
 
-        if any(u.timestamp_ns is not None for u, _ in normalised) \
-                and "insert_event_time" not in self.server_capabilities():
-            raise OrderbookError(-1,
-                "this server does not accept an event time on INSERT/MINSERT, so the values would "
-                "be discarded and the rows stored with their arrival time instead. Nothing was "
-                "sent. Upgrade the server, or drop timestamp_ns to accept arrival time "
-                "deliberately.")
+        self._refuse_unstorable_event_time(any(u.timestamp_ns is not None for u, _ in normalised))
 
         commands = [_insert_command(u.symbol, u.exchange, u.side.lower(), u.prices, u.qtys,
                                     counts, u.timestamp_ns)
