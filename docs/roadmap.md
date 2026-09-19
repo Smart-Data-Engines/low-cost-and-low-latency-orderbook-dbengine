@@ -2202,6 +2202,91 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 136. Writing the same event-time span twice destroys a symbol's segment, and the only diagnosis names a race that did not happen
+
+Found on the aarch64 benchmark box, by a wire probe that replayed the same twenty-level updates
+against one server three times and produced **200 `ERROR` lines** — one per symbol per replay — in
+a run whose client saw nothing but `OK`.
+
+A segment's identity **is its time range**: the directory is
+`<data-dir>/<symbol>/<exchange>/<start_ts>_<end_ts>`. Two flushes covering the same span therefore
+write to the same directory, and `ColumnarStore::merge_segments()`
+(`src/columnar_store.cpp:603`) refuses to index a `dir_path` it already holds. Its comment states
+its premise in one line — *"Two flush paths raced"*, the defect **#26** fixed, *"Defence in depth,
+not the fix"* — and that premise was **true when it was written**. Before **#105** the wire dropped
+the client's `timestamp_ns` and the server stamped arrival time, so no two client writes could ever
+produce the same span. #105 put event time on the wire so that backfills are expressible, and in
+doing so made a second way to reach this state: **one client, sequentially, writing the same span
+twice**, which is what re-running a backfill is.
+
+**Measured, four cases, one symbol, 200 updates of 20 levels, `--flush-interval-ms 1000`.**
+Every write was acknowledged and every `FLUSH` returned `OK`.
+
+| the second write | rows readable after it | what happened |
+|---|---|---|
+| same span, same shape, **different prices** | 4000 of an expected 8000 | the first write's values are **gone**: the rows read back carry the second write's prices under the first write's index entry |
+| same span, **5 levels instead of 20** | **0** | the index keeps `row_count=4000`, the directory now holds 1000 rows, and the reader refuses the whole segment: `Skipping segment …: short column(s) for row_count=4000` |
+| span shifted by half (overlapping) | 8000 | **both readable** — a control |
+| a disjoint later span | 8000 | **both readable** — a control |
+
+The two controls are what make this a claim about **identical spans** rather than about overlap in
+general, and they bound who is exposed: a backfill re-run with the same boundaries, not any
+re-delivery.
+
+**The severity is in the third column, not the second.** The first row is silent replacement of
+acknowledged data. The second is worse and is the one to read: two acknowledged writes, and the
+symbol then returns **nothing at all** — the index's count and the bytes on disk disagree, and the
+second guard, which is correct, drops the segment rather than serve a short one. There is no error
+to the client at any point in either case.
+
+**Why no test catches it.** Nothing in the suite writes the same span twice; before #105 nothing
+could. And the guard reports the state with a cause attached, so a reader who hits it goes looking
+for a flush race. This repository's own rule from the flagship product applies here: **a wrong
+diagnosis is worse than none.**
+
+**Three candidate answers, and the cheapest is not obviously right.**
+
+1. **Make segment identity unique** — an ordinal or a monotonic counter in the directory name, so
+   identity stops being derived from content. Correct in principle and the widest change: the
+   snapshot manifest addresses segments by directory, retention orders them by name, and a replica
+   bootstrapping from a snapshot indexes what it is sent.
+2. **Replace the index entry when the directory is rewritten** — smallest diff, and it makes the
+   second write win silently, which is a semantic nobody asked for and which #26's guard exists to
+   prevent.
+3. **Refuse at write time, to the client** — the honest minimum: a flush that would produce a span
+   already indexed fails the `FLUSH`, so the operator learns it from the call rather than from a
+   log line naming something else. It does not make the backfill work; it stops the loss.
+
+Whichever is chosen, the guard's message must stop asserting a cause it cannot know.
+
+**Reproduction**, in full, because a pointer at a file nobody else has is not one. Start a node
+with `--flush-interval-ms 1000` on an empty data directory, then from the Python client:
+
+```python
+prices = [5_000_000 - i * 100 for i in range(20)]
+sizes  = [1_000 + i for i in range(20)]
+for u in range(200):                       # one span: BASE .. BASE + 199_000
+    engine.insert("SYMA", "EX", "bid", prices, sizes, timestamp_ns=BASE + u * 1000)
+engine.flush(); time.sleep(2.5)
+len(engine.query("SELECT * FROM 'SYMA'.'EX'"))      # 4000
+
+prices = [9_000_000 - i * 100 for i in range(5)]    # same span, five levels
+sizes  = [1_000 + i for i in range(5)]
+for u in range(200):
+    engine.insert("SYMA", "EX", "bid", prices, sizes, timestamp_ns=BASE + u * 1000)
+engine.flush(); time.sleep(2.5)
+len(engine.query("SELECT * FROM 'SYMA'.'EX'"))      # 0
+```
+
+Keep the second `range(20)` instead of `range(5)` and the count stays 4000 with the second write's
+prices, which is the first row of the table. Shift the second loop's `BASE` by `100_000` and both
+writes are readable, which is the control.
+
+- Effort: M | Impact: **P0 by consequence.** Two acknowledged writes over one event-time span leave
+  a symbol returning nothing, with no error to the client and a server line naming a different
+  cause. Reachable from the public API by re-running a backfill, which is the operation #105 added
+  event time on the wire to make possible
+
 ### 135. The mesh registry writes to `endpoints[0]` while its coordinator client talks to whichever endpoint answered ✅
 
 Found while writing #132's `read_self_key()`, which became the **second** of three places to
@@ -7179,12 +7264,13 @@ measures the harness.
 
 ## Recommended order
 
-No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #74, #80, #88 and
-#97 — is closed, and several were found by running a real cluster rather than by reading the code
+**One P0 is open: #136**, filed rather than fixed because the three candidate answers differ in
+what they cost and one of them changes the on-disk segment layout. Every P0 raised before it —
+#60, #61, #62, #64, #68, #73, #74, #80, #88 and #97 — is closed, and several were found by running a real cluster rather than by reading the code
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: none.** Every item above #58 is marked closed, and
+**Open: #136.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
