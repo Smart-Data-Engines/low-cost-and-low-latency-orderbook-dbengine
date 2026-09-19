@@ -130,6 +130,36 @@ static char* put_seven(char* p, char* end, const QueryResult& r) {
     return p;
 }
 
+/// The narrowed path, deliberately out of line.
+///
+/// Not a style choice, and not where this started. With both loops inlined into
+/// `format_query_response` the function grew from 919 instructions to 1672, past what GCC will
+/// keep inlining into - and what it stopped inlining was `std::to_chars`. It shows up in the
+/// profile as `std::__to_chars_i`, **6.71% of the server**, a symbol that does not appear at all
+/// in the build before projection. Formatting `SELECT *` cost 2.134 G cycles before and 2.460 G
+/// after, up 15%, for a response whose bytes did not change.
+///
+/// Out of line, the hot path is the size it was and `to_chars` inlines into it again. The cost
+/// lands on the narrowed query instead: one call per response, which is nothing beside the
+/// thousands of rows inside it.
+[[gnu::noinline]] static void format_narrow_rows(std::string& out,
+                                                 const std::vector<QueryResult>& rows,
+                                                 const std::vector<QueryColumn>& columns) {
+    // One allocation for the whole response, sized from this query's own list because a repeated
+    // column repeats its width - `SELECT sequence_number, sequence_number, ...` at twenty repeats
+    // needs 420 bytes where seven distinct columns need 105.
+    std::vector<char> buf(max_row_bytes(columns));
+    char* const buf_end = buf.data() + buf.size();
+    const size_t last = columns.size() - 1;
+    for (const auto& r : rows) {
+        char* p = buf.data();
+        for (size_t i = 0; i < columns.size(); ++i) {
+            p = put_column(p, buf_end, r, columns[i], i == last ? '\n' : '\t');
+        }
+        out.append(buf.data(), static_cast<size_t>(p - buf.data()));
+    }
+}
+
 std::string format_query_response(const std::vector<QueryResult>& rows,
                                   const std::vector<QueryColumn>& columns) {
     std::string out;
@@ -150,12 +180,11 @@ std::string format_query_response(const std::vector<QueryResult>& rows,
     // One buffer for the row and one append for it: thirteen appends a row was thirteen chances
     // to grow the string and thirteen calls into its bookkeeping.
     //
-    // Two loops rather than one with a branch in it, and the second attempt at this is why. A
-    // single loop writing through a `char*` that might point at either a stack array or a heap
-    // one left the compiler unable to treat the canonical path's buffer as a known local, and
-    // `SELECT *` stayed ~5% slower than before projection even with the row writer unrolled.
-    // Split, the canonical path is the same shape it was: a fixed local array nothing else can
-    // alias.
+    // The canonical seven are written here, unrolled, into a fixed local array - the shape this
+    // had before projection, and it took three measurements to get back to it. A shared loop was
+    // 24% more cycles; unrolling the row writer inside a shared loop left ~5%, because the buffer
+    // had become a pointer that might point at the heap; and moving the narrow path out of line
+    // is what let `to_chars` inline again.
     if (columns == all_query_columns()) {
         char line[kMaxQueryRowBytes];
         for (const auto& r : rows) {
@@ -163,19 +192,7 @@ std::string format_query_response(const std::vector<QueryResult>& rows,
             out.append(line, static_cast<size_t>(p - line));
         }
     } else if (!columns.empty()) {
-        // One allocation for the whole response, sized from this query's own list because a
-        // repeated column repeats its width - `SELECT sequence_number, sequence_number, ...` at
-        // twenty repeats needs 420 bytes where seven distinct columns need 105.
-        std::vector<char> buf(max_row_bytes(columns));
-        char* const buf_end = buf.data() + buf.size();
-        const size_t last = columns.size() - 1;
-        for (const auto& r : rows) {
-            char* p = buf.data();
-            for (size_t i = 0; i < columns.size(); ++i) {
-                p = put_column(p, buf_end, r, columns[i], i == last ? '\n' : '\t');
-            }
-            out.append(buf.data(), static_cast<size_t>(p - buf.data()));
-        }
+        format_narrow_rows(out, rows, columns);
     }
     // An empty column list emits a header of nothing and a row of nothing, which is what asking
     // for no columns means. Not reachable from the parser, which requires at least one item.
