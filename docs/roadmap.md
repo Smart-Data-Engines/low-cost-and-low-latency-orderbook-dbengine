@@ -2230,6 +2230,25 @@ cannot land on one side of the ratio:
 work. Divided by round trips the before column is **52.75, 51.68 and 52.15 ms** at batch 8, 64 and
 512 — the same figure at three batch sizes, which is a timer rather than any per-byte cost.
 
+**Read those as the wire's rate, not as a sustained ingest rate, and the difference is a flush.**
+400,000 levels at a 2000 ms flush interval means **no flush fell inside any of the eight runs** —
+which is right for isolating the protocol, and wrong for quoting as throughput. The same client
+against the same build, sweeping volume at `--flush-interval-ms 1000`:
+
+| levels | wall | levels/s |
+|---|---|---|
+| 200,000 | 0.092 s | 2,172,964 |
+| 500,000 | 0.224 s | 2,227,273 |
+| 1,000,000 | 0.452 s | 2,214,381 |
+| 2,000,000 | 1.208 s | 1,655,960 |
+| 4,000,000 | 3.344 s | 1,196,162 |
+
+Flat to **1,000,000 levels**, which is `MAX_PENDING_ROWS` exactly, and falling after it. That is
+#137's slope, and it is the next ceiling: a request/response client could not reach it, so until
+this change nothing could. The before/after ratio above is unaffected — both sides ran the same
+volume at the same interval — but the number a reader should carry away for sustained ingest is
+**1,196,162 levels/s at four million**, not 2,174,287.
+
 **The diagnosis is the control on the other side.** `TCP_QUICKACK` re-armed before every `recv` in
 the client — the server unchanged, not rebuilt, not restarted — took the same 250 round trips from
 **12.963 s to 0.021 s**. So what the pipelining client was paying for was the server's *second*
@@ -2288,6 +2307,23 @@ connect(` is not one of them) and requires each to set the option or carry a co-
 consequence on a real server socket, which is the closest anything gets: measured against the
 tree with the one line removed, **41.0 ms median, min 40.9, max 42.1** over 25 round trips on the
 development machine, against sub-millisecond with it.
+
+**What it exposes, now that the server is the bottleneck again.** A profile of the write path was
+not worth taking before this: the server was idle almost all of the time, waiting for an
+acknowledgement, so the samples would have landed in `epoll_wait`. Below the pending-row ceiling,
+six rounds of 400,000 levels, 2K samples at 1999 Hz:
+
+| | share |
+|---|---|
+| `ob::insert_level` | 15.1% |
+| `malloc` + `_int_free` + `cfree` | 9.1% |
+| `get_or_create_store` + the string-keyed hashtable `find` under it | 7.1% |
+| `from_chars` + `parse_minsert` + `Session::feed` + `tokenize` + `memchr` | 11.9% |
+
+The allocation share is the one with an obvious owner: `Session::feed()` returns
+`std::vector<std::string>`, so a batch of 512 commands is 512 heap allocations and 512 frees that
+live for the length of one loop. None of that is in this item — it is named here because this
+change is what made it measurable.
 
 **Mutations: nine, each with the verdict it is meant to produce, and two of them must survive.**
 

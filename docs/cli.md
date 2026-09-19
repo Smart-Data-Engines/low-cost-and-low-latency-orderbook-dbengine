@@ -256,7 +256,9 @@ A connection may carry several commands before their answers are read. The serve
 complete command from one read and answers them in order, so a client that keeps a window open
 spends one round trip on a batch rather than one per command. Measured on an m9g.xlarge over
 loopback, 20 levels per `MINSERT`: **1,314,663 levels/s** asking one at a time, **2,174,287** at
-512 commands in flight — 1.65× for a change on the client's side only.
+512 commands in flight — 1.65× for a change on the client's side only. Both of those are the
+wire's rate with no flush due; sustained over four million levels at a one-second flush interval
+the same client measures **1,196,162 levels/s**.
 
 Until #140 this was not worth doing, and the reason was not the engine's parsing. No socket the
 server *accepted* turned Nagle off, so the second answer of a batch waited in the server's kernel
