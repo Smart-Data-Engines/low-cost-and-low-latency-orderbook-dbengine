@@ -149,6 +149,11 @@ and the in-process benchmark, at that last volume — 1,000,000 iterations of tw
 | in process (`BM_IngestionThroughputBatched`) | **1014** | **67** |
 | over the wire, same volume | **1059** | 525 |
 
+The in-process row is the three-repetition run above (20,284 ns per twenty-level iteration, cv
+0.14%). The published report's own invocation of the same benchmark gave 991,008 levels/s, which is
+1009 ns per level — 0.5% from this one, and quoted here rather than reconciled away, because two
+artefacts in one pull request giving two numbers for one quantity is the shape this page is about.
+
 **Wall-clock throughput is the same to within about 4% whether the levels arrive over a socket or
 are applied in process.** The round trip costs about 460 ns of server CPU per level — roughly eight
 times what applying the level costs — and costs almost nothing in throughput, because throughput is
