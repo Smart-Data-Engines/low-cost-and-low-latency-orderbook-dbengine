@@ -250,6 +250,30 @@ signal that a client is not keeping up, and it should sit at zero in a healthy s
 Use `LIMIT` when you do not need the whole scan — it is cheaper on both sides than transferring rows
 you will discard.
 
+## Pipelining
+
+A connection may carry several commands before their answers are read. The server executes every
+complete command from one read and answers them in order, so a client that keeps a window open
+spends one round trip on a batch rather than one per command. Measured on an m9g.xlarge over
+loopback, 20 levels per `MINSERT`: **1,314,663 levels/s** asking one at a time, **2,174,287** at
+512 commands in flight — 1.65× for a change on the client's side only. Both of those are the
+wire's rate with no flush due. Sustained over four million levels the same client measures
+**~2.1M levels/s at the default `--flush-interval-ms 100`**, and 1.2M at one second: past a
+million pending rows a writer waits for the next flush, so a longer interval costs throughput
+(#137).
+
+Until #140 this was not worth doing, and the reason was not the engine's parsing. No socket the
+server *accepted* turned Nagle off, so the second answer of a batch waited in the server's kernel
+for the client's delayed acknowledgement of the first: a fixed **~52 ms per round trip whatever
+the batch size**, which capped a pipelining client at about nineteen round trips a second. If you
+are reading numbers from before that change, that is what they measured.
+
+Two things follow for a client. Responses are self-delimiting — `OK` bodies end in a blank line,
+`ERR` and `PONG` are one line each — so a batched reader must count answers rather than read
+"the next line"; and a terminator can straddle two reads, so a buffer cleared between reads loses
+it. The subscription stream is unaffected either way: `PUSH` lines arrive as the server produces
+them, whether or not anything else is in flight.
+
 ## Typical Session
 
 ```

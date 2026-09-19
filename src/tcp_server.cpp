@@ -1,4 +1,5 @@
 #include "orderbook/tcp_server.hpp"
+#include "orderbook/socket_options.hpp"
 #include "orderbook/version.hpp"
 #include "orderbook/subscription_hub.hpp"
 #include "orderbook/logger.hpp"
@@ -1880,6 +1881,9 @@ void TcpServer::run() {
                 // Draining: stop accepting new connections.
                 if (draining_.load(std::memory_order_relaxed)) {
                     // Reject all pending connections.
+                    //
+                    // OB_NO_TCP_NODELAY: one line and a close, so there is never an earlier
+                    // unacknowledged byte for Nagle to hold a second write behind (#140).
                     while (true) {
                         int reject_fd = ::accept4(listen_fd_, nullptr, nullptr, SOCK_NONBLOCK);
                         if (reject_fd < 0) break;
@@ -1903,6 +1907,10 @@ void TcpServer::run() {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                         break; // accept error, continue loop
                     }
+
+                    // Before anything is written to it, including the banner: a client that
+                    // pipelines pays a delayed-ACK timer per round trip without this (#140).
+                    set_tcp_nodelay(client_fd, "tcp_server");
 
                     if (!session_mgr.add_session(client_fd, next_conn_id++)) {
                         // Server full — reject.

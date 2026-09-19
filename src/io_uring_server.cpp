@@ -1,6 +1,7 @@
 #ifdef OB_USE_IO_URING
 
 #include "orderbook/io_uring_server.hpp"
+#include "orderbook/socket_options.hpp"
 #include "orderbook/tcp_server.hpp"  // for execute_command(), parse_cli_args()
 #include "orderbook/compression.hpp"
 #include "orderbook/logger.hpp"
@@ -282,6 +283,12 @@ void IoUringServer::handle_accept(int client_fd) {
         submit_accept(); // re-arm
         return;
     }
+
+    // Same reason as the epoll transport's accept path: a pipelining client otherwise pays a
+    // delayed-ACK timer per round trip (#140). No CI job runs this loop, so the two transports
+    // are held together by `tests/test_socket_options.cpp` rather than by a test that executes
+    // them.
+    set_tcp_nodelay(client_fd, "io_uring");
 
     // Check session limit
     if (!session_mgr_->add_session(client_fd)) {

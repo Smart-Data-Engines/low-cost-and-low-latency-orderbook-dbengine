@@ -3,6 +3,7 @@
 //         pool routing, health-check, failover.
 
 #include "orderbook/client.hpp"
+#include "orderbook/socket_options.hpp"
 #include "orderbook/loop_guard.hpp"
 #include "orderbook/thread_boundary.hpp"
 
@@ -97,9 +98,8 @@ Result<void> OrderbookClient::connect() {
     if (fd_ < 0)
         return Result<void>::err(OB_ERR_IO, "socket() failed");
 
-    // TCP_NODELAY immediately
-    int flag = 1;
-    ::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    // TCP_NODELAY immediately, through the one definition that explains why (#140).
+    set_tcp_nodelay(fd_, "client");
 
     // Non-blocking for connect timeout
     int flags = ::fcntl(fd_, F_GETFL, 0);

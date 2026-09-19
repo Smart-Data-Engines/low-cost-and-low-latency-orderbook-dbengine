@@ -2212,6 +2212,160 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 140. No accepted socket turned Nagle off, so a client that pipelines paid a kernel timer per round trip ✅
+
+Measured on one m9g.xlarge, quiet box, loopback, one connection, 20,000 updates of 20 levels each
+through `MINSERT`. Before and after in the same run, alternating, so a neighbour's periodic load
+cannot land on one side of the ratio:
+
+| commands per round trip | before, wall | before, levels/s | after, wall | after, levels/s |
+|---|---|---|---|---|
+| 1 — the control | 0.306 s | 1,305,742 | 0.304 s | **1,314,663** |
+| 8 | 131.885 s | 3,033 | 0.200 s | **1,997,199** |
+| 64 | 16.150 s | 24,767 | 0.185 s | **2,159,195** |
+| 512 | 2.037 s | 196,409 | 0.184 s | **2,174,287** |
+
+**The server's CPU is the part that says what this was.** For the same 400,000 levels it spent
+0.16, 0.12 and 0.14 seconds before, and 0.16, 0.15 and 0.15 after. The 131.885 seconds were not
+work. Divided by round trips the before column is **52.75, 51.68 and 52.15 ms** at batch 8, 64 and
+512 — the same figure at three batch sizes, which is a timer rather than any per-byte cost.
+
+**Read those as the wire's rate, not as a sustained ingest rate, and the difference is a flush.**
+400,000 levels at a 2000 ms flush interval means **no flush fell inside any of the eight runs** —
+which is right for isolating the protocol, and wrong for quoting as throughput. The same client
+against the same build, sweeping volume at `--flush-interval-ms 1000`:
+
+| levels | wall | levels/s |
+|---|---|---|
+| 200,000 | 0.092 s | 2,172,964 |
+| 500,000 | 0.224 s | 2,227,273 |
+| 1,000,000 | 0.452 s | 2,214,381 |
+| 2,000,000 | 1.208 s | 1,655,960 |
+| 4,000,000 | 3.344 s | 1,196,162 |
+
+Flat to **1,000,000 levels**, which is `MAX_PENDING_ROWS` exactly, and falling after it. That is
+#137's slope, and a request/response client could not reach it, so until this change nothing
+could. The before/after ratio above is unaffected: both sides ran the same volume at the same
+interval.
+
+**And the sweep is at `--flush-interval-ms 1000`, which is not what this engine ships.** The
+default is 100 ms, and asking the same question there was worth doing before writing the sentence
+this paragraph nearly carried. Four runs of each, alternating, four million levels:
+
+| `--flush-interval-ms` | levels/s |
+|---|---|
+| 100 — the default | 2,175,674 / 2,122,961 / 2,028,399 / 2,225,517 |
+| 1000 | 1,196,163 / 1,192,260 / 1,195,473 / 1,197,076 |
+
+At the shipped default **the ceiling costs nothing measurable** — four million levels run at the
+same rate as two hundred thousand. At one second it costs **1.8×**, and the 1000 ms column is so
+tight across four runs because what it is measuring is a timer rather than work. So the honest
+sustained figure depends on a setting: **~2.1M levels/s as shipped**, and 1.2M for an operator who
+has lengthened the interval. That is a narrower claim than the one this paragraph started with,
+and the measurement that narrowed it took four minutes.
+
+**The diagnosis is the control on the other side.** `TCP_QUICKACK` re-armed before every `recv` in
+the client — the server unchanged, not rebuilt, not restarted — took the same 250 round trips from
+**12.963 s to 0.021 s**. So what the pipelining client was paying for was the server's *second*
+response sitting in the server's kernel, waiting for an acknowledgement the client had no reason
+to send until it had read the first.
+
+Nagle holds a small write while an earlier byte on the connection is unacknowledged; the peer's
+delayed-ACK timer releases it. Both are correct. Together they cost tens of milliseconds on any
+exchange where one side writes twice before the other has a reason to answer, and every message
+this engine sends is small. **A request/response client never meets it and never could** — with
+one response outstanding there is nothing unacknowledged when the next write happens. That is why
+this survived every benchmark this repository has published: all of them ask one question at a
+time.
+
+**What it cost the subscription path is a tail, not a median, and saying that precisely matters.**
+Two hundred updates at each of three rates, one connection subscribing and never writing:
+
+| updates | before: median / p99 / max | after: median / p99 / max |
+|---|---|---|
+| one per 50 ms | 0.003 / 0.006 / **48.126** ms | 0.003 / 0.006 / **0.009** ms |
+| one per 5 ms | 0.003 / 0.007 / **40.884** ms | 0.004 / 0.005 / **0.006** ms |
+| one per 1 ms | 0.004 / 0.007 / **43.330** ms | 0.004 / 0.007 / **0.015** ms |
+
+The median did not move and the p99 did not move. `SubscriptionHub` accumulates a batch and the
+drain writes it once, so most pushes go out with nothing outstanding. But the worst push in
+**every** run was a full delayed-ACK timer — roughly one update in two hundred at these rates,
+and which one depends on when the subscriber's acknowledgement happened to be due. For a feed
+whose whole argument is latency, a tail at 40 ms is the number a client would quote back.
+
+**The asymmetry.** The engine set `TCP_NODELAY` on every socket it *dialled* — both mesh
+directions, the C++ client library — and on **no** socket it accepted. The replication link had it
+on neither end, which is the same shape in the smaller: a live record and the `ACK` answering it
+are two small writes with nothing else in flight.
+
+**The fix is one definition** (`ob::set_tcp_nodelay`, `include/orderbook/socket_options.hpp`),
+called from both client transports, both ends of the replication link, both mesh directions and
+the client library. `src/metrics_server.cpp` is exempt and says so beside its own socket: it
+writes the whole response in one `::send()` and closes, so there is never an earlier
+unacknowledged byte to hold a second write behind, and setting the option there would be a line
+that reads as caution and changes nothing.
+
+Not done here, and the reason is a measurement rather than a preference: **coalescing the
+responses of one read batch into a single write**. `send_response()` flushes per command, so a
+batch of 64 leaves as 64 small segments. With Nagle off that costs syscalls and packets, not a
+timer, and the after column above is already 1.65× the request/response client — so it is an
+optimisation to measure on its own rather than a defect to fix under this number.
+
+**Three checks, because none of them is sufficient alone.** A socket option cannot be read from
+the other end of a connection, so no client can ask whether the server set it.
+`tests/test_socket_options.cpp` reads it back with `getsockopt` against a control asserting it was
+off beforehand, and — separately — derives the connection-holding sources from the tree (an
+`accept` or `connect` syscall, matched with a leading non-identifier so `CoordinatorClient::
+connect(` is not one of them) and requires each to set the option or carry a co-located
+`OB_NO_TCP_NODELAY:` reason. It refuses a raw `setsockopt(..., TCP_NODELAY, ...)` anywhere in
+`src/`, so a sixth site cannot open-code it. `tests/integration/test_wire_nodelay.py` observes the
+consequence on a real server socket, which is the closest anything gets: measured against the
+tree with the one line removed, **41.0 ms median, min 40.9, max 42.1** over 25 round trips on the
+development machine, against sub-millisecond with it.
+
+**What it exposes, now that the server is the bottleneck again.** A profile of the write path was
+not worth taking before this: the server was idle almost all of the time, waiting for an
+acknowledgement, so the samples would have landed in `epoll_wait`. Below the pending-row ceiling,
+six rounds of 400,000 levels, 2K samples at 1999 Hz:
+
+| | share |
+|---|---|
+| `ob::insert_level` | 15.1% |
+| `malloc` + `_int_free` + `cfree` | 9.1% |
+| `get_or_create_store` + the string-keyed hashtable `find` under it | 7.1% |
+| `from_chars` + `parse_minsert` + `Session::feed` + `tokenize` + `memchr` | 11.9% |
+
+The allocation share is the one with an obvious owner: `Session::feed()` returns
+`std::vector<std::string>`, so a batch of 512 commands is 512 heap allocations and 512 frees that
+live for the length of one loop. None of that is in this item — it is named here because this
+change is what made it measurable.
+
+**Mutations: nine, each with the verdict it is meant to produce, and two of them must survive.**
+
+| mutation | wanted | got |
+|---|---|---|
+| the client port's accept forgets it | KILLED | static, and the integration test independently (41.0 ms median) |
+| the io_uring accept forgets it | KILLED | static — nothing else can, since no CI job runs that loop |
+| the replication accept forgets it, the dial keeps it | KILLED | static — **this is the one the per-file rule survived** |
+| the replication dial forgets it, the accept keeps it | KILLED | static |
+| the helper does nothing | KILLED | behavioural: `getsockopt` reads the option back |
+| the metrics server drops its exemption reason | KILLED | static |
+| a sixth site open-codes `setsockopt(..., TCP_NODELAY, ...)` | KILLED | static, two assertions |
+| CONTROL: the exemption's reason is reworded | SURVIVES | survived |
+| CONTROL: the log component string changes | SURVIVES | survived |
+
+Two things about that run are worth more than the table. The open-coding mutation was first
+planted in `src/metrics_server.cpp` and **did not build** — that file cannot name `TCP_NODELAY`
+without a new include — so the *mutation* was reshaped and moved to a file that already has the
+header, rather than the code being changed to accommodate it. And the harness scored both controls
+as failures because it compared the word `SURVIVED` against the word `SURVIVES`: an instrument
+disagreeing with itself about spelling, in the two rows whose whole job is to be the check on the
+instrument.
+
+- Effort: S | Impact: A pipelining client was capped at ~19 round trips per second whatever it
+  batched, and the worst push to a subscriber waited out a 40 ms kernel timer. Neither is visible
+  to a request/response client, which is every benchmark this engine has published
+
 ### 139. A select list was parsed, validated, and then ignored, so every row query was `SELECT *` ✅
 
 Measured on a running server rather than read off the parser, because the parser's own behaviour
