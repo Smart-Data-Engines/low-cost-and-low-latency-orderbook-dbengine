@@ -22,6 +22,11 @@ import argparse
 import socket
 import sys
 from datetime import datetime, timezone
+import json
+import os
+import subprocess
+import tempfile
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -37,6 +42,13 @@ REPO = Path(__file__).resolve().parents[2]
 # What this engine cannot do, stated because the comparison is uneven in its favour. A specialised
 # engine beating general databases at its one workload is its whole thesis - and a number that does
 # not say what it gives up promises a replacement.
+# Figures in the prose below that justify a design choice rather than interpret the table are
+# attributed rather than re-measured every run: what a fresh `clickhouse-client` costs is an
+# argument for holding a connection open, and it does not change what this run measured. They said
+# "measured" with no machine beside them, which on any other machine is a claim about the wrong one.
+PROSE_FIGURES_MACHINE = ("an Intel i3-7100U workstation, ext4 over LUKS on NVMe - the machine this "
+                         "harness was written on")
+
 ENGINE_LIMITATIONS = [
     # The first entry of this list used to be the event-time limitation, and it is gone rather than
     # softened: `INSERT` and `MINSERT` take a trailing `event_time_ns` since #105, the Python client
@@ -47,18 +59,13 @@ ENGINE_LIMITATIONS = [
     # stopped looking.
     "orderbook: no bulk-load path over the wire, so the ingest row measures the protocol's shape "
     "as much as the engine's speed - this harness sends one MINSERT round trip per book update "
-    "while the SQL systems receive the whole CSV in one request. Measured on this machine: the "
-    "engine ingests 446,219 updates/s in process (bench_engine BM_IngestionThroughput, 2552 ns/op "
-    "mean over 1,221,610 iterations, Release) and 4,012 updates/s through the wire, a factor of "
-    "111 - the round trip is the whole of it",
+    "while the SQL systems receive the whole CSV in one request. {in_process}",
     # Phrased without the two words `resolution.py` owns, and the guard caught this file twice in
     # one session - the second time on a sentence *denying* a comparison. The rule is deliberately
     # blunt about use against mention, because the flagship product spent four versions learning
     # that telling them apart is harder than avoiding the word.
     "orderbook: no column projection - every row query is `SELECT *`, so a client wanting three "
-    "columns receives seven. Measured, and it is *not* where the query column's extra "
-    "milliseconds go: parsing 4000 seven-column lines and converting three fields costs p50 "
-    "4.795 ms against 4.893 ms for three-column lines, which is the same number twice",
+    "columns receives seven. {projection}",
     "orderbook: no general-purpose SQL - a fixed set of commands, not a query language",
     "orderbook: no joins, and no cross-symbol queries",
     "orderbook: the schema is imposed, not derived from a model",
@@ -66,6 +73,99 @@ ENGINE_LIMITATIONS = [
     "orderbook: aggregates run over the live book, so a VWAP over a historical time range is not "
     "the same question the SQL equivalents answer",
 ]
+
+
+def parse_cost(rows: int, samples: int = 9) -> tuple[float, float]:
+    """Seconds to turn `rows` lines of tab-separated text into tuples, seven columns and three.
+
+    Every query figure in the table includes this, for all three systems, because each adapter
+    receives text. It was stated as "about 4.8 ms" - measured once, on the workstation this harness
+    was written on, and then printed inside every report generated anywhere since.
+
+    On the first machine that was not that one, the same table's fastest query median came out at
+    1.47 ms: a constant declared to be *included* in every figure while being larger than the
+    smallest of them. A reader can see that contradiction; the harness could not, because the
+    constant was prose and the medians were measurements.
+
+    The experiment is the one the column-projection note describes, so the two agree by
+    construction: build the lines, split them, convert three fields, take the fastest of several
+    passes.
+    """
+    wide = ["\t".join(("1700000000000000000", "SYM0001", "EX", "B", str(i % 20),
+                        str(5_000_000 - i), str(1_000 + i))) for i in range(rows)]
+    narrow = ["\t".join(("1700000000000000000", str(5_000_000 - i), str(1_000 + i)))
+              for i in range(rows)]
+
+    def timed_parse(lines: list[str], price_at: int, size_at: int) -> float:
+        best = float("inf")
+        for _ in range(samples):
+            started = time.perf_counter()
+            out = []
+            for line in lines:
+                fields = line.split("\t")
+                out.append((int(fields[0]), int(fields[price_at]), int(fields[size_at])))
+            elapsed = time.perf_counter() - started
+            if len(out) != len(lines):          # the loop must not be optimised into nothing
+                raise RuntimeError("the parse loop did not produce a row per line")
+            best = min(best, elapsed)
+        return best
+
+    return timed_parse(wide, 5, 6), timed_parse(narrow, 1, 2)
+
+
+def in_process_sentence(build_dir: Path, wire_levels_per_second: float | None,
+                        levels_per_update: int) -> str:
+    """The in-process figure, measured by this run rather than quoted from another machine.
+
+    This sentence used to carry three numbers as literals - 446,219 updates/s in process, 4,012
+    over the wire, a factor of 111 - under the words "Measured on this machine". They were measured
+    on *a* machine, and then travelled into every report generated anywhere else: the first aarch64
+    run printed them inside a header reading "Amazon EC2 m9g.xlarge", where the same benchmark
+    measures about 946,000 levels/s.
+
+    Staleness was the smaller half. The two figures were in **different units**:
+    `BM_IngestionThroughput` applies one level per call, this harness sends twenty levels per round
+    trip, so "updates/s" meant two things a factor of twenty apart and the factor of 111 was mostly
+    that. Both halves are levels per second now, and the in-process half comes from
+    `BM_IngestionThroughputBatched`, which uses the wire's shape.
+    """
+    binary = build_dir / "benchmarks" / "bench_engine"
+    if not binary.is_file():
+        return (f"The in-process figure is not measured in this run: there is no bench_engine in "
+                f"{build_dir / 'benchmarks'}. Build it and run again rather than reading a number "
+                f"from another machine")
+
+    with tempfile.TemporaryDirectory() as scratch:
+        out = Path(scratch) / "inproc.json"
+        completed = subprocess.run(
+            [str(binary), "--benchmark_filter=BM_IngestionThroughputBatched",
+             "--benchmark_format=json", f"--benchmark_out={out}"],
+            capture_output=True, text=True, timeout=600, check=False,
+            # The engine writes its storage where this run put everything else, so the in-process
+            # figure is measured against the same filesystem as the wire figure beside it.
+            env={**os.environ, "TMPDIR": str(build_dir / "bench-data")})
+        if completed.returncode != 0 or not out.is_file():
+            return (f"The in-process figure is not measured in this run: bench_engine exited "
+                    f"{completed.returncode}. Its output is not quoted from elsewhere")
+        payload = json.loads(out.read_text())
+
+    rows = [b for b in payload.get("benchmarks", [])
+            if b.get("items_per_second") and "Batched" in b.get("name", "")]
+    if not rows:
+        return ("The in-process figure is not measured in this run: bench_engine reported no "
+                "items_per_second for the batched ingestion benchmark")
+    levels_per_second = max(r["items_per_second"] for r in rows)
+    storage = payload.get("context", {}).get("engine_storage_fs", "unknown filesystem")
+
+    measured = (f"Measured by this run: the engine applies {levels_per_second:,.0f} levels/s in "
+                f"process (bench_engine BM_IngestionThroughputBatched, {levels_per_update} levels "
+                f"per update, storage on {storage})")
+    if not wire_levels_per_second:
+        return measured + ", and the figure over the wire is in the ingest column above"
+    ratio = levels_per_second / wire_levels_per_second
+    return (f"{measured} against {wire_levels_per_second:,.0f} levels/s through the wire, a factor "
+            f"of {ratio:.1f}. Both numbers count levels and both use the same {levels_per_update}"
+            f"-level update, which is what makes them subtractable")
 
 
 def timed(call: Callable[[], QueryResult], rounds: int) -> dict:
@@ -165,18 +265,15 @@ def losses_search(entries: list[dict], reference_name: str, floor: resolution.Re
 # Properties of the measurement, not of any system in it. Kept apart from ENGINE_LIMITATIONS
 # because a constant every system pays is not something the engine cannot do.
 MEASUREMENT_NOTES = [
-    "every figure in the query column includes a measured p50 of about 4.8 ms of Python-side "
-    "parsing for 4000 rows, identical for all three systems, because each adapter turns text into "
-    "tuples. What separates the systems is what is left after that constant, and it is stated here "
-    "rather than subtracted from the table",
+    "{parsing}",
     "each adapter holds one connection open for every timed request. That is not a courtesy: "
-    "measured, a fresh `clickhouse-client` costs 80 ms and a fresh `psql` 40-60 ms, against "
-    "queries of a few milliseconds - and the first version of this harness charged both of those "
-    "to the competitor",
+    "measured on {prose_machine}, a fresh `clickhouse-client` costs 80 ms and a fresh `psql` "
+    "40-60 ms, against queries of a few milliseconds - and the first version of this harness "
+    "charged both of those to the competitor",
     "the noise floor is measured inside the run it governs, by timing the reference system's own "
-    "query twice per round. Across runs the same workload varies more than that floor: two "
-    "consecutive runs of this table gave 9.69 ms and 10.97 ms for the same query, which is why a "
-    "comparison is only made between numbers from one run",
+    "query twice per round. Across runs the same workload varies more than that floor: on "
+    "{prose_machine}, two consecutive runs of this table gave 9.69 ms and 10.97 ms for the same "
+    "query, which is why a comparison is only made between numbers from one run",
 ]
 
 
@@ -210,9 +307,9 @@ def main(argv: list[str] | None = None) -> int:
     engine_fs = hardware.require_durable_storage(data_dir)
     hw = hardware.describe(data_dir, args.build_dir)
     print(f"Platform: {hw.platform}")
+    clock = f"{hw.mhz:.0f} MHz ({hw.clock_source})" if hw.mhz else hw.clock_source
     print(f"Hardware: {hw.cpu_model}, {hw.cores} cores, {hw.ram_mib} MiB, {hw.filesystem}, "
-          f"clock {hw.mhz:.0f} MHz from {hw.clock_source}, kernel {hw.kernel} "
-          f"(digest {hw.digest()})")
+          f"clock {clock}, kernel {hw.kernel} (digest {hw.digest()})")
     print(f"Build: {build_type} from {args.build_dir}")
     print(f"Engine storage: {data_dir} on {engine_fs}")
 
@@ -362,6 +459,48 @@ def main(argv: list[str] | None = None) -> int:
         for system in systems:
             system.teardown()
 
+    # After every server is down, so the in-process figure is measured on a quiet machine, and from
+    # this build rather than from prose. `entries` carries the wire figure this is put beside.
+    wire_levels = next(
+        (e["workloads"]["ingest"]["value"] for e in entries
+         if e.get("name") == reference_name and isinstance(e.get("workloads"), dict)
+         and isinstance(e["workloads"].get("ingest"), dict)
+         and e["workloads"]["ingest"].get("value")),
+        None)
+    # The row count the time-range query actually returned for the reference system, so the parse
+    # measurement below is over the same number of lines the table's query column carried. A
+    # constant here would be the same mistake one size smaller.
+    query_rows = next(
+        (e["workloads"]["time_range"]["rows"] for e in entries
+         if e.get("name") == reference_name and isinstance(e.get("workloads"), dict)
+         and isinstance(e["workloads"].get("time_range"), dict)
+         and e["workloads"]["time_range"].get("rows")),
+        0)
+    wide_s, narrow_s = parse_cost(rows=query_rows) if query_rows else (0.0, 0.0)
+    fills = {
+        "in_process": in_process_sentence(args.build_dir, wire_levels, args.levels),
+        "projection": ("Not measured in this run: the time-range query returned no rows, so there "
+                       "is nothing to say about the cost of parsing them")
+        if not query_rows else (
+            f"Measured by this run, and it is *not* where the query column's extra milliseconds "
+            f"go: parsing {query_rows} seven-column lines and converting three fields costs "
+            f"{wide_s * 1000:.3f} ms against {narrow_s * 1000:.3f} ms for three-column lines"),
+        "parsing": ("the query column's Python-side parsing cost is not measured in this run: "
+                    "the time-range query returned no rows")
+        if not query_rows else (
+            f"every figure in the query column includes a measured {wide_s * 1000:.3f} ms of "
+            f"Python-side parsing for {query_rows} rows, identical for all three systems, because "
+            f"each adapter turns text into tuples. What separates the systems is what is left "
+            f"after that constant, and it is stated here rather than subtracted from the table"),
+        "prose_machine": PROSE_FIGURES_MACHINE,
+    }
+
+    def fill(entry: str) -> str:
+        return entry.format(**fills) if "{" in entry else entry
+
+    limitations = [fill(entry) for entry in ENGINE_LIMITATIONS]
+    measurement_notes = [fill(note) for note in MEASUREMENT_NOTES]
+
     document = report.Report(
         run={"timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
              "seed": args.seed, "rounds": args.rounds, "build_type": build_type},
@@ -369,8 +508,8 @@ def main(argv: list[str] | None = None) -> int:
         dataset=manifest.as_dict(),
         resolution=floor.as_dict(),
         systems=entries,
-        limitations=ENGINE_LIMITATIONS,
-        measurement_notes=MEASUREMENT_NOTES,
+        limitations=limitations,
+        measurement_notes=measurement_notes,
         losses=losses,
         losses_search=losses_search(entries, reference_name, floor, wins, ties),
     )

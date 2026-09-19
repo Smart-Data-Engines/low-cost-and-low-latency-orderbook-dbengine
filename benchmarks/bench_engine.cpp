@@ -149,6 +149,48 @@ BENCHMARK(BM_IngestionThroughput)
     ->Unit(benchmark::kNanosecond)
     ->MinTime(2.0);
 
+// ── BM_IngestionThroughputBatched ────────────────────────────────────────────
+//
+// The same path with twenty levels per update instead of one, and it exists so that the in-process
+// figure can be compared with the one over the wire.
+//
+// The comparative harness sends one MINSERT per book update and the dataset's updates carry twenty
+// levels, so its ingest row is levels per second at twenty levels an update. The benchmark above
+// applies **one** level per call, and calling both of them "updates/s" made a factor-of-twenty unit
+// difference invisible: the published claim that the round trip costs a factor of 111 was one
+// number in each unit. This one counts levels and uses the wire's shape, so the two are subtractable.
+//
+// It is also a less flattering measurement, which is the other reason it is here: the single-level
+// benchmark rewrites one price on a one-level book, which is the most cache-friendly shape this
+// engine has.
+static void BM_IngestionThroughputBatched(benchmark::State& state) {
+    constexpr uint16_t kLevels = 20;
+
+    TempDir tmp;
+    ob::Engine engine(tmp.path.string(), /*flush_interval_ns=*/1'000'000'000ULL);
+    engine.open();
+
+    ob::DeltaUpdate du{};
+    std::vector<ob::Level> levels;
+    uint64_t seq = 1;
+    const uint64_t base_ts = 1'700'000'000'000'000'000ULL;
+
+    int64_t applied_levels = 0;
+    for (auto _ : state) {
+        uint64_t cur_seq = seq++;
+        make_delta(du, levels, cur_seq, base_ts + cur_seq, kLevels);
+        benchmark::DoNotOptimize(engine.apply_delta(du, levels.data()));
+        applied_levels += kLevels;
+    }
+
+    engine.close();
+    state.SetItemsProcessed(applied_levels);
+    state.SetLabel("levels/sec, twenty per update - the shape the wire carries");
+}
+BENCHMARK(BM_IngestionThroughputBatched)
+    ->Unit(benchmark::kNanosecond)
+    ->MinTime(2.0);
+
 // ── BM_VwapLatency ────────────────────────────────────────────────────────────
 // Measures VWAP computation latency over 1000 levels on a warm SoA buffer.
 //
