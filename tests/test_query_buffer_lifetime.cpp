@@ -106,7 +106,7 @@ TEST(QueryBufferLifetime, ASnapshotInstallDuringAQueryDoesNotFreeWhatTheQueryRea
         const ob::SnapshotManifest manifest{};
         uint64_t installs = 0;
         for (int i = 0; i < 600; ++i) {
-            engine.load_snapshot(manifest);
+            engine.adopt_store_on_disk();
             ++installs;
             // Re-create the buffer, so the next query has something to resolve and the window is
             // entered again rather than short-circuiting on a missing symbol.

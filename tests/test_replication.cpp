@@ -2890,7 +2890,7 @@ TEST_F(SnapshotEngineTest, SnapshotLoadBasic) {
         auto manifest = engine.create_snapshot();
 
         // Simulate loading: clear and rebuild.
-        engine.load_snapshot(manifest);
+        engine.adopt_store_on_disk();
 
         auto stats = engine.stats();
         EXPECT_GT(stats.segment_count, 0u) << "After load_snapshot, segments should be present";

@@ -1412,7 +1412,7 @@ void Engine::adopt_snapshot_sequence_state(
                 vector.size(), held.size(), seq_tracker_.symbol_count());
 }
 
-void Engine::load_snapshot(const SnapshotManifest& /*manifest*/) {
+void Engine::adopt_store_on_disk() {
     // flush_mtx_ first: clearing stores_ destroys the ColumnarStore objects that a
     // concurrent Phase B may be iterating over.
     std::lock_guard<std::mutex> flush_lock(flush_mtx_);
@@ -1443,6 +1443,38 @@ void Engine::load_snapshot(const SnapshotManifest& /*manifest*/) {
     // Rebuild columnar index from the new files on disk.
     combined_store_.close();
     combined_store_.open_existing();
+}
+
+bool Engine::install_snapshot(const std::string& staging_dir,
+                              const SnapshotManifest& manifest) {
+    std::vector<std::string> paths;
+    paths.reserve(manifest.files.size());
+    for (const auto& entry : manifest.files) paths.push_back(entry.path);
+
+    // flush_mtx_ first: replacing the store destroys the ColumnarStore state a concurrent
+    // Phase B may be iterating over (pitfall 10).
+    std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+    std::unique_lock<std::mutex> lock(mtx_);
+
+    OB_LOG_INFO("engine", "Installing a snapshot of %zu file(s) from '%s'",
+                paths.size(), staging_dir.c_str());
+
+    stores_.clear();
+    buffers_.clear();
+    pending_rows_.clear();
+    seq_tracker_.reset();
+
+    combined_store_.close();
+    if (!combined_store_.replace_from_staging(staging_dir, paths)) {
+        OB_LOG_ERROR("engine",
+                     "Installing the snapshot failed; this node now holds an incomplete store "
+                     "and has to bootstrap again");
+        return false;
+    }
+
+    OB_LOG_INFO("engine", "Snapshot installed: the store now holds %zu segment(s)",
+                combined_store_.segment_count());
+    return true;
 }
 
 bool Engine::holds_no_data() {
