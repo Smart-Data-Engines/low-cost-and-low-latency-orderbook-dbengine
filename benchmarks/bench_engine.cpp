@@ -27,6 +27,7 @@
 #include "orderbook/aggregation.hpp"
 #include "orderbook/data_model.hpp"
 #include "orderbook/engine.hpp"
+#include "orderbook/response_formatter.hpp"
 #include "orderbook/soa_buffer.hpp"
 #include "orderbook/types.hpp"
 
@@ -190,6 +191,47 @@ static void BM_IngestionThroughputBatched(benchmark::State& state) {
 BENCHMARK(BM_IngestionThroughputBatched)
     ->Unit(benchmark::kNanosecond)
     ->MinTime(2.0);
+
+// ── BM_FormatQueryResponse ───────────────────────────────────────────────────
+//
+// The response, on its own. It is here because `perf` put `format_query_response` at **22.96%** of
+// the server's profile over 16,000 of the comparative benchmark's time-range query, against
+// **2.70%** for `ColumnarStore::scan` - the answer cost eight times the read it came from.
+//
+// Read it beside the path rather than instead of it: an isolated component overstates what
+// removing it buys on the path containing it, which this repository has measured (187 ns of CRC32C
+// saving was worth 25 ns inside `apply_delta`). The claim about the query belongs to a query.
+//
+// 4,000 rows is the size the comparative harness asks for - one symbol of a 200,000-row dataset -
+// and the values are the shape that dataset carries, because the cost is digits and a benchmark
+// over single-digit fields would measure a row a third the width.
+static void BM_FormatQueryResponse(benchmark::State& state) {
+    const size_t n = static_cast<size_t>(state.range(0));
+    std::vector<ob::QueryResult> rows(n);
+    const uint64_t base_ts = 1'700'000'000'000'000'000ULL;
+    for (size_t i = 0; i < n; ++i) {
+        rows[i].timestamp_ns    = base_ts + i * 1'000ULL;
+        rows[i].price           = 5'000'000LL - static_cast<int64_t>(i % 20) * 100LL;
+        rows[i].quantity        = 1'000ULL + (i % 20);
+        rows[i].order_count     = 1;
+        rows[i].side            = static_cast<uint8_t>(i & 1U);
+        rows[i].level           = static_cast<uint16_t>(i % 20);
+        rows[i].sequence_number = i + 1;
+    }
+
+    size_t bytes = 0;
+    for (auto _ : state) {
+        std::string out = ob::format_query_response(rows);
+        bytes = out.size();
+        benchmark::DoNotOptimize(out.data());
+        benchmark::ClobberMemory();
+    }
+
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
+    state.SetBytesProcessed(static_cast<int64_t>(state.iterations() * bytes));
+    state.SetLabel("rows/sec formatted; " + std::to_string(bytes / (n ? n : 1)) + " bytes/row");
+}
+BENCHMARK(BM_FormatQueryResponse)->Arg(4000)->Unit(benchmark::kMicrosecond);
 
 // ── BM_VwapLatency ────────────────────────────────────────────────────────────
 // Measures VWAP computation latency over 1000 levels on a warm SoA buffer.
