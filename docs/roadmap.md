@@ -2266,6 +2266,21 @@ memory half under a name that cannot be mistaken for an install. Both installers
 loops; an unsafe path now refuses the **whole** install rather than skipping one entry, because the
 store is about to be replaced by exactly that list and an entry we decline is a hole in it.
 
+**Mutations: five, each with the verdict it was meant to give.**
+
+| mutation | verdict |
+|---|---|
+| the removal loop never runs | **killed** — 122 rows again, and the unit test for the overlapping name |
+| the staging directory is not spared | **killed** — the clear eats the files it is about to install |
+| `wal_*` is not spared | **killed** — the WAL and `wal_identity` go with the segments |
+| a failed move reports success | **killed** — an install that installed nothing reads as done |
+| the closing log line is reworded | **survives**, and it is the control |
+
+The control is the row that says the other four mean something: a table in which everything dies
+reports a broken harness as diligence. Baseline green before and after, and the source restored
+byte for byte — with `copyfile` plus a touch rather than `copy2`, which keeps the backup's mtime
+and leaves the rebuild with nothing to do (pitfall 272, twice in this repository).
+
 - Effort: M | Impact: P0 by consequence — a replica answered `SELECT` with rows its primary never
   had, silently and durably, after the documented recovery from a truncated position
 
