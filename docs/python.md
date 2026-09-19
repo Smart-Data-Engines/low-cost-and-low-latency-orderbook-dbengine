@@ -143,6 +143,14 @@ Three named refusals, each because the honest answer is not obvious:
 In embedded mode this is a loop over `insert()`, which is exactly what it is, and the docstring
 says so rather than implying a round trip that does not exist.
 
+**A transport failure part-way through raises, and the outcomes already read are lost.** The
+server answers in order, so when the connection drops some of the batch has been acknowledged and
+the rest has not, and this method cannot hand back both a list and an exception. Treat a raise as
+*indeterminate* — the batch may have landed in full, in part, or not at all — and read to find
+out. It is where a single `insert()` leaves you when the connection drops on its reply, widened
+to the size of the batch, which is a reason to keep batches at a size whose re-examination you
+can afford.
+
 #### engine.flush()
 
 Force-flush pending data so it becomes queryable.

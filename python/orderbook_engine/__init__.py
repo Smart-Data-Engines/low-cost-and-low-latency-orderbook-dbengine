@@ -1829,6 +1829,15 @@ class OrderbookEngine:
 
         In local mode this is a loop over `insert()`, which is exactly the same thing, and saying
         so is better than implying a round trip that does not exist.
+
+        **A transport failure part-way through raises, and the outcomes already read are lost.**
+        The server answers in order, so by the time the connection drops some of the batch has
+        been acknowledged and the rest has not — and this method has no way to hand back both a
+        list and an exception. Treat a raise from here as *indeterminate*: the batch may have
+        landed in full, in part, or not at all, and the only way to find out is to read. It is the
+        same position a single `insert()` leaves you in when the connection drops on its reply,
+        widened to the size of the batch, which is a reason to keep batches at a size whose
+        re-examination you can afford.
         """
         if self._closed:
             raise OrderbookError(-1, "Engine is closed")
