@@ -2874,6 +2874,29 @@ Learned the hard way. Check here before debugging.
      simply wrong. That is why `SELECT` projects and `SUBSCRIBE` does not: the fix there is
      announcing the columns in `OK SUB <id>`, which is a protocol change.
 
+347. **A guarantee can be stated three times inside one function, and the copy that holds is the
+     one nothing can mutate.** `ColumnarStore::scan()` widens the caller's `ColumnSet` with
+     `TimestampNs` because it filters on the row's timestamp and will not depend on the caller
+     having remembered; `columns_to_read()` puts it there too, because the engine knows it filters
+     on time; and two lines below the widening, `need(true, "ts.col", timestamps)` opened the file
+     regardless of the set. The third made the first two unobservable, so a mutation deleting the
+     widening **survived** -
+     `ColumnarStoreProjection.TheTimestampIsReadEvenWhenTheSetLeavesItOut`, the test written for
+     exactly that case, stayed green. Two statements of one rule are fine when each has a test at
+     its own level; the one to delete is the one that makes the others impossible to falsify. The
+     fix also moved the code back onto its own requirement, which says the scan opens
+     **exclusively** the files the set names.
+
+348. **`shutil.copy2` in a mutation harness restores the source with the backup's mtime, so the
+     rebuild after it does nothing** - pitfall 272, committed again in a harness written by
+     someone who had just written it down. The per-mutation restores used `write_text` and were
+     fine; only the final one used `copy2`, which left the last mutant's object file in place. The
+     tree afterwards had two red tests in `QueryProjection` with nothing wrong in the source, and
+     `touch src/query_engine.cpp` plus a rebuild turned them green, which is the tell. Restore
+     with `copyfile` and touch. The second half is what would have caught it: the harness checked
+     its baseline **without building first**, so that check described whatever the previous run
+     had left in `build/` rather than the tree it was about to mutate.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
