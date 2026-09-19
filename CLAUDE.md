@@ -2864,8 +2864,11 @@ Learned the hard way. Check here before debugging.
      `AGG_WITH_COLUMNS`, naming the column; the new refusal changed the error code and broke that
      test, which is the only reason it was noticed. A second guarantee for one rule cannot be
      mutated separately. The same session then tried refusing a narrowed `SUBSCRIBE` and withdrew
-     it: three tests use `SUBSCRIBE price ... WHERE price BETWEEN ...`, where the column names
-     what the filter reads.
+     it: **three tests failed** when the refusal was tried, and the form appears five times across
+     four test files - `SUBSCRIBE price ... WHERE price BETWEEN ...`, where the column names what
+     the filter reads. Those two numbers are different questions and the smaller one is the
+     measurement; counting occurrences afterwards is what showed the first version of this entry
+     had used one to mean the other.
 
 346. **A self-describing answer can be refused by a client; a positional one cannot.** A `SELECT`
      response carries a header, so narrowing it is safe in the sense that matters - a client that
