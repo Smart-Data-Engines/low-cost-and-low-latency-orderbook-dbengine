@@ -2,6 +2,7 @@
 #include "orderbook/capabilities.hpp"
 #include "orderbook/version.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <iterator>
 #include <string>
@@ -13,11 +14,11 @@ namespace ob {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// sequence_number goes last on purpose: a client that reads columns by index keeps working, and
-// one that reads by name finds the new field. 0 means "unassigned" — rows written before #64
-// carry no number, and there is no way to invent one for them after the fact.
-static constexpr std::string_view kQueryHeader =
-    "timestamp_ns\tprice\tquantity\torder_count\tside\tlevel\tsequence_number";
+// The row header used to be a literal here. It is generated from `column_name()` now, so the
+// literal was dead - and clang says so where GCC does not: `-Wunused-const-variable` fires for a
+// `static constexpr` at namespace scope, which is how the `fuzz` and `clang-build` jobs found it.
+// The note it carried about why `sequence_number` goes last moved to the table that now decides
+// that order, in `src/query_columns.cpp`.
 
 static constexpr std::string_view kAggHeader = "name\tvalue\tscale";
 
@@ -42,10 +43,16 @@ static std::vector<std::string_view> split(std::string_view sv, char delim) {
 
 // ── format_query_response ─────────────────────────────────────────────────────
 
-/// Widest a row can be: every field at its type's limit, six tabs and a newline.
+/// Widest a `SELECT *` row can be: every field at its type's limit, six tabs and a newline.
 ///
 ///   timestamp_ns 20 + price 20 (19 digits and a sign) + quantity 20 + order_count 10
 ///   + side 3 + level 5 + sequence_number 20  =  98, plus 7 separators.
+///
+/// It is the size of the stack buffer and **not** the worst case any more: a query may name the
+/// same column more than once, so `SELECT sequence_number, sequence_number, ...` needs 21 bytes
+/// per repeat and would run off the end of a buffer sized for seven distinct columns. The row
+/// buffer is sized from the query's own column list, and this is the point at which it stops
+/// fitting on the stack.
 static constexpr size_t kMaxQueryRowBytes = 105;
 
 /// Append `value` and then `sep`, without constructing a string for either.
@@ -59,47 +66,136 @@ static constexpr size_t kMaxQueryRowBytes = 105;
 /// 5.53%, `memcpy` at 24.27%, and malloc/free at 6.84%. After this, three of those five symbols
 /// are not in the profile at all.
 template <typename T>
-static char* put_field(char* p, T value, char sep) {
+static char* put_field(char* p, char* end, T value, char sep) {
+    // `end` is the buffer's real end rather than `p + 24`. The fixed window was correct only
+    // because the buffer was always wider than any one field; handing `to_chars` a pointer past
+    // the allocation is the kind of detail that is fine until a caller sizes the buffer tightly.
+    //
+    // The separator's byte is held back from `to_chars` rather than assumed to be spare. The
+    // callers size their buffers so that it is, but that is an argument made two functions away,
+    // and GCC 11 says so out loud: `writing 1 byte into a region of size 0` on the store below.
+    // Reserving it here makes the guarantee local and provable instead of true-by-inspection.
+    //
     // `side` is a `uint8_t`, which is a character type: handing it to `to_chars` unwidened invites
     // an overload that would write a byte rather than a number. Widen every integer to the type
     // `to_chars` cannot misread.
+    char* const digits_end = end - 1;
     if constexpr (std::is_signed_v<T>) {
-        const auto res = std::to_chars(p, p + 24, static_cast<long long>(value));
+        const auto res = std::to_chars(p, digits_end, static_cast<long long>(value));
         p = res.ptr;
     } else {
-        const auto res = std::to_chars(p, p + 24, static_cast<unsigned long long>(value));
+        const auto res = std::to_chars(p, digits_end, static_cast<unsigned long long>(value));
         p = res.ptr;
     }
     *p++ = sep;
     return p;
 }
 
-std::string format_query_response(const std::vector<QueryResult>& rows) {
+/// One field of one row, chosen by column. Separated from the loop so that the seven-column path
+/// and a narrowed one cannot disagree about what a column means.
+static char* put_column(char* p, char* end, const QueryResult& r, QueryColumn c, char sep) {
+    switch (c) {
+        case QueryColumn::TimestampNs:    return put_field(p, end, r.timestamp_ns,    sep);
+        case QueryColumn::Price:          return put_field(p, end, r.price,           sep);
+        case QueryColumn::Quantity:       return put_field(p, end, r.quantity,        sep);
+        case QueryColumn::OrderCount:     return put_field(p, end, r.order_count,     sep);
+        case QueryColumn::Side:           return put_field(p, end, r.side,            sep);
+        case QueryColumn::Level:          return put_field(p, end, r.level,           sep);
+        case QueryColumn::SequenceNumber: return put_field(p, end, r.sequence_number, sep);
+    }
+    // No `default`, so a column added to the enum and not to this switch is a build error rather
+    // than a field that silently goes missing from every response.
+    return p;
+}
+
+/// The seven-column row, unrolled.
+///
+/// A duplicate of what the loop below does, and it is here because measuring said so rather than
+/// because it looked faster. With only the general loop, `SELECT *` - the shape the published
+/// comparative table measures - cost **24% more cycles inside this function** over 16,000 of that
+/// query on an m9g.xlarge (2.107 G to 2.621 G), while every other symbol stayed flat. Seven
+/// straight-line calls inline; a loop that picks the field by a value cannot, however cheap the
+/// switch is.
+///
+/// The two paths are pinned against each other by a test that formats each column alone through
+/// the loop and compares it with the same field cut out of this one's output.
+static char* put_seven(char* p, char* end, const QueryResult& r) {
+    p = put_field(p, end, r.timestamp_ns,    '\t');
+    p = put_field(p, end, r.price,           '\t');
+    p = put_field(p, end, r.quantity,        '\t');
+    p = put_field(p, end, r.order_count,     '\t');
+    p = put_field(p, end, r.side,            '\t');
+    p = put_field(p, end, r.level,           '\t');
+    p = put_field(p, end, r.sequence_number, '\n');
+    return p;
+}
+
+/// The narrowed path, deliberately out of line.
+///
+/// Not a style choice, and not where this started. With both loops inlined into
+/// `format_query_response` the function grew from 919 instructions to 1672, past what GCC will
+/// keep inlining into - and what it stopped inlining was `std::to_chars`. It shows up in the
+/// profile as `std::__to_chars_i`, **6.71% of the server**, a symbol that does not appear at all
+/// in the build before projection. Formatting `SELECT *` cost 2.134 G cycles before and 2.460 G
+/// after, up 15%, for a response whose bytes did not change.
+///
+/// Out of line, the hot path is the size it was and `to_chars` inlines into it again. The cost
+/// lands on the narrowed query instead: one call per response, which is nothing beside the
+/// thousands of rows inside it.
+[[gnu::noinline]] static void format_narrow_rows(std::string& out,
+                                                 const std::vector<QueryResult>& rows,
+                                                 const std::vector<QueryColumn>& columns) {
+    // One allocation for the whole response, sized from this query's own list because a repeated
+    // column repeats its width - `SELECT sequence_number, sequence_number, ...` at twenty repeats
+    // needs 420 bytes where seven distinct columns need 105.
+    std::vector<char> buf(max_row_bytes(columns));
+    char* const buf_end = buf.data() + buf.size();
+    const size_t last = columns.size() - 1;
+    for (const auto& r : rows) {
+        char* p = buf.data();
+        for (size_t i = 0; i < columns.size(); ++i) {
+            p = put_column(p, buf_end, r, columns[i], i == last ? '\n' : '\t');
+        }
+        out.append(buf.data(), static_cast<size_t>(p - buf.data()));
+    }
+}
+
+std::string format_query_response(const std::vector<QueryResult>& rows,
+                                  const std::vector<QueryColumn>& columns) {
     std::string out;
     // 64 rather than `kMaxQueryRowBytes`: measured on the comparative benchmark's dataset a row is
-    // **43 bytes**, so 64 leaves half again and reserves 1.6x what is used rather than 2.4x. A
-    // result whose every field sits near its type's limit grows the buffer once, which is correct
-    // and merely slower - and growing is what the 15.4% of that profile spent in `memcpy` was.
+    // **43 bytes** for all seven columns, so 64 leaves half again and reserves 1.6x what is used
+    // rather than 2.4x. A narrower answer over-reserves, which costs one allocation of unused
+    // bytes and no copying; under-reserving costs a copy of everything written so far, and
+    // growing is what the 24.27% of that profile spent in `memcpy` was.
     out.reserve(96 + rows.size() * 64);
 
     out += "OK\n";
-    out += kQueryHeader;
+    for (size_t i = 0; i < columns.size(); ++i) {
+        if (i != 0) out += '\t';
+        out += column_name(columns[i]);
+    }
     out += '\n';
 
-    // One buffer for the row and one append for it: thirteen appends a row was thirteen chances to
-    // grow the string and thirteen calls into its bookkeeping.
-    char line[kMaxQueryRowBytes];
-    for (const auto& r : rows) {
-        char* p = line;
-        p = put_field(p, r.timestamp_ns,    '\t');
-        p = put_field(p, r.price,           '\t');
-        p = put_field(p, r.quantity,        '\t');
-        p = put_field(p, r.order_count,     '\t');
-        p = put_field(p, r.side,            '\t');
-        p = put_field(p, r.level,           '\t');
-        p = put_field(p, r.sequence_number, '\n');
-        out.append(line, static_cast<size_t>(p - line));
+    // One buffer for the row and one append for it: thirteen appends a row was thirteen chances
+    // to grow the string and thirteen calls into its bookkeeping.
+    //
+    // The canonical seven are written here, unrolled, into a fixed local array - the shape this
+    // had before projection, and it took three measurements to get back to it. A shared loop was
+    // 24% more cycles; unrolling the row writer inside a shared loop left ~5%, because the buffer
+    // had become a pointer that might point at the heap; and moving the narrow path out of line
+    // is what let `to_chars` inline again.
+    if (columns == all_query_columns()) {
+        char line[kMaxQueryRowBytes];
+        for (const auto& r : rows) {
+            char* p = put_seven(line, line + sizeof(line), r);
+            out.append(line, static_cast<size_t>(p - line));
+        }
+    } else if (!columns.empty()) {
+        format_narrow_rows(out, rows, columns);
     }
+    // An empty column list emits a header of nothing and a row of nothing, which is what asking
+    // for no columns means. Not reachable from the parser, which requires at least one item.
 
     out += '\n'; // empty line terminator
     return out;

@@ -354,10 +354,11 @@ std::string execute_command(const Command& cmd,
         if (engine.is_bootstrapping()) return format_error("bootstrapping");
         auto t0_select = std::chrono::steady_clock::now();
         std::vector<QueryResult> rows;
+        QueryShape shape;
         try {
             std::string err = engine.execute(cmd.raw_sql, [&](const QueryResult& r) {
                 rows.push_back(r);
-            });
+            }, shape);
             if (!err.empty()) {
                 return format_error(err);
             }
@@ -379,7 +380,7 @@ std::string execute_command(const Command& cmd,
         if (!rows.empty() && !rows.front().agg_values.empty()) {
             return format_agg_response(rows.front().agg_values);
         }
-        return format_query_response(rows);
+        return format_query_response(rows, shape.columns);
     }
 
     case CommandType::INSERT: {

@@ -397,6 +397,14 @@ Learned the hard way. Check here before debugging.
     side. Build with the other compiler occasionally; the README promised Clang support for months
     before anything checked it (#37).
 
+    **Same lesson, a year of entries later, and this time it cost two required checks.** #139
+    replaced the row header literal with a generator over the column table, which left
+    `kQueryHeader` dead - a `static constexpr std::string_view` at namespace scope, which GCC
+    ignores and clang refuses under `-Wunused-const-variable`. Both `clang-build` and `fuzz` failed
+    on it (the fuzz harnesses are the only other clang build in CI), on a branch whose local
+    verification had been GCC-only from the first commit to the pull request. When a generator
+    takes over from a literal, the literal is dead by construction: grep for it in the same edit.
+
 59. **An answer that means four different things cannot be acted on.** `get_cluster_state()`
     returned `std::nullopt` for not-connected, an empty HTTP response, a key that genuinely was not
     there, and a body that would not parse. A primary reading that as "the leader key is gone" would
@@ -2821,6 +2829,107 @@ Learned the hard way. Check here before debugging.
      work over a socket — which cannot be true and is exactly the shape that gets published when
      one number is read without its neighbour. Google Benchmark prints both columns for this
      reason. Find where the wall time goes before quoting either.
+
+340. **A profile is a sample, so it has a sample size, and the small entries go first.** The pilot
+     profile behind #138 ran 400 queries - about 0.2 s of server CPU, a few hundred samples at
+     1999 Hz - and reported `format_query_response` at **40.11%** against `ColumnarStore::scan`
+     at 2.74%. Re-run over 16,000 queries it is **22.96% against 2.70%**. The pilot was right
+     about which function dominates, which is what a pilot is for, and wrong by nearly a factor
+     of two about how much, because at that size a 2% entry is a handful of samples and a ratio
+     built on it is arithmetic over noise. Print the sample or cycle count beside the shares, and
+     do not publish a ratio whose denominator is small.
+
+341. **A share that goes up while the total goes down is the expected shape, not a contradiction.**
+     After #138 the formatter's share rose from 22.96% to 32.55% while the server spent 42% fewer
+     cycles on the same 16,000 queries. Work that had been attributed to `_M_construct`, `malloc`
+     and `memcpy` moved inside the function and got smaller. Compare **absolute** cycles across
+     two profiles; percentages are of different totals and cannot be subtracted.
+
+342. **A loop that picks a field by a value cannot match straight-line code that inlines, and the
+     difference is worth measuring before you assume either way.** Replacing seven unrolled
+     `put_field` calls with a loop over a column list cost `format_query_response` **24% more
+     cycles** for `SELECT *` - 2.107 G to 2.621 G - with every other symbol flat. The general
+     loop is still right for a narrowed answer; the canonical shape keeps its unrolled path. Add
+     the specialised path **after** the measurement says so, which is what #139's own spec
+     required, and never before.
+
+343. **Two code paths producing one output need a test that reaches both, and a content-based
+     dispatch makes that harder than it looks.** `format_query_response` picks the unrolled path
+     when the column list *is* the canonical seven, so no call can be made to take the general
+     path over that shape. The test formats each column **alone** - necessarily the loop - and
+     compares it with that field cut out of the unrolled output. A test that only checked the
+     fast path against literal bytes would pass while the two drifted.
+
+344. **A buffer sized for "the widest row" stops being the widest row when the query can repeat a
+     column.** The row buffer was a 105-byte stack array, correct for seven distinct columns and
+     a stack overflow for `SELECT sequence_number, sequence_number, ...` at twenty repeats. The
+     size has to come from the query's own list. The same reasoning retired `p + 24` as the end
+     pointer handed to `to_chars`: fine while the buffer was always wider than any one field.
+
+345. **Before refusing something, find out whether it is already refused and whether the form is
+     in use.** #139 added a parse-time refusal for a select list mixing columns with aggregates,
+     on the assumption that mixing was accepted. `execute()` had refused it for a long time with
+     `AGG_WITH_COLUMNS`, naming the column; the new refusal changed the error code and broke that
+     test, which is the only reason it was noticed. A second guarantee for one rule cannot be
+     mutated separately. The same session then tried refusing a narrowed `SUBSCRIBE` and withdrew
+     it: **three tests failed** when the refusal was tried, and the form appears five times across
+     four test files - `SUBSCRIBE price ... WHERE price BETWEEN ...`, where the column names what
+     the filter reads. Those two numbers are different questions and the smaller one is the
+     measurement; counting occurrences afterwards is what showed the first version of this entry
+     had used one to mean the other.
+
+346. **A self-describing answer can be refused by a client; a positional one cannot.** A `SELECT`
+     response carries a header, so narrowing it is safe in the sense that matters - a client that
+     cannot read the new shape can say so by name. A `PUSH` line has no header, so narrowing it
+     changes what field 2 means with no signal at all, and a subscriber reading positionally is
+     simply wrong. That is why `SELECT` projects and `SUBSCRIBE` does not: the fix there is
+     announcing the columns in `OK SUB <id>`, which is a protocol change.
+
+347. **A guarantee can be stated three times inside one function, and the copy that holds is the
+     one nothing can mutate.** `ColumnarStore::scan()` widens the caller's `ColumnSet` with
+     `TimestampNs` because it filters on the row's timestamp and will not depend on the caller
+     having remembered; `columns_to_read()` puts it there too, because the engine knows it filters
+     on time; and two lines below the widening, `need(true, "ts.col", timestamps)` opened the file
+     regardless of the set. The third made the first two unobservable, so a mutation deleting the
+     widening **survived** -
+     `ColumnarStoreProjection.TheTimestampIsReadEvenWhenTheSetLeavesItOut`, the test written for
+     exactly that case, stayed green. Two statements of one rule are fine when each has a test at
+     its own level; the one to delete is the one that makes the others impossible to falsify. The
+     fix also moved the code back onto its own requirement, which says the scan opens
+     **exclusively** the files the set names.
+
+348. **`shutil.copy2` in a mutation harness restores the source with the backup's mtime, so the
+     rebuild after it does nothing** - pitfall 272, committed again in a harness written by
+     someone who had just written it down. The per-mutation restores used `write_text` and were
+     fine; only the final one used `copy2`, which left the last mutant's object file in place. The
+     tree afterwards had two red tests in `QueryProjection` with nothing wrong in the source, and
+     `touch src/query_engine.cpp` plus a rebuild turned them green, which is the tell. Restore
+     with `copyfile` and touch. The second half is what would have caught it: the harness checked
+     its baseline **without building first**, so that check described whatever the previous run
+     had left in `build/` rather than the tree it was about to mutate.
+
+349. **An anchor on a literal dies with the literal, and the thing that replaced it is the new
+     anchor.** `test_mesh_link_faults.py` pins the seven-column header it strips out of every
+     query answer, and pinned it by looking for that string in `src/response_formatter.cpp` —
+     right until #139 replaced the literal with a loop over the column table and the clang fix
+     deleted the leftover. The test then failed saying the string no longer exists, which is the
+     correct report from an anchor pointing at nothing. Two things follow. The replacement anchor
+     is `src/query_columns.cpp`'s spellings table, **which is stronger than what it replaces**: a
+     literal can agree with a header nothing prints, and a mutation swapping two rows of the table
+     now fails the test where before it would not have. And the commit that removed the literal
+     was verified with a **C++ build and `ctest`** — the only reader of that source text is a
+     Python integration test, so the local verification could not have seen it. When a change
+     deletes a string, grep the whole tree for it, tests in other languages included.
+
+350. **A function-scoped fixture writing to one symbol on a session-scoped cluster turns every
+     count assertion into an assertion about test order.** Storage is append-only, so
+     `test_column_projection.py`'s `book` fixture added a row per test to one shared symbol: six
+     of its seven tests read `lines[2]`, where the first row is the same however many follow it,
+     and the seventh asserted `len(rows) == 1` and read **seven**. It is the order that decides,
+     not the code, and it had never run to completion in CI before — the branch's previous run was
+     cancelled, so the first completion was the first report. Give each test its own symbol; the
+     count then says what it looks like it says, and the six that passed become exact rather than
+     merely satisfied.
 
 ## Current state and open problems
 

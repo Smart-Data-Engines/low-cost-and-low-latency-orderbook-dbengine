@@ -2212,12 +2212,12 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
-### 139. A select list is parsed, validated, and then ignored, so every row query is `SELECT *`
+### 139. A select list was parsed, validated, and then ignored, so every row query was `SELECT *` ✅
 
 Measured on a running server rather than read off the parser, because the parser's own behaviour
-here is the thing in question. One row inserted, then four queries:
+was the thing in question. One row inserted, then four queries:
 
-| asked | answered |
+| asked | answered, before |
 |---|---|
 | `SELECT * FROM 'AAA'.'EX'` | seven columns |
 | `SELECT price FROM 'AAA'.'EX'` | **seven columns** |
@@ -2225,48 +2225,178 @@ here is the thing in question. One row inserted, then four queries:
 | `SELECT quantity, price FROM 'AAA'.'EX'` | **seven columns, in the other order** |
 
 Every one answered `OK`. This is #107's class in the query language rather than in the command
-parser: there the extra token was unread, here the select list is read, its names are checked
-against the seven the lexer knows, aggregate calls in it are validated by name and argument — and
-then the row path never looks at `ast.select_exprs` again. A client that asks for one column gets
-seven and has no way to tell that it did not get what it asked for, because the header it is handed
-names seven and is correct about the bytes that follow it.
+parser: there the extra token was unread, here the select list was read, its names were checked
+against the seven the lexer knows, aggregate calls in it were validated by name and argument — and
+then the row path never looked at `ast.select_exprs` again. A client that asked for one column got
+seven and had no way to tell, because the header it was handed named seven and was correct about
+the bytes that followed it.
 
-It costs three things at once, and the comparative harness pays all three. It sends us
-`SELECT * FROM 'SYM0000'.'EX' WHERE timestamp BETWEEN …` and sends ClickHouse and TimescaleDB
-`SELECT ts_ns, price_ticks, size_lots FROM …`, then **throws four of our seven columns away in
-Python** (`_raw_rows` reads the three it wants out of the header by name). So against the same
-question the competitors answer, the engine:
+**Two lists, and keeping them apart is most of the change.** What has to be *answered* is ordered
+and may repeat, because it answers the question literally: `SELECT price, price` is two columns.
+What has to be *read* is a set, and wider — `SELECT price WHERE timestamp BETWEEN …` has to read
+`ts.col` and must not answer it. Holding those in one type is the defect.
+`include/orderbook/query_columns.hpp` holds both.
 
-- reads and decodes seven `.col` files per segment where three would do — `ColumnarStore::scan` is
-  not given the select list at all, so this is not a narrowing it declines, it is one it cannot be
-  asked for;
-- puts **43 bytes on the wire per row** where three columns is about 25;
-- formats seven fields per row and makes the client split seven and discard four.
+**One column had two names and they already disagreed.** The lexer took `timestamp`, the response
+header said `timestamp_ns`, so a name copied out of a header was a syntax error. Both spellings
+parse now, the header is generated from one table, and `SELECT *` is byte-identical by
+construction — a test compares the generated header against the literal bytes clients already
+parse, written out rather than referenced, because a generator compared against itself passes for
+every spelling including a wrong one.
 
-`benchmarks/comparative/run.py` already lists this as a limitation of ours in the published table.
-What the limitation does not say is that it makes the row a comparison of two different questions,
-in the direction that flatters neither side honestly — we do more work, and a reader cannot see it
-in the number.
+`ColumnarStore::scan` takes the set and opens only those files. Seven near-identical read blocks
+became one helper — part of the change rather than tidying alongside it, because projection adds
+a condition to each and seven conditions in seven copies is seven places to get it wrong
+differently. The sequence number is the expensive column, Simple8b **and** zigzag-delta, so a
+query without it skips two of a segment's four decode passes. A missing column file now refuses
+the segment only for a query that needs that column; before, any one of the seven missing dropped
+the segment from **every** query, including ones that would never have looked at it.
 
-Three candidate answers, and they are not the same size:
+**A latent stack overflow came with it and is fixed here.** The row buffer was a 105-byte stack
+array sized for seven distinct columns, which is the widest row **that list** can produce. A query
+may name one column many times, and twenty repeats of `sequence_number` is 420 bytes - so the
+first version of this change ran off the end of it for any list whose widths came to more than
+105, which `SELECT *` cannot and a repeat easily can. The buffer is sized from the query's own
+list, and the test uses the widest column with a value at its type's limit.
 
-1. **Project the response only.** The scan still reads seven files; the header and rows carry what
-   was asked for. Buys the wire and the client, not the read. Smallest change, and it makes the
-   header variable, which every client that indexes it by position would have to survive — ours
-   reads it by name already, and #65 is the precedent for a column arriving.
-2. **Project the read as well.** `ColumnarStore::scan` takes the wanted set and opens only those
-   files. This is the one that makes the store columnar in the sense the word implies; today it
-   pays the layout's cost and collects none of its benefit. It changes a `std::function` signature
-   that the live-buffer path shares, so both readers have to agree.
-3. **Refuse a select list that is not `*`.** Cheapest, honest, and worse than both: it turns a
-   silently wrong answer into a loud refusal of something the engine will want anyway.
+**Both clients read rows by position**, so a narrowed response would have come back as an empty
+list from the Python one — it skips a row with fewer than six fields — and `bad timestamp_ns` from
+the C++ one. A silent wrong answer in our own client is the same defect this removes from the
+server. Both now refuse a header they cannot read and name the columns they were handed; reading
+by name is the follow-up. A prefix of the canonical list is still accepted, because #65's seventh
+column means this client still talks to a server that sends six.
 
-Whichever is taken, the harness adapter should then ask for the three columns it keeps, so the four
-systems are asked the same question — and the table regenerated in one run, because one run
-produces every number in it or none.
+### What it costs and what it buys
 
-- Effort: M | Impact: the answer stops being a different question from the one asked; the published
-  query row stops measuring seven columns against three
+One m9g.xlarge (4 ARM64 cores, 16 GiB), Release, one probe binary against both servers - and the
+probe parses nothing, which is also the only way to measure a server whose answer our C++ client
+now refuses. The box is shared with another session's benchmark, and its load is not a constant:
+**2.3 falling to 0.1** across the cycle run, **2.6 rising to 4.1** across the wall run, and 7.5
+falling to 1.7 across a repetition an hour earlier, with its ClickHouse holding about a third of a
+core whenever it was working. **Cycles counted against the server's own pid are therefore the
+instrument**, because that is the number a neighbour cannot move; the wall clock is reported beside
+them and each table says what the box was doing.
+
+| 4,000 rounds of a 4,000-row query | before | after | ratio |
+|---|---|---|---|
+| `SELECT timestamp, price, quantity` | 3,045,211,432 cycles, **43.0 bytes/row** | 2,436,299,208 cycles, **33.0 bytes/row** | **0.800** |
+| `SELECT *` - the control | 3,101,138,099 cycles | 3,030,782,086 cycles | 0.977 |
+
+The same SQL to both servers, and they answer differently: before, 4,000 rows in **171,911
+bytes**, because the list was ignored; after, 4,000 rows in **132,032 bytes**.
+
+Two things about how to read that table. Each pair is adjacent in time, which matters because the
+neighbour's load fell from 2.3 to 0.14 across the twenty minutes the four windows took - so the
+control pair was measured busy and the claim pair quiet, and neither comparison crosses that. And
+the same measurement on the previous head, an hour earlier under a load average of 7.5 falling to
+1.7, gave **0.816** against this run's 0.800: two runs whose conditions differed that much
+agreeing to within 2% is the argument for the instrument, and it is also the honest width of a
+single cycle figure here.
+
+Wall clock, eight rounds, **with the round order alternating** - odd rounds before-then-after,
+even rounds after-then-before, because interleaving defends a ratio against slow drift and not
+against a neighbour whose load has a period near the round:
+
+| 8 rounds | before | after | ratio median | range | rounds faster |
+|---|---|---|---|---|---|
+| three columns | 0.305 ms | **0.242 ms** | **0.794** | 0.775-0.810 | 8 of 8 |
+| `SELECT *` - the control | 0.305 ms | 0.303 ms | 0.993 | 0.981-1.000 | 7 of 8 |
+
+The order made no difference: 0.795 before-first against 0.794 after-first on the three-column
+question, which is what that experiment was for.
+
+### And the profile says the saving is not mostly where it was expected
+
+16,000 of the three-column query against each side, one m9g.xlarge at a load average under 1, no
+call graph so the shares are flat and comparable. **The total agrees with the cycle table to four
+digits** - 11.889 G against 9.506 G is 0.7995, where `perf stat` over 4,000 rounds gave 0.800 -
+which is two instruments and one number.
+
+Where it went, in **absolute** cycles rather than shares, because a share of a smaller total is
+the trap #138 already paid for:
+
+| symbol | before | after | saved |
+|---|---|---|---|
+| the row formatter | 4.247 G | 3.754 G | 0.49 G |
+| `decode_prices` | 0.780 G | 0.380 G | **0.40 G** |
+| `decode_simple8b` | 0.636 G | 0.402 G | **0.23 G** |
+| `ColumnarStore::scan` | 0.633 G | 0.472 G | 0.16 G |
+| everything below the 1% cut | 2.8 G | 1.6 G | 1.2 G |
+
+**The two decoders together saved more than the formatter did**, which is the opposite of what the
+work was aimed at: this item exists because the formatter dominated the profile, and the answer it
+produced is mostly cheaper because the scan stopped decoding two columns nobody asked for -
+`decode_prices` runs once instead of twice (price, and the sequence number's zigzag) and
+`decode_simple8b` once instead of twice (quantity, and the sequence number's bit-packing), which is
+the "skips two of a segment's four decode passes" sentence turning into a number. `memcpy` and the
+row callback did not move by more than this profile can resolve; at 8-10K samples a 5% entry is a
+few hundred samples, so read the four largest rows and not the small differences.
+
+### The control failed twice before it held, and the two failures had different causes
+
+The spec written before any of this said to write the general loop, measure `SELECT *` against
+master, and only add a specialised path if it slowed - so the gate was there, and it fired.
+
+*First attempt: a general loop for everything.* `SELECT *` came out 1.019-1.102 slower, 8 of 8
+rounds in that direction. Small, but the wrong direction on the shape the published comparative
+table measures. Profiling both sides over 16,000 of that query said where, rather than leaving it
+to be argued: `format_query_response` went from **2.107 G cycles to 2.621 G, up 24%**, with every
+other symbol flat. Seven straight-line calls inline; a loop that picks the field by a value
+cannot, however cheap the switch is.
+
+*Second attempt: unroll the row writer, keep one loop with a branch in it.* Barely moved -
+0.991-1.085, still ~5% slow. `objdump` said the function had gone 919 to 1672 instructions with
+both paths inlined, and the cause turned out not to be the row writer at all: the shared loop
+wrote through a `char*` that might point at a stack array or at a heap one, so the compiler could
+no longer treat the canonical buffer as a local nothing else aliases. **The row writer was the
+suspect; the buffer was the cause**, and only reading the disassembly separated them.
+
+*Third: two loops, and the narrow one out of line.* The profile named the real cost of the second
+attempt - `std::__to_chars_i` had appeared as its own symbol at **6.71% of the server**, a symbol
+absent from the build before projection. The function had outgrown GCC's inlining budget and
+taken `to_chars` out of line with it. `[[gnu::noinline]]` on the narrow path brings it back:
+**1027 instructions against master's 919, and zero out-of-line references to `to_chars`, the same
+as master.** The canonical path gets back its own fixed local array and is the shape it was before
+projection - a duplicate, added because three measurements said so.
+
+Two paths need something holding them together, and it cannot be a call that picks between them,
+because the choice is made from the column list. So the test formats each column **alone**, which
+is necessarily the loop, and compares it with that field cut out of the unrolled output: a fast
+path that wrote a field differently, or in the wrong order, fails on that column and names it.
+
+### One guarantee said three times, and the copy that held was the one nothing could mutate
+
+The mutation table found it rather than review. `ColumnarStore::scan()` widens the caller's set
+with the timestamp because it filters on it and will not depend on the caller having remembered;
+`columns_to_read()` puts it there too, because the engine knows it filters on time; and two lines
+below the widening, `need(true, "ts.col", timestamps)` opened the file regardless of the set. So
+the mutation deleting the widening **survived**, with
+`ColumnarStoreProjection.TheTimestampIsReadEvenWhenTheSetLeavesItOut` - the test written for
+exactly that case - still green. The file is opened through the set now, like every other one,
+which is also what requirement 2.1 says: the scan opens **exclusively** the files the set names.
+
+### What this does not do
+
+`SUBSCRIBE` still pushes seven columns, and now says so once per subscription. Both obvious
+alternatives are worse. Narrowing the push cannot be made safe, because **a `PUSH` line has no
+header** — a `SELECT` response describes itself, so a client that cannot read a narrowed one can
+say so, while a subscriber reading field 2 as the price has nothing to check against and would
+simply read the wrong field; announcing the columns in `OK SUB <id>` is the fix and it is a
+protocol change. And refusing breaks a form that works and is in use: `SUBSCRIBE price FROM …
+WHERE price BETWEEN …` names the column it filters on. **Three tests failed** when the refusal
+was tried, which is how it was found; counting afterwards, the form appears five times across four
+test files.
+
+The comparative harness still asks us `SELECT *` while asking ClickHouse and TimescaleDB for three
+columns, then throws four of our seven away in Python. The adapter is ready for it - `_raw_rows()`
+already finds its three columns **by name in the header**, which it does because #65 added a
+column and the alternative was reading the wrong field - so that is one line of SQL. What makes it
+the next commit rather than this one is the table: one run produces every number in it or none,
+and `scripts/check_comparative_claim.py` has to agree with what that run wrote.
+
+- Effort: M | Impact: the answer stops being a different question from the one asked; **a fifth
+  off** the three-column query - 20% of the server's cycles, 21% of the wall clock - and **23%
+  fewer bytes** on the wire
 
 ### 138. Formatting the answer cost eight times the read it came from ✅
 
@@ -2338,8 +2468,8 @@ What this does **not** do: the comparative table is not regenerated here. One ru
 number in it or none of them, and the table is pinned to the run it cites by
 `scripts/check_comparative_claim.py`. The query row will move when that run happens, and it will
 move for this reason. Nor does it touch the larger finding underneath: the harness asks us
-`SELECT *` and asks ClickHouse and TimescaleDB for three columns, because the engine cannot yet
-express the narrower question — that is #139, and it is the bigger number.
+`SELECT *` and asks ClickHouse and TimescaleDB for three columns, because at this commit the
+engine could not express the narrower question — that is #139, and it is the bigger number.
 
 - Effort: S | Impact: 32% off the published query path, measured on the path rather than on a
   micro-benchmark
@@ -7498,14 +7628,14 @@ measures the harness.
 **Two P0s are open: #136 and #137**, both found by the same afternoon on a machine this tree
 had never run on, and both filed rather than fixed because each has candidate answers that
 differ in what they cost. #136 changes an on-disk layout the snapshot manifest and retention
-both address; #137 changes what backpressure means. **#139** is open too and is not a P0: the row
-path ignores the select list it parsed, so a client that asks for one column is handed seven and
-answered `OK`. Every P0 raised before it —
+both address; #137 changes what backpressure means. **#139 was the third item on this line and is
+closed**: the row path answers the columns a query names, `SELECT *` byte for byte unchanged and a
+fifth off a three-column question. Every P0 raised before it —
 #60, #61, #62, #64, #68, #73, #74, #80, #88 and #97 — is closed, and several were found by running a real cluster rather than by reading the code
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #136, #137 and #139.** Every other item above #58 is marked closed, and
+**Open: #136 and #137.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -7788,10 +7918,19 @@ absolute thresholds for a designated benchmark host.
 
 ### Test suite
 
-Verified by [the full CI run for PR #149](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/35435355356),
-on the tree carrying the aarch64 write-up and the two P0s that run filed, **#136 and #137** — so
-the page has open items again, and both were found by the tree being on a machine it had never run
-on rather than by reading it. Runtimes below are from GitHub's
+Verified by [the full CI run for PR #153](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/35451405759),
+on the tree carrying column projection (#139).
+
+**The row this replaces was two merges behind, and the arithmetic is the argument for the
+script.** It cited PR #149 and said 1102, while master after
+[PR #151](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/pull/151)
+and
+[PR #152](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/pull/152)
+was **1109** — both of those merged without a table commit, so nothing was wrong with any number
+in isolation and the pair had stopped describing a tree that exists. Against 1109 this branch is **+31**, which is
+exactly the count of test macros it adds, and against 273 it is **+7**, which is exactly
+`test_column_projection.py`. That both deltas reconcile to the file is the check worth having;
+a delta measured against a stale baseline reconciles to nothing. Runtimes below are from GitHub's
 `ubuntu-24.04` runners except where a row says otherwise, not the machine-B performance baseline
 above.
 
@@ -7808,9 +7947,9 @@ ran 265 tests, because `re.search` returns the *first* match and pytest's verdic
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1102 | all passing with `ctest -j1` on the i3-7100U, **219-235 s in a single run** — **four more than the previous commit, and all four are about the machine this tree had never run on**: two in `tests/test_mm_snapshot.cpp` pin the ten header bytes of a snapshot chunk literally rather than through our own decoder, and a full-size chunk, because the frame is sized once now (PR #146); two in `tests/test_crc32c.cpp` are the pair that makes the rest of that file mean anything on this architecture — one skips with an explanation where there is only the table to compare against itself, which is what every agreement test had been doing off x86, and one requires the implementation the engine *reports* to be the one that runs (PR #147) across the four runs this tree and its two predecessors recorded, against 236-390 s three commits back when another session's containers were resident — the spread, not either end, is what the next number is read against. **Four more than the previous commit, and the arithmetic is worth writing down: six new and two removed** (#121). The six are three in `tests/test_hlc_skew.cpp` — the bound accepts up to itself and refuses one nanosecond past it, a peer behind us is plausible however far behind, and `UINT64_MAX` is refused so the logical carry can never saturate — and three in `tests/test_mm_wire_clock.cpp`, which is the only instrument that can reach this at all: a fake peer framing one DELTA whose HLC says what no real clock would. The two removed are the ones that **pinned the behaviour this decision reverses**, `AnHourInTheFutureOnTheWireBecomesThisNodesClockAndStays` and `ARecordFromAPeerWhoseClockIsWrongIsStillApplied`, both written by #54's stage D to state that nothing bounded the absorption. They were not deleted into a gap: the same file now asserts the opposite about the same wire shape, which is what makes a falling count readable rather than alarming. **And the local number that preceded this row was wrong by exactly those four.** A full local run on this branch printed `1094/1094` against a build directory that had not registered the four; the reconciliation is three measurements agreeing — CI's 1098, `ctest -N` listing 1100, and a local rerun after the merge giving **1098 passed in 218.95 s**. A stale build answers in the same voice it would use if it were right, which this repository has now paid for in five different shapes. **Before it**, unchanged by three commits: #134 deleted two methods no test referenced, and #135's tests are integration ones — three runs of the same suite on the same machine, the slowest with another session's containers resident and ~1 GB actually free. That spread, not any one of its ends, is what the next number is read against: it is wider than anything a commit in this repository has changed. **Seven more than the previous commit, and all seven are #131's.** Five are `LoopGuard`'s own, in the new `tests/test_loop_guard.cpp`: the counter counts every failing iteration rather than every episode, the episode counts consecutive failures and reopens after a recovery, two successes running report nothing (the observable half of "loud once" for a loop that polls ten times a second), a **null** registry still gets loud-once because two of the seven loops run in somebody else's process, and the name it writes is in the registry's own output. The other two are the descriptor `MetricsServer::handle_request` used to leak on the paths that throw — one behavioural, fifty requests against a live server with no growth in `/proc/self/fd`, and one static, because **the throwing path cannot be driven**: nothing in the process can make `serialize()` fail on demand and a knob to make it would be a knob nothing turns in production. **Before them**, four were #112's last two loops. Three are in the new `tests/test_replication_io_boundary.cpp`: that the pacing function returns zero only while a catch-up can progress, that nothing in `run_loop()` assigns `wait_ms` any other way (counted at **three** sites, because losing the one in the `catch` is the regression), and that both `try`s are where they have to be — anchored on the dispatch loop's own line rather than on a log phrase, which is the mistake #128's version of this test made. The fourth is in `tests/test_thread_boundaries.cpp` and is the one worth reading: the set of loops that guard an iteration is **derived from the tree** rather than listed, because a mutation deleting a row from the hand-written list **survived**. Fourteen `void Class::…loop()` definitions in `src/`, one a notifier with no loop in it and named, six of the remaining thirteen guarded and **seven not** — those seven are #131. Checked in both directions, so a loop in neither list fails and a row naming a function the tree no longer has fails too. **Before them**, the most recent addition was #129's: a registry given a 1200-second lease interval has to stop inside two seconds, which is a property stated three orders of magnitude clear of load rather than a duration. **Before it**, four were #128's, and they divide the way that defect does: three in `tests/test_mm_epoll_identity.cpp` are about the shape — that the two reserved event keys cannot collide with a connection, that closing a descriptor takes its registration with it (measured against `dup2`, which forces the reuse the defect needs instead of hoping for it), and that no registration in `src/multi_master.cpp` carries a bare descriptor number. The fourth is behavioural: a connection landing on the descriptor its predecessor gave back is its own connection, with both numbers read back so a run where the kernel did not recycle the number says so rather than passing quietly. Three of the six mutations in that item's table are killed by the static test **and by nothing else**, which is what says it carries weight. **Before them**, two were #126's, and they pin the replayer's rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. **Earlier**: two were #54's D3, three #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists **1085**: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The count that passes and the count CTest lists differ by exactly those two harnesses, always; a row two commits back gave one number for both. The runtimes are what this machine gave on the commit measured, not a budget |
-| Python integration | 273 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 273; count pytest's final result rather than the report plugin's progress characters. `273 passed, 2 skipped in 22:14` on the GitHub runner for this commit — and **29:20 for the same 273 under TSan**, which is the job that has to be read as well, because a battery that skips under instrumentation reads as green. Against `20:37` on the development machine (i3-7100U, native etcd) **for the 263-test tree seven commits back** — the figure is kept as the spread to expect between the two machines, and labelled with the tree it came from rather than silently paired with a count it never measured. **Unchanged by #121, and the reason is the instrument rather than the effort**: producing a real node whose physical clock is five minutes off needs the host clock moved or a time namespace, which is not something this battery can do to the machine it runs on — so the assertion lives at the wire instead, where #54's stage D already built the fake peer for it. **Before it, one more than the commit before, in the existing `test_failover_storage_faults.py` beside the control that was already there** (#130): what a node *says* while it holds a leader key it won and cannot act on. The assertion with teeth is sampled rather than read once — `ROLE` must never name this node's own replication port as the primary it follows, across a twenty-second window in which the pre-fix code answered exactly that on **every** sample. The second assertion is that the condition is reported **once**, with what an operator can do about it, because the loop runs every second and the storage that refused the record usually goes on refusing it. Measured against the two source files from the commit before that fix: **1 failed, 2 passed in 66.8 s**, the failure arriving on the **first** sample with `REPLICA 127.0.0.1:43273 2` and #112's two tests untouched. **Before it, two more, both in the new `test_coordinator_endpoint_order.py`, and the second is a control rather than a second case** (#135): the same unreachable coordinator endpoint in the harmless position, which passed before that fix and has to keep passing — without it, a harness that quietly stopped prepending anything would leave the first test green and meaningless. Both assert their premise from `Popen.args`, the command line the node actually got, rather than from the attribute that put it there, because an attribute is what the harness *meant* to say. The first also requires the mesh to form on top of both registrations, because that is the only assertion reaching the third of the three call sites: two registered nodes that never see each other is a topology watch still reading the wrong endpoint. Measured against the four source files from the commit before that fix, harness and tests unchanged: **1 failed, 1 passed in 50.1 s**, the failure naming both nodes. **Before them, one more than the commit before that, and all three in `test_peer_lease_lost.py` were rewritten**, because #132 turned the first one's premise inside out: it was written to assert that the registration **does not** come back, with a note saying that the day that loop learns to re-register is the day it fails. That day was this commit. It now polls **both** halves — the key and the log line — because the key lands in etcd before the line lands in the log, and reading the log once at the moment the key appears is a race the first rewrite lost. The #133 test needed a **new premise** as well (`stop_etcd()` rather than a revoke, which also exercises the branch that keeps this fix quiet), because after #132 a revoked lease is no longer a permanent condition, and counting log lines over a condition that repairs itself counts a condition that happened once. **The third is the one that says the gate is real**: a refusal over a key that **exists**, which nothing else in this battery produces — `redirect_peer()` writes without a lease, so the test captures the lease id before redirecting and revokes it by id afterwards. Its control is the *premise* rather than the outcome, because without asserting that a refusal reached the log it passes against a node whose refresh is succeeding. The other two gained a rate bound that is independent of wording: the count of registry lines above `DEBUG` across the window, measured at one and two. This tree's battery ran locally only as **the one module** (3 tests in **40 s**, and stage C's twelve in **3:37** as the regression check on the fixture this fix had to leave alone); the whole battery on this commit is CI's, and the 224-235 s `ctest` above is local. **Before them**, two were #112's `monitor_loop` half and both in the new `test_failover_storage_faults.py`: a replica whose data directory refuses the `EPOCH` record a role transition writes loses that monitor tick and not the thread, and its control at a size nothing writes, which must inject nothing. The assertion that carries the guarantee in the first of the two is the **recovery** line rather than the error line — only a later tick can write it, so a run in which the thread died would report the error and then say nothing, which is what a boundary is for. The pair costs **45.7 s** locally, and the module asserts its own premise: `OB_FAULT_PATH=ob_node1_` names the replica's data directory only because `ClusterManager.start()` waits for node-0 to hold PRIMARY before it starts node-1, and a change to that ordering would aim the injector at the **primary's** startup promotion, which exits the process. **Before them**, two were #112's `io_loop` half and both in the new `test_mesh_storage_faults.py`: a mesh receiver whose WAL refuses one record still receives the ones after it (**38.6 s**, because it waits for a mesh to form and for four records to cross it), and its control at a size nothing writes, which must inject nothing (**28.2 s**); that pair costs **67 s** locally. **Before those**: three were #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
-| Python integration under TSan | 273 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `273 passed in 29:18` on the GitHub runner for this commit. **This row was four behind, and the tool that exists to prevent that had already printed the right number**: the citation above it named [PR #139's run](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/34947630036), which reported `273 in 29:06`, while the cell said `269 in 28:17` — a run on an older tree. `scripts/test_table.py` prints all three counts in one block precisely so that one edit carries them together, and the previous table commit carried two of the three. Reading it is the part a script cannot do — and this job is what closed #122: it turned **red** on the pull request for #117 with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **22:02** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
+| C++ (GTest + RapidCheck) | 1140 | all passing with `ctest -j1` on the i3-7100U, **205 s in a single run** — **thirty-one more than master, and the breakdown is one file per question** (#139). Nine are the new `tests/test_query_columns.cpp`: what a select list resolves to, that `columns_to_read()` is wider than the output list because a filter reads what the answer does not carry, and that the canonical order is the table's order. Eight in `tests/test_response_formatter.cpp` cover the narrowed path against the unrolled one **by formatting each column alone and cutting that field out of the `SELECT *` output** — a content-based dispatch means no call can be made to take the general path over the canonical shape, so the two are held together by construction rather than by a literal. Eight in `tests/test_query_engine.cpp`, three in `tests/test_columnar_store.cpp` — including the one that found a guarantee stated three times, where a hardcoded `true` made two widenings unobservable and the mutation for them survived — and three in `tests/test_client.cpp` for the two clients' refusals, because both read a row by position and neither can read a narrowed answer. **Before them**, **four more than the previous commit, and all four are about the machine this tree had never run on**: two in `tests/test_mm_snapshot.cpp` pin the ten header bytes of a snapshot chunk literally rather than through our own decoder, and a full-size chunk, because the frame is sized once now (PR #146); two in `tests/test_crc32c.cpp` are the pair that makes the rest of that file mean anything on this architecture — one skips with an explanation where there is only the table to compare against itself, which is what every agreement test had been doing off x86, and one requires the implementation the engine *reports* to be the one that runs (PR #147) across the four runs this tree and its two predecessors recorded, against 236-390 s three commits back when another session's containers were resident — the spread, not either end, is what the next number is read against. **Four more than the previous commit, and the arithmetic is worth writing down: six new and two removed** (#121). The six are three in `tests/test_hlc_skew.cpp` — the bound accepts up to itself and refuses one nanosecond past it, a peer behind us is plausible however far behind, and `UINT64_MAX` is refused so the logical carry can never saturate — and three in `tests/test_mm_wire_clock.cpp`, which is the only instrument that can reach this at all: a fake peer framing one DELTA whose HLC says what no real clock would. The two removed are the ones that **pinned the behaviour this decision reverses**, `AnHourInTheFutureOnTheWireBecomesThisNodesClockAndStays` and `ARecordFromAPeerWhoseClockIsWrongIsStillApplied`, both written by #54's stage D to state that nothing bounded the absorption. They were not deleted into a gap: the same file now asserts the opposite about the same wire shape, which is what makes a falling count readable rather than alarming. **And the local number that preceded this row was wrong by exactly those four.** A full local run on this branch printed `1094/1094` against a build directory that had not registered the four; the reconciliation is three measurements agreeing — CI's 1098, `ctest -N` listing 1100, and a local rerun after the merge giving **1098 passed in 218.95 s**. A stale build answers in the same voice it would use if it were right, which this repository has now paid for in five different shapes. **Before it**, unchanged by three commits: #134 deleted two methods no test referenced, and #135's tests are integration ones — three runs of the same suite on the same machine, the slowest with another session's containers resident and ~1 GB actually free. That spread, not any one of its ends, is what the next number is read against: it is wider than anything a commit in this repository has changed. **Seven more than the previous commit, and all seven are #131's.** Five are `LoopGuard`'s own, in the new `tests/test_loop_guard.cpp`: the counter counts every failing iteration rather than every episode, the episode counts consecutive failures and reopens after a recovery, two successes running report nothing (the observable half of "loud once" for a loop that polls ten times a second), a **null** registry still gets loud-once because two of the seven loops run in somebody else's process, and the name it writes is in the registry's own output. The other two are the descriptor `MetricsServer::handle_request` used to leak on the paths that throw — one behavioural, fifty requests against a live server with no growth in `/proc/self/fd`, and one static, because **the throwing path cannot be driven**: nothing in the process can make `serialize()` fail on demand and a knob to make it would be a knob nothing turns in production. **Before them**, four were #112's last two loops. Three are in the new `tests/test_replication_io_boundary.cpp`: that the pacing function returns zero only while a catch-up can progress, that nothing in `run_loop()` assigns `wait_ms` any other way (counted at **three** sites, because losing the one in the `catch` is the regression), and that both `try`s are where they have to be — anchored on the dispatch loop's own line rather than on a log phrase, which is the mistake #128's version of this test made. The fourth is in `tests/test_thread_boundaries.cpp` and is the one worth reading: the set of loops that guard an iteration is **derived from the tree** rather than listed, because a mutation deleting a row from the hand-written list **survived**. Fourteen `void Class::…loop()` definitions in `src/`, one a notifier with no loop in it and named, six of the remaining thirteen guarded and **seven not** — those seven are #131. Checked in both directions, so a loop in neither list fails and a row naming a function the tree no longer has fails too. **Before them**, the most recent addition was #129's: a registry given a 1200-second lease interval has to stop inside two seconds, which is a property stated three orders of magnitude clear of load rather than a duration. **Before it**, four were #128's, and they divide the way that defect does: three in `tests/test_mm_epoll_identity.cpp` are about the shape — that the two reserved event keys cannot collide with a connection, that closing a descriptor takes its registration with it (measured against `dup2`, which forces the reuse the defect needs instead of hoping for it), and that no registration in `src/multi_master.cpp` carries a bare descriptor number. The fourth is behavioural: a connection landing on the descriptor its predecessor gave back is its own connection, with both numbers read back so a run where the kernel did not recycle the number says so rather than passing quietly. Three of the six mutations in that item's table are killed by the static test **and by nothing else**, which is what says it carries weight. **Before them**, two were #126's, and they pin the replayer's rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. **Earlier**: two were #54's D3, three #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists **1085**: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The count that passes and the count CTest lists differ by exactly those two harnesses, always; a row two commits back gave one number for both. The runtimes are what this machine gave on the commit measured, not a budget |
+| Python integration | 280 | all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 280; count pytest's final result rather than the report plugin's progress characters. `280 passed, 2 skipped in 22:42` on the GitHub runner for this commit — **seven more than master, and all seven are the new `test_column_projection.py`**, which asks the question over the raw protocol on purpose: both of our clients read a row by position, so neither can read a narrowed answer and the refusals are at the bottom of that file. **Two of its tests had never run to completion before this run** — the branch's previous CI was cancelled — and both failed on the first one that did. One pinned the seven-column header as a literal in `src/response_formatter.cpp`, which this branch replaced with a generator and then deleted; it reads the column table now, which is stronger, because a dead literal can agree with a header nothing prints. The other wrote one row per test into one symbol on a session-scoped cluster, so with storage append-only the seventh test read seven rows where it had written one — and **29:20 for the same 273 under TSan**, which is the job that has to be read as well, because a battery that skips under instrumentation reads as green. Against `20:37` on the development machine (i3-7100U, native etcd) **for the 263-test tree seven commits back** — the figure is kept as the spread to expect between the two machines, and labelled with the tree it came from rather than silently paired with a count it never measured. **Unchanged by #121, and the reason is the instrument rather than the effort**: producing a real node whose physical clock is five minutes off needs the host clock moved or a time namespace, which is not something this battery can do to the machine it runs on — so the assertion lives at the wire instead, where #54's stage D already built the fake peer for it. **Before it, one more than the commit before, in the existing `test_failover_storage_faults.py` beside the control that was already there** (#130): what a node *says* while it holds a leader key it won and cannot act on. The assertion with teeth is sampled rather than read once — `ROLE` must never name this node's own replication port as the primary it follows, across a twenty-second window in which the pre-fix code answered exactly that on **every** sample. The second assertion is that the condition is reported **once**, with what an operator can do about it, because the loop runs every second and the storage that refused the record usually goes on refusing it. Measured against the two source files from the commit before that fix: **1 failed, 2 passed in 66.8 s**, the failure arriving on the **first** sample with `REPLICA 127.0.0.1:43273 2` and #112's two tests untouched. **Before it, two more, both in the new `test_coordinator_endpoint_order.py`, and the second is a control rather than a second case** (#135): the same unreachable coordinator endpoint in the harmless position, which passed before that fix and has to keep passing — without it, a harness that quietly stopped prepending anything would leave the first test green and meaningless. Both assert their premise from `Popen.args`, the command line the node actually got, rather than from the attribute that put it there, because an attribute is what the harness *meant* to say. The first also requires the mesh to form on top of both registrations, because that is the only assertion reaching the third of the three call sites: two registered nodes that never see each other is a topology watch still reading the wrong endpoint. Measured against the four source files from the commit before that fix, harness and tests unchanged: **1 failed, 1 passed in 50.1 s**, the failure naming both nodes. **Before them, one more than the commit before that, and all three in `test_peer_lease_lost.py` were rewritten**, because #132 turned the first one's premise inside out: it was written to assert that the registration **does not** come back, with a note saying that the day that loop learns to re-register is the day it fails. That day was this commit. It now polls **both** halves — the key and the log line — because the key lands in etcd before the line lands in the log, and reading the log once at the moment the key appears is a race the first rewrite lost. The #133 test needed a **new premise** as well (`stop_etcd()` rather than a revoke, which also exercises the branch that keeps this fix quiet), because after #132 a revoked lease is no longer a permanent condition, and counting log lines over a condition that repairs itself counts a condition that happened once. **The third is the one that says the gate is real**: a refusal over a key that **exists**, which nothing else in this battery produces — `redirect_peer()` writes without a lease, so the test captures the lease id before redirecting and revokes it by id afterwards. Its control is the *premise* rather than the outcome, because without asserting that a refusal reached the log it passes against a node whose refresh is succeeding. The other two gained a rate bound that is independent of wording: the count of registry lines above `DEBUG` across the window, measured at one and two. This tree's battery ran locally only as **the one module** (3 tests in **40 s**, and stage C's twelve in **3:37** as the regression check on the fixture this fix had to leave alone); the whole battery on this commit is CI's, and the 224-235 s `ctest` above is local. **Before them**, two were #112's `monitor_loop` half and both in the new `test_failover_storage_faults.py`: a replica whose data directory refuses the `EPOCH` record a role transition writes loses that monitor tick and not the thread, and its control at a size nothing writes, which must inject nothing. The assertion that carries the guarantee in the first of the two is the **recovery** line rather than the error line — only a later tick can write it, so a run in which the thread died would report the error and then say nothing, which is what a boundary is for. The pair costs **45.7 s** locally, and the module asserts its own premise: `OB_FAULT_PATH=ob_node1_` names the replica's data directory only because `ClusterManager.start()` waits for node-0 to hold PRIMARY before it starts node-1, and a change to that ordering would aim the injector at the **primary's** startup promotion, which exits the process. **Before them**, two were #112's `io_loop` half and both in the new `test_mesh_storage_faults.py`: a mesh receiver whose WAL refuses one record still receives the ones after it (**38.6 s**, because it waits for a mesh to form and for four records to cross it), and its control at a size nothing writes, which must inject nothing (**28.2 s**); that pair costs **67 s** locally. **Before those**: three were #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
+| Python integration under TSan | 280 | all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `280 passed in 29:06` on the GitHub runner for this commit. **This row was four behind, and the tool that exists to prevent that had already printed the right number**: the citation above it named [PR #139's run](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/34947630036), which reported `273 in 29:06`, while the cell said `269 in 28:17` — a run on an older tree. `scripts/test_table.py` prints all three counts in one block precisely so that one edit carries them together, and the previous table commit carried two of the three. Reading it is the part a script cannot do — and this job is what closed #122: it turned **red** on the pull request for #117 with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **22:02** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than

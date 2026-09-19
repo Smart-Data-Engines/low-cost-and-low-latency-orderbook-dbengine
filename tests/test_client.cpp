@@ -761,3 +761,66 @@ TEST(ClientEventTime, AWriteWithoutATimeAsksNothing) {
             << "a write with no event time asked the capability question anyway: " << line;
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// #139: a narrowed response is refused rather than read positionally
+//
+// This client converts fields by position, so a server answering the columns a query asked for
+// would have it read the price as a timestamp, or report `bad timestamp_ns` about a response that
+// is perfectly well formed. Each refusal here is paired with the response it must still accept:
+// a check that refuses everything proves nothing.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(ClientUnit, RowParserRefusesANarrowedResponseAndNamesTheColumns) {
+    std::string wire =
+        "OK\n"
+        "price\tquantity\n"
+        "5000000\t1000\n"
+        "\n";
+
+    ob::OrderbookClient client;
+    auto result = client.parse_query_response(wire);
+    ASSERT_FALSE(result.has_value()) << "two columns cannot be read as seven by position";
+    EXPECT_NE(result.error_message().find("price\tquantity"), std::string::npos)
+        << "the refusal has to name what it was handed, got: " << result.error_message();
+}
+
+TEST(ClientUnit, RowParserRefusesTheSevenColumnsInTheWrongOrder) {
+    // The count is right and every name is known, so a check counting columns would pass this and
+    // then hand back a row whose price and timestamp are swapped.
+    std::string wire =
+        "OK\n"
+        "price\ttimestamp_ns\tquantity\torder_count\tside\tlevel\tsequence_number\n"
+        "5000000\t1700000000000000000\t1000\t1\t0\t3\t42\n"
+        "\n";
+
+    ob::OrderbookClient client;
+    EXPECT_FALSE(client.parse_query_response(wire).has_value());
+}
+
+TEST(ClientUnit, RowParserStillAcceptsTheSevenColumnsAndTheOlderSix) {
+    // Both controls. The seven-column response is what every query this client sends produces,
+    // and the six-column one is a server older than #65 - a tolerance that predates this check
+    // and has to survive it.
+    ob::OrderbookClient client;
+
+    std::string seven =
+        "OK\n"
+        "timestamp_ns\tprice\tquantity\torder_count\tside\tlevel\tsequence_number\n"
+        "1700000000000000000\t5000000\t1000\t1\t0\t3\t42\n"
+        "\n";
+    auto with_seven = client.parse_query_response(seven);
+    ASSERT_TRUE(with_seven.has_value()) << with_seven.error_message();
+    ASSERT_EQ(with_seven.value().rows.size(), 1u);
+    EXPECT_EQ(with_seven.value().rows[0].sequence_number, 42u);
+
+    std::string six =
+        "OK\n"
+        "timestamp_ns\tprice\tquantity\torder_count\tside\tlevel\n"
+        "1700000000000000000\t5000000\t1000\t1\t0\t3\n"
+        "\n";
+    auto with_six = client.parse_query_response(six);
+    ASSERT_TRUE(with_six.has_value()) << with_six.error_message();
+    ASSERT_EQ(with_six.value().rows.size(), 1u);
+    EXPECT_EQ(with_six.value().rows[0].sequence_number, 0u) << "unknown, not invented";
+}

@@ -187,12 +187,20 @@ disk gives `ENOSPC` from `write`, which is how #112 and #113 made a failing disk
 client is told about — so mapping the write path would have reinstated process death for a full
 disk, in a form strictly harder to handle than the one those items closed.
 
-What this does **not** foreclose: three of the seven column files — `ts.col`, `cnt.col` and
-`side.col` — are raw fixed-width arrays read straight into vectors, so a mapped *reader* could in
-principle skip a copy and an allocation for those. `price.col`, `qty.col` and `seq.col` are
-delta+zigzag and Simple8b encoded and have to be decoded into a buffer however the bytes arrive.
-That is a question about a reader nobody has written and a benchmark nobody has run; the class that
-was removed was an **appender**, so deleting it says nothing either way.
+What this does **not** foreclose: **four** of the seven column files — `ts.col`, `cnt.col`,
+`side.col` and `level.col` — are raw fixed-width arrays read straight into vectors, so a mapped
+*reader* could in principle skip a copy and an allocation for those. (This paragraph said three
+and named three; `level.col` is a raw `uint16` array like the others and was simply missed.)
+`price.col`, `qty.col` and `seq.col` are delta+zigzag and Simple8b encoded and have to be decoded
+into a buffer however the bytes arrive. That is a question about a reader nobody has written and a
+benchmark nobody has run; the class that was removed was an **appender**, so deleting it says
+nothing either way.
+
+Since #139 there is a cheaper version of the same saving, and it is already taken: a scan is told
+which columns the query needs and does not open the others at all. Not reading a file beats
+reading it without a copy, and it applies to the encoded three as well — a query that does not ask
+for the sequence number skips two of a segment's four decode passes, because `seq.col` is Simple8b
+**and** zigzag-delta.
 
 ## SoA Buffer (In-Memory)
 

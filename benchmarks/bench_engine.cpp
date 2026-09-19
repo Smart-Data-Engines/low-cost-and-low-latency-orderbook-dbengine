@@ -205,8 +205,14 @@ BENCHMARK(BM_IngestionThroughputBatched)
 // 4,000 rows is the size the comparative harness asks for - one symbol of a 200,000-row dataset -
 // and the values are the shape that dataset carries, because the cost is digits and a benchmark
 // over single-digit fields would measure a row a third the width.
-static void BM_FormatQueryResponse(benchmark::State& state) {
-    const size_t n = static_cast<size_t>(state.range(0));
+//
+// Two column lists, because they answer different questions. Seven is what `SELECT *` costs and
+// is the figure comparable with every measurement taken before projection existed. Three is the
+// question the comparative harness actually asks ClickHouse and TimescaleDB, and since #139 it is
+// the one it asks this engine too.
+namespace {
+
+std::vector<ob::QueryResult> benchmark_rows(size_t n) {
     std::vector<ob::QueryResult> rows(n);
     const uint64_t base_ts = 1'700'000'000'000'000'000ULL;
     for (size_t i = 0; i < n; ++i) {
@@ -218,10 +224,16 @@ static void BM_FormatQueryResponse(benchmark::State& state) {
         rows[i].level           = static_cast<uint16_t>(i % 20);
         rows[i].sequence_number = i + 1;
     }
+    return rows;
+}
+
+void run_format_benchmark(benchmark::State& state, const std::vector<ob::QueryColumn>& columns) {
+    const size_t n = static_cast<size_t>(state.range(0));
+    const std::vector<ob::QueryResult> rows = benchmark_rows(n);
 
     size_t bytes = 0;
     for (auto _ : state) {
-        std::string out = ob::format_query_response(rows);
+        std::string out = ob::format_query_response(rows, columns);
         bytes = out.size();
         benchmark::DoNotOptimize(out.data());
         benchmark::ClobberMemory();
@@ -229,9 +241,25 @@ static void BM_FormatQueryResponse(benchmark::State& state) {
 
     state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
     state.SetBytesProcessed(static_cast<int64_t>(state.iterations() * bytes));
-    state.SetLabel("rows/sec formatted; " + std::to_string(bytes / (n ? n : 1)) + " bytes/row");
+    state.SetLabel(std::to_string(columns.size()) + " columns; " +
+                   std::to_string(bytes / (n ? n : 1)) + " bytes/row");
+}
+
+}  // namespace
+
+static void BM_FormatQueryResponse(benchmark::State& state) {
+    run_format_benchmark(state, ob::all_query_columns());
 }
 BENCHMARK(BM_FormatQueryResponse)->Arg(4000)->Unit(benchmark::kMicrosecond);
+
+/// The harness's three columns. Comparable with the seven above only as a ratio: it is a cheaper
+/// answer to a narrower question, not the same work done faster.
+static void BM_FormatQueryResponseProjected(benchmark::State& state) {
+    run_format_benchmark(state, {ob::QueryColumn::TimestampNs,
+                                 ob::QueryColumn::Price,
+                                 ob::QueryColumn::Quantity});
+}
+BENCHMARK(BM_FormatQueryResponseProjected)->Arg(4000)->Unit(benchmark::kMicrosecond);
 
 // ── BM_VwapLatency ────────────────────────────────────────────────────────────
 // Measures VWAP computation latency over 1000 levels on a warm SoA buffer.

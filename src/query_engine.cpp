@@ -3,6 +3,7 @@
 #include "orderbook/logger.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <climits>
@@ -82,6 +83,10 @@ static const KwEntry KEYWORDS[] = {
     {"quantity",          TokKind::KW_QUANTITY},
     {"order_count",       TokKind::KW_ORDER_COUNT},
     {"timestamp",         TokKind::KW_TIMESTAMP},
+    // The same column under the name a client reads out of a response header. Accepting only
+    // `timestamp` meant a name copied from the header was a syntax error, which is a poor answer
+    // to someone doing exactly what the header invites.
+    {"timestamp_ns",      TokKind::KW_TIMESTAMP},
     {"sequence_number",   TokKind::KW_SEQUENCE_NUMBER},
     {"side",              TokKind::KW_SIDE},
     {"level",             TokKind::KW_LEVEL},
@@ -288,6 +293,27 @@ private:
     // subscribe_stmt body (after SUBSCRIBE keyword consumed)
     std::string parse_subscribe_body(QueryAST& out) {
         if (auto e = parse_select_list(out); !e.empty()) return e;
+
+        // A pushed row is still seven columns, and that is said out loud rather than left to be
+        // discovered. It is not refused, and both of the obvious alternatives are worse:
+        //
+        //   * narrowing the push cannot be made safe, because a `PUSH` line has **no header**.
+        //     A `SELECT` response describes itself, so a client that cannot read a narrowed one
+        //     can say so; a subscriber reading field 2 as the price has nothing to check against
+        //     and would simply read the wrong field. Announcing the columns in `OK SUB <id>` is
+        //     the fix, and it is a protocol change rather than a line here.
+        //   * refusing breaks a form that works and is in use - `SUBSCRIBE price FROM ...
+        //     WHERE price BETWEEN ...` names the column it filters on, and three tests in this
+        //     tree are written that way.
+        //
+        // So the list is accepted and the push stays wide, which is what it did before, with a
+        // line saying so once per subscription. Filed rather than fixed.
+        if (!out.projection.empty()) {
+            OB_LOG_WARN("query",
+                        "SUBSCRIBE named %zu column(s); pushed rows still carry all seven, "
+                        "because a PUSH line has no header to describe a narrower one",
+                        out.projection.size());
+        }
         if (auto e = expect_from(out); !e.empty()) return e;
         if (at(TokKind::KW_WHERE)) {
             consume();
@@ -300,18 +326,32 @@ private:
 
     std::string parse_select_list(QueryAST& out) {
         std::string expr;
-        if (auto e = parse_select_item(expr); !e.empty()) return e;
-        out.select_exprs.push_back(expr);
+        std::optional<QueryColumn> column;
 
-        while (at(TokKind::COMMA)) {
-            consume();
-            if (auto e = parse_select_item(expr); !e.empty()) return e;
+        for (bool first = true; first || at(TokKind::COMMA); first = false) {
+            if (!first) consume();  // the comma
+            column.reset();
+            if (auto e = parse_select_item(expr, column); !e.empty()) return e;
             out.select_exprs.push_back(expr);
+            if (column.has_value()) out.projection.push_back(*column);
         }
+
+        // A list mixing columns with aggregates is **not** refused here. `execute()` already
+        // refuses it with `AGG_WITH_COLUMNS`, naming the column, and a second refusal for one
+        // rule is a guarantee that cannot be mutated separately - the first version of this work
+        // added one anyway, on the assumption that mixing was accepted, and the existing test for
+        // it is what said otherwise.
+
+        OB_LOG_DEBUG("query", "Parsed select list: %zu item(s), projection %s",
+                     out.select_exprs.size(),
+                     out.projection.empty() ? "all columns" : "narrowed");
         return {};
     }
 
-    std::string parse_select_item(std::string& out_expr) {
+    /// `out_col` is filled only for a plain column name: `*` and aggregate calls leave it empty,
+    /// which is how the caller tells the three apart without re-reading the text it just built.
+    std::string parse_select_item(std::string& out_expr,
+                                  std::optional<QueryColumn>& out_col) {
         if (at(TokKind::STAR)) {
             consume();
             out_expr = "*";
@@ -323,17 +363,46 @@ private:
         }
         // column_name
         if (is_column_name(current().kind)) {
+            out_col = column_of(current().kind);
             out_expr = consume().text;
             return {};
         }
         return make_error("expected column name, aggregation function, or '*'");
     }
 
+    /// Which token names which column, indexed by `QueryColumn`.
+    ///
+    /// One table rather than a predicate and a switch that have to agree: `is_column_name()` and
+    /// `column_of()` both read it, so a column the parser accepts and cannot name is not a state
+    /// this file can be in. The `static_assert` is what makes adding an enumerator without a token
+    /// a build error - a switch could not, because a switch over `TokKind` would have to name
+    /// every keyword in the language to keep `-Wswitch` useful.
+    static constexpr std::array<TokKind, kQueryColumnCount> kColumnTokens{
+        TokKind::KW_TIMESTAMP,
+        TokKind::KW_PRICE,
+        TokKind::KW_QUANTITY,
+        TokKind::KW_ORDER_COUNT,
+        TokKind::KW_SIDE,
+        TokKind::KW_LEVEL,
+        TokKind::KW_SEQUENCE_NUMBER,
+    };
+    static_assert(kColumnTokens.size() == kQueryColumnCount,
+                  "every column needs the token that names it");
+
+    static QueryColumn column_of(TokKind k) {
+        for (size_t i = 0; i < kColumnTokens.size(); ++i) {
+            if (kColumnTokens[i] == k) return static_cast<QueryColumn>(i);
+        }
+        // Unreachable while `is_column_name()` guards every call site, and that predicate reads
+        // the same table.
+        return QueryColumn::TimestampNs;
+    }
+
     bool is_column_name(TokKind k) const {
-        return k == TokKind::KW_PRICE || k == TokKind::KW_QUANTITY ||
-               k == TokKind::KW_ORDER_COUNT || k == TokKind::KW_TIMESTAMP ||
-               k == TokKind::KW_SEQUENCE_NUMBER || k == TokKind::KW_SIDE ||
-               k == TokKind::KW_LEVEL;
+        for (TokKind t : kColumnTokens) {
+            if (t == k) return true;
+        }
+        return false;
     }
 
     bool is_agg_func(TokKind k) const {
@@ -656,6 +725,13 @@ static bool parse_i64_strict(const std::string& s, int64_t& out) {
 } // anonymous namespace
 
 std::string QueryEngine::execute(std::string_view sql, RowCallback cb) {
+    // Discarded: every caller that does not need the shape - thirty-odd of them, nearly all
+    // tests - keeps the two-argument spelling rather than growing an argument it ignores.
+    QueryShape unused;
+    return execute(sql, std::move(cb), unused);
+}
+
+std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShape& shape) {
     QueryAST ast;
     if (auto err = parse(sql, ast); !err.empty()) return err;
 
@@ -788,7 +864,8 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb) {
         // Key: (side << 16) | level_index  →  last SnapshotRow
         std::unordered_map<uint32_t, SnapshotRow> state;
 
-        store_.scan(0, snap_ts, ast.symbol, ast.exchange,
+        // A snapshot is every field of every row, so it really does want all seven.
+    store_.scan(0, snap_ts, ast.symbol, ast.exchange, ColumnSet::all(),
                     [&](const SnapshotRow& row) {
                         uint32_t key = (static_cast<uint32_t>(row.side) << 16) |
                                        static_cast<uint32_t>(row.level_index);
@@ -889,17 +966,31 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb) {
                      "Aggregate query: symbol=%s exchange=%s count=%zu",
                      ast.symbol.c_str(), ast.exchange.c_str(), qr.agg_values.size());
 
+        shape.is_aggregate = true;
         cb(qr);
         return {};
     }
 
     // ── SELECT without aggregation (columnar scan) ────────────────────────────
+    //
+    // Expanded here rather than left empty: the server writes the header before the first row and
+    // has to write one even for an answer with no rows, so "empty means all seven" would have to
+    // be understood identically by two readers that do not share a line of code.
+    shape.columns = ast.projection.empty() ? all_query_columns() : ast.projection;
+    OB_LOG_DEBUG("query", "Answer shape: %zu column(s)%s",
+                 shape.columns.size(), ast.projection.empty() ? " (SELECT *)" : "");
+
     uint64_t ts_start = ast.ts_start_ns.value_or(0);
     uint64_t ts_end   = ast.ts_end_ns.value_or(UINT64_MAX);
     uint64_t lim      = ast.limit.value_or(UINT64_MAX);
     uint64_t count    = 0;
 
-    store_.scan(ts_start, ts_end, ast.symbol, ast.exchange,
+    // Wider than the answer where a predicate needs it to be: a price filter reads `price.col`
+    // whether or not the answer carries the price.
+    const ColumnSet to_read = columns_to_read(
+        shape.columns, ast.price_lo.has_value() || ast.price_hi.has_value());
+
+    store_.scan(ts_start, ts_end, ast.symbol, ast.exchange, to_read,
                 [&](const SnapshotRow& row) {
                     if (count >= lim) return;
 

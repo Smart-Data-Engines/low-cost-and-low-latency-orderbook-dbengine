@@ -3,6 +3,7 @@
 #include "orderbook/aggregation.hpp"
 #include "orderbook/columnar_store.hpp"
 #include "orderbook/data_model.hpp"
+#include "orderbook/query_columns.hpp"
 #include "orderbook/soa_buffer.hpp"
 
 #include <atomic>
@@ -66,6 +67,13 @@ struct QueryAST {
     std::optional<int64_t>  price_lo;
     std::optional<int64_t>  price_hi;
     std::vector<std::string> select_exprs;  // column names or agg calls
+
+    /// The columns to answer with, in the order the query asked for them. Empty means `SELECT *`.
+    ///
+    /// Not a second copy of `select_exprs`: that one holds the text of aggregate expressions,
+    /// which a column list cannot express, and exactly one of the two is populated for any query
+    /// because a list mixing the two is refused.
+    std::vector<QueryColumn> projection;
     std::optional<uint64_t> limit;
     std::optional<uint64_t> snapshot_ts_ns;
 };
@@ -95,6 +103,26 @@ using RowCallback = std::function<void(const QueryResult&)>;
 /// puts a scan's latency on every writer.
 using LiveBufferLookup = std::function<std::shared_ptr<SoABuffer>(const std::string& key)>;
 
+// ── QueryShape ────────────────────────────────────────────────────────────────
+//
+// What the answer looks like, filled before the first row arrives.
+//
+// The server has to write a header before it writes a row, and a query returning no rows still
+// has one - so this cannot be inferred from the rows, and the server has no AST to read it from.
+// It is an out-parameter on an overload rather than a default argument for the same reason the
+// formatter's column list is required: a caller that does not pass it has not decided, and the
+// value it would default to is wrong for every narrowed query.
+
+struct QueryShape {
+    /// The columns of a row scan, in the order to emit them. Never empty for a row query:
+    /// `SELECT *` arrives here expanded to the seven, because an empty list meaning "all" in one
+    /// place and "none" in another is how the two readers of one field come to disagree.
+    std::vector<QueryColumn> columns;
+
+    /// True when the answer is aggregates, which have their own three-column shape.
+    bool is_aggregate{false};
+};
+
 // ── QueryEngine ───────────────────────────────────────────────────────────────
 
 class QueryEngine {
@@ -111,6 +139,9 @@ public:
 
     /// Execute a SQL query; returns error string on failure, empty on success.
     std::string execute(std::string_view sql, RowCallback cb);
+
+    /// As above, and report the shape of the answer in `shape` before the first row.
+    std::string execute(std::string_view sql, RowCallback cb, QueryShape& shape);
 
     /// Parse only; returns error string on failure, empty on success.
     std::string parse(std::string_view sql, QueryAST& out);

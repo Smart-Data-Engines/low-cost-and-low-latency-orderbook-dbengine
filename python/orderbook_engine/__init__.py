@@ -127,6 +127,12 @@ OB_ERR_INTERNAL    = -99
 
 # ── TCP response parser ───────────────────────────────────────────────────────
 
+#: The columns a `SELECT *` row response carries, in order. This client reads rows by position,
+#: so this is not documentation - it is the shape it is able to read.
+_QUERY_COLUMNS = ["timestamp_ns", "price", "quantity", "order_count",
+                  "side", "level", "sequence_number"]
+
+
 def _parse_tcp_response(raw: str):
     """
     Parse a TCP wire-format response.
@@ -1757,10 +1763,26 @@ class OrderbookEngine:
                 -1,
                 "this query returned aggregates, not rows; use query_agg() "
                 f"(columns: {header})")
+        # This client reads rows **by position**, so a response whose columns are not the ones
+        # it expects has to be refused rather than parsed. Since #139 the server answers the
+        # columns a query asked for, and `SELECT price` returns one - which this loop would have
+        # skipped as "too short", handing back an empty list for a query that matched every row.
+        # A silent wrong answer in the client is the same defect #139 removed from the server.
+        #
+        # Checked against the header rather than against the SQL: this client does not parse SQL
+        # and is not about to start.
+        if header != _QUERY_COLUMNS[:len(header)] or len(header) < 6:
+            raise OrderbookError(
+                -1,
+                "this client reads the standard row columns by position and the server answered "
+                f"with {header}. Ask for `SELECT *`, or read the response with a client that "
+                "reads columns by name.")
+
         # Parse TSV rows into OrderbookRow objects
         # Header: timestamp_ns  price  quantity  order_count  side  level  sequence_number
         # The seventh column arrived after the first six, so it is read when present rather than
-        # required: this client still talks to a server that sends six.
+        # required: this client still talks to a server that sends six - which is why the guard
+        # above accepts a prefix of the canonical list rather than demanding all seven.
         rows: List[OrderbookRow] = []
         for r in data_rows:
             if len(r) < 6:

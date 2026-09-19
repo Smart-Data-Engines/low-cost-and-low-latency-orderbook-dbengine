@@ -125,6 +125,22 @@ timestamp or price filter rather than accepting one and ignoring it.
 `query()` raises `OrderbookError` if the query turns out to return aggregates, because the row parser
 would silently discard all three columns and hand back an empty list.
 
+It raises for the same reason on a **narrowed** response. Since #139 the server answers the columns
+a query names — `SELECT price, quantity FROM ...` returns two — and this client reads a row by
+position, so it would read the price as a timestamp or skip the row as too short. It checks the
+header instead and names the columns it was handed:
+
+```python
+engine.query("SELECT price FROM 'BTC-USD'.'BINANCE' WHERE ...")
+# OrderbookError: this client reads the standard row columns by position and the server
+# answered with ['price']. Ask for `SELECT *`, or read the response with a client that
+# reads columns by name.
+```
+
+A narrowed query is worth asking for — it is fewer bytes on the wire and less work in the server —
+but until this client reads columns by name it has to be sent over the raw protocol. `SELECT *` is
+unchanged and is what every method here sends.
+
 #### engine.status() → dict
 
 Returns server statistics, parsed from every `key: value` field the server sends: `sessions`,

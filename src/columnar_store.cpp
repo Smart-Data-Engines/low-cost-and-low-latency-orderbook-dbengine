@@ -378,9 +378,38 @@ std::optional<SegmentMeta> ColumnarStore::flush_segment() {
 
 // ── scan ──────────────────────────────────────────────────────────────────────
 
+namespace {
+
+/// Read a whole column file into `out`; false when the file is not there.
+///
+/// It replaces seven near-identical copies that each decided for themselves what a missing file
+/// meant - four skipped the segment in silence, three logged first. With a read set the answer
+/// depends on whether the caller asked for that column, so the decision moves to the caller and
+/// this only reports.
+template <typename T>
+bool read_column_file(const std::string& dir, const char* name, std::vector<T>& out) {
+    const std::string path = dir + "/" + name;
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return false;
+    f.seekg(0, std::ios::end);
+    const auto sz = static_cast<size_t>(f.tellg());
+    f.seekg(0, std::ios::beg);
+    out.resize(sz / sizeof(T));
+    f.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(sz));
+    return true;
+}
+
+}  // namespace
+
 void ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
                           std::string_view symbol, std::string_view exchange,
+                          ColumnSet columns,
                           std::function<void(const SnapshotRow&)> cb) const {
+    // Whatever the caller asked to be handed, this filters on the row's timestamp, so it reads
+    // that column. Adding it here rather than trusting the caller means a set built by hand
+    // cannot produce a scan that compares every row against a zero it never loaded.
+    columns.add(QueryColumn::TimestampNs);
+
     // Take a snapshot of the index under shared lock to avoid data race
     // with merge_segments() which modifies index_ under exclusive lock.
     std::vector<SegmentMeta> index_snapshot;
@@ -389,6 +418,13 @@ void ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
         index_snapshot = index_;
     }
 
+    const bool want_price = columns.has(QueryColumn::Price);
+    const bool want_qty   = columns.has(QueryColumn::Quantity);
+    const bool want_cnt   = columns.has(QueryColumn::OrderCount);
+    const bool want_side  = columns.has(QueryColumn::Side);
+    const bool want_level = columns.has(QueryColumn::Level);
+    const bool want_seq   = columns.has(QueryColumn::SequenceNumber);
+
     for (const auto& meta : index_snapshot) {
         // Filter by symbol/exchange
         if (meta.symbol != symbol || meta.exchange != exchange) continue;
@@ -396,7 +432,6 @@ void ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
         // Time-range pruning: skip segments that don't overlap [start_ns, end_ns]
         if (meta.end_ts_ns < start_ns || meta.start_ts_ns > end_ns) continue;
 
-        // Read column files
         const std::string& dir = meta.dir_path;
 
         // A segment written by an older format lacks side, level_index and
@@ -411,135 +446,57 @@ void ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
             continue;
         }
 
-        // Read price.col
-        std::vector<uint64_t> enc_prices;
-        {
-            std::string path = dir + "/price.col";
-            std::ifstream f(path, std::ios::binary);
-            if (!f.is_open()) continue;
-            f.seekg(0, std::ios::end);
-            auto sz = static_cast<size_t>(f.tellg());
-            f.seekg(0, std::ios::beg);
-            enc_prices.resize(sz / sizeof(uint64_t));
-            f.read(reinterpret_cast<char*>(enc_prices.data()),
-                   static_cast<std::streamsize>(sz));
-        }
-
-        // Read qty.col
-        std::vector<uint64_t> enc_qtys;
-        {
-            std::string path = dir + "/qty.col";
-            std::ifstream f(path, std::ios::binary);
-            if (!f.is_open()) continue;
-            f.seekg(0, std::ios::end);
-            auto sz = static_cast<size_t>(f.tellg());
-            f.seekg(0, std::ios::beg);
-            enc_qtys.resize(sz / sizeof(uint64_t));
-            f.read(reinterpret_cast<char*>(enc_qtys.data()),
-                   static_cast<std::streamsize>(sz));
-        }
-
-        // Read ts.col
-        std::vector<uint64_t> timestamps;
-        {
-            std::string path = dir + "/ts.col";
-            std::ifstream f(path, std::ios::binary);
-            if (!f.is_open()) continue;
-            f.seekg(0, std::ios::end);
-            auto sz = static_cast<size_t>(f.tellg());
-            f.seekg(0, std::ios::beg);
-            timestamps.resize(sz / sizeof(uint64_t));
-            f.read(reinterpret_cast<char*>(timestamps.data()),
-                   static_cast<std::streamsize>(sz));
-        }
-
-        // Read cnt.col
+        std::vector<uint64_t> timestamps, enc_prices, enc_qtys, enc_seq;
         std::vector<uint32_t> counts;
-        {
-            std::string path = dir + "/cnt.col";
-            std::ifstream f(path, std::ios::binary);
-            if (!f.is_open()) continue;
-            f.seekg(0, std::ios::end);
-            auto sz = static_cast<size_t>(f.tellg());
-            f.seekg(0, std::ios::beg);
-            counts.resize(sz / sizeof(uint32_t));
-            f.read(reinterpret_cast<char*>(counts.data()),
-                   static_cast<std::streamsize>(sz));
-        }
-
-        // Read side.col (raw uint8)
-        std::vector<uint8_t> sides;
-        {
-            std::string path = dir + "/side.col";
-            std::ifstream f(path, std::ios::binary);
-            if (!f.is_open()) {
-                OB_LOG_ERROR("columnar",
-                             "Skipping segment %s: missing column side.col",
-                             dir.c_str());
-                continue;
-            }
-            f.seekg(0, std::ios::end);
-            auto sz = static_cast<size_t>(f.tellg());
-            f.seekg(0, std::ios::beg);
-            sides.resize(sz / sizeof(uint8_t));
-            f.read(reinterpret_cast<char*>(sides.data()),
-                   static_cast<std::streamsize>(sz));
-        }
-
-        // Read level.col (raw uint16)
+        std::vector<uint8_t>  sides;
         std::vector<uint16_t> levels;
-        {
-            std::string path = dir + "/level.col";
-            std::ifstream f(path, std::ios::binary);
-            if (!f.is_open()) {
-                OB_LOG_ERROR("columnar",
-                             "Skipping segment %s: missing column level.col",
-                             dir.c_str());
-                continue;
+
+        // A missing file is fatal for the segment only when the query needs that column. Before
+        // the read set existed every column was needed, so a segment missing any one of the seven
+        // was dropped from every query - including queries that would never have looked at it.
+        bool missing = false;
+        auto need = [&](bool wanted, const char* file, auto& dest) {
+            if (!wanted) return;
+            if (!read_column_file(dir, file, dest)) {
+                OB_LOG_ERROR("columnar", "Skipping segment %s: missing column %s",
+                             dir.c_str(), file);
+                missing = true;
             }
-            f.seekg(0, std::ios::end);
-            auto sz = static_cast<size_t>(f.tellg());
-            f.seekg(0, std::ios::beg);
-            levels.resize(sz / sizeof(uint16_t));
-            f.read(reinterpret_cast<char*>(levels.data()),
-                   static_cast<std::streamsize>(sz));
+        };
+        // Every column is opened through the set, the timestamp included - the widening at the
+        // top of this function is what puts it there. A hardcoded `true` here reads as belt and
+        // braces and is worse than that: it makes that widening unobservable, so a mutation
+        // deleting it survived the test written to catch exactly that.
+        need(columns.has(QueryColumn::TimestampNs), "ts.col", timestamps);
+        need(want_price, "price.col", enc_prices);
+        need(want_qty,   "qty.col",   enc_qtys);
+        need(want_cnt,   "cnt.col",   counts);
+        need(want_side,  "side.col",  sides);
+        need(want_level, "level.col", levels);
+        need(want_seq,   "seq.col",   enc_seq);
+        if (missing) continue;
+
+        // Decoding follows the set too, and the sequence number is the expensive one: it is
+        // Simple8b **and** zigzag-delta, so a query that does not ask for it skips two of the
+        // four decode passes a segment would otherwise cost.
+        std::vector<int64_t>  prices;
+        std::vector<uint64_t> qtys;
+        std::vector<int64_t>  seqs;
+        if (want_price) prices = decode_prices(enc_prices);
+        if (want_qty)   qtys   = decode_simple8b(enc_qtys, meta.row_count);
+        if (want_seq) {
+            auto zigzag_seq = decode_simple8b(enc_seq, meta.row_count);
+            seqs = decode_prices(zigzag_seq);
         }
-
-        // Read seq.col (zigzag-delta encoded)
-        std::vector<uint64_t> enc_seq;
-        {
-            std::string path = dir + "/seq.col";
-            std::ifstream f(path, std::ios::binary);
-            if (!f.is_open()) {
-                OB_LOG_ERROR("columnar",
-                             "Skipping segment %s: missing column seq.col",
-                             dir.c_str());
-                continue;
-            }
-            f.seekg(0, std::ios::end);
-            auto sz = static_cast<size_t>(f.tellg());
-            f.seekg(0, std::ios::beg);
-            enc_seq.resize(sz / sizeof(uint64_t));
-            f.read(reinterpret_cast<char*>(enc_seq.data()),
-                   static_cast<std::streamsize>(sz));
-        }
-
-        // Decode prices
-        auto prices = decode_prices(enc_prices);
-
-        // Decode quantities
-        auto qtys = decode_simple8b(enc_qtys, meta.row_count);
-
-        // Decode sequence numbers: unpack Simple8b, then undo zigzag-delta.
-        auto zigzag_seq = decode_simple8b(enc_seq, meta.row_count);
-        auto seqs = decode_prices(zigzag_seq);
 
         // A short column means a truncated or corrupt segment. Emitting the rows
         // it does have, padded with zeros, is what produced the lost-order-side
-        // defect this format version fixes, so refuse the segment instead.
+        // defect this format version fixes, so refuse the segment instead. Only the columns
+        // being read can be short here; one that was never opened is empty by construction.
         const size_t expected = static_cast<size_t>(meta.row_count);
-        if (sides.size() < expected || levels.size() < expected ||
-            seqs.size() < expected) {
+        if ((want_side  && sides.size()  < expected) ||
+            (want_level && levels.size() < expected) ||
+            (want_seq   && seqs.size()   < expected)) {
             OB_LOG_ERROR("columnar",
                          "Skipping segment %s: short column(s) for row_count=%zu "
                          "(side=%zu level=%zu seq=%zu)",
@@ -554,14 +511,16 @@ void ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
             uint64_t ts = (i < timestamps.size()) ? timestamps[i] : 0;
             if (ts < start_ns || ts > end_ns) continue;
 
+            // Value-initialised, so a field whose column was not read is zero rather than
+            // whatever the last row left there.
             SnapshotRow row{};
-            row.timestamp_ns    = ts;
-            row.sequence_number = static_cast<uint64_t>(seqs[i]);
-            row.side            = sides[i];
-            row.level_index     = levels[i];
-            row.price           = (i < prices.size()) ? prices[i] : 0;
-            row.quantity        = (i < qtys.size())   ? qtys[i]   : 0;
-            row.order_count     = (i < counts.size()) ? counts[i] : 0;
+            row.timestamp_ns = ts;
+            if (want_seq)   row.sequence_number = static_cast<uint64_t>(seqs[i]);
+            if (want_side)  row.side            = sides[i];
+            if (want_level) row.level_index     = levels[i];
+            if (want_price) row.price           = (i < prices.size()) ? prices[i] : 0;
+            if (want_qty)   row.quantity        = (i < qtys.size())   ? qtys[i]   : 0;
+            if (want_cnt)   row.order_count     = (i < counts.size()) ? counts[i] : 0;
             cb(row);
         }
     }

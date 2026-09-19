@@ -203,6 +203,11 @@ function(ob_add_columnar_test name)
     gtest_discover_tests(${name} PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 endfunction()
 
+# ── #139: column identities, spellings and read sets ─────────────────────────
+ob_add_columnar_test(test_query_columns
+    test_query_columns.cpp
+)
+
 # ── Tasks 7.2–7.6: ColumnarStore property and unit tests ──────────────────────
 ob_add_columnar_test(test_columnar_store
     test_columnar_store.cpp

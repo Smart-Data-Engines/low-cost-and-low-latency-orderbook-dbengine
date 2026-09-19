@@ -1,6 +1,6 @@
 // The query response, byte for byte.
 //
-// `format_query_response` is 40% of the server's profile while answering the benchmark's
+// `format_query_response` is the largest engine function in the server's profile while answering
 // time-range query — measured with `perf` on an m9g.xlarge, against 2.7% for
 // `ColumnarStore::scan` — so it is the first thing worth making faster. It is also a **wire
 // format**: every client in this repository and every client anybody writes reads these bytes, so
@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -62,13 +63,14 @@ std::vector<std::string> lines_of(const std::string& s) {
 }  // namespace
 
 TEST(ResponseFormatter, AnEmptyResultIsStillAHeaderAndATerminator) {
-    const std::string out = ob::format_query_response({});
+    const std::string out = ob::format_query_response({}, ob::all_query_columns());
     EXPECT_EQ(out, std::string("OK\n") + kHeader + "\n\n");
 }
 
 TEST(ResponseFormatter, OneRowIsSevenTabSeparatedFieldsInHeaderOrder) {
     const std::string out = ob::format_query_response(
-        {row(1'700'000'000'000'000'000ULL, 5'000'000, 1'000, 1, 0, 3, 42)});
+        {row(1'700'000'000'000'000'000ULL, 5'000'000, 1'000, 1, 0, 3, 42)},
+        ob::all_query_columns());
     EXPECT_EQ(out, std::string("OK\n") + kHeader +
                        "\n1700000000000000000\t5000000\t1000\t1\t0\t3\t42\n\n");
 }
@@ -77,7 +79,8 @@ TEST(ResponseFormatter, OneRowIsSevenTabSeparatedFieldsInHeaderOrder) {
 // byte rather than a number. Both documented values are pinned.
 TEST(ResponseFormatter, SideIsPrintedAsANumberAndNotAsACharacter) {
     for (uint8_t side : {uint8_t{0}, uint8_t{1}}) {
-        const std::string out = ob::format_query_response({row(1, 2, 3, 4, side, 6, 7)});
+        const std::string out =
+            ob::format_query_response({row(1, 2, 3, 4, side, 6, 7)}, ob::all_query_columns());
         const auto ls = lines_of(out);
         ASSERT_GE(ls.size(), 3U);
         EXPECT_EQ(ls[2], "1\t2\t3\t4\t" + std::to_string(static_cast<unsigned>(side)) + "\t6\t7");
@@ -92,7 +95,7 @@ TEST(ResponseFormatter, EveryFieldAtItsTypesLimitRoundTripsExactly) {
              std::numeric_limits<uint32_t>::max(),
              std::numeric_limits<uint8_t>::max(),
              std::numeric_limits<uint16_t>::max(),
-             std::numeric_limits<uint64_t>::max())});
+             std::numeric_limits<uint64_t>::max())}, ob::all_query_columns());
     const auto ls = lines_of(out);
     ASSERT_GE(ls.size(), 3U);
     EXPECT_EQ(ls[2],
@@ -102,7 +105,8 @@ TEST(ResponseFormatter, EveryFieldAtItsTypesLimitRoundTripsExactly) {
 
 // A negative price is the one signed field, and the sign has to survive.
 TEST(ResponseFormatter, ANegativePriceKeepsItsSign) {
-    const std::string out = ob::format_query_response({row(1, -12345, 1, 1, 1, 1, 1)});
+    const std::string out =
+        ob::format_query_response({row(1, -12345, 1, 1, 1, 1, 1)}, ob::all_query_columns());
     EXPECT_NE(out.find("\t-12345\t"), std::string::npos);
 }
 
@@ -113,7 +117,7 @@ TEST(ResponseFormatter, ManyRowsAreOnePerLineWithExactlyOneBlankLineAtTheEnd) {
                            i * 7, static_cast<uint32_t>(i), static_cast<uint8_t>(i & 1),
                            static_cast<uint16_t>(i), i + 1));
     }
-    const std::string out = ob::format_query_response(rows);
+    const std::string out = ob::format_query_response(rows, ob::all_query_columns());
     const auto ls = lines_of(out);
     // "OK", header, 64 rows, the blank terminator, and the empty tail after the final newline.
     ASSERT_EQ(ls.size(), 68U);
@@ -131,9 +135,132 @@ TEST(ResponseFormatter, ManyRowsAreOnePerLineWithExactlyOneBlankLineAtTheEnd) {
 // note in the formatter says why; this fails if the order changes under a client that reads by
 // index.
 TEST(ResponseFormatter, TheHeaderNamesSevenColumnsInTheDocumentedOrder) {
-    const std::string out = ob::format_query_response({});
+    const std::string out = ob::format_query_response({}, ob::all_query_columns());
     const auto ls = lines_of(out);
     ASSERT_GE(ls.size(), 2U);
     EXPECT_EQ(fields(ls[1]), 7U);
     EXPECT_EQ(ls[1], kHeader);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// #139: the response carries the columns the query asked for
+//
+// Every test above passes `all_query_columns()` and compares against the bytes the seven-column
+// response has always had. These are the narrowed answers, and the first of them is the one that
+// says the order is the query's order rather than the canonical one.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(QueryResponseProjection, TwoColumnsAreTwoColumnsInTheHeaderAndTheRow) {
+    const std::string out = ob::format_query_response(
+        {row(111, 222, 333, 4, 1, 5, 6)},
+        {ob::QueryColumn::Price, ob::QueryColumn::Quantity});
+    EXPECT_EQ(out, "OK\nprice\tquantity\n222\t333\n\n");
+}
+
+TEST(QueryResponseProjection, TheOrderIsTheQuerysOrderAndNotTheCanonicalOne) {
+    const std::string out = ob::format_query_response(
+        {row(111, 222, 333, 4, 1, 5, 6)},
+        {ob::QueryColumn::Quantity, ob::QueryColumn::Price});
+    EXPECT_EQ(out, "OK\nquantity\tprice\n333\t222\n\n");
+}
+
+TEST(QueryResponseProjection, OneColumnHasNoTabAtAll) {
+    const std::string out = ob::format_query_response(
+        {row(111, 222, 333, 4, 1, 5, 6)}, {ob::QueryColumn::Price});
+    EXPECT_EQ(out, "OK\nprice\n222\n\n");
+}
+
+TEST(QueryResponseProjection, AColumnAskedForTwiceIsAnsweredTwice) {
+    const std::string out = ob::format_query_response(
+        {row(111, 222, 333, 4, 1, 5, 6)},
+        {ob::QueryColumn::Price, ob::QueryColumn::Price});
+    EXPECT_EQ(out, "OK\nprice\tprice\n222\t222\n\n");
+}
+
+TEST(QueryResponseProjection, AnEmptyNarrowedResultIsStillItsOwnHeaderAndATerminator) {
+    const std::string out = ob::format_query_response(
+        {}, {ob::QueryColumn::Side, ob::QueryColumn::Level});
+    EXPECT_EQ(out, "OK\nside\tlevel\n\n");
+}
+
+TEST(QueryResponseProjection, ARepeatedColumnDoesNotRunOffTheRowBuffer) {
+    // The buffer used to be a 105-byte stack array sized for the seven distinct columns. A query
+    // may name one column many times, and twenty repeats of `sequence_number` is 420 bytes - so
+    // this case is a stack overflow against that version, which is why it is written with the
+    // widest column and a value at its type's limit. Under ASan it fails loudly; here it fails by
+    // producing the wrong bytes.
+    constexpr size_t kRepeats = 20;
+    std::vector<ob::QueryColumn> columns(kRepeats, ob::QueryColumn::SequenceNumber);
+    const std::string out = ob::format_query_response(
+        {row(1, 1, 1, 1, 0, 1, UINT64_MAX)}, columns);
+
+    std::string expected_header, expected_row;
+    for (size_t i = 0; i < kRepeats; ++i) {
+        if (i) { expected_header += '\t'; expected_row += '\t'; }
+        expected_header += "sequence_number";
+        expected_row += "18446744073709551615";
+    }
+    EXPECT_EQ(out, "OK\n" + expected_header + "\n" + expected_row + "\n\n");
+}
+
+TEST(QueryResponseProjection, SelectStarIsExactlyTheSevenColumnList) {
+    // Says that `all_query_columns()` is not merely a list that happens to work: the narrowed
+    // path and the seven-column path are the same code, so this is the pair that would catch the
+    // day they stop agreeing.
+    const auto rows = std::vector<ob::QueryResult>{row(1, 2, 3, 4, 1, 6, 7),
+                                                   row(8, 9, 10, 11, 0, 12, 13)};
+    EXPECT_EQ(ob::format_query_response(rows, ob::all_query_columns()),
+              "OK\ntimestamp_ns\tprice\tquantity\torder_count\tside\tlevel\tsequence_number\n"
+              "1\t2\t3\t4\t1\t6\t7\n8\t9\t10\t11\t0\t12\t13\n\n");
+}
+
+TEST(QueryResponseProjection, TheUnrolledSevenAndTheGeneralLoopAgreeFieldForField) {
+    // `SELECT *` runs an unrolled path because the general loop measured 24% more cycles inside
+    // the formatter for exactly that shape. Two paths need something holding them together, and
+    // it cannot be a call that picks between them - the choice is made from the column list, so
+    // any list of the canonical seven takes the fast one.
+    //
+    // So: format each column **alone**, which is necessarily the loop, and compare it with that
+    // field cut out of the unrolled output. A fast path that wrote a field differently, or in the
+    // wrong order, fails here on that column and names it.
+    const std::vector<ob::QueryResult> rows{
+        row(1'700'000'000'000'000'001ULL, -5'000'000, 999'999, 4'000'000'000u, 1, 65'535, 7),
+        row(0, 0, 0, 0, 0, 0, 0),
+        row(UINT64_MAX, INT64_MIN, UINT64_MAX, UINT32_MAX, 255, 1, UINT64_MAX),
+    };
+
+    const std::string wide = ob::format_query_response(rows, ob::all_query_columns());
+    std::vector<std::vector<std::string>> wide_fields;
+    {
+        std::istringstream in(wide);
+        std::string line;
+        std::getline(in, line);   // OK
+        std::getline(in, line);   // header
+        while (std::getline(in, line) && !line.empty()) {
+            std::vector<std::string> fields;
+            size_t pos = 0;
+            for (;;) {
+                const size_t tab = line.find('\t', pos);
+                fields.push_back(line.substr(pos, tab == std::string::npos
+                                                      ? std::string::npos : tab - pos));
+                if (tab == std::string::npos) break;
+                pos = tab + 1;
+            }
+            wide_fields.push_back(std::move(fields));
+        }
+    }
+    ASSERT_EQ(wide_fields.size(), rows.size());
+
+    for (size_t c = 0; c < ob::all_query_columns().size(); ++c) {
+        const ob::QueryColumn column = ob::all_query_columns()[c];
+        std::string expected = "OK\n" + std::string(ob::column_name(column)) + "\n";
+        for (const auto& fields : wide_fields) {
+            ASSERT_EQ(fields.size(), ob::all_query_columns().size());
+            expected += fields[c];
+            expected += '\n';
+        }
+        expected += '\n';
+        EXPECT_EQ(ob::format_query_response(rows, {column}), expected)
+            << "the two paths disagree about " << ob::column_name(column);
+    }
 }
