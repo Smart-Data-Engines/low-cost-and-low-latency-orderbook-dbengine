@@ -2212,6 +2212,75 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 141. The engine could be pipelined and no client of ours could do it ✅
+
+#140 measured **2,174,287 levels/s against 1,314,663** for a client asking one question at a time,
+and the client that measured it was a forty-line C++ probe written for the occasion. Both of the
+clients this repository ships send one command and wait for its answer, so that number described
+a client nobody had — the mechanism present on one side of the wire and absent on the other, which
+is the shape this workspace has filed seven times under other names.
+
+Nothing on the wire changes. `Session::feed()` has always returned every complete command from one
+read and the server has always answered them in order; what was missing is a client that sends
+more than one before reading. `_TcpClient._recv_response()` already consumed exactly one response
+and left the rest of the buffer alone — it has to, because a `PUSH` may arrive between a command
+and its reply (#45) — so the transport half of this is a loop.
+
+**Measured on one m9g.xlarge, 5000 updates of 20 levels, five rounds with the order alternating
+between them, medians:**
+
+| | levels/s | client CPU per level | against the loop |
+|---|---|---|---|
+| `insert()` in a loop | 969,204 | 623 ns | — |
+| `insert_batch`, 1 per call | 883,923 | 725 ns | **0.91×** |
+| `insert_batch`, 8 per call | 1,261,354 | 531 ns | 1.30× |
+| `insert_batch`, 64 per call | 1,542,355 | 496 ns | **1.59×** |
+| `insert_batch`, 512 per call | 1,542,096 | 502 ns | 1.59× |
+
+**The row that does not flatter it is the control.** A batch of one is 9% *slower* than `insert()`,
+reproducibly across five rounds, and the client CPU column says why: 725 ns per level against 623,
+so about two microseconds of extra Python per update — a normalisation pass, an outcome object, a
+size sum. For one update `insert()` is the right call and the documentation says so. The API pays
+from about eight and stops improving after 64.
+
+**The other thing that column says is where the remaining ceiling is.** At batch 64 the client
+spends 0.050 s of its own CPU against 0.065 s of wall: **the Python client is three quarters of
+what is left**, and the same work from C++ reaches 2,174,287 levels/s against the same server. So
+the honest reading of 1.59× is "as much of #140 as Python can collect", not "what the engine can
+do". A client in a compiled language gets the rest.
+
+**It is not a transaction and the shape of the answer says so.** A batch is N independent writes
+in one journey; some may land and others be refused. The result is a list of outcomes each
+carrying its own index, rather than a return code or one exception, because a caller that filters
+or regroups that list would otherwise lose which update bounced — and losing that is the failure
+this API exists to prevent. Everything decidable *before* sending is decided for the whole batch,
+since a partial send after rejecting update k is a write nobody can find afterwards.
+
+**Three refusals, each because the honest answer is not the obvious one.** Pool and sharded mode:
+the router picks a connection per symbol, so a batch spanning symbols is several batches on
+several connections and which of them is one round trip is a decision nobody has measured. A
+compressed connection: each command is its own LZ4 frame, and whether the server takes several
+frames from one read has not been measured — "probably works" is the wrong thing to find out about
+in production. And `MAX_BATCH_BYTES`, which is **not** a server limit and says so where it is
+defined: the server answers a `MINSERT` in four bytes against a 64 MB per-session cap, so from
+that side a batch could carry sixteen million commands. What eight megabytes bounds is the
+caller's own memory.
+
+**One definition of the wire spelling, which this change forced.** `insert()` spelled a write
+twice — once for pool mode, once for TCP — and a third copy was the natural way to write this. Two
+copies of a protocol's syntax is how two clients of one server begin saying different things; the
+same rule already governs this engine's identifier quoting, its set of write-shaped operations and
+its query header. Four parametrised cases pin the bytes, so the extraction is checked rather than
+assumed.
+
+**The C++ client did not get this and that is recorded rather than implied.** The harness that
+publishes comparative numbers is in Python, so Python is where the measurement needed a client;
+`OrderbookClient::minsert_batch()` is the same loop over a reader that already exists and is worth
+doing when something needs it.
+
+- Effort: S | Impact: #140's measurement becomes reachable from the client this project ships,
+  which is the difference between a protocol that allows something and a product that does it
+
 ### 140. No accepted socket turned Nagle off, so a client that pipelines paid a kernel timer per round trip ✅
 
 Measured on one m9g.xlarge, quiet box, loopback, one connection, 20,000 updates of 20 levels each
