@@ -1022,6 +1022,16 @@ The remaining loss is a limit of the **protocol** rather than of the storage eng
 useful finding: the same engine ingests **446,219 updates/s in process** here against **4,012
 through the wire** — a factor of 111, all of it the round trip.
 
+**That last sentence is wrong in both of its halves, and the correction belongs here rather than in
+place of it, because the run happened.** The two figures are in different units — the in-process
+benchmark applied **one** level per call and the harness sends **twenty** per round trip — so a
+factor of twenty of the 111 was the word "updates" meaning two things. And "all of it the round
+trip" is false: measured on the aarch64 box at equal volume and with the client held fixed, the
+engine's wall-clock ingest over a socket is within **about 4%** of its own in-process figure, the
+round trip costs about eight times the storage path's CPU per level and almost nothing in
+throughput, and the largest single term in that column is the harness's own Python client. The
+measurements are in [`../benchmarks/on-a-bigger-machine.md`](../benchmarks/on-a-bigger-machine.md).
+
 **Five findings came out of running it, and four of them are about our own code.**
 
 **#105, filed rather than patched: `insert(timestamp_ns=…)` is silently dropped over TCP.** The
