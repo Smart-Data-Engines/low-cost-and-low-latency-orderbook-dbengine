@@ -2931,6 +2931,29 @@ Learned the hard way. Check here before debugging.
      count then says what it looks like it says, and the six that passed become exact rather than
      merely satisfied.
 
+351. **Two correct mechanisms compose into a fixed timer, and the only client that can see it is
+     one nobody benchmarked.** Nagle holds a small write while an earlier byte is unacknowledged;
+     delayed ACK withholds the acknowledgement. Each is right. Together, on a server that had
+     `TCP_NODELAY` on every socket it dialled and none it accepted, a client pipelining commands
+     paid **52.75, 51.68 and 52.15 ms per round trip at batch 8, 64 and 512** — the same number at
+     three batch sizes, which is what says timer rather than cost. The server's own CPU for those
+     runs was 0.16, 0.12 and 0.14 seconds against 131.885 seconds of wall, which is pitfall 339's
+     tell at a ratio of 800. A request/response client meets none of it, because with one response
+     outstanding there is nothing unacknowledged when the next write happens — so the defect
+     survived every published benchmark, all of which ask one question at a time. The clinching
+     control is on the **client** side and changes nothing on the server: re-arming `TCP_QUICKACK`
+     before every `recv` took the same 250 round trips from 12.963 s to 0.021 s (#140).
+
+352. **A median that does not move can hide a tail that is an entire timer, so report the
+     statistic that moved.** The same defect on the subscription path left the median push latency
+     at 0.003 ms and the p99 at 0.006 ms — `SubscriptionHub` batches a drain, so most pushes go
+     out with nothing outstanding — while the **maximum** in every one of three runs was a full
+     delayed-ACK timer: 48.126, 40.884 and 43.330 ms, against 0.009, 0.006 and 0.015 after. Had
+     only the median been quoted this would read as "no effect on subscribers", and for a feed
+     sold on latency the 40 ms tail is the number a client quotes back. Roughly one update in two
+     hundred at those rates, and which one depends on when the subscriber's acknowledgement
+     happened to be due (#140).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
