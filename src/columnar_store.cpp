@@ -43,6 +43,47 @@ void ColumnarStore::ensure_dirs(const std::string& path) const {
     fs::create_directories(path);
 }
 
+/// How many segments may share one event-time span before this gives up. A backfill re-run
+/// produces one collision, not thousands; a number this large being reached means something is
+/// rewriting the same span in a loop, and failing the flush is the honest answer to that.
+static constexpr uint32_t kMaxSegmentsPerSpan = 10000;
+
+std::string ColumnarStore::create_unique_segment_dir(const std::string& symbol,
+                                                     const std::string& exchange,
+                                                     uint64_t start_ts,
+                                                     uint64_t end_ts) const {
+    const std::string base = segment_dir(symbol, exchange, start_ts, end_ts);
+    ensure_dirs(fs::path(base).parent_path().string());
+
+    std::error_code ec;
+    if (fs::create_directory(base, ec)) return base;
+    if (ec) {
+        throw std::runtime_error("ColumnarStore: cannot create segment directory '" + base +
+                                 "': " + ec.message());
+    }
+
+    // The span is taken. Before #136 this is where the second flush wrote over the first.
+    for (uint32_t n = 1; n < kMaxSegmentsPerSpan; ++n) {
+        const std::string candidate = base + "_" + std::to_string(n);
+        if (fs::create_directory(candidate, ec)) {
+            OB_LOG_INFO("columnar",
+                        "Segment span %llu_%llu for %s.%s is already stored; this flush writes "
+                        "'%s' instead of overwriting it",
+                        static_cast<unsigned long long>(start_ts),
+                        static_cast<unsigned long long>(end_ts),
+                        symbol.c_str(), exchange.c_str(), candidate.c_str());
+            return candidate;
+        }
+        if (ec) {
+            throw std::runtime_error("ColumnarStore: cannot create segment directory '" +
+                                     candidate + "': " + ec.message());
+        }
+    }
+    throw std::runtime_error("ColumnarStore: " + std::to_string(kMaxSegmentsPerSpan) +
+                             " segments already share the span " + std::to_string(start_ts) +
+                             "_" + std::to_string(end_ts) + " for " + symbol + "." + exchange);
+}
+
 void ColumnarStore::write_meta_json(const std::string& dir,
                                      const SegmentMeta& meta) const {
     std::string path = dir + "/meta.json";
@@ -237,10 +278,10 @@ std::optional<SegmentMeta> ColumnarStore::flush_segment() {
     uint64_t end_ts = ts_buf_.empty() ? active_segment_start_
                                       : ts_buf_.back();
 
-    // Build segment directory path
-    std::string dir = segment_dir(symbol_, exchange_,
-                                   active_segment_start_, end_ts);
-    ensure_dirs(dir);
+    // Build segment directory path. Unique per segment rather than per span, so a second flush
+    // covering the same event-time range is a second segment instead of a collision (#136).
+    std::string dir = create_unique_segment_dir(symbol_, exchange_,
+                                                active_segment_start_, end_ts);
 
     // Encode price column: delta + zigzag
     auto encoded_prices = encode_prices(price_buf_);
@@ -635,17 +676,20 @@ size_t ColumnarStore::merge_segments(const std::vector<SegmentMeta>& new_segment
     size_t refused = 0;
     bool added = false;
     for (const auto& meta : new_segments) {
-        // Defence in depth, not the fix. Serialising the flush paths is what stops
-        // the same segment being produced twice; this makes sure that if it ever
-        // happens again the log says so, instead of every client silently seeing
-        // each row in that segment twice.
+        // Defence in depth, not the fix. Since #136 a directory belongs to one segment rather
+        // than to one event-time span, so two flushes covering the same span get two
+        // directories and cannot reach here; what remains is the same meta merged twice, which
+        // is a caller mistake. The message below used to name a cause — "two flush paths raced"
+        // — that stopped being the only way here the moment #105 let a client choose its own
+        // event time, and it sent a reader hunting a race that had not happened. It reports
+        // the state now and leaves the cause to whoever has the rest of the log.
         const bool already_indexed =
             std::any_of(index_.begin(), index_.end(),
                         [&](const SegmentMeta& m) { return m.dir_path == meta.dir_path; });
         if (already_indexed) {
             OB_LOG_ERROR("columnar",
                          "Refusing to merge a segment already in the index: dir=%s rows=%llu. "
-                         "Two flush paths raced; rows would be scanned twice",
+                         "Merging it would make every client read those rows twice",
                          meta.dir_path.c_str(),
                          static_cast<unsigned long long>(meta.row_count));
             ++refused;
