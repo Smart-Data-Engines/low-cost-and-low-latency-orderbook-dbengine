@@ -57,15 +57,12 @@ ENGINE_LIMITATIONS = [
     # comment for one release so that a reader comparing two published tables can see why the
     # exclusion disappeared: the number changed because the engine did, not because the harness
     # stopped looking.
-    "orderbook: no bulk-load path over the wire, so the ingest row measures the protocol's shape "
-    "as much as the engine's speed - this harness sends one MINSERT round trip per book update "
-    "while the SQL systems receive the whole CSV in one request. {in_process}",
-    # Phrased without the two words `resolution.py` owns, and the guard caught this file twice in
-    # one session - the second time on a sentence *denying* a comparison. The rule is deliberately
-    # blunt about use against mention, because the flagship product spent four versions learning
-    # that telling them apart is harder than avoiding the word.
-    "orderbook: no column projection - every row query is `SELECT *`, so a client wanting three "
-    "columns receives seven. {projection}",
+    "orderbook: no bulk-load path over the wire, so the ingest row still measures the protocol's "
+    "shape as much as the engine's speed - but less of it than it did. Since #141 this harness "
+    "pipelines 64 updates per round trip, so it sends rows/64 requests where the SQL systems "
+    "receive the whole CSV in one. 64 is the knee #141 measured (1.59x against one update per "
+    "round trip, and 512 gave the same 1.59x), chosen from that measurement rather than by trying "
+    "several here and keeping the best. {in_process}",
     "orderbook: no general-purpose SQL - a fixed set of commands, not a query language",
     "orderbook: no joins, and no cross-symbol queries",
     "orderbook: the schema is imposed, not derived from a model",
@@ -87,9 +84,10 @@ def parse_cost(rows: int, samples: int = 9) -> tuple[float, float]:
     smallest of them. A reader can see that contradiction; the harness could not, because the
     constant was prose and the medians were measurements.
 
-    The experiment is the one the column-projection note describes, so the two agree by
-    construction: build the lines, split them, convert three fields, take the fastest of several
-    passes.
+    Both costs are still measured, and since #139 only the narrow one is paid: the engine answers
+    this query with three columns like the others, so the wide figure survives here to say what
+    the engine used to pay alone rather than to describe the run. Build the lines, split them,
+    convert three fields, take the fastest of several passes.
     """
     wide = ["\t".join(("1700000000000000000", "SYM0001", "EX", "B", str(i % 20),
                         str(5_000_000 - i), str(1_000 + i))) for i in range(rows)]
@@ -503,19 +501,15 @@ def main(argv: list[str] | None = None) -> int:
     wide_s, narrow_s = parse_cost(rows=query_rows) if query_rows else (0.0, 0.0)
     fills = {
         "in_process": in_process_sentence(args.build_dir, wire_levels, args.levels),
-        "projection": ("Not measured in this run: the time-range query returned no rows, so there "
-                       "is nothing to say about the cost of parsing them")
-        if not query_rows else (
-            f"Measured by this run, and it is *not* where the query column's extra milliseconds "
-            f"go: parsing {query_rows} seven-column lines and converting three fields costs "
-            f"{wide_s * 1000:.3f} ms against {narrow_s * 1000:.3f} ms for three-column lines"),
         "parsing": ("the query column's Python-side parsing cost is not measured in this run: "
                     "the time-range query returned no rows")
         if not query_rows else (
-            f"every figure in the query column includes a measured {wide_s * 1000:.3f} ms of "
-            f"Python-side parsing for {query_rows} rows, identical for all three systems, because "
-            f"each adapter turns text into tuples. What separates the systems is what is left "
-            f"after that constant, and it is stated here rather than subtracted from the table"),
+            f"every figure in the query column includes a measured {narrow_s * 1000:.3f} ms of "
+            f"Python-side parsing for {query_rows} three-column rows, and since #139 that really "
+            f"is the same work for all three systems - the engine used to answer this query with "
+            f"seven columns and pay {wide_s * 1000:.3f} ms for it, which made the constant ours "
+            f"alone. What separates the systems is what is left after it, stated here rather than "
+            f"subtracted from the table"),
         "prose_machine": PROSE_FIGURES_MACHINE,
     }
 

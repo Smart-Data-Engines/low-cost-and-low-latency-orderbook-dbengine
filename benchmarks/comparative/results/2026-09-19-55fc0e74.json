@@ -1,0 +1,233 @@
+{
+  "dataset": {
+    "interval_ns": 1000000,
+    "levels": 20,
+    "price_tick_base": 100000,
+    "rows": 200000,
+    "seed": 7,
+    "sha256": "edae9be70fa537258e629190d81f243c61101a998cbef6bea5959ca7dd819d8b",
+    "size_lot_max": 5000,
+    "start_ns": 1700000000000000000,
+    "symbols": 50
+  },
+  "hardware": {
+    "clock_source": "not published by this platform",
+    "compiler": "gcc14-g++ (GCC) 14.2.1 20250110 (Red Hat 14.2.1-7)",
+    "cores": 4,
+    "cpu_model": "aarch64 implementer 0x41 part 0xd84 r0p1",
+    "digest": "55fc0e74",
+    "disk_model": "Amazon Elastic Block Store",
+    "disk_rotational": false,
+    "disk_stack": "nvme0n1p1 \u2192 nvme0n1",
+    "filesystem": "xfs",
+    "kernel": "6.18.48-109.150.amzn2023.aarch64",
+    "mhz": 0.0,
+    "platform": "Amazon EC2 m9g.xlarge",
+    "ram_mib": 15640
+  },
+  "limitations": [
+    "orderbook: no bulk-load path over the wire, so the ingest row still measures the protocol's shape as much as the engine's speed - but less of it than it did. Since #141 this harness pipelines 64 updates per round trip, so it sends rows/64 requests where the SQL systems receive the whole CSV in one. 64 is the knee #141 measured (1.59x against one update per round trip, and 512 gave the same 1.59x), chosen from that measurement rather than by trying several here and keeping the best. Measured by this run: the engine applies 9,051,734 levels/s in process by the wall clock and 15,266,276 levels/s of CPU (bench_engine BM_IngestionThroughputBatched, 20 levels per update, 2,089,094 iterations, storage on xfs); the same twenty-level update over the wire, in the ingest column above, is 404,326 levels/s. **These two are not divided here**: they are at different volumes and behind different clients, and a quotient of them would be the same mistake as the factor of 111 this sentence replaced. Its wall clock is 1.7 times its CPU time, so that run spent most of its wall clock waiting, and it wrote 41,781,880 rows - a different volume from this table's dataset, which the benchmark's registration fixes by setting its own minimum time, so the count cannot be varied from the command line.",
+    "orderbook: no general-purpose SQL - a fixed set of commands, not a query language",
+    "orderbook: no joins, and no cross-symbol queries",
+    "orderbook: the schema is imposed, not derived from a model",
+    "orderbook: append-only; nothing deletes rows except TTL retention",
+    "orderbook: aggregates run over the live book, so a VWAP over a historical time range is not the same question the SQL equivalents answer"
+  ],
+  "losses": [
+    "ingest: orderbook 404,326 rows/s against clickhouse 1,165,162 rows/s (65.3% apart, floor 1.8%)",
+    "time_range: orderbook 2.35 ms against clickhouse 1.51 ms (35.6% apart, floor 1.8%)",
+    "time_range: orderbook 2.35 ms against timescaledb 1.84 ms (21.9% apart, floor 1.8%)"
+  ],
+  "losses_search": "Every workload was run against every system that answered, and each pair was classified by resolution.classify() against this machine's measured floor of 0.0179 - not by inspection. Compared against: clickhouse, timescaledb. 0 workload(s) came out faster, 1 inside the floor and therefore reported as indistinguishable rather than as a win. Not measured: kdb+ (kdb+ is not installed: the binary and its licence both come from a vendor registration, which is a human action (see benchmarks/install_competitors.md). The free edition's licence terms also decide whether numbers from it may be published here, which is a licensing decision rather than a technical one).",
+  "measurement_notes": [
+    "every figure in the query column includes a measured 1.074 ms of Python-side parsing for 4000 three-column rows, and since #139 that really is the same work for all three systems - the engine used to answer this query with seven columns and pay 1.300 ms for it, which made the constant ours alone. What separates the systems is what is left after it, stated here rather than subtracted from the table",
+    "each adapter holds one connection open for every timed request. That is not a courtesy: measured on an Intel i3-7100U workstation, ext4 over LUKS on NVMe - the machine this harness was written on, a fresh `clickhouse-client` costs 80 ms and a fresh `psql` 40-60 ms, against queries of a few milliseconds - and the first version of this harness charged both of those to the competitor",
+    "the noise floor is measured inside the run it governs, by timing the reference system's own query twice per round. Across runs the same workload varies more than that floor: on an Intel i3-7100U workstation, ext4 over LUKS on NVMe - the machine this harness was written on, two consecutive runs of this table gave 9.69 ms and 10.97 ms for the same query, which is why a comparison is only made between numbers from one run"
+  ],
+  "resolution": {
+    "control_ratios": [
+      1.0104683852958067,
+      0.9886607211710983,
+      0.9996078720431593,
+      1.0178681211147935,
+      1.0145897941315785,
+      0.9871817314592272,
+      1.0075962185605312,
+      0.9979599267492754,
+      1.017468234897364,
+      1.0121058186431382,
+      0.9918708893626299,
+      0.9704303248717108
+    ],
+    "discarded_outlier": 0.02956967512828923,
+    "floor": 0.017868121114793523,
+    "note": "control floor 0.0179 over 12 interleaved rounds; this machine does not separate differences smaller than that. One extreme of 0.0296 was discarded as an outlier and every control ratio is in the results file",
+    "rounds": 12,
+    "verdict": "usable",
+    "warmup": 2
+  },
+  "run": {
+    "build_type": "Release",
+    "rounds": 12,
+    "seed": 7,
+    "timestamp": "2026-09-19T20:28:04+00:00"
+  },
+  "systems": [
+    {
+      "available": true,
+      "config": "# Resolved configuration. Provenance in brackets: a list of values does not say which\n# of them you chose, and that is the question this flag exists to answer.\n  anti-entropy-interval-seconds    30  (default)\n  coordinator-endpoints              (default)\n  coordinator-lease-ttl            10  (default)\n  data-dir                         /home/ec2-user/engine/build-release/bench-data/ob_bench_h4sawcj7  (command line)\n  election-deference-ms            3000  (default)\n  election-lease-wait-ms           0  (default)\n  failover-enabled                 true  (default)\n  drain-timeout-ms                 10000  (default)\n  flush-interval-ms                1000  (command line)\n  auth-secret-file                 (none)  (default)\n  cluster-secret-file              (none)  (default)\n  fsync-policy                     interval  (default)\n  handover-cooldown-seconds        15  (default)\n  handover-grace-seconds           5  (default)\n  log-level                        INFO  (default)\n  max-sessions                     64  (default)\n  max-subscriber-queue-bytes       8388608  (default)\n  max-subscriptions-per-session    16  (default)\n  metrics-bind                     (every interface)  (default)\n  metrics-port                     0  (default)\n  mm-max-catchup-bytes             536870912  (default)\n  mm-max-peer-send-buffer          67108864  (default)\n  mm-node-id                       0  (default)\n  mm-replication-port              0  (default)\n  multi-master                     false  (default)\n  no-sqpoll                        false  (default)\n  node-id                            (default)\n  port                             45253  (command line)\n  primary-host                       (default)\n  primary-port                     0  (default)\n  read-only                        false  (default)\n  replication-compress             false  (default)\n  replication-port                 0  (default)\n  ring-size                        256  (default)\n  shard-id                           (default)\n  shard-vnodes                     150  (default)\n  snapshot-chunk-size              262144  (default)\n  snapshot-staging-dir               (default)\n  sqpoll-idle-ms                   1000  (default)\n  tls-ca-file                      (none)  (default)\n  tls-cert-file                    (none)  (default)\n  tls-client                       false  (default)\n  tls-key-file                     (none)  (default)\n  tls-multi-master                 false  (default)\n  tls-peer-names                   (any name the CA signed)  (default)\n  tls-replication                  false  (default)\n  ttl-hours                        0  (default)\n  ttl-scan-interval-seconds        300  (default)\n  wal-rotate-bytes                 536870912  (default)\n  workers                          4  (default)\n\n# workers is parsed and not used: client commands run inline on the epoll loop. It is\n# printed because hiding it would leave an operator tuning a knob that does nothing.\n",
+      "name": "orderbook",
+      "tuning_applied": [
+        "--flush-interval-ms 1000 (default 100): fewer, larger segment writes during a bulk load",
+        "one MINSERT per update rather than one INSERT per level: a round trip per book change instead of per price level, which is what the wire protocol is shaped for",
+        "the timed query is read from the socket and parsed into tuples rather than through `OrderbookEngine.query()`: measured on 4000 rows, the client's row objects cost p50 15.5 ms against 5.3 ms for the same bytes parsed as tuples, and no other adapter here pays that - it is a real cost to a Python user and not a property of the engine"
+      ],
+      "version": "0.1.0",
+      "workloads": {
+        "ingest": {
+          "rows_loaded": 200000,
+          "seconds": 0.49464987599640153,
+          "unit": "rows/s",
+          "value": 404326.39267750457
+        },
+        "time_range": {
+          "max": 0.002397421994828619,
+          "min": 0.002320879000762943,
+          "rows": 4000,
+          "samples": [
+            0.002320879000762943,
+            0.002329819995793514,
+            0.0023303510024561547,
+            0.0023382040017168038,
+            0.0023417260017595254,
+            0.0023529350000899285,
+            0.002353299001697451,
+            0.002361484002904035,
+            0.002370684000197798,
+            0.0023726559957140125,
+            0.002373575000092387,
+            0.002397421994828619
+          ],
+          "unit": "s",
+          "value": 0.002353299001697451
+        },
+        "vwap": {
+          "max": 1.6250996850430965e-05,
+          "min": 1.268699998036027e-05,
+          "rows": 1,
+          "samples": [
+            1.268699998036027e-05,
+            1.2971002433914691e-05,
+            1.298700226470828e-05,
+            1.3044998922850937e-05,
+            1.3067001418676227e-05,
+            1.3263997971080244e-05,
+            1.3648001186084002e-05,
+            1.3942997611593455e-05,
+            1.4482000551652163e-05,
+            1.4854995242785662e-05,
+            1.55200032168068e-05,
+            1.6250996850430965e-05
+          ],
+          "unit": "s",
+          "value": 1.3648001186084002e-05
+        }
+      }
+    },
+    {
+      "available": true,
+      "config": "endpoint: http://127.0.0.1:8123 (kept-alive, one connection)\nCREATE TABLE ob_bench.book\\n(\\n    `ts_ns` Int64 CODEC(DoubleDelta, LZ4),\\n    `symbol` LowCardinality(String),\\n    `exchange` LowCardinality(String),\\n    `side` LowCardinality(String),\\n    `level` UInt16,\\n    `price_ticks` Int64,\\n    `size_lots` Int64\\n)\\nENGINE = MergeTree\\nORDER BY (symbol, ts_ns, side, level)\\nSETTINGS index_granularity = 8192\n\nchanged settings:\n",
+      "name": "clickhouse",
+      "tuning_applied": [
+        "ORDER BY (symbol, ts_ns, side, level): the time-range query filters on symbol and ts_ns, so the primary key makes it a range scan instead of a full scan",
+        "CODEC(DoubleDelta, LZ4) on ts_ns: the codec ClickHouse's own documentation names for a monotonically increasing timestamp, which is what this dataset's time column is",
+        "max_insert_block_size = 1,000,000: the CSV arrives as one block",
+        "LowCardinality(String) for symbol, exchange and side: three columns with at most fifty distinct values between them",
+        "one kept-alive HTTP connection for every timed request: measured, a fresh `clickhouse-client` process costs 80 ms, which is 40 times the query it carries"
+      ],
+      "version": "26.8.2.7",
+      "workloads": {
+        "ingest": {
+          "rows_loaded": 200000,
+          "seconds": 0.1716498829991906,
+          "unit": "rows/s",
+          "value": 1165162.4603842176
+        },
+        "time_range": {
+          "max": 0.0016326120021403767,
+          "min": 0.0014015580018167384,
+          "rows": 4000,
+          "samples": [
+            0.0014015580018167384,
+            0.0014056139989406802,
+            0.0014174989992170595,
+            0.0014555559973814525,
+            0.0014695849968120456,
+            0.0014804429956711829,
+            0.0015144239951041527,
+            0.001532241003587842,
+            0.0015817769963177852,
+            0.0016142139938892797,
+            0.0016318380003212951,
+            0.0016326120021403767
+          ],
+          "unit": "s",
+          "value": 0.0015144239951041527
+        },
+        "vwap": {
+          "note": "NOT COMPARABLE: clickhouse disagrees with orderbook at row 0, column 0: orderbook has 100241.527539, clickhouse has '100235.35676148761'"
+        }
+      }
+    },
+    {
+      "available": true,
+      "config": "endpoint: 127.0.0.1:5433/ob_bench (one psql session)\nDROP TABLE IF EXISTS book;\nCREATE TABLE book (\n    ts_ns       BIGINT   NOT NULL,\n    symbol      TEXT     NOT NULL,\n    exchange    TEXT     NOT NULL,\n    side        TEXT     NOT NULL,\n    level       SMALLINT NOT NULL,\n    price_ticks BIGINT   NOT NULL,\n    size_lots   BIGINT   NOT NULL\n);\nSELECT create_hypertable('book', 'ts_ns', chunk_time_interval => 1000000000);\nCREATE INDEX book_symbol_ts ON book (symbol, ts_ns DESC);\nchunks after load: 10\nnon-default settings:\nDateStyle = ISO, MDY\nTimeZone = UTC\napplication_name = psql\nautovacuum_max_workers = 10\nautovacuum_naptime = 10\ncheckpoint_completion_target = 0.9\nconfig_file = /var/lib/pgsql/data/postgresql.conf\ndata_directory = /var/lib/pgsql/data\ndefault_statistics_target = 100\ndefault_text_search_config = pg_catalog.english\ndefault_toast_compression = lz4\ndynamic_shared_memory_type = posix\neffective_cache_size = 1501440\neffective_io_concurrency = 256\nhba_file = /var/lib/pgsql/data/pg_hba.conf\nident_file = /var/lib/pgsql/data/pg_ident.conf\njit = off\nlc_messages = C.UTF-8\nlc_monetary = C.UTF-8\nlc_numeric = C.UTF-8\nlc_time = C.UTF-8\nmaintenance_work_mem = 2001920\nmax_connections = 100\nmax_locks_per_transaction = 256\nmax_parallel_workers = 4\nmax_parallel_workers_per_gather = 2\nmax_wal_size = 1024\nmax_worker_processes = 23\nmin_wal_size = 512\nport = 5433\nrandom_page_cost = 1.1\nshared_buffers = 500480\nshared_preload_libraries = timescaledb\nsynchronous_commit = on\ntimescaledb.max_background_workers = 16\ntransaction_deferrable = off\ntransaction_isolation = read committed\ntransaction_read_only = off\nwal_buffers = 2048\nwork_mem = 31280",
+      "name": "timescaledb",
+      "tuning_applied": [
+        "create_hypertable(chunk_time_interval => 1,000,000,000 ns): one second of market time per chunk, which is what a ten-second dataset can support - the module docstring says why that is the dataset's limit and not a setting chosen to hurt",
+        "index on (symbol, ts_ns DESC): the time-range query filters on both columns",
+        "synchronous_commit = off for the bulk load only: the documented setting for loading, and restored afterwards so the query workloads run under the server's own default",
+        "timescaledb-tune applied to the cluster: shared_buffers, work_mem, max_worker_processes and the rest set by Timescale's own tool for this machine's cores and RAM",
+        "one long-lived psql session for every timed statement: measured, a fresh psql costs 40-60 ms, which is ten times the query it carries"
+      ],
+      "version": "TimescaleDB 2.30.0 on PostgreSQL 16.15",
+      "workloads": {
+        "ingest": {
+          "rows_loaded": 200000,
+          "seconds": 0.48789495499659097,
+          "unit": "rows/s",
+          "value": 409924.3043031618
+        },
+        "time_range": {
+          "max": 0.0019088540066150017,
+          "min": 0.0017967070016311482,
+          "rows": 4000,
+          "samples": [
+            0.0017967070016311482,
+            0.0017967469975701533,
+            0.0018037449990515597,
+            0.0018068770004902035,
+            0.0018254550013807602,
+            0.00182641400169814,
+            0.0018367720040259883,
+            0.00183945400203811,
+            0.0018423939982312731,
+            0.001862191995314788,
+            0.0018875140012823977,
+            0.0019088540066150017
+          ],
+          "unit": "s",
+          "value": 0.0018367720040259883
+        },
+        "vwap": {
+          "note": "NOT COMPARABLE: timescaledb disagrees with orderbook at row 0, column 0: orderbook has 100241.527539, timescaledb has '100235.356761487614'"
+        }
+      }
+    },
+    {
+      "available": false,
+      "name": "kdb+",
+      "reason": "kdb+ is not installed: the binary and its licence both come from a vendor registration, which is a human action (see benchmarks/install_competitors.md). The free edition's licence terms also decide whether numbers from it may be published here, which is a licensing decision rather than a technical one"
+    }
+  ]
+}

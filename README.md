@@ -14,28 +14,39 @@ Built by [Smart Data Engines](https://smartdataengines.com), who build custom da
 ## How it compares
 
 Measured against natively installed competitors on one machine, by
-`python -m benchmarks.comparative.run --rows 200000 --rounds 12`. **Control floor 2.26%** over
+`python -m benchmarks.comparative.run --rows 200000 --rounds 12`. **Control floor 1.79%** over
 twelve interleaved rounds: this machine does not separate differences smaller than that, so anything
 below it is reported as indistinguishable rather than as a win. That floor was **21.2%** on the
-machine the previous table was measured on, which is most of why this one exists.
+machine an earlier table was measured on, which is most of why this one exists.
 
 Amazon EC2 m9g.xlarge, aarch64 implementer 0x41 part 0xd84 r0p1, 4 cores, 15.3 GiB, Amazon Elastic Block Store on nvme0n1p1 → nvme0n1, xfs, kernel 6.18.48, gcc14-g++ 14.2.1, Release. Clock: not published by this platform.
 200,000 rows, 50 symbols, 20 levels, seed 7.
 
 | System | Version | Ingest (rows/s) | Time-range query (4000 rows) | Why it is not a like-for-like number |
 |---|---|---|---|---|
-| **orderbook-dbengine** | 0.1.0 | **350,509** | **3.02 ms** (2.99–3.08) | one `MINSERT` round trip per book update: there is no bulk-load path over the wire |
-| ClickHouse | 26.8.2.7 | 1,151,732 | 1.49 ms (1.38–1.59) | the whole CSV in one request |
-| TimescaleDB | 2.30.0 / PG 16.15 | 416,715 | 1.96 ms (1.94–2.03) | `\copy` of the whole CSV; `timescaledb-tune` applied |
+| **orderbook-dbengine** | 0.1.0 | **404,326** | **2.35 ms** (2.32–2.40) | 64 updates per round trip: there is still no bulk-load path over the wire, so this sends rows/64 requests |
+| ClickHouse | 26.8.2.7 | 1,165,162 | 1.51 ms (1.40–1.63) | the whole CSV in one request |
+| TimescaleDB | 2.30.0 / PG 16.15 | 409,924 | 1.84 ms (1.80–1.91) | `\copy` of the whole CSV; `timescaledb-tune` applied |
 | kdb+ | — | NOT MEASURED | NOT MEASURED | needs a vendor registration, and whether its free edition's numbers may be published here is a licence question rather than a technical one |
 
-**All four comparable pairs are losses**, classified by the harness against its own measured floor rather than by
-inspection:
+**Three of the four comparable pairs are losses and the fourth is a tie**, classified by the
+harness against its own measured floor rather than by inspection:
 
-- **ingest** against ClickHouse — **69.6% apart** against a 2.26% floor. A loss.
-- **ingest** against TimescaleDB — **15.9% apart** against a 2.26% floor. A loss.
-- **the time-range query** against ClickHouse — **50.7% apart** against a 2.26% floor. A loss.
-- **the time-range query** against TimescaleDB — **35.3% apart** against a 2.26% floor. A loss.
+- **ingest** against ClickHouse — **65.3% apart** against a 1.79% floor. A loss.
+- **ingest** against TimescaleDB — **1.4% apart, inside the floor**. Indistinguishable, which is
+  the harness's word for it and not a win.
+- **the time-range query** against ClickHouse — **35.6% apart** against a 1.79% floor. A loss.
+- **the time-range query** against TimescaleDB — **21.9% apart** against a 1.79% floor. A loss.
+
+**What changed since the previous table, and what it is safe to say about it.** The engine went
+from 350,509 rows/s to 404,326 and from 3.02 ms to 2.35 ms, because two limitations of the
+*harness* were removed: the row query now asks for the three columns it uses rather than for all
+seven (#139 — TimescaleDB was already asking for three, so this removed an asymmetry that was
+costing us), and ingest pipelines 64 updates per round trip rather than one (#141). Both
+competitors moved by **1.2% and 1.6% on ingest**, which is the control that says the change is the
+engine's and not the machine's. Read that comparison with the caveat the results file states
+itself: **the floor above governs comparisons inside one run**, and two runs of this table on one
+machine vary by more than it.
 
 One row of this dataset is one book level, so rows and levels are the same count in this table. They
 are **not** the same count in the paragraph below about the wire, and that difference used to be
@@ -62,9 +73,23 @@ neither: server CPU per level is flat at 525–530 ns across a tenfold change in
 level climbs and then stops. The full series, the caveats and what is still unexplained are in
 [`benchmarks/on-a-bigger-machine.md`](benchmarks/on-a-bigger-machine.md).
 
-What that does not excuse is the ingest column itself, and the gap **widens with volume**: at five
-times the rows ClickHouse loads 2.76× faster than it did and this engine loads 1.01× — flat, because
-a round trip per update does not amortise — so 69.6% apart becomes 89.2% apart.
+What that does not excuse is the ingest column itself, and against ClickHouse the gap **still
+widens with volume**: at five times the rows (1,000,000, six rounds, floor 0.66%,
+[`…-55fc0e74-2.md`](benchmarks/comparative/results/2026-09-19-55fc0e74-2.md)) ClickHouse loads
+**2.75× faster than it did** and this engine **1.20×**, so 65.3% apart becomes **84.9% apart**.
+
+The 1.20× is the part that changed, and it is worth being precise about why. The previous table
+measured **1.01× — flat**, and explained it: a round trip per update does not amortise. Since #141
+this harness sends 64 updates per round trip, so some of it does, and the sentence that explained
+the flatness no longer describes the harness. What the engine gains from volume is still far less
+than ClickHouse gains.
+
+**At five times the rows this engine is faster than TimescaleDB on ingest** — 483,400 rows/s
+against 409,505, **15.3% apart against a 0.66% floor** — where at 200,000 rows the two are
+indistinguishable. TimescaleDB loads **1.00×** what it did, so the crossing is this engine gaining
+from volume rather than TimescaleDB losing. That is one workload out of four and it is stated
+next to the three that are still losses; it is also a cross-run comparison, which the in-run floor
+does not govern.
 
 ### What it costs, which is a different question from who finishes first
 
@@ -75,16 +100,26 @@ name contains a claim about cost. Measured over 2,000,000 levels by
 
 | system | wall | levels/s | server CPU | client CPU | **levels per server CPU-second** | server cores |
 |---|---|---|---|---|---|---|
-| orderbook | 5.574 s | 358,829 | 1.130 s | 4.537 s | **1,769,912** | **0.20** |
-| clickhouse | 0.469 s | 4,265,060 | 1.120 s | 0.055 s | **1,785,714** | **2.39** |
-| timescaledb | 5.241 s | 381,626 | 4.250 s | 0.083 s | 470,588 | 0.81 |
+| orderbook | 4.055 s | 493,254 | 0.880 s | 4.403 s | **2,272,727** | **0.22** |
+| clickhouse | 0.466 s | 4,295,642 | 1.140 s | 0.046 s | **1,754,386** | **2.45** |
+| timescaledb | 4.907 s | 407,580 | 4.130 s | 0.073 s | 484,262 | 0.84 |
 
-Per server CPU-second the engine and ClickHouse are **1,769,912 against 1,785,714** — inside every
-floor this machine has measured, and one 10 ms clock tick apart, so indistinguishable twice over.
-The two figures are given rather than their quotient, because the quotient is smaller than the
-resolution of the clock that produced them. ClickHouse wins the
-clock by spending **2.39 cores** where the engine spends **0.20**; TimescaleDB costs 3.8× the CPU
-per level of either.
+Per server CPU-second the engine is **2,272,727 against ClickHouse's 1,754,386**, a ratio of
+**1.30**. This is a different script from the comparative run above and carries no floor of its
+own, so it is given as the two figures and their ratio rather than borrowed into the vocabulary
+that run owns — the claim checker refuses the phrase for exactly that reason, and refused this
+sentence once. It did not lead before: the previous run put the two at 1,769,912 against 1,785,714,
+one 10 ms clock tick apart and indistinguishable twice over.
+
+**What moved was the server's CPU, and it moved because of a client change.** The same 2,000,000
+levels cost the server **0.880 s** where they cost 1.130 s, because 64 updates per round trip
+(#141) is 64 times fewer wire reads, parses and responses for the same rows. Both competitors are
+within 2% of their previous figures, which is the control. Do not read the engine's wall-clock
+improvement as storage getting faster — `apply_delta` was not touched by any of this.
+
+ClickHouse still wins the clock, by spending **2.45 cores** where the engine spends **0.22**:
+eleven times the parallelism for eight times the throughput. TimescaleDB costs **4.7×** the CPU
+per level of the engine.
 
 Three things belong beside that rather than after it. ClickHouse is doing **more** work per level —
 parsing text and building compressed parts where the engine receives binary frames and appends — so
@@ -101,7 +136,7 @@ rather than subtracted — an earlier version of this page carried a parsing con
 smallest query median in the same table, because the constant had been measured on a different
 machine and written into the report as prose.
 
-Full run, with every tuning declaration and every refusal: [`benchmarks/comparative/results/2026-09-19-55fc0e74-5.md`](benchmarks/comparative/results/2026-09-19-55fc0e74-5.md). The write-up of
+Full run, with every tuning declaration and every refusal: [`benchmarks/comparative/results/2026-09-19-55fc0e74.md`](benchmarks/comparative/results/2026-09-19-55fc0e74.md). The write-up of
 what this machine found, including the nine defects it exposed and the prediction registered before
 it booted: [`benchmarks/on-a-bigger-machine.md`](benchmarks/on-a-bigger-machine.md).
 To reproduce it, install the competitors natively first —

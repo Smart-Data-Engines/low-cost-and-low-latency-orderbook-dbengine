@@ -189,39 +189,78 @@ class OrderbookSystem:
 
     # ── Workloads ────────────────────────────────────────────────────────────
 
-    def load(self, csv_path: Path) -> LoadResult:
-        """One `MINSERT` per update: the rows sharing a timestamp go in a single round trip.
+    #: Updates per round trip. #141 measured the knee at 64 (1.59x against a loop of `insert()`,
+    #: and 512 gave the same 1.59x), so this is the number that measurement already argued for
+    #: rather than the best of several tried here — picking it by trying is picking the flattering
+    #: one. It is stated in the limitations line beside the ingest figure, because what each system
+    #: is allowed to send per request is part of what the row means.
+    BATCH_UPDATES = 64
 
-        Grouped on `(ts_ns, symbol, side)` rather than on `(symbol, side)`, because the client takes
-        one `timestamp_ns` per call and batching across timestamps would store the wrong ones - which
-        the time-range query then selects on. Found by running this, not by reading it.
+    def load(self, csv_path: Path) -> LoadResult:
+        """`insert_batch()` of BATCH_UPDATES updates per round trip, since #141.
+
+        Each update is still the rows sharing one `(ts_ns, symbol, side)`, grouped on the timestamp
+        as well as the symbol and side because every row in an update carries the call's single
+        `timestamp_ns` — batching across timestamps would store the wrong ones, which the
+        time-range query then selects on. Found by running this, not by reading it.
+
+        What changed with #141 is only how many of those updates cross the wire per round trip. It
+        is still not what the SQL systems get: they receive the whole CSV in **one** request, and
+        this sends `rows / BATCH_UPDATES` of them.
         """
         import csv as csv_module
 
         self._ensure_running()
         assert self._engine is not None
 
+        from orderbook_engine import BookUpdate
+
         started = time.perf_counter()
         rows = 0
+        batch: list = []
         current: tuple[int, str, str] | None = None
         prices: list[int] = []
         sizes: list[int] = []
+
+        def queue(key: tuple[int, str, str], px: list[int], sz: list[int]) -> None:
+            ts_ns, symbol, side = key
+            batch.append(BookUpdate(symbol=symbol, exchange="EX", side=side,
+                                    prices=px, qtys=sz, timestamp_ns=ts_ns))
 
         with csv_path.open(encoding="utf-8") as handle:
             for row in csv_module.DictReader(handle):
                 key = (int(row["ts_ns"]), row["symbol"], row["side"])
                 if current is not None and key != current:
-                    self._send_update(current, prices, sizes)
+                    queue(current, prices, sizes)
                     prices, sizes = [], []
+                    if len(batch) >= self.BATCH_UPDATES:
+                        self._send_batch(batch)
+                        batch = []
                 current = key
                 prices.append(int(row["price_ticks"]))
                 sizes.append(int(row["size_lots"]))
                 rows += 1
         if current is not None and prices:
-            self._send_update(current, prices, sizes)
+            queue(current, prices, sizes)
+        if batch:
+            self._send_batch(batch)
 
         self._engine.flush()
         return LoadResult(rows_loaded=rows, seconds=time.perf_counter() - started)
+
+    def _send_batch(self, batch: list) -> None:
+        """One round trip for many updates, with every refusal surfaced rather than counted.
+
+        `insert_batch()` answers **per update** — a batch is N independent writes in one journey,
+        not a transaction — so a partly-refused batch is a silently short load if only the call's
+        return is checked. A load that did not store what it was given must not be timed.
+        """
+        assert self._engine is not None
+        refused = [r for r in self._engine.insert_batch(batch) if not r.ok]
+        if refused:
+            raise RuntimeError(
+                f"the engine refused {len(refused)} of {len(batch)} updates in a batch; "
+                f"first was update {refused[0].index}: {refused[0].message}")
 
     def _send_update(self, key: tuple[int, str, str], prices: list[int],
                      sizes: list[int]) -> None:
@@ -254,8 +293,13 @@ class OrderbookSystem:
         self._ensure_running()
         assert self._engine is not None
         started = time.perf_counter()
+        # Three columns since #139, which is what makes the question the **same** as the others:
+        # TimescaleDB already asks for `ts_ns, price_ticks, size_lots` and we were the only system
+        # receiving seven. Not an optimisation of ours — the removal of an asymmetry that was
+        # costing us.
         rows = self._raw_rows(
-            f"SELECT * FROM 'SYM0000'.'EX' WHERE timestamp BETWEEN {start_ns} AND {end_ns}")
+            f"SELECT timestamp, price, quantity FROM 'SYM0000'.'EX' "
+            f"WHERE timestamp BETWEEN {start_ns} AND {end_ns}")
         elapsed = time.perf_counter() - started
         # The first version of this mapped `r.timestamp` and `r.size`, which do not exist -
         # `OrderbookRow` names them `timestamp_ns` and `quantity`. It raised `AttributeError` from
