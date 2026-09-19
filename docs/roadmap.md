@@ -2212,12 +2212,12 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
-### 139. A select list is parsed, validated, and then ignored, so every row query is `SELECT *`
+### 139. A select list was parsed, validated, and then ignored, so every row query was `SELECT *` ✅
 
 Measured on a running server rather than read off the parser, because the parser's own behaviour
-here is the thing in question. One row inserted, then four queries:
+was the thing in question. One row inserted, then four queries:
 
-| asked | answered |
+| asked | answered, before |
 |---|---|
 | `SELECT * FROM 'AAA'.'EX'` | seven columns |
 | `SELECT price FROM 'AAA'.'EX'` | **seven columns** |
@@ -2225,48 +2225,151 @@ here is the thing in question. One row inserted, then four queries:
 | `SELECT quantity, price FROM 'AAA'.'EX'` | **seven columns, in the other order** |
 
 Every one answered `OK`. This is #107's class in the query language rather than in the command
-parser: there the extra token was unread, here the select list is read, its names are checked
-against the seven the lexer knows, aggregate calls in it are validated by name and argument — and
-then the row path never looks at `ast.select_exprs` again. A client that asks for one column gets
-seven and has no way to tell that it did not get what it asked for, because the header it is handed
-names seven and is correct about the bytes that follow it.
+parser: there the extra token was unread, here the select list was read, its names were checked
+against the seven the lexer knows, aggregate calls in it were validated by name and argument — and
+then the row path never looked at `ast.select_exprs` again. A client that asked for one column got
+seven and had no way to tell, because the header it was handed named seven and was correct about
+the bytes that followed it.
 
-It costs three things at once, and the comparative harness pays all three. It sends us
-`SELECT * FROM 'SYM0000'.'EX' WHERE timestamp BETWEEN …` and sends ClickHouse and TimescaleDB
-`SELECT ts_ns, price_ticks, size_lots FROM …`, then **throws four of our seven columns away in
-Python** (`_raw_rows` reads the three it wants out of the header by name). So against the same
-question the competitors answer, the engine:
+**Two lists, and keeping them apart is most of the change.** What has to be *answered* is ordered
+and may repeat, because it answers the question literally: `SELECT price, price` is two columns.
+What has to be *read* is a set, and wider — `SELECT price WHERE timestamp BETWEEN …` has to read
+`ts.col` and must not answer it. Holding those in one type is the defect.
+`include/orderbook/query_columns.hpp` holds both.
 
-- reads and decodes seven `.col` files per segment where three would do — `ColumnarStore::scan` is
-  not given the select list at all, so this is not a narrowing it declines, it is one it cannot be
-  asked for;
-- puts **43 bytes on the wire per row** where three columns is about 25;
-- formats seven fields per row and makes the client split seven and discard four.
+**One column had two names and they already disagreed.** The lexer took `timestamp`, the response
+header said `timestamp_ns`, so a name copied out of a header was a syntax error. Both spellings
+parse now, the header is generated from one table, and `SELECT *` is byte-identical by
+construction — a test compares the generated header against the literal bytes clients already
+parse, written out rather than referenced, because a generator compared against itself passes for
+every spelling including a wrong one.
 
-`benchmarks/comparative/run.py` already lists this as a limitation of ours in the published table.
-What the limitation does not say is that it makes the row a comparison of two different questions,
-in the direction that flatters neither side honestly — we do more work, and a reader cannot see it
-in the number.
+`ColumnarStore::scan` takes the set and opens only those files. Seven near-identical read blocks
+became one helper — part of the change rather than tidying alongside it, because projection adds
+a condition to each and seven conditions in seven copies is seven places to get it wrong
+differently. The sequence number is the expensive column, Simple8b **and** zigzag-delta, so a
+query without it skips two of a segment's four decode passes. A missing column file now refuses
+the segment only for a query that needs that column; before, any one of the seven missing dropped
+the segment from **every** query, including ones that would never have looked at it.
 
-Three candidate answers, and they are not the same size:
+**A latent stack overflow came with it and is fixed here.** The row buffer was a 105-byte stack
+array sized for seven distinct columns, which is the widest row **that list** can produce. A query
+may name one column many times, and twenty repeats of `sequence_number` is 420 bytes - so the
+first version of this change ran off the end of it for any list whose widths came to more than
+105, which `SELECT *` cannot and a repeat easily can. The buffer is sized from the query's own
+list, and the test uses the widest column with a value at its type's limit.
 
-1. **Project the response only.** The scan still reads seven files; the header and rows carry what
-   was asked for. Buys the wire and the client, not the read. Smallest change, and it makes the
-   header variable, which every client that indexes it by position would have to survive — ours
-   reads it by name already, and #65 is the precedent for a column arriving.
-2. **Project the read as well.** `ColumnarStore::scan` takes the wanted set and opens only those
-   files. This is the one that makes the store columnar in the sense the word implies; today it
-   pays the layout's cost and collects none of its benefit. It changes a `std::function` signature
-   that the live-buffer path shares, so both readers have to agree.
-3. **Refuse a select list that is not `*`.** Cheapest, honest, and worse than both: it turns a
-   silently wrong answer into a loud refusal of something the engine will want anyway.
+**Both clients read rows by position**, so a narrowed response would have come back as an empty
+list from the Python one — it skips a row with fewer than six fields — and `bad timestamp_ns` from
+the C++ one. A silent wrong answer in our own client is the same defect this removes from the
+server. Both now refuse a header they cannot read and name the columns they were handed; reading
+by name is the follow-up. A prefix of the canonical list is still accepted, because #65's seventh
+column means this client still talks to a server that sends six.
 
-Whichever is taken, the harness adapter should then ask for the three columns it keeps, so the four
-systems are asked the same question — and the table regenerated in one run, because one run
-produces every number in it or none.
+### What it costs and what it buys
 
-- Effort: M | Impact: the answer stops being a different question from the one asked; the published
-  query row stops measuring seven columns against three
+One m9g.xlarge (4 ARM64 cores, 16 GiB), Release, one probe binary against both servers - and the
+probe parses nothing, which is also the only way to measure a server whose answer our C++ client
+now refuses. The box is shared with another session's benchmark, and its load is not a constant:
+**2.3 falling to 0.1** across the cycle run, **2.6 rising to 4.1** across the wall run, and 7.5
+falling to 1.7 across a repetition an hour earlier, with its ClickHouse holding about a third of a
+core whenever it was working. **Cycles counted against the server's own pid are therefore the
+instrument**, because that is the number a neighbour cannot move; the wall clock is reported beside
+them and each table says what the box was doing.
+
+| 4,000 rounds of a 4,000-row query | before | after | ratio |
+|---|---|---|---|
+| `SELECT timestamp, price, quantity` | 3,045,211,432 cycles, **43.0 bytes/row** | 2,436,299,208 cycles, **33.0 bytes/row** | **0.800** |
+| `SELECT *` - the control | 3,101,138,099 cycles | 3,030,782,086 cycles | 0.977 |
+
+The same SQL to both servers, and they answer differently: before, 4,000 rows in **171,911
+bytes**, because the list was ignored; after, 4,000 rows in **132,032 bytes**.
+
+Two things about how to read that table. Each pair is adjacent in time, which matters because the
+neighbour's load fell from 2.3 to 0.14 across the twenty minutes the four windows took - so the
+control pair was measured busy and the claim pair quiet, and neither comparison crosses that. And
+the same measurement on the previous head, an hour earlier under a load average of 7.5 falling to
+1.7, gave **0.816** against this run's 0.800: two runs whose conditions differed that much
+agreeing to within 2% is the argument for the instrument, and it is also the honest width of a
+single cycle figure here.
+
+Wall clock, eight rounds, **with the round order alternating** - odd rounds before-then-after,
+even rounds after-then-before, because interleaving defends a ratio against slow drift and not
+against a neighbour whose load has a period near the round:
+
+| 8 rounds | before | after | ratio median | range | rounds faster |
+|---|---|---|---|---|---|
+| three columns | 0.305 ms | **0.242 ms** | **0.794** | 0.775-0.810 | 8 of 8 |
+| `SELECT *` - the control | 0.305 ms | 0.303 ms | 0.993 | 0.981-1.000 | 7 of 8 |
+
+The order made no difference: 0.795 before-first against 0.794 after-first on the three-column
+question, which is what that experiment was for.
+
+### The control failed twice before it held, and the two failures had different causes
+
+The spec written before any of this said to write the general loop, measure `SELECT *` against
+master, and only add a specialised path if it slowed - so the gate was there, and it fired.
+
+*First attempt: a general loop for everything.* `SELECT *` came out 1.019-1.102 slower, 8 of 8
+rounds in that direction. Small, but the wrong direction on the shape the published comparative
+table measures. Profiling both sides over 16,000 of that query said where, rather than leaving it
+to be argued: `format_query_response` went from **2.107 G cycles to 2.621 G, up 24%**, with every
+other symbol flat. Seven straight-line calls inline; a loop that picks the field by a value
+cannot, however cheap the switch is.
+
+*Second attempt: unroll the row writer, keep one loop with a branch in it.* Barely moved -
+0.991-1.085, still ~5% slow. `objdump` said the function had gone 919 to 1672 instructions with
+both paths inlined, and the cause turned out not to be the row writer at all: the shared loop
+wrote through a `char*` that might point at a stack array or at a heap one, so the compiler could
+no longer treat the canonical buffer as a local nothing else aliases. **The row writer was the
+suspect; the buffer was the cause**, and only reading the disassembly separated them.
+
+*Third: two loops, and the narrow one out of line.* The profile named the real cost of the second
+attempt - `std::__to_chars_i` had appeared as its own symbol at **6.71% of the server**, a symbol
+absent from the build before projection. The function had outgrown GCC's inlining budget and
+taken `to_chars` out of line with it. `[[gnu::noinline]]` on the narrow path brings it back:
+**1027 instructions against master's 919, and zero out-of-line references to `to_chars`, the same
+as master.** The canonical path gets back its own fixed local array and is the shape it was before
+projection - a duplicate, added because three measurements said so.
+
+Two paths need something holding them together, and it cannot be a call that picks between them,
+because the choice is made from the column list. So the test formats each column **alone**, which
+is necessarily the loop, and compares it with that field cut out of the unrolled output: a fast
+path that wrote a field differently, or in the wrong order, fails on that column and names it.
+
+### One guarantee said three times, and the copy that held was the one nothing could mutate
+
+The mutation table found it rather than review. `ColumnarStore::scan()` widens the caller's set
+with the timestamp because it filters on it and will not depend on the caller having remembered;
+`columns_to_read()` puts it there too, because the engine knows it filters on time; and two lines
+below the widening, `need(true, "ts.col", timestamps)` opened the file regardless of the set. So
+the mutation deleting the widening **survived**, with
+`ColumnarStoreProjection.TheTimestampIsReadEvenWhenTheSetLeavesItOut` - the test written for
+exactly that case - still green. The file is opened through the set now, like every other one,
+which is also what requirement 2.1 says: the scan opens **exclusively** the files the set names.
+
+### What this does not do
+
+`SUBSCRIBE` still pushes seven columns, and now says so once per subscription. Both obvious
+alternatives are worse. Narrowing the push cannot be made safe, because **a `PUSH` line has no
+header** — a `SELECT` response describes itself, so a client that cannot read a narrowed one can
+say so, while a subscriber reading field 2 as the price has nothing to check against and would
+simply read the wrong field; announcing the columns in `OK SUB <id>` is the fix and it is a
+protocol change. And refusing breaks a form that works and is in use: `SUBSCRIBE price FROM …
+WHERE price BETWEEN …` names the column it filters on. **Three tests failed** when the refusal
+was tried, which is how it was found; counting afterwards, the form appears five times across four
+test files.
+
+The comparative harness still asks us `SELECT *` while asking ClickHouse and TimescaleDB for three
+columns, then throws four of our seven away in Python. The adapter is ready for it - `_raw_rows()`
+already finds its three columns **by name in the header**, which it does because #65 added a
+column and the alternative was reading the wrong field - so that is one line of SQL. What makes it
+the next commit rather than this one is the table: one run produces every number in it or none,
+and `scripts/check_comparative_claim.py` has to agree with what that run wrote.
+
+- Effort: M | Impact: the answer stops being a different question from the one asked; **a fifth
+  off** the three-column query - 20% of the server's cycles, 21% of the wall clock - and **23%
+  fewer bytes** on the wire
 
 ### 138. Formatting the answer cost eight times the read it came from ✅
 
@@ -2338,8 +2441,8 @@ What this does **not** do: the comparative table is not regenerated here. One ru
 number in it or none of them, and the table is pinned to the run it cites by
 `scripts/check_comparative_claim.py`. The query row will move when that run happens, and it will
 move for this reason. Nor does it touch the larger finding underneath: the harness asks us
-`SELECT *` and asks ClickHouse and TimescaleDB for three columns, because the engine cannot yet
-express the narrower question — that is #139, and it is the bigger number.
+`SELECT *` and asks ClickHouse and TimescaleDB for three columns, because at this commit the
+engine could not express the narrower question — that is #139, and it is the bigger number.
 
 - Effort: S | Impact: 32% off the published query path, measured on the path rather than on a
   micro-benchmark
@@ -7498,14 +7601,14 @@ measures the harness.
 **Two P0s are open: #136 and #137**, both found by the same afternoon on a machine this tree
 had never run on, and both filed rather than fixed because each has candidate answers that
 differ in what they cost. #136 changes an on-disk layout the snapshot manifest and retention
-both address; #137 changes what backpressure means. **#139** is open too and is not a P0: the row
-path ignores the select list it parsed, so a client that asks for one column is handed seven and
-answered `OK`. Every P0 raised before it —
+both address; #137 changes what backpressure means. **#139 was the third item on this line and is
+closed**: the row path answers the columns a query names, `SELECT *` byte for byte unchanged and a
+fifth off a three-column question. Every P0 raised before it —
 #60, #61, #62, #64, #68, #73, #74, #80, #88 and #97 — is closed, and several were found by running a real cluster rather than by reading the code
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #136, #137 and #139.** Every other item above #58 is marked closed, and
+**Open: #136 and #137.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
