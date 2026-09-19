@@ -2979,7 +2979,14 @@ Read the sanitizer claims with #83 in mind: until it landed, `OB_ENABLE_ASAN`, `
 libraries**, because `add_compile_options()` only affects targets declared after it and those blocks
 sat below all of them.
 
-**Two P0s are open, and they are the first thing to know: #136 and #137.** Writing the same event-time span
+**Three P0s are open, and they are the first thing to know: #136, #137 and #142** — that set is
+held mechanically by the `Open:` line in `docs/roadmap.md`, so read it there rather than trusting
+this sentence to have been updated. **#142** is the newest: a replica bootstrapped by snapshot
+after retention removes its position keeps rows the primary does not have — measured with both
+nodes queried in one run, primary 100 and replica 138, for the symbol the replica already held,
+while the symbol it never had is exact. Nine runs of nine on the development machine across three
+trees, green on the runner every time, which is what kept it hidden. The other two:
+writing the same event-time span
 twice for one symbol — which is what re-running a backfill is, and #105 put event time on the wire
 so that backfills are expressible — destroys that symbol's segment. Both writes are acknowledged;
 the first write's values are silently replaced, or, when the second write has fewer rows, the
