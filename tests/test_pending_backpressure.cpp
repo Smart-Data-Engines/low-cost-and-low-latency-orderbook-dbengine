@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <future>
 #include <optional>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -114,12 +115,21 @@ TEST(PendingBackpressure, AWriterAtTheCeilingWaitsForAFlushRatherThanForTheInter
     // predicate is permanently true and the loop flushes as fast as it can — a core burned and
     // nothing said, which is #298's shape. Ticks are the observable: at a one-hour interval the
     // only ones that should run are the ones a writer asked for.
+    // A window for a spin to show in. A request the loop never clears leaves its predicate
+    // permanently true, so the loop stops waiting altogether — and it accumulates nothing at all
+    // in the microsecond between the last write and this line, which is how the first version of
+    // this assertion measured 1 tick against a mutation that removes the clear. Two hundred
+    // milliseconds against a one-hour interval is three orders of magnitude of room: a healthy
+    // loop cannot tick in it, and a spinning one cannot help but.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
     const auto ticks = counter_value(engine.registry().serialize(), "ob_flush_ticks_total");
     ASSERT_TRUE(ticks.has_value()) << "the tick counter is not in the exposition at all";
     EXPECT_GT(*ticks, 0u) << "no flush ran at all, so nothing was asked for";
-    EXPECT_LT(*ticks, 50u)
-        << "the flush loop ran " << *ticks << " times against a one-hour interval and one "
-           "request, so the request flag is not being cleared";
+    EXPECT_LT(*ticks, 20u)
+        << "the flush loop ran " << *ticks << " times against a one-hour interval, one "
+           "request and a 200 ms window, so the request flag is not being cleared and the "
+           "loop is spinning";
 
     engine.close();
     fs::remove_all(dir);
