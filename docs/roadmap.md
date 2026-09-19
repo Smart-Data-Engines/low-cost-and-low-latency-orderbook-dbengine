@@ -2212,6 +2212,150 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 142. A replica bootstrapped by snapshot keeps rows the primary does not have, for a symbol it already held
+
+Found while verifying #141's branch, and **not caused by it**: the same test fails on this
+machine against #141's tree, against #139's, and against plain master, nine targeted runs of
+nine plus the one in a full battery. On the GitHub runner the two trees it has run — master and
+#139's — were both green, and #141's tree had not yet run when this was written.
+
+`tests/integration/test_wal_rotation.py::test_a_replica_whose_position_was_truncated_is_bootstrapped`
+writes 100 rows for one symbol, waits for the replica to hold them, kills it, writes 1500 rows
+for a second symbol, waits until retention has removed the WAL file the replica's saved position
+names, and lets it back. The replica is refused with `ERR WAL_TRUNCATED`, asks for a snapshot, and
+should end holding what the primary holds.
+
+**Measured with both nodes queried in the same run, twice:**
+
+| | primary | replica |
+|---|---|---|
+| the symbol written **before** the outage | 100 | **138**, then **117** |
+| the symbol written **during** it | 1500 | 1500 |
+
+The symbol the replica never had is exact. The symbol it **already held** gains rows — a different
+number each run, between 115 and 183 across nine. So the bootstrap replaced the store for one
+symbol and not for the other, and the difference between them is that the replica had a copy of
+the second already.
+
+**Why this is worth a P0 rather than a test fix.** Every precondition in that test passes before
+the failing line: the primary reports zero replicas connected, the held WAL file is gone from its
+directory, the refusal is in the log, and the 1500 rows arrive. What fails is the count of rows a
+client reads back — so a replica serving reads answers a `SELECT` with rows its primary does not
+have, silently, and the only reason anybody noticed is a test that counts. Storage is append-only,
+so the duplicates are durable.
+
+**Three candidate mechanisms, none of them confirmed, and the measurement does not separate
+them.** The replica's old segments may survive the clear that a snapshot install performs. Or the
+snapshot's segment for that symbol may be refused by the duplicate-directory guard — a segment's
+identity is its event-time range, and the replica's own copy covers the same range, which is
+**#136's guard in a second place**. Or the WAL tail replayed after the snapshot re-appends rows
+the snapshot already carried, which would mean the position the snapshot carries is behind its
+own contents.
+
+**Why CI is green.** The count varies run to run, so it is timing-dependent, and the runner's
+timing happens to land on the case that works. That is pitfall 55 from the other side: a test that
+fails only on one machine is a measurement of that machine *or* of a defect, and here the primary
+and replica disagreeing about stored rows settles which.
+
+Not diagnosed further and not fixed here: it is a data-correctness defect on the replication path
+and it deserves its own change, not a paragraph in a pull request about a client method.
+
+- Effort: M | Impact: P0 by consequence — a replica answers reads with rows that were never
+  written, after the documented recovery from a truncated position. Reachable whenever retention
+  removes a disconnected replica's position, which is the case #125 exists for
+
+### 141. The engine could be pipelined and no client of ours could do it ✅
+
+#140 measured **2,174,287 levels/s against 1,314,663** for a client asking one question at a time,
+and the client that measured it was a forty-line C++ probe written for the occasion. Both of the
+clients this repository ships send one command and wait for its answer, so that number described
+a client nobody had — the mechanism present on one side of the wire and absent on the other, which
+is the shape this workspace has filed seven times under other names.
+
+Nothing on the wire changes. `Session::feed()` has always returned every complete command from one
+read and the server has always answered them in order; what was missing is a client that sends
+more than one before reading. `_TcpClient._recv_response()` already consumed exactly one response
+and left the rest of the buffer alone — it has to, because a `PUSH` may arrive between a command
+and its reply (#45) — so the transport half of this is a loop.
+
+**Measured on one m9g.xlarge, 5000 updates of 20 levels, five rounds with the order alternating
+between them, medians:**
+
+| | levels/s | client CPU per level | against the loop |
+|---|---|---|---|
+| `insert()` in a loop | 969,204 | 623 ns | — |
+| `insert_batch`, 1 per call | 883,923 | 725 ns | **0.91×** |
+| `insert_batch`, 8 per call | 1,261,354 | 531 ns | 1.30× |
+| `insert_batch`, 64 per call | 1,542,355 | 496 ns | **1.59×** |
+| `insert_batch`, 512 per call | 1,542,096 | 502 ns | 1.59× |
+
+**The row that does not flatter it is the control.** A batch of one is 9% *slower* than `insert()`,
+reproducibly across five rounds, and the client CPU column says why: 725 ns per level against 623,
+so about two microseconds of extra Python per update — a normalisation pass, an outcome object, a
+size sum. For one update `insert()` is the right call and the documentation says so. The API pays
+from about eight and stops improving after 64.
+
+**The other thing that column says is where the remaining ceiling is.** At batch 64 the client
+spends 0.050 s of its own CPU against 0.065 s of wall: **the Python client is three quarters of
+what is left**, and the same work from C++ reaches 2,174,287 levels/s against the same server. So
+the honest reading of 1.59× is "as much of #140 as Python can collect", not "what the engine can
+do". A client in a compiled language gets the rest.
+
+**It is not a transaction and the shape of the answer says so.** A batch is N independent writes
+in one journey; some may land and others be refused. The result is a list of outcomes each
+carrying its own index, rather than a return code or one exception, because a caller that filters
+or regroups that list would otherwise lose which update bounced — and losing that is the failure
+this API exists to prevent. Everything decidable *before* sending is decided for the whole batch,
+since a partial send after rejecting update k is a write nobody can find afterwards.
+
+**Three refusals, each because the honest answer is not the obvious one.** Pool and sharded mode:
+the router picks a connection per symbol, so a batch spanning symbols is several batches on
+several connections and which of them is one round trip is a decision nobody has measured. A
+compressed connection: each command is its own LZ4 frame, and whether the server takes several
+frames from one read has not been measured — "probably works" is the wrong thing to find out about
+in production. And `MAX_BATCH_BYTES`, which is **not** a server limit and says so where it is
+defined: the server answers a `MINSERT` in four bytes against a 64 MB per-session cap, so from
+that side a batch could carry sixteen million commands. What eight megabytes bounds is the
+caller's own memory.
+
+**One definition of the wire spelling, which this change forced.** `insert()` spelled a write
+twice — once for pool mode, once for TCP — and a third copy was the natural way to write this. Two
+copies of a protocol's syntax is how two clients of one server begin saying different things; the
+same rule already governs this engine's identifier quoting, its set of write-shaped operations and
+its query header. Four parametrised cases pin the bytes, so the extraction is checked rather than
+assumed.
+
+**The C++ client did not get this and that is recorded rather than implied.** The harness that
+publishes comparative numbers is in Python, so Python is where the measurement needed a client;
+`OrderbookClient::minsert_batch()` is the same loop over a reader that already exists and is worth
+doing when something needs it.
+
+**Mutations: nine, each with the verdict it is meant to produce, and the first control is the one
+worth reading.**
+
+| mutation | wanted | got |
+|---|---|---|
+| the wire spelling drops the event time | KILLED | KILLED |
+| every write is spelled `INSERT` | KILLED | KILLED |
+| only the first outcome is returned | KILLED | KILLED |
+| every outcome claims success | KILLED | KILLED |
+| the batch ceiling is gone | KILLED | KILLED |
+| the level lists need not line up | KILLED | KILLED |
+| an event time the server cannot store is sent anyway | KILLED | KILLED |
+| CONTROL: the batch is sent one command at a time | SURVIVES | survived |
+| CONTROL: the pool refusal is reworded | SURVIVES | survived |
+
+Replacing the single write with a loop of `execute()` — which is `insert()` again, one round trip
+per command — **survives every test in this module**, and it should. The tests state what a batch
+*stores* and what it *says about each update*, and neither of those changes when the same bytes
+take nine hundred round trips instead of one. What the speed claim rests on is the measured table
+above, which no test can be a substitute for; a test that gated on it would be a gate on a clock,
+and this repository has one of those to point at already. Saying which of the two carries the
+claim is the reason that row is in the table rather than left out.
+
+- Effort: S | Impact: #140's measurement becomes reachable from the client this project ships,
+  which is the difference between a protocol that allows something and a product that does it
+
 ### 140. No accepted socket turned Nagle off, so a client that pipelines paid a kernel timer per round trip ✅
 
 Measured on one m9g.xlarge, quiet box, loopback, one connection, 20,000 updates of 20 levels each
@@ -7779,17 +7923,21 @@ measures the harness.
 
 ## Recommended order
 
-**Two P0s are open: #136 and #137**, both found by the same afternoon on a machine this tree
-had never run on, and both filed rather than fixed because each has candidate answers that
-differ in what they cost. #136 changes an on-disk layout the snapshot manifest and retention
-both address; #137 changes what backpressure means. **#139 was the third item on this line and is
+**Three P0s are open: #136, #137 and #142** — the mechanical list is the `Open:` line below, and
+this paragraph says what they cost rather than repeating it. All three were found by running the
+tree somewhere it had not run before, and all three are filed rather than fixed because each has
+candidate answers that differ in price. #136 changes an on-disk layout the snapshot manifest and
+retention both address; #137 changes what backpressure means; #142 is the newest and the least
+understood — a replica bootstrapped by snapshot keeps rows the primary does not have, for a
+symbol it already held, and its three candidate mechanisms include #136's guard in a second
+place. **#139 was the third item on this line and is
 closed**: the row path answers the columns a query names, `SELECT *` byte for byte unchanged and a
 fifth off a three-column question. Every P0 raised before it —
 #60, #61, #62, #64, #68, #73, #74, #80, #88 and #97 — is closed, and several were found by running a real cluster rather than by reading the code
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #136 and #137.** Every other item above #58 is marked closed, and
+**Open: #136, #137 and #142.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.

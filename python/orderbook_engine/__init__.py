@@ -32,7 +32,7 @@ import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 try:
     import lz4.frame as _lz4_frame
@@ -46,10 +46,55 @@ logger = logging.getLogger("orderbook_engine")
 
 __version__ = "0.2.0"
 __all__ = ["OrderbookEngine", "OrderbookRow", "OrderbookError", "OrderbookTlsError",
-           "AggValue",
+           "AggValue", "BookUpdate", "BatchOutcome",
            "_murmurhash3_x86_32", "_ConsistentHashRing",
            "_parse_shard_map_response", "_parse_shard_info_response",
            "_parse_shard_error"]
+
+
+# ── The wire spelling of a write ───────────────────────────────────────────────
+
+def _insert_command(symbol: str, exchange: str, side_lower: str,
+                    prices: List[int], qtys: List[int], counts: List[int],
+                    timestamp_ns: Optional[int]) -> str:
+    """The bytes of one update, without sending them.
+
+    One definition, because `insert()` spelled this twice — once for pool mode and once for TCP —
+    and `insert_batch()` would have made three. Two copies of a protocol's syntax is how two
+    clients of one server start saying different things; this repository has the same rule about
+    identifier quoting, about what counts as a write, and about the query header.
+
+    The event time is appended **only when the caller gave one**. Sending a client-generated "now"
+    instead would quietly move the clock that decides a row's time from the server to the caller,
+    which is a different guarantee wearing the same name (#105).
+    """
+    wire_ts = f" {timestamp_ns}" if timestamp_ns is not None else ""
+    if len(prices) > 1:
+        header = f"MINSERT {symbol} {exchange} {side_lower} {len(prices)}{wire_ts}"
+        body = "\n".join(f"{prices[i]} {qtys[i]} {counts[i]}" for i in range(len(prices)))
+        return header + "\n" + body
+    return (f"INSERT {symbol} {exchange} {side_lower} "
+            f"{prices[0]} {qtys[0]} {counts[0]}{wire_ts}")
+
+
+def _normalise_levels(prices: List[int], qtys: List[int], counts: Optional[List[int]],
+                      where: str) -> List[int]:
+    """Check the three parallel lists agree and fill in the default counts.
+
+    Shared by `insert()` and `insert_batch()` because it is one rule, and two copies of one rule
+    is how the same call becomes legal in one method and not in the other. `where` names the
+    update inside a batch; for a single write it is empty and the message reads as it always did.
+    """
+    n = len(prices)
+    if n == 0:
+        raise ValueError(f"{where}no levels")
+    if len(qtys) != n:
+        raise ValueError(f"{where}prices and qtys must have the same length")
+    if counts is None:
+        return [1] * n
+    if len(counts) != n:
+        raise ValueError(f"{where}counts must have the same length as prices")
+    return counts
 
 
 # ── Data types ─────────────────────────────────────────────────────────────────
@@ -78,6 +123,33 @@ class OrderbookRow:
                 f"side={self.side}, level={self.level}, "
                 f"price={self.price}, qty={self.quantity}, "
                 f"orders={self.order_count}, seq={self.sequence_number})")
+
+
+@dataclass
+class BookUpdate:
+    """One book update, in the shape `insert()` takes, so a batch is a list of what you already
+    know how to write."""
+    symbol: str
+    exchange: str
+    side: str                                   # "bid" or "ask"
+    prices: List[int]
+    qtys: List[int]
+    counts: Optional[List[int]] = None
+    timestamp_ns: Optional[int] = None
+
+
+@dataclass
+class BatchOutcome:
+    """What the server said about one update of a batch.
+
+    The index is in the record and not only in the position, because a caller that filters or
+    regroups the list loses "which one was it" exactly when it needs it. A batch is N independent
+    writes in one journey: some may land and others be refused, and this is how that is visible
+    rather than collapsed into one exception.
+    """
+    index: int
+    ok: bool
+    message: str = ""
 
 
 @dataclass
@@ -573,6 +645,32 @@ class _TcpBackend:
         """Send a command and return the raw response string."""
         self._send(command)
         return self._recv_response()
+
+    def execute_pipelined(self, commands: List[str]) -> List[str]:
+        """Send every command in one write, then read one response per command, in order.
+
+        The protocol has always allowed this — `Session::feed()` returns every complete command
+        from one read and the server answers them in order — and until #140 it was not worth
+        doing, because no accepted socket turned Nagle off and the second answer of a batch waited
+        out the client's delayed-ACK timer. Measured after that change on one m9g.xlarge:
+        **2,174,287 levels/s at 512 commands in flight against 1,314,663 one at a time.**
+
+        `_recv_response()` already consumes exactly one response and leaves the rest of the buffer
+        alone — it has to, because a `PUSH` can arrive between a command and its reply — so the
+        loop below is the whole of the change on this side.
+        """
+        if not commands:
+            return []
+        if self._compressed:
+            # One frame per command back to back would probably work and has not been measured,
+            # and a batch that half-arrives is the wrong thing to find out about in production.
+            raise OrderbookError(-1,
+                "pipelining is not available on a compressed connection: each command is its own "
+                "LZ4 frame, and whether the server reads several frames from one read has not "
+                "been measured. Nothing was sent.")
+        self._sock.sendall("".join(c if c.endswith("\n") else c + "\n"
+                                   for c in commands).encode("utf-8"))
+        return [self._recv_response() for _ in commands]
 
     def close(self):
         if self._sock:
@@ -1643,13 +1741,8 @@ class OrderbookEngine:
         if self._closed:
             raise OrderbookError(-1, "Engine is closed")
 
+        counts = _normalise_levels(prices, qtys, counts, "")
         n = len(prices)
-        if len(qtys) != n:
-            raise ValueError("prices and qtys must have the same length")
-        if counts is None:
-            counts = [1] * n
-        if len(counts) != n:
-            raise ValueError("counts must have the same length as prices")
 
         # Two arguments this method used to accept and then drop on the wire. Both refusals happen
         # **before a single byte is sent**, because a write that went out without the value its
@@ -1660,12 +1753,7 @@ class OrderbookEngine:
                     "seq cannot be chosen over the wire: a sequence number belongs to the origin, "
                     "and the origin here is the server, which assigns one per symbol. It was "
                     "accepted and discarded before this release. Use local mode to choose it.")
-            if timestamp_ns is not None and "insert_event_time" not in self.server_capabilities():
-                raise OrderbookError(-1,
-                    "this server does not accept an event time on INSERT/MINSERT, so the value "
-                    "would be discarded and the row stored with its arrival time instead. Nothing "
-                    "was sent. Upgrade the server, or drop the timestamp_ns argument to accept "
-                    "arrival time deliberately.")
+            self._refuse_unstorable_event_time(timestamp_ns is not None)
 
         if seq is None:
             self._seq += 1
@@ -1673,11 +1761,9 @@ class OrderbookEngine:
         else:
             self._seq = max(self._seq, seq)
 
+        # Local mode wants a timestamp whatever the caller said; the wire spelling wants the
+        # caller's or nothing, and `_insert_command()` owns that distinction now.
         ts = timestamp_ns if timestamp_ns is not None else int(time.time_ns())
-        # Appended only when the caller gave one. Sending a client-generated "now" instead would
-        # quietly move the clock that decides a row's time from the server to the caller, which is a
-        # different guarantee wearing the same name.
-        wire_ts = f" {timestamp_ns}" if timestamp_ns is not None else ""
         side_lower = side.lower()
         side_int = 1 if side_lower == "ask" else 0
 
@@ -1685,12 +1771,8 @@ class OrderbookEngine:
             self._local.insert(symbol, exchange, side_int, prices, qtys, counts, seq, ts)
         elif self._mode == "pool":
             # Pool mode: route writes to primary or shard.
-            if n > 1:
-                header = f"MINSERT {symbol} {exchange} {side_lower} {n}{wire_ts}"
-                payload_lines = [f"{prices[i]} {qtys[i]} {counts[i]}" for i in range(n)]
-                cmd = header + "\n" + "\n".join(payload_lines)
-            else:
-                cmd = f"INSERT {symbol} {exchange} {side_lower} {prices[0]} {qtys[0]} {counts[0]}{wire_ts}"
+            cmd = _insert_command(symbol, exchange, side_lower, prices, qtys, counts,
+                                  timestamp_ns)
             if self._pool.is_sharded:
                 raw = self._pool.execute_write_sharded(symbol, exchange, cmd)
             else:
@@ -1700,24 +1782,119 @@ class OrderbookEngine:
                 raise OrderbookError(-1, f"Pool INSERT failed: {msg}")
         else:
             # TCP mode
-            if n > 1:
-                # MINSERT: single round-trip for multiple levels
-                header = f"MINSERT {symbol} {exchange} {side_lower} {n}{wire_ts}"
-                payload_lines = [f"{prices[i]} {qtys[i]} {counts[i]}" for i in range(n)]
-                cmd = header + "\n" + "\n".join(payload_lines)
-                raw = self._tcp.execute(cmd)
-                is_err, msg, _, _ = _parse_tcp_response(raw)
-                if is_err:
-                    raise OrderbookError(-1, f"TCP MINSERT failed: {msg}")
-            else:
-                # INSERT: backward compat for single level
-                cmd = f"INSERT {symbol} {exchange} {side_lower} {prices[0]} {qtys[0]} {counts[0]}{wire_ts}"
-                raw = self._tcp.execute(cmd)
-                is_err, msg, _, _ = _parse_tcp_response(raw)
-                if is_err:
-                    raise OrderbookError(-1, f"TCP INSERT failed: {msg}")
+            cmd = _insert_command(symbol, exchange, side_lower, prices, qtys, counts, timestamp_ns)
+            raw = self._tcp.execute(cmd)
+            is_err, msg, _, _ = _parse_tcp_response(raw)
+            if is_err:
+                raise OrderbookError(-1, f"TCP {'MINSERT' if n > 1 else 'INSERT'} failed: {msg}")
 
         return seq
+
+    def _refuse_unstorable_event_time(self, any_given: bool) -> None:
+        """Refuse before sending if the caller chose a time this server would drop (#105).
+
+        One definition for `insert()` and `insert_batch()`: a rule about what the wire can carry,
+        stated twice, is the shape where one writer keeps honouring an argument the other has
+        quietly started discarding.
+        """
+        if any_given and "insert_event_time" not in self.server_capabilities():
+            raise OrderbookError(-1,
+                "this server does not accept an event time on INSERT/MINSERT, so the value would "
+                "be discarded and the row stored with its arrival time instead. Nothing was sent. "
+                "Upgrade the server, or drop timestamp_ns to accept arrival time deliberately.")
+
+    #: Bytes of one batch's request, before it is sent.
+    #:
+    #: Not a server limit. The server queues **responses** against a 64 MB per-session cap, and a
+    #: `MINSERT` is answered in four bytes, so from that side a batch could carry sixteen million
+    #: commands; on the request side it reads in 64 kB chunks and consumes as it goes. What this
+    #: bounds is the caller's own memory: one string of every command and one outcome per update,
+    #: both held for the length of the call. Eight megabytes is about half a million updates of
+    #: twenty levels, which is past any batch with a reason to exist.
+    MAX_BATCH_BYTES = 8 * 1024 * 1024
+
+    def insert_batch(self, updates: Sequence[BookUpdate]) -> List[BatchOutcome]:
+        """Write several book updates in one round trip, and say what happened to each.
+
+        The engine could always be pipelined; until #140 no client could benefit, because the
+        server's second answer sat behind Nagle waiting for an acknowledgement the client had no
+        reason to send. Measured after that change on one m9g.xlarge, 20 levels per update:
+        **2,174,287 levels/s at 512 updates in flight against 1,314,663 one at a time.**
+
+        **This is not a transaction and does not pretend to be.** A batch is N independent writes
+        in one journey; some may land and others be refused. That is why the result is a list
+        rather than a return code — and why every refusal that can be decided *before* sending is
+        decided for the whole batch, since a partial send after rejecting update k would be a
+        write nobody can find afterwards.
+
+        In local mode this is a loop over `insert()`, which is exactly the same thing, and saying
+        so is better than implying a round trip that does not exist.
+
+        **A transport failure part-way through raises, and the outcomes already read are lost.**
+        The server answers in order, so by the time the connection drops some of the batch has
+        been acknowledged and the rest has not — and this method has no way to hand back both a
+        list and an exception. Treat a raise from here as *indeterminate*: the batch may have
+        landed in full, in part, or not at all, and the only way to find out is to read. It is the
+        same position a single `insert()` leaves you in when the connection drops on its reply,
+        widened to the size of the batch, which is a reason to keep batches at a size whose
+        re-examination you can afford.
+        """
+        if self._closed:
+            raise OrderbookError(-1, "Engine is closed")
+        if not updates:
+            return []
+
+        # Validated in full first: see the docstring. `insert()` performs the same refusals, and
+        # they are the ones that must happen before a byte goes out (#105).
+        normalised = [(u, _normalise_levels(u.prices, u.qtys, u.counts, f"update {i}: "))
+                      for i, u in enumerate(updates)]
+
+        if self._mode == "local":
+            out = []
+            for i, (u, counts) in enumerate(normalised):
+                try:
+                    self.insert(u.symbol, u.exchange, u.side, u.prices, u.qtys, counts,
+                                timestamp_ns=u.timestamp_ns)
+                    out.append(BatchOutcome(index=i, ok=True))
+                except (OrderbookError, ValueError) as exc:
+                    out.append(BatchOutcome(index=i, ok=False, message=str(exc)))
+            return out
+
+        if self._mode == "pool":
+            raise OrderbookError(-1,
+                "insert_batch is not available in pool mode: the router picks a connection per "
+                "symbol, so a batch spanning symbols is several batches on several connections "
+                "and which of them is one round trip is a decision nobody has measured. Nothing "
+                "was sent. Use insert(), or open a direct connection to the node you mean.")
+
+        self._refuse_unstorable_event_time(any(u.timestamp_ns is not None for u, _ in normalised))
+
+        commands = [_insert_command(u.symbol, u.exchange, u.side.lower(), u.prices, u.qtys,
+                                    counts, u.timestamp_ns)
+                    for u, counts in normalised]
+        size = sum(len(c) + 1 for c in commands)
+        if size > self.MAX_BATCH_BYTES:
+            raise OrderbookError(-1,
+                f"batch of {size} bytes exceeds MAX_BATCH_BYTES ({self.MAX_BATCH_BYTES}); "
+                f"nothing was sent. Split it: the whole point is one round trip per batch, and "
+                f"two batches are two round trips rather than a failure.")
+
+        # The server assigns the sequence number per symbol, so the client's counter is advanced
+        # by the number of updates for the same reason `insert()` advances it by one: it is the
+        # local view of how many writes this client has made.
+        self._seq += len(commands)
+        logger.debug("insert_batch: %d updates, %d bytes in one round trip", len(commands), size)
+
+        raws = self._tcp.execute_pipelined(commands)
+        out = []
+        for i, raw in enumerate(raws):
+            is_err, msg, _, _ = _parse_tcp_response(raw)
+            out.append(BatchOutcome(index=i, ok=not is_err, message=msg if is_err else ""))
+        refused = sum(1 for o in out if not o.ok)
+        if refused:
+            logger.warning("insert_batch: %d of %d updates refused; first at index %d",
+                           refused, len(out), next(o.index for o in out if not o.ok))
+        return out
 
     def flush(self):
         """Flush pending data so it becomes queryable."""
