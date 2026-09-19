@@ -948,3 +948,115 @@ TEST(ColumnarStoreProjection, AMissingColumnFileOnlyRefusesTheSegmentForQueriesT
                [&](const ob::SnapshotRow& r) { refused.push_back(r); });
     EXPECT_TRUE(refused.empty()) << "narrowing must not weaken the check for a column in the set";
 }
+
+// ── replace_from_staging: a snapshot replaces the store, it does not join it (#142) ──────────
+
+namespace {
+
+/// Write a minimal segment directory: enough `meta.json` for `open_existing()` to index it.
+static void plant_segment(const fs::path& base, const std::string& symbol,
+                          const std::string& exchange, uint64_t start_ns, uint64_t end_ns) {
+    const fs::path dir = base / symbol / exchange /
+                         (std::to_string(start_ns) + "_" + std::to_string(end_ns));
+    fs::create_directories(dir);
+    std::ofstream meta(dir / "meta.json");
+    meta << "{\"symbol\":\"" << symbol << "\",\"exchange\":\"" << exchange
+         << "\",\"start_ts_ns\":" << start_ns << ",\"end_ts_ns\":" << end_ns
+         << ",\"row_count\":1,\"wal_identity\":0,\"wal_file_index\":0,\"wal_byte_offset\":0}";
+}
+
+static std::string segment_relpath(const std::string& symbol, const std::string& exchange,
+                                   uint64_t start_ns, uint64_t end_ns) {
+    return symbol + "/" + exchange + "/" + std::to_string(start_ns) + "_" +
+           std::to_string(end_ns) + "/meta.json";
+}
+
+} // namespace
+
+// The shape #142 was: a replica killed mid-stream has flushed a **prefix**, so its directory ends
+// earlier than the one arriving. The ranges overlap and the names differ, which is why the
+// duplicate-directory guard had nothing to refuse and the rows were returned twice.
+TEST(ColumnarStoreReplace, AStaleSegmentWhoseRangeOverlapsButDoesNotMatchIsRemoved) {
+    TempDir data("replace_overlap");
+    TempDir staging("replace_overlap_stage");
+
+    plant_segment(data.path, "SYM", "EX", 1000, 1088);      // ours, a prefix
+    plant_segment(staging.path, "SYM", "EX", 1000, 1100);   // theirs, the whole thing
+
+    ob::ColumnarStore store(data.path.string());
+    store.open_existing();
+    ASSERT_EQ(store.segment_count(), 1u) << "the stale segment was not indexed, so this test "
+                                            "cannot show that it is removed";
+
+    ASSERT_TRUE(store.replace_from_staging(
+        staging.path.string(), {segment_relpath("SYM", "EX", 1000, 1100)}));
+
+    EXPECT_EQ(store.segment_count(), 1u)
+        << "the store holds more than the snapshot named, so the install joined rather than "
+           "replaced";
+    EXPECT_FALSE(fs::exists(data.path / "SYM" / "EX" / "1000_1088"))
+        << "the stale directory is still on disk; open_existing() will index it again";
+    EXPECT_TRUE(fs::exists(data.path / "SYM" / "EX" / "1000_1100" / "meta.json"));
+}
+
+// The WAL is not the store's to delete, and `wal_identity` says which stream this directory
+// belongs to — losing it turns a resumable replica into one that re-syncs from zero (#101).
+TEST(ColumnarStoreReplace, TheWalAndTheIdentityAndPlainFilesSurvive) {
+    TempDir data("replace_spares");
+    TempDir staging("replace_spares_stage");
+
+    plant_segment(data.path, "SYM", "EX", 1000, 1088);
+    { std::ofstream(data.path / "wal_000000.bin") << "wal"; }
+    { std::ofstream(data.path / "wal_identity") << "7"; }
+    { std::ofstream(data.path / "repl_state.txt") << "pos"; }
+    fs::create_directories(data.path / "wal_archive");          // a directory, but WAL's
+    plant_segment(staging.path, "SYM", "EX", 1000, 1100);
+
+    ob::ColumnarStore store(data.path.string());
+    store.open_existing();
+    ASSERT_TRUE(store.replace_from_staging(
+        staging.path.string(), {segment_relpath("SYM", "EX", 1000, 1100)}));
+
+    EXPECT_TRUE(fs::exists(data.path / "wal_000000.bin"));
+    EXPECT_TRUE(fs::exists(data.path / "wal_identity"));
+    EXPECT_TRUE(fs::exists(data.path / "repl_state.txt"));
+    EXPECT_TRUE(fs::exists(data.path / "wal_archive"));
+}
+
+// Both callers stage **inside** the data directory, so a clear that does not know about staging
+// deletes the files it is about to install. This is the one that turns the fix into the defect.
+TEST(ColumnarStoreReplace, TheStagingDirectoryInsideTheDataDirectoryIsNotDeleted) {
+    TempDir data("replace_staging_inside");
+    const fs::path staging = data.path / "snapshot_staging";
+
+    plant_segment(data.path, "SYM", "EX", 1000, 1088);
+    plant_segment(staging, "SYM", "EX", 1000, 1100);
+
+    ob::ColumnarStore store(data.path.string());
+    store.open_existing();
+    ASSERT_TRUE(store.replace_from_staging(
+        staging.string(), {segment_relpath("SYM", "EX", 1000, 1100)}))
+        << "the install failed, which is what happens when the clear ate the staged files";
+
+    EXPECT_TRUE(fs::exists(data.path / "SYM" / "EX" / "1000_1100" / "meta.json"));
+    EXPECT_FALSE(fs::exists(data.path / "SYM" / "EX" / "1000_1088"));
+}
+
+// A store that refuses has to leave an index describing what is actually there, because the node
+// stays up and serves reads until it bootstraps again.
+TEST(ColumnarStoreReplace, AMissingStagedFileRefusesAndLeavesACoherentIndex) {
+    TempDir data("replace_missing");
+    TempDir staging("replace_missing_stage");
+
+    plant_segment(data.path, "SYM", "EX", 1000, 1088);
+    ob::ColumnarStore store(data.path.string());
+    store.open_existing();
+
+    EXPECT_FALSE(store.replace_from_staging(
+        staging.path.string(), {segment_relpath("SYM", "EX", 1000, 1100)}))
+        << "a staged file that is not there has to be refused rather than installed as nothing";
+
+    EXPECT_EQ(store.segment_count(), 0u)
+        << "the index still names the directory the clear removed, so a scan would open files "
+           "that are gone and answer short";
+}

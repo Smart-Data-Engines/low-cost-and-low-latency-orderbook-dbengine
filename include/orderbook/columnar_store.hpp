@@ -143,6 +143,27 @@ public:
     /// Called on startup to rebuild segment index from persisted meta.json files.
     void open_existing();
 
+    /// Replace everything this store holds with the files staged under `staging_dir` at
+    /// `relative_paths`, which are paths relative to this store's base directory.
+    ///
+    /// **One exclusive hold for the whole swap**, which is the point of putting it here rather
+    /// than in the caller. A scan takes the same mutex shared, so it waits and then sees the new
+    /// store — it cannot see a half of each. Before #142 the installers renamed the received
+    /// files in and removed nothing, so a replica that had flushed a *prefix* of a symbol kept
+    /// its own segment beside the arriving one: overlapping event-time ranges, different
+    /// directory names, nothing for the duplicate-directory guard to refuse, and the rows were
+    /// returned twice. Measured then: 122 rows where the primary held 100.
+    ///
+    /// Spares anything whose name begins with `wal_` (the WAL files and `wal_identity`), every
+    /// plain file in the base directory (`repl_state.txt`), and the staging directory itself,
+    /// which the callers put **inside** the data directory.
+    ///
+    /// Returns false if any staged file could not be moved, having already cleared — the caller
+    /// is bootstrapping and the recovery is to bootstrap again, which is what its saved position
+    /// forces anyway.
+    [[nodiscard]] bool replace_from_staging(const std::string& staging_dir,
+                                            const std::vector<std::string>& relative_paths);
+
     /// Flush active segment and release resources.
     void close();
 
@@ -214,6 +235,11 @@ private:
     mutable std::shared_mutex index_mtx_;
 
     // Helpers
+    /// Rebuild `index_` from the `meta.json` files under `base_dir_`. Caller holds `index_mtx_`
+    /// exclusively — `open_existing()` and `replace_from_staging()` both need this and
+    /// `std::shared_mutex` is not recursive, so taking it here would deadlock the second one.
+    void rebuild_index_locked();
+
     std::string segment_dir(const std::string& symbol, const std::string& exchange,
                             uint64_t start_ts, uint64_t end_ts) const;
     void ensure_dirs(const std::string& path) const;

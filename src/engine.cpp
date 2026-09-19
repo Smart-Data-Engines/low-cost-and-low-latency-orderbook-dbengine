@@ -421,7 +421,7 @@ void Engine::discard_local_data_for_resync() {
     // as a duplicate and the store stays empty. Measured, before this line existed: 0 rows where 1
     // was replayed.
     //
-    // `load_snapshot()` has done this since snapshot bootstrap existed, for the same reason and
+    // The snapshot install has done this since bootstrap existed, for the same reason and
     // with the reason written on `reset()` itself. Before the dedup guard an over-claimed frontier
     // cost nothing here, which is why nothing noticed.
     seq_tracker_.reset();
@@ -1412,7 +1412,7 @@ void Engine::adopt_snapshot_sequence_state(
                 vector.size(), held.size(), seq_tracker_.symbol_count());
 }
 
-void Engine::load_snapshot(const SnapshotManifest& /*manifest*/) {
+void Engine::adopt_store_on_disk() {
     // flush_mtx_ first: clearing stores_ destroys the ColumnarStore objects that a
     // concurrent Phase B may be iterating over.
     std::lock_guard<std::mutex> flush_lock(flush_mtx_);
@@ -1443,6 +1443,45 @@ void Engine::load_snapshot(const SnapshotManifest& /*manifest*/) {
     // Rebuild columnar index from the new files on disk.
     combined_store_.close();
     combined_store_.open_existing();
+
+    // Discarding the pending rows made room, and since #137 there can be a writer asleep waiting
+    // for exactly that. Without this it waits out the five-second deadline and is **refused**,
+    // which is a spurious refusal rather than a hang — narrow, because a node adopting a store is
+    // bootstrapping and a replica takes no client writes, but it costs one line.
+    pending_cv_.notify_all();
+}
+
+bool Engine::install_snapshot(const std::string& staging_dir,
+                              const SnapshotManifest& manifest) {
+    std::vector<std::string> paths;
+    paths.reserve(manifest.files.size());
+    for (const auto& entry : manifest.files) paths.push_back(entry.path);
+
+    // flush_mtx_ first: replacing the store destroys the ColumnarStore state a concurrent
+    // Phase B may be iterating over (pitfall 10).
+    std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+    std::unique_lock<std::mutex> lock(mtx_);
+
+    OB_LOG_INFO("engine", "Installing a snapshot of %zu file(s) from '%s'",
+                paths.size(), staging_dir.c_str());
+
+    stores_.clear();
+    buffers_.clear();
+    pending_rows_.clear();
+    seq_tracker_.reset();
+
+    combined_store_.close();
+    if (!combined_store_.replace_from_staging(staging_dir, paths)) {
+        OB_LOG_ERROR("engine",
+                     "Installing the snapshot failed; this node now holds an incomplete store "
+                     "and has to bootstrap again");
+        return false;
+    }
+
+    OB_LOG_INFO("engine", "Snapshot installed: the store now holds %zu segment(s)",
+                combined_store_.segment_count());
+    pending_cv_.notify_all();          // see adopt_store_on_disk() for why
+    return true;
 }
 
 bool Engine::holds_no_data() {
@@ -2123,7 +2162,7 @@ void Engine::flush_write_and_merge() {
     // so that disk I/O does not block writers.
 
     // Snapshot the store pointers under mtx_. stores_ is mutated by
-    // get_or_create_store(), load_snapshot() and the REPLICA transition; iterating
+    // get_or_create_store(), the snapshot install and the REPLICA transition; iterating
     // it unlocked risked an invalidated iterator on insert and a use-after-free on
     // clear(). The raw pointers stay valid because every mutator of stores_ holds
     // flush_mtx_, which this caller holds too.

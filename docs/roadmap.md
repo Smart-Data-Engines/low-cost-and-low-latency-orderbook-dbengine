@@ -2212,57 +2212,85 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
-### 142. A replica bootstrapped by snapshot keeps rows the primary does not have, for a symbol it already held
+### 142. A replica bootstrapped by snapshot keeps rows the primary does not have, for a symbol it already held ✅
 
-Found while verifying #141's branch, and **not caused by it**: the same test fails on this
-machine against #141's tree, against #139's, and against plain master, nine targeted runs of
-nine plus the one in a full battery. On the GitHub runner the two trees it has run — master and
-#139's — were both green, and #141's tree had not yet run when this was written.
+**Closed.** The staged files replace the store now, in one exclusive operation, rather than being
+renamed in beside it.
 
-`tests/integration/test_wal_rotation.py::test_a_replica_whose_position_was_truncated_is_bootstrapped`
-writes 100 rows for one symbol, waits for the replica to hold them, kills it, writes 1500 rows
-for a second symbol, waits until retention has removed the WAL file the replica's saved position
-names, and lets it back. The replica is refused with `ERR WAL_TRUNCATED`, asks for a snapshot, and
-should end holding what the primary holds.
+**The evidence, with both nodes' data directories preserved.** The replica ends with *three*
+segment directories for a symbol the primary has two of, and the extra one is its own:
 
-**Measured with both nodes queried in the same run, twice:**
-
-| | primary | replica |
+| node | segment directories for that symbol | rows |
 |---|---|---|
-| the symbol written **before** the outage | 100 | **138**, then **117** |
-| the symbol written **during** it | 1500 | 1500 |
+| primary | `…483039636760`, `…483041495609` | 100 between them |
+| replica | **those two, plus its own `…018354201021`** | **122** |
 
-The symbol the replica never had is exact. The symbol it **already held** gains rows — a different
-number each run, between 115 and 183 across nine. So the bootstrap replaced the store for one
-symbol and not for the other, and the difference between them is that the replica had a copy of
-the second already.
+The extra 22 are the replica's own, flushed before it was killed. An earlier run of the same test
+gave 88 + 100 = **188**: the number varies with how much the replica had flushed when it died,
+which is the whole shape of the defect. After the fix the replica's directory list is the
+primary's, name for name.
 
-**Why this is worth a P0 rather than a test fix.** Every precondition in that test passes before
-the failing line: the primary reports zero replicas connected, the held WAL file is gone from its
-directory, the refusal is in the log, and the 1500 rows arrive. What fails is the count of rows a
-client reads back — so a replica serving reads answers a `SELECT` with rows its primary does not
-have, silently, and the only reason anybody noticed is a test that counts. Storage is append-only,
-so the duplicates are durable.
+**The mechanism, and it is none of the three this item was filed with.** `Engine::load_snapshot()`
+cleared `stores_`, `buffers_`, `pending_rows_` and the sequence frontier — **memory only** — and
+then rebuilt the index from *whatever was on disk*. `ReplicationClient::install_snapshot()` renamed
+each received file into place, overwriting a colliding path and touching nothing else. A segment's
+directory name **is** its event-time range, so a replica killed mid-stream has flushed a *prefix*:
+its directory ends earlier, the two names share a start and differ in the end, and that is an
+**overlap rather than an equality** — nothing for #136's duplicate-directory guard to refuse. The
+snapshot's segment was installed, no WAL record was re-applied, and the old segments did not
+survive a clear: **there was no clear.** The function was named for the caller's intention, not for
+what it did.
 
-**Three candidate mechanisms, none of them confirmed, and the measurement does not separate
-them.** The replica's old segments may survive the clear that a snapshot install performs. Or the
-snapshot's segment for that symbol may be refused by the duplicate-directory guard — a segment's
-identity is its event-time range, and the replica's own copy covers the same range, which is
-**#136's guard in a second place**. Or the WAL tail replayed after the snapshot re-appends rows
-the snapshot already carried, which would mean the position the snapshot carries is behind its
-own contents.
+**Why CI was green, as a mechanism rather than as "timing".** If the replica flushes **all** of the
+symbol's rows before it is killed, its directory is named by the same range as the primary's, the
+rename overwrites it file by file, and the count is exactly right. The defect needs a *prefix*. So
+the green runs were never "no defect"; they were "the stale directory happened to be the one being
+overwritten".
 
-**Why CI is green.** The count varies run to run, so it is timing-dependent, and the runner's
-timing happens to land on the case that works. That is pitfall 55 from the other side: a test that
-fails only on one machine is a measurement of that machine *or* of a defect, and here the primary
-and replica disagreeing about stored rows settles which.
+**The fix is one method, on the component that owns the directory layout.**
+`ColumnarStore::replace_from_staging()` holds `index_mtx_` **exclusively for the whole swap**:
+drop the index, remove the segment directories, move the staged files in, re-read. A scan takes
+that same mutex shared, so it waits and then sees the new store. That is why it did not go in the
+caller: clearing there and rebuilding afterwards would have **moved** the window rather than
+removed it — `ColumnarStore::close()` keeps the index and every read path opens files per call, so
+a scan in the gap answers *short* rather than failing. The window already existed, as a rename over
+live files; it is gone now.
 
-Not diagnosed further and not fixed here: it is a data-correctness defect on the replication path
-and it deserves its own change, not a paragraph in a pull request about a client method.
+It spares anything named `wal_*` (the WAL and `wal_identity`), plain files (`repl_state.txt`) and
+**the staging directory**, which both callers put *inside* the data directory — a clear that did
+not know that would delete the files it was about to install, and there is a test for exactly that.
 
-- Effort: M | Impact: P0 by consequence — a replica answers reads with rows that were never
-  written, after the documented recovery from a truncated position. Reachable whenever retention
-  removes a disconnected replica's position, which is the case #125 exists for
+`Engine::load_snapshot()` is two functions now, because one of them was a lie:
+`install_snapshot(staging_dir, manifest)` does the whole thing, and `adopt_store_on_disk()` is the
+memory half under a name that cannot be mistaken for an install. Both installers lost their rename
+loops; an unsafe path now refuses the **whole** install rather than skipping one entry, because the
+store is about to be replaced by exactly that list and an entry we decline is a hole in it.
+
+**One thing only the rebase could show.** #137 gave `pending_rows_` a waiter with a five-second
+deadline, and both halves of this change clear that vector under `mtx_` without waking it — which
+on their own branches was nothing, because before #137 nobody was asleep there. Together it is a
+writer that waits out the deadline and is **refused** after room had already been made. Narrow (a
+node installing a store is bootstrapping, and a replica takes no client writes) and one line, but
+it is the shape worth naming: two changes that are each correct alone, meeting for the first time
+in a rebase. `pending_cv_.notify_all()` after the clear, in both.
+
+**Mutations: five, each with the verdict it was meant to give.**
+
+| mutation | verdict |
+|---|---|
+| the removal loop never runs | **killed** — 122 rows again, and the unit test for the overlapping name |
+| the staging directory is not spared | **killed** — the clear eats the files it is about to install |
+| `wal_*` is not spared | **killed** — the WAL and `wal_identity` go with the segments |
+| a failed move reports success | **killed** — an install that installed nothing reads as done |
+| the closing log line is reworded | **survives**, and it is the control |
+
+The control is the row that says the other four mean something: a table in which everything dies
+reports a broken harness as diligence. Baseline green before and after, and the source restored
+byte for byte — with `copyfile` plus a touch rather than `copy2`, which keeps the backup's mtime
+and leaves the rebuild with nothing to do (pitfall 272, twice in this repository).
+
+- Effort: M | Impact: P0 by consequence — a replica answered `SELECT` with rows its primary never
+  had, silently and durably, after the documented recovery from a truncated position
 
 ### 141. The engine could be pipelined and no client of ours could do it ✅
 
@@ -7998,16 +8026,16 @@ measures the harness.
 
 ## Recommended order
 
-**Two P0s are open: #136 and #142** — the mechanical list is the `Open:` line below, and
-this paragraph says what they cost rather than repeating it. Both were found by running the
-tree somewhere it had not run before, and both are filed rather than fixed because each has
-candidate answers that differ in price. #136 changes an on-disk layout the snapshot manifest and
-retention both address; #142 is the newest and the least
-understood — a replica bootstrapped by snapshot keeps rows the primary does not have, for a
-symbol it already held, and its three candidate mechanisms include #136's guard in a second
-place. **#137 was on this line and is closed**: a writer at the pending-row ceiling asks for a
-flush now, and four million levels at a one-second interval went 1,196,745 to 2,209,501 levels/s —
-the rate the same client gets below the ceiling, so the slope is gone rather than softened.
+**One P0 is open: #136** — the mechanical list is the `Open:` line below, and this paragraph
+says what it costs rather than repeating it. It was found by running the tree somewhere it had
+not run before, and it is filed rather than fixed because its candidate answers differ in price:
+#136 changes an on-disk layout the snapshot manifest and retention both address. Two were on this
+line with it and both are closed. **#137**: a writer at the pending-row ceiling asks for a flush
+now, and four million levels at a one-second interval went 1,196,745 to 2,209,501 levels/s — the
+rate the same client gets below the ceiling, so the slope is gone rather than softened. **#142**:
+the snapshot install renamed the received files in beside the replica's own and removed nothing,
+so a replica that had flushed a *prefix* of a symbol answered with both copies — 122 rows against
+the primary's 100, and none of the three mechanisms this page filed it with was the one.
 **#139 was on it too and is
 closed**: the row path answers the columns a query names, `SELECT *` byte for byte unchanged and a
 fifth off a three-column question. Every P0 raised before it —
@@ -8015,7 +8043,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #136 and #142.** Every other item above #58 is marked closed, and
+**Open: #136.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.

@@ -530,6 +530,10 @@ void ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
 
 void ColumnarStore::open_existing() {
     std::unique_lock<std::shared_mutex> lock(index_mtx_);
+    rebuild_index_locked();
+}
+
+void ColumnarStore::rebuild_index_locked() {
     index_.clear();
 
     if (!fs::exists(base_dir_)) return;
@@ -548,6 +552,71 @@ void ColumnarStore::open_existing() {
 
     // Sort by start_ts_ns
     std::sort(index_.begin(), index_.end(), segment_order_less);
+}
+
+bool ColumnarStore::replace_from_staging(const std::string& staging_dir,
+                                         const std::vector<std::string>& relative_paths) {
+    std::unique_lock<std::shared_mutex> lock(index_mtx_);
+
+    // The index goes first, so that nothing below is describing directories it names. A scan
+    // waits on this same mutex and then reads the store this function leaves behind.
+    index_.clear();
+    rolled_segments_.clear();
+    has_active_segment_ = false;
+    active_row_count_   = 0;
+
+    std::error_code ec;
+    const fs::path staging = fs::absolute(fs::path(staging_dir), ec);
+
+    size_t removed = 0;
+    for (auto& entry : fs::directory_iterator(base_dir_, ec)) {
+        if (!entry.is_directory(ec)) continue;               // repl_state.txt and friends
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("wal_", 0) == 0) continue;            // WAL files and wal_identity
+        const fs::path here = fs::absolute(entry.path(), ec);
+        if (!staging.empty() && here == staging) continue;   // the files we are about to install
+        OB_LOG_DEBUG("columnar", "replace_from_staging: removing stale segment directory '%s'",
+                     entry.path().string().c_str());
+        fs::remove_all(entry.path(), ec);
+        if (ec) {
+            OB_LOG_ERROR("columnar",
+                         "replace_from_staging: cannot remove '%s': %s — the store now holds "
+                         "part of what was here and part of what is arriving",
+                         entry.path().string().c_str(), ec.message().c_str());
+            rebuild_index_locked();
+            return false;
+        }
+        ++removed;
+    }
+
+    size_t installed = 0;
+    for (const auto& rel : relative_paths) {
+        const fs::path src = fs::path(staging_dir) / rel;
+        const fs::path dst = fs::path(base_dir_) / rel;
+        fs::create_directories(dst.parent_path(), ec);
+        fs::rename(src, dst, ec);
+        if (ec) {
+            // Cross-device staging: copy then remove.
+            std::error_code copy_ec;
+            fs::copy_file(src, dst, fs::copy_options::overwrite_existing, copy_ec);
+            if (copy_ec) {
+                OB_LOG_ERROR("columnar",
+                             "replace_from_staging: cannot install '%s': %s",
+                             rel.c_str(), copy_ec.message().c_str());
+                rebuild_index_locked();
+                return false;
+            }
+            fs::remove(src, copy_ec);
+        }
+        ++installed;
+    }
+
+    rebuild_index_locked();
+    OB_LOG_INFO("columnar",
+                "Store replaced from staging: removed %zu stale directory/ies, installed %zu "
+                "file(s), index now holds %zu segment(s)",
+                removed, installed, index_.size());
+    return true;
 }
 
 // ── merge_segments ────────────────────────────────────────────────────────────

@@ -243,14 +243,32 @@ public:
 
     /// Replace this node's sequence state with a snapshot sender's.
     ///
-    /// Only legitimate straight after `load_snapshot()`, because it resets: our contents are now
-    /// the sender's contents, so our frontiers must be the sender's frontiers and nothing else.
+    /// Only legitimate straight after `install_snapshot()` or `adopt_store_on_disk()`, because it
+    /// resets: our contents are now the sender's contents, so our frontiers must be the sender's
+    /// frontiers and nothing else.
     void adopt_snapshot_sequence_state(const std::vector<SequenceTracker::VectorEntry>& vector,
                                        const std::vector<SequenceTracker::HeldRanges>& held);
 
-    /// Load a snapshot received from the primary: replace the columnar store
-    /// index with the snapshot's segments.
-    void load_snapshot(const SnapshotManifest& manifest);
+    /// Install a received snapshot: the staged files **replace** this node's columnar store, and
+    /// the in-memory state that described the old one is discarded.
+    ///
+    /// This is the whole of what "bootstrap from a snapshot" means, in one call, because the
+    /// defect it closes was that it used to be two and the first one did not exist (#142). Each
+    /// installer renamed the received files into the data directory and removed nothing, then
+    /// called a function named `load_snapshot` which cleared **memory** and rebuilt the index
+    /// from whatever was on disk — so a replica that had flushed a *prefix* of a symbol kept its
+    /// own segment beside the arriving one and answered with both. The name described the
+    /// caller's intention rather than what the function did.
+    [[nodiscard]] bool install_snapshot(const std::string& staging_dir,
+                                        const SnapshotManifest& manifest);
+
+    /// Discard the in-memory store and re-read the index from whatever is on disk.
+    ///
+    /// Note what this does **not** do: it does not touch the files. It is the second half of
+    /// `install_snapshot()`, exposed because a test that wants the buffers cleared has no
+    /// snapshot to install — and named for what it does, so that no caller can mistake it for an
+    /// install again.
+    void adopt_store_on_disk();
 
     /// Returns true if the replica is currently bootstrapping from a snapshot.
     bool is_bootstrapping() const;

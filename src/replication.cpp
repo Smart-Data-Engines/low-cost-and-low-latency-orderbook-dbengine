@@ -2951,40 +2951,29 @@ void ReplicationClient::install_snapshot(const std::string& staging_dir,
                                           const SnapshotManifest& manifest) {
     const std::string& data_dir = engine_.base_dir();
 
-    // Move staged files into the data directory.
-    // We move entire segment directories (parent of column files).
-    std::set<std::string> moved_dirs;
+    // Defence in depth. request_and_receive_snapshot() already validates every path before
+    // writing to staging, but the install is what writes inside the live data directory, so it
+    // re-checks rather than trusting the manifest it was handed. Refusing here rather than
+    // skipping the entry: the store is about to be replaced by exactly this list, so an entry we
+    // will not install is a hole in it.
     for (const auto& entry : manifest.files) {
-        // Defence in depth. request_and_receive_snapshot() already validates
-        // every path before writing to staging, but this is the call that
-        // overwrites files inside the live data directory, so it re-checks
-        // rather than trusting the manifest it was handed.
         if (!is_safe_snapshot_path(entry.path) ||
             !path_stays_within(data_dir, entry.path)) {
             OB_LOG_ERROR("repl_client",
-                         "Refusing to install snapshot entry with unsafe path: '%s'",
+                         "Refusing to install a snapshot naming an unsafe path: '%s'",
                          entry.path.c_str());
-            continue;
-        }
-
-        std::string src = staging_dir + "/" + entry.path;
-        std::string dst = data_dir + "/" + entry.path;
-
-        // Ensure destination parent directory exists.
-        fs::create_directories(fs::path(dst).parent_path());
-
-        // Move (rename) the file.
-        std::error_code ec;
-        fs::rename(src, dst, ec);
-        if (ec) {
-            // Fallback: copy + remove (cross-device move).
-            fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
-            if (!ec) fs::remove(src, ec);
+            return;
         }
     }
 
-    // Load the snapshot into the engine.
-    engine_.load_snapshot(manifest);
+    // One call, because the two halves have to be one: the files replace the store rather than
+    // joining it (#142).
+    if (!engine_.install_snapshot(staging_dir, manifest)) {
+        OB_LOG_ERROR("repl_client",
+                     "Snapshot install failed; not recording its WAL position, so the next "
+                     "attempt starts from the position this node already had");
+        return;
+    }
 
     // Update confirmed WAL position.
     confirmed_file_.store(manifest.wal_file_index, std::memory_order_relaxed);

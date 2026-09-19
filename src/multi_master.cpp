@@ -508,7 +508,7 @@ bool MultiMasterManager::handle_remote_record(uint16_t /*peer_node_id*/,
     uint16_t origin = hdr.origin_node_id;
 
     // Nothing may be applied while a snapshot is being installed, and — just as important —
-    // nothing may be *recorded as seen*. load_snapshot() discards the in-memory buffers, so a
+    // nothing may be *recorded as seen*. install_snapshot() discards the in-memory buffers, so a
     // delta applied now can vanish while its number stays in the tracker: a frontier claiming a
     // row that does not exist, which no later catch-up will ever fill. Left unmarked, the record
     // comes back on the next vector exchange, because our frontier will not cover it.

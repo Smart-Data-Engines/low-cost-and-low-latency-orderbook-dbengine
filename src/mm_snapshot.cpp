@@ -625,7 +625,7 @@ void MultiMasterManager::handle_snapshot_begin(PeerConnection& peer,
     }
 
     // Refuse writes from this point. Applying anything now would be applying it to contents that
-    // load_snapshot() is about to discard.
+    // install_snapshot() is about to replace.
     start_bootstrap();
 
     OB_LOG_INFO("mm",
@@ -862,7 +862,8 @@ void MultiMasterManager::handle_snapshot_end(PeerConnection& peer,
         return;
     }
 
-    engine_.load_snapshot(st.manifest);
+    // install_snapshot_files() has already replaced the store; this imports the sender's
+    // frontiers over the reset that performed.
     engine_.adopt_snapshot_sequence_state(st.vector, st.held);
 
     const auto elapsed = std::chrono::duration<double>(
@@ -884,7 +885,6 @@ void MultiMasterManager::handle_snapshot_end(PeerConnection& peer,
 bool MultiMasterManager::install_snapshot_files() {
     auto& st = snapshot_recv_;
     const std::string& data_dir = engine_.base_dir();
-    bool all_ok = true;
 
     // Check every staged file before renaming any of them. Renaming as we go and stopping at the
     // first failure leaves the data directory holding part of one snapshot and part of whatever
@@ -913,27 +913,12 @@ bool MultiMasterManager::install_snapshot_files() {
             OB_LOG_ERROR("mm", "Refusing to install unsafe path '%s'", entry.path.c_str());
             return false;
         }
-
-        const std::string src = st.staging_dir + "/" + entry.path;
-        const std::string dst = data_dir + "/" + entry.path;
-
-        std::error_code ec;
-        fs::create_directories(fs::path(dst).parent_path(), ec);
-        fs::rename(src, dst, ec);
-        if (ec) {
-            // Cross-device staging: copy then remove.
-            std::error_code copy_ec;
-            fs::copy_file(src, dst, fs::copy_options::overwrite_existing, copy_ec);
-            if (copy_ec) {
-                OB_LOG_ERROR("mm", "Cannot install '%s': %s",
-                             entry.path.c_str(), copy_ec.message().c_str());
-                all_ok = false;
-                break;
-            }
-            fs::remove(src, copy_ec);
-        }
     }
-    return all_ok;
+
+    // The staged files **replace** the store rather than joining it, in one exclusive operation,
+    // and that is #142: this used to be a rename loop that removed nothing, followed by a call
+    // named `load_snapshot` which only cleared memory.
+    return engine_.install_snapshot(st.staging_dir, st.manifest);
 }
 
 void MultiMasterManager::abort_bootstrap(const char* reason) {

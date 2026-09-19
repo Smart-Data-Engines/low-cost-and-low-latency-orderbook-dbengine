@@ -97,7 +97,7 @@ using RowCallback = std::function<void(const QueryResult&)>;
 /// snapshot install clears them, so a query that resolved a raw pointer under the lock and then
 /// read through it after releasing the lock read freed memory. Measured with AddressSanitizer, 3
 /// of 3 runs: `heap-use-after-free` on the seqlock version load inside `read_snapshot()`, from the
-/// query thread, with the free in `load_snapshot()`. The cost is one atomic increment per query and
+/// query thread, with the free in the snapshot install. The cost is one atomic increment per query and
 /// nothing on the write path, which resolves its buffer under the same lock it writes beneath. The
 /// alternative that costs more is named in the roadmap: holding `Engine::mtx_` across a whole query
 /// puts a scan's latency on every writer.
