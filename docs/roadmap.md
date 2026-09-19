@@ -2772,7 +2772,64 @@ engine could not express the narrower question — that is #139, and it is the b
 - Effort: S | Impact: 32% off the published query path, measured on the path rather than on a
   micro-benchmark
 
-### 137. A writer that hits the pending-row ceiling waits for a flush nothing asks for, and the writer is the epoll thread
+### 137. A writer that hits the pending-row ceiling waits for a flush nothing asks for, and the writer is the epoll thread ✅
+
+**Closed.** A writer that runs out of room asks for a flush before it sleeps, and its wait has a
+deadline.
+
+**What it was waiting for takes 73 ms.** Measured on an m9g.xlarge with the flush interval set to
+an hour so that the only flush is the one being timed, at three sizes, under a load average of
+2.95 from the neighbouring session — pessimistic, which is the right direction for choosing a
+deadline:
+
+| pending rows | write | **flush** |
+|---|---|---|
+| 250,000 | 0.086 s | **0.017 s** |
+| 500,000 | 0.179 s | **0.034 s** |
+| 1,000,000 — the full ceiling | 0.393 s | **0.073 s** |
+
+Linear, 0.068 µs a row. So the writer was waiting out `--flush-interval-ms` for work that takes
+73 ms: thirteenfold at one second, and at the hour an operator can set it, a node that cannot be
+told apart from a hung one.
+
+**Measured, and the prediction was written before the work.** One m9g.xlarge, 4,000,000 levels
+through a pipelining client, alternating, with a load guard refusing to start while the
+neighbouring session was busy:
+
+| `--flush-interval-ms` | before | after |
+|---|---|---|
+| 1000 | 1,196,745 / 1,195,609 | **2,209,501 / 2,203,385** |
+| 100 — the default | 2,217,558 / 2,212,487 | 2,225,466 / 2,187,635 |
+
+**1.85× at one second, and the slope is gone rather than softened**: 2.21M is the rate the same
+client gets *below* the ceiling, so four million levels now cost what two hundred thousand do.
+The prediction recorded before the change was 1.9–2.2M and the measurement is 2.20–2.21M. The
+100 ms row is the control and it does not move, which is the answer to "does this cost anything
+at the setting the engine ships with": no.
+
+**Two halves, and the control shows both are load-bearing.** Asking removes the dependency on the
+interval; it does nothing when the flush itself cannot make progress, which is a full disk or
+#113's `EIO`. So the wait has a five-second deadline and the write is **refused** after it rather
+than accepted — sixty times the 73 ms, so a healthy flush never reaches it even an order of
+magnitude slower. A deadline a healthy write can touch is a gate on a clock, and those teach
+operators to ignore refusals. Measured with the ask removed and the deadline kept: the same test
+takes the refusal path in 5 s and fails with a sentence, where before this item it would have
+waited an hour and reported a stuck runner.
+
+**Where the numbers to compare came from, and the run that did not count.** The first before/after
+went on two trees that both predate #140 and produced eight rows at **20.1–20.5 s and ~198,000
+levels/s** — the same at 100 ms and at 1000 ms, and the same on both trees. My first reading was
+that the shared box had been busy. The arithmetic says otherwise: 200,000 updates at batch 512 is
+391 round trips, and 391 × the 52.15 ms delayed-ACK timer #140 measured is **20.4 s** against
+20.13 measured. The ceiling under test was never reached, because the wire capped the run an order
+of magnitude below it. **A quantity that will not move when you move its input is not noise, it is
+a different limit**, and a fix measured against a baseline missing an earlier fix measures the
+earlier one.
+
+- Effort: M | Impact: P0. The waiting thread is the epoll loop, so while it waits the node accepts
+  nothing, answers nothing, logs nothing and — measured — does not observe `SIGTERM` for 273 s
+
+**How it was found and what it cost before, kept below.**
 
 Found on the aarch64 benchmark box while measuring the wire, by a probe that ran a node with
 `--flush-interval-ms 3600000` so that no flush would perturb the timing. The node accepted 50,000
@@ -7923,21 +7980,24 @@ measures the harness.
 
 ## Recommended order
 
-**Three P0s are open: #136, #137 and #142** — the mechanical list is the `Open:` line below, and
-this paragraph says what they cost rather than repeating it. All three were found by running the
-tree somewhere it had not run before, and all three are filed rather than fixed because each has
+**Two P0s are open: #136 and #142** — the mechanical list is the `Open:` line below, and
+this paragraph says what they cost rather than repeating it. Both were found by running the
+tree somewhere it had not run before, and both are filed rather than fixed because each has
 candidate answers that differ in price. #136 changes an on-disk layout the snapshot manifest and
-retention both address; #137 changes what backpressure means; #142 is the newest and the least
+retention both address; #142 is the newest and the least
 understood — a replica bootstrapped by snapshot keeps rows the primary does not have, for a
 symbol it already held, and its three candidate mechanisms include #136's guard in a second
-place. **#139 was the third item on this line and is
+place. **#137 was on this line and is closed**: a writer at the pending-row ceiling asks for a
+flush now, and four million levels at a one-second interval went 1,196,745 to 2,209,501 levels/s —
+the rate the same client gets below the ceiling, so the slope is gone rather than softened.
+**#139 was on it too and is
 closed**: the row path answers the columns a query names, `SELECT *` byte for byte unchanged and a
 fifth off a three-column question. Every P0 raised before it —
 #60, #61, #62, #64, #68, #73, #74, #80, #88 and #97 — is closed, and several were found by running a real cluster rather than by reading the code
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #136, #137 and #142.** Every other item above #58 is marked closed, and
+**Open: #136 and #142.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
