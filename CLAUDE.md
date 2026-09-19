@@ -2983,6 +2983,40 @@ Learned the hard way. Check here before debugging.
      hundred at those rates, and which one depends on when the subscriber's acknowledgement
      happened to be due (#140).
 
+356. **A function named for what its caller wants is a function nobody checks against what it
+     does, and here the name was the whole defect.** `Engine::load_snapshot()` cleared the
+     in-memory store and rebuilt the index from **whatever was on disk**; it never touched a file.
+     Both installers renamed the received files in and removed nothing, on the reasonable reading
+     that a function called *load snapshot* loads the snapshot — the mesh's own comment says
+     applying a write now "would be applying it to contents that `load_snapshot()` is about to
+     discard", and it discards memory. So a replica that had flushed a *prefix* of a symbol kept
+     its own segment beside the arriving one: **122 rows against the primary's 100** (#142). The
+     names overlap without matching, because a segment's directory name is its event-time range
+     and a prefix ends earlier, so #136's duplicate-directory guard had nothing to refuse. Two
+     rules fall out. When a function's name states an effect, grep for the syscall that would have
+     it — here `remove`, and there was none. And split the name rather than the behaviour:
+     `install_snapshot()` does the whole thing and `adopt_store_on_disk()` is the memory half,
+     under a name that cannot be mistaken for the other.
+
+357. **Clearing in the caller and rebuilding afterwards moves a window; clearing under the lock
+     the readers take removes it.** The obvious fix for #142 — delete the directories, then
+     rename, then reopen — leaves a gap in which a scan answers **short** rather than failing,
+     because `ColumnarStore::close()` keeps the index and every read path opens its files per
+     call with an `is_open()` test. That gap already existed as a rename over live files, which is
+     why it is worth saying that the fix removes it rather than inherits it: the swap lives in
+     `ColumnarStore` and holds `index_mtx_` exclusively for all four steps, so a concurrent scan
+     blocks on the shared lock and then sees one store. The trap on the way: `open_existing()`
+     takes that mutex itself and `std::shared_mutex` is not recursive, so the rebuild had to be
+     split into an unlocked half first — the same shape as pitfalls 20 and 68, met a third time.
+
+358. **Both snapshot staging directories live inside the data directory, so "clear the store"
+     deletes the files you are about to install.** Replication stages at `<base>/snapshot_staging`
+     and the mesh at `<base>/mm_snapshot_staging`. A clear written as "every top-level directory
+     whose name does not begin with `wal_`" — which is what `discard_local_data_for_resync()`
+     already says, correctly, for its own path — eats the snapshot. There is a unit test for
+     exactly that, because it is the one mistake that turns this fix into a worse defect than the
+     one it closes.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -3008,16 +3042,17 @@ Read the sanitizer claims with #83 in mind: until it landed, `OB_ENABLE_ASAN`, `
 libraries**, because `add_compile_options()` only affects targets declared after it and those blocks
 sat below all of them.
 
-**Two P0s are open, and the set is held mechanically by the `Open:` line in `docs/roadmap.md` —
-read it there rather than trusting this sentence to have been updated.** **#137 closed with the
-change beside this one**: a writer at the pending-row ceiling asks for a flush instead of waiting
-out `--flush-interval-ms`, measured 1,196,745 → 2,209,501 levels/s at four million levels and a
-one-second interval, unchanged at the 100 ms default. **#142** is the newest: a replica
-bootstrapped by snapshot after retention removes its position keeps rows the primary does not
-have — measured with both nodes queried in one run, primary 100 and replica 138, for the symbol
-the replica already held, while the symbol it never had is exact. Nine runs of nine on the
-development machine across three trees, and green on the runner for the two of those three it has
-run, which is what kept it hidden. And #136: writing the same event-time span
+**One P0 is open, and the set is held mechanically by the `Open:` line in `docs/roadmap.md` —
+read it there rather than trusting this sentence to have been updated: #136.** Two closed beside
+it. **#137**: a writer at the pending-row ceiling asks for a flush instead of waiting out
+`--flush-interval-ms`, measured 1,196,745 → 2,209,501 levels/s at four million levels and a
+one-second interval, unchanged at the 100 ms default. **#142**: a snapshot install renamed the
+received files in and removed nothing, so a replica that had flushed a *prefix* of a symbol kept
+its own segment beside the arriving one and answered with both — 122 rows against the primary's
+100, varying with how much it had flushed when it died. The staged files replace the store now, in
+one exclusive operation on `ColumnarStore`, and the green CI runs were never "no defect": a
+replica that flushed the **whole** set produced a directory named identically, so the rename
+overwrote it. What is left is #136: writing the same event-time span
 twice for one symbol — which is what re-running a backfill is, and #105 put event time on the wire
 so that backfills are expressible — destroys that symbol's segment. Both writes are acknowledged;
 the first write's values are silently replaced, or, when the second write has fewer rows, the
