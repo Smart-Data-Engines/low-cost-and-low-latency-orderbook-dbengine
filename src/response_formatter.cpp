@@ -102,6 +102,28 @@ static char* put_column(char* p, char* end, const QueryResult& r, QueryColumn c,
     return p;
 }
 
+/// The seven-column row, unrolled.
+///
+/// A duplicate of what the loop below does, and it is here because measuring said so rather than
+/// because it looked faster. With only the general loop, `SELECT *` - the shape the published
+/// comparative table measures - cost **24% more cycles inside this function** over 16,000 of that
+/// query on an m9g.xlarge (2.107 G to 2.621 G), while every other symbol stayed flat. Seven
+/// straight-line calls inline; a loop that picks the field by a value cannot, however cheap the
+/// switch is.
+///
+/// The two paths are pinned against each other by a test that formats each column alone through
+/// the loop and compares it with the same field cut out of this one's output.
+static char* put_seven(char* p, char* end, const QueryResult& r) {
+    p = put_field(p, end, r.timestamp_ns,    '\t');
+    p = put_field(p, end, r.price,           '\t');
+    p = put_field(p, end, r.quantity,        '\t');
+    p = put_field(p, end, r.order_count,     '\t');
+    p = put_field(p, end, r.side,            '\t');
+    p = put_field(p, end, r.level,           '\t');
+    p = put_field(p, end, r.sequence_number, '\n');
+    return p;
+}
+
 std::string format_query_response(const std::vector<QueryResult>& rows,
                                   const std::vector<QueryColumn>& columns) {
     std::string out;
@@ -135,11 +157,18 @@ std::string format_query_response(const std::vector<QueryResult>& rows,
     }
     char* const line_end = line + std::max(needed, sizeof(stack_line));
 
+    // Decided once for the whole response, so the unrolled path costs one predictable branch per
+    // row rather than a test per field.
+    const bool canonical = (columns == all_query_columns());
     const size_t last = columns.empty() ? 0 : columns.size() - 1;
     for (const auto& r : rows) {
         char* p = line;
-        for (size_t i = 0; i < columns.size(); ++i) {
-            p = put_column(p, line_end, r, columns[i], i == last ? '\n' : '\t');
+        if (canonical) {
+            p = put_seven(p, line_end, r);
+        } else {
+            for (size_t i = 0; i < columns.size(); ++i) {
+                p = put_column(p, line_end, r, columns[i], i == last ? '\n' : '\t');
+            }
         }
         out.append(line, static_cast<size_t>(p - line));
     }

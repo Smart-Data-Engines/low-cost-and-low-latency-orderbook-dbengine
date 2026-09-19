@@ -113,8 +113,24 @@ ob> query SELECT * FROM 'BTC-USD'.'BINANCE' WHERE timestamp BETWEEN 0 AND 999999
   1773478813948808615  | bid  |     0 |      6499000 |          200 |      5 |        2
   ── 2 row(s) in 0.11 ms
 
+A select list narrows the answer. `SELECT price, quantity FROM 'BTC-USD'.'BINANCE' WHERE ...`
+returns two columns, in that order, and the server reads only the column files it needs to answer
+it — `SELECT quantity, price` answers in the order asked, and a column named twice is answered
+twice. Naming a column the engine does not have is refused, as it always was.
+
+The column is spelt `timestamp` or `timestamp_ns` in a query; the response header always calls it
+`timestamp_ns`. Both spellings parse, so a name copied out of a header works.
+
+**`query` above renders the seven-column shape and refuses anything else**, and so does the Python
+client: both read a row by position, so they name the columns they were handed rather than read the
+wrong field. A narrowed query goes over the raw protocol until they read columns by name.
+
+`SUBSCRIBE` takes a select list and **does not** narrow what it pushes — a `PUSH` line carries no
+header, so a narrowed push would change what field 2 means with no way for a client to tell. The
+server logs that once per subscription.
+
 `seq` is the per-origin sequence number of the update that produced the row, and the wire protocol
-carries it as the seventh column of a `SELECT` response. Consecutive numbers for one symbol mean
+carries it as the seventh column of a `SELECT *` response. Consecutive numbers for one symbol mean
 nothing is missing between them; a hole means a row did not arrive. `0` means the number is unknown —
 the row was stored before sequencing existed, or the server predates the column and sent six fields.
 ```

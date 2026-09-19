@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -211,4 +212,55 @@ TEST(QueryResponseProjection, SelectStarIsExactlyTheSevenColumnList) {
     EXPECT_EQ(ob::format_query_response(rows, ob::all_query_columns()),
               "OK\ntimestamp_ns\tprice\tquantity\torder_count\tside\tlevel\tsequence_number\n"
               "1\t2\t3\t4\t1\t6\t7\n8\t9\t10\t11\t0\t12\t13\n\n");
+}
+
+TEST(QueryResponseProjection, TheUnrolledSevenAndTheGeneralLoopAgreeFieldForField) {
+    // `SELECT *` runs an unrolled path because the general loop measured 24% more cycles inside
+    // the formatter for exactly that shape. Two paths need something holding them together, and
+    // it cannot be a call that picks between them - the choice is made from the column list, so
+    // any list of the canonical seven takes the fast one.
+    //
+    // So: format each column **alone**, which is necessarily the loop, and compare it with that
+    // field cut out of the unrolled output. A fast path that wrote a field differently, or in the
+    // wrong order, fails here on that column and names it.
+    const std::vector<ob::QueryResult> rows{
+        row(1'700'000'000'000'000'001ULL, -5'000'000, 999'999, 4'000'000'000u, 1, 65'535, 7),
+        row(0, 0, 0, 0, 0, 0, 0),
+        row(UINT64_MAX, INT64_MIN, UINT64_MAX, UINT32_MAX, 255, 1, UINT64_MAX),
+    };
+
+    const std::string wide = ob::format_query_response(rows, ob::all_query_columns());
+    std::vector<std::vector<std::string>> wide_fields;
+    {
+        std::istringstream in(wide);
+        std::string line;
+        std::getline(in, line);   // OK
+        std::getline(in, line);   // header
+        while (std::getline(in, line) && !line.empty()) {
+            std::vector<std::string> fields;
+            size_t pos = 0;
+            for (;;) {
+                const size_t tab = line.find('\t', pos);
+                fields.push_back(line.substr(pos, tab == std::string::npos
+                                                      ? std::string::npos : tab - pos));
+                if (tab == std::string::npos) break;
+                pos = tab + 1;
+            }
+            wide_fields.push_back(std::move(fields));
+        }
+    }
+    ASSERT_EQ(wide_fields.size(), rows.size());
+
+    for (size_t c = 0; c < ob::all_query_columns().size(); ++c) {
+        const ob::QueryColumn column = ob::all_query_columns()[c];
+        std::string expected = "OK\n" + std::string(ob::column_name(column)) + "\n";
+        for (const auto& fields : wide_fields) {
+            ASSERT_EQ(fields.size(), ob::all_query_columns().size());
+            expected += fields[c];
+            expected += '\n';
+        }
+        expected += '\n';
+        EXPECT_EQ(ob::format_query_response(rows, {column}), expected)
+            << "the two paths disagree about " << ob::column_name(column);
+    }
 }
