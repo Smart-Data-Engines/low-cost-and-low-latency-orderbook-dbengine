@@ -4,8 +4,9 @@ The engine sets TCP_NODELAY on every socket it dials and, until #140, on none it
 holds a small write while an earlier byte is unacknowledged; a client that sends several commands
 before reading gives the server two writes and has no reason to acknowledge the first, so the
 second sat in the server's kernel until the client's delayed-ACK timer fired. Measured on one
-m9g.xlarge: **19.6 round trips per second, a fixed 51.5 ms each**, against 0.084 ms once the
-client acknowledged immediately — the same server, the same bytes.
+m9g.xlarge: **52.75 ms per round trip at batch 8**, and 51.68 and 52.15 at 64 and 512 — the same
+figure at three batch sizes, which is a timer rather than a cost. The same 250 round trips took
+12.963 s before and 0.021 s once the client acknowledged immediately, the server unchanged.
 
 A socket option cannot be read from the other end of a connection, so this asks about the
 consequence instead. The two numbers are three orders of magnitude apart, so the threshold is not

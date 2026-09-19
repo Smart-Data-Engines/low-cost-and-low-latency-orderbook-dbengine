@@ -5,8 +5,9 @@
 // timer releases it. With one response in flight there is nothing unacknowledged, so a
 // request/response client never meets it — and every published number for this engine came from
 // such a client. A client that pipelines meets it on every round trip: measured on one
-// m9g.xlarge, **19.6 round trips per second at a fixed 51.5 ms**, unchanged at batch 64 and 512,
-// against 0.084 ms once the client acknowledged immediately without the server changing at all.
+// m9g.xlarge, **52.75 ms per round trip at batch 8**, and 51.68 and 52.15 at 64 and 512 — the
+// same figure at three batch sizes, which is a timer. The same 250 round trips took 12.963 s
+// before and 0.021 s once the client acknowledged immediately, with the server unchanged.
 //
 // Two checks, because neither is sufficient alone. The behavioural one proves the helper does what
 // its name says on a real socket, which is what a no-op mutation has to survive. The static one

@@ -20,9 +20,11 @@ namespace ob {
 /// line, a WAL record, an `ACK`.
 ///
 /// Measured before it was set on the accepted client socket (Amazon EC2 m9g.xlarge, quiet box,
-/// loopback, one connection): a client pipelining eight `MINSERT`s per round trip completed
-/// **19.6 round trips per second**, a fixed **51.5 ms** each, and the figure did not move with the
-/// batch size — 19.4/s at 64 and 19.3/s at 512, so it was a timer rather than any per-byte cost.
+/// loopback, one connection, 20,000 updates of 20 levels): a client pipelining eight `MINSERT`s
+/// per round trip spent **52.75 ms** on each, and the figure did not move with the batch size —
+/// **51.68 ms** at 64 and **52.15 ms** at 512, so it was a timer rather than any per-byte cost.
+/// The server's own CPU across those three runs was 0.16, 0.12 and 0.14 seconds for the same
+/// 400,000 levels, so none of that wall time was work.
 /// The diagnosis is the client-side control: re-arming `TCP_QUICKACK` before every `recv` so the
 /// client acknowledges immediately, changing nothing on the server, took the same 250 round trips
 /// from **12.963 s to 0.021 s**. Nothing else about either process changed, so what the pipelining
