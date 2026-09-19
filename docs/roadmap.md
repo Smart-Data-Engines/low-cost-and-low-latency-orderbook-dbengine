@@ -2330,6 +2330,29 @@ publishes comparative numbers is in Python, so Python is where the measurement n
 `OrderbookClient::minsert_batch()` is the same loop over a reader that already exists and is worth
 doing when something needs it.
 
+**Mutations: nine, each with the verdict it is meant to produce, and the first control is the one
+worth reading.**
+
+| mutation | wanted | got |
+|---|---|---|
+| the wire spelling drops the event time | KILLED | KILLED |
+| every write is spelled `INSERT` | KILLED | KILLED |
+| only the first outcome is returned | KILLED | KILLED |
+| every outcome claims success | KILLED | KILLED |
+| the batch ceiling is gone | KILLED | KILLED |
+| the level lists need not line up | KILLED | KILLED |
+| an event time the server cannot store is sent anyway | KILLED | KILLED |
+| CONTROL: the batch is sent one command at a time | SURVIVES | survived |
+| CONTROL: the pool refusal is reworded | SURVIVES | survived |
+
+Replacing the single write with a loop of `execute()` — which is `insert()` again, one round trip
+per command — **survives every test in this module**, and it should. The tests state what a batch
+*stores* and what it *says about each update*, and neither of those changes when the same bytes
+take nine hundred round trips instead of one. What the speed claim rests on is the measured table
+above, which no test can be a substitute for; a test that gated on it would be a gate on a clock,
+and this repository has one of those to point at already. Saying which of the two carries the
+claim is the reason that row is in the table rather than left out.
+
 - Effort: S | Impact: #140's measurement becomes reachable from the client this project ships,
   which is the difference between a protocol that allows something and a product that does it
 
