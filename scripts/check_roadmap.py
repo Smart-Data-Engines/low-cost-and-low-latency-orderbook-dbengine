@@ -67,6 +67,12 @@ CODE_SPAN_RE = re.compile(r"`[^`]*`")
 # numbered above the last item is the first one that fails. A rule that passes by coincidence is
 # indistinguishable from one that works until the coincidence ends.
 GITHUB_LINK_RE = re.compile(r"\[[^\]]*\]\(https://(?:www\.)?github\.com/[^)]*\)")
+# And the same two kinds of thing sharing one notation, without a link around it. `PR #146` is a
+# pull request; `#146` on its own is item 146. The link rule above closed the case where a citation
+# carries a URL and left this one, which failed the first time this page cited a PR numbered above
+# the item count - two of them, in the same line. The token before the number is the whole
+# distinction, so it is the whole rule: a bare `#9999` still fails and `PR #9999` does not.
+PR_REF_RE = re.compile(r"\bPRs?\s+#\d+(?:\s*(?:,|and)\s*#\d+)*")
 # The priority table, anchored on its header row. A table of what to do next that lists an item
 # already closed is the rot the `Open:` line was mechanised against, one section further down: it
 # happened on 7 September to three items at once, was fixed by hand, and happened again to #121 and
@@ -119,7 +125,7 @@ def main() -> int:
             cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
             if len(cells) < 2:
                 continue
-            cleaned = GITHUB_LINK_RE.sub("", CODE_SPAN_RE.sub("", cells[1]))
+            cleaned = PR_REF_RE.sub("", GITHUB_LINK_RE.sub("", CODE_SPAN_RE.sub("", cells[1])))
             for ref in REF_RE.finditer(cleaned):
                 number = int(ref.group(1))
                 title = items.get(number)
@@ -144,6 +150,7 @@ def main() -> int:
         # range/reference overlap logic below still line up.
         line = CODE_SPAN_RE.sub(lambda m: " " * len(m.group(0)), line)
         line = GITHUB_LINK_RE.sub(lambda m: " " * len(m.group(0)), line)
+        line = PR_REF_RE.sub(lambda m: " " * len(m.group(0)), line)
         checked_spans = []
         for match in RANGE_RE.finditer(line):
             checked_spans.append(match.span())
