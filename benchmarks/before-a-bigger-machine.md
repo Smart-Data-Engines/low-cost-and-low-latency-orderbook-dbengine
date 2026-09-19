@@ -8,6 +8,12 @@ gets published is a number about the engine rather than a number about its defau
 It is a read-only survey: nothing in it changes the engine, and every claim in it was checked
 against the tree rather than remembered.
 
+**The run happened. The results are in [`on-a-bigger-machine.md`](on-a-bigger-machine.md)**, on an
+`m9g.xlarge` — which is aarch64, where this page asked for x86_64, and the one reason it asked is
+answered there. **Nothing below this line has been edited since it was written**, including the
+prediction near the end and including the parts the measurement contradicted: a prediction rewritten
+after the run is not a prediction, and every one of these was too conservative.
+
 
 ## The finding that matters most: the engine does not size itself to the machine at all
 
@@ -166,6 +172,15 @@ python3 -m benchmarks.comparative.run --rows 200000 --symbols 50 --levels 20 --s
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release && cmake --build build-release -j$(nproc)
 ./build-release/benchmarks/bench_engine --benchmark_filter=BM_IngestionThroughput
 ```
+
+**The command is unchanged and its meaning is not.** Google Benchmark's filter is a regex *search*,
+so this one name now selects two benchmarks - verified by running `--benchmark_filter=BM_Ingestion`
+against a build that has only the first, which listed it. The difference matters because
+`BM_IngestionThroughput` applies **one** level per call, which is this engine's most cache-friendly
+shape and was the source of the published in-process figure, while the harness above sends
+**twenty** levels per round trip: the two halves of the published ratio were in different units.
+`BM_IngestionThroughputBatched` is the twenty-level one, added beside the first rather than
+replacing it, and this line now runs both.
 
 Both numbers go into the same write-up or neither does: a table carrying only the wire figure
 describes a protocol, and one carrying only the in-process figure describes a library nobody can
