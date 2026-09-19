@@ -2985,7 +2985,8 @@ this sentence to have been updated. **#142** is the newest: a replica bootstrapp
 after retention removes its position keeps rows the primary does not have — measured with both
 nodes queried in one run, primary 100 and replica 138, for the symbol the replica already held,
 while the symbol it never had is exact. Nine runs of nine on the development machine across three
-trees, green on the runner every time, which is what kept it hidden. The other two:
+trees, and green on the runner for the two of those three it has run, which is what kept it
+hidden. The other two:
 writing the same event-time span
 twice for one symbol — which is what re-running a backfill is, and #105 put event time on the wire
 so that backfills are expressible — destroys that symbol's segment. Both writes are acknowledged;

@@ -2215,8 +2215,9 @@ ignore checks.
 ### 142. A replica bootstrapped by snapshot keeps rows the primary does not have, for a symbol it already held
 
 Found while verifying #141's branch, and **not caused by it**: the same test fails on this
-machine against #141's tree, against #139's, and against plain master, nine runs of nine. It is
-green on the GitHub runner in all three.
+machine against #141's tree, against #139's, and against plain master, nine targeted runs of
+nine plus the one in a full battery. On the GitHub runner the two trees it has run — master and
+#139's — were both green, and #141's tree had not yet run when this was written.
 
 `tests/integration/test_wal_rotation.py::test_a_replica_whose_position_was_truncated_is_bootstrapped`
 writes 100 rows for one symbol, waits for the replica to hold them, kills it, writes 1500 rows
