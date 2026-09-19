@@ -2244,10 +2244,25 @@ against the same build, sweeping volume at `--flush-interval-ms 1000`:
 | 4,000,000 | 3.344 s | 1,196,162 |
 
 Flat to **1,000,000 levels**, which is `MAX_PENDING_ROWS` exactly, and falling after it. That is
-#137's slope, and it is the next ceiling: a request/response client could not reach it, so until
-this change nothing could. The before/after ratio above is unaffected — both sides ran the same
-volume at the same interval — but the number a reader should carry away for sustained ingest is
-**1,196,162 levels/s at four million**, not 2,174,287.
+#137's slope, and a request/response client could not reach it, so until this change nothing
+could. The before/after ratio above is unaffected: both sides ran the same volume at the same
+interval.
+
+**And the sweep is at `--flush-interval-ms 1000`, which is not what this engine ships.** The
+default is 100 ms, and asking the same question there was worth doing before writing the sentence
+this paragraph nearly carried. Four runs of each, alternating, four million levels:
+
+| `--flush-interval-ms` | levels/s |
+|---|---|
+| 100 — the default | 2,175,674 / 2,122,961 / 2,028,399 / 2,225,517 |
+| 1000 | 1,196,163 / 1,192,260 / 1,195,473 / 1,197,076 |
+
+At the shipped default **the ceiling costs nothing measurable** — four million levels run at the
+same rate as two hundred thousand. At one second it costs **1.8×**, and the 1000 ms column is so
+tight across four runs because what it is measuring is a timer rather than work. So the honest
+sustained figure depends on a setting: **~2.1M levels/s as shipped**, and 1.2M for an operator who
+has lengthened the interval. That is a narrower claim than the one this paragraph started with,
+and the measurement that narrowed it took four minutes.
 
 **The diagnosis is the control on the other side.** `TCP_QUICKACK` re-armed before every `recv` in
 the client — the server unchanged, not rebuilt, not restarted — took the same 250 round trips from
