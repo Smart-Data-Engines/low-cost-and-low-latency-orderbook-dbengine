@@ -5,6 +5,7 @@
 //
 // Requirements: 4.1–4.8, 9.1–9.6
 
+#include "orderbook/socket_options.hpp"
 #include "orderbook/level_payload.hpp"
 #include "orderbook/multi_master.hpp"
 #include "orderbook/loop_guard.hpp"
@@ -768,9 +769,7 @@ void MultiMasterManager::io_loop() {
                         }
 
                         set_nonblocking(client_fd);
-                        int tcp_nodelay = 1;
-                        ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY,
-                                     &tcp_nodelay, sizeof(tcp_nodelay));
+                        set_tcp_nodelay(client_fd, "mm");
 
                         std::lock_guard<std::mutex> lock(mtx_);
 
@@ -1222,8 +1221,7 @@ void MultiMasterManager::finish_dial(uint16_t node_id, int fd, const std::string
         return;
     }
 
-    int tcp_nodelay = 1;
-    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &tcp_nodelay, sizeof(tcp_nodelay));
+    set_tcp_nodelay(fd, "mm");
 
     peer.fd             = fd;
     peer.conn_id        = next_conn_id_++;

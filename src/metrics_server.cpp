@@ -203,6 +203,10 @@ void MetricsServer::handle_request(int client_fd) {
     }
 
     // Best-effort send — metrics endpoint is non-critical
+    // OB_NO_TCP_NODELAY: the whole response leaves in this one `::send()` and the descriptor is
+    // closed immediately after, so there is never an earlier unacknowledged byte for Nagle to hold
+    // a second write behind. Setting the option here would be a line that reads as caution and
+    // changes nothing (#140).
     ::send(client_fd, response.data(), response.size(), MSG_NOSIGNAL);
 }
 

@@ -410,6 +410,16 @@ target_compile_definitions(test_field_usage
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 
+# Derives the set of connection-holding sources from the tree rather than listing them, because the
+# sixth accept site is the one that will be added without the option (#140). Reads src/ and the
+# header, so it needs the source directory.
+ob_add_engine_test(test_socket_options
+    test_socket_options.cpp
+)
+target_compile_definitions(test_socket_options
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
 # ── Replication tests ──────────────────────────────────────────────────────────
 ob_add_engine_test(test_replication
     test_replication.cpp

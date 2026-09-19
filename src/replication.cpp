@@ -38,6 +38,7 @@
 // Requirements: 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 3.1, 3.2, 3.3, 3.4, 3.5, 4.1, 4.2, 4.3, 4.4, 4.5, 6.2, 6.3
 
 #include "orderbook/replication.hpp"
+#include "orderbook/socket_options.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/compression.hpp"
 #include "orderbook/level_payload.hpp"
@@ -1053,6 +1054,9 @@ void ReplicationManager::accept_replica() {
             OB_LOG_WARN("repl_mgr", "accept4 failed: %s", std::strerror(errno));
             break;
         }
+
+        // A live record and the `ACK` answering it are the two-small-writes shape exactly (#140).
+        set_tcp_nodelay(client_fd, "repl_mgr");
 
         // Build address string for logging.
         char addr_str[64];
@@ -2082,6 +2086,10 @@ void ReplicationClient::connect_to_primary() {
         throw std::runtime_error(std::string("ReplicationClient: connect() failed: ") +
                                  std::strerror(errno));
     }
+
+    // The other end of the pair above: this socket carries an `ACK` per record, and the primary
+    // holds the next record behind Nagle until one arrives (#140).
+    set_tcp_nodelay(fd_, "repl_client");
 
     // Set a receive timeout so we can periodically check running_ flag.
     struct timeval tv{};
