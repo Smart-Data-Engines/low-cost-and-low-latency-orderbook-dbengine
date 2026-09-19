@@ -36,8 +36,10 @@ namespace ob {
 ///
 /// **The asymmetry this closes.** Before #140 the engine set `TCP_NODELAY` on every socket it
 /// *dialled* — both mesh directions, the C++ client library — and on no socket it *accepted*.
-/// `tests/test_socket_options.cpp` derives the accept sites from the source and refuses one that
-/// does not call this, because the sixth of them is the one that will be added without it.
+/// `tests/test_socket_options.cpp` derives the connection-holding sites from the source and
+/// counts them against the calls each file makes, because the sixth of them is the one that will
+/// be added without it — and counting per file rather than per socket would have let
+/// `src/replication.cpp`, which holds two, lose one of them silently.
 ///
 /// A failure is logged and not fatal: the connection works, it is just slower, and refusing to
 /// serve a client over a socket option would be the worse trade.
