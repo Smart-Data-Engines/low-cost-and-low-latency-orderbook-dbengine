@@ -185,22 +185,28 @@ def main() -> int:
             allowed.add(round(abs(a - b) / max(a, b) * 100, 4))
             # Named so a reader of this script can see classify() is what decides, not the number.
             res_mod.classify(a, b, resolution)
-    # Distances between this run and every other run committed beside it, same system and
-    # workload. The README's "against the previous run" sentence is one of these, and a number
-    # invented for it would otherwise be the one claim on the page nothing checks.
+    # Every distance measurable from a results file committed in this tree: between two systems
+    # inside one run, and between two runs for one system. The README compares this run's systems,
+    # quotes the same pair from the larger-volume run beside it, and says how far this run's ingest
+    # is from the previous one - all three are real and all three are checkable, and a number
+    # invented for any of them would otherwise be a claim nothing reads.
     for other in sorted(results.parent.glob("*.json")):
-        if other == results:
-            continue
         try:
-            past = {s["name"]: s for s in json.loads(other.read_text(encoding="utf-8"))["systems"]}
-        except (json.JSONDecodeError, KeyError):
+            payload = json.loads(other.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
             problems.append(f"{other.name} sits beside the cited run and cannot be read, so a "
-                            f"cross-run figure cannot be checked against it")
+                            f"figure quoted from it cannot be checked")
             continue
-        for name, system in systems.items():
-            if not system["available"] or name not in past or not past[name]["available"]:
-                continue
-            for workload, key in (("ingest", "seconds"), ("time_range", "value")):
+        past = {s["name"]: s for s in payload.get("systems", [])}
+        for workload, key in (("ingest", "seconds"), ("time_range", "value")):
+            live = [(n, s["workloads"][workload][key]) for n, s in past.items()
+                    if s.get("available") and key in s["workloads"].get(workload, {})]
+            for i, (_, a) in enumerate(live):          # two systems, one run
+                for _, b in live[i + 1:]:
+                    allowed.add(round(abs(a - b) / max(a, b) * 100, 4))
+            for name, system in systems.items():        # one system, two runs
+                if not system["available"] or name not in past or not past[name]["available"]:
+                    continue
                 now, then = system["workloads"].get(workload), past[name]["workloads"].get(workload)
                 if now and then and key in now and key in then:
                     a, b = now[key], then[key]

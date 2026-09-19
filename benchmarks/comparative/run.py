@@ -150,22 +150,46 @@ def in_process_sentence(build_dir: Path, wire_levels_per_second: float | None,
         payload = json.loads(out.read_text())
 
     rows = [b for b in payload.get("benchmarks", [])
-            if b.get("items_per_second") and "Batched" in b.get("name", "")]
+            if b.get("real_time") and b.get("cpu_time") and "Batched" in b.get("name", "")
+            and b.get("run_type") != "aggregate"]
     if not rows:
         return ("The in-process figure is not measured in this run: bench_engine reported no "
-                "items_per_second for the batched ingestion benchmark")
-    levels_per_second = max(r["items_per_second"] for r in rows)
+                "timed run of the batched ingestion benchmark")
+
+    # **Not** `items_per_second`, which Google Benchmark computes from **CPU** time - verified on
+    # this benchmark: 20 levels / 1336 ns of CPU is the 14.97M/s it prints, where the wall figure
+    # is 20 / 20284 ns. The ingest column beside this is wall-clock, so quoting the counter here
+    # would compare a CPU rate with a wall rate and call the quotient a factor. That is the defect
+    # this whole sentence was rewritten to remove, one unit along.
+    real = sorted(r["real_time"] for r in rows)[len(rows) // 2]
+    cpu = sorted(r["cpu_time"] for r in rows)[len(rows) // 2]
+    iterations = max(r.get("iterations", 0) for r in rows)
+    levels_per_second = levels_per_update / (real * 1e-9)
+    levels_per_cpu_second = levels_per_update / (cpu * 1e-9)
     storage = payload.get("context", {}).get("engine_storage_fs", "unknown filesystem")
 
-    measured = (f"Measured by this run: the engine applies {levels_per_second:,.0f} levels/s in "
-                f"process (bench_engine BM_IngestionThroughputBatched, {levels_per_update} levels "
-                f"per update, storage on {storage})")
+    measured = (
+        f"Measured by this run: the engine applies {levels_per_second:,.0f} levels/s in process "
+        f"by the wall clock and {levels_per_cpu_second:,.0f} levels/s of CPU (bench_engine "
+        f"BM_IngestionThroughputBatched, {levels_per_update} levels per update, "
+        f"{iterations:,} iterations, storage on {storage})")
+    rows_written = iterations * levels_per_update
+    gap = (f" Its wall clock is {real / cpu:.1f} times its CPU time, so that run spent most of its "
+           f"wall clock waiting, and it wrote {rows_written:,} rows - a different volume from this "
+           f"table's dataset, which the benchmark's registration fixes by setting its own minimum "
+           f"time, so the count cannot be varied from the command line.")
+    # **No ratio between these two.** They are measured at volumes two orders of magnitude apart
+    # and by clients written in different languages, and dividing one by the other would produce
+    # exactly the kind of figure this sentence exists to have stopped printing. The comparison that
+    # holds the volume and the client is in benchmarks/on-a-bigger-machine.md, and it finds the two
+    # within a few per cent of each other - which is a different conclusion from any quotient of
+    # the two numbers here.
     if not wire_levels_per_second:
-        return measured + ", and the figure over the wire is in the ingest column above"
-    ratio = levels_per_second / wire_levels_per_second
-    return (f"{measured} against {wire_levels_per_second:,.0f} levels/s through the wire, a factor "
-            f"of {ratio:.1f}. Both numbers count levels and both use the same {levels_per_update}"
-            f"-level update, which is what makes them subtractable")
+        return measured + "." + gap + " The figure over the wire is in the ingest column above"
+    return (f"{measured}; the same twenty-level update over the wire, in the ingest column above, "
+            f"is {wire_levels_per_second:,.0f} levels/s. **These two are not divided here**: they "
+            f"are at different volumes and behind different clients, and a quotient of them would "
+            f"be the same mistake as the factor of 111 this sentence replaced.{gap}")
 
 
 def timed(call: Callable[[], QueryResult], rounds: int) -> dict:
