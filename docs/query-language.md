@@ -56,6 +56,20 @@ SELECT * FROM 'BTC-USD'.'BINANCE'
   LIMIT 100
 ```
 
+### Which columns come back
+
+The ones named, in the order named. `SELECT quantity, price` answers quantity first; a column named
+twice is answered twice; `SELECT *` is the seven below, in the order of the table. The response
+header names them, so a client can tell what it was handed — which is the only reason narrowing a
+`SELECT` is safe and narrowing a `PUSH` is not.
+
+Two consequences worth knowing before writing a query. The server reads only the column files it
+needs, so a narrower question is a cheaper one — including for a column a predicate uses but the
+answer does not carry: `SELECT quantity ... WHERE price BETWEEN ...` reads `price` and does not
+answer it. And the bundled Python and C++ clients read a row **by position**, so they accept the
+seven and refuse anything narrower by name rather than misreading it; a narrowed query goes over
+the raw protocol until they read columns by name.
+
 ## Aggregation Queries
 
 Aggregation functions operate on the live SoA buffer — the current in-memory orderbook state, not
@@ -163,9 +177,12 @@ C: UNSUBSCRIBE 1
 S: OK 1
 ```
 
-`PUSH <id>` is followed by the **same seven columns as a query row, in the same order**, tab
-separated. A client that already parses `SELECT` output adds one branch on the prefix rather than a
-second format.
+`PUSH <id>` is followed by **all seven columns, in the order of the table below**, tab separated —
+the same shape as `SELECT *`, and the same shape whatever select list the `SUBSCRIBE` named. A
+`PUSH` line carries no header, so a narrowed push would change what field 2 means with no signal at
+all; announcing the columns in `OK SUB <id>` is the fix and it is a protocol change. The server logs
+once per subscription when a list was named and ignored. A client that already parses `SELECT *`
+output adds one branch on the prefix rather than a second format.
 
 Four things worth knowing before writing a client:
 

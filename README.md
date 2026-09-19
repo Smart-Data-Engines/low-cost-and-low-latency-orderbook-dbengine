@@ -117,9 +117,13 @@ installs anything, and a containerised competitor would measure the container.
 - **Aggregation engine** (VWAP, spread, mid-price, imbalance, etc.) with optional AVX2/AVX-512 SIMD,
   reachable over the wire protocol: every result carries its scale factor and distinguishes an empty
   aggregate from a zero
-- **SQL-like query language** with time-range filters and aggregations
+- **SQL-like query language** with time-range filters and aggregations. A `SELECT` answers the
+  columns it names, in the order it names them, and the server opens only the column files needed
+  to answer it — including a column a predicate reads and the answer does not carry
 - **Streaming subscriptions, pushed** — `SUBSCRIBE 'SYM'.'EXCH'` over the wire and the server sends
-  rows as they are written, prefixed `PUSH <id>` with the same seven columns as a query row. A
+  rows as they are written, prefixed `PUSH <id>` with all seven columns, whatever select list the
+  subscription named: a `PUSH` line has no header, so a narrowed push would change what a field
+  means with nothing for a client to check against. A
   bounded queue per subscriber, and a consumer that stops reading is disconnected rather than
   allowed to grow the server's memory. Also available embedded (`Engine::subscribe()`,
   `ob_subscribe()`) and from the Python client (`subscribe()` / `poll()`)
