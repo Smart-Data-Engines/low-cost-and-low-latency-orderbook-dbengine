@@ -6,6 +6,7 @@
 #include "orderbook/epoch.hpp"
 #include "orderbook/failover.hpp"
 #include "orderbook/hlc.hpp"
+#include "orderbook/log_episode.hpp"
 #include "orderbook/metrics.hpp"
 #include "orderbook/multi_master.hpp"
 #include "orderbook/query_engine.hpp"
@@ -487,6 +488,42 @@ private:
     // does not have to wait out a full flush interval before join() returns.
     std::mutex              flush_stop_mtx_;
     std::condition_variable flush_stop_cv_;
+
+    /// Set by a writer that has run out of room, cleared by the flush loop when it wakes.
+    ///
+    /// Without it a writer at the ceiling waits for `--flush-interval-ms` to elapse, because
+    /// nothing asks the flush loop to run on account of a writer waiting — and the work it is
+    /// waiting for takes **73 ms** for a full million rows, measured on an m9g.xlarge under a
+    /// load average of 2.95, linear at 0.068 µs a row. At a one-second interval that is a
+    /// thirteenfold wait for the same work (#137).
+    ///
+    /// **Lock order.** `request_flush()` takes `flush_stop_mtx_` while the caller holds `mtx_`,
+    /// which adds `mtx_ → flush_stop_mtx_` to the order documented above. It is safe because
+    /// `flush_stop_mtx_` is a leaf: it is taken in exactly two places — the wait in
+    /// `flush_loop()` and the wake in `close()` — and neither holds `mtx_` while doing so.
+    /// Taking it is not optional: setting the flag without it loses the wake-up when the flush
+    /// loop has evaluated its predicate and not yet slept.
+    std::atomic<bool> flush_now_{false};
+
+    /// Loud once when writers start waiting, loud once when they stop (#116's mechanism).
+    /// Guarded by `mtx_`, which every waiter already holds.
+    LogEpisode backpressure_;
+
+    /// How long a writer waits for room before the write is refused.
+    ///
+    /// Asking for a flush removes the dependency on the operator's interval; it does not help
+    /// when the flush itself cannot make progress, which is a full disk or #113's `EIO`. Sixty
+    /// times the 73 ms a full ceiling takes to flush, so a healthy flush never reaches it even on
+    /// a machine an order of magnitude slower — a deadline a healthy write can touch is a gate on
+    /// a clock, and those teach operators to ignore refusals.
+    static constexpr std::chrono::seconds kBackpressureDeadline{5};
+
+    /// Ask the flush loop to run now. Caller may hold `mtx_`; see `flush_now_`.
+    void request_flush();
+
+    /// Wait for room in the pending queue. False means the deadline passed and the caller must
+    /// refuse the write rather than accept one it cannot store.
+    [[nodiscard]] bool await_pending_room(std::unique_lock<std::mutex>& lock);
 
     // Pending rows for columnar flush
     struct PendingRow {

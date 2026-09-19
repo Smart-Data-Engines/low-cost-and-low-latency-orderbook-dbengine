@@ -88,6 +88,13 @@ MetricsRegistry::MetricsRegistry() {
     // two ask for different actions: a full disk is freed, a disk reporting EIO is replaced.
     counters_.push_back(make_counter("ob_wal_fsync_errors_total",
                                      "fsync calls on the WAL that failed"));
+    // A writer that ran out of room in the pending queue, and one whose wait for room ran out
+    // (#137). The pair matters: waits without refusals is backpressure working, and refusals
+    // mean the flush itself is not making progress.
+    counters_.push_back(make_counter("ob_writer_backpressure_waits_total",
+                                     "writes that waited for room in the pending queue"));
+    counters_.push_back(make_counter("ob_writer_backpressure_refusals_total",
+                                     "writes refused because the pending queue never freed room"));
     // Mesh events whose handling threw and which the io loop abandoned (#112). Registered in the
     // same change that writes it: measured, an ENOSPC on a peer's delta used to end that thread
     // outright, and every outside signal - PING, MM_PEERS, the peer's `connected` row - stayed
