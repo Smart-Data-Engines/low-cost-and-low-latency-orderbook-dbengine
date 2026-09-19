@@ -71,14 +71,20 @@ static char* put_field(char* p, char* end, T value, char sep) {
     // because the buffer was always wider than any one field; handing `to_chars` a pointer past
     // the allocation is the kind of detail that is fine until a caller sizes the buffer tightly.
     //
+    // The separator's byte is held back from `to_chars` rather than assumed to be spare. The
+    // callers size their buffers so that it is, but that is an argument made two functions away,
+    // and GCC 11 says so out loud: `writing 1 byte into a region of size 0` on the store below.
+    // Reserving it here makes the guarantee local and provable instead of true-by-inspection.
+    //
     // `side` is a `uint8_t`, which is a character type: handing it to `to_chars` unwidened invites
     // an overload that would write a byte rather than a number. Widen every integer to the type
     // `to_chars` cannot misread.
+    char* const digits_end = end - 1;
     if constexpr (std::is_signed_v<T>) {
-        const auto res = std::to_chars(p, end, static_cast<long long>(value));
+        const auto res = std::to_chars(p, digits_end, static_cast<long long>(value));
         p = res.ptr;
     } else {
-        const auto res = std::to_chars(p, end, static_cast<unsigned long long>(value));
+        const auto res = std::to_chars(p, digits_end, static_cast<unsigned long long>(value));
         p = res.ptr;
     }
     *p++ = sep;
