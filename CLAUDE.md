@@ -3145,7 +3145,11 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   measured to be no slower than either.
 - **The whole suite has run on a weakly-ordered memory model**, which it never had before
   19 September 2026: 1102 tests pass on aarch64 in Release, again under ThreadSanitizer with zero
-  reports, and again under AddressSanitizer + UBSan with zero findings. That is the strongest
+  reports, again under AddressSanitizer + UBSan with zero findings, and the **integration battery**
+  there too — 273 passed with the two opt-in skips in 22:46, zero unexplained node deaths. That
+  fourth one matters on its own: the C++ passes drive the apply path with aligned `Level` arrays,
+  which is the gap #127 lived in, and the battery is the only thing that takes a delta off a
+  socket. That is the strongest
   evidence available and it is not proof — a race is probabilistic and TSan reasons about
   synchronisation rather than about the hardware — but until that day every seqlock and every
   atomic in this engine had only ever executed on x86, which is TSO.

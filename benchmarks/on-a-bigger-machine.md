@@ -37,16 +37,25 @@ it. It was added and measured before any comparison ran.
 | Full C++ suite, Release | **1102 tests, 100% passed** | 113.7 s |
 | Full C++ suite, ThreadSanitizer | **1102 tests, 100% passed, zero reports** | 190.9 s |
 | Full C++ suite, AddressSanitizer + UBSan | **1102 tests, 100% passed, zero findings** | 1873.1 s |
+| Integration battery (pytest, real clusters) | **273 passed, 2 opt-in skips** | 1366.0 s |
 | `BM_IngestionThroughput` (one level) | 1072 ns wall, 655 ns CPU | cv 0.82% / **0.11%** |
 | `BM_IngestionThroughputBatched` (twenty levels) | 20,284 ns wall, 1336 ns CPU | cv **0.14%** |
 | `BM_UpdateLatency` | 10,289.86 ns | cv 0.34% |
 | `BM_VwapLatency` | 620.94 ns | cv **0.02%** |
 | `BM_TimeRangeQuery/100000` | 1.34 ms | cv 1.04% |
 
-The first three lines are the result worth having most, and they are about correctness rather than
+The first four lines are the result worth having most, and they are about correctness rather than
 speed: **this engine had never been compiled or run on a weakly-ordered memory model.** Every
 seqlock, every atomic and every lock-free path in it had only ever executed on x86, which is TSO — a
-missing acquire or release is invisible there and real here. Three full passes, three clean.
+missing acquire or release is invisible there and real here. Four full passes, four clean — and the fourth is the one that had to be run rather than assumed.
+The three C++ passes drive the apply path with real, aligned `Level` arrays, and that is exactly the
+gap **#127** lived in: a pointer into a byte buffer cast to `const Level*`, invisible to
+ThreadSanitizer (which does not check alignment) and unreachable from the C++ suite (in which
+nothing took a delta **off a socket**) while a mesh frame puts the levels 130 bytes in. The
+integration battery is the only thing here that drives real clusters, real sockets, replication and
+the multi-master mesh, and it has only ever run on GitHub's x86_64 runners. On this machine: **273
+passed, 2 opt-in skips, 22:46**, the same 273 the runners report, zero unexplained node deaths and
+nothing in any node's log.
 
 That is evidence and not proof, and the difference is worth stating: a race is probabilistic, and
 ThreadSanitizer reasons about synchronisation rather than about the hardware, so a build that is
