@@ -155,3 +155,67 @@ def test_a_batch_and_a_loop_of_inserts_store_the_same_thing(cluster):
         assert a == b and len(a) == 25
     finally:
         client.close()
+
+
+# ── the response counter, with no socket in it ───────────────────────────────
+
+class _DribblingSocket:
+    """Hands over a canned byte stream `chunk` bytes at a time.
+
+    The trap this exists for is not hypothetical: the probe written to measure #140 hung at batch
+    two because it cleared its buffer between reads and lost a terminator that straddled them.
+    `_recv_response()` is what `execute_pipelined()` calls once per command, so the boundary it
+    has to survive is every boundary.
+    """
+
+    def __init__(self, payload: bytes, chunk: int) -> None:
+        self._payload, self._chunk, self._at = payload, chunk, 0
+
+    def recv(self, _n: int) -> bytes:
+        out = self._payload[self._at:self._at + self._chunk]
+        self._at += len(out)
+        return out
+
+    def settimeout(self, _t) -> None:
+        pass
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 3, 5, 7, 4096])
+def test_the_reader_takes_one_answer_at_a_time_however_the_bytes_arrive(chunk):
+    """Three answers of three shapes in one stream, delivered `chunk` bytes at a time.
+
+    An `OK` body ends in a blank line, an `ERR` is one line, and a `PONG` is one line, so "the
+    next line" and "the next answer" are different things — and a client that read lines would
+    hand the caller the blank line after the first `OK` as the second command's reply.
+    """
+    from orderbook_engine import _TcpBackend
+
+    stream = b"OK\n\nERR something went wrong\nOK\n\n"
+    client = _TcpBackend.__new__(_TcpBackend)      # no connection: this is the parser, not the socket
+    client._sock = _DribblingSocket(stream, chunk)
+    client._buf = b""
+    client._compressed = False
+    client._pushes = []
+
+    assert client._recv_response() == "OK\n\n"
+    assert client._recv_response() == "ERR something went wrong\n"
+    assert client._recv_response() == "OK\n\n"
+    assert client._buf == b"", "the reader consumed more than the three answers"
+
+
+def test_both_writers_ask_the_same_two_questions():
+    """A static check, because two copies of one rule is how the same call becomes legal in one
+    writer and not in the other.
+
+    Derived from the source rather than from a list here: a list is one more thing to keep in
+    step with the tree, and this repository has paid for hand-written lists three times.
+    """
+    import inspect
+    import orderbook_engine as ob
+
+    for rule in ("_normalise_levels(", "_refuse_unstorable_event_time("):
+        callers = {name for name in ("insert", "insert_batch")
+                   if rule in inspect.getsource(getattr(ob.OrderbookEngine, name))}
+        assert callers == {"insert", "insert_batch"}, (
+            f"{rule} is called from {sorted(callers)}; both writers have to ask the same rule, "
+            "or one of them keeps honouring an argument the other has started discarding")
