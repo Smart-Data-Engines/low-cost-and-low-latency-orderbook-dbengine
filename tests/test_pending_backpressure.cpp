@@ -20,9 +20,11 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <future>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -36,6 +38,28 @@ constexpr uint64_t kOneHourNs = 3'600'000'000'000ULL;
 /// Rows above `MAX_PENDING_ROWS` (1,000,000), written 1000 at a time.
 constexpr int kLevelsPerDelta = 1000;
 constexpr int kDeltas         = 1100;
+
+/// The value of one counter, out of the Prometheus exposition.
+///
+/// Written because the obvious lookup is wrong here in a way that passes: the exposition is
+/// `ob_flush_ticks_total{node_role="standalone"} 3`, so a search for the name followed by a space
+/// finds nothing, and "absent" then reads as zero. That is pitfall 66 of this repository, and the
+/// first version of this file committed it twice — once failing loudly, and once **passing** for
+/// the wrong reason, because `find("name 0") == npos` is satisfied by a line that never had the
+/// shape `name 0` in the first place.
+std::optional<uint64_t> counter_value(const std::string& exposition, const std::string& name) {
+    for (size_t at = exposition.find("\n" + name); at != std::string::npos;
+         at = exposition.find("\n" + name, at + 1)) {
+        const size_t after = at + 1 + name.size();
+        if (after >= exposition.size()) continue;
+        if (exposition[after] != '{' && exposition[after] != ' ') continue;  // a longer name
+        const size_t space = exposition.find(' ', after);
+        const size_t eol   = exposition.find('\n', after);
+        if (space == std::string::npos || space > eol) continue;             // a HELP/TYPE line
+        return std::strtoull(exposition.c_str() + space + 1, nullptr, 10);
+    }
+    return std::nullopt;
+}
 
 std::string temp_dir(const std::string& prefix) {
     auto path = fs::temp_directory_path() / (prefix + std::to_string(std::rand()));
@@ -86,6 +110,17 @@ TEST(PendingBackpressure, AWriterAtTheCeilingWaitsForAFlushRatherThanForTheInter
     EXPECT_EQ(written.get(), ob::OB_OK)
         << "the writes were refused, which is the deadline firing on a flush that should have "
            "been asked for and should have taken milliseconds";
+    // The flag the writer sets has to be cleared by the loop that reads it. Left set, the
+    // predicate is permanently true and the loop flushes as fast as it can — a core burned and
+    // nothing said, which is #298's shape. Ticks are the observable: at a one-hour interval the
+    // only ones that should run are the ones a writer asked for.
+    const auto ticks = counter_value(engine.registry().serialize(), "ob_flush_ticks_total");
+    ASSERT_TRUE(ticks.has_value()) << "the tick counter is not in the exposition at all";
+    EXPECT_GT(*ticks, 0u) << "no flush ran at all, so nothing was asked for";
+    EXPECT_LT(*ticks, 50u)
+        << "the flush loop ran " << *ticks << " times against a one-hour interval and one "
+           "request, so the request flag is not being cleared";
+
     engine.close();
     fs::remove_all(dir);
 }
@@ -104,11 +139,15 @@ TEST(PendingBackpressure, TheWaitIsCountedSoAnOperatorCanSeeItHappened) {
     // the process without it. Before #137 there was no line and no counter, which is why a node
     // that had stopped looked exactly like a node with nothing to do.
     const std::string exposition = engine.registry().serialize();
-    EXPECT_NE(exposition.find("ob_writer_backpressure_waits_total"), std::string::npos)
-        << "the counter is not in /metrics at all";
-    EXPECT_EQ(exposition.find("ob_writer_backpressure_waits_total 0"), std::string::npos)
+    const auto waits = counter_value(exposition, "ob_writer_backpressure_waits_total");
+    const auto refusals = counter_value(exposition, "ob_writer_backpressure_refusals_total");
+    ASSERT_TRUE(waits.has_value()) << "the counter is not in the exposition at all";
+    EXPECT_GT(*waits, 0u)
         << "writing past MAX_PENDING_ROWS did not count a single wait, so either the ceiling was "
-           "not reached or the counter is not fed:\n" << exposition.substr(0, 400);
+           "not reached or the counter is not fed";
+    // The pair is what an operator reads: waits without refusals is backpressure working.
+    ASSERT_TRUE(refusals.has_value());
+    EXPECT_EQ(*refusals, 0u) << "a write was refused, so the flush never freed room";
 
     engine.close();
     fs::remove_all(dir);

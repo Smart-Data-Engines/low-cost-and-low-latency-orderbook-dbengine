@@ -1954,6 +1954,7 @@ void Engine::flush_loop() {
         }
 
         try {
+            registry_.increment_counter("ob_flush_ticks_total");
             flush_tick();
             if (consecutive_flush_failures_ > 0) {
                 OB_LOG_INFO("engine", "flush_loop: flushing again after %llu failed tick(s)",
