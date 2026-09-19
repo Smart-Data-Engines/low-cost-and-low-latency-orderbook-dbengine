@@ -2212,6 +2212,138 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 139. A select list is parsed, validated, and then ignored, so every row query is `SELECT *`
+
+Measured on a running server rather than read off the parser, because the parser's own behaviour
+here is the thing in question. One row inserted, then four queries:
+
+| asked | answered |
+|---|---|
+| `SELECT * FROM 'AAA'.'EX'` | seven columns |
+| `SELECT price FROM 'AAA'.'EX'` | **seven columns** |
+| `SELECT price, quantity FROM 'AAA'.'EX'` | **seven columns** |
+| `SELECT quantity, price FROM 'AAA'.'EX'` | **seven columns, in the other order** |
+
+Every one answered `OK`. This is #107's class in the query language rather than in the command
+parser: there the extra token was unread, here the select list is read, its names are checked
+against the seven the lexer knows, aggregate calls in it are validated by name and argument — and
+then the row path never looks at `ast.select_exprs` again. A client that asks for one column gets
+seven and has no way to tell that it did not get what it asked for, because the header it is handed
+names seven and is correct about the bytes that follow it.
+
+It costs three things at once, and the comparative harness pays all three. It sends us
+`SELECT * FROM 'SYM0000'.'EX' WHERE timestamp BETWEEN …` and sends ClickHouse and TimescaleDB
+`SELECT ts_ns, price_ticks, size_lots FROM …`, then **throws four of our seven columns away in
+Python** (`_raw_rows` reads the three it wants out of the header by name). So against the same
+question the competitors answer, the engine:
+
+- reads and decodes seven `.col` files per segment where three would do — `ColumnarStore::scan` is
+  not given the select list at all, so this is not a narrowing it declines, it is one it cannot be
+  asked for;
+- puts **43 bytes on the wire per row** where three columns is about 25;
+- formats seven fields per row and makes the client split seven and discard four.
+
+`benchmarks/comparative/run.py` already lists this as a limitation of ours in the published table.
+What the limitation does not say is that it makes the row a comparison of two different questions,
+in the direction that flatters neither side honestly — we do more work, and a reader cannot see it
+in the number.
+
+Three candidate answers, and they are not the same size:
+
+1. **Project the response only.** The scan still reads seven files; the header and rows carry what
+   was asked for. Buys the wire and the client, not the read. Smallest change, and it makes the
+   header variable, which every client that indexes it by position would have to survive — ours
+   reads it by name already, and #65 is the precedent for a column arriving.
+2. **Project the read as well.** `ColumnarStore::scan` takes the wanted set and opens only those
+   files. This is the one that makes the store columnar in the sense the word implies; today it
+   pays the layout's cost and collects none of its benefit. It changes a `std::function` signature
+   that the live-buffer path shares, so both readers have to agree.
+3. **Refuse a select list that is not `*`.** Cheapest, honest, and worse than both: it turns a
+   silently wrong answer into a loud refusal of something the engine will want anyway.
+
+Whichever is taken, the harness adapter should then ask for the three columns it keeps, so the four
+systems are asked the same question — and the table regenerated in one run, because one run
+produces every number in it or none.
+
+- Effort: M | Impact: the answer stops being a different question from the one asked; the published
+  query row stops measuring seven columns against three
+
+### 138. Formatting the answer cost eight times the read it came from ✅
+
+Found by profiling the server while it answered the query the comparative table publishes, rather
+than by reasoning about where a slow range scan spends its time. The arithmetic pointed here first —
+an in-process scan is about 13 ns a row and the same rows over a socket were costing about 116 — but
+arithmetic names an amount, not a function, so `perf` was asked. Over 16,000 of that query, both
+sides profiled the same way:
+
+| share of the server's profile | before | after |
+|---|---|---|
+| `format_query_response` | **22.96%** | 32.55% |
+| `memcpy` | 24.27% | 6.18% |
+| `basic_string::_M_construct` | 5.53% | *gone* |
+| `malloc` / `_int_free` / `cfree` | 6.84% | 1.10% |
+| `memset` | 1.82% | *gone* |
+| `ColumnarStore::scan` | **2.70%** | 5.18% |
+| **total cycles for the same 16,000 queries** | **20.56 G** | **11.90 G** |
+
+The read was 2.70% and the answer was 22.96%, eight times as much. The old loop called
+`std::to_string` seven times a row, once per column, so a 4,000-row response allocated 28,000
+temporary strings and freed them again — and that is not a deduction, it is the four symbols beside
+the formatter: constructing them, copying them, allocating them and freeing them. Three of those
+four leave the profile entirely. `std::to_chars` writes into a caller's buffer and allocates
+nothing: the loop now fills one 105-byte stack buffer per row — sized from every field at its
+type's limit plus the six tabs and the newline — and appends it to a string reserved once.
+
+The formatter's *share* goes **up** while the total goes down by 42%, and that is the expected
+shape rather than a contradiction: work that used to be attributed to `_M_construct`, `malloc` and
+`memcpy` is now done inside the function, on the stack, and there is much less of it.
+
+**The first profile of this was under-sampled and I published its numbers before checking that.**
+It ran 400 queries — about 0.2 s of server CPU, a few hundred samples at 1999 Hz — and said 40.11%
+against 2.74%. It was right about which function dominates, which is what a pilot is for, and wrong
+by nearly a factor of two about how much, because a 2% entry there is a handful of samples. The
+numbers above come from 16,000 queries and about 16 s of CPU on each side. A profile is a sample,
+so it has a sample size, and the entries small enough to matter for a ratio are the ones that
+sample size ruins first.
+
+`side` is `uint8_t`, which is a character type, so it is widened before `to_chars`. Without that its
+digits would be written as a character, which is the one mistake in this change that produces a
+well-formed response saying something else, so a test pins it by name.
+
+Measured on machine C, Release, before and after interleaved on one idle box with a single probe
+binary against both servers, so neither the client nor the build configuration is a variable:
+
+| 4,000 rows, the published shape | before | after |
+|---|---|---|
+| server and wire, median of 8 rounds | 0.470 ms | 0.314 ms |
+| through a C++ client, end to end | 0.614 ms | 0.450 ms |
+| the formatter alone, `BM_FormatQueryResponse` | 258 µs | 95.5 µs |
+
+**A 32% reduction on the server-and-wire path at the floor of the range** (0.6797), 33% at the
+median, and 8 of 8 rounds in the same direction — well above this machine's own noise floor, which
+ranged 0.89% to 5.37% over six runs. The control is the change itself: the response is meant to be
+byte-identical, and both sides answered with 4,000 rows in 171,911 bytes.
+
+Two instruments agree on it, which is worth more than either alone. Under `perf` — which slows both
+sides — the same query went 0.505 ms to 0.338 ms, a ratio of 0.669 against the unprofiled run's
+0.667. And the cycle counts say the same thing in a different unit: **42% less server CPU for the
+same 16,000 queries**.
+
+The two instruments nearly agree, and that is worth recording because usually they do not. The
+formatter alone saves 162 µs a response; the path saved 156 µs. A 4% overstatement, where the
+isolated CRC32C saving in #81 overstated its path by 8× — the difference is that formatting sits
+alone on the response path with nothing overlapping it, so removing it removes the whole of it.
+
+What this does **not** do: the comparative table is not regenerated here. One run produces every
+number in it or none of them, and the table is pinned to the run it cites by
+`scripts/check_comparative_claim.py`. The query row will move when that run happens, and it will
+move for this reason. Nor does it touch the larger finding underneath: the harness asks us
+`SELECT *` and asks ClickHouse and TimescaleDB for three columns, because the engine cannot yet
+express the narrower question — that is #139, and it is the bigger number.
+
+- Effort: S | Impact: 32% off the published query path, measured on the path rather than on a
+  micro-benchmark
+
 ### 137. A writer that hits the pending-row ceiling waits for a flush nothing asks for, and the writer is the epoll thread
 
 Found on the aarch64 benchmark box while measuring the wire, by a probe that ran a node with
@@ -7366,12 +7498,14 @@ measures the harness.
 **Two P0s are open: #136 and #137**, both found by the same afternoon on a machine this tree
 had never run on, and both filed rather than fixed because each has candidate answers that
 differ in what they cost. #136 changes an on-disk layout the snapshot manifest and retention
-both address; #137 changes what backpressure means. Every P0 raised before it —
+both address; #137 changes what backpressure means. **#139** is open too and is not a P0: the row
+path ignores the select list it parsed, so a client that asks for one column is handed seven and
+answered `OK`. Every P0 raised before it —
 #60, #61, #62, #64, #68, #73, #74, #80, #88 and #97 — is closed, and several were found by running a real cluster rather than by reading the code
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #136 and #137.** Every other item above #58 is marked closed, and
+**Open: #136, #137 and #139.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
