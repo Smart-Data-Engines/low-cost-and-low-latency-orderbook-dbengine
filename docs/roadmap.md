@@ -1022,6 +1022,16 @@ The remaining loss is a limit of the **protocol** rather than of the storage eng
 useful finding: the same engine ingests **446,219 updates/s in process** here against **4,012
 through the wire** — a factor of 111, all of it the round trip.
 
+**That last sentence is wrong in both of its halves, and the correction belongs here rather than in
+place of it, because the run happened.** The two figures are in different units — the in-process
+benchmark applied **one** level per call and the harness sends **twenty** per round trip — so a
+factor of twenty of the 111 was the word "updates" meaning two things. And "all of it the round
+trip" is false: measured on the aarch64 box at equal volume and with the client held fixed, the
+engine's wall-clock ingest over a socket is within **about 4%** of its own in-process figure, the
+round trip costs about eight times the storage path's CPU per level and almost nothing in
+throughput, and the largest single term in that column is the harness's own Python client. The
+measurements are in [`../benchmarks/on-a-bigger-machine.md`](../benchmarks/on-a-bigger-machine.md).
+
 **Five findings came out of running it, and four of them are about our own code.**
 
 **#105, filed rather than patched: `insert(timestamp_ns=…)` is silently dropped over TCP.** The
@@ -2201,6 +2211,180 @@ ignore checks.
 
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
+
+### 137. A writer that hits the pending-row ceiling waits for a flush nothing asks for, and the writer is the epoll thread
+
+Found on the aarch64 benchmark box while measuring the wire, by a probe that ran a node with
+`--flush-interval-ms 3600000` so that no flush would perturb the timing. The node accepted 50,000
+twenty-level updates and then stopped: no reply, **no line in its log**, and a new connection could
+not read the banner. The process was alive.
+
+**The arithmetic names it exactly.** `MAX_PENDING_ROWS` is `1'000'000`
+(`include/orderbook/engine.hpp:498`) and 50,000 updates of twenty levels is 1,000,000 rows.
+`apply_delta_impl()` blocks there:
+
+```cpp
+// Backpressure: wait until pending queue has room.
+// This blocks the writer if the flush thread can't keep up.
+pending_cv_.wait(lock, [this]() {
+    return pending_rows_.size() < MAX_PENDING_ROWS || stop_flush_.load(...);
+});
+```
+
+The only thing that empties `pending_rows_` is the flush, and `pending_cv_` is notified in exactly
+two places: at the end of a flush, and in shutdown. **Nothing asks the flush loop to run because a
+writer is waiting.** So the writer waits for the timer, and the timer is an operator's flag.
+
+**Confirmed with a backtrace rather than inferred.** Both threads in `futex_do_wait`, 0.5 s of CPU
+between them:
+
+```
+Thread 1  ob::Engine::apply_delta_impl  <- std::condition_variable::wait
+          ob::execute_command <- ob::TcpServer::run <- main
+Thread 2  ob::Engine::flush_loop        <- pthread_cond_clockwait
+```
+
+Thread 1 is the **epoll loop**. That is what turns a stalled writer into a stopped node: while it
+sits in `apply_delta`, nothing accepts a connection, nothing answers `PING`, nothing writes a log
+line, and — measured — **`SIGTERM` is not observed either**. The node logged `Shutdown requested`
+(that line comes from the signal handler) and was still in the same two futexes **273 seconds
+later**, at which point it had to be killed with `SIGKILL`. A supervisor does exactly that, and
+whatever was pending is lost.
+
+**It is a slope, not a cliff, and the slope is what makes the far end look like a hang.** Measured
+at 4,000,000 levels through the wire, one flush interval per row, everything else held:
+
+| `--flush-interval-ms` | wall | levels/s | against 1000 ms |
+|---|---|---|---|
+| 1000 | 3.70 s | **1,081,417** | — |
+| 5000 | 15.71 s | 254,691 | 4.2× slower |
+| 20000 | 60.68 s | 65,930 | 16.4× slower |
+| 60000 | **did not finish in 120 s** | — | the extrapolated rate puts it near 180 s |
+
+Throughput falls roughly in inverse proportion to the interval, which is exactly what "the writer
+waits for the next flush" predicts, and none of those rows logged an error: backpressure is doing
+what it says. At 3,600,000 ms the same slope reaches a node that cannot be distinguished from a
+hung one, and that is where this was found.
+
+**So the earlier version of this paragraph was wrong and the correction is the point.** It said
+that at the 1000 ms the comparative harness sets, one interval is one ceiling — reasoned from
+`MAX_PENDING_ROWS` and the ingest rate, and contradicted by a measurement taken the same afternoon:
+the volume series pushed 20,000,000 levels at that interval with no stall. The shipped default of
+100 ms is further still. What is defective is not the ceiling, it is that the wait is on a timer
+nobody can shorten, that the thread doing the waiting is the one serving every client, and that
+none of it is logged.
+
+**Three candidate answers.**
+
+1. **Let the writer ask.** A flush-now signal beside `flush_stop_cv_`, which already exists so that
+   `join()` does not wait out the interval — the writer's wait becomes bounded by how long a flush
+   takes rather than by the interval. Smallest change, and it keeps backpressure meaning what it
+   says.
+2. **Refuse instead of waiting.** Bound the wait and answer `ERR`, which is the answer this engine
+   takes elsewhere: #113 refuses a write it cannot sync rather than acknowledging it. It turns a
+   silent stop into a named refusal and does not make the writes land.
+3. **Refuse the configuration.** Unavailable: whether an interval is long enough to reach the
+   ceiling depends on the write rate, which is not knowable at startup.
+
+Whichever is chosen, the log has nothing to say today and should: a writer that has been blocked on
+backpressure for longer than an interval is the one line an operator needs, and this node emitted
+none.
+
+**Reproduction.** Start a node with `--flush-interval-ms 3600000`, send more than 1,000,000 rows —
+50,000 `MINSERT`s of twenty levels will do — and then try `PING` from a second connection, and
+`SIGTERM`. Note what the probe got wrong, because it matters for anyone repeating it: a crude
+`/dev/tcp` banner check reported "stopped answering" two seconds in, while the node was still
+starting and holding 7.5 MB. The evidence here is the backtrace and the 273 seconds, not that line.
+
+- Effort: M | Impact: **P0 by consequence.** A node stops serving every client, logs nothing, and
+  cannot be shut down gracefully, from a documented flag set to a value the project's own tuning
+  note recommends for bulk loads. The margin at that recommended value is a factor of one on this
+  hardware
+
+### 136. Writing the same event-time span twice destroys a symbol's segment, and the only diagnosis names a race that did not happen
+
+Found on the aarch64 benchmark box, by a wire probe that replayed the same twenty-level updates
+against one server three times and produced **200 `ERROR` lines** — one per symbol per replay — in
+a run whose client saw nothing but `OK`.
+
+A segment's identity **is its time range**: the directory is
+`<data-dir>/<symbol>/<exchange>/<start_ts>_<end_ts>`. Two flushes covering the same span therefore
+write to the same directory, and `ColumnarStore::merge_segments()`
+(`src/columnar_store.cpp:603`) refuses to index a `dir_path` it already holds. Its comment states
+its premise in one line — *"Two flush paths raced"*, the defect **#26** fixed, *"Defence in depth,
+not the fix"* — and that premise was **true when it was written**. Before **#105** the wire dropped
+the client's `timestamp_ns` and the server stamped arrival time, so no two client writes could ever
+produce the same span. #105 put event time on the wire so that backfills are expressible, and in
+doing so made a second way to reach this state: **one client, sequentially, writing the same span
+twice**, which is what re-running a backfill is.
+
+**Measured, four cases, one symbol, 200 updates of 20 levels, `--flush-interval-ms 1000`.**
+Every write was acknowledged and every `FLUSH` returned `OK`.
+
+| the second write | rows readable after it | what happened |
+|---|---|---|
+| same span, same shape, **different prices** | 4000 of an expected 8000 | the first write's values are **gone**: the rows read back carry the second write's prices under the first write's index entry |
+| same span, **5 levels instead of 20** | **0** | the index keeps `row_count=4000`, the directory now holds 1000 rows, and the reader refuses the whole segment: `Skipping segment …: short column(s) for row_count=4000` |
+| span shifted by half (overlapping) | 8000 | **both readable** — a control |
+| a disjoint later span | 8000 | **both readable** — a control |
+
+The two controls are what make this a claim about **identical spans** rather than about overlap in
+general, and they bound who is exposed: a backfill re-run with the same boundaries, not any
+re-delivery.
+
+**The severity is in the third column, not the second.** The first row is silent replacement of
+acknowledged data. The second is worse and is the one to read: two acknowledged writes, and the
+symbol then returns **nothing at all** — the index's count and the bytes on disk disagree, and the
+second guard, which is correct, drops the segment rather than serve a short one. There is no error
+to the client at any point in either case.
+
+**Why no test catches it.** Nothing in the suite writes the same span twice; before #105 nothing
+could. And the guard reports the state with a cause attached, so a reader who hits it goes looking
+for a flush race. This repository's own rule from the flagship product applies here: **a wrong
+diagnosis is worse than none.**
+
+**Three candidate answers, and the cheapest is not obviously right.**
+
+1. **Make segment identity unique** — an ordinal or a monotonic counter in the directory name, so
+   identity stops being derived from content. Correct in principle and the widest change: the
+   snapshot manifest addresses segments by directory, retention orders them by name, and a replica
+   bootstrapping from a snapshot indexes what it is sent.
+2. **Replace the index entry when the directory is rewritten** — smallest diff, and it makes the
+   second write win silently, which is a semantic nobody asked for and which #26's guard exists to
+   prevent.
+3. **Refuse at write time, to the client** — the honest minimum: a flush that would produce a span
+   already indexed fails the `FLUSH`, so the operator learns it from the call rather than from a
+   log line naming something else. It does not make the backfill work; it stops the loss.
+
+Whichever is chosen, the guard's message must stop asserting a cause it cannot know.
+
+**Reproduction**, in full, because a pointer at a file nobody else has is not one. Start a node
+with `--flush-interval-ms 1000` on an empty data directory, then from the Python client:
+
+```python
+prices = [5_000_000 - i * 100 for i in range(20)]
+sizes  = [1_000 + i for i in range(20)]
+for u in range(200):                       # one span: BASE .. BASE + 199_000
+    engine.insert("SYMA", "EX", "bid", prices, sizes, timestamp_ns=BASE + u * 1000)
+engine.flush(); time.sleep(2.5)
+len(engine.query("SELECT * FROM 'SYMA'.'EX'"))      # 4000
+
+prices = [9_000_000 - i * 100 for i in range(5)]    # same span, five levels
+sizes  = [1_000 + i for i in range(5)]
+for u in range(200):
+    engine.insert("SYMA", "EX", "bid", prices, sizes, timestamp_ns=BASE + u * 1000)
+engine.flush(); time.sleep(2.5)
+len(engine.query("SELECT * FROM 'SYMA'.'EX'"))      # 0
+```
+
+Keep the second `range(20)` instead of `range(5)` and the count stays 4000 with the second write's
+prices, which is the first row of the table. Shift the second loop's `BASE` by `100_000` and both
+writes are readable, which is the control.
+
+- Effort: M | Impact: **P0 by consequence.** Two acknowledged writes over one event-time span leave
+  a symbol returning nothing, with no error to the client and a server line naming a different
+  cause. Reachable from the public API by re-running a backfill, which is the operation #105 added
+  event time on the wire to make possible
 
 ### 135. The mesh registry writes to `endpoints[0]` while its coordinator client talks to whichever endpoint answered ✅
 
@@ -7179,12 +7363,15 @@ measures the harness.
 
 ## Recommended order
 
-No P0 is open. Every P0 that has been raised — #60, #61, #62, #64, #68, #73, #74, #80, #88 and
-#97 — is closed, and several were found by running a real cluster rather than by reading the code
+**Two P0s are open: #136 and #137**, both found by the same afternoon on a machine this tree
+had never run on, and both filed rather than fixed because each has candidate answers that
+differ in what they cost. #136 changes an on-disk layout the snapshot manifest and retention
+both address; #137 changes what backpressure means. Every P0 raised before it —
+#60, #61, #62, #64, #68, #73, #74, #80, #88 and #97 — is closed, and several were found by running a real cluster rather than by reading the code
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: none.** Every item above #58 is marked closed, and
+**Open: #136 and #137.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -7193,7 +7380,12 @@ Read that as narrowly as it is written. It says every defect **that has been fil
 closed, and #121, the last of them, was a question rather than a defect — answered by bounding how
 far a peer's clock may move this one, refusing the peer rather than the record, the clock or a
 clamp. It does not say the engine is finished; the capability table below is the list of what it is
-not. And **#37**'s remaining half — a coverage badge — is below the floor and still a decision.
+not. **#37** is ticked as well, and the badge it used to leave open was **answered rather than
+dropped**: the number is on the front page with its denominator and the run that measured it, and
+the `coverage` job is required, so a tree below the floor cannot have a green CI badge. A percentage
+badge would have said less that is checkable than the badge already there. This sentence said the
+opposite for four days, which is the reason the table below is now checked — and the reason that
+check would not have caught this one, because #37 is below its floor.
 
 **#117**, **#118**, **#122** and **#123** are closed, and
 together they are one investigation that started with five registered
@@ -7308,16 +7500,16 @@ nothing fails when it stops being accurate. So this one points rather than resta
 answer `docs/requirements.md` in the flagship product took for the same shape: a document that is
 never meant to speak about status is easier to keep true than one meant to be current.
 
-Two of the open items are **maintainer decisions rather than work** — #121, whose ceiling costs
-causal order against the peer whose clock is wrong, and the coverage badge left from #37, which
-needs a choice of external reporting service. Existing coverage reports and the line-coverage floor
-continue to run inside GitHub Actions. The capability items are in the table below.
+Both of the maintainer decisions that used to be listed here are made: #121 bounds the drift a
+peer may introduce by refusing the peer, and #37 answered the coverage badge with a number and a
+mechanism instead of a badge. This paragraph named them for one session after they were closed,
+directly below the sentence above explaining why a second statement about the open set is the one
+that rots — so `scripts/check_roadmap.py` now refuses any row of the table below whose **Item**
+names a closed entry. Its first run found three of them, one more than reading the page had.
+The capability items are in the table below.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **Decision** | Bound the drift a peer may introduce (#121) | S | Measured and filed rather than answered: a ceiling costs causal order against exactly the peer whose clock is wrong |
-| **Decision** | Coverage badge (#37) | S | Requires choosing an external service; the existing report and floor are already in CI |
-| **P2** | Comparative numbers from a larger machine (#39) | S | Everything but the box is in place: the harness recomputes all four numbers in one run, the competitors install natively, and `benchmarks/before-a-bigger-machine.md` is the survey of what would otherwise make it a number about our defaults |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |

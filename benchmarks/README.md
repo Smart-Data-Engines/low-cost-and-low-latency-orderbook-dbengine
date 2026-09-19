@@ -22,7 +22,8 @@ timestamp fields emitted by Google Benchmark automatically.
 | Benchmark              | Metric                          | Requirement |
 |------------------------|---------------------------------|-------------|
 | `BM_UpdateLatency`     | p50/p99/p99.9 per `apply_delta` | 12.1        |
-| `BM_IngestionThroughput` | updates/second, single core   | 12.2        |
+| `BM_IngestionThroughput` | updates/second, single core, **one level per call** | 12.2 |
+| `BM_IngestionThroughputBatched` | levels/second, **twenty levels per call** — the shape the wire carries | 12.2 |
 | `BM_VwapLatency`       | VWAP over 1000 levels           | 12.3        |
 | `BM_TimeRangeQuery`    | query latency over N snapshots  | 12.4        |
 
@@ -275,7 +276,10 @@ What the harness does that a manual comparison cannot:
   itself, interleaved, and anything smaller than the worst deviation it saw is reported as
   `INDISTINGUISHABLE ON THIS HARDWARE` rather than as a win. Measured across four runs on one
   afternoon: floors of 0.05, 0.07, 0.15 and **0.35**, which is why the floor is published beside
-  every table and why comparisons are only made inside one run;
+  every table and why comparisons are only made inside one run. A quiet dedicated instance narrows
+  it and does not make it a constant: six runs on an `m9g.xlarge` gave 0.0089, 0.0141, 0.0226,
+  0.0231, 0.0306 and **0.0537**, so the resolution of that machine is a range and the published
+  table quotes the run it came from;
 - **checks that two systems answered the same question before timing them.** Rows, by value, not by
   checksum — a checksum says "different" and a value says *which column*;
 - **refuses a competitor that declares no tuning**, because an untuned competitor measures our

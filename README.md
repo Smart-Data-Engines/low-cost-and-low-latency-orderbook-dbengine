@@ -14,60 +14,99 @@ Built by [Smart Data Engines](https://smartdataengines.com), who build custom da
 ## How it compares
 
 Measured against natively installed competitors on one machine, by
-`python -m benchmarks.comparative.run --rows 200000 --rounds 12`. **Control floor 21.2%** over
+`python -m benchmarks.comparative.run --rows 200000 --rounds 12`. **Control floor 2.26%** over
 twelve interleaved rounds: this machine does not separate differences smaller than that, so anything
-below it is reported as indistinguishable rather than as a win.
+below it is reported as indistinguishable rather than as a win. That floor was **21.2%** on the
+machine the previous table was measured on, which is most of why this one exists.
 
-Intel i3-7100U, 4 cores, 15.9 GiB, NVMe behind LUKS, ext4, kernel 6.8, GCC 13.3, Release.
-200 000 rows, 50 symbols, 20 levels, seed 7.
+Amazon EC2 m9g.xlarge, aarch64 implementer 0x41 part 0xd84 r0p1, 4 cores, 15.3 GiB, Amazon Elastic Block Store on nvme0n1p1 → nvme0n1, xfs, kernel 6.18.48, gcc14-g++ 14.2.1, Release. Clock: not published by this platform.
+200,000 rows, 50 symbols, 20 levels, seed 7.
 
 | System | Version | Ingest (rows/s) | Time-range query (4000 rows) | Why it is not a like-for-like number |
 |---|---|---|---|---|
-| **orderbook-dbengine** | 0.1.0 | **66,072** | **9.32 ms** (8.46–13.28) | one `MINSERT` round trip per book update: there is no bulk-load path over the wire |
-| ClickHouse | 26.8.2.7 | 428,842 | 5.26 ms (4.78–6.85) | the whole CSV in one request |
-| TimescaleDB | 2.30.0 / PG 16.15 | 116,438 | 8.67 ms (5.60–10.54) | `\copy` of the whole CSV; `timescaledb-tune` applied |
+| **orderbook-dbengine** | 0.1.0 | **350,509** | **3.02 ms** (2.99–3.08) | one `MINSERT` round trip per book update: there is no bulk-load path over the wire |
+| ClickHouse | 26.8.2.7 | 1,151,732 | 1.49 ms (1.38–1.59) | the whole CSV in one request |
+| TimescaleDB | 2.30.0 / PG 16.15 | 416,715 | 1.96 ms (1.94–2.03) | `\copy` of the whole CSV; `timescaledb-tune` applied |
 | kdb+ | — | NOT MEASURED | NOT MEASURED | needs a vendor registration, and whether its free edition's numbers may be published here is a licence question rather than a technical one |
 
-**Three of the four comparable pairs are losses and one is inside the floor**, classified by the
-harness against its own measured floor rather than by inspection:
+**All four comparable pairs are losses**, classified by the harness against its own measured floor rather than by
+inspection:
 
-- **ingest** against ClickHouse — 84.6% apart, and against TimescaleDB — 43.3% apart. Both losses.
-- **the time-range query** against ClickHouse — 43.6% apart. A loss.
-- **the time-range query** against TimescaleDB — 9.32 ms against 8.67 ms, which is **7% apart
-  against a 21.2% floor**, so this machine cannot separate them and the harness reports it as
-  indistinguishable rather than as a win.
+- **ingest** against ClickHouse — **69.6% apart** against a 2.26% floor. A loss.
+- **ingest** against TimescaleDB — **15.9% apart** against a 2.26% floor. A loss.
+- **the time-range query** against ClickHouse — **50.7% apart** against a 2.26% floor. A loss.
+- **the time-range query** against TimescaleDB — **35.3% apart** against a 2.26% floor. A loss.
 
-**This table is the first one that compares the same question**, and that is the change worth more
-than the numbers. Until #105 the engine could not be given event time at all: a write's own
-timestamp was accepted by the client and dropped at the wire, so its rows carried arrival time and
-the dataset's own span selected **0 of 400 rows** where the SQL systems selected 400. The query
-column therefore used to compare price and size with the time column excluded. `INSERT` and
-`MINSERT` now take a trailing `event_time_ns`, all three systems filter on the same range, and every
-column of the result is held to the same value.
+One row of this dataset is one book level, so rows and levels are the same count in this table. They
+are **not** the same count in the paragraph below about the wire, and that difference used to be
+published as a ratio.
 
-The remaining protocol limit is the ingest column, and it is a limit of the *protocol* rather than of
-the storage engine: **there is no bulk-load path over the wire**, so this harness sends one round trip
-per book update while the SQL systems receive the whole CSV in one request. The same engine ingests
-**446,219 updates/s in process** on this machine (`bench_engine BM_IngestionThroughput`, 2552 ns/op
-mean over 1,221,610 iterations) against **4,012 updates/s** through the wire — a factor of 111, and
-the round trip is all of it.
+The ingest column is a limit of the *protocol* rather than of the storage engine: **there is no
+bulk-load path over the wire**, so this harness sends one round trip per book update while the SQL
+systems receive the whole CSV in one request.
 
-Every figure in the query column also includes about **4.8 ms of Python-side parsing** for 4000
-rows, identical for all three systems, because each adapter turns text into tuples. It is stated
-rather than subtracted.
+It used to say the round trip was the whole of the difference — "446,219 updates/s in process
+against 4,012 updates/s through the wire, a factor of 111" — and that was wrong twice. Both numbers
+said "updates" while one meant a single level and the other twenty, so a factor of twenty of the
+111 was the word. And the remainder is not the round trip. Holding the volume and the client fixed
+and changing only the path, at 20,000,000 levels on this machine:
 
-One number moved in a direction worth naming rather than explaining away: ingest reads 66,072 here
-against 78,151 in the previous run. That is **15% apart against this run's 21.2% floor**, so it is
-not separable from noise — and the harness's own note says why comparisons are only made within one
-run: two consecutive runs of this table gave 9.69 ms and 10.97 ms for the same query. The table is
-one run, recomputed rather than edited.
+| | wall ns per level | server CPU ns per level |
+|---|---|---|
+| in process (`bench_engine BM_IngestionThroughputBatched`) | **1014** | **67** |
+| the same update over a socket, C++ client | **1059** | 525 |
 
-Full run, with every tuning declaration and every refusal:
-[`benchmarks/comparative/results/2026-09-12-ece487a1.md`](benchmarks/comparative/results/2026-09-12-ece487a1.md).
+**Wall-clock throughput is the same to within about 4%.** The protocol costs about eight times the
+storage path's CPU per level and almost nothing in throughput, because throughput is bounded by
+neither: server CPU per level is flat at 525–530 ns across a tenfold change in volume while wall per
+level climbs and then stops. The full series, the caveats and what is still unexplained are in
+[`benchmarks/on-a-bigger-machine.md`](benchmarks/on-a-bigger-machine.md).
+
+What that does not excuse is the ingest column itself, and the gap **widens with volume**: at five
+times the rows ClickHouse loads 2.76× faster than it did and this engine loads 1.01× — flat, because
+a round trip per update does not amortise — so 69.6% apart becomes 89.2% apart.
+
+### What it costs, which is a different question from who finishes first
+
+Wall-clock on a four-core box conflates "faster per core" with "uses more cores", and this engine's
+name contains a claim about cost. Measured over 2,000,000 levels by
+[`scripts/measure_cpu_cost.py`](scripts/measure_cpu_cost.py), counting each server's
+`utime+stime+cutime+cstime` and each client's own CPU including its live children:
+
+| system | wall | levels/s | server CPU | client CPU | **levels per server CPU-second** | server cores |
+|---|---|---|---|---|---|---|
+| orderbook | 5.574 s | 358,829 | 1.130 s | 4.537 s | **1,769,912** | **0.20** |
+| clickhouse | 0.469 s | 4,265,060 | 1.120 s | 0.055 s | **1,785,714** | **2.39** |
+| timescaledb | 5.241 s | 381,626 | 4.250 s | 0.083 s | 470,588 | 0.81 |
+
+Per server CPU-second the engine and ClickHouse are **1,769,912 against 1,785,714** — inside every
+floor this machine has measured, and one 10 ms clock tick apart, so indistinguishable twice over.
+The two figures are given rather than their quotient, because the quotient is smaller than the
+resolution of the clock that produced them. ClickHouse wins the
+clock by spending **2.39 cores** where the engine spends **0.20**; TimescaleDB costs 3.8× the CPU
+per level of either.
+
+Three things belong beside that rather than after it. ClickHouse is doing **more** work per level —
+parsing text and building compressed parts where the engine receives binary frames and appends — so
+parity per CPU-second is not a flattering result for us. **Our client burns four times what our
+server burns**, and a C++ client sending the same 100,000 round trips does it with 0.44 s and
+reaches 1,319,261 levels/s, so this ingest column measures the harness's Python as much as the
+protocol: the loss to ClickHouse is 4.1× rather than 11.9×, and the smaller number is the honest one
+to argue against. And two CPU figures one 10 ms tick apart agree to within the measurement's own
+resolution and nothing more should be read into them.
+
+Every figure in the query column also includes Python-side parsing for 4000 rows, identical for all
+three systems, because each adapter turns text into tuples. It is **measured in the run** and stated
+rather than subtracted — an earlier version of this page carried a parsing constant larger than the
+smallest query median in the same table, because the constant had been measured on a different
+machine and written into the report as prose.
+
+Full run, with every tuning declaration and every refusal: [`benchmarks/comparative/results/2026-09-19-55fc0e74-5.md`](benchmarks/comparative/results/2026-09-19-55fc0e74-5.md). The write-up of
+what this machine found, including the nine defects it exposed and the prediction registered before
+it booted: [`benchmarks/on-a-bigger-machine.md`](benchmarks/on-a-bigger-machine.md).
 To reproduce it, install the competitors natively first —
 [`benchmarks/install_competitors.md`](benchmarks/install_competitors.md); nothing in the harness
 installs anything, and a containerised competitor would measure the container.
-
 ## Features
 
 - **SoA (Struct-of-Arrays) buffer** with seqlock for lock-free concurrent reads

@@ -67,6 +67,13 @@ CODE_SPAN_RE = re.compile(r"`[^`]*`")
 # numbered above the last item is the first one that fails. A rule that passes by coincidence is
 # indistinguishable from one that works until the coincidence ends.
 GITHUB_LINK_RE = re.compile(r"\[[^\]]*\]\(https://(?:www\.)?github\.com/[^)]*\)")
+# The priority table, anchored on its header row. A table of what to do next that lists an item
+# already closed is the rot the `Open:` line was mechanised against, one section further down: it
+# happened on 7 September to three items at once, was fixed by hand, and happened again to #121 and
+# #37 on the day both were closed - in a table two paragraphs below the sentence explaining why a
+# second statement about the open set is the one that rots. Repairing the same prose by hand twice
+# is the signal to check it instead.
+PRIORITY_HEADER = "| Priority | Item | Effort | Why now |"
 
 
 def main() -> int:
@@ -89,6 +96,37 @@ def main() -> int:
         problems.append(f"item number {number} is used more than once")
 
     lines = text.splitlines()
+
+    header_at = None
+    for line_no, line in enumerate(lines, start=1):
+        if line.strip() == PRIORITY_HEADER:
+            header_at = line_no
+            break
+    if header_at is None:
+        problems.append(
+            "the priority table's header row is not on this page, so the check that it lists no "
+            "closed item has nothing to read - if the table was renamed, rename PRIORITY_HEADER "
+            "with it, because a check whose scope can shrink silently is not a check")
+    else:
+        for line in lines[header_at:]:
+            if not line.startswith("|"):
+                break
+            # Only the Item cell, which is what the row is *about*. The rationale column legitimately
+            # mentions closed work - "authentication landed with #30, authorisation did not" is true
+            # and belongs there - and the first version of this check flagged it. Use against
+            # mention, in a checker written to catch prose that rots: the control that caught it was
+            # a reference that was correct.
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if len(cells) < 2:
+                continue
+            cleaned = GITHUB_LINK_RE.sub("", CODE_SPAN_RE.sub("", cells[1]))
+            for ref in REF_RE.finditer(cleaned):
+                number = int(ref.group(1))
+                title = items.get(number)
+                if title is not None and CLOSED_MARK in title:
+                    problems.append(
+                        f"the priority table names #{number}, which is marked closed - a table of "
+                        f"what to do next that lists finished work reads as a plan and is not one")
     # A fenced block is code, for the same reason a backtick span is: `#0 ob::Engine::…` in a quoted
     # sanitizer stack trace is a frame number, not a reference to item zero. The inline rule was
     # already here; this is the same rule at block scale, and it arrived the day an item quoted a
