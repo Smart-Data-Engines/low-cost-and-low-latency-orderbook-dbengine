@@ -2861,9 +2861,10 @@ answers differ in what they cost; the measurements and the candidates are on the
 nothing signals the flush loop because a writer is waiting, so the wait is for
 `--flush-interval-ms` to elapse. That writer is the **epoll thread**, so the node stops accepting,
 stops answering, logs nothing, and does not observe `SIGTERM`: measured, still blocked **273 s**
-after it, both threads in `futex_do_wait` with 0.5 s of CPU between them. The default 100 ms is out
-of reach at any rate this hardware sustains; at the **1000 ms** the comparative harness sets and
-`tuning_applied()` recommends for bulk loads, one interval is one ceiling.
+after it, both threads in `futex_do_wait` with 0.5 s of CPU between them. It is a slope rather than a cliff:
+measured at 4,000,000 levels, **1,081,417 levels/s at a 1000 ms interval, 254,691 at 5000 and
+65,930 at 20,000**, roughly inverse and with no error logged at any of them, so the shipped 100 ms
+and the harness's 1000 ms are both safe here and the hour is the same mechanism in the limit.
 
 Things a newcomer should know, because they are real limits rather than bugs to file again:
 

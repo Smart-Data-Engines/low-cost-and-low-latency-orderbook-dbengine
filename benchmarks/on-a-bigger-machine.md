@@ -305,9 +305,10 @@ never been on.
    blocks there until a flush drains it; the flush runs on `--flush-interval-ms` and nothing
    signals it because a writer is waiting. So the node stops accepting, stops answering, logs
    nothing, and — measured — does not observe `SIGTERM` either: still in the same two futexes
-   **273 seconds** after it, with 0.5 s of CPU between both threads, killed with `SIGKILL`. At the
-   1000 ms this project's own tuning note recommends for a bulk load, one interval is one ceiling
-   on this hardware.
+   **273 seconds** after it, with 0.5 s of CPU between both threads, killed with `SIGKILL`. It is a
+   slope rather than a cliff — 1,081,417 levels/s at a 1000 ms interval, 254,691 at 5000, 65,930 at
+   20,000, roughly inverse — and an earlier draft of this line said 1000 ms was one interval from
+   the ceiling, which the sweep contradicted.
 
 One thing worked exactly as designed on a machine it had never run on, and it is worth the line
 because the failure it replaced was a `SIGABRT`: a second node on a taken port printed

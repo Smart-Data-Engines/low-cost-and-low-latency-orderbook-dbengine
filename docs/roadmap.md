@@ -2251,11 +2251,28 @@ line, and — measured — **`SIGTERM` is not observed either**. The node logged
 later**, at which point it had to be killed with `SIGKILL`. A supervisor does exactly that, and
 whatever was pending is lost.
 
-**How close the shipped defaults are.** At 100 ms, the default, a million rows would have to arrive
-in one interval, which needs about ten million rows a second — out of reach here. At the **1000 ms**
-the comparative harness sets, and which `tuning_applied()` recommends for a bulk load, this machine
-ingests around one million levels a second: one interval is one ceiling. The margin is a factor of
-one.
+**It is a slope, not a cliff, and the slope is what makes the far end look like a hang.** Measured
+at 4,000,000 levels through the wire, one flush interval per row, everything else held:
+
+| `--flush-interval-ms` | wall | levels/s | against 1000 ms |
+|---|---|---|---|
+| 1000 | 3.70 s | **1,081,417** | — |
+| 5000 | 15.71 s | 254,691 | 4.2× slower |
+| 20000 | 60.68 s | 65,930 | 16.4× slower |
+| 60000 | **did not finish in 120 s** | — | the extrapolated rate puts it near 180 s |
+
+Throughput falls roughly in inverse proportion to the interval, which is exactly what "the writer
+waits for the next flush" predicts, and none of those rows logged an error: backpressure is doing
+what it says. At 3,600,000 ms the same slope reaches a node that cannot be distinguished from a
+hung one, and that is where this was found.
+
+**So the earlier version of this paragraph was wrong and the correction is the point.** It said
+that at the 1000 ms the comparative harness sets, one interval is one ceiling — reasoned from
+`MAX_PENDING_ROWS` and the ingest rate, and contradicted by a measurement taken the same afternoon:
+the volume series pushed 20,000,000 levels at that interval with no stall. The shipped default of
+100 ms is further still. What is defective is not the ceiling, it is that the wait is on a timer
+nobody can shorten, that the thread doing the waiting is the one serving every client, and that
+none of it is logged.
 
 **Three candidate answers.**
 
