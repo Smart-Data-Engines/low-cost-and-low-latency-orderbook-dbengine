@@ -1881,6 +1881,9 @@ void TcpServer::run() {
                 // Draining: stop accepting new connections.
                 if (draining_.load(std::memory_order_relaxed)) {
                     // Reject all pending connections.
+                    //
+                    // OB_NO_TCP_NODELAY: one line and a close, so there is never an earlier
+                    // unacknowledged byte for Nagle to hold a second write behind (#140).
                     while (true) {
                         int reject_fd = ::accept4(listen_fd_, nullptr, nullptr, SOCK_NONBLOCK);
                         if (reject_fd < 0) break;

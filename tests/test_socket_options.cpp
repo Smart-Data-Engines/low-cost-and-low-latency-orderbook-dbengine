@@ -77,9 +77,24 @@ std::vector<std::filesystem::path> engine_sources() {
 /// rule matched that method and put an exemption comment above a function with no socket in it.
 /// `io_uring_prep_accept` is here because on that transport the accept is a submitted request and
 /// the descriptor arrives in a completion handler, so no syscall spelling appears at all.
-bool owns_a_connection(const std::string& code) {
+size_t connection_sites(const std::string& code) {
     static const std::regex syscall(R"([^A-Za-z0-9_:]::(accept4?|connect)\s*\()");
-    return std::regex_search(code, syscall) || code.find("io_uring_prep_accept") != std::string::npos;
+    const auto begin = std::sregex_iterator(code.begin(), code.end(), syscall);
+    size_t n = static_cast<size_t>(std::distance(begin, std::sregex_iterator()));
+    // On the io_uring transport the accept is a submitted request and the descriptor arrives in a
+    // completion handler, so no syscall spelling appears anywhere in the file.
+    if (code.find("io_uring_prep_accept") != std::string::npos) ++n;
+    return n;
+}
+
+bool owns_a_connection(const std::string& code) { return connection_sites(code) > 0; }
+
+size_t count_of(const std::string& haystack, const std::string& needle) {
+    size_t n = 0;
+    for (size_t at = haystack.find(needle); at != std::string::npos;
+         at = haystack.find(needle, at + needle.size()))
+        ++n;
+    return n;
 }
 
 std::string rel(const std::filesystem::path& p) {
@@ -139,36 +154,47 @@ TEST(SocketOptions, ABadDescriptorIsLoggedRatherThanFatal) {
 
 // ── and it is called where it is needed ──────────────────────────────────────
 
-TEST(SocketOptionsStatic, EveryFileHoldingAConnectionSetsItOrSaysWhyNot) {
-    std::vector<std::string> holders, exempt, missing;
+TEST(SocketOptionsStatic, EverySocketSetsItOrSaysWhyNot) {
+    // Counted per site rather than per file. A per-file rule is satisfied by either of two
+    // sockets, so `src/replication.cpp` — which accepts a replica and dials a primary — would
+    // keep passing after losing one of its two calls: the rule would cover less than it reads as
+    // covering, which is the failure mode this repository files most often.
+    size_t files_with_sockets = 0, files_setting = 0, files_exempting = 0;
+    std::vector<std::string> short_of;
 
     for (const auto& path : engine_sources()) {
         const std::string raw  = read_file(path);
         ASSERT_FALSE(raw.empty()) << "cannot read " << rel(path);
         const std::string code = without_comments(raw);
-        if (!owns_a_connection(code)) continue;
+        const size_t sites = connection_sites(code);
+        if (sites == 0) continue;
 
-        holders.push_back(rel(path));
-        if (code.find("set_tcp_nodelay(") != std::string::npos) continue;
+        ++files_with_sockets;
+        const size_t calls = count_of(code, "set_tcp_nodelay(");
         // The exemption lives beside the socket it exempts, not in a list here: a list in this
         // file is one more thing to keep in step with the tree, and the reason belongs where the
         // next reader of that accept call is standing.
-        if (raw.find(kExemption) != std::string::npos) { exempt.push_back(rel(path)); continue; }
-        missing.push_back(rel(path));
+        const size_t reasons = count_of(raw, kExemption);
+        if (calls > 0) ++files_setting;
+        if (reasons > 0) ++files_exempting;
+
+        if (calls + reasons < sites)
+            short_of.push_back(rel(path) + " (" + std::to_string(sites) + " sockets, " +
+                               std::to_string(calls) + " set, " + std::to_string(reasons) +
+                               " explained)");
     }
 
-    EXPECT_TRUE(missing.empty()) << "these accept or dial a TCP connection and neither set "
-                                    "TCP_NODELAY nor carry an " << kExemption << " reason: "
-                                 << [&] { std::string s; for (auto& m : missing) s += m + " "; return s; }();
+    EXPECT_TRUE(short_of.empty())
+        << "these hold more TCP connections than they either set TCP_NODELAY on or carry an "
+        << kExemption << " reason for: "
+        << [&] { std::string s; for (auto& m : short_of) s += m + "; "; return s; }();
 
-    // A scan that finds nothing satisfies every rule above. These two say the sweep reached the
-    // tree and that both branches of the rule are live — one file that sets it, one that explains
-    // why it does not — so neither branch can quietly stop being exercised.
-    EXPECT_GE(holders.size(), 4u) << "the sweep found almost no connection-holding sources";
-    EXPECT_NE(std::find(holders.begin(), holders.end(), std::string("src/tcp_server.cpp")),
-              holders.end()) << "the client port is not in the derived set";
-    EXPECT_FALSE(exempt.empty()) << "no file exercises the exemption branch any more";
-    EXPECT_LT(exempt.size(), holders.size()) << "no file exercises the setting branch any more";
+    // A scan that finds nothing satisfies every rule above. These say the sweep reached the tree
+    // and that both branches of the rule are live — files that set it, files that explain why
+    // they do not — so neither branch can quietly stop being exercised.
+    EXPECT_GE(files_with_sockets, 4u) << "the sweep found almost no connection-holding sources";
+    EXPECT_GT(files_setting, 0u) << "no file exercises the setting branch any more";
+    EXPECT_GT(files_exempting, 0u) << "no file exercises the exemption branch any more";
 }
 
 TEST(SocketOptionsStatic, NothingCallsItThatDoesNotHoldAConnection) {
