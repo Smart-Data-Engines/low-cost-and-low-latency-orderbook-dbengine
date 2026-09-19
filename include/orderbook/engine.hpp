@@ -516,6 +516,17 @@ private:
     /// times the 73 ms a full ceiling takes to flush, so a healthy flush never reaches it even on
     /// a machine an order of magnitude slower — a deadline a healthy write can touch is a gate on
     /// a clock, and those teach operators to ignore refusals.
+    ///
+    /// **What it bounds, exactly.** `wait_for` times the *condition* wait and not the
+    /// reacquisition of `mtx_` afterwards, and the flush holds `mtx_` for the whole of its first
+    /// phase — measured at **1.2 s** for a million rows on the development machine, against
+    /// 73 ms for the segment write that follows it outside the lock. So a writer parked behind
+    /// that phase is not bounded by this deadline and will not be refused: it waits for the
+    /// mutex, gets it, finds room, and proceeds. That is the right outcome and it is not what
+    /// the constant's name suggests, which is why it is written here. A mutation shortening this
+    /// to one millisecond therefore **survives** the unit tests, and the case it does bite —
+    /// a flush that throws, releases `mtx_` and leaves the queue full — is the fault-injector
+    /// test this item has not written yet.
     static constexpr std::chrono::seconds kBackpressureDeadline{5};
 
     /// Ask the flush loop to run now. Caller may hold `mtx_`; see `flush_now_`.
