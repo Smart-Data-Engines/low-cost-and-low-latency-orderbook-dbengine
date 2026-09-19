@@ -3014,6 +3014,19 @@ disambiguator until the docstring of the field ruled it out: a received segment 
 path reads as a claim about this node. An in-memory counter does not survive a restart; the
 ordinal's state is the directory listing, which does.
 
+**Mutations: four, each with the verdict it was meant to give.**
+
+| mutation | verdict |
+|---|---|
+| identity is the span again | **killed** — the defect, and both integration cases with it |
+| `exists()` before the create instead of letting it arbitrate | **killed** by the four-thread race test |
+| the ordinal starts at 0 | **killed** — the second segment is named `_1`, and that is pinned |
+| the log line is reworded | **survives**, and it is the control |
+
+The second row is the one worth reading: it says the arbiter is load-bearing rather than a
+stylistic preference, because a check-then-create hands two flushers the same free name. Baseline
+green before and after, source restored byte for byte.
+
 The guard's message no longer names a cause it cannot know.
 
 **How it was found and what it cost, kept below.**
