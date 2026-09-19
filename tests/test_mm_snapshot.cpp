@@ -303,6 +303,52 @@ TEST(MMSnapshotCodec, BeginRefusesWhatItCannotAct0n) {
     EXPECT_FALSE(ob::decode_snapshot_begin(p2.data(), p2.size(), out));
 }
 
+TEST(MMSnapshotCodec, ChunkHeaderBytesAreLittleEndianAtFixedOffsets) {
+    // The ten header bytes, written out by hand.
+    //
+    // The round-trip test below sends the encoder's output through *our own* decoder, so a change
+    // that reversed the byte order would change both halves together and stay green. This frame is
+    // read by a different node, which may be running an older build, so the bytes are the contract
+    // and not the pair of functions. Spelling the expected header here is the only thing that makes
+    // that contract observable from inside this repository.
+    const std::vector<uint8_t> data = {0xAA, 0xBB, 0xCC};
+    const auto framed = ob::encode_snapshot_chunk(0x0201, 0x0807060504030201ULL,
+                                                  data.data(), data.size());
+
+    ASSERT_EQ(framed.size(), ob::MM_SNAPSHOT_CHUNK_HEADER_SIZE + data.size());
+    const std::vector<uint8_t> expected_header = {
+        0x01, 0x02,                                      // file_index, little-endian
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,  // byte_offset, little-endian
+    };
+    EXPECT_EQ(std::vector<uint8_t>(framed.begin(),
+                                   framed.begin() + ob::MM_SNAPSHOT_CHUNK_HEADER_SIZE),
+              expected_header);
+    EXPECT_EQ(std::vector<uint8_t>(framed.begin() + ob::MM_SNAPSHOT_CHUNK_HEADER_SIZE,
+                                   framed.end()),
+              data);
+}
+
+TEST(MMSnapshotCodec, AFullSizeChunkIsEncodedWithoutCorruption) {
+    // The largest payload the transfer path produces, which is also the size the discarded
+    // alternative encoder would have copied a second time on every chunk.
+    std::vector<uint8_t> data(ob::MM_SNAPSHOT_CHUNK_BYTES);
+    for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<uint8_t>((i * 31u + 7u) & 0xFFu);
+
+    const auto framed = ob::encode_snapshot_chunk(65535, ~0ULL, data.data(), data.size());
+    ASSERT_EQ(framed.size(), ob::MM_SNAPSHOT_CHUNK_HEADER_SIZE + data.size());
+
+    uint16_t file_index = 0;
+    uint64_t offset = 0;
+    const uint8_t* bytes = nullptr;
+    size_t n = 0;
+    ASSERT_TRUE(ob::decode_snapshot_chunk(framed.data(), framed.size(),
+                                          file_index, offset, bytes, n));
+    EXPECT_EQ(file_index, 65535u);
+    EXPECT_EQ(offset, ~0ULL);
+    ASSERT_EQ(n, data.size());
+    EXPECT_EQ(std::memcmp(bytes, data.data(), n), 0);
+}
+
 TEST(MMSnapshotCodec, ChunkRoundTripsIncludingTheEmptyOne) {
     const std::vector<uint8_t> data = {1, 2, 3, 4, 5};
     const auto payload = ob::encode_snapshot_chunk(7, 4096, data.data(), data.size());

@@ -32,17 +32,25 @@ namespace fs = std::filesystem;
 
 namespace {
 
-void put_u16(std::vector<uint8_t>& out, uint16_t v) {
-    out.push_back(static_cast<uint8_t>(v & 0xFF));
-    out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+/// Little-endian write at a known offset in a buffer that is already sized.
+template <typename T>
+void put_le_at(uint8_t* p, T v) {
+    for (size_t i = 0; i < sizeof(T); ++i) p[i] = static_cast<uint8_t>((v >> (8 * i)) & 0xFFu);
 }
 
+/// Little-endian append to a buffer that is still growing.
+///
+/// Expressed in terms of put_le_at so that one loop in this file decides what little-endian means.
+/// It was two spellings before - explicit push_backs for the 16-bit form, a loop for the others -
+/// which is how a wire format grows a second opinion about its own byte order.
+///
+/// Only the 32-bit form survives, and the compiler is what established that: rewriting the chunk
+/// encoder below left `put_u16` and `put_u64` with no callers at all, so each of them existed for
+/// exactly one call site. The begin-frame encoder is the one that still appends.
 void put_u32(std::vector<uint8_t>& out, uint32_t v) {
-    for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
-}
-
-void put_u64(std::vector<uint8_t>& out, uint64_t v) {
-    for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+    const size_t at = out.size();
+    out.resize(at + sizeof(uint32_t));
+    put_le_at<uint32_t>(out.data() + at, v);
 }
 
 uint16_t get_u16(const uint8_t* p) {
@@ -95,11 +103,28 @@ bool decode_snapshot_begin(const uint8_t* data, size_t len, SnapshotBegin& out) 
 
 std::vector<uint8_t> encode_snapshot_chunk(uint16_t file_index, uint64_t byte_offset,
                                            const uint8_t* bytes, size_t n) {
-    std::vector<uint8_t> out;
-    out.reserve(MM_SNAPSHOT_CHUNK_HEADER_SIZE + n);
-    put_u16(out, file_index);
-    put_u64(out, byte_offset);
-    if (n > 0 && bytes) out.insert(out.end(), bytes, bytes + n);
+    // Sized once at its final length and written by index, rather than reserved and pushed into.
+    //
+    // The shape this replaces was correct: reserve() covered the header and the payload, so none of
+    // the ten push_back()s that followed could grow the vector. GCC 14 cannot prove that when the
+    // reserve argument contains a runtime `n` - it inlines push_back's growth branch, fails to kill
+    // it, and reports the deallocation inside that dead branch as -Wfree-nonheap-object, which
+    // -Werror turns into a build failure. encode_snapshot_begin() above reserves a *constant* and
+    // draws no diagnostic on the same compiler: that difference is what identifies the mechanism
+    // rather than the line, and it is why this is a false positive and not a defect it found.
+    //
+    // The other shape that silences it - reserve the header's constant, let insert() grow the
+    // vector for the payload - would copy up to MM_SNAPSHOT_CHUNK_BYTES (32 KiB) per chunk on the
+    // snapshot transfer path. One allocation and no copy is the better answer as well as the quiet
+    // one, which is the only reason this file changed at all rather than the diagnostic being
+    // switched off.
+    static_assert(MM_SNAPSHOT_CHUNK_HEADER_SIZE == sizeof(uint16_t) + sizeof(uint64_t),
+                  "the two offsets written below and the header constant are one fact; a header "
+                  "that grows a field must move them together");
+    std::vector<uint8_t> out(MM_SNAPSHOT_CHUNK_HEADER_SIZE + n);
+    put_le_at<uint16_t>(out.data(), file_index);
+    put_le_at<uint64_t>(out.data() + sizeof(uint16_t), byte_offset);
+    if (n > 0 && bytes) std::memcpy(out.data() + MM_SNAPSHOT_CHUNK_HEADER_SIZE, bytes, n);
     return out;
 }
 
