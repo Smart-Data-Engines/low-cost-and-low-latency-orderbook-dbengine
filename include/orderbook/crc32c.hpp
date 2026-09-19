@@ -27,6 +27,21 @@
 // cost 197 ns per WAL record, four times the biggest hot-path saving previously recorded in the
 // roadmap.
 //
+// Measured again on aarch64 (Neoverse-V3, 4 vCPU, Amazon Linux 2023, GCC 14, Release), same
+// harness and the same per-iteration mutation, when the second hardware path was added:
+//
+//   size        table        hardware     speedup
+//   64 B        93.9 ns      5.9 ns       16x
+//   128 B       229.5 ns     9.9 ns       23x
+//   1 KB        2.14 us      40.4 ns      53x
+//   64 KB       140.2 us     2.50 us      56x
+//   4 MB        8.97 ms      160.5 us     56x
+//
+// The table is faster on this core than on the older x86 one (~470-680 MB/s against ~295 MB/s) and
+// the instruction is faster still, so the ratio is wider, not narrower. The number that matters is
+// the middle row: a 112-byte WAL record costs 220 ns of table fold that the instruction does not
+// charge, on a machine where the whole ingestion path is measured in microseconds.
+//
 // Usage:
 //   #include "orderbook/crc32c.hpp"
 //   uint32_t checksum = ob::crc32c(data_ptr, data_len);
@@ -35,15 +50,35 @@
 #include <cstddef>
 #include <cstdint>
 
-// x86-64 with a GNU-compatible compiler: the hardware path needs both the instruction and
-// `__attribute__((target(...)))`, which is how it is compiled without a global -msse4.2. Anything
-// else — another architecture, another compiler — gets the table, which is the same code as before.
+// Two architectures have an instruction for exactly this polynomial, and both are used when the
+// CPU running the process has it: SSE4.2's `crc32` on x86-64, and the ARMv8 CRC32 extension's
+// `crc32c*` on aarch64. Anything else — another architecture, another compiler — gets the table,
+// which is the same code as before.
+//
+// On x86-64 the hardware path needs both the instruction and `__attribute__((target(...)))`, which
+// is how it is compiled without a global -msse4.2. On aarch64 the equivalent lives in the assembly
+// template; the long comment above that fold says why, and why it is not the intrinsic.
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
 #define OB_CRC32C_X86 1
 #include <nmmintrin.h>
 #else
 #define OB_CRC32C_X86 0
 #endif
+
+// aarch64 detection reads the Linux auxiliary vector, so this asks for Linux as well as the
+// architecture. The engine needs epoll and io_uring, so there is no aarch64 target here that is not
+// Linux; naming it keeps the condition honest rather than lucky.
+#if defined(__aarch64__) && defined(__linux__) && (defined(__GNUC__) || defined(__clang__))
+#define OB_CRC32C_ARM 1
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#else
+#define OB_CRC32C_ARM 0
+#endif
+
+// One condition for "this build has a second implementation to dispatch to", so that the call site
+// below has one branch rather than one per architecture.
+#define OB_CRC32C_HW (OB_CRC32C_X86 || OB_CRC32C_ARM)
 
 namespace ob {
 namespace detail {
@@ -124,6 +159,68 @@ inline const bool crc32c_has_hw = __builtin_cpu_supports("sse4.2");
 
 #endif  // OB_CRC32C_X86
 
+#if OB_CRC32C_ARM
+
+/// Hardware fold, aarch64.
+///
+/// Written as assembly rather than the `__crc32cd`/`__crc32cb` intrinsics, and that is a
+/// measurement rather than a preference. The intrinsics live in <arm_acle.h> behind
+/// `__ARM_FEATURE_CRC32`, which a per-function target attribute does not define, so each compiler
+/// wants a different spelling and rejects the other's: GCC 14 exposes them when the include sits
+/// inside `#pragma GCC target("+crc")` and clang 15 does not, while clang's own
+/// `__builtin_arm_crc32cd` under `target("crc")` is refused by GCC, which wants `+crc`. Two
+/// spellings of one instruction, each working on one compiler, is the shape this header exists to
+/// avoid having.
+///
+/// The `.arch_extension` directive travels with the instruction inside the template, so one form
+/// satisfies both compilers, and it costs nothing: measured on a Neoverse-V3, best of five runs,
+/// the assembly form came out at 0.95x, 0.99x and 1.00x of the GCC intrinsic at 64 B, 1 KiB and
+/// 4 MiB. The first attempt at that comparison reported 1.82 ns for 64 bytes *and* for four
+/// megabytes, because the accumulator was cast to void and the whole fold was deleted — the same
+/// class of non-measurement as the 82 TB/s above, and caught the same way, by the number being
+/// absurd rather than by reading the code.
+///
+/// The alternative to selecting per function is building the whole engine for `armv8-a+crc`. CRC32
+/// is mandatory from ARMv8.1, so that is true of every server-class part, and it would drop the
+/// ARMv8.0 CPUs that this one binary still runs on. Runtime dispatch is the reason this header has
+/// the shape it has, so the architecture that arrived second does not get to change it.
+inline uint32_t crc32c_arm_u64(uint32_t crc, uint64_t v) noexcept {
+    uint32_t out;
+    __asm__(".arch_extension crc\n\tcrc32cx %w0, %w1, %x2" : "=r"(out) : "r"(crc), "r"(v));
+    return out;
+}
+
+inline uint32_t crc32c_arm_u8(uint32_t crc, uint8_t v) noexcept {
+    uint32_t out;
+    __asm__(".arch_extension crc\n\tcrc32cb %w0, %w1, %w2" : "=r"(out) : "r"(crc), "r"(v));
+    return out;
+}
+
+inline uint32_t crc32c_update_hw(uint32_t crc, const uint8_t* p, size_t len) noexcept {
+    uint32_t c = crc;
+    while (len >= 8) {
+        uint64_t chunk;
+        __builtin_memcpy(&chunk, p, sizeof(chunk));   // no alignment requirement, unlike a cast
+        c = crc32c_arm_u64(c, chunk);
+        p += 8;
+        len -= 8;
+    }
+    while (len-- > 0) {
+        c = crc32c_arm_u8(c, *p++);
+    }
+    return c;
+}
+
+/// Decided once, from the Linux auxiliary vector, which is the interface the kernel documents for
+/// this feature. `__builtin_cpu_supports` does not cover it on both compilers at the versions this
+/// tree supports.
+///
+/// Same failure mode as the x86 flag: lose the static-initialisation race and this reads false and
+/// the table runs. Slower, never wrong.
+inline const bool crc32c_has_hw = (getauxval(AT_HWCAP) & HWCAP_CRC32) != 0;
+
+#endif  // OB_CRC32C_ARM
+
 }  // namespace detail
 
 /// Fold `len` bytes into a running CRC32C state.
@@ -132,7 +229,7 @@ inline const bool crc32c_has_hw = __builtin_cpu_supports("sse4.2");
 /// implementations — the instruction is defined on the same reflected polynomial as the table.
 inline uint32_t crc32c_update(uint32_t crc, const void* data, size_t len) noexcept {
     const auto* p = static_cast<const uint8_t*>(data);
-#if OB_CRC32C_X86
+#if OB_CRC32C_HW
     if (detail::crc32c_has_hw) {
         return detail::crc32c_update_hw(crc, p, len);
     }
@@ -154,10 +251,27 @@ inline uint32_t crc32c(const void* data, size_t len) noexcept {
 /// Worth logging at startup: the difference is a factor of twenty on the write path, and "which
 /// implementation am I running" is not otherwise answerable from outside.
 inline bool crc32c_has_hardware() noexcept {
-#if OB_CRC32C_X86
+#if OB_CRC32C_HW
     return detail::crc32c_has_hw;
 #else
     return false;
+#endif
+}
+
+/// Which implementation this process will use, named rather than described.
+///
+/// The startup line printed "SSE4.2 instruction" on the hardware branch, which was true while
+/// exactly one architecture had one. With two, the string is a claim about the CPU underneath and
+/// has to be decided in the same place the dispatch is — otherwise a node on one architecture
+/// reports the other one's instruction, and the log is the only thing that answers "which fold is
+/// this process running" from outside.
+inline const char* crc32c_implementation() noexcept {
+#if OB_CRC32C_X86
+    return detail::crc32c_has_hw ? "SSE4.2 crc32 instruction" : "lookup table";
+#elif OB_CRC32C_ARM
+    return detail::crc32c_has_hw ? "ARMv8 crc32c instruction" : "lookup table";
+#else
+    return "lookup table";
 #endif
 }
 

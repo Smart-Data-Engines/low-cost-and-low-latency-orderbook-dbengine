@@ -3,8 +3,14 @@
 //
 // These checksums go into WAL record headers, snapshot manifests and every replication frame, so a
 // build that computed them differently would reject its own files and disconnect its own peers. The
-// hardware path uses the SSE4.2 `crc32` instruction, which implements this exact reflected
-// polynomial; that is a claim worth testing at every length and alignment rather than trusting.
+// hardware path is the SSE4.2 `crc32` instruction on x86-64 and the ARMv8 CRC32 extension's
+// `crc32c*` on aarch64, both of which implement this exact reflected polynomial; that is a claim
+// worth testing at every length and alignment rather than trusting.
+//
+// Read the first test before the rest: on a build with no hardware path, or on a CPU without the
+// instruction, every "both implementations agree" test below compares the table with itself and
+// passes without asserting anything. That was the state of this file on every non-x86 platform
+// until aarch64 got a fold of its own.
 
 #include "orderbook/crc32c.hpp"
 
@@ -26,6 +32,36 @@ std::vector<uint8_t> pattern(size_t n, uint8_t seed = 0) {
 }
 
 }  // namespace
+
+TEST(Crc32c, TheComparisonsBelowHaveTwoImplementationsToCompare) {
+    // The agreement tests call crc32c() and crc32c_table_only(). Where crc32c() *is* the table -
+    // an architecture with no fold of its own, or a CPU that does not advertise the instruction -
+    // those tests compare one function with itself: green, and vacuous.
+    //
+    // This test is the only thing that makes that visible from a passing run. It does not fail on
+    // such a platform, because the table is the correct answer there and a red suite would be a
+    // lie about the code; it skips, and says so, which is the difference between a suite that
+    // reports its own scope and one that lets a reader assume it.
+    if (!ob::crc32c_has_hardware()) {
+        GTEST_SKIP() << "this build has no hardware CRC32C fold, or this CPU does not advertise "
+                        "the instruction, so every agreement test in this file compares the table "
+                        "implementation with itself";
+    }
+    SUCCEED() << "agreement tested against: " << ob::crc32c_implementation();
+}
+
+TEST(Crc32c, TheReportedImplementationIsTheOneThatRuns) {
+    // Two facts that are printed once at startup and never again: whether a hardware fold was
+    // found, and what it is called. They are decided in the same header but by different
+    // expressions, so nothing but this stops them disagreeing - and the startup line is the only
+    // answer an operator has to "which fold is this process running".
+    const std::string named = ob::crc32c_implementation();
+    if (ob::crc32c_has_hardware()) {
+        EXPECT_NE(named, "lookup table");
+    } else {
+        EXPECT_EQ(named, "lookup table");
+    }
+}
 
 TEST(Crc32c, BothImplementationsAgreeAtEveryLengthUpToAFewHundred) {
     // Every length, not a sample: the hardware path processes eight bytes at a time and then
