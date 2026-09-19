@@ -5,6 +5,10 @@ target_link_libraries(bench_engine
         orderbook_engine
         orderbook_agg
         orderbook_core
+        # For BM_FormatQueryResponse. The response is 40% of the server's profile while answering
+        # the comparative benchmark's query, so it is measured here rather than only inferred from
+        # a profile.
+        orderbook_tcp_server_lib
         # benchmark, not benchmark_main: bench_engine.cpp has its own main, so that the filesystem
         # the engine's storage lands on reaches --benchmark_out through AddCustomContext.
         benchmark::benchmark

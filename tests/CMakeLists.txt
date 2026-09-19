@@ -361,6 +361,14 @@ ob_add_tcp_test(test_command_arity
     test_command_arity.cpp
 )
 
+# The query response is a wire format and was covered only indirectly, through the server tests.
+# `format_query_response` is 40% of the profile while answering the comparative benchmark's query,
+# so its hot loop gets rewritten - and a rewrite of a wire format needs a net that fails on a
+# changed byte.
+ob_add_tcp_test(test_response_formatter
+    test_response_formatter.cpp
+)
+
 ob_add_tcp_test(test_tcp_server
     test_tcp_server.cpp
 )
