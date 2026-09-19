@@ -87,6 +87,62 @@ Two things follow, and both are refusals rather than surprises:
   that is the server, which assigns one per symbol. The argument used to be accepted and discarded;
   it is now refused. In embedded mode you still choose it.
 
+#### engine.insert_batch(updates) → List[BatchOutcome]
+
+Several updates in one round trip, with a word about each of them.
+
+```python
+from orderbook_engine import BookUpdate
+
+outcomes = engine.insert_batch([
+    BookUpdate("BTC-USD", "BINANCE", "bid", [6_500_000], [150]),
+    BookUpdate("ETH-USD", "BINANCE", "ask", [3_100_000, 3_100_500], [40, 60]),
+])
+for o in outcomes:
+    if not o.ok:
+        print(f"update {o.index} refused: {o.message}")
+```
+
+The server has always executed every complete command it finds in one read; until #140 no client
+gained anything by sending several, because the second answer waited out a delayed-ACK timer.
+Measured on an m9g.xlarge, 5000 updates of 20 levels, five rounds with alternating order, medians:
+
+| | levels/s | client CPU per level | against the loop |
+|---|---|---|---|
+| `insert()` in a loop | 969,204 | 623 ns | — |
+| `insert_batch`, 1 per call | 883,923 | 725 ns | **0.91×** |
+| `insert_batch`, 8 per call | 1,261,354 | 531 ns | 1.30× |
+| `insert_batch`, 64 per call | 1,542,355 | 496 ns | **1.59×** |
+| `insert_batch`, 512 per call | 1,542,096 | 502 ns | 1.59× |
+
+**A batch of one is 9% slower than `insert()`, reproducibly** — the extra 102 ns per level is this
+method's own bookkeeping, and for one update `insert()` is the right call. It pays from about
+eight, and stops improving after 64.
+
+Two things that table says about the client rather than the engine. At batch 64 it spends 0.050 s
+of its own CPU on 0.065 s of wall, so **the Python client is most of what is left**: the same work
+from the C++ client reaches 2,174,287 levels/s against the same server. And these are the wire's
+rate with no flush due — sustained over four million levels the server settles near 1.2M
+levels/s, which is a property of the engine rather than of the client.
+
+**It is not a transaction.** A batch is N independent writes in one journey: some may land and
+others be refused, which is why the result is a list rather than a return code. Everything that
+can be refused *before* sending is refused for the whole batch, because a partial send after
+rejecting one update is a write nobody can find afterwards.
+
+Three named refusals, each because the honest answer is not obvious:
+
+- **pool and sharded mode**: the router picks a connection per symbol, so a batch spanning symbols
+  is several batches on several connections, and which of them is one round trip is a decision
+  nobody has measured.
+- **a compressed connection**: each command is its own LZ4 frame, and whether the server takes
+  several frames from one read has not been measured.
+- **`MAX_BATCH_BYTES` (8 MB)**: not a server limit — it bounds the caller's own memory. Split and
+  send twice; two batches are two round trips, not a failure.
+
+In embedded mode this is a loop over `insert()`, which is exactly what it is, and the docstring
+says so rather than implying a round trip that does not exist.
+
 #### engine.flush()
 
 Force-flush pending data so it becomes queryable.
