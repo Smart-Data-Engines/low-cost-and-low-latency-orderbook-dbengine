@@ -463,7 +463,11 @@ void ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
                 missing = true;
             }
         };
-        need(true,       "ts.col",    timestamps);
+        // Every column is opened through the set, the timestamp included - the widening at the
+        // top of this function is what puts it there. A hardcoded `true` here reads as belt and
+        // braces and is worse than that: it makes that widening unobservable, so a mutation
+        // deleting it survived the test written to catch exactly that.
+        need(columns.has(QueryColumn::TimestampNs), "ts.col", timestamps);
         need(want_price, "price.col", enc_prices);
         need(want_qty,   "qty.col",   enc_qtys);
         need(want_cnt,   "cnt.col",   counts);
