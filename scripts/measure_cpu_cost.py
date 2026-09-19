@@ -160,20 +160,27 @@ def main() -> int:
     header = ("system", "wall s", "levels/s", "srv CPU s", "cli CPU s", "levels/srv-CPU-s",
               "srv cores")
     print("{:13}{:>9}{:>13}{:>12}{:>12}{:>18}{:>12}".format(*header))
-    for name, system in cases:
-        ok, note = system.available()
-        if not ok:
-            print(f"{name:13}unavailable: {note[:70]}")
-            continue
-        srv_before, cli_before = server_cpu(COMMS[name]), client_cpu()
-        loaded = system.load(csv_path)
-        srv_cpu = server_cpu(COMMS[name]) - srv_before
-        cli = client_cpu() - cli_before
-        per_cpu = manifest.rows / srv_cpu if srv_cpu > 0 else float("nan")
-        print("{:13}{:9.3f}{:13,.0f}{:12.3f}{:12.3f}{:18,.0f}{:12.2f}".format(
-            name, loaded.seconds, manifest.rows / loaded.seconds, srv_cpu, cli, per_cpu,
-            srv_cpu / loaded.seconds))
-        system.teardown()
+    try:
+        for name, system in cases:
+            ok, note = system.available()
+            if not ok:
+                print(f"{name:13}unavailable: {note[:70]}")
+                continue
+            srv_before, cli_before = server_cpu(COMMS[name]), client_cpu()
+            loaded = system.load(csv_path)
+            srv_cpu = server_cpu(COMMS[name]) - srv_before
+            cli = client_cpu() - cli_before
+            per_cpu = manifest.rows / srv_cpu if srv_cpu > 0 else float("nan")
+            print("{:13}{:9.3f}{:13,.0f}{:12.3f}{:12.3f}{:18,.0f}{:12.2f}".format(
+                name, loaded.seconds, manifest.rows / loaded.seconds, srv_cpu, cli, per_cpu,
+                srv_cpu / loaded.seconds))
+    finally:
+        # `run.py` has had this since it was written and this script did not, so a run that raised
+        # - mine did, on an import - left a node holding a port and a data directory with nobody
+        # to stop it. Measured: one survived for an hour. Teardown is idempotent and safe on a
+        # system that never started.
+        for _, system in cases:
+            system.teardown()
     return 0
 
 
