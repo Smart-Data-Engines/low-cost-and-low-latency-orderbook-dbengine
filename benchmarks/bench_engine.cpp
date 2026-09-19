@@ -16,10 +16,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
+
+#include <sys/statfs.h>
 
 #include "orderbook/aggregation.hpp"
 #include "orderbook/data_model.hpp"
@@ -146,6 +149,48 @@ BENCHMARK(BM_IngestionThroughput)
     ->Unit(benchmark::kNanosecond)
     ->MinTime(2.0);
 
+// ── BM_IngestionThroughputBatched ────────────────────────────────────────────
+//
+// The same path with twenty levels per update instead of one, and it exists so that the in-process
+// figure can be compared with the one over the wire.
+//
+// The comparative harness sends one MINSERT per book update and the dataset's updates carry twenty
+// levels, so its ingest row is levels per second at twenty levels an update. The benchmark above
+// applies **one** level per call, and calling both of them "updates/s" made a factor-of-twenty unit
+// difference invisible: the published claim that the round trip costs a factor of 111 was one
+// number in each unit. This one counts levels and uses the wire's shape, so the two are subtractable.
+//
+// It is also a less flattering measurement, which is the other reason it is here: the single-level
+// benchmark rewrites one price on a one-level book, which is the most cache-friendly shape this
+// engine has.
+static void BM_IngestionThroughputBatched(benchmark::State& state) {
+    constexpr uint16_t kLevels = 20;
+
+    TempDir tmp;
+    ob::Engine engine(tmp.path.string(), /*flush_interval_ns=*/1'000'000'000ULL);
+    engine.open();
+
+    ob::DeltaUpdate du{};
+    std::vector<ob::Level> levels;
+    uint64_t seq = 1;
+    const uint64_t base_ts = 1'700'000'000'000'000'000ULL;
+
+    int64_t applied_levels = 0;
+    for (auto _ : state) {
+        uint64_t cur_seq = seq++;
+        make_delta(du, levels, cur_seq, base_ts + cur_seq, kLevels);
+        benchmark::DoNotOptimize(engine.apply_delta(du, levels.data()));
+        applied_levels += kLevels;
+    }
+
+    engine.close();
+    state.SetItemsProcessed(applied_levels);
+    state.SetLabel("levels/sec, twenty per update - the shape the wire carries");
+}
+BENCHMARK(BM_IngestionThroughputBatched)
+    ->Unit(benchmark::kNanosecond)
+    ->MinTime(2.0);
+
 // ── BM_VwapLatency ────────────────────────────────────────────────────────────
 // Measures VWAP computation latency over 1000 levels on a warm SoA buffer.
 //
@@ -245,6 +290,76 @@ BENCHMARK(BM_TimeRangeQuery)
 } // namespace
 
 // ── main ──────────────────────────────────────────────────────────────────────
-// benchmark::Initialize + RunSpecifiedBenchmarks is provided by
-// benchmark::benchmark_main (linked via CMake).
+//
+// Hand-written rather than benchmark_main's, for one reason: the filesystem the engine's storage
+// lands on belongs beside these numbers, and the only way into --benchmark_out is to call
+// AddCustomContext before the run.
+//
+// `temp_directory_path()` is $TMPDIR, or /tmp. On a machine whose /tmp is a tmpfs - the default on
+// a good share of them, including the AWS instance where this was first noticed - the WAL and the
+// segments this benchmark writes go to **memory**, and BM_IngestionThroughput becomes a measurement
+// of the engine against RAM. That is a legitimate number, and a different one from the same
+// benchmark on a disk: measured on one such machine, the two differ by more than the change this
+// file was being used to evaluate. What is not legitimate is publishing either without saying which.
+//
+// Reported rather than refused, unlike the comparative harness, and the difference is who is being
+// compared: there one system would have been on RAM while two were on disk, which is a false
+// comparison; here there is one system and both storage choices are real questions about it. Point
+// $TMPDIR at a disk to ask the other one.
+//
 // To emit JSON: ./bench_engine --benchmark_format=json --benchmark_out=results.json
+
+namespace {
+
+/// The filesystem under `path`, from statfs rather than from a subprocess.
+///
+/// The magic numbers are the kernel's, and the ones not listed fall through to hex rather than to
+/// "unknown": a number a reader can look up is worth more than a word that says nothing.
+std::string filesystem_name(const std::filesystem::path& path) {
+    struct statfs info {};
+    if (::statfs(path.c_str(), &info) != 0) {
+        return "unknown (statfs failed)";
+    }
+    switch (static_cast<unsigned long>(info.f_type)) {
+        case 0x01021994UL: return "tmpfs";
+        case 0x858458F6UL: return "ramfs";
+        case 0x0000EF53UL: return "ext2/3/4";
+        case 0x58465342UL: return "xfs";
+        case 0x9123683EUL: return "btrfs";
+        case 0x2FC12FC1UL: return "zfs";
+        case 0x794C7630UL: return "overlayfs";
+        case 0x65735546UL: return "fuse";
+        default: {
+            char buf[32];
+            std::snprintf(buf, sizeof buf, "0x%lx", static_cast<unsigned long>(info.f_type));
+            return buf;
+        }
+    }
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    benchmark::Initialize(&argc, argv);
+    if (benchmark::ReportUnrecognizedArguments(argc, argv)) {
+        return 1;
+    }
+
+    const std::filesystem::path storage = std::filesystem::temp_directory_path();
+    const std::string fs = filesystem_name(storage);
+    benchmark::AddCustomContext("engine_storage_path", storage.string());
+    benchmark::AddCustomContext("engine_storage_fs", fs);
+
+    if (fs == "tmpfs" || fs == "ramfs") {
+        // Said out loud as well as recorded, because the person watching the run is the one who can
+        // still point $TMPDIR somewhere else.
+        std::fprintf(stderr,
+                     "bench_engine: engine storage is %s at %s - the WAL and the segments are in "
+                     "memory, not on a disk. Set TMPDIR to measure the other thing.\n",
+                     fs.c_str(), storage.c_str());
+    }
+
+    benchmark::RunSpecifiedBenchmarks();
+    benchmark::Shutdown();
+    return 0;
+}

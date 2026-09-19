@@ -98,7 +98,17 @@ def to_markdown(report: Report) -> str:
     hw = report.hardware
     lines.append(f"### Comparative benchmark — {report.run.get('timestamp', 'unknown date')}")
     lines.append("")
-    lines.append(f"**Hardware:** {hw.get('cpu_model')}, {hw.get('cores')} cores, "
+    # The clock is printed only when the platform published one. It used to render as "0.0 MHz" on
+    # any machine without an x86 `cpu MHz` line, which is a measurement nobody took wearing the
+    # shape of one.
+    source = hw.get("clock_source", "/proc/cpuinfo cpu MHz")
+    clock = (f", {hw.get('mhz'):.0f} MHz" if hw.get("mhz")
+             else f", clock {source}" if source else "")
+    platform = hw.get("platform")
+    if platform:
+        lines.append(f"**Platform:** {platform}")
+        lines.append("")
+    lines.append(f"**Hardware:** {hw.get('cpu_model')}, {hw.get('cores')} cores{clock}, "
                  f"{hw.get('ram_mib')} MiB RAM, {hw.get('disk_model')} "
                  f"({'rotational' if hw.get('disk_rotational') else 'solid state'}), "
                  f"{hw.get('filesystem')}, kernel {hw.get('kernel')}, {hw.get('compiler')}")

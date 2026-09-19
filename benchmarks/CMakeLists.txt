@@ -5,7 +5,9 @@ target_link_libraries(bench_engine
         orderbook_engine
         orderbook_agg
         orderbook_core
-        benchmark::benchmark_main
+        # benchmark, not benchmark_main: bench_engine.cpp has its own main, so that the filesystem
+        # the engine's storage lands on reaches --benchmark_out through AddCustomContext.
+        benchmark::benchmark
 )
 
 # ── TLS cost probes (#30 part three) ─────────────────────────────────────────
