@@ -421,7 +421,7 @@ void Engine::discard_local_data_for_resync() {
     // as a duplicate and the store stays empty. Measured, before this line existed: 0 rows where 1
     // was replayed.
     //
-    // `load_snapshot()` has done this since snapshot bootstrap existed, for the same reason and
+    // The snapshot install has done this since bootstrap existed, for the same reason and
     // with the reason written on `reset()` itself. Before the dedup guard an over-claimed frontier
     // cost nothing here, which is why nothing noticed.
     seq_tracker_.reset();
@@ -1443,6 +1443,12 @@ void Engine::adopt_store_on_disk() {
     // Rebuild columnar index from the new files on disk.
     combined_store_.close();
     combined_store_.open_existing();
+
+    // Discarding the pending rows made room, and since #137 there can be a writer asleep waiting
+    // for exactly that. Without this it waits out the five-second deadline and is **refused**,
+    // which is a spurious refusal rather than a hang — narrow, because a node adopting a store is
+    // bootstrapping and a replica takes no client writes, but it costs one line.
+    pending_cv_.notify_all();
 }
 
 bool Engine::install_snapshot(const std::string& staging_dir,
@@ -1474,6 +1480,7 @@ bool Engine::install_snapshot(const std::string& staging_dir,
 
     OB_LOG_INFO("engine", "Snapshot installed: the store now holds %zu segment(s)",
                 combined_store_.segment_count());
+    pending_cv_.notify_all();          // see adopt_store_on_disk() for why
     return true;
 }
 
@@ -2155,7 +2162,7 @@ void Engine::flush_write_and_merge() {
     // so that disk I/O does not block writers.
 
     // Snapshot the store pointers under mtx_. stores_ is mutated by
-    // get_or_create_store(), load_snapshot() and the REPLICA transition; iterating
+    // get_or_create_store(), the snapshot install and the REPLICA transition; iterating
     // it unlocked risked an invalidated iterator on insert and a use-after-free on
     // clear(). The raw pointers stay valid because every mutator of stores_ holds
     // flush_mtx_, which this caller holds too.

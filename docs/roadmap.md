@@ -2266,6 +2266,14 @@ memory half under a name that cannot be mistaken for an install. Both installers
 loops; an unsafe path now refuses the **whole** install rather than skipping one entry, because the
 store is about to be replaced by exactly that list and an entry we decline is a hole in it.
 
+**One thing only the rebase could show.** #137 gave `pending_rows_` a waiter with a five-second
+deadline, and both halves of this change clear that vector under `mtx_` without waking it — which
+on their own branches was nothing, because before #137 nobody was asleep there. Together it is a
+writer that waits out the deadline and is **refused** after room had already been made. Narrow (a
+node installing a store is bootstrapping, and a replica takes no client writes) and one line, but
+it is the shape worth naming: two changes that are each correct alone, meeting for the first time
+in a rebase. `pending_cv_.notify_all()` after the clear, in both.
+
 **Mutations: five, each with the verdict it was meant to give.**
 
 | mutation | verdict |
