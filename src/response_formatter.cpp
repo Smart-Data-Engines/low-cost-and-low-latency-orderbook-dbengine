@@ -14,11 +14,11 @@ namespace ob {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// sequence_number goes last on purpose: a client that reads columns by index keeps working, and
-// one that reads by name finds the new field. 0 means "unassigned" — rows written before #64
-// carry no number, and there is no way to invent one for them after the fact.
-static constexpr std::string_view kQueryHeader =
-    "timestamp_ns\tprice\tquantity\torder_count\tside\tlevel\tsequence_number";
+// The row header used to be a literal here. It is generated from `column_name()` now, so the
+// literal was dead - and clang says so where GCC does not: `-Wunused-const-variable` fires for a
+// `static constexpr` at namespace scope, which is how the `fuzz` and `clang-build` jobs found it.
+// The note it carried about why `sequence_number` goes last moved to the table that now decides
+// that order, in `src/query_columns.cpp`.
 
 static constexpr std::string_view kAggHeader = "name\tvalue\tscale";
 

@@ -397,6 +397,14 @@ Learned the hard way. Check here before debugging.
     side. Build with the other compiler occasionally; the README promised Clang support for months
     before anything checked it (#37).
 
+    **Same lesson, a year of entries later, and this time it cost two required checks.** #139
+    replaced the row header literal with a generator over the column table, which left
+    `kQueryHeader` dead - a `static constexpr std::string_view` at namespace scope, which GCC
+    ignores and clang refuses under `-Wunused-const-variable`. Both `clang-build` and `fuzz` failed
+    on it (the fuzz harnesses are the only other clang build in CI), on a branch whose local
+    verification had been GCC-only from the first commit to the pull request. When a generator
+    takes over from a literal, the literal is dead by construction: grep for it in the same edit.
+
 59. **An answer that means four different things cannot be acted on.** `get_cluster_state()`
     returned `std::nullopt` for not-connected, an empty HTTP response, a key that genuinely was not
     there, and a body that would not parse. A primary reading that as "the leader key is gone" would

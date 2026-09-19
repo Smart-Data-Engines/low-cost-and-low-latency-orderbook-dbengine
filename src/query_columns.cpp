@@ -10,6 +10,11 @@ namespace {
 
 /// Header spelling and SQL spelling side by side, so the pair that differs is visible rather than
 /// discovered. Only `TimestampNs` differs, and it differed before this table existed.
+///
+/// The order below is the order `SELECT *` emits, and `sequence_number` goes last on purpose: a
+/// client that reads columns by index keeps working, and one that reads by name finds the new
+/// field (#65). `0` there means "unassigned" - rows written before #64 carry no number and there
+/// is no way to invent one after the fact.
 struct Spelling {
     std::string_view header;
     std::string_view keyword;

@@ -2305,6 +2305,33 @@ against a neighbour whose load has a period near the round:
 The order made no difference: 0.795 before-first against 0.794 after-first on the three-column
 question, which is what that experiment was for.
 
+### And the profile says the saving is not mostly where it was expected
+
+16,000 of the three-column query against each side, one m9g.xlarge at a load average under 1, no
+call graph so the shares are flat and comparable. **The total agrees with the cycle table to four
+digits** - 11.889 G against 9.506 G is 0.7995, where `perf stat` over 4,000 rounds gave 0.800 -
+which is two instruments and one number.
+
+Where it went, in **absolute** cycles rather than shares, because a share of a smaller total is
+the trap #138 already paid for:
+
+| symbol | before | after | saved |
+|---|---|---|---|
+| the row formatter | 4.247 G | 3.754 G | 0.49 G |
+| `decode_prices` | 0.780 G | 0.380 G | **0.40 G** |
+| `decode_simple8b` | 0.636 G | 0.402 G | **0.23 G** |
+| `ColumnarStore::scan` | 0.633 G | 0.472 G | 0.16 G |
+| everything below the 1% cut | 2.8 G | 1.6 G | 1.2 G |
+
+**The two decoders together saved more than the formatter did**, which is the opposite of what the
+work was aimed at: this item exists because the formatter dominated the profile, and the answer it
+produced is mostly cheaper because the scan stopped decoding two columns nobody asked for -
+`decode_prices` runs once instead of twice (price, and the sequence number's zigzag) and
+`decode_simple8b` once instead of twice (quantity, and the sequence number's bit-packing), which is
+the "skips two of a segment's four decode passes" sentence turning into a number. `memcpy` and the
+row callback did not move by more than this profile can resolve; at 8-10K samples a 5% entry is a
+few hundred samples, so read the four largest rows and not the small differences.
+
 ### The control failed twice before it held, and the two failures had different causes
 
 The spec written before any of this said to write the general loop, measure `SELECT *` against
