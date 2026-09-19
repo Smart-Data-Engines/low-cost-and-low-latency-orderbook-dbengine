@@ -33,3 +33,12 @@ target_link_libraries(tls_cost PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Thr
 
 add_executable(ssl_write_retry tls/ssl_write_retry.c)
 target_link_libraries(ssl_write_retry PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+
+# ── The wire, without Python in it (benchmarks/on-a-bigger-machine.md) ───────
+#
+# Compiled, deliberately not run, for the same reason as the probes above: it needs a running node,
+# and a source file nothing compiles is a source file that rots. It is what measured that the round
+# trip costs about 4% of throughput rather than all of it, so the claim it overturned is now
+# checkable with a command instead of a reimplementation.
+add_executable(wire_load wire_load.cpp)
+target_link_libraries(wire_load PRIVATE orderbook_client)
