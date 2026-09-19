@@ -141,37 +141,38 @@ std::string format_query_response(const std::vector<QueryResult>& rows,
     }
     out += '\n';
 
-    // One buffer for the row and one append for it: thirteen appends a row was thirteen chances to
-    // grow the string and thirteen calls into its bookkeeping.
+    // One buffer for the row and one append for it: thirteen appends a row was thirteen chances
+    // to grow the string and thirteen calls into its bookkeeping.
     //
-    // The buffer is sized from this query's own column list, because a repeated column repeats
-    // its width. The stack holds the ordinary case; anything wider - which takes a select list
-    // longer than `SELECT *` - gets one heap allocation for the whole response, not one per row.
-    char stack_line[kMaxQueryRowBytes];
-    std::vector<char> heap_line;
-    const size_t needed = max_row_bytes(columns);
-    char* line = stack_line;
-    if (needed > sizeof(stack_line)) {
-        heap_line.resize(needed);
-        line = heap_line.data();
-    }
-    char* const line_end = line + std::max(needed, sizeof(stack_line));
-
-    // Decided once for the whole response, so the unrolled path costs one predictable branch per
-    // row rather than a test per field.
-    const bool canonical = (columns == all_query_columns());
-    const size_t last = columns.empty() ? 0 : columns.size() - 1;
-    for (const auto& r : rows) {
-        char* p = line;
-        if (canonical) {
-            p = put_seven(p, line_end, r);
-        } else {
-            for (size_t i = 0; i < columns.size(); ++i) {
-                p = put_column(p, line_end, r, columns[i], i == last ? '\n' : '\t');
-            }
+    // Two loops rather than one with a branch in it, and the second attempt at this is why. A
+    // single loop writing through a `char*` that might point at either a stack array or a heap
+    // one left the compiler unable to treat the canonical path's buffer as a known local, and
+    // `SELECT *` stayed ~5% slower than before projection even with the row writer unrolled.
+    // Split, the canonical path is the same shape it was: a fixed local array nothing else can
+    // alias.
+    if (columns == all_query_columns()) {
+        char line[kMaxQueryRowBytes];
+        for (const auto& r : rows) {
+            char* p = put_seven(line, line + sizeof(line), r);
+            out.append(line, static_cast<size_t>(p - line));
         }
-        out.append(line, static_cast<size_t>(p - line));
+    } else if (!columns.empty()) {
+        // One allocation for the whole response, sized from this query's own list because a
+        // repeated column repeats its width - `SELECT sequence_number, sequence_number, ...` at
+        // twenty repeats needs 420 bytes where seven distinct columns need 105.
+        std::vector<char> buf(max_row_bytes(columns));
+        char* const buf_end = buf.data() + buf.size();
+        const size_t last = columns.size() - 1;
+        for (const auto& r : rows) {
+            char* p = buf.data();
+            for (size_t i = 0; i < columns.size(); ++i) {
+                p = put_column(p, buf_end, r, columns[i], i == last ? '\n' : '\t');
+            }
+            out.append(buf.data(), static_cast<size_t>(p - buf.data()));
+        }
     }
+    // An empty column list emits a header of nothing and a row of nothing, which is what asking
+    // for no columns means. Not reachable from the parser, which requires at least one item.
 
     out += '\n'; // empty line terminator
     return out;
