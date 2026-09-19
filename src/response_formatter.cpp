@@ -2,6 +2,7 @@
 #include "orderbook/capabilities.hpp"
 #include "orderbook/version.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <iterator>
 #include <string>
@@ -42,10 +43,16 @@ static std::vector<std::string_view> split(std::string_view sv, char delim) {
 
 // ── format_query_response ─────────────────────────────────────────────────────
 
-/// Widest a row can be: every field at its type's limit, six tabs and a newline.
+/// Widest a `SELECT *` row can be: every field at its type's limit, six tabs and a newline.
 ///
 ///   timestamp_ns 20 + price 20 (19 digits and a sign) + quantity 20 + order_count 10
 ///   + side 3 + level 5 + sequence_number 20  =  98, plus 7 separators.
+///
+/// It is the size of the stack buffer and **not** the worst case any more: a query may name the
+/// same column more than once, so `SELECT sequence_number, sequence_number, ...` needs 21 bytes
+/// per repeat and would run off the end of a buffer sized for seven distinct columns. The row
+/// buffer is sized from the query's own column list, and this is the point at which it stops
+/// fitting on the stack.
 static constexpr size_t kMaxQueryRowBytes = 105;
 
 /// Append `value` and then `sep`, without constructing a string for either.
@@ -59,45 +66,81 @@ static constexpr size_t kMaxQueryRowBytes = 105;
 /// 5.53%, `memcpy` at 24.27%, and malloc/free at 6.84%. After this, three of those five symbols
 /// are not in the profile at all.
 template <typename T>
-static char* put_field(char* p, T value, char sep) {
+static char* put_field(char* p, char* end, T value, char sep) {
+    // `end` is the buffer's real end rather than `p + 24`. The fixed window was correct only
+    // because the buffer was always wider than any one field; handing `to_chars` a pointer past
+    // the allocation is the kind of detail that is fine until a caller sizes the buffer tightly.
+    //
     // `side` is a `uint8_t`, which is a character type: handing it to `to_chars` unwidened invites
     // an overload that would write a byte rather than a number. Widen every integer to the type
     // `to_chars` cannot misread.
     if constexpr (std::is_signed_v<T>) {
-        const auto res = std::to_chars(p, p + 24, static_cast<long long>(value));
+        const auto res = std::to_chars(p, end, static_cast<long long>(value));
         p = res.ptr;
     } else {
-        const auto res = std::to_chars(p, p + 24, static_cast<unsigned long long>(value));
+        const auto res = std::to_chars(p, end, static_cast<unsigned long long>(value));
         p = res.ptr;
     }
     *p++ = sep;
     return p;
 }
 
-std::string format_query_response(const std::vector<QueryResult>& rows) {
+/// One field of one row, chosen by column. Separated from the loop so that the seven-column path
+/// and a narrowed one cannot disagree about what a column means.
+static char* put_column(char* p, char* end, const QueryResult& r, QueryColumn c, char sep) {
+    switch (c) {
+        case QueryColumn::TimestampNs:    return put_field(p, end, r.timestamp_ns,    sep);
+        case QueryColumn::Price:          return put_field(p, end, r.price,           sep);
+        case QueryColumn::Quantity:       return put_field(p, end, r.quantity,        sep);
+        case QueryColumn::OrderCount:     return put_field(p, end, r.order_count,     sep);
+        case QueryColumn::Side:           return put_field(p, end, r.side,            sep);
+        case QueryColumn::Level:          return put_field(p, end, r.level,           sep);
+        case QueryColumn::SequenceNumber: return put_field(p, end, r.sequence_number, sep);
+    }
+    // No `default`, so a column added to the enum and not to this switch is a build error rather
+    // than a field that silently goes missing from every response.
+    return p;
+}
+
+std::string format_query_response(const std::vector<QueryResult>& rows,
+                                  const std::vector<QueryColumn>& columns) {
     std::string out;
     // 64 rather than `kMaxQueryRowBytes`: measured on the comparative benchmark's dataset a row is
-    // **43 bytes**, so 64 leaves half again and reserves 1.6x what is used rather than 2.4x. A
-    // result whose every field sits near its type's limit grows the buffer once, which is correct
-    // and merely slower - and growing is what the 15.4% of that profile spent in `memcpy` was.
+    // **43 bytes** for all seven columns, so 64 leaves half again and reserves 1.6x what is used
+    // rather than 2.4x. A narrower answer over-reserves, which costs one allocation of unused
+    // bytes and no copying; under-reserving costs a copy of everything written so far, and
+    // growing is what the 24.27% of that profile spent in `memcpy` was.
     out.reserve(96 + rows.size() * 64);
 
     out += "OK\n";
-    out += kQueryHeader;
+    for (size_t i = 0; i < columns.size(); ++i) {
+        if (i != 0) out += '\t';
+        out += column_name(columns[i]);
+    }
     out += '\n';
 
     // One buffer for the row and one append for it: thirteen appends a row was thirteen chances to
     // grow the string and thirteen calls into its bookkeeping.
-    char line[kMaxQueryRowBytes];
+    //
+    // The buffer is sized from this query's own column list, because a repeated column repeats
+    // its width. The stack holds the ordinary case; anything wider - which takes a select list
+    // longer than `SELECT *` - gets one heap allocation for the whole response, not one per row.
+    char stack_line[kMaxQueryRowBytes];
+    std::vector<char> heap_line;
+    const size_t needed = max_row_bytes(columns);
+    char* line = stack_line;
+    if (needed > sizeof(stack_line)) {
+        heap_line.resize(needed);
+        line = heap_line.data();
+    }
+    char* const line_end = line + std::max(needed, sizeof(stack_line));
+
+    const size_t last = columns.empty() ? 0 : columns.size() - 1;
     for (const auto& r : rows) {
         char* p = line;
-        p = put_field(p, r.timestamp_ns,    '\t');
-        p = put_field(p, r.price,           '\t');
-        p = put_field(p, r.quantity,        '\t');
-        p = put_field(p, r.order_count,     '\t');
-        p = put_field(p, r.side,            '\t');
-        p = put_field(p, r.level,           '\t');
-        p = put_field(p, r.sequence_number, '\n');
+        for (size_t i = 0; i < columns.size(); ++i) {
+            p = put_column(p, line_end, r, columns[i], i == last ? '\n' : '\t');
+        }
         out.append(line, static_cast<size_t>(p - line));
     }
 

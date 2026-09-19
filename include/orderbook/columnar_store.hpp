@@ -1,6 +1,7 @@
 #pragma once
 
 #include "orderbook/data_model.hpp"
+#include "orderbook/query_columns.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -122,8 +123,21 @@ public:
     std::vector<SegmentMeta> take_rolled_segments();
 
     /// Time-range scan; calls cb for each decoded row in [start_ns, end_ns].
+    ///
+    /// `columns` is what to read. A column file outside it is not opened, not decoded, and the
+    /// field it fills is left at its default in every row - so a caller that reads a field it did
+    /// not ask for gets a plausible zero rather than a value. The set is the caller's statement
+    /// of what it will look at.
+    ///
+    /// `TimestampNs` is added to the set whichever way it arrives: the scan compares every row's
+    /// timestamp against the range, so a set without it would filter against a column it never
+    /// read.
+    ///
+    /// **Required, not defaulted.** A default would be `all()`, which is correct for every
+    /// caller and therefore never wrong enough for anyone to notice they had not chosen.
     void scan(uint64_t start_ns, uint64_t end_ns,
               std::string_view symbol, std::string_view exchange,
+              ColumnSet columns,
               std::function<void(const SnapshotRow&)> cb) const;
 
     /// Called on startup to rebuild segment index from persisted meta.json files.

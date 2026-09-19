@@ -980,6 +980,10 @@ std::string Engine::execute(std::string_view sql, RowCallback cb) {
     return query_engine_->execute(sql, std::move(cb));
 }
 
+std::string Engine::execute(std::string_view sql, RowCallback cb, QueryShape& shape) {
+    return query_engine_->execute(sql, std::move(cb), shape);
+}
+
 std::string Engine::parse(std::string_view sql, QueryAST& out) {
     return query_engine_->parse(sql, out);
 }

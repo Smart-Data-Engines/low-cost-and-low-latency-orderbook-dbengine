@@ -92,6 +92,9 @@ RC_GTEST_PROP(QueryEngineProps, prop_query_roundtrip, ()) {
     RC_ASSERT(ast1.ts_start_ns == ast2.ts_start_ns);
     RC_ASSERT(ast1.ts_end_ns   == ast2.ts_end_ns);
     RC_ASSERT(ast1.limit       == ast2.limit);
+    // The select list travels through `format()` as text and back. Nothing checked that until
+    // #139 gave it somewhere to land, and this query is the comparative harness's own.
+    RC_ASSERT(ast1.projection  == ast2.projection);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -428,4 +431,88 @@ TEST(QueryEngineUnit, FormatIsReparseable) {
     EXPECT_EQ(ast1.ts_start_ns, ast2.ts_start_ns);
     EXPECT_EQ(ast1.ts_end_ns,   ast2.ts_end_ns);
     EXPECT_EQ(ast1.limit,       ast2.limit);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// #139: the select list reaches the AST as columns
+//
+// Before this, the list was parsed, its names were checked, and nothing read it again: every row
+// query answered with all seven columns. These pin the parser half of the fix - that the question
+// arrives in the AST as asked, including its order and its repeats.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(QueryProjection, SelectStarLeavesTheProjectionEmpty) {
+    QEFixture fix;
+    ob::QueryAST ast;
+    ASSERT_TRUE(fix.engine.parse("SELECT * FROM 'AAA'.'EX'", ast).empty());
+    EXPECT_TRUE(ast.projection.empty()) << "an empty projection is how the AST spells `*`";
+    ASSERT_EQ(ast.select_exprs.size(), 1u);
+    EXPECT_EQ(ast.select_exprs[0], "*");
+}
+
+TEST(QueryProjection, TwoColumnsArriveAsTwoColumns) {
+    QEFixture fix;
+    ob::QueryAST ast;
+    ASSERT_TRUE(fix.engine.parse("SELECT price, quantity FROM 'AAA'.'EX'", ast).empty());
+    ASSERT_EQ(ast.projection.size(), 2u);
+    EXPECT_EQ(ast.projection[0], ob::QueryColumn::Price);
+    EXPECT_EQ(ast.projection[1], ob::QueryColumn::Quantity);
+}
+
+TEST(QueryProjection, TheOrderIsTheOrderTheQueryAskedFor) {
+    // The pair that says this is not sorted into the canonical order behind the client's back.
+    QEFixture fix;
+    ob::QueryAST ast;
+    ASSERT_TRUE(fix.engine.parse("SELECT quantity, price FROM 'AAA'.'EX'", ast).empty());
+    ASSERT_EQ(ast.projection.size(), 2u);
+    EXPECT_EQ(ast.projection[0], ob::QueryColumn::Quantity);
+    EXPECT_EQ(ast.projection[1], ob::QueryColumn::Price);
+}
+
+TEST(QueryProjection, AColumnAskedForTwiceIsKeptTwice) {
+    QEFixture fix;
+    ob::QueryAST ast;
+    ASSERT_TRUE(fix.engine.parse("SELECT price, price FROM 'AAA'.'EX'", ast).empty());
+    EXPECT_EQ(ast.projection.size(), 2u);
+}
+
+TEST(QueryProjection, TheTimestampAnswersToBothOfItsNames) {
+    // `timestamp` is what the lexer has always taken; `timestamp_ns` is what the response header
+    // calls the same column, so it is what a client copies. Both parse, to the same column.
+    QEFixture fix;
+    ob::QueryAST a, b;
+    ASSERT_TRUE(fix.engine.parse("SELECT timestamp FROM 'AAA'.'EX'", a).empty());
+    ASSERT_TRUE(fix.engine.parse("SELECT timestamp_ns FROM 'AAA'.'EX'", b).empty());
+    ASSERT_EQ(a.projection.size(), 1u);
+    ASSERT_EQ(b.projection.size(), 1u);
+    EXPECT_EQ(a.projection[0], ob::QueryColumn::TimestampNs);
+    EXPECT_EQ(b.projection[0], ob::QueryColumn::TimestampNs);
+}
+
+TEST(QueryProjection, AllSevenColumnsCanBeNamed) {
+    QEFixture fix;
+    ob::QueryAST ast;
+    ASSERT_TRUE(fix.engine.parse(
+        "SELECT timestamp, price, quantity, order_count, side, level, sequence_number "
+        "FROM 'AAA'.'EX'", ast).empty());
+    EXPECT_EQ(ast.projection, ob::all_query_columns())
+        << "naming all seven in order has to mean the same as `*`";
+}
+
+TEST(QueryProjection, AnAggregateIsNotACollumnAndDoesNotEnterTheProjection) {
+    // Mixing a column with an aggregate is refused by `execute()` with `AGG_WITH_COLUMNS`, which
+    // predates this work - so what is worth pinning here is narrower: an aggregate expression
+    // must not arrive in the projection, or a lone aggregate query would carry a column list and
+    // be answered as rows.
+    QEFixture fix;
+    ob::QueryAST ast;
+    ASSERT_TRUE(fix.engine.parse("SELECT VWAP(price), SPREAD(*) FROM 'AAA'.'EX'", ast).empty());
+    EXPECT_TRUE(ast.projection.empty()) << "an aggregate is not a column";
+    EXPECT_EQ(ast.select_exprs.size(), 2u);
+}
+
+TEST(QueryProjection, AnUnknownColumnNameIsStillRefused) {
+    QEFixture fix;
+    ob::QueryAST ast;
+    EXPECT_FALSE(fix.engine.parse("SELECT nonexistent FROM 'AAA'.'EX'", ast).empty());
 }

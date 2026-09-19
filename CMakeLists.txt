@@ -265,8 +265,15 @@ target_link_libraries(orderbook_codec PUBLIC orderbook_core)
 # ── MMAP store compiled library ────────────────────────────────────────────────
 
 # ── Columnar store compiled library ────────────────────────────────────────────
+# ── Query column names and sets ───────────────────────────────────────────────
+# A leaf on purpose: the store needs it to know which files to open, the formatter needs it to
+# write a header, and the client needs it to recognise a header it cannot read. One definition of
+# the seven names rather than three.
+add_library(orderbook_query_columns STATIC src/query_columns.cpp)
+target_link_libraries(orderbook_query_columns PUBLIC orderbook_logger)
+
 add_library(orderbook_columnar STATIC src/columnar_store.cpp)
-target_link_libraries(orderbook_columnar PUBLIC orderbook_codec orderbook_logger)
+target_link_libraries(orderbook_columnar PUBLIC orderbook_codec orderbook_logger orderbook_query_columns)
 
 # ── LZ4 compression library ────────────────────────────────────────────────────
 find_package(PkgConfig)
@@ -462,7 +469,7 @@ add_library(orderbook_client STATIC src/client.cpp)
 # `orderbook_metrics` for the reason given above `orderbook_shard_router`: the pool's
 # health-check loop is guarded by the same header the server's loops use, and it passes a
 # null registry.
-target_link_libraries(orderbook_client PUBLIC orderbook_core orderbook_shard_router orderbook_auth orderbook_tls orderbook_metrics)
+target_link_libraries(orderbook_client PUBLIC orderbook_core orderbook_shard_router orderbook_auth orderbook_tls orderbook_metrics orderbook_query_columns)
 
 option(OB_CLIENT_LZ4 "Enable optional LZ4 compression in orderbook_client" OFF)
 if(OB_CLIENT_LZ4)

@@ -63,7 +63,7 @@ static ob::SnapshotRow make_row(uint64_t ts_ns, int64_t price = 10000,
 /// Collect every row a store returns for the full time range.
 static std::vector<ob::SnapshotRow> scan_all(const ob::ColumnarStore& store) {
     std::vector<ob::SnapshotRow> out;
-    store.scan(0, UINT64_MAX, "", "",
+    store.scan(0, UINT64_MAX, "", "", ob::ColumnSet::all(),
                [&](const ob::SnapshotRow& r) { out.push_back(r); });
     return out;
 }
@@ -233,7 +233,7 @@ RC_GTEST_PROP(ColumnarStoreProperty, prop_insertion_order, ()) {
 
     // Scan back all rows
     std::vector<ob::SnapshotRow> read_back;
-    store.scan(0, UINT64_MAX, "", "",
+    store.scan(0, UINT64_MAX, "", "", ob::ColumnSet::all(),
                [&](const ob::SnapshotRow& r) { read_back.push_back(r); });
 
     RC_ASSERT(static_cast<int>(read_back.size()) == n);
@@ -289,7 +289,7 @@ RC_GTEST_PROP(ColumnarStoreProperty, prop_restart_durability, ()) {
 
     // Scan and verify all rows present
     std::vector<ob::SnapshotRow> recovered;
-    store2.scan(0, UINT64_MAX, "", "",
+    store2.scan(0, UINT64_MAX, "", "", ob::ColumnSet::all(),
                 [&](const ob::SnapshotRow& r) { recovered.push_back(r); });
 
     RC_ASSERT(static_cast<int>(recovered.size()) == n);
@@ -328,7 +328,7 @@ TEST(ColumnarStore, SingleSegmentAppendScan) {
     ASSERT_EQ(store.segment_count(), 1u);
 
     std::vector<ob::SnapshotRow> out;
-    store.scan(0, UINT64_MAX, "", "",
+    store.scan(0, UINT64_MAX, "", "", ob::ColumnSet::all(),
                [&](const ob::SnapshotRow& r) { out.push_back(r); });
 
     ASSERT_EQ(out.size(), rows.size());
@@ -391,7 +391,7 @@ TEST(ColumnarStore, OpenExistingRebuildsIndex) {
 
     // Scan and verify data
     std::vector<ob::SnapshotRow> out;
-    store2.scan(0, UINT64_MAX, "", "",
+    store2.scan(0, UINT64_MAX, "", "", ob::ColumnSet::all(),
                 [&](const ob::SnapshotRow& r) { out.push_back(r); });
 
     ASSERT_EQ(out.size(), 2u);
@@ -421,7 +421,7 @@ TEST(ColumnarStore, ScanWithTimeRangePruning) {
     // Scan only segment 0 range
     {
         std::vector<ob::SnapshotRow> out;
-        store.scan(0, 500, "", "",
+        store.scan(0, 500, "", "", ob::ColumnSet::all(),
                    [&](const ob::SnapshotRow& r) { out.push_back(r); });
         ASSERT_EQ(out.size(), 3u);
         for (const auto& r : out) {
@@ -432,7 +432,7 @@ TEST(ColumnarStore, ScanWithTimeRangePruning) {
     // Scan only segment 1 range
     {
         std::vector<ob::SnapshotRow> out;
-        store.scan(1000, 2000, "", "",
+        store.scan(1000, 2000, "", "", ob::ColumnSet::all(),
                    [&](const ob::SnapshotRow& r) { out.push_back(r); });
         ASSERT_EQ(out.size(), 3u);
         for (const auto& r : out) {
@@ -443,7 +443,7 @@ TEST(ColumnarStore, ScanWithTimeRangePruning) {
     // Scan a range that covers neither segment
     {
         std::vector<ob::SnapshotRow> out;
-        store.scan(500, 999, "", "",
+        store.scan(500, 999, "", "", ob::ColumnSet::all(),
                    [&](const ob::SnapshotRow& r) { out.push_back(r); });
         EXPECT_EQ(out.size(), 0u);
     }
@@ -840,4 +840,111 @@ RC_GTEST_PROP(ColumnarStoreFieldsProperty,
         RC_ASSERT(got->level_index == want.level);
         RC_ASSERT(got->sequence_number == want.seq);
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// #139: a scan reads the columns it was asked for and no others
+//
+// The interesting part of these is how they are written rather than what they assert. A test that
+// checks "the field I did not ask for came back as zero" passes just as happily against a store
+// that read the column, if the stored value happens to be zero. So the values here are chosen so
+// that zero is impossible to produce by accident.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(ColumnarStoreProjection, AColumnLeftOutOfTheSetIsNotRead) {
+    TempDir tmp("ut_projection_skips");
+    ob::ColumnarStore store(tmp.str());
+
+    // Every sequence number here is non-zero, and `make_row` derives it from the timestamp, so a
+    // store that read `seq.col` cannot hand back a zero. Same for side, level and order count.
+    for (uint64_t i = 1; i <= 8; ++i) {
+        store.append(make_row(i * 1'000'000ULL, 10'000 + static_cast<int64_t>(i),
+                              100 + i, static_cast<uint32_t>(i + 1),
+                              ob::SIDE_ASK, static_cast<uint16_t>(i)));
+    }
+    store.flush_segment();
+
+    // The control first: with everything in the set, none of those fields is zero.
+    const auto full = scan_all(store);
+    ASSERT_EQ(full.size(), 8u);
+    for (const auto& r : full) {
+        ASSERT_NE(r.sequence_number, 0u) << "the fixture has to make zero impossible";
+        ASSERT_NE(r.order_count, 0u);
+        ASSERT_NE(r.side, 0u);
+        ASSERT_NE(r.level_index, 0u);
+    }
+
+    // Now ask for two columns, and the rest must come back at their defaults.
+    std::vector<ob::SnapshotRow> narrow;
+    ob::ColumnSet set;
+    set.add(ob::QueryColumn::Price).add(ob::QueryColumn::Quantity);
+    store.scan(0, UINT64_MAX, "", "", set,
+               [&](const ob::SnapshotRow& r) { narrow.push_back(r); });
+
+    ASSERT_EQ(narrow.size(), full.size()) << "narrowing changes the fields, not the rows";
+    for (size_t i = 0; i < narrow.size(); ++i) {
+        EXPECT_EQ(narrow[i].price,    full[i].price);
+        EXPECT_EQ(narrow[i].quantity, full[i].quantity);
+        // The timestamp is read whatever the caller asked for, because the scan filters on it.
+        EXPECT_EQ(narrow[i].timestamp_ns, full[i].timestamp_ns);
+
+        EXPECT_EQ(narrow[i].sequence_number, 0u) << "seq.col was not in the set";
+        EXPECT_EQ(narrow[i].order_count,     0u) << "cnt.col was not in the set";
+        EXPECT_EQ(narrow[i].side,            0u) << "side.col was not in the set";
+        EXPECT_EQ(narrow[i].level_index,     0u) << "level.col was not in the set";
+    }
+}
+
+TEST(ColumnarStoreProjection, TheTimestampIsReadEvenWhenTheSetLeavesItOut) {
+    // A set built by hand can omit it; the scan compares every row against the time range, so it
+    // adds the column itself rather than filtering against a zero it never loaded.
+    TempDir tmp("ut_projection_ts");
+    ob::ColumnarStore store(tmp.str());
+    for (uint64_t i = 1; i <= 4; ++i) store.append(make_row(i * 1'000'000ULL));
+    store.flush_segment();
+
+    ob::ColumnSet price_only;
+    price_only.add(ob::QueryColumn::Price);
+    std::vector<ob::SnapshotRow> out;
+    store.scan(2'000'000ULL, 3'000'000ULL, "", "", price_only,
+               [&](const ob::SnapshotRow& r) { out.push_back(r); });
+
+    ASSERT_EQ(out.size(), 2u) << "the range filter has to work without the caller asking for ts";
+    EXPECT_EQ(out[0].timestamp_ns, 2'000'000ULL);
+    EXPECT_EQ(out[1].timestamp_ns, 3'000'000ULL);
+}
+
+TEST(ColumnarStoreProjection, AMissingColumnFileOnlyRefusesTheSegmentForQueriesThatNeedIt) {
+    TempDir tmp("ut_projection_missing");
+    ob::ColumnarStore store(tmp.str());
+    for (uint64_t i = 1; i <= 5; ++i) store.append(make_row(i * 1'000'000ULL));
+    store.flush_segment();
+    ASSERT_EQ(scan_all(store).size(), 5u);
+
+    // Delete one column file. Before the read set, this dropped the whole segment from every
+    // query, including the ones that would never have looked at it.
+    size_t removed = 0;
+    for (auto& e : fs::recursive_directory_iterator(tmp.path)) {
+        if (e.is_regular_file() && e.path().filename() == "seq.col") {
+            fs::remove(e.path());
+            ++removed;
+        }
+    }
+    ASSERT_EQ(removed, 1u) << "the fixture has to actually remove the file it is about";
+
+    // A query that does not need it is answered.
+    ob::ColumnSet without_seq;
+    without_seq.add(ob::QueryColumn::Price).add(ob::QueryColumn::Quantity);
+    std::vector<ob::SnapshotRow> ok;
+    store.scan(0, UINT64_MAX, "", "", without_seq,
+               [&](const ob::SnapshotRow& r) { ok.push_back(r); });
+    EXPECT_EQ(ok.size(), 5u) << "a column nobody asked for cannot make a segment unreadable";
+
+    // A query that needs it is still refused the segment, as before.
+    ob::ColumnSet with_seq;
+    with_seq.add(ob::QueryColumn::SequenceNumber);
+    std::vector<ob::SnapshotRow> refused;
+    store.scan(0, UINT64_MAX, "", "", with_seq,
+               [&](const ob::SnapshotRow& r) { refused.push_back(r); });
+    EXPECT_TRUE(refused.empty()) << "narrowing must not weaken the check for a column in the set";
 }

@@ -458,6 +458,32 @@ Result<void> OrderbookClient::parse_ok_response(std::string_view resp) {
     return Result<void>::err(OB_ERR_PARSE, "unexpected response");
 }
 
+namespace {
+
+/// Can this client read a row response with these columns?
+///
+/// It reads by position, so the answer is "only the canonical order, and only a prefix of it".
+/// A prefix rather than the exact seven because the sequence number arrived in #65 and a server
+/// older than that sends six - that tolerance predates this check and is kept by it.
+bool is_readable_row_header(std::string_view header) {
+    static constexpr std::string_view kColumns[] = {
+        "timestamp_ns", "price", "quantity", "order_count", "side", "level", "sequence_number",
+    };
+    size_t i = 0;
+    for (size_t pos = 0; pos <= header.size(); ) {
+        const size_t tab = header.find('\t', pos);
+        const std::string_view name =
+            header.substr(pos, tab == std::string_view::npos ? std::string_view::npos : tab - pos);
+        if (i >= std::size(kColumns) || name != kColumns[i]) return false;
+        ++i;
+        if (tab == std::string_view::npos) break;
+        pos = tab + 1;
+    }
+    return i >= 6;
+}
+
+}  // namespace
+
 Result<QueryResult> OrderbookClient::parse_query_response(std::string_view resp) {
     // Expected format: "OK\n<header_tsv>\n<row1_tsv>\n...<rowN_tsv>\n\n"
     if (resp.starts_with("ERR ")) {
@@ -469,6 +495,7 @@ Result<QueryResult> OrderbookClient::parse_query_response(std::string_view resp)
 
     // Must start with "OK\n"
     if (!resp.starts_with("OK\n"))
+
         return Result<QueryResult>::err(OB_ERR_PARSE, "unexpected response");
 
     // Strip "OK\n" prefix and trailing "\n\n"
@@ -491,6 +518,21 @@ Result<QueryResult> OrderbookClient::parse_query_response(std::string_view resp)
         return Result<QueryResult>::err(
             OB_ERR_PARSE,
             "response holds aggregates, not rows; use query_agg()");
+
+    // This client reads a row's fields by position, so a response carrying different columns has
+    // to be refused rather than parsed. Since #139 the server answers the columns a query asked
+    // for: `SELECT price` returns one, and reading that positionally would report `bad
+    // timestamp_ns` - a diagnosis naming the wrong thing entirely.
+    //
+    // A prefix of the canonical list is accepted, not the whole of it: the seventh column
+    // arrived in #65 and this client still talks to a server that sends six.
+    if (!is_readable_row_header(header))
+        return Result<QueryResult>::err(
+            OB_ERR_PARSE,
+            std::string("this client reads the standard row columns by position and the server "
+                        "answered with '") + std::string(header) +
+                "'; ask for SELECT * to get the columns it can read");
+
     resp.remove_prefix(header_end + 1);
 
     // Parse data rows

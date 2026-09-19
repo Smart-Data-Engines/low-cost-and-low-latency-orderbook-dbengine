@@ -98,6 +98,9 @@ public:
     /// Execute a SQL query.
     std::string execute(std::string_view sql, RowCallback cb);
 
+    /// As above, and report the shape of the answer in `shape` before the first row.
+    std::string execute(std::string_view sql, RowCallback cb, QueryShape& shape);
+
     /// Parse a SQL query.
     std::string parse(std::string_view sql, QueryAST& out);
 

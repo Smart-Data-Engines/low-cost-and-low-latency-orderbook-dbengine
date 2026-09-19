@@ -1,5 +1,6 @@
 #pragma once
 
+#include "orderbook/query_columns.hpp"
 #include "orderbook/query_engine.hpp"
 
 #include <atomic>
@@ -111,10 +112,19 @@ struct ParsedResponse {
 /// Format a successful query result as TSV with headers.
 /// Returns "OK\n<header>\n<row1>\n...<rowN>\n\n"
 ///
+/// `columns` names what to emit and in what order, which is what the query asked for: a repeated
+/// column is emitted twice and `SELECT quantity, price` answers in that order. Pass
+/// `all_query_columns()` for `SELECT *`.
+///
+/// **Required rather than defaulted.** A default would let a caller not decide, and the value it
+/// would have to default to - all seven - is the wrong answer for every narrowed query, returned
+/// without complaint. There is one caller in the server and it has the list from the parser.
+///
 /// Row scans only. An aggregate result does not fit this shape — it has no price,
 /// quantity or level — and passing one here is what made every aggregate query
 /// answer a network client with a row of zeros. Use format_agg_response().
-std::string format_query_response(const std::vector<QueryResult>& rows);
+std::string format_query_response(const std::vector<QueryResult>& rows,
+                                  const std::vector<QueryColumn>& columns);
 
 /// Format aggregate results as TSV: one row per aggregate, three columns.
 ///

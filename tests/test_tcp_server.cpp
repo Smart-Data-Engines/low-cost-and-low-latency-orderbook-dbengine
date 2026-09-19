@@ -304,7 +304,7 @@ RC_GTEST_PROP(ResponseFormatter, RoundTrip, ()) {
             rc::gen::container<std::vector<ob::QueryResult>>(rc::genQueryResult())
         );
 
-        std::string wire = ob::format_query_response(rows);
+        std::string wire = ob::format_query_response(rows, ob::all_query_columns());
         ob::ParsedResponse parsed = ob::parse_response(wire);
 
         RC_ASSERT(!parsed.is_error);
@@ -339,7 +339,7 @@ RC_GTEST_PROP(ResponseFormatter, SuccessFormatInvariant, ()) {
         rc::gen::container<std::vector<ob::QueryResult>>(rc::genQueryResult())
     );
 
-    std::string wire = ob::format_query_response(rows);
+    std::string wire = ob::format_query_response(rows, ob::all_query_columns());
 
     // (a) Starts with "OK\n"
     RC_ASSERT(wire.size() >= size_t(3));
