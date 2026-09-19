@@ -342,14 +342,13 @@ once - the architecture and the machine class - so no difference between the two
 attributed to either. Within one table that does not matter, and the harness refuses cross-run
 comparisons for exactly this reason. Three things do make it matter:
 
-- **TimescaleDB is not the same build on the two architectures.** Its repository serves 33 RPMs for
-  x86_64 and **zero** for aarch64, so this run compares against a **source build** at that tag where
-  the previous run compared against the vendor's package. That difference is ours by necessity rather
-  than by choice, and it is a difference in the competitor.
+- **TimescaleDB is not the same build on the two architectures.** `rpm -q
+  timescaledb-2-postgresql-16` reports nothing here, so this run compares against a **source build**
+  at that tag where the previous run compared against the vendor's package. That difference is ours
+  by necessity rather than by choice, and it is a difference in the competitor.
 - **The x86_64 CRC32C path has never been measured on a quiet machine.** #81 measured it at 21.2%
   floor; the ARM path was measured here against a floor between 0.9% and 5.4% and is worth 2.4% on
-  the ingest path. Whether the
-  SSE4.2 path is worth the same, more or less is unmeasured.
+  the ingest path. Whether the SSE4.2 path is worth the same, more, or less is unmeasured.
 - Most prospective readers run x86_64, so a table on comparable x86_64 hardware is the more useful
   artefact regardless of what it says.
 
@@ -395,6 +394,13 @@ guarantee than a measurement wants.)
 **If only one boot is possible, take the four-core one.** Question 1 removes a confound from numbers
 we already publish; question 2 adds a number we do not yet claim.
 
-**What another machine would not fix.** The ingest column is a protocol limit, not a storage-engine
-limit, and a faster box multiplies every system by its own factor without changing that. The fix for
-it is a bulk-load path over the wire, which is work rather than hardware.
+**What another machine would not fix**, and this paragraph used to say the opposite of what was
+measured. The ingest column is *not* simply a protocol limit: at equal volume the protocol costs
+about 4% of throughput, the throughput ceiling is the storage path, and the largest single term in
+that column is the harness's own Python client — a C++ client doing the same 100,000 round trips
+reaches 1,319,261 levels/s where the harness reads 358,829 for the same 2,000,000 levels. Against
+ClickHouse's 4,265,060 at that volume the loss is still 3.2×, so the gap is real and it is smaller
+than the table shows. None of those three terms is a hardware problem: a faster box multiplies every
+system by its own factor. The work is a bulk-load path over the wire, a client that does not cost
+four times the server, and whatever the storage ceiling turns out to be — and the third of those is
+not yet understood well enough to name.
