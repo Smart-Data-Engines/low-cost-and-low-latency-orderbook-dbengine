@@ -33,6 +33,13 @@ jobs:
       - name: What the documents say about coverage is what this workflow enforces
         run: python3 scripts/check_coverage_claim.py
 
+      - name: The comparative table on the front page is the run it cites
+        # Unlike the test-suite table, this claim's source of truth is committed beside it, so it
+        # is checkable offline - and a claim that can be checked and is not is how this table came
+        # to publish two numbers in different units as a ratio. The table has now been rewritten
+        # by hand three times; the fourth is checked.
+        run: python3 scripts/check_comparative_claim.py
+
       - name: The ruleset still gates what the workflows produce
         # A warning in docs/github-security.md until this step, and the warning was already being
         # ignored: sanitizers (asan) and sanitizers (tsan) ran on every PR and gated nothing, and
