@@ -2944,6 +2944,35 @@ Learned the hard way. Check here before debugging.
      control is on the **client** side and changes nothing on the server: re-arming `TCP_QUICKACK`
      before every `recv` took the same 250 round trips from 12.963 s to 0.021 s (#140).
 
+353. **An upstream bottleneck makes the one you are measuring invisible, and the tell is a
+     figure that does not move with the variable you are changing.** #137's first before/after ran
+     on two trees that both predate #140, and every one of eight rows came out at **20.1-20.5 s
+     and ~198,000 levels/s** — the same at a 100 ms flush interval as at 1000, and the same on
+     both trees. My first reading was that the shared box had been busy, and that was wrong:
+     200,000 updates at batch 512 is 391 round trips, and 391 × the 52.15 ms delayed-ACK timer
+     #140 measured is **20.4 s** against 20.13 measured. The ceiling under test was never reached.
+     A quantity that refuses to move when you move its input is not noise, it is a different
+     limit — and a fix measured against a baseline missing an earlier fix measures the earlier
+     one. Re-run on a #140 base the same comparison is 1,196,745 → 2,209,501 levels/s.
+
+354. **`wait_for` bounds the condition wait, not the reacquisition of the mutex after it.** #137's
+     deadline is meant to refuse a write whose queue never frees, and a mutation shortening it
+     from five seconds to one millisecond **survived**: the flush holds `mtx_` for the whole of
+     its first phase — 1.2 s for a million rows, against 73 ms for the segment write that follows
+     outside the lock — so the writer parked behind it is waiting for the mutex, not on the
+     condition, and it is never refused. The outcome is right and the constant's name does not
+     say so, which is why the header does. The case the deadline does bite is a flush that
+     throws, releases `mtx_` and leaves the queue full, and that is a fault-injector test rather
+     than a unit one.
+
+355. **An assertion that something is absent is satisfied by a shape that never existed.** Two
+     `/metrics` assertions in one new test were wrong in opposite directions, both from pitfall
+     66: the exposition writes `name{node_role="standalone"} 3`, so a lookup for the name and a
+     space finds nothing. One failed loudly. The other — `find("name 0") == npos`, meaning "the
+     counter is not zero" — **passed**, because no line in that document has ever had the shape
+     `name 0`. Before asserting that a string is absent, check that the string could have been
+     present.
+
 352. **A median that does not move can hide a tail that is an entire timer, so report the
      statistic that moved.** The same defect on the subscription path left the median push latency
      at 0.003 ms and the p99 at 0.006 ms — `SubscriptionHub` batches a drain, so most pushes go
@@ -2979,15 +3008,16 @@ Read the sanitizer claims with #83 in mind: until it landed, `OB_ENABLE_ASAN`, `
 libraries**, because `add_compile_options()` only affects targets declared after it and those blocks
 sat below all of them.
 
-**Three P0s are open, and they are the first thing to know: #136, #137 and #142** — that set is
-held mechanically by the `Open:` line in `docs/roadmap.md`, so read it there rather than trusting
-this sentence to have been updated. **#142** is the newest: a replica bootstrapped by snapshot
-after retention removes its position keeps rows the primary does not have — measured with both
-nodes queried in one run, primary 100 and replica 138, for the symbol the replica already held,
-while the symbol it never had is exact. Nine runs of nine on the development machine across three
-trees, and green on the runner for the two of those three it has run, which is what kept it
-hidden. The other two:
-writing the same event-time span
+**Two P0s are open, and the set is held mechanically by the `Open:` line in `docs/roadmap.md` —
+read it there rather than trusting this sentence to have been updated.** **#137 closed with the
+change beside this one**: a writer at the pending-row ceiling asks for a flush instead of waiting
+out `--flush-interval-ms`, measured 1,196,745 → 2,209,501 levels/s at four million levels and a
+one-second interval, unchanged at the 100 ms default. **#142** is the newest: a replica
+bootstrapped by snapshot after retention removes its position keeps rows the primary does not
+have — measured with both nodes queried in one run, primary 100 and replica 138, for the symbol
+the replica already held, while the symbol it never had is exact. Nine runs of nine on the
+development machine across three trees, and green on the runner for the two of those three it has
+run, which is what kept it hidden. And #136: writing the same event-time span
 twice for one symbol — which is what re-running a backfill is, and #105 put event time on the wire
 so that backfills are expressible — destroys that symbol's segment. Both writes are acknowledged;
 the first write's values are silently replaced, or, when the second write has fewer rows, the

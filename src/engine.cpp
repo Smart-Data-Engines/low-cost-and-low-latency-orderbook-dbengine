@@ -602,10 +602,7 @@ ob_status_t Engine::apply_delta_impl(const DeltaUpdate& delta_in, const Level* l
 
     // Backpressure: wait until pending queue has room.
     // This blocks the writer if the flush thread can't keep up.
-    pending_cv_.wait(lock, [this]() {
-        return pending_rows_.size() < MAX_PENDING_ROWS ||
-               stop_flush_.load(std::memory_order_relaxed);
-    });
+    if (!await_pending_room(lock)) return OB_ERR_FULL;
 
     // 1. Assign the sequence number, then write to WAL before any state mutation
     //    (Requirement 8.1). No fsync here — group commit via flush_loop() or close().
@@ -713,10 +710,7 @@ ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta_in, const Level* lev
     }
 
     // Backpressure: wait until pending queue has room.
-    pending_cv_.wait(lock, [this]() {
-        return pending_rows_.size() < MAX_PENDING_ROWS ||
-               stop_flush_.load(std::memory_order_relaxed);
-    });
+    if (!await_pending_room(lock)) return OB_ERR_FULL;
 
     // 1. Tick local HLC to get a timestamp for this write.
     HLCTimestamp hlc_ts = hlc_->tick_local();
@@ -1879,6 +1873,61 @@ ColumnarStore& Engine::get_or_create_store(const std::string& symbol,
     return ref;
 }
 
+void Engine::request_flush() {
+    {
+        std::lock_guard<std::mutex> lock(flush_stop_mtx_);
+        flush_now_.store(true, std::memory_order_relaxed);
+    }
+    flush_stop_cv_.notify_all();
+}
+
+bool Engine::await_pending_room(std::unique_lock<std::mutex>& lock) {
+    const auto room = [this]() {
+        return pending_rows_.size() < MAX_PENDING_ROWS ||
+               stop_flush_.load(std::memory_order_relaxed);
+    };
+    if (room()) {
+        // The episode has to be closed here as well as after a wait, because the writer that
+        // ends it is usually one that never waited: the flush drains the queue, and the next
+        // write walks straight through. Closing it only on the waiting path would leave the
+        // "room again" line for whichever later writer happened to block, or for never.
+        // `end()` is a load, a store and a branch on the hot path, and #137's checklist requires
+        // that to be measured rather than assumed.
+        if (const uint64_t waited = backpressure_.end()) {
+            OB_LOG_INFO("engine", "The pending queue has room again; %llu write(s) waited for it.",
+                        static_cast<unsigned long long>(waited));
+        }
+        return true;
+    }
+
+    request_flush();
+    registry_.increment_counter("ob_writer_backpressure_waits_total");
+    if (backpressure_.begin()) {
+        OB_LOG_WARN("engine",
+                    "A writer is waiting for room in the pending queue (%zu rows). The flush has "
+                    "been asked to run now rather than at the next interval; the write is refused "
+                    "if it does not free room within %lld s.",
+                    pending_rows_.size(),
+                    static_cast<long long>(kBackpressureDeadline.count()));
+    }
+
+    const bool got_room = pending_cv_.wait_for(lock, kBackpressureDeadline, room);
+
+    if (!got_room) {
+        registry_.increment_counter("ob_writer_backpressure_refusals_total");
+        OB_LOG_ERROR("engine",
+                     "The pending queue did not free room in %lld s, so this write is refused "
+                     "rather than accepted. The flush cannot make progress - a full disk or a "
+                     "failing fsync is the usual reason, and ob_flush_errors_total and "
+                     "ob_wal_fsync_errors_total say which.",
+                     static_cast<long long>(kBackpressureDeadline.count()));
+        return false;
+    }
+    // Deliberately not closed here: the waiter that gets room is still inside the episode, and
+    // the line belongs to the write that finds the queue already drained. See the fast path.
+    return true;
+}
+
 void Engine::flush_loop() {
     const auto interval = std::chrono::nanoseconds(flush_interval_ns_);
     while (!stop_flush_.load(std::memory_order_relaxed)) {
@@ -1888,9 +1937,14 @@ void Engine::flush_loop() {
         // and tests that open and close an Engine per case paid it every time.
         {
             std::unique_lock<std::mutex> lock(flush_stop_mtx_);
-            const bool stop_requested = flush_stop_cv_.wait_for(
+            const bool woken = flush_stop_cv_.wait_for(
                 lock, interval,
-                [this]() { return stop_flush_.load(std::memory_order_relaxed); });
+                [this]() { return stop_flush_.load(std::memory_order_relaxed) ||
+                                  flush_now_.load(std::memory_order_relaxed); });
+            const bool stop_requested = stop_flush_.load(std::memory_order_relaxed);
+            // Cleared **before** the tick, not after: a request that arrives while this tick runs
+            // is about rows this tick may not have seen, so it has to cause the next one.
+            if (woken && !stop_requested) flush_now_.store(false, std::memory_order_relaxed);
             if (stop_requested) {
                 // close() performs the final drain, sync, segment flush and WAL
                 // flush itself, so leaving now loses nothing.
@@ -1900,6 +1954,7 @@ void Engine::flush_loop() {
         }
 
         try {
+            registry_.increment_counter("ob_flush_ticks_total");
             flush_tick();
             if (consecutive_flush_failures_ > 0) {
                 OB_LOG_INFO("engine", "flush_loop: flushing again after %llu failed tick(s)",

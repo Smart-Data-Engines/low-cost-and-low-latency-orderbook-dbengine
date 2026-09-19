@@ -406,6 +406,13 @@ target_compile_definitions(test_thread_boundaries
 ob_add_engine_test(test_field_usage
     test_field_usage.cpp
 )
+
+# Writes a million rows to reach MAX_PENDING_ROWS, so it is slower than most unit tests and still
+# well inside the default TIMEOUT. It bounds its own wait rather than relying on that timeout:
+# the defect it guards is a thread that stops, and a test that stops with it reports nothing.
+ob_add_engine_test(test_pending_backpressure
+    test_pending_backpressure.cpp
+)
 target_compile_definitions(test_field_usage
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
