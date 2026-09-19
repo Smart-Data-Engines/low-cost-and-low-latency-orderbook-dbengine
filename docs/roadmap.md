@@ -2963,8 +2963,60 @@ starting and holding 7.5 MB. The evidence here is the backtrace and the 273 seco
   cannot be shut down gracefully, from a documented flag set to a value the project's own tuning
   note recommends for bulk loads. The margin at that recommended value is a factor of one on this
   hardware
+### 136. Writing the same event-time span twice destroys a symbol's segment, and the only diagnosis names a race that did not happen ✅
 
-### 136. Writing the same event-time span twice destroys a symbol's segment, and the only diagnosis names a race that did not happen
+**Closed.** A directory belongs to one segment rather than to one event-time span.
+
+**The same two cases, measured over the wire against the fix**, with the node's own log counted
+rather than the client's replies — the client always said `OK`:
+
+| the second write | before | after |
+|---|---|---|
+| same span, different prices | 4000 of an expected 8000, 200 `ERROR` lines | **8000**, zero |
+| same span, 5 levels instead of 20 | **0**, 200 `ERROR` lines | **5000**, zero |
+
+5000 is 4000 + 1000 and not 8000, which is the point: the two writes are different sizes and both
+are now stored, where before the shorter one made the whole symbol unreadable.
+
+**The fix is one function with one caller, and the first segment of a span keeps its name
+character for character.** `create_unique_segment_dir()` asks for `<start>_<end>` and, only if
+that is taken, `_1`, `_2`, and so on — so the format differs exactly where the engine used to lose
+data, and existing directories keep working because `open_existing()` reads the timestamps from
+`meta.json` rather than from the name. No migration, no manifest version.
+
+**`create_directory()` is the arbiter rather than an `exists()` before it.** It reports whether it
+created the directory or found one, so two flushers racing for the same free name cannot both win
+it — and that holds without a claim about which lock the caller holds, which is worth more here
+than the claim would be: the guard this narrows asserted a locking fact about its callers and was
+wrong about it from the day #105 shipped.
+
+**The item's own costing of its candidates was wrong, and that is why the correct answer looked
+expensive.** It said candidate 1 was "the widest change: the snapshot manifest addresses segments
+by directory, retention orders them by name, and a replica bootstrapping from a snapshot indexes
+what it is sent." Nothing parses a segment directory name: `segment_dir()` had exactly one caller
+and every other use of `dir_path` is opaque. Retention does **not** order by name — it sorts with
+`segment_order_less`, which is `start_ts_ns`, then `end_ts_ns`, with `dir_path` only as a
+tie-break. The manifest carries opaque relative paths, and since #142 one function installs them.
+
+**And a consequence nobody had written down.** `segment_order_less`'s own comment says *"dir_path
+is unique per segment, so this is a total order."* Under this defect it was not unique — that is
+the defect — so the comparator was not a total order in exactly the state the defect produces, and
+the same comment records a TTL property test that used to fail one run in three on a non-total
+order. This does not merely stop the data loss; it **restores a premise the code already
+asserted**.
+
+**What was rejected.** Candidate 2 (replace the index entry) makes the second write a silent
+winner, which is the semantic #26's guard exists to prevent. Candidate 3 (refuse at write time) is
+honest and leaves the backfill re-run broken; unique identity gets that honesty for free, because
+the state it would refuse no longer arises. And the **WAL position** was the obvious
+disambiguator until the docstring of the field ruled it out: a received segment carries the
+*sender's* position, "meaningless here, and dangerous if believed" — a foreign number in a local
+path reads as a claim about this node. An in-memory counter does not survive a restart; the
+ordinal's state is the directory listing, which does.
+
+The guard's message no longer names a cause it cannot know.
+
+**How it was found and what it cost, kept below.**
 
 Found on the aarch64 benchmark box, by a wire probe that replayed the same twenty-level updates
 against one server three times and produced **200 `ERROR` lines** — one per symbol per replay — in
@@ -8026,11 +8078,15 @@ measures the harness.
 
 ## Recommended order
 
-**One P0 is open: #136** — the mechanical list is the `Open:` line below, and this paragraph
-says what it costs rather than repeating it. It was found by running the tree somewhere it had
-not run before, and it is filed rather than fixed because its candidate answers differ in price:
-#136 changes an on-disk layout the snapshot manifest and retention both address. Two were on this
-line with it and both are closed. **#137**: a writer at the pending-row ceiling asks for a flush
+**No P0 is open** — the mechanical list is the `Open:` line below, and it reads `none`. Read it
+there rather than trusting this paragraph, which is prose and has been wrong about this before.
+Four were on this line and all four are closed. **#136**: a directory belongs to one segment
+rather than to one event-time span, so a backfill re-run stores a second segment instead of
+destroying the first — 8000 rows where the wire probe used to read 4000, and 5000 where it used
+to read **nothing**. Its own costing of its candidates was wrong in the direction that made the
+correct answer look expensive: nothing parses a segment directory name, so the change is one
+function with one caller and is backward compatible with every directory already on disk.
+**#137**: a writer at the pending-row ceiling asks for a flush
 now, and four million levels at a one-second interval went 1,196,745 to 2,209,501 levels/s — the
 rate the same client gets below the ceiling, so the slope is gone rather than softened. **#142**:
 the snapshot install renamed the received files in beside the replica's own and removed nothing,
@@ -8043,7 +8099,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #136.** Every other item above #58 is marked closed, and
+**Open: none.** Every item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.

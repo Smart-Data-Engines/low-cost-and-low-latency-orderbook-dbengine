@@ -3017,6 +3017,35 @@ Learned the hard way. Check here before debugging.
      exactly that, because it is the one mistake that turns this fix into a worse defect than the
      one it closes.
 
+359. **An item's own estimate of what a fix would cost is an estimate, and this one blocked the
+     correct answer for a week.** #136 said making segment identity unique was "the widest change:
+     the snapshot manifest addresses segments by directory, retention orders them by name, and a
+     replica bootstrapping from a snapshot indexes what it is sent." Two of the three are false.
+     `segment_dir()` had **one caller**; every other use of `dir_path` is an opaque string;
+     retention sorts with `segment_order_less` (`start_ts_ns`, then `end_ts_ns`, `dir_path` only
+     as a tie-break), not by name; and `open_existing()` takes the timestamps from `meta.json`, so
+     the name format is not part of any contract and the change is **backward compatible with
+     every directory already on disk**. The cheap-looking candidate — replace the index entry —
+     was the one that silently loses a write. Cost an item's candidates the way you would measure
+     anything else: by reading who actually depends on the thing you would change.
+
+360. **A comparator's comment can state the invariant a defect breaks, which makes it a defect
+     report nobody filed.** `segment_order_less` says *"dir_path is unique per segment, so this is
+     a total order"* and records that a TTL property test used to fail one run in three when it
+     was not. Under #136 `dir_path` was **not** unique — that is the whole defect — so the
+     comparator was not a total order in exactly the state the defect produces. Fixing identity
+     restored a premise the code had been asserting for a year. When a comment says "X, so this
+     holds", ask what happens where X is false, and whether anything stops it being false.
+
+361. **Let the syscall arbitrate instead of testing first.** The disambiguating name for a segment
+     directory is chosen with `fs::create_directory()`, which reports whether it created the
+     directory or found one, rather than with an `exists()` followed by a create. That removes the
+     race without a claim about which lock the caller holds — worth more than the claim, because
+     the guard this narrows had asserted a locking fact about *its* callers and had been wrong
+     about it since #105 shipped. The general form: when the question is "is this name free",
+     prefer the call that takes the name and tells you, over the call that answers and leaves a
+     gap.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -3042,34 +3071,41 @@ Read the sanitizer claims with #83 in mind: until it landed, `OB_ENABLE_ASAN`, `
 libraries**, because `add_compile_options()` only affects targets declared after it and those blocks
 sat below all of them.
 
-**One P0 is open, and the set is held mechanically by the `Open:` line in `docs/roadmap.md` —
-read it there rather than trusting this sentence to have been updated: #136.** Two closed beside
-it. **#137**: a writer at the pending-row ceiling asks for a flush instead of waiting out
-`--flush-interval-ms`, measured 1,196,745 → 2,209,501 levels/s at four million levels and a
-one-second interval, unchanged at the 100 ms default. **#142**: a snapshot install renamed the
-received files in and removed nothing, so a replica that had flushed a *prefix* of a symbol kept
-its own segment beside the arriving one and answered with both — 122 rows against the primary's
-100, varying with how much it had flushed when it died. The staged files replace the store now, in
-one exclusive operation on `ColumnarStore`, and the green CI runs were never "no defect": a
-replica that flushed the **whole** set produced a directory named identically, so the rename
-overwrote it. What is left is #136: writing the same event-time span
-twice for one symbol — which is what re-running a backfill is, and #105 put event time on the wire
-so that backfills are expressible — destroys that symbol's segment. Both writes are acknowledged;
-the first write's values are silently replaced, or, when the second write has fewer rows, the
-symbol returns **nothing at all**. A segment's identity is its time range, so the second flush
-writes to a directory already in the index, and the guard that refuses it was written for #26's
-flush race and still says so in its message. Filed rather than fixed because the three candidate
-answers differ in what they cost; the measurements and the candidates are on the roadmap.
+**No P0 is open, and the set is held mechanically by the `Open:` line in `docs/roadmap.md` — read
+it there rather than trusting this sentence, which has been wrong about it before.** Four closed
+in one run, and each is worth knowing because each changes what the engine promises.
 
-**#137** is the other one and it stops the whole node. `apply_delta_impl()` blocks a writer once
-`pending_rows_` reaches `MAX_PENDING_ROWS` (1,000,000) and waits for a flush to drain it — and
-nothing signals the flush loop because a writer is waiting, so the wait is for
-`--flush-interval-ms` to elapse. That writer is the **epoll thread**, so the node stops accepting,
-stops answering, logs nothing, and does not observe `SIGTERM`: measured, still blocked **273 s**
-after it, both threads in `futex_do_wait` with 0.5 s of CPU between them. It is a slope rather than a cliff:
-measured at 4,000,000 levels, **1,081,417 levels/s at a 1000 ms interval, 254,691 at 5000 and
-65,930 at 20,000**, roughly inverse and with no error logged at any of them, so the shipped 100 ms
-and the harness's 1000 ms are both safe here and the hour is the same mechanism in the limit.
+**#139**: a row query answers the columns it names. `SELECT *` is byte for byte what it was; a
+three-column question costs a fifth less.
+
+**#140**: every accepted socket sets `TCP_NODELAY`. A client that pipelines paid a **52 ms kernel
+timer per round trip** — the same figure at three batch sizes, which is what says timer rather
+than cost — and a request/response client could never see it, which is why every published
+benchmark missed it.
+
+**#141**: `insert_batch()` in the Python client, so that measurement describes a client somebody
+has. 1.59× at a batch of 64, and the single-row batch is **9% slower** than `insert()` — the row
+that does not flatter is the control.
+
+**#137**: a writer at the pending-row ceiling asks for a flush instead of waiting out
+`--flush-interval-ms`, and its wait has a deadline after which the write is refused rather than
+accepted. 1,196,745 → 2,209,501 levels/s at four million levels and a one-second interval,
+unchanged at the 100 ms default the engine ships with.
+
+**#142**: a snapshot install **replaces** the store. It used to rename the received files in and
+remove nothing, so a replica that had flushed a *prefix* of a symbol kept its own segment beside
+the arriving one and answered with both — 122 rows against the primary's 100. The green CI runs
+were never "no defect": a replica that flushed the **whole** set produced a directory named
+identically, so the rename overwrote it.
+
+**#136**: a directory belongs to one segment rather than to one event-time span, so re-running a
+backfill stores a second segment instead of destroying the first. Measured over the wire: **8000
+rows where it read 4000**, and **5000 where it read nothing at all**, with zero `ERROR` lines
+where there were 200. Two things worth carrying from it — the item's own costing said this was the
+widest of three candidates and it is one function with one caller, because **nothing parses a
+segment directory name**; and `segment_order_less` had been asserting in its own comment that
+`dir_path` is unique per segment, which is precisely what the defect broke.
+
 
 Things a newcomer should know, because they are real limits rather than bugs to file again:
 
