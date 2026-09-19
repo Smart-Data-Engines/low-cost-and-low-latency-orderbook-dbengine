@@ -7193,7 +7193,12 @@ Read that as narrowly as it is written. It says every defect **that has been fil
 closed, and #121, the last of them, was a question rather than a defect — answered by bounding how
 far a peer's clock may move this one, refusing the peer rather than the record, the clock or a
 clamp. It does not say the engine is finished; the capability table below is the list of what it is
-not. And **#37**'s remaining half — a coverage badge — is below the floor and still a decision.
+not. **#37** is ticked as well, and the badge it used to leave open was **answered rather than
+dropped**: the number is on the front page with its denominator and the run that measured it, and
+the `coverage` job is required, so a tree below the floor cannot have a green CI badge. A percentage
+badge would have said less that is checkable than the badge already there. This sentence said the
+opposite for four days, which is the reason the table below is now checked — and the reason that
+check would not have caught this one, because #37 is below its floor.
 
 **#117**, **#118**, **#122** and **#123** are closed, and
 together they are one investigation that started with five registered
@@ -7308,16 +7313,16 @@ nothing fails when it stops being accurate. So this one points rather than resta
 answer `docs/requirements.md` in the flagship product took for the same shape: a document that is
 never meant to speak about status is easier to keep true than one meant to be current.
 
-Two of the open items are **maintainer decisions rather than work** — #121, whose ceiling costs
-causal order against the peer whose clock is wrong, and the coverage badge left from #37, which
-needs a choice of external reporting service. Existing coverage reports and the line-coverage floor
-continue to run inside GitHub Actions. The capability items are in the table below.
+Both of the maintainer decisions that used to be listed here are made: #121 bounds the drift a
+peer may introduce by refusing the peer, and #37 answered the coverage badge with a number and a
+mechanism instead of a badge. This paragraph named them for one session after they were closed,
+directly below the sentence above explaining why a second statement about the open set is the one
+that rots — so `scripts/check_roadmap.py` now refuses any row of the table below whose **Item**
+names a closed entry. Its first run found three of them, one more than reading the page had.
+The capability items are in the table below.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **Decision** | Bound the drift a peer may introduce (#121) | S | Measured and filed rather than answered: a ceiling costs causal order against exactly the peer whose clock is wrong |
-| **Decision** | Coverage badge (#37) | S | Requires choosing an external service; the existing report and floor are already in CI |
-| **P2** | Comparative numbers from a larger machine (#39) | S | Everything but the box is in place: the harness recomputes all four numbers in one run, the competitors install natively, and `benchmarks/before-a-bigger-machine.md` is the survey of what would otherwise make it a number about our defaults |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
