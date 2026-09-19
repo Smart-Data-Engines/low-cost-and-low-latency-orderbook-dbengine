@@ -120,6 +120,28 @@ def wal_files(data_dir: str) -> list:
                   if name.startswith("wal_") and name.endswith(".bin"))
 
 
+def segment_dirs(data_dir: str, symbol: str) -> list:
+    """The segment directories one symbol has on disk, as `exchange/start_end` names.
+
+    A segment's directory name **is** its event-time range, which is why this is worth reading
+    rather than only counting rows: a node that ends up with two directories covering overlapping
+    ranges for one symbol returns both, and the duplicate is durable because storage is
+    append-only. Diagnostic rather than assertion — see the bootstrap test for why comparing the
+    sets is the wrong assertion for a node that keeps flushing.
+    """
+    root = os.path.join(data_dir, symbol)
+    if not os.path.isdir(root):
+        return []
+    found = []
+    for exchange in sorted(os.listdir(root)):
+        path = os.path.join(root, exchange)
+        if not os.path.isdir(path):
+            continue
+        found.extend(f"{exchange}/{name}" for name in sorted(os.listdir(path))
+                     if os.path.isdir(os.path.join(path, name)))
+    return found
+
+
 def wal_index(name: str) -> int:
     """The file index in a WAL filename: `wal_000003.bin` -> 3."""
     return int(name[len("wal_"):-len(".bin")])
@@ -405,6 +427,11 @@ def test_a_replica_whose_position_was_truncated_is_bootstrapped(rotating_cluster
     store, and the rows the primary had not yet flushed when it took one are not in it: they arrive
     afterwards as WAL records, from the position the snapshot carries. "Everything, not just what
     came after" is the part of that handover worth pinning.
+
+    That count is asked of **both** nodes since #142, because the failure it has to catch is the
+    replica holding rows the primary does not: the install renames the snapshot's files in and
+    removes nothing, so a replica that had flushed a *prefix* of the symbol keeps its own segment
+    beside the arriving one — overlapping ranges, different directory names, nothing to refuse.
     """
     primary = rotating_cluster.primary()
     replica = rotating_cluster.replica()
@@ -465,11 +492,24 @@ def test_a_replica_whose_position_was_truncated_is_bootstrapped(rotating_cluster
         f"its position named is gone, so the only way they reach it is a snapshot:\n"
         f"{tail_node_log(replica, 25)}")
 
+    # Both nodes, in the same run, because the question is whether they **agree** (#142). The
+    # hardcoded 100 this replaced is satisfied by a primary that lost rows too, and — the way it
+    # actually failed — says nothing about a replica that gained them: the bootstrap left the
+    # replica's own 88-row segment beside the primary's 100-row one and it answered 188. A count
+    # is also satisfied by the case the runner lands on, where the replica had flushed the whole
+    # set, so its directory is named identically, the rename overwrites it, and the total is right
+    # for a reason unrelated to the install.
     got_early = len(data_rows(replica.tcp_port, early))
-    assert got_early == 100, (
-        f"the replica holds {got_early} of the 100 rows it had before the outage; a bootstrap "
-        f"replaces its whole store, so losing these means the snapshot was incomplete rather than "
-        f"the stream")
+    want_early = len(data_rows(primary.tcp_port, early))
+    assert got_early == want_early, (
+        f"the replica holds {got_early} rows for {early} and its primary holds {want_early}. A "
+        f"snapshot replaces the store, so neither direction is allowed: fewer means the snapshot "
+        f"was incomplete, more means the install left something behind.\n"
+        f"  primary segments: {segment_dirs(primary.data_dir, early)}\n"
+        f"  replica segments: {segment_dirs(replica.data_dir, early)}")
+    assert want_early == 100, (
+        f"the primary holds {want_early} of the 100 rows it was given, so this test can say "
+        f"nothing about the replica")
 
 
 def test_a_reconnecting_replica_is_caught_up_across_file_boundaries(held_cluster):
