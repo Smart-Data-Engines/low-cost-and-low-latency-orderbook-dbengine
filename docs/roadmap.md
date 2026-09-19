@@ -2807,6 +2807,24 @@ The prediction recorded before the change was 1.9–2.2M and the measurement is 
 100 ms row is the control and it does not move, which is the answer to "does this cost anything
 at the setting the engine ships with": no.
 
+**What the write path pays, counted rather than argued** (`scripts/mnemonic_diff.py`, Release,
+aarch64, against the same two trees the table above came from):
+
+| | before | after |
+|---|---|---|
+| `Engine::apply_delta_impl` | 588 | **571** |
+| `Engine::apply_delta_mm` | 657 | **641** |
+| `Engine::apply_delta` | 2 | 2 |
+
+**Both callers got shorter, and that is not a saving** — it is pitfall 251's tell. The inline
+condition-variable wait they used to carry moved into `await_pending_room`, which is **162
+instructions, out of line, and called**. So the steady state trades seventeen inline instructions
+for a call, a return and the episode's load-store-branch; the other 145 are the waiting path,
+which a write that finds room never enters. The obvious next step if it ever matters is the one
+#117 took with the WAL counter: put the fast-path check inline in the header and leave only the
+wait out of line. Not done here, because a change that moves the same work behind a call is not
+the place to claim a cycle either way.
+
 **Two halves, and the control shows both are load-bearing.** Asking removes the dependency on the
 interval; it does nothing when the flush itself cannot make progress, which is a full disk or
 #113's `EIO`. So the wait has a five-second deadline and the write is **refused** after it rather
