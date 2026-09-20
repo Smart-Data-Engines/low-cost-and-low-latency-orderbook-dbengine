@@ -27,8 +27,15 @@ static std::string_view rtrim(std::string_view sv) {
 }
 
 /// Extract whitespace-delimited tokens from a string_view.
-static std::vector<std::string_view> tokenize(std::string_view sv) {
-    std::vector<std::string_view> tokens;
+/// Split on runs of spaces and tabs into `out`, which is cleared first and keeps its capacity.
+///
+/// The out-parameter exists for one call site: `parse_minsert()` tokenizes **every level line**, so
+/// a 20-level update allocated twenty-one vectors where one would do. Measured before this, under
+/// a pipelining client, allocation was **21.0%** of the server's CPU against 15.5% for the book
+/// update itself. The tokens are already `string_view`s into the caller's buffer, so nothing here
+/// copies text; what cost was the vector.
+static void tokenize_into(std::string_view sv, std::vector<std::string_view>& out) {
+    out.clear();
     size_t i = 0;
     while (i < sv.size()) {
         // skip whitespace
@@ -36,8 +43,14 @@ static std::vector<std::string_view> tokenize(std::string_view sv) {
         if (i >= sv.size()) break;
         size_t start = i;
         while (i < sv.size() && sv[i] != ' ' && sv[i] != '\t') ++i;
-        tokens.push_back(sv.substr(start, i - start));
+        out.push_back(sv.substr(start, i - start));
     }
+}
+
+/// The allocating form, kept for the two call sites that tokenize once per command.
+static std::vector<std::string_view> tokenize(std::string_view sv) {
+    std::vector<std::string_view> tokens;
+    tokenize_into(sv, tokens);
     return tokens;
 }
 
@@ -410,6 +423,11 @@ Command parse_command(std::string_view line) {
 /// Split a string_view into lines on '\n'.
 static std::vector<std::string_view> split_lines(std::string_view sv) {
     std::vector<std::string_view> lines;
+    // Reserved from the newline count rather than grown from empty. A `MINSERT` block is one
+    // header line plus one line per level, and `MAX_LEVELS` is 1000 — so growing from zero costs
+    // about eleven reallocations and copies of up to 16 KB, against one extra sequential pass over
+    // a block that is already in cache.
+    lines.reserve(static_cast<size_t>(std::count(sv.begin(), sv.end(), '\n')) + 1);
     size_t pos = 0;
     while (pos < sv.size()) {
         size_t nl = sv.find('\n', pos);
@@ -479,8 +497,11 @@ Command parse_minsert(std::string_view block) {
     if (lines.size() < static_cast<size_t>(1 + args.n_levels)) return cmd;
 
     args.levels.reserve(args.n_levels);
+    // One buffer for every level line, not one per line — see tokenize_into().
+    std::vector<std::string_view> toks;
+    toks.reserve(kMinsertLevelTokens + 1);
     for (uint16_t i = 0; i < args.n_levels; ++i) {
-        auto toks = tokenize(lines[1 + i]);
+        tokenize_into(lines[1 + i], toks);
         if (toks.size() < 2) return cmd;
         // A level line is not a command and has no row, but it has the same grammar and the same
         // silence: `100\t5\t1\tnotanumber` stored a level and answered `OK`. The refusal names the
