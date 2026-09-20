@@ -54,6 +54,7 @@ def cpu_seconds(pid: int) -> float:
 class Node:
     def __init__(self, tmp_path, *args: str) -> None:
         self.port = free_port()
+        tmp_path.mkdir(parents=True, exist_ok=True)   # the second test gives a subdirectory per profile
         self.log = open(tmp_path / "node.log", "w", encoding="utf-8")
         self.process = subprocess.Popen(
             [server_binary_path(), "--port", str(self.port),
