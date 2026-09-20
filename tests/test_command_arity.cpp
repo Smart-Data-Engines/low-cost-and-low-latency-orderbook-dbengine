@@ -10,6 +10,7 @@
 // refusal test. The two directions are what make this file mean anything.
 
 #include "orderbook/command_parser.hpp"
+#include "orderbook/data_model.hpp"
 #include "orderbook/session.hpp"
 
 #include <gtest/gtest.h>
@@ -130,6 +131,73 @@ TEST(CommandArity, EveryRowOfTheTableHasACanonicalLine) {
                                          });
         EXPECT_TRUE(covered) << g.keyword << " has no canonical line in kCanonical, so nothing "
                              << "here ever asserts that it is accepted";
+    }
+}
+
+// ── BOOK's own refusals (#145) ────────────────────────────────────────────────
+//
+// The arity table above covers "one token too many". The depth argument has three more refusals
+// that only it can have, and they belong in this file rather than only in the integration battery:
+// a mutation dropping the ceiling **survived** the C++ suite, because the wire refusals for this
+// command were tested exclusively over a socket.
+
+TEST(BookRefusals, TheDepthCeilingIsTheMostLevelsTheEngineStores) {
+    const Command over = parse_command("BOOK AAA EX 5000");
+    EXPECT_EQ(over.type, CommandType::UNKNOWN);
+    EXPECT_TRUE(mentions(over.error, "5000"))
+        << "the refusal does not name the depth it refused: " << over.error;
+    EXPECT_TRUE(mentions(over.error, std::to_string(MAX_LEVELS)))
+        << "the refusal does not say what the maximum is: " << over.error;
+
+    // The boundary itself is accepted, because a refusal that is off by one is a different refusal
+    // from the one `docs/cli.md` prints (#124's lesson about a flag's floor).
+    const Command at = parse_command("BOOK AAA EX " + std::to_string(MAX_LEVELS));
+    EXPECT_EQ(at.type, CommandType::BOOK) << at.error;
+    EXPECT_EQ(at.book_args.depth, MAX_LEVELS);
+}
+
+TEST(BookRefusals, ZeroIsRefusedRatherThanReadAsNoDepthGiven) {
+    // An empty answer on request is indistinguishable from a book that is not there, and those are
+    // different answers. Omitting the argument is how you ask for everything - which is the
+    // control, and it is what says this refusal is about zero rather than about the argument.
+    const Command zero = parse_command("BOOK AAA EX 0");
+    EXPECT_EQ(zero.type, CommandType::UNKNOWN);
+    EXPECT_TRUE(mentions(zero.error, "at least 1")) << zero.error;
+
+    const Command omitted = parse_command("BOOK AAA EX");
+    EXPECT_EQ(omitted.type, CommandType::BOOK) << omitted.error;
+    EXPECT_EQ(omitted.book_args.depth, 0u)
+        << "no depth given must reach the engine as 'everything the side has'";
+}
+
+TEST(BookRefusals, ADepthThatIsNotANumberIsNamedRatherThanDefaulted) {
+    // `MM_CONFLICTS notanumber` used to answer with the default limit of 100, which is an answer to
+    // a question nobody asked (#107). Same shape, same refusal.
+    const Command bad = parse_command("BOOK AAA EX notanumber");
+    EXPECT_EQ(bad.type, CommandType::UNKNOWN);
+    EXPECT_TRUE(mentions(bad.error, "notanumber")) << bad.error;
+}
+
+TEST(BookRefusals, ASymbolWithoutAnExchangeIsRefusedWithTheUsage) {
+    const Command short_line = parse_command("BOOK AAA");
+    EXPECT_EQ(short_line.type, CommandType::UNKNOWN);
+    EXPECT_TRUE(mentions(short_line.error, "BOOK <symbol> <exchange> [depth]"))
+        << "the refusal does not say what BOOK accepts: " << short_line.error;
+}
+
+TEST(BookRefusals, ItRoundTripsThroughFormatCommand) {
+    // The fuzzer's oracle compares these structures field by field, so the formatter has to carry
+    // the depth when one was given and **not** invent one when it was not - the same rule the event
+    // time taught (#105): a formatter that filled the field in would turn "everything the side has"
+    // into a fixed number the first time anything replayed a command.
+    for (const char* line : {"BOOK AAA EX", "BOOK AAA EX 7"}) {
+        const Command first = parse_command(line);
+        ASSERT_EQ(first.type, CommandType::BOOK) << first.error;
+        const Command again = parse_command(format_command(first));
+        EXPECT_EQ(again.type, CommandType::BOOK) << again.error;
+        EXPECT_EQ(again.book_args.symbol, first.book_args.symbol);
+        EXPECT_EQ(again.book_args.exchange, first.book_args.exchange);
+        EXPECT_EQ(again.book_args.depth, first.book_args.depth);
     }
 }
 
