@@ -274,6 +274,48 @@ Two things follow for a client. Responses are self-delimiting — `OK` bodies en
 it. The subscription stream is unaffected either way: `PUSH` lines arrive as the server produces
 them, whether or not anything else is in flight.
 
+## Latency profiles: eco and boost
+
+`--profile` names a set of the knobs below rather than a second code path. `eco` is the default and
+is byte for byte what the server always did; `boost` sets `--io-spin-us`, so the io thread keeps
+polling for a while after an event instead of blocking immediately.
+
+What that buys is the **kernel wake-up**, and it is a constant on every round trip rather than a
+tail. Measured on an m9g.xlarge over loopback, seven interleaved rounds of 20,000 `PING` round
+trips through a bare socket, the order alternated, `loadavg` 0.01-0.05 throughout — and measured
+**through the flag**, so the figures describe what ships rather than a hand-edited loop:
+
+| | p50 | p99 | minimum | server CPU for 20,000 | while the probe ran |
+|---|---|---|---|---|---|
+| `eco` | 8074 ns | 8369 ns | 7573 ns | 0.090 s | 56% of a core |
+| `boost` | **6578 ns** | **6837 ns** | **5993 ns** | 0.120 s | 91% of a core |
+| difference | **−18.5%** | **−18.3%** | −20.9% | **+33%** | |
+
+Medians of the rounds. Round to round, `eco`'s p50 spans 7978-8130 ns and `boost`'s 6499-6640, so
+the difference is an order of magnitude wider than the spread it is read against.
+
+**p50 and p99 fall by the same absolute amount** — 1496 ns and 1532 ns — which is what says a
+constant on every round trip; a tail would take far more off p99 than off p50. The minimum moves
+too, and by about the same amount, with more spread (`eco`'s ranges 6327-7689 across the rounds)
+because a blocking loop is occasionally already awake when the next request arrives.
+
+**The bounded window costs nothing against spinning for ever, and that is measured rather than
+assumed.** `--io-spin-us 100000000` is a window long enough never to close, which is byte for byte
+"always spin": three rounds gave p50 **6578 ns** — the same median as `boost` — for **0.130 s** of
+CPU, 98% of a core. So the window buys back the idle cost and gives up no latency under continuous
+traffic, which is the whole reason the mode has one: with no window an idle node holds a core
+indefinitely, and the honest public cost is **"up to one core while traffic flows"** rather than
+"one core".
+
+**One thing this measurement does not say.** It is loopback on one machine: across a real network a
+round trip is orders of magnitude larger and 1.5 µs stops being 18% and becomes noise. The mode is
+worth exactly what it is worth to a **colocated** client.
+
+`--io-spin-us` is the knob underneath and can be set on its own — a value the operator gave wins
+over the profile, and `--print-config` says which of the two a value came from. `--profile`
+refuses a name it does not know, so `--profile bost` does not start a node in `eco` that looks
+like it started in `boost`.
+
 ## Typical Session
 
 ```
@@ -376,6 +418,8 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--drain-timeout-ms` | `<N>` | On shutdown, how long to wait for open client sessions before closing them (default: 10000; 0 waits indefinitely) |
 | `--flush-interval-ms` | `<N>` | Background flush interval in ms (default: 100) |
 | `--fsync-policy` | `<POLICY>` | WAL durability: every, interval or none (lower case; default: interval) |
+| `--io-spin-us` | `<N>` | Keep polling for this many microseconds after the last event before blocking again (default: 0, always block). Costs up to one core while traffic flows and takes ~20% off the loopback round trip |
+| `--profile` | `<NAME>` | `eco` (default, blocking io) or `boost` (sets `io-spin-us`). A named set of the knobs, not a second code path; an unknown name is refused |
 | `--handover-cooldown-seconds` | `<N>` | How long a node that handed the role over abstains |
 | `--handover-grace-seconds` | `<N>` | Grace period granted to a handover target |
 | `--log-level` | `<LEVEL>` | ERROR, WARN, INFO or DEBUG (upper case; default: INFO) |

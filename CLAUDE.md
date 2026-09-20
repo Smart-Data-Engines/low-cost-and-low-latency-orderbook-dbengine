@@ -3046,6 +3046,30 @@ Learned the hard way. Check here before debugging.
      prefer the call that takes the name and tells you, over the call that answers and leaves a
      gap.
 
+362. **A test that quotes the shape of a rendered artefact has to read the renderer, and the word
+     on its own is satisfied by the line below it.** My provenance test for the io profile asserted
+     that `format_config()` contained `[profile]`; the renderer prints `(profile)`, so it failed
+     for the right reason on its first run. The half worth keeping is that the bracketed version
+     would have been the wrong check *anyway*: `profile` is a key on the next line of the same
+     output, so a search for the word anywhere is satisfied by a cross-reference — pitfall 237's
+     shape, and the third time a check in this repository has been satisfied by a mention of the
+     thing rather than the thing. The assertion extracts the `io-spin-us` line and requires the
+     value and the provenance *in that line*.
+363. **A control mutation is what finds the literal you did not notice you had written, and this
+     one found two.** #144's table needs a row that must **survive**: a retuning of `kBoostSpinUs`
+     inside the window the tests state as legitimate, which is what says the constant is bounded
+     rather than pinned. Drafting it before running it caught the first mistake — I copied "widened
+     to 5.5 minutes" from #121, where the bound is measured in minutes, and here the tests state
+     `0 < kBoostSpinUs <= 1000 µs`, so that widening is a **kill**. Both rows belong in the table
+     and for different reasons: the retuning survives, the widening past the documented window
+     dies, and one without the other reads as an accident.
+     Then the corrected control — 200 µs, comfortably inside those bounds — **killed as well**, and
+     the reason is the whole value of having it: a third test, the one asserting `--print-config`
+     attributes the value to the profile, looked for the literal `"50"` in the rendered line. That
+     is pitfall 324's mistake committed in the test written to honour it, it was invisible to
+     reading, and nothing but a mutation that changes the constant can find it. The expectation is
+     `std::to_string(ob::kBoostSpinUs)` now.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -3072,8 +3096,11 @@ libraries**, because `add_compile_options()` only affects targets declared after
 sat below all of them.
 
 **No P0 is open, and the set is held mechanically by the `Open:` line in `docs/roadmap.md` — read
-it there rather than trusting this sentence, which has been wrong about it before.** Four closed
-in one run, and each is worth knowing because each changes what the engine promises.
+it there rather than trusting this sentence, which has been wrong about it before.** The items
+below are the recent closures worth knowing because each changes what the engine promises; the list
+carries no count, because the previous version of this sentence said "four" above a list of six and
+omitted the newest one entirely - which is the rot pitfall 312 is about, in the paragraph that
+warns about it.
 
 **#139**: a row query answers the columns it names. `SELECT *` is byte for byte what it was; a
 three-column question costs a fifth less.
@@ -3091,6 +3118,32 @@ that does not flatter is the control.
 `--flush-interval-ms`, and its wait has a deadline after which the write is refused rather than
 accepted. 1,196,745 → 2,209,501 levels/s at four million levels and a one-second interval,
 unchanged at the 100 ms default the engine ships with.
+
+**#144**: `--profile eco|boost`, with `--io-spin-us` underneath. The io thread always blocked
+between events, so every round trip paid a kernel wake-up. Measured **through the flag** on an
+m9g.xlarge over loopback, seven interleaved rounds of 20,000 `PING` round trips: p50
+**8074 → 6578 ns**, p99 **8369 → 6837**, for **+33%** server CPU — 91% of a core against 56% while
+the probe saturates it. What says constant rather than tail is that **p50 and p99 fall by the same
+absolute amount** (1496 and 1532 ns); a tail would take far more off p99. A third column settles
+what the window costs: `--io-spin-us 100000000` never closes, gives the **same p50** for 98% of a
+core, so the bounded window gives up no latency under traffic and buys back the idle cost — which
+is the whole reason the public cost is "up to one core while traffic flows" rather than a core.
+Two things not to overstate. It is **loopback on one machine**: across a real network 1.5 µs is
+noise, so the mode is worth what it is worth to a *colocated* client. And a profile is a **named
+set of the knobs, not a second code path** — nothing in the loop branches on its name, `eco`
+resolves to the default `--io-spin-us 0`, and `--print-config` attributes a value the profile chose
+to the profile, because a mode whose effect cannot be read is a mode on somebody's word.
+**One claim from the gate measurement is withdrawn**: that run reported the minimum unchanged and
+this one does not — `eco`'s is 6327-7689 ns against `boost`'s 5955-6076. It does not reproduce with
+this probe and the roadmap says so rather than swapping the sentence.
+
+**#143**: one session's unparsed input is bounded. A client that sent bytes and never sent a
+newline took the server's resident memory to **257 MiB**, needing no authentication, and
+`--max-line-length` could not bound it — that check runs on a line that has already been assembled,
+and a client that never sends a newline never assembles one. The cap is one number over **both**
+accumulations (`Session::unparsed_bytes()`), because a pending `MINSERT` collects payload lines that
+never come back from `feed()` either, so a fix for the receive buffer alone would have left the
+second route open.
 
 **#142**: a snapshot install **replaces** the store. It used to rename the received files in and
 remove nothing, so a replica that had flushed a *prefix* of a symbol kept its own segment beside
