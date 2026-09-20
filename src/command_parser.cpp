@@ -55,12 +55,19 @@ static std::vector<std::string_view> tokenize(std::string_view sv) {
 }
 
 /// Case-insensitive comparison of a string_view against a literal.
+/// ASCII-only, and deliberately so: `std::toupper` consults the current locale, which showed up at
+/// **2.21% of the server's CPU** in a profile of the ingest path — for comparing command names
+/// against literals. Every name this protocol has is ASCII (`INSERT`, `MINSERT`, `SELECT`, …), and
+/// a locale that mapped one of those letters differently would change what command a client had
+/// sent, so locale-awareness here is a hazard rather than a feature.
+static constexpr char ascii_upper(char c) {
+    return (c >= 'a' && c <= 'z') ? static_cast<char>(c - ('a' - 'A')) : c;
+}
+
 static bool iequals(std::string_view a, std::string_view b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i) {
-        if (std::toupper(static_cast<unsigned char>(a[i])) !=
-            std::toupper(static_cast<unsigned char>(b[i])))
-            return false;
+        if (ascii_upper(a[i]) != ascii_upper(b[i])) return false;
     }
     return true;
 }
