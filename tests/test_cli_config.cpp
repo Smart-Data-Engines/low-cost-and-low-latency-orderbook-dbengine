@@ -186,7 +186,11 @@ TEST(IoProfile, BoostSetsTheSpinAndSaysItWasTheProfile) {
     const std::size_t at = printed.find("io-spin-us");
     ASSERT_NE(at, std::string::npos) << printed;
     const std::string rendered = printed.substr(at, printed.find('\n', at) - at);
-    EXPECT_NE(rendered.find("50"), std::string::npos) << rendered;
+    // The value derived from the constant, not the literal 50. A mutation retuning `kBoostSpinUs`
+    // to 200 us - inside the window the unit tests state as legitimate, and therefore the control
+    // that has to **survive** - killed the first version of this line, which is pitfall 324's
+    // mistake committed in the test written to honour it.
+    EXPECT_NE(rendered.find(std::to_string(ob::kBoostSpinUs)), std::string::npos) << rendered;
     EXPECT_NE(rendered.find("(profile)"), std::string::npos) << rendered;
 }
 
