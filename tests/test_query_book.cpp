@@ -15,6 +15,8 @@
 
 #include <cstring>
 #include <filesystem>
+#include <iterator>
+#include <fstream>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -142,9 +144,12 @@ TEST(QueryBook, EveryRowCarriesTheSameSnapshotIdentity) {
             EXPECT_EQ(r.timestamp_ns, rows.front().timestamp_ns);
             EXPECT_EQ(r.sequence_number, rows.front().sequence_number);
         }
-        // And it is the **latest** update rather than the first, so a client can resume a
-        // SUBSCRIBE from it.
+        // And **neither is zero**, which the "all equal" assertions above cannot say: a mutation
+        // that emitted 0 for every row would satisfy them perfectly. The sequence number is also
+        // the **latest** update rather than the first, so a client can resume a SUBSCRIBE from it.
         EXPECT_EQ(rows.front().sequence_number, 3u);
+        EXPECT_GT(rows.front().timestamp_ns, 0u)
+            << "the snapshot's time is zero, so every row agrees about nothing";
         engine.close();
     }
     fs::remove_all(dir);
@@ -186,4 +191,49 @@ TEST(QueryBook, AOneSidedBookAnswersWithThatSide) {
         engine.close();
     }
     fs::remove_all(dir);
+}
+
+
+// ── The two properties a behavioural test cannot reach ────────────────────────
+
+TEST(QueryBookStatic, OneSnapshotPerAnswerAndAnOwningHandleForTheWholeOfIt) {
+    // Both of these are about concurrency, and neither has a behavioural test that would mean
+    // anything. **One snapshot**: two reads of an idle buffer give identical answers, so only a
+    // writer racing the read could tell the difference, and the assertion would be probabilistic
+    // ("no crossed spread") on a property that is really "the two halves came from one read".
+    // **An owning handle**: dropping it is invisible without AddressSanitizer, and the type-level
+    // test in `test_query_buffer_lifetime.cpp` checks the *lookup's* type rather than what this
+    // function does with what it returns.
+    //
+    // Anchored on the code rather than on any message, because a check anchored on prose makes
+    // the prose load-bearing and hands the next person who rewords it a failure with no
+    // explanation (#128).
+    const std::filesystem::path path = std::filesystem::path(OB_SOURCE_DIR) / "src/query_engine.cpp";
+    std::ifstream in(path);
+    const std::string source((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+    ASSERT_FALSE(source.empty()) << "cannot read " << path << ", so this test checks nothing";
+
+    const std::size_t at = source.find("std::string QueryEngine::read_book(");
+    ASSERT_NE(at, std::string::npos) << "read_book() is not in src/query_engine.cpp - this test's "
+                                        "anchor has moved, so it is asserting about nothing";
+    const std::size_t end = source.find("\nstd::string QueryEngine::", at + 1);
+    const std::string body = source.substr(at, end == std::string::npos ? std::string::npos
+                                                                        : end - at);
+
+    std::size_t snapshots = 0;
+    for (std::size_t p = body.find("read_snapshot("); p != std::string::npos;
+         p = body.find("read_snapshot(", p + 1)) {
+        ++snapshots;
+    }
+    EXPECT_EQ(snapshots, 1u)
+        << "read_book() takes " << snapshots << " snapshots. One per answer, or the two sides come "
+           "from two moments separated by the formatting of up to two thousand levels - and a book "
+           "assembled that way can show a crossed spread the market never had";
+
+    EXPECT_NE(body.find("std::shared_ptr<SoABuffer>"), std::string::npos)
+        << "read_book() does not hold an owning handle to the buffer it reads, so a snapshot "
+           "install during the read frees what it is reading (#92)";
+    EXPECT_EQ(body.find("live_buffer_(key).get()"), std::string::npos)
+        << "read_book() drops the owning handle and keeps a raw pointer, which is #92 exactly";
 }
