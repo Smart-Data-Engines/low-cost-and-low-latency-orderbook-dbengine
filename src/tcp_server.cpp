@@ -829,7 +829,9 @@ const std::vector<std::string>& known_flags() {
         "failover-enabled",
         "flush-interval-ms",
         "fsync-policy",
+        "profile",
         "handover-cooldown-seconds",
+        "io-spin-us",
         "handover-grace-seconds",
         "log-level",
         "max-sessions",
@@ -901,6 +903,8 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"auth-secret-file", {"<PATH>", "Client credentials, '<identity> <secret>' per line; mode 600. Empty disables client authentication"}},
         {"cluster-secret-file", {"<PATH>", "Shared secret for replication and multi-master links, one line; mode 600"}},
         {"drain-timeout-ms", {"<N>", "On shutdown, how long to wait for open client sessions before closing them (default: 10000; 0 waits indefinitely)"}},
+        {"io-spin-us", {"<N>", "Keep polling for this many microseconds after the last event before blocking again (default: 0, always block). Costs up to one core while traffic flows and takes ~20% off the round trip on loopback"}},
+        {"profile", {"<name>", "eco (default, blocking io) or boost (sets io-spin-us). A named set of the knobs, not a second code path"}},
         {"flush-interval-ms", {"<N>", "Background flush interval in ms (default: 100)"}},
         {"fsync-policy", {"<POLICY>", "WAL durability: every, interval or none (lower case; default: interval)"}},
         {"handover-cooldown-seconds", {"<N>", "How long a node that handed the role over abstains"}},
@@ -1293,6 +1297,10 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.cluster_secret_file = std::string{cursor.value()};
         } else if (arg == "--drain-timeout-ms") {
             config.drain_timeout_ms = cursor.value_as<uint64_t>();
+        } else if (arg == "--io-spin-us") {
+            config.io_spin_us = cursor.value_as<uint64_t>();
+        } else if (arg == "--profile") {
+            config.profile = std::string{cursor.value()};
         } else if (arg == "--flush-interval-ms") {
             config.flush_interval_ms = cursor.value_as<uint64_t>();
         } else if (arg == "--log-level") {
@@ -1478,6 +1486,36 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
                     config.anti_entropy_interval_sec);
     }
 
+    // The profile is applied last and refuses a name it does not know, because a parser that
+    // ignores what it does not understand hides operator mistakes (#27, #36): `--profile bost`
+    // must not start a node in eco and look like it started in boost.
+    //
+    // It only sets what the operator did not. A value from the command line or the config file
+    // wins, and what the profile did set is attributed to the profile, so `--print-config` answers
+    // "what is this node doing" rather than "which switches were thrown".
+    {
+        const bool spin_set = origin.count("io-spin-us") > 0;
+        if (config.profile == "boost") {
+            if (!spin_set) {
+                config.io_spin_us = kBoostSpinUs;
+                origin["io-spin-us"] = Origin::Profile;
+            }
+        } else if (config.profile != "eco") {
+            std::fprintf(stderr,
+                "Error: unknown --profile '%s'; known profiles are 'eco' and 'boost'\n",
+                config.profile.c_str());
+            std::exit(1);
+        }
+        OB_LOG_INFO("cli",
+                    "io profile: %s (io-spin-us=%llu) — %s",
+                    config.profile.c_str(),
+                    static_cast<unsigned long long>(config.io_spin_us),
+                    config.io_spin_us == 0
+                        ? "the io thread blocks between events"
+                        : "the io thread polls after an event and may use a whole core while "
+                          "traffic flows");
+    }
+
     ResolvedConfig resolved{config, origin};
 
     if (print_config_requested) {
@@ -1499,6 +1537,7 @@ std::string format_config(const ResolvedConfig& resolved) {
         switch (it->second) {
             case Origin::File:        return "file";
             case Origin::CommandLine: return "command line";
+            case Origin::Profile:     return "profile";
             case Origin::Default:     break;
         }
         return "default";
@@ -1528,6 +1567,8 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("election-lease-wait-ms", std::to_string(c.election_lease_wait_ms));
     line("failover-enabled", c.failover_enabled ? "true" : "false");
     line("drain-timeout-ms", std::to_string(c.drain_timeout_ms));
+    line("io-spin-us", std::to_string(c.io_spin_us));
+    line("profile", c.profile);
     line("flush-interval-ms", std::to_string(c.flush_interval_ms));
     // The *path*, and there is no value to print because the secret is never a field of
     // ServerConfig. `--print-config` exists to be pasted into a ticket.
@@ -1826,8 +1867,16 @@ void TcpServer::run() {
     uint64_t published_refused{0};
 
     // 8. Epoll loop.
+    //
+    // The wait is a decision rather than a constant since the io-spin profile: `io_wait_ms()`
+    // answers 0 while the spin window since the last event is open and the blocking timeout
+    // otherwise, so `--io-spin-us 0` — the default — is byte for byte the old behaviour.
+    auto last_event_at = std::chrono::steady_clock::now();
     while (running_.load(std::memory_order_relaxed)) {
-        int nfds = ::epoll_wait(epoll_fd_, events, MAX_EVENTS, 100 /*ms timeout*/);
+        const int wait_ms = io_wait_ms(last_event_at, config_.io_spin_us, 100,
+                                       std::chrono::steady_clock::now());
+        int nfds = ::epoll_wait(epoll_fd_, events, MAX_EVENTS, wait_ms);
+        if (nfds > 0) last_event_at = std::chrono::steady_clock::now();
         if (nfds < 0) {
             if (errno == EINTR) continue;
             break; // fatal epoll error
@@ -2241,6 +2290,16 @@ void TcpServer::disarm_epollout(int fd) {
         OB_LOG_WARN("tcp_server", "disarm_epollout failed: fd=%d errno=%s",
                     fd, std::strerror(errno));
     }
+}
+
+int io_wait_ms(std::chrono::steady_clock::time_point last_event,
+               uint64_t spin_us,
+               int blocking_timeout_ms,
+               std::chrono::steady_clock::time_point now) {
+    if (spin_us == 0) return blocking_timeout_ms;      // the default, and what this always did
+    const auto since = std::chrono::duration_cast<std::chrono::microseconds>(now - last_event);
+    if (since.count() < 0) return 0;                   // clock went backwards; poll rather than sleep
+    return static_cast<uint64_t>(since.count()) < spin_us ? 0 : blocking_timeout_ms;
 }
 
 DrainVerdict drain_verdict(std::chrono::steady_clock::time_point drain_started,

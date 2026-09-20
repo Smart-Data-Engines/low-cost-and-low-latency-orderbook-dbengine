@@ -25,6 +25,18 @@ namespace ob {
 
 // ── Server configuration ──────────────────────────────────────────────────────
 
+/// What `--profile boost` sets `io_spin_us` to.
+///
+/// **A judgement, not a measurement, and the difference is the point.** What was measured is that
+/// removing the wakeup is worth 1.6 µs of an 8.0 µs round trip; nothing measured how long a window
+/// should stay open, because that depends on the gaps in a particular client's traffic and this
+/// engine cannot know them. 50 µs is six round trips' worth on the machine the measurement came
+/// from — long enough that a client sending back-to-back requests never meets a blocking wait, and
+/// short enough that an idle node stops spinning within a scheduler tick.
+///
+/// An operator who knows their traffic sets `--io-spin-us` and this number stops applying.
+inline constexpr uint64_t kBoostSpinUs = 50;
+
 struct ServerConfig {
     uint16_t    port{9090};
     std::string data_dir{"/tmp/ob_data"};
@@ -44,6 +56,36 @@ struct ServerConfig {
     /// disables it: nothing could set one, so the branch would be untestable and would read as an
     /// option this engine offers.
     size_t      max_unparsed_bytes{524288};
+
+    /// --io-spin-us: how long the client loop keeps polling with a zero timeout after the last
+    /// event before it goes back to blocking. 0 is blocking always, which is what this engine has
+    /// always done and remains the default.
+    ///
+    /// **What it buys, measured** (m9g.xlarge, four interleaved rounds of 20,000 raw-socket
+    /// `PING`s against the same tree with only the timeout changed): p50 **7963 → 6342 ns** and
+    /// p99 **8276 → 6720**, for **+59% CPU on the io thread**. The *minimum* does not move —
+    /// ~5.9 µs in both — which is what says the thing that leaves is the kernel's wakeup rather
+    /// than a tail: a constant on every round trip, not an occasional stall.
+    ///
+    /// **What it does not buy, and this has to travel with the number:** that is loopback on one
+    /// machine. Across a real network a round trip is orders of magnitude larger and 1.6 µs stops
+    /// being 20% of it. This is worth what it is worth to a **colocated** client.
+    ///
+    /// The window is why it is microseconds rather than a boolean: a bare zero timeout burns a
+    /// core on an idle node for ever, and the low CPU figure above was measured only because the
+    /// probe kept the loop busy. Spinning for a bounded time *after an event* means a node under
+    /// continuous load never blocks and an idle one costs nothing.
+    uint64_t    io_spin_us{0};
+
+    /// --profile: a named set of the knobs above, so an operator can ask for the trade rather than
+    /// know which flag carries it. `eco` is the default and sets nothing; `boost` sets
+    /// `io_spin_us`. A later flag joins the profile rather than becoming a second profile.
+    ///
+    /// It is a **source of values**, not a second code path — there is one io loop and the profile
+    /// decides a number in it. `--print-config` attributes what the profile set to the profile
+    /// (`Origin::Profile`), because a mode whose effect you cannot read is a mode on somebody's
+    /// word, and the weaker mode nobody can see is the one that ends up on production (#136).
+    std::string profile{"eco"};
     bool        read_only{false};       // reject INSERT/FLUSH when true (replica mode)
 
     /// --fsync-policy: when the write-ahead log becomes durable. `every`, `interval` or `none`.
@@ -296,6 +338,20 @@ enum class DrainVerdict {
 ///
 /// Pure: the caller logs, because only the caller knows which transport it is and how many sessions
 /// it is about to cut.
+/// How long the client loop should wait for the next event: 0 to poll, or the blocking timeout.
+///
+/// Pure, and a separate function for the same reason `drain_verdict()` below is: the loop asks
+/// once per pass and a test can ask it a thousand times without a socket. A spin window expressed
+/// as "keep polling until `last_event + window`" is the whole of the mode — there is no second
+/// code path, and this is the only place that decides.
+///
+/// `spin_us == 0` answers the blocking timeout always, which is this engine's behaviour before the
+/// mode existed and its default after.
+int io_wait_ms(std::chrono::steady_clock::time_point last_event,
+               uint64_t spin_us,
+               int blocking_timeout_ms,
+               std::chrono::steady_clock::time_point now);
+
 DrainVerdict drain_verdict(std::chrono::steady_clock::time_point drain_started,
                            int active_sessions,
                            uint64_t drain_timeout_ms,
@@ -388,7 +444,7 @@ bool allowed_before_authentication(CommandType t);
 
 /// Where a configuration value came from. For `--print-config`, which exists to answer exactly
 /// that: a list of values does not tell an operator which of them they chose.
-enum class Origin { Default, File, CommandLine };
+enum class Origin { Default, File, CommandLine, Profile };
 
 /// Every flag `parse_cli_args()` accepts, without the leading dashes — which is also the set of
 /// valid keys in a config file, because a key *is* a flag name.

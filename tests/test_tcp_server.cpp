@@ -1202,6 +1202,98 @@ TEST(BoundedDrain, NeitherTransportDecidesForItself) {
     }
 }
 
+// ── The io wait: eco and boost (#144) ─────────────────────────────────────────
+//
+// `boost` buys the kernel wake-up and nothing else. Measured on an m9g.xlarge over loopback, four
+// interleaved rounds of 20,000 `PING` round trips: p50 7963 -> 6342 ns, p99 8276 -> 6720, and the
+// **minimum unchanged** at ~5.9 µs - so what leaves is 1.6 µs of the 8.0 at both percentiles,
+// which is what says wake-up rather than tail. Server CPU +59%.
+//
+// The decision is a pure function for the same reason `drain_verdict()` is: the alternative is a
+// clock gate, and a test whose threshold is a duration fails on legitimate variation and teaches
+// its reader to re-run it.
+
+TEST(IoWait, ZeroSpinAlwaysBlocksAndThatIsTheDefault) {
+    const auto now = std::chrono::steady_clock::now();
+    // The shipped default, and byte for byte the behaviour before the mode existed: elapsed time
+    // cannot matter, because there is no window to be inside.
+    EXPECT_EQ(ob::io_wait_ms(now, 0, 100, now), 100);
+    EXPECT_EQ(ob::io_wait_ms(now, 0, 100, now + std::chrono::hours(1)), 100);
+    EXPECT_EQ(ob::io_wait_ms(now, 0, 100, now - std::chrono::hours(1)), 100);
+
+    EXPECT_EQ(ob::ServerConfig{}.io_spin_us, 0u)
+        << "spinning costs up to a core, so it has to be asked for";
+    EXPECT_EQ(ob::ServerConfig{}.profile, "eco")
+        << "the default profile is the one that changes nothing";
+}
+
+TEST(IoWait, InsideTheWindowThePollDoesNotBlock) {
+    const auto last = std::chrono::steady_clock::now();
+    EXPECT_EQ(ob::io_wait_ms(last, 50, 100, last), 0);
+    EXPECT_EQ(ob::io_wait_ms(last, 50, 100, last + std::chrono::microseconds(49)), 0);
+}
+
+TEST(IoWait, TheWindowEndsAndTheLoopGoesBackToBlocking) {
+    const auto last = std::chrono::steady_clock::now();
+    // The boundary blocks: `since == spin_us` is the first instant the window is over, and the
+    // alternative is a window one tick longer than the number an operator gave.
+    EXPECT_EQ(ob::io_wait_ms(last, 50, 100, last + std::chrono::microseconds(50)), 100);
+    EXPECT_EQ(ob::io_wait_ms(last, 50, 100, last + std::chrono::seconds(1)), 100);
+    // This is what bounds the cost: an idle node spins for one window after its last event and
+    // then stops, so the public cost is "up to one core while traffic flows" rather than a core.
+    EXPECT_EQ(ob::io_wait_ms(last, ob::kBoostSpinUs, 100, last + std::chrono::seconds(30)), 100);
+}
+
+TEST(IoWait, AClockThatWentBackwardsPollsRatherThanSleeps) {
+    // `steady_clock` is monotonic, so this is unreachable rather than expected - which is exactly
+    // why it needs an answer written down: the signed subtraction would otherwise be cast to an
+    // enormous unsigned value and read as "the window is long over", blocking a node that has just
+    // had an event. Polling one pass costs a pass.
+    const auto last = std::chrono::steady_clock::now();
+    EXPECT_EQ(ob::io_wait_ms(last, 50, 100, last - std::chrono::microseconds(1)), 0);
+}
+
+TEST(IoWait, TheBoostWindowIsBoundedFromBothSidesRatherThanPinned) {
+    // Deliberately not `EXPECT_EQ(kBoostSpinUs, 50)`: pinning the number fails on any legitimate
+    // retuning and teaches a reader that this test is noise (the lesson #121 wrote down). What the
+    // bounds say instead is that the two ends are different modes - zero would make `boost`
+    // identical to `eco`, and a window past a millisecond is a node that mostly spins, which is a
+    // different promise from the one `docs/cli.md` prints.
+    EXPECT_GT(ob::kBoostSpinUs, 0u);
+    EXPECT_LE(ob::kBoostSpinUs, 1000u);
+}
+
+TEST(IoWait, TheLoopTakesItsTimeoutFromTheDecisionRatherThanALiteral) {
+    // Static for the same reason as `NeitherTransportDecidesForItself` above: replacing `wait_ms`
+    // with `100` reinstates the blocking behaviour and leaves every test above green, because they
+    // measure the function and not its use. A behavioural test for this would be a clock gate.
+    const auto read = [](const char* rel) {
+        std::ifstream in(std::string(OB_SOURCE_DIR) + "/" + rel);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::string source = read("src/tcp_server.cpp");
+    ASSERT_FALSE(source.empty()) << "cannot read src/tcp_server.cpp, so this test checks nothing";
+
+    EXPECT_NE(source.find("io_wait_ms("), std::string::npos)
+        << "the epoll loop no longer consults io_wait_ms(), so --io-spin-us does nothing";
+
+    // Every epoll_wait in this file must take the computed wait. One call site today; the check is
+    // over all of them so a second loop cannot quietly hard-code its own.
+    std::size_t calls = 0;
+    for (std::size_t at = source.find("epoll_wait("); at != std::string::npos;
+         at = source.find("epoll_wait(", at + 1)) {
+        ++calls;
+        const std::size_t end = source.find(')', at);
+        ASSERT_NE(end, std::string::npos);
+        const std::string args = source.substr(at, end - at);
+        EXPECT_NE(args.find("wait_ms"), std::string::npos)
+            << "epoll_wait with a hard-coded timeout: " << args
+            << "\nThe wait is a decision since the io-spin profile; a literal here is the mode "
+               "silently switched off";
+    }
+    EXPECT_GT(calls, 0u) << "no epoll_wait found, so this test asserted nothing";
+}
+
 // ── Event time on the wire (#105) ─────────────────────────────────────────────
 //
 // Measured before this existed, by #39 part two: a dataset's own span selected **0 of 400 rows**

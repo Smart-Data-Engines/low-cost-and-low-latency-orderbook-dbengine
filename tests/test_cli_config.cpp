@@ -154,6 +154,75 @@ TEST(CliConfigDeath, ConfigInsideAConfigFileIsRefused) {
     std::filesystem::remove(path);
 }
 
+// ── The profile, and what --print-config says it did (#144) ───────────────────
+//
+// A profile is a named set of the knobs, so the interesting question is not what it sets but
+// **which answer it gives about where a value came from**: `--print-config` exists to answer "what
+// is this node doing", and a value the profile chose reported as a default is the one thing it must
+// not say. The provenance is checked through `format_config()` as well as through the map, because
+// the map is what the rendering reads and the rendering is what an operator pastes into a report.
+
+namespace {
+
+ob::ResolvedConfig resolve(std::vector<std::string> args) {
+    args.insert(args.begin(), "ob_tcp_server");
+    std::vector<char*> argv;
+    for (auto& a : args) argv.push_back(a.data());
+    return ob::resolve_cli_args(static_cast<int>(argv.size()), argv.data());
+}
+
+}  // namespace
+
+TEST(IoProfile, BoostSetsTheSpinAndSaysItWasTheProfile) {
+    const auto resolved = resolve({"--profile", "boost"});
+    EXPECT_EQ(resolved.config.io_spin_us, ob::kBoostSpinUs);
+    ASSERT_EQ(resolved.origin.count("io-spin-us"), 1u)
+        << "a value the profile chose reported as a default is what --print-config exists not to do";
+    EXPECT_EQ(resolved.origin.at("io-spin-us"), ob::Origin::Profile);
+    // The rendered line, not merely the word: the provenance an operator reads has to be attached
+    // to *this* key, and a search for the word alone would be satisfied by the `profile` line
+    // below it.
+    const std::string printed = ob::format_config(resolved);
+    const std::size_t at = printed.find("io-spin-us");
+    ASSERT_NE(at, std::string::npos) << printed;
+    const std::string rendered = printed.substr(at, printed.find('\n', at) - at);
+    EXPECT_NE(rendered.find("50"), std::string::npos) << rendered;
+    EXPECT_NE(rendered.find("(profile)"), std::string::npos) << rendered;
+}
+
+TEST(IoProfile, AValueTheOperatorGaveWinsOverTheProfile) {
+    const auto resolved = resolve({"--profile", "boost", "--io-spin-us", "7"});
+    EXPECT_EQ(resolved.config.io_spin_us, 7u)
+        << "the profile overwrote a value the operator asked for";
+    EXPECT_EQ(resolved.origin.at("io-spin-us"), ob::Origin::CommandLine);
+    // Order must not decide it either: the profile is applied after the whole command line, so it
+    // sees what was set regardless of which side of it the flag appeared on.
+    const auto reversed = resolve({"--io-spin-us", "7", "--profile", "boost"});
+    EXPECT_EQ(reversed.config.io_spin_us, 7u);
+    EXPECT_EQ(reversed.origin.at("io-spin-us"), ob::Origin::CommandLine);
+}
+
+TEST(IoProfile, EcoIsTheDefaultAndChangesNothing) {
+    // The control: without it, a profile block that set the spin unconditionally would pass every
+    // test above.
+    const auto named = resolve({"--profile", "eco"});
+    EXPECT_EQ(named.config.io_spin_us, 0u);
+    EXPECT_EQ(named.origin.count("io-spin-us"), 0u)
+        << "eco set a value, so it is not the default behaviour under another name";
+
+    const auto silent = resolve({});
+    EXPECT_EQ(silent.config.profile, "eco");
+    EXPECT_EQ(silent.config.io_spin_us, 0u);
+}
+
+TEST(IoProfile, AnUnknownNameIsRefusedRatherThanReadAsTheDefault) {
+    // #27 and #36 in a new place: a parser that ignores what it does not understand hides operator
+    // mistakes, and here the mistake is silent in the worst direction - a node started in eco that
+    // its operator believes is in boost.
+    EXPECT_EXIT(resolve({"--profile", "bost"}), ::testing::ExitedWithCode(1),
+                "unknown --profile 'bost'");
+}
+
 // ── The two lists, against the parser's own source ────────────────────────────
 
 TEST(CliConfigStatic, KnownFlagsMatchTheParser) {

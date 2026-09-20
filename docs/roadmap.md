@@ -2212,6 +2212,82 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 144. The io thread always blocked between events, so every round trip paid a kernel wake-up ✅
+
+**Closed.** `--profile eco|boost`, with `--io-spin-us` as the knob underneath. A profile is a named
+set of the knobs and not a second code path: nothing in the loop branches on its name, and at
+`--io-spin-us 0` — the default, and what `eco` resolves to — `io_wait_ms()` returns the blocking
+timeout the loop always used.
+
+**The gate for building it at all was a measurement, and it corrected what the mode is for.** The
+first version of the design said `boost` buys cores for throughput. That was wrong about the
+customer: the client loop blocks in `epoll_wait`, so every request waits for the kernel to wake the
+io thread, and a trading firm buys the latency tail rather than batch throughput.
+
+**Measured, m9g.xlarge, four interleaved rounds of 20,000 `PING` round trips through a bare socket**
+(a C++ probe, so the number is about the server and the kernel rather than about a client), against
+the same tree with `epoll_wait(..., 0)` as its only change:
+
+| | p50 | p99 | minimum | server CPU |
+|---|---|---|---|---|
+| blocking | 7963 ns | 8276 ns | 5964 ns | 8.5 ticks |
+| spinning | **6342 ns** | **6720 ns** | 5915 ns | 13.5 ticks |
+| difference | **−20.4%** | **−18.8%** | ~0% | **+59%** |
+
+**The minimum row is the one that says what this is.** ~5.9 µs is the irreducible floor of the
+syscalls and the loopback and it is identical in both, so what leaves p50 and p99 is 1.6 µs of the
+8.0 — the same amount at both percentiles, which is what says wake-up rather than tail. A change
+that took a tail off would have moved p99 and left p50 alone.
+
+**The spin has to have a window, and that is the one correction the measurement forced.** The
+variant measured above is a bare timeout of zero, which on an idle node burns a core indefinitely —
+the modest CPU figure in that table is an artefact of the probe keeping the loop busy for the whole
+run. The shipped mode polls for a bounded window after the last event and then goes back to
+blocking, so under continuous traffic there is no wake-up and an idle node costs nothing. The cost
+to state publicly is therefore **"up to one core while traffic flows"**, not "one core".
+
+**What the measurement does not say, and it belongs next to the number rather than in a footnote:**
+this is loopback on one machine. Across a real network a round trip is orders of magnitude larger
+and 1.6 µs stops being 20% and becomes noise. The mode is worth exactly what it is worth to a
+**colocated** client, and `docs/cli.md` says so where an operator will read it.
+
+**Three refusals, each because the alternative is silent.** An unknown name is refused with the
+name in the message (#27 and #36 on the wire's other side: a parser that ignores what it does not
+understand hides operator mistakes, and here the mistake is a node started in `eco` that its
+operator believes is in `boost`). The profile sets only what the operator did not, so a value from
+the command line or the config file wins. And what the profile did set is attributed to the profile
+(`Origin::Profile`), so `--print-config` answers "what is this node doing" rather than "which
+switches were thrown" — a mode whose effect cannot be read is a mode on somebody's word.
+
+`io_wait_ms()` is a pure function for the same reason `drain_verdict()` is (#106): the alternative
+is a clock gate, and a test whose threshold is a duration fails on legitimate variation and teaches
+its reader to re-run it. The static half is what the unit tests cannot reach — replacing `wait_ms`
+with a literal at the one `epoll_wait` call site reinstates the blocking behaviour and leaves every
+unit test green, because they measure the function rather than its use.
+
+**Mutations: six, each with the verdict it was meant to give.**
+
+| mutation | verdict |
+|---|---|
+| the loop takes a literal timeout instead of `io_wait_ms()` | **killed** by the static test only |
+| the profile sets the spin unconditionally, overwriting the operator's value | **killed** |
+| the profile block accepts any name | **killed** |
+| the value is attributed to `Origin::Default` rather than `Origin::Profile` | **killed** |
+| the window boundary is `<=` rather than `<` | **killed** |
+| `kBoostSpinUs` widened to 5.5 minutes | **survives** |
+
+Row one is why the static test exists. Row six is the control and survives deliberately: every
+expectation about the window is written in terms of `kBoostSpinUs` rather than pinned to 50, because
+pinning the number fails on any legitimate retuning and teaches a reader that the test is noise
+(#121's lesson). What the bounds say instead is that the two ends are different modes — zero makes
+`boost` identical to `eco`, and a window past a millisecond is a node that mostly spins, which is a
+different promise from the one the reference prints. A widening large enough to change an answer
+does not compile; one small enough to compile changes nothing observable.
+
+- Effort: S | Impact: the first knob in this engine that trades CPU for latency rather than for
+  durability or throughput, and the only one whose public cost has to name the deployment it is
+  worth anything in
+
 ### 143. One session could hold unbounded unparsed input, and the limit that exists cannot see it ✅
 
 **Closed.** Found while profiling the ingest path for something else — reading `Session::feed()`

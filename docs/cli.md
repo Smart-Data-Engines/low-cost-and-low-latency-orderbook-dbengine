@@ -274,6 +274,38 @@ Two things follow for a client. Responses are self-delimiting — `OK` bodies en
 it. The subscription stream is unaffected either way: `PUSH` lines arrive as the server produces
 them, whether or not anything else is in flight.
 
+## Latency profiles: eco and boost
+
+`--profile` names a set of the knobs below rather than a second code path. `eco` is the default and
+is byte for byte what the server always did; `boost` sets `--io-spin-us`, so the io thread keeps
+polling for a while after an event instead of blocking immediately.
+
+What that buys is the **kernel wake-up**, and it is a constant rather than a tail. Measured on an
+m9g.xlarge over loopback, four interleaved rounds of 20,000 `PING` round trips through a bare
+socket:
+
+| | p50 | p99 | minimum | server CPU |
+|---|---|---|---|---|
+| `eco` | 7963 ns | 8276 ns | 5964 ns | 8.5 ticks |
+| `boost` | **6342 ns** | **6720 ns** | 5915 ns | 13.5 ticks |
+| difference | **−20.4%** | **−18.8%** | ~0% | **+59%** |
+
+The minimum row is the one to read first: ~5.9 µs is the irreducible floor of the syscalls and the
+loopback and it does not move, so what leaves p50 and p99 is 1.6 µs of the 8.0 — the same amount at
+both percentiles, which is what says wake-up rather than tail.
+
+**Two things this measurement does not say.** It is loopback on one machine: across a real network
+a round trip is orders of magnitude larger and 1.6 µs stops being 20% and becomes noise, so the
+mode is worth exactly what it is worth to a **colocated** client. And the figures above come from a
+bare `epoll_wait(..., 0)`, which on an idle node burns a core indefinitely; the shipped mode spins
+for a bounded window after the last event and then goes back to blocking, so the cost to state
+publicly is **"up to one core while traffic flows"** rather than "one core".
+
+`--io-spin-us` is the knob underneath and can be set on its own — a value the operator gave wins
+over the profile, and `--print-config` says which of the two a value came from. `--profile`
+refuses a name it does not know, so `--profile bost` does not start a node in `eco` that looks
+like it started in `boost`.
+
 ## Typical Session
 
 ```
@@ -376,6 +408,8 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--drain-timeout-ms` | `<N>` | On shutdown, how long to wait for open client sessions before closing them (default: 10000; 0 waits indefinitely) |
 | `--flush-interval-ms` | `<N>` | Background flush interval in ms (default: 100) |
 | `--fsync-policy` | `<POLICY>` | WAL durability: every, interval or none (lower case; default: interval) |
+| `--io-spin-us` | `<N>` | Keep polling for this many microseconds after the last event before blocking again (default: 0, always block). Costs up to one core while traffic flows and takes ~20% off the loopback round trip |
+| `--profile` | `<NAME>` | `eco` (default, blocking io) or `boost` (sets `io-spin-us`). A named set of the knobs, not a second code path; an unknown name is refused |
 | `--handover-cooldown-seconds` | `<N>` | How long a node that handed the role over abstains |
 | `--handover-grace-seconds` | `<N>` | Grace period granted to a handover target |
 | `--log-level` | `<LEVEL>` | ERROR, WARN, INFO or DEBUG (upper case; default: INFO) |
