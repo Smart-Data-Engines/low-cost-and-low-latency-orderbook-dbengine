@@ -184,11 +184,35 @@ public:
     uint32_t auth_attempts() const;
     void increment_auth_attempts();
 
+    /// Bytes this session has read that do not yet form a complete command.
+    ///
+    /// Everything `feed()` could parse has left the buffer, so whatever is still here is an
+    /// **incomplete** command — and an incomplete command longer than the longest legal one is not
+    /// a command. `TcpServer` bounds it for that reason: before #143 a client could send bytes
+    /// with no newline for ever and the buffer grew without limit. Measured: 227 MiB sent on one
+    /// connection took the server's resident memory to **257 MiB**, and the connection needs no
+    /// authentication to do it. `--max-line-length` could not bound it, because that check runs on
+    /// a line that has already been assembled and a client that never sends a newline never
+    /// assembles one. This is the input-side mirror of #69, which capped the send buffer.
+    ///
+    /// **It counts the half-assembled `MINSERT` too, and that is the half a single number is for.**
+    /// Payload lines never come back from `feed()` — they are collected here until the count in
+    /// the header is met — so the line-length check cannot see them either, and a client that
+    /// announces a thousand levels and then sends long lines accumulates just as freely by a
+    /// second route. Two accumulations, one cap, no gap between them.
+    size_t unparsed_bytes() const {
+        size_t n = read_buffer_.size() + minsert_header_.size();
+        for (const auto& line : minsert_lines_) n += line.size() + 1;   // +1 for the newline
+        return n;
+    }
+
+
 private:
     int         fd_;
     bool        refusal_logged_{false};
     uint64_t    conn_id_;
     std::string read_buffer_;
+
 
     /// Bytes accepted from execute_command() but not yet taken by the socket.
     /// Holds already-framed bytes, so in compressed mode a partial write cannot

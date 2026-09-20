@@ -2212,6 +2212,69 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 143. One session could hold unbounded unparsed input, and the limit that exists cannot see it ✅
+
+**Closed.** Found while profiling the ingest path for something else — reading `Session::feed()`
+to see where its 9.97% of the server's CPU went, not looking for this.
+
+**Measured, m9g.xlarge, one connection, no authentication:** a client that sends bytes and never
+sends a newline took the server's resident memory from 1.9 MiB to **257 MiB** after 227 MiB on the
+wire, with the server draining the socket as fast as it arrived. There is no cap: `feed()` appends
+to `read_buffer_` and erases only up to the last **complete** line, so a stream with no line in it
+is never erased.
+
+**`--max-line-length` exists, is 256 KB, and cannot bound this.** The check is
+`if (line.size() > config_.max_line_length)` inside the loop over the lines `feed()` returned — so
+a client that never completes a line produces no lines, the loop body never runs, and the check
+never executes. The limit is real and guards the wrong thing: the size of a command that already
+exists, not the size of an accumulation that might never become one.
+
+**There are two routes and a fix for one would have left the other.** Beside the receive buffer, a
+pending `MINSERT` collects its payload lines into `minsert_lines_`, and those lines **do** end in
+newlines — they simply never come back from `feed()`, so the per-line check cannot see them either.
+A client that announces a thousand levels and then sends 32 KB payload lines accumulates just as
+freely. That is why the ceiling is one number over both (`Session::unparsed_bytes()`) rather than a
+check on the buffer: two accumulations with one cap have no gap between them.
+
+**The bound is twice `max_line_length`**, because a session can legitimately hold one `MINSERT`
+block being assembled *and* the start of the next command, each bounded by the line length.
+Anything past that is not a command in progress. Deliberately with **no flag and no disabling
+value**: its sibling `max_line_length` has no flag either, so claiming otherwise would promise
+configurability that does not exist, and a value nothing could set would be an untestable branch
+reading as an option this engine offers.
+
+`ob_sessions_unparsed_overflow_total` is the only external sign, registered in the change that
+writes it.
+
+**The control is the test that matters.** A ceiling low enough to break real traffic would pass
+both refusal tests and be a worse defect than the one it closes, so a 1000-level `MINSERT` — what
+`max_line_length`'s own comment says the protocol supports — has to keep working, and is asserted
+on the row count rather than on the absence of an error.
+
+This is the input-side mirror of **#69**, which capped the send buffer at 64 MB per session after
+clearing a partially-sent one corrupted the peer's framing. The output side was bounded two years
+before the input side, which is the ordinary direction for this mistake: the bytes you send are
+yours to count, and the bytes you receive arrive whether you counted them or not.
+
+**Mutations: four, each with the verdict it was meant to give — per test, because the point of
+three tests is that they answer differently.**
+
+| mutation | no-newline | pending `MINSERT` | the control |
+|---|---|---|---|
+| no ceiling at all | **fails** | **fails** | passes |
+| the ceiling counts the receive buffer only | passes | **fails** | passes |
+| the ceiling is 1024 bytes | passes | passes | **fails** |
+| the refusal is reworded | passes | passes | passes |
+
+Row two is the design decision, demonstrated: a fix that bounded only the receive buffer leaves the
+`MINSERT` route wide open, and one number over both accumulations is what closes it. Row three is
+why the control exists — a ceiling below real traffic passes both refusals and would have shipped.
+Row four is the control mutation and survives. Baseline green before and after; sources restored
+byte for byte.
+
+- Effort: S | Impact: P0 by consequence — a single unauthenticated connection exhausts the memory
+  of a node that is otherwise healthy, and the refusal it needed was one comparison
+
 ### 142. A replica bootstrapped by snapshot keeps rows the primary does not have, for a symbol it already held ✅
 
 **Closed.** The staged files replace the store now, in one exclusive operation, rather than being
