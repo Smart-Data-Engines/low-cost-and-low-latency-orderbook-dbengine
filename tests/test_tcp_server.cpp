@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <fstream>
+#include <regex>
 #include <iterator>
 #include "orderbook/command_parser.hpp"
 #include "orderbook/response_formatter.hpp"
@@ -1274,9 +1275,6 @@ TEST(IoWait, TheLoopTakesItsTimeoutFromTheDecisionRatherThanALiteral) {
     const std::string source = read("src/tcp_server.cpp");
     ASSERT_FALSE(source.empty()) << "cannot read src/tcp_server.cpp, so this test checks nothing";
 
-    EXPECT_NE(source.find("io_wait_ms("), std::string::npos)
-        << "the epoll loop no longer consults io_wait_ms(), so --io-spin-us does nothing";
-
     // Every epoll_wait in this file must take the computed wait. One call site today; the check is
     // over all of them so a second loop cannot quietly hard-code its own.
     std::size_t calls = 0;
@@ -1292,6 +1290,32 @@ TEST(IoWait, TheLoopTakesItsTimeoutFromTheDecisionRatherThanALiteral) {
                "silently switched off";
     }
     EXPECT_GT(calls, 0u) << "no epoll_wait found, so this test asserted nothing";
+
+    // And `wait_ms` itself must come from the decision, at every assignment. The first version of
+    // this test asked only whether `io_wait_ms(` appears in the file, and a mutation replacing the
+    // computation with a literal **survived** it: the file still contains the function's own
+    // definition, so the check was satisfied by a mention rather than by a use. Same shape as the
+    // check that was satisfied by a neighbouring DEBUG line, and the assignment is the thing the
+    // mode actually turns on. Idiom borrowed from `ReplicationIoBoundary` (#112), which learnt it
+    // for the same reason.
+    // The leading non-identifier character matters: this file also has `election_lease_wait_ms`
+    // and the parser's own `wait_ms` keys, and a bare `wait_ms` matches the tail of each. Pitfall
+    // 252's shape - `rds` inside `records` - met again in the check written to close a substring
+    // hole, so the first run of this version reported three assignments and named two flags.
+    const std::regex assign(R"(([^A-Za-z0-9_])wait_ms\s*=\s*([^;]+);)");
+    std::size_t assignments = 0;
+    for (auto it = std::sregex_iterator(source.begin(), source.end(), assign);
+         it != std::sregex_iterator(); ++it) {
+        ++assignments;
+        const std::string rhs = (*it)[2].str();
+        EXPECT_NE(rhs.find("io_wait_ms("), std::string::npos)
+            << "wait_ms = " << rhs << ", not through io_wait_ms(). Two places deciding one timeout "
+               "is how --io-spin-us comes to do nothing while every unit test stays green";
+    }
+    // One: the declaration inside the loop. A count rather than "at least one", because a rule
+    // that stopped matching would report a clean tree.
+    EXPECT_EQ(assignments, 1u)
+        << "expected one assignment to wait_ms in src/tcp_server.cpp; found " << assignments;
 }
 
 // ── Event time on the wire (#105) ─────────────────────────────────────────────
