@@ -878,6 +878,11 @@ ob_add_engine_test(test_query_buffer_lifetime
     test_query_buffer_lifetime.cpp
 )
 
+# ── The live book on the wire (#145) ──────────────────────────────────────────
+ob_add_engine_test(test_query_book
+    test_query_book.cpp
+)
+
 ob_add_engine_test(test_query_live_buffer_race
     test_query_live_buffer_race.cpp
 )

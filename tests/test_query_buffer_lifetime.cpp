@@ -128,6 +128,58 @@ TEST(QueryBufferLifetime, ASnapshotInstallDuringAQueryDoesNotFreeWhatTheQueryRea
     fs::remove_all(dir);
 }
 
+TEST(QueryBufferLifetime, ABookReadDuringASnapshotInstallDoesNotFreeWhatItReads) {
+    // The same window as the test above, driven by `BOOK` instead of by VWAP - and `BOOK` is the
+    // better instrument for this class, which is worth saying because the neighbouring test had to
+    // *pick* its driver. `SELECT *` resolves the live buffer for an existence check and never
+    // dereferences it, so it drove this race for three ASan runs and reported clean; the
+    // aggregation branch reads through the pointer and had to be chosen deliberately. `read_book()`
+    // cannot do anything else: every row it emits comes out of the snapshot it took through that
+    // pointer (#145).
+    const std::string dir = make_temp_dir("ob_bookllife_");
+    {
+        ob::Engine engine(dir, 60'000'000'000ULL, ob::FsyncPolicy::NONE);
+        engine.open();
+        write_one(engine, 1, 50'000);
+
+        std::atomic<bool> stop{false};
+        std::atomic<uint64_t> reads{0};
+        std::atomic<uint64_t> rows{0};
+
+        std::thread reader([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                engine.read_book("LIFE", "EX", 0,
+                                 [&](const ob::QueryResult&) {
+                                     rows.fetch_add(1, std::memory_order_relaxed);
+                                 });
+                reads.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+
+        uint64_t installs = 0;
+        for (int i = 0; i < 600; ++i) {
+            engine.adopt_store_on_disk();
+            ++installs;
+            write_one(engine, static_cast<uint64_t>(i) + 2, 50'000 + i);
+            std::this_thread::sleep_for(std::chrono::microseconds(300));
+        }
+
+        stop.store(true, std::memory_order_relaxed);
+        reader.join();
+
+        EXPECT_GT(reads.load(), 100u)
+            << "the reader barely ran, so this test proves nothing about the window";
+        EXPECT_GT(installs, 100u);
+        // And rows, not just calls: a run in which every read answered `not found` would satisfy
+        // the count above while never once dereferencing the pointer this test is about - which is
+        // exactly the failure mode the VWAP driver above was written to escape.
+        EXPECT_GT(rows.load(), 100u)
+            << "no read returned a level, so nothing read through the resolved buffer";
+        engine.close();
+    }
+    fs::remove_all(dir);
+}
+
 TEST(QueryBufferLifetimeStatic, TheLookupHandsOutAnOwningHandle) {
     // The shape that makes the race above impossible rather than unlikely: what the query holds is
     // an owning handle, so a buffer cleared out of `buffers_` mid-query stays alive until that

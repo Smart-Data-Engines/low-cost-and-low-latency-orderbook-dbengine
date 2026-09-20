@@ -79,6 +79,7 @@ constexpr Canonical kCanonical[] = {
          "AUTH alice "
          "0000000000000000000000000000000000000000000000000000000000000000"),
                                                 CommandType::AUTH},
+    {"BOOK AAA EX", CommandType::BOOK},
 };
 
 } // namespace

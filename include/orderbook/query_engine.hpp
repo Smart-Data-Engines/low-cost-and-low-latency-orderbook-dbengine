@@ -143,6 +143,29 @@ public:
     /// As above, and report the shape of the answer in `shape` before the first row.
     std::string execute(std::string_view sql, RowCallback cb, QueryShape& shape);
 
+    /// The live book for one symbol, as rows. Error string on failure, empty on success.
+    ///
+    /// The engine's central data structure is `SoABuffer` - per side a depth and its levels,
+    /// updated in place by `apply_delta` and read consistently under a seqlock - and until #145
+    /// **no wire command returned it**. `read_snapshot()` had exactly one caller, the aggregate
+    /// branch of `execute()`, so a client could ask for VWAP *over* the book and could not ask for
+    /// the book; its two routes were `SUBSCRIBE` and rebuild, or `SELECT` history and replay, both
+    /// of which make it hold what the server already holds.
+    ///
+    /// It lives here rather than on `Engine` because this class owns the lookup that keeps #92
+    /// closed. A second supplier of that lookup is what the static test in
+    /// `tests/test_query_live_buffer_race.cpp` exists to refuse.
+    ///
+    /// `depth` is per side and counts from the best level; **zero means "everything the side
+    /// has"**. That differs from the wire, which refuses an explicit zero - the two decisions are
+    /// deliberately separate, because a caller inside the process has no token to be told about.
+    ///
+    /// Rows carry the seven columns of a `SELECT` row, and **two of the seven come from the buffer
+    /// rather than from a level**, so every row of one answer carries the same `timestamp_ns` and
+    /// `sequence_number`. That is the identity of the snapshot rather than a per-level time.
+    std::string read_book(const std::string& symbol, const std::string& exchange,
+                          uint32_t depth, RowCallback cb);
+
     /// Parse only; returns error string on failure, empty on success.
     std::string parse(std::string_view sql, QueryAST& out);
 

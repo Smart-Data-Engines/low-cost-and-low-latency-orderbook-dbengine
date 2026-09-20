@@ -41,6 +41,17 @@ struct alignas(64) SoASide {
 // Verify SoASide is 64-byte aligned.
 static_assert(alignof(SoASide) == 64, "SoASide must be 64-byte aligned");
 
+// The wire's level ceiling and the array that holds them are **one fact**, and until #145 they were
+// two constants of the same value with nothing comparing them. `MAX_LEVELS` in `data_model.hpp` is
+// what the command parser refuses a `MINSERT` above and what sizes every WAL payload buffer; this
+// one is the array length. Diverging would not be memory-unsafe - `insert_level()` answers
+// `OB_ERR_FULL` - but a `MINSERT` accepted by the parser and then refused level by level is a
+// refusal from the wrong layer, and the version number in three places (#107) is what this shape
+// costs when nobody notices. Found while writing `BOOK`'s depth ceiling, which is the third reader
+// of that number.
+static_assert(SoASide::MAX_LEVELS == MAX_LEVELS,
+              "SoASide's array length and the wire's level ceiling must be the same number");
+
 // SoABuffer: one per (symbol, exchange) pair (Requirement 1.1).
 // Holds bid and ask sides plus metadata.
 struct SoABuffer {

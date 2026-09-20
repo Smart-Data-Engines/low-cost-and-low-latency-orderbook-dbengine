@@ -176,6 +176,7 @@ bool allowed_before_authentication(CommandType t) {
     case CommandType::UNKNOWN:   // refused anyway, and by the parser's own message
         return true;
     case CommandType::SELECT:
+    case CommandType::BOOK:
     case CommandType::INSERT:
     case CommandType::MINSERT:
     case CommandType::FLUSH:
@@ -384,6 +385,38 @@ std::string execute_command(const Command& cmd,
         return format_query_response(rows, shape.columns);
     }
 
+    case CommandType::BOOK: {
+        session.increment_commands();
+        // The same refusal a `SELECT` gets during bootstrap, and for the same reason: a replica
+        // installing a snapshot is replacing the store under itself (#142), and an answer composed
+        // across that is an answer about two trees.
+        if (engine.is_bootstrapping()) return format_error("bootstrapping");
+        auto t0_book = std::chrono::steady_clock::now();
+        std::vector<QueryResult> rows;
+        try {
+            std::string err = engine.read_book(cmd.book_args.symbol, cmd.book_args.exchange,
+                                               cmd.book_args.depth,
+                                               [&](const QueryResult& r) { rows.push_back(r); });
+            if (!err.empty()) return format_error(err);
+        } catch (const std::exception& e) {
+            return format_error(e.what());
+        }
+        if (registry) {
+            double secs =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_book).count();
+            // The same histogram a row query uses. A second one would split the operator's view of
+            // "how long does a read take here" across two names for no reason a dashboard cares
+            // about, and `ob_total_queries` is the count an operator already alerts on.
+            registry->observe_histogram("ob_query_latency_seconds", secs);
+            registry->increment_counter("ob_total_queries");
+        }
+        session.increment_queries();
+        stats.total_queries.fetch_add(1, std::memory_order_relaxed);
+        // The canonical seven, deliberately: projection is #139's and belongs to `SELECT`, and a
+        // second column list to keep in step is a second thing to get wrong before anybody asked
+        // for it.
+        return format_query_response(rows, all_query_columns());
+    }
     case CommandType::INSERT: {
         session.increment_commands();
         if (read_only || engine.node_role() == NodeRole::REPLICA) return format_error("read-only replica");

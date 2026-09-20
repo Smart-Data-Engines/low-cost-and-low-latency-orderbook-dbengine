@@ -724,6 +724,60 @@ static bool parse_i64_strict(const std::string& s, int64_t& out) {
 
 } // anonymous namespace
 
+// ── read_book ─────────────────────────────────────────────────────────────────
+
+std::string QueryEngine::read_book(const std::string& symbol, const std::string& exchange,
+                                   uint32_t depth, RowCallback cb) {
+    const std::string key = symbol + "." + exchange;
+    // Resolved to an owning handle and held for the whole answer. A raw pointer here is #92: the
+    // engine owns these buffers and a snapshot install replaces the store, so a query still
+    // reading through a resolved pointer reads freed memory - measured then as
+    // `heap-use-after-free` in 3 of 3 ASan runs.
+    std::shared_ptr<SoABuffer> buf = live_buffer_(key);
+    if (buf == nullptr) {
+        OB_LOG_DEBUG("query_engine", "BOOK: no live buffer: symbol=%s exchange=%s",
+                     symbol.c_str(), exchange.c_str());
+        return "OB_ERR_NOT_FOUND: symbol '" + symbol + "' exchange '" + exchange +
+               "' not found in live buffers";
+    }
+
+    // One snapshot for the whole answer. Reading per side while emitting rows would compose the
+    // answer from two moments separated by the formatting of up to two thousand levels, and a
+    // book assembled that way can show a crossed spread the market never had.
+    SoASide bid, ask;
+    read_snapshot(*buf, bid, ask);
+
+    const uint64_t ts  = buf->last_timestamp_ns;
+    const uint64_t seq = buf->sequence_number.load(std::memory_order_relaxed);
+
+    const auto emit = [&](const SoASide& side, uint8_t side_code) {
+        const uint32_t have = side.depth;
+        const uint32_t want = (depth == 0) ? have : std::min(depth, have);
+        for (uint32_t i = 0; i < want; ++i) {
+            QueryResult r{};
+            // The same pair on every row: these two are properties of the buffer, not of a level,
+            // so they say *as of which update* this book is rather than when a level changed.
+            r.timestamp_ns    = ts;
+            r.sequence_number = seq;
+            r.price           = side.prices[i];
+            r.quantity        = side.quantities[i];
+            r.order_count     = side.order_counts[i];
+            r.side            = side_code;
+            r.level           = static_cast<uint16_t>(i);
+            cb(r);
+        }
+        return want;
+    };
+
+    const uint32_t bids = emit(bid, 0);
+    const uint32_t asks = emit(ask, 1);
+    OB_LOG_DEBUG("query_engine",
+                 "BOOK: symbol=%s exchange=%s depth_asked=%u bids=%u asks=%u seq=%llu",
+                 symbol.c_str(), exchange.c_str(), depth, bids, asks,
+                 static_cast<unsigned long long>(seq));
+    return {};
+}
+
 std::string QueryEngine::execute(std::string_view sql, RowCallback cb) {
     // Discarded: every caller that does not need the shape - thirty-odd of them, nearly all
     // tests - keeps the two-argument spelling rather than growing an argument it ignores.

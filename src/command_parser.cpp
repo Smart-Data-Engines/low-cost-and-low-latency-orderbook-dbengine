@@ -119,6 +119,8 @@ static constexpr CommandGrammar kGrammar[] = {
      "UNSUBSCRIBE [id], where no id means every subscription of this session", true},
     {CommandType::AUTH,         "AUTH",         3,
      "AUTH to ask for a challenge, or AUTH <identity> <response> to answer one", false},
+    {CommandType::BOOK,         "BOOK",         4,
+     "BOOK <symbol> <exchange> [depth]", true},
 };
 
 static_assert(std::size(kGrammar) == static_cast<size_t>(CommandType::UNKNOWN),
@@ -392,6 +394,52 @@ Command parse_command(std::string_view line) {
         return cmd;
     }
 
+    if (iequals(first, "BOOK")) {
+        // Two bare tokens rather than the query language's `'SYM'.'EXCH'`, and the spec's first
+        // sketch had it the other way round. The quoted form belongs to the commands this layer
+        // hands to the SQL parser; `BOOK` is tokenised here, like `INSERT` and `MINSERT`, which
+        // are the other per-symbol tokenised commands. A quote parser for one command would be a
+        // second syntax for one idea.
+        static constexpr const char* kBookUsage = "BOOK <symbol> <exchange> [depth]";
+        if (tokens.size() < 3) {
+            return refuse(cmd, std::string("BOOK needs a symbol and an exchange; BOOK takes: ") +
+                                   kBookUsage);
+        }
+        cmd.type = CommandType::BOOK;
+        cmd.book_args.symbol   = std::string(tokens[1]);
+        cmd.book_args.exchange = std::string(tokens[2]);
+
+        if (tokens.size() >= 4) {
+            uint32_t depth_val = 0;
+            auto sv = tokens[3];
+            auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), depth_val);
+            if (ec != std::errc{} || ptr != sv.data() + sv.size()) {
+                return refuse(cmd, "BOOK depth is not a number: '" + std::string(sv) +
+                                       "'; BOOK takes: " + kBookUsage);
+            }
+            if (depth_val == 0) {
+                // Refused rather than read as "no depth given": an empty answer on request is
+                // indistinguishable from a book that is not there, and those are different
+                // answers. Omit the argument to ask for everything.
+                return refuse(cmd, std::string("BOOK depth must be at least 1; omit it to ask for "
+                                               "every level. BOOK takes: ") + kBookUsage);
+            }
+            if (depth_val > MAX_LEVELS) {
+                // Named, not clamped. A client asking for five thousand levels is asking for
+                // something this engine cannot store, and silence makes that its own reading
+                // error (#107).
+                return refuse(cmd, "BOOK depth '" + std::string(sv) + "' exceeds the maximum " +
+                                       std::to_string(MAX_LEVELS) + " levels per side; BOOK "
+                                       "takes: " + kBookUsage);
+            }
+            cmd.book_args.depth = depth_val;
+        }
+        OB_LOG_DEBUG("cmd_parser", "Parsed command: BOOK symbol=%s exchange=%s depth=%u",
+                     cmd.book_args.symbol.c_str(), cmd.book_args.exchange.c_str(),
+                     cmd.book_args.depth);
+        return cmd;
+    }
+
     if (iequals(first, "SUBSCRIBE")) {
         cmd.type = CommandType::SUBSCRIBE;
         // The whole line, including the keyword: the query engine parses it, not this layer.
@@ -604,6 +652,21 @@ std::string format_command(const Command& cmd) {
             out += std::to_string(lvl.count);
             out += '\n';
         }
+        return out;
+    }
+
+    case CommandType::BOOK: {
+        const auto& a = cmd.book_args;
+        // The depth is emitted only when one was given, for the reason `INSERT`'s timestamp is:
+        // a formatter that filled it in would turn "everything the side has" into a fixed number
+        // the first time anything round-tripped a command, and the fuzzer's oracle compares these
+        // structures field by field (#38, #105).
+        std::string out = "BOOK " + a.symbol + " " + a.exchange;
+        if (a.depth != 0) {
+            out += ' ';
+            out += std::to_string(a.depth);
+        }
+        out += '\n';
         return out;
     }
 
