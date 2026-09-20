@@ -2256,6 +2256,22 @@ clearing a partially-sent one corrupted the peer's framing. The output side was 
 before the input side, which is the ordinary direction for this mistake: the bytes you send are
 yours to count, and the bytes you receive arrive whether you counted them or not.
 
+**Mutations: four, each with the verdict it was meant to give — per test, because the point of
+three tests is that they answer differently.**
+
+| mutation | no-newline | pending `MINSERT` | the control |
+|---|---|---|---|
+| no ceiling at all | **fails** | **fails** | passes |
+| the ceiling counts the receive buffer only | passes | **fails** | passes |
+| the ceiling is 1024 bytes | passes | passes | **fails** |
+| the refusal is reworded | passes | passes | passes |
+
+Row two is the design decision, demonstrated: a fix that bounded only the receive buffer leaves the
+`MINSERT` route wide open, and one number over both accumulations is what closes it. Row three is
+why the control exists — a ceiling below real traffic passes both refusals and would have shipped.
+Row four is the control mutation and survives. Baseline green before and after; sources restored
+byte for byte.
+
 - Effort: S | Impact: P0 by consequence — a single unauthenticated connection exhausts the memory
   of a node that is otherwise healthy, and the refusal it needed was one comparison
 
