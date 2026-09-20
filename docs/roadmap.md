@@ -2224,31 +2224,43 @@ first version of the design said `boost` buys cores for throughput. That was wro
 customer: the client loop blocks in `epoll_wait`, so every request waits for the kernel to wake the
 io thread, and a trading firm buys the latency tail rather than batch throughput.
 
-**Measured, m9g.xlarge, four interleaved rounds of 20,000 `PING` round trips through a bare socket**
-(a C++ probe, so the number is about the server and the kernel rather than about a client), against
-the same tree with `epoll_wait(..., 0)` as its only change:
+**Measured through the flag, m9g.xlarge, seven interleaved rounds of 20,000 `PING` round trips
+through a bare socket** (a C++ probe, so the number is about the server and the kernel rather than
+about a client), the order alternated, `loadavg` 0.01-0.05 throughout:
 
-| | p50 | p99 | minimum | server CPU |
-|---|---|---|---|---|
-| blocking | 7963 ns | 8276 ns | 5964 ns | 8.5 ticks |
-| spinning | **6342 ns** | **6720 ns** | 5915 ns | 13.5 ticks |
-| difference | **−20.4%** | **−18.8%** | ~0% | **+59%** |
+| | p50 | p99 | minimum | server CPU for 20,000 | while the probe ran |
+|---|---|---|---|---|---|
+| `eco` | 8074 ns | 8369 ns | 7573 ns | 0.090 s | 56% of a core |
+| `boost` | **6578 ns** | **6837 ns** | **5993 ns** | 0.120 s | 91% of a core |
+| difference | **−18.5%** | **−18.3%** | −20.9% | **+33%** | |
 
-**The minimum row is the one that says what this is.** ~5.9 µs is the irreducible floor of the
-syscalls and the loopback and it is identical in both, so what leaves p50 and p99 is 1.6 µs of the
-8.0 — the same amount at both percentiles, which is what says wake-up rather than tail. A change
-that took a tail off would have moved p99 and left p50 alone.
+Medians of the rounds. `eco`'s p50 spans 7978-8130 ns round to round and `boost`'s 6499-6640, so
+the difference is an order of magnitude wider than the spread it is read against.
 
-**The spin has to have a window, and that is the one correction the measurement forced.** The
-variant measured above is a bare timeout of zero, which on an idle node burns a core indefinitely —
-the modest CPU figure in that table is an artefact of the probe keeping the loop busy for the whole
-run. The shipped mode polls for a bounded window after the last event and then goes back to
-blocking, so under continuous traffic there is no wake-up and an idle node costs nothing. The cost
-to state publicly is therefore **"up to one core while traffic flows"**, not "one core".
+**What says this is a constant on every round trip rather than a tail: p50 and p99 fall by the same
+absolute amount**, 1496 ns and 1532 ns. A tail would take far more off p99.
+
+**The bounded window costs nothing against spinning for ever, and the third column is what makes
+the window defensible rather than cautious.** `--io-spin-us 100000000` never closes, which is byte
+for byte the `epoll_wait(..., 0)` variant the gate was measured on: three rounds gave p50
+**6578 ns** — the same median as `boost` — for **0.130 s** of CPU, 98% of a core. Same latency,
+lower idle cost, and on an idle node the difference is the whole of it: always-spin holds that core
+indefinitely while `boost` returns to nothing, which is why the public cost is **"up to one core
+while traffic flows"**. The integration test asserts the idle half, because it is the one claim
+here that nothing else can check.
+
+**And one claim from the gate measurement is withdrawn rather than quietly replaced.** That run
+reported the **minimum unchanged** (5964 against 5915 ns) and I published "the minimum does not
+move" as what distinguishes a wake-up from a tail. It does move: `eco`'s minimum is 6327-7689 ns
+across seven rounds against `boost`'s 5955-6076, about the same 1.5 µs as the percentiles, with
+more spread because a blocking loop is occasionally already awake when the next request arrives.
+The gate's figure does not reproduce with this probe and I cannot explain it, so the honest course
+is to say so and rest the claim on the two percentiles falling by the same amount, which is
+stronger anyway. The gate was a hand-edited loop; this is the flag.
 
 **What the measurement does not say, and it belongs next to the number rather than in a footnote:**
 this is loopback on one machine. Across a real network a round trip is orders of magnitude larger
-and 1.6 µs stops being 20% and becomes noise. The mode is worth exactly what it is worth to a
+and 1.5 µs stops being 18% and becomes noise. The mode is worth exactly what it is worth to a
 **colocated** client, and `docs/cli.md` says so where an operator will read it.
 
 **Three refusals, each because the alternative is silent.** An unknown name is refused with the
@@ -2265,7 +2277,16 @@ its reader to re-run it. The static half is what the unit tests cannot reach —
 with a literal at the one `epoll_wait` call site reinstates the blocking behaviour and leaves every
 unit test green, because they measure the function rather than its use.
 
-**Mutations: six, each with the verdict it was meant to give.**
+**And the integration module adds the two questions that need a process, which is the only reason it
+exists.** A node with the mode on serves normally, with `eco` as the control in the same
+parametrised test — the window lives inside the event loop, so a mistake there costs missed events
+rather than a wrong answer, and a wrong answer is what a client sees. And the window **closes**:
+three seconds of idling with a threshold three orders of magnitude clear of the value (#129's
+shape), plus a `PING` afterwards, because a window that closed because the loop stopped looking
+would satisfy a CPU assertion perfectly.
+
+**Mutations: seven, each with the verdict it was meant to give — and the last row is the reason
+the other six are worth reading.**
 
 | mutation | verdict |
 |---|---|
@@ -2274,15 +2295,30 @@ unit test green, because they measure the function rather than its use.
 | the profile block accepts any name | **killed** |
 | the value is attributed to `Origin::Default` rather than `Origin::Profile` | **killed** |
 | the window boundary is `<=` rather than `<` | **killed** |
-| `kBoostSpinUs` widened to 5.5 minutes | **survives** |
+| `kBoostSpinUs` widened past the documented window, to 5 ms | **killed** |
+| `kBoostSpinUs` retuned inside the documented window, to 200 µs | **survives** (control) |
 
-Row one is why the static test exists. Row six is the control and survives deliberately: every
+**Row one is why the static test exists, and it is there because the first version of that test did
+not kill it.** That version asked only whether `io_wait_ms(` appears in `src/tcp_server.cpp` —
+which it does, as its own definition — so replacing the computed timeout with a literal **survived**
+a check satisfied by a mention rather than by a use. It requires every assignment to `wait_ms` to
+come through `io_wait_ms(` now, and counts them.
+
+**Rows six and seven are one claim from two sides, and the control had to be fixed twice.** Every
 expectation about the window is written in terms of `kBoostSpinUs` rather than pinned to 50, because
 pinning the number fails on any legitimate retuning and teaches a reader that the test is noise
-(#121's lesson). What the bounds say instead is that the two ends are different modes — zero makes
-`boost` identical to `eco`, and a window past a millisecond is a node that mostly spins, which is a
-different promise from the one the reference prints. A widening large enough to change an answer
-does not compile; one small enough to compile changes nothing observable.
+(#121's lesson). What the two rows say is that the bounds are load-bearing: zero makes `boost`
+identical to `eco` and a window past a millisecond is a node that mostly spins, so a widening large
+enough to change an answer **does not compile**, while one small enough to compile changes nothing
+observable. The first draft of row seven said 5.5 minutes, copied from #121 where the bound is
+measured in minutes — a **kill** here, caught by writing the table before running it. And the
+corrected 200 µs killed as well, which is the whole value of keeping a control: the provenance test
+was looking for the literal `"50"` in the rendered line, which is #121's mistake committed in the
+test written to honour it, invisible to reading, and findable only by a mutation that moves the
+constant.
+
+Baseline green before and after; sources restored byte for byte, with the mtime touched, because
+`copy2` restores the backup's timestamp and the rebuild after it then does nothing.
 
 - Effort: S | Impact: the first knob in this engine that trades CPU for latency rather than for
   durability or throughput, and the only one whose public cost has to name the deployment it is

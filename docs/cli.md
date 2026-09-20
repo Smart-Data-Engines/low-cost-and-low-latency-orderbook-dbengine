@@ -280,26 +280,36 @@ them, whether or not anything else is in flight.
 is byte for byte what the server always did; `boost` sets `--io-spin-us`, so the io thread keeps
 polling for a while after an event instead of blocking immediately.
 
-What that buys is the **kernel wake-up**, and it is a constant rather than a tail. Measured on an
-m9g.xlarge over loopback, four interleaved rounds of 20,000 `PING` round trips through a bare
-socket:
+What that buys is the **kernel wake-up**, and it is a constant on every round trip rather than a
+tail. Measured on an m9g.xlarge over loopback, seven interleaved rounds of 20,000 `PING` round
+trips through a bare socket, the order alternated, `loadavg` 0.01-0.05 throughout — and measured
+**through the flag**, so the figures describe what ships rather than a hand-edited loop:
 
-| | p50 | p99 | minimum | server CPU |
-|---|---|---|---|---|
-| `eco` | 7963 ns | 8276 ns | 5964 ns | 8.5 ticks |
-| `boost` | **6342 ns** | **6720 ns** | 5915 ns | 13.5 ticks |
-| difference | **−20.4%** | **−18.8%** | ~0% | **+59%** |
+| | p50 | p99 | minimum | server CPU for 20,000 | while the probe ran |
+|---|---|---|---|---|---|
+| `eco` | 8074 ns | 8369 ns | 7573 ns | 0.090 s | 56% of a core |
+| `boost` | **6578 ns** | **6837 ns** | **5993 ns** | 0.120 s | 91% of a core |
+| difference | **−18.5%** | **−18.3%** | −20.9% | **+33%** | |
 
-The minimum row is the one to read first: ~5.9 µs is the irreducible floor of the syscalls and the
-loopback and it does not move, so what leaves p50 and p99 is 1.6 µs of the 8.0 — the same amount at
-both percentiles, which is what says wake-up rather than tail.
+Medians of the rounds. Round to round, `eco`'s p50 spans 7978-8130 ns and `boost`'s 6499-6640, so
+the difference is an order of magnitude wider than the spread it is read against.
 
-**Two things this measurement does not say.** It is loopback on one machine: across a real network
-a round trip is orders of magnitude larger and 1.6 µs stops being 20% and becomes noise, so the
-mode is worth exactly what it is worth to a **colocated** client. And the figures above come from a
-bare `epoll_wait(..., 0)`, which on an idle node burns a core indefinitely; the shipped mode spins
-for a bounded window after the last event and then goes back to blocking, so the cost to state
-publicly is **"up to one core while traffic flows"** rather than "one core".
+**p50 and p99 fall by the same absolute amount** — 1496 ns and 1532 ns — which is what says a
+constant on every round trip; a tail would take far more off p99 than off p50. The minimum moves
+too, and by about the same amount, with more spread (`eco`'s ranges 6327-7689 across the rounds)
+because a blocking loop is occasionally already awake when the next request arrives.
+
+**The bounded window costs nothing against spinning for ever, and that is measured rather than
+assumed.** `--io-spin-us 100000000` is a window long enough never to close, which is byte for byte
+"always spin": three rounds gave p50 **6578 ns** — the same median as `boost` — for **0.130 s** of
+CPU, 98% of a core. So the window buys back the idle cost and gives up no latency under continuous
+traffic, which is the whole reason the mode has one: with no window an idle node holds a core
+indefinitely, and the honest public cost is **"up to one core while traffic flows"** rather than
+"one core".
+
+**One thing this measurement does not say.** It is loopback on one machine: across a real network a
+round trip is orders of magnitude larger and 1.5 µs stops being 18% and becomes noise. The mode is
+worth exactly what it is worth to a **colocated** client.
 
 `--io-spin-us` is the knob underneath and can be set on its own — a value the operator gave wins
 over the profile, and `--print-config` says which of the two a value came from. `--profile`
