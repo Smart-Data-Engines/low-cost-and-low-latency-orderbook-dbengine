@@ -574,7 +574,7 @@ ob_status_t Engine::apply_delta_impl(const DeltaUpdate& delta_in, const Level* l
     const std::string symbol_key = std::string(delta.symbol) + "." + delta.exchange;
 
     // Reject writes to migrated symbols (Requirement 6.6).
-    if (migrated_symbols_.count(symbol_key)) {
+    if (!migrated_symbols_.empty() && migrated_symbols_.count(symbol_key)) {
         OB_LOG_WARN("engine", "Rejecting write to migrated symbol: symbol_key=%s",
                     symbol_key.c_str());
         return OB_ERR_MIGRATED;
@@ -703,7 +703,7 @@ ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta_in, const Level* lev
     const std::string symbol_key = std::string(delta.symbol) + "." + delta.exchange;
 
     // Reject writes to migrated symbols (Requirement 6.6).
-    if (migrated_symbols_.count(symbol_key)) {
+    if (!migrated_symbols_.empty() && migrated_symbols_.count(symbol_key)) {
         OB_LOG_WARN("engine", "Rejecting write to migrated symbol: symbol_key=%s",
                     symbol_key.c_str());
         return OB_ERR_MIGRATED;
@@ -2142,10 +2142,27 @@ void Engine::flush_drain_pending() {
     const uint32_t wal_file   = wal_pos.file_index;
     const uint64_t wal_offset = static_cast<uint64_t>(wal_pos.offset);
 
+    // The store is resolved per **run of one symbol**, not per row. Pending rows arrive an update
+    // at a time and an update is one symbol's levels, so consecutive rows almost always share a
+    // symbol — and `get_or_create_store()` builds `symbol + "." + exchange` and hashes it on every
+    // call. Measured before this: `get_or_create_store` was **5.06%** of the server's CPU under a
+    // pipelining client, all of it inside this loop, for a lookup whose answer had just been
+    // computed. Same shape as #66, which found the write path building one symbol key four times.
+    //
+    // Compared by value rather than cached across calls: a run is a local fact about this vector,
+    // so nothing survives the function and there is no invalidation to get wrong when a snapshot
+    // install replaces `stores_` (#142).
+    const std::string* run_symbol   = nullptr;
+    const std::string* run_exchange = nullptr;
+    ColumnarStore*     store        = nullptr;
     for (const auto& pr : pending_rows_) {
-        ColumnarStore& store = get_or_create_store(pr.symbol, pr.exchange);
-        store.set_wal_position(wal_identity_, wal_file, wal_offset);
-        store.append(pr.row);
+        if (store == nullptr || *run_symbol != pr.symbol || *run_exchange != pr.exchange) {
+            store        = &get_or_create_store(pr.symbol, pr.exchange);
+            run_symbol   = &pr.symbol;
+            run_exchange = &pr.exchange;
+            store->set_wal_position(wal_identity_, wal_file, wal_offset);
+        }
+        store->append(pr.row);
     }
     pending_rows_.clear();
 
