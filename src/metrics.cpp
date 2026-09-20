@@ -84,6 +84,13 @@ MetricsRegistry::MetricsRegistry() {
     // answers clients (#112).
     counters_.push_back(make_counter("ob_flush_errors_total",
                                      "Flush ticks that ended in an exception and were retried"));
+    // A session dropped for holding more unparsed input than a command can legitimately need
+    // (#143). Registered in the same change that writes it. It is the only external sign of this
+    // refusal, and it distinguishes the two ways a client can reach it: bytes with no newline at
+    // all, and a `MINSERT` that announced levels and then sent oversized payload lines. Neither
+    // was bounded before, and neither could be seen by the per-line length check.
+    counters_.push_back(make_counter("ob_sessions_unparsed_overflow_total",
+                                     "Sessions closed for unparsed input above the ceiling"));
     // Failed `fsync` calls on the WAL (#113). Separate from ob_flush_errors_total because the
     // two ask for different actions: a full disk is freed, a disk reporting EIO is replaced.
     counters_.push_back(make_counter("ob_wal_fsync_errors_total",

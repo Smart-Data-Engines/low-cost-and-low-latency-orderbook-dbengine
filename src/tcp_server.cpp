@@ -2060,6 +2060,19 @@ void TcpServer::run() {
                     }
 
                     auto lines = session->feed(buf, got);
+
+                    // Outside the loop below, and that is the whole point: a client that never
+                    // sends a newline produces **no lines**, so every check written per line —
+                    // including `max_line_length` directly under here — never runs for it, and
+                    // the session accumulates for ever. Measured before this: 227 MiB on one
+                    // unauthenticated connection took the server to 257 MiB resident (#143).
+                    if (session->unparsed_bytes() > config_.max_unparsed_bytes) {
+                        engine_->registry().increment_counter("ob_sessions_unparsed_overflow_total");
+                        session->send_response(format_error("unparsed input too long"));
+                        close_session(fd, "unparsed input too long");
+                        goto next_event;
+                    }
+
                     for (const auto& line : lines) {
                         // Check line length.
                         if (line.size() > config_.max_line_length) {

@@ -31,6 +31,19 @@ struct ServerConfig {
     int         max_sessions{64};
     int         worker_threads{4};
     size_t      max_line_length{262144}; // max command bytes (256KB, supports MINSERT with 1000 levels)
+    /// Ceiling on what one session may hold that is not yet a command (#143).
+    ///
+    /// Twice `max_line_length`, because a session can legitimately hold one `MINSERT` block being
+    /// assembled *and* the beginning of the next command, and each of those is bounded by the
+    /// line length. Anything past that is not a command in progress.
+    ///
+    /// **No command-line flag, exactly like `max_line_length` above**, which is the sibling this
+    /// bound is derived from: both are compile-time ceilings an embedder or a test can set on the
+    /// config object, and neither is on the wire-facing surface. Claiming otherwise here would
+    /// promise configurability that does not exist. There is deliberately **no** value that
+    /// disables it: nothing could set one, so the branch would be untestable and would read as an
+    /// option this engine offers.
+    size_t      max_unparsed_bytes{524288};
     bool        read_only{false};       // reject INSERT/FLUSH when true (replica mode)
 
     /// --fsync-policy: when the write-ahead log becomes durable. `every`, `interval` or `none`.
