@@ -358,6 +358,38 @@ over the profile, and `--print-config` says which of the two a value came from. 
 refuses a name it does not know, so `--profile bost` does not start a node in `eco` that looks
 like it started in `boost`.
 
+## Client event loops: `--io-threads`
+
+`--io-threads N` gives the server N client event loops. The one that holds the listening socket
+accepts every connection and deals it to the next loop in turn; a connection stays on the loop it
+was dealt to for its whole life, so the order of its answers is unchanged. `1` is the default and
+is the single loop this server always had. The log names where each connection went —
+`Reactor 2 adopted fd=14 conn_id=7 from 10.0.0.5:51234` — and the threads are named `ob-io-0` …
+`ob-io-N-1`, so `top -H` says which loop is busy.
+
+What more loops buy depends on what the connections ask, and both halves are measured (m9g.xlarge,
+four cores, loopback, four connections pipelining batches of 64; roadmap #151):
+
+| | 1 loop | 2 loops | 4 loops |
+|---|---|---|---|
+| `BOOK` reads, levels read / s | 15 992 260 | 30 254 474 | **49 212 362** |
+| `MINSERT` writes, levels / s | 4 878 479 | 4 327 641 | 4 505 432 |
+| a writer beside a connection scanning 1.5 M rows, levels / s | 65 424 | **4 995 672** | 4 877 810 |
+
+- **Reads scale with the loops**, 3.08× at four here, with the load generator on the same cores.
+- **A query no longer stalls the writes of another connection** — if that connection is on another
+  loop. At one loop a writer beside a connection looping a 134 ms scan waited behind every scan;
+  on another loop it did not notice. Connections are dealt in turn, so two can share a loop, and a
+  heavy query holds its own loop for as long as it runs.
+- **Pipelined writes from several connections do not scale yet, and cost about 10% with a tripled
+  p99.** The engine takes its write lock once per record, and with several loops writing every
+  acquisition contends. Until the engine applies a read's writes under one acquisition, a
+  write-only workload is best served by the default.
+
+`--max-sessions` is one limit for the server, not one per loop, and `--drain-timeout-ms` is one
+deadline. `FAILOVER` and `MIGRATE` run alone across the loops, as they did when one loop ran every
+command. Values from 1 to 64 are accepted, and 0 is refused rather than guessed at.
+
 ## Typical Session
 
 ```
