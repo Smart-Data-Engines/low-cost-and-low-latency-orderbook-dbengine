@@ -5,6 +5,7 @@
 #include <chrono>
 #include <fstream>
 #include <regex>
+#include <sstream>
 #include <iterator>
 #include "orderbook/command_parser.hpp"
 #include "orderbook/response_formatter.hpp"
@@ -664,6 +665,41 @@ TEST_F(ExecuteCommandTest, StatusReturnsStats) {
     EXPECT_NE(response.find("sessions"), std::string::npos);
     EXPECT_NE(response.find("queries"), std::string::npos);
     EXPECT_NE(response.find("inserts"), std::string::npos);
+}
+
+// STATUS answers the engine's figures from a snapshot of its own (#151). Formatting from the shared
+// ServerStats instead - which STATUS no longer writes, because two client loops answering STATUS at
+// once would race on its vector - answers zeros for every engine figure, and nothing in this suite
+// looked at one until the mutation that did it survived.
+TEST_F(ExecuteCommandTest, StatusAnswersTheEnginesFiguresNotTheSharedDefaults) {
+    ob::Session session(fd_server_);
+    ob::Command insert{};
+    insert.type = ob::CommandType::INSERT;
+    insert.insert_args.symbol   = "SNAP";
+    insert.insert_args.exchange = "EX";
+    insert.insert_args.side     = 0;
+    insert.insert_args.price    = 100;
+    insert.insert_args.qty      = 5;
+    insert.insert_args.count    = 1;
+    ASSERT_EQ(ob::execute_command(insert, *engine_, session, stats_), "OK\n\n");
+
+    ob::Command status{};
+    status.type = ob::CommandType::STATUS;
+    const std::string answer = ob::execute_command(status, *engine_, session, stats_);
+
+    // "OK", the header, then the values under it.
+    const auto header_end = answer.find('\n', answer.find('\n') + 1);
+    ASSERT_NE(header_end, std::string::npos) << answer;
+    const auto values_end = answer.find('\n', header_end + 1);
+    ASSERT_NE(values_end, std::string::npos) << answer;
+    std::vector<std::string> values;
+    std::istringstream row(answer.substr(header_end + 1, values_end - header_end - 1));
+    for (std::string field; std::getline(row, field, '\t');) values.push_back(field);
+    ASSERT_EQ(values.size(), 7u) << "sessions queries inserts pending_rows wal_file segments "
+                                    "symbols, got: " << answer;
+    EXPECT_EQ(values[6], "1") << "one symbol written and STATUS counts " << values[6]
+                              << ", which is what an answer from the shared defaults says";
+    EXPECT_NE(values[3], "0") << "a row pending and STATUS says none";
 }
 
 // Test UNKNOWN command → returns "ERR unknown command\n"
@@ -1736,4 +1772,17 @@ TEST(AnswerCeiling, TheLoopAnswersAnErrorInsteadOfClosing) {
         << "an answer too large to send is not replaced by an error";
     EXPECT_EQ(branch.find("close_session("), std::string::npos)
         << "an answer too large to send closes the session of a client that did nothing wrong";
+    // The error is what gets queued, and the session ends only if even the error cannot be. The
+    // first version of this rule stopped at the two lines above, and a branch that built the error,
+    // dropped it and set `queue_refused` satisfied both - the session closed exactly as before
+    // (#151's mutation row 4).
+    const auto queued = branch.find("if (!session->queue_response(refusal)) {");
+    ASSERT_NE(queued, std::string::npos) << "the error replacing the answer is not queued";
+    const auto refused = branch.find("queue_refused = true;");
+    EXPECT_TRUE(refused == std::string::npos || refused > queued)
+        << "the branch gives up on the session before trying to queue the error";
+    EXPECT_EQ(branch.find("queue_refused = true;", refused == std::string::npos ? 0 : refused + 1),
+              std::string::npos)
+        << "the branch gives up on the session on more than the one path where the error itself "
+           "does not fit";
 }
