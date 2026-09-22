@@ -6,6 +6,7 @@
 #include "orderbook/metrics.hpp"
 #include "orderbook/metrics_server.hpp"
 #include "orderbook/shard_coordinator.hpp"
+#include "orderbook/loop_guard.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -1716,9 +1717,664 @@ TcpServer::TcpServer(ServerConfig config)
 }
 
 TcpServer::~TcpServer() {
-    if (epoll_fd_ >= 0) ::close(epoll_fd_);
     if (listen_fd_ >= 0) ::close(listen_fd_);
 }
+
+// ── Reactor ───────────────────────────────────────────────────────────────────
+//
+// One epoll loop and the sessions it owns: what `TcpServer::run()` was, taken out of it so there
+// can be more than one ("the engine uses the whole machine", stage 2). A `Session`
+// is not thread-safe and never was, so a session belongs to exactly one reactor for its whole life,
+// and everything a reactor does to one - reading, answering, arming EPOLLOUT, closing - happens on
+// that reactor's thread.
+//
+// What every reactor of one server shares is in `ReactorShared`, and it is references: the server
+// owns all of it and outlives every reactor. The counters in `ServerStats` are atomics for exactly
+// this reason.
+
+namespace {
+
+struct ReactorShared {
+    const ServerConfig&      config;
+    Engine&                  engine;
+    const LoadedTlsContexts& tls;
+    const LoadedSecrets&     secrets;
+    std::atomic<bool>&       running;
+    std::atomic<bool>&       draining;
+    std::atomic<bool>&       read_only;
+    ServerStats&             stats;
+    ShardCoordinator*        shard_coord;
+    MetricsServer*           metrics_server;
+};
+
+class Reactor {
+public:
+    /// `listen_fd` is the server's listening socket for the reactor that accepts, and a descriptor
+    /// of -1 for any other. A reference, because the reactor that accepts is also the one that
+    /// closes it when a drain begins, and the server's destructor must see that.
+    Reactor(int index, const ReactorShared& shared, int& listen_fd);
+    ~Reactor();
+
+    Reactor(const Reactor&) = delete;
+    Reactor& operator=(const Reactor&) = delete;
+
+    /// The event loop. Returns when the server stops running: a drain that finished or reached its
+    /// deadline, or a fatal `epoll_wait()` error. Every session still open is closed on the way out.
+    void run_loop();
+
+private:
+    /// One place that closes a session, so every close carries a reason in the log.
+    /// This used to be five copies of the same four lines, none of them logging,
+    /// which is why a session dying in the middle of a large response left no trace.
+    void close_session(int fd, const char* reason);
+
+    /// Arm EPOLLOUT for a session with queued output, and disarm once it drains.
+    ///
+    /// Armed only after a partial write. Leaving EPOLLOUT armed permanently on an
+    /// edge-triggered fd spins the loop and burns a core.
+    void arm_epollout(int fd);
+    void disarm_epollout(int fd);
+
+    const int                index_;
+    const ServerConfig&      config_;
+    Engine*                  engine_;
+    const LoadedTlsContexts& tls_;
+    const LoadedSecrets&     secrets_;
+    std::atomic<bool>&       running_;
+    std::atomic<bool>&       draining_;
+    std::atomic<bool>&       read_only_;
+    ServerStats&             stats_;
+    ShardCoordinator*        shard_coord_;
+    MetricsServer*           metrics_server_;
+    int&                     listen_fd_;
+    int                      epoll_fd_{-1};
+
+    SessionManager  sessions_;
+
+    // Streaming subscriptions (#45). Owned by this loop, and its eventfd joins the epoll set: a
+    // notification arriving from another thread enqueues and wakes us, because Session is not
+    // thread-safe and arming EPOLLOUT belongs to this thread.
+    SubscriptionHub hub_;
+
+    /// Monotonic per run. Descriptor numbers are reused, so a subscription pinned to `fd` alone
+    /// would outlive its connection and push rows to whoever inherits the number.
+    uint64_t next_conn_id_{1};
+
+    static constexpr int MAX_EVENTS = 64;
+    struct epoll_event   events_[MAX_EVENTS]{};
+
+    // Whether this loop has already reacted to a shutdown request. See the note in shutdown():
+    // the descriptors and the metrics server belong to this thread, and only this thread closes
+    // them.
+    bool drain_started_{false};
+    // Only read once `drain_started_` is true, so the value before the drain begins is never used.
+    std::chrono::steady_clock::time_point drain_started_at_{};
+
+    // What has already been published to the monotonic counters, so the loop can publish deltas.
+    uint64_t published_rows_pushed_{0};
+    uint64_t published_overflow_disconnects_{0};
+    uint64_t published_refused_{0};
+
+    // The wait is a decision rather than a constant since the io-spin profile: `io_wait_ms()`
+    // answers 0 while the spin window since the last event is open and the blocking timeout
+    // otherwise, so `--io-spin-us 0` — the default — is byte for byte the old behaviour.
+    std::chrono::steady_clock::time_point last_event_at_{};
+
+    /// The per-event boundary (#112, #131): what the log calls this loop, and the guard that is
+    /// loud once per episode and counts every occurrence in `ob_loop_errors_total`.
+    std::string event_what_;
+    LoopGuard   event_guard_;
+};
+
+Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd)
+    : index_(index)
+    , config_(shared.config)
+    , engine_(&shared.engine)
+    , tls_(shared.tls)
+    , secrets_(shared.secrets)
+    , running_(shared.running)
+    , draining_(shared.draining)
+    , read_only_(shared.read_only)
+    , stats_(shared.stats)
+    , shard_coord_(shared.shard_coord)
+    , metrics_server_(shared.metrics_server)
+    , listen_fd_(listen_fd)
+    , sessions_(shared.config.max_sessions)
+    , hub_(shared.config.max_subscriber_queue_bytes, shared.config.max_subscriptions_per_session)
+    , event_what_("serving a client event on reactor " + std::to_string(index))
+    , event_guard_("tcp_server", event_what_.c_str(), &shared.engine.registry()) {
+    // 5. Create epoll instance.
+    epoll_fd_ = ::epoll_create1(0);
+    if (epoll_fd_ < 0) {
+        throw std::runtime_error(std::string("epoll_create1() failed: ") + std::strerror(errno));
+    }
+
+    // 6. Add the listening socket to epoll, on the reactor that accepts.
+    if (listen_fd_ >= 0) {
+        struct epoll_event ev{};
+        ev.events  = EPOLLIN;
+        ev.data.fd = listen_fd_;
+        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &ev) < 0) {
+            const std::string why = std::strerror(errno);
+            ::close(epoll_fd_);
+            epoll_fd_ = -1;
+            throw std::runtime_error("epoll_ctl() failed: " + why);
+        }
+    }
+
+    if (hub_.wakeup_fd() >= 0) {
+        struct epoll_event hub_ev{};
+        hub_ev.events  = EPOLLIN;
+        hub_ev.data.fd = hub_.wakeup_fd();
+        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, hub_.wakeup_fd(), &hub_ev) < 0) {
+            OB_LOG_ERROR("tcp_server", "epoll_ctl on the subscription wakeup fd failed: %s",
+                         std::strerror(errno));
+        } else {
+            OB_LOG_INFO("tcp_server", "Subscription hub wakeup fd=%d joined the epoll set",
+                        hub_.wakeup_fd());
+        }
+    }
+    OB_LOG_DEBUG("tcp_server", "Reactor %d ready: epoll fd=%d, accepts=%s", index_, epoll_fd_,
+                 listen_fd_ >= 0 ? "yes" : "no");
+}
+
+Reactor::~Reactor() {
+    if (epoll_fd_ >= 0) {
+        ::close(epoll_fd_);
+        epoll_fd_ = -1;
+    }
+}
+
+void Reactor::close_session(int fd, const char* reason) {
+    size_t pending = 0;
+    if (Session* s = sessions_.get_session(fd)) {
+        pending = s->pending_output_bytes();
+    }
+    OB_LOG_INFO("tcp_server",
+                "Closing session: fd=%d reason=%s pending_bytes=%zu",
+                fd, reason, pending);
+    ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+    // Before remove_session, and the order is load-bearing: the other way round leaves a window
+    // in which a notification lands in a queue whose session is already gone, and the hub would
+    // have to tolerate that instead of the invariant holding.
+    if (Session* s = sessions_.get_session(fd)) {
+        hub_.remove_connection(*engine_, fd, s->conn_id());
+    }
+    sessions_.remove_session(fd);
+    stats_.active_sessions.fetch_sub(1, std::memory_order_relaxed);
+    engine_->registry().increment_gauge("ob_active_sessions", -1);
+}
+
+void Reactor::arm_epollout(int fd) {
+    if (epoll_fd_ < 0 || fd < 0) return;
+
+    struct epoll_event ev{};
+    ev.events  = EPOLLIN | EPOLLOUT | EPOLLET;
+    ev.data.fd = fd;
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0) {
+        OB_LOG_WARN("tcp_server", "arm_epollout failed: fd=%d errno=%s",
+                    fd, std::strerror(errno));
+    }
+}
+
+void Reactor::disarm_epollout(int fd) {
+    if (epoll_fd_ < 0 || fd < 0) return;
+
+    // Back to read-only interest. Leaving EPOLLOUT armed on an edge-triggered fd
+    // makes epoll_wait return immediately whenever the socket is writable, which is
+    // almost always, and the loop spins on a core for nothing.
+    struct epoll_event ev{};
+    ev.events  = EPOLLIN | EPOLLET;
+    ev.data.fd = fd;
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0) {
+        OB_LOG_WARN("tcp_server", "disarm_epollout failed: fd=%d errno=%s",
+                    fd, std::strerror(errno));
+    }
+}
+
+// At column zero on purpose, like every loop in src/: the scan in `tests/test_thread_boundaries.cpp`
+// finds a loop by that signature and has to classify it (#131).
+void Reactor::run_loop() {
+    last_event_at_ = std::chrono::steady_clock::now();
+    while (running_.load(std::memory_order_relaxed)) {
+        const int wait_ms = io_wait_ms(last_event_at_, config_.io_spin_us, 100,
+                                       std::chrono::steady_clock::now());
+        int nfds = ::epoll_wait(epoll_fd_, events_, MAX_EVENTS, wait_ms);
+        if (nfds > 0) last_event_at_ = std::chrono::steady_clock::now();
+        if (nfds < 0) {
+            if (errno == EINTR) continue;
+            break; // fatal epoll error
+        }
+
+        // Subscriptions, once per iteration and before the event loop below.
+        //
+        // Unconditional, and not inside a branch on the wakeup fd — the same decision as
+        // `poll_snapshot_preparation()` in the multi-master loop (#79): a plain 100 ms timeout also
+        // picks up anything queued, so a lost wake-up costs latency rather than delivery.
+        {
+            const auto condemned = hub_.drain(
+                sessions_, [&](int fd) { arm_epollout(fd); });
+            for (int fd : condemned) {
+                close_session(fd, "subscriber queue overflowed");
+            }
+            engine_->registry().set_gauge(
+                "ob_subscriptions_active",
+                static_cast<int64_t>(hub_.active()));
+            engine_->registry().set_gauge(
+                "ob_subscription_queued_bytes",
+                static_cast<int64_t>(hub_.queued_bytes()));
+            // Counters are monotonic and only ever incremented, so the loop publishes the delta
+            // against what it last saw rather than the hub's total. The hub keeps its own totals
+            // because it is testable without a registry, and a second source of truth here would be
+            // the kind that drifts.
+            const auto publish = [&](const char* name, uint64_t total, uint64_t& seen) {
+                if (total > seen) {
+                    engine_->registry().increment_counter(name, total - seen);
+                    seen = total;
+                }
+            };
+            publish("ob_subscription_rows_pushed_total", hub_.rows_pushed(),
+                    published_rows_pushed_);
+            publish("ob_subscription_overflow_disconnects_total",
+                    hub_.overflow_disconnects(), published_overflow_disconnects_);
+            publish("ob_subscription_refused_total", hub_.refused(),
+                    published_refused_);
+        }
+
+        // Once per loop iteration, not per event: the sum walks the session map, and
+        // there is nothing to learn from updating it several times per wake-up.
+        engine_->registry().set_gauge(
+            "ob_session_pending_bytes",
+            static_cast<int64_t>(sessions_.total_pending_output_bytes()));
+
+        // One event is the unit a failure costs, not the reactor: an exception while serving one
+        // closes that session, is counted, and the loop goes on with the rest of the batch. The
+        // rest matters because every client descriptor is edge-triggered, so an event abandoned
+        // with its batch is not delivered again - the reason the mesh loop guards per event too.
+        bool threw_this_pass = false;
+        for (int i = 0; i < nfds; ++i) {
+            int fd = events_[i].data.fd;
+            try {
+
+                if (fd == listen_fd_) {
+                    // Draining: stop accepting new connections.
+                    if (draining_.load(std::memory_order_relaxed)) {
+                        // Reject all pending connections.
+                        //
+                        // OB_NO_TCP_NODELAY: one line and a close, so there is never an earlier
+                        // unacknowledged byte for Nagle to hold a second write behind (#140).
+                        while (true) {
+                            int reject_fd = ::accept4(listen_fd_, nullptr, nullptr, SOCK_NONBLOCK);
+                            if (reject_fd < 0) break;
+                            const char* msg = "ERR server shutting down\n";
+                            auto wr = ::send(reject_fd, msg, std::strlen(msg), MSG_NOSIGNAL);
+                            (void)wr;
+                            ::close(reject_fd);
+                        }
+                        continue;
+                    }
+
+                    // Accept new connection(s).
+                    while (true) {
+                        struct sockaddr_in client_addr{};
+                        socklen_t client_len = sizeof(client_addr);
+                        int client_fd = ::accept4(listen_fd_,
+                                                  reinterpret_cast<struct sockaddr*>(&client_addr),
+                                                  &client_len,
+                                                  SOCK_NONBLOCK);
+                        if (client_fd < 0) {
+                            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                            break; // accept error, continue loop
+                        }
+
+                        // Before anything is written to it, including the banner: a client that
+                        // pipelines pays a delayed-ACK timer per round trip without this (#140).
+                        set_tcp_nodelay(client_fd, "tcp_server");
+
+                        if (!sessions_.add_session(client_fd, next_conn_id_++)) {
+                            // Server full — reject.
+                            const char* msg = "ERR server full\n";
+                            auto wr = ::send(client_fd, msg, std::strlen(msg), MSG_NOSIGNAL);
+                            (void)wr;
+                            ::close(client_fd);
+                            continue;
+                        }
+
+                        // Add to epoll (edge-triggered).
+                        struct epoll_event cev{};
+                        cev.events  = EPOLLIN | EPOLLET;
+                        cev.data.fd = client_fd;
+                        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &cev) < 0) {
+                            sessions_.remove_session(client_fd);
+                            continue;
+                        }
+
+                        stats_.active_sessions.fetch_add(1, std::memory_order_relaxed);
+                        engine_->registry().increment_gauge("ob_active_sessions");
+
+                        Session* s = sessions_.get_session(client_fd);
+                        if (s && tls_.client_port) {
+                            // Wrap before anything is written: the banner is application data and must
+                            // not precede the handshake. It is queued here and goes out with the first
+                            // flush after the handshake completes, which is what send_response() on a
+                            // handshaking session does - the bytes sit in send_buf_ and SSL_write is
+                            // not reached until tls_handshaking_ clears.
+                            try {
+                                s->enable_tls(tls_.client_port->wrap(client_fd, /*server_side=*/true));
+                                OB_LOG_DEBUG("tls", "handshake started: fd=%d", client_fd);
+                            } catch (const std::exception& e) {
+                                OB_LOG_WARN("tls", "cannot start a handshake on fd=%d: %s",
+                                            client_fd, e.what());
+                                sessions_.remove_session(client_fd);
+                                ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr);
+                                ::close(client_fd);
+                                stats_.active_sessions.fetch_sub(1, std::memory_order_relaxed);
+                                engine_->registry().increment_gauge("ob_active_sessions", -1);
+                                continue;
+                            }
+                        }
+
+                        // Send welcome message. The version comes from the build system like
+                        // every other place a node reports it (#90); this one was a literal until
+                        // #148, so the first bump would have made the banner name a build that was
+                        // not running.
+                        if (s) {
+                            static const std::string banner =
+                                "OK ob_tcp_server v" + std::string(version()) + "\n\n";
+                            s->send_response(banner);
+                        }
+                    }
+                } else {
+                    // Writable first: a session with queued output is waiting on this,
+                    // and draining it may be the only thing that lets the client send
+                    // its next command.
+                    if (events_[i].events & EPOLLOUT) {
+                        Session* session = sessions_.get_session(fd);
+                        if (session) {
+                            // A handshake that wanted to write is why this event arrived.
+                            if (session->tls_handshaking()) {
+                                if (!session->continue_tls_handshake()) {
+                                    close_session(fd, "tls handshake failed");
+                                    continue;
+                                }
+                                if (session->io_want() == IoWant::Write) continue;  // still writing
+                                disarm_epollout(fd);
+                                if (session->tls_handshaking()) continue;           // now wants to read
+                            }
+                            if (!session->flush_output()) {
+                                close_session(fd, "flush failed");
+                                continue;
+                            }
+                            // Disarm unless OpenSSL still wants to write. With TLS, bytes can remain
+                            // queued while OpenSSL is waiting to *read* - a key update - and keeping
+                            // EPOLLOUT armed then spins the loop on a writable socket (pitfall 5). The
+                            // EPOLLIN path below retries the flush for exactly that case.
+                            const bool wants_write = session->io_want() == IoWant::Write;
+                            if (!session->has_pending_output() || !wants_write) {
+                                disarm_epollout(fd);
+                            }
+                            if (!session->has_pending_output() && session->close_requested()) {
+                                close_session(fd, "quit after flush");
+                                continue;
+                            }
+                        }
+                    }
+
+                    if (!(events_[i].events & EPOLLIN)) continue;
+
+                    {
+                        // A handshake in progress consumes this event and nothing else: not one byte
+                        // reaches feed() until TLS is up, because a command arriving before that is a
+                        // command from an unauthenticated transport.
+                        Session* session = sessions_.get_session(fd);
+                        if (session && session->tls_handshaking()) {
+                            if (!session->continue_tls_handshake()) {
+                                close_session(fd, "tls handshake failed");
+                                continue;
+                            }
+                            if (session->io_want() == IoWant::Write) arm_epollout(fd);
+                            if (session->tls_handshaking()) continue;
+                            // Just completed: the queued banner has not been written yet.
+                            if (!session->flush_output()) {
+                                close_session(fd, "flush failed after handshake");
+                                continue;
+                            }
+                            if (session->has_pending_output() &&
+                                session->io_want() == IoWant::Write) {
+                                arm_epollout(fd);
+                            }
+                        }
+                        // A write that stopped because OpenSSL wanted to read resumes here - the one
+                        // case where readability is what unblocks a *send*.
+                        if (session && !session->tls_handshaking() &&
+                            session->has_pending_output() && session->io_want() == IoWant::Read) {
+                            if (!session->flush_output()) {
+                                close_session(fd, "flush failed");
+                                continue;
+                            }
+                            if (session->has_pending_output() &&
+                                session->io_want() == IoWant::Write) {
+                                arm_epollout(fd);
+                            }
+                        }
+                    }
+
+                    // Client data ready.
+                    // Edge-triggered: read until EAGAIN.
+                    //
+                    // 64 KiB rather than 4 KiB, because since #146 the answers to a read go out in one
+                    // send and the read's size is therefore the batch's: a pipelined batch of 64
+                    // twenty-level `MINSERT`s is 20,736 bytes, which a 4 KiB read took in six pieces
+                    // and answered with six sends (measured: 6.00 sends per batch, 1.00 at 64 KiB). On
+                    // the stack of the thread that owns this loop; the edge-triggered loop drains the
+                    // socket either way, so a larger read changes how many syscalls a burst costs and
+                    // not which session is served first.
+                    char buf[64 * 1024];
+                    while (true) {
+                        Session* session = sessions_.get_session(fd);
+                        if (!session) break;
+
+                        size_t got = 0;
+                        const Session::IoResult r = session->receive(buf, sizeof(buf), got);
+                        if (r == Session::IoResult::Closed) {
+                            close_session(fd, "peer closed");
+                            break;
+                        }
+                        if (r == Session::IoResult::Error) {
+                            close_session(fd, "read error");
+                            break;
+                        }
+                        if (r == Session::IoResult::Again) {
+                            // Nothing more now. With TLS this can mean OpenSSL wants to *write*, so
+                            // arm what it asked for rather than assuming readability.
+                            if (session->io_want() == IoWant::Write) arm_epollout(fd);
+                            break;
+                        }
+
+                        auto lines = session->feed(buf, got);
+
+                        // Outside the loop below, and that is the whole point: a client that never
+                        // sends a newline produces **no lines**, so every check written per line —
+                        // including `max_line_length` directly under here — never runs for it, and
+                        // the session accumulates for ever. Measured before this: 227 MiB on one
+                        // unauthenticated connection took the server to 257 MiB resident (#143).
+                        if (session->unparsed_bytes() > config_.max_unparsed_bytes) {
+                            engine_->registry().increment_counter("ob_sessions_unparsed_overflow_total");
+                            session->send_response(format_error("unparsed input too long"));
+                            close_session(fd, "unparsed input too long");
+                            goto next_event;
+                        }
+
+                        {
+                            // Every command from this read is answered into the session's buffer, and
+                            // the buffer goes out in **one** send below (#146). One send per response
+                            // made a pipelined batch of 64 commands 64 `send()` calls and 64 segments:
+                            // 32.4% of the io thread on an m9g.xlarge. The buffer is the wire order,
+                            // so the bytes a client reads are the same bytes in the same order.
+                            //
+                            // What ends the batch early, and each keeps the effect it had when every
+                            // response was sent on its own: a line too long or a full send buffer
+                            // close the session after what is queued has been offered to the socket,
+                            // `QUIT` closes once it has drained, and a command that asked for the
+                            // session to end - a failed `AUTH` - stops the batch **there**. That last
+                            // one is the rate limit on authentication (#30): nothing that arrived in
+                            // the same read behind a failed attempt is executed.
+                            const char* close_after_flush = nullptr;
+                            bool        quit              = false;
+                            bool        queue_refused     = false;
+                            for (const auto& line : lines) {
+                                if (line.size() > config_.max_line_length) {
+                                    (void)session->queue_response(format_error("line too long"));
+                                    close_after_flush = "line too long";
+                                    break;
+                                }
+
+                                // Multi-line blocks (containing \n) are MINSERT — use parse_minsert()
+                                Command cmd = (line.find('\n') != std::string::npos)
+                                                  ? parse_minsert(line)
+                                                  : parse_command(line);
+                                std::string response = execute_command(cmd, *engine_, *session, stats_, read_only_.load(std::memory_order_acquire), &engine_->registry(), shard_coord_, &hub_, secrets_.client_store());
+
+                                if (response.empty()) {
+                                    quit = true;
+                                    break;
+                                }
+
+                                if (!session->queue_response(response)) {
+                                    // The send buffer cap. EPIPE and ECONNRESET surface in the flush.
+                                    queue_refused = true;
+                                    break;
+                                }
+
+                                // Compression starts AFTER the plain-text ack is queued. Everything
+                                // queued before this point goes out as it was queued - plain - and
+                                // everything after it is framed, which is the order the client expects.
+                                if (cmd.type == CommandType::COMPRESS) {
+                                    session->set_compressed(true);
+                                }
+
+                                if (session->close_requested()) break;
+                            }
+
+                            if (queue_refused) {
+                                close_session(fd, "send failed");
+                                goto next_event;
+                            }
+
+                            if (!session->flush_output()) {
+                                // A real error: EPIPE, ECONNRESET. A full socket buffer is not one of
+                                // these — it leaves bytes queued and is handled just below.
+                                close_session(fd, close_after_flush ? close_after_flush : "send failed");
+                                goto next_event;
+                            }
+
+                            if (close_after_flush) {
+                                close_session(fd, close_after_flush);
+                                goto next_event;
+                            }
+
+                            if (quit) {
+                                // If a response is still draining, let it finish first: closing now
+                                // would truncate data the client already asked for and is still reading.
+                                if (session->has_pending_output()) {
+                                    session->request_close_after_flush();
+                                    arm_epollout(fd);
+                                    goto next_event;
+                                }
+                                close_session(fd, "quit");
+                                goto next_event;
+                            }
+
+                            if (session->has_pending_output()) {
+                                // The socket took part of the batch. The rest goes out on EPOLLOUT;
+                                // closing here is what truncated every response larger than the socket
+                                // buffer.
+                                arm_epollout(fd);
+                            }
+
+                            if (session->close_requested()) {
+                                // A command asked for the session to end once its response was out.
+                                // `close_requested()` was once consulted only in the EPOLLOUT drain,
+                                // which runs only after a *partial* write - so a response small enough
+                                // to fit the socket buffer left the session open with the flag set and
+                                // nothing reading it, and `ERR auth_failed\n` is eighteen bytes. With
+                                // bytes still queued the drain closes it; either way nothing more is
+                                // read from this socket.
+                                if (!session->has_pending_output()) {
+                                    close_session(fd, "close requested after flush");
+                                }
+                                goto next_event;
+                            }
+                        }
+                    }
+                    next_event:;
+                }
+            } catch (const std::exception& e) {
+                threw_this_pass = true;
+                event_guard_.caught(e);
+                // Nothing can vouch for a session whose event threw halfway, so it is closed rather
+                // than served again. The listening socket and the reactor's own descriptors have no
+                // session, and for them there is nothing to close.
+                if (sessions_.get_session(fd) != nullptr) {
+                    close_session(fd, "an exception while serving it");
+                }
+            }
+        }
+        // Gated on a pass that had events and none of which threw, so the recovery line cannot
+        // alternate with the error it closes (pitfall 291).
+        if (nfds > 0 && !threw_this_pass) event_guard_.ok();
+
+        // React to a shutdown request here, on the thread that owns these descriptors, rather
+        // than inside shutdown() on the thread that requested it (#80).
+        //
+        // At the *end* of the iteration, not the start: the events just processed can include one
+        // for listen_fd_, and closing it first would leave `fd == listen_fd_` comparing against
+        // -1, so that event would fall through to the session path carrying a descriptor this
+        // loop had already closed. The wait above has a 100 ms timeout, so nothing is needed to
+        // wake it, and during that window new connections are still accepted and answered with
+        // "server shutting down" — a better answer than a refused connection.
+        if (!drain_started_ && draining_.load(std::memory_order_acquire)) {
+            drain_started_ = true;
+            drain_started_at_ = std::chrono::steady_clock::now();
+            OB_LOG_INFO("tcp_server", "Drain requested: closing the listen socket, fd=%d",
+                        listen_fd_);
+            if (metrics_server_) {
+                metrics_server_->stop();
+            }
+            if (listen_fd_ >= 0) {
+                ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, listen_fd_, nullptr);
+                ::close(listen_fd_);
+                listen_fd_ = -1;
+            }
+        }
+
+        // Drain phase, decided by `drain_verdict()` rather than here: a pure function a test can
+        // ask a thousand times without a socket, and one definition of the bound (#106).
+        if (drain_started_) {
+            const int open = stats_.active_sessions.load(std::memory_order_relaxed);
+            switch (drain_verdict(drain_started_at_, open, config_.drain_timeout_ms,
+                                  std::chrono::steady_clock::now())) {
+            case DrainVerdict::AllSessionsClosed:
+                running_.store(false, std::memory_order_relaxed);
+                break;
+            case DrainVerdict::DeadlineReached:
+                OB_LOG_WARN("tcp_server",
+                            "Drain deadline of %llu ms reached with %d session(s) still open - "
+                            "closing them and exiting; raise --drain-timeout-ms, or set it to 0 to "
+                            "wait indefinitely",
+                            static_cast<unsigned long long>(config_.drain_timeout_ms), open);
+                running_.store(false, std::memory_order_relaxed);
+                break;
+            case DrainVerdict::KeepWaiting:
+                break;
+            }
+        }
+    }
+
+    // Shutdown: close every session this reactor still holds.
+    sessions_.close_all();
+}
+}  // namespace
 
 void TcpServer::run() {
     // Wire up the dynamic read-only flag so failover transitions toggle it.
@@ -1792,520 +2448,19 @@ void TcpServer::run() {
                 static_cast<unsigned>(config_.port), std::string(version()).c_str(),
                 config_.data_dir.c_str());
 
-    // 5. Create epoll instance.
-    epoll_fd_ = ::epoll_create1(0);
-    if (epoll_fd_ < 0) {
-        throw std::runtime_error(std::string("epoll_create1() failed: ") + std::strerror(errno));
-    }
-
-    // 6. Add listen_fd_ to epoll.
-    struct epoll_event ev{};
-    ev.events  = EPOLLIN;
-    ev.data.fd = listen_fd_;
-    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &ev) < 0) {
-        throw std::runtime_error(std::string("epoll_ctl() failed: ") + std::strerror(errno));
-    }
-
-    // 7. Create SessionManager and ServerStats.
-    SessionManager session_mgr(config_.max_sessions);
-
-    // Streaming subscriptions (#45). Owned by this loop, and its eventfd joins the epoll set below:
-    // a notification arriving from MultiMasterManager::io_loop enqueues and wakes us, because
-    // Session is not thread-safe and arming EPOLLOUT belongs to this thread.
-    SubscriptionHub subscription_hub(config_.max_subscriber_queue_bytes,
-                                     config_.max_subscriptions_per_session);
-
-    /// Monotonic per run. Descriptor numbers are reused, so a subscription pinned to `fd` alone
-    /// would outlive its connection and push rows to whoever inherits the number.
-    uint64_t next_conn_id = 1;
-
-    if (subscription_hub.wakeup_fd() >= 0) {
-        struct epoll_event hub_ev{};
-        hub_ev.events  = EPOLLIN;
-        hub_ev.data.fd = subscription_hub.wakeup_fd();
-        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, subscription_hub.wakeup_fd(), &hub_ev) < 0) {
-            OB_LOG_ERROR("tcp_server", "epoll_ctl on the subscription wakeup fd failed: %s",
-                         std::strerror(errno));
-        } else {
-            OB_LOG_INFO("tcp_server", "Subscription hub wakeup fd=%d joined the epoll set",
-                        subscription_hub.wakeup_fd());
-        }
-    }
-
     ServerStats stats;
-    // One place that closes a session, so every close carries a reason in the log.
-    // This used to be five copies of the same four lines, none of them logging,
-    // which is why a session dying in the middle of a large response left no trace.
-    auto close_session = [&](int fd, const char* reason) {
-        size_t pending = 0;
-        if (Session* s = session_mgr.get_session(fd)) {
-            pending = s->pending_output_bytes();
-        }
-        OB_LOG_INFO("tcp_server",
-                    "Closing session: fd=%d reason=%s pending_bytes=%zu",
-                    fd, reason, pending);
-        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-        // Before remove_session, and the order is load-bearing: the other way round leaves a window
-        // in which a notification lands in a queue whose session is already gone, and the hub would
-        // have to tolerate that instead of the invariant holding.
-        if (Session* s = session_mgr.get_session(fd)) {
-            subscription_hub.remove_connection(*engine_, fd, s->conn_id());
-        }
-        session_mgr.remove_session(fd);
-        stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
-        engine_->registry().increment_gauge("ob_active_sessions", -1);
-    };
-
-    // Store pointers for use in accept_connection / handle_client_data.
-    // We use a local lambda-based epoll loop so these are captured by reference.
-
-    static constexpr int MAX_EVENTS = 64;
-    struct epoll_event events[MAX_EVENTS];
+    ReactorShared shared{config_,         *engine_,  tls_,   secrets_, running_, draining_,
+                         read_only_,      stats,     shard_coord.get(),  metrics_server_.get()};
 
     running_.store(true, std::memory_order_relaxed);
-
-    // Whether this loop has already reacted to a shutdown request. See the note in shutdown():
-    // the descriptors and the metrics server belong to this thread, and only this thread closes
-    // them.
-    bool drain_started = false;
-    // Only read once `drain_started` is true, so the value before the drain begins is never used.
-    std::chrono::steady_clock::time_point drain_started_at{};
-
-    // What has already been published to the monotonic counters, so the loop can publish deltas.
-    uint64_t published_rows_pushed{0};
-    uint64_t published_overflow_disconnects{0};
-    uint64_t published_refused{0};
-
-    // 8. Epoll loop.
-    //
-    // The wait is a decision rather than a constant since the io-spin profile: `io_wait_ms()`
-    // answers 0 while the spin window since the last event is open and the blocking timeout
-    // otherwise, so `--io-spin-us 0` — the default — is byte for byte the old behaviour.
-    auto last_event_at = std::chrono::steady_clock::now();
-    while (running_.load(std::memory_order_relaxed)) {
-        const int wait_ms = io_wait_ms(last_event_at, config_.io_spin_us, 100,
-                                       std::chrono::steady_clock::now());
-        int nfds = ::epoll_wait(epoll_fd_, events, MAX_EVENTS, wait_ms);
-        if (nfds > 0) last_event_at = std::chrono::steady_clock::now();
-        if (nfds < 0) {
-            if (errno == EINTR) continue;
-            break; // fatal epoll error
-        }
-
-        // Subscriptions, once per iteration and before the event loop below.
-        //
-        // Unconditional, and not inside a branch on the wakeup fd — the same decision as
-        // `poll_snapshot_preparation()` in the multi-master loop (#79): a plain 100 ms timeout also
-        // picks up anything queued, so a lost wake-up costs latency rather than delivery.
-        {
-            const auto condemned = subscription_hub.drain(
-                session_mgr, [&](int fd) { arm_epollout(fd); });
-            for (int fd : condemned) {
-                close_session(fd, "subscriber queue overflowed");
-            }
-            engine_->registry().set_gauge(
-                "ob_subscriptions_active",
-                static_cast<int64_t>(subscription_hub.active()));
-            engine_->registry().set_gauge(
-                "ob_subscription_queued_bytes",
-                static_cast<int64_t>(subscription_hub.queued_bytes()));
-            // Counters are monotonic and only ever incremented, so the loop publishes the delta
-            // against what it last saw rather than the hub's total. The hub keeps its own totals
-            // because it is testable without a registry, and a second source of truth here would be
-            // the kind that drifts.
-            const auto publish = [&](const char* name, uint64_t total, uint64_t& seen) {
-                if (total > seen) {
-                    engine_->registry().increment_counter(name, total - seen);
-                    seen = total;
-                }
-            };
-            publish("ob_subscription_rows_pushed_total", subscription_hub.rows_pushed(),
-                    published_rows_pushed);
-            publish("ob_subscription_overflow_disconnects_total",
-                    subscription_hub.overflow_disconnects(), published_overflow_disconnects);
-            publish("ob_subscription_refused_total", subscription_hub.refused(),
-                    published_refused);
-        }
-
-        // Once per loop iteration, not per event: the sum walks the session map, and
-        // there is nothing to learn from updating it several times per wake-up.
-        engine_->registry().set_gauge(
-            "ob_session_pending_bytes",
-            static_cast<int64_t>(session_mgr.total_pending_output_bytes()));
-
-        for (int i = 0; i < nfds; ++i) {
-            int fd = events[i].data.fd;
-
-            if (fd == listen_fd_) {
-                // Draining: stop accepting new connections.
-                if (draining_.load(std::memory_order_relaxed)) {
-                    // Reject all pending connections.
-                    //
-                    // OB_NO_TCP_NODELAY: one line and a close, so there is never an earlier
-                    // unacknowledged byte for Nagle to hold a second write behind (#140).
-                    while (true) {
-                        int reject_fd = ::accept4(listen_fd_, nullptr, nullptr, SOCK_NONBLOCK);
-                        if (reject_fd < 0) break;
-                        const char* msg = "ERR server shutting down\n";
-                        auto wr = ::send(reject_fd, msg, std::strlen(msg), MSG_NOSIGNAL);
-                        (void)wr;
-                        ::close(reject_fd);
-                    }
-                    continue;
-                }
-
-                // Accept new connection(s).
-                while (true) {
-                    struct sockaddr_in client_addr{};
-                    socklen_t client_len = sizeof(client_addr);
-                    int client_fd = ::accept4(listen_fd_,
-                                              reinterpret_cast<struct sockaddr*>(&client_addr),
-                                              &client_len,
-                                              SOCK_NONBLOCK);
-                    if (client_fd < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        break; // accept error, continue loop
-                    }
-
-                    // Before anything is written to it, including the banner: a client that
-                    // pipelines pays a delayed-ACK timer per round trip without this (#140).
-                    set_tcp_nodelay(client_fd, "tcp_server");
-
-                    if (!session_mgr.add_session(client_fd, next_conn_id++)) {
-                        // Server full — reject.
-                        const char* msg = "ERR server full\n";
-                        auto wr = ::send(client_fd, msg, std::strlen(msg), MSG_NOSIGNAL);
-                        (void)wr;
-                        ::close(client_fd);
-                        continue;
-                    }
-
-                    // Add to epoll (edge-triggered).
-                    struct epoll_event cev{};
-                    cev.events  = EPOLLIN | EPOLLET;
-                    cev.data.fd = client_fd;
-                    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &cev) < 0) {
-                        session_mgr.remove_session(client_fd);
-                        continue;
-                    }
-
-                    stats.active_sessions.fetch_add(1, std::memory_order_relaxed);
-                    engine_->registry().increment_gauge("ob_active_sessions");
-
-                    Session* s = session_mgr.get_session(client_fd);
-                    if (s && tls_.client_port) {
-                        // Wrap before anything is written: the banner is application data and must
-                        // not precede the handshake. It is queued here and goes out with the first
-                        // flush after the handshake completes, which is what send_response() on a
-                        // handshaking session does - the bytes sit in send_buf_ and SSL_write is
-                        // not reached until tls_handshaking_ clears.
-                        try {
-                            s->enable_tls(tls_.client_port->wrap(client_fd, /*server_side=*/true));
-                            OB_LOG_DEBUG("tls", "handshake started: fd=%d", client_fd);
-                        } catch (const std::exception& e) {
-                            OB_LOG_WARN("tls", "cannot start a handshake on fd=%d: %s",
-                                        client_fd, e.what());
-                            session_mgr.remove_session(client_fd);
-                            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr);
-                            ::close(client_fd);
-                            stats.active_sessions.fetch_sub(1, std::memory_order_relaxed);
-                            engine_->registry().increment_gauge("ob_active_sessions", -1);
-                            continue;
-                        }
-                    }
-
-                    // Send welcome message. The version comes from the build system like
-                    // every other place a node reports it (#90); this one was a literal until #148,
-                    // so the first bump would have made the banner name a build that was not
-                    // running.
-                    if (s) {
-                        static const std::string banner =
-                            "OK ob_tcp_server v" + std::string(version()) + "\n\n";
-                        s->send_response(banner);
-                    }
-                }
-            } else {
-                // Writable first: a session with queued output is waiting on this,
-                // and draining it may be the only thing that lets the client send
-                // its next command.
-                if (events[i].events & EPOLLOUT) {
-                    Session* session = session_mgr.get_session(fd);
-                    if (session) {
-                        // A handshake that wanted to write is why this event arrived.
-                        if (session->tls_handshaking()) {
-                            if (!session->continue_tls_handshake()) {
-                                close_session(fd, "tls handshake failed");
-                                continue;
-                            }
-                            if (session->io_want() == IoWant::Write) continue;  // still writing
-                            disarm_epollout(fd);
-                            if (session->tls_handshaking()) continue;           // now wants to read
-                        }
-                        if (!session->flush_output()) {
-                            close_session(fd, "flush failed");
-                            continue;
-                        }
-                        // Disarm unless OpenSSL still wants to write. With TLS, bytes can remain
-                        // queued while OpenSSL is waiting to *read* - a key update - and keeping
-                        // EPOLLOUT armed then spins the loop on a writable socket (pitfall 5). The
-                        // EPOLLIN path below retries the flush for exactly that case.
-                        const bool wants_write = session->io_want() == IoWant::Write;
-                        if (!session->has_pending_output() || !wants_write) {
-                            disarm_epollout(fd);
-                        }
-                        if (!session->has_pending_output() && session->close_requested()) {
-                            close_session(fd, "quit after flush");
-                            continue;
-                        }
-                    }
-                }
-
-                if (!(events[i].events & EPOLLIN)) continue;
-
-                {
-                    // A handshake in progress consumes this event and nothing else: not one byte
-                    // reaches feed() until TLS is up, because a command arriving before that is a
-                    // command from an unauthenticated transport.
-                    Session* session = session_mgr.get_session(fd);
-                    if (session && session->tls_handshaking()) {
-                        if (!session->continue_tls_handshake()) {
-                            close_session(fd, "tls handshake failed");
-                            continue;
-                        }
-                        if (session->io_want() == IoWant::Write) arm_epollout(fd);
-                        if (session->tls_handshaking()) continue;
-                        // Just completed: the queued banner has not been written yet.
-                        if (!session->flush_output()) {
-                            close_session(fd, "flush failed after handshake");
-                            continue;
-                        }
-                        if (session->has_pending_output() &&
-                            session->io_want() == IoWant::Write) {
-                            arm_epollout(fd);
-                        }
-                    }
-                    // A write that stopped because OpenSSL wanted to read resumes here - the one
-                    // case where readability is what unblocks a *send*.
-                    if (session && !session->tls_handshaking() &&
-                        session->has_pending_output() && session->io_want() == IoWant::Read) {
-                        if (!session->flush_output()) {
-                            close_session(fd, "flush failed");
-                            continue;
-                        }
-                        if (session->has_pending_output() &&
-                            session->io_want() == IoWant::Write) {
-                            arm_epollout(fd);
-                        }
-                    }
-                }
-
-                // Client data ready.
-                // Edge-triggered: read until EAGAIN.
-                //
-                // 64 KiB rather than 4 KiB, because since #146 the answers to a read go out in one
-                // send and the read's size is therefore the batch's: a pipelined batch of 64
-                // twenty-level `MINSERT`s is 20,736 bytes, which a 4 KiB read took in six pieces
-                // and answered with six sends (measured: 6.00 sends per batch, 1.00 at 64 KiB). On
-                // the stack of the thread that owns this loop; the edge-triggered loop drains the
-                // socket either way, so a larger read changes how many syscalls a burst costs and
-                // not which session is served first.
-                char buf[64 * 1024];
-                while (true) {
-                    Session* session = session_mgr.get_session(fd);
-                    if (!session) break;
-
-                    size_t got = 0;
-                    const Session::IoResult r = session->receive(buf, sizeof(buf), got);
-                    if (r == Session::IoResult::Closed) {
-                        close_session(fd, "peer closed");
-                        break;
-                    }
-                    if (r == Session::IoResult::Error) {
-                        close_session(fd, "read error");
-                        break;
-                    }
-                    if (r == Session::IoResult::Again) {
-                        // Nothing more now. With TLS this can mean OpenSSL wants to *write*, so
-                        // arm what it asked for rather than assuming readability.
-                        if (session->io_want() == IoWant::Write) arm_epollout(fd);
-                        break;
-                    }
-
-                    auto lines = session->feed(buf, got);
-
-                    // Outside the loop below, and that is the whole point: a client that never
-                    // sends a newline produces **no lines**, so every check written per line —
-                    // including `max_line_length` directly under here — never runs for it, and
-                    // the session accumulates for ever. Measured before this: 227 MiB on one
-                    // unauthenticated connection took the server to 257 MiB resident (#143).
-                    if (session->unparsed_bytes() > config_.max_unparsed_bytes) {
-                        engine_->registry().increment_counter("ob_sessions_unparsed_overflow_total");
-                        session->send_response(format_error("unparsed input too long"));
-                        close_session(fd, "unparsed input too long");
-                        goto next_event;
-                    }
-
-                    {
-                        // Every command from this read is answered into the session's buffer, and
-                        // the buffer goes out in **one** send below (#146). One send per response
-                        // made a pipelined batch of 64 commands 64 `send()` calls and 64 segments:
-                        // 32.4% of the io thread on an m9g.xlarge. The buffer is the wire order,
-                        // so the bytes a client reads are the same bytes in the same order.
-                        //
-                        // What ends the batch early, and each keeps the effect it had when every
-                        // response was sent on its own: a line too long or a full send buffer
-                        // close the session after what is queued has been offered to the socket,
-                        // `QUIT` closes once it has drained, and a command that asked for the
-                        // session to end - a failed `AUTH` - stops the batch **there**. That last
-                        // one is the rate limit on authentication (#30): nothing that arrived in
-                        // the same read behind a failed attempt is executed.
-                        const char* close_after_flush = nullptr;
-                        bool        quit              = false;
-                        bool        queue_refused     = false;
-                        for (const auto& line : lines) {
-                            if (line.size() > config_.max_line_length) {
-                                (void)session->queue_response(format_error("line too long"));
-                                close_after_flush = "line too long";
-                                break;
-                            }
-
-                            // Multi-line blocks (containing \n) are MINSERT — use parse_minsert()
-                            Command cmd = (line.find('\n') != std::string::npos)
-                                              ? parse_minsert(line)
-                                              : parse_command(line);
-                            std::string response = execute_command(cmd, *engine_, *session, stats, read_only_.load(std::memory_order_acquire), &engine_->registry(), shard_coord.get(), &subscription_hub, secrets_.client_store());
-
-                            if (response.empty()) {
-                                quit = true;
-                                break;
-                            }
-
-                            if (!session->queue_response(response)) {
-                                // The send buffer cap. EPIPE and ECONNRESET surface in the flush.
-                                queue_refused = true;
-                                break;
-                            }
-
-                            // Compression starts AFTER the plain-text ack is queued. Everything
-                            // queued before this point goes out as it was queued - plain - and
-                            // everything after it is framed, which is the order the client expects.
-                            if (cmd.type == CommandType::COMPRESS) {
-                                session->set_compressed(true);
-                            }
-
-                            if (session->close_requested()) break;
-                        }
-
-                        if (queue_refused) {
-                            close_session(fd, "send failed");
-                            goto next_event;
-                        }
-
-                        if (!session->flush_output()) {
-                            // A real error: EPIPE, ECONNRESET. A full socket buffer is not one of
-                            // these — it leaves bytes queued and is handled just below.
-                            close_session(fd, close_after_flush ? close_after_flush : "send failed");
-                            goto next_event;
-                        }
-
-                        if (close_after_flush) {
-                            close_session(fd, close_after_flush);
-                            goto next_event;
-                        }
-
-                        if (quit) {
-                            // If a response is still draining, let it finish first: closing now
-                            // would truncate data the client already asked for and is still reading.
-                            if (session->has_pending_output()) {
-                                session->request_close_after_flush();
-                                arm_epollout(fd);
-                                goto next_event;
-                            }
-                            close_session(fd, "quit");
-                            goto next_event;
-                        }
-
-                        if (session->has_pending_output()) {
-                            // The socket took part of the batch. The rest goes out on EPOLLOUT;
-                            // closing here is what truncated every response larger than the socket
-                            // buffer.
-                            arm_epollout(fd);
-                        }
-
-                        if (session->close_requested()) {
-                            // A command asked for the session to end once its response was out.
-                            // `close_requested()` was once consulted only in the EPOLLOUT drain,
-                            // which runs only after a *partial* write - so a response small enough
-                            // to fit the socket buffer left the session open with the flag set and
-                            // nothing reading it, and `ERR auth_failed\n` is eighteen bytes. With
-                            // bytes still queued the drain closes it; either way nothing more is
-                            // read from this socket.
-                            if (!session->has_pending_output()) {
-                                close_session(fd, "close requested after flush");
-                            }
-                            goto next_event;
-                        }
-                    }
-                }
-                next_event:;
-            }
-        }
-
-        // React to a shutdown request here, on the thread that owns these descriptors, rather
-        // than inside shutdown() on the thread that requested it (#80).
-        //
-        // At the *end* of the iteration, not the start: the events just processed can include one
-        // for listen_fd_, and closing it first would leave `fd == listen_fd_` comparing against
-        // -1, so that event would fall through to the session path carrying a descriptor this
-        // loop had already closed. The wait above has a 100 ms timeout, so nothing is needed to
-        // wake it, and during that window new connections are still accepted and answered with
-        // "server shutting down" — a better answer than a refused connection.
-        if (!drain_started && draining_.load(std::memory_order_acquire)) {
-            drain_started = true;
-            drain_started_at = std::chrono::steady_clock::now();
-            OB_LOG_INFO("tcp_server", "Drain requested: closing the listen socket, fd=%d",
-                        listen_fd_);
-            if (metrics_server_) {
-                metrics_server_->stop();
-            }
-            if (listen_fd_ >= 0) {
-                ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, listen_fd_, nullptr);
-                ::close(listen_fd_);
-                listen_fd_ = -1;
-            }
-        }
-
-        // Drain phase, decided by `drain_verdict()` rather than here: a pure function a test can
-        // ask a thousand times without a socket, and one definition of the bound (#106).
-        if (drain_started) {
-            const int open = stats.active_sessions.load(std::memory_order_relaxed);
-            switch (drain_verdict(drain_started_at, open, config_.drain_timeout_ms,
-                                  std::chrono::steady_clock::now())) {
-            case DrainVerdict::AllSessionsClosed:
-                running_.store(false, std::memory_order_relaxed);
-                break;
-            case DrainVerdict::DeadlineReached:
-                OB_LOG_WARN("tcp_server",
-                            "Drain deadline of %llu ms reached with %d session(s) still open - "
-                            "closing them and exiting; raise --drain-timeout-ms, or set it to 0 to "
-                            "wait indefinitely",
-                            static_cast<unsigned long long>(config_.drain_timeout_ms), open);
-                running_.store(false, std::memory_order_relaxed);
-                break;
-            case DrainVerdict::KeepWaiting:
-                break;
-            }
-        }
+    {
+        // 7-8. One reactor, which accepts as well as serves: byte for byte the loop this function
+        // used to contain. Destroying it closes its epoll descriptor.
+        Reactor reactor(0, shared, listen_fd_);
+        reactor.run_loop();
     }
 
-    // Shutdown: close all sessions, close epoll, close listen socket.
-    session_mgr.close_all();
-
-    if (epoll_fd_ >= 0) {
-        ::close(epoll_fd_);
-        epoll_fd_ = -1;
-    }
-    // listen_fd_ may already be closed by shutdown() during drain.
+    // listen_fd_ may already be closed by the reactor during drain.
     if (listen_fd_ >= 0) {
         ::close(listen_fd_);
         listen_fd_ = -1;
@@ -2324,33 +2479,6 @@ void TcpServer::run() {
     }
 
     engine_->close();
-}
-
-void TcpServer::arm_epollout(int fd) {
-    if (epoll_fd_ < 0 || fd < 0) return;
-
-    struct epoll_event ev{};
-    ev.events  = EPOLLIN | EPOLLOUT | EPOLLET;
-    ev.data.fd = fd;
-    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0) {
-        OB_LOG_WARN("tcp_server", "arm_epollout failed: fd=%d errno=%s",
-                    fd, std::strerror(errno));
-    }
-}
-
-void TcpServer::disarm_epollout(int fd) {
-    if (epoll_fd_ < 0 || fd < 0) return;
-
-    // Back to read-only interest. Leaving EPOLLOUT armed on an edge-triggered fd
-    // makes epoll_wait return immediately whenever the socket is writable, which is
-    // almost always, and the loop spins on a core for nothing.
-    struct epoll_event ev{};
-    ev.events  = EPOLLIN | EPOLLET;
-    ev.data.fd = fd;
-    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0) {
-        OB_LOG_WARN("tcp_server", "disarm_epollout failed: fd=%d errno=%s",
-                    fd, std::strerror(errno));
-    }
 }
 
 int io_wait_ms(std::chrono::steady_clock::time_point last_event,

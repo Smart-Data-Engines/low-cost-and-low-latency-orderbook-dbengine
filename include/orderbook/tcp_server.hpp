@@ -386,17 +386,6 @@ private:
     std::atomic<bool>        draining_{false};  // drain phase: reject new connections, finish in-flight
     std::atomic<bool>        read_only_{false};  // dynamic read-only flag, toggled by failover
     int                      listen_fd_{-1};
-    int                      epoll_fd_{-1};
-
-    void accept_connection();
-    void handle_client_data(int fd);
-
-    /// Arm EPOLLOUT for a session with queued output, and disarm once it drains.
-    ///
-    /// Armed only after a partial write. Leaving EPOLLOUT armed permanently on an
-    /// edge-triggered fd spins the loop and burns a core.
-    void arm_epollout(int fd);
-    void disarm_epollout(int fd);
 };
 
 // ── Free functions ────────────────────────────────────────────────────────────

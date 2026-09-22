@@ -270,6 +270,14 @@ TEST(ThreadBoundaries, EveryLoopInTheTreeIsEitherGuardedPerIterationOrRecorded) 
          "same problem as the others from the other side (#131)"},
         {"OrderbookPool::health_check_loop",
          "a client pool stops noticing dead connections; the only one outside the server (#131)"},
+        {"Reactor::run_loop",
+         "every client this reactor serves stops being answered - on the reactor that accepts, no "
+         "new client is admitted either - while the process, its other reactors and /metrics all "
+         "look healthy. Guarded per event rather than per pass, because client descriptors are "
+         "edge-triggered and an event abandoned with its batch is not delivered again. Note what "
+         "this row's check cannot see: the loop also holds the `try` that wraps a TLS handshake, "
+         "which satisfies this scan on its own, so the reactor's boundary has a static test of "
+         "its own in test_tcp_server.cpp"},
     };
 
     // Empty since #131, and it stays in the test rather than being deleted: this is where the next

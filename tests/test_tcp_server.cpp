@@ -1514,3 +1514,59 @@ TEST(ReadLoopStatic, EveryCommandFromOneReadIsAnsweredWithOneSend) {
     EXPECT_EQ(flushes, 1u) << "expected one flush of the queued answers after the loop, found "
                            << flushes;
 }
+
+TEST(ReactorStatic, EveryClientEventIsServedInsideTheBoundary) {
+    // The generic loop scan in test_thread_boundaries.cpp accepts any `try {` after the loop
+    // statement, and this loop holds one that has nothing to do with surviving an iteration: the
+    // TLS handshake started at accept. So the scan alone passes with the boundary deleted, and this
+    // test asks the specific question - is the handling of each event inside a `try` whose `catch`
+    // counts the failure and closes the session it happened on?
+    const auto read = [](const char* rel) {
+        std::ifstream in(std::string(OB_SOURCE_DIR) + "/" + rel);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::string source = read("src/tcp_server.cpp");
+    ASSERT_FALSE(source.empty()) << "cannot read src/tcp_server.cpp, so this test checks nothing";
+
+    const std::size_t fn = source.find("\nvoid Reactor::run_loop() {\n");
+    ASSERT_NE(fn, std::string::npos) << "Reactor::run_loop() moved; this test would check nothing";
+    const std::size_t fn_end = source.find("\n}\n", fn);
+    ASSERT_NE(fn_end, std::string::npos);
+    const std::string loop = source.substr(fn, fn_end - fn);
+
+    // The loop over one pass's events, and the first statements of its body.
+    const std::size_t header = loop.find("for (int i = 0; i < nfds; ++i) {");
+    ASSERT_NE(header, std::string::npos) << "no loop over the events of a pass";
+    const std::size_t open = loop.find('{', header);
+    std::size_t close = open;
+    int depth = 0;
+    for (std::size_t i = open; i < loop.size(); ++i) {
+        if (loop[i] == '{') ++depth;
+        if (loop[i] == '}' && --depth == 0) { close = i; break; }
+    }
+    ASSERT_GT(close, open) << "unbalanced braces in the event loop";
+    const std::string body = loop.substr(open + 1, close - open - 1);
+
+    const std::size_t fd_line = body.find("int fd = events_[i].data.fd;");
+    ASSERT_NE(fd_line, std::string::npos);
+    const std::size_t try_at = body.find_first_not_of(" \n", fd_line + std::strlen("int fd = events_[i].data.fd;"));
+    ASSERT_NE(try_at, std::string::npos);
+    EXPECT_EQ(body.compare(try_at, 5, "try {"), 0)
+        << "the handling of an event does not begin with `try {`, so an exception serving one client "
+           "leaves the reactor and every other client on it";
+
+    // The catch that closes that try, at the event loop's own depth.
+    const std::size_t catch_at = body.rfind("} catch (const std::exception& e) {");
+    ASSERT_NE(catch_at, std::string::npos) << "no catch at the end of the event handling";
+    const std::string handler = body.substr(catch_at);
+    EXPECT_NE(handler.find("event_guard_.caught(e)"), std::string::npos)
+        << "the boundary does not count the failure, so an operator has nothing to alarm on";
+    EXPECT_NE(handler.find("close_session(fd,"), std::string::npos)
+        << "the boundary does not close the session whose event threw, so it is served again in "
+           "a state nothing can vouch for";
+
+    // And the recovery line waits for a pass in which nothing threw (pitfall 291).
+    const std::string after = loop.substr(close);
+    EXPECT_NE(after.find("if (nfds > 0 && !threw_this_pass) event_guard_.ok();"), std::string::npos)
+        << "the recovery line is not gated on a pass that had events and none of which threw";
+}
