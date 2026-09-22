@@ -3187,6 +3187,25 @@ Learned the hard way. Check here before debugging.
      built the error, dropped it and set `queue_refused` satisfied both while closing the session
      exactly as before. The rule now asks for what the branch must *do* - queue the error, and give
      up only if even that does not fit - which is what the mutation row was for.
+382. **A record that ends a file for every reader has to be followed by leaving the file, whatever
+     else fails.** Replay and catch-up stop at a ROTATE record; `rotate()` synced the marker and threw
+     on a failed sync before moving to the next file, so the next acknowledged write went in behind
+     it and was gone after a restart (#153). The question to ask of any marker is not whether it was
+     written but where the writer is afterwards.
+383. **Housekeeping that throws after a write reports the write as failed, and the client sends it
+     again.** A rotation that could not write its marker threw out of the `INSERT` whose record was
+     already in the file - `ERR` and present, which a retry turns into two rows (#153). An exception
+     from after the side effect belongs to the thing that failed, not to the one that succeeded.
+384. **Closing before opening is the right order, and it leaves nothing to write to if the open
+     fails.** `open_current()` closed the old descriptor first - correct, because that file must not
+     be written to again - and a failed open left `fd_ = -1` with nothing that ever opened another,
+     so every write was `Bad file descriptor` until a restart, after the directory was writable
+     again (#154). A state with no resource needs something that retries getting one.
+385. **A relative path handed to a child that runs somewhere else kills every row of a mutation
+     table.** mut153 passed the server to pytest as `wt-2b/build/…` and pytest ran from `wt-2b`, so
+     seven integration rows "died" of `FileNotFoundError`. Only the control, which has to survive,
+     and the baseline after the last restore, which has to pass, said so - resolve paths before
+     handing them over, and never drop either of those two.
 
 ## Current state and open problems
 
