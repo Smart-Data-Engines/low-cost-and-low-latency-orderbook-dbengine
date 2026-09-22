@@ -235,6 +235,10 @@ Session::IoResult Session::receive(char* buf, size_t len, size_t& out_n) {
 }
 
 bool Session::send_response(std::string_view response) {
+    return queue_response(response) && flush_output();
+}
+
+bool Session::queue_response(std::string_view response) {
     if (compressed_) {
         // Compressed mode: [4-byte BE length][LZ4 frame]. Framed before queueing, so
         // a partial write can never split a frame.
@@ -266,8 +270,7 @@ bool Session::send_response(std::string_view response) {
         }
         send_buf_.append(response.data(), response.size());
     }
-
-    return flush_output();
+    return true;
 }
 
 // Out of line, and the attribute is the point rather than a hint - the numbers and the reasoning
