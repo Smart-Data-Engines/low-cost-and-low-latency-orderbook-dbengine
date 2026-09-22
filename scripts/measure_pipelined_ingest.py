@@ -19,6 +19,18 @@ build.
         --probe build-release/benchmarks/pipelined_ingest --rounds 5 --connections 1 \\
         --count-syscalls
 
+One binary under several configurations is several `--server` entries with the same path and a
+`--flags NAME=...` each, which is how the multi-reactor stage compared `--io-threads 1, 2, 4`:
+
+    scripts/measure_pipelined_ingest.py \\
+        --server r1=build-release/ob_tcp_server --flags "r1=--io-threads 1" \\
+        --server r2=build-release/ob_tcp_server --flags "r2=--io-threads 2" \\
+        --server-cpus 0-1 --probe-cpus 2-3 --connections 2
+
+`--server-cpus` and `--probe-cpus` pin the two with `taskset`, so a client that needs a core does
+not take it from the server it is measuring - on a four-core machine, the difference between a
+reactor that has a core and one that shares it with the load generator.
+
 Two refusals before any run, both borrowed from the comparative harness rather than restated
 (`benchmarks/comparative/hardware.py`): a server whose build directory is not Release, and a data
 directory on memory. The second is not hypothetical here. This script's first version put each
@@ -57,12 +69,18 @@ def loadavg() -> str:
     return " ".join(Path("/proc/loadavg").read_text().split()[:3])
 
 
-def start_node(server: Path, data_dir: Path) -> tuple[subprocess.Popen, int]:
+def pinned(cpus: str | None, argv: list[str]) -> list[str]:
+    return ["taskset", "-c", cpus, *argv] if cpus else argv
+
+
+def start_node(server: Path, data_dir: Path, flags: list[str],
+               cpus: str | None) -> tuple[subprocess.Popen, int]:
     port = free_port()
     log = open(data_dir / "node.log", "wb")
     proc = subprocess.Popen(
-        [str(server), "--port", str(port), "--metrics-port", str(free_port()),
-         "--data-dir", str(data_dir / "data"), "--drain-timeout-ms", "500"],
+        pinned(cpus, [str(server), "--port", str(port), "--metrics-port", str(free_port()),
+                      "--data-dir", str(data_dir / "data"), "--drain-timeout-ms", "500",
+                      *flags]),
         stdout=log, stderr=subprocess.STDOUT)
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
@@ -88,8 +106,9 @@ def perf_counts(path: Path) -> dict[str, int]:
 
 
 def one_run(name: str, server: Path, args: argparse.Namespace) -> dict:
+    flags = args.flags_by_name.get(name, [])
     with tempfile.TemporaryDirectory(prefix="pipelined-ingest-", dir=args.data_root) as tmp:
-        node, port = start_node(server, Path(tmp))
+        node, port = start_node(server, Path(tmp), flags, args.server_cpus)
         perf = None
         try:
             if args.count_syscalls:
@@ -99,13 +118,16 @@ def one_run(name: str, server: Path, args: argparse.Namespace) -> dict:
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 time.sleep(0.3)
             out = subprocess.run(
-                [str(args.probe), str(port), str(node.pid), str(args.connections),
-                 str(args.batches // args.connections), str(args.levels), str(args.batch)],
+                pinned(args.probe_cpus,
+                       [str(args.probe), str(port), str(node.pid), str(args.connections),
+                        str(args.batches // args.connections), str(args.levels),
+                        str(args.batch)]),
                 capture_output=True, text=True)
             if out.returncode != 0:
                 raise SystemExit(f"probe failed ({out.returncode}) against {name}: "
                                  f"{out.stderr.strip()}")
-            row = {"server": name, "loadavg": loadavg(), "probe": json.loads(out.stdout)}
+            row = {"server": name, "flags": flags, "loadavg": loadavg(),
+                   "probe": json.loads(out.stdout)}
             if perf is not None:
                 subprocess.run(["sudo", "kill", "-INT", str(perf.pid)], check=False)
                 perf.wait(timeout=30)
@@ -133,6 +155,10 @@ def main() -> int:
     ap.add_argument("--levels", type=int, default=20)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--count-syscalls", action="store_true")
+    ap.add_argument("--flags", action="append", default=[], metavar="NAME=FLAGS",
+                    help="server flags for the --server of that name, space-separated")
+    ap.add_argument("--server-cpus", help="taskset list for the server, e.g. 0-1")
+    ap.add_argument("--probe-cpus", help="taskset list for the probe, e.g. 2-3")
     ap.add_argument("--data-root", type=Path, default=REPO / "build-release" / "bench-data",
                     help="where each run's node keeps its data; refused if it is memory")
     args = ap.parse_args()
@@ -145,6 +171,13 @@ def main() -> int:
             f"which was 10-15% of every figure on the machine this was written for. Pass "
             f"--data-root on the disk the engine would use.") from None
 
+    args.flags_by_name = {}
+    for spec in args.flags:
+        name, sep, flags = spec.partition("=")
+        if not sep or not name:
+            raise SystemExit(f"--flags wants NAME=FLAGS, got {spec!r}")
+        args.flags_by_name[name] = flags.split()
+
     servers = []
     for spec in args.server:
         name, sep, path = spec.partition("=")
@@ -155,6 +188,9 @@ def main() -> int:
         except hardware.NotReleaseBuild as refusal:
             raise SystemExit(f"--server {name}: {refusal}") from None
         servers.append((name, Path(path)))
+    unknown = set(args.flags_by_name) - {name for name, _ in servers}
+    if unknown:
+        raise SystemExit(f"--flags names no --server: {sorted(unknown)}")
 
     hw = hardware.describe(args.data_root, Path(servers[0][1]).resolve().parent)
     print(f"storage: {args.data_root} on {fstype}, {hw.disk_model} ({hw.disk_stack}); "
@@ -172,8 +208,10 @@ def main() -> int:
     print(f"loadavg at end: {loadavg()}", file=sys.stderr)
 
     counted = args.count_syscalls
+    pins = (f"; server on CPUs {args.server_cpus or 'any'}, probe on {args.probe_cpus or 'any'}"
+            if args.server_cpus or args.probe_cpus else "")
     print(f"\n{args.connections} connection(s), batches of {args.batch} x {args.levels}-level "
-          f"MINSERT, medians of {args.rounds} rounds\n")
+          f"MINSERT, medians of {args.rounds} rounds{pins}\n")
     head = "| build | levels/s | range | batch p50 | batch p99 | server CPU |"
     rule = "|---|---|---|---|---|---|"
     if counted:
