@@ -568,72 +568,83 @@ std::string execute_command(const Command& cmd,
 
     case CommandType::STATUS: {
         session.increment_commands();
+        // A snapshot for this answer, not the `ServerStats` every connection shares. Everything
+        // below is a vector, strings and plain integers, which was safe while one thread ran every
+        // command and is a data race - on a vector - the moment two reactors answer `STATUS` at
+        // once. Only the three counters are shared, and they are atomics.
+        ServerStats snap;
+        snap.total_queries.store(stats.total_queries.load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+        snap.total_inserts.store(stats.total_inserts.load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+        snap.active_sessions.store(stats.active_sessions.load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
         auto es = engine.stats();
-        stats.engine_metrics.pending_rows   = es.pending_rows;
-        stats.engine_metrics.wal_file_index = es.wal_file_index;
-        stats.engine_metrics.segment_count  = es.segment_count;
-        stats.engine_metrics.symbol_count   = es.symbol_count;
+        snap.engine_metrics.pending_rows   = es.pending_rows;
+        snap.engine_metrics.wal_file_index = es.wal_file_index;
+        snap.engine_metrics.segment_count  = es.segment_count;
+        snap.engine_metrics.symbol_count   = es.symbol_count;
 
         // Copy replication metrics
-        stats.replicas.clear();
+        snap.replicas.clear();
         for (const auto& r : es.replicas) {
-            stats.replicas.push_back({r.address, r.confirmed_file, r.confirmed_offset,
+            snap.replicas.push_back({r.address, r.confirmed_file, r.confirmed_offset,
                                       r.lag_bytes, r.lag_known});
         }
-        stats.is_replica            = es.is_replica;
-        stats.repl_confirmed_file   = es.repl_confirmed_file;
-        stats.repl_confirmed_offset = es.repl_confirmed_offset;
-        stats.repl_records_replayed = es.repl_records_replayed;
-        stats.repl_connected        = es.repl_connected;
-        stats.bootstrapping         = es.bootstrapping;
-        stats.snapshot_bytes_received = es.snapshot_bytes_received;
-        stats.snapshot_bytes_total  = es.snapshot_bytes_total;
-        stats.snapshot_active       = es.snapshot_active;
+        snap.is_replica            = es.is_replica;
+        snap.repl_confirmed_file   = es.repl_confirmed_file;
+        snap.repl_confirmed_offset = es.repl_confirmed_offset;
+        snap.repl_records_replayed = es.repl_records_replayed;
+        snap.repl_connected        = es.repl_connected;
+        snap.bootstrapping         = es.bootstrapping;
+        snap.snapshot_bytes_received = es.snapshot_bytes_received;
+        snap.snapshot_bytes_total  = es.snapshot_bytes_total;
+        snap.snapshot_active       = es.snapshot_active;
 
         // Failover state
-        stats.node_role           = static_cast<uint8_t>(es.node_role);
-        stats.current_epoch       = es.current_epoch;
-        stats.primary_address     = es.primary_address;
-        stats.lease_ttl_remaining = es.lease_ttl_remaining;
+        snap.node_role           = static_cast<uint8_t>(es.node_role);
+        snap.current_epoch       = es.current_epoch;
+        snap.primary_address     = es.primary_address;
+        snap.lease_ttl_remaining = es.lease_ttl_remaining;
 
         // Compression metrics from the requesting session
-        stats.compress_bytes_in  = session.compress_bytes_in();
-        stats.compress_bytes_out = session.compress_bytes_out();
+        snap.compress_bytes_in  = session.compress_bytes_in();
+        snap.compress_bytes_out = session.compress_bytes_out();
 
         // TTL / data retention metrics
-        stats.ttl_hours            = es.ttl_hours;
-        stats.ttl_segments_deleted = es.ttl_segments_deleted;
-        stats.ttl_bytes_reclaimed  = es.ttl_bytes_reclaimed;
+        snap.ttl_hours            = es.ttl_hours;
+        snap.ttl_segments_deleted = es.ttl_segments_deleted;
+        snap.ttl_bytes_reclaimed  = es.ttl_bytes_reclaimed;
 
         // Flush integrity
-        stats.segment_merge_refused = es.segment_merge_refused;
+        snap.segment_merge_refused = es.segment_merge_refused;
 
         // Sharding metrics
-        stats.shard_id              = es.shard_id;
-        stats.shard_status          = es.shard_status;
-        stats.shard_symbols_count   = es.shard_symbols_count;
-        stats.shard_map_version     = es.shard_map_version;
-        stats.migration_in_progress = es.migration_in_progress;
-        stats.migration_symbol      = es.migration_symbol;
-        stats.migration_target_shard = es.migration_target_shard;
-        stats.migration_progress_pct = es.migration_progress_pct;
-        stats.shard_routing_errors  = es.shard_routing_errors;
+        snap.shard_id              = es.shard_id;
+        snap.shard_status          = es.shard_status;
+        snap.shard_symbols_count   = es.shard_symbols_count;
+        snap.shard_map_version     = es.shard_map_version;
+        snap.migration_in_progress = es.migration_in_progress;
+        snap.migration_symbol      = es.migration_symbol;
+        snap.migration_target_shard = es.migration_target_shard;
+        snap.migration_progress_pct = es.migration_progress_pct;
+        snap.shard_routing_errors  = es.shard_routing_errors;
 
         // Multi-master metrics
-        stats.mm_node_role = static_cast<uint8_t>(es.node_role);
+        snap.mm_node_role = static_cast<uint8_t>(es.node_role);
         if (es.node_role == NodeRole::MULTI_MASTER) {
-            stats.mm_node_id           = es.mm_node_id;
-            stats.mm_peer_count        = es.mm_peer_count;
-            stats.mm_connected_peers   = es.mm_connected_peers;
-            stats.mm_conflicts_total   = es.mm_conflicts_total;
-            stats.mm_anti_entropy_runs = es.mm_anti_entropy_runs;
-            stats.mm_anti_entropy_repairs = es.mm_anti_entropy_repairs;
-            stats.mm_hlc_physical_ns   = es.mm_hlc_physical_ns;
-            stats.mm_hlc_logical       = es.mm_hlc_logical;
-            stats.mm_hlc_drift_ns      = es.mm_hlc_drift_ns;
+            snap.mm_node_id           = es.mm_node_id;
+            snap.mm_peer_count        = es.mm_peer_count;
+            snap.mm_connected_peers   = es.mm_connected_peers;
+            snap.mm_conflicts_total   = es.mm_conflicts_total;
+            snap.mm_anti_entropy_runs = es.mm_anti_entropy_runs;
+            snap.mm_anti_entropy_repairs = es.mm_anti_entropy_repairs;
+            snap.mm_hlc_physical_ns   = es.mm_hlc_physical_ns;
+            snap.mm_hlc_logical       = es.mm_hlc_logical;
+            snap.mm_hlc_drift_ns      = es.mm_hlc_drift_ns;
         }
 
-        return format_status(stats, session.identity());
+        return format_status(snap, session.identity());
     }
 
     case CommandType::ROLE:
