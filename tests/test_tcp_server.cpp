@@ -5,6 +5,7 @@
 #include <chrono>
 #include <fstream>
 #include <regex>
+#include <sstream>
 #include <iterator>
 #include "orderbook/command_parser.hpp"
 #include "orderbook/response_formatter.hpp"
@@ -666,6 +667,41 @@ TEST_F(ExecuteCommandTest, StatusReturnsStats) {
     EXPECT_NE(response.find("inserts"), std::string::npos);
 }
 
+// STATUS answers the engine's figures from a snapshot of its own (#151). Formatting from the shared
+// ServerStats instead - which STATUS no longer writes, because two client loops answering STATUS at
+// once would race on its vector - answers zeros for every engine figure, and nothing in this suite
+// looked at one until the mutation that did it survived.
+TEST_F(ExecuteCommandTest, StatusAnswersTheEnginesFiguresNotTheSharedDefaults) {
+    ob::Session session(fd_server_);
+    ob::Command insert{};
+    insert.type = ob::CommandType::INSERT;
+    insert.insert_args.symbol   = "SNAP";
+    insert.insert_args.exchange = "EX";
+    insert.insert_args.side     = 0;
+    insert.insert_args.price    = 100;
+    insert.insert_args.qty      = 5;
+    insert.insert_args.count    = 1;
+    ASSERT_EQ(ob::execute_command(insert, *engine_, session, stats_), "OK\n\n");
+
+    ob::Command status{};
+    status.type = ob::CommandType::STATUS;
+    const std::string answer = ob::execute_command(status, *engine_, session, stats_);
+
+    // "OK", the header, then the values under it.
+    const auto header_end = answer.find('\n', answer.find('\n') + 1);
+    ASSERT_NE(header_end, std::string::npos) << answer;
+    const auto values_end = answer.find('\n', header_end + 1);
+    ASSERT_NE(values_end, std::string::npos) << answer;
+    std::vector<std::string> values;
+    std::istringstream row(answer.substr(header_end + 1, values_end - header_end - 1));
+    for (std::string field; std::getline(row, field, '\t');) values.push_back(field);
+    ASSERT_EQ(values.size(), 7u) << "sessions queries inserts pending_rows wal_file segments "
+                                    "symbols, got: " << answer;
+    EXPECT_EQ(values[6], "1") << "one symbol written and STATUS counts " << values[6]
+                              << ", which is what an answer from the shared defaults says";
+    EXPECT_NE(values[3], "0") << "a row pending and STATUS says none";
+}
+
 // Test UNKNOWN command → returns "ERR unknown command\n"
 TEST_F(ExecuteCommandTest, UnknownCommandReturnsError) {
     ob::Session session(fd_server_);
@@ -1280,6 +1316,11 @@ TEST(IoWait, TheLoopTakesItsTimeoutFromTheDecisionRatherThanALiteral) {
     std::size_t calls = 0;
     for (std::size_t at = source.find("epoll_wait("); at != std::string::npos;
          at = source.find("epoll_wait(", at + 1)) {
+        // A mention in a comment is not a call. The reactor's own docstring says "a fatal
+        // `epoll_wait()` error", and the first version of this loop failed on it - use against
+        // mention again, in a check whose own comment above warns about exactly that.
+        const std::size_t line_start = source.rfind('\n', at) + 1;
+        if (source.substr(line_start, at - line_start).find("//") != std::string::npos) continue;
         ++calls;
         const std::size_t end = source.find(')', at);
         ASSERT_NE(end, std::string::npos);
@@ -1495,7 +1536,11 @@ TEST(ReadLoopStatic, EveryCommandFromOneReadIsAnsweredWithOneSend) {
     const std::string body = path.substr(open, close - open);
     const std::string after = path.substr(close);
 
-    EXPECT_NE(body.find("queue_response("), std::string::npos)
+    // `queue_answer`, not `queue_response`: since #152 the loop queues through the call that tells
+    // an answer too large to ever send from a client that stopped reading, and the one
+    // `queue_response` left in the loop is the error that replaces such an answer - which would
+    // satisfy a search for `queue_response(` while the path every other answer takes was gone.
+    EXPECT_NE(body.find("= session->queue_answer(response);"), std::string::npos)
         << "the commands of a read are no longer answered into the session's buffer";
     EXPECT_EQ(body.find("send_response("), std::string::npos)
         << "a response is sent from inside the loop over the commands of one read: one send per "
@@ -1513,4 +1558,231 @@ TEST(ReadLoopStatic, EveryCommandFromOneReadIsAnsweredWithOneSend) {
     }
     EXPECT_EQ(flushes, 1u) << "expected one flush of the queued answers after the loop, found "
                            << flushes;
+}
+
+TEST(ReactorStatic, EveryClientEventIsServedInsideTheBoundary) {
+    // The generic loop scan in test_thread_boundaries.cpp accepts any `try {` after the loop
+    // statement, and this loop holds one that has nothing to do with surviving an iteration: the
+    // TLS handshake started at accept. So the scan alone passes with the boundary deleted, and this
+    // test asks the specific question - is the handling of each event inside a `try` whose `catch`
+    // counts the failure and closes the session it happened on?
+    const auto read = [](const char* rel) {
+        std::ifstream in(std::string(OB_SOURCE_DIR) + "/" + rel);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::string source = read("src/tcp_server.cpp");
+    ASSERT_FALSE(source.empty()) << "cannot read src/tcp_server.cpp, so this test checks nothing";
+
+    const std::size_t fn = source.find("\nvoid Reactor::run_loop() {\n");
+    ASSERT_NE(fn, std::string::npos) << "Reactor::run_loop() moved; this test would check nothing";
+    const std::size_t fn_end = source.find("\n}\n", fn);
+    ASSERT_NE(fn_end, std::string::npos);
+    const std::string loop = source.substr(fn, fn_end - fn);
+
+    // The loop over one pass's events, and the first statements of its body.
+    const std::size_t header = loop.find("for (int i = 0; i < nfds; ++i) {");
+    ASSERT_NE(header, std::string::npos) << "no loop over the events of a pass";
+    const std::size_t open = loop.find('{', header);
+    std::size_t close = open;
+    int depth = 0;
+    for (std::size_t i = open; i < loop.size(); ++i) {
+        if (loop[i] == '{') ++depth;
+        if (loop[i] == '}' && --depth == 0) { close = i; break; }
+    }
+    ASSERT_GT(close, open) << "unbalanced braces in the event loop";
+    const std::string body = loop.substr(open + 1, close - open - 1);
+
+    const std::size_t fd_line = body.find("int fd = events_[i].data.fd;");
+    ASSERT_NE(fd_line, std::string::npos);
+    const std::size_t try_at =
+        body.find_first_not_of(" \n", fd_line + std::strlen("int fd = events_[i].data.fd;"));
+    ASSERT_NE(try_at, std::string::npos);
+    EXPECT_EQ(body.compare(try_at, 5, "try {"), 0)
+        << "the handling of an event does not begin with `try {`, so an exception serving one client "
+           "leaves the reactor and every other client on it";
+
+    // The catch that closes that try, at the event loop's own depth.
+    const std::size_t catch_at = body.rfind("} catch (const std::exception& e) {");
+    ASSERT_NE(catch_at, std::string::npos) << "no catch at the end of the event handling";
+    const std::string handler = body.substr(catch_at);
+    EXPECT_NE(handler.find("event_guard_.caught(e)"), std::string::npos)
+        << "the boundary does not count the failure, so an operator has nothing to alarm on";
+    EXPECT_NE(handler.find("close_session(fd,"), std::string::npos)
+        << "the boundary does not close the session whose event threw, so it is served again in "
+           "a state nothing can vouch for";
+
+    // And the recovery line waits for a pass in which nothing threw (pitfall 291).
+    const std::string after = loop.substr(close);
+    EXPECT_NE(after.find("if (nfds > 0 && !threw_this_pass) event_guard_.ok();"), std::string::npos)
+        << "the recovery line is not gated on a pass that had events and none of which threw";
+}
+
+namespace {
+
+/// Every `remove_session(X)` in `source` followed, in the rest of its block, by `::close(X)`: the
+/// statements after the call up to the first `return`, `continue;` or `break;`, or the `}` that
+/// closes the block the call is in. Each entry is the call and the close, for the message.
+std::vector<std::string> closes_after_remove(const std::string& source) {
+    std::vector<std::string> found;
+    const std::string call = "remove_session(";
+    for (std::size_t at = source.find(call); at != std::string::npos;
+         at = source.find(call, at + 1)) {
+        const std::size_t open = at + call.size();
+        const std::size_t shut = source.find(')', open);
+        if (shut == std::string::npos) break;
+        const std::string arg = source.substr(open, shut - open);
+        // The declaration and the definition name a parameter type; a call names a descriptor.
+        if (arg.empty() || arg.find(' ') != std::string::npos) continue;
+        int depth = 0;
+        std::size_t end = shut;
+        for (; end < source.size(); ++end) {
+            const char c = source[end];
+            if (c == '{') ++depth;
+            if (c == '}' && --depth < 0) break;
+            if (depth == 0 && (source.compare(end, 6, "return") == 0 ||
+                               source.compare(end, 9, "continue;") == 0 ||
+                               source.compare(end, 6, "break;") == 0)) {
+                break;
+            }
+        }
+        const std::string tail = source.substr(shut, end - shut);
+        if (tail.find("::close(" + arg + ")") != std::string::npos) {
+            found.push_back("remove_session(" + arg + ") then ::close(" + arg + ")");
+        }
+    }
+    return found;
+}
+
+}  // namespace
+
+TEST(SessionsStatic, NoDescriptorIsClosedAgainAfterItsSessionIsRemoved) {
+    // `SessionManager::remove_session()` closes the descriptor. The accept path's TLS failure
+    // branch removed the session and then closed the number itself (#150): a second close of a
+    // number the kernel is free to have handed, in between, to a file another thread opened -
+    // #128's class, which this server's WAL, flush and replication threads make more than
+    // theoretical. The branch moved into `Reactor::adopt()` with the multi-reactor stage and closes
+    // once now; this holds every other place that removes a session to the same rule.
+
+    // The rule's own cases: the shape #150 was, and the shape that is right.
+    EXPECT_EQ(closes_after_remove("    sessions_.remove_session(fd);\n"
+                                  "    ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);\n"
+                                  "    ::close(fd);\n"
+                                  "    continue;\n")
+                  .size(),
+              1u);
+    EXPECT_TRUE(closes_after_remove("    ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);\n"
+                                    "    sessions_.remove_session(fd);\n"
+                                    "    return;\n"
+                                    "}\n"
+                                    "void other(int fd) { ::close(fd); }\n")
+                    .empty())
+        << "a close in a different function is not a close after this removal";
+
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/src/tcp_server.cpp");
+    const std::string source((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+    ASSERT_NE(source.find("remove_session("), std::string::npos)
+        << "src/tcp_server.cpp removes no session, so this rule reads nothing";
+    for (const std::string& hit : closes_after_remove(source)) {
+        ADD_FAILURE() << "src/tcp_server.cpp: " << hit
+                      << " - remove_session() has already closed it, and the number may belong to "
+                         "someone else by now";
+    }
+}
+
+// ── Commands that run alone across reactors ────────────────────────────────────
+
+TEST(AdminSerialisation, ExactlyFailoverAndMigrateRunAlone) {
+    // Iterating the enumeration rather than a list, like the authentication gate: a new command
+    // classified as serialised fails here, and a new command classified at all is forced by
+    // -Wswitch in the classifier.
+    std::vector<int> alone;
+    for (int i = 0; i <= static_cast<int>(ob::CommandType::UNKNOWN); ++i) {
+        if (ob::serialised_across_reactors(static_cast<ob::CommandType>(i))) alone.push_back(i);
+    }
+    EXPECT_EQ(alone, (std::vector<int>{static_cast<int>(ob::CommandType::FAILOVER),
+                                       static_cast<int>(ob::CommandType::MIGRATE)}))
+        << "FAILOVER and MIGRATE were written for one caller at a time; anything added to that set "
+           "is a decision, and so is anything taken out of it";
+}
+
+TEST(AdminSerialisation, TheClassifierHasNoDefaultAndTheLoopConsultsIt) {
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/src/tcp_server.cpp");
+    ASSERT_TRUE(in) << "cannot read src/tcp_server.cpp";
+    const std::string src((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+
+    const auto begin = src.find("bool serialised_across_reactors(CommandType t) {");
+    ASSERT_NE(begin, std::string::npos) << "classifier not found - did it get renamed?";
+    const auto end = src.find("\n}\n", begin);
+    ASSERT_NE(end, std::string::npos);
+    EXPECT_EQ(src.substr(begin, end - begin).find("default:"), std::string::npos)
+        << "a default label turns off the exhaustiveness check this classifier relies on";
+
+    // A classifier nothing consults is a comment. The reactor's dispatch must take the shared
+    // mutex for what it names, before the command runs.
+    const auto loop = src.find("\nvoid Reactor::run_loop() {\n");
+    ASSERT_NE(loop, std::string::npos);
+    const auto call = src.find("= execute_command(", loop);
+    ASSERT_NE(call, std::string::npos) << "the reactor does not dispatch commands any more?";
+    const std::string before = src.substr(loop, call - loop);
+    const auto consult = before.rfind("if (serialised_across_reactors(cmd.type)) alone.lock();");
+    ASSERT_NE(consult, std::string::npos)
+        << "the reactor runs every command without asking whether it must run alone";
+    EXPECT_EQ(before.find('\n', before.find('\n', consult) + 1), std::string::npos)
+        << "the lock is taken more than a line before the command it guards";
+}
+
+// ── An answer too large to ever send (#152) ────────────────────────────────────
+
+TEST(AnswerCeiling, AnAnswerLargerThanTheCapIsRefusedAloneAndNothingIsQueued) {
+    int sv[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    {
+        ob::Session s(sv[0], 1);
+        const std::string too_large(ob::Session::max_queued_bytes() + 1, 'x');
+        EXPECT_EQ(s.queue_answer(too_large), ob::Session::Queued::TooLargeAlone);
+        EXPECT_EQ(s.pending_output_bytes(), 0u) << "a refused answer left bytes queued";
+        // The control: the largest answer that fits is queued, because the refusal is about one
+        // answer being larger than the cap, not about being large.
+        const std::string at_cap(ob::Session::max_queued_bytes(), 'y');
+        EXPECT_EQ(s.queue_answer(at_cap), ob::Session::Queued::Yes);
+        EXPECT_EQ(s.pending_output_bytes(), ob::Session::max_queued_bytes());
+        // And the other refusal is still the other one: one byte more behind a full buffer is a
+        // client that is not reading.
+        EXPECT_EQ(s.queue_answer("z"), ob::Session::Queued::CapExceeded);
+    }
+    // A Session does not own its descriptor - SessionManager::remove_session() closes it.
+    ::close(sv[0]);
+    ::close(sv[1]);
+}
+
+TEST(AnswerCeiling, TheLoopAnswersAnErrorInsteadOfClosing) {
+    // Static, because the behavioural half needs an answer above 64 MB, which is a store of about
+    // two and a half million rows - measured on the m9g.xlarge at 76 MB for the query that found
+    // this. The unit test above holds the classification; this holds that the loop acts on it.
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/src/tcp_server.cpp");
+    const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ASSERT_FALSE(src.empty());
+    const auto at = src.find("if (queued == Session::Queued::TooLargeAlone) {");
+    ASSERT_NE(at, std::string::npos) << "the read loop does not tell an answer too large to send "
+                                        "from a client that stopped reading";
+    const std::string branch = src.substr(at, src.find("} else if", at) - at);
+    EXPECT_NE(branch.find("format_error("), std::string::npos)
+        << "an answer too large to send is not replaced by an error";
+    EXPECT_EQ(branch.find("close_session("), std::string::npos)
+        << "an answer too large to send closes the session of a client that did nothing wrong";
+    // The error is what gets queued, and the session ends only if even the error cannot be. The
+    // first version of this rule stopped at the two lines above, and a branch that built the error,
+    // dropped it and set `queue_refused` satisfied both - the session closed exactly as before
+    // (#151's mutation row 4).
+    const auto queued = branch.find("if (!session->queue_response(refusal)) {");
+    ASSERT_NE(queued, std::string::npos) << "the error replacing the answer is not queued";
+    const auto refused = branch.find("queue_refused = true;");
+    EXPECT_TRUE(refused == std::string::npos || refused > queued)
+        << "the branch gives up on the session before trying to queue the error";
+    EXPECT_EQ(branch.find("queue_refused = true;", refused == std::string::npos ? 0 : refused + 1),
+              std::string::npos)
+        << "the branch gives up on the session on more than the one path where the error itself "
+           "does not fit";
 }

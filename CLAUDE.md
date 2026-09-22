@@ -3156,6 +3156,37 @@ Learned the hard way. Check here before debugging.
      parsed, listed, documented as "Number of worker threads (default: 4)" — and read by nothing
      (#149). The check that finds it goes one step further than any list: a field the parser
      writes must be read by something other than the function that prints it back.
+376. **A lock's cost across threads is its handoffs, not its critical section.** The multi-reactor
+     stage predicted 1.6–2.4× for writes, bounded by Amdahl at 1.84× with 39% of the io thread under
+     `Engine::mtx_`, and measured 0.89–0.93×. The bound counted the work under the lock; the lock is
+     taken once per record, 768 000 times in three seconds by four threads, and each contended
+     acquisition is a futex sleep and wake that costs more than the section it guards (#151).
+     `perf stat -e syscalls:sys_enter_futex` before and after is a thirty-second measurement, and
+     `perf record -g` on the same tracepoint names the lock: here, 100% on one address.
+377. **Two builds compared are two compilers until shown otherwise.** The box's master build used
+     `gcc14-g++` from an earlier configure and the branch the default `c++`, which is GCC 11, and the
+     branch read 18% faster at one reactor on identical code (19.3 against 16.0 million levels a
+     second). `grep CMAKE_CXX_COMPILER CMakeCache.txt` in both trees, before the first number.
+378. **Connections dealt in turn put two on one loop whenever the order says so, and a measurement of
+     isolation has to say which loop each landed on.** The first isolation run at two reactors dealt
+     the writer to the scanning connection's reactor, because it was the fourth connection, and
+     showed no benefit at all. Read the placement from the node's `Reactor N adopted` lines; do not
+     assume it from the count.
+379. **A scripted rename that rewrites every write can leave the read.** `STATUS`'s snapshot was made
+     by replacing `stats.` with `snap.` in its body, which changed every field it wrote and left
+     `format_status(stats, …)` - the one use not followed by a dot. It was caught by reading the diff,
+     and the mutation that restores it survived every unit test until
+     `StatusAnswersTheEnginesFiguresNotTheSharedDefaults` was written for it.
+380. **Staging hunks by marker can commit a state that does not build.** The admin serialisation and
+     the drain change touched the same four places; staging the hunks that named `admin_mtx` also
+     removed a member whose use sat in a hunk left unstaged. Hunks are units of text, not of meaning;
+     check that the committed tree builds, or build the intermediate file state instead of staging
+     pieces of the final one.
+381. **A static rule that asks for a word in a branch passes a branch that ignores it.** #152's rule
+     asked for `format_error(` in the too-large branch and no `close_session(`, and a mutation that
+     built the error, dropped it and set `queue_refused` satisfied both while closing the session
+     exactly as before. The rule now asks for what the branch must *do* - queue the error, and give
+     up only if even that does not fit - which is what the mutation row was for.
 
 ## Current state and open problems
 
@@ -3204,6 +3235,18 @@ that does not flatter is the control.
 `--flush-interval-ms`, and its wait has a deadline after which the write is refused rather than
 accepted. 1,196,745 → 2,209,501 levels/s at four million levels and a one-second interval,
 unchanged at the 100 ms default the engine ships with.
+
+**#151**: `--io-threads N` gives the server N client event loops, connections dealt to them in
+turn and kept for life. Measured on the m9g.xlarge, every build with GCC 14, four connections:
+**reads scale** — `BOOK` 16.0 → 30.3 → **49.2 million levels read a second** at one, two and four
+loops — and **a query no longer stalls another loop's writes**: a writer beside a connection
+looping a 134 ms scan went from 65 424 levels a second with a p99 of 136 ms to 4 995 672 and
+241 µs. **Pipelined writes do not scale yet, and cost about 10% with a tripled p99**, because the
+engine takes `mtx_` once per record and holds it through the WAL's `write()`: 1 128 futex calls at
+one loop, 1 485 158 at four, every one of them in `apply_delta_impl`. The default stays 1 until
+the engine takes one lock and one write per read (the next stage). Two things it fixed on the way
+are their own items: #150 (a TLS handshake that could not start closed its descriptor twice) and
+#152 (an answer above 64 MB closed the connection of a client that was reading).
 
 **#147**: the io_uring transport is gone. Measured before it went, on the m9g.xlarge: a pipelined
 batch of six commands came back as **177 bytes of the server's heap** — `submit_write()` reassigned

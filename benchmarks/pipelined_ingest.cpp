@@ -22,7 +22,12 @@
 // variants rotate so prices move between updates. An answer other than `OK` is refused with the
 // first bytes of it, rather than counted: a probe timing error answers measures the error path.
 //
-//   pipelined_ingest <port> <server-pid> <connections> <batches-per-connection> <levels> <batch>
+//   pipelined_ingest <port> <server-pid> <connections> <batches-per-connection> <levels> <batch> [book]
+//
+// With `book` as the last argument each batch is `batch` BOOK queries instead, over the same four
+// symbols per connection, which one MINSERT per side populates before the clock starts. That is
+// the read half of the multi-reactor question: a read takes the engine's lock only to find the
+// buffer, so it is the work N client loops can do at once.
 //
 // scripts/measure_pipelined_ingest.py runs it against fresh nodes in interleaved rounds.
 
@@ -108,10 +113,11 @@ int connect_to(int port) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 7) {
-        std::fprintf(stderr, "usage: %s <port> <server-pid> <connections> <batches-per-connection> <levels> <batch>\n", argv[0]);
+    if (argc < 7 || (argc == 8 && std::strcmp(argv[7], "book") != 0) || argc > 8) {
+        std::fprintf(stderr, "usage: %s <port> <server-pid> <connections> <batches-per-connection> <levels> <batch> [book]\n", argv[0]);
         return 2;
     }
+    const bool book_mode = argc == 8;
     const int port = std::atoi(argv[1]);
     const int pid = std::atoi(argv[2]);
     const int conns = std::atoi(argv[3]);
@@ -134,6 +140,48 @@ int main(int argc, char** argv) {
     // buffers of `batch` MINSERTs over that connection's own four symbols.
     std::vector<std::vector<std::string>> payloads(static_cast<size_t>(conns));
     for (int c = 0; c < conns; ++c) {
+        if (book_mode) {
+            // One batch of BOOK queries, which does not change between rounds, and before it one
+            // MINSERT per side and symbol so every book has `levels` levels on both sides.
+            std::string seed;
+            for (int sym = 0; sym < 4; ++sym) {
+                for (const char* side : {"bid", "ask"}) {
+                    char head[96];
+                    std::snprintf(head, sizeof head, "MINSERT C%02dS%d EX %s %d\n", c, sym, side, levels);
+                    seed += head;
+                    for (int l = 0; l < levels; ++l) {
+                        const long long price = side[0] == 'b' ? 5'000'000LL - l * 100 : 5'000'100LL + l * 100;
+                        char line[64];
+                        std::snprintf(line, sizeof line, "%lld %d 1\n", price, 1000 + l);
+                        seed += line;
+                    }
+                }
+            }
+            const int fd = fds[static_cast<size_t>(c)];
+            if (::send(fd, seed.data(), seed.size(), MSG_NOSIGNAL) != static_cast<ssize_t>(seed.size())) {
+                std::fprintf(stderr, "seeding connection %d failed\n", c);
+                return 1;
+            }
+            std::string acc;
+            char sbuf[4096];
+            int seeded = 0;
+            while (seeded < 8) {
+                const ssize_t got = ::recv(fd, sbuf, sizeof sbuf, 0);
+                if (got <= 0) { std::fprintf(stderr, "seeding connection %d: no answer\n", c); return 1; }
+                acc.append(sbuf, static_cast<size_t>(got));
+                size_t pos = 0, hit;
+                while ((hit = acc.find("OK\n\n", pos)) != std::string::npos) { ++seeded; pos = hit + 4; }
+                acc.erase(0, pos);
+            }
+            std::string p;
+            for (int b = 0; b < batch; ++b) {
+                char q[64];
+                std::snprintf(q, sizeof q, "BOOK C%02dS%d EX\n", c, b % 4);
+                p += q;
+            }
+            for (int v = 0; v < kVariants; ++v) payloads[static_cast<size_t>(c)].push_back(p);
+            continue;
+        }
         for (int v = 0; v < kVariants; ++v) {
             std::string p;
             for (int b = 0; b < batch; ++b) {
@@ -180,8 +228,12 @@ int main(int argc, char** argv) {
                     const ssize_t got = ::recv(fd, buf.data(), buf.size(), 0);
                     if (got <= 0) { failed = true; return; }
                     acc.append(buf.data(), static_cast<size_t>(got));
+                    // A write answers `OK` and a blank line; a BOOK answers rows and then the
+                    // blank line, so what ends an answer is the blank line in both.
                     size_t pos = 0, hit;
-                    while ((hit = acc.find("OK\n\n", pos)) != std::string::npos) { ++answered; pos = hit + 4; }
+                    const char* end = book_mode ? "\n\n" : "OK\n\n";
+                    const size_t end_len = book_mode ? 2 : 4;
+                    while ((hit = acc.find(end, pos)) != std::string::npos) { ++answered; pos = hit + end_len; }
                     if (acc.find("ERR") != std::string::npos) {
                         std::fprintf(stderr, "REFUSED: connection %d got an error answer: %s\n", c, acc.substr(0, 200).c_str());
                         failed = true; return;
@@ -209,7 +261,9 @@ int main(int argc, char** argv) {
     std::vector<long long> all;
     for (auto& v : lat) all.insert(all.end(), v.begin(), v.end());
     std::sort(all.begin(), all.end());
-    const double total_levels = static_cast<double>(conns) * batches * batch * levels;
+    // In book mode a "level" is a level read back: every BOOK answers `levels` per side.
+    const double total_levels = static_cast<double>(conns) * batches * batch * levels *
+                                (book_mode ? 2 : 1);
 
     std::vector<std::pair<double, std::string>> busy;
     double server_total = 0.0;

@@ -132,6 +132,28 @@ TEST(CliArgsDeath, WorkersIsRefusedBecauseNothingEverReadIt) {
                 "unknown argument '--workers'");
 }
 
+TEST(CliArgs, IoThreadsDefaultsToTheOneLoopTheServerAlwaysHad) {
+    EXPECT_EQ(parse({}).io_threads, 1u);
+    EXPECT_EQ(parse({"--io-threads", "4"}).io_threads, 4u);
+    // Both ends of the range, because a refusal that also refuses a boundary is a different
+    // refusal from the one documented, and `docs/cli.md` prints these two numbers.
+    EXPECT_EQ(parse({"--io-threads", "1"}).io_threads, 1u);
+    EXPECT_EQ(parse({"--io-threads", std::to_string(ob::kMaxIoThreads)}).io_threads,
+              ob::kMaxIoThreads);
+}
+
+TEST(CliArgsDeath, ZeroIoThreadsIsRefused) {
+    // A server that accepts connections and serves none of them.
+    EXPECT_EXIT(parse({"--io-threads", "0"}), ::testing::ExitedWithCode(1),
+                "--io-threads \\(0\\) must be between 1 and 64");
+}
+
+TEST(CliArgsDeath, IoThreadsAboveTheCeilingIsRefused) {
+    // One above, so the comparison is pinned rather than the order of magnitude.
+    EXPECT_EXIT(parse({"--io-threads", std::to_string(ob::kMaxIoThreads + 1)}),
+                ::testing::ExitedWithCode(1), "must be between 1 and 64");
+}
+
 TEST(CliArgsDeath, AValueOutOfRangeForItsTypeIsRefused) {
     // 99999 does not fit a uint16 port. static_cast would have wrapped it to 34463.
     EXPECT_EXIT(parse({"--port", "99999"}), ::testing::ExitedWithCode(1),

@@ -132,6 +132,10 @@ struct ServerConfig {
     /// `0` keeps the old behaviour — wait for ever — and has to be asked for, because the default
     /// is what a supervisor meets.
     uint64_t    drain_timeout_ms{10000};  // --drain-timeout-ms (0 = wait indefinitely)
+    /// --io-threads: client event loops. Connections are dealt to them in turn by the one that
+    /// accepts, and a connection stays on its reactor for life, because a Session is not
+    /// thread-safe. 1 is the loop this server always had.
+    uint32_t    io_threads{1};
 
     // Replication (primary)
     uint16_t replication_port{0};       // 0 = disabled
@@ -314,6 +318,10 @@ LoadedTlsContexts load_tls_or_exit(const ServerConfig& config);
 
 // ── TcpServer ─────────────────────────────────────────────────────────────────
 
+/// The largest `--io-threads` accepted. Well above any core count this engine is run on, and
+/// low enough that a typo such as 400 is refused rather than started.
+inline constexpr uint32_t kMaxIoThreads = 64;
+
 /// What a draining loop should do this pass.
 enum class DrainVerdict {
     KeepWaiting,       ///< sessions are still open and the deadline has not passed
@@ -386,17 +394,6 @@ private:
     std::atomic<bool>        draining_{false};  // drain phase: reject new connections, finish in-flight
     std::atomic<bool>        read_only_{false};  // dynamic read-only flag, toggled by failover
     int                      listen_fd_{-1};
-    int                      epoll_fd_{-1};
-
-    void accept_connection();
-    void handle_client_data(int fd);
-
-    /// Arm EPOLLOUT for a session with queued output, and disarm once it drains.
-    ///
-    /// Armed only after a partial write. Leaving EPOLLOUT armed permanently on an
-    /// edge-triggered fd spins the loop and burns a core.
-    void arm_epollout(int fd);
-    void disarm_epollout(int fd);
 };
 
 // ── Free functions ────────────────────────────────────────────────────────────
@@ -435,6 +432,21 @@ std::string execute_command(const Command& cmd,
 /// refuses a `default:` being added, because that label is what would turn the compiler's
 /// exhaustiveness check off and make the next command's classification an accident.
 bool allowed_before_authentication(CommandType t);
+
+/// Whether a command must run alone across every client event loop of this server.
+///
+/// With one loop every command was serialised by construction, and two were written for exactly
+/// that: `FAILOVER` (two at once revoke one lease twice, and the one that loses clears the
+/// winner's handover intent, its election block and its `handing_over_` flag while the handover is
+/// still running) and `MIGRATE` (two of one symbol both pass validation before either starts).
+/// With `--io-threads` above one, two connections can ask at once, so these take a mutex the
+/// reactors share. Data commands do not: the engine is already called from the replication and
+/// mesh threads concurrently, under its own locks, and `FLUSH` is serialised by the engine's
+/// `flush_mtx_` because the flush thread calls it too.
+///
+/// Same shape as `allowed_before_authentication()`: no `default:`, so a new command does not build
+/// until somebody decides which kind it is.
+bool serialised_across_reactors(CommandType t);
 
 /// Where a configuration value came from. For `--print-config`, which exists to answer exactly
 /// that: a list of values does not tell an operator which of them they chose.

@@ -108,9 +108,11 @@ What does matter:
 
 ### CPU placement
 
-The hot path is one epoll loop, one flush thread, and in multi-master one more io loop. What helps
-is keeping those off the cores that handle NIC interrupts, so that a burst of packets does not
-preempt the thread applying writes.
+The hot path is the client event loops (`--io-threads`, one by default, named `ob-io-0` …), one
+flush thread, and in multi-master one more io loop. What helps is keeping those off the cores that
+handle NIC interrupts, so that a burst of packets does not preempt the thread applying writes. With
+more than one client loop, `top -H -p $(pidof ob_tcp_server)` shows which loop is busy, and the log
+line `Reactor N adopted fd=... conn_id=... from ...` says which connection it is serving.
 
 ```bash
 # Where the NIC's interrupts land today:

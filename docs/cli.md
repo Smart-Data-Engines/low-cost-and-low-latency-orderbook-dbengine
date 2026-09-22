@@ -281,6 +281,10 @@ consequences worth knowing:
   stops reading entirely while asking for more hits that cap and has its session closed, with the
   reason logged. This bounds server memory: without a cap, one client that never reads would grow the
   process without limit.
+- **One answer larger than the cap is refused, not sent** — to any client, however fast it reads.
+  The session gets `ERR answer of N bytes is larger than the 67108864 a session may have queued;
+  narrow the query or add LIMIT` in its place and stays open (#152). Before that, the connection
+  was closed with nothing but EOF to say why.
 
 `ob_session_pending_bytes` in `/metrics` reports the bytes queued across all sessions. It is the
 signal that a client is not keeping up, and it should sit at zero in a healthy system.
@@ -353,6 +357,38 @@ worth exactly what it is worth to a **colocated** client.
 over the profile, and `--print-config` says which of the two a value came from. `--profile`
 refuses a name it does not know, so `--profile bost` does not start a node in `eco` that looks
 like it started in `boost`.
+
+## Client event loops: `--io-threads`
+
+`--io-threads N` gives the server N client event loops. The one that holds the listening socket
+accepts every connection and deals it to the next loop in turn; a connection stays on the loop it
+was dealt to for its whole life, so the order of its answers is unchanged. `1` is the default and
+is the single loop this server always had. The log names where each connection went —
+`Reactor 2 adopted fd=14 conn_id=7 from 10.0.0.5:51234` — and the threads are named `ob-io-0` …
+`ob-io-N-1`, so `top -H` says which loop is busy.
+
+What more loops buy depends on what the connections ask, and both halves are measured (m9g.xlarge,
+four cores, loopback, four connections pipelining batches of 64; roadmap #151):
+
+| | 1 loop | 2 loops | 4 loops |
+|---|---|---|---|
+| `BOOK` reads, levels read / s | 15 992 260 | 30 254 474 | **49 212 362** |
+| `MINSERT` writes, levels / s | 4 878 479 | 4 327 641 | 4 505 432 |
+| a writer beside a connection scanning 1.5 M rows, levels / s | 65 424 | **4 995 672** | 4 877 810 |
+
+- **Reads scale with the loops**, 3.08× at four here, with the load generator on the same cores.
+- **A query no longer stalls the writes of another connection** — if that connection is on another
+  loop. At one loop a writer beside a connection looping a 134 ms scan waited behind every scan;
+  on another loop it did not notice. Connections are dealt in turn, so two can share a loop, and a
+  heavy query holds its own loop for as long as it runs.
+- **Pipelined writes from several connections do not scale yet, and cost about 10% with a tripled
+  p99.** The engine takes its write lock once per record, and with several loops writing every
+  acquisition contends. Until the engine applies a read's writes under one acquisition, a
+  write-only workload is best served by the default.
+
+`--max-sessions` is one limit for the server, not one per loop, and `--drain-timeout-ms` is one
+deadline. `FAILOVER` and `MIGRATE` run alone across the loops, as they did when one loop ran every
+command. Values from 1 to 64 are accepted, and 0 is refused rather than guessed at.
 
 ## Typical Session
 
@@ -457,6 +493,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--flush-interval-ms` | `<N>` | Background flush interval in ms (default: 100) |
 | `--fsync-policy` | `<POLICY>` | WAL durability: every, interval or none (lower case; default: interval) |
 | `--io-spin-us` | `<N>` | Keep polling for this many microseconds after the last event before blocking again (default: 0, always block). Costs up to one core while traffic flows and takes ~20% off the loopback round trip |
+| `--io-threads` | `<N>` | Client event loops, 1 to 64 (default: 1). The loop that accepts deals connections to them in turn, and a connection stays on the loop it was dealt to for its whole life |
 | `--profile` | `<NAME>` | `eco` (default, blocking io) or `boost` (sets `io-spin-us`). A named set of the knobs, not a second code path; an unknown name is refused |
 | `--handover-cooldown-seconds` | `<N>` | How long a node that handed the role over abstains |
 | `--handover-grace-seconds` | `<N>` | Grace period granted to a handover target |
