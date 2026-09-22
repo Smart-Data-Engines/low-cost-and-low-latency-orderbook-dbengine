@@ -1280,6 +1280,11 @@ TEST(IoWait, TheLoopTakesItsTimeoutFromTheDecisionRatherThanALiteral) {
     std::size_t calls = 0;
     for (std::size_t at = source.find("epoll_wait("); at != std::string::npos;
          at = source.find("epoll_wait(", at + 1)) {
+        // A mention in a comment is not a call. The reactor's own docstring says "a fatal
+        // `epoll_wait()` error", and the first version of this loop failed on it - use against
+        // mention again, in a check whose own comment above warns about exactly that.
+        const std::size_t line_start = source.rfind('\n', at) + 1;
+        if (source.substr(line_start, at - line_start).find("//") != std::string::npos) continue;
         ++calls;
         const std::size_t end = source.find(')', at);
         ASSERT_NE(end, std::string::npos);
