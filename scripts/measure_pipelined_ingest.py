@@ -121,7 +121,7 @@ def one_run(name: str, server: Path, args: argparse.Namespace) -> dict:
                 pinned(args.probe_cpus,
                        [str(args.probe), str(port), str(node.pid), str(args.connections),
                         str(args.batches // args.connections), str(args.levels),
-                        str(args.batch)]),
+                        str(args.batch), *(["book"] if args.book else [])]),
                 capture_output=True, text=True)
             if out.returncode != 0:
                 raise SystemExit(f"probe failed ({out.returncode}) against {name}: "
@@ -157,6 +157,8 @@ def main() -> int:
     ap.add_argument("--count-syscalls", action="store_true")
     ap.add_argument("--flags", action="append", default=[], metavar="NAME=FLAGS",
                     help="server flags for the --server of that name, space-separated")
+    ap.add_argument("--book", action="store_true",
+                    help="batches of BOOK queries over seeded books instead of MINSERTs")
     ap.add_argument("--server-cpus", help="taskset list for the server, e.g. 0-1")
     ap.add_argument("--probe-cpus", help="taskset list for the probe, e.g. 2-3")
     ap.add_argument("--data-root", type=Path, default=REPO / "build-release" / "bench-data",
@@ -210,8 +212,10 @@ def main() -> int:
     counted = args.count_syscalls
     pins = (f"; server on CPUs {args.server_cpus or 'any'}, probe on {args.probe_cpus or 'any'}"
             if args.server_cpus or args.probe_cpus else "")
-    print(f"\n{args.connections} connection(s), batches of {args.batch} x {args.levels}-level "
-          f"MINSERT, medians of {args.rounds} rounds{pins}\n")
+    what = (f"BOOK of {args.levels} levels a side" if args.book
+            else f"{args.levels}-level MINSERT")
+    print(f"\n{args.connections} connection(s), batches of {args.batch} x {what}, "
+          f"medians of {args.rounds} rounds{pins}\n")
     head = "| build | levels/s | range | batch p50 | batch p99 | server CPU |"
     rule = "|---|---|---|---|---|---|"
     if counted:
