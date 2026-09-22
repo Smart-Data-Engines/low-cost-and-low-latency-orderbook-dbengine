@@ -53,3 +53,11 @@ target_link_libraries(wire_load PRIVATE orderbook_client)
 # and reports `BOOK` against a `PING` baseline in the same round, which is what makes the table in
 # the roadmap re-measurable with a command.
 add_executable(command_latency command_latency.cpp)
+
+# ── Pipelined ingest, K connections, the server's CPU per thread (#146) ──────
+#
+# Compiled, deliberately not run, for the reason above. scripts/measure_pipelined_ingest.py drives
+# it against fresh nodes in rotated rounds and counts sends and reads per batch from the kernel's
+# tracepoints, which is how the table in the roadmap was measured.
+add_executable(pipelined_ingest pipelined_ingest.cpp)
+target_link_libraries(pipelined_ingest PRIVATE Threads::Threads)
