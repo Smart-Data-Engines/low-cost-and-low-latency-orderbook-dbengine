@@ -344,7 +344,7 @@ std::string execute_command(const Command& cmd,
         }
         // NOTE: Do NOT call session.set_compressed(true) here!
         // The "OK COMPRESS LZ4\n\n" response must be sent as plain text.
-        // The caller (epoll/io_uring loop) enables compression AFTER
+        // The caller (the epoll loop) enables compression AFTER
         // sending this response.
         // Double newline required — client uses \n\n as OK terminator.
         return "OK COMPRESS LZ4\n\n";
@@ -684,9 +684,10 @@ std::string execute_command(const Command& cmd,
     case CommandType::SUBSCRIBE: {
         session.increment_commands();
         if (hub == nullptr) {
-            // The io_uring transport builds the same execute_command() without a hub. Saying so is
-            // better than accepting the command and never pushing anything: a client that gets OK
-            // and then silence has no way to tell that from a market with no updates.
+            // A caller without a hub - the unit tests, and until #147 the io_uring transport - gets
+            // a refusal. Saying so is better than accepting the command and never pushing
+            // anything: a client that gets OK and then silence has no way to tell that from a
+            // market with no updates.
             return format_error("subscriptions are not available on this transport");
         }
         std::string error;
@@ -877,7 +878,6 @@ const std::vector<std::string>& known_flags() {
         "mm-node-id",
         "mm-replication-port",
         "multi-master",
-        "no-sqpoll",
         "node-id",
         "port",
         "primary-host",
@@ -886,12 +886,10 @@ const std::vector<std::string>& known_flags() {
         "read-only",
         "replication-compress",
         "replication-port",
-        "ring-size",
         "shard-id",
         "shard-vnodes",
         "snapshot-chunk-size",
         "snapshot-staging-dir",
-        "sqpoll-idle-ms",
         "tls-ca-file",
         "tls-cert-file",
         "tls-client",
@@ -953,7 +951,6 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"mm-node-id", {"<N>", "Multi-master node id, unique in the mesh"}},
         {"mm-replication-port", {"<PORT>", "Multi-master peer port"}},
         {"multi-master", {"", "Run as a multi-master node instead of primary/replica"}},
-        {"no-sqpoll", {"", "Disable io_uring SQPOLL even where it is available"}},
         {"node-id", {"<ID>", "This node's name, as it appears to the coordinator"}},
         {"port", {"<PORT>", "TCP port to listen on (default: 9090)"}},
         {"primary-host", {"<HOST>", "Primary to replicate from, when starting as a replica"}},
@@ -962,12 +959,10 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"read-only", {"", "Refuse writes regardless of role"}},
         {"replication-compress", {"", "Compress the replication stream with LZ4"}},
         {"replication-port", {"<PORT>", "Port replicas connect to on this node"}},
-        {"ring-size", {"<N>", "io_uring submission queue size"}},
         {"shard-id", {"<N>", "This node's shard, when sharding by symbol"}},
         {"shard-vnodes", {"<N>", "Virtual nodes per shard in the consistent hash ring"}},
         {"snapshot-chunk-size", {"<N>", "Bytes per snapshot transfer chunk"}},
         {"snapshot-staging-dir", {"<DIR>", "Where an incoming snapshot is staged before install"}},
-        {"sqpoll-idle-ms", {"<N>", "io_uring SQPOLL idle timeout in ms"}},
         {"tls-ca-file", {"<PATH>", "Trust anchor (PEM) for verifying peer certificates on node "
                                    "links; required by --tls-replication and --tls-multi-master"}},
         {"tls-cert-file", {"<PATH>", "This node's certificate chain (PEM), used on every TLS "
@@ -1020,7 +1015,6 @@ std::string format_usage(const std::string& program) {
 const std::vector<std::string>& boolean_flags() {
     static const std::vector<std::string> flags = {
         "multi-master",
-        "no-sqpoll",
         "print-config",
         "read-only",
         "replication-compress",
@@ -1345,12 +1339,6 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
                 std::exit(1);
             }
             config.log_level = level;
-        } else if (arg == "--sqpoll-idle-ms") {
-            config.uring_sqpoll_idle_ms = cursor.value_as<uint32_t>();
-        } else if (arg == "--ring-size") {
-            config.uring_ring_size = cursor.value_as<uint32_t>();
-        } else if (arg == "--no-sqpoll") {
-            config.uring_no_sqpoll = true;
         } else if (arg == "--shard-id") {
             config.shard_id = std::string{cursor.value()};
         } else if (arg == "--shard-vnodes") {
@@ -1623,7 +1611,6 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("mm-node-id", std::to_string(c.mm_node_id));
     line("mm-replication-port", std::to_string(c.mm_replication_port));
     line("multi-master", c.multi_master ? "true" : "false");
-    line("no-sqpoll", c.uring_no_sqpoll ? "true" : "false");
     line("node-id", c.node_id);
     line("port", std::to_string(c.port));
     line("primary-host", c.primary_host);
@@ -1631,12 +1618,10 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("read-only", c.read_only ? "true" : "false");
     line("replication-compress", c.replication_compress ? "true" : "false");
     line("replication-port", std::to_string(c.replication_port));
-    line("ring-size", std::to_string(c.uring_ring_size));
     line("shard-id", c.shard_id);
     line("shard-vnodes", std::to_string(c.shard_vnodes));
     line("snapshot-chunk-size", std::to_string(c.snapshot_chunk_size));
     line("snapshot-staging-dir", c.snapshot_staging_dir);
-    line("sqpoll-idle-ms", std::to_string(c.uring_sqpoll_idle_ms));
     line("tls-ca-file", c.tls_ca_file.empty() ? "(none)" : c.tls_ca_file);
     line("tls-cert-file", c.tls_cert_file.empty() ? "(none)" : c.tls_cert_file);
     line("tls-client", c.tls_client ? "true" : "false");
@@ -2122,10 +2107,11 @@ void TcpServer::run() {
                 //
                 // 64 KiB rather than 4 KiB, because since #146 the answers to a read go out in one
                 // send and the read's size is therefore the batch's: a pipelined batch of 64
-                // twenty-level `MINSERT`s is 20,736 bytes, which a 4 KiB read took in six pieces and
-                // answered with six sends (measured: 6.00 sends per batch, 1.00 at 64 KiB). On the stack of the thread that owns this loop; the
-                // edge-triggered loop drains the socket either way, so a larger read changes how
-                // many syscalls a burst costs and not which session is served first.
+                // twenty-level `MINSERT`s is 20,736 bytes, which a 4 KiB read took in six pieces
+                // and answered with six sends (measured: 6.00 sends per batch, 1.00 at 64 KiB). On
+                // the stack of the thread that owns this loop; the edge-triggered loop drains the
+                // socket either way, so a larger read changes how many syscalls a burst costs and
+                // not which session is served first.
                 char buf[64 * 1024];
                 while (true) {
                     Session* session = session_mgr.get_session(fd);
@@ -2292,9 +2278,8 @@ void TcpServer::run() {
             }
         }
 
-        // Drain phase, decided by `drain_verdict()` rather than here, because the io_uring loop
-        // asks the same question in two more places and a bound written three times is a bound
-        // that drifts (#106).
+        // Drain phase, decided by `drain_verdict()` rather than here: a pure function a test can
+        // ask a thousand times without a socket, and one definition of the bound (#106).
         if (drain_started) {
             const int open = stats.active_sessions.load(std::memory_order_relaxed);
             switch (drain_verdict(drain_started_at, open, config_.drain_timeout_ms,

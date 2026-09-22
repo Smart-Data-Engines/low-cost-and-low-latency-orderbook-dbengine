@@ -406,12 +406,9 @@ TEST(MetricsRegistry, CorrectlyNamedWritesAreNotReportedAsUnknown) {
 
 // ── Arithmetic that belongs to metrics rather than to its callers (#117) ──────
 //
-// Both helpers below live in `metrics.hpp` because of where their callers are. `counter_delta`
-// is called from three places in the engine that each own a different total; `queue_utilization_
-// percent` is called from the io_uring transport, which **no CI job runs** — #108 added a job that
-// compiles that file and says in its own message that compiling is all it does. Arithmetic left
-// beside that caller would ship unverified for ever, so the part that can be checked was moved
-// to where the ordinary suite both builds and executes it.
+// `counter_delta` lives in `metrics.hpp` because it is called from three places in the engine that
+// each own a different total. A second helper stood beside it for the io_uring transport's queue
+// gauge, and went with that transport (#147).
 
 TEST(CounterDelta, TheOrdinaryCaseIsTheDifference) {
     EXPECT_EQ(ob::counter_delta(10, 4), 6u);
@@ -440,33 +437,4 @@ TEST(CounterDelta, RepublishingAnUnchangedTotalAddsNothing) {
     }
     // 5 for the first, 4 for the rise to 9, then 2 because the source restarted at 2.
     EXPECT_EQ(sum, 11u);
-}
-
-TEST(QueueUtilization, ReportsWholePercentAcrossTheRange) {
-    EXPECT_EQ(ob::queue_utilization_percent(0, 256), 0);
-    EXPECT_EQ(ob::queue_utilization_percent(64, 256), 25);
-    EXPECT_EQ(ob::queue_utilization_percent(256, 256), 100);
-}
-
-// A ring that reports no capacity has nothing queued either, so the answer is 0 and not a
-// division. Asserted rather than left to the reader because the alternative crashes a transport
-// that no test runs.
-TEST(QueueUtilization, ZeroCapacityIsZeroRatherThanADivision) {
-    EXPECT_EQ(ob::queue_utilization_percent(0, 0), 0);
-    EXPECT_EQ(ob::queue_utilization_percent(7, 0), 0);
-}
-
-// Saturating rather than exceeding 100. `io_uring_sq_ready()` and `io_uring_sq_space_left()` are
-// read one after the other without a lock on a ring the kernel also writes, so `used` can come
-// back larger than the capacity derived beside it. A gauge reading 103% is a gauge an operator
-// stops believing.
-TEST(QueueUtilization, MoreUsedThanCapacitySaturatesAtOneHundred) {
-    EXPECT_EQ(ob::queue_utilization_percent(300, 256), 100);
-}
-
-// Truncation towards zero, stated so that changing it has to be deliberate: a queue one entry
-// short of half full reads 49, never 50.
-TEST(QueueUtilization, TruncatesRatherThanRounds) {
-    EXPECT_EQ(ob::queue_utilization_percent(127, 256), 49);
-    EXPECT_EQ(ob::queue_utilization_percent(1, 256), 0);
 }

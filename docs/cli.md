@@ -471,7 +471,6 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--mm-node-id` | `<N>` | Multi-master node id, unique in the mesh |
 | `--mm-replication-port` | `<PORT>` | Multi-master peer port |
 | `--multi-master` | — (boolean) | Run as a multi-master node instead of primary/replica |
-| `--no-sqpoll` | — (boolean) | Disable io_uring SQPOLL even where it is available |
 | `--node-id` | `<ID>` | This node's name, as it appears to the coordinator |
 | `--port` | `<PORT>` | TCP port to listen on (default: 9090) |
 | `--primary-host` | `<HOST>` | Primary to replicate from, when starting as a replica |
@@ -480,12 +479,10 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--read-only` | — (boolean) | Refuse writes regardless of role |
 | `--replication-compress` | — (boolean) | Compress the replication stream with LZ4 |
 | `--replication-port` | `<PORT>` | Port replicas connect to on this node |
-| `--ring-size` | `<N>` | io_uring submission queue size |
 | `--shard-id` | `<N>` | This node's shard, when sharding by symbol |
 | `--shard-vnodes` | `<N>` | Virtual nodes per shard in the consistent hash ring |
 | `--snapshot-chunk-size` | `<N>` | Bytes per snapshot transfer chunk |
 | `--snapshot-staging-dir` | `<DIR>` | Where an incoming snapshot is staged before install |
-| `--sqpoll-idle-ms` | `<N>` | io_uring SQPOLL idle timeout in ms |
 | `--tls-ca-file` | `<PATH>` | Trust anchor (PEM) for verifying peer certificates on node links; required by `--tls-replication` and `--tls-multi-master` |
 | `--tls-cert-file` | `<PATH>` | This node's certificate chain (PEM), used on every TLS surface and in both roles |
 | `--tls-client` | — (boolean) | TLS on the client port; needs --tls-cert-file and --tls-key-file |

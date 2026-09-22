@@ -1,8 +1,9 @@
 // Does this OpenSSL negotiate kTLS on a real socket?
 //
 // Decisive for #30 part three: with kTLS the record layer runs in the kernel and the data path
-// stays ordinary send()/recv() - so the io_uring transport keeps working unchanged after the
-// handshake. Without it, that path needs a memory-BIO rewrite or a named refusal.
+// stays ordinary send()/recv() - so a transport with its own data path (the io_uring one, until
+// #147 removed it) would keep working unchanged after the handshake. Without it, that path needs a
+// memory-BIO rewrite or a named refusal.
 // Numbers, method and what they do not cover: benchmarks/tls/README.md
 #include <openssl/ssl.h>
 #include <openssl/err.h>

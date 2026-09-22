@@ -338,8 +338,9 @@ because the failure it replaced was a `SIGABRT`: a second node on a taken port p
 - **kdb+.** Unchanged: the binary and its licence both come from a vendor registration, and whether
   the free edition's terms permit publishing numbers is a licensing question rather than a
   technical one.
-- **Any claim about the io_uring transport.** It builds here, as CI requires, and nothing in this
-  run executed it.
+- **Any claim about the io_uring transport.** It built here, as CI then required, and nothing in
+  this run executed it. *(Measured on the next instance and removed, #147: slower than the epoll
+  server's `--profile boost`, and it sent a pipelining client bytes of the server's heap.)*
 - **Any per-core comparison against ClickHouse.** Its parallelism was not constrained, so "levels
   per CPU-second" is what was measured and "levels per core" is not.
 ## Does this need a different machine?

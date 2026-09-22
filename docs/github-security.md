@@ -21,8 +21,8 @@ The required checks and the remaining branch protections are described below.
 
 ### Required checks and how to update them ✅
 
-**Fourteen checks are required** after roadmap #38 added `fuzz`, which followed #108 adding
-`io-uring-build`. The complete list lives in
+**Thirteen checks are required** since roadmap #147 removed the io_uring transport and with it
+`io-uring-build`, which #108 had added; #38 added `fuzz` before that. The complete list lives in
 [`.github/rulesets/master.json`](../.github/rulesets/master.json), alongside the other branch
 protections. That sentence is no longer maintained by hand: the drift checker derives the count from
 the ruleset and fails if this paragraph disagrees with it, or if the paragraph stops making the
@@ -55,10 +55,12 @@ gh api repos/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/rule
                   | {count: length, contexts: .})}'
 ```
 
-`io-uring-build` compiles `ob_tcp_server_iouring` in Release with `OB_USE_IO_URING=ON` and
-`OB_BUILD_TESTS=OFF`. It also requires the linked binary to define `IoUringServer::run()`, because
-`ob_tcp_server` remains an epoll binary even when that option is enabled. This check proves
-compilation and linking. It does not run the transport or establish runtime or sanitizer coverage.
+`io-uring-build` compiled `ob_tcp_server_iouring` and nothing else, and said so: it proved
+compilation and linking and never ran the transport. #147 removed the transport after measuring what
+that meant — it sent a pipelining client bytes of the server's heap and ignored `--fsync-policy` —
+so the check went with it. Removing a required context has an order, and it is the reverse of adding
+one: the live ruleset first, then the merge, because a pull request that deletes the job can never
+report it.
 
 `fuzz` came with roadmap #38. It builds three libFuzzer harnesses over the parsers that read
 untrusted bytes — wire commands, multi-master framing and WAL replay — under Clang with ASan and
@@ -274,10 +276,10 @@ person's attention were both read, and are recorded here rather than left in a w
   WAL directory can already write where their own permissions allow. Not reachable from the network and
   not reachable from a client connection. Triage as such, with the reason recorded on the alert.
 - **`cpp/stack-address-escape`, warning, `src/engine.cpp:1272`** — `set_read_only_flag()` stores a raw
-  `std::atomic<bool>*`. False as stated: both callers pass `&read_only_`, a *member* of `TcpServer` /
-  `IoUringServer`, so no stack address escapes. What it does surface is real and unguarded, though:
+  `std::atomic<bool>*`. False as stated: the caller passes `&read_only_`, a *member* of `TcpServer`
+  (and, until #147 removed it, of `IoUringServer`), so no stack address escapes. What it does surface is real and unguarded, though:
   `Engine` holds a raw pointer into a server object's storage, nothing sets it back to `nullptr` in
-  either destructor, and an `Engine` outliving its server would read freed memory. Today the lifetimes
+  the destructor, and an `Engine` outliving its server would read freed memory. Today the lifetimes
   are nested in `main()`, so it is latent rather than live — which is precisely the kind of thing that
   should be a roadmap item instead of a comment nobody wrote. The command under "Verify afterwards" prints what is
 actually enforced, which is the only answer worth trusting.
@@ -558,7 +560,7 @@ handles (c), and 2FA with signed commits and tag protection handle (d).
 ✅ ruleset: clang-build required — added with #37, because the README claimed Clang support that
    nothing checked
 ✅ ruleset: coverage required — added with #37; gates library instrumentation and a 58% line floor
-✅ ruleset: io-uring-build required — added with #108; compiles and verifies the linked transport
+✅ ruleset: io-uring-build removed with the transport it built — #147; it was added with #108
 ✅ .github/rulesets/master.json matches the live ruleset again, see §1.1
 ✅ the 30 vendored CodeQL alerts dismissed with a reason — paths-ignore does not work here, see §1
 ⚙️ triage the two own-code CodeQL alerts recorded in §1; the other thirteen are note-level tidiness

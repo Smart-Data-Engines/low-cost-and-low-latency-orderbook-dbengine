@@ -55,12 +55,13 @@ TEST(CliArgs, ParsesTheCommonFlags) {
 }
 
 TEST(CliArgs, BooleanFlagsTakeNoValue) {
-    const auto config = parse({"--read-only", "--replication-compress", "--no-sqpoll",
-                               "--port", "5556"});
+    // Two booleans rather than three: the third was `--no-sqpoll`, which went with the io_uring
+    // transport (#147), and every other boolean brings a rule of its own - `--multi-master` needs a
+    // node id and endpoints and refuses `--read-only` - that this test is not about.
+    const auto config = parse({"--read-only", "--replication-compress", "--port", "5556"});
 
     EXPECT_TRUE(config.read_only);
     EXPECT_TRUE(config.replication_compress);
-    EXPECT_TRUE(config.uring_no_sqpoll);
     EXPECT_EQ(config.port, 5556) << "a boolean flag must not swallow the next argument";
 }
 

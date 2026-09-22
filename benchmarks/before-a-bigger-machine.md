@@ -46,7 +46,6 @@ chosen on a two-core laptop.
 |------|-------------------------------|
 | `--flush-interval-ms` | how often the columnar flush runs; the ingest path's back-pressure comes from `MAX_PENDING_ROWS` ahead of it |
 | `--fsync-policy` | `interval` is the default (**not** `every` — `docs/architecture.md` claimed otherwise until #113). On instance-store NVMe versus gp3 this is the single biggest storage knob |
-| `--ring-size`, `--no-sqpoll`, `--sqpoll-idle-ms` | io_uring only, and that transport is compiled but not run by CI (#108). If the AWS run uses it, it is the first time anything does |
 | `--max-sessions` | the benchmark harness opens one connection per client; the protocol round trip is where we lose (111× measured), so client count is a first-class variable |
 | `--snapshot-chunk-size` | irrelevant to ingest, relevant if the run includes a bootstrap |
 | `--mm-max-catchup-bytes`, `--mm-max-peer-send-buffer` | mesh only; not in the comparative workload |

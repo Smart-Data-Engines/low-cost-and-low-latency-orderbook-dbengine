@@ -34,9 +34,9 @@ bool mentions(const std::string& haystack, std::string_view needle) {
     return haystack.find(needle) != std::string::npos;
 }
 
-/// Route a line the way both transports route it, rather than picking the parser the test means.
+/// Route a line the way the server routes it, rather than picking the parser the test means.
 ///
-/// `tcp_server.cpp` and `io_uring_server.cpp` both decide by `line.find('\n')`, so a fixture that
+/// `tcp_server.cpp` decides by `line.find('\n')`, so a fixture that
 /// called `parse_command` directly would be testing a dispatch nobody performs — and `MINSERT`,
 /// whose canonical form is the only multi-line one, would have no canonical case at all. Which is
 /// exactly what the coverage test below reported the first time it ran.

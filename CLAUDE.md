@@ -40,7 +40,7 @@ ctest --test-dir build --output-on-failure -j1
 First configure pulls googletest, google/benchmark, rapidcheck and nlohmann/json via `FetchContent`,
 which needs network access and a few minutes.
 
-System dependencies: `liblz4-dev`, `libcurl4-openssl-dev`, `liburing-dev`.
+System dependencies: `liblz4-dev`, `libcurl4-openssl-dev`.
 
 Tests that touch coordination need a native `etcd` on PATH (or `OB_ETCD_BINARY`). Installation
 instructions are in [tests/integration/README.md](tests/integration/README.md) and
@@ -3121,6 +3121,27 @@ Learned the hard way. Check here before debugging.
      descriptor each read was on — here, that one read per pass of the loop is the subscription
      hub's eventfd, drained whether or not it fired.
 
+371. **A second copy of the server loop drifts in the direction nobody tests, and every feature
+     added after it was written went to one of the two.** The io_uring transport constructed its
+     engine with `FsyncPolicy::INTERVAL` and a 100 ms flush interval as literals, passed no
+     multi-master configuration, handed subscriptions a null hub and refused TLS — so
+     `--fsync-policy every` parsed, was accepted and did nothing: **2 fsyncs for 200 acknowledged
+     writes**, against 201 on epoll (#147). Nothing failed, because no CI job ran that binary. When
+     two loops must agree, one of them should not exist, and the proof that it could go was a
+     latency table in which the other one's `boost` won.
+372. **An asynchronous send borrows its buffer until the completion arrives, so a per-descriptor
+     slot reused by the next submission is a use-after-free with the right length.**
+     `pending_writes_[fd].assign(data, len)` ran once per answer while the sends prepared for the
+     earlier answers still pointed into that string; a longer answer reallocated it. The client got
+     exactly as many bytes as it asked for, which is why the byte count looked right — and they were
+     **memory of the server process**. A sequential client never has two answers in flight, so only
+     a pipeline could see it (#147).
+373. **Writing "not measured here" is how the measurement gets made.** #146's closing paragraph was
+     going to say the io_uring transport "sends one answer at a time and is untouched". Checking
+     that sentence against the transport took ten minutes and found a heap disclosure and a
+     durability flag that did nothing. Fourth time in this repository that writing for a reader
+     tested the code (pitfalls 84, 112, 228).
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -3133,9 +3154,8 @@ because commit messages and specs cite these numbers.
 [docs/roadmap.md](docs/roadmap.md). Both suites run in CI on every pull request, the whole integration
 battery a second time under ThreadSanitizer, with an unexpected skip failing the job. The CLI and
 C++ client harness are built alongside the selected server in both integration jobs. Clang builds
-and tests the tree too. **Fourteen checks are required** on `master`: #108 added
-`io-uring-build`, which compiles the optional transport and verifies its symbol in
-`ob_tcp_server_iouring` without claiming runtime coverage, and #38 added `fuzz`. The exact contexts
+and tests the tree too. **Thirteen checks are required** on `master`: #38 added `fuzz`, and #147
+took `io-uring-build` away with the transport it built. The exact contexts
 live in `.github/rulesets/master.json`, and `check_contexts.py` now derives that number and checks
 **this sentence** against it as well as the one in `docs/github-security.md` — it said "Thirteen"
 for one item, which is pitfall 223 happening in the second document its own mechanism did not
@@ -3169,6 +3189,17 @@ that does not flatter is the control.
 `--flush-interval-ms`, and its wait has a deadline after which the write is refused rather than
 accepted. 1,196,745 → 2,209,501 levels/s at four million levels and a one-second interval,
 unchanged at the 100 ms default the engine ships with.
+
+**#147**: the io_uring transport is gone. Measured before it went, on the m9g.xlarge: a pipelined
+batch of six commands came back as **177 bytes of the server's heap** — `submit_write()` reassigned
+one per-descriptor string under every send already queued on it — `--fsync-policy every` gave **2
+fsyncs for 200 acknowledged writes** against 201 on epoll, because its engine was built with
+`FsyncPolicy::INTERVAL` as a literal, and it answered `PING` in 7,487 ns p50 against **6,295** for
+epoll's `--profile boost`, at three times the CPU. With no measured advantage left, repairing two
+defects of that consequence in a second copy of the server loop — and keeping that copy in step
+with every feature, the multi-reactor stage included — lost to deleting it, the decision #114 made
+about `MmapStore`. `-DOB_USE_IO_URING=ON` is refused at configure time with the item's number, and
+its three flags are unknown to the parser, which refuses them by name.
 
 **#146**: the answers to one read go out in **one** `send()`, and the read is 64 KiB, so one read
 is one batch. A pipelined batch of 64 answers used to cost 64 sends and 64 segments — 32.4% of the
@@ -3266,9 +3297,7 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   same defect as one that was never documented.)*
   What is still true: **an unconfigured node is plaintext and unauthenticated on all three
   surfaces**, and the startup log WARNs for each disabled surface rather than leaving "default open"
-  in a document. The io_uring transport **refuses** every `--tls-*` flag — the client port needs a
-  memory-BIO rewrite, and node-link TLS has no runtime tests on this transport.
-  The `io-uring-build` job checks compilation and linking only (#108).
+  in a document.
   Certificate rotation needs a restart. Three things to know before touching authentication: the
   client gate sits *before* `execute_command`'s switch and its classifier has no `default:` (pitfall
   109); the surface label is inside the HMAC input because replication and multi-master share one
@@ -3429,9 +3458,7 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   fifty). Cost measured, not argued: **+3 instructions** per record in both write paths, no new
   `lock`-prefixed instruction, `apply_delta_mm` unchanged. `ob_repl_records_replayed` needed only a
   publisher — and pitfall 250 — because `STATUS` has printed it as `replayed=` all along. The
-  io_uring pair is fed in a loop **no CI job runs**, so the arithmetic moved to `metrics.hpp` where
-  the suite executes it and the rest is asserted against the source text in
-  `tests/test_iouring_instrumentation.cpp`, which is deliberately not behind `OB_USE_IO_URING`.
+  io_uring pair went with its transport (#147).
 - **The hybrid logical clock never goes backwards, and a peer's clock can no longer become the
   mesh's clock without limit** (#119, #120, #121 closed). The reversal was the `uint16` `logical`
   counter wrapping while the physical component was pinned above the wall clock — measured at tick

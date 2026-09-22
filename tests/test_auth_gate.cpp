@@ -155,16 +155,17 @@ TEST(AuthGateStatic, TheClassifierHasNoDefaultLabel) {
         << "a default label turns off the exhaustiveness check this function relies on";
 }
 
-TEST(AuthGateStatic, EveryTransportPassesACredentialStoreToExecuteCommand) {
-    // The gate is one seam for two loops only while both loops pass the store. `execute_command`
-    // takes it as a defaulted argument - which every unit test relies on - so a transport that
-    // forgets it compiles, runs, and authenticates nobody.
+TEST(AuthGateStatic, TheServerPassesACredentialStoreToExecuteCommand) {
+    // The gate is one seam only while the loop that dispatches passes the store. `execute_command`
+    // takes it as a defaulted argument - which every unit test relies on - so a loop that forgets
+    // it compiles, runs, and authenticates nobody.
     //
-    // io_uring is the case this exists for: `OB_USE_IO_URING` is off by default, and since #108 a
-    // CI job **builds** that file without running anything in it — so nothing else would notice. Same shape as the four integration modules
-    // that built their own path to the server binary (#85) - a mechanism whose scope can shrink in
-    // silence.
-    for (const char* rel : {"/src/tcp_server.cpp", "/src/io_uring_server.cpp"}) {
+    // Written for two loops: the io_uring transport was the case this existed for, a file CI built
+    // and never ran, so nothing else would have noticed. That transport is gone (#147), and the
+    // rule is kept for the next loop - the multi-reactor work adds loops, and a defaulted argument is
+    // exactly what a new one forgets. Same shape as the four integration modules that built their
+    // own path to the server binary (#85): a mechanism whose scope can shrink in silence.
+    for (const char* rel : {"/src/tcp_server.cpp"}) {
         std::ifstream in(std::string(OB_SOURCE_DIR) + rel);
         ASSERT_TRUE(in) << "cannot read " << rel;
         const std::string src((std::istreambuf_iterator<char>(in)),

@@ -262,11 +262,6 @@ struct ServerConfig {
     /// --max-subscriptions-per-session: without a limit one session can order an unbounded amount
     /// of work onto every other client's write path.
     int      max_subscriptions_per_session{16};
-
-    // io_uring (used only when OB_USE_IO_URING is active)
-    uint32_t uring_ring_size{256};            // --ring-size
-    uint32_t uring_sqpoll_idle_ms{1000};      // --sqpoll-idle-ms
-    bool     uring_no_sqpoll{false};          // --no-sqpoll
 };
 
 // ── Loaded credentials ────────────────────────────────────────────────────────
@@ -327,17 +322,17 @@ enum class DrainVerdict {
     DeadlineReached,   ///< the bound expired with sessions still open; close them and stop
 };
 
-/// The drain decision, shared by both transports because it exists in both of them.
+/// The drain decision, in one place.
 ///
-/// `io_uring_server.cpp` checks `draining_ && active_sessions <= 0` in **two** places and the epoll
-/// loop in one, none of which had a deadline (#106) — and **no CI job builds the io_uring file**, so
-/// a bound written three times could not even be compiled on one of the two sides. This repository
-/// has paid for "the fix exists and is used at one of two sites" in #91 (`c_api.cpp` beside the
-/// server), #101 (two wipe sites) and #102 (two entry points), so the decision lives here once and
-/// a static test refuses a drain check that does not come through it.
+/// Written when two transports asked it: the io_uring loop checked `draining_ && active_sessions <=
+/// 0` in **two** places and the epoll loop in one, none of which had a deadline (#106), and no CI
+/// job built the io_uring file, so a bound written three times could not even be compiled on one of
+/// the two sides. That transport is gone (#147); the function stays, because the decision is pure
+/// and a test can ask it a thousand times without a socket, and because this repository has paid
+/// for "the fix exists and is used at one of two sites" in #91, #101 and #102. A static test refuses
+/// a drain check that does not come through it.
 ///
-/// Pure: the caller logs, because only the caller knows which transport it is and how many sessions
-/// it is about to cut.
+/// Pure: the caller logs, because only the caller knows how many sessions it is about to cut.
 /// How long the client loop should wait for the next event: 0 to poll, or the blocking timeout.
 ///
 /// Pure, and a separate function for the same reason `drain_verdict()` below is: the loop asks

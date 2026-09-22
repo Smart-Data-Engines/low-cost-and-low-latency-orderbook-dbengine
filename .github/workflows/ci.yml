@@ -62,7 +62,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config \
-            liblz4-dev libcurl4-openssl-dev liburing-dev
+            liblz4-dev libcurl4-openssl-dev
 
       # etcd runs natively, like the engine itself. No containers in the test path.
       - name: Install etcd
@@ -131,7 +131,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config \
-            liblz4-dev libcurl4-openssl-dev liburing-dev
+            liblz4-dev libcurl4-openssl-dev
 
       # etcd runs natively, like the engine itself. No containers in the test path.
       - name: Install etcd
@@ -234,7 +234,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config \
-            liblz4-dev libcurl4-openssl-dev liburing-dev
+            liblz4-dev libcurl4-openssl-dev
 
       - name: Configure (Release, no tests)
         run: cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DOB_BUILD_TESTS=OFF
@@ -258,41 +258,6 @@ jobs:
           kill $SERVER_PID || true
           exit 1
 
-  # Compilation coverage for the optional transport (#108). Runtime support for io_uring on a
-  # hosted runner is a separate question; this job makes no claim about serving requests.
-  io-uring-build:
-    name: io-uring-build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential binutils cmake pkg-config \
-            liblz4-dev libcurl4-openssl-dev libssl-dev liburing-dev
-
-      - name: Configure io_uring (Release, no tests)
-        run: >-
-          cmake -S . -B build-io-uring -DCMAKE_BUILD_TYPE=Release
-          -DOB_USE_IO_URING=ON -DOB_BUILD_TESTS=OFF
-
-      - name: Build the io_uring server
-        run: cmake --build build-io-uring --target ob_tcp_server_iouring -j$(nproc)
-
-      - name: Verify the binary contains the io_uring transport
-        # OB_USE_IO_URING adds a separate executable; ob_tcp_server still uses epoll. Check the
-        # linked code, so a successful build of the wrong transport cannot satisfy this job.
-        run: |
-          nm -C --defined-only build-io-uring/ob_tcp_server_iouring > build-io-uring/symbols.txt
-          if ! grep -E ' T ob::IoUringServer::run\(\)$' build-io-uring/symbols.txt; then
-            echo "::error::The built server does not contain IoUringServer::run()"
-            exit 1
-          fi
-
   # Clang, because the README and CLAUDE.md both claim GCC >= 12 / Clang >= 15 and nothing had ever
   # checked the second half of that sentence.
   #
@@ -313,7 +278,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config clang \
-            liblz4-dev libcurl4-openssl-dev liburing-dev
+            liblz4-dev libcurl4-openssl-dev
           clang++ --version
 
       # etcd for the handful of C++ tests that talk to a coordinator.
@@ -396,7 +361,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config \
-            liblz4-dev libcurl4-openssl-dev liburing-dev
+            liblz4-dev libcurl4-openssl-dev
           python3 -m pip install --quiet gcovr
 
       # etcd for the C++ tests that talk to a coordinator; without it their lines read as uncovered
@@ -526,7 +491,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config \
-            liblz4-dev libcurl4-openssl-dev liburing-dev
+            liblz4-dev libcurl4-openssl-dev
 
       # ThreadSanitizer refuses to start when the kernel hands out more ASLR entropy than its
       # shadow mapping allows: "FATAL: ThreadSanitizer: unexpected memory mapping". Ubuntu 24.04
@@ -582,7 +547,7 @@ jobs:
       - name: Install build and packaging dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq liblz4-dev libcurl4-openssl-dev liburing-dev rpm
+          sudo apt-get install -y -qq liblz4-dev libcurl4-openssl-dev rpm
           # rpm brings rpmbuild, which is what makes the RPM generator appear. Without it CMake
           # configures DEB and TGZ only — see the note by CPACK_GENERATOR.
 
@@ -631,7 +596,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config \
-            liblz4-dev libcurl4-openssl-dev liburing-dev
+            liblz4-dev libcurl4-openssl-dev
 
       - name: Install etcd
         run: |
@@ -787,7 +752,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config clang libclang-rt-dev \
-            liblz4-dev libcurl4-openssl-dev libssl-dev liburing-dev
+            liblz4-dev libcurl4-openssl-dev libssl-dev
           clang++ --version
 
       - name: Configure the fuzzing tree (Clang, libFuzzer, ASan + UBSan)

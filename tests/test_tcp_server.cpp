@@ -1163,17 +1163,18 @@ TEST(BoundedDrain, ZeroMeansWaitForEverAndHasToBeAskedFor) {
         << "the default is what a supervisor meets, so it cannot be unbounded";
 }
 
-TEST(BoundedDrain, NeitherTransportDecidesForItself) {
-    // The reason this is static: `io_uring_server.cpp` asked the same question in **two** places
-    // and the epoll loop in one, and **no CI job builds the io_uring file** - so a bound written
-    // three times could not even be compiled on one of the two sides. This repository has paid for
-    // "the fix exists and is used at one of two sites" in #91, #101 and #102.
+TEST(BoundedDrain, TheLoopDoesNotDecideForItself) {
+    // The reason this is static: the io_uring transport asked the same question in **two** places
+    // and the epoll loop in one, and no CI job built the io_uring file - so a bound written three
+    // times could not even be compiled on one of the two sides. That transport is gone (#147); the
+    // rule stays, because this repository has paid for "the fix exists and is used at one of two
+    // sites" in #91, #101 and #102, and a second loop is exactly what the next stage adds.
     const auto read = [](const char* rel) {
         std::ifstream in(std::string(OB_SOURCE_DIR) + "/" + rel);
         return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     };
 
-    for (const char* rel : {"src/tcp_server.cpp", "src/io_uring_server.cpp"}) {
+    for (const char* rel : {"src/tcp_server.cpp"}) {
         const std::string source = read(rel);
         ASSERT_FALSE(source.empty()) << rel << " could not be read, so this test checks nothing";
 

@@ -377,8 +377,8 @@ ob_add_tcp_test(test_response_formatter
 ob_add_tcp_test(test_tcp_server
     test_tcp_server.cpp
 )
-# The drain rule (#106) is checked by reading both transports' sources: the bound has to live in one
-# place, and the io_uring half is in a file no CI job builds.
+# The drain rule (#106) is checked by reading the server's source: the bound has to live in one
+# place.
 target_compile_definitions(test_tcp_server
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
@@ -665,7 +665,6 @@ target_link_libraries(test_client
 )
 gtest_discover_tests(test_client PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
 
-# ── io_uring property-based and unit tests (io-uring-transport, Task 9) ───────
 # ── ShardMap & ConsistentHashRing property and unit tests (symbol-sharding) ───
 add_executable(test_shard_map test_shard_map.cpp)
 target_link_libraries(test_shard_map
@@ -703,21 +702,6 @@ target_link_libraries(test_shard_coordinator
 )
 gtest_discover_tests(test_shard_coordinator PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
 
-# ── io_uring property-based and unit tests (io-uring-transport, Task 9) ───────
-if(OB_USE_IO_URING)
-    add_executable(test_io_uring test_io_uring.cpp)
-    target_compile_definitions(test_io_uring PRIVATE OB_USE_IO_URING)
-    target_link_libraries(test_io_uring
-        PRIVATE
-            orderbook_iouring_server_lib
-            orderbook_tcp_server_lib
-            GTest::gtest_main
-            rapidcheck
-            rapidcheck_gtest
-    )
-    gtest_discover_tests(test_io_uring PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
-endif()
-
 # ── HLC property-based and unit tests (multi-master-replication, Tasks 1.4–1.10) ─
 add_executable(test_hlc test_hlc.cpp)
 target_link_libraries(test_hlc
@@ -728,14 +712,6 @@ target_link_libraries(test_hlc
         rapidcheck_gtest
 )
 gtest_discover_tests(test_hlc PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
-
-# ── What the io_uring transport publishes, read from its source (#117) ───────
-# Not behind OB_USE_IO_URING on purpose: the point is to check a file this build does not compile,
-# because the build that does compile it runs no tests.
-ob_add_test(test_iouring_instrumentation test_iouring_instrumentation.cpp)
-target_compile_definitions(test_iouring_instrumentation
-    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
-)
 
 # ── HLC under clock skew (fault-injection stage D, #54; defects #119 and #120) ─
 add_executable(test_hlc_skew test_hlc_skew.cpp)
@@ -901,7 +877,7 @@ target_compile_definitions(test_query_live_buffer_race
 ob_add_tls_test(test_tls_context
     test_tls_context.cpp
 )
-# Reads src/ to hold the io_uring refusal against the parser's own flag list.
+# Reads src/tls.cpp to hold the shape that makes a leaked context impossible.
 target_compile_definitions(test_tls_context
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )

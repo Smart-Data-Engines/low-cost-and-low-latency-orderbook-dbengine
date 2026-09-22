@@ -66,8 +66,8 @@
 #endif
 
 // aarch64 detection reads the Linux auxiliary vector, so this asks for Linux as well as the
-// architecture. The engine needs epoll and io_uring, so there is no aarch64 target here that is not
-// Linux; naming it keeps the condition honest rather than lucky.
+// architecture. The engine needs epoll, so there is no aarch64 target here that is not Linux;
+// naming it keeps the condition honest rather than lucky.
 #if defined(__aarch64__) && defined(__linux__) && (defined(__GNUC__) || defined(__clang__))
 #define OB_CRC32C_ARM 1
 #include <asm/hwcap.h>

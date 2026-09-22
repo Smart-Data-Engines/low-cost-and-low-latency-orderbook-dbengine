@@ -2212,6 +2212,80 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 147. The io_uring transport sent a pipelining client bytes of the server's heap, and ignored `--fsync-policy` ✅
+
+**Closed by removing the transport.** `ob_tcp_server_iouring`, `OB_USE_IO_URING`,
+`src/io_uring_server.cpp` and the flags only it read are gone, and so is the `io-uring-build`
+required check, which built it and nothing else. Three measurements, and the last is the one that
+settled it.
+
+**What a pipelined batch received.** Six commands in one write — `PING`, two `INSERT`s, an unknown
+command, a `BOOK`, `PING` — answered through each transport, with two controls: the same batch one
+command at a time, and the same batch on the epoll transport. Measured on the m9g.xlarge:
+
+| | one command at a time | the batch in one write |
+|---|---|---|
+| epoll | 177 bytes, correct | 177 bytes, identical |
+| io_uring | 177 bytes, correct | **177 bytes, not the answers** |
+
+The io_uring bytes began `\x8b\x00\x00\x00\x00\x8b\x00\x00\x00\xb6\xe0\x0c\t\x00…` and held
+fragments of other answers — **memory of the server process, sent to a client**. The mechanism is
+one line: `IoUringServer::submit_write()` did `pending_writes_[fd].assign(data, len)` and prepared a
+send pointing at that string's buffer. Every answer of one read calls it for the same descriptor
+before the ring is submitted, so every send of the read pointed into one string that each later
+`assign` rewrote — and reallocated when a longer answer came along, which left the earlier sends
+pointing at freed memory. The length of each send was right, so the byte count came out right.
+Sequential clients never have two answers in flight, which is why nothing saw it: no test drove this
+transport with a pipeline, and no CI job ran it at all (#108 built it, and said that was all).
+
+**What `--fsync-policy every` did.** 200 acknowledged writes under that flag: **201 fsyncs** on the
+epoll transport and **2** on io_uring. `IoUringServer` constructed its engine with
+`FsyncPolicy::INTERVAL` and a 100 ms flush interval as literals, so the flag parsed, was accepted, and
+did nothing — #113's defect (acknowledged writes that were not synced) in the transport #113 did not
+look at, and without even the `EIO` to make it visible.
+
+**What else it did not carry, read rather than measured:** no multi-master configuration reached its
+engine, subscriptions were handed a null hub, sharding a null coordinator, and every `--tls-*` flag
+was refused. Every server feature added since it was written had been added to one transport.
+
+**And what it was for.** The transport existed to be the fast path — its own comment put `PING` at
+24 µs against 45 µs on epoll, on the reference machine, before #144 gave epoll a spin window. Measured now,
+m9g.xlarge, five interleaved rounds of 20,000 `PING` round trips through a bare socket:
+
+| | p50 | p99 | server CPU for 20,000 |
+|---|---|---|---|
+| epoll, `--profile eco` | 7,733 ns | 8,053 ns | 0.070 s |
+| io_uring | 7,487 ns | 7,876 ns | **0.200 s** |
+| epoll, `--profile boost` | **6,295 ns** | **6,774 ns** | 0.060 s |
+
+`boost` answers faster than io_uring did, for **a third of its CPU**. With no measured
+advantage left, the choice was between fixing two defects of this severity in a second copy of the
+server loop — and then keeping it in step with every feature, including the multi-reactor work that
+is next — or deleting it. It is the same decision as #114, for the same kind of reason: the cost of
+the component was a failure mode, and there was no measurement on the other side.
+
+**What would bring it back** is a measurement, not a preference: an io_uring loop that shares
+`Session`'s output buffer and the engine's construction with the epoll loop rather than copying
+them, and that beats `boost` on the table above. The spec it was built from is still in
+`kiro-workspace/specs/io-uring-transport/`, with a note at its head naming this item.
+
+**What removing it took, and the order it had to happen in.** Four files deleted (the transport,
+its header, its property tests, and #117's test reading its source), its build block, its metrics
+and the one helper only it called, three flags, and every test that checked a rule "in both
+transports" — which now check it in one, with the reason kept beside them, because the multi-reactor
+stage adds loops and a rule written for two is exactly what a new one forgets. Two refusals stand in
+its place: `-DOB_USE_IO_URING=ON` fails at configure time naming this item, rather than configuring
+cleanly and leaving a build script to look for a binary that no longer exists; and `--ring-size`,
+`--no-sqpoll` and `--sqpoll-idle-ms` are unknown to the parser, which refuses a flag it does not
+know by name (#36). All three were accepted by the **epoll** binary too — `--print-config` reported
+them back as set — and did nothing there, which is pitfall 27 in flags nobody would have thought to
+try. And the required check had to go
+**before** the merge: a pull request that deletes a job can never report it, so the live ruleset was
+narrowed to thirteen first, read back, and only then was this merged.
+
+- Effort: S | Impact: P0 in consequence on the builds that used it — heap memory to a client, and a
+  durability flag that did nothing — and one server loop to make parallel instead of two
+
 ### 146. The io thread sent one segment per answer, so a pipelined batch of 64 cost 64 sends ✅
 
 **Closed.** The answers to every command parsed from one read are queued into the session's buffer
@@ -8738,18 +8812,14 @@ Things a reviewer will notice, listed here so they do not look like oversights:
   that was never a condition of the item: it would mean sending builds of a public repository to a
   third-party service, the same class of decision as the coverage badge in #37.
 
-- **Every encrypted surface is off by default, and one transport cannot have it at all.** All
+- **Every encrypted surface is off by default.** All
   three surfaces authenticate (`--auth-secret-file`, `--cluster-secret-file`) and all three can be
   encrypted since #30 part three — `--tls-client` for client sessions, `--tls-replication` and
   `--tls-multi-master` for the node links, TLS 1.3 with no configurable floor. Both shipped clients
   verify the chain *and* the name; on the node links verification is mutual and cannot be configured
-  otherwise. Four things are still worth a reviewer's notice. **Every one of those flags defaults
+  otherwise. Three things are still worth a reviewer's notice. **Every one of those flags defaults
   to off**, so a cluster that nobody configured is plaintext on all three surfaces and says so only
-  in its startup log. **The io_uring transport refuses every `--tls-*` flag** — for the client port
-  because receive stays in userspace even with kernel TLS, so that loop needs a memory-BIO rewrite;
-  for the node links because encrypted links on this transport have no runtime tests. The
-  `io-uring-build` job (#108) verifies compilation and linking only. The transport remains
-  plaintext-only. **Certificate rotation needs a restart**, one node at a time. And **`--tls-peer-names` empty means chain-only verification**,
+  in its startup log. **Certificate rotation needs a restart**, one node at a time. And **`--tls-peer-names` empty means chain-only verification**,
   which under a company-wide CA means any host it signs may join the cluster — the list is the
   mechanism that narrows that, and the startup log names which mode is in force.
   *(This bullet used to say the replication link and the mesh were plaintext. That was true until
@@ -8808,7 +8878,7 @@ Baselines are hardware-specific. **Never quote a number without the machine it c
 | Native ingestion | ~1.35M updates/s | C++ benchmark, single core |
 | Native update latency | ~2.8 µs p50 | C++ benchmark |
 | PING latency (epoll) | ~45 µs avg | Python client, loopback |
-| PING latency (io_uring) | ~24 µs avg | Python client, loopback |
+| PING latency (io_uring) | ~24 µs avg | Python client, loopback. The transport was removed in #147: measured on an m9g.xlarge it answered `PING` in 7,487 ns p50 against 6,295 for the epoll server's `--profile boost` |
 | Single INSERT (TCP) | ~0.3 ms | Python client |
 | MINSERT 1000 levels (TCP) | ~3 ms | Python client, single round-trip |
 | FLUSH (incremental) | ~2-3 ms | Non-blocking, two-phase |

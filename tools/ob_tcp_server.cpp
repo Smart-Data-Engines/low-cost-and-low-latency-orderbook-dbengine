@@ -8,9 +8,6 @@
 
 #include "orderbook/tcp_server.hpp"
 #include "orderbook/version.hpp"
-#ifdef OB_USE_IO_URING
-#include "orderbook/io_uring_server.hpp"
-#endif
 
 #include <atomic>
 #include <csignal>
@@ -91,11 +88,7 @@ static int run_server(int argc, char* argv[]) {
                 static_cast<unsigned>(config.port), config.data_dir.c_str());
     std::fflush(stdout);
 
-#ifdef OB_USE_IO_URING
-    ob::IoUringServer server(std::move(config));
-#else
     ob::TcpServer server(std::move(config));
-#endif
 
     // Monitor thread: polls g_shutdown_requested and calls server.shutdown().
     //
