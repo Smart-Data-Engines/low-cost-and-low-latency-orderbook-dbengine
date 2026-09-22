@@ -22,6 +22,7 @@ import re
 import signal
 import socket
 import tempfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -51,22 +52,26 @@ class ReactorNode(Node):
         """conn_id -> reactor, from the node's own log."""
         return {int(conn): int(reactor) for reactor, conn in ADOPTED.findall(self.log_text())}
 
-    def active_sessions(self) -> int:
+    def gauge(self, name: str) -> int:
         with urllib.request.urlopen(f"http://127.0.0.1:{self.metrics_port}/metrics",
                                     timeout=patience(10)) as r:
             body = r.read().decode()
         for line in body.splitlines():
-            if line.startswith("ob_active_sessions") and not line.startswith("#"):
+            # A metric line is the name, its labels in braces, a space and the value (pitfall 66).
+            if line.startswith(name + "{") or line.startswith(name + " "):
                 return int(float(line.rsplit(" ", 1)[1]))
-        raise AssertionError("ob_active_sessions is not in /metrics, so this test cannot wait on it")
+        raise AssertionError(f"{name} is not in /metrics, so this test cannot wait on it")
 
-    def wait_for_sessions(self, n: int, limit: float = 10.0) -> None:
+    def wait_for_gauge(self, name: str, n: int, limit: float = 10.0) -> None:
         deadline = time.monotonic() + patience(limit)
-        seen = self.active_sessions()
+        seen = self.gauge(name)
         while seen != n and time.monotonic() < deadline:
             time.sleep(0.02)
-            seen = self.active_sessions()
-        assert seen == n, f"ob_active_sessions stayed at {seen}, never {n}"
+            seen = self.gauge(name)
+        assert seen == n, f"{name} stayed at {seen}, never {n}"
+
+    def wait_for_sessions(self, n: int, limit: float = 10.0) -> None:
+        self.wait_for_gauge("ob_active_sessions", n, limit)
 
 
 def started(extra: list[str], metrics: bool = False):
@@ -202,11 +207,93 @@ def test_a_drain_with_sessions_on_several_reactors_ends_at_one_deadline():
         assert node.proc.returncode == 0, node.log_text()[-2000:]
         # One deadline for every reactor: 1.5 s plus one wait of each loop, not four in a row.
         assert took < patience(4.0), f"the drain took {took:.2f} s against a 1.5 s deadline"
-        assert "Drain deadline of 1500 ms reached with 4 session(s)" in node.log_text(), (
-            node.log_text()[-2000:])
+        # Said once, by the reactor that stopped the server, not by each that reached the deadline.
+        said = node.log_text().count("Drain deadline of 1500 ms reached with 4 session(s)")
+        assert said == 1, f"the deadline was reported {said} times:\n{node.log_text()[-2000:]}"
     finally:
         for s in idle:
             s.close()
         if node.proc and node.proc.poll() is None:
             node.stop()
         d.cleanup()
+
+
+def test_four_reactors_running_every_kind_of_command_at_once_answer_all_of_them(four_reactors):
+    """Four connections on four reactors, each sending mixed batches - writes, `BOOK`, `STATUS`,
+    `SELECT`, `PING` - in a loop, at the same time.
+
+    What it asserts is modest: every command gets a well-formed answer, `OK` for the writes and
+    rows for the reads, and every connection sees its own writes. What it is for is the job that
+    runs this battery under ThreadSanitizer: this is the one test in which every reactor executes
+    every kind of command at the same moment, which is where a piece of state written for one
+    loop - `STATUS` filling a shared `ServerStats` was the one found by reading - shows up as a
+    report rather than as a wrong answer one run in a thousand.
+    """
+    node = four_reactors
+    node.wait_for_sessions(0)
+    rounds = 40
+    errors: list[str] = []
+
+    def worker(i: int) -> None:
+        try:
+            s = connect(node.port)
+            pending = bytearray()
+            symbol = f"MIX{i}"
+            for r in range(rounds):
+                batch = [
+                    f"MINSERT {symbol} EX bid 3\n{900 - r} 1 1\n{899 - r} 2 1\n{898 - r} 3 1",
+                    f"BOOK {symbol} EX",
+                    "STATUS",
+                    f"SELECT * FROM '{symbol}'.'EX'",
+                    "PING",
+                ]
+                s.sendall(("\n".join(batch) + "\n").encode())
+                answers = [read_response(s, pending) for _ in batch]
+                if answers[0] != b"OK\n\n":
+                    errors.append(f"{symbol} round {r}: MINSERT answered {answers[0][:80]!r}")
+                if f"\t{900 - r}\t".encode() not in answers[1]:
+                    errors.append(f"{symbol} round {r}: BOOK does not show its own write: "
+                                  f"{answers[1][:120]!r}")
+                if not answers[2].startswith(b"OK\n"):
+                    errors.append(f"{symbol} round {r}: STATUS answered {answers[2][:80]!r}")
+                if not answers[3].startswith(b"OK\n") and not answers[3].startswith(b"timestamp"):
+                    errors.append(f"{symbol} round {r}: SELECT answered {answers[3][:80]!r}")
+                if answers[4] != b"PONG\n":
+                    errors.append(f"{symbol} round {r}: PING answered {answers[4][:80]!r}")
+            s.close()
+        except Exception as e:  # noqa: BLE001 - reported below, with the connection it came from
+            errors.append(f"connection {i}: {type(e).__name__}: {e}")
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=patience(60))
+    assert not any(t.is_alive() for t in threads), "a connection never finished its rounds"
+    reactors = {node.adoptions()[c] for c in sorted(node.adoptions())[-4:]}
+    assert reactors == {0, 1, 2, 3}, f"the four connections were served by {reactors}"
+    assert not errors, "\n".join(errors[:10])
+
+
+def test_a_gauge_every_reactor_contributes_to_is_their_sum(four_reactors):
+    """One subscription on each of four reactors is four active subscriptions.
+
+    Each reactor publishes the change in its own share of `ob_subscriptions_active` rather than
+    setting the gauge, because a gauge set from four loops is whichever wrote last: one, here,
+    for ever. The control is the other end - the count goes back to zero as they close.
+    """
+    node = four_reactors
+    node.wait_for_sessions(0)
+    subs = [connect(node.port) for _ in range(4)]
+    try:
+        reactors = {node.adoptions()[c] for c in sorted(node.adoptions())[-4:]}
+        assert reactors == {0, 1, 2, 3}, reactors
+        for i, s in enumerate(subs):
+            s.sendall(f"SUBSCRIBE * FROM 'GAUGE{i}'.'EX'\n".encode())
+            ack = read_response(s, bytearray())
+            assert ack.startswith(b"OK SUB "), ack
+        node.wait_for_gauge("ob_subscriptions_active", 4)
+    finally:
+        for s in subs:
+            s.close()
+    node.wait_for_gauge("ob_subscriptions_active", 0)
