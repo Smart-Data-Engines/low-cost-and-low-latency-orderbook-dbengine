@@ -155,6 +155,14 @@ installs anything, and a containerised competitor would measure the container.
 - **SQL-like query language** with time-range filters and aggregations. A `SELECT` answers the
   columns it names, in the order it names them, and the server opens only the column files needed
   to answer it — including a column a predicate reads and the answer does not carry
+- **The live book, on the wire** — `BOOK <symbol> <exchange> [depth]` returns the current levels of
+  both sides from the structure the engine updates in place, under one seqlock read, bids first and
+  each side in its own order. Distinct from `SELECT`, which reads history and answers with every
+  version of a level it has stored: this answers with one row per level. Measured on an m9g.xlarge
+  over loopback, ten levels per side is **9.7 µs p50** of which 8.0 µs is the round trip, and the
+  marginal cost is 45–53 ns per level. Two of the seven columns are properties of the read rather
+  than of a level, so every row carries the same `timestamp_ns` and `sequence_number` — which is
+  the number to resume a `SUBSCRIBE` from. Also in the Python client (`book()`) and in `ob_cli`
 - **Streaming subscriptions, pushed** — `SUBSCRIBE 'SYM'.'EXCH'` over the wire and the server sends
   rows as they are written, prefixed `PUSH <id>` with all seven columns, whatever select list the
   subscription named: a `PUSH` line has no header, so a narrowed push would change what a field

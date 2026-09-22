@@ -3070,6 +3070,27 @@ Learned the hard way. Check here before debugging.
      reading, and nothing but a mutation that changes the constant can find it. The expectation is
      `std::to_string(ob::kBoostSpinUs)` now.
 
+364. **A probe that assembles its command by appending to a default measures the default, and the
+     two columns look like an answer.** The first version of the probe behind #145's table
+     had `std::string command = "PING"` and then appended its arguments, so every round trip sent
+     `PINGBOOK SYM EX` and both the baseline and the subject measured the server's
+     `ERR unknown command` — **two plausible figures a hundred nanoseconds apart**, which reads
+     precisely as "the book read is free" and would have been published as that. Nothing in the
+     latency said otherwise. What said otherwise was the field the probe prints for exactly this
+     reason: **twenty bytes of answer for a thousand levels per side.** A latency figure for a
+     payload nobody states is a figure about nothing, so the probe reports the payload and the
+     harness refuses a row whose answer is not the shape it asked for - both now in the
+     repository, as `benchmarks/command_latency.cpp` and `scripts/measure_book_latency.py`. Fourth variant
+     of "the instrument answers in the same voice it would use if the code were fine", and the
+     first where the *difference* between two columns was the thing being fabricated.
+365. **Match the symbol whose body you are claiming about, not the one with the name you expect.**
+     The write-path diff for #145 first reported `ob::Engine::apply_delta` as **2 instructions**
+     in both builds and "identical", which is true and says nothing: its body moved to
+     `apply_delta_impl` long ago and what is left is a tail call. The claim needs
+     `apply_delta_impl` (588), `apply_delta_mm` (647) and `WALWriter::append` (111). `mnemonic_diff`
+     warns about this in its own docstring and the warning is not enough — the check is
+     `nm -C <archive> | grep <name>` before choosing the symbol.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -3118,6 +3139,34 @@ that does not flatter is the control.
 `--flush-interval-ms`, and its wait has a deadline after which the write is refused rather than
 accepted. 1,196,745 → 2,209,501 levels/s at four million levels and a one-second interval,
 unchanged at the 100 ms default the engine ships with.
+
+**#145**: `BOOK <symbol> <exchange> [depth]` returns the **live** book, in the Python client as
+`book()` and in `ob_cli` as `book`. `SoABuffer` **is** the current book and `read_snapshot()` had
+exactly one caller — the aggregate branch — so of eighteen wire commands none returned its levels,
+and a client's two routes (`SUBSCRIBE` and rebuild, or `SELECT` history and replay) both made it
+hold what the server already holds. It is the most orderbook-specific question there is and the one
+where a column store is not slow but **structurally wrong**, which is also why the comparative table
+said `NOT COMPARABLE` about the workload this engine is named after.
+Measured on an m9g.xlarge over loopback, three rounds of 20,000 round trips per level count with a
+`PING` baseline in every round: ten levels per side answers in **9.7 µs p50** of which 8.0 is the
+round trip, and the marginal cost settles at **45–53 ns per level**. The honest reading is not the
+flattering one — server CPU is 0.08 s for 20,000 `PING`s against **2.14 s** for 20,000 full
+1000-per-side books, so a deep answer is TSV at about forty bytes a level rather than the seqlock,
+and the read is not the thing to optimise. `apply_delta_impl`, `apply_delta_mm` and
+`WALWriter::append` are identical instruction for instruction against master. The table is
+re-measurable with `scripts/measure_book_latency.py`, which drives
+`benchmarks/command_latency.cpp` and refuses an answer of the wrong shape.
+Four things worth knowing before touching it. **One `read_snapshot()` per answer**, taken before any
+row is emitted: reading a side as its rows are formatted composes the answer from two moments
+separated by up to two thousand levels of formatting, and a book assembled that way can show a
+crossed spread the market never had. It is **not** an atomic read of both sides, and `docs/cli.md`
+says so — that needs one seqlock per buffer instead of one per side, which is a write-path change.
+**Two of the seven columns come from the buffer**, so every row of one answer carries the same
+`timestamp_ns` and `sequence_number`; that is the identity of the snapshot and the number to resume
+a `SUBSCRIBE` from, not a per-level time. And **at capacity a side evicts its worst-priced level**
+rather than refusing the new one, which is what makes "the best N levels" a question all three
+systems can be asked — a design property nobody had reason to write down until the benchmark needed
+it.
 
 **#144**: `--profile eco|boost`, with `--io-spin-us` underneath. The io thread always blocked
 between events, so every round trip paid a kernel wake-up. Measured **through the flag** on an

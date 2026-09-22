@@ -2212,6 +2212,161 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 145. The engine's central data structure was not readable over the wire ✅
+
+**Closed.** `BOOK <symbol> <exchange> [depth]`, on the wire, in the Python client and in `ob_cli`.
+
+`SoABuffer` **is** the current book — per side a depth and its levels, updated in place by
+`apply_delta`, read consistently under a seqlock — and the engine keeps one for every symbol it has
+seen. Checked in the code rather than recalled, because #130 paid for a filed mechanism that named
+the wrong function: **`read_snapshot()` had exactly one caller**, the aggregate branch of
+`QueryEngine::execute()`, feeding `is_agg_expr` — VWAP, MID_PRICE, IMBALANCE and the rest. A row
+`SELECT` goes to `store_.scan()`, which is the **columnar history**.
+
+So a client could ask for VWAP *over* the book and could not ask for the book. Of the eighteen wire
+commands, none returned its levels, and the two routes a client had were both indirect and both
+made it hold what the server already holds: `SUBSCRIBE` and rebuild from the stream, or `SELECT`
+history and replay it.
+
+**Why this is worth more than its size.** It is the most orderbook-specific question there is, and
+the one where a column store is not slow but **structurally wrong**: answering it from history means
+finding the latest row per (side, price) over everything stored. Ours is a `memcpy` per side under a
+seqlock. It is also why the comparative table said `NOT COMPARABLE` about exactly the workload this
+engine exists for — the two comparable columns there, bulk ingest and a time-range scan, are generic,
+and we lose both. With `BOOK` the same question becomes expressible for all three systems.
+
+**A separate command rather than a form of `SELECT`.** In this protocol `SELECT` means history, and
+a form that silently meant something else is the worst kind of addition: a client that writes
+`SELECT * FROM 'BTC'.'EX' LIMIT 10` gets ten rows of history today and would get ten levels of the
+book after such a change, with no signal. Two bare tokens rather than the query language's
+`'SYM'.'EXCH'`, which is where the spec's first sketch changed: the quoted form belongs to the
+commands this layer hands to the SQL parser, and `BOOK` is tokenised here like `INSERT` and
+`MINSERT`, the other per-symbol tokenised commands. A quote parser for one command would be a second
+syntax for one idea.
+
+**One snapshot per answer, and the limit named rather than smoothed over.** A single
+`read_snapshot()` fills both sides before any row is emitted. The alternative — reading a side as
+its rows are formatted — composes the answer from two moments separated by the formatting of up to
+two thousand levels, and a book assembled that way can show a crossed spread the market never had.
+What `BOOK` is **not** is an atomic read of both sides: `read_snapshot()` spins per side, so the two
+halves are microseconds apart. Making it atomic means one seqlock per buffer instead of one per
+side, which is a change on the write path and not this item's to make.
+
+**Two of the seven columns are properties of the read.** `timestamp_ns` and `sequence_number` come
+from the buffer, so every row of one answer carries the same pair. That is stated in `docs/cli.md`
+and in `docs/python.md` where a client reads it, because the column names suggest a per-level time —
+and it is **useful** rather than filler: the pair says *as of which update* this book is, which is
+the number to resume a `SUBSCRIBE` from.
+
+**The lookup, not a second copy of it.** The buffer is resolved through the same
+`LiveBufferLookup` the aggregate branch uses and held for the whole answer, which is #92: `buffers_`
+owns these and a snapshot install replaces the store (#142), so a read still going through a
+resolved raw pointer reads freed memory — measured then as `heap-use-after-free` in 3 of 3 ASan
+runs. `read_book()` therefore lives in `QueryEngine`, which owns that lookup; putting it on `Engine`
+would have made a **second supplier**, which is what the static test in
+`tests/test_query_live_buffer_race.cpp` exists to refuse, because the C API had the identical race
+one file away.
+
+And the same sentence in the other direction, which #92's own first test paid for: a test of
+that class must **dereference** the buffer. `SELECT *` resolves it for an existence check and never reads
+through it, which is why it drove that race for three clean ASan runs, and why #91's test had to pick
+VWAP deliberately. `read_book()` cannot do anything else — every row it emits comes out of the
+snapshot it took through that pointer — so it is a **better** instrument for the class than the
+driver that had to be chosen.
+
+**Three things the grammar gives for free, and one number that had two copies.** The arity row makes
+a nineteenth command a *compile* error until it declares itself; the authentication gate applies
+because it sits before the `switch` whose classifier has no `default:`; and the refusals name the
+token. The depth ceiling is `MAX_LEVELS`, and writing that line found that
+`SoASide::MAX_LEVELS` and `ob::MAX_LEVELS` were **two constants of the same value with nothing
+comparing them** — the first is the array length, the second is what the parser refuses a `MINSERT`
+above and what sizes every WAL payload buffer. Diverging would not be memory-unsafe, because
+`insert_level` answers `OB_ERR_FULL`, but a `MINSERT` accepted by the parser and refused level by
+level is a refusal from the wrong layer. One `static_assert` now ties them, which is the version
+number in three places (#107) caught before it cost anything.
+
+**What it deliberately does not do.** No column projection — that is #139's and belongs to `SELECT`;
+a second column list to keep in step is a second thing to get wrong before anybody asked. Nothing to
+`SUBSCRIBE`, whose column header is a protocol change #139 recorded as open. No history: "how did
+the book look at 9:30" is a range query and stays one. And **no C API entry point**, so the Python
+client refuses `book()` in local mode with a message that says why — the C API is a published ABI
+and extending it is separate work, not something to smuggle in behind a keyword argument.
+
+**Measured on an m9g.xlarge over loopback, three interleaved rounds of 20,000 round trips per
+level count, `loadavg` 0.07-0.34, with a `PING` in every round as the baseline** — because on
+loopback the round trip is most of a small answer, so a `BOOK` latency quoted alone would be read
+as the cost of the read when it is mostly the cost of the socket:
+
+| levels per side | `PING` p50 | `BOOK` p50 | difference | `BOOK` p99 | answer | per level |
+|---|---|---|---|---|---|---|
+| 1 | 7941 ns | 8636 ns | **695 ns** | 8940 ns | 149 B | 348 ns |
+| 10 | 8044 ns | 9653 ns | **1609 ns** | 10 021 ns | 851 B | 80 ns |
+| 100 | 7919 ns | 16 978 ns | **9059 ns** | 17 611 ns | 8071 B | 45 ns |
+| 1000 | 7974 ns | 114 359 ns | **106 385 ns** | 131 892 ns | 83 691 B | 53 ns |
+
+Medians of the rounds; the `BOOK` p50 spread within a level count is under 0.2% and `PING`'s across
+all twelve rounds is 7816-8111 ns, so every difference above the first is an order of magnitude
+outside the floor, and the first is still four times it.
+
+**The honest reading, which is not the flattering one: the book read is nearly free and the wire
+format is not.** Ten levels per side answers in 9.7 µs, of which 8.0 is the round trip. The marginal
+cost settles at **45-53 ns per level**, and server CPU says where it goes — 0.08 s for 20,000
+`PING`s against 2.14 s for 20,000 full books, which is ~107 µs of CPU per 2000-level answer against
+a snapshot that is two `memcpy`s of about 16 kB. So what a client pays for a **deep** book is TSV at
+roughly forty bytes a level, not the seqlock. That is worth stating plainly because it is also the
+answer to "should this have a binary form": the read is not the thing to optimise.
+
+**And the probe had the defect first, which is the reason `answer_bytes` is in its output.** The
+first version assembled its command as `std::string command = "PING"` and then *appended* the
+arguments, so every round trip sent `PINGBOOK SYM EX` and both columns measured the server's
+`ERR unknown command`: two plausible numbers **a hundred nanoseconds apart**, which reads exactly
+like "the book read is free". Nothing in the latency said so. Twenty bytes of answer for a thousand
+levels per side did. A measurement whose control does not pass is not a measurement, so the
+instrument is in the repository now rather than in a scratch directory:
+`benchmarks/command_latency.cpp` refuses an error answer instead of timing it and reports the size
+of the answer it timed, and `scripts/measure_book_latency.py` refuses a book whose answer is not
+the 2N + 3 lines N levels per side must be. Run once more on the development laptop, the committed
+probe reproduces the answer sizes above to the byte - 149, 851 and 83,691 - and its latencies,
+from a machine with a load average near three, are not this table and are not offered as one.
+
+**The write path is untouched, and that is a diff rather than an assurance.**
+`scripts/mnemonic_diff.py` against master, Release: `apply_delta_impl` **588 → 588**,
+`apply_delta_mm` **647 → 647** and `WALWriter::append` **111 → 111**, mnemonic sequences identical
+in all three. Measured on `apply_delta_impl` and not on `apply_delta`, which reads as two
+instructions in both builds because its body moved to that function years ago — a symbol matched by
+the name a reader expects can report a tail-call shim and call it the write path (pitfall 251).
+
+**And two of its own tests came out of a surviving mutation.** Dropping the depth ceiling and
+reading an explicit `0` as "no depth given" both **survived** the C++ suite, because the wire
+refusals for this command were tested exclusively over a socket — so the unit job and the mutation
+harness could not see either. Five parser tests in `tests/test_command_arity.cpp` now cover them,
+each with the control that says what it is about: the ceiling accepts its own boundary, omitting the
+argument still means "everything", and a valid line still parses.
+
+**Mutations: ten, each with the verdict it was meant to give.** Baseline green before and after,
+sources restored from bytes kept beside the harness rather than from `HEAD`.
+
+| mutation | verdict |
+|---|---|
+| the two sides are read by two snapshots rather than one | **killed** |
+| depth is ignored, so every answer is the whole book | **killed** |
+| depth bounds the whole answer rather than each side | **killed** |
+| asks are emitted before bids | **killed** |
+| the snapshot identity is left at zero on every row | **killed** |
+| the owning handle is dropped for a raw pointer | **killed** |
+| a missing symbol is not refused | **killed** |
+| the depth ceiling is dropped | **killed** — survived until the parser tests existed |
+| an explicit depth of zero is read as "no depth given" | **killed** — survived until the parser tests existed |
+| the not-found refusal is reworded | **survives** (control) |
+
+Row five was reshaped once rather than the code changed for it: written as `r.timestamp_ns = 0`, it
+left `ts` unused and `-Werror` refused to build it, which is a verdict about the compiler and not
+about the tests. `ts * 0` is the same mutation that compiles.
+
+- Effort: M | Impact: the one question this engine answers better than a column store by
+  construction, expressible for the first time — and the reason the comparative table could not
+  speak about the workload the product is named after
+
 ### 144. The io thread always blocked between events, so every round trip paid a kernel wake-up ✅
 
 **Closed.** `--profile eco|boost`, with `--io-spin-us` as the knob underneath. A profile is a named
