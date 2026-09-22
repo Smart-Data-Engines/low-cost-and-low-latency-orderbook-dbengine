@@ -3091,6 +3091,36 @@ Learned the hard way. Check here before debugging.
      warns about this in its own docstring and the warning is not enough — the check is
      `nm -C <archive> | grep <name>` before choosing the symbol.
 
+366. **Profile the thread you are about to multiply before you multiply it.** The plan for using
+     every core started with more reactors, because one io thread sat at 0.88 of wall time and the
+     rate was flat in connections. The profile of that thread said a third of it was sending
+     answers one segment at a time — a per-batch cost every additional reactor would have paid
+     again. Removing it first bought +55% on the same thread and made the per-reactor unit of work
+     smaller before there were several of them (#146).
+367. **A test that reads a counter the instant a client closes asserts an ordering between two
+     processes, and flow control can hold that ordering up for years.** #143's ceiling tests passed
+     for as long as the server read 4 KiB at a time: it drained slowly enough that the client
+     blocked in `sendall()` until the server's reset arrived, so the refusal always landed before
+     the client got to look. Reading 64 KiB let the client finish writing into kernel buffers and
+     look first — **4 of 40** immediate reads missed a refusal 1.5–2.1 ms away, **0 of 40** once
+     settled. Wait for the property with a deadline; the test changed and the engine did not.
+368. **A premise a test states in a comment rather than an assertion is true until someone changes
+     the thing it depends on, and then it is silently false.** "2000 commands are about 10 kB, so
+     the server takes them in several reads" — they were 96 kB, which made "several" true by
+     accident, and a 64 KiB read made it two. The size is asserted now, against the read size it
+     is about.
+369. **A check that lives in one harness does not protect the next script, and pitfall 326 was met
+     again three days after it was written down.** The comparative harness refuses a data directory on
+     tmpfs; the pipelined-ingest script written for #146 put each node's data under `tempfile`'s
+     default, `/tmp`, which on Amazon Linux is a tmpfs, and read **11–15% high** on every row.
+     Import the check (`benchmarks/comparative/hardware.py`) rather than remembering it.
+370. **Count syscalls with tracepoints and attribute them with `strace`, because `strace` changes
+     what it counts.** Under `strace` the read that finds the socket empty disappears: the traced
+     server is slow enough that the client's next batch has arrived by the time it reads again. The
+     tracepoint count (`perf stat -e syscalls:sys_enter_read`) is the number; `strace` says which
+     descriptor each read was on — here, that one read per pass of the loop is the subscription
+     hub's eventfd, drained whether or not it fired.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -3139,6 +3169,19 @@ that does not flatter is the control.
 `--flush-interval-ms`, and its wait has a deadline after which the write is refused rather than
 accepted. 1,196,745 → 2,209,501 levels/s at four million levels and a one-second interval,
 unchanged at the 100 ms default the engine ships with.
+
+**#146**: the answers to one read go out in **one** `send()`, and the read is 64 KiB, so one read
+is one batch. A pipelined batch of 64 answers used to cost 64 sends and 64 segments — 32.4% of the
+io thread, found by profiling the thread the next stage would parallelise, before parallelising it.
+Measured on an m9g.xlarge with the node's data on the instance's disk, one connection:
+**3.12 → 4.85 million levels/s**, batch p50 363.9 → 222.4 µs, the server's CPU for the same work
+4.70 → 3.05 s, sends per batch 64 → 1. What it is not: more cores — the io thread is at 0.84 of wall
+time afterwards and four connections still reach the rate of one, which is the next stage.
+The bytes a client reads are unchanged, so the speed half is pinned by a static test over the loop's
+shape (`ReadLoopStatic.EveryCommandFromOneReadIsAnsweredWithOneSend`), and the behaviour half by
+`tests/integration/test_pipelined_answers.py`, including a failed `AUTH` ending its batch where it
+stands. Reproduce with `scripts/measure_pipelined_ingest.py`, which refuses a data directory on
+memory and a build that is not Release.
 
 **#145**: `BOOK <symbol> <exchange> [depth]` returns the **live** book, in the Python client as
 `book()` and in `ob_cli` as `book`. `SoABuffer` **is** the current book and `read_snapshot()` had

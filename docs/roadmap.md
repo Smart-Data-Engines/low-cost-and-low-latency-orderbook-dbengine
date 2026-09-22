@@ -2212,6 +2212,141 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 146. The io thread sent one segment per answer, so a pipelined batch of 64 cost 64 sends ✅
+
+**Closed.** The answers to every command parsed from one read are queued into the session's buffer
+and go out with **one** `send()` after the read's last command, and the read is 64 KiB rather than
+4 KiB, so one read is one batch. What a client reads is byte for byte what it read before.
+
+**Found by measuring what the next piece of work would parallelise, before parallelising it.** The
+first step of making the engine use every core it is given
+(`kiro-workspace/specs/uses-the-whole-machine/`) was a baseline, and it said two things. The rate
+did not move with the number of writers — about 3.14 million levels a second at one connection and
+at four — and one thread, the epoll loop, sat at 0.88 of wall time throughout. Flat in connections
+with one thread saturated means that thread is the ceiling. A profile of it then said the thing
+worth fixing before splitting it into several: **32.4% of it was sending answers**, one `send()`
+per response and 64 per batch, each its own segment since #140 turned Nagle off, with the kernel
+running the loopback receive path of every segment inside the sender's own call. More reactors
+would have multiplied that cost rather than removed it.
+
+**Measured, m9g.xlarge (4 cores, aarch64), loopback, a fresh node per run with its data on the
+instance's EBS volume, five rounds with the order rotated so every build ran first, second and
+third; `loadavg` 0.15–0.91.** Batches of 64 twenty-level `MINSERT`s, 12,000 batches a run, every
+answer read before the next batch is sent; sends and reads counted by the kernel's syscall
+tracepoints. `scripts/measure_pipelined_ingest.py` driving `benchmarks/pipelined_ingest.cpp`
+reproduces it.
+
+One connection:
+
+| | levels/s | range | batch p50 | batch p99 | server CPU | sends per batch | reads per batch |
+|---|---|---|---|---|---|---|---|
+| before | 3,121,306 | 3.113–3.152 M | 363.9 µs | 395.1 µs | 4.70 s | 64.00 | 8.00 |
+| one send per read | 4,591,504 | 4.585–4.625 M | 236.6 µs | 265.7 µs | 3.19 s | 6.00 | 8.00 |
+| and a 64 KiB read | **4,845,612** | 4.833–4.865 M | **222.4 µs** | **251.3 µs** | **3.05 s** | **1.00** | **3.00** |
+
+**+55% levels a second, −39% at p50 and −35% of the server's CPU for the same 15.36 million
+levels.** The ranges do not overlap, and the same comparison through a second harness an hour
+earlier gave 3.14, 4.59 and 4.85 million.
+
+Four connections:
+
+| | levels/s | batch p50 | batch p99 |
+|---|---|---|---|
+| before | 3,137,759 | 1,437.6 µs | 14,139.4 µs |
+| one send per read | 4,623,883 | 929.0 µs | 2,059.2 µs |
+| and a 64 KiB read | 4,895,226 | 877.8 µs | 1,980.3 µs |
+
+**What the tables do not say, and it is the larger half.** This is the same one thread doing less
+per batch: the io thread is at 0.84 of wall time afterwards, and four connections still reach the
+rate of one. That is the next stage — more than one reactor — and this one came first because it is
+a per-batch cost every reactor would have paid. The four-connection p99 falling from 14.1 ms to
+2.1 ms is not a second effect: one thread serves four clients, so a batch queues behind the others,
+and the queue is shorter when each batch costs less.
+
+**The client pays less too.** The probe's own CPU for a run fell from 1.49 s to 0.06 s, because it
+receives one segment per batch where it received 64.
+
+**Every read in the counts is accounted for.** A batch is 20,736 bytes. Of the eight reads per
+batch before, six carried data — a 4 KiB read takes that batch in six pieces — one found the socket
+empty and ended the edge-triggered drain, and one was the subscription hub's eventfd, which the
+loop drains on every pass whether or not it fired (attributed with `strace`, whose own slowness
+also removes the empty read by letting the next batch arrive first — so the counts come from the
+tracepoints and the attribution from `strace`, and neither alone). With the 64 KiB read that is one
+of each. The eventfd read is a syscall on every pass of the loop for a feature most connections do
+not use; it is a candidate for the latency work and is measured there rather than removed here.
+
+**What did not change, and is held by tests rather than by this paragraph.**
+`tests/integration/test_pipelined_answers.py`, eight tests: the bytes and their order are what one
+command at a time produces, in the clear, compressed and over TLS; a batch several reads long is
+answered whole and in order; `QUIT` delivers everything before it, **including while those answers
+are still draining**; a line too long delivers the answers before it; `COMPRESS` inside a batch
+frames exactly what follows its acknowledgement; and a failed `AUTH` ends the batch where it
+stands, with a control proving that the same write is made when no failure precedes it — one
+attempt per connection is #30's whole rate limit.
+
+The half of this that matters for speed is invisible on the wire, because the bytes are the same,
+so `ReadLoopStatic.EveryCommandFromOneReadIsAnsweredWithOneSend` pins the loop's shape: answers
+queued inside the loop over a read's commands, no send and no flush there, and exactly one flush
+after it.
+
+**Mutation table: ten rows, each with the verdict it was supposed to produce** — eight killed and
+two surviving, committed before the first mutation, every source restored from bytes kept beside the
+run and touched so the build sees it, and each row's run made of the static test plus 59 wire tests
+across seven integration modules:
+
+| | mutation | verdict | killed by |
+|---|---|---|---|
+| 1 | a flush after every answer, inside the loop | killed | `ReadLoopStatic` only |
+| 2 | `send_response` in place of `queue_response` | killed | `ReadLoopStatic` only |
+| 3 | a second flush after the loop | killed | `ReadLoopStatic`: exactly one flush |
+| 4 | no stop after a failed `AUTH` | killed | `test_a_failed_auth_ends_its_batch_where_it_stands` |
+| 5 | compression switched on before its acknowledgement is queued | killed | `test_compression_negotiated_inside_a_batch_frames_everything_after_it` |
+| 6 | a line too long closes without flushing what came before it | killed | `test_a_line_too_long_behind_a_batch_delivers_the_answers_before_it` |
+| 7 | `QUIT` closes while answers are still draining | killed | `test_quit_behind_answers_still_draining_delivers_all_of_them`, and only it |
+| 8 | the #143 ceiling disabled | killed | both ceiling tests, now that they wait for the refusal |
+| 9 | **control:** the loop's two early exits in the other order | survived | a batch can set at most one of them |
+| 10 | the read back to 4 KiB | survived | by design |
+
+Rows 1–3 pass **all 59 wire tests**, which is the case for a static test made in one line: the
+cost this item removes cannot be seen from the socket. Row 7 fails no test that existed before this
+item — the old `QUIT` test survives it. Row 10 survives on purpose: the read size is throughput
+rather than correctness, a test for it would be a gate on a clock, and the measurement above is its
+evidence.
+
+**Four things found on the way, every one of them in a test or an instrument rather than in the
+engine.**
+
+- **The #143 ceiling tests asserted an ordering between two processes.** They read their counter
+  the instant the client closed, and the 64 KiB read made one of them fail. Measured
+  on the i3-7100U with a probe repeating the test's own scenario forty times: with the 64 KiB read
+  **4 of 40** immediate reads missed a refusal that landed 1.5–2.1 ms later, and 33 of the 40
+  clients managed to send all 4 MiB; with the 4 KiB read the server drained more slowly, flow
+  control held the client until the server's reset, and **0 of 40** missed. Settled, none missed in
+  either build — the property held throughout and the instant was the thing that had been lucky.
+  Both tests now wait for the counter, and disabling the ceiling still fails both, in 22 s.
+- **`QUIT` defers its close while answers are still queued, and nothing reached that branch.** The
+  test for it sends twenty `PING`s, whose answers fit the socket buffer, so the flush leaves nothing
+  pending. A hundred full books behind a receive window clamped to 64 KiB do not — and the mutation
+  that closes at once is now killed by that test alone.
+- **A premise described instead of asserted.** The test for a batch spanning several reads said its
+  2000 commands were "about 10 kB"; they were 96 kB, so "several reads" had been true by accident,
+  and the 64 KiB read made it two. It sends 288 kB now and asserts that it is more than four reads.
+- **The measurement script's first version wrote each node's data to `/tmp`, and `/tmp` on this
+  instance is a tmpfs.** The same three builds read **3.46, 5.26 and 5.57** million levels a second
+  there against 3.12, 4.59 and 4.85 on the disk: 11-15% of every figure was the WAL going to
+  memory. This is pitfall 326, recorded three days earlier about the comparative harness
+  and met again by a script written after it. The script now refuses a data directory on memory and a
+  build that is not Release, with the comparative harness's own checks rather than a second copy of
+  them.
+
+**Not measured here, and said rather than implied.** Over TLS a read returns what `SSL_read` hands
+back, which is bounded by the record rather than by this buffer, so the send count per batch over
+TLS was not measured; the TLS test holds the bytes, not the count. And the io_uring transport has
+its own read path and is untouched here.
+
+- Effort: S | Impact: +55% pipelined ingest on the same thread, the per-batch cost every reactor of
+  the next stage would otherwise pay
+
 ### 145. The engine's central data structure was not readable over the wire ✅
 
 **Closed.** `BOOK <symbol> <exchange> [depth]`, on the wire, in the Python client and in `ob_cli`.
