@@ -96,7 +96,8 @@ reproducible from its uploaded `fuzz` artefact without re-running anything.
 `fuzz/corpus/command_parser/` is text, one command per file, and the names say which branch each
 one is for: every command keyword, plus `bad_side`, `overflow` (numbers past their type),
 `trailing_token` (the shape #107 refuses), `short_batch` (a `MINSERT` header promising more levels
-than follow) and `binary_bytes` (NUL and non-ASCII where a keyword belongs).
+than follow), `book_depth` (the optional depth whose round trip `BOOK` has to keep, #145) and
+`binary_bytes` (NUL and non-ASCII where a keyword belongs).
 `fuzz/command_parser.dict` gives the mutator the keywords, so it reaches recognised branches
 instead of spending its budget rediscovering the word `INSERT`.
 

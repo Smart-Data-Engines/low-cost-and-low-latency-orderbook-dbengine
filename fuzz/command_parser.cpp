@@ -17,9 +17,11 @@ namespace {
 /// carry the time it happened and a write that asked for arrival time are then the same write,
 /// which is the exact defect roadmap item #105 existed to fix.
 ///
-/// There is no `default:` here on purpose. A nineteenth command would otherwise compare equal
-/// through a branch nobody wrote, so `-Wswitch` is left to make it a build error instead - the
-/// same mechanism that guards the authentication gate and the arity table (#107).
+/// There is no `default:` here on purpose. A new command would otherwise compare equal through a
+/// branch nobody wrote, so `-Wswitch` is left to make it a build error instead - the same mechanism
+/// that guards the authentication gate and the arity table (#107). It did its job for the first
+/// command added after it: `BOOK` (#145) failed this harness's build on CI until it said what its
+/// round trip has to preserve.
 bool same_meaning(const ob::Command& a, const ob::Command& b) {
     if (a.type != b.type) return false;
     switch (a.type) {
@@ -61,6 +63,14 @@ bool same_meaning(const ob::Command& a, const ob::Command& b) {
         return a.unsubscribe_id == b.unsubscribe_id;
     case ob::CommandType::AUTH:
         return a.auth_identity == b.auth_identity && a.auth_response == b.auth_response;
+    case ob::CommandType::BOOK: {
+        // The depth included: an omitted depth means "every level" and an explicit one bounds each
+        // side, so a formatter that dropped it would turn a ten-level question into the whole book
+        // and both texts would still parse.
+        const auto& x = a.book_args;
+        const auto& y = b.book_args;
+        return x.symbol == y.symbol && x.exchange == y.exchange && x.depth == y.depth;
+    }
     // Commands whose whole content is their name.
     case ob::CommandType::FLUSH:
     case ob::CommandType::PING:
