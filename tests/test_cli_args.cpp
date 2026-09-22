@@ -44,13 +44,11 @@ ob::ServerConfig parse(std::vector<std::string> args) {
 
 TEST(CliArgs, ParsesTheCommonFlags) {
     const auto config = parse({"--port", "5555", "--data-dir", "/tmp/x",
-                               "--max-sessions", "42", "--workers", "3",
-                               "--metrics-port", "9100"});
+                               "--max-sessions", "42", "--metrics-port", "9100"});
 
     EXPECT_EQ(config.port, 5555);
     EXPECT_EQ(config.data_dir, "/tmp/x");
     EXPECT_EQ(config.max_sessions, 42);
-    EXPECT_EQ(config.worker_threads, 3);
     EXPECT_EQ(config.metrics_port, 9100);
 }
 
@@ -124,6 +122,14 @@ TEST(CliArgsDeath, AMissingValueIsRefusedRatherThanIgnored) {
 TEST(CliArgsDeath, AnUnknownFlagIsRefusedRatherThanIgnored) {
     EXPECT_EXIT(parse({"--prot", "5599"}), ::testing::ExitedWithCode(1),
                 "unknown argument '--prot'");
+}
+
+TEST(CliArgsDeath, WorkersIsRefusedBecauseNothingEverReadIt) {
+    // #149: accepted, printed back, documented as "Number of worker threads (default: 4)", and read
+    // by nothing since the first commit. Refused by the same rule as any unknown flag rather than
+    // kept as a knob that does nothing — an operator tuning it would be tuning nothing.
+    EXPECT_EXIT(parse({"--workers", "4"}), ::testing::ExitedWithCode(1),
+                "unknown argument '--workers'");
 }
 
 TEST(CliArgsDeath, AValueOutOfRangeForItsTypeIsRefused) {

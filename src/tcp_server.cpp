@@ -900,7 +900,6 @@ const std::vector<std::string>& known_flags() {
         "ttl-hours",
         "ttl-scan-interval-seconds",
         "wal-rotate-bytes",
-        "workers",
     };
     return flags;
 }
@@ -979,7 +978,6 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"ttl-scan-interval-seconds", {"<N>", "How often retention scans for expired rows"}},
         {"wal-rotate-bytes", {"<N>", "WAL bytes before the next file is opened; a file may "
                                      "exceed it by one record (default: 536870912)"}},
-        {"workers", {"<N>", "Number of worker threads (default: 4)"}},
     };
     return help;
 }
@@ -1199,8 +1197,6 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.data_dir = std::string{cursor.value()};
         } else if (arg == "--max-sessions") {
             config.max_sessions = cursor.value_as<int>();
-        } else if (arg == "--workers") {
-            config.worker_threads = cursor.value_as<int>();
         } else if (arg == "--max-subscriber-queue-bytes") {
             config.max_subscriber_queue_bytes = cursor.value_as<size_t>();
         } else if (arg == "--max-subscriptions-per-session") {
@@ -1639,10 +1635,6 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("ttl-hours", std::to_string(c.ttl_hours));
     line("ttl-scan-interval-seconds", std::to_string(c.ttl_scan_interval_seconds));
     line("wal-rotate-bytes", std::to_string(c.wal_rotate_bytes));
-    line("workers", std::to_string(c.worker_threads));
-    out += "\n";
-    out += "# workers is parsed and not used: client commands run inline on the epoll loop. It is\n";
-    out += "# printed because hiding it would leave an operator tuning a knob that does nothing.\n";
     return out;
 }
 
@@ -2022,9 +2014,14 @@ void TcpServer::run() {
                         }
                     }
 
-                    // Send welcome message.
+                    // Send welcome message. The version comes from the build system like
+                    // every other place a node reports it (#90); this one was a literal until #148,
+                    // so the first bump would have made the banner name a build that was not
+                    // running.
                     if (s) {
-                        s->send_response("OK ob_tcp_server v0.1.0\n\n");
+                        static const std::string banner =
+                            "OK ob_tcp_server v" + std::string(version()) + "\n\n";
+                        s->send_response(banner);
                     }
                 }
             } else {

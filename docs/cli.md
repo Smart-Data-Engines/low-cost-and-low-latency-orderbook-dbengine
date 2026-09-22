@@ -493,7 +493,6 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--ttl-hours` | `<N>` | Retention in hours; 0 keeps everything. Counted from **the record's own event time**, per segment — so a backfill written with `[event_time_ns]` arrives with its age, and a batch whose oldest row is past the window is expired on the next sweep. One row dated in the future keeps its whole segment |
 | `--ttl-scan-interval-seconds` | `<N>` | How often retention scans for expired rows |
 | `--wal-rotate-bytes` | `<N>` | WAL bytes before the next file is opened (default: 536870912). A **trigger**, not a file size: rotation is checked after a write, so a file may exceed it by one record. Refused below 65573 (one maximal record) and above 2 GiB |
-| `--workers` | `<N>` | Number of worker threads (default: 4) |
 
 ## Argument handling
 
@@ -660,9 +659,10 @@ $ ob_tcp_server --config /etc/orderbook/ob.conf --port 9191 --print-config
 `--print-config` prints and exits **without opening a port**, so it still works when the port is
 taken — which is one of the situations you reach for it in.
 
-The output includes `workers`, which is parsed and not used: client commands run inline on the epoll
-loop. It is printed rather than hidden, because hiding it would leave an operator tuning a knob that
-does nothing.
+Every value it prints is one the server reads, except `profile`, which is the name of the set of
+values it decided. `--workers` used to be the other exception — parsed, printed here with a note
+that nothing used it, and read by nothing — and it is refused now (#149), with
+`CliConfigStatic.EveryParsedValueIsReadByTheServer` holding the rule for the rest.
 
 ### Refusals
 

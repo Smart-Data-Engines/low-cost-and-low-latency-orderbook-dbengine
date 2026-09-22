@@ -7,10 +7,10 @@ namespace ob {
 /// The engine's version, from `project(... VERSION)` in `CMakeLists.txt`.
 ///
 /// One definition, reached through the `OB_VERSION` compile definition on `orderbook_core`, because
-/// the number used to be retyped: a literal `v0.1.0` in `tools/ob_tcp_server.cpp` was the only place
-/// a running node's version appeared at all, and nothing checked it against the build system or
-/// against `pyproject.toml` (#90). `VersionStatic.TheVersionIsNotRetyped` holds the two files that
-/// still carry it in agreement.
+/// the number used to be retyped: a literal `v0.1.0` in `tools/ob_tcp_server.cpp` and two more in
+/// the welcome banner and the CLI, none checked against the build system or `pyproject.toml` (#90,
+/// #148). `VersionStatic.ThePythonPackageAgreesWithTheBuildSystem` holds the two files that still
+/// carry it in agreement, and `VersionStatic.TheVersionIsNotRetypedInSources` refuses a third.
 ///
 /// A default is deliberately absent: if the compile definition is missing the build fails here,
 /// rather than shipping a binary that reports "unknown" to an operator asking which build is running.

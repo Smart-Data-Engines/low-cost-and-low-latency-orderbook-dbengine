@@ -2212,6 +2212,121 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 149. `--workers` was accepted, printed and documented for six months, and read by nothing ✅
+
+**Found while planning the multi-reactor stage, which is about to add the knob this one looked
+like.** `--workers <N>` was parsed into `ServerConfig::worker_threads`, printed back by
+`--print-config`, and listed in `--help` and in `docs/cli.md` as "Number of worker threads
+(default: 4)" — and read by nothing, from the server's first commit in March. #32 noticed, and
+printed a note under it (`# workers is parsed and not used: client commands run inline on the epoll
+loop`) on the argument that hiding it would leave an operator tuning a knob that does nothing. The
+note was true; the knob stayed, so the operator could still tune it, and `--help` still said it made
+threads. Next to a real knob for the client event loops, a flag that looks like one and does
+nothing is a trap.
+
+**Refused now, by the rule every unknown flag gets** — `unknown argument '--workers'`, from a config
+file as much as from a command line. **BREAKING** for a command line that passes it, which is the
+point: the alternative is a server that starts, and does something other than what the operator
+believed it would.
+
+**The mechanism is the link #32's static tests did not check.** Those hold the parser's branches
+against the known-flag list, and the list against `--help` and `docs/cli.md`, and all of them agreed
+the whole time — the parser was never what was missing. What was missing is the next link: a field
+the parser writes must be read by something other than the function that prints it back.
+`CliConfigStatic.EveryParsedValueIsReadByTheServer` takes every `ServerConfig` member from the
+header, cuts the parser and the formatter out of `src/tcp_server.cpp`, and requires a `.field` or
+`->field` for each of the rest somewhere in `src/`, `tools/` or `include/`. One field is exempt and
+pinned in both directions: `profile`, which the parser resolves into the knobs it names, so its
+value is only what `--print-config` reports. The rule runs its own cases first, through the same
+functions — a header with a dead field, and a server source with the two writers in it — and
+against the tree before this change it names `worker_threads` and nothing else.
+
+What it cannot see is written beside it: a field read only by code the binary does not build.
+#147's three io_uring flags were exactly that — read in `src/io_uring_server.cpp`, doing nothing in
+the epoll binary — and a read in any source file counts.
+
+**Mutation table: ten rows** — nine killed and the control surviving, run the same way:
+
+| | mutation | verdict | killed by |
+|---|---|---|---|
+| 1 | `--workers` back, whole — field, branch, list, help, `--print-config` | killed | the new rule, naming `worker_threads` and nothing else |
+| 2 | the same, against the refusal test | killed | `WorkersIsRefusedBecauseNothingEverReadIt` |
+| 3 | a live field made dead: the subscription hub built with a literal instead of `--max-subscriber-queue-bytes` | killed | the new rule, naming `max_subscriber_queue_bytes` |
+| 4 | the parser not cut | killed | the rule's own cases |
+| 5 | the formatter not cut | killed | the rule's own cases |
+| 6 | a longer identifier read as the field (`.deadline` as `.dead`) | killed | the rule's own cases |
+| 7 | comments read as code | killed | the rule's own cases |
+| 8 | a member without an initializer missed | killed | the rule's own cases |
+| 9 | `profile`'s exemption dropped | killed | the tree, which really does leave it unread |
+| 10 | **control:** the failure message reworded | survived | by design |
+
+Row 3 is the one that says what the rule is for: it catches a field that stops being read, not
+only the one field that never was.
+
+- Effort: S | Impact: an operator tuning `--workers` was tuning nothing, and the multi-reactor stage
+  would have added the real knob beside it
+
+### 148. The welcome banner and the CLI carried the version as literals, and #90's guard could not see #90 ✅
+
+**Found while reading the client loop before making it parallel**, at the line that greets every
+connection: `s->send_response("OK ob_tcp_server v0.1.0\n\n")`. #90 took the version out of the
+startup line so that it would come from `project(... VERSION)`, and this one — the first bytes every
+client of every node reads — stayed a literal. So did `ob_cli`'s greeting,
+`"orderbook-dbengine CLI v0.1.0\n"`. Both date from the server's first commit, in March. The first
+version bump would have had every node greet its clients with the previous release's number, while
+`STATUS` and `/metrics` told the truth.
+
+**The guard #90 added could not have caught #90.** `VersionStatic.TheVersionIsNotRetypedInSources`
+refused the pattern `"v?0\.1\.0"`: a string literal made of the version **and nothing else**. The
+literal #90 removed was `"ob_tcp_server v0.1.0 listening on port %u, data-dir: %s\n"`, which that
+pattern does not match. Measured rather than argued: that line restored verbatim, against #90's own
+test, **passes** (row 4 below). And the files it read were four names written into the
+test, so `tools/ob_cli.cpp` was never opened. #90's entry says both guards were mutation-checked;
+whatever that mutation was, it was not #90's own diff reversed, which is the first one to try,
+because the defect as it was is the one input a guard written after it must refuse.
+
+**What changed.** Both greetings take `ob::version()`, like every other place a node reports its
+version. The rule now finds the version anywhere inside one literal, as a whole number — `v10.1.0`
+is not `0.1.0` — in every `.cpp` and `.hpp` under `src/`, `tools/`, `include/` and `benchmarks/`,
+listed from the tree. It runs its own cases through the function it runs the tree through: the
+banner, the CLI line, a comment quoting the version, the right form, and a longer number on each
+side, of which exactly the first two must be reported. So a scan that stops seeing a literal fails
+on its cases instead of passing a tree it no longer reads, and the four files copies were found in
+must be among the files it read, so a walk that lost a directory says so.
+
+**Mutation table: thirteen rows, each with the verdict it was supposed to produce** — eleven killed
+and two surviving, committed before the first mutation and every source restored from bytes kept
+beside the run:
+
+| | mutation | verdict | killed by |
+|---|---|---|---|
+| 1 | the banner's literal back | killed | the tree scan, naming the line |
+| 2 | the CLI's literal back | killed | the tree scan |
+| 3 | #90's removed startup line back, against this rule | killed | the tree scan |
+| 4 | **the same line, against #90's rule** | **survived** | nothing — the demonstration |
+| 5 | a literal in a header | killed | the tree scan, which reads `include/` now |
+| 6 | #90's pattern back, over the whole tree | killed | the rule's own cases |
+| 7 | the leading word boundary dropped | killed | the case `v1` + version |
+| 8 | the trailing word boundary dropped | killed | the case version + `1` |
+| 9 | the prefilter inverted | killed | the rule's own cases |
+| 10 | a comment quoting the version read as code | killed | the case that is a comment |
+| 11 | the walk loses `tools/` | killed | the files that must be read |
+| 12 | the walk loses `include/` | killed | the files that must be read |
+| 13 | **control:** the failure message reworded | survived | by design |
+
+Rows 6–10 are the rule's own cases doing their job: each mutation of the scanner leaves the tree
+green, because the tree has no literal left for a weakened scanner to miss, and fails on the six
+lines the scanner is run on first.
+
+**Three sentences corrected beside it, all saying the same wrong thing.** `CMakeLists.txt`,
+`include/orderbook/version.hpp` and the test's own header called the startup line **the only**
+place the version appeared in the C++; #90's entry below says so too, and is left as written,
+because it records what #90 believed. It was not the only place: it was the one somebody looked at.
+`version.hpp` also cited the drift guard by a name no test has (`TheVersionIsNotRetyped`).
+
+- Effort: S | Impact: the first version bump would have shipped a banner naming the previous
+  release, under a guard that could not see the defect it was written after
+
 ### 147. The io_uring transport sent a pipelining client bytes of the server's heap, and ignored `--fsync-policy` ✅
 
 **Closed by removing the transport.** `ob_tcp_server_iouring`, `OB_USE_IO_URING`,

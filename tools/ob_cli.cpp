@@ -31,6 +31,7 @@
 #include "orderbook/engine.hpp"
 #include "orderbook/query_engine.hpp"
 #include "orderbook/types.hpp"
+#include "orderbook/version.hpp"
 
 namespace {
 
@@ -527,7 +528,7 @@ static int run_cli(int argc, char* argv[]) {
     }
 
     std::filesystem::create_directories(data_dir);
-    std::cout << "orderbook-dbengine CLI v0.1.0\n";
+    std::cout << "orderbook-dbengine CLI v" << ob::version() << "\n";
     std::cout << "Data directory: " << data_dir << "\n";
     std::cout << "Type 'help' for commands.\n\n";
 

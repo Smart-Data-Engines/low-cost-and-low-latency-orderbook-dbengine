@@ -13,12 +13,14 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <filesystem>
 #include <map>
 #include <fstream>
 #include <regex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -35,6 +37,73 @@ std::string read_source(const char* relative) {
     const std::filesystem::path path = std::filesystem::path(OB_SOURCE_DIR) / relative;
     std::ifstream in(path);
     return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+/// `text` with every `//` comment cut, line by line. A `//` inside a string literal is cut too,
+/// which can only hide a read, never invent one.
+std::string without_comments(const std::string& text) {
+    std::string out;
+    std::istringstream in(text);
+    std::string line;
+    while (std::getline(in, line)) {
+        out += line.substr(0, line.find("//"));
+        out += '\n';
+    }
+    return out;
+}
+
+/// The members of `struct ServerConfig` in `header`, in declaration order: every line between the
+/// struct's opening and the first `};` at column 0 that declares one name and ends with `;`.
+std::vector<std::string> config_fields(const std::string& header) {
+    std::vector<std::string> fields;
+    const std::size_t start = header.find("\nstruct ServerConfig {");
+    if (start == std::string::npos) return fields;
+    const std::size_t end = header.find("\n};", start);
+    std::istringstream body(without_comments(header.substr(start, end - start)));
+    const std::regex member(R"(^\s+[\w:<>,\s]*?[\w>]\s+(\w+)\s*(\{[^}]*\})?\s*;\s*$)");
+    std::string line;
+    while (std::getline(body, line)) {
+        std::smatch m;
+        if (std::regex_match(line, m, member)) fields.push_back(m[1].str());
+    }
+    return fields;
+}
+
+/// Whether `code` reads `field` as a member: `.field` or `->field`, not followed by more of an
+/// identifier. A name another struct shares reads as a read, so this can pass a dead field whose
+/// name collides with a live one elsewhere, and cannot fail a field something reads.
+bool reads_member(const std::string& code, const std::string& field) {
+    for (const std::string& prefix : {std::string("."), std::string("->")}) {
+        const std::string needle = prefix + field;
+        for (std::size_t at = code.find(needle); at != std::string::npos;
+             at = code.find(needle, at + 1)) {
+            const std::size_t after = at + needle.size();
+            const bool longer = after < code.size() &&
+                                (std::isalnum(static_cast<unsigned char>(code[after])) ||
+                                 code[after] == '_');
+            if (!longer) return true;
+        }
+    }
+    return false;
+}
+
+/// `source` with the top-level function whose definition starts with `signature` cut out, from
+/// that line to the first `}` at column 0 after it. False when there is no such function.
+bool cut_function(std::string& source, const std::string& signature) {
+    const std::size_t start = source.find("\n" + signature);
+    if (start == std::string::npos) return false;
+    const std::size_t end = source.find("\n}\n", start);
+    if (end == std::string::npos) return false;
+    source.erase(start, end + 3 - start);
+    return true;
+}
+
+/// `source` without the two functions whose job is to write `ServerConfig` and to print it back,
+/// or empty when either is missing — so a rename cannot quietly turn every write into a read.
+std::string without_parser(std::string source) {
+    if (!cut_function(source, "ResolvedConfig resolve_cli_args(")) return {};
+    if (!cut_function(source, "std::string format_config(")) return {};
+    return source;
 }
 
 }  // namespace
@@ -254,6 +323,95 @@ TEST(CliConfigStatic, KnownFlagsMatchTheParser) {
         << "known_flags() and the parser disagree. A flag the parser accepts and the list omits is "
            "a config key that refuses to load; a key in the list the parser does not accept is a "
            "key that loads and does nothing.";
+}
+
+TEST(CliConfigStatic, EveryParsedValueIsReadByTheServer) {
+    // The link after the one above. A flag the parser accepts becomes a `ServerConfig` field, and
+    // a field nothing reads is a flag that loads and does nothing. `--workers` was that from the
+    // first commit to #149: parsed into `worker_threads`, printed back by --print-config,
+    // documented as "Number of worker threads (default: 4)", and read by nothing. The lists above
+    // agreed with the parser the whole time, because the parser was never what was missing.
+    //
+    // "Read" is `.field` or `->field` anywhere in `src/`, `tools/` or `include/`, outside the two
+    // functions whose job is to write the struct and print it back.
+    //
+    // What this cannot see, and #147 was: a field read only by code the binary does not build. The
+    // three io_uring flags were read in `src/io_uring_server.cpp` and did nothing in the epoll
+    // binary, and a read in any source file counts here.
+
+    // The rule's own cases, through the functions the tree goes through.
+    {
+        const std::string header =
+            "\nstruct ServerConfig {\n"
+            "    int         used{1};\n"
+            "    std::vector<std::string> also_used;   // a comment naming .dead\n"
+            "    int         dead{2};\n"
+            "    bool        method() const;\n"
+            "};\n";
+        const std::vector<std::string> fields = config_fields(header);
+        ASSERT_EQ(fields, (std::vector<std::string>{"used", "also_used", "dead"}));
+        // A server source with the two writers in it, which is the shape of `src/tcp_server.cpp`.
+        const std::string server = without_parser(
+            "\nResolvedConfig resolve_cli_args(int argc, char* argv[]) {\n"
+            "    config.dead = 1;\n"
+            "}\n"
+            "\nstd::string format_config(const ResolvedConfig& resolved) {\n"
+            "    return std::to_string(resolved.config.dead);\n"
+            "}\n"
+            "\nvoid run(const ServerConfig& c) { go(c.used); }\n");
+        ASSERT_FALSE(server.empty());
+        const std::string code = without_comments(
+            server +
+            "void more(const Server* s) { for (auto& e : s->config_->also_used) {} }\n"
+            "// c.dead in a comment is not a read\n"
+            "int x = y.deadline;\n");
+        std::vector<std::string> unread;
+        for (const auto& f : fields) {
+            if (!reads_member(code, f)) unread.push_back(f);
+        }
+        ASSERT_EQ(unread, (std::vector<std::string>{"dead"}))
+            << "the rule misreads its own cases, so its verdict on the tree means nothing";
+    }
+
+    const std::vector<std::string> fields =
+        config_fields(read_source("include/orderbook/tcp_server.hpp"));
+    ASSERT_GT(fields.size(), 40u) << "found " << fields.size() << " fields in ServerConfig; the "
+                                  << "declaration's shape changed and this rule is reading little";
+    for (const char* known : {"port", "data_dir", "profile", "drain_timeout_ms"}) {
+        ASSERT_NE(std::find(fields.begin(), fields.end(), known), fields.end()) << known;
+    }
+
+    std::string code;
+    for (const char* dir : {"src", "tools", "include"}) {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                 std::filesystem::path(OB_SOURCE_DIR) / dir)) {
+            const std::string extension = entry.path().extension().string();
+            if (!entry.is_regular_file() || (extension != ".cpp" && extension != ".hpp")) continue;
+            std::ifstream in(entry.path());
+            std::string source((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+            const bool the_parser = entry.path().filename() == "tcp_server.cpp" &&
+                                    entry.path().parent_path().filename() == "src";
+            if (the_parser) {
+                source = without_parser(source);
+                ASSERT_FALSE(source.empty())
+                    << "src/tcp_server.cpp no longer has resolve_cli_args() and format_config() "
+                       "in the shape this rule cuts; without the cut, every write reads as a read";
+            }
+            code += without_comments(source);
+        }
+    }
+
+    std::vector<std::string> unread;
+    for (const auto& f : fields) {
+        if (!reads_member(code, f)) unread.push_back(f);
+    }
+    // `profile` is a source of values, not a knob: the parser resolves it into the fields it names
+    // (`io_spin_us` today), so its own value is only what --print-config reports. Pinned in both
+    // directions, so a profile that grows a second code path takes itself off this list.
+    EXPECT_EQ(unread, (std::vector<std::string>{"profile"}))
+        << "a ServerConfig field is parsed and printed and read by nothing else, so its flag loads "
+           "and does nothing. Either the server reads it, or the flag goes.";
 }
 
 TEST(CliConfigStatic, BooleanFlagsTakeNoValueInTheParser) {

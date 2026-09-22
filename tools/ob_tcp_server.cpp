@@ -1,7 +1,7 @@
 // tools/ob_tcp_server.cpp — TCP server executable for orderbook-dbengine.
 //
 // Usage:
-//   ./ob_tcp_server [--port PORT] [--data-dir DIR] [--max-sessions N] [--workers N]
+//   ./ob_tcp_server [--port PORT] [--data-dir DIR] [--max-sessions N] [--help]
 //
 // Signals:
 //   SIGINT / SIGTERM → graceful shutdown
