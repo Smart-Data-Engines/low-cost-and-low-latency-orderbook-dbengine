@@ -281,6 +281,10 @@ consequences worth knowing:
   stops reading entirely while asking for more hits that cap and has its session closed, with the
   reason logged. This bounds server memory: without a cap, one client that never reads would grow the
   process without limit.
+- **One answer larger than the cap is refused, not sent** — to any client, however fast it reads.
+  The session gets `ERR answer of N bytes is larger than the 67108864 a session may have queued;
+  narrow the query or add LIMIT` in its place and stays open (#152). Before that, the connection
+  was closed with nothing but EOF to say why.
 
 `ob_session_pending_bytes` in `/metrics` reports the bytes queued across all sessions. It is the
 signal that a client is not keeping up, and it should sit at zero in a healthy system.

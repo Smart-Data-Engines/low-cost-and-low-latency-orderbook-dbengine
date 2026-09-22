@@ -1500,7 +1500,11 @@ TEST(ReadLoopStatic, EveryCommandFromOneReadIsAnsweredWithOneSend) {
     const std::string body = path.substr(open, close - open);
     const std::string after = path.substr(close);
 
-    EXPECT_NE(body.find("queue_response("), std::string::npos)
+    // `queue_answer`, not `queue_response`: since #152 the loop queues through the call that tells
+    // an answer too large to ever send from a client that stopped reading, and the one
+    // `queue_response` left in the loop is the error that replaces such an answer - which would
+    // satisfy a search for `queue_response(` while the path every other answer takes was gone.
+    EXPECT_NE(body.find("= session->queue_answer(response);"), std::string::npos)
         << "the commands of a read are no longer answered into the session's buffer";
     EXPECT_EQ(body.find("send_response("), std::string::npos)
         << "a response is sent from inside the loop over the commands of one read: one send per "
@@ -1648,4 +1652,45 @@ TEST(SessionsStatic, NoDescriptorIsClosedAgainAfterItsSessionIsRemoved) {
                       << " - remove_session() has already closed it, and the number may belong to "
                          "someone else by now";
     }
+}
+
+// ── An answer too large to ever send (#152) ────────────────────────────────────
+
+TEST(AnswerCeiling, AnAnswerLargerThanTheCapIsRefusedAloneAndNothingIsQueued) {
+    int sv[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    {
+        ob::Session s(sv[0], 1);
+        const std::string too_large(ob::Session::max_queued_bytes() + 1, 'x');
+        EXPECT_EQ(s.queue_answer(too_large), ob::Session::Queued::TooLargeAlone);
+        EXPECT_EQ(s.pending_output_bytes(), 0u) << "a refused answer left bytes queued";
+        // The control: the largest answer that fits is queued, because the refusal is about one
+        // answer being larger than the cap, not about being large.
+        const std::string at_cap(ob::Session::max_queued_bytes(), 'y');
+        EXPECT_EQ(s.queue_answer(at_cap), ob::Session::Queued::Yes);
+        EXPECT_EQ(s.pending_output_bytes(), ob::Session::max_queued_bytes());
+        // And the other refusal is still the other one: one byte more behind a full buffer is a
+        // client that is not reading.
+        EXPECT_EQ(s.queue_answer("z"), ob::Session::Queued::CapExceeded);
+    }
+    // A Session does not own its descriptor - SessionManager::remove_session() closes it.
+    ::close(sv[0]);
+    ::close(sv[1]);
+}
+
+TEST(AnswerCeiling, TheLoopAnswersAnErrorInsteadOfClosing) {
+    // Static, because the behavioural half needs an answer above 64 MB, which is a store of about
+    // two and a half million rows - measured on the m9g.xlarge at 76 MB for the query that found
+    // this. The unit test above holds the classification; this holds that the loop acts on it.
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/src/tcp_server.cpp");
+    const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ASSERT_FALSE(src.empty());
+    const auto at = src.find("if (queued == Session::Queued::TooLargeAlone) {");
+    ASSERT_NE(at, std::string::npos) << "the read loop does not tell an answer too large to send "
+                                        "from a client that stopped reading";
+    const std::string branch = src.substr(at, src.find("} else if", at) - at);
+    EXPECT_NE(branch.find("format_error("), std::string::npos)
+        << "an answer too large to send is not replaced by an error";
+    EXPECT_EQ(branch.find("close_session("), std::string::npos)
+        << "an answer too large to send closes the session of a client that did nothing wrong";
 }

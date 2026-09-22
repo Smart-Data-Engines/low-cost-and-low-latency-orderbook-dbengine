@@ -2436,8 +2436,23 @@ void Reactor::run_loop() {
                                     break;
                                 }
 
-                                if (!session->queue_response(response)) {
-                                    // The send buffer cap. EPIPE and ECONNRESET surface in the flush.
+                                const Session::Queued queued = session->queue_answer(response);
+                                if (queued == Session::Queued::TooLargeAlone) {
+                                    // No client could be sent this, however fast it reads, so the
+                                    // session is not the thing that failed: it gets an error in
+                                    // the answer's place and stays open (#152).
+                                    const std::string refusal = format_error(
+                                        "answer of " + std::to_string(response.size()) +
+                                        " bytes is larger than the " +
+                                        std::to_string(Session::max_queued_bytes()) +
+                                        " a session may have queued; narrow the query or add LIMIT");
+                                    if (!session->queue_response(refusal)) {
+                                        queue_refused = true;
+                                        break;
+                                    }
+                                } else if (queued == Session::Queued::CapExceeded) {
+                                    // The send buffer cap: a client that has stopped reading. EPIPE
+                                    // and ECONNRESET surface in the flush.
                                     queue_refused = true;
                                     break;
                                 }

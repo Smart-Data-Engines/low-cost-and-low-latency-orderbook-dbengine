@@ -94,6 +94,24 @@ public:
     /// The bytes and their order are the same either way: the buffer is the wire order.
     bool queue_response(std::string_view response);
 
+    /// What `queue_answer()` did with an answer.
+    enum class Queued {
+        Yes,            ///< appended to the send buffer
+        TooLargeAlone,  ///< larger than the whole cap on its own; nothing queued
+        CapExceeded,    ///< fits alone, not behind what is already queued; nothing queued
+    };
+
+    /// `queue_response()` with its two refusals told apart, because only one of them is the
+    /// client's doing. `CapExceeded` is a client that has stopped reading, and the session is
+    /// closed for it as before. `TooLargeAlone` is an answer that no client could ever be sent,
+    /// however fast it reads: the loop answers an error in its place and the session stays open.
+    /// Before #152 both closed the connection, so a `SELECT` whose answer passed 64 MB ended the
+    /// session of a client that was reading perfectly well, with nothing but EOF to say why.
+    Queued queue_answer(std::string_view response);
+
+    /// The most bytes a session may hold queued, and so the largest answer it can ever be sent.
+    static constexpr size_t max_queued_bytes() { return kMaxSendBuffer; }
+
     /// Push queued bytes towards the socket. Same contract as send_response().
     /// Push queued output to the socket. False means the session is finished.
     ///

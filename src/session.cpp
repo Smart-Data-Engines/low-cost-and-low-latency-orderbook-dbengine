@@ -239,6 +239,10 @@ bool Session::send_response(std::string_view response) {
 }
 
 bool Session::queue_response(std::string_view response) {
+    return queue_answer(response) == Queued::Yes;
+}
+
+Session::Queued Session::queue_answer(std::string_view response) {
     if (compressed_) {
         // Compressed mode: [4-byte BE length][LZ4 frame]. Framed before queueing, so
         // a partial write can never split a frame.
@@ -249,11 +253,17 @@ bool Session::queue_response(std::string_view response) {
         compress_bytes_out_ += static_cast<uint64_t>(compressed.size());
 
         uint32_t frame_len = static_cast<uint32_t>(compressed.size());
+        if (4 + compressed.size() > kMaxSendBuffer) {
+            OB_LOG_WARN("session",
+                        "Answer too large to ever send: fd=%d frame=%zu cap=%zu (compressed)",
+                        fd_, 4 + compressed.size(), kMaxSendBuffer);
+            return Queued::TooLargeAlone;
+        }
         if (send_buf_.size() + 4 + compressed.size() > kMaxSendBuffer) {
             OB_LOG_ERROR("session",
                          "Send buffer cap exceeded: fd=%d pending=%zu adding=%zu cap=%zu",
                          fd_, send_buf_.size(), 4 + compressed.size(), kMaxSendBuffer);
-            return false;
+            return Queued::CapExceeded;
         }
         send_buf_.push_back(static_cast<char>((frame_len >> 24) & 0xFF));
         send_buf_.push_back(static_cast<char>((frame_len >> 16) & 0xFF));
@@ -262,15 +272,20 @@ bool Session::queue_response(std::string_view response) {
         send_buf_.append(reinterpret_cast<const char*>(compressed.data()),
                          compressed.size());
     } else {
+        if (response.size() > kMaxSendBuffer) {
+            OB_LOG_WARN("session", "Answer too large to ever send: fd=%d answer=%zu cap=%zu", fd_,
+                        response.size(), kMaxSendBuffer);
+            return Queued::TooLargeAlone;
+        }
         if (send_buf_.size() + response.size() > kMaxSendBuffer) {
             OB_LOG_ERROR("session",
                          "Send buffer cap exceeded: fd=%d pending=%zu adding=%zu cap=%zu",
                          fd_, send_buf_.size(), response.size(), kMaxSendBuffer);
-            return false;
+            return Queued::CapExceeded;
         }
         send_buf_.append(response.data(), response.size());
     }
-    return true;
+    return Queued::Yes;
 }
 
 // Out of line, and the attribute is the point rather than a hint - the numbers and the reasoning
