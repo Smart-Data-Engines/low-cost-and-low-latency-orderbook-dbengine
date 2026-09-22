@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import socket
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -30,6 +31,7 @@ from conftest import patience
 from orderbook_engine import OrderbookEngine
 
 CEILING = 512 * 1024          # TcpServerConfig::max_unparsed_bytes, twice max_line_length
+OVERFLOWS = "ob_sessions_unparsed_overflow_total"
 
 
 def _metric(port: int, name: str) -> float:
@@ -42,6 +44,26 @@ def _metric(port: int, name: str) -> float:
         # The exposition carries a label set: `name{node_role="standalone"} 3` (pitfall 66).
         return float(line.rsplit(" ", 1)[1])
     return 0.0
+
+
+def _wait_for_refusal(metrics_port: int, before: float) -> float:
+    """The overflow counter once the refusal has landed, waiting for it rather than reading once.
+
+    The client can finish writing before the server has read as far as the ceiling: loopback
+    absorbs megabytes, so `sendall()` returning says the bytes are in a kernel buffer and nothing
+    about the server having seen them. Reading the counter the instant the socket closes therefore
+    asserts an ordering between two processes. Measured on the i3-7100U with #146's 64 KiB read:
+    **4 of 40** immediate reads missed a refusal that landed 1.5-2.1 ms later, and 33 of the 40
+    clients sent all 4 MiB. With the old 4 KiB read the server drained more slowly, flow control
+    held the client until the server's reset, and 0 of 40 missed. Settled, **none** missed in either
+    build, so the property held throughout and the instant was the thing that was lucky.
+    """
+    deadline = time.monotonic() + patience(10)
+    value = _metric(metrics_port, OVERFLOWS)
+    while value <= before and time.monotonic() < deadline:
+        time.sleep(0.01)
+        value = _metric(metrics_port, OVERFLOWS)
+    return value
 
 
 def _read_banner(sock: socket.socket) -> None:
@@ -67,7 +89,7 @@ def test_a_client_that_never_sends_a_newline_is_dropped(cluster):
     """
     primary = cluster.primary()
     before_rss = _rss_kib(primary)
-    before = _metric(primary.metrics_port, "ob_sessions_unparsed_overflow_total")
+    before = _metric(primary.metrics_port, OVERFLOWS)
 
     sock = socket.create_connection(("127.0.0.1", primary.tcp_port), timeout=patience(20))
     try:
@@ -83,7 +105,7 @@ def test_a_client_that_never_sends_a_newline_is_dropped(cluster):
     finally:
         sock.close()
 
-    after = _metric(primary.metrics_port, "ob_sessions_unparsed_overflow_total")
+    after = _wait_for_refusal(primary.metrics_port, before)
     assert after > before, (
         f"ob_sessions_unparsed_overflow_total did not move ({before} -> {after}) after {sent} "
         f"bytes of one unterminated line, so whatever ended that connection was not this "
@@ -110,7 +132,7 @@ def test_a_client_that_never_sends_a_newline_is_dropped(cluster):
 def test_a_minsert_that_never_completes_is_dropped(cluster):
     """Route two: the payload lines end in newlines and still never reach the per-line check."""
     port = cluster.primary().tcp_port
-    before = _metric(cluster.primary().metrics_port, "ob_sessions_unparsed_overflow_total")
+    before = _metric(cluster.primary().metrics_port, OVERFLOWS)
 
     sock = socket.create_connection(("127.0.0.1", port), timeout=patience(20))
     try:
@@ -127,7 +149,7 @@ def test_a_minsert_that_never_completes_is_dropped(cluster):
     finally:
         sock.close()
 
-    after = _metric(cluster.primary().metrics_port, "ob_sessions_unparsed_overflow_total")
+    after = _wait_for_refusal(cluster.primary().metrics_port, before)
     assert after > before, (
         f"a MINSERT collecting oversized payload lines was not refused ({before} -> {after}); "
         f"those lines never come back from feed(), so the per-line length check cannot see them")
