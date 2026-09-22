@@ -2022,9 +2022,14 @@ void TcpServer::run() {
                         }
                     }
 
-                    // Send welcome message.
+                    // Send welcome message. The version comes from the build system like
+                    // every other place a node reports it (#90); this one was a literal until #148,
+                    // so the first bump would have made the banner name a build that was not
+                    // running.
                     if (s) {
-                        s->send_response("OK ob_tcp_server v0.1.0\n\n");
+                        static const std::string banner =
+                            "OK ob_tcp_server v" + std::string(version()) + "\n\n";
+                        s->send_response(banner);
                     }
                 }
             } else {

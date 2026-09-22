@@ -5,8 +5,10 @@ project(orderbook-dbengine VERSION 0.1.0 LANGUAGES CXX)
 #
 # `project(... VERSION)` above is the source, and it reaches the binary as a compile definition
 # rather than being retyped. It was retyped: a literal `v0.1.0` in `tools/ob_tcp_server.cpp` was the
-# only place a running node's version appeared anywhere, and nothing checked it against this line
-# or against `pyproject.toml` (#90). Three copies of one fact, two of which could drift silently.
+# startup line's version, and nothing checked it against this line or against `pyproject.toml`
+# (#90). #90 took that one out and missed two more, the welcome banner every client reads and the
+# interactive CLI's greeting, because the test it wrote could not see a version inside a longer
+# literal (#148).
 set(OB_VERSION "${PROJECT_VERSION}")
 
 # ── Language standard ──────────────────────────────────────────────────────────
