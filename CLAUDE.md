@@ -3141,6 +3141,21 @@ Learned the hard way. Check here before debugging.
      that sentence against the transport took ten minutes and found a heap disclosure and a
      durability flag that did nothing. Fourth time in this repository that writing for a reader
      tested the code (pitfalls 84, 112, 228).
+374. **A guard written after a defect is checked against the defect as it was, not against the
+     shape the guard looks for.** #90 removed `"ob_tcp_server v0.1.0 listening on port %u,
+     data-dir: %s\n"` and added a rule refusing `"v?0\.1\.0"` — a literal made of the version and
+     nothing else, which that line does not match. Restored verbatim, the removed line passes the
+     rule written to keep it out, and two older copies inside longer literals — the welcome banner
+     and the CLI's greeting, both from March — passed it for as long as it existed (#148). #90 says
+     the guard was mutation-checked; whatever the mutation was, it was not the diff's own minus
+     side, which is the first one to try: the defect as it was is the one input the guard must
+     refuse.
+375. **A chain of static checks is only as long as its last link, and the missing link is the one
+     that reads.** #32 held the parser's branches against the known-flag list and the list against
+     the help text and the CLI reference, and all of them agreed on `--workers` for six months:
+     parsed, listed, documented as "Number of worker threads (default: 4)" — and read by nothing
+     (#149). The check that finds it goes one step further than any list: a field the parser
+     writes must be read by something other than the function that prints it back.
 
 ## Current state and open problems
 
