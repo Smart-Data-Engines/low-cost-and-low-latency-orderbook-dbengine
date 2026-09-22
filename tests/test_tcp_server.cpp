@@ -455,7 +455,6 @@ TEST(CliArgs, DefaultValues) {
     EXPECT_EQ(config.port, 9090);
     EXPECT_EQ(config.data_dir, "/tmp/ob_data");
     EXPECT_EQ(config.max_sessions, 64);
-    EXPECT_EQ(config.worker_threads, 4);
 }
 
 // Test partial args (only port)

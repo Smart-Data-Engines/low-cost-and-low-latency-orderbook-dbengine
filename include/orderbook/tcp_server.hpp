@@ -41,7 +41,6 @@ struct ServerConfig {
     uint16_t    port{9090};
     std::string data_dir{"/tmp/ob_data"};
     int         max_sessions{64};
-    int         worker_threads{4};
     size_t      max_line_length{262144}; // max command bytes (256KB, supports MINSERT with 1000 levels)
     /// Ceiling on what one session may hold that is not yet a command (#143).
     ///
