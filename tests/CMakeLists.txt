@@ -878,6 +878,17 @@ ob_add_engine_test(test_query_buffer_lifetime
     test_query_buffer_lifetime.cpp
 )
 
+# ── The live book on the wire (#145) ──────────────────────────────────────────
+ob_add_engine_test(test_query_book
+    test_query_book.cpp
+)
+# It reads `src/query_engine.cpp` at run time: the two properties that matter about `read_book()`
+# are "one snapshot per answer" and "the owning handle is held", and neither has a behavioural
+# test that would mean anything (#145).
+target_compile_definitions(test_query_book
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
 ob_add_engine_test(test_query_live_buffer_race
     test_query_live_buffer_race.cpp
 )

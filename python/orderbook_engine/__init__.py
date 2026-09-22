@@ -1984,6 +1984,67 @@ class OrderbookEngine:
             sql += f" LIMIT {limit}"
         return self.query(sql)
 
+    def book(self, symbol: str, exchange: str,
+             depth: Optional[int] = None) -> List[OrderbookRow]:
+        """The **live** book for one symbol: the current levels of both sides.
+
+        A different question from `query()`, which reads history. This reads the engine's own
+        current state - the structure `apply_delta` updates in place - so it answers with one
+        version of each level rather than every version it has stored. `depth` is per side and
+        counts from the best level; omit it for everything the side has.
+
+        Bids come first, then asks, each side in its own order, and `level` restarts at 0 for the
+        asks because a level index is a position within a side.
+
+        **Two of the seven columns are properties of the read rather than of a level**: every row
+        carries the same `timestamp_ns` and `sequence_number`, which say *as of which update* this
+        book is. That is the number to resume a `subscribe()` from.
+
+        Refused in local mode. The embedded path goes through the C API, which has no entry point
+        for this - and adding one is a change to a published ABI, so it is a separate piece of work
+        rather than something to smuggle in behind a keyword argument. The refusal names that,
+        because a client that silently got history instead would have no way to tell.
+        """
+        if self._closed:
+            raise OrderbookError(-1, "Engine is closed")
+        if self._mode == "local":
+            raise OrderbookError(
+                -1,
+                "book() needs the wire: the embedded path goes through the C API, which has no "
+                "entry point for a live-book read. Use a TCP connection, or read the aggregate "
+                "functions, which do reach the live buffer in local mode.")
+        if depth is not None and depth < 1:
+            # Refused rather than sent, for the reason the server refuses it: an empty answer on
+            # request is indistinguishable from a book that is not there. `None` asks for
+            # everything.
+            raise OrderbookError(-1, "book() depth must be at least 1, or None for every level")
+
+        command = f"BOOK {symbol} {exchange}" + (f" {depth}" if depth is not None else "")
+        raw = self._pool.execute_read(command) if self._mode == "pool" else self._tcp.execute(command)
+        is_err, msg, header, data_rows = _parse_tcp_response(raw)
+        if is_err:
+            raise OrderbookError(-1, f"book error: {msg}")
+        # The same by-position guard `query()` carries, and for the same reason: this client reads
+        # the standard columns by index, so a header that is not those columns has to be refused
+        # rather than parsed into a silently wrong answer.
+        if header != _QUERY_COLUMNS[:len(header)] or len(header) < 6:
+            raise OrderbookError(
+                -1,
+                "this client reads the standard row columns by position and the server answered "
+                f"with {header}")
+        return [
+            OrderbookRow(
+                timestamp_ns=int(r[0]),
+                price=int(r[1]),
+                quantity=int(r[2]),
+                order_count=int(r[3]),
+                side="bid" if r[4] == "0" else "ask",
+                level=int(r[5]),
+                sequence_number=int(r[6]) if len(r) > 6 else 0,
+            )
+            for r in data_rows if len(r) >= 6
+        ]
+
     def subscribe(self, symbol: str, exchange: str, *, where: str = "") -> int:
         """Ask the server to push rows for one book. Returns the subscription id.
 

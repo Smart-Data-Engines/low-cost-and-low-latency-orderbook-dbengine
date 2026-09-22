@@ -170,6 +170,35 @@ rows = engine.query(
 
 Convenience method to query all rows for a symbol/exchange pair.
 
+#### engine.book(symbol, exchange, depth=None) → List[OrderbookRow]
+
+The **live** book: the current levels of both sides. TCP and pool mode only.
+
+A different question from `query()`, which reads history and answers with every version of a level
+it has stored. This reads the structure the engine updates in place, so there is one row per level,
+and it is one `memcpy` per side on the server.
+
+```python
+rows = engine.book("BTC-USD", "BINANCE", depth=5)   # five levels per side
+best_bid = next(r for r in rows if r.side == "bid")
+as_of    = rows[0].sequence_number                  # resume a subscribe() from here
+```
+
+Bids come first, then asks, each side in its own order (bids descending, asks ascending), and
+`level` restarts at 0 for the asks because a level index is a position within a side.
+
+**Two of the seven fields are properties of the read rather than of a level**: every row carries
+the same `timestamp_ns` and `sequence_number`, which say *as of which update* this book is. They
+are not the time a level changed.
+
+`depth` is per side and counts from the best level; `None` asks for everything the side has. A
+`depth` below 1 is refused by the client before it reaches the wire, and one above 1000 is refused
+by the server, which is the most levels per side it stores.
+
+Refused in local mode, and the message says why: the embedded path goes through the C API, which
+has no entry point for a live-book read. The aggregate functions do reach the live buffer in local
+mode.
+
 #### engine.query_agg(symbol, exchange, *exprs) → Dict[str, AggValue]
 
 Run aggregate expressions against the live orderbook. TCP and pool mode only.

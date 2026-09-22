@@ -978,6 +978,11 @@ std::string Engine::execute(std::string_view sql, RowCallback cb, QueryShape& sh
     return query_engine_->execute(sql, std::move(cb), shape);
 }
 
+std::string Engine::read_book(const std::string& symbol, const std::string& exchange,
+                              uint32_t depth, RowCallback cb) {
+    return query_engine_->read_book(symbol, exchange, depth, std::move(cb));
+}
+
 std::string Engine::parse(std::string_view sql, QueryAST& out) {
     return query_engine_->parse(sql, out);
 }

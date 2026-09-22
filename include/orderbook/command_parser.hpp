@@ -30,6 +30,7 @@ enum class CommandType {
     SUBSCRIBE,
     UNSUBSCRIBE,
     AUTH,
+    BOOK,
     UNKNOWN
 };
 
@@ -74,6 +75,21 @@ struct MinsertArgs {
     std::vector<Level> levels;
 };
 
+// ── BOOK arguments ────────────────────────────────────────────────────────────
+
+struct BookArgs {
+    std::string symbol;
+    std::string exchange;
+
+    /// Levels per side, counting from the best. Zero means "everything the side has".
+    ///
+    /// Zero as the default is safe here and is **not** the sentinel #105 had to refuse: there,
+    /// zero was a legal event time, so it could not also mean absence. A book of zero levels per
+    /// side is not a question anybody asks, so the parser refuses an explicit `0` and this field's
+    /// zero can carry "no depth given" without ambiguity.
+    uint32_t    depth{0};
+};
+
 // ── Parsed command ────────────────────────────────────────────────────────────
 
 struct Command {
@@ -81,6 +97,7 @@ struct Command {
     std::string raw_sql;        // for SELECT
     InsertArgs  insert_args;    // for INSERT
     MinsertArgs minsert_args;   // for MINSERT
+    BookArgs    book_args;      // for BOOK
     std::string target_node_id; // for FAILOVER
     std::string migrate_symbol;       // "symbol.exchange" for MIGRATE
     std::string migrate_target_shard; // target shard_id for MIGRATE

@@ -17,6 +17,7 @@
 "SUBSCRIBE"
 "UNSUBSCRIBE"
 "AUTH"
+"BOOK"
 "bid"
 "ask"
 "0"

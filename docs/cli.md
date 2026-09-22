@@ -153,6 +153,44 @@ clause and reject one.
 
 See [Query Language](query-language.md) for full SQL syntax.
 
+### book
+
+    BOOK <symbol> <exchange> [depth]
+
+The **live** book for one symbol: the current levels of both sides, bids first and then asks, each
+side in its own order (bids descending, asks ascending). `depth` is per side and counts from the
+best level; omit it for everything the side has. Rows carry the same seven columns as a `SELECT`
+row, so a client that parses one parses the other.
+
+This is a different question from `SELECT`, which reads **history** — the columnar store — and will
+answer with every version of a level it has. `BOOK` reads the engine's own current state under a
+seqlock and is one `memcpy` per side.
+
+**Two of those seven columns come from the buffer rather than from a level, so every row of one
+answer carries the same `timestamp_ns` and `sequence_number`.** That is the identity of the
+snapshot — *as of which update* this book is — not the time a level changed. It is the number to
+resume a `SUBSCRIBE` from: take the book, then subscribe, and discard anything at or below that
+sequence number.
+
+`BOOK` is not an atomic read of both sides. Each side is read under its own seqlock, one after the
+other, so in principle the two halves are microseconds apart. Making it atomic means one seqlock
+per buffer instead of one per side, which is a change on the write path; the alternative that was
+rejected is worse — reading each side while emitting its rows puts the formatting of up to two
+thousand levels between the two halves.
+
+Refusals, all naming the token: a symbol with no live buffer is `OB_ERR_NOT_FOUND`, a non-numeric
+depth, a depth of `0` (omit the argument to ask for everything — an empty answer on request is
+indistinguishable from a book that is not there), and a depth above 1000, which is the most levels
+per side this engine stores.
+
+    ob> book BTC-USD BINANCE 2
+    OK
+    timestamp_ns	price	quantity	order_count	side	level	sequence_number
+    1758614400000000000	6500000	100	1	bid	0	42
+    1758614400000000000	6499000	250	3	bid	1	42
+    1758614400000000000	6501000	80	2	ask	0	42
+    1758614400000000000	6502000	140	1	ask	1	42
+
 ### status
 
 Show engine statistics.

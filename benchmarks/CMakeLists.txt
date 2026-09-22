@@ -46,3 +46,10 @@ target_link_libraries(ssl_write_retry PRIVATE OpenSSL::SSL OpenSSL::Crypto Threa
 # checkable with a command instead of a reimplementation.
 add_executable(wire_load wire_load.cpp)
 target_link_libraries(wire_load PRIVATE orderbook_client)
+
+# ── What one command costs against the round trip it travels on (#145) ───────
+#
+# Compiled, deliberately not run, for the reason above. scripts/measure_book_latency.py drives it
+# and reports `BOOK` against a `PING` baseline in the same round, which is what makes the table in
+# the roadmap re-measurable with a command.
+add_executable(command_latency command_latency.cpp)

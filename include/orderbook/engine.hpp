@@ -102,6 +102,15 @@ public:
     /// As above, and report the shape of the answer in `shape` before the first row.
     std::string execute(std::string_view sql, RowCallback cb, QueryShape& shape);
 
+    /// The live book for one symbol, as rows. Error string on failure, empty on success.
+    ///
+    /// Delegates to `QueryEngine`, which owns the live-buffer lookup. Deliberately not resolving
+    /// the buffer here: a second supplier of that lookup is what the static test in
+    /// `tests/test_query_live_buffer_race.cpp` refuses, because the C API had the identical race
+    /// one file away and fixing only the server would have left it (#91, #92).
+    std::string read_book(const std::string& symbol, const std::string& exchange,
+                          uint32_t depth, RowCallback cb);
+
     /// Parse a SQL query.
     std::string parse(std::string_view sql, QueryAST& out);
 

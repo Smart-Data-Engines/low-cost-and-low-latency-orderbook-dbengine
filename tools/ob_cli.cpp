@@ -12,6 +12,7 @@
 //   help
 //   quit
 
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -63,6 +64,11 @@ Commands:
       Run a SQL query. Data must be flushed first (see 'flush').
       Syntax: SELECT <cols> FROM '<symbol>'.'<exchange>' WHERE timestamp BETWEEN <start> AND <end>
       Example: query SELECT price, quantity FROM 'BTC-USD'.'BINANCE' WHERE timestamp BETWEEN 0 AND 9999999999999999999
+
+  book <symbol> <exchange> [depth]
+      The live book: current levels of both sides, bids first. Needs no flush - this
+      reads the structure the engine updates in place, not the stored history.
+      Example: book BTC-USD BINANCE 5
 
   flush
       Force-flush all pending data to the columnar store so queries can see it.
@@ -436,6 +442,61 @@ void cmd_query(ob::Engine& engine, const std::string& sql) {
     ++g_queries;
 }
 
+void cmd_book(ob::Engine& engine, std::istringstream& args) {
+    std::string symbol, exchange;
+    args >> symbol >> exchange;
+    static constexpr const char* kUsage = "book <symbol> <exchange> [depth]";
+    if (args.fail()) {
+        std::cerr << "Usage: " << kUsage << "\n";
+        return;
+    }
+    // Optional, and read the way #110 made this tool read every optional argument: a word that is
+    // not a number is refused rather than turned into a default nobody asked for.
+    uint32_t depth = 0;
+    std::string depth_str;
+    if (args >> depth_str) {
+        uint32_t parsed = 0;
+        const auto* end = depth_str.data() + depth_str.size();
+        const auto [ptr, ec] = std::from_chars(depth_str.data(), end, parsed);
+        // Two refusals rather than one, matching the wire's: "not a number" and "not at least 1"
+        // are different mistakes, and a single message sends whoever made the second one looking
+        // for a typo. That distinction is what #110 was about in this tool.
+        if (ec != std::errc{} || ptr != end) {
+            std::cerr << "'" << depth_str << "' is not a number\nUsage: " << kUsage << "\n";
+            return;
+        }
+        if (parsed == 0) {
+            std::cerr << "a depth must be at least 1; omit it to ask for every level\nUsage: "
+                      << kUsage << "\n";
+            return;
+        }
+        depth = parsed;
+    }
+    if (!nothing_follows(args, kUsage)) return;
+
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<ob::QueryResult> results;
+    const std::string err = engine.read_book(symbol, exchange, depth,
+                                             [&](const ob::QueryResult& r) { results.push_back(r); });
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+    if (!err.empty()) {
+        std::cerr << "  ERROR: " << err << "\n";
+        return;
+    }
+
+    // The same table `query` prints, deliberately: the columns are the same seven, and a second
+    // layout for the same row would make one tool print a row two ways.
+    std::cout << "  ts_ns               | side | level | price        | qty          | orders |      seq\n";
+    std::cout << "  ────────────────────┼──────┼───────┼──────────────┼──────────────┼────────┼─────────\n";
+    for (const auto& r : results) {
+        std::printf("  %-20lu | %-4s | %5u | %12ld | %12lu | %6u | %8lu\n",
+                    r.timestamp_ns, r.side == 0 ? "bid" : "ask", r.level, r.price,
+                    r.quantity, r.order_count, r.sequence_number);
+    }
+    std::cout << "  ── " << results.size() << " level(s) in " << ms << " ms\n";
+}
+
 void cmd_status() {
     std::cout << "  sequence: " << g_seq
               << "  inserts: " << g_inserts
@@ -514,6 +575,8 @@ static int run_cli(int argc, char* argv[]) {
             } else {
                 cmd_query(engine, line.substr(sql_start));
             }
+        } else if (cmd == "book") {
+            cmd_book(engine, iss);
         } else {
             std::cerr << "Unknown command: " << cmd << "  (type 'help')\n";
         }
