@@ -55,12 +55,12 @@ TEST(CliArgs, ParsesTheCommonFlags) {
 }
 
 TEST(CliArgs, BooleanFlagsTakeNoValue) {
-    const auto config = parse({"--read-only", "--replication-compress", "--no-sqpoll",
+    const auto config = parse({"--read-only", "--replication-compress", "--multi-master",
                                "--port", "5556"});
 
     EXPECT_TRUE(config.read_only);
     EXPECT_TRUE(config.replication_compress);
-    EXPECT_TRUE(config.uring_no_sqpoll);
+    EXPECT_TRUE(config.multi_master);
     EXPECT_EQ(config.port, 5556) << "a boolean flag must not swallow the next argument";
 }
 

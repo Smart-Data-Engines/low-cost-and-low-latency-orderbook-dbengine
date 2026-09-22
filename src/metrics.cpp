@@ -295,35 +295,6 @@ MetricsRegistry::MetricsRegistry() {
                                      "wall clock. The log says this twice per excursion, at its "
                                      "edges (#120); this counts every occurrence, so it is the "
                                      "alertable half"));
-
-#ifdef OB_USE_IO_URING
-    // io_uring metrics. Behind the same guard as the transport, so a default build does not carry
-    // them at all — which is why #117 counted them from the source rather than from a running
-    // process: in an io_uring build they were registered and fed by nothing, and in every other
-    // build they were absent.
-    gauges_.push_back(make_gauge("ob_iouring_sq_utilization",
-                                 "Submission queue occupancy as a percentage, sampled once per "
-                                 "loop pass *before* submitting - after submitting it is zero "
-                                 "whatever the handlers queued. The denominator is the ring's "
-                                 "real capacity, not the configured depth, because the kernel "
-                                 "rounds the request up to a power of two"));
-    counters_.push_back(make_counter("ob_iouring_cq_overflows",
-                                     "Completion queue overflow **episodes**. The kernel exposes "
-                                     "overflow as a flag that stays raised, so this counts the "
-                                     "transitions into it; the log says so twice per episode "
-                                     "rather than once per loop pass"));
-    counters_.push_back(make_counter("ob_iouring_submit_errors_total",
-                                     "io_uring_submit() calls that failed. Every one of them left "
-                                     "prepared entries in the ring, so this transport made no "
-                                     "progress on that pass - the result used to be discarded"));
-    counters_.push_back(make_counter("ob_iouring_sqe_submitted",
-                                     "Submission queue entries actually submitted, as reported by "
-                                     "io_uring_submit(). It used to be fed the *completion* count, "
-                                     "which made it equal to ob_iouring_cqe_processed by "
-                                     "construction - so comparing the two to find a backlog "
-                                     "compared a number with itself"));
-    counters_.push_back(make_counter("ob_iouring_cqe_processed", "Total number of CQEs processed"));
-#endif
 }
 
 // ── Lookup helpers ────────────────────────────────────────────────────────────

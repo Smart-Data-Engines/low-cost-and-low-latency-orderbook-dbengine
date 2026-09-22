@@ -287,7 +287,6 @@ TEST(CliConfigStatic, EveryValuelessBooleanDefaultsToFalse) {
     const ob::ServerConfig defaults;
     const std::map<std::string, bool> defaults_by_key = {
         {"multi-master",         defaults.multi_master},
-        {"no-sqpoll",            defaults.uring_no_sqpoll},
         {"read-only",            defaults.read_only},
         {"replication-compress", defaults.replication_compress},
         {"tls-client",           defaults.tls_client},

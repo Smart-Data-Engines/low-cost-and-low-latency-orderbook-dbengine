@@ -52,22 +52,6 @@ struct HistogramEntry {
 // Central registry for Prometheus-style metrics.
 // Hot-path operations (increment_counter, set_gauge, observe_histogram) are
 // lock-free using std::atomic.  Only serialize() acquires a mutex.
-/// A queue's occupancy as a whole percentage, 0-100.
-///
-/// Here rather than beside its caller on purpose. Its caller is the io_uring transport, which
-/// **no CI job runs** — #108 added a job that compiles that file and says so in its own message —
-/// so arithmetic left there would ship unverified for ever. Pulled into a header the ordinary
-/// suite builds and executes, the part that can be checked is checked, and what remains
-/// unverified in that transport is the part that genuinely needs a running ring (#117).
-///
-/// `capacity == 0` answers 0 rather than dividing: a ring that reports no capacity has nothing
-/// queued either, and a metric is the wrong place to raise the question.
-constexpr int queue_utilization_percent(unsigned used, unsigned capacity) {
-    if (capacity == 0) return 0;
-    if (used >= capacity) return 100;
-    return static_cast<int>((static_cast<uint64_t>(used) * 100) / capacity);
-}
-
 /// How much of `total` has not been published yet, given that the source may have restarted.
 ///
 /// The registry's counters take an increment, and several totals in this engine are owned by

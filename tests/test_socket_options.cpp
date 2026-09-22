@@ -76,16 +76,12 @@ std::vector<std::filesystem::path> engine_sources() {
 /// Derived rather than listed. `::accept` and `::connect` are matched with a leading
 /// non-identifier so `CoordinatorClient::connect(` is not one of them — the first version of this
 /// rule matched that method and put an exemption comment above a function with no socket in it.
-/// `io_uring_prep_accept` is here because on that transport the accept is a submitted request and
-/// the descriptor arrives in a completion handler, so no syscall spelling appears at all.
+/// It also counted `io_uring_prep_accept`, because on that transport the accept was a submitted
+/// request with no syscall spelling at all; the transport is gone (#147).
 size_t connection_sites(const std::string& code) {
     static const std::regex syscall(R"([^A-Za-z0-9_:]::(accept4?|connect)\s*\()");
     const auto begin = std::sregex_iterator(code.begin(), code.end(), syscall);
-    size_t n = static_cast<size_t>(std::distance(begin, std::sregex_iterator()));
-    // On the io_uring transport the accept is a submitted request and the descriptor arrives in a
-    // completion handler, so no syscall spelling appears anywhere in the file.
-    if (code.find("io_uring_prep_accept") != std::string::npos) ++n;
-    return n;
+    return static_cast<size_t>(std::distance(begin, std::sregex_iterator()));
 }
 
 bool owns_a_connection(const std::string& code) { return connection_sites(code) > 0; }

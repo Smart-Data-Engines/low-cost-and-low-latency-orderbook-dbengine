@@ -214,41 +214,6 @@ TEST(TlsContext, RequiresTlsOneThree) {
     fs::remove_all(fs::path(kp.cert).parent_path());
 }
 
-// ── The refusal that is the feature ──────────────────────────────────────────
-
-TEST(TlsStatic, EveryTlsFlagIsRefusedByTheIoUringTransport) {
-    // `--tls-client` that quietly meant plaintext would be the single worst outcome this feature
-    // can produce, and it would look identical to working. No CI job builds the io_uring file, so
-    // this is the only thing standing between that flag and a plaintext listener.
-    //
-    // Asserted against the refusal branch's own source rather than against a list written here:
-    // a fourth TLS flag added without extending that branch fails this test.
-    std::ifstream flags_src(std::string(OB_SOURCE_DIR) + "/src/tcp_server.cpp");
-    ASSERT_TRUE(flags_src);
-    const std::string flags((std::istreambuf_iterator<char>(flags_src)),
-                            std::istreambuf_iterator<char>());
-
-    std::ifstream uring_src(std::string(OB_SOURCE_DIR) + "/src/io_uring_server.cpp");
-    ASSERT_TRUE(uring_src);
-    const std::string uring((std::istreambuf_iterator<char>(uring_src)),
-                            std::istreambuf_iterator<char>());
-
-    // Every "tls-..." key the parser knows must be named in the io_uring refusal.
-    size_t checked = 0;
-    for (size_t pos = flags.find("\"tls-"); pos != std::string::npos;
-         pos = flags.find("\"tls-", pos + 1)) {
-        const size_t end = flags.find('"', pos + 1);
-        ASSERT_NE(end, std::string::npos);
-        const std::string key = flags.substr(pos + 1, end - pos - 1);
-        const std::string flag = "--" + key;
-        EXPECT_NE(uring.find(flag), std::string::npos)
-            << flag << " is a TLS flag the io_uring transport does not refuse, so that build "
-                       "would accept it and listen in plaintext";
-        ++checked;
-    }
-    EXPECT_GE(checked, 3u) << "expected at least three tls-* keys; found " << checked;
-}
-
 // ── The leak class, refused by shape rather than caught by a sanitizer ────────
 
 TEST(TlsStatic, EveryContextAllocationIsOwnedBeforeAnythingCanThrow) {

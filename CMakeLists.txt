@@ -481,31 +481,16 @@ endif()
 add_executable(ob_tcp_server tools/ob_tcp_server.cpp)
 target_link_libraries(ob_tcp_server PRIVATE orderbook_tcp_server_lib)
 
-# ── io_uring transport (optional) ─────────────────────────────────────────────
-option(OB_USE_IO_URING "Build with io_uring transport instead of epoll" OFF)
-
+# ── The io_uring transport was removed (#147) ────────────────────────────────
+#
+# Refused rather than ignored: a build script that still passes -DOB_USE_IO_URING=ON would otherwise
+# configure cleanly, build the epoll server, and look for an `ob_tcp_server_iouring` that no longer
+# exists - or worse, be read as having built it. Measured before it went: it sent a pipelining client
+# bytes of the server's heap, ran `--fsync-policy every` with 2 fsyncs for 200 acknowledged writes,
+# and answered PING more slowly than the epoll server's `--profile boost`.
 if(OB_USE_IO_URING)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(URING REQUIRED IMPORTED_TARGET liburing)
-
-    # Enable io_uring metrics registration in metrics library (PRIVATE: only metrics.cpp needs it)
-    target_compile_definitions(orderbook_metrics PRIVATE OB_USE_IO_URING)
-
-    add_library(orderbook_iouring_server_lib STATIC
-        src/io_uring_server.cpp
-        src/command_parser.cpp
-        src/response_formatter.cpp
-        src/session.cpp
-        src/subscription_hub.cpp
-    )
-    target_compile_definitions(orderbook_iouring_server_lib PUBLIC OB_USE_IO_URING)
-    target_link_libraries(orderbook_iouring_server_lib PUBLIC
-        orderbook_engine orderbook_logger orderbook_metrics_server orderbook_auth PkgConfig::URING
-    )
-
-    add_executable(ob_tcp_server_iouring tools/ob_tcp_server.cpp)
-    target_compile_definitions(ob_tcp_server_iouring PRIVATE OB_USE_IO_URING)
-    target_link_libraries(ob_tcp_server_iouring PRIVATE orderbook_iouring_server_lib orderbook_tcp_server_lib)
+    message(FATAL_ERROR "OB_USE_IO_URING: the io_uring transport was removed, see roadmap #147. "
+                        "The epoll server with --profile boost is the low-latency configuration.")
 endif()
 
 # ── CLI tool ───────────────────────────────────────────────────────────────────
