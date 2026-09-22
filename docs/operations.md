@@ -171,7 +171,8 @@ that suffers from sharing a queue.
 
 `--wal-rotate-bytes` decides how large a WAL file grows before the writer opens the next one. It
 defaults to 512 MB and it is a **trigger, not a file size**: rotation is checked after a write, so a
-file may exceed it by one record.
+file may exceed it by one record — by more only while the disk refuses the record that would end it
+(below).
 
 Three things follow from it, which is why it is worth a section rather than a row in a table:
 
@@ -211,6 +212,30 @@ and on the replica, `snapshot bootstrap` lines ending in an install. **An `ERROR
 asked again every five seconds for ever. If you are running a build from before #125 and a replica
 is stuck in that loop, the way out is to stop it, delete its data directory and start it again: it
 then bootstraps as a new node rather than asking for a position.
+
+**A rotation the disk refuses** is logged and survived, and neither of its two shapes refuses the
+write that asked for it — that record is already in the file (#153):
+
+- The ROTATE marker could not be written — a full disk at the moment the file ended:
+
+  ```
+  {"component":"wal","msg":"could not end .../wal_000004.bin with a ROTATE record: WALWriter: write failed: No space left on device. The record that crossed the rotation threshold is written; the rotation is tried again after the next one"}
+  ```
+
+  The file then goes on past the threshold, by one record per refused attempt, and ends at the
+  first marker the disk accepts. This is the only way a file exceeds the threshold by more than
+  one record.
+- The next file could not be created — permissions, a full inode table, a descriptor limit:
+
+  ```
+  {"component":"wal","msg":"WALWriter: cannot open .../wal_000005.bin: Permission denied: this node has no WAL file to write to, so every write is refused until one can be opened; each write tries again"}
+  ```
+
+  Every write is then refused with that reason, and **the node recovers by itself** once the
+  cause is gone — the next write opens the file and the log says
+  `opened .../wal_000005.bin at offset 0; the writer had no WAL file for N attempt(s)`. Before
+  #154 it did not: the writer stayed without a file, and every write was refused with
+  `Bad file descriptor` until the process restarted.
 
 The value is refused at both ends rather than clamped. Above 2 GiB: a WAL position is a file index
 and a 32-bit offset read as one value, and a larger file would let the offset wrap and report a

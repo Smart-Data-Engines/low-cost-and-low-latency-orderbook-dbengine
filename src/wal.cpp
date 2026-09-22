@@ -179,6 +179,8 @@ std::optional<uint64_t> WALWriter::bytes_since(WalPosition from) const {
 
 WalPosition WALWriter::write_record(const WALRecord& hdr, const void* payload,
                                      size_t payload_len, bool allow_fsync) {
+    ensure_open();
+
     // Combine header + payload into a single write to minimize syscalls.
     const size_t total = sizeof(WALRecord) + payload_len;
     write_buf_.resize(total);
@@ -264,6 +266,8 @@ WalPosition WALWriter::append(const DeltaUpdate& update, const Level* levels) {
 
 WalPosition WALWriter::write_record_v2(const WALRecordV2& hdr, const void* payload,
                                         size_t payload_len) {
+    ensure_open();
+
     // Combine 38B header + payload into a single write to minimize syscalls.
     const size_t total = sizeof(WALRecordV2) + payload_len;
     write_buf_.resize(total);
@@ -464,16 +468,81 @@ void WALWriter::rotate() {
     hdr.record_type     = WAL_RECORD_ROTATE;
     hdr._pad            = 0;
 
-    write_record(hdr, nullptr, 0);
+    // Without a sync of its own, and that is the first half of #153. Replay and catch-up both stop
+    // reading a file at its ROTATE record, so from the moment those bytes are in the file the
+    // writer must be somewhere else. Written with the sync, a failed fsync under
+    // `--fsync-policy every` threw from here with the writer still on this file, and the next
+    // record went in **behind the marker**: answered `OK` and gone after a restart - measured, one
+    // acknowledged write lost per failed sync of a marker. Nothing is given up by not syncing it:
+    // the marker holds no client's data, and `open_current()` syncs the file it leaves before it
+    // closes it, recording a failure there as every other sync does.
+    try {
+        write_record(hdr, nullptr, 0, /*allow_fsync=*/false);
+    } catch (const std::exception& e) {
+        // The second half of #153: a rotation that fails is not the failure of the record that
+        // asked for it, which is already in the file - and throwing from here answered that record
+        // `ERR`, so a client that sent it again stored it twice. Two ways to arrive here, and both
+        // leave the writer somewhere it may write. Nothing of the marker reached the file: then the
+        // file is readable to its end, the next record goes into it, and the rotation is tried
+        // again after that one - so this is the one case in which a file passes the threshold by
+        // more than one record, because the disk refused the record that would have ended it. Or
+        // the marker tore, and `abandon_torn_file()` has already left the file.
+        OB_LOG_ERROR("wal",
+                     "could not end %s with a ROTATE record: %s. The record that crossed the "
+                     "rotation threshold is written; the rotation is tried again after the next one",
+                     wal_filename(dir_, current_position().file_index).c_str(), e.what());
+        return;
+    }
 
-    // Open the next file and publish the new position in **one** store. Incrementing the index and
-    // letting open_current() set the offset afterwards would make `(N+1, previous file's offset)`
-    // observable - the very pair this change removes. The cross-thread test found that at 96
-    // observations in 4.3 million.
+    if (leave_for_next_file()) {
+        const WalPosition now = current_position();
+        OB_LOG_DEBUG("wal", "rotated to file %u at offset %u", now.file_index, now.offset);
+    }
+}
+
+bool WALWriter::leave_for_next_file() noexcept {
+    // The index and the offset are published in **one** store. Incrementing the index and letting
+    // open_current() set the offset afterwards would make `(N+1, previous file's offset)`
+    // observable - the very pair #85 removed. The cross-thread test found that at 96 observations
+    // in 4.3 million.
+    const WalPosition at = current_position();
+    const uint32_t next_index = at.file_index + 1;
+    try {
+        const uint32_t next_offset = open_current(next_index);
+        position_.store(WalPosition{next_index, next_offset}, std::memory_order_relaxed);
+        return true;
+    } catch (const std::exception& e) {
+        // `open_current()` has closed the old descriptor, so there is no file to write to now, and
+        // that is the right way round: the old one must not be written to again. `ensure_open()`
+        // tries once more before every write, and until it can, every write is refused with this
+        // reason rather than with a bad descriptor (#154).
+        if (no_file_.begin()) {
+            OB_LOG_ERROR("wal",
+                         "%s: this node has no WAL file to write to, so every write is refused "
+                         "until one can be opened; each write tries again",
+                         e.what());
+        }
+        return false;
+    }
+}
+
+void WALWriter::ensure_open() {
+    if (fd_ >= 0) return;
     const uint32_t next_index = current_position().file_index + 1;
-    const uint32_t next_offset = open_current(next_index);
+    uint32_t next_offset = 0;
+    try {
+        next_offset = open_current(next_index);
+    } catch (const std::exception&) {
+        (void)no_file_.begin();   // counted, and said once: in leave_for_next_file()
+        throw;
+    }
     position_.store(WalPosition{next_index, next_offset}, std::memory_order_relaxed);
-    OB_LOG_DEBUG("wal", "rotated to file %u at offset %u", next_index, next_offset);
+    const uint64_t refused = no_file_.end();
+    OB_LOG_INFO("wal",
+                "opened %s at offset %u; the writer had no WAL file for %llu attempt(s) to open "
+                "one, and the writes refused meanwhile were answered with the reason",
+                wal_filename(dir_, next_index).c_str(), next_offset,
+                static_cast<unsigned long long>(refused));
 }
 
 void WALWriter::abandon_torn_file(size_t stranded_bytes, int write_errno) noexcept {
@@ -489,17 +558,15 @@ void WALWriter::abandon_torn_file(size_t stranded_bytes, int write_errno) noexce
     // is to write a record into the file we have just established cannot be written to. What
     // replaces the marker is the replayer's rule - a checksum mismatch in a file that is not the
     // last one is a tear, so replay continues with the next file (#126).
-    try {
-        const uint32_t next_index  = at.file_index + 1;
-        const uint32_t next_offset = open_current(next_index);
-        position_.store(WalPosition{next_index, next_offset}, std::memory_order_relaxed);
+    //
+    // A next file that cannot be opened is said by `leave_for_next_file()`, and is retried before
+    // the next write (#154) - once, this left the writer with no descriptor for the rest of the
+    // process. Nothing is thrown from here: that would replace the write's own error, the one that
+    // says why the disk refused, with a second one about the recovery.
+    if (leave_for_next_file()) {
+        const WalPosition now = current_position();
         OB_LOG_INFO("wal", "abandoned file %u after a torn record; writing to %u at offset %u",
-                    at.file_index, next_index, next_offset);
-    } catch (const std::exception& e) {
-        // The tail stays stranded, which is what happened before this existed, and the operator is
-        // told so. Throwing here would replace the write's own error - the one that says why the
-        // disk refused - with a second one about the recovery.
-        OB_LOG_ERROR("wal", "could not open the next WAL file after a torn record: %s", e.what());
+                    at.file_index, now.file_index, now.offset);
     }
 }
 

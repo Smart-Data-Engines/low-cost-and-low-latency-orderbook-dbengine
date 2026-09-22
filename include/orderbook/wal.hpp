@@ -10,6 +10,7 @@
 #include "orderbook/data_model.hpp"
 #include "orderbook/epoch.hpp"
 #include "orderbook/hlc.hpp"
+#include "orderbook/log_episode.hpp"
 
 namespace ob {
 
@@ -281,6 +282,12 @@ public:
     uint64_t current_epoch() const { return current_epoch_; }
 
     /// Force rotation: write ROTATE record, close current file, open next.
+    ///
+    /// Does not throw for a failure of the disk, and that is #153. The record that carried the file
+    /// past the threshold is written before this runs, so a rotation that fails is not that
+    /// record's failure: when the marker cannot be written the file is left as it was and the
+    /// rotation is tried again after the next record, and when the next file cannot be opened the
+    /// writer is left with no file and `ensure_open()` opens it before the next write (#154).
     void rotate();
 
     /// fsync the current file (group commit boundary).
@@ -386,6 +393,27 @@ private:
     /// why the disk refused, and it must not be replaced by a second error about the recovery.
     void abandon_torn_file(size_t stranded_bytes, int write_errno) noexcept;
 
+    /// Leave the current file for the next one, once nothing more may be written to it: its ROTATE
+    /// marker is in it (replay and catch-up both stop reading a file there), or a torn record is.
+    ///
+    /// `open_current()` closes the old descriptor before it opens the new one, so a next file that
+    /// cannot be opened leaves the writer with **no** file rather than with the old one - the right
+    /// way round, since writing on behind the marker is #153's loss. Returns whether it opened one.
+    /// Until then every write is refused, with the reason the file could not be opened, and each
+    /// write tries again (#154).
+    bool leave_for_next_file() noexcept;
+
+    /// Open the next file if the writer has none, before a write: the retry #154 was missing.
+    /// Before it, a writer whose next file could not be opened once kept `fd_ = -1` for the rest of
+    /// the process, and every write after that was refused with `EBADF` - even once the directory
+    /// was writable again. Throws what `open_current()` throws, which names the file and the
+    /// reason, and that is what the client is told instead of a bad descriptor.
+    void ensure_open();
+
+    /// Open while the writer has no file: one line when it starts and one when it ends, however
+    /// many writes are refused in between (#95's shape, #116's answer).
+    LogEpisode no_file_;
+
 public:
 
 private:
@@ -441,11 +469,6 @@ private:
     /// caught it at 96 observations in 4.3 million.
     uint32_t open_current(uint32_t index);
 
-    /// Write a complete record (header + payload) and return the position it was written at.
-    /// Does NOT fsync.
-    /// allow_fsync=false writes the record without honouring FsyncPolicy::EVERY. Only
-    /// for records whose loss is harmless: a lost CHECKPOINT costs a redundant replay,
-    /// never a lost row, so paying an fsync for it would slow every flush for nothing.
     /// Advance the published position past a record of `total` bytes and count it, returning the
     /// position of its first byte.
     ///
@@ -477,6 +500,13 @@ private:
         return written_at;
     }
 
+    /// Write a complete record (header + payload) and return the position it was written at.
+    ///
+    /// Under `FsyncPolicy::EVERY` it syncs the record, unless `allow_fsync` is false - which is only
+    /// for records whose loss is harmless. A lost CHECKPOINT costs a redundant replay, never a lost
+    /// row, so paying an fsync for it would slow every flush for nothing; and a lost ROTATE marker
+    /// leaves a file that is read to its end, while a failed sync *of* one is what stranded a
+    /// record behind it (#153).
     WalPosition write_record(const WALRecord& hdr, const void* payload, size_t payload_len,
                              bool allow_fsync = true);
 

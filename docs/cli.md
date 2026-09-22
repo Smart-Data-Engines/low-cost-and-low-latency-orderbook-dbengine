@@ -443,7 +443,8 @@ replay described above cannot recover a record that never reached the platter.
 
 How large the WAL grows before it starts a new file is `--wal-rotate-bytes`, and it is a **trigger
 rather than a file size**: rotation is checked after a write, so a file may exceed the threshold by
-one record. Three things follow from the number, which is why it is a knob at all. It bounds what a
+one record — by more only while the disk refuses the ROTATE record that would end it, which
+`docs/operations.md` shows in the log. Three things follow from the number, which is why it is a knob at all. It bounds what a
 crash replays, together with `--flush-interval-ms`. It bounds what a reconnecting replica may have
 to scan before the primary decides a snapshot is cheaper. And it is the granularity retention frees,
 because WAL files are deleted whole and only below the file the slowest **connected** replica has
