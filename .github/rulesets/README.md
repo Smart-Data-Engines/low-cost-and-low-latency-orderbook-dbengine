@@ -13,6 +13,12 @@ When adding a required check, put the workflow job and its entry in `master.json
 and update any other open branches so they can produce the new context. Requiring a context an open
 PR cannot produce blocks it indefinitely. After PUT, read back the contexts and their count.
 
+**Removing a required check reverses the order.** The PR that deletes the job and its entry in
+`master.json` can never report that context, so against the live ruleset it is blocked for ever.
+PUT the narrowed `master.json` **from that branch first**, read it back, and only then merge. The
+window between the two is harmless — a context that is still produced but no longer required gates
+nothing — which is not true of the opposite mistake. Done this way for `io-uring-build` in #147.
+
 ```bash
 REPO=Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine
 
