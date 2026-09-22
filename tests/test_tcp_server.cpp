@@ -1554,7 +1554,8 @@ TEST(ReactorStatic, EveryClientEventIsServedInsideTheBoundary) {
 
     const std::size_t fd_line = body.find("int fd = events_[i].data.fd;");
     ASSERT_NE(fd_line, std::string::npos);
-    const std::size_t try_at = body.find_first_not_of(" \n", fd_line + std::strlen("int fd = events_[i].data.fd;"));
+    const std::size_t try_at =
+        body.find_first_not_of(" \n", fd_line + std::strlen("int fd = events_[i].data.fd;"));
     ASSERT_NE(try_at, std::string::npos);
     EXPECT_EQ(body.compare(try_at, 5, "try {"), 0)
         << "the handling of an event does not begin with `try {`, so an exception serving one client "
@@ -1574,4 +1575,77 @@ TEST(ReactorStatic, EveryClientEventIsServedInsideTheBoundary) {
     const std::string after = loop.substr(close);
     EXPECT_NE(after.find("if (nfds > 0 && !threw_this_pass) event_guard_.ok();"), std::string::npos)
         << "the recovery line is not gated on a pass that had events and none of which threw";
+}
+
+namespace {
+
+/// Every `remove_session(X)` in `source` followed, in the rest of its block, by `::close(X)`: the
+/// statements after the call up to the first `return`, `continue;` or `break;`, or the `}` that
+/// closes the block the call is in. Each entry is the call and the close, for the message.
+std::vector<std::string> closes_after_remove(const std::string& source) {
+    std::vector<std::string> found;
+    const std::string call = "remove_session(";
+    for (std::size_t at = source.find(call); at != std::string::npos;
+         at = source.find(call, at + 1)) {
+        const std::size_t open = at + call.size();
+        const std::size_t shut = source.find(')', open);
+        if (shut == std::string::npos) break;
+        const std::string arg = source.substr(open, shut - open);
+        // The declaration and the definition name a parameter type; a call names a descriptor.
+        if (arg.empty() || arg.find(' ') != std::string::npos) continue;
+        int depth = 0;
+        std::size_t end = shut;
+        for (; end < source.size(); ++end) {
+            const char c = source[end];
+            if (c == '{') ++depth;
+            if (c == '}' && --depth < 0) break;
+            if (depth == 0 && (source.compare(end, 6, "return") == 0 ||
+                               source.compare(end, 9, "continue;") == 0 ||
+                               source.compare(end, 6, "break;") == 0)) {
+                break;
+            }
+        }
+        const std::string tail = source.substr(shut, end - shut);
+        if (tail.find("::close(" + arg + ")") != std::string::npos) {
+            found.push_back("remove_session(" + arg + ") then ::close(" + arg + ")");
+        }
+    }
+    return found;
+}
+
+}  // namespace
+
+TEST(SessionsStatic, NoDescriptorIsClosedAgainAfterItsSessionIsRemoved) {
+    // `SessionManager::remove_session()` closes the descriptor. The accept path's TLS failure
+    // branch removed the session and then closed the number itself (#150): a second close of a
+    // number the kernel is free to have handed, in between, to a file another thread opened -
+    // #128's class, which this server's WAL, flush and replication threads make more than
+    // theoretical. The branch moved into `Reactor::adopt()` with the multi-reactor stage and closes
+    // once now; this holds every other place that removes a session to the same rule.
+
+    // The rule's own cases: the shape #150 was, and the shape that is right.
+    EXPECT_EQ(closes_after_remove("    sessions_.remove_session(fd);\n"
+                                  "    ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);\n"
+                                  "    ::close(fd);\n"
+                                  "    continue;\n")
+                  .size(),
+              1u);
+    EXPECT_TRUE(closes_after_remove("    ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);\n"
+                                    "    sessions_.remove_session(fd);\n"
+                                    "    return;\n"
+                                    "}\n"
+                                    "void other(int fd) { ::close(fd); }\n")
+                    .empty())
+        << "a close in a different function is not a close after this removal";
+
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/src/tcp_server.cpp");
+    const std::string source((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+    ASSERT_NE(source.find("remove_session("), std::string::npos)
+        << "src/tcp_server.cpp removes no session, so this rule reads nothing";
+    for (const std::string& hit : closes_after_remove(source)) {
+        ADD_FAILURE() << "src/tcp_server.cpp: " << hit
+                      << " - remove_session() has already closed it, and the number may belong to "
+                         "someone else by now";
+    }
 }

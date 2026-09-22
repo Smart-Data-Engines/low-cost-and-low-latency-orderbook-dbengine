@@ -457,6 +457,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--flush-interval-ms` | `<N>` | Background flush interval in ms (default: 100) |
 | `--fsync-policy` | `<POLICY>` | WAL durability: every, interval or none (lower case; default: interval) |
 | `--io-spin-us` | `<N>` | Keep polling for this many microseconds after the last event before blocking again (default: 0, always block). Costs up to one core while traffic flows and takes ~20% off the loopback round trip |
+| `--io-threads` | `<N>` | Client event loops, 1 to 64 (default: 1). The loop that accepts deals connections to them in turn, and a connection stays on the loop it was dealt to for its whole life |
 | `--profile` | `<NAME>` | `eco` (default, blocking io) or `boost` (sets `io-spin-us`). A named set of the knobs, not a second code path; an unknown name is refused |
 | `--handover-cooldown-seconds` | `<N>` | How long a node that handed the role over abstains |
 | `--handover-grace-seconds` | `<N>` | Grace period granted to a handover target |

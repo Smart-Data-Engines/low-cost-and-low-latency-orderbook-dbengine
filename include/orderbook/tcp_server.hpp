@@ -132,6 +132,10 @@ struct ServerConfig {
     /// `0` keeps the old behaviour — wait for ever — and has to be asked for, because the default
     /// is what a supervisor meets.
     uint64_t    drain_timeout_ms{10000};  // --drain-timeout-ms (0 = wait indefinitely)
+    /// --io-threads: client event loops. Connections are dealt to them in turn by the one that
+    /// accepts, and a connection stays on its reactor for life, because a Session is not
+    /// thread-safe. 1 is the loop this server always had.
+    uint32_t    io_threads{1};
 
     // Replication (primary)
     uint16_t replication_port{0};       // 0 = disabled
@@ -313,6 +317,10 @@ struct LoadedTlsContexts {
 LoadedTlsContexts load_tls_or_exit(const ServerConfig& config);
 
 // ── TcpServer ─────────────────────────────────────────────────────────────────
+
+/// The largest `--io-threads` accepted. Well above any core count this engine is run on, and
+/// low enough that a typo such as 400 is refused rather than started.
+inline constexpr uint32_t kMaxIoThreads = 64;
 
 /// What a draining loop should do this pass.
 enum class DrainVerdict {

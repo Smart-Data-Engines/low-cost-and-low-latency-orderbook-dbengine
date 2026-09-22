@@ -7,6 +7,7 @@
 #include "orderbook/metrics_server.hpp"
 #include "orderbook/shard_coordinator.hpp"
 #include "orderbook/loop_guard.hpp"
+#include "orderbook/thread_boundary.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -32,8 +33,13 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <pthread.h>
+
+#include <mutex>
+#include <thread>
 
 namespace ob {
 
@@ -878,6 +884,7 @@ const std::vector<std::string>& known_flags() {
         "profile",
         "handover-cooldown-seconds",
         "io-spin-us",
+        "io-threads",
         "handover-grace-seconds",
         "log-level",
         "max-sessions",
@@ -946,6 +953,7 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"cluster-secret-file", {"<PATH>", "Shared secret for replication and multi-master links, one line; mode 600"}},
         {"drain-timeout-ms", {"<N>", "On shutdown, how long to wait for open client sessions before closing them (default: 10000; 0 waits indefinitely)"}},
         {"io-spin-us", {"<N>", "Keep polling for this many microseconds after the last event before blocking again (default: 0, always block). Costs up to one core while traffic flows and takes ~20% off the round trip on loopback"}},
+        {"io-threads", {"<N>", "Client event loops, 1 to 64 (default: 1). Connections are dealt to them in turn and stay on one for life"}},
         {"profile", {"<name>", "eco (default, blocking io) or boost (sets io-spin-us). A named set of the knobs, not a second code path"}},
         {"flush-interval-ms", {"<N>", "Background flush interval in ms (default: 100)"}},
         {"fsync-policy", {"<POLICY>", "WAL durability: every, interval or none (lower case; default: interval)"}},
@@ -1334,6 +1342,8 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.drain_timeout_ms = cursor.value_as<uint64_t>();
         } else if (arg == "--io-spin-us") {
             config.io_spin_us = cursor.value_as<uint64_t>();
+        } else if (arg == "--io-threads") {
+            config.io_threads = cursor.value_as<uint32_t>();
         } else if (arg == "--profile") {
             config.profile = std::string{cursor.value()};
         } else if (arg == "--flush-interval-ms") {
@@ -1371,6 +1381,18 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             std::fprintf(stderr, "Error: unknown argument '%s'\n", arg.c_str());
             std::exit(1);
         }
+    }
+
+    // Validation: the number of client event loops. Zero would be a server that accepts
+    // connections and serves none of them, and a count far above the cores is a typo more often
+    // than a plan: each reactor is a thread with an epoll set of its own, and more of them than
+    // cores only adds switching.
+    if (config.io_threads == 0 || config.io_threads > kMaxIoThreads) {
+        std::fprintf(stderr,
+                     "Error: --io-threads (%u) must be between 1 and %u. It is the number of client "
+                     "event loops; 1 is the single loop this server always had.\n",
+                     config.io_threads, kMaxIoThreads);
+        std::exit(1);
     }
 
     // Validation: the WAL rotation threshold, refused at both ends rather than clamped.
@@ -1597,6 +1619,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("failover-enabled", c.failover_enabled ? "true" : "false");
     line("drain-timeout-ms", std::to_string(c.drain_timeout_ms));
     line("io-spin-us", std::to_string(c.io_spin_us));
+    line("io-threads", std::to_string(c.io_threads));
     line("profile", c.profile);
     line("flush-interval-ms", std::to_string(c.flush_interval_ms));
     // The *path*, and there is no value to print because the secret is never a field of
@@ -1745,6 +1768,8 @@ TcpServer::~TcpServer() {
 
 namespace {
 
+class Reactor;
+
 struct ReactorShared {
     const ServerConfig&      config;
     Engine&                  engine;
@@ -1756,6 +1781,15 @@ struct ReactorShared {
     ServerStats&             stats;
     ShardCoordinator*        shard_coord;
     MetricsServer*           metrics_server;
+
+    /// When the drain began, in steady-clock nanoseconds since its epoch; 0 until then. Set once,
+    /// by whichever reactor sees the request first, so `--drain-timeout-ms` is measured from one
+    /// moment on every reactor rather than from each one's own wake-up.
+    std::atomic<int64_t>&    drain_started_ns;
+
+    /// Every reactor of this server, for the one that accepts to deal connections to. Filled
+    /// before any of them runs and not changed afterwards, so reading it needs no lock.
+    std::vector<Reactor*>*   reactors;
 };
 
 class Reactor {
@@ -1773,7 +1807,24 @@ public:
     /// deadline, or a fatal `epoll_wait()` error. Every session still open is closed on the way out.
     void run_loop();
 
+    /// Give this reactor a connection another one accepted. Called on the accepting reactor's
+    /// thread; the descriptor is registered, wrapped for TLS and greeted on this one's, because a
+    /// `Session` belongs to the thread that serves it from its first byte.
+    void hand_off(int fd, uint64_t conn_id);
+
+    int index() const { return index_; }
+
 private:
+    /// Take ownership of an accepted connection: session, epoll registration, TLS, banner. The
+    /// session count was taken at accept, so every failure here gives it back.
+    void adopt(int fd, uint64_t conn_id);
+
+    /// Everything handed off since the last pass, adopted in the order it was accepted.
+    void adopt_handed_off();
+
+    /// A gauge this reactor contributes to, published as the change since its last publication.
+    /// `set_gauge` from several reactors would be the last writer's number rather than the sum.
+    void publish_gauge(const char* name, int64_t now, int64_t& published);
     /// One place that closes a session, so every close carries a reason in the log.
     /// This used to be five copies of the same four lines, none of them logging,
     /// which is why a session dying in the middle of a large response left no trace.
@@ -1788,6 +1839,8 @@ private:
 
     const int                index_;
     const ServerConfig&      config_;
+    std::atomic<int64_t>&    drain_started_ns_;
+    std::vector<Reactor*>*   reactors_;
     Engine*                  engine_;
     const LoadedTlsContexts& tls_;
     const LoadedSecrets&     secrets_;
@@ -1799,6 +1852,19 @@ private:
     MetricsServer*           metrics_server_;
     int&                     listen_fd_;
     int                      epoll_fd_{-1};
+
+    /// An eventfd in this reactor's epoll set: written by `hand_off()` from the accepting thread.
+    int                      wake_fd_{-1};
+    std::mutex               handoff_mtx_;
+    std::vector<std::pair<int, uint64_t>> handoff_;   ///< (descriptor, conn_id), under handoff_mtx_
+
+    /// Where the next accepted connection goes. Only the accepting reactor reads it.
+    size_t                   next_reactor_{0};
+
+    // What this reactor last contributed to each summed gauge.
+    int64_t published_subscriptions_active_{0};
+    int64_t published_subscription_queued_bytes_{0};
+    int64_t published_session_pending_bytes_{0};
 
     SessionManager  sessions_;
 
@@ -1840,6 +1906,8 @@ private:
 Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd)
     : index_(index)
     , config_(shared.config)
+    , drain_started_ns_(shared.drain_started_ns)
+    , reactors_(shared.reactors)
     , engine_(&shared.engine)
     , tls_(shared.tls)
     , secrets_(shared.secrets)
@@ -1885,11 +1953,44 @@ Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd)
                         hub_.wakeup_fd());
         }
     }
-    OB_LOG_DEBUG("tcp_server", "Reactor %d ready: epoll fd=%d, accepts=%s", index_, epoll_fd_,
-                 listen_fd_ >= 0 ? "yes" : "no");
+    wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (wake_fd_ < 0) {
+        const std::string why = std::strerror(errno);
+        ::close(epoll_fd_);
+        epoll_fd_ = -1;
+        throw std::runtime_error("eventfd() failed for reactor " + std::to_string(index_) + ": " +
+                                 why);
+    }
+    struct epoll_event wake_ev{};
+    wake_ev.events  = EPOLLIN;
+    wake_ev.data.fd = wake_fd_;
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &wake_ev) < 0) {
+        const std::string why = std::strerror(errno);
+        ::close(wake_fd_);
+        ::close(epoll_fd_);
+        wake_fd_ = epoll_fd_ = -1;
+        throw std::runtime_error("epoll_ctl() failed for reactor " + std::to_string(index_) +
+                                 "'s wake descriptor: " + why);
+    }
+    OB_LOG_DEBUG("tcp_server", "Reactor %d ready: epoll fd=%d, wake fd=%d, accepts=%s", index_,
+                 epoll_fd_, wake_fd_, listen_fd_ >= 0 ? "yes" : "no");
 }
 
 Reactor::~Reactor() {
+    if (wake_fd_ >= 0) {
+        ::close(wake_fd_);
+        wake_fd_ = -1;
+    }
+    // A connection handed off and never adopted belongs to nobody else, so it is closed here and
+    // its place in the session count given back.
+    for (const auto& [fd, conn_id] : handoff_) {
+        OB_LOG_INFO("tcp_server", "Reactor %d closing fd=%d (conn_id=%llu): handed off, never "
+                    "adopted", index_, fd, static_cast<unsigned long long>(conn_id));
+        ::close(fd);
+        stats_.active_sessions.fetch_sub(1, std::memory_order_relaxed);
+        engine_->registry().increment_gauge("ob_active_sessions", -1);
+    }
+    handoff_.clear();
     if (epoll_fd_ >= 0) {
         ::close(epoll_fd_);
         epoll_fd_ = -1;
@@ -1928,6 +2029,108 @@ void Reactor::arm_epollout(int fd) {
     }
 }
 
+void Reactor::hand_off(int fd, uint64_t conn_id) {
+    {
+        std::lock_guard<std::mutex> lock(handoff_mtx_);
+        handoff_.emplace_back(fd, conn_id);
+    }
+    const uint64_t one = 1;
+    const ssize_t wr = ::write(wake_fd_, &one, sizeof(one));
+    if (wr != static_cast<ssize_t>(sizeof(one))) {
+        // An eventfd write fails only when the counter is saturated, which already means a wake-up
+        // is pending; the connection is in the queue either way and the next pass adopts it.
+        OB_LOG_WARN("tcp_server", "Reactor %d: wake write for fd=%d returned %zd: %s", index_, fd,
+                    wr, std::strerror(errno));
+    }
+    OB_LOG_DEBUG("tcp_server", "Handed fd=%d (conn_id=%llu) to reactor %d", fd,
+                 static_cast<unsigned long long>(conn_id), index_);
+}
+
+void Reactor::adopt_handed_off() {
+    uint64_t counter = 0;
+    const ssize_t rd = ::read(wake_fd_, &counter, sizeof(counter));
+    (void)rd;   // EAGAIN just means a previous pass already took the wake-up; the queue decides
+    std::vector<std::pair<int, uint64_t>> taken;
+    {
+        std::lock_guard<std::mutex> lock(handoff_mtx_);
+        taken.swap(handoff_);
+    }
+    for (const auto& [fd, conn_id] : taken) {
+        adopt(fd, conn_id);
+    }
+}
+
+void Reactor::adopt(int fd, uint64_t conn_id) {
+    // Every failure below gives back the place in the session count the accepting reactor took.
+    const auto give_back = [&] {
+        stats_.active_sessions.fetch_sub(1, std::memory_order_relaxed);
+        engine_->registry().increment_gauge("ob_active_sessions", -1);
+    };
+
+    if (!sessions_.add_session(fd, conn_id)) {
+        // Not the global limit, which the accepting reactor applied: this reactor's own table.
+        const char* msg = "ERR server full\n";
+        auto wr = ::send(fd, msg, std::strlen(msg), MSG_NOSIGNAL);
+        (void)wr;
+        ::close(fd);
+        give_back();
+        return;
+    }
+
+    // Add to epoll (edge-triggered).
+    struct epoll_event cev{};
+    cev.events  = EPOLLIN | EPOLLET;
+    cev.data.fd = fd;
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &cev) < 0) {
+        OB_LOG_WARN("tcp_server", "Reactor %d: cannot register fd=%d: %s", index_, fd,
+                    std::strerror(errno));
+        sessions_.remove_session(fd);   // closes the descriptor
+        give_back();
+        return;
+    }
+
+    Session* s = sessions_.get_session(fd);
+    if (s && tls_.client_port) {
+        // Wrap before anything is written: the banner is application data and must not precede
+        // the handshake. It is queued here and goes out with the first flush after the handshake
+        // completes, which is what send_response() on a handshaking session does - the bytes sit in
+        // send_buf_ and SSL_write is not reached until tls_handshaking_ clears.
+        try {
+            s->enable_tls(tls_.client_port->wrap(fd, /*server_side=*/true));
+            OB_LOG_DEBUG("tls", "handshake started: fd=%d", fd);
+        } catch (const std::exception& e) {
+            OB_LOG_WARN("tls", "cannot start a handshake on fd=%d: %s", fd, e.what());
+            // Unregistered first, while the number is still this connection's, and then closed
+            // exactly once - by remove_session(). The path this replaces closed it a second time
+            // after remove_session() had, which on a server with other threads opening files is a
+            // close of whatever the kernel had handed that number to in between (#128's class).
+            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+            sessions_.remove_session(fd);
+            give_back();
+            return;
+        }
+    }
+
+    // INFO, like the close: a connection's two ends are the events an operator reads to find a
+    // client, and with several reactors this line is the only place that says which one serves it.
+    OB_LOG_INFO("tcp_server", "Reactor %d adopted fd=%d conn_id=%llu from %s", index_, fd,
+                static_cast<unsigned long long>(conn_id), peer_address(fd).c_str());
+
+    // Send welcome message. The version comes from the build system (#148).
+    if (s) {
+        static const std::string banner =
+            "OK ob_tcp_server v" + std::string(version()) + "\n\n";
+        s->send_response(banner);
+    }
+}
+
+void Reactor::publish_gauge(const char* name, int64_t now, int64_t& published) {
+    if (now != published) {
+        engine_->registry().increment_gauge(name, now - published);
+        published = now;
+    }
+}
+
 void Reactor::disarm_epollout(int fd) {
     if (epoll_fd_ < 0 || fd < 0) return;
 
@@ -1954,7 +2157,12 @@ void Reactor::run_loop() {
         if (nfds > 0) last_event_at_ = std::chrono::steady_clock::now();
         if (nfds < 0) {
             if (errno == EINTR) continue;
-            break; // fatal epoll error
+            // Fatal. With one loop this ended run(); with several, leaving alone would strand this
+            // reactor's sessions while the others went on, so it stops the server the same way.
+            OB_LOG_ERROR("tcp_server", "Reactor %d: epoll_wait failed, stopping the server: %s",
+                         index_, std::strerror(errno));
+            running_.store(false, std::memory_order_relaxed);
+            break;
         }
 
         // Subscriptions, once per iteration and before the event loop below.
@@ -1968,12 +2176,10 @@ void Reactor::run_loop() {
             for (int fd : condemned) {
                 close_session(fd, "subscriber queue overflowed");
             }
-            engine_->registry().set_gauge(
-                "ob_subscriptions_active",
-                static_cast<int64_t>(hub_.active()));
-            engine_->registry().set_gauge(
-                "ob_subscription_queued_bytes",
-                static_cast<int64_t>(hub_.queued_bytes()));
+            publish_gauge("ob_subscriptions_active", static_cast<int64_t>(hub_.active()),
+                          published_subscriptions_active_);
+            publish_gauge("ob_subscription_queued_bytes", static_cast<int64_t>(hub_.queued_bytes()),
+                          published_subscription_queued_bytes_);
             // Counters are monotonic and only ever incremented, so the loop publishes the delta
             // against what it last saw rather than the hub's total. The hub keeps its own totals
             // because it is testable without a registry, and a second source of truth here would be
@@ -1994,9 +2200,9 @@ void Reactor::run_loop() {
 
         // Once per loop iteration, not per event: the sum walks the session map, and
         // there is nothing to learn from updating it several times per wake-up.
-        engine_->registry().set_gauge(
-            "ob_session_pending_bytes",
-            static_cast<int64_t>(sessions_.total_pending_output_bytes()));
+        publish_gauge("ob_session_pending_bytes",
+                      static_cast<int64_t>(sessions_.total_pending_output_bytes()),
+                      published_session_pending_bytes_);
 
         // One event is the unit a failure costs, not the reactor: an exception while serving one
         // closes that session, is counted, and the loop goes on with the rest of the batch. The
@@ -2006,6 +2212,11 @@ void Reactor::run_loop() {
         for (int i = 0; i < nfds; ++i) {
             int fd = events_[i].data.fd;
             try {
+
+                if (fd == wake_fd_) {
+                    adopt_handed_off();
+                    continue;
+                }
 
                 if (fd == listen_fd_) {
                     // Draining: stop accepting new connections.
@@ -2042,7 +2253,14 @@ void Reactor::run_loop() {
                         // pipelines pays a delayed-ACK timer per round trip without this (#140).
                         set_tcp_nodelay(client_fd, "tcp_server");
 
-                        if (!sessions_.add_session(client_fd, next_conn_id_++)) {
+                        // The limit is global and it is taken here, on the reactor that accepts.
+                        // Counted wherever the connection is adopted instead, a burst of accepts
+                        // would be checked against a number that had not caught up and let more
+                        // than --max-sessions in.
+                        const int admitted =
+                            stats_.active_sessions.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (admitted > config_.max_sessions) {
+                            stats_.active_sessions.fetch_sub(1, std::memory_order_relaxed);
                             // Server full — reject.
                             const char* msg = "ERR server full\n";
                             auto wr = ::send(client_fd, msg, std::strlen(msg), MSG_NOSIGNAL);
@@ -2050,49 +2268,16 @@ void Reactor::run_loop() {
                             ::close(client_fd);
                             continue;
                         }
-
-                        // Add to epoll (edge-triggered).
-                        struct epoll_event cev{};
-                        cev.events  = EPOLLIN | EPOLLET;
-                        cev.data.fd = client_fd;
-                        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &cev) < 0) {
-                            sessions_.remove_session(client_fd);
-                            continue;
-                        }
-
-                        stats_.active_sessions.fetch_add(1, std::memory_order_relaxed);
                         engine_->registry().increment_gauge("ob_active_sessions");
 
-                        Session* s = sessions_.get_session(client_fd);
-                        if (s && tls_.client_port) {
-                            // Wrap before anything is written: the banner is application data and must
-                            // not precede the handshake. It is queued here and goes out with the first
-                            // flush after the handshake completes, which is what send_response() on a
-                            // handshaking session does - the bytes sit in send_buf_ and SSL_write is
-                            // not reached until tls_handshaking_ clears.
-                            try {
-                                s->enable_tls(tls_.client_port->wrap(client_fd, /*server_side=*/true));
-                                OB_LOG_DEBUG("tls", "handshake started: fd=%d", client_fd);
-                            } catch (const std::exception& e) {
-                                OB_LOG_WARN("tls", "cannot start a handshake on fd=%d: %s",
-                                            client_fd, e.what());
-                                sessions_.remove_session(client_fd);
-                                ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr);
-                                ::close(client_fd);
-                                stats_.active_sessions.fetch_sub(1, std::memory_order_relaxed);
-                                engine_->registry().increment_gauge("ob_active_sessions", -1);
-                                continue;
-                            }
-                        }
-
-                        // Send welcome message. The version comes from the build system like
-                        // every other place a node reports it (#90); this one was a literal until
-                        // #148, so the first bump would have made the banner name a build that was
-                        // not running.
-                        if (s) {
-                            static const std::string banner =
-                                "OK ob_tcp_server v" + std::string(version()) + "\n\n";
-                            s->send_response(banner);
+                        // Dealt in turn, so four connections on four reactors are one each, and a
+                        // connection stays where it is dealt for its whole life.
+                        const uint64_t conn_id = next_conn_id_++;
+                        Reactor* target = (*reactors_)[next_reactor_++ % reactors_->size()];
+                        if (target == this) {
+                            adopt(client_fd, conn_id);
+                        } else {
+                            target->hand_off(client_fd, conn_id);
                         }
                     }
                 } else {
@@ -2346,13 +2531,24 @@ void Reactor::run_loop() {
         // "server shutting down" — a better answer than a refused connection.
         if (!drain_started_ && draining_.load(std::memory_order_acquire)) {
             drain_started_ = true;
-            drain_started_at_ = std::chrono::steady_clock::now();
-            OB_LOG_INFO("tcp_server", "Drain requested: closing the listen socket, fd=%d",
-                        listen_fd_);
-            if (metrics_server_) {
-                metrics_server_->stop();
-            }
+            // One start for every reactor: whichever sees the request first publishes it, and the
+            // rest read it back, so --drain-timeout-ms is measured from one moment rather than from
+            // each reactor's own wake-up.
+            const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count();
+            int64_t expected = 0;
+            drain_started_ns_.compare_exchange_strong(expected, now_ns, std::memory_order_acq_rel);
+            drain_started_at_ = std::chrono::steady_clock::time_point(
+                std::chrono::nanoseconds(drain_started_ns_.load(std::memory_order_acquire)));
+            OB_LOG_INFO("tcp_server", "Reactor %d: drain requested, %d session(s) open here",
+                        index_, sessions_.active_count());
             if (listen_fd_ >= 0) {
+                OB_LOG_INFO("tcp_server", "Drain requested: closing the listen socket, fd=%d",
+                            listen_fd_);
+                if (metrics_server_) {
+                    metrics_server_->stop();
+                }
                 ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, listen_fd_, nullptr);
                 ::close(listen_fd_);
                 listen_fd_ = -1;
@@ -2369,12 +2565,15 @@ void Reactor::run_loop() {
                 running_.store(false, std::memory_order_relaxed);
                 break;
             case DrainVerdict::DeadlineReached:
-                OB_LOG_WARN("tcp_server",
-                            "Drain deadline of %llu ms reached with %d session(s) still open - "
-                            "closing them and exiting; raise --drain-timeout-ms, or set it to 0 to "
-                            "wait indefinitely",
-                            static_cast<unsigned long long>(config_.drain_timeout_ms), open);
-                running_.store(false, std::memory_order_relaxed);
+                // Every reactor measures one deadline from one start, so several can reach it in
+                // the same pass; the one that stops the server is the one that says so.
+                if (running_.exchange(false, std::memory_order_relaxed)) {
+                    OB_LOG_WARN("tcp_server",
+                                "Drain deadline of %llu ms reached with %d session(s) still open - "
+                                "closing them and exiting; raise --drain-timeout-ms, or set it to 0 "
+                                "to wait indefinitely",
+                                static_cast<unsigned long long>(config_.drain_timeout_ms), open);
+                }
                 break;
             case DrainVerdict::KeepWaiting:
                 break;
@@ -2382,8 +2581,12 @@ void Reactor::run_loop() {
         }
     }
 
-    // Shutdown: close every session this reactor still holds.
+    // Shutdown: close every session this reactor still holds, and take back what it contributed
+    // to the gauges it shares with the others.
     sessions_.close_all();
+    publish_gauge("ob_subscriptions_active", 0, published_subscriptions_active_);
+    publish_gauge("ob_subscription_queued_bytes", 0, published_subscription_queued_bytes_);
+    publish_gauge("ob_session_pending_bytes", 0, published_session_pending_bytes_);
 }
 }  // namespace
 
@@ -2460,16 +2663,81 @@ void TcpServer::run() {
                 config_.data_dir.c_str());
 
     ServerStats stats;
-    ReactorShared shared{config_,         *engine_,  tls_,   secrets_, running_, draining_,
-                         read_only_,      stats,     shard_coord.get(),  metrics_server_.get()};
+    std::atomic<int64_t> drain_started_ns{0};
+    std::vector<Reactor*> dealt_to;
+    ReactorShared shared{config_,    *engine_, tls_,  secrets_,          running_,
+                         draining_,  read_only_, stats, shard_coord.get(), metrics_server_.get(),
+                         drain_started_ns, &dealt_to};
+
+    // 7-8. Reactor 0 holds the listening socket and runs on this thread; the others have a thread
+    // each. Every one is built before any of them runs, so the list reactor 0 deals from is complete
+    // and never changes while it is read.
+    int no_listener = -1;
+    std::vector<std::unique_ptr<Reactor>> reactors;
+    reactors.reserve(config_.io_threads);
+    for (uint32_t i = 0; i < config_.io_threads; ++i) {
+        reactors.push_back(std::make_unique<Reactor>(static_cast<int>(i), shared,
+                                                     i == 0 ? listen_fd_ : no_listener));
+        dealt_to.push_back(reactors.back().get());
+    }
+    OB_LOG_INFO("tcp_server", "%u io thread(s): connections are dealt to them in turn",
+                config_.io_threads);
 
     running_.store(true, std::memory_order_relaxed);
+
+    // A reactor that ends on an exception ends the server, as the single loop did: run() leaves
+    // with the error once every other reactor has stopped. Left running, the others would go on
+    // dealing connections to a loop that no longer serves them.
+    std::exception_ptr failure;
+    std::atomic<bool>  a_reactor_failed{false};
     {
-        // 7-8. One reactor, which accepts as well as serves: byte for byte the loop this function
-        // used to contain. Destroying it closes its epoll descriptor.
-        Reactor reactor(0, shared, listen_fd_);
-        reactor.run_loop();
+        std::vector<std::thread> threads;
+        threads.reserve(reactors.size() - 1);
+        // Stops and joins what was started on every way out of this block - including a
+        // std::thread constructor that throws - because a joinable std::thread destroyed by
+        // unwinding terminates the process (#102, #112).
+        struct StopAndJoin {
+            std::atomic<bool>&        running;
+            std::vector<std::thread>& threads;
+            ~StopAndJoin() {
+                running.store(false, std::memory_order_relaxed);
+                for (auto& t : threads) {
+                    if (t.joinable()) t.join();
+                }
+            }
+        } stop_and_join{running_, threads};
+
+        for (size_t i = 1; i < reactors.size(); ++i) {
+            Reactor* r = reactors[i].get();
+            // `std::thread(` spelled out rather than `emplace_back`, so the scan in
+            // test_thread_boundaries.cpp sees this construction and checks its boundary (#112).
+            threads.push_back(std::thread([this, r, &a_reactor_failed] {
+                run_thread_body("tcp_server", "a client event loop", [&] {
+                    try {
+                        r->run_loop();
+                    } catch (...) {
+                        a_reactor_failed.store(true, std::memory_order_relaxed);
+                        running_.store(false, std::memory_order_relaxed);
+                        throw;   // the boundary logs it, with what it was
+                    }
+                });
+            }));
+            // Named so `top -H` and a per-thread CPU sample say which loop is which. The kernel
+            // limit is fifteen characters, and "ob-io-63" fits.
+            const std::string name = "ob-io-" + std::to_string(i);
+            pthread_setname_np(threads.back().native_handle(), name.c_str());
+        }
+        pthread_setname_np(pthread_self(), "ob-io-0");
+
+        try {
+            reactors[0]->run_loop();
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        // Reactor 0 returned, so the server is stopping: a finished drain, a deadline, a fatal
+        // error, or another reactor's failure. The block's end stops and joins the others.
     }
+    reactors.clear();   // closes every reactor's descriptors, and anything still handed off
 
     // listen_fd_ may already be closed by the reactor during drain.
     if (listen_fd_ >= 0) {
@@ -2490,6 +2758,12 @@ void TcpServer::run() {
     }
 
     engine_->close();
+
+    if (failure) std::rethrow_exception(failure);
+    if (a_reactor_failed.load(std::memory_order_relaxed)) {
+        throw std::runtime_error("a client event loop ended on an exception, so the server "
+                                 "stopped; the log names it");
+    }
 }
 
 int io_wait_ms(std::chrono::steady_clock::time_point last_event,
