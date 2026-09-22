@@ -2107,10 +2107,11 @@ void TcpServer::run() {
                 //
                 // 64 KiB rather than 4 KiB, because since #146 the answers to a read go out in one
                 // send and the read's size is therefore the batch's: a pipelined batch of 64
-                // twenty-level `MINSERT`s is 20,736 bytes, which a 4 KiB read took in six pieces and
-                // answered with six sends (measured: 6.00 sends per batch, 1.00 at 64 KiB). On the stack of the thread that owns this loop; the
-                // edge-triggered loop drains the socket either way, so a larger read changes how
-                // many syscalls a burst costs and not which session is served first.
+                // twenty-level `MINSERT`s is 20,736 bytes, which a 4 KiB read took in six pieces
+                // and answered with six sends (measured: 6.00 sends per batch, 1.00 at 64 KiB). On
+                // the stack of the thread that owns this loop; the edge-triggered loop drains the
+                // socket either way, so a larger read changes how many syscalls a burst costs and
+                // not which session is served first.
                 char buf[64 * 1024];
                 while (true) {
                     Session* session = session_mgr.get_session(fd);
