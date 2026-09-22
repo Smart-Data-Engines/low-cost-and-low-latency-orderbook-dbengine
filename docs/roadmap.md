@@ -2212,6 +2212,183 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 152. An answer larger than 64 MB closed the connection of a client that was reading ✅
+
+**Found by the isolation measurement of #151**, whose scanning connection kept dying. The second
+`SELECT timestamp, price` of one symbol, after more writes had arrived, was a 76 616 983-byte answer,
+and the log said `Send buffer cap exceeded: fd=8 pending=0 adding=76616983 cap=67108864` and closed
+the session. `pending=0` is the tell: nothing was queued, the client was reading as fast as it
+could, and the answer alone was larger than everything a session may hold. **No client could ever
+have been sent it**, and it was told so by EOF.
+
+`docs/cli.md` described the cap as what happens to "a client that stops reading entirely while
+asking for more" — true of the cap, and not of this: a query whose answer passes 64 MB failed for
+every client, every time, and the reader was left to guess from a closed socket whether the server
+had crashed.
+
+**Now the two refusals are told apart.** `Session::queue_answer()` returns `TooLargeAlone` for an
+answer larger than the whole cap on its own — compared after LZ4 framing on a compressed session,
+where it is the frame that must fit — and `CapExceeded` for one that does not fit behind what is
+already queued. The second is a client that has stopped reading and closes the session as before.
+The first gets `ERR answer of N bytes is larger than the 67108864 a session may have queued; narrow
+the query or add LIMIT`, and the session stays open.
+
+**What this does not fix, stated rather than implied:** the answer is still built in full before
+it is measured, so the query that found this allocated 76 MB to be told no. Streaming an answer as
+the socket drains would remove both the allocation and the ceiling, and it is a change to how every
+query produces rows, not to this check.
+
+Held by `AnswerCeiling.AnAnswerLargerThanTheCapIsRefusedAloneAndNothingIsQueued` — the refusal, the
+largest answer that still fits as its control, and the other refusal still the other one — and by a
+static rule that the loop replaces such an answer with an error and does not close. The behavioural
+half needs a store of about 2.5 million rows, so it was checked once on the m9g.xlarge instead:
+the same query that found it, 76 437 783 bytes this time, answered `ERR answer of 76437783 bytes
+is larger than the 67108864 a session may have queued; narrow the query or add LIMIT`, and the
+session stayed open.
+
+- Effort: S | Impact: every query whose answer passed 64 MB ended its session without a reason
+
+### 151. One client event loop for every connection, so the engine used one core of four ✅
+
+**`--io-threads N` gives the server N client event loops ("reactors").** The one holding the
+listening socket accepts every connection and deals it to the next reactor in turn; a connection
+stays on the reactor it was dealt to for its whole life, because a `Session` is not thread-safe and
+the order of a connection's answers is the order its reactor wrote them. Default 1, which is the
+loop this server always had — and measured to be it: at one reactor the new binary and master are
+the same within the noise on both workloads below.
+
+**Measured on the m9g.xlarge** (four Graviton cores, Release, loopback, every build with GCC 14,
+five interleaved rounds, the probe on the same machine; `scripts/measure_pipelined_ingest.py` and
+`benchmarks/pipelined_ingest`, which gained a `book` mode for the read half):
+
+| four connections, batches of 64 | master | 1 reactor | 2 reactors | 4 reactors |
+|---|---|---|---|---|
+| **reads**: `BOOK`, levels read / s | 16 133 184 | 15 992 260 | **30 254 474** | **49 212 362** |
+| reads, batch p99 | 649 µs | 655 µs | 353 µs | **222 µs** |
+| **writes**: `MINSERT` × 20, levels / s | 4 856 227 | 4 878 479 | 4 327 641 | 4 505 432 |
+| writes, batch p99 | 1 387 µs | 1 248 µs | 4 863 µs | 4 067 µs |
+
+**Reads scale, 3.08× at four reactors** — and that is with the probe on the same four cores: its
+own CPU is 0.45 s of 0.62 s wall at four reactors, so the machine is full rather than the server
+done. **Writes do not scale, and get worse**, and that was not the prediction. The design said
+1.6–2.4× for writes, bounded above by Amdahl at 1.84× with 39% of the io thread under the engine's
+lock. The bound was computed on the work under the lock and ignored the lock itself.
+
+**The kernel says why, and says it in one place.** `perf stat` on the futex tracepoint over the
+same 768 000 `MINSERT`s: **1 128 calls at one reactor, 1 222 274 at two, 1 485 158 at four**, with
+607 404 and 758 130 context switches. `perf record -g` on that tracepoint puts **100%** of them in
+`Engine::apply_delta_impl` — half in `pthread_mutex_lock` waiting, half in `unlock` waking — on one
+address. The engine takes `mtx_` once per record and holds it through the WAL's `write()`, so with
+two writers every acquisition is contended, and a futex handoff (sleep, wake, reschedule) costs more
+than the critical section it guards. That is a convoy, and more reactors feed it faster. The
+next stage takes one lock and one WAL write per read rather than per record; until it does, more
+than one reactor is for reads and for isolation, and the documentation says so.
+
+**Isolation is the other half, and it is large.** One connection loops a `SELECT` of 1.5 million
+rows (134 ms each) while the probe pipelines writes on another:
+
+| writer beside a scanning connection | levels / s | batch p99 |
+|---|---|---|
+| 1 reactor | 65 424 | 136 145 µs |
+| 2 reactors, writer on the other reactor | 4 995 672 | 241 µs |
+| 4 reactors, writer on another reactor | 4 877 810 | 243 µs |
+| control, no scan | 4 908 385 – 4 969 225 | 241 – 243 µs |
+
+At one reactor the writer waits behind every scan: **76× less throughput and a p99 equal to the
+scan**. On another reactor it does not notice. And the first run of this measurement showed what
+"another reactor" means: at two reactors the writer was dealt, by the order connections arrived, to
+the scanning connection's own reactor, and saw nothing — isolation holds between reactors, not
+within one. The table comes from a run that opens one idle connection before the writer, which
+moves it off the scanner's reactor at two; without it, the writer at two reactors read
+**64 492 levels a second with a p99 of 138 ms** — the one-reactor figures.
+
+**What had to become one thing for N reactors to be one server**, each held by a test in
+`tests/integration/test_io_reactors.py` or by a static rule:
+- `--max-sessions` is one limit, checked on the accepting reactor against one count before the
+  connection is dealt anywhere — counted where it is adopted, a burst of accepts would be checked
+  against a number that had not caught up;
+- `conn_id` comes from the accepting reactor, so it stays unique;
+- the drain has one deadline: each reactor starts its clock when it sees the request, the first to
+  see it reaches the deadline first, and stopping `running_` stops them all — so a shared start,
+  which the design called for, would only have moved the others' clocks to that same moment, and it
+  was taken out again;
+- the gauges every reactor contributes to are published as each reactor's change, because a gauge
+  set from four loops is whichever wrote last;
+- `STATUS` answers from a snapshot of its own — it wrote the engine's figures, a vector among them,
+  into the one `ServerStats` all connections share, which is a data race the moment two reactors
+  answer it (found by reading, before anything ran in parallel);
+- `FAILOVER` and `MIGRATE` run alone across reactors, through a classifier with no `default:` like
+  the authentication gate's: two concurrent `FAILOVER`s revoke one lease twice, and the loser clears
+  the winner's handover intent, election block and in-handover flag while the handover runs;
+- a reactor that ends on an exception stops the server and `run()` leaves with the error once the
+  others are joined, as the single loop did — left running, the others would go on dealing
+  connections to a loop that no longer serves them;
+- threads are named `ob-io-0` … so `top -H` and a per-thread sample say which loop is which.
+
+**One defect found in the path the reactors now share, and two in what they read:** #150 (a TLS
+handshake that could not start closed its descriptor twice) is fixed in `Reactor::adopt()`; #152
+(an answer larger than 64 MB closed the connection of a client that was reading) is fixed in the
+loop. And the measurement's first version compared master built with GCC 14 against this branch
+built with GCC 11, and reported this branch 18% faster at one reactor on reads — which was the
+compiler (GCC 11's build reads 19.3 million levels a second, GCC 14's 16.0, on identical code). Every
+number above is one compiler.
+
+**Mutation table: thirteen rows, each with the verdict it was supposed to produce** — eleven
+killed and two surviving by design, committed before the first mutation, every source restored
+from bytes kept beside the run; unit rows run `test_tcp_server`, the others
+`tests/integration/test_io_reactors.py`:
+
+| | mutation | verdict | killed by |
+|---|---|---|---|
+| 1 | the admin lock not taken | killed | the rule that the loop consults the classifier |
+| 2 | `FAILOVER` classified as a data command | killed | `AdminSerialisation.ExactlyFailoverAndMigrateRunAlone` |
+| 3 | the TLS failure branch closing its descriptor again (#150) | killed | `SessionsStatic` |
+| 4 | an answer too large to send closing the session (#152) | killed — **on the second run** | the rule, after it learned what to ask |
+| 5 | the too-large check gone from the session (#152) | killed | `AnswerCeiling`'s unit test |
+| 6 | `STATUS` formatted from the shared struct | killed — **on the second run** | `StatusAnswersTheEnginesFiguresNotTheSharedDefaults` |
+| 7 | every connection kept by the accepting reactor | killed | the deal: eight connections went to `[0, 0, 0, 0, 0, 0, 0, 0]` |
+| 8 | `--max-sessions` counted per reactor | killed | the fourth connection got the banner |
+| 9 | a hand-off that does not wake its reactor | killed | the connection is never answered |
+| 10 | a summed gauge set instead of changed | killed | `ob_subscriptions_active` stayed at 1, never 4 |
+| 11 | the deadline reported by every reactor | killed | it was said four times |
+| 12 | a reactor that dies not stopping the server | survived | no test can make a reactor die outside an event |
+| 13 | **control:** a debug line reworded | survived | by design |
+
+**Two rows survived the first run, and both were the tests' fault.** Row 4: the static rule for
+#152 asked for `format_error(` in the branch and no `close_session(`, and a branch that built the
+error, dropped it and set `queue_refused` satisfied both while closing the session exactly as
+before — it now asks that the error be what is queued, and that the session end only if even the
+error does not fit. Row 6: formatting `STATUS` from the shared struct, which `STATUS` no longer
+writes, answered zeros for every engine figure and passed all seventy unit tests, because none of
+them looked at a figure; now one does. Row 12 is stated rather than hidden: an exception can only
+leave a reactor's loop outside an event, which nothing in a test can arrange.
+
+- Effort: L | Impact: reads and queries use the machine's cores and no longer stall ingest on the
+  loop they share; writes wait on the engine's lock per record until the next stage
+
+### 150. A TLS handshake that could not start closed its connection's descriptor twice ✅
+
+**Found reading the accept path before moving it into the reactors.** When `wrap()` refused to
+start a handshake on a newly accepted connection, the branch did `remove_session(client_fd)` —
+which closes the descriptor — and then `::close(client_fd)` again. Between the two closes the
+kernel is free to hand that number to any file another thread opens, and this server has several
+that do: the WAL writer rotating, the flush thread writing segments, replication and the mesh
+accepting. The second close would then close **their** file, with no error on either side — #128's
+class, on the client port.
+
+**Reachable only when OpenSSL cannot allocate**, which is why nothing ever saw it: `wrap()` throws
+when `SSL_new` or `SSL_set_fd` fails, and both fail only for want of memory. Not reproduced, and
+said so; the defect is in the order of three lines, which a reading establishes.
+
+**Fixed where the branch now lives.** The multi-reactor stage (#151) moved the accept path's second
+half into `Reactor::adopt()`, which unregisters the descriptor from epoll first, while the number
+is still this connection's, and then removes the session — one close. The class is held rather
+than the line: `SessionsStatic.NoDescriptorIsClosedAgainAfterItsSessionIsRemoved` reads every
+`remove_session(X)` in the file and refuses a `::close(X)` in the rest of its block, and it runs its
+own two cases first — the shape this was, and the right one. Restoring the old branch fails it.
+
+- Effort: S | Impact: under memory exhaustion only, a close of another thread's file
+
 ### 149. `--workers` was accepted, printed and documented for six months, and read by nothing ✅
 
 **Found while planning the multi-reactor stage, which is about to add the knob this one looked
