@@ -175,6 +175,36 @@ LoadedSecrets load_secrets_or_exit(const ServerConfig& config) {
     return out;
 }
 
+bool serialised_across_reactors(CommandType t) {
+    switch (t) {
+    case CommandType::FAILOVER:
+    case CommandType::MIGRATE:
+        return true;
+    case CommandType::SELECT:
+    case CommandType::BOOK:
+    case CommandType::INSERT:
+    case CommandType::MINSERT:
+    case CommandType::FLUSH:     // the engine's flush_mtx_ already serialises it
+    case CommandType::STATUS:
+    case CommandType::ROLE:
+    case CommandType::PING:
+    case CommandType::QUIT:
+    case CommandType::COMPRESS:
+    case CommandType::SHARD_MAP:
+    case CommandType::SHARD_INFO:
+    case CommandType::MM_PEERS:
+    case CommandType::MM_CONFLICTS:
+    case CommandType::SUBSCRIBE:
+    case CommandType::UNSUBSCRIBE:
+    case CommandType::AUTH:
+    case CommandType::UNKNOWN:
+        return false;
+    }
+    // A value outside the enumeration: serialising is the safe direction here, because running a
+    // command alone costs latency and running it concurrently may cost a handover.
+    return true;
+}
+
 bool allowed_before_authentication(CommandType t) {
     switch (t) {
     case CommandType::AUTH:
@@ -1782,14 +1812,14 @@ struct ReactorShared {
     ShardCoordinator*        shard_coord;
     MetricsServer*           metrics_server;
 
-    /// When the drain began, in steady-clock nanoseconds since its epoch; 0 until then. Set once,
-    /// by whichever reactor sees the request first, so `--drain-timeout-ms` is measured from one
-    /// moment on every reactor rather than from each one's own wake-up.
-    std::atomic<int64_t>&    drain_started_ns;
 
     /// Every reactor of this server, for the one that accepts to deal connections to. Filled
     /// before any of them runs and not changed afterwards, so reading it needs no lock.
     std::vector<Reactor*>*   reactors;
+
+    /// Held for a command `serialised_across_reactors()` names, so it runs alone as it did when
+    /// one loop ran every command.
+    std::mutex&              admin_mtx;
 };
 
 class Reactor {
@@ -1839,8 +1869,8 @@ private:
 
     const int                index_;
     const ServerConfig&      config_;
-    std::atomic<int64_t>&    drain_started_ns_;
     std::vector<Reactor*>*   reactors_;
+    std::mutex&              admin_mtx_;
     Engine*                  engine_;
     const LoadedTlsContexts& tls_;
     const LoadedSecrets&     secrets_;
@@ -1906,8 +1936,8 @@ private:
 Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd)
     : index_(index)
     , config_(shared.config)
-    , drain_started_ns_(shared.drain_started_ns)
     , reactors_(shared.reactors)
+    , admin_mtx_(shared.admin_mtx)
     , engine_(&shared.engine)
     , tls_(shared.tls)
     , secrets_(shared.secrets)
@@ -2429,7 +2459,12 @@ void Reactor::run_loop() {
                                 Command cmd = (line.find('\n') != std::string::npos)
                                                   ? parse_minsert(line)
                                                   : parse_command(line);
+                                // Alone across reactors for the two commands written for one
+                                // caller at a time, and released before the answer is queued.
+                                std::unique_lock<std::mutex> alone(admin_mtx_, std::defer_lock);
+                                if (serialised_across_reactors(cmd.type)) alone.lock();
                                 std::string response = execute_command(cmd, *engine_, *session, stats_, read_only_.load(std::memory_order_acquire), &engine_->registry(), shard_coord_, &hub_, secrets_.client_store());
+                                if (alone.owns_lock()) alone.unlock();
 
                                 if (response.empty()) {
                                     quit = true;
@@ -2546,16 +2581,10 @@ void Reactor::run_loop() {
         // "server shutting down" — a better answer than a refused connection.
         if (!drain_started_ && draining_.load(std::memory_order_acquire)) {
             drain_started_ = true;
-            // One start for every reactor: whichever sees the request first publishes it, and the
-            // rest read it back, so --drain-timeout-ms is measured from one moment rather than from
-            // each reactor's own wake-up.
-            const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                       std::chrono::steady_clock::now().time_since_epoch())
-                                       .count();
-            int64_t expected = 0;
-            drain_started_ns_.compare_exchange_strong(expected, now_ns, std::memory_order_acq_rel);
-            drain_started_at_ = std::chrono::steady_clock::time_point(
-                std::chrono::nanoseconds(drain_started_ns_.load(std::memory_order_acquire)));
+            // Each reactor starts its own clock, and the drain still has one deadline: the reactor
+            // that saw the request first reaches it first, and stopping `running_` stops them all.
+            // A shared start would only move the others' clocks to that same moment.
+            drain_started_at_ = std::chrono::steady_clock::now();
             OB_LOG_INFO("tcp_server", "Reactor %d: drain requested, %d session(s) open here",
                         index_, sessions_.active_count());
             if (listen_fd_ >= 0) {
@@ -2678,11 +2707,11 @@ void TcpServer::run() {
                 config_.data_dir.c_str());
 
     ServerStats stats;
-    std::atomic<int64_t> drain_started_ns{0};
     std::vector<Reactor*> dealt_to;
+    std::mutex            admin_mtx;
     ReactorShared shared{config_,    *engine_, tls_,  secrets_,          running_,
                          draining_,  read_only_, stats, shard_coord.get(), metrics_server_.get(),
-                         drain_started_ns, &dealt_to};
+                         &dealt_to, admin_mtx};
 
     // 7-8. Reactor 0 holds the listening socket and runs on this thread; the others have a thread
     // each. Every one is built before any of them runs, so the list reactor 0 deals from is complete

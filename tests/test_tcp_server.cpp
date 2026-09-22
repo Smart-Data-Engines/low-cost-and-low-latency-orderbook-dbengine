@@ -1654,6 +1654,49 @@ TEST(SessionsStatic, NoDescriptorIsClosedAgainAfterItsSessionIsRemoved) {
     }
 }
 
+// ── Commands that run alone across reactors ────────────────────────────────────
+
+TEST(AdminSerialisation, ExactlyFailoverAndMigrateRunAlone) {
+    // Iterating the enumeration rather than a list, like the authentication gate: a new command
+    // classified as serialised fails here, and a new command classified at all is forced by
+    // -Wswitch in the classifier.
+    std::vector<int> alone;
+    for (int i = 0; i <= static_cast<int>(ob::CommandType::UNKNOWN); ++i) {
+        if (ob::serialised_across_reactors(static_cast<ob::CommandType>(i))) alone.push_back(i);
+    }
+    EXPECT_EQ(alone, (std::vector<int>{static_cast<int>(ob::CommandType::FAILOVER),
+                                       static_cast<int>(ob::CommandType::MIGRATE)}))
+        << "FAILOVER and MIGRATE were written for one caller at a time; anything added to that set "
+           "is a decision, and so is anything taken out of it";
+}
+
+TEST(AdminSerialisation, TheClassifierHasNoDefaultAndTheLoopConsultsIt) {
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/src/tcp_server.cpp");
+    ASSERT_TRUE(in) << "cannot read src/tcp_server.cpp";
+    const std::string src((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+
+    const auto begin = src.find("bool serialised_across_reactors(CommandType t) {");
+    ASSERT_NE(begin, std::string::npos) << "classifier not found - did it get renamed?";
+    const auto end = src.find("\n}\n", begin);
+    ASSERT_NE(end, std::string::npos);
+    EXPECT_EQ(src.substr(begin, end - begin).find("default:"), std::string::npos)
+        << "a default label turns off the exhaustiveness check this classifier relies on";
+
+    // A classifier nothing consults is a comment. The reactor's dispatch must take the shared
+    // mutex for what it names, before the command runs.
+    const auto loop = src.find("\nvoid Reactor::run_loop() {\n");
+    ASSERT_NE(loop, std::string::npos);
+    const auto call = src.find("= execute_command(", loop);
+    ASSERT_NE(call, std::string::npos) << "the reactor does not dispatch commands any more?";
+    const std::string before = src.substr(loop, call - loop);
+    const auto consult = before.rfind("if (serialised_across_reactors(cmd.type)) alone.lock();");
+    ASSERT_NE(consult, std::string::npos)
+        << "the reactor runs every command without asking whether it must run alone";
+    EXPECT_EQ(before.find('\n', before.find('\n', consult) + 1), std::string::npos)
+        << "the lock is taken more than a line before the command it guards";
+}
+
 // ── An answer too large to ever send (#152) ────────────────────────────────────
 
 TEST(AnswerCeiling, AnAnswerLargerThanTheCapIsRefusedAloneAndNothingIsQueued) {

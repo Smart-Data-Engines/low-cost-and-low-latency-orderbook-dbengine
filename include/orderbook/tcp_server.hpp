@@ -433,6 +433,21 @@ std::string execute_command(const Command& cmd,
 /// exhaustiveness check off and make the next command's classification an accident.
 bool allowed_before_authentication(CommandType t);
 
+/// Whether a command must run alone across every client event loop of this server.
+///
+/// With one loop every command was serialised by construction, and two were written for exactly
+/// that: `FAILOVER` (two at once revoke one lease twice, and the one that loses clears the
+/// winner's handover intent, its election block and its `handing_over_` flag while the handover is
+/// still running) and `MIGRATE` (two of one symbol both pass validation before either starts).
+/// With `--io-threads` above one, two connections can ask at once, so these take a mutex the
+/// reactors share. Data commands do not: the engine is already called from the replication and
+/// mesh threads concurrently, under its own locks, and `FLUSH` is serialised by the engine's
+/// `flush_mtx_` because the flush thread calls it too.
+///
+/// Same shape as `allowed_before_authentication()`: no `default:`, so a new command does not build
+/// until somebody decides which kind it is.
+bool serialised_across_reactors(CommandType t);
+
 /// Where a configuration value came from. For `--print-config`, which exists to answer exactly
 /// that: a list of values does not tell an operator which of them they chose.
 enum class Origin { Default, File, CommandLine, Profile };
