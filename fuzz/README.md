@@ -62,6 +62,13 @@ The first directory is where new inputs are written; the second is the read-only
 Generated inputs stay out of the repository on purpose — a corpus that grows with every run stops
 being a set of cases somebody chose.
 
+**Read the `Done N runs` line before trusting a local run.** On the development laptop that
+command did **186 executions in 90 seconds** against CI's hundreds of thousands, and nothing about
+it looked like a failure: libFuzzer symbolises every newly covered function by talking to
+`llvm-symbolizer`, and there that process blocked it for the whole budget (traced: one child
+spawned, then silence until the timeout). `-print_funcs=0` skips the symbolising and the same run
+did **1,511,527**. Crash reports are symbolised separately, so nothing is lost by it.
+
 ## A real campaign
 
 The CI run is a regression gate, not a campaign. An actual campaign is hours, and wants its own
