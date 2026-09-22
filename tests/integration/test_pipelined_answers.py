@@ -154,18 +154,24 @@ def test_a_pipelined_batch_is_answered_byte_for_byte_as_one_at_a_time(open_node)
 
 def test_a_batch_spanning_several_reads_is_answered_in_full_and_in_order(open_node):
     sock = connect(open_node.port)
-    # 2000 commands are about 10 kB, so the server takes them in several reads and answers each
-    # read with its own send: the order across those sends is what is being held.
-    lines = [f"INSERT SPAN EX bid {1000 + i} 1 1 {T0 + i}" for i in range(1999)] + ["BOOK SPAN EX 3"]
-    sock.sendall(("\n".join(lines) + "\n").encode())
+    # The server reads 64 KiB at a time (#146) and answers each read with its own send, so the
+    # order across those sends is what is being held - which needs a batch several reads long.
+    # The first version of this comment called 2000 of these "about 10 kB"; they were 96 kB, so
+    # the premise was true by accident and would have become false at the next read-size change.
+    # It is asserted now instead of described.
+    writes = 5999
+    lines = [f"INSERT SPAN EX bid {1000 + i} 1 1 {T0 + i}" for i in range(writes)] + ["BOOK SPAN EX 3"]
+    payload = ("\n".join(lines) + "\n").encode()
+    assert len(payload) > 4 * 64 * 1024, f"{len(payload)} bytes is not several 64 KiB reads"
+    sock.sendall(payload)
     pending = bytearray()
     answers = [read_response(sock, pending) for _ in lines]
     sock.close()
-    assert answers[:-1] == [b"OK\n\n"] * 1999
+    assert answers[:-1] == [b"OK\n\n"] * writes
     book = answers[-1].decode()
-    # The best three bids of the 1999 written, in the side's own order, and nothing else.
+    # The best three bids of the ones written, in the side's own order, and nothing else.
     rows = [row for row in book.splitlines()[2:] if row]   # the terminating blank line is not a row
-    assert [row.split("\t")[1] for row in rows] == ["2998", "2997", "2996"], book
+    assert [row.split("\t")[1] for row in rows] == ["6998", "6997", "6996"], book
 
 
 def test_quit_behind_a_batch_delivers_every_answer_before_it(open_node):
@@ -173,6 +179,46 @@ def test_quit_behind_a_batch_delivers_every_answer_before_it(open_node):
     sock.sendall(b"PING\n" * 20 + b"QUIT\n" + b"PING\n")
     assert read_until_eof(sock) == b"PONG\n" * 20
     sock.close()
+
+
+def test_quit_behind_answers_still_draining_delivers_all_of_them(open_node):
+    """`QUIT` behind answers too big for the socket closes once they have drained, not at once.
+
+    The test above cannot reach this branch: twenty PONGs fit the socket buffer, so the flush
+    leaves nothing pending and the deferred close never runs - a mutation closing at once passed
+    it. Here a hundred full books are queued behind a receive window clamped to 64 KiB, which is
+    more than the kernel will hold for this connection, so `QUIT` arrives while the session still
+    has megabytes of answers to send.
+    """
+    levels = 1000
+    seeder = connect(open_node.port)
+    bids = "\n".join(f"{6_500_000 - i} {i + 1} 1" for i in range(levels))
+    asks = "\n".join(f"{6_501_000 + i} {i + 1} 1" for i in range(levels))
+    seeder.sendall(f"MINSERT DEEP EX bid {levels} {T0}\n{bids}\n"
+                   f"MINSERT DEEP EX ask {levels} {T0 + 1}\n{asks}\n".encode())
+    pending = bytearray()
+    assert read_response(seeder, pending) == b"OK\n\n"
+    assert read_response(seeder, pending) == b"OK\n\n"
+    seeder.sendall(b"BOOK DEEP EX\n")
+    one_book = read_response(seeder, pending)
+    seeder.close()
+    assert one_book.count(b"\n") == 2 * levels + 3, "the seed did not produce the book this needs"
+
+    books = 100
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 16)
+    sock.settimeout(patience(10))
+    sock.connect(("127.0.0.1", open_node.port))
+    banner = bytearray()
+    while not banner.endswith(b"\n\n"):
+        banner += sock.recv(4096)
+    sock.sendall(b"BOOK DEEP EX\n" * books + b"QUIT\nPING\n")
+    got = read_until_eof(sock, limit=60)
+    sock.close()
+    assert len(got) == books * len(one_book), (
+        f"{len(got)} bytes arrived of {books * len(one_book)} queued before QUIT: the session "
+        f"closed with answers still to send")
+    assert got == one_book * books, "the answers arrived whole but not as the books that were asked"
 
 
 def test_a_line_too_long_behind_a_batch_delivers_the_answers_before_it(open_node):
