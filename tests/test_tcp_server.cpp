@@ -1456,3 +1456,61 @@ TEST_F(ExecuteCommandTest, StatusNamesWhatThisBuildCanDo) {
             << "the list in capabilities.hpp names " << name << " and STATUS does not:\n" << wire;
     }
 }
+
+// ── One send per read, not one per response (#146) ───────────────────────────
+
+TEST(ReadLoopStatic, EveryCommandFromOneReadIsAnsweredWithOneSend) {
+    // Static, because nothing behavioural can see it: the bytes a client reads are the same bytes in
+    // the same order whether the loop sends once per read or once per response - which is exactly
+    // what `tests/integration/test_pipelined_answers.py` holds - so a change back to one send per
+    // response passes every test that reads the wire. What it costs is measured, not observed: 32.4%
+    // of the io thread on an m9g.xlarge, one `send()` and one segment per response.
+    const auto read = [](const char* rel) {
+        std::ifstream in(std::string(OB_SOURCE_DIR) + "/" + rel);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::string source = read("src/tcp_server.cpp");
+    ASSERT_FALSE(source.empty()) << "cannot read src/tcp_server.cpp, so this test checks nothing";
+
+    // The read path runs from the line the session hands back to the label the loop jumps to.
+    const std::size_t from = source.find("auto lines = session->feed(buf, got);");
+    ASSERT_NE(from, std::string::npos) << "the read path moved; this test would check nothing";
+    const std::size_t to = source.find("next_event:;", from);
+    ASSERT_NE(to, std::string::npos);
+    const std::string path = source.substr(from, to - from);
+
+    // The loop over the commands of this read, found by its header and closed by brace matching
+    // rather than by the next `}` - its body has braces of its own.
+    const std::size_t header = path.find("for (const auto& line : lines)");
+    ASSERT_NE(header, std::string::npos) << "no loop over the commands of a read";
+    const std::size_t open = path.find('{', header);
+    ASSERT_NE(open, std::string::npos);
+    std::size_t close = open;
+    int depth = 0;
+    for (std::size_t i = open; i < path.size(); ++i) {
+        if (path[i] == '{') ++depth;
+        if (path[i] == '}' && --depth == 0) { close = i; break; }
+    }
+    ASSERT_GT(close, open) << "unbalanced braces in the read loop";
+    const std::string body = path.substr(open, close - open);
+    const std::string after = path.substr(close);
+
+    EXPECT_NE(body.find("queue_response("), std::string::npos)
+        << "the commands of a read are no longer answered into the session's buffer";
+    EXPECT_EQ(body.find("send_response("), std::string::npos)
+        << "a response is sent from inside the loop over the commands of one read: one send per "
+           "response again, which is what #146 measured at 32.4% of the io thread";
+    EXPECT_EQ(body.find("flush_output("), std::string::npos)
+        << "the session is flushed from inside the loop over the commands of one read";
+
+    // And exactly one flush of what the loop queued. A count rather than "at least one", because a
+    // second flush after the loop is a second send per read and a rule that stopped matching would
+    // report a clean tree.
+    std::size_t flushes = 0;
+    for (std::size_t at = after.find("flush_output("); at != std::string::npos;
+         at = after.find("flush_output(", at + 1)) {
+        ++flushes;
+    }
+    EXPECT_EQ(flushes, 1u) << "expected one flush of the queued answers after the loop, found "
+                           << flushes;
+}

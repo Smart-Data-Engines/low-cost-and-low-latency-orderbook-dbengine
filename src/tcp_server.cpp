@@ -2119,7 +2119,14 @@ void TcpServer::run() {
 
                 // Client data ready.
                 // Edge-triggered: read until EAGAIN.
-                char buf[4096];
+                //
+                // 64 KiB rather than 4 KiB, because since #146 the answers to a read go out in one
+                // send and the read's size is therefore the batch's: a pipelined batch of 64
+                // twenty-level `MINSERT`s is 20,736 bytes, which a 4 KiB read took in six pieces and
+                // answered with six sends (measured: 6.00 sends per batch, 1.00 at 64 KiB). On the stack of the thread that owns this loop; the
+                // edge-triggered loop drains the socket either way, so a larger read changes how
+                // many syscalls a burst costs and not which session is served first.
+                char buf[64 * 1024];
                 while (true) {
                     Session* session = session_mgr.get_session(fd);
                     if (!session) break;
@@ -2155,24 +2162,77 @@ void TcpServer::run() {
                         goto next_event;
                     }
 
-                    for (const auto& line : lines) {
-                        // Check line length.
-                        if (line.size() > config_.max_line_length) {
-                            session->send_response(format_error("line too long"));
-                            close_session(fd, "line too long");
-                            goto next_event; // break out of both loops
+                    {
+                        // Every command from this read is answered into the session's buffer, and
+                        // the buffer goes out in **one** send below (#146). One send per response
+                        // made a pipelined batch of 64 commands 64 `send()` calls and 64 segments:
+                        // 32.4% of the io thread on an m9g.xlarge. The buffer is the wire order,
+                        // so the bytes a client reads are the same bytes in the same order.
+                        //
+                        // What ends the batch early, and each keeps the effect it had when every
+                        // response was sent on its own: a line too long or a full send buffer
+                        // close the session after what is queued has been offered to the socket,
+                        // `QUIT` closes once it has drained, and a command that asked for the
+                        // session to end - a failed `AUTH` - stops the batch **there**. That last
+                        // one is the rate limit on authentication (#30): nothing that arrived in
+                        // the same read behind a failed attempt is executed.
+                        const char* close_after_flush = nullptr;
+                        bool        quit              = false;
+                        bool        queue_refused     = false;
+                        for (const auto& line : lines) {
+                            if (line.size() > config_.max_line_length) {
+                                (void)session->queue_response(format_error("line too long"));
+                                close_after_flush = "line too long";
+                                break;
+                            }
+
+                            // Multi-line blocks (containing \n) are MINSERT — use parse_minsert()
+                            Command cmd = (line.find('\n') != std::string::npos)
+                                              ? parse_minsert(line)
+                                              : parse_command(line);
+                            std::string response = execute_command(cmd, *engine_, *session, stats, read_only_.load(std::memory_order_acquire), &engine_->registry(), shard_coord.get(), &subscription_hub, secrets_.client_store());
+
+                            if (response.empty()) {
+                                quit = true;
+                                break;
+                            }
+
+                            if (!session->queue_response(response)) {
+                                // The send buffer cap. EPIPE and ECONNRESET surface in the flush.
+                                queue_refused = true;
+                                break;
+                            }
+
+                            // Compression starts AFTER the plain-text ack is queued. Everything
+                            // queued before this point goes out as it was queued - plain - and
+                            // everything after it is framed, which is the order the client expects.
+                            if (cmd.type == CommandType::COMPRESS) {
+                                session->set_compressed(true);
+                            }
+
+                            if (session->close_requested()) break;
                         }
 
-                        // Multi-line blocks (containing \n) are MINSERT — use parse_minsert()
-                        Command cmd = (line.find('\n') != std::string::npos)
-                                          ? parse_minsert(line)
-                                          : parse_command(line);
-                        std::string response = execute_command(cmd, *engine_, *session, stats, read_only_.load(std::memory_order_acquire), &engine_->registry(), shard_coord.get(), &subscription_hub, secrets_.client_store());
+                        if (queue_refused) {
+                            close_session(fd, "send failed");
+                            goto next_event;
+                        }
 
-                        if (response.empty()) {
-                            // QUIT. If a previous response is still draining, let it
-                            // finish first: closing now would truncate data the
-                            // client already asked for and is still reading.
+                        if (!session->flush_output()) {
+                            // A real error: EPIPE, ECONNRESET. A full socket buffer is not one of
+                            // these — it leaves bytes queued and is handled just below.
+                            close_session(fd, close_after_flush ? close_after_flush : "send failed");
+                            goto next_event;
+                        }
+
+                        if (close_after_flush) {
+                            close_session(fd, close_after_flush);
+                            goto next_event;
+                        }
+
+                        if (quit) {
+                            // If a response is still draining, let it finish first: closing now
+                            // would truncate data the client already asked for and is still reading.
                             if (session->has_pending_output()) {
                                 session->request_close_after_flush();
                                 arm_epollout(fd);
@@ -2182,39 +2242,25 @@ void TcpServer::run() {
                             goto next_event;
                         }
 
-                        if (!session->send_response(response)) {
-                            // A real error: EPIPE, ECONNRESET or the buffer cap. A
-                            // full socket buffer is not one of these — it leaves
-                            // bytes queued and is handled just below.
-                            close_session(fd, "send failed");
-                            goto next_event;
-                        }
-
                         if (session->has_pending_output()) {
-                            // The socket took part of the response. The rest goes out
-                            // on EPOLLOUT; closing here is what truncated every
-                            // response larger than the socket buffer.
+                            // The socket took part of the batch. The rest goes out on EPOLLOUT;
+                            // closing here is what truncated every response larger than the socket
+                            // buffer.
                             arm_epollout(fd);
-                        } else if (session->close_requested()) {
-                            // A command asked for the session to end once its response was out,
-                            // and the response is out.
-                            //
-                            // This branch was missing. `close_requested()` was consulted only in
-                            // the EPOLLOUT drain, which runs only after a *partial* write - so a
-                            // response small enough to fit the socket buffer left the session
-                            // open with the flag set and nothing reading it. That is exactly the
-                            // case that matters here: `ERR auth_failed\n` is eighteen bytes, so a
-                            // failed authentication kept its connection and could try again,
-                            // which is the entire rate limit gone. Found by the integration test,
-                            // not by the unit test - which asserted the flag rather than the
-                            // effect (pitfall 45).
-                            close_session(fd, "close requested after flush");
-                            goto next_event;
                         }
 
-                        // Enable compression AFTER sending the plain-text ack.
-                        if (cmd.type == CommandType::COMPRESS) {
-                            session->set_compressed(true);
+                        if (session->close_requested()) {
+                            // A command asked for the session to end once its response was out.
+                            // `close_requested()` was once consulted only in the EPOLLOUT drain,
+                            // which runs only after a *partial* write - so a response small enough
+                            // to fit the socket buffer left the session open with the flag set and
+                            // nothing reading it, and `ERR auth_failed\n` is eighteen bytes. With
+                            // bytes still queued the drain closes it; either way nothing more is
+                            // read from this socket.
+                            if (!session->has_pending_output()) {
+                                close_session(fd, "close requested after flush");
+                            }
+                            goto next_event;
                         }
                     }
                 }

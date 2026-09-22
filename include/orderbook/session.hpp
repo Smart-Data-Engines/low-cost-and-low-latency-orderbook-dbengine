@@ -80,7 +80,19 @@ public:
     /// queued and the caller must arm EPOLLOUT. Reading EAGAIN as "the client is
     /// gone" is what closed the session in the middle of every response larger than
     /// the socket buffer, with no log line to say so.
+    ///
+    /// Exactly `queue_response()` followed by `flush_output()`.
     bool send_response(std::string_view response);
+
+    /// Queue a response without sending it: the LZ4 frame in compressed mode, the cap check, the
+    /// append. False only when the cap would be exceeded, and then nothing is queued.
+    ///
+    /// Exists so the epoll loop can answer every command from one read with **one** send (#146).
+    /// Sending per response made a pipelined batch of 64 commands 64 `send()` calls and, with
+    /// `TCP_NODELAY` on every accepted socket (#140), 64 segments - measured at 32.4% of the io
+    /// thread on an m9g.xlarge, because on loopback the sender also runs the receiver's softirq.
+    /// The bytes and their order are the same either way: the buffer is the wire order.
+    bool queue_response(std::string_view response);
 
     /// Push queued bytes towards the socket. Same contract as send_response().
     /// Push queued output to the socket. False means the session is finished.
