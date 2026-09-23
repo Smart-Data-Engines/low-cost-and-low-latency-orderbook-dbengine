@@ -10,6 +10,8 @@
 #include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -88,8 +90,21 @@ struct SegmentMeta {
 /// which is how the same segment once landed in the query index twice.
 class ColumnarStore {
 public:
+    static constexpr uint64_t kDefaultSegmentDurationNs = 3600ULL * 1'000'000'000ULL;
+
+    /// Whether this store indexes the segments it writes itself (#165).
+    ///
+    /// A store on its own - a test, a tool - has to: it is the only index there is. A store whose
+    /// segments go to someone else's index must not. The engine's and the C API's stores keep one
+    /// symbol's rows each and hand every segment they write to a combined store, which is the one
+    /// every query reads and the one retention prunes; the copy each of them also kept was read by
+    /// nothing, pruned by nothing, and grew by one `SegmentMeta` per segment for the life of the
+    /// process.
+    enum class OwnIndex { kYes, kNo };
+
     explicit ColumnarStore(std::string_view base_dir,
-                           uint64_t segment_duration_ns = 3600ULL * 1'000'000'000ULL);
+                           uint64_t segment_duration_ns = kDefaultSegmentDurationNs,
+                           OwnIndex own_index = OwnIndex::kYes);
 
     ~ColumnarStore() { close(); }
 
@@ -208,15 +223,17 @@ public:
     /// Number of segments in the index (including active if flushed).
     size_t segment_count() const {
         std::shared_lock<std::shared_mutex> lock(index_mtx_);
-        return index_.size();
+        return indexed_count_;
     }
 
-    /// Access the segment index (read-only snapshot).
-    /// NOTE: Returns a copy for thread safety. Use scan() for iteration.
-    std::vector<SegmentMeta> index() const {
-        std::shared_lock<std::shared_mutex> lock(index_mtx_);
-        return index_;
-    }
+    /// Every indexed segment, in `segment_order_less` order across all symbols - a copy, for the
+    /// paths that need the whole index: startup's recovery, replay's filter and snapshots. Not for
+    /// anything on a query's or a tick's path: that is the whole-index walk #165 took out of them.
+    std::vector<SegmentMeta> index() const;
+
+    /// Whether any segment of this symbol is indexed. What a query asks before it answers "not
+    /// found" - which used to copy the whole index to find out (#165).
+    bool holds(std::string_view symbol, std::string_view exchange) const;
 
     /// Merge new segments into the index, maintaining sort order by start_ts_ns.
     ///
@@ -229,6 +246,7 @@ public:
 private:
     std::string base_dir_;
     uint64_t    segment_duration_ns_;
+    OwnIndex    own_index_;
 
     // Active segment state
     uint64_t    wal_identity_{0};
@@ -263,10 +281,37 @@ private:
     /// append → flush boundary.
     std::vector<SegmentMeta> rolled_segments_;
 
-    // Segment index (rebuilt from meta.json on open_existing)
-    std::vector<SegmentMeta> index_;
+    /// One symbol's segments, sorted by `segment_order_less` (#165). The index was one vector of
+    /// every segment of every symbol, which every tick's merge compared each new segment against and
+    /// sorted whole under the engine's lock, and which every query copied whole before looking at
+    /// one symbol: measured on the m9g.xlarge, a merge of 16 new segments took 7.7 ms at 100 000
+    /// segments and a scan that found nothing 3.3 ms.
+    struct SymbolIndex {
+        std::vector<SegmentMeta> segments;
+        /// The widest `end - start` among them. A segment can overlap a query's [s, e] only if
+        /// its start is in [s - widest_ns, e], and the vector is sorted by start - so a scan
+        /// searches that window rather than every segment. Removals do not lower it: it is a bound,
+        /// and one a little too wide costs comparisons, never a segment.
+        uint64_t widest_ns{0};
+    };
+    static std::string index_key(std::string_view symbol, std::string_view exchange);
 
-    // Protects index_ for concurrent scan() (shared) vs merge_segments()/open_existing() (exclusive)
+    // The index (rebuilt from meta.json on open_existing). By symbol, keyed with a NUL between
+    // symbol and exchange rather than the dot the engine's other maps use, because a symbol can
+    // carry a dot: "A.B" on "C" and "A" on "B.C" are one key with a dot and two with a NUL.
+    std::unordered_map<std::string, SymbolIndex> by_symbol_;
+    std::unordered_set<std::string> indexed_dirs_;   // what the duplicate check asks, in O(1)
+    size_t indexed_count_{0};
+
+    /// Index one segment: false, and nothing changed, if its directory is already indexed.
+    /// Caller holds `index_mtx_` exclusively.
+    bool insert_locked(SegmentMeta meta);
+    /// Whether this directory is indexed, taking the lock. A scan asks it about a segment whose
+    /// files it could not open: retention may have taken it out between the scan's copy and its
+    /// read, and that is not the corruption a missing file otherwise is.
+    bool still_indexed(const std::string& dir) const;
+
+    // Protects the index for concurrent scan() (shared) vs merge_segments()/open_existing() (exclusive)
     mutable std::shared_mutex index_mtx_;
 
     // What the last rebuild read to repair ranges written before #166. Guarded by index_mtx_.
@@ -284,7 +329,7 @@ private:
     /// the device, and only then does a `rename()` publish each one, so a crash anywhere leaves
     /// every segment with the old file or the new one and never with half of either. Caller holds
     /// `index_mtx_` exclusively.
-    void repair_ranges_locked();
+    void repair_ranges_locked(std::vector<SegmentMeta>& found);
 
     /// Create a segment directory for this span that no other segment is using, and return it.
     ///

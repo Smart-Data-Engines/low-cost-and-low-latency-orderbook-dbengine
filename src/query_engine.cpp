@@ -808,13 +808,8 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
     bool found_in_live = (live_buf != nullptr);
     bool found_in_store = false;
     if (!found_in_live) {
-        auto idx_snapshot = store_.index();
-        for (const auto& seg : idx_snapshot) {
-            if (seg.symbol == ast.symbol && seg.exchange == ast.exchange) {
-                found_in_store = true;
-                break;
-            }
-        }
+        // A lookup, where it was a copy of every segment of every symbol searched for one (#165).
+        found_in_store = store_.holds(ast.symbol, ast.exchange);
     }
     if (!found_in_live && !found_in_store) {
         return "OB_ERR_NOT_FOUND: symbol '" + ast.symbol +

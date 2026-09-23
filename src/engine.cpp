@@ -2114,7 +2114,10 @@ ColumnarStore& Engine::get_or_create_store(const std::string& symbol,
     auto it = stores_.find(key);
     if (it != stores_.end()) return *it->second;
 
-    auto store = std::make_unique<ColumnarStore>(base_dir_);
+    // Its segments go to combined_store_, which every query reads and retention prunes, so this
+    // store keeps no index of its own (#165).
+    auto store = std::make_unique<ColumnarStore>(base_dir_, ColumnarStore::kDefaultSegmentDurationNs,
+                                                 ColumnarStore::OwnIndex::kNo);
     store->set_symbol_exchange(symbol, exchange);
     auto& ref = *store;
     if (mtx_held) {
