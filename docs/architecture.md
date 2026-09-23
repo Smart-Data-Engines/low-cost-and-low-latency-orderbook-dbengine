@@ -60,7 +60,10 @@ The engine is composed of six subsystems, each responsible for a specific concer
 ### Startup (open)
 
 1. Scan the columnar store directory and rebuild the segment index from `meta.json` files. This
-   happens **first**, because recovery needs to know what is already durable.
+   happens **first**, because recovery needs to know what is already durable. A segment written
+   before #166, whose recorded time range was not its rows', is given its rows' range here — read
+   once from its `ts.col`, corrected in the index always and on disk where it can be done safely —
+   and the same happens to segments a snapshot install brings in.
 2. Remove the segments no surviving `CHECKPOINT` vouches for, and leave their rows to the replay
    below (#160). A checkpoint is appended only after the segments it claims were synced, so a newer
    segment belongs to a flush whose checkpoint never made it - cut short by a crash, a sync that

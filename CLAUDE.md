@@ -1748,7 +1748,10 @@ Learned the hard way. Check here before debugging.
     than correctness; TTL retention works on whole segments by their newest event time, so a
     **backfill arrives with its age** and one row dated in the future keeps its segment alive. The
     first made the change possible, the third is what an operator meets at 3 a.m. and is now in
-    `docs/operations.md` (#105).
+    `docs/operations.md` (#105). **The second and third were false until #166**, which is the
+    lesson inside this one: they were checked against `SegmentMeta`'s comments ("earliest",
+    "latest"), and the function that fills the fields wrote the first row's hour and the last row.
+    Read what writes a field, not what declares it.
 
 209. **A capability list is a published vocabulary, so a name in it is a promise — and a promise
     nothing reads is the shape this workspace has paid for five times.** `capabilities:` uses names
@@ -3409,6 +3412,19 @@ Learned the hard way. Check here before debugging.
 424. **`pkill -f` with a pattern your own shell's command line contains kills that shell** — pitfall
      122 in its destructive form: exit 144, and the command meant to stop a hung probe took the
      session's shell with it. Stop a process by the PID it was started with.
+425. **When a fix changes what a field means, every reader of the old meaning needs its own
+     answer.** `end_ts_ns` had four readers: pruning and retention needed the newest row, and the
+     sort and the directory name did not care — but replay's fallback needed exactly the old
+     number, the last row's time, and given the newest it would have turned a record applied twice
+     into a record never applied. #166 kept that number as a field of its own
+     (`last_row_ts_ns`); the one test that says so passes before the fix and after it, and fails
+     only under the mutation that reads the newest row.
+426. **A repair of data already on disk has to be as crash-safe as the write that made it, and
+     cheap enough to run on all of it.** A corrected `meta.json` per old segment through
+     `write_file_atomically()` is an `fsync` of the file and of its directory per segment, for
+     every segment a node ever wrote. The same guarantee in batches: write each corrected file
+     beside the old one, one `syncfs()`, then `rename()` each over its original — and a failed
+     `syncfs()` publishes nothing of its batch (#166).
 
 ## Current state and open problems
 
@@ -3441,6 +3457,12 @@ below are the recent closures worth knowing because each changes what the engine
 carries no count, because the previous version of this sentence said "four" above a list of six and
 omitted the newest one entirely - which is the rot pitfall 312 is about, in the paragraph that
 warns about it.
+
+**#166**: a segment's time range is its rows' earliest and latest timestamp. It was the start of
+the first row's hour and the last row's time, so a row that reached a flush out of time order fell
+outside it: a `SELECT` answered `OK` without it, and `--ttl-hours` deleted a row a second old with a
+two-day-old one written after it. Segments written before the fix are repaired at the first start
+that finds them, crash-safely, and replay's fallback still compares with the last row's time.
 
 **#164**: the flush tick syncs the WAL, drains its rows and deletes without the engine's lock, and
 the file a rotation leaves is synced by the tick rather than by the writer that crossed the
