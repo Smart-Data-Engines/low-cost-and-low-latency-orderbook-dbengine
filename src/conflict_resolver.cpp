@@ -4,10 +4,10 @@
 // Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6
 
 #include "orderbook/conflict_resolver.hpp"
+#include "orderbook/wall_clock.hpp"
 #include "orderbook/logger.hpp"
 
 #include <algorithm>
-#include <chrono>
 
 namespace ob {
 
@@ -38,11 +38,9 @@ ConflictResolution ConflictResolver::resolve(const ConflictKey& key,
     const auto& local_state = it->second;
     const auto& local_hlc = local_state.hlc;
 
-    // Get wall-clock time for the conflict entry.
-    const auto now_ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
-            .count());
+    // Wall-clock time for the conflict entry - which this comment promised while the line under it
+    // read `steady_clock`, a count from this machine's boot (#163).
+    const uint64_t now_ns = wall_clock_ns();
 
     // Compare using HLC total order (physical_ns → logical → node_id).
     // But for tie-break we only compare physical_ns and logical first,

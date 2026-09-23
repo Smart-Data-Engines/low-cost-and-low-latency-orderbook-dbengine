@@ -650,7 +650,7 @@ void FailoverManager::monitor_tick() {
                 std::lock_guard<std::mutex> lk(mtx_);
                 confirmed = last_ownership_confirmed_;
             }
-            if (confirmed.time_since_epoch().count() != 0 &&
+            if (confirmed != std::chrono::steady_clock::time_point{} &&
                 std::chrono::steady_clock::now() - confirmed >= ttl) {
                 OB_LOG_WARN("failover",
                             "could not confirm the leader key names us for %lld s (TTL %lld s) "

@@ -46,7 +46,7 @@ struct AntiEntropyConfig {
 
 struct AntiEntropyResult {
     uint64_t run_id{0};
-    uint64_t timestamp_ns{0};
+    uint64_t timestamp_ns{0};    ///< when the run started: nanoseconds since the epoch (#163)
     size_t   peers_checked{0};
     size_t   gaps_detected{0};   ///< pairs where the two sides disagree, both directions
     size_t   we_lack{0};         ///< of those, the ones where this node is behind

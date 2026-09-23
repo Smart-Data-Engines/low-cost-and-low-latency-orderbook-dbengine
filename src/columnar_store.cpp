@@ -773,11 +773,14 @@ std::pair<size_t, size_t> ColumnarStore::delete_expired_segments(uint64_t cutoff
             ++segments_deleted;
             bytes_reclaimed += dir_bytes;
 
-            // Log successful deletion: path, age (cutoff - end_ts), size
-            uint64_t age_ns = (cutoff_ns > meta.end_ts_ns) ? (cutoff_ns - meta.end_ts_ns) : 0;
-            double age_hours = static_cast<double>(age_ns) / 3.6e12;
-            OB_LOG_INFO("retention", "deleted segment %s age=%.1fh size=%zu bytes",
-                meta.dir_path.c_str(), age_hours, dir_bytes);
+            // How far past the cutoff the segment's newest row is - which this line used to call
+            // the segment's age. It is not: a segment 25 hours old under a 24-hour retention is an
+            // hour past it. And while the cutoff was a count from boot (#163) it said
+            // `age=4626822.4h` of a segment written a second before.
+            const uint64_t past_ns = (cutoff_ns > meta.end_ts_ns) ? (cutoff_ns - meta.end_ts_ns) : 0;
+            OB_LOG_INFO("retention",
+                        "deleted segment %s: its newest row is %.1f h past the retention, %zu bytes",
+                        meta.dir_path.c_str(), static_cast<double>(past_ns) / 3.6e12, dir_bytes);
         } else {
             remaining.push_back(std::move(meta));
         }

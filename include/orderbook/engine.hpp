@@ -19,6 +19,7 @@
 
 #include <optional>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -37,6 +38,27 @@ struct TTLConfig {
     uint64_t ttl_hours{0};                  // 0 = disabled
     uint64_t scan_interval_seconds{300};    // default 5 minutes
 };
+
+/// The event time before which a segment has expired under a retention of `ttl_hours`: a segment
+/// whose newest row is older than this goes. 0 - nothing has expired - when the retention is 0,
+/// which is the flag's "keep everything", or when it reaches back past the epoch (#163).
+///
+/// `wall_now_ns` is **the wall clock**, `wall_clock_ns()`, because a segment's times are event
+/// times - nanoseconds since the Unix epoch, whether the server stamped a row on arrival or the
+/// client gave its time (#105) - and a cutoff is a comparison with them only on the same clock. The
+/// sweep used to read `steady_clock`, which counts from boot. On a machine up for less than the
+/// retention the subtraction wrapped, the cutoff came out past every timestamp and the first sweep
+/// deleted every segment: measured, a restart with `--ttl-hours 24` on a machine up 21.5 hours
+/// took 200 rows and both their segment directories to none. On a machine up for longer the cutoff
+/// was a few hours into 1970, so nothing ever expired.
+///
+/// Saturating, and without a product that can overflow: `ttl_hours` comes from a flag that takes
+/// any `uint64_t`, and a retention of a million years is a request with an answer, not a wrap.
+constexpr uint64_t ttl_cutoff_ns(uint64_t wall_now_ns, uint64_t ttl_hours) {
+    constexpr uint64_t kNsPerHour = 3600ULL * 1'000'000'000ULL;
+    if (ttl_hours == 0 || ttl_hours > wall_now_ns / kNsPerHour) return 0;
+    return wall_now_ns - ttl_hours * kNsPerHour;
+}
 
 /// One write for `Engine::apply_deltas()`: the update and its levels, both the caller's, which must
 /// outlive the call. Pointers, not a copy of the update: the engine copies it once, into the batch
@@ -515,7 +537,13 @@ private:
     // the duplicate was caught by the index check rather than prevented by
     // flush_mtx_. Worth alerting on, and it is what the concurrency test asserts.
     std::atomic<uint64_t> segment_merge_refused_{0};
-    uint64_t last_ttl_scan_ns_{0};
+    /// When the last TTL sweep ran, for the sweep's **cadence** - on the monotonic clock, because
+    /// "every five minutes" must not stretch or shrink when the wall clock is stepped. The sweep's
+    /// **cutoff** is on the wall clock, because it is compared with event times (`ttl_cutoff_ns()`).
+    /// Two clocks for two questions, and a `time_point` here rather than a count of nanoseconds, so
+    /// the one cannot be compared with the other: a count from this clock read as a time is #163.
+    /// Default-constructed until the first sweep, which runs at the first tick.
+    std::chrono::steady_clock::time_point last_ttl_scan_{};
 
     // Sharding: symbols that have been migrated away from this shard
     std::unordered_set<std::string> migrated_symbols_;
