@@ -541,11 +541,12 @@ TEST(WriteBatchStatic, TheWritesOfABatchTakeTheLockOnceAndReachTheWalInOneCall) 
     }
 }
 
-TEST(FlushTickStatic, TheTicksSyncRunsWithoutTheEnginesLock) {
-    // Stage 5 of #151. The behavioural test is in test_storage_faults.py - a writer timed while the
-    // tick's sync is made to last three seconds - and it needs the injector, which this suite does
-    // not load. A sync moved back under the lock leaves every other test green, because the state
-    // it produces is the same; so the shape is asserted here as well, where no node has to start.
+TEST(FlushTickStatic, TheTicksSyncAndDrainRunWithoutTheEnginesLock) {
+    // Stage 5 of #151. The behavioural tests are in test_storage_faults.py - a writer timed while
+    // the tick's sync, or a segment write inside its drain, is made to last seconds - and they need
+    // the injector, which this suite does not load. A sync or a drain moved back under the lock
+    // leaves every other test green, because the state it produces is the same; so the shape is
+    // asserted here as well, where no node has to start.
     const std::string src = read_source("src/engine.cpp");
     ASSERT_FALSE(src.empty()) << "cannot read src/engine.cpp, so this test checks nothing";
     const std::string tick = definition_body(src, "void Engine::flush_tick(");
@@ -557,9 +558,13 @@ TEST(FlushTickStatic, TheTicksSyncRunsWithoutTheEnginesLock) {
     EXPECT_FALSE(inside_a_lock_of(tick, perform, lock))
         << "the flush tick syncs the WAL with the engine's lock held, so every writer waits for "
            "the fsync (7.9 ms at p50 and 25.8 at worst, measured)";
+    const std::size_t drain = tick.find("drain_batch(batch, ticket.position(), /*mtx_held=*/false)");
+    ASSERT_NE(drain, std::string::npos) << "the tick does not drain its batch without the lock";
+    EXPECT_FALSE(inside_a_lock_of(tick, drain, lock))
+        << "the flush tick drains with the engine's lock held, so every writer waits for ~640k rows "
+           "to reach their stores (11 ms at p99.9 with only the sync outside, measured)";
 
-    for (const char* step : {"wal_.prepare_sync(", "wal_.complete_sync(", "drain_rows(",
-                             "syncing_rows_.swap(pending_rows_)"}) {
+    for (const char* step : {"wal_.prepare_sync(", "wal_.complete_sync(", "pending_rows_.take_all()"}) {
         const std::size_t at = tick.find(step);
         ASSERT_NE(at, std::string::npos) << step;
         EXPECT_TRUE(inside_a_lock_of(tick, at, lock))
