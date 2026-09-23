@@ -135,7 +135,7 @@ Reading read_v1(const SystemView& view, const std::string& dir) {
         const std::optional<double> period = period_file.status == FileRead::Status::Read
                                                  ? number(period_file.text)
                                                  : std::optional<double>{};
-        if (!period || *period <= 0 || *quota == 0) return r;
+        if (!period || *period <= 0 || *quota <= 0) return r;   // -1 was handled above
         r.level = Level::Limit;
         r.cpus  = *quota / *period;
         return r;
@@ -145,13 +145,14 @@ Reading read_v1(const SystemView& view, const std::string& dir) {
 }
 
 std::string format_cpus(double cpus) {
+    // Two places, and a whole number of CPUs without them. Decided on the printed text rather than
+    // by comparing the value with its floor, because an exact comparison of doubles is a question
+    // about representation - and the text is the thing the reason carries.
     char buf[32];
-    if (cpus == std::floor(cpus)) {
-        std::snprintf(buf, sizeof(buf), "%.0f", cpus);
-    } else {
-        std::snprintf(buf, sizeof(buf), "%.2f", cpus);
-    }
-    return buf;
+    std::snprintf(buf, sizeof(buf), "%.2f", cpus);
+    std::string text(buf);
+    if (text.size() > 3 && text.compare(text.size() - 3, 3, ".00") == 0) text.resize(text.size() - 3);
+    return text;
 }
 
 } // namespace
