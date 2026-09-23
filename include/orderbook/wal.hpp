@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "orderbook/data_model.hpp"
 #include "orderbook/epoch.hpp"
@@ -403,6 +404,12 @@ public:
     /// `fsync` covers every byte written before the ticket was taken even if the writer rotates to a
     /// new file in the meantime - and it is the ticket's own, so the rotation closing the writer's
     /// descriptor cannot close it from under the sync, nor hand its number to another file (#128).
+    ///
+    /// It also carries the files a rotation has left since the last ticket, still to be synced and
+    /// closed. Rotation used to do that itself, on the thread of the writer that crossed the
+    /// threshold and under the engine's lock: under `--fsync-policy none` nothing else syncs the WAL,
+    /// so that was up to 512 MB at once - measured 295 and 323 ms, and a pipelining writer's worst
+    /// batch was exactly that `fsync`.
     class SyncTicket {
     public:
         SyncTicket() = default;
@@ -413,16 +420,22 @@ public:
         ~SyncTicket();
 
         /// Whether `perform_sync()` has anything to do.
-        bool owed() const { return fd_ >= 0; }
+        bool owed() const { return fd_ >= 0 || !leaving_.empty(); }
         /// Where the log was when the ticket was taken: everything before it is what the sync
         /// covers, and the position a flush stamps into the segments it closes from those rows.
         WalPosition position() const { return position_; }
 
     private:
         friend class WALWriter;
-        int         fd_{-1};
-        size_t      records_{0};
-        WalPosition position_{};
+        /// Syncs and closes whatever the ticket still holds. Only a ticket dropped before it was
+        /// performed has anything left; a rotated file closed unsynced would be one nobody syncs.
+        void settle() noexcept;
+
+        WALWriter*       owner_{nullptr};
+        int              fd_{-1};
+        std::vector<int> leaving_;
+        size_t           records_{0};
+        WalPosition      position_{};
     };
 
     /// Under the writer's lock: what a sync now would cover. Not `owed()` when nothing is - the
@@ -434,9 +447,10 @@ public:
     /// to drain rows whose records were never synced. Its result is in the second member.
     [[nodiscard]] std::pair<SyncTicket, int> prepare_sync();
 
-    /// Without the writer's lock: `fsync` the ticket's descriptor and close it. 0, or the `errno`
-    /// it failed with - counted in `fsync_failures()` and logged, as every sync here is. Touches
-    /// nothing of the writer's but that atomic counter, which is what makes it callable unlocked.
+    /// Without the writer's lock: `fsync` and close the files the ticket carries - the ones a
+    /// rotation left, then its descriptor of the current one. 0, or the first `errno` a sync failed
+    /// with - each counted in `fsync_failures()` and logged, as every sync here is. Touches nothing
+    /// of the writer's but that atomic counter, which is what makes it callable unlocked.
     [[nodiscard]] int perform_sync(SyncTicket& ticket);
 
     /// Under the writer's lock again: on success the records the ticket covered are no longer owed a
@@ -581,6 +595,19 @@ private:
     /// The same for any descriptor: what `fsync_or_record()` and `perform_sync()` share, so a failure
     /// is counted and said in one way whichever descriptor it came through.
     int fsync_fd_or_record(int fd, const char* why);
+
+    /// Sync and close every file a rotation left; 0 or the first `errno` a sync failed with. Called
+    /// wherever the writer promises the log is synced up to now under its lock - `flush()`, the
+    /// destructor, and the fallback when a ticket cannot be made - because a promise that skipped
+    /// the file just left would skip exactly the records written last before the rotation.
+    int sync_and_close_leaving(const char* why);
+
+    /// Files a rotation has left and nobody has synced yet, for the next `prepare_sync()` to hand
+    /// to the flush tick (stage 5 of #151). Bounded: past `kMaxLeavingFiles` the writer syncs the
+    /// oldest itself, as rotation always did - a node whose ticks are minutes apart would otherwise
+    /// hold one open descriptor, and up to 512 MB of unsynced log, per rotation in between.
+    std::vector<int> leaving_fds_;
+    static constexpr size_t kMaxLeavingFiles = 4;
 
     size_t      pending_sync_{0};
 
