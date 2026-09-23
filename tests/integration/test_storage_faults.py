@@ -21,6 +21,7 @@ import socket
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 
 import pytest
@@ -680,21 +681,23 @@ ROTATE_BYTES = "65573"
 ROTATING_INSERT = -(-int(ROTATE_BYTES) // int(DELTA_BYTES))
 
 
-def test_a_failed_sync_while_rotating_costs_no_acknowledged_write():
-    """#153: the sync of a rotation fails under `--fsync-policy every`, and nothing is lost.
+def test_a_failed_sync_of_a_file_the_wal_rotated_away_from_costs_no_acknowledged_write():
+    """#153, where stage 5 of #151 moved the sync it was about: the file a rotation leaves.
 
     Replay and catch-up both stop reading a file at its ROTATE record. The marker used to be written
     through the path that syncs under `every`, and a failed sync threw **before** the writer moved
     to the next file - so the next record went into the same file, behind the marker. Measured
-    before the fix, failing exactly that sync: the insert that crossed the threshold was answered
+    before #153's fix, failing exactly that sync: the insert that crossed the threshold was answered
     `ERR` although its record was on the disk, and **the one after it was answered `OK` and was gone
     after a restart** - 487 acknowledged, 487 back, and the one missing was acknowledged.
 
-    Which sync fails is arithmetic, and the test proves the arithmetic rather than trusting it:
-    under `every` each insert syncs the file once, so syncs 0..481 are the first 482 inserts and 482
-    is the rotating insert's own, and the next one is the rotation's. Had the injection hit a
-    client's own sync instead, that client would have been answered `ERR` (#113) - so "one fault
-    fired and every insert was answered `OK`" is what says it was the rotation's.
+    Since stage 5 the rotation syncs nothing: the file it leaves is synced later, by the flush tick
+    without the engine's lock, or by a `FLUSH` - which is what makes the failure deterministic here,
+    with the tick an hour away. Under `every` each insert syncs the file once, so syncs 0..482 are
+    the 483 inserts that fill `wal_000000.bin`, and **no** sync of it follows the rotation until
+    the `FLUSH`: the injector has fired zero times when the inserts are done, which is the premise
+    that the rotation no longer syncs. The `FLUSH`'s sync of the left file fails and it says so; no
+    insert was answered anything but `OK`; and after a restart every acknowledged write is back.
     """
     node = FaultNode(OB_FAULT_PATH=WAL_SEGMENT, OB_FAULT_OP="fsync", OB_FAULT_ERRNO="EIO",
                      OB_FAULT_SKIP=str(ROTATING_INSERT), OB_FAULT_COUNT="1",
@@ -703,13 +706,17 @@ def test_a_failed_sync_while_rotating_costs_no_acknowledged_write():
         node.wait_until_answering()
         prices = [1000 + i for i in range(1, ROTATING_INSERT + 6)]
         replies = node.insert_each(prices)
-        assert node.injections() == 1, f"no sync was made to fail:\n{node.fault_log_text()}"
         refused = {p: r for p, r in replies.items() if r != "OK"}
-        assert not refused, (
-            f"a failed sync of the rotation was reported as the failure of a client's write, "
-            f"whose own record was written and synced: {refused}")
+        assert not refused, f"an insert around the rotation was refused: {refused}"
         assert node.wal_files() == ["wal_000000.bin", "wal_000001.bin"], (
             f"the writer did not move to the next file; WAL files are {node.wal_files()}")
+        assert node.injections() == 0, (
+            "a sync of the left file ran before anything asked for one - the rotation syncs it "
+            f"itself again, under the engine's lock:\n{node.fault_log_text()}")
+
+        assert node.talk("FLUSH")[0].startswith("ERR"), (
+            "the FLUSH whose sync of the file the WAL rotated away from failed answered OK")
+        assert node.injections() == 1, f"no sync was made to fail:\n{node.fault_log_text()}"
 
         node.kill_and_restart_without_faults()
         back = set(prices_in(node.talk(SELECT_ALL)[0]))
@@ -1383,5 +1390,142 @@ def test_retention_moves_under_every_while_writes_flow():
             f"retention to delete: {files}")
         assert WAL_SEGMENT not in files, (
             f"retention kept every WAL file while writes flowed under `every`: {files}")
+    finally:
+        node.cleanup()
+
+
+def test_a_writer_does_not_wait_for_a_segment_the_ticks_drain_writes():
+    """Stage 5 of #151: the flush tick drains its rows without the engine's lock.
+
+    The drain appends each row to its store, and a row whose event time crosses its segment's hour
+    rolls the segment over - which **writes** it, from inside the drain. With the drain under the
+    lock, every writer waited for that write, and with only the tick's sync taken out of the lock
+    the drain was what was left: 11 ms at p99.9 on the m9g.xlarge. Here row 100 is in hour 1 and
+    row 200 in hour 2, both queued before the first tick, so that tick's drain rolls hour 1 over and
+    the injector makes that write - the first `price.col` this node writes - last three seconds.
+    Ten writes timed inside it must not wait for it; and after it, every row is there once.
+    """
+    stall_ms = 3000
+    node = FaultNode(OB_FAULT_PATH="price.col", OB_FAULT_OP="write",
+                     OB_FAULT_DELAY_MS=str(stall_ms), OB_FAULT_COUNT="1",
+                     OB_FAULT_POLICY="interval", OB_FAULT_FLUSH_MS="3000",
+                     OB_FAULT_EXTRA_ARGS="--log-level DEBUG")
+    base = 1_700_000_000 * 1_000_000_000 // HOUR_NS * HOUR_NS
+    try:
+        node.wait_until_answering()
+        assert insert_at(node, "ROLL", 100, base + 1) == "OK"
+        assert insert_at(node, "ROLL", 200, base + HOUR_NS + 1) == "OK"
+        deadline = time.time() + patience(15)
+        while "action=delay" not in node.fault_log_text() and time.time() < deadline:
+            time.sleep(0.02)
+        assert "action=delay" in node.fault_log_text(), node.fault_log_text()
+        # The premise: the slow write is the drain's rollover rather than a segment the tick writes
+        # after it, which never held the lock. Nothing was flushed before this tick, so the first
+        # `price.col` is the one that rolled over.
+        assert "Segment rolled over" in node.log(), (
+            "the first segment write was not a rollover inside the drain, so this measured nothing")
+
+        started = time.monotonic()
+        replies = node.insert_each(range(101, 111))
+        took = time.monotonic() - started
+        custom_metrics["ten_writes_during_a_3s_drain_rollover_s"] = round(took, 3)
+        assert all(r == "OK" for r in replies.values()), replies
+        assert took < stall_ms / 1000 / 3, (
+            f"ten writes took {took:.2f} s while a segment the flush tick's drain rolled over took "
+            f"{stall_ms} ms to write - they waited for it, so the tick drains under the engine's lock")
+
+        time.sleep(stall_ms / 1000 + 0.5)
+        assert node.talk("FLUSH")[0] == "OK"
+        assert sorted(prices_of(node, "ROLL")) == [100, 200]
+        assert sorted(prices_of(node, "SYM")) == list(range(101, 111))
+    finally:
+        node.cleanup()
+
+
+def test_rows_written_during_a_ticks_drain_survive_a_crash_after_it():
+    """The drain without the lock, through a crash (stage 5 of #151).
+
+    Rows keep arriving while a tick drains now, and they are queued for the next tick rather than
+    drained into this one's segments - which carry the position of the tick's sync, before those
+    rows' records. Rows 100 and 200 are drained by a tick whose rollover write is made to last two
+    seconds, rows 101-103 are written during it, the node is killed after that tick has made its
+    segments readable and before the next one runs, and after a restart all five are back, each once.
+    """
+    node = FaultNode(OB_FAULT_PATH="price.col", OB_FAULT_OP="write", OB_FAULT_DELAY_MS="2000",
+                     OB_FAULT_COUNT="1", OB_FAULT_POLICY="interval", OB_FAULT_FLUSH_MS="4000")
+    base = 1_700_000_000 * 1_000_000_000 // HOUR_NS * HOUR_NS
+    try:
+        node.wait_until_answering()
+        assert insert_at(node, "ROLL", 100, base + 1) == "OK"
+        assert insert_at(node, "ROLL", 200, base + HOUR_NS + 1) == "OK"
+        deadline = time.time() + patience(15)
+        while "action=delay" not in node.fault_log_text() and time.time() < deadline:
+            time.sleep(0.02)
+        assert "action=delay" in node.fault_log_text(), node.fault_log_text()
+        replies = node.insert_each([101, 102, 103])
+        assert all(r == "OK" for r in replies.values()), replies
+
+        # The slow tick merges ROLL's segments when its write ends; SYM's rows wait for the next.
+        deadline = time.time() + patience(10)
+        while sorted(prices_of(node, "ROLL")) != [100, 200] and time.time() < deadline:
+            time.sleep(0.05)
+        assert sorted(prices_of(node, "ROLL")) == [100, 200], node.log()[-1500:]
+        assert prices_of(node, "SYM") == [], (
+            "the rows written during the drain were drained by it - they have to wait for the next "
+            "tick, whose sync is the one that covers their records")
+
+        node.kill_and_restart_without_faults()
+        assert sorted(prices_of(node, "ROLL")) == [100, 200]
+        assert sorted(prices_of(node, "SYM")) == [101, 102, 103], (
+            "a row written while the tick drained was lost or doubled by the replay after a crash")
+    finally:
+        node.cleanup()
+
+
+def test_a_writer_does_not_wait_for_the_sync_of_a_file_a_rotation_left():
+    """Stage 5 of #151: a file the WAL rotated away from is synced by the flush tick, unlocked.
+
+    `open_current()` synced the file it was leaving before closing it - on the thread of the writer
+    whose record crossed the threshold, under the engine's lock. Under `--fsync-policy none` nothing
+    else syncs the WAL, so that was the whole file at once: 295 and 323 ms measured on the
+    m9g.xlarge at 512 MB, and a pipelining writer's worst batch was exactly that `fsync`. Here the
+    threshold is the smallest the flag takes, and the first `fsync` of `wal_000000.bin` - under
+    `none` the one that settles it after the rotation, since nothing else syncs that file - is made
+    to last three seconds. A second session fills the file; ten writes on this one are timed inside
+    the stall.
+    """
+    stall_ms = 3000
+    node = FaultNode(OB_FAULT_PATH=WAL_SEGMENT, OB_FAULT_OP="fsync",
+                     OB_FAULT_DELAY_MS=str(stall_ms), OB_FAULT_COUNT="1",
+                     OB_FAULT_POLICY="none", OB_FAULT_FLUSH_MS="200",
+                     OB_FAULT_ROTATE_BYTES=ROTATE_BYTES)
+    try:
+        node.wait_until_answering()
+        filled: dict[int, str] = {}
+        filler = threading.Thread(
+            target=lambda: filled.update(node.insert_each(range(1, ROTATING_INSERT + 2))))
+        filler.start()
+        deadline = time.time() + patience(20)
+        while "action=delay" not in node.fault_log_text() and time.time() < deadline:
+            time.sleep(0.02)
+        assert "action=delay" in node.fault_log_text(), (
+            "nothing synced the first WAL file, so nothing was measured:\n" + node.fault_log_text())
+
+        started = time.monotonic()
+        replies = node.insert_each(range(9001, 9011))
+        took = time.monotonic() - started
+        filler.join(timeout=patience(30))
+        custom_metrics["ten_writes_during_a_3s_rotation_sync_s"] = round(took, 3)
+        assert all(r == "OK" for r in replies.values()), replies
+        assert all(r == "OK" for r in filled.values()) and len(filled) == ROTATING_INSERT + 1, filled
+        assert took < stall_ms / 1000 / 3, (
+            f"ten writes took {took:.2f} s while the sync of a file the WAL rotated away from took "
+            f"{stall_ms} ms - they waited for it, so it runs under the engine's lock")
+        assert node.wal_files() == ["wal_000000.bin", "wal_000001.bin"], node.wal_files()
+
+        time.sleep(stall_ms / 1000 + 0.5)
+        assert node.talk("FLUSH")[0] == "OK"
+        back = set(prices_in(node.talk(SELECT_ALL)[0]))
+        assert back >= set(range(1, ROTATING_INSERT + 2)) | set(range(9001, 9011))
     finally:
         node.cleanup()
