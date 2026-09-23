@@ -1250,18 +1250,22 @@ TEST(BoundedDrain, TheLoopDoesNotDecideForItself) {
 // clock gate, and a test whose threshold is a duration fails on legitimate variation and teaches
 // its reader to re-run it.
 
-TEST(IoWait, ZeroSpinAlwaysBlocksAndThatIsTheDefault) {
+TEST(IoWait, ZeroSpinAlwaysBlocks) {
     const auto now = std::chrono::steady_clock::now();
-    // The shipped default, and byte for byte the behaviour before the mode existed: elapsed time
-    // cannot matter, because there is no window to be inside.
+    // eco's value, and byte for byte the behaviour before the mode existed: elapsed time cannot
+    // matter, because there is no window to be inside.
     EXPECT_EQ(ob::io_wait_ms(now, 0, 100, now), 100);
     EXPECT_EQ(ob::io_wait_ms(now, 0, 100, now + std::chrono::hours(1)), 100);
     EXPECT_EQ(ob::io_wait_ms(now, 0, 100, now - std::chrono::hours(1)), 100);
 
+    // The struct's defaults are eco's, because a struct cannot know the machine: a ServerConfig
+    // built in code is the engine as it was. The command line starts from `kDefaultProfile`
+    // (boost) instead - pinned in test_cli_config.cpp, where the resolution is.
     EXPECT_EQ(ob::ServerConfig{}.io_spin_us, 0u)
-        << "spinning costs up to a core, so it has to be asked for";
+        << "spinning costs up to a core, so a struct built in code must not do it";
     EXPECT_EQ(ob::ServerConfig{}.profile, "eco")
-        << "the default profile is the one that changes nothing";
+        << "the struct's profile names its own values";
+    EXPECT_STREQ(ob::kDefaultProfile, "boost");
 }
 
 TEST(IoWait, InsideTheWindowThePollDoesNotBlock) {

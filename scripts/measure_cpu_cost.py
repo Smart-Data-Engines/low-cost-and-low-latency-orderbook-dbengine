@@ -4,8 +4,8 @@
 Wall clock says who finishes first. CPU time says what it cost, and this engine's name contains a
 claim about cost. The distinction is not academic on a small box: the engine runs a fixed set of
 threads with fixed roles - `grep -rn 'hardware_concurrency\\|_SC_NPROCESSORS' src include` returned
-nothing when this was written, and what #156 reads is not used to size anything before stage 4 of
-#151 - while ClickHouse sizes itself to the cores it can see and `timescaledb-tune` sizes
+nothing when this was written; since #158 the default sizes the client event loops to the CPUs #156
+reads, and the flush, replication and mesh threads keep their fixed roles - while ClickHouse sizes itself to the cores it can see and `timescaledb-tune` sizes
 PostgreSQL to the machine. A wall-clock comparison there conflates "faster per core" with "uses
 more cores".
 

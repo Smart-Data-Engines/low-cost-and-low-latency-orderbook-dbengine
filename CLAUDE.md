@@ -3262,6 +3262,24 @@ Learned the hard way. Check here before debugging.
      `src/machine.cpp`, and none of the three would have noticed, because nobody re-runs a search
      whose answer they have already published (#156). Say when it was true, and when you add the
      thing a published search looked for, search the tree for the search.
+397. **A thread's name is not the program's.** The rule measurement checked that the PID behind
+     `taskset` and `systemd-run` was the server by reading `/proc/PID/comm` - the main thread's name -
+     and the server's main thread runs the first client loop and calls itself `ob-io-0`, so the check
+     refused the server as a wrapper (#158). `/proc/PID/exe` is the program.
+398. **A log read from its tail cannot see what a process said first.** The new profile tests looked
+     for the `machine:` and `io profile` lines through the module's `tail()`, the last 2000
+     characters, and a node's startup is 3.5 KB: the lines that decide everything after them are the
+     ones a tail misses (#158).
+399. **A spin window's cost is the window.** With more busy threads than cores, a loop that is
+     spinning keeps the core its client needs until the window closes, so the client's p99 grows by
+     the window - 16.4 µs at 10, 24.2 at 20, 53.9 at 50 (#158). #144 chose 50 as a judgement about
+     the gaps between requests; the gain was complete at 10 on the machine we publish from, and the
+     other 40 were tail.
+400. **An apostrophe in a comment ends a single-quoted `ssh` argument.** A script sent as
+     `ssh host '... cat > f <<"EOF" ... the server's own ... EOF'` closed its own quoting at
+     `server's`, and the rest ran in the local shell, stopping at a `cd … || exit 2` that was all
+     that stood between it and a benchmark run on the wrong machine. Write the script locally and
+     `scp` it.
 
 ## Current state and open problems
 
@@ -3311,6 +3329,15 @@ that does not flatter is the control.
 accepted. 1,196,745 → 2,209,501 levels/s at four million levels and a one-second interval,
 unchanged at the 100 ms default the engine ships with.
 
+**#158**: `boost` is the command line's default - one client event loop per usable CPU, and a
+10 µs spin window where the process may run on two CPUs or more and a cgroup limit leaves a CPU of
+time beyond the loops. Measured with the binary (m9g.xlarge, four cores, 12 connections): reads
+15.9 → **49.7 million levels a second**, writes 6.1 → **10.5 million**, `PING` 7.77 → 6.33 µs, and a
+`PING` beside three pipelining writers 503 → **6.2 µs** p50, because it has a loop of its own. The
+window is 10 µs rather than #144's 50 because under oversubscription the tail **is** the window
+(p99 16.4 µs at 10, 53.9 at 50), and on one CPU the spin doubled a sharing client's p99, so boost
+does not spin there. `eco` is the engine as it was; `ServerConfig{}` stays eco's values.
+
 **#156**: the node works out how many CPUs it can use — the affinity mask and the tightest cgroup
 CPU limit on the way from its cgroup to the root, rounded down — and says so at startup and in
 `--print-config` (`machine: 1 usable CPU: affinity 4, cgroup v2 limit 1.50 CPUs (…)`). A cgroup file
@@ -3335,7 +3362,7 @@ looping a 134 ms scan went from 65 424 levels a second with a p99 of 136 ms to 4
 241 µs. **Pipelined writes did not scale, and cost about 10% with a tripled p99**, because the
 engine took `mtx_` once per record and held it through the WAL's `write()`: 1 128 futex calls at
 one loop, 1 485 158 at four, every one of them in `apply_delta_impl` - which is what #155 fixed.
-The default stays 1 until the stage that sizes the loops to the machine. Two things it fixed on the way
+The default was 1 until stage 4 (#158) made it the profile's - one per usable CPU. Two things it fixed on the way
 are their own items: #150 (a TLS handshake that could not start closed its descriptor twice) and
 #152 (an answer above 64 MB closed the connection of a client that was reading).
 
@@ -3407,7 +3434,9 @@ resolves to the default `--io-spin-us 0`, and `--print-config` attributes a valu
 to the profile, because a mode whose effect cannot be read is a mode on somebody's word.
 **One claim from the gate measurement is withdrawn**: that run reported the minimum unchanged and
 this one does not — `eco`'s is 6327-7689 ns against `boost`'s 5955-6076. It does not reproduce with
-this probe and the roadmap says so rather than swapping the sentence.
+this probe and the roadmap says so rather than swapping the sentence. **Since #158** `boost` is the
+default and its window is 10 µs, not the 50 these figures were measured with: the same gain, without
+the 50 µs tail a spinning loop costs a client when the cores are oversubscribed.
 
 **#143**: one session's unparsed input is bounded. A client that sent bytes and never sent a
 newline took the server's resident memory to **257 MiB**, needing no authentication, and

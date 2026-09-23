@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <fstream>
 #include <regex>
 #include <set>
@@ -268,7 +269,10 @@ TEST(MachineInConfig, PrintConfigSaysWhatWasFound) {
 
 TEST(IoProfile, BoostSetsTheSpinAndSaysItWasTheProfile) {
     const auto resolved = resolve({"--profile", "boost"});
-    EXPECT_EQ(resolved.config.io_spin_us, ob::kBoostSpinUs);
+    // What the rule gives on this machine: the window where the process has a CPU to spare, zero
+    // on a single CPU - so the test holds on a one-CPU runner and says which of the two it met.
+    const ob::BoostChoice choice = ob::choose_boost(resolved.machine);
+    EXPECT_EQ(resolved.config.io_spin_us, choice.io_spin_us) << choice.reason;
     ASSERT_EQ(resolved.origin.count("io-spin-us"), 1u)
         << "a value the profile chose reported as a default is what --print-config exists not to do";
     EXPECT_EQ(resolved.origin.at("io-spin-us"), ob::Origin::Profile);
@@ -279,11 +283,12 @@ TEST(IoProfile, BoostSetsTheSpinAndSaysItWasTheProfile) {
     const std::size_t at = printed.find("io-spin-us");
     ASSERT_NE(at, std::string::npos) << printed;
     const std::string rendered = printed.substr(at, printed.find('\n', at) - at);
-    // The value derived from the constant, not the literal 50. A mutation retuning `kBoostSpinUs`
-    // to 200 us - inside the window the unit tests state as legitimate, and therefore the control
-    // that has to **survive** - killed the first version of this line, which is pitfall 324's
-    // mistake committed in the test written to honour it.
-    EXPECT_NE(rendered.find(std::to_string(ob::kBoostSpinUs)), std::string::npos) << rendered;
+    // The value derived from the rule, not a literal. A mutation retuning `kBoostSpinUs` to 200 us
+    // - inside the window the unit tests state as legitimate, and therefore the control that has
+    // to **survive** - killed the first version of this line, which is pitfall 324's mistake
+    // committed in the test written to honour it.
+    EXPECT_NE(rendered.find(" " + std::to_string(choice.io_spin_us) + " "), std::string::npos)
+        << rendered;
     EXPECT_NE(rendered.find("(profile)"), std::string::npos) << rendered;
 }
 
@@ -299,17 +304,134 @@ TEST(IoProfile, AValueTheOperatorGaveWinsOverTheProfile) {
     EXPECT_EQ(reversed.origin.at("io-spin-us"), ob::Origin::CommandLine);
 }
 
-TEST(IoProfile, EcoIsTheDefaultAndChangesNothing) {
-    // The control: without it, a profile block that set the spin unconditionally would pass every
-    // test above.
+TEST(IoProfile, EcoChangesNothing) {
+    // The control: without it, a profile block that set the knobs unconditionally would pass every
+    // test above. eco is the engine as it was before either knob, so it sets neither, and the
+    // values are the struct's own.
     const auto named = resolve({"--profile", "eco"});
     EXPECT_EQ(named.config.io_spin_us, 0u);
+    EXPECT_EQ(named.config.io_threads, 1u);
     EXPECT_EQ(named.origin.count("io-spin-us"), 0u)
-        << "eco set a value, so it is not the default behaviour under another name";
+        << "eco set a value, so it is not the old engine under another name";
+    EXPECT_EQ(named.origin.count("io-threads"), 0u)
+        << "eco set a value, so it is not the old engine under another name";
+    EXPECT_EQ(named.config.io_spin_us, ob::ServerConfig{}.io_spin_us);
+    EXPECT_EQ(named.config.io_threads, ob::ServerConfig{}.io_threads);
+}
 
+TEST(IoProfile, BoostIsTheCommandLinesDefault) {
+    // Stage 4 of #151. A server started with no profile is sized to the machine it runs on, and
+    // --print-config says the profile is the default and the two numbers are the profile's.
     const auto silent = resolve({});
-    EXPECT_EQ(silent.config.profile, "eco");
-    EXPECT_EQ(silent.config.io_spin_us, 0u);
+    EXPECT_EQ(silent.config.profile, "boost");
+    EXPECT_EQ(silent.origin.count("profile"), 0u) << "boost is the default, not something set";
+    const ob::BoostChoice choice = ob::choose_boost(silent.machine);
+    EXPECT_EQ(silent.config.io_threads, choice.io_threads);
+    EXPECT_EQ(silent.config.io_spin_us, choice.io_spin_us);
+    ASSERT_EQ(silent.origin.count("io-threads"), 1u);
+    ASSERT_EQ(silent.origin.count("io-spin-us"), 1u);
+    EXPECT_EQ(silent.origin.at("io-threads"), ob::Origin::Profile);
+    EXPECT_EQ(silent.origin.at("io-spin-us"), ob::Origin::Profile);
+}
+
+TEST(IoProfile, PrintConfigSaysWhatTheProfileChoseAndWhy) {
+    // The two numbers a profile sets are never printed without the sentence that says why they
+    // are what they are, under the machine they were chosen for.
+    const auto silent = resolve({});
+    const std::string printed = ob::format_config(silent);
+    const std::string expected = "# profile boost: " + ob::choose_boost(silent.machine).reason + "\n";
+    EXPECT_NE(printed.find(expected), std::string::npos) << printed;
+    EXPECT_LT(printed.find("# machine: "), printed.find("# profile boost: ")) << printed;
+
+    const auto eco = resolve({"--profile", "eco"});
+    EXPECT_NE(ob::format_config(eco).find("# profile eco: 1 client event loop, blocking between events\n"),
+              std::string::npos)
+        << ob::format_config(eco);
+}
+
+TEST(IoProfile, TheOperatorsLoopsWinAndTheProfileLineSaysSo) {
+    const auto resolved = resolve({"--io-threads", "2"});
+    EXPECT_EQ(resolved.config.io_threads, 2u);
+    EXPECT_EQ(resolved.origin.at("io-threads"), ob::Origin::CommandLine);
+    // The spin is still the profile's: overriding one knob does not switch the profile off.
+    EXPECT_EQ(resolved.origin.at("io-spin-us"), ob::Origin::Profile);
+    EXPECT_NE(resolved.profile_choice.find("(io-threads set by the operator)"), std::string::npos)
+        << resolved.profile_choice;
+    EXPECT_EQ(resolved.profile_choice.find("io-spin-us set by the operator"), std::string::npos)
+        << resolved.profile_choice;
+}
+
+// ── The boost rule, on machines written as literals (stage 4 of #151) ─────────
+//
+// `choose_boost()` is pure, so every case the measurement decided is a machine written down here
+// rather than a machine to go and find - including the single CPU and the cgroup limits that the
+// runners this suite is on do not have.
+
+namespace {
+
+ob::MachineResources machine_of(unsigned affinity, std::optional<double> quota, unsigned usable) {
+    // All three written by the caller: deriving `usable` here would be a second copy of
+    // detect_machine()'s arithmetic, and a test that agrees with a copy tests the copy.
+    ob::MachineResources m;
+    m.affinity_cpus = affinity;
+    m.quota_cpus    = quota;
+    m.usable_cpus   = usable;
+    m.reason        = "written by the test";
+    return m;
+}
+
+}  // namespace
+
+TEST(BoostRule, OneLoopPerUsableCpu) {
+    for (unsigned cpus : {1u, 2u, 3u, 4u, 8u, 16u}) {
+        EXPECT_EQ(ob::choose_boost(machine_of(cpus, std::nullopt, cpus)).io_threads, cpus)
+            << cpus << " usable CPUs";
+    }
+}
+
+TEST(BoostRule, TheLoopsStopAtTheCeilingTheFlagHas) {
+    EXPECT_EQ(ob::choose_boost(machine_of(200, std::nullopt, 200)).io_threads, ob::kMaxIoThreads);
+    EXPECT_EQ(ob::choose_boost(machine_of(64, std::nullopt, 64)).io_threads, 64u);
+}
+
+TEST(BoostRule, SpinsWhereTheProcessHasACpuToSpare) {
+    const ob::BoostChoice c = ob::choose_boost(machine_of(4, std::nullopt, 4));
+    EXPECT_EQ(c.io_threads, 4u);
+    EXPECT_EQ(c.io_spin_us, ob::kBoostSpinUs);
+    EXPECT_EQ(c.reason, "4 client event loops, one per usable CPU, and a " +
+                            std::to_string(ob::kBoostSpinUs) + " µs spin window");
+}
+
+TEST(BoostRule, NoSpinOnTheOnlyCpuTheProcessMayRunOn) {
+    // Measured: a client sharing that CPU had a p99 of 5.9 µs without the spin and 13.7 µs with
+    // a 10 µs window - the spinning loop holds the CPU the client needs until the window closes.
+    const ob::BoostChoice c = ob::choose_boost(machine_of(1, std::nullopt, 1));
+    EXPECT_EQ(c.io_threads, 1u);
+    EXPECT_EQ(c.io_spin_us, 0u);
+    EXPECT_EQ(c.reason, "1 client event loop, one per usable CPU, and no spin: the only CPU this "
+                        "process may run on is shared with its flush, the kernel and any client on "
+                        "this machine");
+}
+
+TEST(BoostRule, NoSpinUnderALimitThatBinds) {
+    // A limit below the mask is the loops' floor, so it never leaves a CPU of time beyond them.
+    const ob::BoostChoice one = ob::choose_boost(machine_of(4, 1.5, 1));
+    EXPECT_EQ(one.io_threads, 1u);
+    EXPECT_EQ(one.io_spin_us, 0u);
+    EXPECT_NE(one.reason.find("a cgroup limit of 1.50 CPUs"), std::string::npos) << one.reason;
+
+    const ob::BoostChoice two = ob::choose_boost(machine_of(8, 2.5, 2));
+    EXPECT_EQ(two.io_threads, 2u);
+    EXPECT_EQ(two.io_spin_us, 0u) << two.reason;
+}
+
+TEST(BoostRule, ALimitThatLeavesACpuBeyondTheLoopsDoesNotStopTheSpin) {
+    // The boundary on both sides: a limit of exactly loops + 1 leaves one CPU of time, a hair
+    // under it does not. A limit above the mask does not bind at all.
+    EXPECT_EQ(ob::choose_boost(machine_of(4, 5.0, 4)).io_spin_us, ob::kBoostSpinUs);
+    EXPECT_EQ(ob::choose_boost(machine_of(4, 4.99, 4)).io_spin_us, 0u);
+    EXPECT_EQ(ob::choose_boost(machine_of(4, 8.0, 4)).io_spin_us, ob::kBoostSpinUs);
+    EXPECT_EQ(ob::choose_boost(machine_of(4, 8.0, 4)).io_threads, 4u);
 }
 
 TEST(IoProfile, AnUnknownNameIsRefusedRatherThanReadAsTheDefault) {
@@ -431,7 +553,7 @@ TEST(CliConfigStatic, EveryParsedValueIsReadByTheServer) {
         if (!reads_member(code, f)) unread.push_back(f);
     }
     // `profile` is a source of values, not a knob: the parser resolves it into the fields it names
-    // (`io_spin_us` today), so its own value is only what --print-config reports. Pinned in both
+    // (`io_threads` and `io_spin_us`), so its own value is only what --print-config reports. Pinned in both
     // directions, so a profile that grows a second code path takes itself off this list.
     EXPECT_EQ(unread, (std::vector<std::string>{"profile"}))
         << "a ServerConfig field is parsed and printed and read by nothing else, so its flag loads "

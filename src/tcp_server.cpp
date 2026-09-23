@@ -1064,9 +1064,9 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"auth-secret-file", {"<PATH>", "Client credentials, '<identity> <secret>' per line; mode 600. Empty disables client authentication"}},
         {"cluster-secret-file", {"<PATH>", "Shared secret for replication and multi-master links, one line; mode 600"}},
         {"drain-timeout-ms", {"<N>", "On shutdown, how long to wait for open client sessions before closing them (default: 10000; 0 waits indefinitely)"}},
-        {"io-spin-us", {"<N>", "Keep polling for this many microseconds after the last event before blocking again (default: 0, always block). Costs up to one core while traffic flows and takes ~20% off the round trip on loopback"}},
-        {"io-threads", {"<N>", "Client event loops, 1 to 64 (default: 1). Connections are dealt to them in turn and stay on one for life"}},
-        {"profile", {"<name>", "eco (default, blocking io) or boost (sets io-spin-us). A named set of the knobs, not a second code path"}},
+        {"io-spin-us", {"<N>", "Keep polling for this many microseconds after the last event before blocking again (default: set by the profile - 10 under boost where the process has a CPU to spare, 0 under eco). Costs up to one core per loop while traffic flows and takes ~17% off the round trip on loopback"}},
+        {"io-threads", {"<N>", "Client event loops, 1 to 64 (default: set by the profile - one per usable CPU under boost, 1 under eco). Connections are dealt to them in turn and stay on one for life"}},
+        {"profile", {"<name>", "boost (default: one client event loop per usable CPU, and a 10 us spin where it cannot starve anything) or eco (one loop, blocking between events). A named set of the knobs, not a second code path"}},
         {"flush-interval-ms", {"<N>", "Background flush interval in ms (default: 100)"}},
         {"fsync-policy", {"<POLICY>", "WAL durability: every, interval or none (lower case; default: interval)"}},
         {"handover-cooldown-seconds", {"<N>", "How long a node that handed the role over abstains"}},
@@ -1276,8 +1276,40 @@ std::vector<std::string> config_file_to_args(const std::string& path,
     return args;
 }
 
+BoostChoice choose_boost(const MachineResources& machine) {
+    BoostChoice choice;
+    choice.io_threads = std::min<uint32_t>(std::max(1u, machine.usable_cpus), kMaxIoThreads);
+    choice.reason = std::to_string(choice.io_threads) +
+                    (choice.io_threads == 1 ? " client event loop" : " client event loops") +
+                    ", one per usable CPU";
+    if (machine.affinity_cpus < 2) {
+        // The only CPU this process may be scheduled on: the flush, the kernel and any client on
+        // this machine run there too, and a loop spinning on it holds it from all of them.
+        choice.io_spin_us = 0;
+        choice.reason += ", and no spin: the only CPU this process may run on is shared with its "
+                         "flush, the kernel and any client on this machine";
+    } else if (machine.quota_cpus && *machine.quota_cpus < choice.io_threads + 1.0) {
+        // A limit that leaves no CPU of time beyond the loops. When the limit binds, the loops are
+        // its floor, so this is every binding limit - and spinning would spend it.
+        char limit[32];
+        std::snprintf(limit, sizeof(limit), "%.2f", *machine.quota_cpus);
+        choice.io_spin_us = 0;
+        choice.reason += std::string(", and no spin: a cgroup limit of ") + limit +
+                         " CPUs leaves no CPU of time beyond the loops, and spinning spends it";
+    } else {
+        choice.io_spin_us = kBoostSpinUs;
+        choice.reason += ", and a " + std::to_string(kBoostSpinUs) + " µs spin window";
+    }
+    return choice;
+}
+
 ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
     ServerConfig config;
+    // The command line's default is `boost`, not the struct's `eco`: a struct cannot know the
+    // machine, and a server started without a profile is sized to the one it runs on. A profile
+    // given in the file or on the command line replaces this in the loop below, and is recorded
+    // as coming from there; this one is recorded as the default, because that is what it is.
+    config.profile = kDefaultProfile;
     std::map<std::string, Origin> origin;
     bool print_config_requested = false;
 
@@ -1649,6 +1681,12 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
                     config.anti_entropy_interval_sec);
     }
 
+    // How many CPUs this process can use. Read here, where every other fact the configuration is
+    // resolved from is read, so the log line and `--print-config` say what the node was sized
+    // against - and before the profile, which sizes the loops and the spin to it.
+    const MachineResources machine = detect_machine(read_system_view());
+    OB_LOG_INFO("cli", "machine: %s", machine.reason.c_str());
+
     // The profile is applied last and refuses a name it does not know, because a parser that
     // ignores what it does not understand hides operator mistakes (#27, #36): `--profile bost`
     // must not start a node in eco and look like it started in boost.
@@ -1656,36 +1694,45 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
     // It only sets what the operator did not. A value from the command line or the config file
     // wins, and what the profile did set is attributed to the profile, so `--print-config` answers
     // "what is this node doing" rather than "which switches were thrown".
+    std::string profile_choice;
     {
-        const bool spin_set = origin.count("io-spin-us") > 0;
+        const bool spin_set    = origin.count("io-spin-us") > 0;
+        const bool threads_set = origin.count("io-threads") > 0;
         if (config.profile == "boost") {
+            const BoostChoice choice = choose_boost(machine);
+            if (!threads_set) {
+                config.io_threads = choice.io_threads;
+                origin["io-threads"] = Origin::Profile;
+            }
             if (!spin_set) {
-                config.io_spin_us = kBoostSpinUs;
+                config.io_spin_us = choice.io_spin_us;
                 origin["io-spin-us"] = Origin::Profile;
             }
-        } else if (config.profile != "eco") {
+            profile_choice = "boost: " + choice.reason;
+        } else if (config.profile == "eco") {
+            // Nothing to set: the struct's defaults are eco's values, one loop and no spin.
+            profile_choice = "eco: 1 client event loop, blocking between events";
+        } else {
             std::fprintf(stderr,
                 "Error: unknown --profile '%s'; known profiles are 'eco' and 'boost'\n",
                 config.profile.c_str());
             std::exit(1);
         }
+        // What the operator set is said beside the profile's reason, so a line reading "4 client
+        // event loops" above a node running 2 is not left to be noticed.
+        if (threads_set) profile_choice += " (io-threads set by the operator)";
+        if (spin_set) profile_choice += " (io-spin-us set by the operator)";
         OB_LOG_INFO("cli",
-                    "io profile: %s (io-spin-us=%llu) — %s",
-                    config.profile.c_str(),
+                    "io profile %s (io-threads=%u io-spin-us=%llu); %s",
+                    profile_choice.c_str(), config.io_threads,
                     static_cast<unsigned long long>(config.io_spin_us),
                     config.io_spin_us == 0
-                        ? "the io thread blocks between events"
-                        : "the io thread polls after an event and may use a whole core while "
+                        ? "the io threads block between events"
+                        : "an io thread polls after an event and may use a whole core while "
                           "traffic flows");
     }
 
-    // How many CPUs this process can use. Read here, where every other fact the configuration is
-    // resolved from is read, so the log line and `--print-config` say what the node was sized
-    // against - and so the next stage, which sizes the loops to it, has it in the same place.
-    const MachineResources machine = detect_machine(read_system_view());
-    OB_LOG_INFO("cli", "machine: %s", machine.reason.c_str());
-
-    ResolvedConfig resolved{config, origin, machine};
+    ResolvedConfig resolved{config, origin, machine, profile_choice};
 
     if (print_config_requested) {
         // Printed and exited, without opening a port. Diagnostics that need a free port are useless
@@ -1722,6 +1769,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     out += "# Resolved configuration. Provenance in brackets: a list of values does not say which\n";
     out += "# of them you chose, and that is the question this flag exists to answer.\n";
     out += "# machine: " + resolved.machine.reason + "\n";
+    if (!resolved.profile_choice.empty()) out += "# profile " + resolved.profile_choice + "\n";
     line("anti-entropy-interval-seconds", std::to_string(c.anti_entropy_interval_sec));
     {
         std::string joined;
