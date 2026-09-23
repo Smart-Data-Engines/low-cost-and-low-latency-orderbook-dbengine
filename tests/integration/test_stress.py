@@ -18,7 +18,7 @@ import time
 
 import pytest
 
-from orderbook_engine import OrderbookEngine
+from orderbook_engine import OrderbookEngine, OrderbookError
 
 pytestmark = pytest.mark.stress
 
@@ -30,6 +30,29 @@ custom_metrics: dict = {}
 STRESS_SECONDS = float(os.environ.get("OB_STRESS_SECONDS", "5"))
 LEVELS_PER_INSERT = 50
 
+# The upper end of a timestamp range, the same literal the client's `query_all()` uses.
+NO_LATER_THAN = 9_999_999_999_999_999_999
+
+
+def count_rows(client: OrderbookEngine, symbol: str, exchange: str, lo: int, hi: int) -> int:
+    """How many rows `symbol` holds with `lo <= timestamp < hi`, in answers the server will send.
+
+    One answer above 64 MB is refused by the session's answer ceiling (#152) - the server saying
+    what it should say - and a run that inserts for a fixed time inserts as much as the machine
+    allows, so counting a sustained run in one `SELECT` fails on any runner fast enough (#157). A
+    window whose answer is refused is split in two and each half counted; half-open windows, so a
+    row on a boundary is counted once.
+    """
+    sql = (f"SELECT * FROM '{symbol}'.'{exchange}' "
+           f"WHERE timestamp >= {lo} AND timestamp < {hi}")
+    try:
+        return len(client.query(sql))
+    except OrderbookError as exc:
+        if "larger than" not in str(exc) or hi - lo < 2:
+            raise
+    mid = lo + (hi - lo) // 2
+    return count_rows(client, symbol, exchange, lo, mid) + count_rows(client, symbol, exchange, mid, hi)
+
 
 def test_sustained_insert_throughput(heavy_client: OrderbookEngine):
     """Insert continuously for the configured window and account for every level."""
@@ -39,6 +62,7 @@ def test_sustained_insert_throughput(heavy_client: OrderbookEngine):
     batches = 0
     errors = 0
     started = time.monotonic()
+    started_ns = time.time_ns()
 
     while time.monotonic() < deadline:
         base = 1_000_000 + batches * LEVELS_PER_INSERT
@@ -65,9 +89,17 @@ def test_sustained_insert_throughput(heavy_client: OrderbookEngine):
     assert errors == 0, f"{errors} inserts failed during the run"
     assert levels_sent > 0, "no levels were sent at all"
 
-    rows = heavy_client.query_all(symbol, "BINANCE")
-    assert len(rows) == levels_sent, (
-        f"sent {levels_sent} levels, {len(rows)} came back — a sustained run must "
+    # Counted in windows rather than in one answer (#157). The server stamps a row with its own
+    # clock at arrival, and it runs on this host, so the run's rows sit inside its wall-clock span;
+    # the two outer windows are there so that the count does not depend on that - a row outside the
+    # span is still counted, only more slowly.
+    margin = 10 * 1_000_000_000
+    span = (started_ns - margin, time.time_ns() + margin)
+    counted = (count_rows(heavy_client, symbol, "BINANCE", 0, span[0]) +
+               count_rows(heavy_client, symbol, "BINANCE", span[0], span[1]) +
+               count_rows(heavy_client, symbol, "BINANCE", span[1], NO_LATER_THAN))
+    assert counted == levels_sent, (
+        f"sent {levels_sent} levels, {counted} came back — a sustained run must "
         f"not lose or duplicate rows")
 
 

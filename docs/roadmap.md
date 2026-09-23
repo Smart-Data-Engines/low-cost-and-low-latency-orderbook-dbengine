@@ -2212,6 +2212,28 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 157. The sustained-insert test read its whole run in one answer, which #152's ceiling refused on a faster runner ✅
+
+**A required check failed on a pull request whose change could not have caused it** (#156, PR #171),
+and the failure was the server doing what #152 made it do:
+`answer of 77121881 bytes is larger than the 67108864 a session may have queued; narrow the query or
+add LIMIT`. `test_stress.py::test_sustained_insert_throughput` inserts for a fixed time as fast as the
+Python client can and then reads every row back with one `SELECT *`, so the size of that answer is
+the runner's speed times `OB_STRESS_SECONDS` — and the 64 MB ceiling is a constant. The margin had
+been thin for as long as #152 has existed: the same test passed on PR #170's run a few hours earlier.
+With `OB_STRESS_SECONDS=30`, the documented long run, it could not have passed on any machine that
+inserts two million levels in thirty seconds.
+
+The test now counts the run's rows in answers the server will send: half-open windows of the
+timestamp, and a window whose answer is refused split in two and each half counted. The server
+stamps a row at arrival with the host's clock, so the run's rows sit in its wall-clock span; two outer
+windows keep the count from depending on that. Checked with the long run on the development laptop:
+**2 023 750 levels, about 120 MB as one answer, counted exactly**. The claim is unchanged — every
+level sent comes back once — and it no longer has a speed above which it cannot be checked.
+
+- Effort: S | Impact: a required check that failed on fast runners for a reason in the test, not in
+  the engine
+
 ### 156. The engine could not tell how many CPUs it had, so nothing in it could be sized to the machine ✅
 
 **Stage 3 of #151, and what stage 4 needs before it can exist.** Nothing in the engine asked how big
