@@ -132,8 +132,12 @@ TEST(CliArgsDeath, WorkersIsRefusedBecauseNothingEverReadIt) {
                 "unknown argument '--workers'");
 }
 
-TEST(CliArgs, IoThreadsDefaultsToTheOneLoopTheServerAlwaysHad) {
-    EXPECT_EQ(parse({}).io_threads, 1u);
+TEST(CliArgs, IoThreadsDefaultsToWhatTheProfileChooses) {
+    // Stage 4 of #151: the command line's profile is boost, one loop per usable CPU of the machine
+    // this runs on - so the expectation is derived from that machine, not written as a number that
+    // is true on one runner. eco is the single loop this server always had.
+    EXPECT_EQ(parse({}).io_threads, ob::choose_boost(ob::detect_machine(ob::read_system_view())).io_threads);
+    EXPECT_EQ(parse({"--profile", "eco"}).io_threads, 1u);
     EXPECT_EQ(parse({"--io-threads", "4"}).io_threads, 4u);
     // Both ends of the range, because a refusal that also refuses a boundary is a different
     // refusal from the one documented, and `docs/cli.md` prints these two numbers.

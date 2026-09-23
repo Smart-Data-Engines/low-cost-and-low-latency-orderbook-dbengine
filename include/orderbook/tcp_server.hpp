@@ -27,17 +27,27 @@ namespace ob {
 
 // ── Server configuration ──────────────────────────────────────────────────────
 
-/// What `--profile boost` sets `io_spin_us` to.
+/// The spin window `boost` sets `io_spin_us` to, where it spins at all (`choose_boost()`).
 ///
-/// **A judgement, not a measurement, and the difference is the point.** What was measured is that
-/// removing the wakeup is worth 1.6 µs of an 8.0 µs round trip; nothing measured how long a window
-/// should stay open, because that depends on the gaps in a particular client's traffic and this
-/// engine cannot know them. 50 µs is six round trips' worth on the machine the measurement came
-/// from — long enough that a client sending back-to-back requests never meets a blocking wait, and
-/// short enough that an idle node stops spinning within a scheduler tick.
+/// **A measurement, where #144 had a judgement of 50 µs** (stage 4 of #151, m9g.xlarge, 20 000
+/// `PING`s per run, five rounds, medians). The gain saturates at 10 µs — p50 7 569 ns without the
+/// spin, 7 622 at 5 µs, which catches nothing, then 6 279 at 10, 6 252 at 20 and 6 306 at 50 — and
+/// when the machine has more busy threads than cores **the tail is the window**: a `PING` beside
+/// three pipelining writers on the same four cores has a p99 of 15 917 ns without the spin, 16 448
+/// at 10 µs, 24 190 at 20 and 53 900 at 50, because a spinning loop keeps the core the client needs
+/// until the window closes. 10 µs keeps all of the gain and none of that tail.
 ///
-/// An operator who knows their traffic sets `--io-spin-us` and this number stops applying.
-inline constexpr uint64_t kBoostSpinUs = 50;
+/// **Where the number does not travel.** The window has to cover the gap between an answer and the
+/// client's next request, and that gap belongs to the machine and the client. Here it is between 5
+/// and 10 µs; on the development laptop (i3-7100U, 30 µs round trips) 10 and 20 µs catch nothing and
+/// 50 µs takes 18% off. An operator whose client has a longer gap sets `--io-spin-us`, and this
+/// number stops applying.
+inline constexpr uint64_t kBoostSpinUs = 10;
+
+/// The profile the server's command line starts from (stage 4 of #151): the one that sizes the
+/// client event loops and the spin to the machine. `ServerConfig`'s own default stays `eco`, like
+/// the two fields a profile sets - a struct cannot know the machine.
+inline constexpr const char* kDefaultProfile = "boost";
 
 struct ServerConfig {
     uint16_t    port{9090};
@@ -78,9 +88,13 @@ struct ServerConfig {
     /// continuous load never blocks and an idle one costs nothing.
     uint64_t    io_spin_us{0};
 
-    /// --profile: a named set of the knobs above, so an operator can ask for the trade rather than
-    /// know which flag carries it. `eco` is the default and sets nothing; `boost` sets
-    /// `io_spin_us`. A later flag joins the profile rather than becoming a second profile.
+    /// --profile: a named set of the knobs, so an operator can ask for the trade rather than know
+    /// which flags carry it. `boost` sizes `io_threads` and `io_spin_us` to the machine
+    /// (`choose_boost()`); `eco` sets nothing, so it is the engine as it was before either knob -
+    /// one client event loop, blocking between events. **`boost` is the command line's default**
+    /// (`kDefaultProfile`), applied by `resolve_cli_args()`; this field's own default stays `eco`,
+    /// like the fields it governs, because a `ServerConfig` built in code has no machine to be
+    /// sized to. A later knob joins the profiles rather than becoming a third.
     ///
     /// It is a **source of values**, not a second code path — there is one io loop and the profile
     /// decides a number in it. `--print-config` attributes what the profile set to the profile
@@ -324,6 +338,31 @@ LoadedTlsContexts load_tls_or_exit(const ServerConfig& config);
 /// low enough that a typo such as 400 is refused rather than started.
 inline constexpr uint32_t kMaxIoThreads = 64;
 
+/// What the `boost` profile chooses on a machine, and why - one sentence for the startup log and
+/// for `--print-config`, because a mode whose effect you cannot read is a mode on somebody's word.
+struct BoostChoice {
+    uint32_t    io_threads{1};
+    uint64_t    io_spin_us{0};
+    std::string reason;
+};
+
+/// The `boost` rule (stage 4 of #151), from the measurement written down with it:
+///
+/// - **one client event loop per usable CPU**, at most `kMaxIoThreads`. Fewer leaves reads behind -
+///   four loops on four cores read 49.1 million levels a second, three 40.2 to 42.2 - and more than
+///   the CPUs adds nothing and multiplies the tail: three loops on two cores, p99 of a read batch
+///   10.7 ms against 1.05. Below the machine's CPUs a cgroup's limit decides, rounded down, because
+///   loops beyond it are throttled: two loops under a one-CPU limit wrote what one loop wrote, with
+///   a p99 of 25 ms against 0.93 and 1.4 s of every 2 stopped;
+/// - **the spin window `kBoostSpinUs` when the process may run on at least two CPUs and a cgroup
+///   limit, if there is one, leaves at least one CPU of time beyond the loops.** On the only CPU a
+///   process may run on, a spinning loop holds it from everything else there: a client sharing it
+///   measured a p99 of 5.9 µs without the spin and 13.7 µs with it. Under a limit, spinning spends
+///   the limit, and a cgroup over it stops every thread until the next period.
+///
+/// Pure, like `detect_machine()`: the same machine gives the same choice.
+BoostChoice choose_boost(const MachineResources& machine);
+
 /// What a draining loop should do this pass.
 enum class DrainVerdict {
     KeepWaiting,       ///< sessions are still open and the deadline has not passed
@@ -535,6 +574,10 @@ struct ResolvedConfig {
     /// `--print-config`, because "how big is this machine" has two answers and a node sized by the
     /// wrong one is sized for a machine it does not have.
     MachineResources             machine;
+    /// What the profile chose and why, one line - `boost`'s from `choose_boost()`. Logged at
+    /// startup and printed by `--print-config` under the machine it was chosen for, so the two
+    /// numbers a profile sets never appear without the reason they are what they are.
+    std::string                  profile_choice;
 };
 ResolvedConfig resolve_cli_args(int argc, char* argv[]);
 
