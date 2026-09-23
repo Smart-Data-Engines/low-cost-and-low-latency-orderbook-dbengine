@@ -372,6 +372,7 @@ std::string refuse_write(const char* command, const std::string& symbol,
 /// One thread's working space for `execute_writes()`, reused so that a batch allocates nothing
 /// once these have grown to a read's size. Per thread, because every reactor calls it.
 struct WriteBatchScratch {
+    std::vector<DeltaUpdate>  deltas;        // what each engine write points at
     std::vector<ClientWrite>  writes;
     std::vector<size_t>       answer_of;     // the command each engine write answers
     std::vector<size_t>       level_start;   // where each write's levels begin in `levels`
@@ -402,6 +403,7 @@ void execute_writes(std::span<const Command> cmds,
     const size_t n = cmds.size();
     answers.resize(n);
     WriteBatchScratch& s = write_batch_scratch;
+    s.deltas.clear();
     s.writes.clear();
     s.answer_of.clear();
     s.level_start.clear();
@@ -414,6 +416,7 @@ void execute_writes(std::span<const Command> cmds,
         for (const Command& cmd : cmds) {
             total_levels += cmd.type == CommandType::MINSERT ? cmd.minsert_args.n_levels : 1;
         }
+        s.deltas.reserve(n);
         s.writes.reserve(n);
         s.answer_of.reserve(n);
         s.level_start.reserve(n);
@@ -440,8 +443,7 @@ void execute_writes(std::span<const Command> cmds,
             continue;
         }
 
-        ClientWrite write{};
-        DeltaUpdate& delta = write.update;
+        DeltaUpdate delta{};
         std::strncpy(delta.symbol,   symbol.c_str(),   sizeof(delta.symbol)   - 1);
         std::strncpy(delta.exchange, exchange.c_str(), sizeof(delta.exchange) - 1);
         // 0 means "unassigned": Engine::stamp_sequence() gives this write the next
@@ -483,13 +485,16 @@ void execute_writes(std::span<const Command> cmds,
                 s.levels.push_back(level);
             }
         }
-        s.writes.push_back(write);
+        s.deltas.push_back(delta);
+        s.writes.push_back(ClientWrite{});
         s.answer_of.push_back(i);
     }
     if (s.writes.empty()) return;
 
-    // The levels are pointed at only now: `levels` has stopped growing, so nothing moves them.
+    // The updates and levels are pointed at only now: both have stopped growing, so nothing moves
+    // them.
     for (size_t k = 0; k < s.writes.size(); ++k) {
+        s.writes[k].update = &s.deltas[k];
         s.writes[k].levels = s.levels.data() + s.level_start[k];
     }
 

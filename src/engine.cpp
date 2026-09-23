@@ -586,7 +586,7 @@ ob_status_t Engine::apply_delta_impl(const DeltaUpdate& delta_in, const Level* l
     // A batch of one. What a write that could not be applied threw is carried in the outcome
     // rather than thrown out of the batch, so it is thrown here - with the text it always had,
     // because that text is what a client is answered with.
-    const ClientWrite write{delta_in, levels};
+    const ClientWrite write{&delta_in, levels};
     WriteOutcome outcome;
     apply_local_writes(std::span<const ClientWrite>(&write, 1),
                        std::span<WriteOutcome>(&outcome, 1), policy, multi_master);
@@ -688,7 +688,7 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
             // and reused by the migrated-symbol check, the duplicate check and the sequence
             // tracker.
             DeltaUpdate& delta = s.deltas[i];
-            delta = writes[i].update;
+            delta = *writes[i].update;
             std::string& key = s.keys[i];
             key.assign(delta.symbol);
             key += '.';

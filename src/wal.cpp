@@ -257,9 +257,17 @@ WalPosition WALWriter::write_record(const WALRecord& hdr, const void* payload,
 
     const RunResult run = write_run(write_buf_.data(), std::span<const size_t>(&total, 1),
                                     allow_fsync);
-    if (!run.write_error.empty()) throw std::runtime_error(run.write_error);
-    if (!run.sync_error.empty()) throw std::runtime_error(run.sync_error);
+    if (run.write_errno != 0) throw std::runtime_error(write_failed(run.write_errno));
+    if (run.sync_errno != 0) throw std::runtime_error(sync_failed(run.sync_errno));
     return run.first;
+}
+
+std::string WALWriter::write_failed(int err) {
+    return std::string("WALWriter: write failed: ") + std::strerror(err);
+}
+
+std::string WALWriter::sync_failed(int err) {
+    return std::string("WALWriter: fsync failed: ") + std::strerror(err);
 }
 
 WALWriter::RunResult WALWriter::write_run(const uint8_t* data, std::span<const size_t> ends,
@@ -295,7 +303,7 @@ WALWriter::RunResult WALWriter::write_run(const uint8_t* data, std::span<const s
     run.landed = landed;
     if (landed > 0 && allow_fsync && fsync_policy_ == FsyncPolicy::EVERY) {
         if (const int err = fsync_or_record("a write under fsync-policy=every"); err != 0) {
-            run.sync_error = std::string("WALWriter: fsync failed: ") + std::strerror(err);
+            run.sync_errno = err;
         } else {
             pending_sync_ = 0;
         }
@@ -309,7 +317,7 @@ WALWriter::RunResult WALWriter::write_run(const uint8_t* data, std::span<const s
         // leaves it intact, and abandoning it would make a full disk produce one empty WAL file per
         // refused write. Synced first, above, so the records that did land keep their promise.
         if (done > landed_bytes) abandon_torn_file(done - landed_bytes, write_errno);
-        run.write_error = std::string("WALWriter: write failed: ") + std::strerror(write_errno);
+        run.write_errno = write_errno;
     }
     return run;
 }
@@ -406,16 +414,19 @@ size_t WALWriter::append_batch(std::span<const WalDelta> records,
             WalBatchOutcome& out = outcomes[i + k];
             out.position = WalPosition{run.first.file_index,
                                        run.first.offset + static_cast<uint32_t>(within)};
-            out.error = run.sync_error;
-            if (run.sync_error.empty()) ++written;
+            if (run.sync_errno == 0) {
+                out.error.clear();
+                ++written;
+            } else {
+                out.error = sync_failed(run.sync_errno);
+            }
         }
         OB_LOG_DEBUG("wal", "append_batch: %zu of %zu record(s) in one write of %zu bytes at file "
-                            "%u offset %u%s%s",
+                            "%u offset %u%s",
                      landed, j - i, used, run.first.file_index, run.first.offset,
-                     run.sync_error.empty() ? "" : " - not confirmed: ",
-                     run.sync_error.c_str());
+                     run.sync_errno == 0 ? "" : " - not confirmed, the sync failed");
 
-        if (!run.write_error.empty()) {
+        if (run.write_errno != 0) {
             // The record the write stopped at is refused, and the records behind it are tried
             // again in the next run - as the next command after a refused write was. Not the ones
             // before it: they are in the file, and writing them again would store them twice.
@@ -424,7 +435,7 @@ size_t WALWriter::append_batch(std::span<const WalDelta> records,
             // ROTATE marker as well. The rotation is tried after the next record that is written,
             // which is #153's rule, and a disk that stays full would otherwise log a failed marker
             // for every refused write.
-            outcomes[i + landed].error = run.write_error;
+            outcomes[i + landed].error = write_failed(run.write_errno);
             i += landed + 1;
             continue;
         }

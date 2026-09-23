@@ -569,15 +569,22 @@ private:
     /// What `write_run()` did with one run of records.
     ///
     /// `landed` is how many of them, from the first, have every byte in the file; they are counted
-    /// in the position either way. `sync_error` is non-empty when a sync that `FsyncPolicy::EVERY`
-    /// asked for failed, which confirms none of those. `write_error` is non-empty when the write
-    /// stopped at record `landed`, which is therefore not in the file.
+    /// in the position either way. `sync_errno` is non-zero when a sync that `FsyncPolicy::EVERY`
+    /// asked for failed, which confirms none of those. `write_errno` is non-zero when the write
+    /// stopped at record `landed`, which is therefore not in the file. Numbers rather than
+    /// messages: every run builds a result and almost none of them fails, and two strings made
+    /// and destroyed per run were part of what a batch of one cost (#155).
     struct RunResult {
         size_t      landed{0};
         WalPosition first{};
-        std::string sync_error;
-        std::string write_error;
+        int         sync_errno{0};
+        int         write_errno{0};
     };
+
+    /// The text a client is sent for a failed write or sync - the one spelling of each, used by
+    /// both paths that report them.
+    static std::string write_failed(int err);
+    static std::string sync_failed(int err);
 
     /// Write one run - whole records back to back, record `i` ending at `ends[i]` - and account for
     /// it: the one place in this writer where bytes reach the file, so a record written alone

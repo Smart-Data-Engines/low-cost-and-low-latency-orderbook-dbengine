@@ -101,7 +101,7 @@ std::vector<Write> mixed_writes() {
 
 std::vector<ob::ClientWrite> as_client_writes(const std::vector<Write>& writes) {
     std::vector<ob::ClientWrite> out;
-    for (const Write& w : writes) out.push_back(ob::ClientWrite{w.update, w.levels.data()});
+    for (const Write& w : writes) out.push_back(ob::ClientWrite{&w.update, w.levels.data()});
     return out;
 }
 
@@ -375,6 +375,33 @@ std::string definition_body(const std::string& src, const std::string& signature
     return {};
 }
 
+/// Whether position `at` of `body` is inside a `for`, `while` or `do` block. A call counted once
+/// in the text is taken once per write if it sits in the loop over the writes, and that is the one
+/// move a count cannot see - so the blocks enclosing it are read, by what opens each one.
+bool inside_a_loop(const std::string& body, std::size_t at) {
+    std::vector<bool> loops;   // one entry per open block: does it belong to a loop?
+    for (std::size_t i = 0; i < at && i < body.size(); ++i) {
+        if (body[i] == '{') {
+            const std::size_t line = body.rfind('\n', i);
+            const std::string head =
+                body.substr(line == std::string::npos ? 0 : line + 1,
+                            i - (line == std::string::npos ? 0 : line + 1));
+            const auto starts = [&](const char* word) {
+                const std::size_t w = head.find_first_not_of(" \t}");
+                return w != std::string::npos && head.compare(w, std::strlen(word), word) == 0;
+            };
+            loops.push_back(starts("for ") || starts("for(") || starts("while ") ||
+                            starts("while(") || starts("do ") || starts("do{"));
+        } else if (body[i] == '}' && !loops.empty()) {
+            loops.pop_back();
+        }
+    }
+    for (const bool loop : loops) {
+        if (loop) return true;
+    }
+    return false;
+}
+
 std::size_t occurrences(const std::string& text, const std::string& needle) {
     std::size_t n = 0;
     for (std::size_t at = text.find(needle); at != std::string::npos;
@@ -412,6 +439,29 @@ TEST(WriteBatchStatic, TheWritesOfABatchTakeTheLockOnceAndReachTheWalInOneCall) 
         << "stamp_sequence() writes its GAP record itself; a batch has to place it";
     EXPECT_EQ(occurrences(batch, "await_pending_room("), 1u)
         << "the batch waits for room more than once";
+
+    // Once in the text is not once per batch if it is inside the loop over the writes.
+    for (const char* call : {"std::unique_lock<std::mutex> lock(mtx_);", "await_pending_room(",
+                             "wal_.append_batch("}) {
+        const std::size_t at = batch.find(call);
+        ASSERT_NE(at, std::string::npos) << call;
+        EXPECT_FALSE(inside_a_loop(batch, at))
+            << call << " is inside a loop over the writes, so it runs once per write";
+    }
+    // The rule is only worth something if it can see a loop: the numbering is one, and the
+    // observation of each write's number is inside it.
+    ASSERT_TRUE(inside_a_loop(batch, batch.find("observe_sequence(")))
+        << "the loop detection no longer finds the loop the numbering runs in, so it sees nothing";
+
+    // The peers are told after the lock is released (#80): `broadcast_local()` takes the mesh's
+    // mutex, and the mesh's io loop holds it while it takes this one. Under the lock, a client
+    // write and a received delta take the two in opposite orders.
+    const std::size_t unlock = batch.find("lock.unlock();");
+    const std::size_t peers  = batch.find("broadcast_to_peers(");
+    ASSERT_NE(unlock, std::string::npos) << "the batch never releases the lock before the peers";
+    ASSERT_NE(peers, std::string::npos) << "the batch does not tell the peers";
+    EXPECT_LT(unlock, peers) << "the peers are told with the engine's lock held (#80)";
+    EXPECT_EQ(occurrences(batch, "broadcast_to_peers("), 1u);
 
     // The single-write entry points are this with one write, so there is one path to keep right.
     for (const char* entry : {"ob_status_t Engine::apply_delta(",

@@ -38,11 +38,13 @@ struct TTLConfig {
     uint64_t scan_interval_seconds{300};    // default 5 minutes
 };
 
-/// One write for `Engine::apply_deltas()`: the update and its levels, which are the caller's and
-/// must outlive the call.
+/// One write for `Engine::apply_deltas()`: the update and its levels, both the caller's, which must
+/// outlive the call. Pointers, not a copy of the update: the engine copies it once, into the batch
+/// it numbers, and a second copy here was 88 bytes per write for a batch of one (measured with the
+/// rest of that path's overhead: 390 instructions per single in-process write, #155).
 struct ClientWrite {
-    DeltaUpdate  update{};
-    const Level* levels{nullptr};
+    const DeltaUpdate* update{nullptr};
+    const Level*       levels{nullptr};
 };
 
 /// What happened to one write of a batch: the status `apply_delta()` returns for it, or - where

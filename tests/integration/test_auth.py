@@ -187,6 +187,30 @@ def test_an_unauthenticated_session_can_only_ping_and_authenticate(authed_node):
         w.close()
 
 
+def test_writes_before_authentication_are_refused_when_pipelined_too(authed_node):
+    """#155: the event loop holds the writes of a read and applies them together, and a held write
+    never reaches `execute_command()`'s gate - what keeps it out is the rule that decides which
+    writes may be held. A pipeline is the shape that goes through that rule: an `INSERT`, a `PING`
+    and a `MINSERT` in one read, before `AUTH`. Each write is refused where it stands, and after
+    authenticating there is not one row of either."""
+    w = Wire(authed_node.port)
+    try:
+        answers = w.send("INSERT UNAUTHW EX bid 100 1 1\nPING\nMINSERT UNAUTHW EX bid 2\n"
+                         "99 1 1\n98 2 1", settle=0.6)
+        assert answers == "ERR unauthenticated\nPONG\nERR unauthenticated\n", repr(answers)
+
+        challenge = w.send("AUTH")
+        nonce = challenge.split()[2]
+        digest = client_response(ALICE_SECRET, "alice", nonce)
+        assert "OK AUTH alice" in w.send(f"AUTH alice {digest}")
+        assert w.send("FLUSH", settle=1.0).startswith("OK")
+        rows = w.send("SELECT * FROM 'UNAUTHW'.'EX'", settle=1.0)
+        stored = [line for line in rows.splitlines() if line.count("\t") >= 6]
+        assert not stored, f"a write refused before authentication was stored: {stored}"
+    finally:
+        w.close()
+
+
 def test_a_full_challenge_response_admits_the_session(authed_node):
     w = Wire(authed_node.port)
     try:
