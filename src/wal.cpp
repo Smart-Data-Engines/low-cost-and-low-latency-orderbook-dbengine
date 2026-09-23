@@ -160,8 +160,12 @@ WALWriter::WALWriter(std::string_view dir, size_t rotate_threshold_bytes,
 /// whether a client was waiting on it - and it says what Linux does next, because the obvious
 /// reaction (try again) is the one thing that cannot work.
 int WALWriter::fsync_or_record(const char* why) {
-    if (fd_ < 0) return 0;
-    if (::fsync(fd_) == 0) return 0;
+    return fsync_fd_or_record(fd_, why);
+}
+
+int WALWriter::fsync_fd_or_record(int fd, const char* why) {
+    if (fd < 0) return 0;
+    if (::fsync(fd) == 0) return 0;
     const int err = errno;
     fsync_failures_.fetch_add(1, std::memory_order_relaxed);
     OB_LOG_ERROR("wal",
@@ -173,9 +177,10 @@ int WALWriter::fsync_or_record(const char* why) {
 }
 
 WALWriter::~WALWriter() {
+    // Nothing to report to: a destructor that throws during shutdown is #112 again. The counter and
+    // the log are the whole answer here.
+    (void)sync_and_close_leaving("closing the WAL");
     if (fd_ >= 0) {
-        // Nothing to report to: a destructor that throws during shutdown is #112 again. The
-        // counter and the log are the whole answer here.
         (void)fsync_or_record("closing the WAL");
         ::close(fd_);
         fd_ = -1;
@@ -184,11 +189,24 @@ WALWriter::~WALWriter() {
 
 uint32_t WALWriter::open_current(uint32_t index) {
     if (fd_ >= 0) {
-        // A rotation whose sync failed leaves the file it is leaving behind possibly incomplete.
-        // Recorded rather than thrown: this runs from the constructor as well, where there is no
-        // caller to tell.
-        (void)fsync_or_record("rotating the WAL");
-        ::close(fd_);
+        // The file being left is synced by the next flush tick, without the engine's lock, rather
+        // than here - on the thread of the writer that crossed the threshold, under the lock every
+        // writer needs (stage 5 of #151). Under `--fsync-policy none` nothing else syncs the WAL,
+        // so this was up to 512 MB at once: 295 and 323 ms measured, every writer standing for it.
+        // Past the bound the oldest is synced here after all, as it always was.
+        if (leaving_fds_.size() >= kMaxLeavingFiles) {
+            const int oldest = leaving_fds_.front();
+            leaving_fds_.erase(leaving_fds_.begin());
+            (void)fsync_fd_or_record(oldest, "rotating the WAL, with its oldest left file unsynced");
+            ::close(oldest);
+            OB_LOG_WARN("wal",
+                        "%zu files left by rotation were still waiting for a flush tick to sync "
+                        "them; synced the oldest on the writer's thread instead",
+                        kMaxLeavingFiles);
+        }
+        leaving_fds_.push_back(fd_);
+        OB_LOG_DEBUG("wal", "left %s for the flush tick to sync and close (descriptor %d)",
+                     wal_filename(dir_, current_position().file_index).c_str(), fd_);
         fd_ = -1;
     }
 
@@ -678,7 +696,22 @@ void WALWriter::abandon_torn_file(size_t stranded_bytes, int write_errno) noexce
     }
 }
 
+int WALWriter::sync_and_close_leaving(const char* why) {
+    int first_err = 0;
+    for (const int fd : leaving_fds_) {
+        const int err = fsync_fd_or_record(fd, why);
+        if (err != 0 && first_err == 0) first_err = err;
+        ::close(fd);
+    }
+    leaving_fds_.clear();
+    return first_err;
+}
+
 bool WALWriter::flush() {
+    // The files a rotation left first, under every policy: they were synced at the rotation until
+    // stage 5 of #151, `none` included, and "the log is synced up to here" is only true of them
+    // once they are.
+    const bool leaving_ok = sync_and_close_leaving("flush") == 0;
     if (fd_ >= 0 && fsync_policy_ != FsyncPolicy::NONE) {
         if (fsync_or_record("flush") != 0) {
             // `pending_sync_` is left where it is, so the count still says a sync is owed. It
@@ -687,13 +720,107 @@ bool WALWriter::flush() {
             // flush loop there is nothing left to do.
             return false;
         }
-        pending_sync_ = 0;
+        if (leaving_ok) pending_sync_ = 0;
     }
-    return true;
+    return leaving_ok;
 }
 
 bool WALWriter::sync() {
     return flush();
+}
+
+// ── A sync performed without the writer's lock (stage 5 of #151) ─────────────
+
+WALWriter::SyncTicket& WALWriter::SyncTicket::operator=(SyncTicket&& other) noexcept {
+    if (this != &other) {
+        settle();
+        owner_    = other.owner_;
+        fd_       = other.fd_;
+        leaving_  = std::move(other.leaving_);
+        records_  = other.records_;
+        position_ = other.position_;
+        other.fd_      = -1;
+        other.leaving_.clear();
+        other.records_ = 0;
+    }
+    return *this;
+}
+
+WALWriter::SyncTicket::~SyncTicket() { settle(); }
+
+void WALWriter::SyncTicket::settle() noexcept {
+    // A ticket dropped without being performed - the caller threw between taking it and using it.
+    // Its descriptor of the current file is closed: the records it would have covered are still
+    // owed, so the next ticket syncs them. The files a rotation left are synced first, because no
+    // later ticket will have them.
+    for (const int fd : leaving_) {
+        if (owner_ != nullptr) (void)owner_->fsync_fd_or_record(fd, "a dropped sync ticket");
+        ::close(fd);
+    }
+    leaving_.clear();
+    if (fd_ >= 0) ::close(fd_);
+    fd_ = -1;
+}
+
+std::pair<WALWriter::SyncTicket, int> WALWriter::prepare_sync() {
+    SyncTicket ticket;
+    ticket.owner_    = this;
+    ticket.position_ = current_position();
+    // The files a rotation left go with the ticket under every policy: they were synced at the
+    // rotation until stage 5 of #151, and the ticket is where that moved.
+    ticket.leaving_ = std::move(leaving_fds_);
+    leaving_fds_.clear();
+    // The current file is owed on the same terms as `flush()`, plus something written since the
+    // last sync, which is the condition the flush tick has always checked before syncing.
+    if (fd_ < 0 || fsync_policy_ == FsyncPolicy::NONE || pending_sync_ == 0) {
+        return {std::move(ticket), 0};
+    }
+    const int dup_fd = ::fcntl(fd_, F_DUPFD_CLOEXEC, 0);
+    if (dup_fd < 0) {
+        const int dup_err = errno;
+        OB_LOG_WARN("wal",
+                    "could not duplicate the WAL descriptor to sync it outside the engine's lock "
+                    "(%s); syncing under the lock instead, which holds every writer for as long",
+                    std::strerror(dup_err));
+        // Everything under the lock, then, the files a rotation left included - a ticket the
+        // caller is told failed is not one it will perform.
+        leaving_fds_ = std::move(ticket.leaving_);
+        ticket.leaving_.clear();
+        const int leaving_err = sync_and_close_leaving("the flush tick");
+        const int err = fsync_or_record("the flush tick");
+        if (err == 0 && leaving_err == 0) pending_sync_ = 0;
+        return {std::move(ticket), err != 0 ? err : leaving_err};
+    }
+    ticket.fd_      = dup_fd;
+    ticket.records_ = pending_sync_;
+    OB_LOG_DEBUG("wal", "sync ticket: %zu record(s) up to file %u offset %u, descriptor %d",
+                 ticket.records_, ticket.position_.file_index, ticket.position_.offset, dup_fd);
+    return {std::move(ticket), 0};
+}
+
+int WALWriter::perform_sync(SyncTicket& ticket) {
+    int first_err = 0;
+    for (const int fd : ticket.leaving_) {
+        const int err = fsync_fd_or_record(fd, "a file the WAL rotated away from");
+        if (err != 0 && first_err == 0) first_err = err;
+        ::close(fd);
+    }
+    ticket.leaving_.clear();
+    if (ticket.fd_ >= 0) {
+        const int err = fsync_fd_or_record(ticket.fd_, "the flush tick");
+        if (err != 0 && first_err == 0) first_err = err;
+        ::close(ticket.fd_);
+        ticket.fd_ = -1;
+    }
+    return first_err;
+}
+
+void WALWriter::complete_sync(const SyncTicket& ticket, int err) {
+    // A failure leaves the records owed, for the reason `flush()` gives. On success only the
+    // records the ticket counted are paid: those written while the sync ran are after its position
+    // and are owed the next one.
+    if (err != 0) return;
+    pending_sync_ -= std::min(pending_sync_, ticket.records_);
 }
 
 size_t WALWriter::truncate_before(uint32_t before_index) {

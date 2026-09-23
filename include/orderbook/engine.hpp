@@ -1,6 +1,7 @@
 #pragma once
 
 #include "orderbook/aggregation.hpp"
+#include "orderbook/chunked_queue.hpp"
 #include "orderbook/columnar_store.hpp"
 #include "orderbook/data_model.hpp"
 #include "orderbook/epoch.hpp"
@@ -643,7 +644,12 @@ private:
         std::string exchange;
         SnapshotRow row;
     };
-    std::vector<PendingRow> pending_rows_;
+    /// A queue of fixed-size chunks rather than a vector (stage 5 of #151): a flush tick takes
+    /// every row queued so far in one short hold of mtx_, drains them without it, and gives each
+    /// chunk back as it is done. `chunked_queue.hpp` says what two swapped vectors did to memory
+    /// instead. The chunks it keeps are bounded by the ceiling's worth of rows, plus two.
+    using PendingQueue = ChunkedQueue<PendingRow>;
+    PendingQueue pending_rows_{MAX_PENDING_ROWS / PendingQueue::chunk_rows() + 2};
 
     /// How far into the WAL the last completed drain reached: the position it stamped into its
     /// stores. **The engine's answer to "how much of the log is in segment files"** once a flush's
@@ -687,6 +693,30 @@ private:
     /// replays from the last checkpoint synced before the failure, is what rebuilds the segments
     /// written since, and the WAL still holds every record they need. Under `mtx_`.
     bool checkpoints_frozen_{false};
+
+    /// Rows a flush tick has taken out of `pending_rows_` and not yet drained into their stores
+    /// (stage 5 of #151). The tick takes them under mtx_, syncs their WAL records and drains them
+    /// **without** it, and lowers this chunk by chunk as each is drained - so a writer waiting at
+    /// the ceiling waits for one chunk, not for the tick. Zero outside a tick: the tick holds
+    /// `flush_mtx_` from taking the rows to giving the last chunk back, so nothing else that drains
+    /// or replaces the queue runs in between.
+    ///
+    /// Atomic, and lowered **without** mtx_: the first version took mtx_ for each chunk, and at four
+    /// pipelining connections on the m9g.xlarge the drain, queueing ~250 times a tick behind every
+    /// writer, fell behind them - 10.6 -> 9.0 M levels/s - and under `--fsync-policy every`, where a
+    /// writer holds mtx_ through its fsync, it could not give chunks back as fast as they filled.
+    /// Set, and zeroed on a failure, under mtx_; read under it by everything that counts the queue.
+    ///
+    /// Everything that counts the queue counts these as well (`queued_rows()`): they are not in a
+    /// segment yet, a reader of `STATUS` or `holds_no_data()` must not see them vanish for the
+    /// length of an `fsync`, and the room a writer waits for is room in both - otherwise a tick
+    /// that starts at the ceiling would let the queue grow to twice it while the sync runs.
+    std::atomic<size_t> detached_rows_{0};
+
+    /// Rows not yet in a segment: the queue, plus what a flush tick has taken. Caller holds mtx_.
+    size_t queued_rows() const {
+        return pending_rows_.size() + detached_rows_.load(std::memory_order_relaxed);
+    }
 
     // Backpressure: maximum number of pending rows before apply_delta blocks.
     // Default 1M rows ≈ ~100 MB memory. Prevents OOM under sustained ingestion.
@@ -804,7 +834,12 @@ private:
     /// numbers are independently useful, and importing them can only raise what this node claims
     /// to have seen.
     void restore_held_sequences();
-    ColumnarStore& get_or_create_store(const std::string& symbol, const std::string& exchange);
+    /// The store for `symbol.exchange`, created if it is new. Caller holds `flush_mtx_`, which every
+    /// mutator of `stores_` holds, so a lookup needs nothing more; a creation - the one insertion
+    /// into `stores_` - also takes mtx_ unless `mtx_held`, because `holds_no_data()` reads the map
+    /// under mtx_ alone.
+    ColumnarStore& get_or_create_store(const std::string& symbol, const std::string& exchange,
+                                       bool mtx_held);
     void flush_loop();
 
     /// One flush: drain, segment I/O, gauge, WAL truncation and the TTL scan.
@@ -871,6 +906,16 @@ private:
     /// holds is skipped by the WAL position that segment recorded (#63), which needs the index.
     uint64_t replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastCheckpoint& last);
     void flush_drain_pending();    // Phase A: drain pending_rows_ → per-symbol append (must hold mtx_)
+    /// The drain itself: `batch` into its per-symbol stores, each store stamped with `covered` -
+    /// the WAL position every one of these rows' records is at or before, and which a sync has
+    /// reached - and `drained_up_to_` set to it once every row is in. Each chunk is given back to
+    /// `pending_rows_` as soon as it is drained, lowering `detached_rows_`, which the caller set
+    /// to the batch's rows - neither under mtx_. With `mtx_held` the caller holds mtx_ throughout;
+    /// without it, the caller holds only `flush_mtx_`, and mtx_ is taken just to create a store and
+    /// at the end (stage 5 of #151). On a throw - a segment write the disk refused (#161) - the rows
+    /// it appended stay in their stores and the rest go back in front of the queue, and no drain
+    /// position is recorded.
+    void drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool mtx_held);
     /// Phase B: segment I/O, the segment sync, and the index merge (hold `flush_mtx_`, not `mtx_`).
     /// Returns 0, or the `errno` the segment sync failed with - in which case the segments are
     /// merged and visible, and no checkpoint claims them or anything after them in this process

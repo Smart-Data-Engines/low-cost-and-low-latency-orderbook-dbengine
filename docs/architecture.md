@@ -41,7 +41,7 @@ The engine is composed of six subsystems, each responsible for a specific concer
 
 3. **Gap detection** — If the sequence number is not consecutive (`seq != prev_seq + 1`), a gap event is recorded in the WAL.
 
-4. **Columnar enqueue** — SnapshotRows are enqueued for the background flush thread, which periodically drains them into the columnar store.
+4. **Columnar enqueue** — SnapshotRows are enqueued for the background flush thread, which periodically drains them into the columnar store. The queue is a FIFO of 4096-row chunks with a ceiling of a million rows; a writer that finds it full asks for a flush and waits for room (#137), and the flush tick takes it in one short hold of the engine's lock and does its I/O without it ([below](#the-flush-tick-and-what-it-holds-the-engines-lock-for)).
 
 5. **Subscriber notification** — Streaming query callbacks are invoked synchronously within the apply_delta call.
 
@@ -88,6 +88,37 @@ The engine is composed of six subsystems, each responsible for a specific concer
 2. Flush all pending rows to the columnar store.
 3. Flush each columnar segment's metadata.
 4. Flush the WAL to disk.
+
+### The flush tick, and what it holds the engine's lock for
+
+Every `--flush-interval-ms`, and at once when a writer finds the pending queue at its ceiling, the
+flush thread runs one tick. It holds `flush_mtx_` throughout — every mutator of the columnar stores
+holds it, so a client `FLUSH` cannot interleave — and it takes `mtx_`, the lock every writer needs,
+only for bookkeeping (#164):
+
+1. **Under `mtx_`, briefly**: a sync ticket from the WAL — a `dup()` of the current descriptor, the
+   records a sync would cover, the position they end at, and the files rotation has left since the
+   last tick — and every chunk of pending rows queued so far. Every row taken has its record before
+   the ticket's position, because a writer appends the record and queues the row under one hold of
+   `mtx_`.
+2. **Without it**: the `fsync`s, the files rotation left first. Then **under `mtx_` again** the
+   records stop being owed; a sync that failed puts the rows back in front of what was queued since,
+   and the tick throws for #112's boundary to count.
+3. **Without it**: the drain, a chunk at a time into the rows' stores, stamped with the ticket's
+   position. Each chunk is given back, and released from the ceiling, as soon as its rows are in,
+   so a writer at the ceiling waits for a chunk rather than for the tick. A store the drain creates
+   takes `mtx_` for the insertion.
+4. **Without it**: every store's segment written, and one `syncfs()` on the data directory (#160).
+5. **Under `mtx_`**: the new segments merged into the query index, the checkpoint appended (#159),
+   and the WAL files below the retention floor chosen.
+6. **Without it**: those files deleted and, on its own interval, the TTL sweep (#163).
+
+The rows being drained still count against the ceiling, and in `STATUS`, `holds_no_data()` and
+`ob_pending_rows`, so nothing reads as empty for the length of a sync. What bounds a fast writer is
+then the cycle itself rather than the lock: one pipelining connection writing 6.6 M levels a second
+on an m9g.xlarge meets the ceiling once a cycle of about 150 ms. `FLUSH`, `close()` and snapshot
+creation still drain under `mtx_`, straight after a sync under the same hold. Step 5's merge walks
+the whole segment index, which grows with the node's uptime (#165).
 
 ### Sequence numbers and who assigns them
 
@@ -316,9 +347,9 @@ the data directory (#160) and their metadata merged, never before: a checkpoint 
 than is durable turns a crash into data loss, while one that claims less costs a replay.
 
 **What it claims is the position its flush drained up to, not everything before it** (#159). Its
-payload is eight bytes, that position's file index and offset, both little-endian. A flush drains
-the queued rows under the engine's lock and writes their segments without it, so writers go on
-appending while it does: the log then holds records **between** the drain and the checkpoint whose
+payload is eight bytes, that position's file index and offset, both little-endian. A flush takes
+the queued rows in one short hold of the engine's lock, and drains them and writes their segments
+without it (#164), so writers go on appending while it does: the log then holds records **between** the drain and the checkpoint whose
 rows are still queued. Until #159 the checkpoint had an empty payload and meant "everything before
 me", so replay skipped exactly those records, and a crash before the next flush lost every one of
 them — each answered `OK`, under every fsync policy, `every` included. Replay now forwards every

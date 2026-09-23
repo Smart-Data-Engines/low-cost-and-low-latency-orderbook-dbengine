@@ -514,7 +514,9 @@ crash replays, together with `--flush-interval-ms`. It bounds what a reconnectin
 to scan before the primary decides a snapshot is cheaper. And it is the granularity retention frees,
 because WAL files are deleted whole and only below the file the slowest **connected** replica has
 confirmed — so a large threshold means a lagging replica pins more bytes on disk, and a small one
-means more files to walk.
+means more files to walk. Under `--fsync-policy none` it is also the size of the only sync the WAL
+gets: the file a rotation leaves is synced by the next flush tick (#164), and `docs/operations.md`
+says what a writer may wait for meanwhile.
 
 It is refused at both ends rather than clamped. The ceiling is 2 GiB: a WAL position is a file index
 and a 32-bit offset read as one value, and a larger file would let the offset wrap and report a

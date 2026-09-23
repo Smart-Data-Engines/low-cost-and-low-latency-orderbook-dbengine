@@ -866,7 +866,7 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
 
     // Update gauge: pending rows after enqueue. Once per batch: it is a gauge, and a reader
     // sampling it inside the batch could only ever have seen it under this lock anyway.
-    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
+    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(queued_rows()));
 
     if (!multi_master) return;
 
@@ -970,9 +970,8 @@ ob_status_t Engine::apply_in_memory(const std::string& key, const DeltaUpdate& d
     if (query_engine_->has_subscribers() && pending_rows_.size() > rows_before) {
         std::vector<SnapshotRow> batch;
         batch.reserve(pending_rows_.size() - rows_before);
-        for (size_t i = rows_before; i < pending_rows_.size(); ++i) {
-            batch.push_back(pending_rows_[i].row);
-        }
+        pending_rows_.for_each_last(pending_rows_.size() - rows_before,
+                                    [&](const PendingRow& pr) { batch.push_back(pr.row); });
         query_engine_->notify_subscribers(delta.symbol, delta.exchange, batch);
     }
     return status;
@@ -1152,9 +1151,8 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
         if (query_engine_->has_subscribers() && pending_rows_.size() > rows_before) {
             std::vector<SnapshotRow> batch;
             batch.reserve(pending_rows_.size() - rows_before);
-            for (size_t i = rows_before; i < pending_rows_.size(); ++i) {
-                batch.push_back(pending_rows_[i].row);
-            }
+            pending_rows_.for_each_last(pending_rows_.size() - rows_before,
+                                        [&](const PendingRow& pr) { batch.push_back(pr.row); });
             query_engine_->notify_subscribers(delta.symbol, delta.exchange, batch);
         }
     }
@@ -1167,7 +1165,7 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
 
     // 6. Do NOT broadcast further (single-hop propagation in full-mesh).
 
-    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
+    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(queued_rows()));
 
     return OB_OK;
 }
@@ -1227,7 +1225,7 @@ Engine::Stats Engine::stats() {
 
     std::unique_lock<std::mutex> lock(mtx_);
     Stats s{};
-    s.pending_rows      = pending_rows_.size();
+    s.pending_rows      = queued_rows();   // with what a flush tick is syncing (stage 5 of #151)
     // Through the pair even though `mtx_` is held and formally it need not be: two ways of reading
     // the same thing are two ways of which one eventually stops being correct, and nobody notices
     // because both give the same number today.
@@ -1698,12 +1696,12 @@ bool Engine::install_snapshot(const std::string& staging_dir,
 bool Engine::holds_no_data() {
     std::lock_guard<std::mutex> lock(mtx_);
     const bool empty = seq_tracker_.symbol_count() == 0 &&
-                       pending_rows_.empty() &&
+                       queued_rows() == 0 &&
                        stores_.empty() &&
                        combined_store_.segment_count() == 0;
     OB_LOG_DEBUG("engine",
                  "holds_no_data=%d (symbols=%zu pending=%zu stores=%zu segments=%zu)",
-                 empty ? 1 : 0, seq_tracker_.symbol_count(), pending_rows_.size(),
+                 empty ? 1 : 0, seq_tracker_.symbol_count(), queued_rows(),
                  stores_.size(), combined_store_.segment_count());
     return empty;
 }
@@ -2111,7 +2109,7 @@ SoABuffer& Engine::get_or_create_buffer(const std::string& key, const char* symb
 }
 
 ColumnarStore& Engine::get_or_create_store(const std::string& symbol,
-                                            const std::string& exchange) {
+                                            const std::string& exchange, bool mtx_held) {
     const std::string key = symbol + "." + exchange;
     auto it = stores_.find(key);
     if (it != stores_.end()) return *it->second;
@@ -2119,7 +2117,13 @@ ColumnarStore& Engine::get_or_create_store(const std::string& symbol,
     auto store = std::make_unique<ColumnarStore>(base_dir_);
     store->set_symbol_exchange(symbol, exchange);
     auto& ref = *store;
-    stores_[key] = std::move(store);
+    if (mtx_held) {
+        stores_[key] = std::move(store);
+    } else {
+        std::lock_guard<std::mutex> lock(mtx_);
+        stores_[key] = std::move(store);
+    }
+    OB_LOG_DEBUG("engine", "new columnar store for %s", key.c_str());
     return ref;
 }
 
@@ -2133,7 +2137,7 @@ void Engine::request_flush() {
 
 bool Engine::await_pending_room(std::unique_lock<std::mutex>& lock) {
     const auto room = [this]() {
-        return pending_rows_.size() < MAX_PENDING_ROWS ||
+        return queued_rows() < MAX_PENDING_ROWS ||
                stop_flush_.load(std::memory_order_relaxed);
     };
     if (room()) {
@@ -2157,7 +2161,7 @@ bool Engine::await_pending_room(std::unique_lock<std::mutex>& lock) {
                     "A writer is waiting for room in the pending queue (%zu rows). The flush has "
                     "been asked to run now rather than at the next interval; the write is refused "
                     "if it does not free room within %lld s.",
-                    pending_rows_.size(),
+                    queued_rows(),
                     static_cast<long long>(kBackpressureDeadline.count()));
     }
 
@@ -2287,18 +2291,55 @@ void Engine::flush_tick() {
         // The whole tick is one flush, so a client FLUSH cannot interleave with it.
         std::lock_guard<std::mutex> flush_lock(flush_mtx_);
 
-        // Phase A: drain pending rows under mutex.
+        // Phase A: the WAL sync, and the rows it covers - both **outside** mtx_ (stage 5 of #151).
+        // They were the longest things this tick did while holding the lock every writer needs:
+        // on the m9g.xlarge the sync alone took 7.9 ms at p50 and 25.8 ms at worst, and a
+        // pipelining writer's batch waited 21-30 ms at p99.9 once per tick; with only the sync
+        // taken out, the drain of ~640k rows under the lock still held it for 11 ms at p99.9.
+        //
+        // Taken under mtx_: the ticket, and every row queued so far - so every row taken has its
+        // record before the ticket's position, because a writer appends the record and queues the
+        // row under one hold of mtx_. The sync is performed without it and accounted for under it
+        // again; on a failure the rows go back in front of what was written meanwhile, because
+        // draining them would move them out of the only place that still knows they were never
+        // synced, and #112's boundary catches the throw, counts it and runs the next tick. The
+        // drain runs without mtx_ too, giving each chunk back as soon as it is in its stores.
+        WALWriter::SyncTicket ticket;
+        PendingQueue::Batch batch;
         {
             std::unique_lock<std::mutex> lock(mtx_);
-            if (wal_.pending_sync_count() > 0 && !wal_.sync()) {
-                // #112's boundary catches this, counts it and runs the next tick. Throwing rather
-                // than continuing matters: draining pending rows after a failed sync would move
-                // them out of the only place that still knows they were never synced.
+            auto prepared = wal_.prepare_sync();
+            ticket = std::move(prepared.first);
+            if (prepared.second != 0) {
+                // The duplicate could not be made and the sync ran under the lock, and failed.
                 throw std::runtime_error("Engine: WAL sync failed during the flush tick");
             }
-            note_wal_synced();
-            flush_drain_pending();
+            batch = pending_rows_.take_all();
+            detached_rows_.store(batch.rows(), std::memory_order_relaxed);
+            if (!ticket.owed()) {
+                // Nothing to sync - `every` has synced each run, `none` never does, or nothing was
+                // written - and the floor moves here too (#160): nothing owed means the log is
+                // synced to its end, under `every` by the last write's own sync, which is this
+                // path's ordinary case once writes are flowing, since each one resets the count a
+                // checkpoint left. Without this, retention under `every` never moved at all.
+                note_wal_synced();
+            }
         }
+        if (ticket.owed()) {
+            const int sync_err = wal_.perform_sync(ticket);
+            std::unique_lock<std::mutex> lock(mtx_);
+            wal_.complete_sync(ticket, sync_err);
+            if (sync_err != 0) {
+                detached_rows_.store(0, std::memory_order_relaxed);
+                pending_rows_.put_back_front(std::move(batch));
+                throw std::runtime_error("Engine: WAL sync failed during the flush tick");
+            }
+            // The floor follows the checkpoint this sync covered (#160): it was appended by the last
+            // tick, before this ticket's position, and no checkpoint is appended while this tick
+            // holds `flush_mtx_`.
+            note_wal_synced();
+        }
+        drain_batch(batch, ticket.position(), /*mtx_held=*/false);
 
         // Phase B: segment I/O + merge, outside mtx_ so writers are not blocked. A failed segment
         // sync is counted and logged inside, and the tick goes on: the rows are merged and
@@ -2309,7 +2350,12 @@ void Engine::flush_tick() {
         registry_.set_gauge("ob_wal_file_index",
                             static_cast<int64_t>(wal_.current_file_index()));
 
-        // WAL truncation and TTL scan under mutex.
+        // WAL truncation and the TTL sweep: what may go is decided under mtx_, the deleting is done
+        // without it (stage 5 of #151). An unlink of a 512 MB WAL file, or of every file of every
+        // expired segment, is I/O no writer ever needed to wait for - and both only read what they
+        // are handed: `truncate_before()` touches nothing of the writer but its directory's name,
+        // and the combined store has its own lock, which queries take and writers do not.
+        uint32_t safe_truncate = 0;
         {
             std::unique_lock<std::mutex> lock(mtx_);
 
@@ -2326,47 +2372,53 @@ void Engine::flush_tick() {
             // is deleted once the segment holding its rows is synced *and* the checkpoint saying so
             // is too. Either missing after a power cut, startup rebuilds those segments from the
             // WAL - so the records must still be there.
-            uint32_t safe_truncate = retention_floor_.file_index;
+            //
+            // Decided here and done below: a file this number allows cannot stop being allowed
+            // after the lock is released, because the floor only rises and every file below it is
+            // one no writer will write again - the writer is on the file the floor is at or later.
+            // A file a rotation left and no tick has synced yet is at or above the floor for the
+            // same reason (stage 5 of #151): the floor is a position some tick's sync covered.
+            safe_truncate = retention_floor_.file_index;
             if (repl_mgr_) {
                 for (const auto& r : repl_mgr_->replica_states()) {
                     safe_truncate = std::min(safe_truncate, r.confirmed_file);
                 }
             }
-            if (safe_truncate > 0) {
-                wal_.truncate_before(safe_truncate);
-            }
+        }
+        if (safe_truncate > 0) {
+            wal_.truncate_before(safe_truncate);
+        }
 
-            // TTL retention scan: delete expired segments periodically.
-            //
-            // Two clocks, one for each question (#163). **When** to sweep is the monotonic clock,
-            // so a stepped wall clock does not stretch or shrink the interval. **What** has expired
-            // is the wall clock, because segment times are event times: this read `steady_clock`
-            // for both, so the cutoff was a count from boot compared with nanoseconds since 1970 -
-            // on a machine up for less than the retention it wrapped past every timestamp and the
-            // first sweep deleted everything, and on one up for longer nothing ever expired.
-            if (ttl_config_.ttl_hours > 0) {
-                const auto now = std::chrono::steady_clock::now();
-                // Compared in whole seconds, so a large `--ttl-scan-interval-seconds` is a long
-                // wait rather than a duration that overflows on its way to nanoseconds.
-                const bool due =
-                    last_ttl_scan_ == std::chrono::steady_clock::time_point{} ||
-                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
-                                              now - last_ttl_scan_)
-                                              .count()) >= ttl_config_.scan_interval_seconds;
-                if (due) {
-                    const uint64_t wall_now_ns = wall_clock_ns();
-                    const uint64_t cutoff_ns = ttl_cutoff_ns(wall_now_ns, ttl_config_.ttl_hours);
-                    auto [deleted, reclaimed] = combined_store_.delete_expired_segments(cutoff_ns);
-                    ttl_segments_deleted_.fetch_add(deleted, std::memory_order_relaxed);
-                    ttl_bytes_reclaimed_.fetch_add(reclaimed, std::memory_order_relaxed);
-                    last_ttl_scan_ = now;
-                    OB_LOG_DEBUG("retention",
-                                 "TTL sweep: %zu segment(s) and %zu byte(s) older than event time "
-                                 "%llu (the wall clock, %llu, minus %llu h)",
-                                 deleted, reclaimed, static_cast<unsigned long long>(cutoff_ns),
-                                 static_cast<unsigned long long>(wall_now_ns),
-                                 static_cast<unsigned long long>(ttl_config_.ttl_hours));
-                }
+        // TTL retention scan: delete expired segments periodically.
+        //
+        // Two clocks, one for each question (#163). **When** to sweep is the monotonic clock,
+        // so a stepped wall clock does not stretch or shrink the interval. **What** has expired
+        // is the wall clock, because segment times are event times: this read `steady_clock`
+        // for both, so the cutoff was a count from boot compared with nanoseconds since 1970 -
+        // on a machine up for less than the retention it wrapped past every timestamp and the
+        // first sweep deleted everything, and on one up for longer nothing ever expired.
+        if (ttl_config_.ttl_hours > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            // Compared in whole seconds, so a large `--ttl-scan-interval-seconds` is a long
+            // wait rather than a duration that overflows on its way to nanoseconds.
+            const bool due =
+                last_ttl_scan_ == std::chrono::steady_clock::time_point{} ||
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                          now - last_ttl_scan_)
+                                          .count()) >= ttl_config_.scan_interval_seconds;
+            if (due) {
+                const uint64_t wall_now_ns = wall_clock_ns();
+                const uint64_t cutoff_ns = ttl_cutoff_ns(wall_now_ns, ttl_config_.ttl_hours);
+                auto [deleted, reclaimed] = combined_store_.delete_expired_segments(cutoff_ns);
+                ttl_segments_deleted_.fetch_add(deleted, std::memory_order_relaxed);
+                ttl_bytes_reclaimed_.fetch_add(reclaimed, std::memory_order_relaxed);
+                last_ttl_scan_ = now;
+                OB_LOG_DEBUG("retention",
+                             "TTL sweep: %zu segment(s) and %zu byte(s) older than event time "
+                             "%llu (the wall clock, %llu, minus %llu h)",
+                             deleted, reclaimed, static_cast<unsigned long long>(cutoff_ns),
+                             static_cast<unsigned long long>(wall_now_ns),
+                             static_cast<unsigned long long>(ttl_config_.ttl_hours));
             }
         }
 }
@@ -2374,67 +2426,118 @@ void Engine::flush_tick() {
 
 void Engine::flush_drain_pending() {
     // Phase A: drain pending_rows_ into per-symbol columnar stores.
-    // Must be called with mtx_ held.
+    // Must be called with mtx_ held, straight after a `wal_.sync()` under the same hold.
     //
     // The WAL position is read once, here, and stamped into every store this drain touches. It is
     // exact: `wal_.sync()` has just run and every row about to be appended came from a record at or
     // before this point, so a segment closed from these rows covers that symbol's WAL up to here.
     // That is the fact replay needs, and the reason it no longer has to guess from timestamps
     // (#63).
-    const WalPosition wal_pos = wal_.current_position();
-    const uint32_t wal_file   = wal_pos.file_index;
-    const uint64_t wal_offset = static_cast<uint64_t>(wal_pos.offset);
+    PendingQueue::Batch batch = pending_rows_.take_all();
+    detached_rows_.store(batch.rows(), std::memory_order_relaxed);
+    drain_batch(batch, wal_.current_position(), /*mtx_held=*/true);
+}
 
-    // The store is resolved per **run of one symbol**, not per row. Pending rows arrive an update
-    // at a time and an update is one symbol's levels, so consecutive rows almost always share a
-    // symbol — and `get_or_create_store()` builds `symbol + "." + exchange` and hashes it on every
-    // call. Measured before this: `get_or_create_store` was **5.06%** of the server's CPU under a
-    // pipelining client, all of it inside this loop, for a lookup whose answer had just been
-    // computed. Same shape as #66, which found the write path building one symbol key four times.
-    //
-    // Compared by value rather than cached across calls: a run is a local fact about this vector,
-    // so nothing survives the function and there is no invalidation to get wrong when a snapshot
-    // install replaces `stores_` (#142).
-    const std::string* run_symbol   = nullptr;
-    const std::string* run_exchange = nullptr;
-    ColumnarStore*     store        = nullptr;
-    size_t appended = 0;
-    try {
-        for (; appended < pending_rows_.size(); ++appended) {
-            const PendingRow& pr = pending_rows_[appended];
-            if (store == nullptr || *run_symbol != pr.symbol || *run_exchange != pr.exchange) {
-                store        = &get_or_create_store(pr.symbol, pr.exchange);
-                run_symbol   = &pr.symbol;
-                run_exchange = &pr.exchange;
-                store->set_wal_position(wal_identity_, wal_file, wal_offset);
-            }
-            store->append(pr.row);
+void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool mtx_held) {
+    // `covered` is what `flush_drain_pending()` explains: a position every row here has its record
+    // at or before, and that a sync has reached. From the flush tick it is the sync ticket's
+    // position rather than the current one, because the tick synced without the lock and the log
+    // may have moved on since - by exactly the records whose rows are still in `pending_rows_`.
+    const uint32_t wal_file   = covered.file_index;
+    const uint64_t wal_offset = static_cast<uint64_t>(covered.offset);
+
+    // mtx_ for a moment, unless the caller holds it for all of this.
+    const auto under_mtx = [&](auto&& step) {
+        if (mtx_held) {
+            step();
+        } else {
+            std::lock_guard<std::mutex> lock(mtx_);
+            step();
         }
-    } catch (...) {
-        // An append that rolls a segment over writes it, and since #160 a write the disk refuses
-        // is an exception rather than a short file. The rows before this one are in their stores
-        // now, so they leave the queue: left there, the next drain would append them a second
-        // time, into storage that never removes a row. The one that threw was not appended - the
-        // rollover comes before the row is added - and stays first in line. No drain position is
-        // recorded, so no checkpoint claims any of it (#159).
-        pending_rows_.erase(pending_rows_.begin(),
-                            pending_rows_.begin() + static_cast<std::ptrdiff_t>(appended));
-        registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
-        pending_cv_.notify_all();
-        OB_LOG_WARN("engine", "drain stopped after %zu row(s): %zu stay queued for the next flush",
-                    appended, pending_rows_.size());
-        throw;
+    };
+
+    size_t appended = 0;
+    for (size_t k = 0; k < batch.chunks.size(); ++k) {
+        PendingQueue::Chunk& chunk = *batch.chunks[k];
+        const size_t rows_here = chunk.size();
+
+        // The store is resolved per **run of one symbol**, not per row. Pending rows arrive an
+        // update at a time and an update is one symbol's levels, so consecutive rows almost always
+        // share a symbol — and `get_or_create_store()` builds `symbol + "." + exchange` and hashes
+        // it on every call. Measured before this: `get_or_create_store` was **5.06%** of the
+        // server's CPU under a pipelining client, all of it inside this loop, for a lookup whose
+        // answer had just been computed. Same shape as #66, which found the write path building one
+        // symbol key four times.
+        //
+        // A run starts again at each chunk: the pointers below point into this chunk's rows, and
+        // the chunk is cleared before the next one is read - so a run carried across would compare
+        // the next row with a destroyed string. It costs one lookup per chunk of 4096 rows.
+        const std::string* run_symbol   = nullptr;
+        const std::string* run_exchange = nullptr;
+        ColumnarStore*     store        = nullptr;
+        try {
+            for (; chunk.first < chunk.rows.size(); ++chunk.first) {
+                const PendingRow& pr = chunk.rows[chunk.first];
+                if (store == nullptr || *run_symbol != pr.symbol || *run_exchange != pr.exchange) {
+                    store        = &get_or_create_store(pr.symbol, pr.exchange, mtx_held);
+                    run_symbol   = &pr.symbol;
+                    run_exchange = &pr.exchange;
+                    store->set_wal_position(wal_identity_, wal_file, wal_offset);
+                }
+                store->append(pr.row);
+                ++appended;
+            }
+        } catch (...) {
+            // An append that rolls a segment over writes it, and since #160 a write the disk
+            // refuses is an exception rather than a short file. The rows before this one are in
+            // their stores now, so they leave the queue: left there, the next drain would append
+            // them a second time, into storage that never removes a row. The one that threw was
+            // not appended - the rollover comes before the row is added - and `chunk.first` still
+            // points at it, so it is first in line with the rest of this batch behind it, in front
+            // of whatever was queued meanwhile. No drain position is recorded, so no checkpoint
+            // claims any of it (#159).
+            size_t back = 0;
+            under_mtx([&] {
+                PendingQueue::Batch rest;
+                for (size_t r = k; r < batch.chunks.size(); ++r) {
+                    rest.chunks.push_back(std::move(batch.chunks[r]));
+                }
+                back = rest.rows();
+                detached_rows_.store(0, std::memory_order_relaxed);
+                pending_rows_.put_back_front(std::move(rest));
+                registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(queued_rows()));
+            });
+            batch.chunks.clear();
+            pending_cv_.notify_all();
+            OB_LOG_WARN("engine", "drain stopped after %zu row(s): %zu stay queued for the next flush",
+                        appended, back);
+            throw;
+        }
+
+        // Cleared, given back and released from the ceiling, all without mtx_ - destroying 4096
+        // rows is work no writer should wait behind, and the spare chunks have a lock of their own.
+        // Taking mtx_ here instead starved the drain at four pipelining connections: ~250
+        // acquisitions a tick, each behind every writer, and 10.6 -> 9.0 M levels/s (m9g.xlarge).
+        // Given back **before** it leaves the ceiling, so a writer the release lets on finds the
+        // chunk spare rather than allocating one. The notification is not under mtx_, so a writer
+        // between its check of the room and its wait can miss it - and is woken by the next
+        // chunk's, or by the last one below, which is sent after taking mtx_.
+        chunk.rows.clear();
+        PendingQueue::ChunkPtr surplus = pending_rows_.give_back(std::move(batch.chunks[k]));
+        detached_rows_.fetch_sub(rows_here, std::memory_order_relaxed);
+        if (!mtx_held) pending_cv_.notify_all();
+        // A chunk beyond what the queue keeps is freed here, at the end of this iteration.
     }
-    pending_rows_.clear();
+    batch.chunks.clear();
 
     // And kept for what this flush will say it covered once its segments are written (#159): the
     // checkpoint must claim these rows and nothing appended after them, and the WAL files before
     // this one are the only ones whose records are all in this drain. Set only once the drain is
     // complete, so a drain that throws part-way leaves the previous, smaller claim standing.
-    drained_up_to_ = wal_pos;
-
-    // Update gauge: pending rows is now 0 after drain.
-    registry_.set_gauge("ob_pending_rows", 0);
+    under_mtx([&] {
+        drained_up_to_ = covered;
+        registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(queued_rows()));
+    });
 
     // Wake up any writers blocked on backpressure.
     pending_cv_.notify_all();
@@ -2828,7 +2931,7 @@ uint64_t Engine::replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastC
                     static_cast<unsigned long long>(skipped_by_timestamp));
     }
 
-    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
+    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(queued_rows()));
     return applied;
 }
 

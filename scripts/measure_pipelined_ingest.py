@@ -237,8 +237,9 @@ def main() -> int:
             else f"{args.levels}-level MINSERT")
     print(f"\n{args.connections} connection(s), batches of {args.batch} x {what}, "
           f"medians of {args.rounds} rounds{pins}\n")
-    head = "| build | levels/s | range | batch p50 | batch p99 | server CPU |"
-    rule = "|---|---|---|---|---|---|"
+    head = ("| build | levels/s | range | batch p50 | batch p99 | batch p99.9 | batch max | server CPU "
+            "| peak RSS |")
+    rule = "|---|---|---|---|---|---|---|---|---|"
     if counted:
         for event in args.events:
             head += f" {short_name(event)} per batch |"
@@ -247,10 +248,21 @@ def main() -> int:
     print(rule)
     for name, rows in runs.items():
         rate = [x["probe"]["levels_per_s"] for x in rows]
+        def rss(rows_: list[dict]) -> str:
+            values = [x["probe"]["server_rss_peak_kb"] for x in rows_
+                      if x["probe"].get("server_rss_peak_kb", -1) >= 0]
+            return f"{statistics.median(values) / 1024:.0f} MiB" if values else "-"
+        # p99.9 and the maximum are newer than the probe some comparisons use as a baseline, so a
+        # probe that does not print them gives a dash rather than a KeyError halfway through a run.
+        def tail(key: str) -> str:
+            values = [x["probe"][key] for x in rows if key in x["probe"]]
+            return f"{statistics.median(values):.1f} µs" if values else "-"
         line = (f"| {name} | {statistics.median(rate):,.0f} | {min(rate):,.0f}-{max(rate):,.0f} "
                 f"| {statistics.median(x['probe']['batch_p50_us'] for x in rows):.1f} µs "
                 f"| {statistics.median(x['probe']['batch_p99_us'] for x in rows):.1f} µs "
-                f"| {statistics.median(x['probe']['server_cpu_s'] for x in rows):.2f} s |")
+                f"| {tail('batch_p999_us')} | {tail('batch_max_us')} "
+                f"| {statistics.median(x['probe']['server_cpu_s'] for x in rows):.2f} s "
+                f"| {rss(rows)} |")
         if counted:
             for event in args.events:
                 name_ = short_name(event)

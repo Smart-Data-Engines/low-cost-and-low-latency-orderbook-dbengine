@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -1374,4 +1376,306 @@ TEST(WalCheckpoint, TheDrainsPositionMayBeInAnEarlierFileThanTheCheckpoint) {
     std::vector<std::pair<uint8_t, uint64_t>> want;
     for (uint64_t s : expected) want.emplace_back(ob::WAL_RECORD_DELTA, s);
     EXPECT_EQ(forwarded_after_checkpoint(tmp.str()), want);
+}
+
+// ── A sync performed without the writer's lock (stage 5 of #151) ─────────────
+//
+// The flush tick used to sync the WAL while holding the engine's lock, and every writer waited for
+// the `fsync` - 7.9 ms at p50, 25.8 at worst on the m9g.xlarge. The ticket splits it: taken under
+// the lock, performed without it, accounted for under it again. What these pin is the arithmetic of
+// that split and the descriptor it lives on; that the tick really runs the middle step unlocked is
+// `FlushTickStatic` in test_write_batch.cpp, and what a writer sees is test_storage_faults.py.
+
+namespace {
+
+/// Descriptors this process has open, so a ticket that forgets to close its `dup()` is a number
+/// that moved rather than a leak nobody sees until the table is full.
+std::size_t open_descriptors() {
+    std::size_t n = 0;
+    for ([[maybe_unused]] const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) {
+        ++n;
+    }
+    return n;
+}
+
+} // namespace
+
+TEST(WalSyncTicket, ItCoversWhatWasWrittenBeforeItAndLeavesTheRestOwed) {
+    TempDir tmp("ticket_cover");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::INTERVAL);
+    for (uint64_t s = 1; s <= 3; ++s) {
+        ob::DeltaUpdate upd = make_delta(s);
+        writer.append(upd, &lvl);
+    }
+    const ob::WalPosition before = writer.current_position();
+
+    auto [ticket, err] = writer.prepare_sync();
+    ASSERT_EQ(err, 0);
+    ASSERT_TRUE(ticket.owed());
+    EXPECT_EQ(ticket.position().file_index, before.file_index);
+    EXPECT_EQ(ticket.position().offset, before.offset);
+
+    // Written while the sync would be running: after the ticket's position, so not its to pay.
+    for (uint64_t s = 4; s <= 5; ++s) {
+        ob::DeltaUpdate upd = make_delta(s);
+        writer.append(upd, &lvl);
+    }
+    const int performed = writer.perform_sync(ticket);
+    ASSERT_EQ(performed, 0);
+    EXPECT_FALSE(ticket.owed()) << "a performed ticket still holds its descriptor";
+    writer.complete_sync(ticket, performed);
+    EXPECT_EQ(writer.pending_sync_count(), 2u)
+        << "the records written after the ticket must still be owed a sync";
+}
+
+TEST(WalSyncTicket, NothingIsOwedWhereThePolicyOrTheLogOwesNothing) {
+    const ob::Level lvl = make_level();
+    {
+        TempDir tmp("ticket_every");
+        ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::EVERY);
+        ob::DeltaUpdate upd = make_delta(1);
+        writer.append(upd, &lvl);
+        EXPECT_FALSE(writer.prepare_sync().first.owed()) << "`every` has synced the run already";
+    }
+    {
+        TempDir tmp("ticket_none");
+        ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::NONE);
+        ob::DeltaUpdate upd = make_delta(1);
+        writer.append(upd, &lvl);
+        EXPECT_FALSE(writer.prepare_sync().first.owed()) << "`none` is never synced by the tick";
+    }
+    {
+        TempDir tmp("ticket_empty");
+        ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::INTERVAL);
+        EXPECT_FALSE(writer.prepare_sync().first.owed()) << "nothing written, nothing owed";
+    }
+    // The control: the same writer owes one as soon as something is written.
+    TempDir tmp("ticket_control");
+    ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::INTERVAL);
+    ob::DeltaUpdate upd = make_delta(1);
+    writer.append(upd, &lvl);
+    EXPECT_TRUE(writer.prepare_sync().first.owed());
+}
+
+TEST(WalSyncTicket, ARotationBetweenTakingAndPerformingItClosesNothingOfTheTickets) {
+    // The writer stops using its own descriptor when it rotates. The ticket's is a duplicate of it,
+    // so it still names the file the covered records are in - and it is the ticket's to close. The
+    // writer's goes to the files a rotation left, for the **next** ticket: this one was taken
+    // before the rotation and does not carry it.
+    TempDir tmp("ticket_rotate");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), /*rotate_threshold=*/512, ob::FsyncPolicy::INTERVAL);
+    ob::DeltaUpdate first = make_delta(1);
+    writer.append(first, &lvl);
+
+    const std::size_t descriptors = open_descriptors();
+    auto [ticket, err] = writer.prepare_sync();
+    ASSERT_EQ(err, 0);
+    ASSERT_TRUE(ticket.owed());
+    const uint32_t file = ticket.position().file_index;
+    uint64_t s = 2;
+    for (; writer.current_position().file_index == file; ++s) {
+        ob::DeltaUpdate upd = make_delta(s);
+        writer.append(upd, &lvl);
+        ASSERT_LT(s, 100u) << "the writer never rotated, so this test measured nothing";
+    }
+    EXPECT_EQ(writer.perform_sync(ticket), 0) << "the ticket's descriptor went with the rotation";
+    EXPECT_EQ(open_descriptors(), descriptors + 1)
+        << "the ticket leaked its duplicate, or the rotation closed the file it left unsynced";
+
+    auto [next, next_err] = writer.prepare_sync();
+    ASSERT_EQ(next_err, 0);
+    ASSERT_TRUE(next.owed()) << "the file the rotation left is not in the next ticket";
+    EXPECT_EQ(writer.perform_sync(next), 0);
+    EXPECT_EQ(open_descriptors(), descriptors) << "the next ticket did not close the file it synced";
+}
+
+/// Appends until the writer is on file `until` (a threshold of 512 bytes rotates every few records).
+void append_until_file(ob::WALWriter& writer, uint32_t until, uint64_t& seq) {
+    const ob::Level lvl = make_level();
+    while (writer.current_position().file_index < until) {
+        ob::DeltaUpdate upd = make_delta(seq++);
+        writer.append(upd, &lvl);
+        ASSERT_LT(seq, 10'000u) << "the writer never reached file " << until;
+    }
+}
+
+TEST(WalSyncTicket, AFileARotationLeftIsSyncedAndClosedByATicketUnderEveryPolicy) {
+    // Rotation synced the file it left, under the engine's lock, whatever the policy - under `none`
+    // that was up to 512 MB at once, 295 and 323 ms measured (stage 5 of #151). So a ticket carries
+    // it under `none` too, and is owed for it although `none` never owes the current file.
+    for (const ob::FsyncPolicy policy :
+         {ob::FsyncPolicy::NONE, ob::FsyncPolicy::INTERVAL, ob::FsyncPolicy::EVERY}) {
+        TempDir tmp("ticket_left");
+        const std::size_t descriptors = open_descriptors();
+        {
+            ob::WALWriter writer(tmp.str(), 512, policy);
+            uint64_t seq = 1;
+            append_until_file(writer, 1, seq);
+            EXPECT_EQ(open_descriptors(), descriptors + 2)
+                << "the rotation closed the file it left, so nothing will sync it";
+            auto [ticket, err] = writer.prepare_sync();
+            ASSERT_EQ(err, 0);
+            EXPECT_TRUE(ticket.owed()) << "a ticket does not carry the file a rotation left";
+            EXPECT_EQ(writer.perform_sync(ticket), 0);
+            EXPECT_EQ(open_descriptors(), descriptors + 1) << "the left file was synced, not closed";
+        }
+        EXPECT_EQ(open_descriptors(), descriptors);
+    }
+}
+
+TEST(WalSyncTicket, AFlushSyncsAndClosesTheFilesARotationLeft) {
+    // `flush()` is what a client FLUSH, a snapshot and `close()` rely on for "the log is synced up
+    // to here" under the writer's lock. A flush that skipped the file just left would skip the
+    // records written last before the rotation.
+    TempDir tmp("flush_left");
+    const std::size_t descriptors = open_descriptors();
+    ob::WALWriter writer(tmp.str(), 512, ob::FsyncPolicy::INTERVAL);
+    uint64_t seq = 1;
+    append_until_file(writer, 2, seq);
+    EXPECT_EQ(open_descriptors(), descriptors + 3) << "two files left, and the current one";
+    EXPECT_TRUE(writer.flush());
+    EXPECT_EQ(open_descriptors(), descriptors + 1);
+    EXPECT_FALSE(writer.prepare_sync().first.owed()) << "a flush left something owed";
+}
+
+TEST(WalSyncTicket, TheFilesLeftForATickAreBoundedAndTheOldestSyncedOnTheWritersThreadPastIt) {
+    // A node whose ticks are minutes apart would otherwise hold one open descriptor, and up to
+    // 512 MB of unsynced log, per rotation in between.
+    TempDir tmp("left_bound");
+    const std::size_t descriptors = open_descriptors();
+    ob::WALWriter writer(tmp.str(), 512, ob::FsyncPolicy::INTERVAL);
+    uint64_t seq = 1;
+    append_until_file(writer, 12, seq);
+    EXPECT_EQ(open_descriptors(), descriptors + 4 + 1) << "four files left and the current one";
+}
+
+TEST(WalSyncTicket, AWriterDestroyedWithFilesLeftClosesThem) {
+    TempDir tmp("left_destroy");
+    const std::size_t descriptors = open_descriptors();
+    {
+        ob::WALWriter writer(tmp.str(), 512, ob::FsyncPolicy::NONE);
+        uint64_t seq = 1;
+        append_until_file(writer, 3, seq);
+        EXPECT_GT(open_descriptors(), descriptors + 1);
+    }
+    EXPECT_EQ(open_descriptors(), descriptors);
+}
+
+TEST(WalSyncTicket, ADroppedTicketSyncsAndClosesTheFilesARotationLeft) {
+    // No later ticket will carry them, so a ticket dropped before it was performed - the caller
+    // threw between taking it and using it - settles them itself rather than closing them unsynced.
+    TempDir tmp("ticket_left_drop");
+    const std::size_t descriptors = open_descriptors();
+    ob::WALWriter writer(tmp.str(), 512, ob::FsyncPolicy::INTERVAL);
+    uint64_t seq = 1;
+    append_until_file(writer, 1, seq);
+    {
+        auto prepared = writer.prepare_sync();
+        ASSERT_TRUE(prepared.first.owed());
+    }
+    EXPECT_EQ(open_descriptors(), descriptors + 1) << "a dropped ticket kept the file it carried";
+    EXPECT_EQ(writer.fsync_failures(), 0u);
+}
+
+TEST(WalSyncTicket, ADroppedTicketClosesItsDescriptorAndOwesStay) {
+    TempDir tmp("ticket_drop");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::INTERVAL);
+    ob::DeltaUpdate upd = make_delta(1);
+    writer.append(upd, &lvl);
+    const std::size_t descriptors = open_descriptors();
+    {
+        auto prepared = writer.prepare_sync();
+        ASSERT_TRUE(prepared.first.owed());
+        EXPECT_EQ(open_descriptors(), descriptors + 1) << "a ticket that is owed holds a descriptor";
+    }
+    EXPECT_EQ(open_descriptors(), descriptors) << "a ticket dropped unperformed kept its descriptor";
+    EXPECT_EQ(writer.pending_sync_count(), 1u) << "a dropped ticket paid for a sync it never did";
+}
+
+TEST(WalSyncTicket, AFailedSyncLeavesItsRecordsOwed) {
+    // `perform_sync()` failing needs the injector, which test_storage_faults.py loads; what is
+    // pinned here is the accounting that follows it, which is the half that decides whether the
+    // flush tick drains rows whose records never reached the disk.
+    TempDir tmp("ticket_fail");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::INTERVAL);
+    for (uint64_t s = 1; s <= 3; ++s) {
+        ob::DeltaUpdate upd = make_delta(s);
+        writer.append(upd, &lvl);
+    }
+    auto [ticket, err] = writer.prepare_sync();
+    ASSERT_EQ(err, 0);
+    writer.complete_sync(ticket, EIO);
+    EXPECT_EQ(writer.pending_sync_count(), 3u) << "a failed sync was accounted as a paid one";
+    writer.complete_sync(ticket, 0);
+    EXPECT_EQ(writer.pending_sync_count(), 0u) << "the control: success pays what the ticket covered";
+}
+
+TEST(WalSyncStatic, ADroppedTicketReachesTheWriterOnlyThroughTheFailureCount) {
+    // `SyncTicket::settle()` runs from the ticket's destructor, which may be on any thread and
+    // without the writer's lock: it syncs the files a rotation left, through the owner's
+    // `fsync_fd_or_record()` - an atomic counter and a log line - and must touch nothing else of it.
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/src/wal.cpp");
+    const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const std::size_t at = src.find("void WALWriter::SyncTicket::settle(");
+    ASSERT_NE(at, std::string::npos) << "SyncTicket::settle moved";
+    std::size_t pos = src.find('{', at);
+    int depth = 0;
+    const std::size_t start = pos;
+    for (; pos < src.size(); ++pos) {
+        if (src[pos] == '{') ++depth;
+        if (src[pos] == '}' && --depth == 0) break;
+    }
+    const std::string body = src.substr(start, pos - start + 1);
+    std::size_t reaches = 0;
+    for (std::size_t hit = body.find("owner_->"); hit != std::string::npos;
+         hit = body.find("owner_->", hit + 1)) {
+        ++reaches;
+        EXPECT_EQ(body.compare(hit, std::strlen("owner_->fsync_fd_or_record("),
+                               "owner_->fsync_fd_or_record("),
+                  0)
+            << "settle() reaches the writer through something other than its failure count";
+    }
+    EXPECT_EQ(reaches, 1u) << "settle() no longer syncs the files it carries through the writer";
+}
+
+TEST(WalSyncStatic, PerformingATicketTouchesNothingOfTheWritersButTheFailureCount) {
+    // `perform_sync()` runs without the lock that serialises this writer, so everything it reads
+    // or writes of the writer has to be safe to touch from another thread: its failure counter is
+    // an atomic, and nothing else may be named. Read from the source because a race here is one
+    // TSan sees only on the interleaving that produces it.
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/src/wal.cpp");
+    const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ASSERT_FALSE(src.empty()) << "cannot read src/wal.cpp";
+    for (const char* signature : {"int WALWriter::perform_sync(", "int WALWriter::fsync_fd_or_record("}) {
+        const std::size_t at = src.find(signature);
+        ASSERT_NE(at, std::string::npos) << signature << " moved";
+        std::size_t pos = src.find('{', at);
+        int depth = 0;
+        const std::size_t start = pos;
+        for (; pos < src.size(); ++pos) {
+            if (src[pos] == '{') ++depth;
+            if (src[pos] == '}' && --depth == 0) break;
+        }
+        std::string body = src.substr(start, pos - start + 1);
+        // Line comments out: the bodies explain themselves in prose that names the members.
+        for (std::size_t c = body.find("//"); c != std::string::npos; c = body.find("//", c)) {
+            body.erase(c, body.find('\n', c) - c);
+        }
+        for (const char* member :
+             {"fd_", "pending_sync_", "position_", "fsync_policy_", "dir_", "leaving_fds_"}) {
+            const std::string m(member);
+            for (std::size_t hit = body.find(m); hit != std::string::npos; hit = body.find(m, hit + 1)) {
+                const char before = hit == 0 ? ' ' : body[hit - 1];
+                const bool bare = before != '.' && before != '_' && !std::isalnum(static_cast<unsigned char>(before));
+                const char after = hit + m.size() < body.size() ? body[hit + m.size()] : ' ';
+                const bool whole = after != '_' && !std::isalnum(static_cast<unsigned char>(after));
+                EXPECT_FALSE(bare && whole)
+                    << signature << " touches the writer's `" << member << "` without its lock";
+            }
+        }
+    }
 }

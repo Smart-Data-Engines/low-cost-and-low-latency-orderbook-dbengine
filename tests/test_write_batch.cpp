@@ -426,6 +426,34 @@ bool inside_a_loop(const std::string& body, std::size_t at) {
     return false;
 }
 
+/// Whether position `at` of `body` is inside a block that took `lock` before it - a
+/// `std::unique_lock<std::mutex> lock(mtx_);` or a `lock_guard` of it, in that block or in one
+/// enclosing it. Stage 5 of #151 moved the flush tick's `fsync` out of such a block, and a sync put
+/// back inside one reads the same in every behavioural test that does not time it.
+bool inside_a_lock_of(const std::string& body, std::size_t at, const std::string& lock) {
+    std::vector<bool> held;   // one entry per open block: was the lock taken in it?
+    held.push_back(false);
+    for (std::size_t i = 0; i < at && i < body.size(); ++i) {
+        if (body[i] == '{') {
+            held.push_back(false);
+        } else if (body[i] == '}') {
+            if (held.size() > 1) held.pop_back();
+        } else if (body.compare(i, lock.size(), lock) == 0) {
+            const std::size_t line = body.rfind('\n', i);
+            const std::string head = body.substr(line == std::string::npos ? 0 : line + 1,
+                                                 i - (line == std::string::npos ? 0 : line + 1));
+            if (head.find("unique_lock") != std::string::npos ||
+                head.find("lock_guard") != std::string::npos) {
+                held.back() = true;
+            }
+        }
+    }
+    for (const bool h : held) {
+        if (h) return true;
+    }
+    return false;
+}
+
 std::size_t occurrences(const std::string& text, const std::string& needle) {
     std::size_t n = 0;
     for (std::size_t at = text.find(needle); at != std::string::npos;
@@ -511,4 +539,58 @@ TEST(WriteBatchStatic, TheWritesOfABatchTakeTheLockOnceAndReachTheWalInOneCall) 
         ASSERT_FALSE(body.empty()) << step << " moved";
         EXPECT_EQ(body.find("mtx_"), std::string::npos) << step << " names the engine's lock";
     }
+}
+
+TEST(FlushTickStatic, TheTicksSyncDrainAndDeletingRunWithoutTheEnginesLock) {
+    // Stage 5 of #151. The behavioural tests are in test_storage_faults.py - a writer timed while
+    // the tick's sync, or a segment write inside its drain, is made to last seconds - and they need
+    // the injector, which this suite does not load. A sync or a drain moved back under the lock
+    // leaves every other test green, because the state it produces is the same; so the shape is
+    // asserted here as well, where no node has to start.
+    const std::string src = read_source("src/engine.cpp");
+    ASSERT_FALSE(src.empty()) << "cannot read src/engine.cpp, so this test checks nothing";
+    const std::string tick = definition_body(src, "void Engine::flush_tick(");
+    ASSERT_FALSE(tick.empty()) << "Engine::flush_tick moved; this test would check nothing";
+
+    const std::string lock = "lock(mtx_)";
+    const std::size_t perform = tick.find("wal_.perform_sync(");
+    ASSERT_NE(perform, std::string::npos) << "the tick does not perform a sync ticket";
+    EXPECT_FALSE(inside_a_lock_of(tick, perform, lock))
+        << "the flush tick syncs the WAL with the engine's lock held, so every writer waits for "
+           "the fsync (7.9 ms at p50 and 25.8 at worst, measured)";
+    const std::size_t drain = tick.find("drain_batch(batch, ticket.position(), /*mtx_held=*/false)");
+    ASSERT_NE(drain, std::string::npos) << "the tick does not drain its batch without the lock";
+    EXPECT_FALSE(inside_a_lock_of(tick, drain, lock))
+        << "the flush tick drains with the engine's lock held, so every writer waits for ~640k rows "
+           "to reach their stores (11 ms at p99.9 with only the sync outside, measured)";
+
+    // And the deleting the tick does after its segments: an unlink of a 512 MB WAL file, or of every
+    // file of every expired segment, decided under the lock and done without it.
+    for (const char* unlink : {"wal_.truncate_before(safe_truncate)",
+                               "combined_store_.delete_expired_segments(cutoff_ns)"}) {
+        const std::size_t at = tick.find(unlink);
+        ASSERT_NE(at, std::string::npos) << unlink << " moved; this test would check nothing";
+        EXPECT_FALSE(inside_a_lock_of(tick, at, lock))
+            << unlink << " deletes files with the engine's lock held, so every writer waits for it";
+    }
+    const std::size_t floor = tick.find("safe_truncate = retention_floor_.file_index");
+    ASSERT_NE(floor, std::string::npos) << "the truncation no longer reads the retention floor";
+    EXPECT_TRUE(inside_a_lock_of(tick, floor, lock))
+        << "the retention floor is read without the engine's lock";
+
+    for (const char* step : {"wal_.prepare_sync(", "wal_.complete_sync(", "pending_rows_.take_all()"}) {
+        const std::size_t at = tick.find(step);
+        ASSERT_NE(at, std::string::npos) << step;
+        EXPECT_TRUE(inside_a_lock_of(tick, at, lock))
+            << step << " runs without the engine's lock, and a writer appends to the WAL and the "
+                       "queue under it";
+    }
+    EXPECT_EQ(occurrences(tick, "wal_.sync()"), 0u)
+        << "the tick also syncs the WAL the old way, under the lock";
+    // The detection is only worth something if it can tell the two apart in a body it did not
+    // write: a lock in an inner block is out of scope once the block closes.
+    const std::string held = "{ std::unique_lock<std::mutex> lock(mtx_); x(); }";
+    const std::string released = "{ { std::unique_lock<std::mutex> lock(mtx_); } x(); }";
+    EXPECT_TRUE(inside_a_lock_of(held, held.find("x()"), lock));
+    EXPECT_FALSE(inside_a_lock_of(released, released.find("x()"), lock));
 }
