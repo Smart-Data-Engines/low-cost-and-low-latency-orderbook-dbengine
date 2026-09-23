@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -1374,4 +1376,179 @@ TEST(WalCheckpoint, TheDrainsPositionMayBeInAnEarlierFileThanTheCheckpoint) {
     std::vector<std::pair<uint8_t, uint64_t>> want;
     for (uint64_t s : expected) want.emplace_back(ob::WAL_RECORD_DELTA, s);
     EXPECT_EQ(forwarded_after_checkpoint(tmp.str()), want);
+}
+
+// ── A sync performed without the writer's lock (stage 5 of #151) ─────────────
+//
+// The flush tick used to sync the WAL while holding the engine's lock, and every writer waited for
+// the `fsync` - 7.9 ms at p50, 25.8 at worst on the m9g.xlarge. The ticket splits it: taken under
+// the lock, performed without it, accounted for under it again. What these pin is the arithmetic of
+// that split and the descriptor it lives on; that the tick really runs the middle step unlocked is
+// `FlushTickStatic` in test_write_batch.cpp, and what a writer sees is test_storage_faults.py.
+
+namespace {
+
+/// Descriptors this process has open, so a ticket that forgets to close its `dup()` is a number
+/// that moved rather than a leak nobody sees until the table is full.
+std::size_t open_descriptors() {
+    std::size_t n = 0;
+    for ([[maybe_unused]] const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) {
+        ++n;
+    }
+    return n;
+}
+
+} // namespace
+
+TEST(WalSyncTicket, ItCoversWhatWasWrittenBeforeItAndLeavesTheRestOwed) {
+    TempDir tmp("ticket_cover");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::INTERVAL);
+    for (uint64_t s = 1; s <= 3; ++s) {
+        ob::DeltaUpdate upd = make_delta(s);
+        writer.append(upd, &lvl);
+    }
+    const ob::WalPosition before = writer.current_position();
+
+    auto [ticket, err] = writer.prepare_sync();
+    ASSERT_EQ(err, 0);
+    ASSERT_TRUE(ticket.owed());
+    EXPECT_EQ(ticket.position().file_index, before.file_index);
+    EXPECT_EQ(ticket.position().offset, before.offset);
+
+    // Written while the sync would be running: after the ticket's position, so not its to pay.
+    for (uint64_t s = 4; s <= 5; ++s) {
+        ob::DeltaUpdate upd = make_delta(s);
+        writer.append(upd, &lvl);
+    }
+    const int performed = writer.perform_sync(ticket);
+    ASSERT_EQ(performed, 0);
+    EXPECT_FALSE(ticket.owed()) << "a performed ticket still holds its descriptor";
+    writer.complete_sync(ticket, performed);
+    EXPECT_EQ(writer.pending_sync_count(), 2u)
+        << "the records written after the ticket must still be owed a sync";
+}
+
+TEST(WalSyncTicket, NothingIsOwedWhereThePolicyOrTheLogOwesNothing) {
+    const ob::Level lvl = make_level();
+    {
+        TempDir tmp("ticket_every");
+        ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::EVERY);
+        ob::DeltaUpdate upd = make_delta(1);
+        writer.append(upd, &lvl);
+        EXPECT_FALSE(writer.prepare_sync().first.owed()) << "`every` has synced the run already";
+    }
+    {
+        TempDir tmp("ticket_none");
+        ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::NONE);
+        ob::DeltaUpdate upd = make_delta(1);
+        writer.append(upd, &lvl);
+        EXPECT_FALSE(writer.prepare_sync().first.owed()) << "`none` is never synced by the tick";
+    }
+    {
+        TempDir tmp("ticket_empty");
+        ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::INTERVAL);
+        EXPECT_FALSE(writer.prepare_sync().first.owed()) << "nothing written, nothing owed";
+    }
+    // The control: the same writer owes one as soon as something is written.
+    TempDir tmp("ticket_control");
+    ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::INTERVAL);
+    ob::DeltaUpdate upd = make_delta(1);
+    writer.append(upd, &lvl);
+    EXPECT_TRUE(writer.prepare_sync().first.owed());
+}
+
+TEST(WalSyncTicket, ARotationBetweenTakingAndPerformingItClosesNothingOfTheTickets) {
+    // The writer closes its own descriptor when it rotates. The ticket's is a duplicate of it, so it
+    // still names the file the covered records are in - and it is the ticket's to close.
+    TempDir tmp("ticket_rotate");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), /*rotate_threshold=*/512, ob::FsyncPolicy::INTERVAL);
+    ob::DeltaUpdate first = make_delta(1);
+    writer.append(first, &lvl);
+
+    const std::size_t descriptors = open_descriptors();
+    auto [ticket, err] = writer.prepare_sync();
+    ASSERT_EQ(err, 0);
+    ASSERT_TRUE(ticket.owed());
+    const uint32_t file = ticket.position().file_index;
+    for (uint64_t s = 2; writer.current_position().file_index == file; ++s) {
+        ob::DeltaUpdate upd = make_delta(s);
+        writer.append(upd, &lvl);
+        ASSERT_LT(s, 100u) << "the writer never rotated, so this test measured nothing";
+    }
+    EXPECT_EQ(writer.perform_sync(ticket), 0) << "the ticket's descriptor went with the rotation";
+    EXPECT_EQ(open_descriptors(), descriptors) << "the ticket leaked its duplicate descriptor";
+}
+
+TEST(WalSyncTicket, ADroppedTicketClosesItsDescriptorAndOwesStay) {
+    TempDir tmp("ticket_drop");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::INTERVAL);
+    ob::DeltaUpdate upd = make_delta(1);
+    writer.append(upd, &lvl);
+    const std::size_t descriptors = open_descriptors();
+    {
+        auto prepared = writer.prepare_sync();
+        ASSERT_TRUE(prepared.first.owed());
+        EXPECT_EQ(open_descriptors(), descriptors + 1) << "a ticket that is owed holds a descriptor";
+    }
+    EXPECT_EQ(open_descriptors(), descriptors) << "a ticket dropped unperformed kept its descriptor";
+    EXPECT_EQ(writer.pending_sync_count(), 1u) << "a dropped ticket paid for a sync it never did";
+}
+
+TEST(WalSyncTicket, AFailedSyncLeavesItsRecordsOwed) {
+    // `perform_sync()` failing needs the injector, which test_storage_faults.py loads; what is
+    // pinned here is the accounting that follows it, which is the half that decides whether the
+    // flush tick drains rows whose records never reached the disk.
+    TempDir tmp("ticket_fail");
+    const ob::Level lvl = make_level();
+    ob::WALWriter writer(tmp.str(), 1 << 20, ob::FsyncPolicy::INTERVAL);
+    for (uint64_t s = 1; s <= 3; ++s) {
+        ob::DeltaUpdate upd = make_delta(s);
+        writer.append(upd, &lvl);
+    }
+    auto [ticket, err] = writer.prepare_sync();
+    ASSERT_EQ(err, 0);
+    writer.complete_sync(ticket, EIO);
+    EXPECT_EQ(writer.pending_sync_count(), 3u) << "a failed sync was accounted as a paid one";
+    writer.complete_sync(ticket, 0);
+    EXPECT_EQ(writer.pending_sync_count(), 0u) << "the control: success pays what the ticket covered";
+}
+
+TEST(WalSyncStatic, PerformingATicketTouchesNothingOfTheWritersButTheFailureCount) {
+    // `perform_sync()` runs without the lock that serialises this writer, so everything it reads
+    // or writes of the writer has to be safe to touch from another thread: its failure counter is
+    // an atomic, and nothing else may be named. Read from the source because a race here is one
+    // TSan sees only on the interleaving that produces it.
+    std::ifstream in(std::string(OB_SOURCE_DIR) + "/src/wal.cpp");
+    const std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ASSERT_FALSE(src.empty()) << "cannot read src/wal.cpp";
+    for (const char* signature : {"int WALWriter::perform_sync(", "int WALWriter::fsync_fd_or_record("}) {
+        const std::size_t at = src.find(signature);
+        ASSERT_NE(at, std::string::npos) << signature << " moved";
+        std::size_t pos = src.find('{', at);
+        int depth = 0;
+        const std::size_t start = pos;
+        for (; pos < src.size(); ++pos) {
+            if (src[pos] == '{') ++depth;
+            if (src[pos] == '}' && --depth == 0) break;
+        }
+        std::string body = src.substr(start, pos - start + 1);
+        // Line comments out: the bodies explain themselves in prose that names the members.
+        for (std::size_t c = body.find("//"); c != std::string::npos; c = body.find("//", c)) {
+            body.erase(c, body.find('\n', c) - c);
+        }
+        for (const char* member : {"fd_", "pending_sync_", "position_", "fsync_policy_", "dir_"}) {
+            const std::string m(member);
+            for (std::size_t hit = body.find(m); hit != std::string::npos; hit = body.find(m, hit + 1)) {
+                const char before = hit == 0 ? ' ' : body[hit - 1];
+                const bool bare = before != '.' && before != '_' && !std::isalnum(static_cast<unsigned char>(before));
+                const char after = hit + m.size() < body.size() ? body[hit + m.size()] : ' ';
+                const bool whole = after != '_' && !std::isalnum(static_cast<unsigned char>(after));
+                EXPECT_FALSE(bare && whole)
+                    << signature << " touches the writer's `" << member << "` without its lock";
+            }
+        }
+    }
 }

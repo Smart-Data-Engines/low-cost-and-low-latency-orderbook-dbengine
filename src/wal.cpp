@@ -160,8 +160,12 @@ WALWriter::WALWriter(std::string_view dir, size_t rotate_threshold_bytes,
 /// whether a client was waiting on it - and it says what Linux does next, because the obvious
 /// reaction (try again) is the one thing that cannot work.
 int WALWriter::fsync_or_record(const char* why) {
-    if (fd_ < 0) return 0;
-    if (::fsync(fd_) == 0) return 0;
+    return fsync_fd_or_record(fd_, why);
+}
+
+int WALWriter::fsync_fd_or_record(int fd, const char* why) {
+    if (fd < 0) return 0;
+    if (::fsync(fd) == 0) return 0;
     const int err = errno;
     fsync_failures_.fetch_add(1, std::memory_order_relaxed);
     OB_LOG_ERROR("wal",
@@ -694,6 +698,69 @@ bool WALWriter::flush() {
 
 bool WALWriter::sync() {
     return flush();
+}
+
+// ── A sync performed without the writer's lock (stage 5 of #151) ─────────────
+
+WALWriter::SyncTicket& WALWriter::SyncTicket::operator=(SyncTicket&& other) noexcept {
+    if (this != &other) {
+        if (fd_ >= 0) ::close(fd_);
+        fd_       = other.fd_;
+        records_  = other.records_;
+        position_ = other.position_;
+        other.fd_      = -1;
+        other.records_ = 0;
+    }
+    return *this;
+}
+
+WALWriter::SyncTicket::~SyncTicket() {
+    // A ticket dropped without being performed - the caller threw between taking it and using it -
+    // closes its descriptor. The records it would have covered are still owed, so what is lost is
+    // this sync, not a record.
+    if (fd_ >= 0) ::close(fd_);
+}
+
+std::pair<WALWriter::SyncTicket, int> WALWriter::prepare_sync() {
+    SyncTicket ticket;
+    ticket.position_ = current_position();
+    // Owed on the same terms as `flush()`, plus something written since the last sync, which is
+    // the condition the flush tick has always checked before syncing.
+    if (fd_ < 0 || fsync_policy_ == FsyncPolicy::NONE || pending_sync_ == 0) {
+        return {std::move(ticket), 0};
+    }
+    const int dup_fd = ::fcntl(fd_, F_DUPFD_CLOEXEC, 0);
+    if (dup_fd < 0) {
+        const int dup_err = errno;
+        OB_LOG_WARN("wal",
+                    "could not duplicate the WAL descriptor to sync it outside the engine's lock "
+                    "(%s); syncing under the lock instead, which holds every writer for as long",
+                    std::strerror(dup_err));
+        const int err = fsync_or_record("the flush tick");
+        if (err == 0) pending_sync_ = 0;
+        return {std::move(ticket), err};
+    }
+    ticket.fd_      = dup_fd;
+    ticket.records_ = pending_sync_;
+    OB_LOG_DEBUG("wal", "sync ticket: %zu record(s) up to file %u offset %u, descriptor %d",
+                 ticket.records_, ticket.position_.file_index, ticket.position_.offset, dup_fd);
+    return {std::move(ticket), 0};
+}
+
+int WALWriter::perform_sync(SyncTicket& ticket) {
+    if (ticket.fd_ < 0) return 0;
+    const int err = fsync_fd_or_record(ticket.fd_, "the flush tick");
+    ::close(ticket.fd_);
+    ticket.fd_ = -1;
+    return err;
+}
+
+void WALWriter::complete_sync(const SyncTicket& ticket, int err) {
+    // A failure leaves the records owed, for the reason `flush()` gives. On success only the
+    // records the ticket counted are paid: those written while the sync ran are after its position
+    // and are owed the next one.
+    if (err != 0) return;
+    pending_sync_ -= std::min(pending_sync_, ticket.records_);
 }
 
 size_t WALWriter::truncate_before(uint32_t before_index) {

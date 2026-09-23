@@ -688,6 +688,21 @@ private:
     /// written since, and the WAL still holds every record they need. Under `mtx_`.
     bool checkpoints_frozen_{false};
 
+    /// The rows a flush tick has taken out of `pending_rows_` while it syncs their WAL records
+    /// **without** `mtx_` (stage 5 of #151). Empty outside that window: the tick swaps them out
+    /// under `mtx_`, performs the sync unlocked, and drains them - or, if the sync failed, puts them
+    /// back in front of whatever was written meanwhile - under `mtx_` again, all while holding
+    /// `flush_mtx_`, so nothing else that drains or replaces the queue can run in between.
+    ///
+    /// Everything that counts the queue counts these as well (`queued_rows()`): they are not in a
+    /// segment yet, a reader of `STATUS` or `holds_no_data()` must not see them vanish for the
+    /// length of an `fsync`, and the room a writer waits for is room in both - otherwise a tick
+    /// that starts at the ceiling would let the queue grow to twice it while the sync runs.
+    std::vector<PendingRow> syncing_rows_;
+
+    /// Rows not yet in a segment: the queue, plus what a flush tick is syncing. Caller holds mtx_.
+    size_t queued_rows() const { return pending_rows_.size() + syncing_rows_.size(); }
+
     // Backpressure: maximum number of pending rows before apply_delta blocks.
     // Default 1M rows ≈ ~100 MB memory. Prevents OOM under sustained ingestion.
     static constexpr size_t MAX_PENDING_ROWS = 1'000'000;
@@ -871,6 +886,10 @@ private:
     /// holds is skipped by the WAL position that segment recorded (#63), which needs the index.
     uint64_t replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastCheckpoint& last);
     void flush_drain_pending();    // Phase A: drain pending_rows_ → per-symbol append (must hold mtx_)
+    /// The drain itself: `rows` into their per-symbol stores, each store stamped with `covered` -
+    /// the WAL position every one of these rows' records is at or before, and which a sync has
+    /// reached. Clears `rows`. Must hold mtx_.
+    void drain_rows(std::vector<PendingRow>& rows, WalPosition covered);
     /// Phase B: segment I/O, the segment sync, and the index merge (hold `flush_mtx_`, not `mtx_`).
     /// Returns 0, or the `errno` the segment sync failed with - in which case the segments are
     /// merged and visible, and no checkpoint claims them or anything after them in this process

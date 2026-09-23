@@ -1226,3 +1226,84 @@ def test_a_symbol_the_disk_refuses_leaves_the_others_written_and_readable():
         assert prices_of(node, "AAA") == [111] and prices_of(node, "BBB") == [222]
     finally:
         node.cleanup()
+
+
+def test_a_writer_does_not_wait_for_the_flush_ticks_sync():
+    """Stage 5 of #151: the flush tick syncs the WAL without the engine's lock.
+
+    The tick's `fsync` held every writer for as long as it took - 7.9 ms at p50 and 25.8 ms at
+    worst on the m9g.xlarge - and nothing that does not time a writer *while a sync runs* can see
+    that. So the sync is made to last three seconds (the injector's delay mode) and ten writes are
+    timed inside it: with the sync under the lock, the first of them waits for all of it. Then what
+    the delay must not cost: every row, the one the slow sync covered and the ten written while it
+    ran, comes back once.
+    """
+    stall_ms = 3000
+    node = FaultNode(OB_FAULT_PATH=WAL_SEGMENT, OB_FAULT_OP="fsync",
+                     OB_FAULT_DELAY_MS=str(stall_ms), OB_FAULT_COUNT="1",
+                     OB_FAULT_POLICY="interval", OB_FAULT_FLUSH_MS="200")
+    try:
+        node.wait_until_answering()
+        assert node.insert_each([100]) == {100: "OK"}
+        deadline = time.time() + patience(10)
+        while "action=delay" not in node.fault_log_text() and time.time() < deadline:
+            time.sleep(0.02)
+        assert "action=delay" in node.fault_log_text(), (
+            "the flush tick never synced the WAL, so nothing was measured:\n"
+            + node.fault_log_text())
+
+        started = time.monotonic()
+        replies = node.insert_each(range(101, 111))
+        took = time.monotonic() - started
+        custom_metrics["ten_writes_during_a_3s_tick_sync_s"] = round(took, 3)
+        assert all(r == "OK" for r in replies.values()), replies
+        assert took < stall_ms / 1000 / 3, (
+            f"ten writes took {took:.2f} s while the flush tick's sync was made to last "
+            f"{stall_ms} ms - they waited for it, so the tick syncs under the engine's lock")
+
+        time.sleep(stall_ms / 1000 + 0.5)   # the slow sync ends, and the next tick syncs the rest
+        reply = node.talk("FLUSH", "SELECT * FROM 'SYM'.'EX' WHERE timestamp BETWEEN 0 AND "
+                                   "9999999999999999999")[-1]
+        assert sorted(prices_in(reply)) == list(range(100, 111)), reply
+    finally:
+        node.cleanup()
+
+
+def test_a_failed_tick_sync_drains_nothing_and_the_next_one_drains_it_all():
+    """The failure half of stage 5 of #151.
+
+    The tick now takes its rows out of the queue before it syncs, so a sync that fails has to put
+    them back - in front of anything written meanwhile - because draining them would move them out
+    of the only place that still knows they were never synced. Five rows, the tick's first sync
+    fails, and then every row exactly once: none lost with the failed sync, none twice from being
+    queued again. Read without a `FLUSH`, so what drains them is the next tick and nothing else.
+    """
+    node = FaultNode(OB_FAULT_PATH=WAL_SEGMENT, OB_FAULT_OP="fsync", OB_FAULT_ERRNO="EIO",
+                     OB_FAULT_COUNT="1", OB_FAULT_POLICY="interval", OB_FAULT_FLUSH_MS="200")
+    try:
+        node.wait_until_answering()
+        replies = node.insert_each(range(200, 205))
+        assert all(r == "OK" for r in replies.values()), replies
+        deadline = time.time() + patience(10)
+        while node.injections() == 0 and time.time() < deadline:
+            time.sleep(0.05)
+        assert node.injections() == 1, node.fault_log_text()
+        # Published at the start of the next tick, as a delta (#113), so it is waited for rather
+        # than read at the instant the sync failed.
+        deadline = time.time() + patience(10)
+        while node.counter("ob_wal_fsync_errors_total") == 0 and time.time() < deadline:
+            time.sleep(0.05)
+        assert node.counter("ob_wal_fsync_errors_total") == 1
+
+        deadline = time.time() + patience(10)
+        reply = ""
+        while time.time() < deadline:
+            reply = node.talk("SELECT * FROM 'SYM'.'EX' WHERE timestamp BETWEEN 0 AND "
+                              "9999999999999999999")[-1]
+            if len(prices_in(reply)) >= 5:
+                break
+            time.sleep(0.2)
+        assert sorted(prices_in(reply)) == list(range(200, 205)), reply
+        assert node.counter("ob_flush_errors_total") >= 1, "the failed tick was not counted"
+    finally:
+        node.cleanup()

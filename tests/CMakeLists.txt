@@ -178,6 +178,9 @@ gtest_discover_tests(test_machine PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOU
 ob_add_wal_test(test_wal
     test_wal.cpp
 )
+# The source directory, for the rule that performing a sync ticket touches no writer state
+# (stage 5 of #151): it reads src/wal.cpp.
+target_compile_definitions(test_wal PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
 
 # ── WAL position coherence (wal-position-coherence, #85) ──────────────────────
 ob_add_wal_test(test_wal_position

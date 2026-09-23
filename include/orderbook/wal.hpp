@@ -7,6 +7,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "orderbook/data_model.hpp"
 #include "orderbook/epoch.hpp"
@@ -390,6 +391,58 @@ public:
     /// Sync the WAL to disk. Alias for flush() — explicit group commit point.
     [[nodiscard]] bool sync();
 
+    /// A sync of the current file that the caller performs **without** the lock that serialises
+    /// this writer (stage 5 of #151): taken under that lock by `prepare_sync()`, performed without
+    /// it by `perform_sync()`, and accounted for under it again by `complete_sync()`.
+    ///
+    /// Three steps rather than one because the flush tick's `fsync` was the longest thing the
+    /// engine did while holding the lock every writer needs: 7.9 ms at p50 and 25.8 ms at worst on
+    /// the m9g.xlarge, measured with `perf trace`, and every writer stood for as long.
+    ///
+    /// The ticket holds a `dup()` of the current descriptor. It names the same open file, so its
+    /// `fsync` covers every byte written before the ticket was taken even if the writer rotates to a
+    /// new file in the meantime - and it is the ticket's own, so the rotation closing the writer's
+    /// descriptor cannot close it from under the sync, nor hand its number to another file (#128).
+    class SyncTicket {
+    public:
+        SyncTicket() = default;
+        SyncTicket(const SyncTicket&) = delete;
+        SyncTicket& operator=(const SyncTicket&) = delete;
+        SyncTicket(SyncTicket&& other) noexcept { *this = std::move(other); }
+        SyncTicket& operator=(SyncTicket&& other) noexcept;
+        ~SyncTicket();
+
+        /// Whether `perform_sync()` has anything to do.
+        bool owed() const { return fd_ >= 0; }
+        /// Where the log was when the ticket was taken: everything before it is what the sync
+        /// covers, and the position a flush stamps into the segments it closes from those rows.
+        WalPosition position() const { return position_; }
+
+    private:
+        friend class WALWriter;
+        int         fd_{-1};
+        size_t      records_{0};
+        WalPosition position_{};
+    };
+
+    /// Under the writer's lock: what a sync now would cover. Not `owed()` when nothing is - the
+    /// policy is `every`, which has synced each run already, or `none`, which never syncs here, or
+    /// nothing was written since the last sync - and then the ticket carries only the position.
+    ///
+    /// A `dup()` that fails leaves the ticket not owed **after syncing under the lock instead**, as
+    /// this writer did before the ticket existed: a descriptor table that is full is not a reason
+    /// to drain rows whose records were never synced. Its result is in the second member.
+    [[nodiscard]] std::pair<SyncTicket, int> prepare_sync();
+
+    /// Without the writer's lock: `fsync` the ticket's descriptor and close it. 0, or the `errno`
+    /// it failed with - counted in `fsync_failures()` and logged, as every sync here is. Touches
+    /// nothing of the writer's but that atomic counter, which is what makes it callable unlocked.
+    [[nodiscard]] int perform_sync(SyncTicket& ticket);
+
+    /// Under the writer's lock again: on success the records the ticket covered are no longer owed a
+    /// sync. On failure they stay owed, for the reason `flush()` gives.
+    void complete_sync(const SyncTicket& ticket, int err);
+
     /// Number of records written since last sync.
     size_t pending_sync_count() const { return pending_sync_; }
 
@@ -524,6 +577,10 @@ private:
     /// client is handed has to say *why* its write is not durable, and logging inside here would
     /// otherwise have clobbered `errno` before the caller could read it.
     int fsync_or_record(const char* why);
+
+    /// The same for any descriptor: what `fsync_or_record()` and `perform_sync()` share, so a failure
+    /// is counted and said in one way whichever descriptor it came through.
+    int fsync_fd_or_record(int fd, const char* why);
 
     size_t      pending_sync_{0};
 
