@@ -341,7 +341,200 @@ StampedTime stamp_for(const std::optional<uint64_t>& given) {
             false};
 }
 
+/// Why this node does not take a write for `symbol.exchange`, as the answer to send - or empty
+/// when it does. The checks `INSERT` and `MINSERT` each had a copy of, in the order they ran.
+std::string refuse_write(const char* command, const std::string& symbol,
+                         const std::string& exchange, Engine& engine, bool read_only,
+                         ShardCoordinator* shard_coord) {
+    if (read_only || engine.node_role() == NodeRole::REPLICA) return format_error("read-only replica");
+    // Covers the multi-master bootstrap too, which used to need its own block here and
+    // answered with a second spelling of the same error.
+    if (engine.is_bootstrapping()) return format_error("bootstrapping");
+    // Shard ownership check: reject writes for symbols not owned by this shard
+    if (shard_coord) {
+        const std::string symbol_key = symbol + "." + exchange;
+        if (engine.is_symbol_migrated(symbol_key)) {
+            shard_coord->increment_routing_errors();
+            OB_LOG_WARN("tcp_server", "Rejecting %s for migrated symbol=%s", command,
+                        symbol_key.c_str());
+            return format_error("SYMBOL_MIGRATED");
+        }
+        if (!shard_coord->owns_symbol(symbol_key)) {
+            shard_coord->increment_routing_errors();
+            OB_LOG_WARN("tcp_server", "Rejecting %s for non-owned symbol=%s", command,
+                        symbol_key.c_str());
+            return format_error("NOT_OWNER " + symbol_key);
+        }
+    }
+    return {};
+}
+
+/// One thread's working space for `execute_writes()`, reused so that a batch allocates nothing
+/// once these have grown to a read's size. Per thread, because every reactor calls it.
+struct WriteBatchScratch {
+    std::vector<ClientWrite>  writes;
+    std::vector<size_t>       answer_of;     // the command each engine write answers
+    std::vector<size_t>       level_start;   // where each write's levels begin in `levels`
+    std::vector<Level>        levels;
+    std::vector<WriteOutcome> outcomes;
+};
+
+thread_local WriteBatchScratch write_batch_scratch;
+
 } // namespace
+
+bool deferrable_write(const Command& cmd, const Session& session,
+                      const SecretStore* client_secrets) {
+    if (cmd.type != CommandType::INSERT && cmd.type != CommandType::MINSERT) return false;
+    // The gate `execute_command()` puts in front of its switch. A write it would refuse is left to
+    // it, so the refusal is its answer and not a second spelling of it.
+    return client_secrets == nullptr || session.authenticated();
+}
+
+void execute_writes(std::span<const Command> cmds,
+                    Engine& engine,
+                    Session& session,
+                    ServerStats& stats,
+                    bool read_only,
+                    MetricsRegistry* registry,
+                    ShardCoordinator* shard_coord,
+                    std::vector<std::string>& answers) {
+    const size_t n = cmds.size();
+    answers.resize(n);
+    WriteBatchScratch& s = write_batch_scratch;
+    s.writes.clear();
+    s.answer_of.clear();
+    s.level_start.clear();
+    s.levels.clear();
+
+    // Everything these need, reserved before anything is built, so that building cannot fail
+    // half way through a batch and leave the scratch out of step with itself.
+    try {
+        size_t total_levels = 0;
+        for (const Command& cmd : cmds) {
+            total_levels += cmd.type == CommandType::MINSERT ? cmd.minsert_args.n_levels : 1;
+        }
+        s.writes.reserve(n);
+        s.answer_of.reserve(n);
+        s.level_start.reserve(n);
+        s.levels.reserve(total_levels);
+    } catch (const std::exception& e) {
+        for (size_t i = 0; i < n; ++i) {
+            session.increment_commands();
+            answers[i] = format_error(e.what());
+        }
+        return;
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        const Command& cmd = cmds[i];
+        session.increment_commands();
+        const bool single = cmd.type == CommandType::INSERT;
+        const std::string& symbol   = single ? cmd.insert_args.symbol   : cmd.minsert_args.symbol;
+        const std::string& exchange = single ? cmd.insert_args.exchange : cmd.minsert_args.exchange;
+
+        std::string refusal = refuse_write(single ? "INSERT" : "MINSERT", symbol, exchange, engine,
+                                           read_only, shard_coord);
+        if (!refusal.empty()) {
+            answers[i] = std::move(refusal);
+            continue;
+        }
+
+        ClientWrite write{};
+        DeltaUpdate& delta = write.update;
+        std::strncpy(delta.symbol,   symbol.c_str(),   sizeof(delta.symbol)   - 1);
+        std::strncpy(delta.exchange, exchange.c_str(), sizeof(delta.exchange) - 1);
+        // 0 means "unassigned": Engine::stamp_sequence() gives this write the next
+        // number for its symbol. The comment here used to claim the engine handled
+        // sequencing while nothing did, so every stored row carried a zero.
+        delta.sequence_number = 0;
+        s.level_start.push_back(s.levels.size());
+        if (single) {
+            const auto& a = cmd.insert_args;
+            const StampedTime stamp = stamp_for(a.timestamp_ns);
+            delta.timestamp_ns = stamp.ns;
+            OB_LOG_DEBUG("tcp_server", "INSERT %s.%s event time %" PRIu64 " (%s)",
+                         a.symbol.c_str(), a.exchange.c_str(), stamp.ns,
+                         stamp.from_client ? "given by the client" : "stamped on arrival");
+            delta.side     = a.side;
+            delta.n_levels = 1;
+
+            Level level{};
+            level.price = a.price;
+            level.qty   = a.qty;
+            level.cnt   = a.count;
+            s.levels.push_back(level);
+        } else {
+            const auto& a = cmd.minsert_args;
+            const StampedTime stamp = stamp_for(a.timestamp_ns);
+            delta.timestamp_ns = stamp.ns;
+            OB_LOG_DEBUG("tcp_server", "MINSERT %s.%s levels=%u event time %" PRIu64 " (%s)",
+                         a.symbol.c_str(), a.exchange.c_str(), static_cast<unsigned>(a.n_levels),
+                         stamp.ns, stamp.from_client ? "given by the client" : "stamped on arrival");
+            delta.side     = a.side;
+            delta.n_levels = a.n_levels;
+
+            for (uint16_t k = 0; k < a.n_levels; ++k) {
+                Level level{};
+                level.price = a.levels[k].price;
+                level.qty   = a.levels[k].qty;
+                level.cnt   = a.levels[k].count;
+                level._pad  = 0;
+                s.levels.push_back(level);
+            }
+        }
+        s.writes.push_back(write);
+        s.answer_of.push_back(i);
+    }
+    if (s.writes.empty()) return;
+
+    // The levels are pointed at only now: `levels` has stopped growing, so nothing moves them.
+    for (size_t k = 0; k < s.writes.size(); ++k) {
+        s.writes[k].levels = s.levels.data() + s.level_start[k];
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+    try {
+        s.outcomes.resize(s.writes.size());
+        if (engine.is_multi_master()) {
+            engine.apply_deltas_mm(s.writes, s.outcomes);
+        } else {
+            engine.apply_deltas(s.writes, s.outcomes);
+        }
+    } catch (const std::exception& e) {
+        // Only a programming error gets here - every write has an outcome - and then none of the
+        // outcomes can be believed.
+        s.outcomes.resize(s.writes.size());
+        for (WriteOutcome& o : s.outcomes) o.error = e.what();
+    }
+    const double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+    uint64_t taken = 0;
+    for (size_t k = 0; k < s.writes.size(); ++k) {
+        const WriteOutcome& o = s.outcomes[k];
+        std::string& answer = answers[s.answer_of[k]];
+        if (!o.error.empty()) {
+            answer = format_error(o.error);
+        } else if (o.status != OB_OK) {
+            answer = format_error("apply_delta failed with code " + std::to_string(o.status));
+        } else {
+            answer = format_ok();
+            ++taken;
+        }
+    }
+    if (taken == 0) return;
+
+    // Once per batch, with the count: what a single write added per write. The latency each write
+    // is given is the batch's, because that is how long it waited for its answer - the answers of
+    // a read go out together (#146).
+    if (registry) {
+        registry->observe_histogram("ob_insert_latency_seconds", secs, taken);
+        registry->increment_counter("ob_total_inserts", taken);
+    }
+    session.increment_inserts(taken);
+    stats.total_inserts.fetch_add(taken, std::memory_order_relaxed);
+}
 
 std::string execute_command(const Command& cmd,
                             Engine& engine,
@@ -454,130 +647,14 @@ std::string execute_command(const Command& cmd,
         // for it.
         return format_query_response(rows, all_query_columns());
     }
-    case CommandType::INSERT: {
-        session.increment_commands();
-        if (read_only || engine.node_role() == NodeRole::REPLICA) return format_error("read-only replica");
-        // Covers the multi-master bootstrap too, which used to need its own block here and
-        // answered with a second spelling of the same error.
-        if (engine.is_bootstrapping()) return format_error("bootstrapping");
-        // Shard ownership check: reject writes for symbols not owned by this shard
-        if (shard_coord) {
-            const std::string symbol_key = cmd.insert_args.symbol + "." + cmd.insert_args.exchange;
-            if (engine.is_symbol_migrated(symbol_key)) {
-                shard_coord->increment_routing_errors();
-                OB_LOG_WARN("tcp_server", "Rejecting INSERT for migrated symbol=%s", symbol_key.c_str());
-                return format_error("SYMBOL_MIGRATED");
-            }
-            if (!shard_coord->owns_symbol(symbol_key)) {
-                shard_coord->increment_routing_errors();
-                OB_LOG_WARN("tcp_server", "Rejecting INSERT for non-owned symbol=%s", symbol_key.c_str());
-                return format_error("NOT_OWNER " + symbol_key);
-            }
-        }
-        auto t0_insert = std::chrono::steady_clock::now();
-        try {
-            const auto& a = cmd.insert_args;
-
-            DeltaUpdate delta{};
-            std::strncpy(delta.symbol,   a.symbol.c_str(),   sizeof(delta.symbol)   - 1);
-            std::strncpy(delta.exchange, a.exchange.c_str(), sizeof(delta.exchange) - 1);
-            // 0 means "unassigned": Engine::stamp_sequence() gives this write the next
-            // number for its symbol. The comment here used to claim the engine handled
-            // sequencing while nothing did, so every stored row carried a zero.
-            delta.sequence_number = 0;
-            const StampedTime stamp = stamp_for(a.timestamp_ns);
-            delta.timestamp_ns = stamp.ns;
-            OB_LOG_DEBUG("tcp_server", "INSERT %s.%s event time %" PRIu64 " (%s)",
-                         a.symbol.c_str(), a.exchange.c_str(), stamp.ns,
-                         stamp.from_client ? "given by the client" : "stamped on arrival");
-            delta.side     = a.side;
-            delta.n_levels = 1;
-
-            Level level{};
-            level.price = a.price;
-            level.qty   = a.qty;
-            level.cnt   = a.count;
-
-            ob_status_t rc = engine.is_multi_master()
-                ? engine.apply_delta_mm(delta, &level)
-                : engine.apply_delta(delta, &level);
-            if (rc != OB_OK) {
-                return format_error("apply_delta failed with code " + std::to_string(rc));
-            }
-        } catch (const std::exception& e) {
-            return format_error(e.what());
-        }
-        if (registry) {
-            double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_insert).count();
-            registry->observe_histogram("ob_insert_latency_seconds", secs);
-            registry->increment_counter("ob_total_inserts");
-        }
-        session.increment_inserts();
-        stats.total_inserts.fetch_add(1, std::memory_order_relaxed);
-        return format_ok();
-    }
-
+    case CommandType::INSERT:
     case CommandType::MINSERT: {
-        session.increment_commands();
-        if (read_only || engine.node_role() == NodeRole::REPLICA) return format_error("read-only replica");
-        // Covers the multi-master bootstrap too, which used to need its own block here and
-        // answered with a second spelling of the same error.
-        if (engine.is_bootstrapping()) return format_error("bootstrapping");
-        // Shard ownership check: reject writes for symbols not owned by this shard
-        if (shard_coord) {
-            const std::string symbol_key = cmd.minsert_args.symbol + "." + cmd.minsert_args.exchange;
-            if (engine.is_symbol_migrated(symbol_key)) {
-                shard_coord->increment_routing_errors();
-                OB_LOG_WARN("tcp_server", "Rejecting MINSERT for migrated symbol=%s", symbol_key.c_str());
-                return format_error("SYMBOL_MIGRATED");
-            }
-            if (!shard_coord->owns_symbol(symbol_key)) {
-                shard_coord->increment_routing_errors();
-                OB_LOG_WARN("tcp_server", "Rejecting MINSERT for non-owned symbol=%s", symbol_key.c_str());
-                return format_error("NOT_OWNER " + symbol_key);
-            }
-        }
-        auto t0_minsert = std::chrono::steady_clock::now();
-        try {
-            const auto& a = cmd.minsert_args;
-
-            DeltaUpdate delta{};
-            std::strncpy(delta.symbol,   a.symbol.c_str(),   sizeof(delta.symbol)   - 1);
-            std::strncpy(delta.exchange, a.exchange.c_str(), sizeof(delta.exchange) - 1);
-            delta.sequence_number = 0;   // unassigned; the engine numbers it (see INSERT above)
-            const StampedTime stamp = stamp_for(a.timestamp_ns);
-            delta.timestamp_ns = stamp.ns;
-            OB_LOG_DEBUG("tcp_server", "MINSERT %s.%s levels=%u event time %" PRIu64 " (%s)",
-                         a.symbol.c_str(), a.exchange.c_str(), static_cast<unsigned>(a.n_levels),
-                         stamp.ns, stamp.from_client ? "given by the client" : "stamped on arrival");
-            delta.side     = a.side;
-            delta.n_levels = a.n_levels;
-
-            std::vector<Level> levels(a.n_levels);
-            for (uint16_t i = 0; i < a.n_levels; ++i) {
-                levels[i].price = a.levels[i].price;
-                levels[i].qty   = a.levels[i].qty;
-                levels[i].cnt   = a.levels[i].count;
-                levels[i]._pad  = 0;
-            }
-
-            ob_status_t status = engine.is_multi_master()
-                ? engine.apply_delta_mm(delta, levels.data())
-                : engine.apply_delta(delta, levels.data());
-            if (status != OB_OK) {
-                return format_error("apply_delta failed with code " + std::to_string(status));
-            }
-        } catch (const std::exception& e) {
-            return format_error(e.what());
-        }
-        if (registry) {
-            double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_minsert).count();
-            registry->observe_histogram("ob_insert_latency_seconds", secs);
-            registry->increment_counter("ob_total_inserts");
-        }
-        session.increment_inserts();
-        stats.total_inserts.fetch_add(1, std::memory_order_relaxed);
-        return format_ok();
+        // A batch of one: the reactor holds the writes of a read back and answers them through
+        // the same function, so a write's answer does not depend on which path it took (#155).
+        std::vector<std::string> answers;
+        execute_writes(std::span<const Command>(&cmd, 1), engine, session, stats, read_only,
+                       registry, shard_coord, answers);
+        return std::move(answers.front());
     }
 
     case CommandType::FLUSH: {
@@ -1931,6 +2008,12 @@ private:
     /// loud once per episode and counts every occurrence in `ob_loop_errors_total`.
     std::string event_what_;
     LoopGuard   event_guard_;
+
+    /// The writes of the read being served, held until something else needs answering (#155),
+    /// and their answers. Members so a read allocates nothing once they have grown; emptied at
+    /// the start of every read, so nothing held for one session can reach another.
+    std::vector<Command>     pending_writes_;
+    std::vector<std::string> write_answers_;
 };
 
 Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd)
@@ -2448,8 +2531,56 @@ void Reactor::run_loop() {
                             const char* close_after_flush = nullptr;
                             bool        quit              = false;
                             bool        queue_refused     = false;
+
+                            // One answer into the session's buffer. False: the session is to
+                            // close, because a client that has stopped reading cannot be sent
+                            // more.
+                            const auto enqueue = [&](const std::string& response) -> bool {
+                                const Session::Queued queued = session->queue_answer(response);
+                                if (queued == Session::Queued::TooLargeAlone) {
+                                    // No client could be sent this, however fast it reads, so the
+                                    // session is not the thing that failed: it gets an error in
+                                    // the answer's place and stays open (#152).
+                                    const std::string refusal = format_error(
+                                        "answer of " + std::to_string(response.size()) +
+                                        " bytes is larger than the " +
+                                        std::to_string(Session::max_queued_bytes()) +
+                                        " a session may have queued; narrow the query or add LIMIT");
+                                    return session->queue_response(refusal);
+                                }
+                                // The send buffer cap: a client that has stopped reading. EPIPE
+                                // and ECONNRESET surface in the flush.
+                                return queued != Session::Queued::CapExceeded;
+                            };
+
+                            // The writes held back so far, applied under one acquisition of the
+                            // engine's lock and answered in order (#155). Called before any
+                            // other answer is queued and at the end of the read, so the answers
+                            // are in the order the commands came and a command after a write sees
+                            // it. A client whose buffer refuses an answer here has had the writes
+                            // applied and is closed without their answers - the uncertainty of any
+                            // write whose answer never arrives, for the writes of one read where
+                            // one command at a time it was for one.
+                            pending_writes_.clear();
+                            const auto apply_held_writes = [&]() -> bool {
+                                if (pending_writes_.empty()) return true;
+                                execute_writes(pending_writes_, *engine_, *session, stats_,
+                                               read_only_.load(std::memory_order_acquire),
+                                               &engine_->registry(), shard_coord_,
+                                               write_answers_);
+                                pending_writes_.clear();
+                                for (const std::string& answer : write_answers_) {
+                                    if (!enqueue(answer)) return false;
+                                }
+                                return true;
+                            };
+
                             for (const auto& line : lines) {
                                 if (line.size() > config_.max_line_length) {
+                                    if (!apply_held_writes()) {
+                                        queue_refused = true;
+                                        break;
+                                    }
                                     (void)session->queue_response(format_error("line too long"));
                                     close_after_flush = "line too long";
                                     break;
@@ -2459,6 +2590,15 @@ void Reactor::run_loop() {
                                 Command cmd = (line.find('\n') != std::string::npos)
                                                   ? parse_minsert(line)
                                                   : parse_command(line);
+                                if (deferrable_write(cmd, *session, secrets_.client_store())) {
+                                    pending_writes_.push_back(std::move(cmd));
+                                    continue;
+                                }
+                                if (!apply_held_writes()) {
+                                    queue_refused = true;
+                                    break;
+                                }
+
                                 // Alone across reactors for the two commands written for one
                                 // caller at a time, and released before the answer is queued.
                                 std::unique_lock<std::mutex> alone(admin_mtx_, std::defer_lock);
@@ -2471,23 +2611,7 @@ void Reactor::run_loop() {
                                     break;
                                 }
 
-                                const Session::Queued queued = session->queue_answer(response);
-                                if (queued == Session::Queued::TooLargeAlone) {
-                                    // No client could be sent this, however fast it reads, so the
-                                    // session is not the thing that failed: it gets an error in
-                                    // the answer's place and stays open (#152).
-                                    const std::string refusal = format_error(
-                                        "answer of " + std::to_string(response.size()) +
-                                        " bytes is larger than the " +
-                                        std::to_string(Session::max_queued_bytes()) +
-                                        " a session may have queued; narrow the query or add LIMIT");
-                                    if (!session->queue_response(refusal)) {
-                                        queue_refused = true;
-                                        break;
-                                    }
-                                } else if (queued == Session::Queued::CapExceeded) {
-                                    // The send buffer cap: a client that has stopped reading. EPIPE
-                                    // and ECONNRESET surface in the flush.
+                                if (!enqueue(response)) {
                                     queue_refused = true;
                                     break;
                                 }
@@ -2501,6 +2625,9 @@ void Reactor::run_loop() {
 
                                 if (session->close_requested()) break;
                             }
+                            // The writes that ended the read. Every other way out of the loop
+                            // above applied them before the command that ended it.
+                            if (!queue_refused && !apply_held_writes()) queue_refused = true;
 
                             if (queue_refused) {
                                 close_session(fd, "send failed");

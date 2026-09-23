@@ -162,7 +162,8 @@ public:
     uint64_t queries_executed() const;
     uint64_t inserts_executed() const;
     void increment_queries();
-    void increment_inserts();
+    /// `n` at once, for the writes of a read answered together (#155).
+    void increment_inserts(uint64_t n = 1);
 
     /// Compression state
     void set_compressed(bool c);

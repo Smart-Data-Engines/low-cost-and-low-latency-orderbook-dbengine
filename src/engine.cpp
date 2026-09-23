@@ -22,6 +22,7 @@
 #include <fstream>
 #include <functional>
 #include <random>
+#include <stdexcept>
 #include <thread>
 
 #include <fcntl.h>
@@ -533,7 +534,7 @@ void Engine::restore_version_vector() {
     OB_LOG_INFO("engine", "Restored version vector from WAL: entries=%zu", entries.size());
 }
 
-void Engine::stamp_sequence(DeltaUpdate& delta, uint16_t origin, const std::string& key) {
+bool Engine::observe_sequence(DeltaUpdate& delta, uint16_t origin, const std::string& key) {
     // Caller holds mtx_, and passes the "SYMBOL.EXCHANGE" key it already built. Building it
     // again here would add a heap allocation to every write for nothing.
     const SequenceTracker::Decision d = seq_tracker_.observe(key, origin,
@@ -549,100 +550,357 @@ void Engine::stamp_sequence(DeltaUpdate& delta, uint16_t origin, const std::stri
                     static_cast<unsigned long long>(d.expected),
                     static_cast<unsigned long long>(d.sequence_number));
         registry_.increment_counter("ob_sequence_gaps_detected");
+    }
+    return d.gap;
+}
+
+void Engine::stamp_sequence(DeltaUpdate& delta, uint16_t origin, const std::string& key) {
+    if (observe_sequence(delta, origin, key)) {
         wal_.append_gap(delta.sequence_number, delta.timestamp_ns);
     }
 }
 
 ob_status_t Engine::apply_delta(const DeltaUpdate& delta_in, const Level* levels) {
-    return apply_delta_impl(delta_in, levels, DuplicatePolicy::Apply);
+    return apply_delta_impl(delta_in, levels, DuplicatePolicy::Apply, /*multi_master=*/false);
 }
 
 ob_status_t Engine::apply_delta_replicated(const DeltaUpdate& delta_in, const Level* levels) {
-    return apply_delta_impl(delta_in, levels, DuplicatePolicy::DropIfSeen);
+    return apply_delta_impl(delta_in, levels, DuplicatePolicy::DropIfSeen, /*multi_master=*/false);
+}
+
+ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta_in, const Level* levels) {
+    return apply_delta_impl(delta_in, levels, DuplicatePolicy::Apply, /*multi_master=*/true);
+}
+
+void Engine::apply_deltas(std::span<const ClientWrite> writes, std::span<WriteOutcome> outcomes) {
+    apply_local_writes(writes, outcomes, DuplicatePolicy::Apply, /*multi_master=*/false);
+}
+
+void Engine::apply_deltas_mm(std::span<const ClientWrite> writes,
+                             std::span<WriteOutcome> outcomes) {
+    apply_local_writes(writes, outcomes, DuplicatePolicy::Apply, /*multi_master=*/true);
 }
 
 ob_status_t Engine::apply_delta_impl(const DeltaUpdate& delta_in, const Level* levels,
-                                     DuplicatePolicy policy) {
-    // Local copy, because the sequence number is stamped below and the public signature
-    // takes a const reference — a caller's DeltaUpdate is not ours to modify.
-    DeltaUpdate delta = delta_in;
+                                     DuplicatePolicy policy, bool multi_master) {
+    // A batch of one. What a write that could not be applied threw is carried in the outcome
+    // rather than thrown out of the batch, so it is thrown here - with the text it always had,
+    // because that text is what a client is answered with.
+    const ClientWrite write{delta_in, levels};
+    WriteOutcome outcome;
+    apply_local_writes(std::span<const ClientWrite>(&write, 1),
+                       std::span<WriteOutcome>(&outcome, 1), policy, multi_master);
+    if (!outcome.error.empty()) throw std::runtime_error(outcome.error);
+    return outcome.status;
+}
 
+namespace {
+
+/// Where a write of a batch stands. Everything not `Final` when a batch is abandoned - an
+/// allocation failure before its WAL write - is refused with the reason, because a write that is
+/// neither answered nor refused would be answered `OK` by default.
+enum class WriteState : uint8_t { Undecided, Final, Admitted, InWal };
+
+/// One thread's working space for a batch, reused so that a write allocates nothing once these
+/// have grown to a read's size - the per-write key string included, which `apply_delta()` built
+/// from temporaries on every call. Per thread rather than a member, because the multi-master path
+/// reads it after `mtx_` is released and another reactor may be writing by then.
+struct BatchScratch {
+    std::vector<DeltaUpdate>     deltas;
+    std::vector<std::string>     keys;
+    std::vector<HLCTimestamp>    hlcs;
+    std::vector<WriteState>      state;
+    std::vector<WalDelta>        records;
+    std::vector<size_t>          write_of;   // the write each WAL record belongs to
+    std::vector<WalBatchOutcome> wal;
+    bool                         in_use{false};
+};
+
+thread_local BatchScratch batch_scratch;
+
+/// The thread's scratch, or a fresh one if the thread's is in use. Nothing re-enters the write
+/// path from inside it today - the subscribers are queued to, the replicas and the peers are
+/// buffered to - and a re-entry would overwrite the batch it interrupted without a word, so the
+/// fresh one is what that assumption costs when it expires rather than a corruption.
+class ScratchLease {
+public:
+    ScratchLease() {
+        if (!batch_scratch.in_use) {
+            batch_scratch.in_use = true;
+            scratch_ = &batch_scratch;
+        } else {
+            fallback_ = std::make_unique<BatchScratch>();
+            scratch_  = fallback_.get();
+        }
+    }
+    ~ScratchLease() {
+        if (scratch_ == &batch_scratch) batch_scratch.in_use = false;
+    }
+    ScratchLease(const ScratchLease&)            = delete;
+    ScratchLease& operator=(const ScratchLease&) = delete;
+    BatchScratch& operator*() { return *scratch_; }
+
+private:
+    BatchScratch*                 scratch_{nullptr};
+    std::unique_ptr<BatchScratch> fallback_;
+};
+
+} // namespace
+
+void Engine::apply_local_writes(std::span<const ClientWrite> writes,
+                                std::span<WriteOutcome> outcomes, DuplicatePolicy policy,
+                                bool multi_master) {
+    if (outcomes.size() < writes.size()) {
+        throw std::invalid_argument("Engine::apply_local_writes: " +
+                                    std::to_string(outcomes.size()) + " outcome(s) for " +
+                                    std::to_string(writes.size()) + " write(s)");
+    }
+    const size_t n = writes.size();
+    if (n == 0) return;
+    for (size_t i = 0; i < n; ++i) {
+        outcomes[i].status = OB_OK;
+        outcomes[i].error.clear();
+    }
+
+    ScratchLease lease;
+    BatchScratch& s = *lease;
+
+    // Refuse everything this batch has not decided yet. Only an allocation can get here, and only
+    // before the WAL write: nothing refused this way reached the file.
+    const auto abandon = [&](const std::exception& e) {
+        for (size_t i = 0; i < n; ++i) {
+            if (s.state[i] != WriteState::Final) outcomes[i].error = e.what();
+        }
+    };
+
+    s.state.assign(n, WriteState::Undecided);
     std::unique_lock<std::mutex> lock(mtx_);
 
-    // Built once and reused by the migrated-symbol check and stamp_sequence() below. One
-    // string per write, not two.
-    const std::string symbol_key = std::string(delta.symbol) + "." + delta.exchange;
+    // 1. What a single write checked before it waited for room, per write and in order.
+    size_t admitted = 0;
+    try {
+        s.deltas.resize(n);
+        s.keys.resize(n);
+        if (multi_master) s.hlcs.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            // A copy, because the sequence number is stamped below and the caller's update is
+            // not ours to modify. The key is built once, into a string that keeps its capacity,
+            // and reused by the migrated-symbol check, the duplicate check and the sequence
+            // tracker.
+            DeltaUpdate& delta = s.deltas[i];
+            delta = writes[i].update;
+            std::string& key = s.keys[i];
+            key.assign(delta.symbol);
+            key += '.';
+            key += delta.exchange;
 
-    // Reject writes to migrated symbols (Requirement 6.6).
-    if (!migrated_symbols_.empty() && migrated_symbols_.count(symbol_key)) {
-        OB_LOG_WARN("engine", "Rejecting write to migrated symbol: symbol_key=%s",
-                    symbol_key.c_str());
-        return OB_ERR_MIGRATED;
-    }
+            // Reject writes to migrated symbols (Requirement 6.6).
+            if (!migrated_symbols_.empty() && migrated_symbols_.count(key)) {
+                OB_LOG_WARN("engine", "Rejecting write to migrated symbol: symbol_key=%s",
+                            key.c_str());
+                outcomes[i].status = OB_ERR_MIGRATED;
+                s.state[i] = WriteState::Final;
+                continue;
+            }
 
-    // Drop what we already applied, before the WAL append, before any state change, and before
-    // the backpressure wait — a record that is about to be discarded should not queue behind the
-    // flush thread.
-    //
-    // Catch-up over-delivers on purpose, and since #101 it over-delivers by design: a replica
-    // resuming from its saved position is handed up to ten seconds of records it already holds,
-    // because `repl_state.txt` is written on a timer while the confirmed position advances per
-    // record. Storage is append-only, so without this the restart saving would be paid for in
-    // duplicated rows. `apply_remote_delta()` has had the same guard for the mesh since the
-    // measurement in #61's wake turned 9 written rows into 25 stored ones.
-    if (policy == DuplicatePolicy::DropIfSeen && delta.sequence_number != 0 &&
-        seq_tracker_.has_seen(symbol_key, mm_config_.node_id, delta.sequence_number)) {
-        OB_LOG_DEBUG("engine",
-                     "Dropping duplicate replicated record: sym=%s origin=%u seq=%llu",
-                     symbol_key.c_str(), static_cast<unsigned>(mm_config_.node_id),
-                     static_cast<unsigned long long>(delta.sequence_number));
-        registry_.increment_counter("ob_replication_duplicates_dropped");
-        return OB_OK;
-    }
-
-    // Backpressure: wait until pending queue has room.
-    // This blocks the writer if the flush thread can't keep up.
-    if (!await_pending_room(lock)) return OB_ERR_FULL;
-
-    // 1. Assign the sequence number, then write to WAL before any state mutation
-    //    (Requirement 8.1). No fsync here — group commit via flush_loop() or close().
-    //    Origin 0 outside multi-master; a record streamed from a primary arrives here with
-    //    the primary's number already set and keeps it.
-    stamp_sequence(delta, mm_config_.node_id, symbol_key);
-    const WalPosition record_pos = wal_.append(delta, levels);
-
-    // 1b. Broadcast to replicas if replication is enabled (Requirement 1.2).
-    //     Must be within the same mutex lock to maintain WAL ordering.
-    if (repl_mgr_) {
-        const size_t levels_bytes = delta.n_levels * sizeof(Level);
-        const size_t payload_len  = sizeof(DeltaUpdate) + levels_bytes;
-
-        alignas(8) uint8_t payload[sizeof(DeltaUpdate) + MAX_LEVELS * sizeof(Level)];
-        std::memcpy(payload, &delta, sizeof(DeltaUpdate));
-        if (levels_bytes > 0) {
-            std::memcpy(payload + sizeof(DeltaUpdate), levels, levels_bytes);
+            // Drop what we already applied, before the WAL append, before any state change, and
+            // before the backpressure wait - a record that is about to be discarded should not
+            // queue behind the flush thread.
+            //
+            // Catch-up over-delivers on purpose, and since #101 it over-delivers by design: a
+            // replica resuming from its saved position is handed up to ten seconds of records it
+            // already holds, because `repl_state.txt` is written on a timer while the confirmed
+            // position advances per record. Storage is append-only, so without this the restart
+            // saving would be paid for in duplicated rows. `apply_remote_delta()` has had the same
+            // guard for the mesh since the measurement in #61's wake turned 9 written rows into 25
+            // stored ones.
+            if (policy == DuplicatePolicy::DropIfSeen && delta.sequence_number != 0 &&
+                seq_tracker_.has_seen(key, mm_config_.node_id, delta.sequence_number)) {
+                OB_LOG_DEBUG("engine",
+                             "Dropping duplicate replicated record: sym=%s origin=%u seq=%llu",
+                             key.c_str(), static_cast<unsigned>(mm_config_.node_id),
+                             static_cast<unsigned long long>(delta.sequence_number));
+                registry_.increment_counter("ob_replication_duplicates_dropped");
+                s.state[i] = WriteState::Final;
+                continue;
+            }
+            s.state[i] = WriteState::Admitted;
+            ++admitted;
         }
+    } catch (const std::exception& e) {
+        abandon(e);
+        return;
+    }
+    if (admitted == 0) return;
 
-        WALRecord hdr{};
-        hdr.sequence_number = delta.sequence_number;
-        hdr.timestamp_ns    = delta.timestamp_ns;
-        hdr.checksum        = crc32c(payload, payload_len);
-        hdr.payload_len     = static_cast<uint16_t>(payload_len);
-        hdr.record_type     = WAL_RECORD_DELTA;
-        hdr._pad            = 0;
-
-        // The position comes from the append above rather than from the WAL's current position:
-        // that append may have rotated, in which case the current position is in the next file
-        // while this record is at the end of the previous one (#98).
-        repl_mgr_->broadcast(hdr, payload, payload_len, record_pos);
+    // 2. Backpressure: one wait for the batch, with the predicate a single write uses. This is
+    //    the one place the lock may be released before the batch is in the WAL - and nothing is
+    //    numbered yet, so nothing numbered can be waited on.
+    if (!await_pending_room(lock)) {
+        for (size_t i = 0; i < n; ++i) {
+            if (s.state[i] == WriteState::Admitted) {
+                outcomes[i].status = OB_ERR_FULL;
+                s.state[i] = WriteState::Final;
+            }
+        }
+        return;
     }
 
-    // 2. Apply to SoA buffer using seqlock writer protocol.
-    SoABuffer& buf = get_or_create_buffer(symbol_key, delta.symbol, delta.exchange);
-    bool gap_detected = false;   // unused: gaps are decided per origin in stamp_sequence()
-    ob_status_t status = ob::apply_delta(buf, delta, levels, gap_detected);
+    // 3. Number each write and assemble its WAL record - in the order and with the numbers a
+    //    single write would have got, because this is the order the writes arrived in and the
+    //    lock has not been released since.
+    s.records.clear();
+    s.write_of.clear();
+    try {
+        for (size_t i = 0; i < n; ++i) {
+            if (s.state[i] != WriteState::Admitted) continue;
+            DeltaUpdate& delta = s.deltas[i];
 
-    // 4. Enqueue SnapshotRows for background columnar flush + collect them for subscribers.
+            // Asked again: the wait above may have released the lock, and a batch can carry the
+            // same record twice. A single write checked once, which was exact while it could
+            // neither wait between the check and the append on a replica with another writer nor
+            // carry a second copy of itself.
+            if (policy == DuplicatePolicy::DropIfSeen && delta.sequence_number != 0 &&
+                seq_tracker_.has_seen(s.keys[i], mm_config_.node_id, delta.sequence_number)) {
+                OB_LOG_DEBUG("engine",
+                             "Dropping duplicate replicated record: sym=%s origin=%u seq=%llu "
+                             "(seen after it was admitted)",
+                             s.keys[i].c_str(), static_cast<unsigned>(mm_config_.node_id),
+                             static_cast<unsigned long long>(delta.sequence_number));
+                registry_.increment_counter("ob_replication_duplicates_dropped");
+                s.state[i] = WriteState::Final;
+                continue;
+            }
+
+            const HLCTimestamp* hlc = nullptr;
+            if (multi_master) {
+                // Each write its own tick, in order: the HLC a single write got.
+                s.hlcs[i] = hlc_->tick_local();
+                OB_LOG_DEBUG("engine", "apply_delta_mm: sym=%s exch=%s hlc={%lu,%u,%u}",
+                             delta.symbol, delta.exchange,
+                             static_cast<unsigned long>(s.hlcs[i].physical_ns),
+                             s.hlcs[i].logical, s.hlcs[i].node_id);
+                hlc = &s.hlcs[i];
+            }
+
+            // Assign the sequence number for this node's stream, then log before any state
+            // mutation (Requirement 8.1). No fsync here - group commit via flush_loop() or
+            // close(), or per run under `every`. Origin 0 outside multi-master; a record streamed
+            // from a primary arrives here with the primary's number already set and keeps it.
+            // Each node numbers only its own stream, which is what makes (origin, sequence)
+            // comparable across a cluster (Requirement 2.1, 2.2).
+            const bool gap = observe_sequence(delta, mm_config_.node_id, s.keys[i]);
+            s.records.push_back(WalDelta{&delta, writes[i].levels, hlc,
+                                         multi_master ? mm_config_.node_id : uint16_t{0}, gap});
+            s.write_of.push_back(i);
+            s.state[i] = WriteState::InWal;
+        }
+        s.wal.resize(s.records.size());
+    } catch (const std::exception& e) {
+        abandon(e);
+        return;
+    }
+
+    // 4. The WAL: one write() per run. Nothing below runs for a record it did not write.
+    try {
+        (void)wal_.append_batch(s.records, s.wal);
+    } catch (const std::exception& e) {
+        abandon(e);
+        return;
+    }
+
+    // 5. What a written record does, in WAL order. Per record in its own try, because each of
+    //    these writes was a call of its own: one that threw was answered with it, and the next
+    //    one ran.
+    for (size_t k = 0; k < s.records.size(); ++k) {
+        const size_t i = s.write_of[k];
+        s.state[i] = WriteState::Final;
+        if (!s.wal[k].error.empty()) {
+            outcomes[i].error = s.wal[k].error;
+            continue;
+        }
+        try {
+            if (multi_master) {
+                note_local_hlcs(s.deltas[i], writes[i].levels, s.hlcs[i]);
+            } else if (repl_mgr_) {
+                // Within the same lock, to keep the replicas in WAL order (Requirement 1.2).
+                broadcast_to_replicas(s.deltas[i], writes[i].levels, s.wal[k].position);
+            }
+            outcomes[i].status = apply_in_memory(s.keys[i], s.deltas[i], writes[i].levels);
+        } catch (const std::exception& e) {
+            // The record is in the WAL, as it was when a single write threw here.
+            outcomes[i].error = e.what();
+            s.wal[k].error = e.what();   // and the peers are not told of it, as they were not
+        }
+    }
+
+    // Update gauge: pending rows after enqueue. Once per batch: it is a gauge, and a reader
+    // sampling it inside the batch could only ever have seen it under this lock anyway.
+    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
+
+    if (!multi_master) return;
+
+    // 6. Broadcast to peers - with mtx_ released, in the order of the writes.
+    //
+    // This is the last step, and the unlock is the point of it rather than tidiness.
+    // `broadcast_local()` takes MultiMasterManager's mutex, and the io loop holds that mutex
+    // across the whole peer-fd branch - including `apply_remote_delta()`, which takes this one.
+    // Holding mtx_ here made the two orders opposite: a client write going Engine -> MM against a
+    // received delta going MM -> Engine. ThreadSanitizer reports that cycle within seconds of a
+    // three-node cluster doing both, which is what every multi-master node does (#80).
+    //
+    // The cost of moving it out is that two concurrent writers can now reach the wire in an order
+    // that differs from their WAL order. That is already the normal case for a receiver: catch-up
+    // over-delivers and delivers out of order on purpose, records above the frontier are held
+    // rather than rejected, and conflicts are resolved by HLC rather than by arrival. Nothing on
+    // the receiving side reads arrival order as meaning anything.
+    lock.unlock();
+    if (!mm_mgr_) return;
+    for (size_t k = 0; k < s.records.size(); ++k) {
+        if (!s.wal[k].error.empty()) continue;
+        const size_t i = s.write_of[k];
+        try {
+            broadcast_to_peers(s.deltas[i], writes[i].levels, s.hlcs[i]);
+        } catch (const std::exception& e) {
+            // Applied and not sent: answered with what was thrown, as a single write was.
+            outcomes[i].error = e.what();
+        }
+    }
+}
+
+void Engine::broadcast_to_replicas(const DeltaUpdate& delta, const Level* levels,
+                                   WalPosition at) {
+    const size_t levels_bytes = delta.n_levels * sizeof(Level);
+    const size_t payload_len  = sizeof(DeltaUpdate) + levels_bytes;
+
+    alignas(8) uint8_t payload[sizeof(DeltaUpdate) + MAX_LEVELS * sizeof(Level)];
+    std::memcpy(payload, &delta, sizeof(DeltaUpdate));
+    if (levels_bytes > 0) {
+        std::memcpy(payload + sizeof(DeltaUpdate), levels, levels_bytes);
+    }
+
+    WALRecord hdr{};
+    hdr.sequence_number = delta.sequence_number;
+    hdr.timestamp_ns    = delta.timestamp_ns;
+    hdr.checksum        = crc32c(payload, payload_len);
+    hdr.payload_len     = static_cast<uint16_t>(payload_len);
+    hdr.record_type     = WAL_RECORD_DELTA;
+    hdr._pad            = 0;
+
+    // The position comes from the append that wrote this record rather than from the WAL's
+    // current position: that append may have rotated, in which case the current position is in
+    // the next file while this record is at the end of the previous one (#98).
+    repl_mgr_->broadcast(hdr, payload, payload_len, at);
+}
+
+ob_status_t Engine::apply_in_memory(const std::string& key, const DeltaUpdate& delta,
+                                    const Level* levels) {
+    // Apply to SoA buffer using seqlock writer protocol.
+    SoABuffer& buf = get_or_create_buffer(key, delta.symbol, delta.exchange);
+    bool gap_detected = false;   // unused: gaps are decided per origin in observe_sequence()
+    const ob_status_t status = ob::apply_delta(buf, delta, levels, gap_detected);
+
+    // Enqueue SnapshotRows for background columnar flush + collect them for subscribers.
     //
     // The notification used to happen inside this loop, once per level. That made a 1000-level
     // MINSERT a thousand calls into the subscription list, so once that list needed a lock it would
@@ -666,7 +924,7 @@ ob_status_t Engine::apply_delta_impl(const DeltaUpdate& delta_in, const Level* l
         pending_rows_.push_back({delta.symbol, delta.exchange, row});
     }
 
-    // 5. Notify streaming subscribers synchronously (within 1 µs budget, Requirement 10.9).
+    // Notify streaming subscribers synchronously (within 1 µs budget, Requirement 10.9).
     //
     // The batch is copied out of `pending_rows_` here rather than collected in the loop above, and
     // that shape was arrived at through a measured 76% regression. The first version declared
@@ -687,126 +945,40 @@ ob_status_t Engine::apply_delta_impl(const DeltaUpdate& delta_in, const Level* l
         }
         query_engine_->notify_subscribers(delta.symbol, delta.exchange, batch);
     }
-
-    // Update gauge: pending rows after enqueue.
-    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
-
     return status;
 }
 
-ob_status_t Engine::apply_delta_mm(const DeltaUpdate& delta_in, const Level* levels) {
-    DeltaUpdate delta = delta_in;   // see apply_delta() for why this is copied
-
-    std::unique_lock<std::mutex> lock(mtx_);
-
-    // One key string per write; see apply_delta().
-    const std::string symbol_key = std::string(delta.symbol) + "." + delta.exchange;
-
-    // Reject writes to migrated symbols (Requirement 6.6).
-    if (!migrated_symbols_.empty() && migrated_symbols_.count(symbol_key)) {
-        OB_LOG_WARN("engine", "Rejecting write to migrated symbol: symbol_key=%s",
-                    symbol_key.c_str());
-        return OB_ERR_MIGRATED;
-    }
-
-    // Backpressure: wait until pending queue has room.
-    if (!await_pending_room(lock)) return OB_ERR_FULL;
-
-    // 1. Tick local HLC to get a timestamp for this write.
-    HLCTimestamp hlc_ts = hlc_->tick_local();
-
-    OB_LOG_DEBUG("engine", "apply_delta_mm: sym=%s exch=%s hlc={%lu,%u,%u}",
-                 delta.symbol, delta.exchange,
-                 static_cast<unsigned long>(hlc_ts.physical_ns),
-                 hlc_ts.logical, hlc_ts.node_id);
-
-    // 2. Assign the sequence number for this node's stream, then write to WAL with origin
-    //    and HLC (Requirement 2.1, 2.2). Each node numbers only its own stream, which is
-    //    what makes (origin, sequence) comparable across a cluster.
-    stamp_sequence(delta, mm_config_.node_id, symbol_key);
-    wal_.append_with_origin(delta, levels, mm_config_.node_id, hlc_ts);
-
-    // 3. Update conflict resolver HLC for each level.
+void Engine::note_local_hlcs(const DeltaUpdate& delta, const Level* levels,
+                             const HLCTimestamp& hlc) {
     auto& resolver = const_cast<ConflictResolver&>(mm_mgr_->conflict_resolver());
     for (uint16_t i = 0; i < delta.n_levels; ++i) {
         ConflictKey ck{delta.symbol, delta.exchange, delta.side, levels[i].price};
-        resolver.update_hlc(ck, hlc_ts, mm_config_.node_id);
+        resolver.update_hlc(ck, hlc, mm_config_.node_id);
+    }
+}
+
+void Engine::broadcast_to_peers(const DeltaUpdate& delta, const Level* levels,
+                                const HLCTimestamp& hlc) {
+    const size_t levels_bytes = delta.n_levels * sizeof(Level);
+    const size_t payload_len  = sizeof(DeltaUpdate) + levels_bytes;
+
+    alignas(8) uint8_t payload[sizeof(DeltaUpdate) + MAX_LEVELS * sizeof(Level)];
+    std::memcpy(payload, &delta, sizeof(DeltaUpdate));
+    if (levels_bytes > 0) {
+        std::memcpy(payload + sizeof(DeltaUpdate), levels, levels_bytes);
     }
 
-    // 4. Apply to SoA buffer (same logic as apply_delta).
-    SoABuffer& buf = get_or_create_buffer(symbol_key, delta.symbol, delta.exchange);
-    bool gap_detected = false;   // unused: gaps are decided per origin in stamp_sequence()
-    ob_status_t status = ob::apply_delta(buf, delta, levels, gap_detected);
+    WALRecordV2 hdr{};
+    hdr.sequence_number = delta.sequence_number;
+    hdr.timestamp_ns    = delta.timestamp_ns;
+    hdr.checksum        = crc32c(payload, payload_len);
+    hdr.payload_len     = static_cast<uint16_t>(payload_len);
+    hdr.record_type     = WAL_RECORD_DELTA;
+    hdr.version         = 1;
+    hdr.origin_node_id  = mm_config_.node_id;
+    hlc.serialize(hdr.hlc_data);
 
-    // 5. Enqueue SnapshotRows for background columnar flush, then notify subscribers once for the
-    //    whole delta. Nothing is allocated or constructed when nobody is subscribed - see the note
-    //    in apply_delta() about the 76% regression a stack array cost here.
-    const size_t rows_before = pending_rows_.size();
-
-    for (uint16_t i = 0; i < delta.n_levels; ++i) {
-        SnapshotRow row{};
-        row.timestamp_ns    = delta.timestamp_ns;
-        row.sequence_number = delta.sequence_number;
-        row.side            = delta.side;
-        row.level_index     = i;
-        row.price           = levels[i].price;
-        row.quantity        = levels[i].qty;
-        row.order_count     = levels[i].cnt;
-
-        pending_rows_.push_back({delta.symbol, delta.exchange, row});
-    }
-
-    if (query_engine_->has_subscribers() && pending_rows_.size() > rows_before) {
-        std::vector<SnapshotRow> batch;
-        batch.reserve(pending_rows_.size() - rows_before);
-        for (size_t i = rows_before; i < pending_rows_.size(); ++i) {
-            batch.push_back(pending_rows_[i].row);
-        }
-        query_engine_->notify_subscribers(delta.symbol, delta.exchange, batch);
-    }
-
-    registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
-
-    // 6. Broadcast to peers — with mtx_ released.
-    //
-    // This is the last step, and the unlock is the point of it rather than tidiness.
-    // `broadcast_local()` takes MultiMasterManager's mutex, and the io loop holds that mutex
-    // across the whole peer-fd branch — including `apply_remote_delta()`, which takes this one.
-    // Holding mtx_ here made the two orders opposite: a client write going Engine → MM against a
-    // received delta going MM → Engine. ThreadSanitizer reports that cycle within seconds of a
-    // three-node cluster doing both, which is what every multi-master node does (#80).
-    //
-    // The cost of moving it out is that two concurrent writers can now reach the wire in an order
-    // that differs from their WAL order. That is already the normal case for a receiver: catch-up
-    // over-delivers and delivers out of order on purpose, records above the frontier are held
-    // rather than rejected, and conflicts are resolved by HLC rather than by arrival. Nothing on
-    // the receiving side reads arrival order as meaning anything.
-    lock.unlock();
-
-    if (mm_mgr_) {
-        const size_t levels_bytes = delta.n_levels * sizeof(Level);
-        const size_t payload_len  = sizeof(DeltaUpdate) + levels_bytes;
-
-        alignas(8) uint8_t payload[sizeof(DeltaUpdate) + MAX_LEVELS * sizeof(Level)];
-        std::memcpy(payload, &delta, sizeof(DeltaUpdate));
-        if (levels_bytes > 0) {
-            std::memcpy(payload + sizeof(DeltaUpdate), levels, levels_bytes);
-        }
-
-        WALRecordV2 hdr{};
-        hdr.sequence_number = delta.sequence_number;
-        hdr.timestamp_ns    = delta.timestamp_ns;
-        hdr.checksum        = crc32c(payload, payload_len);
-        hdr.payload_len     = static_cast<uint16_t>(payload_len);
-        hdr.record_type     = WAL_RECORD_DELTA;
-        hdr.version         = 1;
-        hdr.origin_node_id  = mm_config_.node_id;
-        hlc_ts.serialize(hdr.hlc_data);
-
-        mm_mgr_->broadcast_local(hdr, payload, payload_len);
-    }
-
-    return status;
+    mm_mgr_->broadcast_local(hdr, payload, payload_len);
 }
 
 ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level* levels,

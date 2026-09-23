@@ -79,7 +79,11 @@ public:
     int64_t gauge_value(std::string_view name) const;
 
     // ── Histogram operations ──────────────────────────────────────────────────
-    void observe_histogram(std::string_view name, double seconds);
+    /// `count` observations of the same value, for operations that finished together - the
+    /// writes of one read (#155). One update of each bucket rather than `count`: the counters are
+    /// atomics every reactor touches, and per-write updates of them are a smaller copy of the
+    /// convoy the batch exists to remove.
+    void observe_histogram(std::string_view name, double seconds, uint64_t count = 1);
 
     // ── Serialization ─────────────────────────────────────────────────────────
     /// Produce Prometheus exposition text with # HELP, # TYPE lines and

@@ -400,7 +400,7 @@ bool Session::close_requested() const { return close_after_flush_; }
 uint64_t Session::queries_executed() const { return queries_; }
 uint64_t Session::inserts_executed() const { return inserts_; }
 void Session::increment_queries() { ++queries_; }
-void Session::increment_inserts() { ++inserts_; }
+void Session::increment_inserts(uint64_t n) { inserts_ += n; }
 
 void Session::set_compressed(bool c) { compressed_ = c; }
 bool Session::is_compressed() const { return compressed_; }

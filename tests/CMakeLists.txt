@@ -293,6 +293,15 @@ ob_add_engine_test(test_sequence_numbers
     test_sequence_numbers.cpp
 )
 
+# The writes of one read under one acquisition of the engine's lock (#155): the same writes applied
+# both ways and compared, and the shape that the state cannot show asserted from the source.
+ob_add_engine_test(test_write_batch
+    test_write_batch.cpp
+)
+target_compile_definitions(test_write_batch
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
 ob_add_engine_test(test_mm_dedup
     test_mm_dedup.cpp
 )
