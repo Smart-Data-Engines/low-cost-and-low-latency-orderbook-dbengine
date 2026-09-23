@@ -280,7 +280,9 @@ purpose: a zero in the second one means "checked, nothing to repair" only if the
 
 With `FsyncPolicy::EVERY` — **not** the default, which is `INTERVAL` — a write that has been
 acknowledged is in a fsynced WAL record before the acknowledgement leaves the server, and it comes
-back after a `SIGKILL`, a power cut, or any other end that skips `close()`. Since #113 that
+back after a `SIGKILL` or any other end that skips `close()`. After a **power cut** it comes back
+until a flush claims it: segment files are never synced, so a checkpoint can then name rows the disk
+never received, and replay skips their records (#160, open — found by reading, not measured). Since #113 that
 sentence is enforced rather than asserted: the `fsync` result is checked, and a write whose sync
 failed is refused instead of acknowledged. *(This paragraph said `EVERY` was the default for
 months. The default has been `INTERVAL` in every one of the four places the code states it, so the
