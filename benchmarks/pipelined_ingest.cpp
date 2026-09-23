@@ -9,6 +9,8 @@
 //   and every other table in this repository counts (pitfall 328 is what mixing units cost);
 // * the batch round trip at p50, p99, p99.9 and its maximum - the last two because a stall that
 //   comes once per flush interval touches one batch in hundreds and is invisible at p99;
+// * the server's peak resident memory (VmHWM), because a change that moves work out of the flush
+//   tick can move memory into it, and a queue held twice is a number rather than a guess;
 // * the client's own CPU, so a result that is really the client's ceiling says so;
 // * and the reason this exists - the server's CPU **per thread**, read from
 //   /proc/<pid>/task/*/stat, so a plateau is attributed to the thread that is saturated rather than
@@ -259,6 +261,14 @@ int main(int argc, char** argv) {
     if (failed) return 1;
 
     const double wall = std::chrono::duration<double>(w1 - w0).count();
+    long rss_peak_kb = -1;
+    {
+        std::ifstream status("/proc/" + std::to_string(pid) + "/status");
+        std::string line;
+        while (std::getline(status, line)) {
+            if (line.rfind("VmHWM:", 0) == 0) rss_peak_kb = std::strtol(line.c_str() + 6, nullptr, 10);
+        }
+    }
     std::vector<long long> all;
     for (auto& v : lat) all.insert(all.end(), v.begin(), v.end());
     std::sort(all.begin(), all.end());
@@ -277,11 +287,11 @@ int main(int argc, char** argv) {
     std::sort(busy.rbegin(), busy.rend());
     std::printf("{\"connections\": %d, \"batch\": %d, \"levels\": %d, \"wall_s\": %.3f, "
                 "\"levels_per_s\": %.0f, \"batch_p50_us\": %.1f, \"batch_p99_us\": %.1f, "
-                "\"batch_p999_us\": %.1f, \"batch_max_us\": %.1f, "
+                "\"batch_p999_us\": %.1f, \"batch_max_us\": %.1f, \"server_rss_peak_kb\": %ld, "
                 "\"client_cpu_s\": %.2f, \"server_cpu_s\": %.2f, \"server_cores\": %.2f, \"threads\": [",
                 conns, batch, levels, wall, total_levels / wall, all[all.size() / 2] / 1e3,
                 all[(all.size() * 99) / 100] / 1e3, all[(all.size() * 999) / 1000] / 1e3,
-                all.back() / 1e3, cli1 - cli0, server_total, server_total / wall);
+                all.back() / 1e3, rss_peak_kb, cli1 - cli0, server_total, server_total / wall);
     for (size_t i = 0; i < busy.size() && i < 8; ++i) {
         std::printf("%s{\"thread\": \"%s\", \"cpu_s\": %.2f, \"of_wall\": %.2f}", i ? ", " : "",
                     busy[i].second.c_str(), busy[i].first, busy[i].first / wall);

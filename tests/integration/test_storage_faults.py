@@ -1357,3 +1357,31 @@ def test_rows_written_during_a_tick_sync_survive_a_crash_after_it():
             "a row written while the tick synced was lost or doubled by the replay after a crash")
     finally:
         node.cleanup()
+
+
+def test_retention_moves_under_every_while_writes_flow():
+    """The retention floor rises under `--fsync-policy every` while writes keep arriving (#160).
+
+    Under `every` each write syncs the WAL itself, which also takes the checkpoint the last tick
+    appended to the device - so a tick usually finds **nothing owed**, and that is the path on which
+    the floor has to move. Stage 5 of #151 split the tick's sync out of the lock, and its first
+    version promoted the floor only on the path that synced: with writes flowing, retention under
+    `every` never moved and the WAL grew for as long as they did.
+
+    The directory is read the moment the writes stop, which is the window that decides it: with the
+    floor stuck, the first promotion comes two ticks later - one to append a checkpoint nobody's
+    write has synced, and one to find it owed.
+    """
+    node = FaultNode(OB_FAULT_POLICY="every", OB_FAULT_FLUSH_MS="300", OB_FAULT_ROTATE_BYTES="65573")
+    try:
+        node.wait_until_answering()
+        replies = node.insert_each(range(1000, 4000))
+        files = node.wal_files()
+        assert all(r == "OK" for r in replies.values())
+        assert any(f >= "wal_000003.bin" for f in files), (
+            f"the writes did not rotate the WAL past its third file, so there was nothing for "
+            f"retention to delete: {files}")
+        assert WAL_SEGMENT not in files, (
+            f"retention kept every WAL file while writes flowed under `every`: {files}")
+    finally:
+        node.cleanup()

@@ -2300,18 +2300,36 @@ void Engine::flush_tick() {
         // move them out of the only place that still knows they were never synced - #112's
         // boundary catches the throw, counts it and runs the next tick.
         WALWriter::SyncTicket ticket;
-        int sync_err = 0;
+        bool drained = false;
         {
             std::unique_lock<std::mutex> lock(mtx_);
             auto prepared = wal_.prepare_sync();
-            ticket   = std::move(prepared.first);
-            sync_err = prepared.second;
-            if (sync_err == 0) syncing_rows_.swap(pending_rows_);
+            ticket = std::move(prepared.first);
+            if (prepared.second != 0) {
+                // The duplicate could not be made and the sync ran under the lock, and failed.
+                throw std::runtime_error("Engine: WAL sync failed during the flush tick");
+            }
+            if (!ticket.owed()) {
+                // Nothing to sync outside the lock - `every` has synced each run, `none` never
+                // does, or nothing was written - so this is the tick as it always was: one hold,
+                // the queue drained at the log's position. Releasing and retaking the lock here
+                // for nothing doubled a pipelining writer's p99 under `none` (m9g.xlarge, four
+                // connections: 718 -> 1578 µs), because the tick then queues for its own drain
+                // behind every writer that takes the lock in between.
+                //
+                // And the floor moves here too (#160): nothing owed means the log is synced to its
+                // end - under `every` by the last write's own sync, which is this path's ordinary
+                // case once writes are flowing, since each one resets the count a checkpoint left.
+                // Without this, retention under `every` never moved at all.
+                note_wal_synced();
+                drain_rows(pending_rows_, ticket.position());
+                drained = true;
+            } else {
+                syncing_rows_.swap(pending_rows_);
+            }
         }
-        if (sync_err == 0 && ticket.owed()) {
-            sync_err = wal_.perform_sync(ticket);
-        }
-        {
+        if (!drained) {
+            const int sync_err = wal_.perform_sync(ticket);
             std::unique_lock<std::mutex> lock(mtx_);
             wal_.complete_sync(ticket, sync_err);
             if (sync_err != 0) {
