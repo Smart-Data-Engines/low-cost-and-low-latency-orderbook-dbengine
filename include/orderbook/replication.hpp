@@ -793,8 +793,15 @@ private:
     /// Close the socket and forget it, once, under fd_mtx_.
     void close_socket();
     void send_ack();
+    /// Replace the state file with the current position, identity and epoch - never rewrite it in
+    /// place (#162). A failure keeps the previous file and is said once per episode.
     void save_state();
     void load_state();
+
+    /// A run of saves that could not replace the state file: loud once, then quiet, and the save
+    /// that succeeds again closes it. Saves are made from the receive thread and from `stop()` after
+    /// it has been joined, so they never run at once.
+    LogEpisode state_save_episode_;
 
     /// Decide what a line announcing `epoch` means for this connection, and remember it if it is
     /// newer than what this node knows (#103).

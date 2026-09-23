@@ -43,6 +43,7 @@
 #include "orderbook/compression.hpp"
 #include "orderbook/level_payload.hpp"
 #include "orderbook/crc32c.hpp"
+#include "orderbook/durable_file.hpp"
 #include "orderbook/engine.hpp"
 #include "orderbook/logger.hpp"
 
@@ -150,29 +151,6 @@ bool path_stays_within(const std::string& base, std::string_view rel) {
 
 namespace {
 
-/// Opens a file for writing with mode 0640, bypassing the process umask.
-///
-/// std::fopen creates files with 0666 & ~umask, so the resulting permissions
-/// depend on how the server was started. Under a systemd unit without an
-/// explicit UMask= that yields world-writable database files. Returns nullptr
-/// on failure, with errno set by open().
-static std::FILE* open_file_private(const std::string& path, const char* mode) {
-    int flags = O_WRONLY | O_CREAT;
-    flags |= (std::strchr(mode, 'a') != nullptr) ? O_APPEND : O_TRUNC;
-
-    const int fd = ::open(path.c_str(), flags, S_IRUSR | S_IWUSR | S_IRGRP);
-    if (fd < 0) {
-        return nullptr;
-    }
-    std::FILE* f = ::fdopen(fd, mode);
-    if (!f) {
-        const int saved = errno;
-        ::close(fd);
-        errno = saved;
-    }
-    return f;
-}
-
 /// Creates a uniquely named temporary file inside `dir` and returns it opened
 /// for writing, with the final path in `out_path`.
 ///
@@ -187,6 +165,8 @@ static std::FILE* open_temp_file_private(const std::string& dir,
     std::vector<char> buf(tmpl.begin(), tmpl.end());
     buf.push_back('\0');
 
+    // OB_DURABLE: a staged snapshot file - the install renames it into the data directory and
+    // syncs the directory before the replica records the snapshot's position (#162).
     const int fd = ::mkstemp(buf.data());
     if (fd < 0) {
         OB_LOG_ERROR("repl_client", "mkstemp failed in %s: %s",
@@ -2640,9 +2620,6 @@ void ReplicationClient::send_ack() {
 void ReplicationClient::save_state() {
     if (config_.state_file.empty()) return;
 
-    std::FILE* f = open_file_private(config_.state_file, "w");
-    if (!f) return;
-
     // The identity goes with the position, always in the same write: a position saved without one
     // is a position nothing can attribute, and `load_state()` reads that as "wipe" (#101).
     //
@@ -2651,12 +2628,46 @@ void ReplicationClient::save_state() {
     // zero and its fencing starts every process unarmed (#103). Unlike the position, it is a
     // ceiling rather than a place - `load_state()` raises the engine's epoch to it and never lowers
     // it - so an out-of-date file costs fencing, never correctness of replay.
-    std::fprintf(f, "file_index=%u\nbyte_offset=%zu\nstream_id=%" PRIu64 "\nepoch=%" PRIu64 "\n",
-                 confirmed_file_.load(std::memory_order_relaxed),
-                 confirmed_offset_.load(std::memory_order_relaxed),
-                 stream_id_.load(std::memory_order_relaxed),
-                 engine_.current_epoch());
-    std::fclose(f);
+    char content[160];
+    const int len = std::snprintf(
+        content, sizeof(content),
+        "file_index=%u\nbyte_offset=%zu\nstream_id=%" PRIu64 "\nepoch=%" PRIu64 "\n",
+        confirmed_file_.load(std::memory_order_relaxed),
+        confirmed_offset_.load(std::memory_order_relaxed),
+        stream_id_.load(std::memory_order_relaxed), engine_.current_epoch());
+
+    // **Replaced, never rewritten in place** (#162). The file was opened with O_TRUNC and written
+    // into, so a replica killed between the truncate and the write left it empty - and an empty
+    // file is a position nothing can attribute, which `load_state()` reads as "wipe the store and
+    // stream the whole log again" (#101), losing the epoch with it (#103). Measured with the write
+    // held open at the kernel: the file came back as 0 bytes, and the restart logged
+    // `clearing local data` and asked for `REPLICATE 0 0 0`. The save runs every ten seconds, so
+    // the window needed no power cut, only a kill at the wrong moment. The temporary is synced
+    // before the rename and the directory after it, so a power cut keeps one file or the other.
+    const int err =
+        (len > 0 && static_cast<size_t>(len) < sizeof(content))
+            ? write_file_atomically(config_.state_file,
+                                    std::string_view(content, static_cast<size_t>(len)))
+            : EOVERFLOW;
+    if (err != 0) {
+        if (state_save_episode_.begin()) {
+            OB_LOG_WARN("repl_client",
+                        "cannot save the replication position to %s (%s): the file keeps the "
+                        "previous one, so a restart resumes from there and receives again what "
+                        "came after it, which the sequence numbers make safe to apply",
+                        config_.state_file.c_str(), std::strerror(err));
+        } else {
+            OB_LOG_DEBUG("repl_client", "cannot save the replication position (%llu in a row): %s",
+                         static_cast<unsigned long long>(state_save_episode_.ticks()),
+                         std::strerror(err));
+        }
+        return;
+    }
+    if (const uint64_t failed = state_save_episode_.end()) {
+        OB_LOG_INFO("repl_client", "the replication position is saved again, after %llu failed "
+                                   "attempt(s)",
+                    static_cast<unsigned long long>(failed));
+    }
 }
 
 void ReplicationClient::load_state() {
