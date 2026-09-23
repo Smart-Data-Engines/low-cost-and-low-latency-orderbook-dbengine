@@ -380,9 +380,10 @@ ClickHouse wins the clock by spending **2.39 cores** where the engine spends **0
 whole of the wall-clock difference on this box, and the section above shows that the round trip is
 not: at equal volume the engine's wall-clock ingest is within 4% of its own in-process figure.
 
-`grep -rn 'hardware_concurrency\|_SC_NPROCESSORS\|sched_getaffinity' src include` returns
-**nothing**: every thread in this engine has a fixed role, and none of them is a pool sized to the
-machine. ClickHouse sizes itself to the cores it can see, and `timescaledb-tune` sizes PostgreSQL
+`grep -rn 'hardware_concurrency\|_SC_NPROCESSORS\|sched_getaffinity' src include` returned
+**nothing** when this was measured: every thread in this engine has a fixed role, and none of them
+is a pool sized to the machine. (Since #156 `src/machine.cpp` reads the CPUs the process can use;
+nothing is sized to that until stage 4 of #151.) ClickHouse sizes itself to the cores it can see, and `timescaledb-tune` sizes PostgreSQL
 to the machine. So the prediction, registered here before any such box exists: **on 8 or 16 cores
 the engine's ingest wall clock stays roughly where it is, ClickHouse's grows with the cores, and
 the per-CPU-second parity holds.** If per-CPU-second parity *breaks* in our favour on a bigger

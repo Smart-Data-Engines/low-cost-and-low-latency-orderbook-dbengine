@@ -3,6 +3,7 @@
 #include "orderbook/auth.hpp"
 #include "orderbook/command_parser.hpp"
 #include "orderbook/engine.hpp"
+#include "orderbook/machine.hpp"
 #include "orderbook/metrics.hpp"
 #include "orderbook/metrics_server.hpp"
 #include "orderbook/response_formatter.hpp"
@@ -529,6 +530,11 @@ ServerConfig parse_cli_args(int argc, char* argv[]);
 struct ResolvedConfig {
     ServerConfig                 config;
     std::map<std::string, Origin> origin;   ///< flag name (no dashes) -> where it came from
+    /// The CPUs this process can use, as the start of the process found them: the affinity mask
+    /// and the tightest cgroup limit (`detect_machine()`). Logged at startup and printed by
+    /// `--print-config`, because "how big is this machine" has two answers and a node sized by the
+    /// wrong one is sized for a machine it does not have.
+    MachineResources             machine;
 };
 ResolvedConfig resolve_cli_args(int argc, char* argv[]);
 

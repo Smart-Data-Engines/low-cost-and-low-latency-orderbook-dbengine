@@ -8,6 +8,7 @@
 // reason the design is safe: a hand-written list with nothing checking it falls behind at the first
 // flag added in a hurry, and the symptom is a config key an operator wrote that does nothing.
 
+#include "orderbook/machine.hpp"
 #include "orderbook/tcp_server.hpp"
 
 #include <gtest/gtest.h>
@@ -241,6 +242,29 @@ ob::ResolvedConfig resolve(std::vector<std::string> args) {
 }
 
 }  // namespace
+
+TEST(MachineInConfig, ResolvingTheConfigurationReadsTheMachine) {
+    // Stage 3: the CPUs this process can use are read where the rest of the configuration is
+    // resolved, so the log line and --print-config describe what the node was sized against. The
+    // same process a moment apart sees the same machine.
+    const auto resolved = resolve({});
+    const ob::MachineResources now = ob::detect_machine(ob::read_system_view());
+    EXPECT_GE(resolved.machine.usable_cpus, 1u);
+    EXPECT_EQ(resolved.machine.usable_cpus, now.usable_cpus);
+    EXPECT_EQ(resolved.machine.reason, now.reason);
+}
+
+TEST(MachineInConfig, PrintConfigSaysWhatWasFound) {
+    // A machine written by hand, so the line checked is the one this function renders and not the
+    // description of whatever runner the test is on.
+    ob::ResolvedConfig resolved = resolve({});
+    resolved.machine.usable_cpus = 3;
+    resolved.machine.reason      = "3 usable CPUs: affinity 8, cgroup v2 limit 3.50 CPUs (x)";
+    const std::string printed = ob::format_config(resolved);
+    EXPECT_NE(printed.find("# machine: 3 usable CPUs: affinity 8, cgroup v2 limit 3.50 CPUs (x)\n"),
+              std::string::npos)
+        << printed;
+}
 
 TEST(IoProfile, BoostSetsTheSpinAndSaysItWasTheProfile) {
     const auto resolved = resolve({"--profile", "boost"});

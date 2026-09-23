@@ -1679,7 +1679,13 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
                           "traffic flows");
     }
 
-    ResolvedConfig resolved{config, origin};
+    // How many CPUs this process can use. Read here, where every other fact the configuration is
+    // resolved from is read, so the log line and `--print-config` say what the node was sized
+    // against - and so the next stage, which sizes the loops to it, has it in the same place.
+    const MachineResources machine = detect_machine(read_system_view());
+    OB_LOG_INFO("cli", "machine: %s", machine.reason.c_str());
+
+    ResolvedConfig resolved{config, origin, machine};
 
     if (print_config_requested) {
         // Printed and exited, without opening a port. Diagnostics that need a free port are useless
@@ -1715,6 +1721,7 @@ std::string format_config(const ResolvedConfig& resolved) {
 
     out += "# Resolved configuration. Provenance in brackets: a list of values does not say which\n";
     out += "# of them you chose, and that is the question this flag exists to answer.\n";
+    out += "# machine: " + resolved.machine.reason + "\n";
     line("anti-entropy-interval-seconds", std::to_string(c.anti_entropy_interval_sec));
     {
         std::string joined;
