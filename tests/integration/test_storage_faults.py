@@ -1032,12 +1032,60 @@ def test_retention_does_not_pass_a_checkpoint_a_failed_wal_sync_may_have_lost():
     finally:
         node.cleanup()
 
+
+def test_under_none_a_failed_wal_sync_freezes_nothing():
+    """`--fsync-policy none` makes no promise a failed sync could break, so it freezes nothing (#160).
+
+    The WAL syncs the file it leaves at a rotation whatever the policy, and that sync is made to fail.
+    Under a policy that promises something, that freezes the checkpoints until a restart; under
+    `none` the checkpoints go on, and retention deletes the file the rotation left.
+    """
+    node = FaultNode(OB_FAULT_PATH=WAL_SEGMENT, OB_FAULT_OP="fsync", OB_FAULT_ERRNO="EIO",
+                     OB_FAULT_COUNT="1", OB_FAULT_POLICY="none", OB_FAULT_FLUSH_MS="300",
+                     OB_FAULT_ROTATE_BYTES="65573")
+    try:
+        node.wait_until_answering()
+        replies = node.insert_each(range(1000, 1600))
+        assert all(r == "OK" for r in replies.values())
+        assert node.injections() == 1, f"the rotation's sync did not fail:\n{node.fault_log_text()}"
+        deadline = time.time() + patience(20)
+        while WAL_SEGMENT in node.wal_files() and time.time() < deadline:
+            time.sleep(0.05)
+        assert WAL_SEGMENT not in node.wal_files(), (
+            f"retention stopped under a policy that promises nothing: {node.wal_files()}")
+        assert node.counter("ob_wal_fsync_errors_total") == 1
+        assert node.counter("ob_checkpoints_frozen") == 0
+    finally:
+        node.cleanup()
+
 HOUR_NS = 3600 * 1_000_000_000   # the columnar store's segment length
 
 
 def insert_at(node: FaultNode, symbol: str, price: int, event_time_ns: int) -> str:
     """One INSERT with its event time, for a test that needs rows in two different segments."""
     return node.talk(f"INSERT {symbol} EX bid {price} 1 1 {event_time_ns}")[0]
+
+
+def partial_segment_dirs(node: FaultNode) -> list[str]:
+    """Segment directories with no `meta.json` - what a refused write leaves if nothing removes it.
+
+    Segments live at `<data dir>/<symbol>/<exchange>/<start>_<end>[_n]`, and `meta.json` is written
+    last, so a directory without one is a write that stopped part-way.
+    """
+    out = []
+    root = node.data_dir
+    for symbol in sorted(os.listdir(root)):
+        for exchange in sorted(os.listdir(os.path.join(root, symbol))
+                               if os.path.isdir(os.path.join(root, symbol)) else []):
+            parent = os.path.join(root, symbol, exchange)
+            if not os.path.isdir(parent):
+                continue
+            for span in sorted(os.listdir(parent)):
+                seg = os.path.join(parent, span)
+                if (re.fullmatch(r"\d+_\d+(_\d+)?", span) and os.path.isdir(seg)
+                        and not os.path.exists(os.path.join(seg, "meta.json"))):
+                    out.append(os.path.relpath(seg, root))
+    return out
 
 
 def prices_of(node: FaultNode, symbol: str) -> list[int]:
@@ -1096,6 +1144,9 @@ def test_a_symbol_the_disk_refuses_leaves_the_others_written_and_readable():
         visible = {s: prices_of(node, s) for s in ("AAA", "BBB")}
         assert sorted(len(v) for v in visible.values()) == [0, 1], (
             f"exactly one symbol's segment should be readable after the first flush: {visible}")
+        # And the refused one left nothing behind: a directory it began is removed, or a disk that
+        # refused a write because it was full would keep what the write managed to put there.
+        assert partial_segment_dirs(node) == [], partial_segment_dirs(node)
         assert node.talk("FLUSH")[0] == "OK"
         assert prices_of(node, "AAA") == [111] and prices_of(node, "BBB") == [222]
         node.kill_and_restart_without_faults()

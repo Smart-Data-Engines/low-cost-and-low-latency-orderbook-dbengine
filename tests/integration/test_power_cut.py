@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import free_port, patience, server_binary_path
+from conftest import fault_injector_path, free_port, patience, server_binary_path
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("OB_POWER_CUT_TESTS") != "1",
@@ -123,14 +123,25 @@ class Node:
         self.proc: subprocess.Popen | None = None
         self.port = self.metrics_port = 0
 
-    def start(self) -> None:
+    def start(self, fault: dict[str, str] | None = None) -> None:
+        """Start the node - with the storage fault injector preloaded when `fault` names one.
+
+        A restart passes nothing, so no fault outlives the run it was for: the environment is
+        rebuilt from this process's own, without any `OB_FAULT_` variable or preload.
+        """
         self.port, self.metrics_port = free_port(), free_port()
+        env = {k: v for k, v in os.environ.items() if not k.startswith("OB_FAULT_")}
+        env.pop("LD_PRELOAD", None)
+        if fault:
+            injector = fault_injector_path()
+            assert injector is not None, "libobfault.so was not built; this test would inject nothing"
+            env.update(fault, LD_PRELOAD=injector)
         with open(self.log_path, "ab") as log:
             self.proc = subprocess.Popen(
                 [SERVER, "--port", str(self.port), "--metrics-port", str(self.metrics_port),
                  "--data-dir", str(self.data_dir), "--fsync-policy", self.policy,
                  "--flush-interval-ms", str(self.flush_ms), "--drain-timeout-ms", "2000"],
-                stdout=log, stderr=subprocess.STDOUT)
+                env=env, stdout=log, stderr=subprocess.STDOUT)
         deadline = time.time() + patience(30)
         while time.time() < deadline:
             try:
@@ -243,5 +254,95 @@ def test_an_acknowledged_write_survives_a_power_cut_after_a_flush(disk, tmp_path
         # empty, and a new identity makes every position the segments recorded foreign.
         assert "wal_identity file present but unusable" not in node.log(), (
             "the WAL identity did not survive the cut")
+    finally:
+        node.kill()
+
+
+def segment_metas(data_dir: Path) -> list[Path]:
+    """Every segment's `meta.json`: segments live at `<data dir>/<symbol>/<exchange>/<span>/`."""
+    return sorted(data_dir.glob("*/*/*/meta.json"))
+
+
+def test_a_segment_the_cut_left_short_is_rebuilt_from_the_wal(disk, tmp_path):
+    """The segment no surviving checkpoint vouches for is removed, and replay rebuilds it (#160).
+
+    The cut lands while the first flush's `syncfs()` is held open by the injector: its segment files
+    are written and not yet synced, and no checkpoint exists, because the checkpoint comes after the
+    sync. The test then does what writeback is free to do on its own and syncs each segment's
+    `meta.json` alone - so the cut leaves a segment whose metadata says it holds the rows and whose
+    columns are empty. That is a shape a real cut can leave, made deterministic.
+
+    Without the rule, the restart indexes that segment, the per-symbol replay filter skips every
+    record its position claims (#63), and the rows are gone. With it, the segment is removed - there
+    is no checkpoint and the WAL starts at its first file, so no record is missing from the log -
+    and replay puts every row back. `every`, because it is the policy under which all 200 rows are
+    on the device whenever the cut lands; the rule itself does not depend on the policy.
+    """
+    data = disk.mount / "data"
+    fault_log = tmp_path / "fault.log"
+    node = Node(data, tmp_path / "node.log", "every", flush_ms=500)
+    try:
+        node.start(fault={"OB_FAULT_PATH": str(data), "OB_FAULT_OP": "syncfs",
+                          "OB_FAULT_DELAY_MS": "8000", "OB_FAULT_COUNT": "1",
+                          "OB_FAULT_LOG": str(fault_log)})
+        assert node.insert(range(1000, 1000 + ROWS)) == ROWS
+        deadline = time.time() + patience(30)
+        while "action=delay" not in (fault_log.read_text() if fault_log.exists() else ""):
+            assert time.time() < deadline, "the flush never reached its segment sync"
+            time.sleep(0.05)
+        metas = segment_metas(data)
+        assert metas, "the flush wrote no segment before its sync"
+        for meta in metas:
+            fd = os.open(meta, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+        disk.cut_power()
+        disk.remount_after(node.kill)
+        # The case this test is about, on the device: the metadata survived and a column did not.
+        survived = segment_metas(data)
+        assert survived, "no segment metadata survived the cut: the case did not happen"
+        columns = [c for meta in survived for c in meta.parent.glob("*.col")]
+        assert any(c.stat().st_size == 0 for c in columns), (
+            "every column survived the cut, so there was nothing for the rule to catch: "
+            + ", ".join(f"{c.name}={c.stat().st_size}" for c in columns))
+
+        node.start()
+        assert sorted(node.prices()) == list(range(1000, 1000 + ROWS)), (
+            f"the rows of the segment the cut left short did not come back:\n{node.log()[-2000:]}")
+        assert (f"{len(survived)} segment(s) written after the last checkpoint that survived were "
+                "removed") in node.log(), node.log()[-2000:]
+    finally:
+        node.kill()
+
+
+def test_the_wal_identity_survives_a_power_cut_before_the_first_flush(disk, tmp_path):
+    """`wal_identity` reaches the device when it is written, not with the first flush (#160).
+
+    The identity is what the positions segments record are positions *in*: a new one makes every one
+    of them foreign, and a replica that sees a new stream starts over (#101). Measured before #160, a
+    cut brought it back empty. Every flush's `syncfs()` now covers it too, so what is left is a cut
+    before the first flush - which is this test: no flush runs, the acknowledged writes are synced by
+    the WAL alone, and after the cut the identity is the one it was.
+    """
+    data = disk.mount / "data"
+    node = Node(data, tmp_path / "node.log", "every", flush_ms=3_600_000)
+    try:
+        node.start()
+        identity = (data / "wal_identity").read_text()
+        assert identity.strip(), "the node wrote no identity at startup"
+        assert node.insert(range(1000, 1010)) == 10
+        assert node.metric("ob_segment_count") == 0, (
+            "a flush ran, and its syncfs() would have covered the identity: the case did not happen")
+
+        disk.cut_power()
+        disk.remount_after(node.kill)
+        after = (data / "wal_identity").read_text()
+        assert after == identity, f"the WAL identity came back as {after!r}, not {identity!r}"
+        node.start()
+        assert sorted(node.prices()) == list(range(1000, 1010))
+        assert "wal_identity file present but unusable" not in node.log()
     finally:
         node.kill()
