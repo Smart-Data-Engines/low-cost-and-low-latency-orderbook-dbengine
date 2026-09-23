@@ -285,6 +285,21 @@ types has consequences nothing shows until the directory is unmanageable.
 
 The file a node is writing is a gauge: `ob_wal_file_index`, published from the flush tick.
 
+**The file a rotation leaves is synced by the flush tick, not by the write that crossed the
+threshold** (#164). Rotation used to `fsync` it on that writer's thread, under the lock every
+writer needs, and under `--fsync-policy none` nothing else syncs the WAL, so that was the whole file
+at once — 295 and 323 ms measured on an m9g.xlarge with its data on EBS — with every writer
+standing for it. The descriptor now goes on a list the next tick syncs and closes without the lock,
+before the tick declares anything synced, and `FLUSH` and a shutdown sync what is on the list too,
+under every policy. If four files are waiting — a node whose ticks are far apart — the writer syncs
+the oldest itself, as before, and logs
+`4 files left by rotation were still waiting for a flush tick to sync them; synced the oldest on the writer's thread instead`.
+Under `none` that sync is still the longest thing the WAL does, and a writer can still meet it
+indirectly: the tick holds the rows it took through the sync, so a writer fast enough to fill the
+rest of the pending queue meanwhile waits for room. Measured with `perf trace` at one pipelining
+connection writing 6.6 M levels a second: the two rotations of the run took 317 and 477 ms on the
+flush thread, and they were the run's only two waits.
+
 ### When an fsync fails
 
 Watch `ob_wal_fsync_errors_total`. It is separate from `ob_flush_errors_total` because the two ask
@@ -403,8 +418,13 @@ logger, to confirm a start.
 - `ob_subscription_queued_bytes` — the same for pushed subscriptions, and
   `ob_subscription_overflow_disconnects_total` is the only way you learn that a consumer could not
   keep up.
-- `ob_pending_rows` — rows waiting for a flush. Growing steadily means the flush interval is longer
-  than the write rate can afford.
+- `ob_pending_rows` — rows waiting for a flush, including a batch the flush tick has taken and not
+  yet drained (#164). Growing steadily means the flush interval is longer than the write rate can
+  afford. At a million a writer waits for room: `ob_writer_backpressure_waits_total` counts each
+  wait, and `ob_writer_backpressure_refusals_total` each write refused after five seconds without
+  room. Waits are not an error — a writer faster than a flush cycle meets the ceiling once a cycle,
+  which one pipelining connection on an m9g.xlarge does at 6.6 M levels a second — and refusals
+  are: the flush cannot make progress.
 
 One counter is worth watching for a different reason: **`ob_refused_commands_total`** is the number
 of command lines the parser would not accept — an unknown word, or a known command carrying a token

@@ -3377,6 +3377,38 @@ Learned the hard way. Check here before debugging.
      retention line printed `age=` for how far past the cutoff a segment was, which is not its age -
      and while the cutoff was a count from boot it said `age=4626822.4h` of a segment written a
      second earlier. It names what it computes now.
+418. **Taking work out of a lock and then taking the lock once per piece of it can cost more than
+     leaving it in.** Stage 5's drain first released the pending-row ceiling under `mtx_` once per
+     4096-row chunk — about 250 acquisitions a tick — and at four pipelining writers each queued
+     behind them, so the drain fell behind and the queue reached the ceiling: 10.6 → 9.0 M levels/s.
+     Under `every`, where a writer holds `mtx_` through its own `fsync`, every give-back waited
+     8.7 ms and the chunk pool filled (RSS 32 → 157 MiB). The count is an atomic now and the pool
+     has a lock of its own (#164).
+419. **Two containers swapped each tick each keep the capacity of the largest tick they held.** The
+     first half of stage 5 did that, and resident memory went 163 → 270 MiB at one connection and
+     158 → 321 at four — the million-row ceiling's memory promise doubled, with nothing failing.
+     Measure peak RSS whenever the container behind a bounded queue changes.
+420. **A diagnostic that did not run reads as one that found nothing.** `perf trace -e` with `unlink`
+     in its list refuses the whole list on aarch64, which only has `unlinkat`, and with stderr sent
+     to `/dev/null` the run traced nothing — which reads exactly like "no slow syscalls". Keep
+     stderr, try the event list on its own first, and check the trace is non-empty before reading a
+     zero out of it.
+421. **When a change moves when something happens, every test that waited for it moves too.** After
+     stage 5, #160's test under `none` expected the failed sync of a rotated file by the time the
+     inserts returned, and it happens at the next tick now; the drain test read its premise — the
+     rollover's log line — while the stalled write was still in progress, and the line is written
+     after the write returns. Both reported a missing premise against a server doing what it should.
+422. **An aggregate cannot count what is stored.** It is computed over the live book, and with a time
+     filter it is refused; a test that has to count stored rows — a drain that may have lost or
+     doubled some — reads them back.
+423. **A test that fits in one chunk cannot see a chunk boundary.** #161's test drains three rows,
+     all in one 4096-row chunk, so once the queue was chunked it could not tell "the rest of the
+     batch" from "the rest of this chunk", and nothing killed a drain that dropped every chunk after
+     the one it stopped in. Writing the mutation table's verdicts down before running it found the
+     row nothing could kill; the multi-chunk test puts the refused rollover in the second of three.
+424. **`pkill -f` with a pattern your own shell's command line contains kills that shell** — pitfall
+     122 in its destructive form: exit 144, and the command meant to stop a hung probe took the
+     session's shell with it. Stop a process by the PID it was started with.
 
 ## Current state and open problems
 
@@ -3409,6 +3441,13 @@ below are the recent closures worth knowing because each changes what the engine
 carries no count, because the previous version of this sentence said "four" above a list of six and
 omitted the newest one entirely - which is the rot pitfall 312 is about, in the paragraph that
 warns about it.
+
+**#164**: the flush tick syncs the WAL, drains its rows and deletes without the engine's lock, and
+the file a rotation leaves is synced by the tick rather than by the writer that crossed the
+threshold. One pipelining connection writes 8-9% more, with its once-a-tick stall halved under the
+default and gone under `none` between rotations; four connections under the default are unchanged,
+because the million-row ceiling binds them and what bounds them is the flush cycle's capacity, not
+its lock.
 
 **#139**: a row query answers the columns it names. `SELECT *` is byte for byte what it was; a
 three-column question costs a fifth less.

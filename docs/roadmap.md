@@ -2212,6 +2212,335 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 166. A segment's time range was its first row's hour and its last row, so a query skipped rows it held and retention deleted current ones **P0**
+
+**Found while measuring #165**, asking why the same one-second query got slower the further back it
+looked. `SegmentMeta` declares `start_ts_ns` as the "earliest timestamp in this segment" and
+`end_ts_ns` as the "latest", and `flush_segment()` fills them with the start of the period its
+first row fell in and the timestamp of its **last** row. The two agree only while rows arrive in
+time order — the case when the server stamps every row on arrival — and not when a client gives its
+own event times (#105), nor in multi-master when a peer's record, which keeps the time the peer gave
+it, is applied after a later local row (read from the code, not measured). Measured on the
+m9g.xlarge through the wire, identically on master and on #164's branch:
+
+| rows written in one flush, in this order | the segment directory, `<start>_<end>` | `SELECT` of everything | `SELECT` of only the row out of place |
+|---|---|---|---|
+| T + 2 s, then T + 1 s | `1790182800000000000_1790183401000000000`: it ends at T + 1 s | both rows | **nothing** |
+| 5 s into an hour, then a minute before it | `1790186400000000000_1790186340000000000`: it **starts after it ends** | both rows | **nothing** |
+
+Both answers are `OK`, and nothing is logged.
+
+**And retention deletes what it should keep.** `delete_expired_segments()` deletes a segment whose
+`end_ts_ns` is older than the cutoff — the last row's time, not the newest's. Under `--ttl-hours 24`,
+a row written now and then one dated 48 hours back, in one flush: **0 of 2 rows** after the first
+sweep, and the log said `its newest row is 24.0 h past the retention` of a segment holding a row one
+second old. In the other order the older row starts a period of its own, the current one rolls it
+over, and only the old row goes — which is the control.
+
+**It is also why a query gets slower the further back it looks.** Every segment of a period claims
+to start at the period's boundary, so pruning keeps every segment of that hour written after the
+window: a one-second `SELECT` of one symbol holding 1100 segments took **2.0 ms two seconds back and
+7.0 ms 115 seconds back**, returning the same 400 rows each time.
+
+**Four documents said otherwise**, because they read the declaration and not the function that
+fills it: #105's item and pitfall 208 ("segment pruning is a range-intersection test, so
+out-of-order times cost scan efficiency, not correctness"; "TTL retention works on whole segments by
+their newest event time"), `docs/operations.md` ("rows arriving out of order widen segments"), and
+the `--ttl-hours` row of `docs/cli.md` ("a batch whose oldest row is past the window is expired").
+The intersection test is right; the range it intersects was not the rows'.
+
+**What the fix has to do.** Every segment written from now on records its rows' minimum and maximum.
+And the segments already on disk keep the ranges they were written with, so a fix to the writer alone
+leaves every out-of-order segment a node holds invisible to the queries it should answer and exposed
+to the retention it should survive: those have to be read once and corrected, in a way a crash in the
+middle cannot make worse. Then the four documents become true, and each says since when.
+
+- Effort: M | Impact: a time-range `SELECT` could answer `OK` without rows the node held, and
+  `--ttl-hours` could delete rows younger than the retention, whenever one symbol's rows reached a
+  flush out of time order
+
+### 165. Nothing merges segments, so the index grows by one per active symbol per tick, and everything that reads it walks it whole **P0**
+
+**Found while measuring stage 5 of #151 (#164).** A flush tick closes the active segment of every
+symbol that received rows since the last tick, so a node gains **one segment per active symbol per
+tick** — ten ticks a second at the default interval — and nothing merges them; TTL deletes them, if
+a TTL is set, and that is all. Four things walk the whole index:
+
+- **every tick's merge, under the engine's lock**: `merge_segments()` checks each new segment
+  against every existing one before inserting it, then sorts the index;
+- **every query**, which copies the index before pruning it;
+- **startup**, which reads every segment's `meta.json`;
+- and **the TTL sweep**, which sorts the whole index and deletes expired directories while holding
+  the index's own lock, which every query takes — outside `mtx_` since #164, but not out of a
+  query's way.
+
+Measured on the m9g.xlarge (Release, the stage-5 server), with a probe that fills an index and times
+the two calls:
+
+| segments in the index | merge of 16 new, under `mtx_` | a scan that finds nothing |
+|---|---|---|
+| 1 000 | 0.055 ms | 0.034 ms |
+| 10 000 | 0.61 | 0.32 |
+| 50 000 | 3.7 | 1.6 |
+| 100 000 | 7.7 | 3.3 |
+
+Linear, and the merge's line is time every writer waits. **How fast a node gets there**: a soak
+writing one 20-level `MINSERT` to each of 256 symbols twenty times a second — 102 400 levels a
+second, a small fraction of what one connection can write — had **105 472 segment directories after
+90 seconds**, and a writer's round grew with them:
+
+| after | segments | a round of 256 writes, p50 | p99 | max | narrow `SELECT` | `PING` |
+|---|---|---|---|---|---|---|
+| 15 s | 21 248 | 0.61 ms | 14.7 ms | 16.4 ms | 2.85 ms | 0.08 ms |
+| 30 s | 41 216 | 0.59 | 32.7 | 37.1 | 4.60 | 0.09 |
+| 45 s | 59 392 | 0.60 | 53.8 | 60.2 | 6.52 | 0.06 |
+| 60 s | 75 776 | 0.59 | 74.7 | 79.9 | 7.83 | 0.09 |
+| 75 s | 91 136 | 0.60 | 89.4 | 93.6 | 9.96 | 0.07 |
+| 90 s | 105 472 | 0.58 | 104.2 | 115.7 | 10.66 | 0.08 |
+
+The median does not move and the p99 grows by about a millisecond per thousand segments, which is
+the shape of a cost paid once a tick under the lock — and the only thing a tick does under it that
+grows with the index is that merge, which by the end of the soak put 256 new segments into 100 000
+every tick, where the probe's row puts 16. The ticks slowed as it grew — 1 416 segments a
+second in the first fifteen seconds, 956 in the last — because each one spends longer merging. A
+`PING` is untouched, because it takes no lock. Restarted with 105 728 segments, the node answered
+its first request after **2.70 s**, and a narrow `SELECT` then took 19.6 ms. Nothing bounds any of
+this but TTL: a node with a thousand active symbols and no retention degrades for as long as it
+runs. A segment is nine inodes — its directory, seven column files and `meta.json` — so the soak
+also created about 950 000 of them in 90 seconds. The m9g.xlarge's 100 GB xfs root reports 52.4 M
+inodes, which that rate would use up in about an hour and a half: a projection, not a measurement.
+And a query reads more of these segments than its range needs, which is #166.
+
+**What a fix has to do, in two parts that can land separately.** The index must stop being walked
+whole — a lookup per symbol rather than a scan, a duplicate check that does not compare against
+every segment, nothing sorted under `mtx_`, and a query that does not copy what it will prune.
+That removes the slope from the writers and the queries. And the count must stop growing with the
+tick rate — a segment that stays open across ticks, or segments merged behind the writers — which
+is what startup, the inodes and every walk that remains need. Which of those is a design question
+with its own measurements, for its own spec.
+
+- Effort: L | Impact: a node's write latency, query latency and restart time all grow with its
+  uptime times its active symbols, without bound unless a TTL is set
+
+### 164. The flush tick synced, drained and deleted under the engine's lock, and a rotation synced its whole file on a writer's thread ✅
+
+**Stage 5 of #151: the flush tick's I/O out of the lock every writer needs.** Once stage 4 made a
+node use every core by default (#158), the longest things the engine did while holding `mtx_` were
+the flush thread's, once a tick: the WAL `fsync` — 7.9 ms at p50 and 25.8 ms at worst on the
+m9g.xlarge, measured with `perf trace` — the drain of a tick's rows into their stores, about 640 000
+of them at one pipelining connection, and the unlinks of WAL truncation and of the TTL sweep. One
+more was a writer's own: the writer whose record crossed `--wal-rotate-bytes` synced the file it was
+leaving, on its thread and under the lock — under `--fsync-policy none`, which syncs nothing else,
+up to 512 MB at once, measured at 295 and 323 ms. A pipelining writer's batch waited 21-30 ms at
+p99.9 once per tick while its p99 said 0.2-0.7 ms: a stall that comes once per interval touches one
+batch in several hundred, so `benchmarks/pipelined_ingest.cpp` prints p99.9 and the maximum now.
+
+**What the tick holds `mtx_` for now is bookkeeping** (`docs/architecture.md`, "The flush tick"):
+
+- **The sync is a ticket in three steps** (`WALWriter::SyncTicket`). Under `mtx_` the tick takes it —
+  a `dup()` of the current descriptor, the records a sync would cover, the position they end at,
+  and the files a rotation has left since the last tick — together with every row queued so far.
+  Every row taken has its record before that position, because a writer appends the record and
+  queues the row under one hold of `mtx_`. Without the lock it performs the `fsync`s; under it
+  again it accounts for them. The duplicate names the same open file, so a rotation in between does
+  not move the sync to the wrong file or close its descriptor from under it (#128's shape); a `dup()`
+  that fails syncs under the lock, as the tick used to. A sync that fails puts the rows back in
+  front of what was written meanwhile and throws for #112's boundary to count: draining them would
+  move them out of the only place that still knows they were never synced.
+- **The queue is a FIFO of fixed-size chunks** (`ChunkedQueue<PendingRow, 4096>`, its own header
+  and its own unit test). Appending never reallocates or moves a row, so nothing copies the queue
+  under the lock when it outgrows a capacity, and taking every row queued so far is moving a vector
+  of chunk pointers. The drain runs without `mtx_`, under `flush_mtx_`, which every mutator of the
+  stores holds, and each chunk is cleared, given back and released from the ceiling as soon as its
+  rows are in their stores — so a writer at the ceiling waits for a chunk, not for the tick. A store
+  the drain creates is the one insertion into the store map and takes `mtx_` for it, because
+  `holds_no_data()` reads the map under `mtx_` alone. Everything that counts the queue — the room a
+  writer waits for, `STATUS`, `holds_no_data()` and `ob_pending_rows` — counts the rows being
+  drained too, so the bound stays one ceiling and nothing reads as empty for the length of an
+  `fsync`.
+- **A rotation leaves its file to the tick.** `open_current()` puts the descriptor on a list the
+  next ticket carries instead of syncing it; `flush()`, the destructor and a ticket dropped before it
+  was performed sync and close what is on the list, under every policy, because a promise that the
+  log is synced to here which skipped the file just left would skip exactly the records written last
+  before the rotation. Past four files waiting, the writer syncs the oldest itself, as it always did:
+  a node whose ticks are minutes apart would otherwise hold a descriptor and up to 512 MB of unsynced
+  log per rotation in between.
+- **WAL truncation and the TTL sweep decide under `mtx_` and delete without it.** A file the number
+  allows cannot stop being allowed once the lock is released: the floor only rises, and only under
+  `flush_mtx_`, which the tick holds throughout.
+
+Only the tick moved. `FLUSH`, `close()` and snapshot creation drain under the lock as they did,
+straight after a sync under the same hold.
+
+**Measured with the binaries that ship it** — master after #163 against this branch, on the
+m9g.xlarge (four Graviton cores shared with the load generator), loopback, GCC 14 Release, data on
+EBS; five interleaved rounds of 40 000 batches of 64 twenty-level `MINSERT`s
+(`scripts/measure_pipelined_ingest.py`), medians, and a batch's latency in µs:
+
+| connections, policy | build | levels / s | p50 | p99 | p99.9 | max | peak RSS |
+|---|---|---|---|---|---|---|---|
+| 1, `interval` (default) | before | 6 191 693 | 171.2 | 194.6 | 22 714 | 31 523 | 163 MiB |
+| | **after** | **6 730 445** | 174.4 | 197.6 | **10 417** | **16 538** | 158 MiB |
+| 1, `every` | before | 559 198 | 2 253.5 | 4 497.6 | 7 412 | 20 316 | 25 MiB |
+| | after | 563 394 | 2 258.3 | 3 949.2 | 6 960 | 15 354 | 24 MiB |
+| 1, `none` | before | 6 240 030 | 171.8 | 195.0 | 9 969 | 308 917 | 138 MiB |
+| | **after** | **6 738 413** | 174.1 | 197.5 | **219** | 299 210 | 155 MiB |
+| 4, `interval` | before | 10 540 230 | 301.8 | 540.0 | 46 425 | 61 081 | 157 MiB |
+| | after | 10 397 988 | 320.0 | 605.3 | 43 391 | 58 677 | 160 MiB |
+| 4, `every` | before | 578 955 | 8 740.4 | 17 259.3 | 19 578 | 30 115 | 32 MiB |
+| | after | 581 750 | 8 765.3 | 12 901.1 | 15 351 | 26 292 | 34 MiB |
+| 4, `none` | before | 11 618 774 | 300.6 | 712.8 | 13 371 | 324 471 | 164 MiB |
+| | **after** | **13 420 237** | 314.0 | 552.3 | **923** | 276 746 | 164 MiB |
+
+It says a different thing per row, so read it that way:
+
+- **One connection: +8.7% under the default and +8.0% under `none`**, with the once-a-tick stall
+  halved under `interval` (22.7 ms at p99.9 → 10.4) and gone under `none` (10.0 ms → 0.22).
+- **Four connections under the default: no change the rounds can tell apart** — −1.3% on the median,
+  with the build before this one spread over 10.18-11.68 M levels a second and this one over
+  10.31-10.49 M. Why is below, and it is the most useful thing this stage measured.
+- **Four connections under `none`: +15.5%**, with p99.9 14× lower.
+- **`every`: the same throughput**, as it must be — every write syncs itself, so nothing is owed at
+  the tick — **and 12-25% off its p99.** Once writes flow the ticket is never owed under that
+  policy, so the only things this change took out of the lock on that path are the drain and the
+  deletes, which no longer sit between two writers' syncs. That is read from the code, not traced.
+- **p50 is 2% higher at one connection and 6% at four, and the server's CPU 3% higher for the same
+  work.** The drain now runs while writers write, on the same cores, where it used to stop them, and
+  handing chunks back is work a swap did not do. That is the price of the tails above.
+- **Resident memory is where it was.** The first half of this stage, which only took the sync out of
+  the lock, swapped two vectors every tick, and each kept the capacity of the largest tick it had
+  held: 163 → **270 MiB** at one connection and 158 → **321** at four, which doubles the memory the
+  million-row ceiling promises. It was not merged. The chunked queue allocates only when no spare
+  chunk is left, so the queue, the batch being drained and the spares together stay within the
+  ceiling plus three chunks.
+
+**The prediction was written before the second measurement, and three of its six lines missed:**
+
+| predicted | measured |
+|---|---|
+| one connection, `interval`: p99.9 under 2 ms, max under 10 | 10.4 and 16.5 ms — **missed** |
+| four connections, `interval`: p99.9 8-15 ms, throughput +0-10% | 43.4 ms and −1.3% — **missed** |
+| `none`: max under 20 ms at both connection counts | 299 and 277 ms — **missed** |
+| four connections, `none`: p99.9 under 5 ms | 0.92 ms |
+| `every`: unchanged within noise | the same throughput, tails lower |
+| peak RSS back to 158-169 MiB | 155-164 MiB |
+
+**All three misses have one cause, and it is not the lock.** A diagnostic run at one connection
+traced every server syscall longer than 2 ms, the kernel's dirty-page throttling
+(`writeback:balance_dirty_pages`) and the page cache's dirty count every 100 ms:
+
+- **Under `interval` the writer meets the ceiling once a flush cycle.** At 6.6 M levels a second it
+  queues about 660 000 rows per 100 ms, and one cycle — sync, drain, segment writes, one `syncfs()` —
+  took about 150 ms: the log counted **51 waits for room in the 7.8-second run, 153 ms apart**, one
+  write each. No syscall on a writer's thread took over 2 ms; the long ones were all the flush
+  thread's — WAL `fsync`s of up to 32.0 ms (a median of 12.2 among the 35 over 2 ms) and `syncfs()`s
+  of up to 66.9 ms (21.3 among 53) — and there was **no dirty-page throttling at all**. The prediction assumed a writer at the
+  ceiling waits for one chunk; it waits for the next drain to reach one, and that is behind the rest
+  of the cycle.
+- **At four connections the ceiling binds throughout**, and a third build says so: this branch with
+  only its drain put back under the lock — row 2 of the table below, built as a server — measured
+  **10 355 986** levels a second and 42.3 ms at p99.9, against 10 298 213 and 43.5 for this branch
+  and 10 437 097 and 45.8 for master in the same five rounds. Three builds, one number. What bounds
+  four writers is how many rows a flush cycle moves, not which lock it holds while it moves them.
+- **Under `none` the maximum is the rotation's `fsync`, which this change moved and could not
+  shorten**: 317 and 477 ms in the diagnostic run, one for each of its two rotations, now on the flush
+  thread. The tick holds the batch it took through that sync, so the rest of the ceiling
+  fills in tens of milliseconds and a writer waits out the remainder: **two waits for room in the
+  run, one per rotation.** What this stage bought under `none` is everything between rotations.
+
+So the next ceiling on the write path is the flush cycle's capacity — the drain and the segment I/O,
+one after the other, on one thread — and it is a stage of its own rather than something to tune here.
+Two things were found on the way: the segment count that cycle leaves behind it, **#165**, and the
+time range each of those segments claims, **#166**.
+
+**The second measurement found a regression of this stage's own.** Its first version released the
+ceiling under `mtx_` once per chunk — about 250 acquisitions a tick — and at four writers each one
+queued behind them, so the drain fell behind and the queue reached the ceiling: **10.6 → 9.0 M levels
+a second**, p50 302 → 335 µs. Under `every`, where a writer holds `mtx_` through its own `fsync`
+(8.7 ms at p50), each give-back waited that long and the queue filled the chunk pool: peak RSS
+**32 → 157 MiB**. Taking work out of a lock and then taking the lock once per piece of it can cost
+more than leaving it in. The spare chunks have a lock of their own now, which a writer takes once in
+4096 rows; the detached count is an atomic lowered without `mtx_`; and the per-chunk notification
+goes out unlocked — a writer that misses one between its check and its wait is woken by the next, or
+by the last, which is sent after taking `mtx_`.
+
+**And the first half found two things before it was set aside.** The crash test it asked for failed
+against the build before it as well — the tick's checkpoint claimed every record written before it,
+including those whose rows were queued after the drain — which is **#159**, older than this stage and
+fixed on its own first. And promoting the retention floor only on the path that performed a sync
+stopped retention under `every` while writes arrived, because under that policy the ticket is never
+owed once they do; `test_retention_moves_under_every_while_writes_flow` holds that now.
+
+**Tests.** Every change has its crash test in the same run, through #54's injector, because
+reordering I/O against a lock is exactly what breaks only under a crash — and the injector gained a
+mode that makes a chosen `fsync` or `write` **slow** rather than failing (`OB_FAULT_DELAY_MS`):
+
+- a writer does not wait for the tick's sync — ten writes timed while that sync is made to last three
+  seconds took **2.988 s** against master and **0.006 s** against this branch — nor for a segment the
+  tick's drain rolls over, nor for the sync of a file a rotation left;
+- rows written during a tick's sync, and during its drain, come back through a crash after it;
+- a failed tick sync drains nothing, and the next tick drains it all;
+- retention moves under `every` while writes flow;
+- a failed sync of a file the WAL rotated away from costs no acknowledged write — #153's test, moved
+  to where that sync happens now;
+- a drain the disk stops part-way puts back every chunk after it: the refused rollover is the 5001st
+  of 9200 rows, in the second chunk, with 1008 rows in a third.
+
+Against master's server the timing tests fail as they should — ten writes waited 2.99-3.00 s behind
+the tick's sync, a rollover in its drain and a rotated file's sync — and #153's test catches the
+rotation syncing the file itself. In C++: nine `ChunkedQueue` tests, one of them a property test
+that the queue behaves as a deque and stays within its bound; ten `WalSyncTicket` tests; two
+static ones — performing a ticket touches nothing of the writer's but its failure count, which is
+what makes it callable unlocked, and a ticket dropped unperformed reaches the writer only through
+that count — and one that pins where the tick's sync, drain and deletes run.
+
+**Mutation table: twenty-four rows, twenty-four with the verdict they were supposed to produce** —
+nineteen killed and five surviving, two of those controls — against committed code, the eight
+instruments green before the first row and after the last, and the sources restored byte for byte.
+
+| # | Mutation | Instrument | Verdict |
+|---|---|---|---|
+| 1s | the tick's sync back under the lock | where the tick runs what (static) | killed |
+| 1i | the same | a writer timed against a 3 s sync | killed: ten writes took 2.99 s |
+| 2s | the tick's drain back under the lock | where the tick runs what | killed |
+| 2i | the same | a writer timed against a 3 s rollover in the drain | killed: 2.99 s |
+| 3 | the ceiling released at the end of the drain rather than per chunk | the same | survives, as written down |
+| 4u | the rotation syncs and closes the file it leaves itself | the ticket's tests | killed |
+| 4i | the same | a writer timed against a 3 s sync of the left file | killed: 3.00 s |
+| 4r | the same | #153's test | killed: the left file was synced before anything asked |
+| 5u | `flush()` leaves the files a rotation left alone | the ticket's tests | killed |
+| 5r | the same | #153's test | killed: the `FLUSH` whose sync failed answered `OK` |
+| 6u | a ticket does not carry the files a rotation left | the ticket's tests | killed |
+| 6i | the same | a writer timed against the left file's sync | killed: nothing synced the file |
+| 7 | no bound on the files left for a tick | the ticket's tests | killed |
+| 8 | a dropped ticket closes its files without syncing them | the ticket's tests | killed |
+| 9 | what a batch did not consume goes behind what was queued since | the queue's tests | killed |
+| 10 | a chunk given back is kept whatever the bound | the queue's tests | killed |
+| 10b | the spare chunks shared without their lock | the queue's tests | survives, as written down |
+| 11 | the last elements start one late | the queue's tests | killed |
+| 12 | a stopped drain puts back only the chunk it stopped in | the multi-chunk drain test | killed: 8192 rows of 9200 |
+| 13 | a new store inserted without `mtx_` | a writer timed against a 3 s rollover in the drain | survives, as written down |
+| 14 | WAL truncation back under the lock | where the tick runs what | killed |
+| 15 | the TTL sweep back under the lock | where the tick runs what | killed |
+| 16 | control: the stopped drain's warning reworded | the multi-chunk drain test | survives |
+| 17 | control: the left file's debug line reworded | a writer timed against the left file's sync | survives |
+
+**The three written down to survive, and why that verdict is right rather than a gap.** Row 3 moves
+*when* room comes back, not whether, and the test that could kill it would be a gate on a clock at
+the ceiling — it is what the second measurement above measured. Rows 10b and 13 are data races, one
+between the drain handing a chunk back and a writer taking one, one between the drain creating a
+store and `holds_no_data()` reading the map: no single-threaded test can see either, and the
+instrument that can is ThreadSanitizer with both threads running, which is the TSan jobs' to run
+rather than this table's. **Row 12 is the row writing the verdicts down first found**: #161's test
+drains three rows, all in one chunk, so it could not tell "the rest of the batch" from "the rest of
+this chunk", and nothing killed a drain that dropped every chunk after the one it stopped in. The
+multi-chunk test exists because of it — and it counts rows by reading them back, because an aggregate
+is computed over the live book, not over what is stored.
+
+- Effort: L | Impact: the flush tick no longer stops every writer once an interval — one connection
+  writes 8-9% more and waits half as long at p99.9 under the default, a node under `none` waits only
+  at a rotation, and the ceiling's memory is what it was
+
 ### 163. `--ttl-hours` measured event times against the time since boot: it deleted every segment, or none ✅ **P0**
 
 **Found while reading the flush tick for stage 5 of #151**, in the retention block under the drain.
@@ -9879,8 +10208,18 @@ measures the harness.
 
 ## Recommended order
 
-**Nothing above #58 is open** — the mechanical list is the `Open:` line below; read it there rather
-than trusting this paragraph, which is prose and has been wrong about this before. **#163 was a P0
+**#166 and #165 are open, and both are P0s** — the mechanical list is the `Open:` line below; read
+it there rather than trusting this paragraph, which is prose and has been wrong about this before.
+**#166** is a wrong answer: a segment's time range was its first row's hour and its last row, so a
+query skipped rows the segment held and `--ttl-hours` deleted rows younger than the retention —
+**0 of 2** after one sweep, a row one second old among them — whenever one symbol's rows reached a
+flush out of time order. **#165** is a slope: nothing merges segments, so a node gains one per
+active symbol per tick, and the tick's merge, every query, startup and the TTL sweep all walk the
+whole index — 256 symbols written at 102 400 levels a second, a small fraction of what one
+connection can write, reached 105 472 segments in 90 seconds, with a writer's p99 grown from 14.7
+to 104 ms along the way. Both were found measuring **#164**, stage 5 of #151, which is closed: the
+flush tick syncs, drains and deletes without the engine's lock, and the file a rotation leaves is
+synced by the tick rather than by the writer that crossed the threshold. **#163 was a P0
 and is closed**: `--ttl-hours` measured event times against the time since boot, so a node
 restarted with a retention longer than its machine had been up deleted its whole store at the first
 sweep - 0 of 200 rows in the measurement - and one running longer than its retention never expired
@@ -9913,13 +10252,13 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: none.** Every item above #58 is marked closed, and
+**Open: #165, #166.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
 
-Read that as narrowly as it is written. It says every defect **that has been filed** above #58 is
-closed. #121, the last question among them, was answered by bounding how far a peer's clock
+Read that as narrowly as it is written. It says every defect **that has been filed** above #58 and
+is not named on it is closed. #121, the last question among them, was answered by bounding how far a peer's clock
 may move this one, refusing the peer rather than the record, the clock or a clamp. It does not say the engine is finished; the capability table below is the list of what it is
 not. **#37** is ticked as well, and the badge it used to leave open was **answered rather than
 dropped**: the number is on the front page with its denominator and the run that measured it, and
@@ -10051,6 +10390,8 @@ The capability items are in the table below.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
+| **P0** | A segment's range is its rows' minimum and maximum, on disk as well (#166) | M | A time-range query answers `OK` without rows the node holds, and retention deletes rows younger than itself, whenever a symbol's rows reach a flush out of time order |
+| **P0** | Segments merged, and the index read without walking it whole (#165) | L | A node's write and query latency and its restart time grow with its uptime times its active symbols: a writer's p99 went 14.7 → 104 ms in 90 seconds at 256 symbols |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
@@ -10191,11 +10532,23 @@ absolute thresholds for a designated benchmark host.
 
 ### Test suite
 
-Verified by [the full CI run for PR #174](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/35871360556),
-on the tree whose segments reach the device before a checkpoint claims them (#160, #161).
+Verified by [the full CI run for PR #176](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/35891068372),
+on the tree whose retention compares event times with the wall clock (#163).
 
-**Against PR #173's run (1236 and 345) C++ is unchanged and integration is +15**, and both reconcile
-to files: #160 and #161 added no C++ test, and the fifteen are the six in the new
+**Against PR #174's run (1236 and 360) C++ is +13 and integration +4, over two merges, and both
+reconcile to files.** #162 added three C++ tests, the `DurableWrites.*` rule in the new
+`tests/test_durable_writes.cpp` that every open for writing says what makes it durable, and three
+integration ones, one per file: a snapshot a replica installs survives a power cut
+(`test_power_cut.py`), a replica killed while it saves its position keeps what it holds
+(`test_replica_restart.py`), and a snapshot whose install could not sync is installed again
+(`test_storage_faults.py`). #163 added ten C++ tests, five `TTLCutoff.*` and three `TTLSweep.*` in
+`tests/test_ttl_retention.cpp` and two `ClockUse.*` in the new `tests/test_clock_use.cpp`, and one
+integration test, the new `test_ttl.py`. `test_durable_writes.cpp` lost 128 lines to #163 and no
+test: its scanner moved into `tests/source_scan.hpp`, so the two rules read the tree the same way.
+PR #175's own run gave 1239 and 363, which is the step between.
+
+**Before that, against PR #173's run (1236 and 345) C++ was unchanged and integration +15**, and both
+reconciled to files: #160 and #161 added no C++ test, and the fifteen are the six in the new
 `tests/integration/test_power_cut.py` - the cut after a flush and its control under both policies,
 a cut during a flush's segment sync and a cut before the first flush - eight in
 `test_storage_faults.py` - a flush whose segment sync failed under both policies, the freeze until a
@@ -10261,9 +10614,9 @@ ran 265 tests, because `re.search` returns the *first* match and pytest's verdic
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1236 | **1236 on this commit**, measured by CI; locally `ctest -j1` gave **1236/1236 in 223.5 s** on the i3-7100U on #160's branch. **Before that**, 1236 on PR #173's tree, and locally 1236/1236 in 216.0 s on #159's branch. **Before that**, 1228 on PR #172's tree, and locally 1228/1228 in 226.7 s on #158's branch rebased onto PR #171's merge. **Before that**, 1182 on PR #169's tree. **Before that**, 1181, measured by CI on #151's tree; locally `ctest -j1` gave **1181/1181 in 262 s** on the i3-7100U on #151's branch, with the build clean and warning-free. **Before that**, 1151, and locally 1151 passed in a single `ctest -j1` run on the i3-7100U with the build clean and warning-free. **Before that**, all passing with `ctest -j1` on the i3-7100U, **205 s in a single run** — **thirty-one more than master, and the breakdown is one file per question** (#139). Nine are the new `tests/test_query_columns.cpp`: what a select list resolves to, that `columns_to_read()` is wider than the output list because a filter reads what the answer does not carry, and that the canonical order is the table's order. Eight in `tests/test_response_formatter.cpp` cover the narrowed path against the unrolled one **by formatting each column alone and cutting that field out of the `SELECT *` output** — a content-based dispatch means no call can be made to take the general path over the canonical shape, so the two are held together by construction rather than by a literal. Eight in `tests/test_query_engine.cpp`, three in `tests/test_columnar_store.cpp` — including the one that found a guarantee stated three times, where a hardcoded `true` made two widenings unobservable and the mutation for them survived — and three in `tests/test_client.cpp` for the two clients' refusals, because both read a row by position and neither can read a narrowed answer. **Before them**, **four more than the previous commit, and all four are about the machine this tree had never run on**: two in `tests/test_mm_snapshot.cpp` pin the ten header bytes of a snapshot chunk literally rather than through our own decoder, and a full-size chunk, because the frame is sized once now (PR #146); two in `tests/test_crc32c.cpp` are the pair that makes the rest of that file mean anything on this architecture — one skips with an explanation where there is only the table to compare against itself, which is what every agreement test had been doing off x86, and one requires the implementation the engine *reports* to be the one that runs (PR #147) across the four runs this tree and its two predecessors recorded, against 236-390 s three commits back when another session's containers were resident — the spread, not either end, is what the next number is read against. **Four more than the previous commit, and the arithmetic is worth writing down: six new and two removed** (#121). The six are three in `tests/test_hlc_skew.cpp` — the bound accepts up to itself and refuses one nanosecond past it, a peer behind us is plausible however far behind, and `UINT64_MAX` is refused so the logical carry can never saturate — and three in `tests/test_mm_wire_clock.cpp`, which is the only instrument that can reach this at all: a fake peer framing one DELTA whose HLC says what no real clock would. The two removed are the ones that **pinned the behaviour this decision reverses**, `AnHourInTheFutureOnTheWireBecomesThisNodesClockAndStays` and `ARecordFromAPeerWhoseClockIsWrongIsStillApplied`, both written by #54's stage D to state that nothing bounded the absorption. They were not deleted into a gap: the same file now asserts the opposite about the same wire shape, which is what makes a falling count readable rather than alarming. **And the local number that preceded this row was wrong by exactly those four.** A full local run on this branch printed `1094/1094` against a build directory that had not registered the four; the reconciliation is three measurements agreeing — CI's 1098, `ctest -N` listing 1100, and a local rerun after the merge giving **1098 passed in 218.95 s**. A stale build answers in the same voice it would use if it were right, which this repository has now paid for in five different shapes. **Before it**, unchanged by three commits: #134 deleted two methods no test referenced, and #135's tests are integration ones — three runs of the same suite on the same machine, the slowest with another session's containers resident and ~1 GB actually free. That spread, not any one of its ends, is what the next number is read against: it is wider than anything a commit in this repository has changed. **Seven more than the previous commit, and all seven are #131's.** Five are `LoopGuard`'s own, in the new `tests/test_loop_guard.cpp`: the counter counts every failing iteration rather than every episode, the episode counts consecutive failures and reopens after a recovery, two successes running report nothing (the observable half of "loud once" for a loop that polls ten times a second), a **null** registry still gets loud-once because two of the seven loops run in somebody else's process, and the name it writes is in the registry's own output. The other two are the descriptor `MetricsServer::handle_request` used to leak on the paths that throw — one behavioural, fifty requests against a live server with no growth in `/proc/self/fd`, and one static, because **the throwing path cannot be driven**: nothing in the process can make `serialize()` fail on demand and a knob to make it would be a knob nothing turns in production. **Before them**, four were #112's last two loops. Three are in the new `tests/test_replication_io_boundary.cpp`: that the pacing function returns zero only while a catch-up can progress, that nothing in `run_loop()` assigns `wait_ms` any other way (counted at **three** sites, because losing the one in the `catch` is the regression), and that both `try`s are where they have to be — anchored on the dispatch loop's own line rather than on a log phrase, which is the mistake #128's version of this test made. The fourth is in `tests/test_thread_boundaries.cpp` and is the one worth reading: the set of loops that guard an iteration is **derived from the tree** rather than listed, because a mutation deleting a row from the hand-written list **survived**. Fourteen `void Class::…loop()` definitions in `src/`, one a notifier with no loop in it and named, six of the remaining thirteen guarded and **seven not** — those seven are #131. Checked in both directions, so a loop in neither list fails and a row naming a function the tree no longer has fails too. **Before them**, the most recent addition was #129's: a registry given a 1200-second lease interval has to stop inside two seconds, which is a property stated three orders of magnitude clear of load rather than a duration. **Before it**, four were #128's, and they divide the way that defect does: three in `tests/test_mm_epoll_identity.cpp` are about the shape — that the two reserved event keys cannot collide with a connection, that closing a descriptor takes its registration with it (measured against `dup2`, which forces the reuse the defect needs instead of hoping for it), and that no registration in `src/multi_master.cpp` carries a bare descriptor number. The fourth is behavioural: a connection landing on the descriptor its predecessor gave back is its own connection, with both numbers read back so a run where the kernel did not recycle the number says so rather than passing quietly. Three of the six mutations in that item's table are killed by the static test **and by nothing else**, which is what says it carries weight. **Before them**, two were #126's, and they pin the replayer's rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. **Earlier**: two were #54's D3, three #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists **1085**: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The count that passes and the count CTest lists differ by exactly those two harnesses, always; a row two commits back gave one number for both. The runtimes are what this machine gave on the commit measured, not a budget |
-| Python integration | 360 | **`360 passed, 2 skipped in 24:15`** on the GitHub runner for this commit, the six power-cut tests among them; locally `360 passed, 2 skipped in 24:35` on the i3-7100U on #160's branch, with `OB_POWER_CUT_TESTS=1`. **Before that**, `345 passed, 2 skipped in 23:55` on PR #173's tree, and locally 345 in 23:51 on #159's branch. **Before that**, `340 passed, 2 skipped in 23:25` on PR #172's tree, and locally 340 in 22:55 on #158's code before its rebase. **Before that**, `330 passed, 2 skipped in 22:38` on PR #169's tree, and before that `327 passed, 2 skipped in 22:56`, and before that `299 passed, 2 skipped in 22:44`, and before that all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 280; count pytest's final result rather than the report plugin's progress characters. `280 passed, 2 skipped in 22:42` on the GitHub runner for this commit — **seven more than master, and all seven are the new `test_column_projection.py`**, which asks the question over the raw protocol on purpose: both of our clients read a row by position, so neither can read a narrowed answer and the refusals are at the bottom of that file. **Two of its tests had never run to completion before this run** — the branch's previous CI was cancelled — and both failed on the first one that did. One pinned the seven-column header as a literal in `src/response_formatter.cpp`, which this branch replaced with a generator and then deleted; it reads the column table now, which is stronger, because a dead literal can agree with a header nothing prints. The other wrote one row per test into one symbol on a session-scoped cluster, so with storage append-only the seventh test read seven rows where it had written one — and **29:20 for the same 273 under TSan**, which is the job that has to be read as well, because a battery that skips under instrumentation reads as green. Against `20:37` on the development machine (i3-7100U, native etcd) **for the 263-test tree seven commits back** — the figure is kept as the spread to expect between the two machines, and labelled with the tree it came from rather than silently paired with a count it never measured. **Unchanged by #121, and the reason is the instrument rather than the effort**: producing a real node whose physical clock is five minutes off needs the host clock moved or a time namespace, which is not something this battery can do to the machine it runs on — so the assertion lives at the wire instead, where #54's stage D already built the fake peer for it. **Before it, one more than the commit before, in the existing `test_failover_storage_faults.py` beside the control that was already there** (#130): what a node *says* while it holds a leader key it won and cannot act on. The assertion with teeth is sampled rather than read once — `ROLE` must never name this node's own replication port as the primary it follows, across a twenty-second window in which the pre-fix code answered exactly that on **every** sample. The second assertion is that the condition is reported **once**, with what an operator can do about it, because the loop runs every second and the storage that refused the record usually goes on refusing it. Measured against the two source files from the commit before that fix: **1 failed, 2 passed in 66.8 s**, the failure arriving on the **first** sample with `REPLICA 127.0.0.1:43273 2` and #112's two tests untouched. **Before it, two more, both in the new `test_coordinator_endpoint_order.py`, and the second is a control rather than a second case** (#135): the same unreachable coordinator endpoint in the harmless position, which passed before that fix and has to keep passing — without it, a harness that quietly stopped prepending anything would leave the first test green and meaningless. Both assert their premise from `Popen.args`, the command line the node actually got, rather than from the attribute that put it there, because an attribute is what the harness *meant* to say. The first also requires the mesh to form on top of both registrations, because that is the only assertion reaching the third of the three call sites: two registered nodes that never see each other is a topology watch still reading the wrong endpoint. Measured against the four source files from the commit before that fix, harness and tests unchanged: **1 failed, 1 passed in 50.1 s**, the failure naming both nodes. **Before them, one more than the commit before that, and all three in `test_peer_lease_lost.py` were rewritten**, because #132 turned the first one's premise inside out: it was written to assert that the registration **does not** come back, with a note saying that the day that loop learns to re-register is the day it fails. That day was this commit. It now polls **both** halves — the key and the log line — because the key lands in etcd before the line lands in the log, and reading the log once at the moment the key appears is a race the first rewrite lost. The #133 test needed a **new premise** as well (`stop_etcd()` rather than a revoke, which also exercises the branch that keeps this fix quiet), because after #132 a revoked lease is no longer a permanent condition, and counting log lines over a condition that repairs itself counts a condition that happened once. **The third is the one that says the gate is real**: a refusal over a key that **exists**, which nothing else in this battery produces — `redirect_peer()` writes without a lease, so the test captures the lease id before redirecting and revokes it by id afterwards. Its control is the *premise* rather than the outcome, because without asserting that a refusal reached the log it passes against a node whose refresh is succeeding. The other two gained a rate bound that is independent of wording: the count of registry lines above `DEBUG` across the window, measured at one and two. This tree's battery ran locally only as **the one module** (3 tests in **40 s**, and stage C's twelve in **3:37** as the regression check on the fixture this fix had to leave alone); the whole battery on this commit is CI's, and the 224-235 s `ctest` above is local. **Before them**, two were #112's `monitor_loop` half and both in the new `test_failover_storage_faults.py`: a replica whose data directory refuses the `EPOCH` record a role transition writes loses that monitor tick and not the thread, and its control at a size nothing writes, which must inject nothing. The assertion that carries the guarantee in the first of the two is the **recovery** line rather than the error line — only a later tick can write it, so a run in which the thread died would report the error and then say nothing, which is what a boundary is for. The pair costs **45.7 s** locally, and the module asserts its own premise: `OB_FAULT_PATH=ob_node1_` names the replica's data directory only because `ClusterManager.start()` waits for node-0 to hold PRIMARY before it starts node-1, and a change to that ordering would aim the injector at the **primary's** startup promotion, which exits the process. **Before them**, two were #112's `io_loop` half and both in the new `test_mesh_storage_faults.py`: a mesh receiver whose WAL refuses one record still receives the ones after it (**38.6 s**, because it waits for a mesh to form and for four records to cross it), and its control at a size nothing writes, which must inject nothing (**28.2 s**); that pair costs **67 s** locally. **Before those**: three were #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
-| Python integration under TSan | 360 | **`360 passed in 30:48`** on the GitHub runner for this commit, against **24:15** uninstrumented on the same runner — instrumentation's cost is the difference between two runs on one machine. **Before that**, `345 passed in 30:13` on PR #173's tree, and `340 passed in 29:39` on PR #172's tree, and `330 passed in 29:56` on PR #169's tree, and before that `327 passed in 29:28`, and before that `299 passed in 29:18`, and before that all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `280 passed in 29:06` on the GitHub runner for this commit. **This row was four behind, and the tool that exists to prevent that had already printed the right number**: the citation above it named [PR #139's run](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/34947630036), which reported `273 in 29:06`, while the cell said `269 in 28:17` — a run on an older tree. `scripts/test_table.py` prints all three counts in one block precisely so that one edit carries them together, and the previous table commit carried two of the three. Reading it is the part a script cannot do — and this job is what closed #122: it turned **red** on the pull request for #117 with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **22:02** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
+| C++ (GTest + RapidCheck) | 1249 | **1249 on PR #176's tree**, measured by CI; locally `ctest -j1` gave **1249/1249 in 226.63 s** on the i3-7100U on #163's branch. **Before that**, 1239 on PR #175's tree, and locally 1239/1239 in 223.84 s on #162's branch; and 1236 on PR #174's tree, and locally 1236/1236 in 223.5 s on #160's branch. **Before that**, 1236 on PR #173's tree, and locally 1236/1236 in 216.0 s on #159's branch. **Before that**, 1228 on PR #172's tree, and locally 1228/1228 in 226.7 s on #158's branch rebased onto PR #171's merge. **Before that**, 1182 on PR #169's tree. **Before that**, 1181, measured by CI on #151's tree; locally `ctest -j1` gave **1181/1181 in 262 s** on the i3-7100U on #151's branch, with the build clean and warning-free. **Before that**, 1151, and locally 1151 passed in a single `ctest -j1` run on the i3-7100U with the build clean and warning-free. **Before that**, all passing with `ctest -j1` on the i3-7100U, **205 s in a single run** — **thirty-one more than master, and the breakdown is one file per question** (#139). Nine are the new `tests/test_query_columns.cpp`: what a select list resolves to, that `columns_to_read()` is wider than the output list because a filter reads what the answer does not carry, and that the canonical order is the table's order. Eight in `tests/test_response_formatter.cpp` cover the narrowed path against the unrolled one **by formatting each column alone and cutting that field out of the `SELECT *` output** — a content-based dispatch means no call can be made to take the general path over the canonical shape, so the two are held together by construction rather than by a literal. Eight in `tests/test_query_engine.cpp`, three in `tests/test_columnar_store.cpp` — including the one that found a guarantee stated three times, where a hardcoded `true` made two widenings unobservable and the mutation for them survived — and three in `tests/test_client.cpp` for the two clients' refusals, because both read a row by position and neither can read a narrowed answer. **Before them**, **four more than the previous commit, and all four are about the machine this tree had never run on**: two in `tests/test_mm_snapshot.cpp` pin the ten header bytes of a snapshot chunk literally rather than through our own decoder, and a full-size chunk, because the frame is sized once now (PR #146); two in `tests/test_crc32c.cpp` are the pair that makes the rest of that file mean anything on this architecture — one skips with an explanation where there is only the table to compare against itself, which is what every agreement test had been doing off x86, and one requires the implementation the engine *reports* to be the one that runs (PR #147) across the four runs this tree and its two predecessors recorded, against 236-390 s three commits back when another session's containers were resident — the spread, not either end, is what the next number is read against. **Four more than the previous commit, and the arithmetic is worth writing down: six new and two removed** (#121). The six are three in `tests/test_hlc_skew.cpp` — the bound accepts up to itself and refuses one nanosecond past it, a peer behind us is plausible however far behind, and `UINT64_MAX` is refused so the logical carry can never saturate — and three in `tests/test_mm_wire_clock.cpp`, which is the only instrument that can reach this at all: a fake peer framing one DELTA whose HLC says what no real clock would. The two removed are the ones that **pinned the behaviour this decision reverses**, `AnHourInTheFutureOnTheWireBecomesThisNodesClockAndStays` and `ARecordFromAPeerWhoseClockIsWrongIsStillApplied`, both written by #54's stage D to state that nothing bounded the absorption. They were not deleted into a gap: the same file now asserts the opposite about the same wire shape, which is what makes a falling count readable rather than alarming. **And the local number that preceded this row was wrong by exactly those four.** A full local run on this branch printed `1094/1094` against a build directory that had not registered the four; the reconciliation is three measurements agreeing — CI's 1098, `ctest -N` listing 1100, and a local rerun after the merge giving **1098 passed in 218.95 s**. A stale build answers in the same voice it would use if it were right, which this repository has now paid for in five different shapes. **Before it**, unchanged by three commits: #134 deleted two methods no test referenced, and #135's tests are integration ones — three runs of the same suite on the same machine, the slowest with another session's containers resident and ~1 GB actually free. That spread, not any one of its ends, is what the next number is read against: it is wider than anything a commit in this repository has changed. **Seven more than the previous commit, and all seven are #131's.** Five are `LoopGuard`'s own, in the new `tests/test_loop_guard.cpp`: the counter counts every failing iteration rather than every episode, the episode counts consecutive failures and reopens after a recovery, two successes running report nothing (the observable half of "loud once" for a loop that polls ten times a second), a **null** registry still gets loud-once because two of the seven loops run in somebody else's process, and the name it writes is in the registry's own output. The other two are the descriptor `MetricsServer::handle_request` used to leak on the paths that throw — one behavioural, fifty requests against a live server with no growth in `/proc/self/fd`, and one static, because **the throwing path cannot be driven**: nothing in the process can make `serialize()` fail on demand and a knob to make it would be a knob nothing turns in production. **Before them**, four were #112's last two loops. Three are in the new `tests/test_replication_io_boundary.cpp`: that the pacing function returns zero only while a catch-up can progress, that nothing in `run_loop()` assigns `wait_ms` any other way (counted at **three** sites, because losing the one in the `catch` is the regression), and that both `try`s are where they have to be — anchored on the dispatch loop's own line rather than on a log phrase, which is the mistake #128's version of this test made. The fourth is in `tests/test_thread_boundaries.cpp` and is the one worth reading: the set of loops that guard an iteration is **derived from the tree** rather than listed, because a mutation deleting a row from the hand-written list **survived**. Fourteen `void Class::…loop()` definitions in `src/`, one a notifier with no loop in it and named, six of the remaining thirteen guarded and **seven not** — those seven are #131. Checked in both directions, so a loop in neither list fails and a row naming a function the tree no longer has fails too. **Before them**, the most recent addition was #129's: a registry given a 1200-second lease interval has to stop inside two seconds, which is a property stated three orders of magnitude clear of load rather than a duration. **Before it**, four were #128's, and they divide the way that defect does: three in `tests/test_mm_epoll_identity.cpp` are about the shape — that the two reserved event keys cannot collide with a connection, that closing a descriptor takes its registration with it (measured against `dup2`, which forces the reuse the defect needs instead of hoping for it), and that no registration in `src/multi_master.cpp` carries a bare descriptor number. The fourth is behavioural: a connection landing on the descriptor its predecessor gave back is its own connection, with both numbers read back so a run where the kernel did not recycle the number says so rather than passing quietly. Three of the six mutations in that item's table are killed by the static test **and by nothing else**, which is what says it carries weight. **Before them**, two were #126's, and they pin the replayer's rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. **Earlier**: two were #54's D3, three #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists **1085**: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The count that passes and the count CTest lists differ by exactly those two harnesses, always; a row two commits back gave one number for both. The runtimes are what this machine gave on the commit measured, not a budget |
+| Python integration | 364 | **`364 passed, 2 skipped in 25:05`** on the GitHub runner for PR #176's tree; locally `364 passed, 2 skipped in 24:48` on the i3-7100U on #163's branch, with `OB_POWER_CUT_TESTS=1`. **Before that**, `363 passed, 2 skipped in 24:34` on PR #175's tree, and locally 363 in 24:52 on #162's branch; and `360 passed, 2 skipped in 24:15` on PR #174's tree, the six power-cut tests among them, and locally 360 in 24:35 on #160's branch. **Before that**, `345 passed, 2 skipped in 23:55` on PR #173's tree, and locally 345 in 23:51 on #159's branch. **Before that**, `340 passed, 2 skipped in 23:25` on PR #172's tree, and locally 340 in 22:55 on #158's code before its rebase. **Before that**, `330 passed, 2 skipped in 22:38` on PR #169's tree, and before that `327 passed, 2 skipped in 22:56`, and before that `299 passed, 2 skipped in 22:44`, and before that all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 280; count pytest's final result rather than the report plugin's progress characters. `280 passed, 2 skipped in 22:42` on the GitHub runner for this commit — **seven more than master, and all seven are the new `test_column_projection.py`**, which asks the question over the raw protocol on purpose: both of our clients read a row by position, so neither can read a narrowed answer and the refusals are at the bottom of that file. **Two of its tests had never run to completion before this run** — the branch's previous CI was cancelled — and both failed on the first one that did. One pinned the seven-column header as a literal in `src/response_formatter.cpp`, which this branch replaced with a generator and then deleted; it reads the column table now, which is stronger, because a dead literal can agree with a header nothing prints. The other wrote one row per test into one symbol on a session-scoped cluster, so with storage append-only the seventh test read seven rows where it had written one — and **29:20 for the same 273 under TSan**, which is the job that has to be read as well, because a battery that skips under instrumentation reads as green. Against `20:37` on the development machine (i3-7100U, native etcd) **for the 263-test tree seven commits back** — the figure is kept as the spread to expect between the two machines, and labelled with the tree it came from rather than silently paired with a count it never measured. **Unchanged by #121, and the reason is the instrument rather than the effort**: producing a real node whose physical clock is five minutes off needs the host clock moved or a time namespace, which is not something this battery can do to the machine it runs on — so the assertion lives at the wire instead, where #54's stage D already built the fake peer for it. **Before it, one more than the commit before, in the existing `test_failover_storage_faults.py` beside the control that was already there** (#130): what a node *says* while it holds a leader key it won and cannot act on. The assertion with teeth is sampled rather than read once — `ROLE` must never name this node's own replication port as the primary it follows, across a twenty-second window in which the pre-fix code answered exactly that on **every** sample. The second assertion is that the condition is reported **once**, with what an operator can do about it, because the loop runs every second and the storage that refused the record usually goes on refusing it. Measured against the two source files from the commit before that fix: **1 failed, 2 passed in 66.8 s**, the failure arriving on the **first** sample with `REPLICA 127.0.0.1:43273 2` and #112's two tests untouched. **Before it, two more, both in the new `test_coordinator_endpoint_order.py`, and the second is a control rather than a second case** (#135): the same unreachable coordinator endpoint in the harmless position, which passed before that fix and has to keep passing — without it, a harness that quietly stopped prepending anything would leave the first test green and meaningless. Both assert their premise from `Popen.args`, the command line the node actually got, rather than from the attribute that put it there, because an attribute is what the harness *meant* to say. The first also requires the mesh to form on top of both registrations, because that is the only assertion reaching the third of the three call sites: two registered nodes that never see each other is a topology watch still reading the wrong endpoint. Measured against the four source files from the commit before that fix, harness and tests unchanged: **1 failed, 1 passed in 50.1 s**, the failure naming both nodes. **Before them, one more than the commit before that, and all three in `test_peer_lease_lost.py` were rewritten**, because #132 turned the first one's premise inside out: it was written to assert that the registration **does not** come back, with a note saying that the day that loop learns to re-register is the day it fails. That day was this commit. It now polls **both** halves — the key and the log line — because the key lands in etcd before the line lands in the log, and reading the log once at the moment the key appears is a race the first rewrite lost. The #133 test needed a **new premise** as well (`stop_etcd()` rather than a revoke, which also exercises the branch that keeps this fix quiet), because after #132 a revoked lease is no longer a permanent condition, and counting log lines over a condition that repairs itself counts a condition that happened once. **The third is the one that says the gate is real**: a refusal over a key that **exists**, which nothing else in this battery produces — `redirect_peer()` writes without a lease, so the test captures the lease id before redirecting and revokes it by id afterwards. Its control is the *premise* rather than the outcome, because without asserting that a refusal reached the log it passes against a node whose refresh is succeeding. The other two gained a rate bound that is independent of wording: the count of registry lines above `DEBUG` across the window, measured at one and two. This tree's battery ran locally only as **the one module** (3 tests in **40 s**, and stage C's twelve in **3:37** as the regression check on the fixture this fix had to leave alone); the whole battery on this commit is CI's, and the 224-235 s `ctest` above is local. **Before them**, two were #112's `monitor_loop` half and both in the new `test_failover_storage_faults.py`: a replica whose data directory refuses the `EPOCH` record a role transition writes loses that monitor tick and not the thread, and its control at a size nothing writes, which must inject nothing. The assertion that carries the guarantee in the first of the two is the **recovery** line rather than the error line — only a later tick can write it, so a run in which the thread died would report the error and then say nothing, which is what a boundary is for. The pair costs **45.7 s** locally, and the module asserts its own premise: `OB_FAULT_PATH=ob_node1_` names the replica's data directory only because `ClusterManager.start()` waits for node-0 to hold PRIMARY before it starts node-1, and a change to that ordering would aim the injector at the **primary's** startup promotion, which exits the process. **Before them**, two were #112's `io_loop` half and both in the new `test_mesh_storage_faults.py`: a mesh receiver whose WAL refuses one record still receives the ones after it (**38.6 s**, because it waits for a mesh to form and for four records to cross it), and its control at a size nothing writes, which must inject nothing (**28.2 s**); that pair costs **67 s** locally. **Before those**: three were #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
+| Python integration under TSan | 364 | **`364 passed in 31:35`** on the GitHub runner for PR #176's tree, against **25:05** uninstrumented on the same runner — instrumentation's cost is the difference between two runs on one machine. **Before that**, `363 passed in 31:15` on PR #175's tree, and `360 passed in 30:48` on PR #174's tree, and `345 passed in 30:13` on PR #173's tree, and `340 passed in 29:39` on PR #172's tree, and `330 passed in 29:56` on PR #169's tree, and before that `327 passed in 29:28`, and before that `299 passed in 29:18`, and before that all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `280 passed in 29:06` on the GitHub runner for this commit. **This row was four behind, and the tool that exists to prevent that had already printed the right number**: the citation above it named [PR #139's run](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/34947630036), which reported `273 in 29:06`, while the cell said `269 in 28:17` — a run on an older tree. `scripts/test_table.py` prints all three counts in one block precisely so that one edit carries them together, and the previous table commit carried two of the three. Reading it is the part a script cannot do — and this job is what closed #122: it turned **red** on the pull request for #117 with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **22:02** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than
