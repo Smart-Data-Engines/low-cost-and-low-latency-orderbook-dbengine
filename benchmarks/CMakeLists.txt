@@ -61,3 +61,10 @@ add_executable(command_latency command_latency.cpp)
 # tracepoints, which is how the table in the roadmap was measured.
 add_executable(pipelined_ingest pipelined_ingest.cpp)
 target_link_libraries(pipelined_ingest PRIVATE Threads::Threads)
+
+# ── What the segment index costs a tick and a query as it grows (#165) ───────
+#
+# Compiled, deliberately not run: it prints a table rather than asserting one, and the numbers in
+# the roadmap came from it on the m9g.xlarge.
+add_executable(segment_index_cost segment_index_cost.cpp)
+target_link_libraries(segment_index_cost PRIVATE orderbook_columnar)

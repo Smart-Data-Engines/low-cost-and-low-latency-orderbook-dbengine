@@ -81,7 +81,10 @@ struct ob_engine {
 
         // Create a new store rooted at base_dir.
         // We set symbol/exchange on it so that segment metadata is correct.
-        auto store = std::make_unique<ob::ColumnarStore>(base_dir);
+        // What this store writes is read through combined_store, so it keeps no index of its own
+        // (#165) - one that nothing read and nothing pruned.
+        auto store = std::make_unique<ob::ColumnarStore>(
+            base_dir, ob::ColumnarStore::kDefaultSegmentDurationNs, ob::ColumnarStore::OwnIndex::kNo);
         store->set_symbol_exchange(symbol, exchange);
         auto& ref = *store;
         stores[key] = std::move(store);

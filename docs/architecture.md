@@ -120,8 +120,10 @@ The rows being drained still count against the ceiling, and in `STATUS`, `holds_
 `ob_pending_rows`, so nothing reads as empty for the length of a sync. What bounds a fast writer is
 then the cycle itself rather than the lock: one pipelining connection writing 6.6 M levels a second
 on an m9g.xlarge meets the ceiling once a cycle of about 150 ms. `FLUSH`, `close()` and snapshot
-creation still drain under `mtx_`, straight after a sync under the same hold. Step 5's merge walks
-the whole segment index, which grows with the node's uptime (#165).
+creation still drain under `mtx_`, straight after a sync under the same hold. Step 5's merge is a
+lookup and an insertion per new segment since part 1 of #165, which made the index per symbol and
+in width tiers; what still grows with the node's uptime is the number of segments, which a start
+reads one directory at a time (#165, part 2).
 
 ### Sequence numbers and who assigns them
 

@@ -1037,6 +1037,26 @@ right range. What it does differently is replay's fallback for a symbol with no 
 position, which in the older build compares with the recorded end — now the newest row rather than
 the last one.
 
+## How long a start takes, and what makes it longer
+
+A start reads the `meta.json` of every segment in the data directory before it answers anything,
+and nothing merges segments yet: a node gains one per symbol that received rows in each flush tick
+(#165 in the roadmap, whose second part is that). So the start grows with the node's uptime times
+its active symbols, unless `--ttl-hours` bounds the store. `ob_segment_count` is the number to watch.
+
+What a segment costs a start depends on what the page cache kept, and the two cases are far apart.
+Measured on an m9g.xlarge with its data on a gp3 volume, after a soak writing 256 symbols for 90
+seconds, which left 139 776 segments:
+
+| page cache | first answer after | read from storage | CPU |
+|---|---|---|---|
+| warm — a restart of a process whose files are still cached | **3.37–3.41 s** | 0 | 3.35–3.39 s |
+| cold — after a reboot, or on a new instance | **107.2–107.5 s** | 1.44 GiB | 4.3 s |
+
+About 24 µs a segment warm and 0.77 ms cold, where the disk, not the engine, is the time. A restart
+in between can land anywhere: one in that run read 63 MiB from storage and took 12 s.
+If a node's start time matters, plan with the cold figure and its segment count, not the warm one.
+
 ## Stopping a node
 
 `SIGTERM` (or `SIGINT`) closes the listening socket **immediately** — a new connection is refused
