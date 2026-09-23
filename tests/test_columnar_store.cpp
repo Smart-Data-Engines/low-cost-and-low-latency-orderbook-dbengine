@@ -509,7 +509,10 @@ TEST(ColumnarStore, test_flush_segment_returns_meta) {
     ASSERT_TRUE(result.has_value());
 
     const ob::SegmentMeta& meta = result.value();
-    EXPECT_EQ(meta.start_ts_ns, 0u);  // rounded down: 1000 / (1<<60) * (1<<60) = 0
+    // The first row's time. This said 0, "rounded down" to the segment's period, until #166:
+    // that start and a last-row end put a row written out of time order outside the range
+    // queries prune by. test_segment_time_range.cpp holds what the range is now.
+    EXPECT_EQ(meta.start_ts_ns, 1000u);
     EXPECT_EQ(meta.end_ts_ns, 3000u);
     EXPECT_EQ(meta.row_count, 3u);
     EXPECT_EQ(meta.symbol, "BTCUSD");
