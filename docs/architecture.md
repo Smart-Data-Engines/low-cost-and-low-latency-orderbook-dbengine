@@ -280,12 +280,12 @@ purpose: a zero in the second one means "checked, nothing to repair" only if the
 
 With `FsyncPolicy::EVERY` — **not** the default, which is `INTERVAL` — a write that has been
 acknowledged is in a fsynced WAL record before the acknowledgement leaves the server, and it comes
-back after a `SIGKILL` or any other end that skips `close()`. After a **power cut** it comes back
-until a flush claims it: segment files are never synced, so a checkpoint can then name rows the disk
-never received, and replay skips their records (#160, open — found by reading, not measured). Since #113 that
-sentence is enforced rather than asserted: the `fsync` result is checked, and a write whose sync
-failed is refused instead of acknowledged. *(This paragraph said `EVERY` was the default for
-months. The default has been `INTERVAL` in every one of the four places the code states it, so the
+back after a `SIGKILL` or any other end that skips `close()`. Since #113 that sentence is enforced
+rather than asserted: the `fsync` result is checked, and a write whose sync failed is refused instead
+of acknowledged. After a **power cut** the write comes back only until a flush claims it: segment
+files are never synced, so a checkpoint can then name rows the disk never received, and replay skips
+their records (#160, open — measured with a simulated power cut: 1 row of 201 came back).
+*(This paragraph said `EVERY` was the default for months. The default has been `INTERVAL` in every one of the four places the code states it, so the
 document claimed a stronger durability guarantee than the engine gives — the mirror image of the
 TLS caveat that outlived the feature.)* That is the whole point of the log, and until August
 2026 it did not hold: `Engine::open()` called replay with a callback that did nothing, so every

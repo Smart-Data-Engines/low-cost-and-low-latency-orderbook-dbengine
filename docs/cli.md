@@ -493,7 +493,7 @@ default. With anything other than `every`, an acknowledged write can be lost on 
 replay described above cannot recover a record that never reached the platter. **With `every` as
 well, once a flush has claimed the write**: segment files are never synced, so a power cut can take
 a segment that a synced checkpoint says holds the row, and replay then skips its record (#160,
-open — found by reading, not measured).
+open — measured with a simulated power cut: 1 row of 201 came back).
 
 How large the WAL grows before it starts a new file is `--wal-rotate-bytes`, and it is a **trigger
 rather than a file size**: rotation is checked after a write, so a file may exceed the threshold by

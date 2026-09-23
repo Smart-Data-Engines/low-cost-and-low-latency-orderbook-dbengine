@@ -316,7 +316,8 @@ trade — a duplicate you can see, against a write you were told was durable and
 failure is rebuilt by replaying the WAL; that holds only until the next flush's checkpoint claims the
 segment's rows, after which replay skips their records and retention may delete the file that held
 them. So under `every`, a write acknowledged as synced can be lost to a power cut once a flush has
-claimed it. Found by reading, not measured, and open as roadmap #160.
+claimed it — measured with a simulated power cut (`scripts/power_cut.sh`): 1 row of 201 came back,
+against 201 of 201 without the cut. Open as roadmap #160.
 
 **Every storage failure this engine can reach is an `errno`, so it is a refusal and a counter —
 never a signal.** That is worth stating because it is a property of a choice rather than of

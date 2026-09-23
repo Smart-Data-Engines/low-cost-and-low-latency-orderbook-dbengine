@@ -2212,29 +2212,40 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
-### 160. Segment files are never synced, so after a power cut a checkpoint can claim rows the disk never received
+### 160. Segment files are never synced, so a power cut after a flush loses rows a synced checkpoint claims
 
-**Found by reading, while writing #159, and not measured.** `src/columnar_store.cpp` writes every
+**Found by reading while writing #159, then measured.** `src/columnar_store.cpp` writes every
 segment file through `std::ofstream` and calls `fsync` on none of them, nor on the directories that
 hold them. The checkpoint that says those rows are in segments is a WAL record, and the WAL is synced
-— under `--fsync-policy every`, by the next write after it. So after a power cut the log can say
-"these records are covered" about segment files that were still in the page cache, replay skips the
-records, and retention (#159) may already have deleted the WAL file that held them.
+— under `--fsync-policy every`, by the very next write. So after a power cut the log can say "these
+records are covered" about segment files the disk never received, and replay skips the records.
+
+**Measured with a power cut the kernel performs** (`scripts/power_cut.sh`: dm-flakey over a loop
+device, switched to drop every write at the chosen moment, the way xfstests simulate one; ext4,
+`every`, a one-second flush): 200 rows acknowledged, a tick writes their segment and its checkpoint,
+one more write — whose sync takes the checkpoint to the device — and the cut. After a remount **all
+eight segment files are zero bytes** while the WAL is whole, replay starts at the checkpoint, and the
+node answers **1 row of 201**: two hundred writes acknowledged as synced, gone, and nothing logged
+worse than a warning. The control is the same run without the cut — the same kill, unmount and
+remount — and it answers **201 of 201**. `wal_identity` came back empty as well, so the restart
+generated a new identity and distrusted every position its segments recorded, which is #63's
+fallback: nothing this engine writes outside the WAL is synced, and the segments are only the part
+that loses rows first.
 
 **This is not a process-crash problem** — a killed process leaves the page cache to the kernel, and
-every test in this repository kills processes. It is a power-loss problem, under the policy whose
-whole point is power loss: `every` answers `OK` only after the record is synced, and that promise
-lasts until the next flush.
+every other test in this repository kills processes. It is a power-loss problem under the policy
+whose whole point is power loss, and it breaks `interval`'s promise too: that policy loses at most one
+flush interval of the WAL, and a checkpoint synced over segments that were not can lose any number.
 
 The fix is a design, not a line. The naive one is an `fsync` per column file per symbol per flush —
-eight files per symbol, every 100 ms, which on a node with a thousand symbols is eighty thousand
-syncs a second. The candidates worth measuring: one `syncfs()` per flush; syncing the segment files
-at a slower cadence and letting the checkpoint claim only what has been synced (two boundaries, "in a
-segment" and "on the platter", where today there is one); and whether a power-loss test is buildable
-at all without a machine to pull the plug on (`dm-flakey` drops unsynced writes on command).
+eight files per symbol, every 100 ms, which on a node with a thousand symbols is eighty thousand syncs
+a second. Candidates worth measuring: one `syncfs()` per flush; syncing the segments at a slower
+cadence and letting the checkpoint claim only what has been synced (two boundaries, "in a segment"
+and "on the platter", where today there is one); and the directories and `wal_identity`, which have to
+be durable before anything points at them. The instrument that measured this is what decides it.
 
-- Effort: M | Impact: under `every`, a write acknowledged as synced can be lost to a power cut once a
-  flush has claimed it — the case that policy exists for
+- Effort: M | Impact: **P0** — under `every`, writes acknowledged as synced are lost to a power cut
+  once a flush claims them, silently; measured 200 of 201
 
 ### 159. A crash after a flush lost the rows written while it wrote its segments, and the tick could delete their WAL file ✅
 
@@ -2313,8 +2324,8 @@ which turns milliseconds into seconds a test can stand in.
 
 `docs/architecture.md` called the checkpoint's payload empty and still described replay's guard as
 the timestamp comparison #63 made a fallback; `docs/cli.md` said replay starts after the last
-checkpoint. Both say what is true now. **Writing #160 down found three sentences it contradicts**, and
-one of them was the guarantee itself: `docs/operations.md` said a segment lost to a power failure is
+checkpoint. Both say what is true now. **Writing #160 down found three sentences it contradicts** — measuring it then made them wrong
+rather than doubtful — and one of them was the guarantee itself: `docs/operations.md` said a segment lost to a power failure is
 rebuilt by replaying the WAL — which holds only until the next checkpoint claims it — and
 `architecture.md` and `cli.md` promised that under `every` an acknowledged write survives a power
 cut. Each now says until when. The same page's device table recommended `--fsync-policy never` for
@@ -9565,11 +9576,11 @@ measures the harness.
 
 ## Recommended order
 
-**One item is open, #160, and it was found by reading rather than measured** — the mechanical list
-is the `Open:` line below; read it there rather than trusting this paragraph, which is prose and has
-been wrong about this before. Segment files are never synced, so under `every` a power cut after a
-flush can lose rows the log says are in segments; P0 by consequence if the reading is right, and
-proving it needs a way to drop unsynced writes, which is part of the item. **#159 was a P0 and is
+**One P0 is open, #160** — the mechanical list is the `Open:` line below; read it there rather than
+trusting this paragraph, which is prose and has been wrong about this before. Segment files are never
+synced, so under `every` a power cut after a flush loses rows a synced checkpoint claims: measured
+with a power cut dm-flakey performs, **1 row of 201** came back, against 201 of 201 in the same run
+without the cut. **#159 was a P0 and is
 closed**: a flush's checkpoint claimed the rows written while it wrote its segments, and a crash
 before the next flush lost them — three of three acknowledged rows in the measurement, under every
 fsync policy — while the tick's retention could delete the WAL file that held them. It was found by

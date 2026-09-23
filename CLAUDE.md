@@ -3330,8 +3330,8 @@ Read the sanitizer claims with #83 in mind: until it landed, `OB_ENABLE_ASAN`, `
 libraries**, because `add_compile_options()` only affects targets declared after it and those blocks
 sat below all of them.
 
-**One item is open, #160 — a power-loss hole found by reading, a P0 by consequence if the reading
-is right — and the set is held mechanically by the `Open:` line in `docs/roadmap.md`; read it there
+**One P0 is open, #160 — segment files are never synced, so a power cut after a flush loses rows
+a synced checkpoint claims (measured: 1 row of 201) — and the set is held mechanically by the `Open:` line in `docs/roadmap.md`; read it there
 rather than trusting this sentence, which has been wrong about it before.** The items
 below are the recent closures worth knowing because each changes what the engine promises; the list
 carries no count, because the previous version of this sentence said "four" above a list of six and
@@ -3364,7 +3364,8 @@ between the position and it, and the position can only add records. WAL retentio
 value (`Engine::drained_up_to_`): it deletes the files before the drain's file, not before the
 current one, which a rotation during the segment write had made the file holding those records
 (measured: 600 of 600 gone). **#160 is open**: segment files are never synced, so after a power cut a
-checkpoint can claim rows the disk never received - found by reading, not measured.
+checkpoint can claim rows the disk never received - measured with a power cut dm-flakey performs
+(`scripts/power_cut.sh`): 1 row of 201 came back, against 201 of 201 without the cut.
 
 **#158**: `boost` is the command line's default - one client event loop per usable CPU, and a
 10 µs spin window where the process may run on two CPUs or more and a cgroup limit leaves a CPU of
