@@ -3362,6 +3362,21 @@ Learned the hard way. Check here before debugging.
      `tools/`, found from the tree in both directions (`tests/test_durable_writes.cpp`). `std::regex`
      over the tree took nine seconds a test in Debug; plain search with identifier boundaries takes
      0.4, and has to reject `fdopen` for `fopen` and `::create_directories` for `::creat`.
+415. **A count from a clock carries nothing of the clock it came from.** The TTL sweep took
+     `steady_clock::now().time_since_epoch()` - nanoseconds since boot - and compared it with event
+     times, nanoseconds since 1970 (#163). Up for less than the retention, the cutoff wrapped past
+     every timestamp and the first sweep deleted everything; up for longer, nothing ever expired.
+     Every unit test passed, because each one handed `delete_expired_segments()` a cutoff it had
+     computed itself. Take moments from `wall_clock_ns()`, keep monotonic readings as
+     `time_point`s, and `tests/test_clock_use.cpp` refuses a count taken any other way.
+416. **A test whose premise is the machine must read the machine.** The wipe needs a retention
+     longer than the uptime, so the TTL tests take the retention from `/proc/uptime` - a CI runner
+     has been up for minutes and a desk machine for a day, and a constant would hold the premise on
+     one of them.
+417. **A log number named for one quantity and computed as another survives every test.** The
+     retention line printed `age=` for how far past the cutoff a segment was, which is not its age -
+     and while the cutoff was a count from boot it said `age=4626822.4h` of a segment written a
+     second earlier. It names what it computes now.
 
 ## Current state and open problems
 

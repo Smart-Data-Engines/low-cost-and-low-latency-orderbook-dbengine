@@ -31,7 +31,7 @@ struct SnapshotManifest {
     size_t      wal_byte_offset{0};
     size_t      total_bytes{0};
     size_t      total_rows{0};
-    uint64_t    created_at_ns{0};
+    uint64_t    created_at_ns{0};   // the wall clock, nanoseconds since the epoch (#163)
     std::vector<SnapshotFileEntry> files;
 
     /// Serialize to JSON string (deterministic alphabetical field ordering).

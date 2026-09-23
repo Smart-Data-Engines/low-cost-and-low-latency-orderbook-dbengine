@@ -2212,6 +2212,90 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 163. `--ttl-hours` measured event times against the time since boot: it deleted every segment, or none ✅ **P0**
+
+**Found while reading the flush tick for stage 5 of #151**, in the retention block under the drain.
+The sweep's cutoff was `steady_clock::now()` minus the retention, and `steady_clock` counts from the
+machine's boot, while a segment's times are event times - nanoseconds since the Unix epoch, whether
+the server stamped a row on arrival or the client gave its time (#105). Two failures from one line,
+and which one a node got depended on how long its machine had been up.
+
+**Up for less than the retention, the subtraction wrapped** to a cutoff past every timestamp, and
+the first sweep - which runs at the first tick - deleted every segment. Measured on the i3-7100U, up
+21.5 hours: a node that had flushed 200 rows, restarted with `--ttl-hours 24`, held **0 of 200 rows
+and none of their two segment directories** after its first sweep; the same restart without the
+flag held all 200. Its log said `age=4626822.4h` of a segment written seconds before. **Up for
+longer, the cutoff was a few hours into 1970** and nothing ever expired: rows dated two hours ago
+under `--ttl-hours 1` were all still there after the sweeps. So a node restarted soon after its
+machine booted lost its store, and one running for longer than its retention kept everything for
+ever. Every unit test passed, because each one handed `delete_expired_segments()` a cutoff it had
+computed itself; nothing ran the sweep through an engine.
+
+**The cutoff is the wall clock now, and it saturates.** `ttl_cutoff_ns(wall_clock_ns(), ttl_hours)`
+next to `TTLConfig`: 0 - nothing expired - for a retention of 0, which is the flag's "keep
+everything", and for one reaching back past the epoch; and no product that can overflow, because the
+flag takes any `uint64_t` and 5 124 096 hours is where its nanoseconds stop fitting. The sweep's
+**cadence** stays on the monotonic clock, as a `time_point`, so the two cannot be compared again: a
+stepped wall clock moves what has expired - it is the clock the rows are stamped with - and not how
+often the sweep runs. The retention line now says how far past the retention a segment was, which is
+what it had always computed and called the segment's age.
+
+**The same shape three more times**, found by sweeping the tree for it rather than by reading:
+an anti-entropy run's time, a conflict's time whose comment said "wall clock", and a snapshot
+manifest's creation time. None of them decided anything, and each would have the day something read
+it. `tests/test_clock_use.cpp` now finds every `time_since_epoch()` in `src/`, `include/` and
+`tools/` - the one way to turn a clock reading into a count - and accepts it on a
+`system_clock::now()` reading, or at one of two listed sites with the reason its number is an
+interval (a log line's milliseconds, and the mesh's grace-window clock); checked both ways, with a
+snippet in which it must flag four and pass four. It shares its scanner with #162's durability rule
+(`tests/source_scan.hpp`), so the two cannot come to disagree about what counts as code.
+
+**Tests.** Three engine tests in `test_ttl_retention.cpp` restart an engine on a directory that
+holds rows older and younger than the retention: one with a retention taken from `/proc/uptime` so
+it is longer than the machine has been up - the premise under which the old sweep deleted
+everything, on any machine rather than on the one it was written on - one at an hour, and one with
+an interval of 31 years, because the first sweep runs at the first tick and counting its interval
+from boot instead would have delayed it by the rest of it. `test_ttl.py` does the measured restart
+through the real flags. Against the build before this fix: **0 of 100** rows written a moment ago
+survived a 23-hour retention on a machine up 21.8 hours.
+
+**Mutation table: eighteen rows, eighteen with the verdict they were supposed to produce** -
+fifteen killed, one refused by the compiler and two controls - against committed code, the three
+instruments green before the first row and after the last, and the sources restored byte for byte.
+
+| # | Mutation | Instrument | Verdict |
+|---|---|---|---|
+| 0u | the sweep exactly as it was: the boot clock and a subtraction that wraps | engine sweep tests | killed |
+| 0n | the same | restarted node | killed: 0 of 100 fresh rows survived |
+| 1u | the boot clock through today's saturating cutoff | engine sweep tests | killed: nothing expires |
+| 1n | the same | restarted node | killed: no sweep deleted anything |
+| 1s | the same | clock rule | killed |
+| 2 | no saturation when the retention reaches past the epoch | cutoff tests | killed |
+| 3 | a retention of 0 expires everything older than now | compiler | refused by a `static_assert` |
+| 4 | the saturation tested with a product that can overflow | cutoff tests | killed |
+| 5 | the first sweep waits an interval counted from boot | engine sweep tests | killed |
+| 6 | an anti-entropy run's time back on the boot clock | clock rule | killed |
+| 7 | a conflict's time back on the boot clock | clock rule | killed |
+| 8 | a symbol snapshot manifest's time back on the boot clock | clock rule | killed |
+| 9 | the rule's list loses the log line's site | clock rule | killed |
+| 10 | the rule's list keeps a count the tree no longer has | clock rule | killed |
+| 11 | the scanner takes any clock's `now()` for the wall clock | clock rule | killed |
+| 12 | the shared scanner reads line comments as code | clock rule | killed |
+| 13 | control: the sweep's debug line reworded | engine sweep tests | survives |
+| 14 | control: the retention line reworded | restarted node | survives |
+
+**Row 4 survived the first run, and that is the row worth reading.** The only overflowing
+retention the tests used was `UINT64_MAX`, whose product happens to wrap to a number larger than any
+wall clock - so a check that multiplied before comparing passed. The first retention whose
+nanoseconds do not fit, 5 124 096 hours, wraps to about 25 minutes, and that check would read a
+retention of 584 years as one of 25 minutes. It is pinned now, and the property test draws
+retentions around that threshold instead of leaving them to an arbitrary 64-bit draw. **Row 5** is
+the one writing the verdicts down first found: nothing killed it until the 31-year interval.
+
+- Effort: S | Impact: a node restarted with `--ttl-hours` longer than its machine's uptime deleted
+  its whole store at the first sweep, and one running longer than its retention never expired
+  anything
+
 ### 162. A replica rewrites its state file in place, and nothing after a snapshot install is synced ✅
 
 **Found while closing #160, by asking what else recovery reads that only the WAL was ever synced
@@ -9796,8 +9880,11 @@ measures the harness.
 ## Recommended order
 
 **Nothing above #58 is open** — the mechanical list is the `Open:` line below; read it there rather
-than trusting this paragraph, which is prose and has been wrong about this before. **#162 closed the
-last one**: a replica's state file rewritten in place, which a kill at the wrong moment turned into
+than trusting this paragraph, which is prose and has been wrong about this before. **#163 was a P0
+and is closed**: `--ttl-hours` measured event times against the time since boot, so a node
+restarted with a retention longer than its machine had been up deleted its whole store at the first
+sweep - 0 of 200 rows in the measurement - and one running longer than its retention never expired
+anything. **#162 closed the one before it**: a replica's state file rewritten in place, which a kill at the wrong moment turned into
 a full resync and a forgotten epoch, and a snapshot install nothing synced, which a power cut after
 the replica recorded its position turned into 0 of 1100 rows. **#160 and #161 were P0s and are closed**: segment files were never synced, so a
 power cut after a flush lost every row the checkpoint claimed - 0 of 201 in the test that now

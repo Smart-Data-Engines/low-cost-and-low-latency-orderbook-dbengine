@@ -4,6 +4,7 @@
 // Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6
 
 #include "orderbook/anti_entropy.hpp"
+#include "orderbook/wall_clock.hpp"
 #include "orderbook/loop_guard.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/engine.hpp"
@@ -145,9 +146,9 @@ void AntiEntropyManager::set_reconciler(ReconcileFn fn) {
 
 AntiEntropyResult AntiEntropyManager::execute_run() {
     const uint64_t run_id = total_runs_.load(std::memory_order_relaxed) + 1;
-    const auto now_ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
+    // The wall clock: `AntiEntropyResult::timestamp_ns` is a time a reader puts a date on, and a
+    // count from this machine's boot is not one (#163).
+    const uint64_t now_ns = wall_clock_ns();
 
     AntiEntropyResult result{};
     result.run_id       = run_id;

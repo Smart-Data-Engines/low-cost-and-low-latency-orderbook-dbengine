@@ -593,7 +593,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--tls-multi-master` | — (boolean) | TLS with mutual certificate verification on the multi-master mesh; needs `--tls-ca-file` |
 | `--tls-peer-names` | `<NAMES>` | Comma-separated identities an accepted peer's certificate may carry; empty accepts any name this CA signed |
 | `--tls-replication` | — (boolean) | TLS with mutual certificate verification on the replication link, in both roles; needs `--tls-ca-file` |
-| `--ttl-hours` | `<N>` | Retention in hours; 0 keeps everything. Counted from **the record's own event time**, per segment — so a backfill written with `[event_time_ns]` arrives with its age, and a batch whose oldest row is past the window is expired on the next sweep. One row dated in the future keeps its whole segment |
+| `--ttl-hours` | `<N>` | Retention in hours; 0 keeps everything. Counted from **the record's own event time**, per segment, against the node's wall clock — so a backfill written with `[event_time_ns]` arrives with its age, and a batch whose oldest row is past the window is expired on the next sweep. One row dated in the future keeps its whole segment |
 | `--ttl-scan-interval-seconds` | `<N>` | How often retention scans for expired rows |
 | `--wal-rotate-bytes` | `<N>` | WAL bytes before the next file is opened (default: 536870912). A **trigger**, not a file size: rotation is checked after a write, so a file may exceed it by one record. Refused below 65573 (one maximal record) and above 2 GiB |
 

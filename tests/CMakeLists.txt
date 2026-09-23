@@ -442,6 +442,15 @@ target_compile_definitions(test_durable_writes
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 
+# A clock reading turned into a count is the wall clock's, or a listed interval (#163). Reads src/,
+# include/ and tools/, so it needs the source directory.
+ob_add_engine_test(test_clock_use
+    test_clock_use.cpp
+)
+target_compile_definitions(test_clock_use
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
 # Derives the set of connection-holding sources from the tree rather than listing them, because the
 # sixth accept site is the one that will be added without the option (#140). Reads src/ and the
 # header, so it needs the source directory.

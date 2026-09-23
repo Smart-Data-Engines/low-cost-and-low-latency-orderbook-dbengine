@@ -8,6 +8,7 @@
 // close(): stop flush thread + final flush + flush_segment + WAL flush.
 
 #include "orderbook/engine.hpp"
+#include "orderbook/wall_clock.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/level_payload.hpp"
 #include "orderbook/crc32c.hpp"
@@ -1402,9 +1403,9 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
     // an open, an allocation and a read cost when repeated once per entry (#79).
     std::vector<uint8_t> read_buf(kSnapshotReadChunk);
 
-    auto now = std::chrono::steady_clock::now().time_since_epoch();
-    manifest.created_at_ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+    // The wall clock: a creation time a reader can put a date on. It read `steady_clock` - a count
+    // from this machine's boot, which no reader can - until #163 swept for that shape.
+    manifest.created_at_ns = wall_clock_ns();
 
     size_t total_bytes = 0;
     size_t total_rows = 0;
@@ -1763,9 +1764,9 @@ SnapshotManifest Engine::create_symbol_snapshot(const std::string& symbol_key) {
         manifest.wal_byte_offset = manifest_pos.offset;
     }
 
-    auto now = std::chrono::steady_clock::now().time_since_epoch();
-    manifest.created_at_ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+    // The wall clock: a creation time a reader can put a date on. It read `steady_clock` - a count
+    // from this machine's boot, which no reader can - until #163 swept for that shape.
+    manifest.created_at_ns = wall_clock_ns();
 
     // Stub: in a full implementation, enumerate segment files for this symbol
     // and populate manifest.files with per-symbol data.
@@ -2336,17 +2337,35 @@ void Engine::flush_tick() {
             }
 
             // TTL retention scan: delete expired segments periodically.
+            //
+            // Two clocks, one for each question (#163). **When** to sweep is the monotonic clock,
+            // so a stepped wall clock does not stretch or shrink the interval. **What** has expired
+            // is the wall clock, because segment times are event times: this read `steady_clock`
+            // for both, so the cutoff was a count from boot compared with nanoseconds since 1970 -
+            // on a machine up for less than the retention it wrapped past every timestamp and the
+            // first sweep deleted everything, and on one up for longer nothing ever expired.
             if (ttl_config_.ttl_hours > 0) {
-                auto now = std::chrono::steady_clock::now().time_since_epoch();
-                uint64_t now_ns = static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
-                uint64_t scan_interval_ns = ttl_config_.scan_interval_seconds * 1'000'000'000ULL;
-                if (now_ns - last_ttl_scan_ns_ >= scan_interval_ns) {
-                    uint64_t cutoff_ns = now_ns - ttl_config_.ttl_hours * 3600ULL * 1'000'000'000ULL;
+                const auto now = std::chrono::steady_clock::now();
+                // Compared in whole seconds, so a large `--ttl-scan-interval-seconds` is a long
+                // wait rather than a duration that overflows on its way to nanoseconds.
+                const bool due =
+                    last_ttl_scan_ == std::chrono::steady_clock::time_point{} ||
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                              now - last_ttl_scan_)
+                                              .count()) >= ttl_config_.scan_interval_seconds;
+                if (due) {
+                    const uint64_t wall_now_ns = wall_clock_ns();
+                    const uint64_t cutoff_ns = ttl_cutoff_ns(wall_now_ns, ttl_config_.ttl_hours);
                     auto [deleted, reclaimed] = combined_store_.delete_expired_segments(cutoff_ns);
                     ttl_segments_deleted_.fetch_add(deleted, std::memory_order_relaxed);
                     ttl_bytes_reclaimed_.fetch_add(reclaimed, std::memory_order_relaxed);
-                    last_ttl_scan_ns_ = now_ns;
+                    last_ttl_scan_ = now;
+                    OB_LOG_DEBUG("retention",
+                                 "TTL sweep: %zu segment(s) and %zu byte(s) older than event time "
+                                 "%llu (the wall clock, %llu, minus %llu h)",
+                                 deleted, reclaimed, static_cast<unsigned long long>(cutoff_ns),
+                                 static_cast<unsigned long long>(wall_now_ns),
+                                 static_cast<unsigned long long>(ttl_config_.ttl_hours));
                 }
             }
         }
