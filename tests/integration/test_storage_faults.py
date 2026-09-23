@@ -59,6 +59,9 @@ class FaultNode:
         # And OB_FAULT_ROTATE_BYTES, for the tests about what happens when a file ends: the default
         # threshold is 512 MB, and a file that never fills never rotates.
         self.rotate_bytes = fault.pop("OB_FAULT_ROTATE_BYTES", None)
+        # And OB_FAULT_EXTRA_ARGS, for the tests that need a second node: a replication port on a
+        # primary, or the primary's address on a replica. Space-separated, appended as given.
+        self.extra_args = fault.pop("OB_FAULT_EXTRA_ARGS", "").split()
         injector = fault_injector_path()
         assert injector is not None, (
             "libobfault.so was not built. Failing rather than skipping: a fault-injection test "
@@ -95,7 +98,7 @@ class FaultNode:
                 "--fsync-policy", self.policy, "--flush-interval-ms", self.flush_ms]
         if self.rotate_bytes is not None:
             argv += ["--wal-rotate-bytes", self.rotate_bytes]
-        return argv
+        return argv + self.extra_args
 
     def counter(self, name: str) -> int:
         """One counter from /metrics, or 0 if it has never been incremented.
@@ -1060,6 +1063,73 @@ def test_under_none_a_failed_wal_sync_freezes_nothing():
         assert node.counter("ob_checkpoints_frozen") == 0
     finally:
         node.cleanup()
+
+
+def test_a_snapshot_whose_install_could_not_sync_is_installed_again():
+    """#162: a replica records a snapshot's position only once the install synced it.
+
+    The install renames the staged files into place and then syncs the data directory; the position
+    that says "the store is this snapshot" is saved only after that. Here the sync fails - the first
+    `syncfs()` of a fresh replica is its install's, because a node with nothing to flush syncs
+    nothing - so the install is reported failed, the position is not saved, the checkpoints freeze
+    (#160), and the replica asks again, is refused again and installs the snapshot a second time,
+    whose sync succeeds. Every row arrives, and the log says the whole story once.
+
+    The primary writes past two rotations with nobody connected, so retention has deleted the file
+    a new replica asks for first: that is what makes its first request a snapshot.
+    """
+    repl_port = free_port()
+    primary = FaultNode(OB_FAULT_POLICY="every", OB_FAULT_FLUSH_MS="200",
+                        OB_FAULT_ROTATE_BYTES="65573",
+                        OB_FAULT_EXTRA_ARGS=f"--replication-port {repl_port}")
+    replica = None
+    try:
+        primary.wait_until_answering()
+        prices = list(range(1000, 2100))
+        assert all(r == "OK" for r in primary.insert_each(prices).values())
+        deadline = time.time() + patience(30)
+        while WAL_SEGMENT in primary.wal_files() and time.time() < deadline:
+            time.sleep(0.1)
+        assert WAL_SEGMENT not in primary.wal_files(), (
+            f"retention kept the first WAL file, so the replica would catch up from the log: "
+            f"{primary.wal_files()}")
+
+        replica = FaultNode(OB_FAULT_PATH=DATA_DIR_PREFIX, OB_FAULT_OP="syncfs", OB_FAULT_ERRNO="EIO",
+                            OB_FAULT_COUNT="1", OB_FAULT_POLICY="every", OB_FAULT_FLUSH_MS="200",
+                            OB_FAULT_EXTRA_ARGS=f"--primary-host 127.0.0.1 --primary-port {repl_port}")
+        replica.wait_until_answering()
+        state = os.path.join(replica.data_dir, "repl_state.txt")
+
+        def position_recorded() -> bool:
+            text = open(state).read() if os.path.exists(state) else ""
+            return bool(re.search(r"file_index=[1-9]", text) or re.search(r"byte_offset=[1-9]", text))
+
+        # The failed install is followed by the replica's reconnect backoff (five seconds), and the
+        # second bootstrap after it. Waited for as that, rather than for the rows: the first install
+        # replaced the store, so every row is readable before the position is ever recorded - the
+        # first version of this test waited for the rows and counted one install.
+        deadline = time.time() + patience(60)
+        while time.time() < deadline and not position_recorded():
+            time.sleep(0.2)
+        assert position_recorded(), f"the replica never recorded a position:\n{replica.log()[-2000:]}"
+        assert node_count(replica, "action=fail", fault=True) == 1, replica.fault_log_text()
+        assert replica.log().count("The installed snapshot could not be synced") == 1, (
+            replica.log()[-2000:])
+        assert replica.log().count("Installing a snapshot of") == 2, (
+            f"the replica recorded the snapshot's position over an install whose sync failed, so it "
+            f"never installed it again:\n{replica.log()[-2000:]}")
+        assert sorted(select_prices(replica)) == prices, (
+            f"the replica did not end with every row:\n{replica.log()[-2000:]}")
+        assert replica.counter("ob_checkpoints_frozen") == 1
+    finally:
+        if replica is not None:
+            replica.cleanup()
+        primary.cleanup()
+
+
+def node_count(node: FaultNode, needle: str, fault: bool = False) -> int:
+    """How often `needle` appears in the node's log, or in its injector's log with `fault`."""
+    return (node.fault_log_text() if fault else node.log()).count(needle)
 
 HOUR_NS = 3600 * 1_000_000_000   # the columnar store's segment length
 
