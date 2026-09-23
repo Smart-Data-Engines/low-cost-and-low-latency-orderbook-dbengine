@@ -108,11 +108,18 @@ What does matter:
 
 ### CPU placement
 
-The hot path is the client event loops (`--io-threads`, one by default, named `ob-io-0` …), one
-flush thread, and in multi-master one more io loop. What helps is keeping those off the cores that
-handle NIC interrupts, so that a burst of packets does not preempt the thread applying writes. With
-more than one client loop, `top -H -p $(pidof ob_tcp_server)` shows which loop is busy, and the log
-line `Reactor N adopted fd=... conn_id=... from ...` says which connection it is serving.
+The hot path is the client event loops (`--io-threads`, named `ob-io-0` …), one flush thread, and
+in multi-master one more io loop. By default there is **one client loop per CPU the node may use**
+and each spins for 10 µs after an event where there is a CPU to spare — the `boost` profile, sized
+at startup to the mask and the cgroup limit it finds (`docs/cli.md`, "Profiles"). On a host the
+engine shares with other work, `--profile eco` is one loop blocking between events, the engine as it
+was; and a mask or a limit you give it is one it sizes itself to, so pinning the service to two cores
+gives it two loops.
+
+What helps is keeping those threads off the cores that handle NIC interrupts, so that a burst of
+packets does not preempt the thread applying writes. With more than one client loop,
+`top -H -p $(pidof ob_tcp_server)` shows which loop is busy, and the log line
+`Reactor N adopted fd=... conn_id=... from ...` says which connection it is serving.
 
 ```bash
 # Where the NIC's interrupts land today:

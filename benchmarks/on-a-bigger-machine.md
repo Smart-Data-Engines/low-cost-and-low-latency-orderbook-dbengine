@@ -382,8 +382,9 @@ not: at equal volume the engine's wall-clock ingest is within 4% of its own in-p
 
 `grep -rn 'hardware_concurrency\|_SC_NPROCESSORS\|sched_getaffinity' src include` returned
 **nothing** when this was measured: every thread in this engine has a fixed role, and none of them
-is a pool sized to the machine. (Since #156 `src/machine.cpp` reads the CPUs the process can use;
-nothing is sized to that until stage 4 of #151.) ClickHouse sizes itself to the cores it can see, and `timescaledb-tune` sizes PostgreSQL
+is a pool sized to the machine. (Since #156 `src/machine.cpp` reads the CPUs the process can use,
+and since #158 the default sizes the client event loops to them; this page measured the engine
+before either.) ClickHouse sizes itself to the cores it can see, and `timescaledb-tune` sizes PostgreSQL
 to the machine. So the prediction, registered here before any such box exists: **on 8 or 16 cores
 the engine's ingest wall clock stays roughly where it is, ClickHouse's grows with the cores, and
 the per-CPU-second parity holds.** If per-CPU-second parity *breaks* in our favour on a bigger

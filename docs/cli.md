@@ -316,54 +316,98 @@ Two things follow for a client. Responses are self-delimiting — `OK` bodies en
 it. The subscription stream is unaffected either way: `PUSH` lines arrive as the server produces
 them, whether or not anything else is in flight.
 
-## Latency profiles: eco and boost
+## Profiles: boost and eco
 
-`--profile` names a set of the knobs below rather than a second code path. `eco` is the default and
-is byte for byte what the server always did; `boost` sets `--io-spin-us`, so the io thread keeps
-polling for a while after an event instead of blocking immediately.
+`--profile` names a set of the knobs below rather than a second code path. **`boost` is the
+default**, and it sizes the node to the machine it runs on: one client event loop per usable CPU
+(`--io-threads`) and, where the process has a CPU to spare, a 10 µs spin window after each event
+(`--io-spin-us`). `eco` is byte for byte what the server did before either knob existed — one loop,
+blocking between events. A value given on the command line or in the file wins over the profile,
+and `--print-config` says which values the profile set and why, under the machine it found:
 
-What that buys is the **kernel wake-up**, and it is a constant on every round trip rather than a
-tail. Measured on an m9g.xlarge over loopback, seven interleaved rounds of 20,000 `PING` round
-trips through a bare socket, the order alternated, `loadavg` 0.01-0.05 throughout — and measured
-**through the flag**, so the figures describe what ships rather than a hand-edited loop:
+```
+# machine: 4 usable CPUs: affinity 4, no cgroup v2 CPU limit
+# profile boost: 4 client event loops, one per usable CPU, and a 10 µs spin window
+  io-spin-us                       10  (profile)
+  io-threads                       4  (profile)
+  profile                          boost  (default)
+```
 
-| | p50 | p99 | minimum | server CPU for 20,000 | while the probe ran |
-|---|---|---|---|---|---|
-| `eco` | 8074 ns | 8369 ns | 7573 ns | 0.090 s | 56% of a core |
-| `boost` | **6578 ns** | **6837 ns** | **5993 ns** | 0.120 s | 91% of a core |
-| difference | **−18.5%** | **−18.3%** | −20.9% | **+33%** | |
+The same sentence is logged at startup (`io profile boost: …`). `--profile` refuses a name it does
+not know, so `--profile bost` does not start a node that looks like it started in `boost`.
 
-Medians of the rounds. Round to round, `eco`'s p50 spans 7978-8130 ns and `boost`'s 6499-6640, so
-the difference is an order of magnitude wider than the spread it is read against.
+**What the default buys**, measured with the binary that ships it (m9g.xlarge, four cores shared
+with the load generator, loopback, five interleaved rounds, a fresh node per run;
+`scripts/measure_profile_rule.py`, roadmap #158):
 
-**p50 and p99 fall by the same absolute amount** — 1496 ns and 1532 ns — which is what says a
-constant on every round trip; a tail would take far more off p99 than off p50. The minimum moves
-too, and by about the same amount, with more spread (`eco`'s ranges 6327-7689 across the rounds)
-because a blocking loop is occasionally already awake when the next request arrives.
+| | `eco` | `boost` (the default) |
+|---|---|---|
+| `BOOK` reads, 12 connections, levels read / s | 15 900 281 | **49 667 582** (3.12×) |
+| `MINSERT` writes, 12 connections, levels / s | 6 122 008 | **10 546 970** (1.72×) |
+| `PING` round trip alone, p50 / p99 | 7 772 / 8 094 ns | **6 329 / 6 775** |
+| `PING` beside three connections pipelining writes, p50 / p99 | 502 705 / 544 954 ns | **6 241 / 15 198** |
 
-**The bounded window costs nothing against spinning for ever, and that is measured rather than
-assumed.** `--io-spin-us 100000000` is a window long enough never to close, which is byte for byte
-"always spin": three rounds gave p50 **6578 ns** — the same median as `boost` — for **0.130 s** of
-CPU, 98% of a core. So the window buys back the idle cost and gives up no latency under continuous
-traffic, which is the whole reason the mode has one: with no window an idle node holds a core
-indefinitely, and the honest public cost is **"up to one core while traffic flows"** rather than
-"one core".
+The last row is the one to read twice: with one loop a latency-sensitive connection waits behind
+every batch the others send; with a loop per CPU it has one of its own.
 
-**One thing this measurement does not say.** It is loopback on one machine: across a real network a
-round trip is orders of magnitude larger and 1.5 µs stops being 18% and becomes noise. The mode is
-worth exactly what it is worth to a **colocated** client.
+### How boost decides
 
-`--io-spin-us` is the knob underneath and can be set on its own — a value the operator gave wins
-over the profile, and `--print-config` says which of the two a value came from. `--profile`
-refuses a name it does not know, so `--profile bost` does not start a node in `eco` that looks
-like it started in `boost`.
+The rule is a measurement, written down with its numbers in roadmap #158:
+
+- **One client event loop per usable CPU**, at most 64 — the smaller of the affinity mask and the
+  cgroup CPU limit rounded down (the `# machine:` line, #156). Fewer loops leave reads behind; more
+  loops than CPUs add nothing and multiply the tail (three loops on two cores: a read batch's p99
+  ten times worse). Under a cgroup limit, loops beyond its floor are throttled: two loops under a
+  one-CPU limit wrote what one loop wrote, with a p99 of 25 ms against 0.93 ms.
+- **A 10 µs spin window where the process may run on at least two CPUs and a cgroup limit, if there
+  is one, leaves at least one CPU of time beyond the loops.** Otherwise no spin, and the profile line
+  says which reason applied:
+
+```
+# profile boost: 1 client event loop, one per usable CPU, and no spin: the only CPU this process may run on is shared with its flush, the kernel and any client on this machine
+# profile boost: 2 client event loops, one per usable CPU, and no spin: a cgroup limit of 2.50 CPUs leaves no CPU of time beyond the loops, and spinning spends it
+```
+
+### The spin window
+
+What the window buys is the **kernel wake-up**, a constant on every round trip rather than a tail:
+p50 and p99 fall by about the same amount (1.4 µs and 1.3 µs off 7.8 and 8.1 above). What it can
+cost is the window itself. When the machine has more busy threads than cores, a loop that is spinning keeps the core
+a client needs until the window closes, so the client's tail grows by the window — which is why
+the default is 10 µs and not the 50 that #144 chose:
+
+| window | `PING` alone, p50 | `PING` beside three writers on the same cores, p99 |
+|---|---|---|
+| none | 7 569 ns | 15 917 ns |
+| 5 µs | 7 622 ns — too short to catch the next request | 16 655 ns |
+| **10 µs** | **6 279 ns** | **16 448 ns** |
+| 20 µs | 6 252 ns | 24 190 ns |
+| 50 µs | 6 306 ns | 53 900 ns |
+
+On one CPU the same thing happens every time the client and the loop meet on it: a client sharing
+the only CPU had a p99 of 5.9 µs without the spin and 13.7 µs with 10 µs — which is why `boost` does
+not spin there.
+
+**Where the 10 does not travel.** The window has to cover the gap between an answer and the
+client's next request, and that belongs to the machine and the client. On the m9g.xlarge it is
+between 5 and 10 µs; on a 2017 laptop CPU (i3-7100U, 30 µs round trips) 10 and 20 µs catch nothing
+and `--io-spin-us 50` takes 18% off. And across a real network a round trip is orders of magnitude
+larger than the wake-up, so the window is worth exactly what it is worth to a **colocated** client.
+
+**The window is bounded, and that is what keeps an idle node idle.** A loop spins for one window
+after an event and then blocks, so an idle node costs nothing and the public cost is **"up to one
+core per loop while traffic flows"**, not a core per loop. When #144 introduced the mode it measured
+`--io-spin-us 100000000`, a window that never closes, against its bounded one: the same p50 for a
+busy client, at 98% of a core — so the window gives up no latency under continuous traffic, and
+without it an idle node would hold its cores indefinitely.
 
 ## Client event loops: `--io-threads`
 
 `--io-threads N` gives the server N client event loops. The one that holds the listening socket
 accepts every connection and deals it to the next loop in turn; a connection stays on the loop it
-was dealt to for its whole life, so the order of its answers is unchanged. `1` is the default and
-is the single loop this server always had. The log names where each connection went —
+was dealt to for its whole life, so the order of its answers is unchanged. The default is the
+profile's: one per usable CPU under `boost`, and `1` — the single loop this server always had —
+under `eco`. The log names where each connection went —
 `Reactor 2 adopted fd=14 conn_id=7 from 10.0.0.5:51234` — and the threads are named `ob-io-0` …
 `ob-io-N-1`, so `top -H` says which loop is busy.
 
@@ -498,9 +542,9 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--drain-timeout-ms` | `<N>` | On shutdown, how long to wait for open client sessions before closing them (default: 10000; 0 waits indefinitely) |
 | `--flush-interval-ms` | `<N>` | Background flush interval in ms (default: 100) |
 | `--fsync-policy` | `<POLICY>` | WAL durability: every, interval or none (lower case; default: interval) |
-| `--io-spin-us` | `<N>` | Keep polling for this many microseconds after the last event before blocking again (default: 0, always block). Costs up to one core while traffic flows and takes ~20% off the loopback round trip |
-| `--io-threads` | `<N>` | Client event loops, 1 to 64 (default: 1). The loop that accepts deals connections to them in turn, and a connection stays on the loop it was dealt to for its whole life |
-| `--profile` | `<NAME>` | `eco` (default, blocking io) or `boost` (sets `io-spin-us`). A named set of the knobs, not a second code path; an unknown name is refused |
+| `--io-spin-us` | `<N>` | Keep polling for this many microseconds after the last event before blocking again (default: the profile's — 10 under `boost` where the process has a CPU to spare, 0 under `eco`). Costs up to one core per loop while traffic flows and takes ~18% off the loopback round trip |
+| `--io-threads` | `<N>` | Client event loops, 1 to 64 (default: the profile's — one per usable CPU under `boost`, 1 under `eco`). The loop that accepts deals connections to them in turn, and a connection stays on the loop it was dealt to for its whole life |
+| `--profile` | `<NAME>` | `boost` (default: one client event loop per usable CPU, and a 10 µs spin where it cannot starve anything) or `eco` (one loop, blocking between events). A named set of the knobs, not a second code path; an unknown name is refused |
 | `--handover-cooldown-seconds` | `<N>` | How long a node that handed the role over abstains |
 | `--handover-grace-seconds` | `<N>` | Grace period granted to a handover target |
 | `--log-level` | `<LEVEL>` | ERROR, WARN, INFO or DEBUG (upper case; default: INFO) |

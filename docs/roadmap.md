@@ -2212,6 +2212,134 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 158. A node started without flags used one core of the machine it ran on ✅
+
+**Stage 4 of #151: `boost` is the default, and it is sized to the machine.** Stages 1 to 2b made
+more than one client event loop possible and made both halves of the traffic scale with them —
+reads 3.08× at four loops (#151), pipelined writes 1.73× (#155) — and a node started without flags
+still ran one loop, so every one of those numbers was behind a flag. The command line's default
+profile is now `boost`: it takes the CPUs stage 3 found (#156) and gives **one client event loop per
+usable CPU**, and a **10 µs spin window** where the process has a CPU to spare. `eco` is the engine as
+it was — one loop, blocking between events — and a value the operator gives wins over either.
+`ServerConfig`'s own default stays `eco`, like the two fields a profile sets: a struct cannot know
+the machine, so a server built in code is today's engine and the command line starts from
+`kDefaultProfile` instead.
+
+**Measured with the binary that ships it** (m9g.xlarge, four Graviton cores shared with the load
+generator, loopback, GCC 14 Release, data on EBS, five interleaved rounds, a fresh node per run;
+`scripts/measure_profile_rule.py`, whose first half is a measurement and whose second is a record
+of what it refuses):
+
+| | `eco` | the default (`boost`) |
+|---|---|---|
+| `BOOK` reads, 12 connections, levels read / s | 15 900 281 (15.72–16.12 M) | **49 667 582** (48.89–50.32 M) |
+| `MINSERT` writes, 12 connections, levels / s | 6 122 008 (6.06–6.13 M) | **10 546 970** (10.51–10.87 M) |
+| read batch p99 | 1 942 µs | 225 µs |
+| `PING` alone, p50 / p99 | 7 772 / 8 094 ns | **6 329 / 6 775** |
+| `PING` beside three connections pipelining writes, p50 / p99 | 502 705 / 544 954 ns | **6 241 / 15 198** |
+
+The last row is the one this stage buys that no earlier one did by itself: with one loop, a
+latency-sensitive connection waits behind every batch the others send; with a loop per CPU it has
+one of its own.
+
+**The rule is a measurement, and the measurement changed two things the design had.** Eight series
+on the m9g.xlarge and one on the development laptop, each a set of placements (the server's cores
+and the probe's under `taskset`, a CPU limit through `systemd-run --user --scope -p CPUQuota=`)
+against configurations against workloads, written down in full in
+`kiro-workspace/specs/uses-the-whole-machine/design.md`:
+
+- **Loops = usable CPUs, no fewer and no more.** Twelve connections — which one to four loops divide
+  evenly — on the server's own cores: two cores read 28.7 million levels a second with two loops and
+  29.5 with three, but three loops on two cores took the read batch's p99 from 1.05 ms to 10.7;
+  three cores read 44.2 million with three loops against 29.9 with two; four cores shared with the
+  probe read 49.1 with four loops against 40.2–42.2 with three. Writes saturate at two loops (the
+  engine's lock, #155) and lose nothing past them.
+- **A cgroup limit's floor, not its ceiling.** Two loops under a one-CPU limit wrote what one wrote,
+  with a p99 of 25 ms against 0.93 and 1.4–1.6 s of every ~2 s run throttled; under 1.5 CPUs, two
+  loops wrote more but spent 211–265 ms throttled with a p99 of 2.3 ms against 0.85. Rounding down
+  in stage 3 is what keeps the loops inside the limit, and now it is measured.
+- **The spin window: 10 µs, not #144's 50.** 50 µs was a judgement about the gaps between a client's
+  requests. The gain saturates at 10 — `PING` p50 7 569 ns with no spin, 7 622 at 5 µs (too short to
+  catch the next request), 6 279 at 10, 6 252 at 20, 6 306 at 50 — and when the machine has more
+  busy threads than cores **the tail is the window**: a `PING` beside three writers on the same four
+  cores had a p99 of 15 917 ns with no spin, 16 448 at 10 µs, 24 190 at 20 and 53 900 at 50, because
+  a spinning loop keeps the core the client needs until the window closes. With the server's cores
+  its own, every window from 10 µs up gave the same (7 664 → 6 203 ns p50).
+- **No spin on one CPU, nor under a limit that binds** — the two places requirement 4.5 named, now
+  with numbers. A client sharing the only CPU had a p99 of 5 859 ns with no spin, 13 706 with 10 µs
+  and 23 704 with 20, in every one of five rounds; on a CPU of the server's own, and under a one-CPU
+  limit on four cores, the same window took 1.4 µs off. Under a limit, spinning spends the limit, and
+  a cgroup over it stops every thread until the next period — the throttling above was measured from
+  loops past the limit rather than from the spin, but the spin's cost in CPU grows with an event rate
+  the engine cannot see, and 1.4 µs of gain against a stop of up to 100 ms decides the direction.
+
+**Where the 10 does not travel, measured rather than assumed.** On the development laptop
+(i3-7100U, 2017, `PING` ~30 µs) 10 and 20 µs catch nothing — 29 875 → 29 836 and 28 759 ns — and
+50 µs takes 18% off (24 360). The window has to cover the gap between an answer and the client's
+next request, which belongs to the machine and the client; 10 µs is the choice for the class of
+machine the published numbers come from, and `--io-spin-us` is the operator's for a client with a
+longer gap. Adapting the window to the gaps a loop observes is the obvious next step and has a
+failure mode worth naming before anyone builds it: a loop spinning on the core its client needs
+*delays* the client's next request, so the gaps it observes grow with its own window, and a rule that
+widens the window to fit them widens it without bound.
+
+**`--print-config` and the log say what was chosen and why**, under the machine it was chosen for:
+
+```
+# machine: 1 usable CPU: affinity 1, no cgroup v2 CPU limit
+# profile boost: 1 client event loop, one per usable CPU, and no spin: the only CPU this process may run on is shared with its flush, the kernel and any client on this machine
+```
+
+and an operator's value is said beside the profile's reason, so a line reading "4 client event
+loops" above a node running 2 is not left to be noticed.
+
+**Four things in the measuring harness, each of which would have measured something else under
+the right name.** The check that the PID behind `taskset` and `systemd-run` was the server read
+`/proc/PID/comm`, got `ob-io-0` and refused the server as a wrapper — the main thread runs the first
+loop and carries its name, so the check reads `/proc/PID/exe`. The writer beside a `PING` probe is
+given a hundred times what it can finish and stopped when the probe ends, so writes cover the whole
+probe by construction rather than because a batch count happened to suffice; under a quota or on a
+shared core the probe takes many times longer than alone. A placement under a quota is refused
+unless the scope's `cpu.max` says what was asked for. And the first comparison of loop counts used
+four connections, which three loops are dealt 2+1+1 — the loop with two was the bottleneck, and
+three loops read as worse than two on writes (9.1 against 10.3 million) until twelve connections
+took the imbalance out (10.7).
+
+**The integration battery runs on the default.** Nothing in it is pinned to `eco`, so every node in
+it runs a loop per CPU of its runner and spins where the rule says. Locally, on the development
+laptop's four hardware threads — four loops per node, the spin on, three-node clusters and the test
+client all on the same four — **340 passed and the 2 opt-in Binance tests skipped, in 22:55**,
+against 338 and 23:04 for #155's tree on the one-loop default. Three tests are
+new in `test_io_profile.py`: a node with no flags runs as many `ob-io-*` threads as its log says it
+chose, counted by the kernel rather than read back from the sentence that claimed them, and as many
+as the mask this test process has; a node under `taskset` on one CPU runs one loop and says why it
+does not spin; and the idle test now measures the default node, since requirement 4.4 is that a
+hundred per cent of the cores means under load, not heating an idle machine.
+
+**Mutation table: fifteen rows, thirteen killed and both controls surviving**, against the committed
+code, sources restored from saved bytes after each row, and both suites asserted green before the
+first row as well as after the last. Killed: the loops sized to the affinity mask rather than to the
+usable CPUs; no ceiling on the loops; a spin on the only CPU; a binding limit that does not stop the
+spin; a limit of exactly loops + 1 refused; the profile overwriting the operator's loops; the
+profile's loops reported as a default; the command line starting from the struct's `eco`; `eco`
+quietly sizing the loops; `--print-config` without the profile's choice; an operator's loops not
+said beside the profile's reason — and two only a live node can see: the server running one loop
+whatever the configuration says (killed by the thread count, *"the log says 4 loops, the kernel lists
+['ob-io-0']"*), and the spin not switched off for one CPU on a node under `taskset`. The controls — the
+window retuned inside its bounds, and the startup line's cost clause reworded — survive, because
+nothing pins either.
+
+**What this does not do.** It sizes the client event loops and the spin, and nothing else: the
+flush thread, replication and the mesh loop keep one thread each (stage 5 is the flush's lock, stage
+6 a scan across cores). The rule is measured up to four CPUs; beyond them it is the reads' linear
+scaling extrapolated, and the machine it runs on will say otherwise if it is wrong. And it does not
+see where the client runs — the tail a spinning loop costs a client on its core is bounded by the
+10 µs window, not removed.
+
+- Effort: M | Impact: a node uses the machine it is given without a flag — on four cores 3.1× the
+  reads and 1.7× the writes of the engine as it was, and a latency-sensitive connection no longer
+  waits behind other connections' batches
+
 ### 157. The sustained-insert test read its whole run in one answer, which #152's ceiling refused on a faster runner ✅
 
 **A required check failed on a pull request whose change could not have caused it** (#156, PR #171),
@@ -3244,8 +3372,10 @@ about the tests. `ts * 0` is the same mutation that compiles.
 
 **Closed.** `--profile eco|boost`, with `--io-spin-us` as the knob underneath. A profile is a named
 set of the knobs and not a second code path: nothing in the loop branches on its name, and at
-`--io-spin-us 0` — the default, and what `eco` resolves to — `io_wait_ms()` returns the blocking
-timeout the loop always used.
+`--io-spin-us 0` — the default when this closed, and what `eco` resolves to — `io_wait_ms()` returns
+the blocking timeout the loop always used. (**Since #158** `boost` is the default, sized to the
+machine, and its window is 10 µs rather than the 50 measured below: the gain was complete at 10,
+and past it the window was tail.)
 
 **The gate for building it at all was a measurement, and it corrected what the mode is for.** The
 first version of the design said `boost` buys cores for throughput. That was wrong about the
