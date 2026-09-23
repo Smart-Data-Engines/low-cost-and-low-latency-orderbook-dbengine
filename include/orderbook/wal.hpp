@@ -286,8 +286,9 @@ public:
     ///   next run, which is what the next command after a refused one did; a sync that fails
     ///   refuses every record of its run, which are in the file and are not tried again, because
     ///   a second copy of a record is the one outcome worse than a refusal;
-    /// - **after a refusal the rotation is not checked**, because a record written alone threw
-    ///   before its append reached the check - so a failure moves no record into another file.
+    /// - **after a write that stopped at a record the rotation is not tried**: a disk that has just
+    ///   refused a write is not asked for a ROTATE marker too, and the rotation is tried after the
+    ///   next record that is written (#153).
     ///
     /// Returns how many were written rather than throwing, because a caller that applied nothing
     /// it was not told about has to know which, and an exception would lose that.

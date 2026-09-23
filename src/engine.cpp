@@ -707,6 +707,12 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
             // before the backpressure wait - a record that is about to be discarded should not
             // queue behind the flush thread.
             //
+            // Checked once, here, as a single write checked it, and exact for the batches this
+            // policy is given: the replication client applies one record at a time, and it is the
+            // only writer on a replica. A batch of replicated records would need the check where
+            // the number is observed as well, because two copies of one record in one batch both
+            // pass this one - the day such a batch exists, that is where it goes.
+            //
             // Catch-up over-delivers on purpose, and since #101 it over-delivers by design: a
             // replica resuming from its saved position is handed up to ten seconds of records it
             // already holds, because `repl_state.txt` is written on a timer while the confirmed
@@ -755,22 +761,6 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
         for (size_t i = 0; i < n; ++i) {
             if (s.state[i] != WriteState::Admitted) continue;
             DeltaUpdate& delta = s.deltas[i];
-
-            // Asked again: the wait above may have released the lock, and a batch can carry the
-            // same record twice. A single write checked once, which was exact while it could
-            // neither wait between the check and the append on a replica with another writer nor
-            // carry a second copy of itself.
-            if (policy == DuplicatePolicy::DropIfSeen && delta.sequence_number != 0 &&
-                seq_tracker_.has_seen(s.keys[i], mm_config_.node_id, delta.sequence_number)) {
-                OB_LOG_DEBUG("engine",
-                             "Dropping duplicate replicated record: sym=%s origin=%u seq=%llu "
-                             "(seen after it was admitted)",
-                             s.keys[i].c_str(), static_cast<unsigned>(mm_config_.node_id),
-                             static_cast<unsigned long long>(delta.sequence_number));
-                registry_.increment_counter("ob_replication_duplicates_dropped");
-                s.state[i] = WriteState::Final;
-                continue;
-            }
 
             const HLCTimestamp* hlc = nullptr;
             if (multi_master) {

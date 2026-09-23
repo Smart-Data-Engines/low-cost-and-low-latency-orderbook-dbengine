@@ -419,12 +419,16 @@ size_t WALWriter::append_batch(std::span<const WalDelta> records,
             // The record the write stopped at is refused, and the records behind it are tried
             // again in the next run - as the next command after a refused write was. Not the ones
             // before it: they are in the file, and writing them again would store them twice.
+            //
+            // And no rotation: a disk that has just refused a write is not asked to write a
+            // ROTATE marker as well. The rotation is tried after the next record that is written,
+            // which is #153's rule, and a disk that stays full would otherwise log a failed marker
+            // for every refused write.
             outcomes[i + landed].error = run.write_error;
             i += landed + 1;
             continue;
         }
         i = j;
-        if (!run.sync_error.empty()) continue;   // a record written alone threw before the check
 
         if (current_position().offset >= rotate_threshold_) {
             rotate();

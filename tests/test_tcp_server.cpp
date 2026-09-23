@@ -1864,7 +1864,19 @@ TEST(AnswerCeiling, TheLoopAnswersAnErrorInsteadOfClosing) {
     const auto at = src.find("if (queued == Session::Queued::TooLargeAlone) {");
     ASSERT_NE(at, std::string::npos) << "the read loop does not tell an answer too large to send "
                                         "from a client that stopped reading";
-    const std::string branch = src.substr(at, src.find("} else if", at) - at);
+    // The branch, by brace matching. Since #155 it is the first half of `enqueue`, which the loop
+    // and the held writes both answer through, and it returns rather than running into an
+    // `else if` - so a slice to the next `} else if` would now run to the end of the file.
+    const auto open = src.find('{', at);
+    ASSERT_NE(open, std::string::npos);
+    std::size_t close = open;
+    int depth = 0;
+    for (std::size_t i = open; i < src.size(); ++i) {
+        if (src[i] == '{') ++depth;
+        if (src[i] == '}' && --depth == 0) { close = i; break; }
+    }
+    ASSERT_GT(close, open) << "unbalanced braces in the too-large branch";
+    const std::string branch = src.substr(at, close - at + 1);
     EXPECT_NE(branch.find("format_error("), std::string::npos)
         << "an answer too large to send is not replaced by an error";
     EXPECT_EQ(branch.find("close_session("), std::string::npos)
@@ -1872,14 +1884,12 @@ TEST(AnswerCeiling, TheLoopAnswersAnErrorInsteadOfClosing) {
     // The error is what gets queued, and the session ends only if even the error cannot be. The
     // first version of this rule stopped at the two lines above, and a branch that built the error,
     // dropped it and set `queue_refused` satisfied both - the session closed exactly as before
-    // (#151's mutation row 4).
-    const auto queued = branch.find("if (!session->queue_response(refusal)) {");
-    ASSERT_NE(queued, std::string::npos) << "the error replacing the answer is not queued";
-    const auto refused = branch.find("queue_refused = true;");
-    EXPECT_TRUE(refused == std::string::npos || refused > queued)
+    // (#151's mutation row 4). Now the branch answers with whether the error fit, and its caller
+    // closes the session on no - so it may return that and nothing else.
+    EXPECT_NE(branch.find("return session->queue_response(refusal);"), std::string::npos)
+        << "the error replacing the answer is not queued";
+    EXPECT_EQ(branch.find("return false;"), std::string::npos)
         << "the branch gives up on the session before trying to queue the error";
-    EXPECT_EQ(branch.find("queue_refused = true;", refused == std::string::npos ? 0 : refused + 1),
-              std::string::npos)
-        << "the branch gives up on the session on more than the one path where the error itself "
-           "does not fit";
+    EXPECT_EQ(branch.find("queue_refused"), std::string::npos)
+        << "the branch decides the session's end itself rather than by whether the error fit";
 }
