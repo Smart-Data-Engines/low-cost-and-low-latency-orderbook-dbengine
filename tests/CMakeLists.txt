@@ -233,6 +233,11 @@ ob_add_columnar_test(test_segment_index
 )
 target_compile_definitions(test_segment_index PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
 
+# ── #165 part 2a: drained rows in published blocks until a seal writes them ───
+ob_add_columnar_test(test_row_blocks
+    test_row_blocks.cpp
+)
+
 # ── Helper to register a test executable that needs the aggregation library ───
 function(ob_add_agg_test name)
     add_executable(${name} ${ARGN})

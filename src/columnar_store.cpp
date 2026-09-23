@@ -32,6 +32,72 @@ ColumnarStore::ColumnarStore(std::string_view base_dir, uint64_t segment_duratio
     , own_index_(own_index)
 {}
 
+// ── Blocks: drained rows before a seal (#165 part 2a) ────────────────────────
+
+std::shared_ptr<const RowBlock> RowBlock::make(std::string symbol, std::string exchange,
+                                               std::vector<SnapshotRow> rows) {
+    if (rows.empty()) return nullptr;
+    auto block = std::make_shared<RowBlock>();
+    block->symbol   = std::move(symbol);
+    block->exchange = std::move(exchange);
+    block->min_ts_ns = rows.front().timestamp_ns;
+    block->max_ts_ns = rows.front().timestamp_ns;
+    for (const auto& r : rows) {
+        block->min_ts_ns = std::min(block->min_ts_ns, r.timestamp_ns);
+        block->max_ts_ns = std::max(block->max_ts_ns, r.timestamp_ns);
+    }
+    block->rows = std::move(rows);
+    return block;
+}
+
+void ColumnarStore::publish_blocks(const std::vector<std::shared_ptr<const RowBlock>>& blocks) {
+    if (blocks.empty()) return;
+    size_t rows = 0;
+    {
+        std::unique_lock<std::shared_mutex> lock(index_mtx_);
+        for (const auto& b : blocks) {
+            if (!b) continue;
+            by_symbol_[index_key(b->symbol, b->exchange)].blocks.push_back(b);
+            rows += b->rows.size();
+        }
+        unsealed_rows_ += rows;
+    }
+    OB_LOG_DEBUG("columnar", "published %zu block(s) of %zu row(s) for queries to read unsealed",
+                 blocks.size(), rows);
+}
+
+size_t ColumnarStore::seal_blocks(const std::string& symbol, const std::string& exchange,
+                                  size_t count, const std::vector<SegmentMeta>& segments) {
+    size_t refused = 0;
+    size_t rows = 0;
+    size_t taken = 0;
+    {
+        std::unique_lock<std::shared_mutex> lock(index_mtx_);
+        auto& entry = by_symbol_[index_key(symbol, exchange)];
+        for (; taken < count && !entry.blocks.empty(); ++taken) {
+            rows += entry.blocks.front()->rows.size();
+            entry.blocks.pop_front();
+        }
+        unsealed_rows_ -= std::min(rows, unsealed_rows_);
+        for (const auto& meta : segments) {
+            if (!insert_locked(meta)) ++refused;
+        }
+        if (entry.tiers.empty() && entry.blocks.empty()) by_symbol_.erase(index_key(symbol, exchange));
+    }
+    if (taken != count) {
+        OB_LOG_ERROR("columnar", "sealing %s.%s: asked to replace %zu block(s) and found %zu - the "
+                                 "blocks a seal wrote from are not the ones published first",
+                     symbol.c_str(), exchange.c_str(), count, taken);
+    }
+    if (refused > 0) {
+        OB_LOG_ERROR("columnar", "sealing %s.%s: %zu segment(s) already in the index were refused",
+                     symbol.c_str(), exchange.c_str(), refused);
+    }
+    OB_LOG_DEBUG("columnar", "sealed %s.%s: %zu block(s), %zu row(s), into %zu segment(s)",
+                 symbol.c_str(), exchange.c_str(), taken, rows, segments.size());
+    return refused;
+}
+
 // ── The index, per symbol (#165) ──────────────────────────────────────────────
 
 std::string ColumnarStore::index_key(std::string_view symbol, std::string_view exchange) {
@@ -53,7 +119,8 @@ bool ColumnarStore::holds(std::string_view symbol, std::string_view exchange) co
     const auto it = by_symbol_.find(index_key(symbol, exchange));
     if (it == by_symbol_.end()) return false;
     const auto& tiers = it->second.tiers;
-    return std::any_of(tiers.begin(), tiers.end(),
+    return !it->second.blocks.empty() ||
+           std::any_of(tiers.begin(), tiers.end(),
                        [](const WidthTier& t) { return !t.segments.empty(); });
 }
 
@@ -590,10 +657,14 @@ ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
     // filter the copy.
     ScanCost cost;
     std::vector<SegmentMeta> index_snapshot;
+    std::vector<std::shared_ptr<const RowBlock>> block_snapshot;
     {
         std::shared_lock<std::shared_mutex> lock(index_mtx_);
         const auto it = by_symbol_.find(index_key(symbol, exchange));
         if (it == by_symbol_.end()) return cost;
+        for (const auto& b : it->second.blocks) {
+            if (b->min_ts_ns <= end_ns && b->max_ts_ns >= start_ns) block_snapshot.push_back(b);
+        }
         for (const WidthTier& tier : it->second.tiers) {
             const auto& v = tier.segments;
             const size_t before = index_snapshot.size();
@@ -615,11 +686,14 @@ ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
         }
     }
     cost.candidates = index_snapshot.size();
-    OB_LOG_DEBUG("columnar", "scan of %.*s.%.*s [%llu, %llu]: %zu segment(s) compared, %zu read",
+    cost.blocks = block_snapshot.size();
+    OB_LOG_DEBUG("columnar", "scan of %.*s.%.*s [%llu, %llu]: %zu segment(s) compared, %zu read, "
+                             "%zu unsealed block(s)",
                  static_cast<int>(symbol.size()), symbol.data(),
                  static_cast<int>(exchange.size()), exchange.data(),
                  static_cast<unsigned long long>(start_ns),
-                 static_cast<unsigned long long>(end_ns), cost.compared, cost.candidates);
+                 static_cast<unsigned long long>(end_ns), cost.compared, cost.candidates,
+                 cost.blocks);
 
     const bool want_price = columns.has(QueryColumn::Price);
     const bool want_qty   = columns.has(QueryColumn::Quantity);
@@ -731,6 +805,25 @@ ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
             cb(row);
         }
     }
+
+    // Then the rows no seal has written yet, after every segment and in the order they were
+    // drained: they are this symbol's newest writes, so a reader that keeps the last row of a tie
+    // keeps the one written later (#168). Field by field as a segment's rows are, so a column the
+    // caller did not ask for is zero here too rather than a value it would read by accident.
+    for (const auto& block : block_snapshot) {
+        for (const SnapshotRow& r : block->rows) {
+            if (r.timestamp_ns < start_ns || r.timestamp_ns > end_ns) continue;
+            SnapshotRow row{};
+            row.timestamp_ns = r.timestamp_ns;
+            if (want_seq)   row.sequence_number = r.sequence_number;
+            if (want_side)  row.side            = r.side;
+            if (want_level) row.level_index     = r.level_index;
+            if (want_price) row.price           = r.price;
+            if (want_qty)   row.quantity        = r.quantity;
+            if (want_cnt)   row.order_count     = r.order_count;
+            cb(row);
+        }
+    }
     return cost;
 }
 
@@ -745,6 +838,7 @@ void ColumnarStore::rebuild_index_locked() {
     by_symbol_.clear();
     indexed_dirs_.clear();
     indexed_count_ = 0;
+    unsealed_rows_ = 0;
     last_rebuild_ranges_read_ = 0;
 
     if (!fs::exists(base_dir_)) return;
@@ -923,6 +1017,7 @@ bool ColumnarStore::replace_from_staging(const std::string& staging_dir,
     by_symbol_.clear();
     indexed_dirs_.clear();
     indexed_count_ = 0;
+    unsealed_rows_ = 0;
     rolled_segments_.clear();
     has_active_segment_ = false;
     active_row_count_   = 0;
@@ -1057,7 +1152,7 @@ std::pair<size_t, size_t> ColumnarStore::delete_expired_segments(uint64_t cutoff
                 v.erase(kept_end, limit);
                 tier = v.empty() ? tiers.erase(tier) : std::next(tier);
             }
-            it = tiers.empty() ? by_symbol_.erase(it) : std::next(it);
+            it = (tiers.empty() && it->second.blocks.empty()) ? by_symbol_.erase(it) : std::next(it);
         }
     }
     // Oldest first, as this has always deleted.
@@ -1139,7 +1234,7 @@ size_t ColumnarStore::remove_segments(const std::vector<std::string>& dirs) {
             v = std::move(remaining);
             tier = v.empty() ? tiers.erase(tier) : std::next(tier);
         }
-        it = tiers.empty() ? by_symbol_.erase(it) : std::next(it);
+        it = (tiers.empty() && it->second.blocks.empty()) ? by_symbol_.erase(it) : std::next(it);
     }
     return removed;
 }

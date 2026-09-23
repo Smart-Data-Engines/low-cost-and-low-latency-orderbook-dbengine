@@ -4,6 +4,7 @@
 #include "orderbook/query_columns.hpp"
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -69,6 +70,30 @@ struct SegmentMeta {
     std::string symbol;     ///< symbol this segment belongs to
     std::string exchange;   ///< exchange this segment belongs to
     std::string dir_path;   ///< full path to the segment directory
+};
+
+/// The rows one drain gave one symbol, held in memory until the flush tick seals them into a
+/// segment (#165 part 2a).
+///
+/// A tick used to write a segment for every symbol that had received a row since the last one: at
+/// 256 symbols about two thousand files and a syncfs() each tick, with 84.7% of the flush thread's
+/// CPU in the kernel creating them, and a node gained one segment per active symbol per tick. Rows
+/// now wait in blocks until their symbol has enough of them or they are old enough, and a query
+/// reads them here meanwhile.
+///
+/// Immutable once published, so a query reads one with no lock held; shared, so an index that
+/// drops it - a seal, a snapshot install - does not free what a query is still reading (#92).
+struct RowBlock {
+    std::string symbol;
+    std::string exchange;
+    std::vector<SnapshotRow> rows;   ///< in the order they were drained
+    uint64_t min_ts_ns{0};
+    uint64_t max_ts_ns{0};
+
+    /// A block of these rows, its range computed from them; null for none, because a symbol that
+    /// received no row this drain has no block.
+    static std::shared_ptr<const RowBlock> make(std::string symbol, std::string exchange,
+                                                std::vector<SnapshotRow> rows);
 };
 
 /// Columnar storage engine for SnapshotRow data.
@@ -173,6 +198,8 @@ public:
     struct ScanCost {
         size_t compared{0};
         size_t candidates{0};
+        /// Published blocks whose range met the query, read from memory (#165 part 2a).
+        size_t blocks{0};
     };
     ScanCost scan(uint64_t start_ns, uint64_t end_ns,
                   std::string_view symbol, std::string_view exchange,
@@ -240,14 +267,33 @@ public:
     /// anything on a query's or a tick's path: that is the whole-index walk #165 took out of them.
     std::vector<SegmentMeta> index() const;
 
-    /// Whether any segment of this symbol is indexed. What a query asks before it answers "not
-    /// found" - which used to copy the whole index to find out (#165).
+    /// Whether any segment or published block of this symbol is indexed. What a query asks before
+    /// it answers "not found" - which used to copy the whole index to find out (#165).
     bool holds(std::string_view symbol, std::string_view exchange) const;
 
+    /// Publish drained rows, so a query reads them before they are sealed (#165 part 2a). A symbol's
+    /// blocks are read after its segments, in the order they were published - the order they were
+    /// written, which is what a tie between two rows of one level resolves by (#168).
+    void publish_blocks(const std::vector<std::shared_ptr<const RowBlock>>& blocks);
+
+    /// Replace the first `count` blocks published for a symbol with the segments written from them,
+    /// **in one step** under the index's lock: a query sees the blocks or the segments, never both
+    /// and never neither. Returns how many of `segments` were refused as already indexed, like
+    /// merge_segments().
+    size_t seal_blocks(const std::string& symbol, const std::string& exchange, size_t count,
+                       const std::vector<SegmentMeta>& segments);
+
+    /// Rows in published blocks that no seal has replaced yet.
+    size_t unsealed_rows() const {
+        std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        return unsealed_rows_;
+    }
+
     /// How many symbols, each with its exchange, the index holds. Every one of them holds a
-    /// segment: retention and remove_segments() erase a symbol whose last segment leaves, or a
-    /// store whose symbols come and go - a contract per expiry, an options chain - would keep an
-    /// entry for every symbol it ever saw. holds() cannot tell: it answers by segments.
+    /// segment or a published block: retention and remove_segments() erase a symbol whose last
+    /// segment leaves and which has no block, or a store whose symbols come and go - a contract per
+    /// expiry, an options chain - would keep an entry for every symbol it ever saw. holds() cannot
+    /// tell: it answers by what the entry holds.
     size_t symbols_indexed() const {
         std::shared_lock<std::shared_mutex> lock(index_mtx_);
         return by_symbol_.size();
@@ -331,6 +377,8 @@ private:
     /// took 7.7 ms at 100 000 segments and a scan that found nothing 3.3 ms.
     struct SymbolIndex {
         std::vector<WidthTier> tiers;
+        /// Published and not yet sealed, oldest first: a drain appends, a seal takes from the front.
+        std::deque<std::shared_ptr<const RowBlock>> blocks;
     };
     static std::string index_key(std::string_view symbol, std::string_view exchange);
 
@@ -340,6 +388,7 @@ private:
     std::unordered_map<std::string, SymbolIndex> by_symbol_;
     std::unordered_set<std::string> indexed_dirs_;   // what the duplicate check asks, in O(1)
     size_t indexed_count_{0};
+    size_t unsealed_rows_{0};                        // rows in every symbol's blocks
 
     /// Index one segment: false, and nothing changed, if its directory is already indexed.
     /// Caller holds `index_mtx_` exclusively.
