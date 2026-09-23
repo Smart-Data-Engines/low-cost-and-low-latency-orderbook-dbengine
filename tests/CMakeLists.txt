@@ -227,6 +227,12 @@ ob_add_columnar_test(test_segment_time_range
     test_segment_time_range.cpp
 )
 
+# ── #165: the segment index per symbol, and nothing walking it whole on a tick's or a query's path ─
+ob_add_columnar_test(test_segment_index
+    test_segment_index.cpp
+)
+target_compile_definitions(test_segment_index PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
+
 # ── Helper to register a test executable that needs the aggregation library ───
 function(ob_add_agg_test name)
     add_executable(${name} ${ARGN})
