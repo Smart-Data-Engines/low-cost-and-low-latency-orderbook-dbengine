@@ -1537,3 +1537,74 @@ def test_a_writer_does_not_wait_for_the_sync_of_a_file_a_rotation_left():
         assert back >= set(range(1, ROTATING_INSERT + 2)) | set(range(9001, 9011))
     finally:
         node.cleanup()
+
+
+def minsert_at(node: FaultNode, symbol: str, first_price: int, levels: int, event_time_ns: int) -> str:
+    """One MINSERT of `levels` levels at one event time, on its own session; its reply."""
+    with socket.create_connection(("127.0.0.1", node.port), timeout=patience(15)) as sock:
+        reader = sock.makefile("rb")
+        while reader.readline().strip():   # the banner ends in a blank line
+            pass
+        lines = [f"MINSERT {symbol} EX bid {levels} {event_time_ns}"]
+        lines += [f"{first_price + i} 1 1" for i in range(levels)]
+        sock.sendall(("\n".join(lines) + "\n").encode())
+        return reader.readline().decode(errors="replace").strip()
+
+
+def prices_stored(node: FaultNode, symbol: str) -> list[int]:
+    """Every stored row's price, read to the end of the answer - 9200 rows do not fit the one read
+    `talk()` makes, and an aggregate is computed over the live book, not over what is stored."""
+    with socket.create_connection(("127.0.0.1", node.port), timeout=patience(15)) as sock:
+        reader = sock.makefile("rb")
+        while reader.readline().strip():   # the banner ends in a blank line
+            pass
+        sock.sendall(f"SELECT price FROM '{symbol}'.'EX' WHERE timestamp BETWEEN 0 AND "
+                     f"9999999999999999999\n".encode())
+        prices = []
+        while True:
+            line = reader.readline().decode(errors="replace").strip()
+            if not line:
+                return prices
+            if line.startswith("ERR"):
+                return []
+            if line.isdigit():
+                prices.append(int(line))
+
+
+def test_a_drain_the_disk_stops_part_way_puts_back_every_chunk_after_it():
+    """#161's rule, across the chunks stage 5 of #151 drains the queue in.
+
+    The drain now takes the queue as chunks of 4096 rows and, when a segment write stops it
+    part-way, puts back **the chunk it stopped in and every chunk after it**, in front of whatever
+    was queued meanwhile. The one-chunk test above cannot tell "the rest of the batch" from "the
+    rest of this chunk". Here the rollover that is refused is the 5001st row - in the second chunk,
+    which holds rows 4097-8192 - and 4199 rows follow it, 1008 of them in a third chunk: dropping
+    what is after the chunk the drain stopped in loses those, and putting the stopped chunk back
+    from its start appends rows 4097-5000 twice.
+    """
+    node = FaultNode(OB_FAULT_PATH="price.col", OB_FAULT_OP="write", OB_FAULT_ERRNO="ENOSPC",
+                     OB_FAULT_COUNT="1", OB_FAULT_FLUSH_MS="3600000")
+    base = 1_700_000_000 * 1_000_000_000 // HOUR_NS * HOUR_NS
+    try:
+        node.wait_until_answering()
+        # Five updates of 1000 levels in hour 1, then 4200 levels in hour 2 in five updates: the
+        # first row of hour 2 is the 5001st row, and appending it rolls hour 1 over.
+        for k in range(5):
+            assert minsert_at(node, "MANY", 10_000 * (k + 1), 1000, base + k + 1) == "OK"
+        for k in range(5):
+            levels = 1000 if k < 4 else 200
+            assert minsert_at(node, "MANY", 100_000 * (k + 1), levels, base + HOUR_NS + k + 1) == "OK"
+        assert node.talk("FLUSH")[0].startswith("ERR"), "the refused rollover was not reported"
+        assert node.injections() == 1, node.fault_log_text()
+        assert node.talk("FLUSH")[0] == "OK"
+        # Every level has its own price, so a row lost shortens the list and a row appended twice
+        # repeats a price.
+        prices = prices_stored(node, "MANY")
+        assert (len(prices), len(set(prices))) == (9200, 9200), (
+            f"the drain the disk stopped lost or doubled rows across its chunks: {len(prices)} rows, "
+            f"{len(set(prices))} distinct\n{node.log()[-1500:]}")
+        node.kill_and_restart_without_faults()
+        prices = prices_stored(node, "MANY")
+        assert (len(prices), len(set(prices))) == (9200, 9200), (len(prices), len(set(prices)))
+    finally:
+        node.cleanup()
