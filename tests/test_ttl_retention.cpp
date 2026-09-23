@@ -3,8 +3,10 @@
 // Requirements: 5.1, 5.2, 5.3, 6.2, 6.3, 6.4, 6.5
 
 #include "orderbook/columnar_store.hpp"
+#include "orderbook/engine.hpp"
 #include "orderbook/response_formatter.hpp"
 #include "orderbook/tcp_server.hpp"
+#include "orderbook/wall_clock.hpp"
 
 #include <gtest/gtest.h>
 #include <rapidcheck.h>
@@ -12,10 +14,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -350,6 +356,161 @@ TEST(TTLDeletion, TTLStatusMetricsDisabled) {
     EXPECT_NE(response.find("ttl_hours: 0"), std::string::npos);
     EXPECT_NE(response.find("ttl_segments_deleted: 0"), std::string::npos);
     EXPECT_NE(response.find("ttl_bytes_reclaimed: 0"), std::string::npos);
+}
+
+// ── The cutoff and the clock it is on (#163) ─────────────────────────────────
+//
+// The sweep compared event times with a count from this machine's boot. `ttl_cutoff_ns()` takes the
+// wall clock as its argument, which is what these pin, and the sweep tests below are what show the
+// engine hands it the wall clock rather than anything else.
+
+constexpr uint64_t kNsPerHour = 3600ULL * 1'000'000'000ULL;
+
+static_assert(ob::ttl_cutoff_ns(10 * kNsPerHour, 1) == 9 * kNsPerHour);
+static_assert(ob::ttl_cutoff_ns(10 * kNsPerHour, 0) == 0, "0 keeps everything, as the flag says");
+
+TEST(TTLCutoff, TheCutoffIsTheWallClockMinusTheRetention) {
+    const uint64_t now = 1'790'000'000'000'000'000ULL;   // September 2026
+    EXPECT_EQ(ob::ttl_cutoff_ns(now, 24), now - 24 * kNsPerHour);
+    EXPECT_EQ(ob::ttl_cutoff_ns(now, 1), now - kNsPerHour);
+}
+
+TEST(TTLCutoff, ARetentionOfZeroExpiresNothing) {
+    EXPECT_EQ(ob::ttl_cutoff_ns(1'790'000'000'000'000'000ULL, 0), 0u);
+}
+
+TEST(TTLCutoff, ARetentionReachingPastTheEpochExpiresNothingRatherThanWrapping) {
+    // The shape of #163 itself: a clock that has counted less than the retention. The subtraction
+    // this replaced wrapped to a cutoff past every timestamp.
+    EXPECT_EQ(ob::ttl_cutoff_ns(5 * kNsPerHour, 6), 0u);
+    // ...and exactly at the boundary the answer is the epoch, not a wrap.
+    EXPECT_EQ(ob::ttl_cutoff_ns(6 * kNsPerHour, 6), 0u);
+    EXPECT_EQ(ob::ttl_cutoff_ns(6 * kNsPerHour + 7, 6), 7u);
+}
+
+TEST(TTLCutoff, ARetentionTooLongToCountInNanosecondsDoesNotOverflow) {
+    // `--ttl-hours` takes any uint64_t, and hours times nanoseconds per hour overflows from
+    // 5 124 096 hours up.
+    EXPECT_EQ(ob::ttl_cutoff_ns(1'790'000'000'000'000'000ULL, UINT64_MAX), 0u);
+    EXPECT_EQ(ob::ttl_cutoff_ns(UINT64_MAX, UINT64_MAX / kNsPerHour),
+              UINT64_MAX - (UINT64_MAX / kNsPerHour) * kNsPerHour);
+}
+
+RC_GTEST_PROP(TTLCutoff, TheCutoffIsNeverAfterNowAndIsExactWheneverItIsNotZero, ()) {
+    const uint64_t now = *rc::gen::arbitrary<uint64_t>();
+    const uint64_t ttl = *rc::gen::oneOf(rc::gen::inRange<uint64_t>(0, 100'000),
+                                         rc::gen::arbitrary<uint64_t>());
+    const uint64_t cutoff = ob::ttl_cutoff_ns(now, ttl);
+    const unsigned __int128 span = static_cast<unsigned __int128>(ttl) * kNsPerHour;
+    RC_ASSERT(cutoff <= now);
+    if (ttl == 0 || span > now) {
+        RC_ASSERT(cutoff == 0u);
+    } else {
+        RC_ASSERT(static_cast<unsigned __int128>(now - cutoff) == span);
+    }
+}
+
+// ── The sweep, through an engine (#163) ──────────────────────────────────────
+
+double machine_uptime_seconds() {
+    std::ifstream in("/proc/uptime");
+    double up = 0;
+    in >> up;
+    return up;
+}
+
+void write_rows(ob::Engine& engine, const char* symbol, uint64_t first_event_time_ns, int rows) {
+    for (int i = 0; i < rows; ++i) {
+        ob::DeltaUpdate delta{};
+        std::strncpy(delta.symbol, symbol, sizeof(delta.symbol) - 1);
+        std::strncpy(delta.exchange, "EX", sizeof(delta.exchange) - 1);
+        delta.timestamp_ns = first_event_time_ns + static_cast<uint64_t>(i);
+        delta.side         = ob::SIDE_BID;
+        delta.n_levels     = 1;
+        ob::Level level{static_cast<int64_t>(1000 + i), 1, 1, 0};
+        ASSERT_EQ(engine.apply_delta(delta, &level), ob::OB_OK);
+    }
+}
+
+/// Rows the engine returns for `symbol`. A symbol whose every segment has expired is one the
+/// engine no longer knows, which it answers with "not found" - zero rows, not an error here.
+int rows_of(ob::Engine& engine, const char* symbol) {
+    int n = 0;
+    const std::string err = engine.execute(
+        std::string("SELECT * FROM '") + symbol +
+            "'.'EX' WHERE timestamp BETWEEN 0 AND 9999999999999999999",
+        [&](const ob::QueryResult&) { ++n; });
+    if (err.rfind("OB_ERR_NOT_FOUND", 0) == 0) return 0;
+    EXPECT_TRUE(err.empty()) << err;
+    return n;
+}
+
+/// A first engine, without a retention, writes `rows` rows of OLD dated `old_age_hours` ago and
+/// `rows` of FRESH dated now, and closes - so both are in segments on disk, as they are for a node
+/// restarted with `--ttl-hours` turned on. A second engine on that directory sweeps once a second.
+/// Returns once the sweep has deleted something or ten seconds have passed.
+struct SweepOutcome {
+    int old_rows;
+    int fresh_rows;
+    uint64_t segments_deleted;
+};
+
+SweepOutcome sweep_after_restart(const fs::path& dir, uint64_t ttl_hours, uint64_t old_age_hours,
+                                 int rows) {
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    {
+        ob::Engine first(dir.string(), 20'000'000ULL);
+        first.open();
+        const uint64_t now = ob::wall_clock_ns();
+        write_rows(first, "OLD", now - old_age_hours * kNsPerHour, rows);
+        write_rows(first, "FRESH", now, rows);
+        first.close();
+    }
+    ob::Engine second(dir.string(), 20'000'000ULL, ob::FsyncPolicy::INTERVAL, {}, {}, {},
+                      ob::TTLConfig{ttl_hours, 1});
+    second.open();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (second.stats().ttl_segments_deleted == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    SweepOutcome out{rows_of(second, "OLD"), rows_of(second, "FRESH"),
+                     second.stats().ttl_segments_deleted};
+    second.close();
+    fs::remove_all(dir);
+    return out;
+}
+
+TEST(TTLSweep, ARestartWithARetentionLongerThanTheMachineHasBeenUpKeepsWhatIsNewer) {
+    // The premise under which the sweep this replaced deleted everything: a retention longer than
+    // the count its clock had reached. Taken from this machine's own uptime, so the test holds that
+    // premise on any machine rather than on the one it was written on - where it was a restart with
+    // `--ttl-hours 24` after 21.5 hours up, and every row went.
+    const double up = machine_uptime_seconds();
+    ASSERT_GT(up, 0.0) << "/proc/uptime could not be read, so the premise cannot be set";
+    const uint64_t ttl_hours = static_cast<uint64_t>(std::ceil(up / 3600.0)) + 1;
+    ASSERT_GT(static_cast<double>(ttl_hours) * 3600.0, up);
+
+    const SweepOutcome o = sweep_after_restart(fs::temp_directory_path() / "ttl_sweep_uptime",
+                                               ttl_hours, ttl_hours + 2, 50);
+    // The sweep ran: the rows older than the retention are the ones it was asked to expire...
+    EXPECT_GE(o.segments_deleted, 1u);
+    EXPECT_EQ(o.old_rows, 0) << "rows dated past the retention were not expired";
+    // ...and it expired nothing else.
+    EXPECT_EQ(o.fresh_rows, 50) << "the sweep deleted rows younger than the retention - with a "
+                                   "retention of " << ttl_hours << " h, on a machine up "
+                                << static_cast<uint64_t>(up / 3600.0) << " h";
+}
+
+TEST(TTLSweep, RowsOlderThanTheRetentionExpireAndNewerOnesStay) {
+    // Against the sweep this replaced this fails whatever the machine's uptime: up for more than
+    // an hour, its cutoff was an hour into 1970 and nothing expired; up for less, it wrapped and
+    // everything did.
+    const SweepOutcome o =
+        sweep_after_restart(fs::temp_directory_path() / "ttl_sweep_one_hour", 1, 3, 50);
+    EXPECT_GE(o.segments_deleted, 1u) << "no sweep deleted anything within ten seconds";
+    EXPECT_EQ(o.old_rows, 0);
+    EXPECT_EQ(o.fresh_rows, 50);
 }
 
 } // namespace
