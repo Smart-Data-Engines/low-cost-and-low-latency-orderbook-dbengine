@@ -903,3 +903,76 @@ TEST(WalTornRecord, AMismatchInTheLastFileStillStopsTheReplay) {
         << "the last file's mismatch was counted as a tear. It is not one: nothing follows it, and "
            "calling it a tear would tell an operator an older build had stranded a file";
 }
+
+// ── #153 and #154: a rotation that fails is not the failure of the record before it ──
+//
+// The integration battery holds the halves that need a failing disk (`test_storage_faults.py`);
+// this one needs only a directory the writer cannot create a file in, so it runs everywhere.
+
+namespace {
+
+/// Takes the write bits off a directory for as long as it lives, and puts them back even when an
+/// assertion leaves the scope early - a directory left read-only is one `TempDir` cannot remove.
+struct ReadOnlyDir {
+    std::filesystem::path path;
+    std::filesystem::perms before;
+    explicit ReadOnlyDir(const std::filesystem::path& p)
+        : path(p), before(std::filesystem::status(p).permissions()) {
+        std::filesystem::permissions(path,
+                                     std::filesystem::perms::owner_write |
+                                         std::filesystem::perms::group_write |
+                                         std::filesystem::perms::others_write,
+                                     std::filesystem::perm_options::remove);
+    }
+    ~ReadOnlyDir() {
+        std::error_code ec;
+        std::filesystem::permissions(path, before, ec);
+    }
+};
+
+} // namespace
+
+TEST(WalRotation, ANextFileThatCannotBeCreatedIsOpenedOnceItCan) {
+    // Run as root, a read-only directory refuses nothing and this would measure nothing.
+    ASSERT_NE(::geteuid(), 0u) << "this test cannot make the next WAL file uncreatable as root";
+
+    TempDir tmp("ut_rot_open");
+    const size_t threshold = 150;   // the first record fits, the second carries the file past it
+    ob::Level lv = make_level(1000LL, 10ULL, 1U);
+    {
+        ob::WALWriter writer(tmp.str(), threshold);
+        writer.append(make_delta(1), &lv);
+        {
+            ReadOnlyDir read_only(tmp.path);
+
+            // Its record is written; the rotation after it cannot create wal_000001.bin, and that
+            // is not this record's failure (#153).
+            EXPECT_NO_THROW(writer.append(make_delta(2), &lv));
+
+            // Nothing to write to now. The refusal names the file and the reason - before #154 it
+            // was `write failed: Bad file descriptor`, for the rest of the process.
+            try {
+                writer.append(make_delta(3), &lv);
+                ADD_FAILURE() << "a write with no WAL file to go to was accepted";
+            } catch (const std::runtime_error& e) {
+                const std::string what = e.what();
+                EXPECT_NE(what.find("wal_000001.bin"), std::string::npos) << what;
+                EXPECT_EQ(what.find("Bad file descriptor"), std::string::npos) << what;
+            }
+        }
+
+        // The directory is writable again, so the next write opens the file the rotation could not.
+        EXPECT_NO_THROW(writer.append(make_delta(4), &lv))
+            << "the writer did not open its next file once it could (#154)";
+        EXPECT_EQ(writer.current_file_index(), 1u);
+    }
+
+    // Replay reaches every record that was written, in order, across the file that ended with
+    // its marker and the one opened late - and not the refused one.
+    std::vector<uint64_t> seqs;
+    ob::WALReplayer replayer(tmp.str());
+    replayer.replay([&](const ob::WALRecord& hdr, const uint8_t* /*payload*/) {
+        if (hdr.record_type == ob::WAL_RECORD_DELTA) seqs.push_back(hdr.sequence_number);
+    });
+    EXPECT_EQ(seqs, (std::vector<uint64_t>{1, 2, 4}));
+}

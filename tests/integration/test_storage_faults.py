@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import signal
 import socket
+import stat
 import subprocess
 import tempfile
 import time
@@ -53,6 +54,9 @@ class FaultNode:
         # instead of [400, 500] on its first run for exactly that reason - a flush had rescued the
         # row before the kill, so the number was about timing rather than about the WAL.
         self.flush_ms = fault.pop("OB_FAULT_FLUSH_MS", "500")
+        # And OB_FAULT_ROTATE_BYTES, for the tests about what happens when a file ends: the default
+        # threshold is 512 MB, and a file that never fills never rotates.
+        self.rotate_bytes = fault.pop("OB_FAULT_ROTATE_BYTES", None)
         injector = fault_injector_path()
         assert injector is not None, (
             "libobfault.so was not built. Failing rather than skipping: a fault-injection test "
@@ -74,11 +78,22 @@ class FaultNode:
             env.update(fault)
             env["OB_FAULT_LOG"] = self.fault_log
 
-        self.proc = subprocess.Popen(
-            [SERVER, "--port", str(self.port), "--data-dir", self.data_dir,
-             "--metrics-port", str(self.metrics_port), "--drain-timeout-ms", "2000",
-             "--fsync-policy", self.policy, "--flush-interval-ms", self.flush_ms],
-            env=env, stdout=self._log, stderr=subprocess.STDOUT)
+        self.proc = subprocess.Popen(self._argv(), env=env, stdout=self._log,
+                                     stderr=subprocess.STDOUT)
+
+    def _argv(self) -> list[str]:
+        """The node's command line, built in one place for the start and every restart.
+
+        There were two copies of it, and a flag added to one of them is a restart that comes back
+        as a different node - pitfall 77, which is how `restart_node()` once lost
+        `--cluster-secret-file`.
+        """
+        argv = [SERVER, "--port", str(self.port), "--data-dir", self.data_dir,
+                "--metrics-port", str(self.metrics_port), "--drain-timeout-ms", "2000",
+                "--fsync-policy", self.policy, "--flush-interval-ms", self.flush_ms]
+        if self.rotate_bytes is not None:
+            argv += ["--wal-rotate-bytes", self.rotate_bytes]
+        return argv
 
     def counter(self, name: str) -> int:
         """One counter from /metrics, or 0 if it has never been incremented.
@@ -135,6 +150,30 @@ class FaultNode:
                     break
         return replies
 
+    def insert_each(self, prices) -> dict[int, str]:
+        """One `INSERT` per price on one session, each answered before the next is sent.
+
+        Not `talk()`: that sleeps 0.2 s per command, and the rotation tests need five hundred of
+        them. The reply is read by its own terminator - `OK` ends in a blank line, `ERR` in one
+        newline - so no command's answer is ever read as the next one's.
+        """
+        replies: dict[int, str] = {}
+        with socket.create_connection(("127.0.0.1", self.port), timeout=patience(15)) as sock:
+            reader = sock.makefile("rb")
+            while reader.readline().strip():   # the banner ends in a blank line
+                pass
+            for price in prices:
+                sock.sendall(f"INSERT SYM EX bid {price} 1 1\n".encode())
+                line = reader.readline().decode(errors="replace").rstrip("\n")
+                if line == "OK":
+                    reader.readline()
+                replies[price] = line or "<the node closed the connection>"
+        return replies
+
+    def wal_files(self) -> list[str]:
+        return sorted(f for f in os.listdir(self.data_dir)
+                      if f.startswith("wal_") and f.endswith(".bin"))
+
     def injections(self) -> int:
         """How many faults actually fired. Zero means this test measured nothing."""
         if not os.path.exists(self.fault_log):
@@ -174,11 +213,8 @@ class FaultNode:
         self._log = open(self._log_path, "a", encoding="utf-8", buffering=1)
         env = {k: v for k, v in os.environ.items() if not k.startswith("OB_FAULT_")}
         env.pop("LD_PRELOAD", None)
-        self.proc = subprocess.Popen(
-            [SERVER, "--port", str(self.port), "--data-dir", self.data_dir,
-             "--metrics-port", str(self.metrics_port), "--drain-timeout-ms", "2000",
-             "--fsync-policy", self.policy, "--flush-interval-ms", self.flush_ms],
-            env=env, stdout=self._log, stderr=subprocess.STDOUT)
+        self.proc = subprocess.Popen(self._argv(), env=env, stdout=self._log,
+                                     stderr=subprocess.STDOUT)
         self.wait_until_answering()
 
     def stop(self) -> int | None:
@@ -487,4 +523,170 @@ def test_a_torn_record_costs_only_the_write_that_tore():
             f"the replay compared a checksum inside the abandoned file, which means the writer left "
             f"something behind the tear:\n{node.log()}")
     finally:
+        node.cleanup()
+
+
+# ── #153 and #154: what happens when a WAL file ends ──────────────────────────
+#
+# The smallest threshold `--wal-rotate-bytes` accepts (a WAL header and the largest payload), so a
+# file ends after a few hundred one-level inserts rather than after 512 MB of them.
+ROTATE_BYTES = "65573"
+# The insert that carries the first file past it: 482 of them reach 65 552 bytes, the 483rd 65 688.
+ROTATING_INSERT = -(-int(ROTATE_BYTES) // int(DELTA_BYTES))
+
+
+def test_a_failed_sync_while_rotating_costs_no_acknowledged_write():
+    """#153: the sync of a rotation fails under `--fsync-policy every`, and nothing is lost.
+
+    Replay and catch-up both stop reading a file at its ROTATE record. The marker used to be written
+    through the path that syncs under `every`, and a failed sync threw **before** the writer moved
+    to the next file - so the next record went into the same file, behind the marker. Measured
+    before the fix, failing exactly that sync: the insert that crossed the threshold was answered
+    `ERR` although its record was on the disk, and **the one after it was answered `OK` and was gone
+    after a restart** - 487 acknowledged, 487 back, and the one missing was acknowledged.
+
+    Which sync fails is arithmetic, and the test proves the arithmetic rather than trusting it:
+    under `every` each insert syncs the file once, so syncs 0..481 are the first 482 inserts and 482
+    is the rotating insert's own, and the next one is the rotation's. Had the injection hit a
+    client's own sync instead, that client would have been answered `ERR` (#113) - so "one fault
+    fired and every insert was answered `OK`" is what says it was the rotation's.
+    """
+    node = FaultNode(OB_FAULT_PATH=WAL_SEGMENT, OB_FAULT_OP="fsync", OB_FAULT_ERRNO="EIO",
+                     OB_FAULT_SKIP=str(ROTATING_INSERT), OB_FAULT_COUNT="1",
+                     OB_FAULT_ROTATE_BYTES=ROTATE_BYTES, OB_FAULT_FLUSH_MS="3600000")
+    try:
+        node.wait_until_answering()
+        prices = [1000 + i for i in range(1, ROTATING_INSERT + 6)]
+        replies = node.insert_each(prices)
+        assert node.injections() == 1, f"no sync was made to fail:\n{node.fault_log_text()}"
+        refused = {p: r for p, r in replies.items() if r != "OK"}
+        assert not refused, (
+            f"a failed sync of the rotation was reported as the failure of a client's write, "
+            f"whose own record was written and synced: {refused}")
+        assert node.wal_files() == ["wal_000000.bin", "wal_000001.bin"], (
+            f"the writer did not move to the next file; WAL files are {node.wal_files()}")
+
+        node.kill_and_restart_without_faults()
+        back = set(prices_in(node.talk(SELECT_ALL)[0]))
+        lost = sorted(p for p in prices if p not in back)
+        custom_metrics["acknowledged_writes_lost_to_a_failed_rotation_sync"] = len(lost)
+        assert not lost, (
+            f"{len(lost)} acknowledged write(s) did not survive the restart: {lost}. Before #153 "
+            f"this was the insert right after the rotating one, written behind the ROTATE marker "
+            f"where replay stops reading")
+    finally:
+        node.cleanup()
+
+
+def test_a_rotation_that_cannot_write_its_marker_does_not_refuse_the_write_that_crossed_it():
+    """#153's other half: the disk refuses the ROTATE marker, and no client is told it failed.
+
+    The marker is the first 24-byte write this node makes: inserts are 136 bytes, and the flush
+    tick - the only other writer of 24-byte records, a checkpoint - is an hour away. Before the fix
+    the refusal of the marker threw out of the `INSERT` that asked for the rotation, whose own record
+    was already in the file: answered `ERR`, present after a restart, so a client that sent it again
+    stored it twice. Now the file is left as it was - readable to its end, since nothing of the
+    marker reached it - the next record goes into it, and the rotation is tried again after that.
+    """
+    node = FaultNode(OB_FAULT_PATH=WAL_SEGMENT, OB_FAULT_OP="write", OB_FAULT_ERRNO="ENOSPC",
+                     OB_FAULT_SIZE="24", OB_FAULT_COUNT="1",
+                     OB_FAULT_ROTATE_BYTES=ROTATE_BYTES, OB_FAULT_FLUSH_MS="3600000")
+    try:
+        node.wait_until_answering()
+        prices = [2000 + i for i in range(1, ROTATING_INSERT + 6)]
+        replies = node.insert_each(prices)
+        assert node.injections() == 1, f"the marker was not refused:\n{node.fault_log_text()}"
+        assert "arg=24 " in node.fault_log_text(), node.fault_log_text()
+        refused = {p: r for p, r in replies.items() if r != "OK"}
+        assert not refused, (
+            f"a refused ROTATE marker was reported as the failure of a client's write: {refused}")
+        assert node.log().count("with a ROTATE record") == 1, node.log()[-2000:]
+        # Tried again after the next record, and that time it worked.
+        assert node.wal_files() == ["wal_000000.bin", "wal_000001.bin"], node.wal_files()
+
+        node.kill_and_restart_without_faults()
+        back = set(prices_in(node.talk(SELECT_ALL)[0]))
+        lost = sorted(p for p in prices if p not in back)
+        assert not lost, f"acknowledged writes did not survive the restart: {lost}"
+    finally:
+        node.cleanup()
+
+
+def test_a_wal_that_could_not_open_its_next_file_opens_it_once_it_can():
+    """#154: the next WAL file cannot be created for a moment, and the node recovers from it.
+
+    Produced without the injector: the data directory is made read-only just before the insert that
+    rotates, so creating the next file fails with EACCES, and writable again one insert later.
+    `open_current()` closes the old descriptor before it opens the new one, and before the fix
+    nothing opened a file again: measured, every write after the rotation was refused with
+    `Bad file descriptor` for the rest of the process - after the directory was writable again.
+
+    Three things are asserted and each is a separate claim: the insert that crossed the threshold
+    is `OK` (its record is written; the rotation is what failed, #153), the one while the directory
+    is still read-only is refused **with the reason** rather than with a bad descriptor, and the
+    ones after it are written to the next file. It happens twice, at the end of two files, because
+    an outage the log reports once has to be reported again the next time it starts. A test run as
+    root would chmod nothing and prove nothing, so it refuses to run as root rather than pass.
+    """
+    assert os.geteuid() != 0, (
+        "run as root, a read-only directory refuses nothing, so this test would measure nothing")
+    node = FaultNode(OB_FAULT_ROTATE_BYTES=ROTATE_BYTES, OB_FAULT_FLUSH_MS="3600000")
+    mode = os.stat(node.data_dir).st_mode
+    replies: dict[int, str] = {}
+    refused: list[int] = []
+
+    def through_a_rotation_that_cannot_open(first_price: int, already_in_file: int) -> int:
+        """Fill the current file to its rotating insert, with the directory read-only for that
+        insert and the next one. Returns the next unused price."""
+        before = [first_price + i for i in range(ROTATING_INSERT - already_in_file - 1)]
+        replies.update(node.insert_each(before))
+        crossing = first_price + len(before)
+        while_read_only = crossing + 1
+        os.chmod(node.data_dir, mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+        try:
+            replies.update(node.insert_each([crossing, while_read_only]))
+        finally:
+            os.chmod(node.data_dir, mode)
+        after = [while_read_only + i for i in range(1, 4)]
+        replies.update(node.insert_each(after))
+
+        assert replies[crossing] == "OK", (
+            f"the insert whose record was written was refused because the rotation after it "
+            f"failed: {replies[crossing]}")
+        refusal = replies[while_read_only]
+        assert refusal.startswith("ERR") and ".bin" in refusal and "denied" in refusal, (
+            f"a write with no WAL file to go to was not refused with the reason: {refusal}")
+        assert "Bad file descriptor" not in refusal, refusal
+        refused.append(while_read_only)
+        refused_after = {p: replies[p] for p in after if replies[p] != "OK"}
+        assert not refused_after, (
+            f"the WAL did not open its next file once it could, so every write stays refused until "
+            f"the process restarts: {refused_after}")
+        return after[-1] + 1
+
+    try:
+        node.wait_until_answering()
+        nxt = through_a_rotation_that_cannot_open(3000, already_in_file=0)
+        assert node.wal_files() == ["wal_000000.bin", "wal_000001.bin"], node.wal_files()
+        # The second file already holds the three inserts written after the first recovery.
+        through_a_rotation_that_cannot_open(nxt, already_in_file=3)
+        assert node.wal_files() == ["wal_000000.bin", "wal_000001.bin", "wal_000002.bin"], (
+            node.wal_files())
+        others = {p: r for p, r in replies.items() if r != "OK" and p not in refused}
+        assert not others, f"writes outside the two read-only moments were refused: {others}"
+
+        # One line when the writer lost its file and one when it got one back - per outage, not
+        # per write, and again for the second outage.
+        assert node.log().count("has no WAL file to write to") == 2, node.log()[-3000:]
+        assert node.log().count("the writer had no WAL file for 2 attempt(s)") == 2, (
+            node.log()[-3000:])
+
+        node.kill_and_restart_without_faults()
+        back = set(prices_in(node.talk(SELECT_ALL)[0]))
+        acknowledged = [p for p, r in replies.items() if r == "OK"]
+        lost = sorted(p for p in acknowledged if p not in back)
+        assert not lost, f"acknowledged writes did not survive the restart: {lost}"
+        assert not [p for p in refused if p in back], "a refused write came back after the restart"
+    finally:
+        os.chmod(node.data_dir, mode)
         node.cleanup()
