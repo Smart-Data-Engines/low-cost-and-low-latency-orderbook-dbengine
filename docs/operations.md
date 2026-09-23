@@ -957,9 +957,16 @@ a backfill land where it belongs instead of at the time of the import. Three con
 checked in the code rather than assumed:
 
 - **Retention counts by the record's own time, per segment.** `--ttl-hours` compares a segment's
-  newest event time against the cutoff, so history loaded with its real timestamps arrives **with
-  its age**: a backfill of last year into a node with a 24-hour TTL is expired on the next sweep.
-  The inverse is also true and stranger — one row dated in the future keeps its whole segment alive.
+  newest event time against **the node's wall clock minus the retention**, so history loaded with
+  its real timestamps arrives **with its age**: a backfill of last year into a node with a 24-hour
+  TTL is expired on the next sweep. The inverse is also true and stranger — one row dated in the
+  future keeps its whole segment alive. The wall clock is the one a row is stamped with on arrival,
+  so a clock **stepped forward expires early by the step** and one stepped back keeps rows longer;
+  how often the sweep runs is on the monotonic clock and does not move with it.
+  Until #163 the cutoff came from the clock that counts from the machine's boot. A node whose
+  retention was longer than its machine had been up deleted **every** segment at its first sweep —
+  measured, 200 rows of 200 after a restart with `--ttl-hours 24` on a machine up 21.5 hours — and
+  one up for longer than its retention never expired anything.
 - **Query pruning gets less effective, not wrong.** A segment is skipped when its `[start, end]`
   range cannot intersect the query's, so rows arriving out of order widen segments and more of them
   are read. Correctness does not depend on monotonic time; scan cost does.
