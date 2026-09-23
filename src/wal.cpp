@@ -194,6 +194,8 @@ uint32_t WALWriter::open_current(uint32_t index) {
 
     const std::string path = wal_filename(dir_, index);
     // O_APPEND ensures all writes go to the end even across processes.
+    // OB_DURABLE: the WAL itself - synced by --fsync-policy, and a checkpoint in it counts for
+    // retention only once a sync has covered it (#160).
     fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd_ < 0) {
         throw std::runtime_error("WALWriter: cannot open " + path +

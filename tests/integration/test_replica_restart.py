@@ -19,7 +19,10 @@ import time
 
 import pytest
 
-from conftest import ClusterManager, node_log_size, node_log_since, patience
+import contextlib
+
+from conftest import (ClusterManager, fault_injector_path, node_log_size, node_log_since,
+                      patience)
 
 pytestmark = pytest.mark.replication
 
@@ -478,5 +481,104 @@ def test_a_replica_keeps_the_epoch_it_fences_with_across_a_crash() -> None:
             f"a superseded primary would have been served on the one connection the guard exists "
             f"for. Handshakes seen: {handshakes[:3]}"
         )
+    finally:
+        cluster.shutdown()
+
+
+@contextlib.contextmanager
+def _injected(**fault: str):
+    """The fault injector in the environment the next node the cluster starts inherits.
+
+    Only while the block runs: `ClusterManager` spawns each node with this process's environment, so
+    the one restart inside the block gets the injector and the restart after it does not.
+    """
+    lib = fault_injector_path()
+    assert lib, ("libobfault.so is not built, so this test would inject nothing and pass; build the "
+                 "`obfault` target, as both integration jobs in CI do (#54)")
+    fault = dict(fault, LD_PRELOAD=lib)
+    before = {key: os.environ.get(key) for key in fault}
+    os.environ.update(fault)
+    try:
+        yield
+    finally:
+        for key, value in before.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_a_replica_killed_while_it_saves_its_position_keeps_what_it_holds(tmp_path) -> None:
+    """#162: the replica's position file is replaced, never rewritten in place.
+
+    `save_state()` opened `repl_state.txt` with `O_TRUNC` and wrote it in place, so a replica killed
+    between the truncate and the write left an **empty** file - which `load_state()` reads as a
+    position nothing can attribute, that is as "wipe the store and stream everything again" (#101),
+    and which forgets the epoch #103 made that file the only keeper of. The file is rewritten every
+    ten seconds, so the window needs no power cut, only a kill at the wrong moment; the injector holds
+    that moment open for eight seconds, and the kill lands inside it.
+
+    The premise is checked rather than assumed: the injector's log has to say it held a write to the
+    state file, or the kill landed somewhere else and this test would be about nothing.
+    """
+    cluster = ClusterManager()
+    cluster.start()
+    try:
+        primary, replica = cluster.primary(), cluster.replica()
+
+        load_primary(primary.tcp_port)
+        raw(primary.tcp_port, "FLUSH", settle=1.5)
+        want = rows(primary.tcp_port, SYMBOLS[0])
+        assert want > 0, "the primary stored nothing, so this test has no subject"
+        deadline = time.time() + patience(120)
+        while time.time() < deadline and rows(replica.tcp_port, SYMBOLS[0]) < want:
+            time.sleep(0.5)
+        assert rows(replica.tcp_port, SYMBOLS[0]) == want, "the replica never caught up"
+        time.sleep(3.0)   # the replica's own flush puts the rows in columnar files
+
+        state_before = replication_state(replica.data_dir)
+        assert re.search(r"stream_id=[1-9]", state_before), (
+            f"the replica saved no stream identity, so a restart could not resume in any case: "
+            f"{state_before!r}")
+        cols_before, _ = store_shape(replica.data_dir)
+        assert cols_before > 0, "the replica has no columnar files, so nothing here is measurable"
+
+        fault_log = str(tmp_path / "fault.log")
+        with _injected(OB_FAULT_PATH="repl_state.txt", OB_FAULT_OP="write",
+                       OB_FAULT_DELAY_MS="8000", OB_FAULT_COUNT="1", OB_FAULT_LOG=fault_log):
+            cluster.restart_node(replica.index)
+        replica = cluster.nodes[replica.index]
+
+        # The first save after the restart is the ten-second timer's; the injector holds its write.
+        deadline = time.time() + patience(40)
+        while time.time() < deadline:
+            held = open(fault_log).read() if os.path.exists(fault_log) else ""
+            if "action=delay" in held:
+                break
+            time.sleep(0.2)
+        assert "action=delay" in held and "repl_state.txt" in held, (
+            f"the injector never held a write of the state file, so the kill would land anywhere:\n"
+            f"{held}")
+        cluster.kill_node(replica.index)
+        state_at_kill = replication_state(replica.data_dir)
+        custom_metrics["state_file_bytes_at_kill"] = len(state_at_kill)
+
+        log_at = node_log_size(replica)
+        cluster.restart_node(replica.index)
+        replica = cluster.nodes[replica.index]
+        first_answer = rows(replica.tcp_port, SYMBOLS[0])
+        log = node_log_since(replica, log_at)
+        cols_after, _ = store_shape(replica.data_dir)
+
+        assert re.search(r"stream_id=[1-9]", state_at_kill), (
+            f"the kill left the state file as {state_at_kill!r}: rewriting it in place means a kill "
+            f"between the truncate and the write leaves a position nothing can attribute")
+        assert "clearing local data" not in log and "REPLICATE 0 0 0" not in log, (
+            "the replica killed while it saved its position wiped its store and asked for the whole "
+            "log again")
+        assert cols_after >= cols_before, (
+            f"the restart deleted columnar files: {cols_before} before, {cols_after} after")
+        assert first_answer == want, (
+            f"the replica's first answer after the restart had {first_answer} of {want} rows")
     finally:
         cluster.shutdown()

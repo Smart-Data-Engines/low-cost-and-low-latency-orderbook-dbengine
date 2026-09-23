@@ -432,6 +432,16 @@ target_compile_definitions(test_field_usage
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 
+# Finds every open for writing in src/, include/ and tools/ and requires each to say what takes its
+# bytes to the device (#160, #162) - the list is the tree, so the next file written beside the WAL
+# is covered by nobody remembering it. Reads the sources, so it needs the source directory.
+ob_add_engine_test(test_durable_writes
+    test_durable_writes.cpp
+)
+target_compile_definitions(test_durable_writes
+    PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+
 # Derives the set of connection-holding sources from the tree rather than listing them, because the
 # sixth accept site is the one that will be added without the option (#140). Reads src/ and the
 # header, so it needs the source directory.
