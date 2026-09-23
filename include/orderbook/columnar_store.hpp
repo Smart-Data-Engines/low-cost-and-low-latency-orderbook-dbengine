@@ -27,6 +27,17 @@ struct SegmentMeta {
     uint32_t format_version{kColumnarFormatVersion};
     uint64_t start_ts_ns;   ///< earliest timestamp in this segment
     uint64_t end_ts_ns;     ///< latest timestamp in this segment
+    /// The timestamp of the row appended **last**, which is not the latest when rows reach a flush
+    /// out of time order. Replay's fallback, for a symbol with no trusted WAL position, compares a
+    /// record's time with this (#63) - and #166 must not change what that fallback reads: before
+    /// #166 `end_ts_ns` held exactly this number, so a segment written then carries it over.
+    uint64_t last_row_ts_ns{0};
+    /// Whether the two above are the minimum and the maximum of the rows' timestamps, which is what
+    /// their comments have always said. False only for a segment written before #166 and not yet
+    /// repaired: its range was the start of the period its first row fell in and the time of its
+    /// last row, so a row that reached a flush out of time order was outside it - skipped by a
+    /// query that asked for it, and deleted by retention with a segment it thought was old.
+    bool time_range_is_rows{false};
     uint64_t row_count;     ///< number of rows stored
     uint64_t first_price;   ///< absolute price anchor for delta decoding (zigzag-encoded)
     bool     has_raw_qty;   ///< true if any qty used raw uint64 fallback
@@ -186,6 +197,14 @@ public:
     /// rather than trust a directory the device may not have received in full.
     size_t remove_segments(const std::vector<std::string>& dirs);
 
+    /// How many segments the last index rebuild had to read `ts.col` of, because their
+    /// `meta.json` predates #166 and does not say its range is the rows'. The next rebuild of the
+    /// same directory reads none of them, once the repair reached the disk.
+    size_t last_rebuild_ranges_read() const {
+        std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        return last_rebuild_ranges_read_;
+    }
+
     /// Number of segments in the index (including active if flushed).
     size_t segment_count() const {
         std::shared_lock<std::shared_mutex> lock(index_mtx_);
@@ -218,6 +237,10 @@ private:
     std::string symbol_;
     std::string exchange_;
     uint64_t    active_segment_start_{0};
+    // The active segment's rows' earliest and latest timestamps (#166). The start above is the
+    // period the segment belongs to, which decides when it rolls over; these are what it records.
+    uint64_t    active_min_ts_{0};
+    uint64_t    active_max_ts_{0};
     uint64_t    active_row_count_{0};
     bool        active_has_raw_qty_{false};
     bool        has_active_segment_{false};
@@ -246,11 +269,22 @@ private:
     // Protects index_ for concurrent scan() (shared) vs merge_segments()/open_existing() (exclusive)
     mutable std::shared_mutex index_mtx_;
 
+    // What the last rebuild read to repair ranges written before #166. Guarded by index_mtx_.
+    size_t last_rebuild_ranges_read_{0};
+
     // Helpers
     /// Rebuild `index_` from the `meta.json` files under `base_dir_`. Caller holds `index_mtx_`
     /// exclusively — `open_existing()` and `replace_from_staging()` both need this and
     /// `std::shared_mutex` is not recursive, so taking it here would deadlock the second one.
     void rebuild_index_locked();
+
+    /// Give every indexed segment whose `meta.json` predates #166 the range of its rows, read from
+    /// its `ts.col` - in the index always, and on disk as well where that can be done safely: each
+    /// corrected `meta.json` is written beside the old one, one `syncfs()` takes a batch of them to
+    /// the device, and only then does a `rename()` publish each one, so a crash anywhere leaves
+    /// every segment with the old file or the new one and never with half of either. Caller holds
+    /// `index_mtx_` exclusively.
+    void repair_ranges_locked();
 
     /// Create a segment directory for this span that no other segment is using, and return it.
     ///
@@ -271,6 +305,7 @@ private:
                             uint64_t start_ts, uint64_t end_ts) const;
     void ensure_dirs(const std::string& path) const;
     void write_meta_json(const std::string& dir, const SegmentMeta& meta) const;
+    std::string meta_json(const SegmentMeta& meta) const;
     bool parse_meta_json(const std::string& path, SegmentMeta& out) const;
 };
 

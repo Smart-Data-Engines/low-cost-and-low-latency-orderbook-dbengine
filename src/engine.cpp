@@ -2814,17 +2814,22 @@ uint64_t Engine::replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastC
     // recorded; it is exact only while timestamps for a symbol increase, which a single node
     // guarantees and multi-master does not, because a peer's record carries the origin's clock
     // (#63).
+    //
+    // The fallback compares with the time of each segment's **last** row, not its newest. The two
+    // were one field until #166 made a segment record its rows' range, and the fallback keeps the
+    // number it always read: were it to read the newest instead, its error with times that do not
+    // rise would turn from a record applied twice into a record never applied.
     struct DurableUpTo {
         uint32_t wal_file_index{0};
         uint64_t wal_byte_offset{0};
         bool     has_position{false};
-        uint64_t end_ts_ns{0};
+        uint64_t last_row_ts_ns{0};
     };
     std::unordered_map<std::string, DurableUpTo> durable;
     for (const auto& meta : combined_store_.index()) {
         const std::string key = meta.symbol + "." + meta.exchange;
         auto& d = durable[key];
-        if (meta.end_ts_ns > d.end_ts_ns) d.end_ts_ns = meta.end_ts_ns;
+        if (meta.last_row_ts_ns > d.last_row_ts_ns) d.last_row_ts_ns = meta.last_row_ts_ns;
         // Trust a position only if it was written against this WAL. A snapshot or a shard
         // migration ships whole segment directories, so a received segment carries the sender's
         // position — believing it would skip records this node never stored. A zero position means
@@ -2882,7 +2887,7 @@ uint64_t Engine::replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastC
                     ++skipped;
                     return;
                 }
-            } else if (delta.timestamp_ns <= d.end_ts_ns) {
+            } else if (delta.timestamp_ns <= d.last_row_ts_ns) {
                 // Legacy segment with no recorded position. Same behaviour as before, and the same
                 // assumption: it holds on a single node and can misfire in multi-master.
                 ++skipped_by_timestamp;

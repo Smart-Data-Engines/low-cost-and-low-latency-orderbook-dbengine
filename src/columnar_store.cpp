@@ -8,10 +8,12 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -87,6 +89,9 @@ std::string ColumnarStore::create_unique_segment_dir(const std::string& symbol,
 
 namespace {
 
+/// Where a corrected meta.json waits for its sync before a rename publishes it (#166).
+constexpr const char* kRangeRepairFile = "meta.json.range";
+
 /// Write `bytes` to a new file at `path`, and throw if any of it does not reach the file (#160).
 ///
 /// The column files and meta.json went through `std::ofstream` and nothing read its state, so a
@@ -127,7 +132,11 @@ void write_file_checked(const std::string& path, const void* data, size_t bytes)
 
 void ColumnarStore::write_meta_json(const std::string& dir,
                                      const SegmentMeta& meta) const {
-    std::string path = dir + "/meta.json";
+    const std::string content = meta_json(meta);
+    write_file_checked(dir + "/meta.json", content.data(), content.size());
+}
+
+std::string ColumnarStore::meta_json(const SegmentMeta& meta) const {
     std::ostringstream f;
     f << "{\"format_version\":" << meta.format_version
       << ",\"start_ts_ns\":" << meta.start_ts_ns
@@ -141,9 +150,12 @@ void ColumnarStore::write_meta_json(const std::string& dir,
       << ",\"wal_byte_offset\":"     << meta.wal_byte_offset
       << ",\"symbol\":\""    << meta.symbol   << "\""
       << ",\"exchange\":\""  << meta.exchange << "\""
-      << "}";
-    const std::string content = f.str();
-    write_file_checked(path, content.data(), content.size());
+      << ",\"last_row_ts_ns\":" << meta.last_row_ts_ns;
+    // Only ever written as "rows": a meta.json without the key is one written before #166, and
+    // that absence is what the repair at open looks for.
+    if (meta.time_range_is_rows) f << ",\"time_range\":\"rows\"";
+    f << "}";
+    return f.str();
 }
 
 bool ColumnarStore::parse_meta_json(const std::string& path,
@@ -157,10 +169,11 @@ bool ColumnarStore::parse_meta_json(const std::string& path,
     // Simple hand-written JSON parser for the fixed schema:
     // {"start_ts_ns":N,"end_ts_ns":N,"row_count":N,"first_price":N,
     //  "has_raw_qty":bool,"symbol":"S","exchange":"E"}
-    auto extract_uint64 = [&](const std::string& key) -> uint64_t {
+    // Absent and zero are different answers for some keys, so the lookup can say which.
+    auto find_uint64 = [&](const std::string& key) -> std::optional<uint64_t> {
         std::string search = "\"" + key + "\":";
         auto pos = content.find(search);
-        if (pos == std::string::npos) return 0;
+        if (pos == std::string::npos) return std::nullopt;
         pos += search.size();
         // skip whitespace
         while (pos < content.size() && content[pos] == ' ') ++pos;
@@ -170,6 +183,9 @@ bool ColumnarStore::parse_meta_json(const std::string& path,
             ++pos;
         }
         return val;
+    };
+    auto extract_uint64 = [&](const std::string& key) -> uint64_t {
+        return find_uint64(key).value_or(0);
     };
 
     auto extract_bool = [&](const std::string& key) -> bool {
@@ -209,6 +225,11 @@ bool ColumnarStore::parse_meta_json(const std::string& path,
     out.wal_byte_offset = extract_uint64("wal_byte_offset");
     out.symbol       = extract_string("symbol");
     out.exchange     = extract_string("exchange");
+    // Both absent before #166. Then the recorded end WAS the last row's time - the number replay's
+    // fallback has always compared with - so it is carried over as that, before any repair moves
+    // the end to the rows' maximum.
+    out.time_range_is_rows = extract_string("time_range") == "rows";
+    out.last_row_ts_ns     = find_uint64("last_row_ts_ns").value_or(out.end_ts_ns);
 
     // Validate: must have at least start_ts_ns and row_count
     return out.row_count > 0 || out.start_ts_ns > 0;
@@ -230,6 +251,8 @@ void ColumnarStore::append(const SnapshotRow& row) {
             exchange_ = "";
         }
         has_active_segment_ = true;
+        active_min_ts_      = row.timestamp_ns;
+        active_max_ts_      = row.timestamp_ns;
         active_row_count_   = 0;
         active_has_raw_qty_ = false;
         price_buf_.clear();
@@ -254,6 +277,8 @@ void ColumnarStore::append(const SnapshotRow& row) {
         }
         active_segment_start_ = seg_start;
         has_active_segment_   = true;
+        active_min_ts_        = row.timestamp_ns;
+        active_max_ts_        = row.timestamp_ns;
         active_row_count_     = 0;
         active_has_raw_qty_   = false;
         price_buf_.clear();
@@ -264,6 +289,15 @@ void ColumnarStore::append(const SnapshotRow& row) {
         level_buf_.clear();
         seq_buf_.clear();
     }
+
+    // What the segment will say it covers (#166). Rows arrive in the order they were written, and
+    // that is time order only while the server stamps every one: a client giving its own event
+    // times (#105) can send them in any order, and a multi-master node applies a peer's record,
+    // stamped by the peer, after a later one of its own. A row that arrives out of order and is
+    // still appended here - one from an earlier period is, because only a later period rolls the
+    // segment over - has to be inside the range queries prune by and retention deletes by.
+    if (row.timestamp_ns < active_min_ts_) active_min_ts_ = row.timestamp_ns;
+    if (row.timestamp_ns > active_max_ts_) active_max_ts_ = row.timestamp_ns;
 
     // Accumulate into buffers
     price_buf_.push_back(row.price);
@@ -313,14 +347,17 @@ std::optional<SegmentMeta> ColumnarStore::flush_segment() {
         return std::nullopt;
     }
 
-    // Compute end timestamp
-    uint64_t end_ts = ts_buf_.empty() ? active_segment_start_
-                                      : ts_buf_.back();
+    // The range this segment records is its rows' - the earliest and the latest timestamp - and
+    // not the period it belongs to and its last row, which is what it was until #166. The two
+    // agree only while rows arrive in time order; when they did not, a query skipped rows this
+    // segment held (measured: `OK` and nothing, for a row a `SELECT` of everything returned) and
+    // retention deleted a row one second old with a two-day-old one written after it.
+    const uint64_t first_ts = active_min_ts_;
+    const uint64_t last_ts  = active_max_ts_;
 
     // Build segment directory path. Unique per segment rather than per span, so a second flush
     // covering the same event-time range is a second segment instead of a collision (#136).
-    std::string dir = create_unique_segment_dir(symbol_, exchange_,
-                                                active_segment_start_, end_ts);
+    std::string dir = create_unique_segment_dir(symbol_, exchange_, first_ts, last_ts);
 
     // A write that fails part-way leaves no directory behind (#160): the exception goes to the
     // flush, the rows stay in memory, and the next flush writes a new segment - so a half-written
@@ -390,13 +427,18 @@ std::optional<SegmentMeta> ColumnarStore::flush_segment() {
     }
 
     OB_LOG_DEBUG("columnar",
-                 "Segment written: dir=%s rows=%zu columns=7 (side/level/seq included)",
-                 dir.c_str(), static_cast<size_t>(active_row_count_));
+                 "Segment written: dir=%s rows=%zu range=[%llu, %llu] last=%llu",
+                 dir.c_str(), static_cast<size_t>(active_row_count_),
+                 static_cast<unsigned long long>(first_ts),
+                 static_cast<unsigned long long>(last_ts),
+                 static_cast<unsigned long long>(ts_buf_.back()));
 
     // Build SegmentMeta
     SegmentMeta meta{};
-    meta.start_ts_ns = active_segment_start_;
-    meta.end_ts_ns   = end_ts;
+    meta.start_ts_ns        = first_ts;
+    meta.end_ts_ns          = last_ts;
+    meta.last_row_ts_ns     = ts_buf_.back();
+    meta.time_range_is_rows = true;
     meta.row_count   = active_row_count_;
     // first_price: store the zigzag-encoded first price as the anchor
     meta.first_price = encoded_prices.empty() ? 0 : encoded_prices[0];
@@ -597,12 +639,20 @@ void ColumnarStore::open_existing() {
 
 void ColumnarStore::rebuild_index_locked() {
     index_.clear();
+    last_rebuild_ranges_read_ = 0;
 
     if (!fs::exists(base_dir_)) return;
 
-    // Recursively scan for meta.json files
+    // Recursively scan for meta.json files, and for what a range repair that did not finish left
+    // beside them. Those are always safe to delete: the repair changes a meta.json only by renaming
+    // one of them over it, so the meta.json beside it is the old one or the new one and whole.
+    std::vector<fs::path> leftovers;
     for (auto& entry : fs::recursive_directory_iterator(base_dir_)) {
         if (!entry.is_regular_file()) continue;
+        if (entry.path().filename() == kRangeRepairFile) {
+            leftovers.push_back(entry.path());
+            continue;
+        }
         if (entry.path().filename() != "meta.json") continue;
 
         SegmentMeta meta;
@@ -611,9 +661,147 @@ void ColumnarStore::rebuild_index_locked() {
         meta.dir_path = entry.path().parent_path().string();
         index_.push_back(meta);
     }
+    for (const auto& leftover : leftovers) {
+        std::error_code ec;
+        fs::remove(leftover, ec);
+        OB_LOG_DEBUG("columnar", "removed %s, left by a range repair that did not finish%s",
+                     leftover.string().c_str(), ec ? " (and could not remove it)" : "");
+    }
 
-    // Sort by start_ts_ns
+    repair_ranges_locked();
+
+    // Sorted after the repair, because the repair moves the ranges the order is taken from.
     std::sort(index_.begin(), index_.end(), segment_order_less);
+}
+
+void ColumnarStore::repair_ranges_locked() {
+    std::vector<SegmentMeta*> legacy;
+    for (auto& meta : index_) {
+        if (!meta.time_range_is_rows) legacy.push_back(&meta);
+    }
+    if (legacy.empty()) return;
+
+    const auto started = std::chrono::steady_clock::now();
+    last_rebuild_ranges_read_ = legacy.size();
+
+    size_t outside = 0;
+    size_t unreadable = 0;
+    std::string first_outside;
+    std::vector<SegmentMeta*> corrected;
+    corrected.reserve(legacy.size());
+    for (SegmentMeta* meta : legacy) {
+        std::vector<uint64_t> ts;
+        if (!read_column_file(meta->dir_path, "ts.col", ts) || ts.empty() ||
+            ts.size() != meta->row_count) {
+            // scan() needs this column for every query, so it skips the segment whatever its
+            // range says; there is nothing to correct and nothing a guess would improve.
+            ++unreadable;
+            OB_LOG_WARN("columnar",
+                        "segment %s: its ts.col could not be read as %llu row(s) (%zu read), so "
+                        "its recorded range stays [%llu, %llu]",
+                        meta->dir_path.c_str(), static_cast<unsigned long long>(meta->row_count),
+                        ts.size(), static_cast<unsigned long long>(meta->start_ts_ns),
+                        static_cast<unsigned long long>(meta->end_ts_ns));
+            continue;
+        }
+        const auto [lo, hi] = std::minmax_element(ts.begin(), ts.end());
+        if (*lo < meta->start_ts_ns || *hi > meta->end_ts_ns) {
+            // A row outside the range it recorded: a query asking for that row skipped this
+            // segment, and retention judged it by a row that was not its newest.
+            ++outside;
+            if (first_outside.empty()) first_outside = meta->dir_path;
+            OB_LOG_DEBUG("columnar", "segment %s: recorded [%llu, %llu], its rows span [%llu, %llu]",
+                         meta->dir_path.c_str(),
+                         static_cast<unsigned long long>(meta->start_ts_ns),
+                         static_cast<unsigned long long>(meta->end_ts_ns),
+                         static_cast<unsigned long long>(*lo),
+                         static_cast<unsigned long long>(*hi));
+        }
+        // In the index always, whatever happens on disk below. `last_row_ts_ns` stays what the
+        // file said, which for this format is its recorded end.
+        meta->start_ts_ns        = *lo;
+        meta->end_ts_ns          = *hi;
+        meta->time_range_is_rows = true;
+        corrected.push_back(meta);
+    }
+
+    // On disk, in batches: every corrected meta.json of a batch is written beside the old one, one
+    // syncfs() takes them all to the device, and only then is each renamed over its meta.json. A
+    // file each through write_file_atomically() would be the same guarantee at an fsync of the file
+    // and one of its directory per segment - and this touches every segment written before #166.
+    // The syncfs() of each batch also makes the previous batch's renames durable; the last batch's
+    // get one more.
+    size_t persisted = 0;
+    size_t not_persisted = 0;
+    const int dir_fd = ::open(base_dir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    constexpr size_t kBatch = 4096;
+    for (size_t first = 0; first < corrected.size(); first += kBatch) {
+        const size_t last = std::min(corrected.size(), first + kBatch);
+        std::vector<SegmentMeta*> written;
+        written.reserve(last - first);
+        for (size_t i = first; i < last; ++i) {
+            SegmentMeta* meta = corrected[i];
+            const std::string content = meta_json(*meta);
+            try {
+                // Through write_file_checked(), whose open is marked for the flush's syncfs(): here
+                // the syncfs() is the one below, before the rename publishes the file.
+                write_file_checked(meta->dir_path + "/" + kRangeRepairFile, content.data(),
+                                   content.size());
+                written.push_back(meta);
+            } catch (const std::exception& e) {
+                ++not_persisted;
+                OB_LOG_DEBUG("columnar", "range repair of %s stays in memory: %s",
+                             meta->dir_path.c_str(), e.what());
+            }
+        }
+        if (written.empty()) continue;
+        const int sync_err = dir_fd < 0 ? EBADF : (::syncfs(dir_fd) == 0 ? 0 : errno);
+        if (sync_err != 0) {
+            for (SegmentMeta* meta : written) {
+                std::error_code ec;
+                fs::remove(meta->dir_path + "/" + kRangeRepairFile, ec);
+            }
+            not_persisted += written.size();
+            OB_LOG_WARN("columnar",
+                        "the range repair could not sync %zu corrected meta.json file(s) (%s): they "
+                        "are corrected in memory and will be repaired again at the next start",
+                        written.size(), std::strerror(sync_err));
+            continue;
+        }
+        for (SegmentMeta* meta : written) {
+            const std::string tmp = meta->dir_path + "/" + kRangeRepairFile;
+            const std::string dst = meta->dir_path + "/meta.json";
+            if (::rename(tmp.c_str(), dst.c_str()) == 0) {
+                ++persisted;
+            } else {
+                const int err = errno;
+                std::error_code ec;
+                fs::remove(tmp, ec);
+                ++not_persisted;
+                OB_LOG_DEBUG("columnar", "range repair of %s stays in memory: rename: %s",
+                             meta->dir_path.c_str(), std::strerror(err));
+            }
+        }
+    }
+    if (persisted > 0 && dir_fd >= 0 && ::syncfs(dir_fd) != 0) {
+        // The renames may not survive a power cut. Nothing is lost if they do not: each segment
+        // then has its old meta.json, and the next start repairs it again.
+        OB_LOG_WARN("columnar", "the range repair's last sync failed (%s): %zu repaired meta.json "
+                                "file(s) may be repaired again at the next start",
+                    std::strerror(errno), persisted);
+    }
+    if (dir_fd >= 0) ::close(dir_fd);
+
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    const std::string first_note =
+        first_outside.empty() ? std::string() : " (the first: " + first_outside + ")";
+    OB_LOG_INFO("columnar",
+                "%zu segment(s) written before #166 were read for their time range in %lld ms: %zu "
+                "held rows outside the range they recorded%s, %zu repaired on disk, %zu only in "
+                "memory, %zu unreadable",
+                legacy.size(), static_cast<long long>(ms), outside, first_note.c_str(),
+                persisted, not_persisted, unreadable);
 }
 
 bool ColumnarStore::replace_from_staging(const std::string& staging_dir,
