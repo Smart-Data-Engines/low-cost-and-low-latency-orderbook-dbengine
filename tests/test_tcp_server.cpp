@@ -1624,9 +1624,18 @@ TEST(ReadLoopStatic, TheWritesOfAReadAreHeldAndAnsweredBeforeAnythingElse) {
     ASSERT_GT(close, open);
     const std::string body = path.substr(open, close - open);
 
-    // Emptied before the loop, so a write held for one session cannot be applied for the next.
+    // Emptied at the start of the read - before the function that applies them, whose own `clear()`
+    // runs only after an `execute_writes()` that returned. What the first one is for is the path
+    // where that did not return: an exception out of it leaves the writes held, and the reactor's
+    // next read may be another session's. Mutation row 14 of #155 removed the first and this rule
+    // found the second - inside the lambda - and passed, so it now asks for one ahead of the lambda.
+    const std::size_t lambda = path.find("const auto apply_held_writes");
+    ASSERT_NE(lambda, std::string::npos);
     const std::size_t cleared = path.find("pending_writes_.clear();");
     ASSERT_NE(cleared, std::string::npos) << "the held writes are not emptied at the start of a read";
+    EXPECT_LT(cleared, lambda)
+        << "the held writes are emptied only inside the function that applies them, which an "
+           "exception out of execute_writes() skips";
     EXPECT_LT(cleared, header);
 
     // Held, and nothing else done with it.

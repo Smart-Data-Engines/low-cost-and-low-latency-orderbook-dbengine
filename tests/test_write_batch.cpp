@@ -399,6 +399,30 @@ bool inside_a_loop(const std::string& body, std::size_t at) {
     for (const bool loop : loops) {
         if (loop) return true;
     }
+    // And a loop without braces, whose body is one statement: on the line of its header, or on the
+    // line after it. Mutation row 7 of #155 was `for (...) (void)wal_.append_batch(...)` - one line,
+    // no block - and this function said no loop.
+    const auto loop_header = [](const std::string& text) {
+        const std::size_t w = text.find_first_not_of(" \t}");
+        if (w == std::string::npos) return false;
+        return text.compare(w, 4, "for ") == 0 || text.compare(w, 4, "for(") == 0 ||
+               text.compare(w, 6, "while ") == 0 || text.compare(w, 6, "while(") == 0;
+    };
+    const std::size_t line_start = [&] {
+        const std::size_t nl = body.rfind('\n', at);
+        return nl == std::string::npos ? std::size_t{0} : nl + 1;
+    }();
+    if (loop_header(body.substr(line_start, at - line_start))) return true;
+    if (line_start >= 2) {
+        const std::size_t prev_end = line_start - 1;
+        const std::size_t prev_nl = body.rfind('\n', prev_end - 1);
+        const std::size_t prev_start = prev_nl == std::string::npos ? 0 : prev_nl + 1;
+        std::string prev = body.substr(prev_start, prev_end - prev_start);
+        prev.erase(prev.find_last_not_of(" \t") + 1);
+        if (loop_header(prev) && !prev.empty() && prev.back() != '{' && prev.back() != ';') {
+            return true;
+        }
+    }
     return false;
 }
 
