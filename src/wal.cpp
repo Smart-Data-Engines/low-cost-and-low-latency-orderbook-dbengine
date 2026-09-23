@@ -875,11 +875,15 @@ uint64_t WALReplayer::replay_after(const LastCheckpoint& last, WALReplayCallback
         cb(ctx);
     });
 
+    // Three states, not two: a log with no checkpoint at all was rendered as a checkpoint that
+    // says nothing of what it covered, which is the older build's case - and since #160 the first
+    // one is common, because a first flush cut short, or a failed sync, leaves no checkpoint.
     const std::string resuming =
-        last.covered ? "at file " + std::to_string(last.covered->file_index) + " offset " +
-                           std::to_string(last.covered->offset)
-                     : std::string("after the checkpoint record, which says nothing of what it "
-                                   "covered");
+        last.covered      ? "at file " + std::to_string(last.covered->file_index) + " offset " +
+                                std::to_string(last.covered->offset)
+        : last.ordinal == 0 ? std::string("from the start of the log, which holds no checkpoint")
+                            : std::string("after the checkpoint record, which says nothing of "
+                                          "what it covered");
     OB_LOG_INFO("wal",
                 "Replay after checkpoint: records=%llu last_checkpoint_ordinal=%llu "
                 "resuming %s, forwarded=%llu (of which %llu written before the checkpoint while "

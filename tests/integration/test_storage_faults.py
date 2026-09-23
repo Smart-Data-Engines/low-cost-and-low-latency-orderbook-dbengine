@@ -885,6 +885,9 @@ def test_a_flush_whose_segments_did_not_sync_claims_nothing(policy):
                                 "were removed") == 1, node.log()[-2000:]
         assert applied(node) == 2 and skipped_by_position(node) == 0, (
             f"the replay did not rebuild the removed segment's two rows: {replay_line(node)!r}")
+        # And it says which of the three states the log was in: no checkpoint at all, which the
+        # replay line used to render as an older build's checkpoint that says nothing.
+        assert "resuming from the start of the log, which holds no checkpoint" in node.log()
     finally:
         node.cleanup()
 
