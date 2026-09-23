@@ -21,9 +21,10 @@ inline constexpr uint8_t WAL_RECORD_SNAPSHOT = 2;
 inline constexpr uint8_t WAL_RECORD_GAP      = 3;
 inline constexpr uint8_t WAL_RECORD_ROTATE   = 4;
 // EPOCH = 5, see append_epoch().
-/// Everything before this record is durable in columnar segments, so replay may skip
-/// it. Written after a successful flush, never before: a checkpoint claiming more than
-/// is durable turns a crash into data loss.
+/// The rows of every record before the position in its payload are durable in columnar
+/// segments, so replay may skip those records (#159: the position its flush drained up to, not
+/// this record's own - see `append_checkpoint()`). Written after a successful flush, never
+/// before: a checkpoint claiming more than is durable turns a crash into data loss.
 inline constexpr uint8_t WAL_RECORD_CHECKPOINT = 6;
 /// A node's version vector: what it holds per (symbol, origin). Written to the WAL so a
 /// restarted node knows it, and sent to peers in the same envelope so a node running the
