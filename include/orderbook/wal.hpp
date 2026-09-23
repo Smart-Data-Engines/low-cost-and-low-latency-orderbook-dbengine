@@ -676,6 +676,21 @@ public:
     /// not happened yet.
     uint64_t replay_after_checkpoint(WALReplayCallbackV2 cb);
 
+    /// What the last CHECKPOINT in the log says, and what the log itself holds: the first pass of
+    /// `replay_after_checkpoint()`, on its own so that a reader can act on the checkpoint before the
+    /// second pass - the engine sets aside the segments it does not vouch for (#160).
+    struct LastCheckpoint {
+        uint64_t ordinal{0};                 ///< 1-based, among every record replayed; 0 = none
+        std::optional<WalPosition> covered;  ///< what it says it covered; empty for an older build's
+        uint64_t records{0};                 ///< every record the log holds
+        bool     any_record{false};
+        uint32_t first_file_index{0};        ///< the oldest WAL file a record came from
+    };
+    LastCheckpoint find_last_checkpoint();
+
+    /// The second pass: forward what `last` does not cover, as `replay_after_checkpoint()` does.
+    uint64_t replay_after(const LastCheckpoint& last, WALReplayCallbackV2 cb);
+
     /// Return the highest epoch found during the last replay (0 if none).
     uint64_t last_epoch() const { return last_epoch_; }
 

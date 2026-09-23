@@ -464,6 +464,11 @@ public:
 private:
     std::string base_dir_;
     uint64_t    flush_interval_ns_;
+    /// The policy the WAL was given, kept here as well because it decides a second thing: whether a
+    /// flush syncs the segments it wrote (#160). `none` promises nothing after a power cut, so it
+    /// does not pay for a sync; `every` and `interval` do, or a checkpoint would claim rows the
+    /// device never received.
+    const FsyncPolicy fsync_policy_;
 
     // Subsystems (order matters for construction/destruction)
     WALWriter         wal_;
@@ -613,14 +618,41 @@ private:
     std::vector<PendingRow> pending_rows_;
 
     /// How far into the WAL the last completed drain reached: the position it stamped into its
-    /// stores. **The engine's one answer to "how much of the log is in segments"** once a flush's
-    /// segments are written (#159), and it has two readers: the checkpoint appended after them
-    /// claims it, and WAL retention deletes only the files before its file. Both used to read the
-    /// log's end instead, which is later by whatever writers appended while the flush wrote
-    /// segments without `mtx_`. Written and read under `mtx_`, with `flush_mtx_` held from the
-    /// drain to the checkpoint, so no other drain comes between them. Zero until a first drain,
-    /// which reads as covering nothing - the direction in which either reader may be wrong.
+    /// stores. **The engine's answer to "how much of the log is in segment files"** once a flush's
+    /// segments are written (#159) - which survives a killed process and not a power cut, so since
+    /// #160 its reader is `durable_up_to_`, which takes this value once a sync has covered those
+    /// files. Both used to read the log's end instead, later by whatever writers appended while
+    /// the flush wrote segments without `mtx_`. Written and read under `mtx_`, with `flush_mtx_`
+    /// held from the drain to the checkpoint, so no other drain comes between them. Zero until a
+    /// first drain, which reads as covering nothing - the direction in which a reader may be wrong.
     WalPosition drained_up_to_{};
+
+    /// How far the WAL is durable in segments **on the device** (#160): the drain position of the
+    /// last flush whose segments a successful `syncfs()` covered. This, not `drained_up_to_`, is
+    /// what the checkpoint claims and what WAL retention reads - `drained_up_to_` says the rows are
+    /// in segment files, which survives a killed process and not a power cut: measured, a cut after
+    /// a flush brought back eight empty segment files under a checkpoint that claimed them. Equal to
+    /// `drained_up_to_` after a flush that synced; behind it after one whose sync failed, until the
+    /// next one succeeds. Under `--fsync-policy none` it follows `drained_up_to_` without a sync.
+    /// Written and read under `mtx_`, like `drained_up_to_`.
+    WalPosition durable_up_to_{};
+
+    /// What the newest checkpoint **known to be on the device** claims (#160) - the one WAL
+    /// retention reads. A checkpoint is appended without a sync of its own, and the next WAL sync
+    /// (the next tick's, or the next write's under `every`) is what makes it durable. Retention in
+    /// the same tick that appended it would otherwise delete WAL files on the strength of a record
+    /// a power cut could still take, while the unlink survives: the segments that checkpoint
+    /// vouched for would then be rebuilt at startup from records that are gone. So this takes
+    /// `durable_up_to_` once a WAL sync has covered the checkpoint - one tick later, which is what
+    /// retention pays. Under `--fsync-policy none` it follows `durable_up_to_` at once. Under `mtx_`.
+    WalPosition retention_floor_{};
+
+    /// The data directory, open for `syncfs()` from `open()` to `close()` (#160). -1 until then.
+    int data_dir_fd_{-1};
+
+    /// A run of flushes whose segment sync failed: loud once, then quiet, and the flush that syncs
+    /// again closes it (#95's shape). Touched only by the thread holding `flush_mtx_`.
+    LogEpisode segment_sync_episode_;
 
     // Backpressure: maximum number of pending rows before apply_delta blocks.
     // Default 1M rows ≈ ~100 MB memory. Prevents OOM under sustained ingestion.
@@ -800,11 +832,24 @@ private:
 
     /// Replay the WAL tail into memory. Returns records applied.
     ///
-    /// Requires combined_store_.open_existing() to have run: rows already covered by
-    /// a segment are skipped by timestamp, which needs the segment index.
-    uint64_t replay_wal_tail();
+    /// Requires combined_store_.open_existing() to have run, and the segments no surviving
+    /// checkpoint vouches for to have been removed (#160): a record a remaining segment already
+    /// holds is skipped by the WAL position that segment recorded (#63), which needs the index.
+    uint64_t replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastCheckpoint& last);
     void flush_drain_pending();    // Phase A: drain pending_rows_ → per-symbol append (must hold mtx_)
-    void flush_write_and_merge();  // Phase B: segment I/O + merge index (must hold flush_mtx_, not mtx_)
+    /// Phase B: segment I/O, the segment sync, and the index merge (hold `flush_mtx_`, not `mtx_`).
+    /// Returns 0, or the `errno` the segment sync failed with - in which case the segments are
+    /// merged and visible, and no checkpoint claims them (#160). The flush tick counts and goes on;
+    /// `FLUSH` answers `ERR`, because a client that asked is told.
+    int flush_write_and_merge();
+    /// Sync what this flush wrote, before anything claims it (#160): one `syncfs()` on the data
+    /// directory, without `mtx_`. Returns 0, or the `errno`; always 0 under `--fsync-policy none`.
+    int sync_segments();
+    /// The WAL was just synced to its end, so the last checkpoint appended is on the device and
+    /// retention may follow its claim (#160). Caller holds `mtx_`.
+    void note_wal_synced();
+    /// At startup, before replay: remove the segments no surviving checkpoint vouches for (#160).
+    void remove_unvouched_segments(const WALReplayer::LastCheckpoint& last);
 };
 
 } // namespace ob

@@ -95,6 +95,18 @@ MetricsRegistry::MetricsRegistry() {
     // two ask for different actions: a full disk is freed, a disk reporting EIO is replaced.
     counters_.push_back(make_counter("ob_wal_fsync_errors_total",
                                      "fsync calls on the WAL that failed"));
+    // Flushes whose segment sync failed (#160). Registered in the same change that writes it. Its
+    // consequence is not a lost row but a checkpoint not written: the segments stay merged and
+    // readable, WAL retention stops advancing, and a power cut in that state replays from the last
+    // flush that synced. A number that climbs here is a disk that accepts writes and refuses to
+    // make them durable, which is the one state in which the WAL grows without anything failing.
+    counters_.push_back(make_counter("ob_segment_sync_errors_total",
+                                     "Flushes whose segment syncfs() failed, so no checkpoint claimed them"));
+    // Segments removed at startup because no surviving checkpoint vouched for them, their rows
+    // rebuilt from the WAL (#160). Registered in the same change that writes it. Nonzero after a
+    // crash that cut a flush short, which is expected; nonzero after a clean restart is not.
+    counters_.push_back(make_counter("ob_segments_rebuilt_from_wal_total",
+                                     "Segments removed at startup and rebuilt from the WAL"));
     // A writer that ran out of room in the pending queue, and one whose wait for room ran out
     // (#137). The pair matters: waits without refusals is backpressure working, and refusals
     // mean the flush itself is not making progress.

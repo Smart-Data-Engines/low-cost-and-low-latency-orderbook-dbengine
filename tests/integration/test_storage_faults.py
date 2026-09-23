@@ -451,7 +451,9 @@ def select_prices(node: FaultNode) -> list[int]:
         lines = []
         while True:
             line = reader.readline()
-            if not line or line == b"\n":
+            # `OK` ends in a blank line and `ERR` in one newline: a symbol with nothing left is
+            # `ERR ... not found`, which a reader waiting for a blank line would hang on.
+            if not line or line == b"\n" or line.startswith(b"ERR"):
                 break
             lines.append(line.decode(errors="replace"))
     return prices_in("".join(lines))
@@ -830,4 +832,192 @@ def test_a_wal_that_could_not_open_its_next_file_opens_it_once_it_can():
         assert not [p for p in refused if p in back], "a refused write came back after the restart"
     finally:
         os.chmod(node.data_dir, mode)
+        node.cleanup()
+
+
+DATA_DIR_PREFIX = "ob_storage_fault_"   # FaultNode's data directory, which is what syncfs() names
+
+
+def replay_line(node: FaultNode) -> str:
+    """The restarted node's account of its WAL replay: what it applied and what segments held."""
+    lines = [l for l in node.log().splitlines() if "WAL replay: records=" in l]
+    return lines[-1] if lines else ""
+
+
+def skipped_by_position(node: FaultNode) -> int:
+    m = re.search(r"skipped_by_position=(\d+)", replay_line(node))
+    return int(m.group(1)) if m else -1
+
+
+def applied(node: FaultNode) -> int:
+    m = re.search(r"applied=(\d+)", replay_line(node))
+    return int(m.group(1)) if m else -1
+
+
+@pytest.mark.parametrize("policy", ["every", "interval"])
+def test_a_flush_whose_segments_did_not_sync_claims_nothing(policy):
+    """#160: segments that could not be made durable are not claimed by a checkpoint.
+
+    The first `syncfs()` is made to fail. `FLUSH` answers `ERR` - a client that asked is told - and the
+    counter moves, while the rows are merged and readable, because they *are* written. What says no
+    checkpoint claimed them is the restart after a kill: the segment no checkpoint vouches for is
+    **removed**, and the replay **applies** both records, rebuilding it. A checkpoint would have
+    covered them, and the replay would have trusted a segment a power cut may have left empty.
+    """
+    node = FaultNode(OB_FAULT_PATH=DATA_DIR_PREFIX, OB_FAULT_OP="syncfs", OB_FAULT_ERRNO="EIO",
+                     OB_FAULT_COUNT="1", OB_FAULT_POLICY=policy, OB_FAULT_FLUSH_MS="3600000")
+    try:
+        node.wait_until_answering()
+        assert node.insert_each([100, 101]) == {100: "OK", 101: "OK"}
+        reply = node.talk("FLUSH")[0]
+        assert "action=fail" in node.fault_log_text(), node.fault_log_text()
+        assert reply.startswith("ERR") and "segment sync failed" in reply, (
+            f"FLUSH did not report the failed segment sync: {reply!r}")
+        assert node.counter("ob_segment_sync_errors_total") == 1
+        assert node.log().count("Segments could not be synced") == 1
+        assert sorted(select_prices(node)) == [100, 101], "the written rows are not readable"
+
+        node.kill_and_restart_without_faults()
+        assert sorted(select_prices(node)) == [100, 101], (
+            f"the rows did not come back exactly once:\n{node.log()[-1500:]}")
+        assert node.log().count("1 segment(s) written after the last checkpoint that survived "
+                                "were removed") == 1, node.log()[-2000:]
+        assert applied(node) == 2 and skipped_by_position(node) == 0, (
+            f"the replay did not rebuild the removed segment's two rows: {replay_line(node)!r}")
+    finally:
+        node.cleanup()
+
+
+def test_the_flush_after_a_failed_segment_sync_claims_both():
+    """The next flush that syncs covers the earlier segments too, and the episode says it is over.
+
+    One `syncfs()` covers everything dirty in the filesystem, so the second flush's checkpoint can
+    claim the first flush's rows as well: after a kill, the replay starts past all three records.
+    """
+    node = FaultNode(OB_FAULT_PATH=DATA_DIR_PREFIX, OB_FAULT_OP="syncfs", OB_FAULT_ERRNO="EIO",
+                     OB_FAULT_COUNT="1", OB_FAULT_POLICY="every", OB_FAULT_FLUSH_MS="3600000")
+    try:
+        node.wait_until_answering()
+        assert node.insert_each([100, 101]) == {100: "OK", 101: "OK"}
+        assert node.talk("FLUSH")[0].startswith("ERR")
+        assert node.insert_each([102]) == {102: "OK"}
+        assert node.talk("FLUSH")[0] == "OK", "the flush after the failed one did not succeed"
+        assert node.log().count("Segments sync again, after 1 flush(es)") == 1, node.log()[-1500:]
+        assert node.counter("ob_segment_sync_errors_total") == 1
+
+        node.kill_and_restart_without_faults()
+        assert sorted(select_prices(node)) == [100, 101, 102]
+        assert skipped_by_position(node) == 0, (
+            f"the replay still read records the second checkpoint should have covered: "
+            f"{replay_line(node)!r}")
+    finally:
+        node.cleanup()
+
+
+def test_retention_does_not_pass_a_segment_that_did_not_sync():
+    """#160: while no flush can sync, no WAL file is deleted - the segments are not on the device.
+
+    Every `syncfs()` fails, and the WAL rotates under six hundred writes. The ticks that write those
+    rows' segments fail to sync them; the ticks after them have nothing to write and so nothing to
+    sync - only a flush with segments syncs - but retention runs on every tick, and it must not move.
+    Before this change retention followed the drain and deleted `wal_000000.bin` at the first tick
+    after the rotation; a power cut then had neither the unsynced segment nor the record.
+    """
+    node = FaultNode(OB_FAULT_PATH=DATA_DIR_PREFIX, OB_FAULT_OP="syncfs", OB_FAULT_ERRNO="EIO",
+                     OB_FAULT_POLICY="interval", OB_FAULT_FLUSH_MS="300",
+                     OB_FAULT_ROTATE_BYTES="65573")
+    try:
+        node.wait_until_answering()
+        prices = list(range(1000, 1600))
+        replies = node.insert_each(prices)
+        assert all(r == "OK" for r in replies.values())
+        assert "wal_000001.bin" in node.wal_files(), node.wal_files()
+        deadline = time.time() + patience(20)
+        while node.counter("ob_segment_sync_errors_total") < 1 and time.time() < deadline:
+            time.sleep(0.05)
+        assert node.counter("ob_segment_sync_errors_total") >= 1, "no segment sync was refused"
+        # Three more ticks, each of which runs retention over the same state.
+        ticks = node.counter("ob_flush_ticks_total")
+        while node.counter("ob_flush_ticks_total") < ticks + 3 and time.time() < deadline:
+            time.sleep(0.05)
+        assert node.counter("ob_flush_ticks_total") >= ticks + 3, "the ticks stopped"
+        assert "wal_000000.bin" in node.wal_files(), (
+            f"retention deleted a WAL file whose segment never synced: {node.wal_files()}")
+        assert node.log().count("Segments could not be synced") == 1, "loud more than once"
+
+        node.kill_and_restart_without_faults()
+        assert sorted(select_prices(node)) == prices
+    finally:
+        node.cleanup()
+
+
+HOUR_NS = 3600 * 1_000_000_000   # the columnar store's segment length
+
+
+def insert_at(node: FaultNode, symbol: str, price: int, event_time_ns: int) -> str:
+    """One INSERT with its event time, for a test that needs rows in two different segments."""
+    return node.talk(f"INSERT {symbol} EX bid {price} 1 1 {event_time_ns}")[0]
+
+
+def prices_of(node: FaultNode, symbol: str) -> list[int]:
+    reply = node.talk(f"SELECT * FROM '{symbol}'.'EX' WHERE timestamp BETWEEN 0 AND "
+                      "9999999999999999999")[0]
+    return [] if reply.startswith("ERR") else prices_in(reply)
+
+
+def test_a_rollover_the_disk_refuses_mid_drain_appends_no_row_twice():
+    """#160: a drain stopped by a segment write keeps only the rows it has not appended queued.
+
+    A row whose event time crosses the segment's hour rolls the segment over, and the rollover
+    writes it - from inside the drain. Since the segment writes are checked, a refused one throws
+    there, part-way through the queue. Rows already appended must leave the queue, or the next
+    drain appends them a second time into storage that never removes a row.
+
+    Row 100 is in hour 1, rows 200 and 300 in hour 2, so appending 200 rolls hour 1 over, and the
+    injector refuses that first `price.col`. The first `FLUSH` fails; the second writes both hours;
+    every row is there once, before a restart and after one.
+    """
+    node = FaultNode(OB_FAULT_PATH="price.col", OB_FAULT_OP="write", OB_FAULT_ERRNO="ENOSPC",
+                     OB_FAULT_COUNT="1", OB_FAULT_FLUSH_MS="3600000")
+    base = 1_700_000_000 * 1_000_000_000 // HOUR_NS * HOUR_NS
+    try:
+        node.wait_until_answering()
+        assert insert_at(node, "ROLL", 100, base + 1) == "OK"
+        assert insert_at(node, "ROLL", 200, base + HOUR_NS + 1) == "OK"
+        assert insert_at(node, "ROLL", 300, base + HOUR_NS + 2) == "OK"
+        assert node.talk("FLUSH")[0].startswith("ERR"), "the refused rollover was not reported"
+        assert node.injections() == 1, node.fault_log_text()
+        assert node.talk("FLUSH")[0] == "OK"
+        assert sorted(prices_of(node, "ROLL")) == [100, 200, 300], (
+            f"a row was lost or appended twice by the drain the rollover stopped:\n"
+            f"{node.log()[-1500:]}")
+        node.kill_and_restart_without_faults()
+        assert sorted(prices_of(node, "ROLL")) == [100, 200, 300]
+    finally:
+        node.cleanup()
+
+
+def test_a_symbol_the_disk_refuses_leaves_the_others_written_and_readable():
+    """#160: one store's refused segment does not take the flush's other segments with it.
+
+    Two symbols in one flush, and the first `price.col` the flush writes is refused - whichever
+    symbol that is. The other's segment is written **and merged**: an exception out of the loop
+    used to skip the merge, and a written segment outside the index is rows no query returns until
+    a restart finds them. The refused one's rows stay in memory and the next flush writes them.
+    """
+    node = FaultNode(OB_FAULT_PATH="price.col", OB_FAULT_OP="write", OB_FAULT_ERRNO="ENOSPC",
+                     OB_FAULT_COUNT="1", OB_FAULT_FLUSH_MS="3600000")
+    try:
+        node.wait_until_answering()
+        assert node.talk("INSERT AAA EX bid 111 1 1")[0] == "OK"
+        assert node.talk("INSERT BBB EX bid 222 1 1")[0] == "OK"
+        assert node.talk("FLUSH")[0].startswith("ERR"), "the refused segment was not reported"
+        visible = {s: prices_of(node, s) for s in ("AAA", "BBB")}
+        assert sorted(len(v) for v in visible.values()) == [0, 1], (
+            f"exactly one symbol's segment should be readable after the first flush: {visible}")
+        assert node.talk("FLUSH")[0] == "OK"
+        assert prices_of(node, "AAA") == [111] and prices_of(node, "BBB") == [222]
+        node.kill_and_restart_without_faults()
+        assert prices_of(node, "AAA") == [111] and prices_of(node, "BBB") == [222]
+    finally:
         node.cleanup()

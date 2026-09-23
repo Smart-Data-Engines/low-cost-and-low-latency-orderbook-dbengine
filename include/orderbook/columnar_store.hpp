@@ -93,6 +93,10 @@ public:
 
     /// Set the symbol and exchange for this store (used by C API wrapper).
     /// Must be called before the first append if symbol/exchange metadata is needed.
+    /// The symbol and exchange this store holds, for a message that has to name them.
+    const std::string& symbol() const { return symbol_; }
+    const std::string& exchange() const { return exchange_; }
+
     void set_symbol_exchange(std::string_view symbol, std::string_view exchange) {
         symbol_   = std::string(symbol);
         exchange_ = std::string(exchange);
@@ -173,6 +177,14 @@ public:
     /// Logs each deletion to stderr.
     /// Skips segments that fail to delete (logs error, continues).
     std::pair<size_t, size_t> delete_expired_segments(uint64_t cutoff_ns);
+
+    /// Remove the segments whose directories are named, from the disk and from the index.
+    /// Returns how many were removed; one whose directory cannot be removed stays indexed.
+    ///
+    /// For recovery (#160): a segment no surviving checkpoint vouches for may be what a power cut
+    /// left of it, and the WAL holds every one of its rows, so the engine removes it before replay
+    /// rather than trust a directory the device may not have received in full.
+    size_t remove_segments(const std::vector<std::string>& dirs);
 
     /// Number of segments in the index (including active if flushed).
     size_t segment_count() const {

@@ -826,26 +826,33 @@ uint64_t WALReplayer::replay(
     return last_good_seq;
 }
 
-uint64_t WALReplayer::replay_after_checkpoint(WALReplayCallbackV2 cb)
+WALReplayer::LastCheckpoint WALReplayer::find_last_checkpoint()
 {
-    // Pass 1: find the ordinal of the last CHECKPOINT record. Reusing replay_v2 here
-    // rather than writing a second parser is deliberate: two parsers for one format
-    // eventually disagree, and this one only needs record types and ordering.
+    // Reusing replay_v2 here rather than writing a second parser is deliberate: two parsers for
+    // one format eventually disagree, and this one only needs record types and ordering.
+    LastCheckpoint last;
     uint64_t ordinal = 0;
-    uint64_t last_checkpoint_ordinal = 0;   // 0 = no checkpoint found
-    // What the last checkpoint covered, when it says (#159). Reset by every checkpoint, so a last
-    // one written by an older build - empty payload - is read by ordinal even after newer ones.
-    std::optional<WalPosition> covered;
     replay_v2([&](const WALReplayContext& ctx) {
         ++ordinal;
+        if (!last.any_record || ctx.wal_file_index < last.first_file_index) {
+            last.first_file_index = ctx.wal_file_index;
+        }
+        last.any_record = true;
         if (ctx.header.record_type == WAL_RECORD_CHECKPOINT) {
-            last_checkpoint_ordinal = ordinal;
-            covered = checkpoint_covered(ctx.payload, ctx.payload_len);
+            last.ordinal = ordinal;
+            // Reset by every checkpoint, so a last one written by an older build - empty payload -
+            // is read by ordinal even after newer ones (#159).
+            last.covered = checkpoint_covered(ctx.payload, ctx.payload_len);
         }
     });
+    last.records = ordinal;
+    return last;
+}
 
-    // Pass 2: forward what the checkpoint does not cover. **Every record after the last checkpoint
-    // is forwarded, whatever its payload says**, and a checkpoint that says what it covered adds to
+uint64_t WALReplayer::replay_after(const LastCheckpoint& last, WALReplayCallbackV2 cb)
+{
+    // Forward what the checkpoint does not cover. **Every record after the last checkpoint is
+    // forwarded, whatever its payload says**, and a checkpoint that says what it covered adds to
     // that the records **before** it that start at or after that position (#159): the ones written
     // while its flush wrote segments without the engine's lock, whose rows were still queued when
     // the checkpoint was appended. So the position can only give records back, never take one away
@@ -858,10 +865,10 @@ uint64_t WALReplayer::replay_after_checkpoint(WALReplayCallbackV2 cb)
     uint64_t given_back = 0;   // records before the last checkpoint, forwarded because of its position
     uint64_t last_seq = replay_v2([&](const WALReplayContext& ctx) {
         ++seen;
-        if (seen <= last_checkpoint_ordinal) {
-            if (!covered || seen == last_checkpoint_ordinal) return;
+        if (seen <= last.ordinal) {
+            if (!last.covered || seen == last.ordinal) return;
             const WalPosition at{ctx.wal_file_index, static_cast<uint32_t>(ctx.wal_byte_offset)};
-            if (wal_position_before(at, *covered)) return;
+            if (wal_position_before(at, *last.covered)) return;
             ++given_back;
         }
         ++forwarded;
@@ -869,19 +876,27 @@ uint64_t WALReplayer::replay_after_checkpoint(WALReplayCallbackV2 cb)
     });
 
     const std::string resuming =
-        covered ? "at file " + std::to_string(covered->file_index) + " offset " +
-                      std::to_string(covered->offset)
-                : std::string("after the checkpoint record, which says nothing of what it covered");
+        last.covered ? "at file " + std::to_string(last.covered->file_index) + " offset " +
+                           std::to_string(last.covered->offset)
+                     : std::string("after the checkpoint record, which says nothing of what it "
+                                   "covered");
     OB_LOG_INFO("wal",
                 "Replay after checkpoint: records=%llu last_checkpoint_ordinal=%llu "
                 "resuming %s, forwarded=%llu (of which %llu written before the checkpoint while "
                 "its flush wrote segments)",
                 static_cast<unsigned long long>(seen),
-                static_cast<unsigned long long>(last_checkpoint_ordinal), resuming.c_str(),
+                static_cast<unsigned long long>(last.ordinal), resuming.c_str(),
                 static_cast<unsigned long long>(forwarded),
                 static_cast<unsigned long long>(given_back));
 
     return last_seq;
+}
+
+uint64_t WALReplayer::replay_after_checkpoint(WALReplayCallbackV2 cb)
+{
+    // Two passes rather than buffering the tail in memory: the first finds the last checkpoint,
+    // the second invokes cb for the records it does not cover.
+    return replay_after(find_last_checkpoint(), std::move(cb));
 }
 
 uint64_t WALReplayer::replay_v2(WALReplayCallbackV2 cb)

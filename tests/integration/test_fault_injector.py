@@ -245,3 +245,36 @@ def test_a_delayed_write_is_slow_and_writes_its_bytes(tmp_path):
     assert written == {0: 64, 1: 64, 2: 64} and size == 192, (
         f"the delayed write did not write its bytes: {written}, file size {size}")
     assert log_actions(log) == ["pass-skip", "delay", "pass-spent"], log_actions(log)
+
+
+SYNCFS_PROBE = r"""
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+for i in range(3):
+    rc = libc.syncfs(fd)
+    print("s %d %d %d" % (i, rc, ctypes.get_errno() if rc != 0 else 0))
+os.close(fd)
+"""
+
+
+def test_a_chosen_syncfs_fails_and_the_others_pass(tmp_path):
+    """`OB_FAULT_OP=syncfs`, the flush's segment sync (#160): the chosen call fails with the errno.
+
+    Called through ctypes, which resolves `syncfs` through the dynamic linker the way the engine's
+    own call does, so the interposer is what answers. The two calls around it are the control.
+    """
+    injector = fault_injector_path()
+    assert injector is not None, "libobfault.so was not built"
+    log = tmp_path / "fault.log"
+    target = tmp_path / "syncfs_target"
+    target.mkdir()
+    env = {k: v for k, v in os.environ.items() if not k.startswith("OB_FAULT_")}
+    env.update(LD_PRELOAD=injector, OB_FAULT_PATH="syncfs_target", OB_FAULT_OP="syncfs",
+               OB_FAULT_ERRNO="EIO", OB_FAULT_SKIP="1", OB_FAULT_COUNT="1", OB_FAULT_LOG=str(log))
+    done = subprocess.run([sys.executable, "-c", SYNCFS_PROBE, str(target)],
+                          env=env, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    results = {int(p[1]): (int(p[2]), int(p[3])) for p in (l.split() for l in done.stdout.splitlines())}
+    assert results == {0: (0, 0), 1: (-1, 5), 2: (0, 0)}, results
+    assert log_actions(log) == ["pass-skip", "fail", "pass-spent"], log_actions(log)

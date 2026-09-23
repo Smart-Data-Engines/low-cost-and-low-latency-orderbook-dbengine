@@ -185,11 +185,25 @@ jobs:
       - name: Benchmark harness unit tests
         run: .venv/bin/python -m pytest benchmarks/comparative/tests/ -q
 
+      # The power-cut tests (#160) put a node's data directory on dm-flakey and switch it to drop
+      # every write, which needs the module - and a cloud kernel may ship it in linux-modules-extra
+      # rather than in the base package. Loaded here, so that a kernel without it is this step's
+      # named failure rather than a test's. The tests themselves fail rather than skip without it.
+      - name: Load dm-flakey for the power-cut tests
+        run: |
+          if ! sudo modprobe dm-flakey 2>/dev/null; then
+            sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe dm-flakey
+          fi
+          sudo dmsetup targets | grep -q '^flakey'
+
       # The harness starts its own etcd per cluster, so nothing is started here. Binance tests are
-      # opt-in and stay skipped without OB_BINANCE_TESTS.
+      # opt-in and stay skipped without OB_BINANCE_TESTS. The power-cut tests are opt-in locally
+      # and switched on here, and the skip gate below is what keeps them on (#160).
       - name: Run the integration suite
         env:
           OB_INTEGRATION_TESTS: "1"
+          OB_POWER_CUT_TESTS: "1"
         run: |
           PYTHONPATH=$PWD/python .venv/bin/python -m pytest tests/integration/ -q \
             --junitxml=integration-report.xml
@@ -634,6 +648,18 @@ jobs:
           .venv/bin/pip install -q --upgrade pip
           .venv/bin/pip install -q -e ".[test]"
 
+      # The power-cut tests (#160) put a node's data directory on dm-flakey and switch it to drop
+      # every write, which needs the module - and a cloud kernel may ship it in linux-modules-extra
+      # rather than in the base package. Loaded here, so that a kernel without it is this step's
+      # named failure rather than a test's. The tests themselves fail rather than skip without it.
+      - name: Load dm-flakey for the power-cut tests
+        run: |
+          if ! sudo modprobe dm-flakey 2>/dev/null; then
+            sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe dm-flakey
+          fi
+          sudo dmsetup targets | grep -q '^flakey'
+
       # The whole battery, not a subset — and the subset is what hid #85 for months.
       #
       # This job used to run three multi-master modules. None of them starts the failover monitor,
@@ -651,6 +677,7 @@ jobs:
       - name: Run the integration battery against the TSan server
         env:
           OB_INTEGRATION_TESTS: "1"
+          OB_POWER_CUT_TESTS: "1"
           OB_SERVER_BINARY: ${{ github.workspace }}/build-tsan/ob_tcp_server
           TSAN_OPTIONS: detect_deadlocks=1:second_deadlock_stack=1:halt_on_error=0:log_path=${{ github.workspace }}/tsan-report
         run: |
