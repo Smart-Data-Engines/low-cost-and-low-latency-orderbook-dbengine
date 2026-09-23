@@ -19,6 +19,19 @@ build.
         --probe build-release/benchmarks/pipelined_ingest --rounds 5 --connections 1 \\
         --count-syscalls
 
+`--events` names other tracepoints to count the same way. Stage 2b of #151 (one write() and one
+lock per read, roadmap #155) was measured with `write`, `futex` and `fsync` added, because what it
+changes is how many times the WAL is written and how often the engine's lock is contended:
+
+    scripts/measure_pipelined_ingest.py ... --count-syscalls \\
+        --events syscalls:sys_enter_sendto,syscalls:sys_enter_read,syscalls:sys_enter_write,\\
+    syscalls:sys_enter_futex
+
+A `write` here is every `write()` of the process: the WAL's, the flush loop's segment files and
+the log's. Per batch the flush loop's are a fraction - it writes per interval, not per batch - and
+the log writes nothing at the default level; both are why the count is read as a rate per batch
+rather than as a total.
+
 One binary under several configurations is several `--server` entries with the same path and a
 `--flags NAME=...` each, which is how the multi-reactor stage compared `--io-threads 1, 2, 4`:
 
@@ -93,13 +106,17 @@ def start_node(server: Path, data_dir: Path, flags: list[str],
     raise SystemExit("node did not start within 15 s")
 
 
-def perf_counts(path: Path) -> dict[str, int]:
+def short_name(event: str) -> str:
+    return event.split("sys_enter_")[1] if "sys_enter_" in event else event
+
+
+def perf_counts(path: Path, events: list[str]) -> dict[str, int]:
     counts = {}
     for line in path.read_text().splitlines():
         fields = line.split()
-        if len(fields) >= 2 and fields[1] in EVENTS:
-            counts[fields[1].split("sys_enter_")[1]] = int(fields[0].replace(",", ""))
-    missing = [e for e in EVENTS if e.split("sys_enter_")[1] not in counts]
+        if len(fields) >= 2 and fields[1] in events:
+            counts[short_name(fields[1])] = int(fields[0].replace(",", ""))
+    missing = [e for e in events if short_name(e) not in counts]
     if missing:
         raise SystemExit(f"perf did not count {missing}: {path.read_text()[-400:]}")
     return counts
@@ -113,7 +130,7 @@ def one_run(name: str, server: Path, args: argparse.Namespace) -> dict:
         try:
             if args.count_syscalls:
                 perf = subprocess.Popen(
-                    ["sudo", "perf", "stat", "-e", ",".join(EVENTS), "-p", str(node.pid),
+                    ["sudo", "perf", "stat", "-e", ",".join(args.events), "-p", str(node.pid),
                      "-o", str(Path(tmp) / "perf.txt")],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 time.sleep(0.3)
@@ -133,7 +150,8 @@ def one_run(name: str, server: Path, args: argparse.Namespace) -> dict:
                 perf.wait(timeout=30)
                 batches = (args.batches // args.connections) * args.connections
                 row["per_batch"] = {k: v / batches
-                                    for k, v in perf_counts(Path(tmp) / "perf.txt").items()}
+                                    for k, v in perf_counts(Path(tmp) / "perf.txt",
+                                                            args.events).items()}
             return row
         finally:
             node.send_signal(signal.SIGTERM)
@@ -155,6 +173,8 @@ def main() -> int:
     ap.add_argument("--levels", type=int, default=20)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--count-syscalls", action="store_true")
+    ap.add_argument("--events", default=",".join(EVENTS),
+                    help="comma-separated perf events --count-syscalls counts, per batch")
     ap.add_argument("--flags", action="append", default=[], metavar="NAME=FLAGS",
                     help="server flags for the --server of that name, space-separated")
     ap.add_argument("--book", action="store_true",
@@ -164,6 +184,7 @@ def main() -> int:
     ap.add_argument("--data-root", type=Path, default=REPO / "build-release" / "bench-data",
                     help="where each run's node keeps its data; refused if it is memory")
     args = ap.parse_args()
+    args.events = [e for e in args.events.split(",") if e]
     args.data_root.mkdir(parents=True, exist_ok=True)
     try:
         fstype = hardware.require_durable_storage(args.data_root)
@@ -219,8 +240,9 @@ def main() -> int:
     head = "| build | levels/s | range | batch p50 | batch p99 | server CPU |"
     rule = "|---|---|---|---|---|---|"
     if counted:
-        head += " sends per batch | reads per batch |"
-        rule += "---|---|"
+        for event in args.events:
+            head += f" {short_name(event)} per batch |"
+            rule += "---|"
     print(head)
     print(rule)
     for name, rows in runs.items():
@@ -230,8 +252,9 @@ def main() -> int:
                 f"| {statistics.median(x['probe']['batch_p99_us'] for x in rows):.1f} µs "
                 f"| {statistics.median(x['probe']['server_cpu_s'] for x in rows):.2f} s |")
         if counted:
-            line += (f" {statistics.median(x['per_batch']['sendto'] for x in rows):.2f} "
-                     f"| {statistics.median(x['per_batch']['read'] for x in rows):.2f} |")
+            for event in args.events:
+                name_ = short_name(event)
+                line += f" {statistics.median(x['per_batch'][name_] for x in rows):.2f} |"
         print(line)
     return 0
 
