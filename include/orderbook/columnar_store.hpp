@@ -165,10 +165,19 @@ public:
     ///
     /// **Required, not defaulted.** A default would be `all()`, which is correct for every
     /// caller and therefore never wrong enough for anyone to notice they had not chosen.
-    void scan(uint64_t start_ns, uint64_t end_ns,
-              std::string_view symbol, std::string_view exchange,
-              ColumnSet columns,
-              std::function<void(const SnapshotRow&)> cb) const;
+    ///
+    /// Returns what the scan looked at in the index (#165): the segments of this symbol it
+    /// compared with the range, and the candidates among them - those whose recorded range meets
+    /// it, whose files it then opens. The first is what the index costs a query; what it compared
+    /// and did not need is bounded per width tier (`WidthTier`).
+    struct ScanCost {
+        size_t compared{0};
+        size_t candidates{0};
+    };
+    ScanCost scan(uint64_t start_ns, uint64_t end_ns,
+                  std::string_view symbol, std::string_view exchange,
+                  ColumnSet columns,
+                  std::function<void(const SnapshotRow&)> cb) const;
 
     /// Called on startup to rebuild segment index from persisted meta.json files.
     void open_existing();
@@ -235,6 +244,15 @@ public:
     /// found" - which used to copy the whole index to find out (#165).
     bool holds(std::string_view symbol, std::string_view exchange) const;
 
+    /// How many symbols, each with its exchange, the index holds. Every one of them holds a
+    /// segment: retention and remove_segments() erase a symbol whose last segment leaves, or a
+    /// store whose symbols come and go - a contract per expiry, an options chain - would keep an
+    /// entry for every symbol it ever saw. holds() cannot tell: it answers by segments.
+    size_t symbols_indexed() const {
+        std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        return by_symbol_.size();
+    }
+
     /// Merge new segments into the index, maintaining sort order by start_ts_ns.
     ///
     /// Returns the number of segments refused because their directory was already
@@ -281,18 +299,38 @@ private:
     /// append → flush boundary.
     std::vector<SegmentMeta> rolled_segments_;
 
-    /// One symbol's segments, sorted by `segment_order_less` (#165). The index was one vector of
-    /// every segment of every symbol, which every tick's merge compared each new segment against and
-    /// sorted whole under the engine's lock, and which every query copied whole before looking at
-    /// one symbol: measured on the m9g.xlarge, a merge of 16 new segments took 7.7 ms at 100 000
-    /// segments and a scan that found nothing 3.3 ms.
-    struct SymbolIndex {
+    /// One width tier of one symbol's segments (#165): those whose `end - start` has this bit
+    /// width, sorted by `segment_order_less`. A segment can overlap a query's [s, e] only if its
+    /// start is in [s - widest_ns, e], so a scan searches that window of each tier.
+    ///
+    /// Tiers, because one window per symbol made one wide segment every query's cost. A flush that
+    /// closes a batch mixing current rows with old ones - a peer's backlog applied after a
+    /// partition, a client's late correction (#105) - writes a segment as wide as the gap between
+    /// them, and with one window every later query of that symbol walked back over each of its
+    /// segments that start within that width of the range. Measured with
+    /// benchmarks/segment_index_cost on the m9g.xlarge, a scan that found nothing past one wide
+    /// segment: 0.0031 ms at 10 000 segments of the symbol, 0.020-0.025 at 50 000, 0.048-0.052 at
+    /// 100 000 - linear in them, as the flat index was in every symbol's. With tiers, 0.0001 ms at
+    /// each of those sizes.
+    ///
+    /// Within a tier every segment is more than half the widest, so what a scan compares there and
+    /// does not need holds one instant: at most the tier's segments that contain
+    /// `s - 2^(width_bits - 1)`, which is one or none when a symbol's segments follow each other,
+    /// and nothing at all in the tier of width zero, whose window starts at `s`.
+    struct WidthTier {
+        unsigned width_bits{0};
         std::vector<SegmentMeta> segments;
-        /// The widest `end - start` among them. A segment can overlap a query's [s, e] only if
-        /// its start is in [s - widest_ns, e], and the vector is sorted by start - so a scan
-        /// searches that window rather than every segment. Removals do not lower it: it is a bound,
-        /// and one a little too wide costs comparisons, never a segment.
+        /// The widest `end - start` here. Removals do not lower it, and it cannot need to: it is
+        /// less than twice the width of any segment the tier holds, which keeps the bound above.
         uint64_t widest_ns{0};
+    };
+    /// One symbol's segments, in tiers by width, ascending - one or two in practice. The index was
+    /// one vector of every segment of every symbol, which every tick's merge compared each new
+    /// segment against and sorted whole under the engine's lock, and which every query copied
+    /// whole before looking at one symbol: measured on the m9g.xlarge, a merge of 16 new segments
+    /// took 7.7 ms at 100 000 segments and a scan that found nothing 3.3 ms.
+    struct SymbolIndex {
+        std::vector<WidthTier> tiers;
     };
     static std::string index_key(std::string_view symbol, std::string_view exchange);
 

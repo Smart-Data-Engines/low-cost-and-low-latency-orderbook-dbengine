@@ -5,9 +5,10 @@
 // segment with every indexed one and sorted all of them under the engine's lock, and each query
 // copied all of them before filtering one symbol out. What these hold is that the per-symbol index
 // answers what the flat one answered - the same rows for every query, the same order from index(),
-// the same refusals - and the things the change added: retention deletes without the lock and a
-// query that meets a segment going says so quietly, and a store whose segments go to a combined
-// store keeps no index of its own.
+// the same refusals - and the things the change added: a scan compares only what its width tiers'
+// windows reach, so one wide segment does not make every query walk its symbol; retention deletes
+// without the lock and a query that meets a segment going says so quietly; and a store whose
+// segments go to a combined store keeps no index of its own.
 
 #include <gtest/gtest.h>
 #include <rapidcheck.h>
@@ -17,11 +18,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -82,10 +85,11 @@ ob::SegmentMeta segment(ob::ColumnarStore& store, const std::string& symbol,
 }
 
 std::vector<int64_t> prices(const ob::ColumnarStore& store, const std::string& symbol,
-                            uint64_t lo, uint64_t hi) {
+                            uint64_t lo, uint64_t hi, ob::ColumnarStore::ScanCost* cost = nullptr) {
     std::vector<int64_t> out;
-    store.scan(lo, hi, symbol, "EX", ob::ColumnSet::all(),
-               [&](const ob::SnapshotRow& r) { out.push_back(r.price); });
+    const auto c = store.scan(lo, hi, symbol, "EX", ob::ColumnSet::all(),
+                              [&](const ob::SnapshotRow& r) { out.push_back(r.price); });
+    if (cost != nullptr) *cost = c;
     std::sort(out.begin(), out.end());
     return out;
 }
@@ -126,17 +130,24 @@ private:
 
 }  // namespace
 
-// A scan answers with the rows of the segments of its symbol that its range can reach - and the
-// candidate window is a search on sorted starts widened by the widest segment. Drawn here: symbols
-// sharing one directory tree, segments in any order and of any width, including one row far from
-// the rest (the shape #166 made representable), and queries of any range. The expected answer is a
-// walk over every row written, which is what the flat index amounted to.
+// A scan answers with the rows of the segments of its symbol that its range can reach, and the
+// candidate windows are searches on sorted starts, one per width tier, each widened by its tier's
+// widest segment. Drawn here: symbols sharing one directory tree, segments in any order and of any
+// width, including one row far from the rest (the shape #166 made representable), and queries of
+// any range. The expected answer is a walk over every row written, which is what the flat index
+// amounted to.
+//
+// And what the scan says it looked at: its candidates are exactly the segments whose range meets
+// the query, and what it compared and did not need is bounded - per tier, the segments holding one
+// instant, so here at most the tiers there are times the most segments any instant is in.
 RC_GTEST_PROP(SegmentIndexProperty, AScanReturnsWhatAWalkOfEveryRowReturns, ()) {
     TempDir dir;
     ob::ColumnarStore store(dir.str());
     const std::vector<std::string> symbols = {"A", "B", "C.D"};
     struct Written { std::string symbol; uint64_t ts; int64_t price; };
+    struct Range { std::string symbol; uint64_t lo; uint64_t hi; };
     std::vector<Written> written;
+    std::vector<Range> ranges;
     const int segments = *rc::gen::inRange(1, 12);
     int64_t price = 1;
     for (int s = 0; s < segments; ++s) {
@@ -148,6 +159,8 @@ RC_GTEST_PROP(SegmentIndexProperty, AScanReturnsWhatAWalkOfEveryRowReturns, ()) 
         }
         segment(store, sym, times, price);
         for (uint64_t ts : times) written.push_back({sym, ts, price++});
+        ranges.push_back({sym, *std::min_element(times.begin(), times.end()),
+                          *std::max_element(times.begin(), times.end())});
     }
     for (int q = 0; q < 8; ++q) {
         const std::string sym = symbols[static_cast<size_t>(*rc::gen::inRange(0, 3))];
@@ -159,8 +172,57 @@ RC_GTEST_PROP(SegmentIndexProperty, AScanReturnsWhatAWalkOfEveryRowReturns, ()) 
             if (w.symbol == sym && w.ts >= lo && w.ts <= hi) expected.push_back(w.price);
         }
         std::sort(expected.begin(), expected.end());
-        RC_ASSERT(prices(store, sym, lo, hi) == expected);
+        ob::ColumnarStore::ScanCost cost;
+        RC_ASSERT(prices(store, sym, lo, hi, &cost) == expected);
+
+        size_t meeting = 0;
+        size_t deepest = 0;
+        std::set<unsigned> widths;
+        for (const auto& r : ranges) {
+            if (r.symbol != sym) continue;
+            if (r.lo <= hi && r.hi >= lo) ++meeting;
+            widths.insert(static_cast<unsigned>(std::bit_width(r.hi - r.lo)));
+            size_t depth = 0;   // the deepest instant is some segment's start
+            for (const auto& o : ranges) {
+                if (o.symbol == sym && o.lo <= r.lo && r.lo <= o.hi) ++depth;
+            }
+            deepest = std::max(deepest, depth);
+        }
+        RC_ASSERT(cost.candidates == meeting);
+        RC_ASSERT(cost.compared >= cost.candidates);
+        RC_ASSERT(cost.compared - cost.candidates <= widths.size() * deepest);
     }
+}
+
+TEST(SegmentIndex, AWideSegmentDoesNotWidenTheWindowOfTheNarrowOnes) {
+    // One wide segment among a symbol's narrow ones - what a flush writes when a batch mixes
+    // current rows with old ones: a peer's backlog after a partition, a late correction (#105).
+    // With one window per symbol, every scan of it walked back over every segment that starts
+    // within that width of its range.
+    TempDir dir;
+    ob::ColumnarStore store(dir.str());
+    constexpr uint64_t kStep = 10 * kSec;
+    constexpr size_t kNarrow = 200;
+    for (size_t i = 0; i < kNarrow; ++i) {
+        segment(store, "A", {kBase + i * kStep}, static_cast<int64_t>(i) + 1);
+    }
+    segment(store, "A", {kBase, kBase + 100 * kStep}, 1000);          // wide: [0, 100) steps
+
+    // A gap near the end, which no segment holds.
+    ob::ColumnarStore::ScanCost cost;
+    const uint64_t gap = kBase + 198 * kStep + kSec;
+    EXPECT_TRUE(prices(store, "A", gap, gap + kSec, &cost).empty());
+    EXPECT_EQ(cost.candidates, 0u);
+    EXPECT_LE(cost.compared, 2u) << "the wide segment's width is the narrow ones' window";
+
+    // The wide segment is still found where it is: the middle of its range, which holds none of
+    // its two rows but meets it.
+    const uint64_t middle = kBase + 50 * kStep + kSec;
+    EXPECT_TRUE(prices(store, "A", middle, middle + kSec, &cost).empty());
+    EXPECT_EQ(cost.candidates, 1u) << "the wide segment was not a candidate for its own range";
+    EXPECT_LE(cost.compared, 2u);
+    EXPECT_EQ(prices(store, "A", kBase + 100 * kStep, kBase + 100 * kStep),
+              (std::vector<int64_t>{101, 1001}));
 }
 
 TEST(SegmentIndex, IndexIsOneOrderAcrossSymbolsAsItAlwaysWas) {
@@ -180,6 +242,23 @@ TEST(SegmentIndex, IndexIsOneOrderAcrossSymbolsAsItAlwaysWas) {
                     std::tie(b.start_ts_ns, b.end_ts_ns, b.dir_path))
             << "not in segment_order_less order at " << i;
     }
+}
+
+TEST(SegmentIndex, RowsReachTheCallbackInTheOrderTheFlatIndexGaveThem) {
+    // Segments of four widths, so four tiers, interleaved by start. A scan reads its candidates in
+    // segment_order_less order, the order the flat index gave them, and rows reach the callback in
+    // it - which a LIMIT and a SNAPSHOT read, since they take the first rows or keep the last.
+    TempDir dir;
+    ob::ColumnarStore store(dir.str());
+    segment(store, "A", {kBase + 1 * kSec}, 1);                      // width 0
+    segment(store, "A", {kBase + 2 * kSec, kBase + 500 * kSec}, 2);  // 498 s
+    segment(store, "A", {kBase + 3 * kSec}, 4);                      // width 0
+    segment(store, "A", {kBase + 4 * kSec, kBase + 6 * kSec}, 5);    // 2 s
+    std::vector<int64_t> order;
+    const auto cost = store.scan(0, UINT64_MAX, "A", "EX", ob::ColumnSet::all(),
+                                 [&](const ob::SnapshotRow& r) { order.push_back(r.price); });
+    EXPECT_EQ(cost.candidates, 4u);
+    EXPECT_EQ(order, (std::vector<int64_t>{1, 2, 3, 4, 5, 6}));
 }
 
 TEST(SegmentIndex, ADuplicateDirectoryIsRefusedAndCountedOnce) {
@@ -219,7 +298,8 @@ TEST(SegmentIndex, RetentionTakesWhatIsPastTheCutoffAndLeavesTheRestInOrder) {
     EXPECT_EQ(deleted, 3u);
     EXPECT_GT(bytes, 0u);
     EXPECT_EQ(store.segment_count(), 2u);
-    EXPECT_FALSE(store.holds("B", "EX")) << "a symbol left without segments is still indexed";
+    EXPECT_EQ(store.symbols_indexed(), 1u) << "a symbol left without segments is still indexed";
+    EXPECT_FALSE(store.holds("B", "EX"));
     EXPECT_EQ(prices(store, "A", 0, UINT64_MAX), (std::vector<int64_t>{2, 3, 6}));
     const auto index = store.index();
     ASSERT_EQ(index.size(), 2u);
@@ -308,6 +388,7 @@ TEST(SegmentIndex, RemovingNamedSegmentsLeavesTheOthers) {
     const auto b = segment(store, "B", {kBase + 3 * kSec}, 3);
     EXPECT_EQ(store.remove_segments({a.dir_path, b.dir_path, "/no/such/segment"}), 2u);
     EXPECT_EQ(store.segment_count(), 1u);
+    EXPECT_EQ(store.symbols_indexed(), 1u) << "a symbol left without segments is still indexed";
     EXPECT_FALSE(store.holds("B", "EX"));
     EXPECT_FALSE(fs::exists(a.dir_path));
     EXPECT_EQ(prices(store, "A", 0, UINT64_MAX), (std::vector<int64_t>{2}));

@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -50,7 +51,10 @@ bool ColumnarStore::still_indexed(const std::string& dir) const {
 bool ColumnarStore::holds(std::string_view symbol, std::string_view exchange) const {
     std::shared_lock<std::shared_mutex> lock(index_mtx_);
     const auto it = by_symbol_.find(index_key(symbol, exchange));
-    return it != by_symbol_.end() && !it->second.segments.empty();
+    if (it == by_symbol_.end()) return false;
+    const auto& tiers = it->second.tiers;
+    return std::any_of(tiers.begin(), tiers.end(),
+                       [](const WidthTier& t) { return !t.segments.empty(); });
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
@@ -366,12 +370,20 @@ bool segment_order_less(const SegmentMeta& a, const SegmentMeta& b) {
 bool ColumnarStore::insert_locked(SegmentMeta meta) {
     if (!indexed_dirs_.insert(meta.dir_path).second) return false;
     SymbolIndex& si = by_symbol_[index_key(meta.symbol, meta.exchange)];
-    if (meta.end_ts_ns > meta.start_ts_ns && meta.end_ts_ns - meta.start_ts_ns > si.widest_ns) {
-        si.widest_ns = meta.end_ts_ns - meta.start_ts_ns;
+    // A range that ends before it starts - a segment #166's repair could not read - is as wide as
+    // nothing, and is found by its start as it always was.
+    const uint64_t width =
+        meta.end_ts_ns > meta.start_ts_ns ? meta.end_ts_ns - meta.start_ts_ns : 0;
+    const auto bits = static_cast<unsigned>(std::bit_width(width));
+    auto tier = std::lower_bound(si.tiers.begin(), si.tiers.end(), bits,
+                                 [](const WidthTier& t, unsigned b) { return t.width_bits < b; });
+    if (tier == si.tiers.end() || tier->width_bits != bits) {
+        tier = si.tiers.insert(tier, WidthTier{bits, {}, 0});
     }
+    if (width > tier->widest_ns) tier->widest_ns = width;
     // Almost always the end: a tick's segment starts after the ones before it. Out-of-order rows
     // (#166) can start one earlier, and then it goes where the order says.
-    auto& v = si.segments;
+    auto& v = tier->segments;
     if (v.empty() || !segment_order_less(meta, v.back())) {
         v.push_back(std::move(meta));
     } else {
@@ -387,7 +399,9 @@ std::vector<SegmentMeta> ColumnarStore::index() const {
         std::shared_lock<std::shared_mutex> lock(index_mtx_);
         all.reserve(indexed_count_);
         for (const auto& [key, si] : by_symbol_) {
-            all.insert(all.end(), si.segments.begin(), si.segments.end());
+            for (const auto& tier : si.tiers) {
+                all.insert(all.end(), tier.segments.begin(), tier.segments.end());
+            }
         }
     }
     std::sort(all.begin(), all.end(), segment_order_less);
@@ -561,32 +575,51 @@ bool read_column_file(const std::string& dir, const char* name, std::vector<T>& 
 
 }  // namespace
 
-void ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
-                          std::string_view symbol, std::string_view exchange,
-                          ColumnSet columns,
-                          std::function<void(const SnapshotRow&)> cb) const {
+ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
+                                             std::string_view symbol, std::string_view exchange,
+                                             ColumnSet columns,
+                                             std::function<void(const SnapshotRow&)> cb) const {
     // Whatever the caller asked to be handed, this filters on the row's timestamp, so it reads
     // that column. Adding it here rather than trusting the caller means a set built by hand
     // cannot produce a scan that compares every row against a zero it never loaded.
     columns.add(QueryColumn::TimestampNs);
 
     // The segments that can hold a row of this range, copied under the shared lock so the files
-    // are read without it. Only this symbol's, and only the window its sorted starts allow (#165):
-    // this used to copy every segment of every symbol - three strings each - and filter the copy.
+    // are read without it. Only this symbol's, and only the window each width tier's sorted starts
+    // allow (#165): this used to copy every segment of every symbol - three strings each - and
+    // filter the copy.
+    ScanCost cost;
     std::vector<SegmentMeta> index_snapshot;
     {
         std::shared_lock<std::shared_mutex> lock(index_mtx_);
         const auto it = by_symbol_.find(index_key(symbol, exchange));
-        if (it == by_symbol_.end()) return;
-        const SymbolIndex& si = it->second;
-        const uint64_t from = start_ns > si.widest_ns ? start_ns - si.widest_ns : 0;
-        auto first = std::lower_bound(
-            si.segments.begin(), si.segments.end(), from,
-            [](const SegmentMeta& m, uint64_t at) { return m.start_ts_ns < at; });
-        for (auto i = first; i != si.segments.end() && i->start_ts_ns <= end_ns; ++i) {
-            if (i->end_ts_ns >= start_ns) index_snapshot.push_back(*i);
+        if (it == by_symbol_.end()) return cost;
+        for (const WidthTier& tier : it->second.tiers) {
+            const auto& v = tier.segments;
+            const size_t before = index_snapshot.size();
+            const uint64_t from = start_ns > tier.widest_ns ? start_ns - tier.widest_ns : 0;
+            auto first = std::lower_bound(
+                v.begin(), v.end(), from,
+                [](const SegmentMeta& m, uint64_t at) { return m.start_ts_ns < at; });
+            for (auto i = first; i != v.end() && i->start_ts_ns <= end_ns; ++i) {
+                ++cost.compared;
+                if (i->end_ts_ns >= start_ns) index_snapshot.push_back(*i);
+            }
+            // In the order the flat index gave them, which is the order rows reach the callback:
+            // each tier's are sorted, so this merges two runs rather than sorting every candidate.
+            if (before != 0 && before != index_snapshot.size()) {
+                std::inplace_merge(index_snapshot.begin(),
+                                   index_snapshot.begin() + static_cast<std::ptrdiff_t>(before),
+                                   index_snapshot.end(), segment_order_less);
+            }
         }
     }
+    cost.candidates = index_snapshot.size();
+    OB_LOG_DEBUG("columnar", "scan of %.*s.%.*s [%llu, %llu]: %zu segment(s) compared, %zu read",
+                 static_cast<int>(symbol.size()), symbol.data(),
+                 static_cast<int>(exchange.size()), exchange.data(),
+                 static_cast<unsigned long long>(start_ns),
+                 static_cast<unsigned long long>(end_ns), cost.compared, cost.candidates);
 
     const bool want_price = columns.has(QueryColumn::Price);
     const bool want_qty   = columns.has(QueryColumn::Quantity);
@@ -698,6 +731,7 @@ void ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
             cb(row);
         }
     }
+    return cost;
 }
 
 // ── open_existing ─────────────────────────────────────────────────────────────
@@ -1003,22 +1037,27 @@ std::pair<size_t, size_t> ColumnarStore::delete_expired_segments(uint64_t cutoff
     {
         std::unique_lock<std::shared_mutex> lock(index_mtx_);
         for (auto it = by_symbol_.begin(); it != by_symbol_.end();) {
-            auto& v = it->second.segments;
-            // A segment that ends before the cutoff starts before it too, so every expired one is
-            // in the prefix of segments starting before the cutoff.
-            const auto limit = std::lower_bound(
-                v.begin(), v.end(), cutoff_ns,
-                [](const SegmentMeta& m, uint64_t at) { return m.start_ts_ns < at; });
-            // Kept first and in order, expired after them and in order.
-            const auto kept_end = std::stable_partition(
-                v.begin(), limit, [&](const SegmentMeta& m) { return m.end_ts_ns >= cutoff_ns; });
-            for (auto i = kept_end; i != limit; ++i) {
-                indexed_dirs_.erase(i->dir_path);
-                expired.push_back(std::move(*i));
+            auto& tiers = it->second.tiers;
+            for (auto tier = tiers.begin(); tier != tiers.end();) {
+                auto& v = tier->segments;
+                // A segment that ends before the cutoff starts before it too, so every expired one
+                // is in the prefix of segments starting before the cutoff.
+                const auto limit = std::lower_bound(
+                    v.begin(), v.end(), cutoff_ns,
+                    [](const SegmentMeta& m, uint64_t at) { return m.start_ts_ns < at; });
+                // Kept first and in order, expired after them and in order.
+                const auto kept_end = std::stable_partition(
+                    v.begin(), limit,
+                    [&](const SegmentMeta& m) { return m.end_ts_ns >= cutoff_ns; });
+                for (auto i = kept_end; i != limit; ++i) {
+                    indexed_dirs_.erase(i->dir_path);
+                    expired.push_back(std::move(*i));
+                }
+                indexed_count_ -= static_cast<size_t>(limit - kept_end);
+                v.erase(kept_end, limit);
+                tier = v.empty() ? tiers.erase(tier) : std::next(tier);
             }
-            indexed_count_ -= static_cast<size_t>(limit - kept_end);
-            v.erase(kept_end, limit);
-            it = v.empty() ? by_symbol_.erase(it) : std::next(it);
+            it = tiers.empty() ? by_symbol_.erase(it) : std::next(it);
         }
     }
     // Oldest first, as this has always deleted.
@@ -1074,29 +1113,33 @@ size_t ColumnarStore::remove_segments(const std::vector<std::string>& dirs) {
     const std::unordered_set<std::string> wanted(dirs.begin(), dirs.end());
     size_t removed = 0;
     for (auto it = by_symbol_.begin(); it != by_symbol_.end();) {
-        auto& v = it->second.segments;
-        std::vector<SegmentMeta> remaining;
-        remaining.reserve(v.size());
-        for (auto& meta : v) {
-            if (wanted.count(meta.dir_path) == 0) {
-                remaining.push_back(std::move(meta));
-                continue;
+        auto& tiers = it->second.tiers;
+        for (auto tier = tiers.begin(); tier != tiers.end();) {
+            auto& v = tier->segments;
+            std::vector<SegmentMeta> remaining;
+            remaining.reserve(v.size());
+            for (auto& meta : v) {
+                if (wanted.count(meta.dir_path) == 0) {
+                    remaining.push_back(std::move(meta));
+                    continue;
+                }
+                std::error_code ec;
+                fs::remove_all(meta.dir_path, ec);
+                if (ec) {
+                    OB_LOG_ERROR("columnar", "cannot remove segment %s: %s - it stays in the index",
+                                 meta.dir_path.c_str(), ec.message().c_str());
+                    remaining.push_back(std::move(meta));
+                    continue;
+                }
+                OB_LOG_DEBUG("columnar", "removed segment %s", meta.dir_path.c_str());
+                indexed_dirs_.erase(meta.dir_path);
+                --indexed_count_;
+                ++removed;
             }
-            std::error_code ec;
-            fs::remove_all(meta.dir_path, ec);
-            if (ec) {
-                OB_LOG_ERROR("columnar", "cannot remove segment %s: %s - it stays in the index",
-                             meta.dir_path.c_str(), ec.message().c_str());
-                remaining.push_back(std::move(meta));
-                continue;
-            }
-            OB_LOG_DEBUG("columnar", "removed segment %s", meta.dir_path.c_str());
-            indexed_dirs_.erase(meta.dir_path);
-            --indexed_count_;
-            ++removed;
+            v = std::move(remaining);
+            tier = v.empty() ? tiers.erase(tier) : std::next(tier);
         }
-        v = std::move(remaining);
-        it = v.empty() ? by_symbol_.erase(it) : std::next(it);
+        it = tiers.empty() ? by_symbol_.erase(it) : std::next(it);
     }
     return removed;
 }
