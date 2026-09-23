@@ -120,11 +120,12 @@ TEST(SnapshotQuery, ALevelsLatestRowAtOrBeforeTheTimeIsTheAnswer) {
 }
 
 TEST(SnapshotQuery, ACorrectionInALaterSegmentIsTheAnswerOnlyAtItsOwnTime) {
-    // The same two rows a flush apart. Whether this was right before the fix depended on the order
-    // the store handed its segments out in: the engine's combined store sorted them by start, which
-    // put the correction first and made the answer right by luck, and a store on its own - this
-    // fixture - handed them out in the order it wrote them, which made it wrong. The comment above
-    // this test first said it passed before the fix; run against that code, it failed with 101.
+    // The same two rows a flush apart. Whether the rule this replaced got it right depended on the
+    // order the store handed its segments out in. Before part 1 of #165 a store on its own - this
+    // fixture - handed them out in the order it wrote them, and the rule answered 101; the comment
+    // here first predicted otherwise, and the run said so. Since then every index hands them out by
+    // start, which puts the correction first and makes the old rule right by luck. So this pins the
+    // answer, not the defect: #168's own test is the one above.
     Fixture f;
     f.segment({level(kBase + 5 * kSec, kBid, 0, 100)});
     f.segment({level(kBase + 3 * kSec, kBid, 0, 101)});
