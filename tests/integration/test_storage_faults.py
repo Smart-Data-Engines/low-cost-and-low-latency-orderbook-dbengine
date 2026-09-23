@@ -770,7 +770,8 @@ def test_a_wal_that_could_not_open_its_next_file_opens_it_once_it_can():
 
     Produced without the injector: the data directory is made read-only just before the insert that
     rotates, so creating the next file fails with EACCES, and writable again one insert later.
-    `open_current()` closes the old descriptor before it opens the new one, and before the fix
+    `open_current()` gives up the old descriptor before it opens the new one - it closed it then,
+    and since stage 5 of #151 it leaves it for the flush tick to sync and close - and before the fix
     nothing opened a file again: measured, every write after the rotation was refused with
     `Bad file descriptor` for the rest of the process - after the directory was writable again.
 
@@ -1049,9 +1050,11 @@ def test_retention_does_not_pass_a_checkpoint_a_failed_wal_sync_may_have_lost():
 def test_under_none_a_failed_wal_sync_freezes_nothing():
     """`--fsync-policy none` makes no promise a failed sync could break, so it freezes nothing (#160).
 
-    The WAL syncs the file it leaves at a rotation whatever the policy, and that sync is made to fail.
-    Under a policy that promises something, that freezes the checkpoints until a restart; under
-    `none` the checkpoints go on, and retention deletes the file the rotation left.
+    The WAL syncs the file a rotation leaves whatever the policy - since stage 5 of #151 at the next
+    flush tick rather than at the rotation, which is why the failure is waited for rather than
+    expected by the time the inserts return - and that sync is made to fail. Under a policy that
+    promises something, that freezes the checkpoints until a restart; under `none` the checkpoints go
+    on, and retention deletes the file the rotation left.
     """
     node = FaultNode(OB_FAULT_PATH=WAL_SEGMENT, OB_FAULT_OP="fsync", OB_FAULT_ERRNO="EIO",
                      OB_FAULT_COUNT="1", OB_FAULT_POLICY="none", OB_FAULT_FLUSH_MS="300",
@@ -1060,7 +1063,11 @@ def test_under_none_a_failed_wal_sync_freezes_nothing():
         node.wait_until_answering()
         replies = node.insert_each(range(1000, 1600))
         assert all(r == "OK" for r in replies.values())
-        assert node.injections() == 1, f"the rotation's sync did not fail:\n{node.fault_log_text()}"
+        deadline = time.time() + patience(10)
+        while node.injections() == 0 and time.time() < deadline:
+            time.sleep(0.05)
+        assert node.injections() == 1, (
+            f"the sync of the file the rotation left did not fail:\n{node.fault_log_text()}")
         deadline = time.time() + patience(20)
         while WAL_SEGMENT in node.wal_files() and time.time() < deadline:
             time.sleep(0.05)
@@ -1419,11 +1426,6 @@ def test_a_writer_does_not_wait_for_a_segment_the_ticks_drain_writes():
         while "action=delay" not in node.fault_log_text() and time.time() < deadline:
             time.sleep(0.02)
         assert "action=delay" in node.fault_log_text(), node.fault_log_text()
-        # The premise: the slow write is the drain's rollover rather than a segment the tick writes
-        # after it, which never held the lock. Nothing was flushed before this tick, so the first
-        # `price.col` is the one that rolled over.
-        assert "Segment rolled over" in node.log(), (
-            "the first segment write was not a rollover inside the drain, so this measured nothing")
 
         started = time.monotonic()
         replies = node.insert_each(range(101, 111))
@@ -1435,6 +1437,12 @@ def test_a_writer_does_not_wait_for_a_segment_the_ticks_drain_writes():
             f"{stall_ms} ms to write - they waited for it, so the tick drains under the engine's lock")
 
         time.sleep(stall_ms / 1000 + 0.5)
+        # The premise, read once the slow write is over, because the rollover says so after it: the
+        # slow write was the drain's rollover rather than a segment the tick writes after the drain,
+        # which never held the lock. Nothing was flushed before this tick, so the first `price.col`
+        # this node wrote is the one that rolled over.
+        assert "Segment rolled over" in node.log(), (
+            "the first segment write was not a rollover inside the drain, so this measured nothing")
         assert node.talk("FLUSH")[0] == "OK"
         assert sorted(prices_of(node, "ROLL")) == [100, 200]
         assert sorted(prices_of(node, "SYM")) == list(range(101, 111))
