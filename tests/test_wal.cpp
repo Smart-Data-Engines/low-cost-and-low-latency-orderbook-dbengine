@@ -10,6 +10,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -975,4 +977,192 @@ TEST(WalRotation, ANextFileThatCannotBeCreatedIsOpenedOnceItCan) {
         if (hdr.record_type == ob::WAL_RECORD_DELTA) seqs.push_back(hdr.sequence_number);
     });
     EXPECT_EQ(seqs, (std::vector<uint64_t>{1, 2, 4}));
+}
+
+// ── Stage 2b: a batch writes what the same records written one at a time wrote ──
+//
+// `append_batch()` exists to put a read's worth of records into the file with one `write()` per run
+// instead of one per record. The claim it has to keep is that nothing else changes: the bytes, the
+// positions, the rotations and the counts are the ones the single-record path produces, so a
+// replayer, a replica streaming the file and a reader of the metrics cannot tell which path wrote
+// it. That is asserted here the only way it can be - by writing the same records both ways into
+// two directories and comparing them.
+
+namespace {
+
+/// One record of the comparison: its levels, whether it is a multi-master (V2) record, and whether
+/// a GAP record goes in front of it, as the engine writes one when a stream skips a number.
+struct BatchCase {
+    ob::DeltaUpdate           update;
+    std::vector<ob::Level>    levels;
+    bool                      v2{false};
+    ob::HLCTimestamp          hlc{};
+    bool                      gap{false};
+};
+
+/// Records of every size the engine writes - one level, a MINSERT's twenty, a full thousand that
+/// grows the batch buffer mid-run - with V1 and V2 interleaved, so the encoder is chosen per record,
+/// and a GAP in front of five of them, one a thousand-level record. Where a GAP is itself the record
+/// that crosses the threshold is a test of its own below, because only a threshold chosen to the
+/// byte puts one there.
+std::vector<BatchCase> mixed_cases() {
+    std::vector<BatchCase> cases;
+    const uint16_t widths[] = {1, 20, 1, 1000, 3, 20, 1, 1, 20, 1};
+    uint64_t seq = 1;
+    for (int round = 0; round < 3; ++round) {
+        for (const uint16_t width : widths) {
+            BatchCase c;
+            c.update = make_delta(seq, (seq % 2) ? ob::SIDE_BID : ob::SIDE_ASK, width);
+            for (uint16_t i = 0; i < width; ++i) {
+                c.levels.push_back(make_level(10000LL + static_cast<int64_t>(seq) * 7 + i,
+                                              100ULL + i, 1U + (i % 3)));
+            }
+            c.v2 = (seq % 3) == 0;
+            c.hlc = ob::HLCTimestamp{1'700'000'000'000'000'000ULL + seq, static_cast<uint16_t>(seq),
+                                     7};
+            c.gap = (seq % 7) == 0 || seq == 14 + 10;   // seq 24 is a thousand-level record
+            cases.push_back(std::move(c));
+            ++seq;
+        }
+    }
+    return cases;
+}
+
+/// Every WAL file in `dir`, by name, with its bytes.
+std::map<std::string, std::string> wal_bytes(const std::filesystem::path& dir) {
+    std::map<std::string, std::string> files;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("wal_", 0) != 0) continue;
+        std::ifstream in(entry.path(), std::ios::binary);
+        files[name] = std::string(std::istreambuf_iterator<char>(in), {});
+    }
+    return files;
+}
+
+} // namespace
+
+TEST(WalBatch, TheBytesArePreciselyThoseOfTheSameRecordsWrittenOneAtATime) {
+    // A threshold narrower than one thousand-level record (24 112 bytes), so each of those ends its
+    // file: the batch has to cut a run there and rotate, the run it cuts holds several smaller
+    // records before it, and the buffer grows in the middle of that run. 30 000 looked a few records
+    // wide and gave two files, because a whole round of widths is 26 752 bytes.
+    const size_t threshold = 10'000;
+    const std::vector<BatchCase> cases = mixed_cases();
+
+    TempDir one_at_a_time("ut_batch_single");
+    TempDir batched("ut_batch_batched");
+
+    std::vector<ob::WalPosition> single_positions;
+    uint64_t single_counted = 0;
+    {
+        ob::WALWriter writer(one_at_a_time.str(), threshold);
+        for (const BatchCase& c : cases) {
+            if (c.gap) writer.append_gap(c.update.sequence_number, c.update.timestamp_ns);
+            single_positions.push_back(
+                c.v2 ? writer.append_with_origin(c.update, c.levels.data(), 7, c.hlc)
+                     : writer.append(c.update, c.levels.data()));
+        }
+        single_counted = writer.records_written();
+    }
+
+    std::vector<ob::WalBatchOutcome> outcomes(cases.size());
+    uint64_t batch_counted = 0;
+    {
+        ob::WALWriter writer(batched.str(), threshold);
+        std::vector<ob::WalDelta> records;
+        for (const BatchCase& c : cases) {
+            records.push_back(ob::WalDelta{&c.update, c.levels.data(), c.v2 ? &c.hlc : nullptr,
+                                           static_cast<uint16_t>(c.v2 ? 7 : 0), c.gap});
+        }
+        EXPECT_EQ(writer.append_batch(records, outcomes), cases.size());
+        for (size_t i = 0; i < outcomes.size(); ++i) {
+            EXPECT_TRUE(outcomes[i].error.empty()) << "record " << i << ": " << outcomes[i].error;
+        }
+        batch_counted = writer.records_written();
+    }
+
+    const auto single_files = wal_bytes(one_at_a_time.path);
+    const auto batch_files  = wal_bytes(batched.path);
+    ASSERT_GE(single_files.size(), 3u)
+        << "the threshold did not make the records rotate, so the batch never had to cut a run";
+    ASSERT_EQ(batch_files.size(), single_files.size());
+    for (const auto& [name, bytes] : single_files) {
+        ASSERT_TRUE(batch_files.count(name)) << name << " was written one at a time and not batched";
+        EXPECT_EQ(batch_files.at(name), bytes) << name << " differs between the two paths";
+    }
+
+    ASSERT_EQ(outcomes.size(), single_positions.size());
+    for (size_t i = 0; i < cases.size(); ++i) {
+        EXPECT_EQ(outcomes[i].position.file_index, single_positions[i].file_index) << "record " << i;
+        EXPECT_EQ(outcomes[i].position.offset, single_positions[i].offset) << "record " << i;
+    }
+    // The ROTATE markers and the GAP records are counted too, on both paths, so the totals agree
+    // only if every run counted each of its records once.
+    EXPECT_EQ(batch_counted, single_counted);
+    size_t gaps = 0;
+    for (const BatchCase& c : cases) gaps += c.gap ? 1 : 0;
+    ASSERT_GE(gaps, 4u) << "the cases no longer put a GAP in front of any record";
+}
+
+TEST(WalBatch, AGapThatCrossesTheThresholdStaysInTheFileOfTheRecordItPrecedes) {
+    // `append_gap()` does not check the rotation and the append after it does, so a GAP that
+    // carries the file past the threshold is followed by its DELTA in the same file, and the file
+    // rotates after that. A batch that cut its runs per WAL record rather than per batch record
+    // would put the ROTATE marker between the two - a file that ends in a GAP, and a DELTA in the
+    // next file that no longer follows the record announcing it.
+    const ob::DeltaUpdate first  = make_delta(1);
+    const ob::DeltaUpdate second = make_delta(5);
+    const ob::Level level = make_level();
+    const size_t one_record = sizeof(ob::WALRecord) + sizeof(ob::DeltaUpdate) + sizeof(ob::Level);
+    const size_t threshold  = one_record + 10;   // after the first record, inside the GAP
+
+    TempDir single("ut_batch_gap_single");
+    {
+        ob::WALWriter writer(single.str(), threshold);
+        (void)writer.append(first, &level);
+        ASSERT_LT(writer.current_position().offset, threshold);
+        writer.append_gap(second.sequence_number, second.timestamp_ns);
+        ASSERT_GE(writer.current_position().offset, threshold)
+            << "the GAP did not cross the threshold, so this test would not be testing that";
+        (void)writer.append(second, &level);
+    }
+
+    TempDir batched("ut_batch_gap_batched");
+    {
+        ob::WALWriter writer(batched.str(), threshold);
+        const ob::WalDelta records[2] = {{&first, &level, nullptr, 0, false},
+                                         {&second, &level, nullptr, 0, true}};
+        ob::WalBatchOutcome outcomes[2]{};
+        EXPECT_EQ(writer.append_batch(records, outcomes), 2u);
+        EXPECT_EQ(outcomes[1].position.file_index, 0u) << "the DELTA went to the next file";
+        EXPECT_EQ(outcomes[1].position.offset, one_record + sizeof(ob::WALRecord));
+    }
+
+    const auto single_files  = wal_bytes(single.path);
+    const auto batched_files = wal_bytes(batched.path);
+    ASSERT_EQ(single_files.size(), 2u);
+    EXPECT_EQ(batched_files, single_files);
+}
+
+TEST(WalBatch, AnEmptyBatchWritesNothingAndIsNotAFailure) {
+    TempDir tmp("ut_batch_empty");
+    ob::WALWriter writer(tmp.str(), 1 << 20);
+    EXPECT_EQ(writer.append_batch({}, {}), 0u);
+    EXPECT_EQ(writer.current_position().offset, 0u);
+    EXPECT_EQ(writer.records_written(), 0u);
+}
+
+TEST(WalBatch, TooFewOutcomesIsRefusedBeforeAnythingReachesTheFile) {
+    // A caller that cannot be told where a record went must not have it written: the position is
+    // what the replication wire sends with it (#98).
+    TempDir tmp("ut_batch_outcomes");
+    ob::WALWriter writer(tmp.str(), 1 << 20);
+    const ob::DeltaUpdate update = make_delta(1);
+    const ob::Level level = make_level();
+    const ob::WalDelta records[2] = {{&update, &level, nullptr, 0, false},
+                                     {&update, &level, nullptr, 0, false}};
+    ob::WalBatchOutcome only_one[1]{};
+    EXPECT_THROW(writer.append_batch(records, only_one), std::invalid_argument);
+    EXPECT_EQ(writer.current_position().offset, 0u);
 }

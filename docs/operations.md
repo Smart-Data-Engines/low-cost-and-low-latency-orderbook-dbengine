@@ -159,13 +159,36 @@ and quietly got something weaker would find out from a lost write.
 
 | Device | Policy | Why |
 |---|---|---|
-| NVMe with power-loss protection | `interval` or `never` | The device's own capacitor makes an fsync per record a cost with no matching guarantee. |
+| NVMe with power-loss protection | `interval` or `never` | The device's own capacitor makes an fsync per write - per read, for a client that pipelines (#155) - a cost with no matching guarantee. |
 | Consumer SSD or anything virtualised | `every` | Without power-loss protection, an acknowledged write that is not fsynced is a write you can lose. |
 | A filesystem on a network device | `every`, and reconsider | The engine's latency claims assume local storage. |
 
 Put the data directory on the fastest local device you have, and **not** on the same device as the
 journal of a busy filesystem: the WAL is sequential and small-record, so it is exactly the workload
 that suffers from sharing a queue.
+
+### A client that pipelines writes
+
+Every `INSERT` and `MINSERT` a client sends in one read is applied as one batch: one acquisition of
+the engine's write lock, and one WAL `write()` per run of records between rotations (#155). A read
+is at most 64 KiB, so a batch is at most a few thousand writes and the lock is held for well under a
+millisecond even then. Nothing a client can read changes — each write is answered as it would have
+been as a command of its own, in the order the commands came, and a command after a write in the
+same read sees it — except what the batch costs:
+
+- **Under `--fsync-policy every`, one `fsync` covers the batch.** That is group commit, and it is what
+  makes `every` affordable for a client that pipelines: measured on an m9g.xlarge with its data on
+  EBS, one connection sending batches of 64 twenty-level `MINSERT`s wrote **10 794 levels a second
+  with a sync per write and 543 260 with a sync per read**. `OK` still means the record is on the
+  disk — the answers are sent after the sync.
+- **A `write()` the disk refuses refuses the record it stopped at**, and the records behind it are
+  tried again with the next `write()`, as the next command after a refused one was. A record torn in
+  the middle abandons its file (#126) and the ones behind it go into the next.
+- **A failed `fsync` refuses every write of the run it covered** — up to a read's worth, where one
+  command at a time it was one. See "When an fsync fails" for what that costs a client that resends.
+- **A client that stops reading** is closed once its send buffer is full, as before. The writes of
+  the read that could not be answered have been applied: the uncertainty of any write whose answer
+  never arrives, for the writes of one read where one command at a time it was for one.
 
 ### WAL rotation, and what frees WAL files
 
@@ -259,7 +282,9 @@ whichever caller happened to be there and then **marks the affected pages clean*
 What the engine does instead:
 
 - under `--fsync-policy every`, the write that could not be synced is **refused**, so the client is
-  never told a record is durable when the sync for it failed
+  never told a record is durable when the sync for it failed — and a client that pipelines has the
+  writes of one read synced by one `fsync`, so a failed one refuses every write of that read's run
+  (#155)
 - a `FLUSH` command over a failed sync is refused for the same reason
 - `close()` logs it and completes the shutdown anyway — refusing to shut down would leave a node
   that cannot be restarted, and the records are in the WAL file either way

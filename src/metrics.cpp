@@ -402,29 +402,30 @@ int64_t MetricsRegistry::gauge_value(std::string_view name) const {
 
 // ── Histogram operations ──────────────────────────────────────────────────────
 
-void MetricsRegistry::observe_histogram(std::string_view name, double seconds) {
+void MetricsRegistry::observe_histogram(std::string_view name, double seconds, uint64_t count) {
     auto* h = find_histogram(name);
     if (!h) {
         report_unknown_metric("histogram", name);
         return;
     }
+    if (count == 0) return;
 
     auto& d = h->data;
 
     // Increment matching buckets (cumulative: all buckets >= observation)
     for (size_t i = 0; i < kNumBuckets; ++i) {
         if (seconds <= kLatencyBuckets[i]) {
-            d.buckets[i].fetch_add(1, std::memory_order_relaxed);
+            d.buckets[i].fetch_add(count, std::memory_order_relaxed);
         }
     }
     // +Inf bucket always incremented
-    d.buckets[kNumBuckets].fetch_add(1, std::memory_order_relaxed);
+    d.buckets[kNumBuckets].fetch_add(count, std::memory_order_relaxed);
 
-    d.count.fetch_add(1, std::memory_order_relaxed);
+    d.count.fetch_add(count, std::memory_order_relaxed);
 
     // Convert seconds to nanoseconds for integer precision
     auto ns = static_cast<int64_t>(seconds * 1e9);
-    d.sum_ns.fetch_add(ns, std::memory_order_relaxed);
+    d.sum_ns.fetch_add(ns * static_cast<int64_t>(count), std::memory_order_relaxed);
 }
 
 // ── Direct histogram access ───────────────────────────────────────────────────

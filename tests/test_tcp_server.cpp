@@ -1500,6 +1500,14 @@ TEST_F(ExecuteCommandTest, StatusNamesWhatThisBuildCanDo) {
 
 // ── One send per read, not one per response (#146) ───────────────────────────
 
+namespace {
+/// Where the loop over one read's commands begins in the read path - what comes before it is set-up.
+std::size_t header_pos_of(const std::string& path) {
+    const std::size_t at = path.find("for (const auto& line : lines)");
+    return at == std::string::npos ? path.size() : at;
+}
+} // namespace
+
 TEST(ReadLoopStatic, EveryCommandFromOneReadIsAnsweredWithOneSend) {
     // Static, because nothing behavioural can see it: the bytes a client reads are the same bytes in
     // the same order whether the loop sends once per read or once per response - which is exactly
@@ -1540,13 +1548,38 @@ TEST(ReadLoopStatic, EveryCommandFromOneReadIsAnsweredWithOneSend) {
     // an answer too large to ever send from a client that stopped reading, and the one
     // `queue_response` left in the loop is the error that replaces such an answer - which would
     // satisfy a search for `queue_response(` while the path every other answer takes was gone.
-    EXPECT_NE(body.find("= session->queue_answer(response);"), std::string::npos)
+    //
+    // Since #155 that call is in one lambda, `enqueue`, which the loop and the held writes both
+    // answer through - so the lambda is read too, and held to the same rule as the loop: a send or
+    // a flush inside it is a send per response, whoever calls it.
+    const auto lambda_body = [&](const std::string& header) {
+        const std::size_t at = path.find(header);
+        if (at == std::string::npos || at > header_pos_of(path)) return std::string();
+        const std::size_t lopen = path.find('{', at);
+        int d = 0;
+        for (std::size_t i = lopen; i < path.size(); ++i) {
+            if (path[i] == '{') ++d;
+            if (path[i] == '}' && --d == 0) return path.substr(lopen, i - lopen);
+        }
+        return std::string();
+    };
+    const std::string enqueue = lambda_body("const auto enqueue = [&](const std::string& response)");
+    ASSERT_FALSE(enqueue.empty()) << "the read path no longer queues its answers through enqueue()";
+    EXPECT_NE(enqueue.find("= session->queue_answer(response);"), std::string::npos)
         << "the commands of a read are no longer answered into the session's buffer";
-    EXPECT_EQ(body.find("send_response("), std::string::npos)
-        << "a response is sent from inside the loop over the commands of one read: one send per "
-           "response again, which is what #146 measured at 32.4% of the io thread";
-    EXPECT_EQ(body.find("flush_output("), std::string::npos)
-        << "the session is flushed from inside the loop over the commands of one read";
+    EXPECT_NE(body.find("enqueue(response)"), std::string::npos)
+        << "the loop over the commands of a read does not queue their answers through enqueue()";
+    const std::string held = lambda_body("const auto apply_held_writes = [&]()");
+    ASSERT_FALSE(held.empty()) << "the read path no longer applies the writes it held (#155)";
+    EXPECT_NE(held.find("enqueue(answer)"), std::string::npos)
+        << "the answers to the held writes are not queued through enqueue()";
+    for (const std::string* part : {&body, &enqueue, &held}) {
+        EXPECT_EQ(part->find("send_response("), std::string::npos)
+            << "a response is sent from inside the handling of one read's commands: one send per "
+               "response again, which is what #146 measured at 32.4% of the io thread";
+        EXPECT_EQ(part->find("flush_output("), std::string::npos)
+            << "the session is flushed from inside the handling of one read's commands";
+    }
 
     // And exactly one flush of what the loop queued. A count rather than "at least one", because a
     // second flush after the loop is a second send per read and a rule that stopped matching would
@@ -1558,6 +1591,79 @@ TEST(ReadLoopStatic, EveryCommandFromOneReadIsAnsweredWithOneSend) {
     }
     EXPECT_EQ(flushes, 1u) << "expected one flush of the queued answers after the loop, found "
                            << flushes;
+}
+
+TEST(ReadLoopStatic, TheWritesOfAReadAreHeldAndAnsweredBeforeAnythingElse) {
+    // What makes a batch of writes invisible to a client (#155): every write the gate lets through
+    // is held rather than executed, the held writes are applied and answered before any other
+    // command is executed or refused, and whatever is still held when the read ends is applied
+    // then. The behavioural half is `test_pipelined_answers.py` - the same bytes pipelined as one
+    // command at a time - but that passes a loop that never holds anything, which is the shape
+    // this stage exists to replace: 64 acquisitions of the engine's lock per read.
+    const auto read = [](const char* rel) {
+        std::ifstream in(std::string(OB_SOURCE_DIR) + "/" + rel);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::string source = read("src/tcp_server.cpp");
+    ASSERT_FALSE(source.empty()) << "cannot read src/tcp_server.cpp, so this test checks nothing";
+    const std::size_t from = source.find("auto lines = session->feed(buf, got);");
+    ASSERT_NE(from, std::string::npos) << "the read path moved; this test would check nothing";
+    const std::size_t to = source.find("next_event:;", from);
+    ASSERT_NE(to, std::string::npos);
+    const std::string path = source.substr(from, to - from);
+
+    const std::size_t header = path.find("for (const auto& line : lines)");
+    ASSERT_NE(header, std::string::npos);
+    const std::size_t open = path.find('{', header);
+    std::size_t close = open;
+    int depth = 0;
+    for (std::size_t i = open; i < path.size(); ++i) {
+        if (path[i] == '{') ++depth;
+        if (path[i] == '}' && --depth == 0) { close = i; break; }
+    }
+    ASSERT_GT(close, open);
+    const std::string body = path.substr(open, close - open);
+
+    // Emptied at the start of the read - before the function that applies them, whose own `clear()`
+    // runs only after an `execute_writes()` that returned. What the first one is for is the path
+    // where that did not return: an exception out of it leaves the writes held, and the reactor's
+    // next read may be another session's. Mutation row 14 of #155 removed the first and this rule
+    // found the second - inside the lambda - and passed, so it now asks for one ahead of the lambda.
+    const std::size_t lambda = path.find("const auto apply_held_writes");
+    ASSERT_NE(lambda, std::string::npos);
+    const std::size_t cleared = path.find("pending_writes_.clear();");
+    ASSERT_NE(cleared, std::string::npos) << "the held writes are not emptied at the start of a read";
+    EXPECT_LT(cleared, lambda)
+        << "the held writes are emptied only inside the function that applies them, which an "
+           "exception out of execute_writes() skips";
+    EXPECT_LT(cleared, header);
+
+    // Held, and nothing else done with it.
+    const std::size_t held = body.find("if (deferrable_write(cmd, *session, secrets_.client_store()))");
+    ASSERT_NE(held, std::string::npos) << "the loop does not hold the writes of a read";
+    const std::size_t pushed = body.find("pending_writes_.push_back(std::move(cmd));", held);
+    ASSERT_NE(pushed, std::string::npos);
+    EXPECT_NE(body.find("continue;", pushed), std::string::npos);
+
+    // Applied before a command that is not a write is executed - and before the one refusal the
+    // loop makes itself, a line too long.
+    const std::size_t executed = body.find("execute_command(");
+    ASSERT_NE(executed, std::string::npos);
+    const std::size_t applied_before = body.rfind("apply_held_writes()", executed);
+    ASSERT_NE(applied_before, std::string::npos)
+        << "a command is executed with the writes before it still held, so its answer overtakes "
+           "theirs and it does not see them";
+    EXPECT_GT(applied_before, pushed);
+    const std::size_t too_long = body.find("format_error(\"line too long\")");
+    ASSERT_NE(too_long, std::string::npos);
+    EXPECT_NE(body.rfind("apply_held_writes()", too_long), std::string::npos)
+        << "a line too long is refused ahead of the writes before it";
+
+    // And applied when the read ends, before the one flush that sends it all.
+    const std::string after = path.substr(close);
+    const std::size_t last = after.find("apply_held_writes()");
+    ASSERT_NE(last, std::string::npos) << "writes still held when the read ends are never applied";
+    EXPECT_LT(last, after.find("flush_output("));
 }
 
 TEST(ReactorStatic, EveryClientEventIsServedInsideTheBoundary) {
@@ -1767,7 +1873,19 @@ TEST(AnswerCeiling, TheLoopAnswersAnErrorInsteadOfClosing) {
     const auto at = src.find("if (queued == Session::Queued::TooLargeAlone) {");
     ASSERT_NE(at, std::string::npos) << "the read loop does not tell an answer too large to send "
                                         "from a client that stopped reading";
-    const std::string branch = src.substr(at, src.find("} else if", at) - at);
+    // The branch, by brace matching. Since #155 it is the first half of `enqueue`, which the loop
+    // and the held writes both answer through, and it returns rather than running into an
+    // `else if` - so a slice to the next `} else if` would now run to the end of the file.
+    const auto open = src.find('{', at);
+    ASSERT_NE(open, std::string::npos);
+    std::size_t close = open;
+    int depth = 0;
+    for (std::size_t i = open; i < src.size(); ++i) {
+        if (src[i] == '{') ++depth;
+        if (src[i] == '}' && --depth == 0) { close = i; break; }
+    }
+    ASSERT_GT(close, open) << "unbalanced braces in the too-large branch";
+    const std::string branch = src.substr(at, close - at + 1);
     EXPECT_NE(branch.find("format_error("), std::string::npos)
         << "an answer too large to send is not replaced by an error";
     EXPECT_EQ(branch.find("close_session("), std::string::npos)
@@ -1775,14 +1893,12 @@ TEST(AnswerCeiling, TheLoopAnswersAnErrorInsteadOfClosing) {
     // The error is what gets queued, and the session ends only if even the error cannot be. The
     // first version of this rule stopped at the two lines above, and a branch that built the error,
     // dropped it and set `queue_refused` satisfied both - the session closed exactly as before
-    // (#151's mutation row 4).
-    const auto queued = branch.find("if (!session->queue_response(refusal)) {");
-    ASSERT_NE(queued, std::string::npos) << "the error replacing the answer is not queued";
-    const auto refused = branch.find("queue_refused = true;");
-    EXPECT_TRUE(refused == std::string::npos || refused > queued)
+    // (#151's mutation row 4). Now the branch answers with whether the error fit, and its caller
+    // closes the session on no - so it may return that and nothing else.
+    EXPECT_NE(branch.find("return session->queue_response(refusal);"), std::string::npos)
+        << "the error replacing the answer is not queued";
+    EXPECT_EQ(branch.find("return false;"), std::string::npos)
         << "the branch gives up on the session before trying to queue the error";
-    EXPECT_EQ(branch.find("queue_refused = true;", refused == std::string::npos ? 0 : refused + 1),
-              std::string::npos)
-        << "the branch gives up on the session on more than the one path where the error itself "
-           "does not fit";
+    EXPECT_EQ(branch.find("queue_refused"), std::string::npos)
+        << "the branch decides the session's end itself rather than by whether the error fit";
 }

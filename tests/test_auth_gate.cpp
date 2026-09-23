@@ -237,6 +237,34 @@ TEST_F(AuthGateTest, ASecondAuthAfterSuccessIsRefused) {
 
 // ── The gate itself ───────────────────────────────────────────────────────────
 
+TEST_F(AuthGateTest, AWriteIsHeldForItsReadOnlyOnceTheSessionHasAuthenticated) {
+    // Since #155 the event loop holds the writes of a read and applies them together through
+    // `execute_writes()`, which does not pass this gate - the loop asks `deferrable_write()` first,
+    // and a write it holds never reaches `execute_command()`. So for a write, that one function *is*
+    // the gate, and a yes too many is a write stored without authentication and answered OK.
+    ob::Session session(fd_server_);
+    const ob::Command insert  = ob::parse_command("INSERT BTCUSD BINANCE ask 50000 10 1");
+    const ob::Command minsert = ob::parse_minsert("MINSERT BTCUSD BINANCE bid 1\n49000 5 1");
+    const ob::Command select  = ob::parse_command("SELECT * FROM orderbook");
+    ASSERT_EQ(insert.type, ob::CommandType::INSERT);
+    ASSERT_EQ(minsert.type, ob::CommandType::MINSERT);
+
+    EXPECT_FALSE(ob::deferrable_write(insert, session, &store_));
+    EXPECT_FALSE(ob::deferrable_write(minsert, session, &store_));
+    // Not held, so the loop hands it to `execute_command()`, whose gate refuses it.
+    EXPECT_EQ(run(session, "INSERT BTCUSD BINANCE ask 50000 10 1"), "ERR unauthenticated\n");
+
+    session.set_authenticated("alice");
+    EXPECT_TRUE(ob::deferrable_write(insert, session, &store_));
+    EXPECT_TRUE(ob::deferrable_write(minsert, session, &store_));
+    EXPECT_FALSE(ob::deferrable_write(select, session, &store_)) << "only writes are held";
+
+    // With authentication off every write is held, as every write was let through.
+    ob::Session open(fd_client_);
+    EXPECT_TRUE(ob::deferrable_write(insert, open, nullptr));
+    EXPECT_FALSE(ob::deferrable_write(select, open, nullptr));
+}
+
 TEST_F(AuthGateTest, SelectBeforeAuthenticationIsRefused) {
     ob::Session s(fd_server_);
     EXPECT_EQ(run(s, "SELECT * FROM orderbook"), "ERR unauthenticated\n");

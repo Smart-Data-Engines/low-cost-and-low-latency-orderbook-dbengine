@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -421,6 +422,32 @@ std::string execute_command(const Command& cmd,
                             ShardCoordinator* shard_coord = nullptr,
                             SubscriptionHub* hub = nullptr,
                             const SecretStore* client_secrets = nullptr);
+
+/// Execute `INSERT` and `MINSERT` commands as one batch - the writes a client sent in one read.
+///
+/// Each is checked and answered exactly as `execute_command()` checks and answers it (read-only
+/// node, bootstrap, shard ownership, the engine's status or what it threw), and the ones this node
+/// takes are applied under one acquisition of the engine's lock (`Engine::apply_deltas()`, #155).
+/// `answers[i]` is the wire answer to `writes[i]`. `execute_command()` answers a write through this
+/// with a batch of one, so a write has one answer whichever path it took.
+///
+/// The authentication gate is the caller's: everything handed here must be a command
+/// `deferrable_write()` said yes to. The metrics count what was taken, as one update per batch.
+void execute_writes(std::span<const Command> writes,
+                    Engine& engine,
+                    Session& session,
+                    ServerStats& stats,
+                    bool read_only,
+                    MetricsRegistry* registry,
+                    ShardCoordinator* shard_coord,
+                    std::vector<std::string>& answers);
+
+/// Whether the event loop may hold `cmd` back, to apply it with the writes around it in the same
+/// read: an `INSERT` or `MINSERT` that the authentication gate lets through. Everything else is
+/// answered where it stands - and the held writes are applied and answered before it, so the
+/// answers keep their order and a command after a write sees it.
+bool deferrable_write(const Command& cmd, const Session& session,
+                      const SecretStore* client_secrets);
 
 /// Whether a command may run on a session that has not authenticated.
 ///

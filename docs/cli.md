@@ -368,12 +368,13 @@ is the single loop this server always had. The log names where each connection w
 `ob-io-N-1`, so `top -H` says which loop is busy.
 
 What more loops buy depends on what the connections ask, and both halves are measured (m9g.xlarge,
-four cores, loopback, four connections pipelining batches of 64; roadmap #151):
+four cores, loopback, four connections pipelining batches of 64; roadmap #151, and the writes again
+for #155, which is what changed them):
 
 | | 1 loop | 2 loops | 4 loops |
 |---|---|---|---|
 | `BOOK` reads, levels read / s | 15 992 260 | 30 254 474 | **49 212 362** |
-| `MINSERT` writes, levels / s | 4 878 479 | 4 327 641 | 4 505 432 |
+| `MINSERT` writes, levels / s | 6 177 795 | **10 192 567** | **10 721 513** |
 | a writer beside a connection scanning 1.5 M rows, levels / s | 65 424 | **4 995 672** | 4 877 810 |
 
 - **Reads scale with the loops**, 3.08× at four here, with the load generator on the same cores.
@@ -381,10 +382,11 @@ four cores, loopback, four connections pipelining batches of 64; roadmap #151):
   loop. At one loop a writer beside a connection looping a 134 ms scan waited behind every scan;
   on another loop it did not notice. Connections are dealt in turn, so two can share a loop, and a
   heavy query holds its own loop for as long as it runs.
-- **Pipelined writes from several connections do not scale yet, and cost about 10% with a tripled
-  p99.** The engine takes its write lock once per record, and with several loops writing every
-  acquisition contends. Until the engine applies a read's writes under one acquisition, a
-  write-only workload is best served by the default.
+- **Pipelined writes scale to about two loops.** The writes of one read are applied under one
+  acquisition of the engine's write lock and reach the WAL with one `write()` (#155), so two loops
+  write 1.65× what one does, and four add 5% more: what is left is the work done holding that lock
+  — the book, the rows queued for the flush, the WAL's encode — which one loop or four do the same
+  amount of. Before #155 the lock was taken once per record and more loops made writes *slower*.
 
 `--max-sessions` is one limit for the server, not one per loop, and `--drain-timeout-ms` is one
 deadline. `FAILOVER` and `MIGRATE` run alone across the loops, as they did when one loop ran every
@@ -409,7 +411,10 @@ checkpoint, applies it, and flushes it into a segment so queries can see it. Whe
 survives a **power cut** is `--fsync-policy`, described under Parameters below — the default,
 `interval`, syncs within the flush interval rather than before the reply, so that sentence is about
 a process ending, not about the platter. Under `every` the reply waits for the `fsync`, and since
-#113 a failed `fsync` is answered `ERR` rather than `OK`.
+#113 a failed `fsync` is answered `ERR` rather than `OK`. The writes a client sends in one read
+share one `fsync` (#155), so a client that pipelines pays one sync per read rather than one per
+write — measured at 50× the throughput of one sync per write on an EBS volume — and a failed sync
+refuses every write it covered.
 The startup log states what happened, and it is worth reading after an unclean stop:
 
 ```

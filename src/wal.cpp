@@ -1,6 +1,6 @@
 // WAL Writer and Replayer implementation.
 // Uses POSIX file I/O: open(2), write(2), fsync(2), close(2), read(2).
-// CRC32C is computed via a software lookup-table (portable, no hardware intrinsics).
+// CRC32C is crc32c.hpp's: the CPU's instruction where it has one (#81), a table otherwise.
 
 #include "orderbook/wal.hpp"
 #include "orderbook/crc32c.hpp"
@@ -30,6 +30,71 @@ static std::string wal_filename(const std::string& dir, uint32_t index) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "wal_%06u.bin", index);
     return dir + "/" + buf;
+}
+
+/// Append one DELTA record - header, then payload - to `buf` at `used`, and advance `used` past it.
+///
+/// Byte for byte what `append()` wrote for a null `d.hlc` and what `append_with_origin()` wrote
+/// otherwise, because both are now batches of one through this function: one encoding of a DELTA
+/// record in this writer, not one per entry point. The payload is built in place and the checksum
+/// is taken over it there, so a record is copied once rather than into a stack buffer and then
+/// again into the write buffer.
+///
+/// `buf` only ever grows: `resize()` zero-fills what it adds, so a buffer cleared and refilled per
+/// batch would pay a memset of every record before overwriting it - the shape #127 measured.
+void encode_delta(const WalDelta& d, std::vector<uint8_t>& buf, size_t& used) {
+    const DeltaUpdate& update = *d.update;
+    const size_t levels_bytes = size_t{update.n_levels} * sizeof(Level);
+    const size_t payload_len  = sizeof(DeltaUpdate) + levels_bytes;
+    const size_t header_len   = d.hlc ? sizeof(WALRecordV2) : sizeof(WALRecord);
+    const size_t total        = header_len + payload_len;
+
+    if (buf.size() < used + total) buf.resize(std::max(used + total, buf.size() * 2));
+    uint8_t* const record  = buf.data() + used;
+    uint8_t* const payload = record + header_len;
+
+    std::memcpy(payload, &update, sizeof(DeltaUpdate));
+    if (levels_bytes > 0) std::memcpy(payload + sizeof(DeltaUpdate), d.levels, levels_bytes);
+    const uint32_t checksum = crc32c(payload, payload_len);
+
+    if (d.hlc == nullptr) {
+        WALRecord hdr{};
+        hdr.sequence_number = update.sequence_number;
+        hdr.timestamp_ns    = update.timestamp_ns;
+        hdr.checksum        = checksum;
+        hdr.payload_len     = static_cast<uint16_t>(payload_len);
+        hdr.record_type     = WAL_RECORD_DELTA;
+        hdr._pad            = 0;
+        std::memcpy(record, &hdr, sizeof(hdr));
+    } else {
+        WALRecordV2 hdr{};
+        hdr.sequence_number = update.sequence_number;
+        hdr.timestamp_ns    = update.timestamp_ns;
+        hdr.checksum        = checksum;
+        hdr.payload_len     = static_cast<uint16_t>(payload_len);
+        hdr.record_type     = WAL_RECORD_DELTA;
+        hdr.version         = 1;
+        hdr.origin_node_id  = d.origin;
+        d.hlc->serialize(hdr.hlc_data);
+        std::memcpy(record, &hdr, sizeof(hdr));
+    }
+    used += total;
+}
+
+/// Append the GAP record `append_gap()` writes for `update`'s number and time: a header with an
+/// empty payload, byte for byte the one `append_gap()` hands `write_record()`.
+void encode_gap(const DeltaUpdate& update, std::vector<uint8_t>& buf, size_t& used) {
+    WALRecord hdr{};
+    hdr.sequence_number = update.sequence_number;
+    hdr.timestamp_ns    = update.timestamp_ns;
+    hdr.checksum        = crc32c(nullptr, 0); // empty payload
+    hdr.payload_len     = 0;
+    hdr.record_type     = WAL_RECORD_GAP;
+    hdr._pad            = 0;
+
+    if (buf.size() < used + sizeof(hdr)) buf.resize(std::max(used + sizeof(hdr), buf.size() * 2));
+    std::memcpy(buf.data() + used, &hdr, sizeof(hdr));
+    used += sizeof(hdr);
 }
 
 } // anonymous namespace
@@ -181,170 +246,206 @@ WalPosition WALWriter::write_record(const WALRecord& hdr, const void* payload,
                                      size_t payload_len, bool allow_fsync) {
     ensure_open();
 
-    // Combine header + payload into a single write to minimize syscalls.
+    // Header and payload in one buffer, so the record is one write. The buffer only grows; the run
+    // says how much of it is this record.
     const size_t total = sizeof(WALRecord) + payload_len;
-    write_buf_.resize(total);
+    if (write_buf_.size() < total) write_buf_.resize(total);
     std::memcpy(write_buf_.data(), &hdr, sizeof(WALRecord));
     if (payload_len > 0) {
         std::memcpy(write_buf_.data() + sizeof(WALRecord), payload, payload_len);
     }
 
-    size_t remaining = total;
-    const uint8_t* ptr = write_buf_.data();
-    while (remaining > 0) {
-        ssize_t n = ::write(fd_, ptr, remaining);
+    const RunResult run = write_run(write_buf_.data(), std::span<const size_t>(&total, 1),
+                                    allow_fsync);
+    if (run.write_errno != 0) throw std::runtime_error(write_failed(run.write_errno));
+    if (run.sync_errno != 0) throw std::runtime_error(sync_failed(run.sync_errno));
+    return run.first;
+}
+
+std::string WALWriter::write_failed(int err) {
+    return std::string("WALWriter: write failed: ") + std::strerror(err);
+}
+
+std::string WALWriter::sync_failed(int err) {
+    return std::string("WALWriter: fsync failed: ") + std::strerror(err);
+}
+
+WALWriter::RunResult WALWriter::write_run(const uint8_t* data, std::span<const size_t> ends,
+                                          bool allow_fsync) {
+    RunResult run;
+    run.first = current_position();
+    const size_t total = ends.back();
+
+    size_t done = 0;
+    int write_errno = 0;
+    while (done < total) {
+        const ssize_t n = ::write(fd_, data + done, total - done);
         if (n < 0) {
-            const int err = errno;
-            // A write that failed **after** writing part of the record leaves bytes no reader can
-            // parse past, and everything appended behind them is unreachable on replay: measured
-            // 2 of 2 acknowledged writes lost (#126). So the file is abandoned here rather than
-            // written to again. A write that failed atomically - nothing of this record reached
-            // the file - leaves it intact, and abandoning it would make a full disk produce one
-            // empty WAL file per refused write.
-            if (remaining < total) abandon_torn_file(total - remaining, err);
-            throw std::runtime_error(std::string("WALWriter: write failed: ") +
-                                     std::strerror(err));
+            write_errno = errno;
+            break;
         }
-        ptr += n;
-        remaining -= static_cast<size_t>(n);
+        done += static_cast<size_t>(n);
     }
 
-    // No fsync here — caller is responsible for calling sync() at group commit boundaries.
-    // Exception: FsyncPolicy::EVERY fsyncs after every record.
-    const WalPosition written_at = advance_after_write(total);
+    // The records whose bytes all reached the file. A run is written front to back, so they are a
+    // prefix, and each of them is as written as a record written alone whose write returned.
+    size_t landed = 0;
+    while (landed < ends.size() && ends[landed] <= done) ++landed;
+    const size_t landed_bytes = landed == 0 ? 0 : ends[landed - 1];
+    if (landed > 0) (void)advance_after_write(landed_bytes, landed);
 
-    if (allow_fsync && fsync_policy_ == FsyncPolicy::EVERY) {
-        // The whole promise of this policy is that `OK` means the record is on the disk, so a
-        // failure here is reported the same way a failed `write` is - which already answers the
-        // client `ERR ...` and leaves the node serving. What a retry costs is in the operations
-        // guide: the record is in this WAL either way, so a client that resends produces a second
-        // row, and that is the honest trade against being told a write is durable when it is not.
+    // No fsync here under the other policies - the flush loop syncs at group commit boundaries.
+    // Under `EVERY` the whole promise is that `OK` means the record is on the disk, so a failure is
+    // reported the way a failed write is, which answers the client `ERR ...` and leaves the node
+    // serving. What a retry costs is in the operations guide: the records are in this WAL either
+    // way, so a client that resends one stores it twice, and that is the honest trade against being
+    // told a write is durable when it is not. One sync covers the run, which is group commit.
+    run.landed = landed;
+    if (landed > 0 && allow_fsync && fsync_policy_ == FsyncPolicy::EVERY) {
         if (const int err = fsync_or_record("a write under fsync-policy=every"); err != 0) {
-            throw std::runtime_error(std::string("WALWriter: fsync failed: ") +
-                                     std::strerror(err));
+            run.sync_errno = err;
+        } else {
+            pending_sync_ = 0;
         }
-        pending_sync_ = 0;
     }
-    return written_at;
+
+    if (write_errno != 0) {
+        // A write that failed **after** writing part of a record leaves bytes no reader can parse
+        // past, and everything appended behind them is unreachable on replay: measured 2 of 2
+        // acknowledged writes lost (#126). So the file is abandoned rather than written to again.
+        // A write that failed on a record boundary - nothing of the next record reached the file -
+        // leaves it intact, and abandoning it would make a full disk produce one empty WAL file per
+        // refused write. Synced first, above, so the records that did land keep their promise.
+        if (done > landed_bytes) abandon_torn_file(done - landed_bytes, write_errno);
+        run.write_errno = write_errno;
+    }
+    return run;
 }
 
 WalPosition WALWriter::append(const DeltaUpdate& update, const Level* levels) {
-    // Build payload: DeltaUpdate header (fixed part) + n_levels * sizeof(Level).
-    const size_t levels_bytes = update.n_levels * sizeof(Level);
-    const size_t payload_len  = sizeof(DeltaUpdate) + levels_bytes;
-
-    // Reuse pre-allocated buffer for payload (avoid heap alloc per record).
-    // We use a separate region of write_buf_ that write_record will overwrite anyway,
-    // so build payload in a local stack buffer for small payloads, or reuse write_buf_.
-    // Max payload: sizeof(DeltaUpdate) + 1024 * sizeof(Level) ≈ 200 + 24K ≈ 25K — fits on stack.
-    alignas(8) uint8_t payload[sizeof(DeltaUpdate) + MAX_LEVELS * sizeof(Level)];
-    std::memcpy(payload, &update, sizeof(DeltaUpdate));
-    if (levels_bytes > 0) {
-        std::memcpy(payload + sizeof(DeltaUpdate), levels, levels_bytes);
+    // A batch of one. The position is captured before any rotation, and that ordering is the whole
+    // of #98: `rotate()` publishes `{next_index, next_offset}` in one store, so after it
+    // `current_position()` is in a file this record is not in - and a caller who needs to name this
+    // record's position has no way back to it. The replication wire needs exactly that, per record.
+    const WalDelta record{&update, levels, nullptr, 0, false};
+    WalBatchOutcome outcome;
+    if (append_batch(std::span<const WalDelta>(&record, 1),
+                     std::span<WalBatchOutcome>(&outcome, 1)) == 0) {
+        throw std::runtime_error(outcome.error);
     }
-
-    WALRecord hdr{};
-    hdr.sequence_number = update.sequence_number;
-    hdr.timestamp_ns    = update.timestamp_ns;
-    hdr.checksum        = crc32c(payload, payload_len);
-    hdr.payload_len     = static_cast<uint16_t>(payload_len);
-    hdr.record_type     = WAL_RECORD_DELTA;
-    hdr._pad            = 0;
-
-    // Captured before the rotation below, and that ordering is the whole of #98. `rotate()`
-    // publishes `{next_index, next_offset}` in one store, so after it `current_position()` is in a
-    // file this record is not in - and a caller who needs to name this record's position has no way
-    // back to it. The replication wire needs exactly that, per record.
-    const WalPosition written_at = write_record(hdr, payload, payload_len);
-
-    // Auto-rotate if threshold exceeded.
-    if (current_position().offset >= rotate_threshold_) {
-        rotate();
-    }
-    return written_at;
-}
-
-WalPosition WALWriter::write_record_v2(const WALRecordV2& hdr, const void* payload,
-                                        size_t payload_len) {
-    ensure_open();
-
-    // Combine 38B header + payload into a single write to minimize syscalls.
-    const size_t total = sizeof(WALRecordV2) + payload_len;
-    write_buf_.resize(total);
-    std::memcpy(write_buf_.data(), &hdr, sizeof(WALRecordV2));
-    if (payload_len > 0) {
-        std::memcpy(write_buf_.data() + sizeof(WALRecordV2), payload, payload_len);
-    }
-
-    size_t remaining = total;
-    const uint8_t* ptr = write_buf_.data();
-    while (remaining > 0) {
-        ssize_t n = ::write(fd_, ptr, remaining);
-        if (n < 0) {
-            const int err = errno;
-            // A write that failed **after** writing part of the record leaves bytes no reader can
-            // parse past, and everything appended behind them is unreachable on replay: measured
-            // 2 of 2 acknowledged writes lost (#126). So the file is abandoned here rather than
-            // written to again. A write that failed atomically - nothing of this record reached
-            // the file - leaves it intact, and abandoning it would make a full disk produce one
-            // empty WAL file per refused write.
-            if (remaining < total) abandon_torn_file(total - remaining, err);
-            throw std::runtime_error(std::string("WALWriter: write failed: ") +
-                                     std::strerror(err));
-        }
-        ptr += n;
-        remaining -= static_cast<size_t>(n);
-    }
-
-    const WalPosition written_at = advance_after_write(total);
-
-    if (fsync_policy_ == FsyncPolicy::EVERY) {
-        if (const int err = fsync_or_record("a write under fsync-policy=every"); err != 0) {
-            throw std::runtime_error(std::string("WALWriter: fsync failed: ") +
-                                     std::strerror(err));
-        }
-        pending_sync_ = 0;
-    }
-    return written_at;
+    return outcome.position;
 }
 
 WalPosition WALWriter::append_with_origin(const DeltaUpdate& update, const Level* levels,
                                     uint16_t origin_node_id, const HLCTimestamp& hlc) {
-    // Build payload: DeltaUpdate header + n_levels * sizeof(Level).
-    const size_t levels_bytes = update.n_levels * sizeof(Level);
-    const size_t payload_len  = sizeof(DeltaUpdate) + levels_bytes;
-
-    alignas(8) uint8_t payload[sizeof(DeltaUpdate) + MAX_LEVELS * sizeof(Level)];
-    std::memcpy(payload, &update, sizeof(DeltaUpdate));
-    if (levels_bytes > 0) {
-        std::memcpy(payload + sizeof(DeltaUpdate), levels, levels_bytes);
-    }
-
-    WALRecordV2 hdr{};
-    hdr.sequence_number = update.sequence_number;
-    hdr.timestamp_ns    = update.timestamp_ns;
-    hdr.checksum        = crc32c(payload, payload_len);
-    hdr.payload_len     = static_cast<uint16_t>(payload_len);
-    hdr.record_type     = WAL_RECORD_DELTA;
-    hdr.version         = 1;
-    hdr.origin_node_id  = origin_node_id;
-    hlc.serialize(hdr.hlc_data);
-
-    OB_LOG_DEBUG("wal", "append_with_origin: seq=%lu origin=%u hlc={%lu,%u,%u} payload=%u",
+    OB_LOG_DEBUG("wal", "append_with_origin: seq=%lu origin=%u hlc={%lu,%u,%u} levels=%u",
                  static_cast<unsigned long>(update.sequence_number),
                  static_cast<unsigned>(origin_node_id),
                  static_cast<unsigned long>(hlc.physical_ns),
                  static_cast<unsigned>(hlc.logical),
                  static_cast<unsigned>(hlc.node_id),
-                 static_cast<unsigned>(payload_len));
+                 static_cast<unsigned>(update.n_levels));
 
-    const WalPosition written_at = write_record_v2(hdr, payload, payload_len);
-
-    // Auto-rotate if threshold exceeded.
-    if (current_position().offset >= rotate_threshold_) {
-        rotate();
+    const WalDelta record{&update, levels, &hlc, origin_node_id, false};
+    WalBatchOutcome outcome;
+    if (append_batch(std::span<const WalDelta>(&record, 1),
+                     std::span<WalBatchOutcome>(&outcome, 1)) == 0) {
+        throw std::runtime_error(outcome.error);
     }
-    return written_at;
+    return outcome.position;
+}
+
+size_t WALWriter::append_batch(std::span<const WalDelta> records,
+                               std::span<WalBatchOutcome> outcomes) {
+    if (outcomes.size() < records.size()) {
+        throw std::invalid_argument("WALWriter::append_batch: " + std::to_string(outcomes.size()) +
+                                    " outcome(s) for " + std::to_string(records.size()) +
+                                    " record(s)");
+    }
+
+    size_t written = 0;
+    size_t i = 0;
+    while (i < records.size()) {
+        try {
+            ensure_open();
+        } catch (const std::exception& e) {
+            // The file and the reason, not a bad descriptor (#154). This record is refused and the
+            // next one tries to open the file again, as the next command did.
+            outcomes[i].error = e.what();
+            ++i;
+            continue;
+        }
+
+        // One run: every record up to and including the one that carries the file to the
+        // threshold - which is where a record written alone would have rotated.
+        const uint64_t start = current_position().offset;
+        size_t used = 0;
+        batch_ends_.clear();
+        batch_deltas_.clear();
+        size_t j = i;
+        try {
+            do {
+                if (records[j].gap_before) {
+                    encode_gap(*records[j].update, batch_buf_, used);
+                    batch_ends_.push_back(used);
+                }
+                encode_delta(records[j], batch_buf_, used);
+                batch_ends_.push_back(used);
+                batch_deltas_.push_back(batch_ends_.size() - 1);
+                ++j;
+            } while (j < records.size() && start + used < rotate_threshold_);
+        } catch (const std::exception& e) {
+            // Out of memory while assembling: nothing of this run reached the file, and nothing
+            // after it will fit either.
+            for (size_t k = i; k < records.size(); ++k) outcomes[k].error = e.what();
+            return written;
+        }
+
+        const RunResult run = write_run(batch_buf_.data(), batch_ends_, /*allow_fsync=*/true);
+
+        // The batch records whose DELTA reached the file. A GAP that landed in front of a DELTA
+        // that did not is in the file and counted, as a GAP written alone before a refused write
+        // was; the record it belongs to is refused.
+        size_t landed = 0;
+        while (landed < j - i && batch_deltas_[landed] < run.landed) ++landed;
+        for (size_t k = 0; k < landed; ++k) {
+            const size_t delta = batch_deltas_[k];
+            const size_t within = delta == 0 ? 0 : batch_ends_[delta - 1];
+            WalBatchOutcome& out = outcomes[i + k];
+            out.position = WalPosition{run.first.file_index,
+                                       run.first.offset + static_cast<uint32_t>(within)};
+            if (run.sync_errno == 0) {
+                out.error.clear();
+                ++written;
+            } else {
+                out.error = sync_failed(run.sync_errno);
+            }
+        }
+        OB_LOG_DEBUG("wal", "append_batch: %zu of %zu record(s) in one write of %zu bytes at file "
+                            "%u offset %u%s",
+                     landed, j - i, used, run.first.file_index, run.first.offset,
+                     run.sync_errno == 0 ? "" : " - not confirmed, the sync failed");
+
+        if (run.write_errno != 0) {
+            // The record the write stopped at is refused, and the records behind it are tried
+            // again in the next run - as the next command after a refused write was. Not the ones
+            // before it: they are in the file, and writing them again would store them twice.
+            //
+            // And no rotation: a disk that has just refused a write is not asked to write a
+            // ROTATE marker as well. The rotation is tried after the next record that is written,
+            // which is #153's rule, and a disk that stays full would otherwise log a failed marker
+            // for every refused write.
+            outcomes[i + landed].error = write_failed(run.write_errno);
+            i += landed + 1;
+            continue;
+        }
+        i = j;
+
+        if (current_position().offset >= rotate_threshold_) {
+            rotate();
+        }
+    }
+    return written;
 }
 
 void WALWriter::set_origin_node_id(uint16_t node_id) {

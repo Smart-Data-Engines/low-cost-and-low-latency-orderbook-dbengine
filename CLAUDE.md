@@ -3206,6 +3206,50 @@ Learned the hard way. Check here before debugging.
      seven integration rows "died" of `FileNotFoundError`. Only the control, which has to survive,
      and the baseline after the last restore, which has to pass, said so - resolve paths before
      handing them over, and never drop either of those two.
+386. **A second write path is the one that goes untested.** Stage 2b could have left `apply_delta()`
+     alone and added `apply_deltas()` beside it: the server would then have used one and most of the
+     tests the other. Carrying the GAP inside the batch, in front of its DELTA, is what let a single
+     write become a batch of one - so every test the single path had now tests the batch (#155).
+387. **A rule no test can tell from its absence is removed, not kept.** Writing #155's mutation
+     table found two in code written the same day, before a row had run: a second duplicate check
+     guarding a batch of replicated records that does not exist, and a rotation skipped after a
+     failed sync only to match the bytes of a single-write path that no longer existed. Kept, each
+     would have read as a guarantee and been none.
+388. **A count of occurrences cannot see a call moved into a loop, and a rule satisfied by any
+     occurrence is satisfied by the wrong one.** The rule for "one wait for room per batch" counted
+     `await_pending_room(`, and moving the call into the loop over the writes keeps one occurrence.
+     Its replacement read the blocks a `{` opens, and mutation row 7 - a loop with no braces - got
+     past it; it now reads a loop header on the call's line or the one before. Row 14 got past a
+     rule that asked for *a* `pending_writes_.clear()` before the loop, by leaving the other one:
+     the rule now names which. Each control is that the rule still finds what it looks for.
+389. **A verification that shares its build directory with the work verifies neither.** Twice in
+     #155: four targets rebuilt in the tree whose full `ctest` was running, and then the run
+     restarted with every other test binary still linked against the previous engine - `ctest`
+     would have reported the old code in the voice it uses for the new. The script now builds
+     first and refuses to test after a failed build, and nothing touches the tree until it ends.
+     (And the script was edited while it ran - bash reads a script as it goes - a third time.)
+390. **A query reads what has been flushed.** A test that wrote 640 rows and queried straight away
+     read 192, the ones the flush timer had moved; a replica refuses `FLUSH` and flushes on its own
+     interval. The flush belongs to the test's premise, not to what it is testing.
+391. **Two engines compared record for record differ in the one field that holds the clock.** A
+     CHECKPOINT carries the wall-clock time `close()` wrote it at. The comparison blanks that field
+     and nothing else, so it still checks that both engines wrote one - dropping the record would
+     have dropped that.
+392. **A gate is tested where it is bypassed, not only where it stands.** The event loop now holds a
+     read's writes and applies them through `execute_writes()`, which does not pass
+     `execute_command()`'s authentication gate: `deferrable_write()` is that gate for a write. The
+     test of an unauthenticated session checked `SELECT`, `STATUS` and `COMPRESS` and not one write,
+     so a yes too many there would have stored writes without authentication with nothing failing.
+393. **`TMPDIR=… sudo cmd` runs `cmd` without `TMPDIR`.** `sudo` resets the environment, so a
+     benchmark meant for the disk wrote its WAL to `/tmp`, a tmpfs on the benchmark host, and read
+     30% faster than every other run of itself. `bench_engine` says so on stderr, and the command
+     had sent stderr to `/dev/null` (#155). Pass the variable inside (`sudo … env TMPDIR=… cmd`),
+     keep stderr, and read it - a refusal nobody reads is a measurement of the wrong thing.
+394. **A bound derived from the number it explains confirms nothing.** Taking the serial fraction
+     from the measured speedup and then finding that Amdahl's bound matches the speedup is one
+     number said twice. #155's first draft did exactly that; the claim now rests on two measurements
+     that do not use it - eight connections giving what four gave, and the profile's time inside
+     the lock (79% of the wall clock) - and that is the only form of it worth writing down.
 
 ## Current state and open problems
 
@@ -3255,15 +3299,25 @@ that does not flatter is the control.
 accepted. 1,196,745 → 2,209,501 levels/s at four million levels and a one-second interval,
 unchanged at the 100 ms default the engine ships with.
 
+**#155**: the writes of one read are applied under one acquisition of `mtx_`, and their WAL records
+reach the file with one `write()` per run - one `fsync` per run under `every`. One connection:
+4 785 305 → **6 081 081** levels a second, `write()` per batch 64 → 1. Under `every`: 10 794 →
+**543 260**, `fsync` per batch 64 → 1 (group commit). Four connections: **10.2 million at two loops
+and 10.7 at four**, against 4.9 million on master at any count, and futex calls per batch 122.55 →
+2.02. What is left is the lock itself, now saturated rather than contended - 43% of the server's
+CPU inside it at four loops, 79% of the wall clock - and it holds the book, the rows queued for the
+flush and the WAL's encode, of which the WAL's `write()` is a few per cent. `apply_delta()` and its
+siblings are the batch with one write, so there is one write path.
+
 **#151**: `--io-threads N` gives the server N client event loops, connections dealt to them in
 turn and kept for life. Measured on the m9g.xlarge, every build with GCC 14, four connections:
 **reads scale** — `BOOK` 16.0 → 30.3 → **49.2 million levels read a second** at one, two and four
 loops — and **a query no longer stalls another loop's writes**: a writer beside a connection
 looping a 134 ms scan went from 65 424 levels a second with a p99 of 136 ms to 4 995 672 and
-241 µs. **Pipelined writes do not scale yet, and cost about 10% with a tripled p99**, because the
-engine takes `mtx_` once per record and holds it through the WAL's `write()`: 1 128 futex calls at
-one loop, 1 485 158 at four, every one of them in `apply_delta_impl`. The default stays 1 until
-the engine takes one lock and one write per read (the next stage). Two things it fixed on the way
+241 µs. **Pipelined writes did not scale, and cost about 10% with a tripled p99**, because the
+engine took `mtx_` once per record and held it through the WAL's `write()`: 1 128 futex calls at
+one loop, 1 485 158 at four, every one of them in `apply_delta_impl` - which is what #155 fixed.
+The default stays 1 until the stage that sizes the loops to the machine. Two things it fixed on the way
 are their own items: #150 (a TLS handshake that could not start closed its descriptor twice) and
 #152 (an answer above 64 MB closed the connection of a client that was reading).
 

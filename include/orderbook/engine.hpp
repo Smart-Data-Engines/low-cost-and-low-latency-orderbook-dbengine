@@ -22,6 +22,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -35,6 +36,23 @@ namespace ob {
 struct TTLConfig {
     uint64_t ttl_hours{0};                  // 0 = disabled
     uint64_t scan_interval_seconds{300};    // default 5 minutes
+};
+
+/// One write for `Engine::apply_deltas()`: the update and its levels, both the caller's, which must
+/// outlive the call. Pointers, not a copy of the update: the engine copies it once, into the batch
+/// it numbers, and a second copy here was 88 bytes per write for a batch of one (measured with the
+/// rest of that path's overhead: 390 instructions per single in-process write, #155).
+struct ClientWrite {
+    const DeltaUpdate* update{nullptr};
+    const Level*       levels{nullptr};
+};
+
+/// What happened to one write of a batch: the status `apply_delta()` returns for it, or - where
+/// `apply_delta()` would have thrown - the message of what it threw, which is the text a client is
+/// sent. `error` is empty exactly when nothing was thrown.
+struct WriteOutcome {
+    ob_status_t status{OB_OK};
+    std::string error;
 };
 
 /// Top-level facade that owns and coordinates all subsystems.
@@ -95,6 +113,24 @@ public:
     /// the mesh, `apply_delta_replayed()` for WAL recovery — so this completes the set rather than
     /// adding an exception to it.
     ob_status_t apply_delta_replicated(const DeltaUpdate& delta, const Level* levels);
+
+    /// Apply several writes - the ones a client sent in one read - under **one** acquisition of
+    /// `mtx_`, with their WAL records written by one `write()` per run between rotations (stage 2b
+    /// of #151, roadmap #155).
+    ///
+    /// Each write is treated as `apply_delta()` treats it - refused for a migrated symbol,
+    /// numbered, written to the WAL before it changes anything, sent to the replicas with its
+    /// position (#98), applied to the book, queued for the columnar flush, pushed to subscribers -
+    /// and `outcomes[i]` says what `apply_delta()` would have returned or thrown for `writes[i]`.
+    /// `apply_delta()` is this with one write, so there is one write path in this engine, not two.
+    ///
+    /// What one acquisition changes, and nothing else: the wait for room in the pending queue is
+    /// taken **once for the batch**, with the predicate a single write uses - so the queue can pass
+    /// its ceiling by the batch's rows, as one `MINSERT` passes it by its own - and a WAL write
+    /// that fails refuses the write it stopped at while the ones behind it are tried again, as the
+    /// next command after a refused one was (`WALWriter::append_batch()`).
+    /// `outcomes` must be at least as long as `writes`.
+    void apply_deltas(std::span<const ClientWrite> writes, std::span<WriteOutcome> outcomes);
 
     /// Execute a SQL query.
     std::string execute(std::string_view sql, RowCallback cb);
@@ -386,6 +422,11 @@ public:
     /// origin → conflict resolver update → SoA buffer apply → broadcast → enqueue.
     ob_status_t apply_delta_mm(const DeltaUpdate& delta, const Level* levels);
 
+    /// `apply_deltas()` in multi-master mode: `apply_delta_mm()` per write - each with its own HLC
+    /// tick, in order - and the peers told after `mtx_` is released, in the order of the writes
+    /// (#80). `apply_delta_mm()` is this with one write.
+    void apply_deltas_mm(std::span<const ClientWrite> writes, std::span<WriteOutcome> outcomes);
+
     /// Apply a remote delta received from a peer node.  Performs loop prevention,
     /// HLC merge, per-level conflict resolution, and WAL append with original origin.
     /// Does NOT re-broadcast (single-hop propagation).
@@ -597,6 +638,13 @@ private:
     /// compare numbers from different nodes.
     void stamp_sequence(DeltaUpdate& delta, uint16_t origin, const std::string& key);
 
+    /// `stamp_sequence()` without the GAP record: the number is assigned, a gap is counted and
+    /// logged, and whether there was one is returned, for a caller that writes the GAP itself - a
+    /// batch, which puts it into the WAL directly in front of its DELTA (`WalDelta::gap_before`),
+    /// the place `stamp_sequence()` puts it. Caller holds `mtx_`.
+    [[nodiscard]] bool observe_sequence(DeltaUpdate& delta, uint16_t origin,
+                                        const std::string& key);
+
     /// Cap on what gets written down. Above it the node relearns by over-asking, which costs
     /// traffic and duplicate drops, never data.
     static constexpr std::size_t kMaxPersistedVectorEntries = 4096;
@@ -618,13 +666,35 @@ private:
     /// nothing about which way true goes.
     enum class DuplicatePolicy { Apply, DropIfSeen };
 
-    /// The body shared by `apply_delta()` and `apply_delta_replicated()`. One acquisition of
-    /// `mtx_`: a wrapper that checked `has_seen()`, released the lock and delegated would leave a
-    /// window between the check and the append. Only the replication client applies on a replica
-    /// today, so nothing would use that window — which is exactly the kind of assumption that
-    /// expires.
+    /// `apply_delta()`, `apply_delta_replicated()` and `apply_delta_mm()`: `apply_local_writes()`
+    /// with one write, and what it could not apply thrown with the text it always had. One
+    /// acquisition of `mtx_` either way: a wrapper that checked `has_seen()`, released the lock and
+    /// delegated would leave a window between the check and the append.
     ob_status_t apply_delta_impl(const DeltaUpdate& delta_in, const Level* levels,
-                                 DuplicatePolicy policy);
+                                 DuplicatePolicy policy, bool multi_master);
+
+    /// The one local write path: `apply_delta()`, `apply_delta_replicated()`, `apply_delta_mm()`
+    /// and both batch entry points are this, with one write or with several. One acquisition of
+    /// `mtx_` for the whole batch; see `apply_deltas()` for what that changes and what it keeps.
+    void apply_local_writes(std::span<const ClientWrite> writes, std::span<WriteOutcome> outcomes,
+                            DuplicatePolicy policy, bool multi_master);
+
+    /// Hand a record the WAL has just written to the replicas, with the position the append
+    /// returned (#98). Caller holds `mtx_` and calls this in WAL order: the replicas apply in the
+    /// order they are sent.
+    void broadcast_to_replicas(const DeltaUpdate& delta, const Level* levels, WalPosition at);
+
+    /// The in-memory half of a write the WAL holds: the live book, the rows for the columnar
+    /// flush, and the subscribers. Caller holds `mtx_`. Returns the book's status.
+    ob_status_t apply_in_memory(const std::string& key, const DeltaUpdate& delta,
+                                const Level* levels);
+
+    /// Multi-master: note each level's HLC with the conflict resolver. Caller holds `mtx_`.
+    void note_local_hlcs(const DeltaUpdate& delta, const Level* levels, const HLCTimestamp& hlc);
+
+    /// Multi-master: send a local write to the peers. Caller must **not** hold `mtx_` (#80).
+    void broadcast_to_peers(const DeltaUpdate& delta, const Level* levels,
+                            const HLCTimestamp& hlc);
 
     /// Path of the file holding the replication position, or empty when nothing saves one.
     ///

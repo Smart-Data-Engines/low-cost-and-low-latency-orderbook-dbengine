@@ -2,6 +2,7 @@
 
 #include <optional>
 #include <atomic>
+#include <span>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -207,6 +208,31 @@ inline constexpr size_t MAX_WAL_ROTATE_THRESHOLD = 2ULL << 30;
 inline constexpr size_t MIN_WAL_ROTATE_THRESHOLD =
     sizeof(WALRecordV2) + WAL_MAX_PAYLOAD_LEN;
 
+/// One DELTA record for `WALWriter::append_batch()`: the update, its levels, and - for a
+/// multi-master write - the origin and HLC that make it a V2 record. A null `hlc` is the V1 record
+/// `append()` writes; a set one is the V2 record `append_with_origin()` writes. Both of those are
+/// batches of one, so there is one encoding of a DELTA record in this writer, not three.
+///
+/// `gap_before` puts a GAP record for the same sequence number and time directly in front of it -
+/// the bytes `append_gap()` followed by this record's append wrote, which is what the engine does
+/// when a stream skips a number. In a batch the two are one unit: a run is never cut between them,
+/// because a record written alone after its GAP went into the file the GAP went into.
+struct WalDelta {
+    const DeltaUpdate*  update{nullptr};
+    const Level*        levels{nullptr};
+    const HLCTimestamp* hlc{nullptr};
+    uint16_t            origin{0};
+    bool                gap_before{false};
+};
+
+/// What `WALWriter::append_batch()` did with one record: written - and under `FsyncPolicy::EVERY`
+/// synced - when `error` is empty, and then `position` is its first byte (#98). Otherwise `error`
+/// is the text a record written alone would have thrown, because that is what the client is told.
+struct WalBatchOutcome {
+    WalPosition position{};
+    std::string error;
+};
+
 class WALWriter {
 public:
     explicit WALWriter(std::string_view dir,
@@ -239,6 +265,35 @@ public:
     /// Writes a WALRecordV2 header (38 bytes, version=1) + payload.
     WalPosition append_with_origin(const DeltaUpdate& update, const Level* levels,
                                     uint16_t origin_node_id, const HLCTimestamp& hlc);
+
+    /// Append several DELTA records with one `write()` per run between rotations, instead of one
+    /// per record - the WAL half of stage 2b of using the whole machine, where a read's writes are
+    /// applied under one acquisition of the engine's lock. The bytes in the file are the ones
+    /// `append()` and `append_with_origin()` would have written, record for record and in order;
+    /// what changes is how many system calls put them there.
+    ///
+    /// Every rule of a record written alone holds per record, and `outcomes[i]` says what
+    /// happened to `records[i]`:
+    /// - **the position of each record** is its first byte (#98);
+    /// - **rotation is checked after the record that crosses the threshold**, so a run ends at it,
+    ///   the file rotates, and the next record opens the next run - a file still passes the
+    ///   threshold by one record at most, except while the disk refuses the marker (#153);
+    /// - **`FsyncPolicy::EVERY` syncs each run before this returns**, so a record counted as
+    ///   written is on the disk under that policy, as it was when each record was synced alone:
+    ///   group commit, and why an answer sent after this call keeps `OK` meaning durable;
+    /// - **a write that stops at a record** refuses that record - a record torn in the middle
+    ///   abandons the file as #126 does - and the records after it are **tried again**, in the
+    ///   next run, which is what the next command after a refused one did; a sync that fails
+    ///   refuses every record of its run, which are in the file and are not tried again, because
+    ///   a second copy of a record is the one outcome worse than a refusal;
+    /// - **after a write that stopped at a record the rotation is not tried**: a disk that has just
+    ///   refused a write is not asked for a ROTATE marker too, and the rotation is tried after the
+    ///   next record that is written (#153).
+    ///
+    /// Returns how many were written rather than throwing, because a caller that applied nothing
+    /// it was not told about has to know which, and an exception would lose that.
+    /// `outcomes` must be at least as long as `records`.
+    size_t append_batch(std::span<const WalDelta> records, std::span<WalBatchOutcome> outcomes);
 
     /// Set the local node_id for WAL_Origin (called once at startup).
     void set_origin_node_id(uint16_t node_id);
@@ -469,8 +524,9 @@ private:
     /// caught it at 96 observations in 4.3 million.
     uint32_t open_current(uint32_t index);
 
-    /// Advance the published position past a record of `total` bytes and count it, returning the
-    /// position of its first byte.
+    /// Advance the published position past `records` whole records totalling `total` bytes and
+    /// count them, returning the position of the first byte of the first. More than one only from
+    /// `write_run()`, for the records of a run that all reached the file.
     ///
     /// One function rather than a copy in each of the two write paths. The two copies it replaces
     /// were identical down to their comment, which is the shape #94 was: a quantity maintained at
@@ -483,7 +539,7 @@ private:
     /// record**. Inline it costs the counter and nothing else, and the `lock`-prefixed instruction
     /// count of the whole archive is unchanged either way — which is the number that mattered
     /// (#117).
-    WalPosition advance_after_write(size_t total) {
+    WalPosition advance_after_write(size_t total, uint64_t records = 1) {
         // One load, one store, on the writer's own thread - the engine's mutexes serialise
         // writers, so no compare-exchange is needed. On x86-64 a relaxed load and store of an
         // aligned eight-byte value are plain moves.
@@ -494,9 +550,9 @@ private:
 
         // Same shape, same reasoning, and it is here rather than in the two callers because a
         // count kept in two places is a count the third writer will not keep (#94, #117).
-        records_written_.store(records_written_.load(std::memory_order_relaxed) + 1,
+        records_written_.store(records_written_.load(std::memory_order_relaxed) + records,
                                std::memory_order_relaxed);
-        ++pending_sync_;
+        pending_sync_ += records;
         return written_at;
     }
 
@@ -510,8 +566,40 @@ private:
     WalPosition write_record(const WALRecord& hdr, const void* payload, size_t payload_len,
                              bool allow_fsync = true);
 
-    /// Write a complete V2 record (38B header + payload) and return where it went. No fsync.
-    WalPosition write_record_v2(const WALRecordV2& hdr, const void* payload, size_t payload_len);
+    /// What `write_run()` did with one run of records.
+    ///
+    /// `landed` is how many of them, from the first, have every byte in the file; they are counted
+    /// in the position either way. `sync_errno` is non-zero when a sync that `FsyncPolicy::EVERY`
+    /// asked for failed, which confirms none of those. `write_errno` is non-zero when the write
+    /// stopped at record `landed`, which is therefore not in the file. Numbers rather than
+    /// messages: every run builds a result and almost none of them fails, and two strings made
+    /// and destroyed per run were part of what a batch of one cost (#155).
+    struct RunResult {
+        size_t      landed{0};
+        WalPosition first{};
+        int         sync_errno{0};
+        int         write_errno{0};
+    };
+
+    /// The text a client is sent for a failed write or sync - the one spelling of each, used by
+    /// both paths that report them.
+    static std::string write_failed(int err);
+    static std::string sync_failed(int err);
+
+    /// Write one run - whole records back to back, record `i` ending at `ends[i]` - and account for
+    /// it: the one place in this writer where bytes reach the file, so a record written alone
+    /// (`write_record()`, `append()`) and a batch cannot disagree about what a failure means.
+    RunResult write_run(const uint8_t* data, std::span<const size_t> ends, bool allow_fsync);
+
+    /// `append_batch()`'s run: the bytes of the records being assembled, where each WAL record
+    /// ends, and for each batch record the index in `batch_ends_` of its DELTA (a GAP in front of
+    /// it is one more WAL record). Members rather than locals, so a batch per read allocates
+    /// nothing once they have grown to a read's size - and they only ever grow, because `resize()`
+    /// zero-fills what it adds and a buffer shrunk to be refilled would pay that on every record
+    /// (#127's measurement).
+    std::vector<uint8_t> batch_buf_;
+    std::vector<size_t>  batch_ends_;
+    std::vector<size_t>  batch_deltas_;
 };
 
 // ── WALReplayer ───────────────────────────────────────────────────────────────

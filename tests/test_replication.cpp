@@ -1075,54 +1075,89 @@ TEST(WalPositionWireStatic, TheEngineBroadcastsThePositionItsAppendReturned) {
     // is not configurable and should not become configurable for a test. This is the mechanism
     // instead, and it is the stronger one for this claim: the engine may not *compute* a position
     // at all.
-    // Whichever function appends a client write and broadcasts it - derived from the two markers
-    // rather than named, so a rename or a split cannot retire the check (it already did once).
-    const std::string body =
-        enclosing_definition("src/engine.cpp", "= wal_.append(delta, levels);");
-    ASSERT_FALSE(body.empty()) << "nothing in src/engine.cpp captures wal_.append(delta, levels); "
-                                  "if the write path changed shape, this test has stopped checking "
+    //
+    // Since #155 the write path is a batch: the append is `append_batch()`, the positions come
+    // back in its outcomes, and the broadcast is `broadcast_to_replicas()`, called per record. The
+    // claim is unchanged and so is how it is checked - every name is read out of the source, so a
+    // rename cannot retire it - but it now runs through two functions, and each link is checked.
+    const std::string batch_marker = "wal_.append_batch(";
+    const std::string body = enclosing_definition("src/engine.cpp", batch_marker);
+    ASSERT_FALSE(body.empty()) << "nothing in src/engine.cpp calls wal_.append_batch(); if the "
+                                  "write path changed shape, this test has stopped checking "
                                   "anything";
 
-    // And they are the *same* function, which is part of the claim rather than a detail: the append
-    // and the broadcast happen under one acquisition of `mtx_`, which is what keeps the WAL order
-    // and the wire order the same.
-    EXPECT_EQ(body, enclosing_definition("src/engine.cpp", "repl_mgr_->broadcast("))
-        << "the append and the broadcast are in different functions, so nothing holds them under "
-           "one lock";
+    // The outcomes the append fills, by the name the call gives them: its second argument.
+    const auto append = body.find(batch_marker);
+    ASSERT_NE(append, std::string::npos);
+    const auto append_end = body.find(");", append);
+    ASSERT_NE(append_end, std::string::npos);
+    const std::string append_args =
+        body.substr(append + batch_marker.size(), append_end - append - batch_marker.size());
+    const auto comma = append_args.find(',');
+    ASSERT_NE(comma, std::string::npos) << "append_batch() is called with one argument: '"
+                                        << append_args << "'";
+    std::string outcomes = append_args.substr(comma + 1);
+    outcomes.erase(0, outcomes.find_first_not_of(" \t\n"));
+    outcomes.erase(outcomes.find_last_not_of(" \t\n") + 1);
+    ASSERT_FALSE(outcomes.empty());
 
-    // The append's position is captured, and the name it is captured under is the one handed to
-    // broadcast(). Read out of the source rather than written down here, so renaming the variable
-    // cannot silently retire the check.
-    const std::string marker = "= wal_.append(delta, levels);";
-    const auto assign = body.find(marker);
-    ASSERT_NE(assign, std::string::npos)
-        << "the write path no longer captures what wal_.append() returns";
-    const auto line_start = body.rfind('\n', assign) + 1;
-    const std::string decl = body.substr(line_start, assign - line_start);
-    // "    const WalPosition record_pos " -> "record_pos"
-    auto last = decl.find_last_not_of(" \t");
-    auto first = decl.find_last_of(" \t", last) + 1;
-    const std::string name = decl.substr(first, last - first + 1);
-    ASSERT_FALSE(name.empty());
-    EXPECT_NE(decl.find("WalPosition"), std::string::npos)
-        << "the append's return is captured as something other than a WalPosition: '" << decl
-        << "'";
-
-    const auto call = body.find("repl_mgr_->broadcast(");
-    ASSERT_NE(call, std::string::npos) << "the write path no longer broadcasts";
+    // The broadcast is in the same function, which is part of the claim rather than a detail: the
+    // append and the broadcast happen under one acquisition of `mtx_`, which is what keeps the WAL
+    // order and the wire order the same. So it is also before the unlock that multi-master takes
+    // for its peers (#80).
+    const std::string call_marker = "broadcast_to_replicas(";
+    const auto call = body.find(call_marker, append_end);
+    ASSERT_NE(call, std::string::npos)
+        << "the function that appends does not broadcast to the replicas after the append";
     const auto call_end = body.find(");", call);
     ASSERT_NE(call_end, std::string::npos);
-    const std::string args = body.substr(call, call_end - call);
-    EXPECT_NE(args.find(name), std::string::npos)
-        << "the position broadcast is not the one wal_.append() returned; it is '" << args << "'";
+    const std::string call_args = body.substr(call, call_end - call);
+    EXPECT_NE(call_args.find(outcomes + "["), std::string::npos)
+        << "the position broadcast is not one of the outcomes append_batch() filled ('" << outcomes
+        << "'); the call is '" << call_args << "'";
+    EXPECT_NE(call_args.find(".position"), std::string::npos)
+        << "the broadcast is not handed the position of the record: '" << call_args << "'";
+    const auto unlock = body.find("lock.unlock()");
+    if (unlock != std::string::npos) {
+        EXPECT_LT(call, unlock) << "the replicas are told after mtx_ is released, so the wire order "
+                                   "is no longer the WAL order";
+    }
 
-    // And nothing in this function derives a position from where the WAL happens to be now. That
-    // is the arithmetic the whole of #98 is about, and after a rotating append it names a file the
+    // And the helper hands the manager exactly the position it was given: its `WalPosition`
+    // parameter, by the name its signature gives it.
+    const std::string src = read_source("src/engine.cpp");
+    const std::string helper_sig = "void Engine::broadcast_to_replicas(";
+    const auto helper = src.find(helper_sig);
+    ASSERT_NE(helper, std::string::npos) << "Engine::broadcast_to_replicas is not defined";
+    const auto params_end = src.find(')', helper);
+    const std::string params = src.substr(helper, params_end - helper);
+    const auto type = params.find("WalPosition ");
+    ASSERT_NE(type, std::string::npos) << "broadcast_to_replicas() takes no WalPosition: '"
+                                       << params << "'";
+    std::string param = params.substr(type + std::string("WalPosition ").size());
+    param.erase(param.find_last_not_of(" \t\n") + 1);
+    ASSERT_FALSE(param.empty());
+    const std::string helper_body = body_at(src, helper);
+    const auto manager = helper_body.find("repl_mgr_->broadcast(");
+    ASSERT_NE(manager, std::string::npos) << "broadcast_to_replicas() does not broadcast";
+    const std::string manager_args =
+        helper_body.substr(manager, helper_body.find(");", manager) - manager);
+    const auto last_comma = manager_args.rfind(',');
+    ASSERT_NE(last_comma, std::string::npos);
+    std::string handed = manager_args.substr(last_comma + 1);
+    handed.erase(0, handed.find_first_not_of(" \t\n"));
+    EXPECT_EQ(handed, param) << "the position handed to ReplicationManager::broadcast() is not the "
+                                "one broadcast_to_replicas() was given: '" << manager_args << "'";
+
+    // And nothing on this path derives a position from where the WAL happens to be now. That is
+    // the arithmetic the whole of #98 is about, and after a rotating append it names a file the
     // record is not in.
     EXPECT_EQ(body.find("current_position()"), std::string::npos)
-        << "Engine::apply_delta reads the WAL's current position. A record's position is what "
-           "append() returned; the current one is past it, and after a rotation it is in the "
-           "next file (#98)";
+        << "the write path reads the WAL's current position. A record's position is what the "
+           "append returned; the current one is past it, and after a rotation it is in the next "
+           "file (#98)";
+    EXPECT_EQ(helper_body.find("current_position()"), std::string::npos)
+        << "broadcast_to_replicas() reads the WAL's current position (#98)";
 }
 
 
