@@ -2350,7 +2350,12 @@ void Engine::flush_tick() {
         registry_.set_gauge("ob_wal_file_index",
                             static_cast<int64_t>(wal_.current_file_index()));
 
-        // WAL truncation and TTL scan under mutex.
+        // WAL truncation and the TTL sweep: what may go is decided under mtx_, the deleting is done
+        // without it (stage 5 of #151). An unlink of a 512 MB WAL file, or of every file of every
+        // expired segment, is I/O no writer ever needed to wait for - and both only read what they
+        // are handed: `truncate_before()` touches nothing of the writer but its directory's name,
+        // and the combined store has its own lock, which queries take and writers do not.
+        uint32_t safe_truncate = 0;
         {
             std::unique_lock<std::mutex> lock(mtx_);
 
@@ -2367,47 +2372,53 @@ void Engine::flush_tick() {
             // is deleted once the segment holding its rows is synced *and* the checkpoint saying so
             // is too. Either missing after a power cut, startup rebuilds those segments from the
             // WAL - so the records must still be there.
-            uint32_t safe_truncate = retention_floor_.file_index;
+            //
+            // Decided here and done below: a file this number allows cannot stop being allowed
+            // after the lock is released, because the floor only rises and every file below it is
+            // one no writer will write again - the writer is on the file the floor is at or later.
+            // A file a rotation left and no tick has synced yet is at or above the floor for the
+            // same reason (stage 5 of #151): the floor is a position some tick's sync covered.
+            safe_truncate = retention_floor_.file_index;
             if (repl_mgr_) {
                 for (const auto& r : repl_mgr_->replica_states()) {
                     safe_truncate = std::min(safe_truncate, r.confirmed_file);
                 }
             }
-            if (safe_truncate > 0) {
-                wal_.truncate_before(safe_truncate);
-            }
+        }
+        if (safe_truncate > 0) {
+            wal_.truncate_before(safe_truncate);
+        }
 
-            // TTL retention scan: delete expired segments periodically.
-            //
-            // Two clocks, one for each question (#163). **When** to sweep is the monotonic clock,
-            // so a stepped wall clock does not stretch or shrink the interval. **What** has expired
-            // is the wall clock, because segment times are event times: this read `steady_clock`
-            // for both, so the cutoff was a count from boot compared with nanoseconds since 1970 -
-            // on a machine up for less than the retention it wrapped past every timestamp and the
-            // first sweep deleted everything, and on one up for longer nothing ever expired.
-            if (ttl_config_.ttl_hours > 0) {
-                const auto now = std::chrono::steady_clock::now();
-                // Compared in whole seconds, so a large `--ttl-scan-interval-seconds` is a long
-                // wait rather than a duration that overflows on its way to nanoseconds.
-                const bool due =
-                    last_ttl_scan_ == std::chrono::steady_clock::time_point{} ||
-                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
-                                              now - last_ttl_scan_)
-                                              .count()) >= ttl_config_.scan_interval_seconds;
-                if (due) {
-                    const uint64_t wall_now_ns = wall_clock_ns();
-                    const uint64_t cutoff_ns = ttl_cutoff_ns(wall_now_ns, ttl_config_.ttl_hours);
-                    auto [deleted, reclaimed] = combined_store_.delete_expired_segments(cutoff_ns);
-                    ttl_segments_deleted_.fetch_add(deleted, std::memory_order_relaxed);
-                    ttl_bytes_reclaimed_.fetch_add(reclaimed, std::memory_order_relaxed);
-                    last_ttl_scan_ = now;
-                    OB_LOG_DEBUG("retention",
-                                 "TTL sweep: %zu segment(s) and %zu byte(s) older than event time "
-                                 "%llu (the wall clock, %llu, minus %llu h)",
-                                 deleted, reclaimed, static_cast<unsigned long long>(cutoff_ns),
-                                 static_cast<unsigned long long>(wall_now_ns),
-                                 static_cast<unsigned long long>(ttl_config_.ttl_hours));
-                }
+        // TTL retention scan: delete expired segments periodically.
+        //
+        // Two clocks, one for each question (#163). **When** to sweep is the monotonic clock,
+        // so a stepped wall clock does not stretch or shrink the interval. **What** has expired
+        // is the wall clock, because segment times are event times: this read `steady_clock`
+        // for both, so the cutoff was a count from boot compared with nanoseconds since 1970 -
+        // on a machine up for less than the retention it wrapped past every timestamp and the
+        // first sweep deleted everything, and on one up for longer nothing ever expired.
+        if (ttl_config_.ttl_hours > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            // Compared in whole seconds, so a large `--ttl-scan-interval-seconds` is a long
+            // wait rather than a duration that overflows on its way to nanoseconds.
+            const bool due =
+                last_ttl_scan_ == std::chrono::steady_clock::time_point{} ||
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                          now - last_ttl_scan_)
+                                          .count()) >= ttl_config_.scan_interval_seconds;
+            if (due) {
+                const uint64_t wall_now_ns = wall_clock_ns();
+                const uint64_t cutoff_ns = ttl_cutoff_ns(wall_now_ns, ttl_config_.ttl_hours);
+                auto [deleted, reclaimed] = combined_store_.delete_expired_segments(cutoff_ns);
+                ttl_segments_deleted_.fetch_add(deleted, std::memory_order_relaxed);
+                ttl_bytes_reclaimed_.fetch_add(reclaimed, std::memory_order_relaxed);
+                last_ttl_scan_ = now;
+                OB_LOG_DEBUG("retention",
+                             "TTL sweep: %zu segment(s) and %zu byte(s) older than event time "
+                             "%llu (the wall clock, %llu, minus %llu h)",
+                             deleted, reclaimed, static_cast<unsigned long long>(cutoff_ns),
+                             static_cast<unsigned long long>(wall_now_ns),
+                             static_cast<unsigned long long>(ttl_config_.ttl_hours));
             }
         }
 }

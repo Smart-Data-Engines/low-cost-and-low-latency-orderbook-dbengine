@@ -541,7 +541,7 @@ TEST(WriteBatchStatic, TheWritesOfABatchTakeTheLockOnceAndReachTheWalInOneCall) 
     }
 }
 
-TEST(FlushTickStatic, TheTicksSyncAndDrainRunWithoutTheEnginesLock) {
+TEST(FlushTickStatic, TheTicksSyncDrainAndDeletingRunWithoutTheEnginesLock) {
     // Stage 5 of #151. The behavioural tests are in test_storage_faults.py - a writer timed while
     // the tick's sync, or a segment write inside its drain, is made to last seconds - and they need
     // the injector, which this suite does not load. A sync or a drain moved back under the lock
@@ -563,6 +563,20 @@ TEST(FlushTickStatic, TheTicksSyncAndDrainRunWithoutTheEnginesLock) {
     EXPECT_FALSE(inside_a_lock_of(tick, drain, lock))
         << "the flush tick drains with the engine's lock held, so every writer waits for ~640k rows "
            "to reach their stores (11 ms at p99.9 with only the sync outside, measured)";
+
+    // And the deleting the tick does after its segments: an unlink of a 512 MB WAL file, or of every
+    // file of every expired segment, decided under the lock and done without it.
+    for (const char* unlink : {"wal_.truncate_before(safe_truncate)",
+                               "combined_store_.delete_expired_segments(cutoff_ns)"}) {
+        const std::size_t at = tick.find(unlink);
+        ASSERT_NE(at, std::string::npos) << unlink << " moved; this test would check nothing";
+        EXPECT_FALSE(inside_a_lock_of(tick, at, lock))
+            << unlink << " deletes files with the engine's lock held, so every writer waits for it";
+    }
+    const std::size_t floor = tick.find("safe_truncate = retention_floor_.file_index");
+    ASSERT_NE(floor, std::string::npos) << "the truncation no longer reads the retention floor";
+    EXPECT_TRUE(inside_a_lock_of(tick, floor, lock))
+        << "the retention floor is read without the engine's lock";
 
     for (const char* step : {"wal_.prepare_sync(", "wal_.complete_sync(", "pending_rows_.take_all()"}) {
         const std::size_t at = tick.find(step);
