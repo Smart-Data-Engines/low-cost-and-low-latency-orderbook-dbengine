@@ -2290,6 +2290,11 @@ The control — the startup line reworded — survives, because no test pins a l
 first version of the substring row did not build (it left the helper unused) and was rewritten to
 make the mistake inside the helper, where it would be made.
 
+**CodeQL on the pull request found one more:** the reason printed "3" or "1.50" by testing the limit
+against its floor — an exact comparison of doubles, which is a question about their representation.
+It now prints two places and drops `.00` from the text, the same output for every limit a cgroup
+can hold.
+
 - Effort: S | Impact: the default profile can be sized to the machine the process actually has, and
   an operator can read what the node found and where it found it
 
