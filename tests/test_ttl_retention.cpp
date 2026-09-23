@@ -390,16 +390,29 @@ TEST(TTLCutoff, ARetentionReachingPastTheEpochExpiresNothingRatherThanWrapping) 
 
 TEST(TTLCutoff, ARetentionTooLongToCountInNanosecondsDoesNotOverflow) {
     // `--ttl-hours` takes any uint64_t, and hours times nanoseconds per hour overflows from
-    // 5 124 096 hours up.
+    // 5 124 096 hours up. The first retention past that is the case worth pinning: its product
+    // wraps to about 25 minutes, so a check that multiplied before comparing would read a retention
+    // of 584 years as one of 25 minutes and expire nearly everything. `UINT64_MAX` alone does not
+    // show it - its product happens to wrap to a number larger than any wall clock - and a mutation
+    // written that way survived the first version of this test.
+    constexpr uint64_t kFirstThatOverflows = UINT64_MAX / kNsPerHour + 1;
+    static_assert(kFirstThatOverflows * kNsPerHour < kNsPerHour, "its product wraps to under an hour");
+    EXPECT_EQ(ob::ttl_cutoff_ns(1'790'000'000'000'000'000ULL, kFirstThatOverflows), 0u);
     EXPECT_EQ(ob::ttl_cutoff_ns(1'790'000'000'000'000'000ULL, UINT64_MAX), 0u);
     EXPECT_EQ(ob::ttl_cutoff_ns(UINT64_MAX, UINT64_MAX / kNsPerHour),
               UINT64_MAX - (UINT64_MAX / kNsPerHour) * kNsPerHour);
 }
 
 RC_GTEST_PROP(TTLCutoff, TheCutoffIsNeverAfterNowAndIsExactWheneverItIsNotZero, ()) {
-    const uint64_t now = *rc::gen::arbitrary<uint64_t>();
-    const uint64_t ttl = *rc::gen::oneOf(rc::gen::inRange<uint64_t>(0, 100'000),
-                                         rc::gen::arbitrary<uint64_t>());
+    // Wall clocks as they are, and any count at all. Retentions near the hours at which the product
+    // overflows are drawn on purpose: an arbitrary 64-bit draw lands there about never.
+    const uint64_t now = *rc::gen::oneOf(
+        rc::gen::inRange<uint64_t>(1'000'000'000'000'000'000ULL, 2'000'000'000'000'000'000ULL),
+        rc::gen::arbitrary<uint64_t>());
+    const uint64_t ttl = *rc::gen::oneOf(
+        rc::gen::inRange<uint64_t>(0, 100'000),
+        rc::gen::inRange<uint64_t>(UINT64_MAX / kNsPerHour - 1000, UINT64_MAX / kNsPerHour + 1000),
+        rc::gen::arbitrary<uint64_t>());
     const uint64_t cutoff = ob::ttl_cutoff_ns(now, ttl);
     const unsigned __int128 span = static_cast<unsigned __int128>(ttl) * kNsPerHour;
     RC_ASSERT(cutoff <= now);
