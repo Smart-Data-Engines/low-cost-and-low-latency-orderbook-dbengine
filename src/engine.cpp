@@ -2315,7 +2315,7 @@ void Engine::flush_tick() {
                 throw std::runtime_error("Engine: WAL sync failed during the flush tick");
             }
             batch = pending_rows_.take_all();
-            detached_rows_ = batch.rows();
+            detached_rows_.store(batch.rows(), std::memory_order_relaxed);
             if (!ticket.owed()) {
                 // Nothing to sync - `every` has synced each run, `none` never does, or nothing was
                 // written - and the floor moves here too (#160): nothing owed means the log is
@@ -2330,7 +2330,7 @@ void Engine::flush_tick() {
             std::unique_lock<std::mutex> lock(mtx_);
             wal_.complete_sync(ticket, sync_err);
             if (sync_err != 0) {
-                detached_rows_ = 0;
+                detached_rows_.store(0, std::memory_order_relaxed);
                 pending_rows_.put_back_front(std::move(batch));
                 throw std::runtime_error("Engine: WAL sync failed during the flush tick");
             }
@@ -2434,7 +2434,7 @@ void Engine::flush_drain_pending() {
     // That is the fact replay needs, and the reason it no longer has to guess from timestamps
     // (#63).
     PendingQueue::Batch batch = pending_rows_.take_all();
-    detached_rows_ = batch.rows();
+    detached_rows_.store(batch.rows(), std::memory_order_relaxed);
     drain_batch(batch, wal_.current_position(), /*mtx_held=*/true);
 }
 
@@ -2503,7 +2503,7 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
                     rest.chunks.push_back(std::move(batch.chunks[r]));
                 }
                 back = rest.rows();
-                detached_rows_ = 0;
+                detached_rows_.store(0, std::memory_order_relaxed);
                 pending_rows_.put_back_front(std::move(rest));
                 registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(queued_rows()));
             });
@@ -2514,19 +2514,19 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
             throw;
         }
 
-        // Cleared here, without mtx_ when the caller does not hold it - destroying 4096 rows is
-        // work no writer should wait behind - and given back under it, which is what lets a writer
-        // at the ceiling go on after one chunk rather than after the whole tick.
+        // Cleared, given back and released from the ceiling, all without mtx_ - destroying 4096
+        // rows is work no writer should wait behind, and the spare chunks have a lock of their own.
+        // Taking mtx_ here instead starved the drain at four pipelining connections: ~250
+        // acquisitions a tick, each behind every writer, and 10.6 -> 9.0 M levels/s (m9g.xlarge).
+        // Given back **before** it leaves the ceiling, so a writer the release lets on finds the
+        // chunk spare rather than allocating one. The notification is not under mtx_, so a writer
+        // between its check of the room and its wait can miss it - and is woken by the next
+        // chunk's, or by the last one below, which is sent after taking mtx_.
         chunk.rows.clear();
-        PendingQueue::ChunkPtr surplus;
-        under_mtx([&] {
-            detached_rows_ -= rows_here;
-            surplus = pending_rows_.give_back(std::move(batch.chunks[k]));
-            registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(queued_rows()));
-        });
+        PendingQueue::ChunkPtr surplus = pending_rows_.give_back(std::move(batch.chunks[k]));
+        detached_rows_.fetch_sub(rows_here, std::memory_order_relaxed);
         if (!mtx_held) pending_cv_.notify_all();
-        // A chunk beyond what the queue keeps is freed here, at the end of this iteration - after
-        // mtx_ was released when the caller does not hold it.
+        // A chunk beyond what the queue keeps is freed here, at the end of this iteration.
     }
     batch.chunks.clear();
 

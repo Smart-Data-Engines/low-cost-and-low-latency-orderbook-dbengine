@@ -18,12 +18,18 @@
 // A chunk never grows past `kChunkRows`, so appending never reallocates and never moves a row: a
 // vector that outgrows its capacity copies every row it holds, under the lock every writer needs.
 //
-// Not thread-safe. Its owner serialises every call under its own lock; the chunks a caller has
-// taken are the caller's alone until it gives them back, which is what lets them be drained and
-// cleared without that lock.
+// Its owner serialises every call under its own lock **except `give_back()`**, which may be called
+// without it: the spare chunks have a lock of their own, which a writer takes only when its chunk
+// is full and it needs another - once in 4096 rows. The first version gave chunks back under the
+// owner's lock, and at four pipelining connections on the m9g.xlarge the drain, taking the engine's
+// lock ~250 times a tick behind every writer, fell behind the writers: 10.6 -> 9.0 M levels/s, and
+// under `--fsync-policy every`, where a writer holds that lock through its fsync, the queue grew
+// until the chunk pool was full. The chunks a caller has taken are the caller's alone until it
+// gives them back, which is what lets them be drained and cleared without either lock.
 
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -52,8 +58,10 @@ public:
         }
     };
 
-    /// `max_chunks_kept` bounds the chunks this queue holds, queued and spare together, beyond which
-    /// a chunk given back is returned to the caller to free rather than kept.
+    /// `max_chunks_kept` bounds the spare chunks this queue keeps for reuse, beyond which a chunk
+    /// given back is returned to the caller to free. It is a safety net rather than the memory
+    /// bound: a chunk is only allocated when there is no spare one, and at that moment every chunk
+    /// alive is queued or taken, which the owner's ceiling bounds.
     explicit ChunkedQueue(size_t max_chunks_kept) : max_kept_(max_chunks_kept) {}
 
     ChunkedQueue(const ChunkedQueue&) = delete;
@@ -70,7 +78,10 @@ public:
     size_t size() const { return size_; }
     bool empty() const { return size_ == 0; }
     /// Chunks queued plus chunks kept for reuse - the memory this queue holds, in chunks.
-    size_t chunks_held() const { return chunks_.size() + spare_.size(); }
+    size_t chunks_held() const {
+        std::lock_guard<std::mutex> lock(spare_mtx_);
+        return chunks_.size() + spare_.size();
+    }
 
     /// Every element queued, in order; the queue is empty afterwards. O(chunks).
     Batch take_all() {
@@ -102,13 +113,14 @@ public:
         b.chunks.clear();
     }
 
-    /// A chunk the caller has consumed and **cleared** comes back for reuse. Kept when the queue
-    /// holds fewer than `max_chunks_kept` chunks; otherwise returned, for the caller to free where
-    /// freeing does not hold its lock.
+    /// A chunk the caller has consumed and **cleared** comes back for reuse - callable without the
+    /// owner's lock. Kept when fewer than `max_chunks_kept` are spare; otherwise returned, for the
+    /// caller to free where freeing holds no lock.
     ChunkPtr give_back(ChunkPtr c) {
         c->rows.clear();   // nothing to destroy when the caller cleared it, as it should have
         c->first = 0;
-        if (chunks_held() >= max_kept_) return c;
+        std::lock_guard<std::mutex> lock(spare_mtx_);
+        if (spare_.size() >= max_kept_) return c;
         spare_.push_back(std::move(c));
         return nullptr;
     }
@@ -151,10 +163,13 @@ public:
 
 private:
     ChunkPtr fresh() {
-        if (!spare_.empty()) {
-            ChunkPtr c = std::move(spare_.back());
-            spare_.pop_back();
-            return c;
+        {
+            std::lock_guard<std::mutex> lock(spare_mtx_);
+            if (!spare_.empty()) {
+                ChunkPtr c = std::move(spare_.back());
+                spare_.pop_back();
+                return c;
+            }
         }
         auto c = std::make_unique<Chunk>();
         c->rows.reserve(kChunkRows);
@@ -162,10 +177,13 @@ private:
     }
 
     void keep(ChunkPtr c) {
-        if (chunks_held() < max_kept_) spare_.push_back(std::move(c));
+        std::lock_guard<std::mutex> lock(spare_mtx_);
+        if (spare_.size() < max_kept_) spare_.push_back(std::move(c));
     }
 
     std::vector<ChunkPtr> chunks_;
+    /// Guards `spare_` only: the queued chunks are the owner's lock's.
+    mutable std::mutex spare_mtx_;
     std::vector<ChunkPtr> spare_;
     size_t size_{0};
     size_t max_kept_;

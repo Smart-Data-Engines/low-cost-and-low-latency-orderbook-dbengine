@@ -699,16 +699,24 @@ private:
     /// **without** it, and lowers this chunk by chunk as each is drained - so a writer waiting at
     /// the ceiling waits for one chunk, not for the tick. Zero outside a tick: the tick holds
     /// `flush_mtx_` from taking the rows to giving the last chunk back, so nothing else that drains
-    /// or replaces the queue runs in between. Under mtx_.
+    /// or replaces the queue runs in between.
+    ///
+    /// Atomic, and lowered **without** mtx_: the first version took mtx_ for each chunk, and at four
+    /// pipelining connections on the m9g.xlarge the drain, queueing ~250 times a tick behind every
+    /// writer, fell behind them - 10.6 -> 9.0 M levels/s - and under `--fsync-policy every`, where a
+    /// writer holds mtx_ through its fsync, it could not give chunks back as fast as they filled.
+    /// Set, and zeroed on a failure, under mtx_; read under it by everything that counts the queue.
     ///
     /// Everything that counts the queue counts these as well (`queued_rows()`): they are not in a
     /// segment yet, a reader of `STATUS` or `holds_no_data()` must not see them vanish for the
     /// length of an `fsync`, and the room a writer waits for is room in both - otherwise a tick
     /// that starts at the ceiling would let the queue grow to twice it while the sync runs.
-    size_t detached_rows_{0};
+    std::atomic<size_t> detached_rows_{0};
 
     /// Rows not yet in a segment: the queue, plus what a flush tick has taken. Caller holds mtx_.
-    size_t queued_rows() const { return pending_rows_.size() + detached_rows_; }
+    size_t queued_rows() const {
+        return pending_rows_.size() + detached_rows_.load(std::memory_order_relaxed);
+    }
 
     // Backpressure: maximum number of pending rows before apply_delta blocks.
     // Default 1M rows ≈ ~100 MB memory. Prevents OOM under sustained ingestion.
@@ -902,11 +910,11 @@ private:
     /// the WAL position every one of these rows' records is at or before, and which a sync has
     /// reached - and `drained_up_to_` set to it once every row is in. Each chunk is given back to
     /// `pending_rows_` as soon as it is drained, lowering `detached_rows_`, which the caller set
-    /// to the batch's rows. With `mtx_held` the caller holds mtx_ throughout; without it, the
-    /// caller holds only `flush_mtx_`, and mtx_ is taken just to give each chunk back, to create
-    /// a store and at the end (stage 5 of #151). On a throw - a segment write the disk refused
-    /// (#161) - the rows it appended stay in their stores and the rest go back in front of the
-    /// queue, and no drain position is recorded.
+    /// to the batch's rows - neither under mtx_. With `mtx_held` the caller holds mtx_ throughout;
+    /// without it, the caller holds only `flush_mtx_`, and mtx_ is taken just to create a store and
+    /// at the end (stage 5 of #151). On a throw - a segment write the disk refused (#161) - the rows
+    /// it appended stay in their stores and the rest go back in front of the queue, and no drain
+    /// position is recorded.
     void drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool mtx_held);
     /// Phase B: segment I/O, the segment sync, and the index merge (hold `flush_mtx_`, not `mtx_`).
     /// Returns 0, or the `errno` the segment sync failed with - in which case the segments are
