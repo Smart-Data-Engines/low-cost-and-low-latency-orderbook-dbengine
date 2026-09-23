@@ -1278,8 +1278,10 @@ def test_a_failed_tick_sync_drains_nothing_and_the_next_one_drains_it_all():
     fails, and then every row exactly once: none lost with the failed sync, none twice from being
     queued again. Read without a `FLUSH`, so what drains them is the next tick and nothing else.
     """
+    # A tick every two seconds, so "the failed tick drained nothing" is a window wide enough to look
+    # into: rows visible between the failed tick and the next one were drained over a failed sync.
     node = FaultNode(OB_FAULT_PATH=WAL_SEGMENT, OB_FAULT_OP="fsync", OB_FAULT_ERRNO="EIO",
-                     OB_FAULT_COUNT="1", OB_FAULT_POLICY="interval", OB_FAULT_FLUSH_MS="200")
+                     OB_FAULT_COUNT="1", OB_FAULT_POLICY="interval", OB_FAULT_FLUSH_MS="2000")
     try:
         node.wait_until_answering()
         replies = node.insert_each(range(200, 205))
@@ -1288,6 +1290,11 @@ def test_a_failed_tick_sync_drains_nothing_and_the_next_one_drains_it_all():
         while node.injections() == 0 and time.time() < deadline:
             time.sleep(0.05)
         assert node.injections() == 1, node.fault_log_text()
+        after_failure = node.talk("SELECT * FROM 'SYM'.'EX' WHERE timestamp BETWEEN 0 AND "
+                                  "9999999999999999999")[-1]
+        assert prices_in(after_failure) == [], (
+            "the tick whose sync failed drained its rows anyway - into segments, over records that "
+            f"never reached the disk: {after_failure}")
         # Published at the start of the next tick, as a delta (#113), so it is waited for rather
         # than read at the instant the sync failed.
         deadline = time.time() + patience(10)
@@ -1305,5 +1312,48 @@ def test_a_failed_tick_sync_drains_nothing_and_the_next_one_drains_it_all():
             time.sleep(0.2)
         assert sorted(prices_in(reply)) == list(range(200, 205)), reply
         assert node.counter("ob_flush_errors_total") >= 1, "the failed tick was not counted"
+    finally:
+        node.cleanup()
+
+
+def test_rows_written_during_a_tick_sync_survive_a_crash_after_it():
+    """The position a tick stamps into its segments, through a crash (stage 5 of #151).
+
+    A segment records how far into the WAL its rows go, and replay starts past it (#63). The tick
+    now syncs without the lock, so rows keep arriving while it does, and their records are *after*
+    the position its sync covers. Stamped with the log's position at drain time instead, a segment
+    would claim records whose rows are still queued - and a crash before the next tick would lose
+    them to a replay that skips them, with every row still answered `OK`.
+
+    So: row 300 before a sync made to last two seconds, rows 301-303 during it, a kill after that
+    tick has drained 300 and before the next one drains the rest, and a restart. All four must come
+    back, each once.
+    """
+    node = FaultNode(OB_FAULT_PATH=WAL_SEGMENT, OB_FAULT_OP="fsync", OB_FAULT_DELAY_MS="2000",
+                     OB_FAULT_COUNT="1", OB_FAULT_POLICY="interval", OB_FAULT_FLUSH_MS="4000")
+    select = "SELECT * FROM 'SYM'.'EX' WHERE timestamp BETWEEN 0 AND 9999999999999999999"
+    try:
+        node.wait_until_answering()
+        assert node.insert_each([300]) == {300: "OK"}
+        deadline = time.time() + patience(15)
+        while "action=delay" not in node.fault_log_text() and time.time() < deadline:
+            time.sleep(0.02)
+        assert "action=delay" in node.fault_log_text(), node.fault_log_text()
+        replies = node.insert_each([301, 302, 303])
+        assert all(r == "OK" for r in replies.values()), replies
+
+        # The slow tick drains 300 when its sync ends; the rest wait four seconds for the next.
+        deadline = time.time() + patience(10)
+        seen = []
+        while time.time() < deadline:
+            seen = prices_in(node.talk(select)[-1])
+            if seen:
+                break
+            time.sleep(0.05)
+        assert seen == [300], f"the slow tick drained {seen}, not the one row its sync covered"
+
+        node.kill_and_restart_without_faults()
+        assert sorted(prices_in(node.talk(select)[-1])) == [300, 301, 302, 303], (
+            "a row written while the tick synced was lost or doubled by the replay after a crash")
     finally:
         node.cleanup()
