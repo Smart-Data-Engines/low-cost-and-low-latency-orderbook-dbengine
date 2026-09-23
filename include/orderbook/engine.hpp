@@ -632,9 +632,9 @@ private:
     /// what the checkpoint claims and what WAL retention reads - `drained_up_to_` says the rows are
     /// in segment files, which survives a killed process and not a power cut: measured, a cut after
     /// a flush brought back eight empty segment files under a checkpoint that claimed them. Equal to
-    /// `drained_up_to_` after a flush that synced; behind it after one whose sync failed, until the
-    /// next one succeeds. Under `--fsync-policy none` it follows `drained_up_to_` without a sync.
-    /// Written and read under `mtx_`, like `drained_up_to_`.
+    /// `drained_up_to_` after a flush that synced; it stops at the first failed sync of any kind, for
+    /// the rest of the process (`checkpoints_frozen_`). Under `--fsync-policy none` it follows
+    /// `drained_up_to_` without a sync. Written and read under `mtx_`, like `drained_up_to_`.
     WalPosition durable_up_to_{};
 
     /// What the newest checkpoint **known to be on the device** claims (#160) - the one WAL
@@ -644,15 +644,21 @@ private:
     /// a power cut could still take, while the unlink survives: the segments that checkpoint
     /// vouched for would then be rebuilt at startup from records that are gone. So this takes
     /// `durable_up_to_` once a WAL sync has covered the checkpoint - one tick later, which is what
-    /// retention pays. Under `--fsync-policy none` it follows `durable_up_to_` at once. Under `mtx_`.
+    /// retention pays - and never after a failed one (`checkpoints_frozen_`). Under
+    /// `--fsync-policy none` it follows `durable_up_to_` at once. Under `mtx_`.
     WalPosition retention_floor_{};
 
     /// The data directory, open for `syncfs()` from `open()` to `close()` (#160). -1 until then.
     int data_dir_fd_{-1};
 
-    /// A run of flushes whose segment sync failed: loud once, then quiet, and the flush that syncs
-    /// again closes it (#95's shape). Touched only by the thread holding `flush_mtx_`.
-    LogEpisode segment_sync_episode_;
+    /// Set by the first failed sync of any kind - a flush's `syncfs()` or a WAL `fsync` - and never
+    /// cleared in this process (#160). Linux reports a failed sync once and marks the pages it could
+    /// not write clean, so the next sync succeeds without writing them: a checkpoint after it would
+    /// vouch for segments, or for a checkpoint, the device may not have. So from the first failure
+    /// no checkpoint is appended and the retention floor stays where it was; the restart, which
+    /// replays from the last checkpoint synced before the failure, is what rebuilds the segments
+    /// written since, and the WAL still holds every record they need. Under `mtx_`.
+    bool checkpoints_frozen_{false};
 
     // Backpressure: maximum number of pending rows before apply_delta blocks.
     // Default 1M rows ≈ ~100 MB memory. Prevents OOM under sustained ingestion.
@@ -839,15 +845,23 @@ private:
     void flush_drain_pending();    // Phase A: drain pending_rows_ → per-symbol append (must hold mtx_)
     /// Phase B: segment I/O, the segment sync, and the index merge (hold `flush_mtx_`, not `mtx_`).
     /// Returns 0, or the `errno` the segment sync failed with - in which case the segments are
-    /// merged and visible, and no checkpoint claims them (#160). The flush tick counts and goes on;
-    /// `FLUSH` answers `ERR`, because a client that asked is told.
+    /// merged and visible, and no checkpoint claims them or anything after them in this process
+    /// (#160). The flush tick counts and goes on; `FLUSH` answers `ERR`, because a client that
+    /// asked is told.
     int flush_write_and_merge();
     /// Sync what this flush wrote, before anything claims it (#160): one `syncfs()` on the data
     /// directory, without `mtx_`. Returns 0, or the `errno`; always 0 under `--fsync-policy none`.
     int sync_segments();
     /// The WAL was just synced to its end, so the last checkpoint appended is on the device and
-    /// retention may follow its claim (#160). Caller holds `mtx_`.
+    /// retention may follow its claim - unless a sync has failed, after which no success vouches for
+    /// anything (#160). Caller holds `mtx_`.
     void note_wal_synced();
+    /// Whether a sync has failed in this process, so that no checkpoint may claim anything
+    /// (`checkpoints_frozen_`). A WAL `fsync` that failed counts too, read from the writer's own
+    /// count, so the freeze does not depend on which path saw it. Caller holds `mtx_`.
+    bool checkpoints_frozen();
+    /// Freeze the checkpoints and say so, once (#160). Caller holds `mtx_`.
+    void freeze_checkpoints(const std::string& what_failed);
     /// At startup, before replay: remove the segments no surviving checkpoint vouches for (#160).
     void remove_unvouched_segments(const WALReplayer::LastCheckpoint& last);
 };

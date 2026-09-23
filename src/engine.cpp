@@ -2297,7 +2297,7 @@ void Engine::flush_tick() {
 
         // Phase B: segment I/O + merge, outside mtx_ so writers are not blocked. A failed segment
         // sync is counted and logged inside, and the tick goes on: the rows are merged and
-        // readable, and retention below stays where the last synced flush left it (#160).
+        // readable, and retention below stays where it was until a restart (#160).
         flush_write_and_merge();
 
         // Update gauge: WAL file index.
@@ -2503,10 +2503,19 @@ int Engine::flush_write_and_merge() {
         // **And only once the sync above succeeded** (#160). Segment files were never synced, so a
         // power cut after a flush brought back all eight of a segment's files empty under a
         // checkpoint that claimed them: 1 row of 201 answered, every one acknowledged as synced.
-        // A flush whose sync failed writes no checkpoint and leaves durable_up_to_ - and with it
-        // WAL retention - where the last synced flush put them; the segments stay merged, and the
-        // next syncfs() covers them together with its own.
-        if (sync_err == 0 && !write_failure) {
+        //
+        // **And never after a sync that failed**, this flush's or an earlier one, the WAL's or the
+        // segments'. The first design had the next successful syncfs() cover the failed flush's
+        // segments together with its own, and that is not what Linux does: a failed sync reports
+        // its error once and marks the pages it could not write clean, so the next one succeeds
+        // without writing them, and its checkpoint would vouch for files the device may not have.
+        // The segments stay merged and readable; what stops is the claim, and a restart - which
+        // replays from the last checkpoint synced before the failure - rebuilds them.
+        if (sync_err != 0) {
+            freeze_checkpoints(std::string("A flush's segment sync failed (") +
+                               std::strerror(sync_err) + ")");
+        }
+        if (!write_failure && !checkpoints_frozen()) {
             durable_up_to_ = drained_up_to_;
             wal_.append_checkpoint(static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2523,24 +2532,10 @@ int Engine::flush_write_and_merge() {
     }
 
     if (sync_err != 0) {
+        // Counted every time, said loudly once - by the freeze, which is the consequence an
+        // operator has to act on (#95's shape).
         registry_.increment_counter("ob_segment_sync_errors_total");
-        if (segment_sync_episode_.begin()) {
-            OB_LOG_ERROR("engine",
-                         "Segments could not be synced (%s): no checkpoint claims them, WAL retention "
-                         "stops where the last synced flush left it, and a power cut now replays from "
-                         "there. The rows are written and readable; the next flush tries again",
-                         std::strerror(sync_err));
-        } else {
-            OB_LOG_DEBUG("engine", "Segment sync failed again (%llu flushes in a row): %s",
-                         static_cast<unsigned long long>(segment_sync_episode_.ticks()),
-                         std::strerror(sync_err));
-        }
-    } else if (!write_failure) {
-        if (const uint64_t failed = segment_sync_episode_.end()) {
-            OB_LOG_INFO("engine", "Segments sync again, after %llu flush(es) whose sync failed; the "
-                                  "checkpoint now claims them all",
-                        static_cast<unsigned long long>(failed));
-        }
+        OB_LOG_DEBUG("engine", "Segment sync failed: %s", std::strerror(sync_err));
     }
     // A write that failed is the flush loop's to count and FLUSH's to answer, as it always was;
     // what changed is that the segments written beside it are in the index first.
@@ -2550,7 +2545,42 @@ int Engine::flush_write_and_merge() {
 
 void Engine::note_wal_synced() {
     // Caller holds mtx_, and the WAL has just been synced to its end.
+    //
+    // **Unless a sync has failed** (#160). A sync that fails after a checkpoint was appended leaves
+    // that checkpoint's pages clean and possibly unwritten, and the next sync succeeds without
+    // touching them - so taking its success as the checkpoint being durable let retention delete a
+    // file whose records a power cut would then need. Measured with the fault injector: the second
+    // sync of a WAL file failed, the third succeeded, and the file before it was gone.
+    if (checkpoints_frozen()) return;
     retention_floor_ = durable_up_to_;
+}
+
+bool Engine::checkpoints_frozen() {
+    // Caller holds mtx_.
+    //
+    // The WAL writer counts its own failed syncs, whichever path made them - a write under `every`,
+    // a rotation, a tick, a FLUSH - so reading its count rather than hooking each path is what
+    // keeps a fifth path from being missed. Under `none` there is no promise a failed sync could
+    // break, so a failed rotation sync there freezes nothing.
+    if (!checkpoints_frozen_ && fsync_policy_ != FsyncPolicy::NONE && wal_.fsync_failures() > 0) {
+        freeze_checkpoints("A WAL sync failed");
+    }
+    return checkpoints_frozen_;
+}
+
+void Engine::freeze_checkpoints(const std::string& what_failed) {
+    // Caller holds mtx_.
+    if (checkpoints_frozen_) return;
+    checkpoints_frozen_ = true;
+    registry_.set_gauge("ob_checkpoints_frozen", 1);
+    OB_LOG_ERROR("engine",
+                 "%s. Linux reports a failed sync once and marks the pages it could not write clean, "
+                 "so no later sync can vouch for them: from here no checkpoint claims anything and "
+                 "WAL retention stays at file %u until this node is restarted. The restart replays "
+                 "from the last checkpoint synced before the failure and rebuilds every segment "
+                 "written since; the rows are written and readable until then, and the WAL keeps "
+                 "every record they need",
+                 what_failed.c_str(), retention_floor_.file_index);
 }
 
 void Engine::remove_unvouched_segments(const WALReplayer::LastCheckpoint& last) {

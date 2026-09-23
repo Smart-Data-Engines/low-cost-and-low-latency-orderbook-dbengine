@@ -874,7 +874,8 @@ def test_a_flush_whose_segments_did_not_sync_claims_nothing(policy):
         assert reply.startswith("ERR") and "segment sync failed" in reply, (
             f"FLUSH did not report the failed segment sync: {reply!r}")
         assert node.counter("ob_segment_sync_errors_total") == 1
-        assert node.log().count("Segments could not be synced") == 1
+        assert node.counter("ob_checkpoints_frozen") == 1
+        assert node.log().count("A flush's segment sync failed (Input/output error)") == 1
         assert sorted(select_prices(node)) == [100, 101], "the written rows are not readable"
 
         node.kill_and_restart_without_faults()
@@ -888,11 +889,18 @@ def test_a_flush_whose_segments_did_not_sync_claims_nothing(policy):
         node.cleanup()
 
 
-def test_the_flush_after_a_failed_segment_sync_claims_both():
-    """The next flush that syncs covers the earlier segments too, and the episode says it is over.
+def test_a_failed_segment_sync_freezes_the_claim_until_a_restart():
+    """#160: after a failed segment sync, no later sync vouches for what that one held.
 
-    One `syncfs()` covers everything dirty in the filesystem, so the second flush's checkpoint can
-    claim the first flush's rows as well: after a kill, the replay starts past all three records.
+    Linux reports a failed sync once and marks the pages it could not write clean, so the next
+    `syncfs()` succeeds **without writing them again**: a checkpoint after it that claimed the first
+    flush's segments would claim files the device may not have. So the second `FLUSH` - whose own
+    sync succeeds, and which answers `OK` for that - claims nothing either, and after a kill the
+    restart removes **both** segments and rebuilds all three rows from the WAL.
+
+    The restart is what ends it: its own flush syncs and claims, so a second restart replays
+    nothing. This test asserted the opposite at first - that the second flush's checkpoint claimed
+    both - and it was checking the design against the kernel's semantics that turned it round.
     """
     node = FaultNode(OB_FAULT_PATH=DATA_DIR_PREFIX, OB_FAULT_OP="syncfs", OB_FAULT_ERRNO="EIO",
                      OB_FAULT_COUNT="1", OB_FAULT_POLICY="every", OB_FAULT_FLUSH_MS="3600000")
@@ -901,15 +909,27 @@ def test_the_flush_after_a_failed_segment_sync_claims_both():
         assert node.insert_each([100, 101]) == {100: "OK", 101: "OK"}
         assert node.talk("FLUSH")[0].startswith("ERR")
         assert node.insert_each([102]) == {102: "OK"}
-        assert node.talk("FLUSH")[0] == "OK", "the flush after the failed one did not succeed"
-        assert node.log().count("Segments sync again, after 1 flush(es)") == 1, node.log()[-1500:]
+        assert node.talk("FLUSH")[0] == "OK", "a flush whose own sync succeeded was refused"
+        assert "action=pass-spent" in node.fault_log_text(), (
+            f"the second flush's sync was not the one after the failure:\n{node.fault_log_text()}")
         assert node.counter("ob_segment_sync_errors_total") == 1
+        assert node.counter("ob_checkpoints_frozen") == 1
+        assert sorted(select_prices(node)) == [100, 101, 102]
 
         node.kill_and_restart_without_faults()
         assert sorted(select_prices(node)) == [100, 101, 102]
-        assert skipped_by_position(node) == 0, (
-            f"the replay still read records the second checkpoint should have covered: "
-            f"{replay_line(node)!r}")
+        assert node.log().count("2 segment(s) written after the last checkpoint that survived "
+                                "were removed") == 1, node.log()[-2000:]
+        assert applied(node) == 3 and skipped_by_position(node) == 0, (
+            f"the replay did not rebuild both segments: {replay_line(node)!r}")
+        assert node.counter("ob_checkpoints_frozen") == 0
+
+        node.kill_and_restart_without_faults()
+        assert sorted(select_prices(node)) == [100, 101, 102]
+        assert applied(node) == 0, (
+            f"the restart's own flush claimed nothing, so the freeze outlived the process that saw "
+            f"the failure: {replay_line(node)!r}")
+        assert node.log().count("segment(s) written after the last checkpoint that survived") == 1
     finally:
         node.cleanup()
 
@@ -943,13 +963,74 @@ def test_retention_does_not_pass_a_segment_that_did_not_sync():
         assert node.counter("ob_flush_ticks_total") >= ticks + 3, "the ticks stopped"
         assert "wal_000000.bin" in node.wal_files(), (
             f"retention deleted a WAL file whose segment never synced: {node.wal_files()}")
-        assert node.log().count("Segments could not be synced") == 1, "loud more than once"
+        assert node.log().count("A flush's segment sync failed") == 1, "loud more than once"
 
         node.kill_and_restart_without_faults()
         assert sorted(select_prices(node)) == prices
     finally:
         node.cleanup()
 
+
+
+def test_retention_does_not_pass_a_checkpoint_a_failed_wal_sync_may_have_lost():
+    """#160: a WAL sync that fails after a checkpoint leaves that checkpoint unvouched for.
+
+    A checkpoint is appended without a sync and the next tick's WAL sync is what puts it on the
+    device - the retention floor waits for that sync. **When it fails, a later one proves nothing**:
+    Linux reports a failed sync once and marks the pages it could not write clean, so the tick after
+    syncs successfully without writing the checkpoint at all. Taking that as the checkpoint being
+    durable let retention delete a file whose records a power cut would then need.
+
+    Deterministic without a clock: under `interval` a rotation leaves a sync owed, so the first sync
+    of `wal_000002.bin` is the phase-A sync of the first tick after the rotation, and that tick
+    drains at least the row that crossed into it - its checkpoint claims a position in file 2. The
+    second sync of the file, the next tick's, is the one that fails.
+    """
+    node = FaultNode(OB_FAULT_PATH="wal_000002.bin", OB_FAULT_OP="fsync", OB_FAULT_ERRNO="EIO",
+                     OB_FAULT_SKIP="1", OB_FAULT_COUNT="1", OB_FAULT_POLICY="interval",
+                     OB_FAULT_FLUSH_MS="300", OB_FAULT_ROTATE_BYTES="65573")
+    try:
+        node.wait_until_answering()
+        prices = list(range(1000, 2100))
+        replies = node.insert_each(prices)
+        assert all(r == "OK" for r in replies.values())
+        files = node.wal_files()
+        assert "wal_000002.bin" in files and "wal_000003.bin" not in files, files
+
+        deadline = time.time() + patience(20)
+        while node.injections() < 1 and time.time() < deadline:
+            time.sleep(0.05)
+        assert node.injections() == 1, f"the WAL sync never failed:\n{node.fault_log_text()}"
+        assert "seen=0 action=pass-skip" in node.fault_log_text(), node.fault_log_text()
+        ticks = node.counter("ob_flush_ticks_total")
+        while node.counter("ob_flush_ticks_total") < ticks + 3 and time.time() < deadline:
+            time.sleep(0.05)
+        assert node.counter("ob_flush_ticks_total") >= ticks + 3, "the ticks stopped"
+        assert "wal_000001.bin" in node.wal_files(), (
+            f"retention deleted a WAL file on the word of a checkpoint whose sync failed: "
+            f"{node.wal_files()}\n{node.fault_log_text()}")
+        assert node.counter("ob_checkpoints_frozen") == 1
+
+        # And it is frozen rather than slow: a row written now, flushed and synced, moves nothing.
+        assert node.insert_each([5000]) == {5000: "OK"}
+        ticks = node.counter("ob_flush_ticks_total")
+        while node.counter("ob_flush_ticks_total") < ticks + 3 and time.time() < deadline:
+            time.sleep(0.05)
+        assert "wal_000001.bin" in node.wal_files(), node.wal_files()
+
+        # The restart is what ends it: its own flush claims what it rebuilt, a sync covers that,
+        # and retention moves past the file it held - the other half of this test, without which
+        # a retention that never deletes anything would pass it.
+        node.kill_and_restart_without_faults()
+        assert sorted(select_prices(node)) == prices + [5000]
+        deadline = time.time() + patience(20)
+        while "wal_000001.bin" in node.wal_files() and time.time() < deadline:
+            time.sleep(0.05)
+        assert "wal_000001.bin" not in node.wal_files(), (
+            f"retention did not move after the restart: {node.wal_files()}")
+        assert node.counter("ob_checkpoints_frozen") == 0
+    finally:
+        node.cleanup()
 
 HOUR_NS = 3600 * 1_000_000_000   # the columnar store's segment length
 
