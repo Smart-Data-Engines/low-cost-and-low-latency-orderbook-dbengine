@@ -298,6 +298,14 @@ ob_add_engine_test(test_wal_recovery
     test_wal_recovery.cpp
 )
 
+# The pending rows' container since stage 5 of #151: a FIFO in fixed-size chunks, which a flush
+# tick takes in one short hold of the engine's lock and drains without it.
+# A header and nothing else, so it links nothing of the engine's.
+add_executable(test_chunked_queue test_chunked_queue.cpp)
+target_include_directories(test_chunked_queue PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_link_libraries(test_chunked_queue PRIVATE GTest::gtest_main rapidcheck rapidcheck_gtest)
+gtest_discover_tests(test_chunked_queue PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
+
 ob_add_engine_test(test_sequence_numbers
     test_sequence_numbers.cpp
 )
