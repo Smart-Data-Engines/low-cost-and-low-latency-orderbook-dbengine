@@ -303,12 +303,6 @@ endif()
 
 # ── Metrics registry compiled library ──────────────────────────────────────────
 # ── Structured logger compiled library ─────────────────────────────────────────
-# ── Machine resources: how many CPUs this process can actually use ────────────
-# The affinity mask and the tightest cgroup CPU limit, as a pure function of what the process can
-# see, so the cases a container, a cpuset and a fractional quota produce are unit tests.
-add_library(orderbook_machine STATIC src/machine.cpp)
-target_link_libraries(orderbook_machine PUBLIC orderbook_core)
-
 add_library(orderbook_logger STATIC src/logger.cpp)
 target_link_libraries(orderbook_logger PUBLIC orderbook_core)
 
@@ -316,6 +310,12 @@ add_library(orderbook_metrics STATIC src/metrics.cpp)
 # Needs the logger: a write to an unregistered metric name updates nothing, so it
 # has to be reported rather than swallowed.
 target_link_libraries(orderbook_metrics PUBLIC orderbook_core orderbook_logger)
+
+# ── Machine resources: how many CPUs this process can actually use ────────────
+# The affinity mask and the tightest cgroup CPU limit, as a pure function of what the process can
+# see, so the cases a container, a cpuset and a fractional quota produce are unit tests.
+add_library(orderbook_machine STATIC src/machine.cpp)
+target_link_libraries(orderbook_machine PUBLIC orderbook_core)
 
 # ── HLC (Hybrid Logical Clock) compiled library ───────────────────────────────
 add_library(orderbook_hlc STATIC src/hlc.cpp)

@@ -8,11 +8,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
 #include <sched.h>
 #include <unistd.h>
 
@@ -80,22 +80,26 @@ std::optional<double> number(const std::string& text) {
     return value;
 }
 
-/// What reading one level said: a limit, "no limit", or nothing readable.
-enum class Level { Limit, Unlimited, Unreadable };
+/// What reading one level said: a limit, "no limit", no file there (a level that limits nothing),
+/// or a file there that could not be read - or held something that is not a limit.
+enum class Level { Limit, Unlimited, Absent, Unreadable };
 
 struct Reading {
-    Level       level{Level::Unreadable};
+    Level       level{Level::Absent};
     double      cpus{0};
     std::string where;
 };
 
-/// cgroup v2: `cpu.max` is `max <period>` or `<quota> <period>`.
+/// cgroup v2: `cpu.max` is `max <period>` or `<quota> <period>`, and does not exist where the CPU
+/// controller is not enabled.
 Reading read_v2(const SystemView& view, const std::string& dir) {
     Reading r;
     r.where = view.cgroup_root + dir + "/cpu.max";
-    const auto text = view.read_file(r.where);
-    if (!text) return r;
-    std::istringstream in(*text);
+    const FileRead file = view.read_file(r.where);
+    if (file.status == FileRead::Status::Absent) return r;
+    r.level = Level::Unreadable;
+    if (file.status != FileRead::Status::Read) return r;
+    std::istringstream in(file.text);
     std::string quota, period;
     if (!(in >> quota >> period)) return r;
     if (quota == "max") {
@@ -116,18 +120,21 @@ Reading read_v1(const SystemView& view, const std::string& dir) {
     Reading r;
     for (const char* mount : {"/cpu", "/cpu,cpuacct", "/cpuacct,cpu"}) {
         const std::string base = view.cgroup_root + mount + dir;
-        const auto quota_text = view.read_file(base + "/cpu.cfs_quota_us");
-        if (!quota_text) continue;
+        const FileRead quota_file = view.read_file(base + "/cpu.cfs_quota_us");
+        if (quota_file.status == FileRead::Status::Absent) continue;
         r.where = base + "/cpu.cfs_quota_us";
-        const auto quota = number(*quota_text);
+        r.level = Level::Unreadable;
+        if (quota_file.status != FileRead::Status::Read) return r;
+        const auto quota = number(quota_file.text);
         if (!quota) return r;
         if (*quota < 0) {
             r.level = Level::Unlimited;
             return r;
         }
-        const auto period_text = view.read_file(base + "/cpu.cfs_period_us");
-        const std::optional<double> period =
-            period_text ? number(*period_text) : std::optional<double>{};
+        const FileRead period_file = view.read_file(base + "/cpu.cfs_period_us");
+        const std::optional<double> period = period_file.status == FileRead::Status::Read
+                                                 ? number(period_file.text)
+                                                 : std::optional<double>{};
         if (!period || *period <= 0 || *quota == 0) return r;
         r.level = Level::Limit;
         r.cpus  = *quota / *period;
@@ -155,8 +162,8 @@ MachineResources detect_machine(const SystemView& view) {
     m.affinity_cpus = affinity_known ? *view.affinity_cpus : std::max(1u, view.online_cpus);
 
     // Which hierarchy holds the cpu controller. On a hybrid system both kinds of line are present
-    // and the controller is v1's - the unified hierarchy has no `cpu.max` to read, and reading it
-    // would report "unreadable" about a file that was never going to exist.
+    // and the controller is v1's - the unified hierarchy has no `cpu.max`, and reading it would
+    // find none and report "no limit" about a hierarchy that does not hold the controller.
     std::optional<std::string> v1_path;
     std::optional<std::string> v2_path;
     if (view.proc_self_cgroup) {
@@ -170,7 +177,8 @@ MachineResources detect_machine(const SystemView& view) {
     }
 
     std::string limit_where;
-    int readable = 0;
+    int read = 0;         // levels whose file said a limit or "no limit"
+    int unreadable = 0;   // levels whose file exists and said neither
     int levels = 0;
     const char* hierarchy = nullptr;
     if (v1_path || v2_path) {
@@ -178,8 +186,12 @@ MachineResources detect_machine(const SystemView& view) {
         for (const std::string& dir : self_and_ancestors(v1_path ? *v1_path : *v2_path)) {
             const Reading r = v1_path ? read_v1(view, dir) : read_v2(view, dir);
             ++levels;
-            if (r.level == Level::Unreadable) continue;
-            ++readable;
+            if (r.level == Level::Absent) continue;
+            if (r.level == Level::Unreadable) {
+                ++unreadable;
+                continue;
+            }
+            ++read;
             if (r.level == Level::Limit && (!m.quota_cpus || r.cpus < *m.quota_cpus)) {
                 m.quota_cpus = r.cpus;
                 limit_where  = r.where;
@@ -201,14 +213,28 @@ MachineResources detect_machine(const SystemView& view) {
     if (!hierarchy) {
         reason += view.proc_self_cgroup ? ", not in a cgroup with a CPU controller"
                                         : ", /proc/self/cgroup unreadable so no cgroup limit known";
-    } else if (m.quota_cpus) {
-        reason += ", " + std::string(hierarchy) + " limit " + format_cpus(*m.quota_cpus) +
-                  " CPUs (" + limit_where + ")";
-    } else if (readable == 0) {
-        reason += ", " + std::string(hierarchy) + " limit unknown - none of " +
-                  std::to_string(levels) + " levels could be read, so none is assumed";
     } else {
-        reason += ", no " + std::string(hierarchy) + " CPU limit";
+        const std::string h(hierarchy);
+        if (m.quota_cpus) {
+            reason += ", " + h + " limit " + format_cpus(*m.quota_cpus) + " CPUs (" + limit_where +
+                      ")";
+        } else if (read > 0) {
+            reason += ", no " + h + " CPU limit";
+        } else if (unreadable > 0) {
+            reason += ", " + h + " limit unknown - no level could be read, so none is assumed";
+        } else if (v1_path) {
+            // Under v1 the files exist in every cgroup of the `cpu` hierarchy, so finding none of
+            // them says where the hierarchy is not mounted, not that it limits nothing.
+            reason += ", " + h + " limit unknown - the cpu controller's files are not under " +
+                      view.cgroup_root + ", so none is assumed";
+        } else {
+            // No `cpu.max` anywhere on the path: the CPU controller is not enabled for it.
+            reason += ", no " + h + " CPU limit";
+        }
+        if (unreadable > 0 && read > 0) {
+            reason += " - " + std::to_string(unreadable) + " of " + std::to_string(levels) +
+                      " levels could not be read, so a limit there is not known";
+        }
     }
     m.reason = reason;
     return m;
@@ -237,15 +263,36 @@ SystemView read_system_view() {
         if (err != EINVAL) break;
     }
 
-    view.read_file = [](const std::string& path) -> std::optional<std::string> {
-        std::ifstream in(path);
-        if (!in) return std::nullopt;
-        std::ostringstream text;
-        text << in.rdbuf();
-        if (in.bad()) return std::nullopt;
-        return text.str();
+    // POSIX rather than a stream, for errno: a file that is not there and a file that is there and
+    // cannot be read are different answers about a cgroup (see FileRead).
+    view.read_file = [](const std::string& path) -> FileRead {
+        FileRead out;
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            out.status = (errno == ENOENT || errno == ENOTDIR) ? FileRead::Status::Absent
+                                                               : FileRead::Status::Unreadable;
+            return out;
+        }
+        char buf[4096];
+        for (;;) {
+            const ssize_t n = ::read(fd, buf, sizeof(buf));
+            if (n > 0) {
+                out.text.append(buf, static_cast<std::size_t>(n));
+                continue;
+            }
+            if (n == 0) break;
+            if (errno == EINTR) continue;
+            ::close(fd);
+            out.status = FileRead::Status::Unreadable;
+            out.text.clear();
+            return out;
+        }
+        ::close(fd);
+        out.status = FileRead::Status::Read;
+        return out;
     };
-    view.proc_self_cgroup = view.read_file("/proc/self/cgroup");
+    const FileRead cgroup = view.read_file("/proc/self/cgroup");
+    if (cgroup.status == FileRead::Status::Read) view.proc_self_cgroup = cgroup.text;
     return view;
 }
 

@@ -11,24 +11,32 @@
 #include <gtest/gtest.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <map>
+#include <set>
 #include <string>
 
 #include <sched.h>
 
 namespace {
 
-/// A view whose files are a map: a path absent from it is a file that cannot be read.
+/// A view whose files are a map: a path in `unreadable` exists and cannot be read, and a path in
+/// neither does not exist.
 ob::SystemView view_of(unsigned affinity, std::string proc_self_cgroup,
-                       std::map<std::string, std::string> files) {
+                       std::map<std::string, std::string> files,
+                       std::set<std::string> unreadable = {}) {
     ob::SystemView v;
     v.affinity_cpus    = affinity;
     v.online_cpus      = affinity;
     v.proc_self_cgroup = std::move(proc_self_cgroup);
-    v.read_file = [files = std::move(files)](const std::string& path) -> std::optional<std::string> {
+    v.read_file = [files = std::move(files),
+                   unreadable = std::move(unreadable)](const std::string& path) -> ob::FileRead {
+        if (unreadable.count(path)) return {ob::FileRead::Status::Unreadable, {}};
         const auto it = files.find(path);
-        if (it == files.end()) return std::nullopt;
-        return it->second;
+        if (it == files.end()) return {ob::FileRead::Status::Absent, {}};
+        return {ob::FileRead::Status::Read, it->second};
     };
     return v;
 }
@@ -113,7 +121,7 @@ TEST(Machine, CgroupV1MinusOneIsNoLimit) {
 
 TEST(Machine, AHybridSystemReadsTheControllerWhereItIs) {
     // Both kinds of line: the cpu controller is v1's, and the unified hierarchy has no cpu.max, so
-    // reading it would report "unreadable" about a file that was never going to exist.
+    // reading it would find none and report "no limit" - about the hierarchy that does not hold it.
     const auto m = ob::detect_machine(view_of(
         4, "0::/app\n3:cpu,cpuacct:/app\n",
         {{"/sys/fs/cgroup/cpu,cpuacct/app/cpu.cfs_quota_us", "200000\n"},
@@ -131,11 +139,48 @@ TEST(Machine, TheControllerIsMatchedByNameNotBySubstring) {
 }
 
 TEST(Machine, AFileThatCannotBeReadIsNoInformationAndSaysSo) {
-    const auto m = ob::detect_machine(view_of(4, kV2, {}));
+    const auto m = ob::detect_machine(view_of(4, kV2, {}, {kLeafV2, kParentV2}));
     EXPECT_EQ(m.usable_cpus, 4u);
     EXPECT_FALSE(m.quota_cpus.has_value());
     EXPECT_NE(m.reason.find("limit unknown"), std::string::npos) << m.reason;
     EXPECT_NE(m.reason.find("could be read"), std::string::npos) << m.reason;
+}
+
+TEST(Machine, NoCpuMaxAnywhereIsNoLimit) {
+    // The hierarchy's root never has a cpu.max, and a cgroup has one only where the CPU controller
+    // is enabled: a path with none limits nothing, which is a different answer from "unknown".
+    const auto m = ob::detect_machine(view_of(4, kV2, {}));
+    EXPECT_EQ(m.usable_cpus, 4u);
+    EXPECT_FALSE(m.quota_cpus.has_value());
+    EXPECT_EQ(m.reason, "4 usable CPUs: affinity 4, no cgroup v2 CPU limit");
+}
+
+TEST(Machine, AnUnreadableLevelIsSaidBesideTheLevelsThatWereRead) {
+    // The leaf says "max" and its parent cannot be read: a limit there would bind, so "no limit"
+    // on its own would say more than was found.
+    const auto m = ob::detect_machine(view_of(4, kV2, {{kLeafV2, "max 100000\n"}}, {kParentV2}));
+    EXPECT_EQ(m.usable_cpus, 4u);
+    EXPECT_FALSE(m.quota_cpus.has_value());
+    EXPECT_EQ(m.reason, "4 usable CPUs: affinity 4, no cgroup v2 CPU limit - 1 of 3 levels could "
+                        "not be read, so a limit there is not known");
+}
+
+TEST(Machine, AnUnreadableLevelDoesNotHideALimitFoundAtAnother) {
+    const auto m =
+        ob::detect_machine(view_of(4, kV2, {{kLeafV2, "150000 100000\n"}}, {kParentV2}));
+    EXPECT_EQ(m.usable_cpus, 1u);
+    EXPECT_NE(m.reason.find("cgroup v2 limit 1.50 CPUs"), std::string::npos) << m.reason;
+    EXPECT_NE(m.reason.find("1 of 3 levels could not be read"), std::string::npos) << m.reason;
+}
+
+TEST(Machine, ACgroupV1HierarchyNotInViewIsNoInformation) {
+    // Under v1 every cgroup of the cpu hierarchy has the files, so none of them in view says the
+    // hierarchy is mounted somewhere this reader does not look - not that it limits nothing.
+    const auto m = ob::detect_machine(view_of(4, "4:cpu,cpuacct:/docker/abc\n", {}));
+    EXPECT_EQ(m.usable_cpus, 4u);
+    EXPECT_FALSE(m.quota_cpus.has_value());
+    EXPECT_NE(m.reason.find("cgroup v1 limit unknown"), std::string::npos) << m.reason;
+    EXPECT_NE(m.reason.find("not under /sys/fs/cgroup"), std::string::npos) << m.reason;
 }
 
 TEST(Machine, NonsenseInALimitFileIsNoInformationNotAZeroLimit) {
@@ -143,6 +188,8 @@ TEST(Machine, NonsenseInALimitFileIsNoInformationNotAZeroLimit) {
         const auto m = ob::detect_machine(view_of(4, kV2, {{kLeafV2, text}}));
         EXPECT_EQ(m.usable_cpus, 4u) << "cpu.max \"" << text << "\"";
         EXPECT_FALSE(m.quota_cpus.has_value()) << "cpu.max \"" << text << "\"";
+        EXPECT_NE(m.reason.find("limit unknown"), std::string::npos)
+            << "cpu.max \"" << text << "\": " << m.reason;
     }
 }
 
@@ -198,6 +245,29 @@ TEST(MachineRealSystem, TheReaderSeesTheMaskItIsGiven) {
     ASSERT_TRUE(whole.affinity_cpus.has_value());
     EXPECT_EQ(*whole.affinity_cpus, static_cast<unsigned>(CPU_COUNT(&before)))
         << "the reader and sched_getaffinity disagree about the restored mask";
+}
+
+TEST(MachineRealSystem, TheReaderTellsAFileThatIsNotThereFromOneThatCannotBeRead) {
+    // The two answers mean different things about a cgroup, and both are made here with nothing but
+    // a temporary directory: a directory opens and cannot be read (EISDIR), whoever runs the test -
+    // a file with mode 000 would not do, because root reads it anyway.
+    char tmpl[] = "/tmp/ob-machine-XXXXXX";
+    ASSERT_NE(::mkdtemp(tmpl), nullptr);
+    const std::filesystem::path dir(tmpl);
+    { std::ofstream(dir / "cpu.max") << "max 100000\n"; }
+
+    const ob::SystemView v = ob::read_system_view();
+    const ob::FileRead file = v.read_file((dir / "cpu.max").string());
+    const ob::FileRead missing = v.read_file((dir / "missing").string());
+    const ob::FileRead under_a_file = v.read_file((dir / "cpu.max" / "x").string());
+    const ob::FileRead a_directory = v.read_file(dir.string());
+    std::filesystem::remove_all(dir);
+
+    EXPECT_EQ(file.status, ob::FileRead::Status::Read);
+    EXPECT_EQ(file.text, "max 100000\n");
+    EXPECT_EQ(missing.status, ob::FileRead::Status::Absent);
+    EXPECT_EQ(under_a_file.status, ob::FileRead::Status::Absent) << "ENOTDIR is not being there";
+    EXPECT_EQ(a_directory.status, ob::FileRead::Status::Unreadable);
 }
 
 TEST(MachineRealSystem, TheAnswerOnThisMachineHasAReason) {
