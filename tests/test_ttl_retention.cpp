@@ -456,7 +456,7 @@ struct SweepOutcome {
 };
 
 SweepOutcome sweep_after_restart(const fs::path& dir, uint64_t ttl_hours, uint64_t old_age_hours,
-                                 int rows) {
+                                 int rows, uint64_t scan_interval_seconds = 1) {
     fs::remove_all(dir);
     fs::create_directories(dir);
     {
@@ -468,7 +468,7 @@ SweepOutcome sweep_after_restart(const fs::path& dir, uint64_t ttl_hours, uint64
         first.close();
     }
     ob::Engine second(dir.string(), 20'000'000ULL, ob::FsyncPolicy::INTERVAL, {}, {}, {},
-                      ob::TTLConfig{ttl_hours, 1});
+                      ob::TTLConfig{ttl_hours, scan_interval_seconds});
     second.open();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (second.stats().ttl_segments_deleted == 0 && std::chrono::steady_clock::now() < deadline) {
@@ -500,6 +500,18 @@ TEST(TTLSweep, ARestartWithARetentionLongerThanTheMachineHasBeenUpKeepsWhatIsNew
     EXPECT_EQ(o.fresh_rows, 50) << "the sweep deleted rows younger than the retention - with a "
                                    "retention of " << ttl_hours << " h, on a machine up "
                                 << static_cast<uint64_t>(up / 3600.0) << " h";
+}
+
+TEST(TTLSweep, TheFirstSweepRunsAtTheFirstTickWhateverTheInterval) {
+    // An interval of 31 years. The sweep's cadence counts from the last sweep, and before the first
+    // one there is none: counted from the monotonic clock's zero - this machine's boot - instead,
+    // the first sweep of a node on a machine up for less than its interval would wait out the rest
+    // of it, and a node restarted after a long stop would keep its expired rows that long.
+    const SweepOutcome o = sweep_after_restart(fs::temp_directory_path() / "ttl_sweep_first_tick", 1,
+                                               3, 50, 1'000'000'000ULL);
+    EXPECT_GE(o.segments_deleted, 1u) << "no sweep ran within ten seconds of starting";
+    EXPECT_EQ(o.old_rows, 0);
+    EXPECT_EQ(o.fresh_rows, 50);
 }
 
 TEST(TTLSweep, RowsOlderThanTheRetentionExpireAndNewerOnesStay) {
