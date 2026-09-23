@@ -3425,6 +3425,32 @@ Learned the hard way. Check here before debugging.
      every segment a node ever wrote. The same guarantee in batches: write each corrected file
      beside the old one, one `syncfs()`, then `rename()` each over its original — and a failed
      `syncfs()` publishes nothing of its batch (#166).
+427. **A bound taken from the worst member of a set is as loose as that member.** The per-symbol
+     index searched `[s - widest, e]`, `widest` the widest segment the symbol ever had, and the
+     design called the window "a little too wide". One segment written from a batch that mixed
+     current rows with an old one - a peer's backlog, a late correction - made every later query
+     of that symbol walk each of its segments within that width: 0.048 ms at 100 000, linear.
+     Tiers by bit width bound each window by its own members, every one more than half the widest,
+     which is a bound a property test can assert (#165).
+428. **An assertion whose message names a property its check cannot see.** The retention test said
+     "a symbol left without segments is still indexed" and asked `holds()`, which answers by
+     segments - so an empty entry left behind could not fail it. Found by reading the mutation table
+     against the tests before its first run: a verdict is a prediction, and some of them can be
+     checked by reading (#165).
+429. **A count returned by the code can be the instrument for a performance property.** "A query
+     compares only what its windows reach" is about comparisons, which a clock cannot assert without
+     flaking. `scan()` returns what it compared, so a property test holds the excess to tiers times
+     the deepest instant, and the mutation that restores the one window is killed by a count (#165).
+430. **The order a function hands results out in is part of the answer of every reader that keeps
+     the first or the last.** A `LIMIT` takes the first rows a scan delivers and a `SNAPSHOT` keeps
+     the last one per level, so the width tiers had to merge their candidates back into the order the
+     flat index gave - and asking which readers depend on that order found #168: `SNAPSHOT` keeps the
+     last row delivered, which is not the latest in time once rows reach a flush out of order.
+431. **A step every answer must pass through is skipped by every early return before it.** #139
+     assigned the shape a row query is formatted with after the `SNAPSHOT` branch had already
+     returned, so `SNAPSHOT` has answered over the wire with no columns since - `OK`, an empty header,
+     empty rows - and the only test of it parses the statement (#167). A new mandatory step is a
+     question about every `return` above it.
 
 ## Current state and open problems
 
@@ -3457,6 +3483,14 @@ below are the recent closures worth knowing because each changes what the engine
 carries no count, because the previous version of this sentence said "four" above a list of six and
 omitted the newest one entirely - which is the rot pitfall 312 is about, in the paragraph that
 warns about it.
+
+**#165, part 1**: the segment index is per symbol and in width tiers, so a flush tick's merge is a
+lookup and an insertion and a query searches only its symbol's windows - a writer's p99 flat at
+0.71-0.76 ms through a 90-second soak where it grew to 94.66 ms. **Part 2 is open and a P0**: the
+count still grows by one segment per active symbol per tick, faster now that ticks no longer slow,
+and a cold start reads every one - 107 s and 1.44 GiB after that soak. **#167 and #168 are open P1s**,
+both `SNAPSHOT`: no columns over the wire since #139, and the last row delivered per level rather
+than the latest at or before its time.
 
 **#166**: a segment's time range is its rows' earliest and latest timestamp. It was the start of
 the first row's hour and the last row's time, so a row that reached a flush out of time order fell
