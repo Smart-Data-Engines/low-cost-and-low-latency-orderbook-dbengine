@@ -152,6 +152,18 @@ Reconstruct the orderbook state at a specific timestamp:
 SELECT * FROM 'BTC-USD'.'BINANCE' WHERE AT 1700000000000000000
 ```
 
+For each side and level, the answer is the row with the **latest event time at or before** the
+one asked for; two rows of one level at one instant resolve to the one written later. Levels come
+bids first, then asks, each by level — the order `BOOK` answers in — so `LIMIT n` keeps the first
+`n` of them. It answers the columns it names, like any row query (`SELECT price, quantity … WHERE
+AT …`), and reads the columnar store, so a row the flush tick has not yet written is not in it.
+
+Two things this answered differently before, and both are fixed (#167, #168 in the roadmap): over
+the wire, from #139 on, it answered `OK` with an empty header and empty rows; and it kept the last
+row a scan *delivered* for each level rather than the latest, so a correction for an earlier
+instant that arrived later — a client's own event time, a mesh peer's backlog — replaced the book it
+came after. Its order was a hash map's.
+
 ## SUBSCRIBE Queries
 
 Register a streaming callback that fires on every matching delta update:

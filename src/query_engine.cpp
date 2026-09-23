@@ -9,6 +9,7 @@
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -908,18 +909,37 @@ std::string QueryEngine::execute(std::string_view sql, RowCallback cb, QueryShap
     if (ast.type == QueryType::SNAPSHOT) {
         uint64_t snap_ts = ast.snapshot_ts_ns.value_or(0);
 
-        // Reconstruct orderbook state: for each (side, level_index) keep the
-        // last row at or before snap_ts.
-        // Key: (side << 16) | level_index  →  last SnapshotRow
-        std::unordered_map<uint32_t, SnapshotRow> state;
+        // A SNAPSHOT is a row query, and it answers the columns it names like any other. The shape
+        // is what the wire formatter prints, and #139 assigned it below this branch's return - so
+        // from #139 on a SNAPSHOT answered over the wire with an empty header and empty rows, while
+        // local mode, which formats nothing, was unaffected (#167).
+        shape.columns = ast.projection.empty() ? all_query_columns() : ast.projection;
 
-        // A snapshot is every field of every row, so it really does want all seven.
-    store_.scan(0, snap_ts, ast.symbol, ast.exchange, ColumnSet::all(),
+        // The book at snap_ts: for each (side, level_index), the row with the latest timestamp at
+        // or before it. It kept the last row a scan *delivered*, which is that only while rows
+        // arrive in time order: a scan hands out segments by start and each segment's rows in the
+        // order they were appended, so a correction for an earlier instant that arrived later - a
+        // client's own event times (#105), a mesh peer's backlog - replaced the book it came after
+        // (#168). A tie on the timestamp keeps the later one delivered, which is what every row got
+        // before. Ordered by side, then level - bids first, as BOOK answers - where a hash map made
+        // the order, and with it what a LIMIT kept, a property of the hash.
+        // Key: (side << 16) | level_index.
+        std::map<uint32_t, SnapshotRow> state;
+
+        // Every column is read whatever the select list says: the key is the side and the level,
+        // and the choice between two rows is their timestamps.
+        store_.scan(0, snap_ts, ast.symbol, ast.exchange, ColumnSet::all(),
                     [&](const SnapshotRow& row) {
-                        uint32_t key = (static_cast<uint32_t>(row.side) << 16) |
-                                       static_cast<uint32_t>(row.level_index);
-                        state[key] = row;
+                        const uint32_t key = (static_cast<uint32_t>(row.side) << 16) |
+                                             static_cast<uint32_t>(row.level_index);
+                        auto [it, inserted] = state.try_emplace(key, row);
+                        if (!inserted && row.timestamp_ns >= it->second.timestamp_ns) {
+                            it->second = row;
+                        }
                     });
+        OB_LOG_DEBUG("query_engine", "SNAPSHOT: symbol=%s exchange=%s at=%llu levels=%zu",
+                     ast.symbol.c_str(), ast.exchange.c_str(),
+                     static_cast<unsigned long long>(snap_ts), state.size());
 
         uint64_t count = 0;
         uint64_t lim = ast.limit.value_or(UINT64_MAX);

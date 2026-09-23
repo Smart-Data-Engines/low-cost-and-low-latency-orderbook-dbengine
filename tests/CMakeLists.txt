@@ -273,6 +273,11 @@ ob_add_query_test(test_query_agg_execution
     test_query_agg_execution.cpp
 )
 
+# ── #167 and #168: what a SNAPSHOT answers ────────────────────────────────────
+ob_add_query_test(test_snapshot_query
+    test_snapshot_query.cpp
+)
+
 # ── Helper to register a test executable that needs the C API library ─────────
 function(ob_add_capi_test name)
     add_executable(${name} ${ARGN})

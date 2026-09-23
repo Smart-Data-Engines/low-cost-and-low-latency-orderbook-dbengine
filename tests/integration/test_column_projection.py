@@ -10,37 +10,18 @@ read a narrowed answer, and the tests for that are the refusals at the bottom of
 from __future__ import annotations
 
 import hashlib
-import socket
-import time
 
 import pytest
 
 from orderbook_engine import OrderbookEngine, OrderbookError
+
+from conftest import raw_query
 
 pytestmark = pytest.mark.smoke
 
 SYMBOL = "PROJ-WIRE"
 EXCHANGE = "BINANCE"
 PRICE, QTY = 6_500_000, 150
-
-
-def raw_query(port: int, sql: str, timeout: float = 6.0) -> list[str]:
-    """Send one query over a bare socket and return its non-empty lines."""
-    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
-        sock.settimeout(timeout)
-        sock.recv(4096)  # banner
-        sock.sendall((sql + "\n").encode())
-        buffered = b""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            chunk = sock.recv(1 << 20)
-            if not chunk:
-                break
-            buffered += chunk
-            # `OK` bodies end in a blank line; `ERR` is a single line.
-            if b"\n\n" in buffered or buffered.startswith(b"ERR "):
-                break
-        return [ln for ln in buffered.decode(errors="replace").strip().splitlines() if ln]
 
 
 @pytest.fixture

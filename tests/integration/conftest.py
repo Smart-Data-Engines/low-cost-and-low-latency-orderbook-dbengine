@@ -219,6 +219,30 @@ class ClosedWithoutReply(Exception):
     """The node accepted the command and closed the connection without answering."""
 
 
+def raw_query(port: int, sql: str, timeout: float = 6.0) -> list[str]:
+    """Send one query over a bare socket and return its non-empty lines.
+
+    For the tests that read an answer's shape - its header and how many fields a row has - which
+    both of our clients cannot, because they read a row by position. It lived in
+    `test_column_projection.py` until a second module needed it (#167).
+    """
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.recv(4096)  # banner
+        sock.sendall((sql + "\n").encode())
+        buffered = b""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            chunk = sock.recv(1 << 20)
+            if not chunk:
+                break
+            buffered += chunk
+            # `OK` bodies end in a blank line; `ERR` is a single line.
+            if b"\n\n" in buffered or buffered.startswith(b"ERR "):
+                break
+        return [ln for ln in buffered.decode(errors="replace").strip().splitlines() if ln]
+
+
 def send_command(port: int, command: str, timeout: float = 10.0) -> str:
     """Send one command and return the reply.
 
