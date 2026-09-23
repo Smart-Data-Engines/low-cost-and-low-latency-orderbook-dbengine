@@ -120,9 +120,11 @@ TEST(SnapshotQuery, ALevelsLatestRowAtOrBeforeTheTimeIsTheAnswer) {
 }
 
 TEST(SnapshotQuery, ACorrectionInALaterSegmentIsTheAnswerOnlyAtItsOwnTime) {
-    // The same two rows a flush apart. A scan hands segments out by start, so the correction's
-    // segment comes first and the answer was right before the fix too - by the order of the
-    // segments, which is what this pins it no longer depends on.
+    // The same two rows a flush apart. Whether this was right before the fix depended on the order
+    // the store handed its segments out in: the engine's combined store sorted them by start, which
+    // put the correction first and made the answer right by luck, and a store on its own - this
+    // fixture - handed them out in the order it wrote them, which made it wrong. The comment above
+    // this test first said it passed before the fix; run against that code, it failed with 101.
     Fixture f;
     f.segment({level(kBase + 5 * kSec, kBid, 0, 100)});
     f.segment({level(kBase + 3 * kSec, kBid, 0, 101)});
