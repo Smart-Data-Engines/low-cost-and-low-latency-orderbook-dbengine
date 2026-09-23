@@ -980,20 +980,62 @@ checked in the code rather than assumed:
   newest event time against **the node's wall clock minus the retention**, so history loaded with
   its real timestamps arrives **with its age**: a backfill of last year into a node with a 24-hour
   TTL is expired on the next sweep. The inverse is also true and stranger — one row dated in the
-  future keeps its whole segment alive. The wall clock is the one a row is stamped with on arrival,
+  future keeps its whole segment alive. *Newest* has been true since #166: until then it was the
+  segment's **last-written** row, so a current row written before an older one went with it —
+  measured, 0 of 2 rows after the first sweep under `--ttl-hours 24`, one of them a second old.
+  The wall clock is the one a row is stamped with on arrival,
   so a clock **stepped forward expires early by the step** and one stepped back keeps rows longer;
   how often the sweep runs is on the monotonic clock and does not move with it.
   Until #163 the cutoff came from the clock that counts from the machine's boot. A node whose
   retention was longer than its machine had been up deleted **every** segment at its first sweep —
   measured, 200 rows of 200 after a restart with `--ttl-hours 24` on a machine up 21.5 hours — and
   one up for longer than its retention never expired anything.
-- **Query pruning gets less effective, not wrong.** A segment is skipped when its `[start, end]`
-  range cannot intersect the query's, so rows arriving out of order widen segments and more of them
-  are read. Correctness does not depend on monotonic time; scan cost does.
+- **Query pruning is exact about time, and costs more when rows arrive out of order.** A segment is
+  skipped when its `[start, end]` range cannot intersect the query's, and since #166 that range is
+  the earliest and the latest row in it — so rows arriving out of order widen segments and more of
+  them are read, but no segment is skipped that holds a row the query asks for. **Until #166 this
+  bullet said the same and was false**: the range was the start of the hour the segment's first row
+  fell in and the time of its last row, so a row written out of order could fall outside it, and a
+  `SELECT` answered `OK` without it. A node upgraded from a build before #166 corrects the ranges of
+  the segments it already has at its first start, reading each one's timestamp column once — one
+  line in the log says how many there were, how many held rows outside their recorded range and how
+  long it took — and never again; see "Upgrading a data directory written before #166" below.
 - **Conflict resolution is untouched.** Multi-master last-writer-wins compares the HLC, which comes
   from the node's clock, not the record's `timestamp_ns` — so a client choosing a time **cannot**
   decide which of two conflicting writes survives. That was the one real risk in the change, and it
   is the reason the field could be added at all.
+
+## Upgrading a data directory written before #166
+
+A segment written before #166 recorded the wrong time range whenever its rows reached a flush out
+of time order (#166 in the roadmap). The first start of a later build finds every such segment by
+its `meta.json` — the ones without `"time_range":"rows"` — reads its `ts.col` once, and gives it its
+rows' range: in the index always, and on disk in batches of 4096, each batch written beside the old
+files, synced with one `syncfs()` and only then renamed over them. So a crash or a power cut in the
+middle leaves every segment with its old `meta.json` or its new one, and the next start finishes the
+job; a leftover `meta.json.range` is the trace of an interrupted batch and is removed at start.
+
+```
+{"component":"columnar","msg":"106752 segment(s) written before #166 were read for their time range in 87131 ms: 0 held rows outside the range they recorded, 106752 repaired on disk, 0 only in memory, 0 unreadable"}
+```
+
+That one is measured, on an m9g.xlarge with its data on EBS and a cold page cache: 106 752 segments
+written by a build before #166, whose cold start took 82 s to read their `meta.json` files and whose
+first start on the new build took 170 s — the repair is roughly one more cold read of the index, once,
+and the start after it took 82 s again. A node that ever wrote rows out of time order has a non-zero
+`held rows outside`, and names the first such segment in the parentheses.
+
+`held rows outside` is the number that matters: those are the segments queries and retention were
+wrong about. `only in memory` counts corrections that could not be written — a read-only directory,
+a full disk, a failed sync — and those are repaired again at the next start. `unreadable` means a
+segment without a readable `ts.col`, which no query could read anyway. The cost is one read of every
+old segment's timestamp column, once; the start after it reads none.
+
+**A downgrade after the repair is safe to read**: the column files are untouched and the format
+version is still 2, so an older build reads the corrected `meta.json` and prunes and expires by the
+right range. What it does differently is replay's fallback for a symbol with no trusted WAL
+position, which in the older build compares with the recorded end — now the newest row rather than
+the last one.
 
 ## Stopping a node
 

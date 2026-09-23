@@ -222,6 +222,11 @@ ob_add_columnar_test(test_columnar_store
     test_columnar_store.cpp
 )
 
+# ── #166: a segment's time range is the range of its rows, and the repair of those written before ─
+ob_add_columnar_test(test_segment_time_range
+    test_segment_time_range.cpp
+)
+
 # ── Helper to register a test executable that needs the aggregation library ───
 function(ob_add_agg_test name)
     add_executable(${name} ${ARGN})
