@@ -96,6 +96,8 @@ namespace {
 /// checkpoint claims them, and the next flush writes a new segment. A raw write rather than a
 /// stream also makes one system call of a column that a stream would cut into buffer-sized pieces.
 void write_file_checked(const std::string& path, const void* data, size_t bytes) {
+    // OB_DURABLE: a segment file - Engine::sync_segments() takes it to the device with one syncfs()
+    // before any checkpoint claims its rows, and startup removes it if none does (#160).
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) {
         throw std::runtime_error("ColumnarStore: cannot create " + path + ": " +
@@ -657,6 +659,8 @@ bool ColumnarStore::replace_from_staging(const std::string& staging_dir,
         fs::rename(src, dst, ec);
         if (ec) {
             // Cross-device staging: copy then remove.
+            // OB_DURABLE: an installed snapshot file - Engine::install_snapshot() syncs the data
+            // directory before anything records the snapshot's position (#162).
             std::error_code copy_ec;
             fs::copy_file(src, dst, fs::copy_options::overwrite_existing, copy_ec);
             if (copy_ec) {

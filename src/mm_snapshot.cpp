@@ -786,6 +786,8 @@ void MultiMasterManager::handle_snapshot_chunk(PeerConnection& peer,
         const std::string path = st.staging_dir + "/" + entry.path;
         std::error_code ec;
         fs::create_directories(fs::path(path).parent_path(), ec);
+        // OB_DURABLE: a staged snapshot file - the install renames it into the data directory and
+        // syncs the directory before the mesh adopts the sender's position (#162).
         st.fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (st.fd < 0) {
             OB_LOG_ERROR("mm", "Cannot stage '%s': %s", path.c_str(), std::strerror(errno));

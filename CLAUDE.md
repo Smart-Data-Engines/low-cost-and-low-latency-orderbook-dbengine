@@ -3341,6 +3341,27 @@ Learned the hard way. Check here before debugging.
      a first flush cut short, or a failed sync, leaves none - and it is the one in which startup
      removes every segment of this WAL. When an enum-shaped value goes into a log, count the states
      before the strings.
+411. **`LD_PRELOAD` cannot see stdio's writes.** glibc's `fclose` flushes through its internal
+     `__write`, not the `write` symbol, so the injector's log stayed empty over the save it was meant
+     to hold - and the test's premise said so rather than passing. The kernel sees every write:
+     `strace -P <path> -e inject=write:delay_enter=8000000` holds the one on a path however the
+     process makes it, and it is what measured #162 on the code before the fix.
+412. **Two missing syncs can cancel each other.** The build before #162 survived the snapshot cut by
+     accident: its position file did not survive the cut either, so the replica bootstrapped again.
+     Making only the position file durable - a durable pointer to data that is not - answered 0 of
+     1100 rows. When a fix makes one of two files durable, test the state in which only that one
+     survives, and ship both halves together.
+413. **Wait for the state the test claims, not for the first line that looks like it.** The snapshot
+     cut first waited for the state file to name a stream, which the replica writes at position zero
+     before it asks for anything, so the cut landed before the install, a second bootstrap healed it,
+     and the test passed with the install's sync removed. The fault test did the same with rows: the
+     first install had already replaced the store, so every row was readable before any position was
+     recorded. Both are now waited for as the position they are about.
+414. **An open for writing is a claim about durability, so the claim sits next to it.**
+     `OB_DURABLE: <what syncs it>` within four lines above every open in `src/`, `include/` and
+     `tools/`, found from the tree in both directions (`tests/test_durable_writes.cpp`). `std::regex`
+     over the tree took nine seconds a test in Debug; plain search with identifier boundaries takes
+     0.4, and has to reject `fdopen` for `fopen` and `::create_directories` for `::creat`.
 
 ## Current state and open problems
 
@@ -3390,6 +3411,15 @@ that does not flatter is the control.
 `--flush-interval-ms`, and its wait has a deadline after which the write is refused rather than
 accepted. 1,196,745 → 2,209,501 levels/s at four million levels and a one-second interval,
 unchanged at the 100 ms default the engine ships with.
+
+**#162**: a replica's position file is replaced, never rewritten in place - a kill between the
+truncate and the write left it empty, which reads as "wipe the store and stream everything again"
+(measured with the write held open by `strace`: 0 bytes, `clearing local data`,
+`REPLICATE 0 0 0`) - and an installed snapshot is synced before the position that names it is
+saved: with only the first half, a power cut answered **0 of 1100** rows, and the build before
+either half answered 1100 by accident, because its position file did not survive the cut either
+(pitfall 412). Every open for writing now carries `OB_DURABLE:` or goes through
+`write_file_atomically()`, derived from the tree by `tests/test_durable_writes.cpp`.
 
 **#160 and #161**: a flush syncs its segment files - one `syncfs()` on the data directory, outside
 `mtx_` - before the checkpoint that claims them, and startup removes every segment no surviving

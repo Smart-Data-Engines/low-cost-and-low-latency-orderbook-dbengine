@@ -347,6 +347,11 @@ Three things about it an operator should know:
 - **It reports a failed writeback from Linux 5.8.** Older kernels returned success from `syncfs()`
   whatever writeback did, so there a failed segment write-back is not seen, and the guarantee is
   only as good as that.
+- **A replica's position is saved only after the data it names is on the device** (#162). A
+  snapshot's files are synced after the install renames them into place and before the replica
+  records the snapshot's position - measured, without that sync a cut right after the record left
+  a replica answering 0 of 1100 rows - and `repl_state.txt` itself is replaced whole rather than
+  rewritten.
 - **A failed sync of any kind freezes the checkpoints until the node is restarted.** One `ERROR`
   line says so, `ob_checkpoints_frozen` goes to 1 and stays there, and `ob_segment_sync_errors_total`
   or `ob_wal_fsync_errors_total` counts the failure. From then on **no checkpoint is appended and
@@ -537,7 +542,10 @@ replaying from zero
 
 Either this replica is new, or its `repl_state.txt` was written by a build older than #101 and so
 names no stream. Expect it exactly **once** per replica on the upgrade — the identity is saved with
-the position from then on — and once for every replica you add.
+the position from then on — and once for every replica you add. Before #162 there was a third way
+here, and it was a defect: the file was rewritten in place every ten seconds, so a replica killed
+between the truncate and the write came back with an empty one and streamed the whole log again.
+It is replaced whole now, so a kill keeps the previous file.
 
 ```
 primary serves stream 4471... and our position belongs to 7213... - a different WAL at the same

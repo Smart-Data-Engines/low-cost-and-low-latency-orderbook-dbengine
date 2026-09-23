@@ -218,7 +218,12 @@ manifest is validated before a byte is written and one unsafe path refuses the w
 file's CRC32C is checked as it completes; and a pre-flight pass confirms every staged file exists at
 its manifest size before the first rename. An abandoned transfer leaves the data directory exactly as
 it was — and leaves the node **usable**, because refusing writes for ever is a worse answer than
-admitting the bootstrap failed.
+admitting the bootstrap failed. **And it reaches the device before anything records it** (#162):
+one `syncfs()` on the data directory after the renames, before the position naming the snapshot is
+saved - a replica resumes from that position after a restart and never asks for the snapshot's rows
+again, so a power cut between the record and the kernel's writeback left one serving files the
+device never received (measured: 0 of 1100 rows). A sync that fails reports the install failed and
+freezes the checkpoints (#160), and the next bootstrap installs it again.
 
 Two things the joiner must not do while a snapshot is in flight. It must not serve reads or accept
 writes, including `FLUSH`, which would write segments into the directory an install is about to
@@ -263,7 +268,9 @@ One side effect landed with it. `snapshot_manifest.json` is written by whoever c
 was written straight onto its own path with `trunc` and no synchronisation — so two creators could
 interleave their JSON, and a reader could catch the file empty. It now goes to a temporary file and is
 renamed into place. The window predates #79, because the two managers have always had separate
-threads; #79 only made it easier to reach.
+threads; #79 only made it easier to reach. Neither the temporary nor the rename was synced until
+#162, so a power cut could keep the rename and lose the bytes; it is `write_file_atomically()` now,
+one writer at a time, because that function's temporary has one name.
 
 ### Anti-entropy: what reconciliation is for, and what it is not
 

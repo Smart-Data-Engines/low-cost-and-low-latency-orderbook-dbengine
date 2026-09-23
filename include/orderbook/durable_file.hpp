@@ -38,6 +38,8 @@ inline int sync_directory(const std::string& dir) {
 /// case `path` still holds what it held before, and the temporary is removed.
 inline int write_file_atomically(const std::string& path, std::string_view content) {
     const std::string tmp = path + ".tmp";
+    // OB_DURABLE: the mechanism - this file is synced below before the rename, and the directory
+    // after it.
     const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0640);
     if (fd < 0) return errno;
     const char* p = content.data();

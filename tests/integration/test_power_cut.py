@@ -24,6 +24,7 @@ losing the variable is a red job rather than a quiet one.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -118,8 +119,10 @@ class FlakeyDisk:
 
 
 class Node:
-    def __init__(self, data_dir: Path, log: Path, policy: str, flush_ms: int):
+    def __init__(self, data_dir: Path, log: Path, policy: str, flush_ms: int,
+                 extra: tuple[str, ...] = ()):
         self.data_dir, self.log_path, self.policy, self.flush_ms = data_dir, log, policy, flush_ms
+        self.extra = list(extra)
         self.proc: subprocess.Popen | None = None
         self.port = self.metrics_port = 0
 
@@ -140,7 +143,8 @@ class Node:
             self.proc = subprocess.Popen(
                 [SERVER, "--port", str(self.port), "--metrics-port", str(self.metrics_port),
                  "--data-dir", str(self.data_dir), "--fsync-policy", self.policy,
-                 "--flush-interval-ms", str(self.flush_ms), "--drain-timeout-ms", "2000"],
+                 "--flush-interval-ms", str(self.flush_ms), "--drain-timeout-ms", "2000",
+                 *self.extra],
                 env=env, stdout=log, stderr=subprocess.STDOUT)
         deadline = time.time() + patience(30)
         while time.time() < deadline:
@@ -346,3 +350,74 @@ def test_the_wal_identity_survives_a_power_cut_before_the_first_flush(disk, tmp_
         assert "wal_identity file present but unusable" not in node.log()
     finally:
         node.kill()
+
+
+def test_a_snapshot_a_replica_installs_survives_a_power_cut(disk, tmp_path):
+    """A replica records a snapshot's position only once the snapshot is on the device (#162).
+
+    The install renames the staged files into the data directory, and none of them was synced; the
+    replica then saves the snapshot's WAL position, and after a restart it resumes from there -
+    nothing afterwards asks for the rows the snapshot carried. So a cut between the save and the
+    kernel's own writeback left a replica that resumed on segment files the device never received.
+
+    The primary is on an ordinary disk and the replica on the one that loses power. The primary
+    writes past two rotations with no replica connected, so retention deletes the file a new
+    replica would ask for first, and the replica's first request is refused and answered with a
+    snapshot. The primary then writes nothing more, so no flush of the replica's own syncs the
+    filesystem for it: the install's sync is the only one. The cut lands as soon as the replica's
+    state file names the snapshot's stream, and after it the replica must answer every row.
+    """
+    primary_dir = tmp_path / "primary"
+    repl_port = free_port()
+    primary = Node(primary_dir, tmp_path / "primary.log", "every", flush_ms=200,
+                   extra=("--replication-port", str(repl_port), "--wal-rotate-bytes", "65573"))
+    replica = Node(disk.mount / "replica", tmp_path / "replica.log", "every", flush_ms=200,
+                   extra=("--primary-host", "127.0.0.1", "--primary-port", str(repl_port)))
+    rows_written = 1100
+    try:
+        primary.start()
+        assert primary.insert(range(1000, 1000 + rows_written)) == rows_written
+        deadline = time.time() + patience(30)
+        while (primary_dir / "wal_000000.bin").exists() and time.time() < deadline:
+            time.sleep(0.1)
+        assert not (primary_dir / "wal_000000.bin").exists(), (
+            "retention kept the first WAL file, so a new replica would catch up from the log and "
+            "the snapshot this test is about would never be sent")
+
+        replica.start()
+        state = disk.mount / "replica" / "repl_state.txt"
+
+        def snapshot_position_recorded() -> bool:
+            # Not the stream identity alone: the replica saves that at position zero **before** it
+            # asks for anything, and a cut there is answered by a second bootstrap - which is what
+            # the first version of this test measured, and passed with the install's sync removed.
+            text = state.read_text() if state.exists() else ""
+            return bool(re.search(r"stream_id=[1-9]", text) and
+                        (re.search(r"file_index=[1-9]", text) or
+                         re.search(r"byte_offset=[1-9]", text)))
+
+        deadline = time.time() + patience(60)
+        while time.time() < deadline and not snapshot_position_recorded():
+            time.sleep(0.02)
+        assert snapshot_position_recorded(), (
+            f"the replica never recorded the snapshot's position: {state.read_text()!r}\n"
+            f"{replica.log()[-1500:]}")
+        assert "snapshot" in replica.log().lower(), (
+            f"the replica caught up from the log rather than a snapshot:\n{replica.log()[-1500:]}")
+
+        disk.cut_power()
+        disk.remount_after(replica.kill)
+        replica.start()
+        deadline = time.time() + patience(60)
+        back: list[int] = []
+        while time.time() < deadline:
+            back = sorted(replica.prices())
+            if len(back) >= rows_written:
+                break
+            time.sleep(0.5)
+        assert back == sorted(primary.prices()) and len(back) == rows_written, (
+            f"the replica answered {len(back)} of {rows_written} rows after a power cut that came "
+            f"after it had recorded the snapshot's position:\n{replica.log()[-2000:]}")
+    finally:
+        replica.kill()
+        primary.kill()
