@@ -3451,6 +3451,18 @@ Learned the hard way. Check here before debugging.
      returned, so `SNAPSHOT` has answered over the wire with no columns since - `OK`, an empty header,
      empty rows - and the only test of it parses the statement (#167). A new mandatory step is a
      question about every `return` above it.
+432. **A regression test can go blind when a neighbouring change fixes the order it relied on.** The
+     two-segment `SNAPSHOT` test caught the last-row rule on the tree it was written on, because a
+     store on its own handed segments out in write order; part 1 of #165 made every index hand them
+     out by start, which makes the old rule right there by luck. Rebasing over a change that touches
+     what a test reads means running its mutation table again, and on the rebased tree the verdict
+     for that row was changed to "survives" before the run - the test now pins the answer (#168).
+433. **A key made by joining two names with a separator either name may contain is not a key.** The
+     engine files a live book, a sequence counter and a store under `symbol + "." + exchange`, so
+     `A.B` on `C` and `A` on `B.C` are one instrument to it - measured: one book, one counter, one
+     segment on disk. And the key is a format too: a version vector carries it into the WAL, the
+     mesh handshake and a mesh snapshot, which is why the fix is a refusal of the separator where
+     it cannot be ordinary - in an exchange name - rather than a new separator (#169).
 
 ## Current state and open problems
 
@@ -3488,9 +3500,13 @@ warns about it.
 lookup and an insertion and a query searches only its symbol's windows - a writer's p99 flat at
 0.71-0.76 ms through a 90-second soak where it grew to 94.66 ms. **Part 2 is open and a P0**: the
 count still grows by one segment per active symbol per tick, faster now that ticks no longer slow,
-and a cold start reads every one - 107 s and 1.44 GiB after that soak. **#167 and #168 are open P1s**,
-both `SNAPSHOT`: no columns over the wire since #139, and the last row delivered per level rather
-than the latest at or before its time.
+and a cold start reads every one - 107 s and 1.44 GiB after that soak. **#169 is an open P1**: an
+exchange name with a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live
+book, sequence numbers and stored rows, measured on the wire.
+
+**#167 and #168**: a `SNAPSHOT` answers the columns it names over the wire - it answered none from
+#139 on - and for each level the row with the latest timestamp at or before its time, a tie going to
+the later written, bids first and then asks, each by level.
 
 **#166**: a segment's time range is its rows' earliest and latest timestamp. It was the start of
 the first row's hour and the last row's time, so a row that reached a flush out of time order fell
