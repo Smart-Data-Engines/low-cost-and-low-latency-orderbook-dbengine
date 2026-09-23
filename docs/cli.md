@@ -450,8 +450,10 @@ ob> quit
 ## Durability and crash recovery
 
 An acknowledged `INSERT` or `MINSERT` is in a WAL record before the reply is sent, and it survives a
-process kill: on the next start, `Engine::open()` replays every WAL record written after the last
-checkpoint, applies it, and flushes it into a segment so queries can see it. Whether it also
+process kill: on the next start, `Engine::open()` replays every WAL record the last checkpoint does
+not cover, applies it, and flushes it into a segment so queries can see it. A checkpoint covers what
+its flush drained, not what the log held when it was written — the records appended while that flush
+wrote its segments are replayed too, and until #159 they were not. Whether it also
 survives a **power cut** is `--fsync-policy`, described under Parameters below — the default,
 `interval`, syncs within the flush interval rather than before the reply, so that sentence is about
 a process ending, not about the platter. Under `every` the reply waits for the `fsync`, and since
