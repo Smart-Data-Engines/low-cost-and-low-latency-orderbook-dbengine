@@ -14,7 +14,10 @@
 #   scripts/power_cut.sh build/ob_tcp_server /path/to/workdir            # the cut
 #   CONTROL=1 scripts/power_cut.sh build/ob_tcp_server /path/to/workdir  # the same run without it
 #
-# Measured on this tree before #160 is fixed: "rows 1" after the cut, "rows 201" for the control.
+# Measured before #160 was fixed: "rows 1" after the cut, "rows 201" for the control - segment
+# files were never synced, and a synced checkpoint claimed them. Since the fix: "rows 201" both
+# times. tests/integration/test_power_cut.py runs the same procedure in the battery, together with
+# the cuts this script does not make: during a flush's segment sync, and before the first flush.
 # POLICY (every), ROWS (200), FLUSH_MS (1000), PORT and METRICS change the run.
 #
 # Needs sudo for losetup, dmsetup and mount, and the dm-flakey module. Everything it creates lives

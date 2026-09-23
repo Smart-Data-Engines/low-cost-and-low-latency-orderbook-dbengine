@@ -164,11 +164,22 @@ Quantities are packed using Simple8b bit-packing:
 
 ## How column files reach the disk
 
-With ordinary buffered stream I/O, and it is worth saying plainly because this section used to say
-the opposite. A segment is a directory `<symbol>/<exchange>/<start_ns>_<end_ns>/` holding seven
-column files — `price`, `qty`, `cnt`, `ts`, `side`, `level`, `seq` — plus `meta.json`. Each is
-written in full with `std::ofstream` when a flush completes and read back with `std::ifstream`;
-there is no in-place update and no memory mapping on this path.
+With plain `write()` calls whose every result is read, and then one sync before anything claims
+them - and it is worth saying plainly, because this section has said the wrong thing twice. A
+segment is a directory `<symbol>/<exchange>/<start_ns>_<end_ns>/` holding seven column files —
+`price`, `qty`, `cnt`, `ts`, `side`, `level`, `seq` — plus `meta.json`, written last. Each is
+written in full by `write_file_checked()` - a `write()` loop and a checked `close()` - when a flush
+completes, and read back with `std::ifstream`; there is no in-place update and no memory mapping on
+this path. A write the disk refuses fails the flush and removes the directory it began.
+
+Until #161 the writer was `std::ofstream` and nothing read the stream's state: with the disk full,
+`price.col` came out zero bytes beside a complete `meta.json`, every price read back as zero, and the
+flush answered `OK`. And until #160 nothing was synced: the checkpoint claiming a segment is a WAL
+record, synced with the next write, so a power cut could keep the claim and lose the files -
+measured, 0 of 201 rows came back. A flush now syncs its segments with one `syncfs()` on the data
+directory, outside the lock writers take, before it appends the checkpoint; startup removes any
+segment no surviving checkpoint vouches for and rebuilds it from the WAL. `docs/operations.md`,
+"What a power cut keeps", has what that costs and what a failed sync does.
 
 **Nothing here memory-maps a column file, and that is now a decision with a measurement behind
 it rather than an accident.** There used to be an `MmapStore` in the tree — a mapped, growable
@@ -182,10 +193,11 @@ allocation happens when the page is first touched, where there is no return valu
 Measured on an 8 MB tmpfs: reserving 64 MB succeeded and left a file of 67 108 864 apparent bytes,
 and writing into it died with `Bus error` — **exit 135**, with a control reserving 2 MB on the same
 filesystem completing normally. There is nothing for a caller to test and nothing for
-`run_thread_body()` (#112) to catch, because a signal is not an exception. With stream I/O the same
+`run_thread_body()` (#112) to catch, because a signal is not an exception. With plain writes the same
 disk gives `ENOSPC` from `write`, which is how #112 and #113 made a failing disk into a refusal the
-client is told about — so mapping the write path would have reinstated process death for a full
-disk, in a form strictly harder to handle than the one those items closed.
+client is told about, and what #161 at last made the column files report — so mapping the write
+path would have reinstated process death for a full disk, in a form strictly harder to handle than
+the one those items closed.
 
 What this does **not** foreclose: **four** of the seven column files — `ts.col`, `cnt.col`,
 `side.col` and `level.col` — are raw fixed-width arrays read straight into vectors, so a mapped

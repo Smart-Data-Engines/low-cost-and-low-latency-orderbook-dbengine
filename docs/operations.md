@@ -213,11 +213,14 @@ Three things follow from it, which is why it is worth a section rather than a ro
 - **What a reconnecting replica may have to scan.** A replica resumes from the position it saved and
   the primary streams forward from there, across files.
 - **What retention can free, and when.** WAL files are deleted **whole**, and only below the file
-  the slowest **connected** replica has acknowledged — and below the file the last flush drained to,
-  since #159: records written while a flush writes its segments have their rows still queued, and a
-  rotation in that window used to leave them in a file retention then deleted. So a large threshold
-  means a lagging replica pins more bytes on disk; a small one means more files for every retention
-  pass to walk.
+  the slowest **connected** replica has acknowledged — and below the file the newest checkpoint
+  **known to be on the device** vouches for (#160). That is one tick behind the flush that wrote it,
+  because a checkpoint is appended without a sync of its own and the next WAL sync is what makes it
+  durable; after a failed sync of any kind it goes no further until a restart ([below](#what-a-power-cut-keeps)).
+  Before #160 it was the file the last flush drained to, and before #159 the file being written —
+  records written while a flush writes its segments have their rows still queued, and a rotation in
+  that window left them in a file retention then deleted. So a large threshold means a lagging
+  replica pins more bytes on disk; a small one means more files for every retention pass to walk.
 
 That last point is the one that surprises people, and it is worth being concrete about the two
 halves, because they differ in a way that matters during an incident:
@@ -225,7 +228,7 @@ halves, because they differ in a way that matters during an incident:
 | The replica is | `safe_truncate` is | What happens to old files |
 |---|---|---|
 | connected and behind (slow, or stopped) | its acknowledged file | **kept** — it can still catch up from the log |
-| gone (crashed, killed, network down) | the file the last flush drained to — usually the current one | **freed** — a reconnect from an old position is answered `ERR WAL_TRUNCATED` and needs a snapshot |
+| gone (crashed, killed, network down) | the file the newest synced checkpoint vouches for — usually the current one | **freed** — a reconnect from an old position is answered `ERR WAL_TRUNCATED` and needs a snapshot |
 
 A replica that is merely slow therefore costs disk, and a replica that is **absent** costs a
 snapshot when it comes back. Neither is a defect; the failure would be a third case, freeing a file
@@ -311,14 +314,6 @@ which store both. Storage is append-only, so the duplicate is visible: `SELECT` 
 number as its seventh column (#65), which is what tells the two rows apart. That is the honest
 trade — a duplicate you can see, against a write you were told was durable and was not.
 
-**What is not covered.** The columnar segment files are written with buffered stream I/O and are
-**never** fsynced, so this policy is about the WAL. This page used to say a segment lost to a power
-failure is rebuilt by replaying the WAL; that holds only until the next flush's checkpoint claims the
-segment's rows, after which replay skips their records and retention may delete the file that held
-them. So under `every`, a write acknowledged as synced can be lost to a power cut once a flush has
-claimed it — measured with a simulated power cut (`scripts/power_cut.sh`): 1 row of 201 came back,
-against 201 of 201 without the cut. Open as roadmap #160.
-
 **Every storage failure this engine can reach is an `errno`, so it is a refusal and a counter —
 never a signal.** That is worth stating because it is a property of a choice rather than of
 storage: nothing here memory-maps a file for writing, and a growable mapping is the one shape in
@@ -328,6 +323,47 @@ to check. Measured on an 8 MB tmpfs: reserving 64 MB succeeded and writing into 
 `Bus error`, exit 135. A signal is not an exception, so #112's thread boundary could not catch it
 and no client could be told. `docs/storage.md` records why the mapped store was removed rather than
 adopted (#114).
+
+### What a power cut keeps
+
+A flush writes its segment files and then makes them durable with **one `syncfs()` on the data
+directory**, before the checkpoint that claims them is appended; and startup **removes any segment
+no surviving checkpoint vouches for**, rebuilding its rows from the WAL (#160). So under `every` an
+acknowledged write survives a power cut, and under `interval` everything up to the last WAL sync
+does. Measured with a cut the kernel performs — `tests/integration/test_power_cut.py`, dm-flakey
+over a loop device, switched to drop every write, the way xfstests simulate one: **201 of 201**
+rows back under both policies, where the build before answered **0**, because segment files were
+never synced and a checkpoint said they were. This page said until then that a segment lost to a
+power failure is rebuilt by replaying the WAL; that held only until the next flush's checkpoint
+claimed its rows.
+
+Three things about it an operator should know:
+
+- **`syncfs()` syncs the whole filesystem**, not the engine's files. On the data directory's own
+  device those are the engine's writes; on a shared filesystem they are everybody's dirty pages as
+  well, and every flush pays for them — one more reason for the dedicated device the table above
+  recommends. On an otherwise idle volume it measured 5–60 ms a flush, outside the lock writers
+  take, and no throughput cost above run-to-run spread.
+- **It reports a failed writeback from Linux 5.8.** Older kernels returned success from `syncfs()`
+  whatever writeback did, so there a failed segment write-back is not seen, and the guarantee is
+  only as good as that.
+- **A failed sync of any kind freezes the checkpoints until the node is restarted.** One `ERROR`
+  line says so, `ob_checkpoints_frozen` goes to 1 and stays there, and `ob_segment_sync_errors_total`
+  or `ob_wal_fsync_errors_total` counts the failure. From then on **no checkpoint is appended and
+  WAL retention stops**, so the WAL grows; the rows are written and readable, and a power cut in that
+  state loses nothing the fsync policy promised, because every record it acknowledged as synced is
+  in the WAL for the restart to rebuild from. The way out is to fix the disk and **restart
+  the node**: the restart replays from the last checkpoint synced before the failure, rebuilds every
+  segment written since (`ob_segments_rebuilt_from_wal_total`, and a `WARN` saying how many), and the
+  freeze ends with the process.
+
+  **Why not simply try the sync again**, which the first version of this change did — it let the
+  next flush whose `syncfs()` succeeded claim the failed one's segments as well. The section above
+  says why that cannot work: a failed sync marks the pages it could not write clean, so the next one
+  succeeds without writing them, and a checkpoint after it vouches for files the device may not
+  have. The same is true of a checkpoint the WAL had not yet synced when a WAL `fsync` failed.
+  PostgreSQL met this in 2018 and answers it by crashing into WAL recovery; this engine keeps
+  serving, and keeps every record until a restart can rebuild from them.
 
 ## Which build is running
 
@@ -372,6 +408,11 @@ all means somebody is sending something they believe is being stored. The matchi
 written **once per connection** (`Refused a command from fd=9: unexpected token 'x'; …`) rather than
 once per line, because a refusal is reachable before authentication and a line per refusal is a
 flood anyone who can reach the port can drive; the counter is the half that carries the volume.
+
+One gauge is an instruction rather than a reading: **`ob_checkpoints_frozen`** is 1 once a sync of
+any kind has failed in this process, and it means *fix the disk, then restart this node* — until
+then no checkpoint is appended and the WAL grows without bound ([what a power cut keeps](#what-a-power-cut-keeps)).
+It never goes back to 0 on its own, because nothing but a restart makes the state it reports safe.
 
 A metric written under a name nobody registered is dropped in silence, so `scripts/check_metrics.py`
 fails CI for the class rather than trusting the reader to notice a flat zero.

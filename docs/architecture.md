@@ -61,16 +61,26 @@ The engine is composed of six subsystems, each responsible for a specific concer
 
 1. Scan the columnar store directory and rebuild the segment index from `meta.json` files. This
    happens **first**, because recovery needs to know what is already durable.
-2. Replay the WAL records the last `CHECKPOINT` does not cover — every record after it, and the
+2. Remove the segments no surviving `CHECKPOINT` vouches for, and leave their rows to the replay
+   below (#160). A checkpoint is appended only after the segments it claims were synced, so a newer
+   segment belongs to a flush whose checkpoint never made it - cut short by a crash, a sync that
+   failed, or a power cut before the WAL sync that would have kept the checkpoint - and it may be
+   whole or what the cut left of it. Neither can be told from the segment: its recorded position
+   speaks for the **whole drain** that produced it, and a flush cut short can leave some of that
+   drain's segments and not others. The WAL still holds every one of their records, because
+   retention deletes nothing a synced checkpoint does not vouch for. A log with no checkpoint at all
+   vouches for no segment, when it starts at its first file; a checkpoint from an older build says
+   nothing of what it covered, and then every segment is taken as written, as it always was.
+3. Replay the WAL records the last `CHECKPOINT` does not cover — every record after it, and the
    records before it that start at or after the position it names (#159) — and apply them to the
    SoA buffer and the pending-row queue. A record its symbol's segments already hold is skipped:
    every segment records the WAL position its rows came from, so "already durable" is a position
    comparison per symbol (#63). Segments written before positions were recorded fall back to
    comparing the record's timestamp with the segment's `end_ts_ns`.
-3. If anything was replayed, flush it into a segment immediately. `QueryEngine` reads segments, not
+4. If anything was replayed, flush it into a segment immediately. `QueryEngine` reads segments, not
    the live SoA buffer, so a recovered row that stays in memory is invisible to every `SELECT`.
-4. Read the epoch record, if any, and restore the fencing epoch.
-5. Start the background flush thread.
+5. Read the epoch record, if any, and restore the fencing epoch.
+6. Start the background flush thread.
 
 ### Shutdown (close)
 
@@ -282,9 +292,10 @@ With `FsyncPolicy::EVERY` — **not** the default, which is `INTERVAL` — a wri
 acknowledged is in a fsynced WAL record before the acknowledgement leaves the server, and it comes
 back after a `SIGKILL` or any other end that skips `close()`. Since #113 that sentence is enforced
 rather than asserted: the `fsync` result is checked, and a write whose sync failed is refused instead
-of acknowledged. After a **power cut** the write comes back only until a flush claims it: segment
-files are never synced, so a checkpoint can then name rows the disk never received, and replay skips
-their records (#160, open — measured with a simulated power cut: 1 row of 201 came back).
+of acknowledged. And it holds after a **power cut** as well, since #160 - before it, only until a
+flush claimed the write: segment files were never synced, so a checkpoint could name rows the disk
+never received, and replay skipped their records. Measured with a cut the kernel performs, 0 rows
+of 201 came back before the change and 201 after it.
 *(This paragraph said `EVERY` was the default for months. The default has been `INTERVAL` in every one of the four places the code states it, so the
 document claimed a stronger durability guarantee than the engine gives — the mirror image of the
 TLS caveat that outlived the feature.)* That is the whole point of the log, and until August
@@ -293,9 +304,9 @@ acknowledged write not yet flushed to a segment was lost. Nothing in 585 tests n
 every one of them ended in `close()`, which drains and flushes.
 
 A `CHECKPOINT` record (type 6) marks how far the log has been made redundant by the columnar store.
-It is appended **after** the segment files are written and their metadata merged, never before: a
-checkpoint that claims more than is durable turns a crash into data loss, while one that claims less
-costs a replay that is skipped anyway.
+It is appended **after** the segment files are written, synced to the device by one `syncfs()` on
+the data directory (#160) and their metadata merged, never before: a checkpoint that claims more
+than is durable turns a crash into data loss, while one that claims less costs a replay.
 
 **What it claims is the position its flush drained up to, not everything before it** (#159). Its
 payload is eight bytes, that position's file index and offset, both little-endian. A flush drains
@@ -316,18 +327,35 @@ before the current one, and the tick deleted it — so a crash before the next t
 segment nor the record.
 
 The checkpoint is deliberately **not** fsynced, even under `FsyncPolicy::EVERY`. It can only ever
-claim that rows are already durable, so losing it in a crash makes the next `open()` replay records
-the per-segment positions then skip. Fsyncing it measured +0.22 ms (+10.5%) on every `FLUSH`,
-paid to protect a record whose loss is harmless; without the fsync the cost is not measurable above
-run-to-run spread. The next WAL write fsyncs the file anyway, so in practice the checkpoint reaches
-the platter moments later.
+claim that rows are already durable, so losing it in a crash makes the next `open()` remove the
+segments it vouched for and rebuild them from the WAL (step 2). Fsyncing it measured +0.22 ms
+(+10.5%) on every `FLUSH`, paid to protect a record whose loss costs a rebuild; without the fsync
+the cost is not measurable above run-to-run spread. The next WAL sync - the next write's under
+`every`, the next tick's under `interval` - takes it to the device, and **WAL retention waits for
+that sync**: it deletes only what the newest checkpoint known to be on the device vouches for, one
+tick behind the one just appended. Retention on the strength of the new checkpoint let a power cut
+keep the unlink and lose the checkpoint, and the segments it vouched for would then be rebuilt from
+records that were gone.
 
-The remaining window is a crash between writing the segment files and appending the checkpoint. The
-records are then replayed even though their rows are durable, which is what the per-symbol
-positions in step 2 above exist to catch — without a guard, replay rewrites an existing segment with
-whatever the WAL tail still holds, and since the WAL is truncated only up to the replica-confirmed
-position, that tail can hold fewer rows than the segment does. Measured with the guard removed, when
-it was still a timestamp comparison: eight durable rows became six.
+**A failed sync of any kind stops the checkpoints for the rest of the process**: a flush's
+`syncfs()`, or any WAL `fsync` the writer counts. Linux reports a failed sync once and marks the
+pages it could not write clean, so the next sync succeeds without writing them - and a checkpoint
+after it would vouch for segments, or for a checkpoint, the device may not have. The first version
+of #160 let the next successful `syncfs()` cover a failed flush's segments together with its own,
+and that is exactly the case it got wrong. So no checkpoint is appended from the first failure, the
+retention floor stays where it was, `ob_checkpoints_frozen` says so, and the restart - which
+replays from the last checkpoint synced before the failure - rebuilds every segment written since.
+Under `--fsync-policy none` nothing is synced and nothing is frozen, because that policy makes no
+promise a failed sync could break.
+
+The remaining window is a crash between writing the segment files and appending the checkpoint, and
+step 2 is what closes it: those segments are removed and rebuilt, whole or not. The per-symbol
+positions in step 3 are the guard for what step 2 keeps and cannot vouch for - segments written
+before positions were recorded, and a log whose last checkpoint comes from an older build. Without a
+guard there, replay rewrites an existing segment with whatever the WAL tail still holds, and since
+the WAL is truncated only up to the replica-confirmed position, that tail can hold fewer rows than
+the segment does. Measured with the guard removed, when it was still a timestamp comparison: eight
+durable rows became six.
 
 The timestamp comparison is now only the fallback for segments written before positions were
 recorded. It uses each segment's `end_ts_ns`, which is the timestamp of the **last** row written into
@@ -335,9 +363,10 @@ it rather than the highest, so it assumes timestamps for one symbol arrive in or
 node, which stamps each write on arrival, and not in multi-master, where a peer's record carries the
 origin's timestamp. That was #63, and recording positions is what closed it.
 
-A clean `close()` ends in a checkpoint that covers everything, so a restart after it replays nothing.
-A `FLUSH` does too, unless something was written while it wrote its segments — and then a restart
-replays exactly those records, which is what makes them survive.
+A clean `close()` ends in a checkpoint that covers everything, so a restart after it replays nothing
+- unless a failed sync froze the checkpoints, and then the restart is the rebuild the freeze was
+waiting for. A `FLUSH` does too, unless something was written while it wrote its segments — and then
+a restart replays exactly those records, which is what makes them survive.
 
 ### Who holds the role, and how a node stops holding it
 
