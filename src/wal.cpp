@@ -523,12 +523,15 @@ void WALWriter::append_held_sequences(const uint8_t* payload, size_t payload_len
                  payload_len, held_pos.file_index, held_pos.offset);
 }
 
-void WALWriter::append_checkpoint(uint64_t timestamp_ns) {
+void WALWriter::append_checkpoint(uint64_t timestamp_ns, WalPosition covered) {
+    uint8_t payload[CHECKPOINT_PAYLOAD_BYTES];
+    checkpoint_payload(covered, payload);
+
     WALRecord hdr{};
     hdr.sequence_number = 0;
     hdr.timestamp_ns    = timestamp_ns;
-    hdr.checksum        = crc32c(nullptr, 0); // empty payload
-    hdr.payload_len     = 0;
+    hdr.checksum        = crc32c(payload, sizeof(payload));
+    hdr.payload_len     = static_cast<uint16_t>(sizeof(payload));
     hdr.record_type     = WAL_RECORD_CHECKPOINT;
     hdr._pad            = 0;
 
@@ -536,11 +539,13 @@ void WALWriter::append_checkpoint(uint64_t timestamp_ns) {
     // already durable; losing it in a crash makes the next open() replay records the
     // timestamp guard then skips. Fsyncing it cost a measured +0.22 ms (+10.5%) on every
     // FLUSH to protect a record whose loss is harmless.
-    write_record(hdr, nullptr, 0, /*allow_fsync=*/false);
+    write_record(hdr, payload, sizeof(payload), /*allow_fsync=*/false);
 
     const WalPosition ckpt_pos = current_position();
-    OB_LOG_DEBUG("wal", "Checkpoint appended (not fsynced): file=%u offset=%u",
-                 ckpt_pos.file_index, ckpt_pos.offset);
+    OB_LOG_DEBUG("wal",
+                 "Checkpoint appended (not fsynced) at file=%u offset=%u, covering records "
+                 "before file=%u offset=%u",
+                 ckpt_pos.file_index, ckpt_pos.offset, covered.file_index, covered.offset);
 }
 
 void WALWriter::append_epoch(const EpochValue& epoch) {
@@ -828,29 +833,53 @@ uint64_t WALReplayer::replay_after_checkpoint(WALReplayCallbackV2 cb)
     // eventually disagree, and this one only needs record types and ordering.
     uint64_t ordinal = 0;
     uint64_t last_checkpoint_ordinal = 0;   // 0 = no checkpoint found
+    // What the last checkpoint covered, when it says (#159). Reset by every checkpoint, so a last
+    // one written by an older build - empty payload - is read by ordinal even after newer ones.
+    std::optional<WalPosition> covered;
     replay_v2([&](const WALReplayContext& ctx) {
         ++ordinal;
         if (ctx.header.record_type == WAL_RECORD_CHECKPOINT) {
             last_checkpoint_ordinal = ordinal;
+            covered = checkpoint_covered(ctx.payload, ctx.payload_len);
         }
     });
 
-    // Pass 2: forward everything after that ordinal.
+    // Pass 2: forward what the checkpoint does not cover. **Every record after the last checkpoint
+    // is forwarded, whatever its payload says**, and a checkpoint that says what it covered adds to
+    // that the records **before** it that start at or after that position (#159): the ones written
+    // while its flush wrote segments without the engine's lock, whose rows were still queued when
+    // the checkpoint was appended. So the position can only give records back, never take one away
+    // - a payload no writer produces (a position past the checkpoint itself) is read as covering
+    // everything before the checkpoint, which is the most an older build's checkpoint ever claimed.
+    // One written before #159 says nothing and is read as it always was, by ordinal; the records it
+    // wrongly covered are not in the log's own account of itself, so they cannot be told apart here.
     uint64_t seen = 0;
     uint64_t forwarded = 0;
+    uint64_t given_back = 0;   // records before the last checkpoint, forwarded because of its position
     uint64_t last_seq = replay_v2([&](const WALReplayContext& ctx) {
         ++seen;
-        if (seen <= last_checkpoint_ordinal) return;
+        if (seen <= last_checkpoint_ordinal) {
+            if (!covered || seen == last_checkpoint_ordinal) return;
+            const WalPosition at{ctx.wal_file_index, static_cast<uint32_t>(ctx.wal_byte_offset)};
+            if (wal_position_before(at, *covered)) return;
+            ++given_back;
+        }
         ++forwarded;
         cb(ctx);
     });
 
+    const std::string resuming =
+        covered ? "at file " + std::to_string(covered->file_index) + " offset " +
+                      std::to_string(covered->offset)
+                : std::string("after the checkpoint record, which says nothing of what it covered");
     OB_LOG_INFO("wal",
                 "Replay after checkpoint: records=%llu last_checkpoint_ordinal=%llu "
-                "forwarded=%llu",
+                "resuming %s, forwarded=%llu (of which %llu written before the checkpoint while "
+                "its flush wrote segments)",
                 static_cast<unsigned long long>(seen),
-                static_cast<unsigned long long>(last_checkpoint_ordinal),
-                static_cast<unsigned long long>(forwarded));
+                static_cast<unsigned long long>(last_checkpoint_ordinal), resuming.c_str(),
+                static_cast<unsigned long long>(forwarded),
+                static_cast<unsigned long long>(given_back));
 
     return last_seq;
 }

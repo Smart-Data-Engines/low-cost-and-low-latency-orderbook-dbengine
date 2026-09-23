@@ -220,12 +220,17 @@ Learned the hard way. Check here before debugging.
     recorded a new leader's address and told the engine nothing, so a replica kept replicating from
     whoever was primary when its client started. Both were invisible while `FAILOVER <target>`
     could not work at all: fixing the first link in a chain is what exposes the rest.
-29. **The checkpoint goes after the flush, never before.** A `CHECKPOINT` record claiming more than
-    is durable turns a crash into data loss; claiming less costs a replay that gets skipped anyway.
-    For the crash window between writing the segment files and appending the checkpoint,
-    `replay_wal_tail()` skips records at or below the highest `end_ts_ns` already on disk — without
-    that, replay rewrites a durable segment from a WAL tail that may hold fewer rows than the segment
-    does, because truncation only follows the replica-confirmed position.
+29. **The checkpoint goes after the flush, never before - and claims the drain, not itself.** A
+    `CHECKPOINT` record claiming more than is durable turns a crash into data loss; claiming less
+    costs a replay that gets skipped anyway. "After the flush" was not enough: the segments are
+    written without `mtx_`, so a checkpoint meaning "everything before me" claimed the records
+    appended during the segment write, whose rows were still queued (#159). It carries the drain's
+    position now, and WAL retention reads the same value. For the crash window between writing the
+    segment files and appending the checkpoint, `replay_wal_tail()` skips a record its symbol's
+    segment already holds, by the WAL position the segment recorded (#63; `end_ts_ns` is only the
+    fallback for older segments) — without that, replay rewrites a durable segment from a WAL tail
+    that may hold fewer rows than the segment does, because truncation only follows the
+    replica-confirmed position.
 30. **A state machine with a branch missing is a state machine with a trap.** `monitor_loop()`
     handled `PRIMARY` and `REPLICA`; a node at `STANDALONE` matched neither and sat there for the rest
     of its life — no lease, no leader poll, no campaign, no replication. Losing a race is not a role:
@@ -3280,6 +3285,26 @@ Learned the hard way. Check here before debugging.
      `server's`, and the rest ran in the local shell, stopping at a `cd … || exit 2` that was all
      that stood between it and a benchmark run on the wrong machine. Write the script locally and
      `scp` it.
+401. **A record that states a boundary has to carry the position the boundary was true at.** The
+     checkpoint meant "everything before me", and the lock was not held from the drain to the
+     record, so "before me" included what writers appended in between (#159). Capture the position
+     when the claim is true - at the drain, under the lock - and write that, not the record's own.
+     The same wrong boundary had a second reader, WAL retention; grep for every reader of a boundary
+     before fixing one.
+402. **An injection point named by size moves when the record's size moves.** `OB_FAULT_SIZE=24`
+     named the checkpoint until it gained an 8-byte payload. The test failed on its own "no fault
+     fired" guard rather than passing over nothing, which is the only reason it was noticed. When a
+     record's layout changes, grep the fault tests for its size.
+403. **`FLUSH` runs on the connection's event loop.** A test that needs a write *during* a flush
+     cannot get it from `FLUSH` on a one-loop node: the writes on another connection wait for the
+     loop, that is for the whole flush - 1.99 s measured, and the `FLUSH` answered first. The flush
+     tick has its own thread. The premise check is what said so; without it the test passes against
+     the defect, because rows written after the flush survive on any build.
+404. **A control run needs the fix's instruments and the defect's code.** The first run of #159's
+     tests against the old server used the old build's injector, whose delay mode knew only syncs,
+     so `OB_FAULT_DELAY_MS` on a write **failed** it instead - a different fault. The tests' own
+     premise ("the injector never slowed segment write number 1", log `action=fail`) refused. Pair
+     the old server with the new injector.
 
 ## Current state and open problems
 
@@ -3305,8 +3330,9 @@ Read the sanitizer claims with #83 in mind: until it landed, `OB_ENABLE_ASAN`, `
 libraries**, because `add_compile_options()` only affects targets declared after it and those blocks
 sat below all of them.
 
-**No P0 is open, and the set is held mechanically by the `Open:` line in `docs/roadmap.md` — read
-it there rather than trusting this sentence, which has been wrong about it before.** The items
+**One P0 is open, #160 — segment files are never synced, so a power cut after a flush loses rows
+a synced checkpoint claims (measured: 1 row of 201) — and the set is held mechanically by the `Open:` line in `docs/roadmap.md`; read it there
+rather than trusting this sentence, which has been wrong about it before.** The items
 below are the recent closures worth knowing because each changes what the engine promises; the list
 carries no count, because the previous version of this sentence said "four" above a list of six and
 omitted the newest one entirely - which is the rot pitfall 312 is about, in the paragraph that
@@ -3328,6 +3354,18 @@ that does not flatter is the control.
 `--flush-interval-ms`, and its wait has a deadline after which the write is refused rather than
 accepted. 1,196,745 → 2,209,501 levels/s at four million levels and a one-second interval,
 unchanged at the 100 ms default the engine ships with.
+
+**#159**: a flush's checkpoint claims the position its drain reached, not everything before
+itself. The segments are written without `mtx_`, so records appended meanwhile precede the
+checkpoint while their rows are still queued; replay skipped them, and a crash before the next flush
+lost them under every fsync policy (measured: 3 of 3 acknowledged rows). The checkpoint's 8-byte
+payload is that position, replay forwards everything after the last checkpoint plus what lies
+between the position and it, and the position can only add records. WAL retention reads the same
+value (`Engine::drained_up_to_`): it deletes the files before the drain's file, not before the
+current one, which a rotation during the segment write had made the file holding those records
+(measured: 600 of 600 gone). **#160 is open**: segment files are never synced, so after a power cut a
+checkpoint can claim rows the disk never received - measured with a power cut dm-flakey performs
+(`scripts/power_cut.sh`): 1 row of 201 came back, against 201 of 201 without the cut.
 
 **#158**: `boost` is the command line's default - one client event loop per usable CPU, and a
 10 µs spin window where the process may run on two CPUs or more and a cgroup limit leaves a CPU of
@@ -3702,10 +3740,12 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   an `LD_PRELOAD` shim over `write`, `pwrite`, `fsync`, `fdatasync` and `ftruncate`, armed by
   `OB_FAULT_PATH` and friends, matching by the path behind the descriptor. It found #112, #113 and
   #114 on its first run. Two things to know before using it: an empty `OB_FAULT_PATH` **disarms**
-  it, and both integration CI jobs build it and assert the shared object exists, because the twelve
-  tests across `test_fault_injector.py` and `test_storage_faults.py` **fail rather than skip** when
-  it is missing — deliberately, since everything they assert would otherwise pass without any fault
-  being injected (pitfall 57).
+  it, and both integration CI jobs build it and assert the shared object exists, because the tests
+  in `test_fault_injector.py` and `test_storage_faults.py` **fail rather than skip** when it is
+  missing — deliberately, since everything they assert would otherwise pass without any fault being
+  injected (pitfall 57). `OB_FAULT_DELAY_MS` makes the chosen write or sync **slow instead of
+  failed** (#159): it holds a flush's segment write open for seconds, which is what made the window
+  between a drain and its checkpoint testable.
 - **A wire write can carry its event time** (#105). `INSERT` and `MINSERT` accept an optional
   trailing `event_time_ns`; absence asks for arrival time, while zero is refused. Both clients check
   the `insert_event_time` capability before sending a supplied time and refuse an older server

@@ -9,9 +9,11 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <span>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -90,6 +92,22 @@ Record observe(const ob::WALReplayContext& ctx, std::span<const uint8_t> input) 
     return record;
 }
 
+/// What a CHECKPOINT says it covered: its payload read as the layout the WAL documents - two
+/// little-endian 32-bit words, the file index then the offset - and nothing unless it is exactly
+/// eight bytes. Decoded here rather than through `ob::checkpoint_covered()`, so a wrong byte order
+/// in the engine is something this oracle disagrees with instead of something it repeats.
+std::optional<std::pair<uint32_t, uint32_t>> claimed_position(const ob::WALReplayContext& ctx) {
+    if (ctx.payload_len != 8 || ctx.payload == nullptr) return std::nullopt;
+    uint32_t words[2] = {0, 0};
+    for (int w = 0; w < 2; ++w) {
+        for (int b = 0; b < 4; ++b) {
+            words[w] |= static_cast<uint32_t>(ctx.payload[4 * w + b]) << (8 * b);
+        }
+    }
+    OB_LOG_DEBUG("fuzz", "Checkpoint claims file=%u offset=%u", words[0], words[1]);
+    return std::make_pair(words[0], words[1]);
+}
+
 } // namespace
 
 extern "C" int LLVMFuzzerInitialize(int*, char***) {
@@ -105,16 +123,32 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     ob::WALReplayer replayer(scratch.directory());
     std::vector<Record> all;
     size_t after_checkpoint = 0;
+    std::optional<std::pair<uint32_t, uint32_t>> covered;
     const uint64_t full_sequence = replayer.replay_v2([&](const ob::WALReplayContext& ctx) {
         all.push_back(observe(ctx, input));
-        if (ctx.header.record_type == ob::WAL_RECORD_CHECKPOINT) after_checkpoint = all.size();
+        if (ctx.header.record_type == ob::WAL_RECORD_CHECKPOINT) {
+            after_checkpoint = all.size();
+            covered = claimed_position(ctx);
+        }
     });
     std::vector<Record> tail;
     const uint64_t tail_sequence = replayer.replay_after_checkpoint([&](const ob::WALReplayContext& ctx) {
         tail.push_back(observe(ctx, input));
     });
     ob::fuzz::require(full_sequence == tail_sequence, "checkpoint replay changed the last sequence");
-    const std::vector<Record> expected(all.begin() + static_cast<std::ptrdiff_t>(after_checkpoint), all.end());
-    ob::fuzz::require(tail == expected, "checkpoint replay did not return the suffix after the last checkpoint");
+
+    // What the contract says comes back: every record after the last checkpoint, and - when that
+    // checkpoint says what it covered - the records before it that start at or after the position
+    // (#159). This harness drives one file, index 0, so a claim naming a later file covers every
+    // record in it and gives nothing back. The checkpoint itself is never among them.
+    std::vector<Record> expected;
+    if (covered && covered->first == 0 && after_checkpoint > 0) {
+        for (size_t i = 0; i + 1 < after_checkpoint; ++i) {
+            if (all[i].fields[0] >= covered->second) expected.push_back(all[i]);
+        }
+    }
+    expected.insert(expected.end(), all.begin() + static_cast<std::ptrdiff_t>(after_checkpoint), all.end());
+    ob::fuzz::require(tail == expected,
+                      "checkpoint replay did not return what the last checkpoint does not cover");
     return 0;
 }

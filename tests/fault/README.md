@@ -60,13 +60,20 @@ what says the injection happened. Read it before you believe anything about the 
 | `OB_FAULT_COUNT` | fail this many, then let the rest through. Default: all of them |
 | `OB_FAULT_SHORT` | `write`: return this many bytes **and write them**, instead of failing |
 | `OB_FAULT_SHORT_THEN_FAIL` | `1`: after the short write, fail the caller's retry |
+| `OB_FAULT_DELAY_MS` | make the chosen call **slow instead of failed**: sleep this long, then do it for real. `write`, `fsync` and `fdatasync` |
 | `OB_FAULT_LOG` | where the decisions go. Without it, nothing is recorded |
 
 **`OB_FAULT_SIZE` matters more than it looks.** This engine's WAL takes a 136-byte delta record from
-the session thread and a 24-byte checkpoint plus a 68-byte version vector from the flush loop, so
+the session thread and a 32-byte checkpoint plus a 68-byte version vector from the flush loop, so
 "the fourth write" is a different call on every run while "the fourth 136-byte write" is the same one
 every time. Requirement 2.2 of the fault-injection spec asks for a *named* injection point, and the
 size filter is what makes one available.
+
+**`OB_FAULT_DELAY_MS` holds a window open rather than breaking anything.** The fault it models is
+time: a segment write or a sync that takes seconds. That is what exposed #159 - rows written while a
+flush writes its segments sit between its drain and its checkpoint, a window of milliseconds on a
+healthy disk - and it is the instrument for anything asking whether a writer waits for the flush.
+The call still succeeds, so the log line says `action=delay` and the test's premise is that it did.
 
 **`OB_FAULT_SHORT_THEN_FAIL` is one fault, not two.** A short write on its own cannot tear a record
 this engine wrote: `WALWriter::write_record()` loops `while (remaining > 0)` and resumes, which is
@@ -74,7 +81,7 @@ correct. The shape that strands a WAL tail needs the cut *and* a failed retry, a
 different size from the record — so the remainder is failed whatever its size, outside the size
 filter that named the first call.
 
-## The four failures worth reproducing
+## The five failures worth reproducing
 
 | Want | Environment |
 |---|---|
@@ -82,9 +89,10 @@ filter that named the first call.
 | A disk that stays full | `OP=write ERRNO=ENOSPC SIZE=136` (no `COUNT`) |
 | A failing `fsync` under `--fsync-policy every` | `OP=fsync ERRNO=EIO` |
 | A torn record, and the writes stranded behind it | `OP=write ERRNO=ENOSPC SIZE=136 SKIP=2 COUNT=1 SHORT=20 SHORT_THEN_FAIL=1` |
+| A flush tick that takes its time over the segments (#159) | `PATH=price.col OP=write DELAY_MS=2000 COUNT=2` |
 
 The last one needs the flush tick out of the way to be *about* the WAL — a tick moves rows into
-segments and writes a checkpoint, and replay starts after the last checkpoint. Add
+segments and writes a checkpoint covering them, and replay skips what the last checkpoint covers. Add
 `--flush-interval-ms 3600000`, kill the node with `SIGKILL` rather than stopping it (a clean stop
 ends in a checkpoint too), and then count what comes back. Roadmap #126 is what that measurement
 found.

@@ -5,6 +5,14 @@
 // data in production are the ones a healthy machine never produces: ENOSPC mid-record, EIO from
 // fsync, a short write that leaves a torn record behind.
 //
+// `OB_FAULT_DELAY_MS=<n>` turns a chosen call into a slow one instead of a failed one: it sleeps n
+// milliseconds and then does what it was asked, for real. The fault it models is time, not an
+// error. On a segment write it holds a flush's segment I/O open for n milliseconds - the window
+// between the flush's drain and its checkpoint, which is milliseconds on a healthy disk and which
+// #159 lost acknowledged rows in. On a sync it is what lets a test tell a writer that waited for
+// the flush tick's sync from one that did not, by the clock, with the sync made to last long
+// enough that no scheduler can blur the two (stage 5 of #151).
+//
 // `OB_FAULT_SHORT_THEN_FAIL=1` is the composite: the chosen write is short and the caller's retry
 // fails. It exists because a short write on its own cannot tear a record this engine wrote -
 // `write_record()` loops until the remainder is written, which is correct - so the shape that
@@ -39,6 +47,7 @@
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 // ── Configuration, read once at load ──────────────────────────────────────────
@@ -60,8 +69,9 @@ static struct {
     long           short_bytes; // write: return this many bytes instead of failing
     long           size;        // only calls whose byte count equals this; -1 means any
     int            short_then_fail; // write: after the short one, fail the remainder
+    long           delay_ms;    // fsync/fdatasync: sleep this long and succeed, rather than fail
     int            log_fd;
-} cfg = { NULL, OP_NONE, EIO, 0, ~0UL, -1, -1, 0, -1 };
+} cfg = { NULL, OP_NONE, EIO, 0, ~0UL, -1, -1, 0, -1, -1 };
 
 static atomic_ulong seen   = 0;   // matching calls for the configured op
 static atomic_ulong failed = 0;   // how many of those were made to fail
@@ -109,6 +119,8 @@ __attribute__((constructor)) static void obfault_init(void) {
     const char *stf = getenv("OB_FAULT_SHORT_THEN_FAIL");
     cfg.short_then_fail = stf && *stf && strcmp(stf, "0") != 0;
     const char *shortw = getenv("OB_FAULT_SHORT");
+    const char *delay = getenv("OB_FAULT_DELAY_MS");
+    if (delay && *delay) cfg.delay_ms = strtol(delay, NULL, 10);
     if (skip)   cfg.skip  = strtoul(skip, NULL, 10);
     if (count)  cfg.count = strtoul(count, NULL, 10);
     if (shortw) cfg.short_bytes = strtol(shortw, NULL, 10);
@@ -150,7 +162,7 @@ static int should_fail(enum fault_op op, const char *name, int fd, long arg) {
     if (cfg.op != op || !cfg.path) return 0;
 
     // A size filter makes the injection point *nameable*: this engine's WAL writes a 136-byte
-    // delta record from the session thread and a 24-byte checkpoint plus a 68-byte version vector
+    // delta record from the session thread and a 32-byte checkpoint plus a 68-byte version vector
     // from the flush loop, so "the fourth write" is a different call on every run while "the
     // 68-byte write" is the same one every time. Requirement 2.2 asks for a named point rather
     // than an ordinal, and this is what makes one available.
@@ -169,8 +181,17 @@ static int should_fail(enum fault_op op, const char *name, int fd, long arg) {
         return 0;
     }
     atomic_fetch_add(&failed, 1);
-    note(name, fd, path, arg, n, cfg.short_bytes >= 0 && op == OP_WRITE ? "short" : "fail");
+    const int delayed = cfg.delay_ms >= 0 && op != OP_FTRUNCATE;
+    note(name, fd, path, arg, n,
+         delayed ? "delay" : (cfg.short_bytes >= 0 && op == OP_WRITE ? "short" : "fail"));
     return 1;
+}
+
+/// The slow sync: sleep, then let the call through. Resumed after a signal, so a stray EINTR does
+/// not shorten the stall the test is timing against.
+static void stall(void) {
+    struct timespec left = { cfg.delay_ms / 1000, (cfg.delay_ms % 1000) * 1000000L };
+    while (nanosleep(&left, &left) != 0 && errno == EINTR) {}
 }
 
 // ── Interposed calls ──────────────────────────────────────────────────────────
@@ -189,6 +210,10 @@ ssize_t write(int fd, const void *buf, size_t count) {
         }
     }
     if (should_fail(OP_WRITE, "write", fd, (long)count)) {
+        if (cfg.delay_ms >= 0) {
+            stall();
+            return (ssize_t)syscall(SYS_write, fd, buf, count);
+        }
         if (cfg.short_bytes >= 0) {
             // A genuine short write: the bytes it claims really do reach the file, which is what
             // leaves a torn record behind. Returning a count without writing would model nothing.
@@ -204,6 +229,10 @@ ssize_t write(int fd, const void *buf, size_t count) {
 
 ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset) {
     if (should_fail(OP_WRITE, "pwrite", fd, (long)count)) {
+        if (cfg.delay_ms >= 0) {
+            stall();
+            return (ssize_t)syscall(SYS_pwrite64, fd, buf, count, offset);
+        }
         if (cfg.short_bytes >= 0) {
             const size_t n = (size_t)cfg.short_bytes < count ? (size_t)cfg.short_bytes : count;
             return (ssize_t)syscall(SYS_pwrite64, fd, buf, n, offset);
@@ -216,6 +245,10 @@ ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset) {
 
 int fsync(int fd) {
     if (should_fail(OP_FSYNC, "fsync", fd, 0)) {
+        if (cfg.delay_ms >= 0) {
+            stall();
+            return (int)syscall(SYS_fsync, fd);
+        }
         errno = cfg.err;
         return -1;
     }
@@ -224,6 +257,10 @@ int fsync(int fd) {
 
 int fdatasync(int fd) {
     if (should_fail(OP_FDATASYNC, "fdatasync", fd, 0)) {
+        if (cfg.delay_ms >= 0) {
+            stall();
+            return (int)syscall(SYS_fdatasync, fd);
+        }
         errno = cfg.err;
         return -1;
     }

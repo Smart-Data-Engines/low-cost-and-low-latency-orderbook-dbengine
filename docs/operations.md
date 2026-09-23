@@ -168,7 +168,7 @@ and quietly got something weaker would find out from a lost write.
 
 | Device | Policy | Why |
 |---|---|---|
-| NVMe with power-loss protection | `interval` or `never` | The device's own capacitor makes an fsync per write - per read, for a client that pipelines (#155) - a cost with no matching guarantee. |
+| NVMe with power-loss protection | `every` if an acknowledged write must survive a power cut; `interval` if losing one flush interval is acceptable | The capacitor makes an fsync **cheap, not unnecessary**: it protects what has reached the device, and a write that was never synced is still in the kernel's page cache, which a power cut empties whatever the device has. This row said `interval` or `never`, with the reasoning the other way round, and `never` is not a value the server accepts — it refuses to start on it. |
 | Consumer SSD or anything virtualised | `every` | Without power-loss protection, an acknowledged write that is not fsynced is a write you can lose. |
 | A filesystem on a network device | `every`, and reconsider | The engine's latency claims assume local storage. |
 
@@ -213,8 +213,11 @@ Three things follow from it, which is why it is worth a section rather than a ro
 - **What a reconnecting replica may have to scan.** A replica resumes from the position it saved and
   the primary streams forward from there, across files.
 - **What retention can free, and when.** WAL files are deleted **whole**, and only below the file
-  the slowest **connected** replica has acknowledged. So a large threshold means a lagging replica
-  pins more bytes on disk; a small one means more files for every retention pass to walk.
+  the slowest **connected** replica has acknowledged — and below the file the last flush drained to,
+  since #159: records written while a flush writes its segments have their rows still queued, and a
+  rotation in that window used to leave them in a file retention then deleted. So a large threshold
+  means a lagging replica pins more bytes on disk; a small one means more files for every retention
+  pass to walk.
 
 That last point is the one that surprises people, and it is worth being concrete about the two
 halves, because they differ in a way that matters during an incident:
@@ -222,7 +225,7 @@ halves, because they differ in a way that matters during an incident:
 | The replica is | `safe_truncate` is | What happens to old files |
 |---|---|---|
 | connected and behind (slow, or stopped) | its acknowledged file | **kept** — it can still catch up from the log |
-| gone (crashed, killed, network down) | the current file | **freed** — a reconnect from an old position is answered `ERR WAL_TRUNCATED` and needs a snapshot |
+| gone (crashed, killed, network down) | the file the last flush drained to — usually the current one | **freed** — a reconnect from an old position is answered `ERR WAL_TRUNCATED` and needs a snapshot |
 
 A replica that is merely slow therefore costs disk, and a replica that is **absent** costs a
 snapshot when it comes back. Neither is a defect; the failure would be a third case, freeing a file
@@ -308,9 +311,13 @@ which store both. Storage is append-only, so the duplicate is visible: `SELECT` 
 number as its seventh column (#65), which is what tells the two rows apart. That is the honest
 trade — a duplicate you can see, against a write you were told was durable and was not.
 
-**What is not covered.** The columnar segment files are written with buffered stream I/O and are not
-fsynced per segment, so this policy is about the WAL. A segment lost to a power failure is rebuilt
-by replaying the WAL, which is what the WAL is for.
+**What is not covered.** The columnar segment files are written with buffered stream I/O and are
+**never** fsynced, so this policy is about the WAL. This page used to say a segment lost to a power
+failure is rebuilt by replaying the WAL; that holds only until the next flush's checkpoint claims the
+segment's rows, after which replay skips their records and retention may delete the file that held
+them. So under `every`, a write acknowledged as synced can be lost to a power cut once a flush has
+claimed it — measured with a simulated power cut (`scripts/power_cut.sh`): 1 row of 201 came back,
+against 201 of 201 without the cut. Open as roadmap #160.
 
 **Every storage failure this engine can reach is an `errno`, so it is a refusal and a counter —
 never a signal.** That is worth stating because it is a property of a choice rather than of

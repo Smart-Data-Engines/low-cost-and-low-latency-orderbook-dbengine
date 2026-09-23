@@ -450,8 +450,10 @@ ob> quit
 ## Durability and crash recovery
 
 An acknowledged `INSERT` or `MINSERT` is in a WAL record before the reply is sent, and it survives a
-process kill: on the next start, `Engine::open()` replays every WAL record written after the last
-checkpoint, applies it, and flushes it into a segment so queries can see it. Whether it also
+process kill: on the next start, `Engine::open()` replays every WAL record the last checkpoint does
+not cover, applies it, and flushes it into a segment so queries can see it. A checkpoint covers what
+its flush drained, not what the log held when it was written — the records appended while that flush
+wrote its segments are replayed too, and until #159 they were not. Whether it also
 survives a **power cut** is `--fsync-policy`, described under Parameters below — the default,
 `interval`, syncs within the flush interval rather than before the reply, so that sentence is about
 a process ending, not about the platter. Under `every` the reply waits for the `fsync`, and since
@@ -488,7 +490,10 @@ two happened is a line in the replica's log, and the three forms it takes are in
 Durability of the WAL write itself is `--fsync-policy`, which takes `every`, `interval` or `none`
 — lower case, compared exactly, and an unrecognised value is refused rather than read as the
 default. With anything other than `every`, an acknowledged write can be lost on a power cut: the
-replay described above cannot recover a record that never reached the platter.
+replay described above cannot recover a record that never reached the platter. **With `every` as
+well, once a flush has claimed the write**: segment files are never synced, so a power cut can take
+a segment that a synced checkpoint says holds the row, and replay then skips its record (#160,
+open — measured with a simulated power cut: 1 row of 201 came back).
 
 How large the WAL grows before it starts a new file is `--wal-rotate-bytes`, and it is a **trigger
 rather than a file size**: rotation is checked after a write, so a file may exceed the threshold by

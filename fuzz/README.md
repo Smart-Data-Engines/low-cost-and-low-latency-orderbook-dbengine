@@ -137,7 +137,9 @@ that do not are named for it.
 | `oversized_payload_claim` | a header promising 65,535 bytes with none present |
 | `rotate_then_tail` | a `ROTATE` record with content after it, which replay must stop at |
 | `checkpoint_tail` | one record after a checkpoint |
-| `two_checkpoints` | two checkpoints, so the suffix is measured from the **last** one |
+| `two_checkpoints` | two checkpoints, so what replay returns is measured from the **last** one |
+| `positioned_checkpoint` | a checkpoint whose payload names the second of the two records before it: that record comes back, the first does not (#159) |
+| `checkpoint_past_itself` | a checkpoint naming a position after itself, which no writer produces: it takes nothing away from the record behind it |
 | `unknown_version` | `version = 255` |
 
 ## What these harnesses check, and what they cannot
@@ -150,8 +152,11 @@ Each one asserts a property rather than merely surviving:
   what order, with what bytes, or whether the stream was refused; a payload survives
   `encode_frame` followed by `parse_frames`; a refusal leaves the buffer untouched; and a
   successful verdict never leaves an over-long frame waiting.
-- **WAL** — `replay_after_checkpoint` returns exactly the suffix of `replay_v2` that follows the
-  last checkpoint; every payload handed to a callback is the bytes on disk at the offset the
+- **WAL** — `replay_after_checkpoint` returns exactly what the last checkpoint does not cover:
+  every record of `replay_v2` after it, and, when its payload is the eight-byte position #159 gave
+  it, the records before it that start at or after that position - decoded by the harness from the
+  documented layout rather than by the engine's own function, so a wrong byte order is disagreed
+  with instead of repeated. Every payload handed to a callback is the bytes on disk at the offset the
   context names; and the checksum is recomputed independently of the engine's own check.
 
 The limits are worth stating, because each was measured with a deliberately broken parser rather
