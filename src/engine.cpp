@@ -1533,44 +1533,25 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
     manifest.total_bytes = total_bytes;
     manifest.total_rows  = total_rows;
 
-    // Write snapshot_manifest.json (at-most-one policy: overwrite previous), through a temporary
-    // file and a rename.
+    // Write snapshot_manifest.json (at-most-one policy: overwrite previous), replaced whole.
     //
     // This function has always had callers on more than one thread — the multi-master io loop and the
     // replication loop are separate threads — and since #79 it also has two worker threads. Writing
     // straight onto the target let two of them interleave their JSON into one file, and nothing
-    // guarded it. rename() within a directory is atomic, so a reader now sees one complete manifest
-    // and concurrent writers race only over which of them is last, which "overwrite previous"
-    // already permits.
-    //
-    // A crash between the write and the rename leaves the temporary behind. Nothing reads it and the
-    // directory walk above skips it (neither a `.col` nor `meta.json`), so the cost is a stray file,
-    // paid to avoid a corrupt one.
+    // guarded it; a temporary and a rename fixed that, with neither synced, so a power cut could keep
+    // the rename and lose the bytes (#162). Now it is `write_file_atomically()` - the temporary synced
+    // before the rename, the directory after - with one writer at a time, because that function's
+    // temporary has one name: concurrent writers race only over which of them is last, which
+    // "overwrite previous" already permits.
     {
+        static std::mutex manifest_writer;
+        std::lock_guard<std::mutex> one_at_a_time(manifest_writer);
         const std::string final_path = base_dir_ + "/snapshot_manifest.json";
-        const std::string tmp_path   =
-            final_path + ".tmp." + std::to_string(manifest.created_at_ns) + "." +
-            std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
-
-        bool written = false;
-        {
-            std::ofstream f(tmp_path, std::ios::out | std::ios::trunc);
-            if (f.is_open()) {
-                f << manifest.to_json();
-                f.flush();
-                written = f.good();
-            }
-        }
-        if (!written) {
-            // Previously both of these failures were silent, so a snapshot could report success
-            // while leaving no manifest, or half of one.
-            OB_LOG_ERROR("engine", "Snapshot: cannot write manifest to '%s': %s",
-                         tmp_path.c_str(), std::strerror(errno));
-            ::unlink(tmp_path.c_str());
-        } else if (::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
-            OB_LOG_ERROR("engine", "Snapshot: cannot install manifest as '%s': %s",
-                         final_path.c_str(), std::strerror(errno));
-            ::unlink(tmp_path.c_str());
+        if (const int err = write_file_atomically(final_path, manifest.to_json()); err != 0) {
+            // Previously both of the failures this replaces were silent, so a snapshot could report
+            // success while leaving no manifest, or half of one.
+            OB_LOG_ERROR("engine", "Snapshot: cannot write the manifest '%s': %s",
+                         final_path.c_str(), std::strerror(err));
         }
     }
 
@@ -1664,29 +1645,52 @@ bool Engine::install_snapshot(const std::string& staging_dir,
     for (const auto& entry : manifest.files) paths.push_back(entry.path);
 
     // flush_mtx_ first: replacing the store destroys the ColumnarStore state a concurrent
-    // Phase B may be iterating over (pitfall 10).
+    // Phase B may be iterating over (pitfall 10). Held to the end, sync included, so no flush comes
+    // between the install and its sync.
     std::lock_guard<std::mutex> flush_lock(flush_mtx_);
-    std::unique_lock<std::mutex> lock(mtx_);
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
 
-    OB_LOG_INFO("engine", "Installing a snapshot of %zu file(s) from '%s'",
-                paths.size(), staging_dir.c_str());
+        OB_LOG_INFO("engine", "Installing a snapshot of %zu file(s) from '%s'",
+                    paths.size(), staging_dir.c_str());
 
-    stores_.clear();
-    buffers_.clear();
-    pending_rows_.clear();
-    seq_tracker_.reset();
+        stores_.clear();
+        buffers_.clear();
+        pending_rows_.clear();
+        seq_tracker_.reset();
 
-    combined_store_.close();
-    if (!combined_store_.replace_from_staging(staging_dir, paths)) {
-        OB_LOG_ERROR("engine",
-                     "Installing the snapshot failed; this node now holds an incomplete store "
-                     "and has to bootstrap again");
-        return false;
+        combined_store_.close();
+        if (!combined_store_.replace_from_staging(staging_dir, paths)) {
+            OB_LOG_ERROR("engine",
+                         "Installing the snapshot failed; this node now holds an incomplete store "
+                         "and has to bootstrap again");
+            return false;
+        }
+
+        OB_LOG_INFO("engine", "Snapshot installed: the store now holds %zu segment(s)",
+                    combined_store_.segment_count());
+        pending_cv_.notify_all();          // see adopt_store_on_disk() for why
     }
 
-    OB_LOG_INFO("engine", "Snapshot installed: the store now holds %zu segment(s)",
-                combined_store_.segment_count());
-    pending_cv_.notify_all();          // see adopt_store_on_disk() for why
+    // **On the device before anything points at it** (#162). The caller records the snapshot's WAL
+    // position next - a replica in `repl_state.txt`, the mesh in the vectors it adopts - and a node
+    // that resumes from that position after a power cut with half of the store on the disk serves
+    // the half as the whole: nothing afterwards asks for the rest. The staged files were written
+    // without a sync and renamed into place, so one syncfs() on the data directory takes both the
+    // bytes and the renames. Without mtx_, like a flush's, and a failure is a failed sync like any
+    // other: it freezes the checkpoints (#160), and the install is reported failed, so the position
+    // is not recorded and the next bootstrap starts again.
+    if (const int err = sync_segments(); err != 0) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        freeze_checkpoints(std::string("A snapshot install's sync failed (") +
+                           std::strerror(err) + ")");
+        OB_LOG_ERROR("engine",
+                     "The installed snapshot could not be synced (%s); its position is not "
+                     "recorded, so this node bootstraps again",
+                     std::strerror(err));
+        return false;
+    }
+    OB_LOG_DEBUG("engine", "The installed snapshot is on the device");
     return true;
 }
 
