@@ -6,7 +6,7 @@ was acknowledged is lost when a later one fails. Neither could be tested before,
 machine never returns ENOSPC.
 
 `OB_FAULT_SIZE` matters more than it looks. This engine's WAL takes a 136-byte delta record on the
-session thread and, from the flush loop, a 24-byte checkpoint and a 68-byte version vector. Failing
+session thread and, from the flush loop, a 32-byte checkpoint and a 68-byte version vector. Failing
 "the fourth write" is a different call on every run; failing "the 136-byte write" is the same one
 every time. It is also what keeps these tests away from #112 — an ENOSPC on either background
 record aborts the process, and that is filed rather than asserted here.
@@ -15,6 +15,7 @@ record aborts the process, and that is filed rather than asserted here.
 from __future__ import annotations
 
 import os
+import re
 import signal
 import socket
 import stat
@@ -30,6 +31,7 @@ pytestmark = pytest.mark.smoke
 SERVER = server_binary_path()
 WAL_SEGMENT = "wal_000000.bin"   # what the first WAL file is called; the delta records go here
 DELTA_BYTES = "136"              # one INSERT of one level, header included
+CHECKPOINT_BYTES = "32"          # the header and, since #159, the 8-byte position it covers
 
 # Read by the report plugin out of `sys.modules`, so the numbers a fault measures are printed with
 # the run rather than living in a comment.
@@ -328,8 +330,11 @@ def test_no_acknowledged_write_survives_less_than_a_restart():
 def test_a_failing_flush_tick_does_not_take_the_node_with_it():
     """#112: an ENOSPC on the flush thread's own WAL write used to abort the process.
 
-    The 24-byte record is the checkpoint, and nothing but the flush loop writes it — which is why
-    the size filter is the whole instrument here. Measured before the fix, by naming that call:
+    The 32-byte record is the checkpoint, and nothing but the flush loop writes it — which is why
+    the size filter is the whole instrument here. It was 24 bytes until #159 gave it the position
+    it covers, and the first run after that change failed on "no fault fired": the size names the
+    call, so a record that changes size moves the injection point, and this test's own guard is
+    what said so rather than a pass over nothing. Measured before the fix, by naming that call:
     SIGABRT with one injection fired, an **idle** node dead 0.5 s into idleness with nobody
     connected, and three consecutive restarts on a disk that stays full each coming up and dying
     unattended after 1.5–2.0 s. The client-facing path handled the same condition correctly the
@@ -340,7 +345,7 @@ def test_a_failing_flush_tick_does_not_take_the_node_with_it():
     outcomes this test exists to separate.
     """
     node = FaultNode(OB_FAULT_PATH=WAL_SEGMENT, OB_FAULT_OP="write", OB_FAULT_ERRNO="ENOSPC",
-                     OB_FAULT_SIZE="24")
+                     OB_FAULT_SIZE=CHECKPOINT_BYTES)
     try:
         node.wait_until_answering()
         assert node.talk("INSERT SYM EX bid 100 1 1")[0] == "OK", "the write path itself refused"
@@ -426,6 +431,141 @@ def test_a_flush_command_does_not_report_success_over_a_failed_sync():
         assert replies[1].startswith("ERR"), (
             f"FLUSH reported success over a sync that failed: {replies}")
         assert node.proc.poll() is None, "the node died on a failed fsync"
+    finally:
+        node.cleanup()
+
+
+SEGMENT_COLUMN = "price.col"   # one column file every segment has; a flush writes it for each
+
+def select_prices(node: FaultNode) -> list[int]:
+    """Every price `SYM.EX` holds, read to the end of the answer.
+
+    Not `talk()`: that takes one `recv()`, and the rows the retention test counts are tens of
+    kilobytes - an answer cut at a segment boundary would read as rows that were lost.
+    """
+    with socket.create_connection(("127.0.0.1", node.port), timeout=patience(15)) as sock:
+        reader = sock.makefile("rb")
+        while reader.readline().strip():   # the banner ends in a blank line
+            pass
+        sock.sendall((SELECT_ALL + "\n").encode())
+        lines = []
+        while True:
+            line = reader.readline()
+            if not line or line == b"\n":
+                break
+            lines.append(line.decode(errors="replace"))
+    return prices_in("".join(lines))
+
+
+def delays_injected(node: FaultNode) -> int:
+    """How many calls the injector has made slow so far."""
+    return node.fault_log_text().count("action=delay")
+
+
+def wait_for_delays(node: FaultNode, count: int, timeout: float = 20.0) -> None:
+    deadline = time.time() + patience(timeout)
+    while delays_injected(node) < count and time.time() < deadline:
+        time.sleep(0.02)
+    assert delays_injected(node) >= count, (
+        f"the injector never slowed segment write number {count}: {node.fault_log_text()}")
+
+
+@pytest.mark.parametrize("policy", ["every", "interval"])
+def test_rows_written_while_a_tick_writes_segments_survive_a_crash_after_it(policy):
+    """#159: the checkpoint claims what its flush drained, not what the log held when it wrote it.
+
+    A flush drains the queued rows under the engine's lock and writes their segments without it,
+    so writers go on while it does - and only then appends the checkpoint that replay starts from.
+    That checkpoint said "everything before me", so it covered the records written during the
+    segment I/O, whose rows were still queued. A crash before they reached a segment then lost
+    every one, **each answered `OK` and under every fsync policy** - `every` included, where the
+    record was on the disk before the client heard anything.
+
+    The injector slows two segment writes by two seconds each. Row 300 goes in before the first
+    tick, rows 301-303 while that tick is writing, and the kill comes while the **next** tick is
+    writing them - after the first tick's checkpoint, before any segment holds them.
+
+    A tick rather than `FLUSH`, which runs on the connection's event loop: with one loop it holds
+    every other connection's writes back for the whole segment write, and the first version of this
+    test measured exactly that - 1.99 s for three `INSERT`s, then a `FLUSH` that had already
+    answered. The premise is checked, not assumed: a row written before the drain survives on the
+    old build too, and this test would then prove nothing.
+    """
+    node = FaultNode(OB_FAULT_PATH=SEGMENT_COLUMN, OB_FAULT_OP="write", OB_FAULT_DELAY_MS="2000",
+                     OB_FAULT_COUNT="2", OB_FAULT_POLICY=policy, OB_FAULT_FLUSH_MS="2000")
+    try:
+        node.wait_until_answering()
+        assert node.insert_each([300]) == {300: "OK"}
+        wait_for_delays(node, 1)
+
+        started = time.monotonic()
+        replies = node.insert_each([301, 302, 303])
+        took = time.monotonic() - started
+        assert all(r == "OK" for r in replies.values()), replies
+        assert node.counter("ob_segment_count") == 0, (
+            f"the slow tick had merged its segment before 301-303 were acknowledged ({took:.3f} s), "
+            "so they were not written during its segment I/O")
+        custom_metrics[f"writes_during_segment_io_s_{policy}"] = round(took, 3)
+
+        wait_for_delays(node, 2)
+        assert node.counter("ob_segment_count") >= 1, "the first tick never merged its segment"
+
+        node.kill_and_restart_without_faults()
+        assert sorted(select_prices(node)) == [300, 301, 302, 303], (
+            "a row acknowledged while a tick wrote its segments was lost (or doubled) by the "
+            f"replay after a crash:\n{node.log()[-1500:]}")
+        # And the restart says so: the one line that tells an operator this happened is the count
+        # of records the checkpoint's position gave back, which here is exactly the three.
+        given_back = re.findall(r"of which (\d+) written before the checkpoint", node.log())
+        assert given_back and given_back[-1] == "3", (
+            f"the replay did not report the three records it gave back: {given_back}")
+    finally:
+        node.cleanup()
+
+
+def test_a_wal_file_rotated_away_while_a_tick_wrote_segments_is_kept():
+    """#159, the second reader of the same boundary: WAL retention.
+
+    The flush tick deleted every WAL file before the **current** one once its segments were
+    written. Writers append while those segments are written, and a rotation in that window leaves
+    their records in a file before the current one - with their rows still queued. The tick deleted
+    it, and a crash before those rows reached a segment had neither the segment nor the record.
+
+    So: row 300, a tick whose segment write is slowed, six hundred rows during it - enough to fill
+    the smallest WAL file the flag allows and rotate - and a kill while the **next** tick is writing
+    them, that is after the first tick's retention ran and before anything else saved them. The
+    checkpoint fix alone does not pass this: it gives back what is in the log, and the log had lost
+    the file.
+    """
+    node = FaultNode(OB_FAULT_PATH=SEGMENT_COLUMN, OB_FAULT_OP="write", OB_FAULT_DELAY_MS="6000",
+                     OB_FAULT_COUNT="2", OB_FAULT_POLICY="every", OB_FAULT_FLUSH_MS="2000",
+                     OB_FAULT_ROTATE_BYTES="65573")
+    burst = list(range(301, 901))
+    try:
+        node.wait_until_answering()
+        assert node.insert_each([300]) == {300: "OK"}
+        wait_for_delays(node, 1)
+
+        started = time.monotonic()
+        replies = node.insert_each(burst)
+        took = time.monotonic() - started
+        assert all(r == "OK" for r in replies.values()), [r for r in replies.values() if r != "OK"][:3]
+        assert "wal_000001.bin" in node.wal_files(), (
+            f"the burst did not rotate the WAL, so there is no earlier file to keep: {node.wal_files()}")
+        assert node.counter("ob_segment_count") == 0, (
+            f"the slow tick had finished before the burst did ({took:.3f} s), so the burst was not "
+            "written during its segment I/O")
+        custom_metrics["retention_burst_s"] = round(took, 3)
+
+        # The first tick finishes, retention runs, and the next tick drains the burst and is slowed
+        # in turn: killed while it writes, the burst is in no segment and only the WAL has it.
+        wait_for_delays(node, 2, timeout=30.0)
+        assert node.counter("ob_segment_count") >= 1, "the first tick never merged its segment"
+        custom_metrics["retention_wal_files_at_kill"] = len(node.wal_files())
+
+        node.kill_and_restart_without_faults()
+        assert sorted(select_prices(node)) == [300] + burst, (
+            f"rows whose WAL file the tick deleted did not come back: {node.log()[-1500:]}")
     finally:
         node.cleanup()
 
@@ -581,8 +721,9 @@ def test_a_failed_sync_while_rotating_costs_no_acknowledged_write():
 def test_a_rotation_that_cannot_write_its_marker_does_not_refuse_the_write_that_crossed_it():
     """#153's other half: the disk refuses the ROTATE marker, and no client is told it failed.
 
-    The marker is the first 24-byte write this node makes: inserts are 136 bytes, and the flush
-    tick - the only other writer of 24-byte records, a checkpoint - is an hour away. Before the fix
+    The marker is the first 24-byte write this node makes: inserts are 136 bytes, a checkpoint has
+    been 32 since #159, and the other 24-byte record - a GAP - needs a sequence number skipped, which
+    nothing here does. The flush tick is an hour away regardless. Before the fix
     the refusal of the marker threw out of the `INSERT` that asked for the rotation, whose own record
     was already in the file: answered `ERR`, present after a restart, so a client that sent it again
     stored it twice. Now the file is left as it was - readable to its end, since nothing of the

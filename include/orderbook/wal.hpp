@@ -185,6 +185,31 @@ static_assert(std::atomic<WalPosition>::is_always_lock_free,
               "std::atomic<WalPosition> must be lock-free: an atomic that quietly takes a lock "
               "would put that lock on the WAL write path, which is the cost this exists to avoid");
 
+/// A CHECKPOINT's payload since #159: the position its flush drained up to, as two little-endian
+/// 32-bit words - the file index, then the offset. Eight bytes, and a checkpoint written before
+/// #159 has none (`checkpoint_covered()` is then empty and replay reads it as it always did).
+inline constexpr size_t CHECKPOINT_PAYLOAD_BYTES = 8;
+
+inline void checkpoint_payload(WalPosition covered, uint8_t out[CHECKPOINT_PAYLOAD_BYTES]) {
+    for (int i = 0; i < 4; ++i) {
+        out[i]     = static_cast<uint8_t>(covered.file_index >> (8 * i));
+        out[4 + i] = static_cast<uint8_t>(covered.offset >> (8 * i));
+    }
+}
+
+/// What a CHECKPOINT covered, or nothing when its payload is not the eight bytes #159 writes - the
+/// empty payload of an older build, or anything else, which is read as saying nothing rather than
+/// as a position somewhere.
+inline std::optional<WalPosition> checkpoint_covered(const uint8_t* payload, size_t len) {
+    if (payload == nullptr || len != CHECKPOINT_PAYLOAD_BYTES) return std::nullopt;
+    WalPosition covered{};
+    for (int i = 0; i < 4; ++i) {
+        covered.file_index |= static_cast<uint32_t>(payload[i]) << (8 * i);
+        covered.offset     |= static_cast<uint32_t>(payload[4 + i]) << (8 * i);
+    }
+    return covered;
+}
+
 /// Largest rotate threshold that keeps the offset inside 32 bits with room to spare.
 ///
 /// The offset is 32 bits so the pair fits one atomic. Rotation is checked *after* a write
@@ -310,11 +335,17 @@ public:
     /// and `append_version_vector()` can *refuse* to write, so it has no position to give.
     void append_gap(uint64_t sequence_number, uint64_t timestamp_ns);
 
-    /// Write a CHECKPOINT record: everything before it is durable in segments.
+    /// Write a CHECKPOINT record: the rows of every record before `covered` are durable in
+    /// segments.
     ///
-    /// Called after a flush has written and merged its segments, so the record's
-    /// presence is evidence that the rows preceding it no longer need replaying.
-    void append_checkpoint(uint64_t timestamp_ns);
+    /// Called after a flush has written and merged its segments. **`covered` is the position the
+    /// flush drained up to, not the end of the log** (#159). The segment I/O runs without the
+    /// engine's lock, so writers go on appending while it does, and the rows of those records are
+    /// still queued when this record is written. A checkpoint that meant "everything before me"
+    /// told replay to skip them, and a crash before the next flush lost every one - each answered
+    /// `OK`, under every fsync policy, `every` included. The position is the record's payload
+    /// (`checkpoint_payload()`), and replay gives back the records between it and the checkpoint.
+    void append_checkpoint(uint64_t timestamp_ns, WalPosition covered);
 
     /// Append this node's serialised version vector: what it holds, per (symbol, origin).
     ///
@@ -625,10 +656,17 @@ public:
     /// Returns the last good sequence_number.
     uint64_t replay_v2(WALReplayCallbackV2 cb);
 
-    /// Replay only the records written after the last CHECKPOINT record.
+    /// Replay the records the last CHECKPOINT does not cover: every record after it, and - when it
+    /// says what it covered (#159) - the records before it that start at or after that position.
+    ///
+    /// The second half is what a checkpoint could not say before #159: its flush writes segments
+    /// without the engine's lock, so the records appended meanwhile precede the checkpoint in the
+    /// log while their rows are still queued. The position only ever adds records; nothing after
+    /// the checkpoint is skipped whatever its payload says. A checkpoint with the empty payload of
+    /// an older build is read as it always was, as covering everything before it.
     ///
     /// Two passes rather than buffering the tail in memory: the first finds the last
-    /// checkpoint, the second invokes cb for the records after it. The tail can be
+    /// checkpoint, the second invokes cb for the records it does not cover. The tail can be
     /// arbitrarily large if flushing fell behind, and open() is not on a latency
     /// path, so bounded memory is worth more than one pass.
     ///

@@ -612,6 +612,16 @@ private:
     };
     std::vector<PendingRow> pending_rows_;
 
+    /// How far into the WAL the last completed drain reached: the position it stamped into its
+    /// stores. **The engine's one answer to "how much of the log is in segments"** once a flush's
+    /// segments are written (#159), and it has two readers: the checkpoint appended after them
+    /// claims it, and WAL retention deletes only the files before its file. Both used to read the
+    /// log's end instead, which is later by whatever writers appended while the flush wrote
+    /// segments without `mtx_`. Written and read under `mtx_`, with `flush_mtx_` held from the
+    /// drain to the checkpoint, so no other drain comes between them. Zero until a first drain,
+    /// which reads as covering nothing - the direction in which either reader may be wrong.
+    WalPosition drained_up_to_{};
+
     // Backpressure: maximum number of pending rows before apply_delta blocks.
     // Default 1M rows ≈ ~100 MB memory. Prevents OOM under sustained ingestion.
     static constexpr size_t MAX_PENDING_ROWS = 1'000'000;

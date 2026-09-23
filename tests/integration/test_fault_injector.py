@@ -65,7 +65,7 @@ def run_probe(tmp_path, **fault_env) -> dict:
     env = dict(os.environ)
     env["LD_PRELOAD"] = injector
     for key in ("OB_FAULT_PATH", "OB_FAULT_OP", "OB_FAULT_ERRNO", "OB_FAULT_SKIP",
-                "OB_FAULT_COUNT", "OB_FAULT_SHORT", "OB_FAULT_LOG"):
+                "OB_FAULT_COUNT", "OB_FAULT_SHORT", "OB_FAULT_LOG", "OB_FAULT_DELAY_MS"):
         env.pop(key, None)
     env.update({k: str(v) for k, v in fault_env.items() if v is not None})
 
@@ -169,3 +169,79 @@ def test_fsync_fails_while_every_write_succeeds(tmp_path):
     assert all(v == ("err", "EIO") for v in result["syncs"].values()), result["syncs"]
     assert result["size"] == WRITES * RECORD
     assert log_actions(log) == ["fail"] * WRITES
+
+
+TIMED_PROBE = r"""
+import os, sys, time
+path = sys.argv[1]
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_APPEND, 0o644)
+for i in range(3):
+    os.write(fd, b"x" * 64)
+    started = time.monotonic()
+    os.fsync(fd)
+    print("s %d %.3f" % (i, time.monotonic() - started))
+os.close(fd)
+"""
+
+
+def test_a_delayed_fsync_is_slow_and_succeeds(tmp_path):
+    """`OB_FAULT_DELAY_MS`, the slow sync stage 5 of #151 needs: the chosen call sleeps, then syncs.
+
+    Only the chosen one. The control is the other two calls in the same run, which must not wait -
+    a delay that leaked to every sync would make every test built on it measure the injector.
+    """
+    injector = fault_injector_path()
+    assert injector is not None, "libobfault.so was not built"
+    log = tmp_path / "fault.log"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("OB_FAULT_")}
+    env.update(LD_PRELOAD=injector, OB_FAULT_PATH="timed_target", OB_FAULT_OP="fsync",
+               OB_FAULT_DELAY_MS="400", OB_FAULT_SKIP="1", OB_FAULT_COUNT="1",
+               OB_FAULT_LOG=str(log))
+    done = subprocess.run([sys.executable, "-c", TIMED_PROBE, str(tmp_path / "timed_target.bin")],
+                          env=env, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, f"a delayed fsync failed instead of succeeding: {done.stderr}"
+    took = {int(p[1]): float(p[2]) for p in (line.split() for line in done.stdout.splitlines())}
+    assert took[1] >= 0.4, f"the chosen fsync took {took[1]:.3f}s, not the 0.4 s it was given"
+    assert took[0] < 0.2 and took[2] < 0.2, f"a sync that was not chosen waited: {took}"
+    assert log_actions(log) == ["pass-skip", "delay", "pass-spent"], log_actions(log)
+
+
+TIMED_WRITE_PROBE = r"""
+import os, sys, time
+path = sys.argv[1]
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_APPEND, 0o644)
+for i in range(3):
+    started = time.monotonic()
+    written = os.write(fd, b"y" * 64)
+    print("w %d %d %.3f" % (i, written, time.monotonic() - started))
+os.close(fd)
+print("size %d" % os.path.getsize(path))
+"""
+
+
+def test_a_delayed_write_is_slow_and_writes_its_bytes(tmp_path):
+    """`OB_FAULT_DELAY_MS` on a write, the fault #159 needed: a segment write that takes its time.
+
+    Slow and **real**: the chosen write returns its full count and its bytes are in the file, since a
+    delay that dropped the bytes would be a different fault wearing this one's name. And only the
+    chosen one - the other two writes in the same run are the control.
+    """
+    injector = fault_injector_path()
+    assert injector is not None, "libobfault.so was not built"
+    log = tmp_path / "fault.log"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("OB_FAULT_")}
+    env.update(LD_PRELOAD=injector, OB_FAULT_PATH="timed_write", OB_FAULT_OP="write",
+               OB_FAULT_DELAY_MS="400", OB_FAULT_SKIP="1", OB_FAULT_COUNT="1",
+               OB_FAULT_LOG=str(log))
+    done = subprocess.run([sys.executable, "-c", TIMED_WRITE_PROBE, str(tmp_path / "timed_write.bin")],
+                          env=env, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, f"a delayed write failed instead of succeeding: {done.stderr}"
+    rows = [line.split() for line in done.stdout.splitlines()]
+    took = {int(r[1]): float(r[3]) for r in rows if r[0] == "w"}
+    written = {int(r[1]): int(r[2]) for r in rows if r[0] == "w"}
+    size = next(int(r[1]) for r in rows if r[0] == "size")
+    assert took[1] >= 0.4, f"the chosen write took {took[1]:.3f}s, not the 0.4 s it was given"
+    assert took[0] < 0.2 and took[2] < 0.2, f"a write that was not chosen waited: {took}"
+    assert written == {0: 64, 1: 64, 2: 64} and size == 192, (
+        f"the delayed write did not write its bytes: {written}, file size {size}")
+    assert log_actions(log) == ["pass-skip", "delay", "pass-spent"], log_actions(log)

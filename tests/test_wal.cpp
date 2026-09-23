@@ -10,9 +10,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iterator>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -20,6 +22,7 @@
 
 #include "orderbook/data_model.hpp"
 #include "orderbook/soa_buffer.hpp"
+#include "orderbook/crc32c.hpp"
 #include "orderbook/wal.hpp"
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
@@ -525,7 +528,7 @@ TEST(WAL, EveryRecordTypeIsCounted) {
     writer.append_gap(7, 1234);
     EXPECT_EQ(writer.records_written(), 2u);
 
-    writer.append_checkpoint(2345);
+    writer.append_checkpoint(2345, ob::WalPosition{});
     EXPECT_EQ(writer.records_written(), 3u);
 
     const uint8_t payload[] = {1, 2, 3, 4};
@@ -1165,4 +1168,210 @@ TEST(WalBatch, TooFewOutcomesIsRefusedBeforeAnythingReachesTheFile) {
     ob::WalBatchOutcome only_one[1]{};
     EXPECT_THROW(writer.append_batch(records, only_one), std::invalid_argument);
     EXPECT_EQ(writer.current_position().offset, 0u);
+}
+
+// ── #159: a checkpoint claims what its flush drained, not what the log held when it was written ──
+//
+// A flush drains the queued rows under the engine's lock, writes their segments without it, and
+// only then appends the checkpoint. Writers go on appending while the segments are written, so
+// the log holds records **between** the drain and the checkpoint whose rows are still queued.
+// A checkpoint that meant "everything before me" had replay skip them, and a crash before the next
+// flush lost every one, each answered `OK`. The checkpoint now carries the position its flush
+// drained up to, and replay gives back what lies between that position and the checkpoint.
+//
+// The last test here is the one that decides whether the position can ever cost a record: a
+// payload no writer produces - a position past the checkpoint - must take nothing away.
+
+namespace {
+
+/// Every record `replay_after_checkpoint` forwards, as (type, sequence), in order - of any type, so
+/// a replayer that forwarded the checkpoint itself or skipped a bookkeeping record would show it.
+std::vector<std::pair<uint8_t, uint64_t>> forwarded_after_checkpoint(const std::string& dir) {
+    std::vector<std::pair<uint8_t, uint64_t>> out;
+    ob::WALReplayer replayer(dir);
+    replayer.replay_after_checkpoint([&](const ob::WALReplayContext& ctx) {
+        out.emplace_back(ctx.header.record_type, ctx.header.sequence_number);
+    });
+    return out;
+}
+
+std::vector<std::pair<uint8_t, uint64_t>> deltas(std::initializer_list<uint64_t> seqs) {
+    std::vector<std::pair<uint8_t, uint64_t>> out;
+    for (uint64_t s : seqs) out.emplace_back(ob::WAL_RECORD_DELTA, s);
+    return out;
+}
+
+/// The CHECKPOINT a build before #159 wrote: a 24-byte header and no payload, so it says nothing
+/// about what it covered. Written by hand, because the writer no longer produces one.
+std::string checkpoint_from_an_older_build(uint64_t timestamp_ns) {
+    ob::WALRecord hdr{};
+    hdr.sequence_number = 0;
+    hdr.timestamp_ns    = timestamp_ns;
+    hdr.checksum        = ob::crc32c(nullptr, 0);
+    hdr.payload_len     = 0;
+    hdr.record_type     = ob::WAL_RECORD_CHECKPOINT;
+    hdr._pad            = 0;
+    return std::string(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+}
+
+}  // namespace
+
+TEST(CheckpointPayload, APositionIsEightBytesTheFileIndexThenTheOffsetBothLittleEndian) {
+    // The layout is asserted byte for byte, not only round-tripped: a payload read back by the
+    // function that wrote it would agree with itself in any byte order, and the order is what an
+    // older or newer build reading this directory depends on.
+    uint8_t bytes[ob::CHECKPOINT_PAYLOAD_BYTES]{};
+    ob::checkpoint_payload(ob::WalPosition{0x01020304u, 0x0A0B0C0Du}, bytes);
+    const uint8_t expected[] = {0x04, 0x03, 0x02, 0x01, 0x0D, 0x0C, 0x0B, 0x0A};
+    EXPECT_EQ(0, std::memcmp(bytes, expected, sizeof(expected)));
+
+    const auto covered = ob::checkpoint_covered(bytes, sizeof(bytes));
+    ASSERT_TRUE(covered.has_value());
+    EXPECT_EQ(covered->file_index, 0x01020304u);
+    EXPECT_EQ(covered->offset, 0x0A0B0C0Du);
+}
+
+TEST(CheckpointPayload, AnythingButEightBytesSaysNothing) {
+    // The empty payload of an older build, and any other length, is "nothing said" - not a position
+    // decoded from whatever bytes happen to be there, which could be anywhere in the log.
+    const uint8_t bytes[9] = {1, 0, 0, 0, 2, 0, 0, 0, 3};
+    EXPECT_FALSE(ob::checkpoint_covered(nullptr, 0).has_value());
+    EXPECT_FALSE(ob::checkpoint_covered(bytes, 0).has_value());
+    EXPECT_FALSE(ob::checkpoint_covered(bytes, 7).has_value());
+    EXPECT_FALSE(ob::checkpoint_covered(bytes, 9).has_value());
+    EXPECT_FALSE(ob::checkpoint_covered(nullptr, 8).has_value());
+    EXPECT_TRUE(ob::checkpoint_covered(bytes, 8).has_value());
+}
+
+TEST(WalCheckpoint, TheRecordsBetweenTheDrainAndTheCheckpointAreGivenBack) {
+    TempDir tmp("ckpt_given_back");
+    const ob::Level lvl = make_level();
+    {
+        ob::WALWriter writer(tmp.str());
+        writer.append(make_delta(1), &lvl);                 // drained: its rows are in segments
+        const ob::WalPosition drained = writer.current_position();
+        writer.append(make_delta(2), &lvl);                 // appended while the segments were
+        writer.append(make_delta(3), &lvl);                 // being written: rows still queued
+        writer.append_checkpoint(1'000, drained);
+        writer.append(make_delta(4), &lvl);
+    }
+    EXPECT_EQ(forwarded_after_checkpoint(tmp.str()), deltas({2, 3, 4}))
+        << "the records the checkpoint's flush did not drain must be replayed, and nothing else - "
+           "neither the one it drained nor the checkpoint itself";
+}
+
+TEST(WalCheckpoint, ACheckpointWrittenWithNothingAfterTheDrainCoversEverythingBeforeIt) {
+    // The control for the test above: a flush during which nobody wrote is the old case, and it
+    // must read exactly as it always did.
+    TempDir tmp("ckpt_quiet");
+    const ob::Level lvl = make_level();
+    {
+        ob::WALWriter writer(tmp.str());
+        writer.append(make_delta(1), &lvl);
+        writer.append(make_delta(2), &lvl);
+        writer.append_checkpoint(1'000, writer.current_position());
+        writer.append(make_delta(3), &lvl);
+    }
+    EXPECT_EQ(forwarded_after_checkpoint(tmp.str()), deltas({3}));
+}
+
+TEST(WalCheckpoint, ACheckpointFromAnOlderBuildIsReadAsCoveringEverythingBeforeIt) {
+    // Compatibility, and the limit of it: the records such a checkpoint wrongly covered are not in
+    // the log's account of itself, so they cannot be told apart and are not replayed.
+    TempDir tmp("ckpt_legacy");
+    const ob::Level lvl = make_level();
+    {
+        ob::WALWriter writer(tmp.str());
+        writer.append(make_delta(1), &lvl);
+        writer.append(make_delta(2), &lvl);
+    }
+    append_raw(tmp.str(), 0, checkpoint_from_an_older_build(1'000));
+    {
+        ob::WALWriter writer(tmp.str());
+        writer.append(make_delta(3), &lvl);
+    }
+    EXPECT_EQ(forwarded_after_checkpoint(tmp.str()), deltas({3}));
+}
+
+TEST(WalCheckpoint, OnlyTheLastCheckpointDecides) {
+    const ob::Level lvl = make_level();
+
+    // A positioned checkpoint followed by an older build's: the last one says nothing, so it is
+    // read by ordinal - the first one's position must not reach past it and give records back.
+    TempDir older_last("ckpt_older_last");
+    {
+        ob::WALWriter writer(older_last.str());
+        const ob::WalPosition at_start = writer.current_position();
+        writer.append(make_delta(1), &lvl);
+        writer.append_checkpoint(1'000, at_start);
+        writer.append(make_delta(2), &lvl);
+    }
+    append_raw(older_last.str(), 0, checkpoint_from_an_older_build(2'000));
+    {
+        ob::WALWriter writer(older_last.str());
+        writer.append(make_delta(3), &lvl);
+    }
+    EXPECT_EQ(forwarded_after_checkpoint(older_last.str()), deltas({3}));
+
+    // And the other way round: an older build's checkpoint, then a positioned one.
+    TempDir positioned_last("ckpt_positioned_last");
+    {
+        ob::WALWriter writer(positioned_last.str());
+        writer.append(make_delta(1), &lvl);
+    }
+    append_raw(positioned_last.str(), 0, checkpoint_from_an_older_build(1'000));
+    {
+        ob::WALWriter writer(positioned_last.str());
+        writer.append(make_delta(2), &lvl);
+        const ob::WalPosition drained = writer.current_position();
+        writer.append(make_delta(3), &lvl);
+        writer.append_checkpoint(2'000, drained);
+        writer.append(make_delta(4), &lvl);
+    }
+    EXPECT_EQ(forwarded_after_checkpoint(positioned_last.str()), deltas({3, 4}));
+}
+
+TEST(WalCheckpoint, APositionPastTheCheckpointTakesNothingAway) {
+    // No writer produces this - the drain always precedes its checkpoint - but a payload is bytes
+    // on a disk, and the rule is that a position can only give records back. Read as covering
+    // everything before the checkpoint, which is the most any checkpoint ever claimed.
+    TempDir tmp("ckpt_future");
+    const ob::Level lvl = make_level();
+    {
+        ob::WALWriter writer(tmp.str());
+        writer.append(make_delta(1), &lvl);
+        writer.append_checkpoint(1'000, ob::WalPosition{7, 0});
+        writer.append(make_delta(2), &lvl);
+        writer.append(make_delta(3), &lvl);
+    }
+    EXPECT_EQ(forwarded_after_checkpoint(tmp.str()), deltas({2, 3}));
+}
+
+TEST(WalCheckpoint, TheDrainsPositionMayBeInAnEarlierFileThanTheCheckpoint) {
+    // A rotation between the drain and the checkpoint puts them in different files, and the
+    // records given back span both. This is also the shape in which the flush tick's retention
+    // used to delete the earlier file - see Engine::flush_loop and roadmap #159.
+    TempDir tmp("ckpt_rotation");
+    const ob::Level lvl = make_level();
+    std::vector<uint64_t> expected;
+    {
+        ob::WALWriter writer(tmp.str(), /*rotate_threshold=*/512);
+        writer.append(make_delta(1), &lvl);
+        const ob::WalPosition drained = writer.current_position();
+        uint64_t seq = 2;
+        while (writer.current_position().file_index == drained.file_index) {
+            writer.append(make_delta(seq), &lvl);
+            expected.push_back(seq++);
+        }
+        writer.append(make_delta(seq), &lvl);                // one in the next file, before it
+        expected.push_back(seq++);
+        writer.append_checkpoint(1'000, drained);
+        writer.append(make_delta(seq), &lvl);
+        expected.push_back(seq);
+        ASSERT_GT(writer.current_position().file_index, drained.file_index)
+            << "the premise: the checkpoint is in a later file than the drain's position";
+    }
+    std::vector<std::pair<uint8_t, uint64_t>> want;
+    for (uint64_t s : expected) want.emplace_back(ob::WAL_RECORD_DELTA, s);
+    EXPECT_EQ(forwarded_after_checkpoint(tmp.str()), want);
 }

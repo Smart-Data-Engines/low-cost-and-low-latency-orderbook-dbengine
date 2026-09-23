@@ -2266,9 +2266,15 @@ void Engine::flush_tick() {
         {
             std::unique_lock<std::mutex> lock(mtx_);
 
-            // WAL truncation: only truncate files that ALL replicas have confirmed
-            // past, so lagging replicas can still catch up (Requirement 6.3).
-            uint32_t safe_truncate = wal_.current_file_index();
+            // WAL truncation: only files the last drain is past, and that ALL replicas have
+            // confirmed past, so lagging replicas can still catch up (Requirement 6.3).
+            //
+            // **The drain, not the log's end** (#159). Phase B ran without mtx_, so writers
+            // appended while it did and their rows are queued, not in segments. A rotation in that
+            // window left their records in a file before the current one, which this used to
+            // delete - and a crash before the next tick then had neither the segment nor the
+            // record. Files before the one the drain reached hold only records it drained.
+            uint32_t safe_truncate = drained_up_to_.file_index;
             if (repl_mgr_) {
                 for (const auto& r : repl_mgr_->replica_states()) {
                     safe_truncate = std::min(safe_truncate, r.confirmed_file);
@@ -2333,6 +2339,12 @@ void Engine::flush_drain_pending() {
     }
     pending_rows_.clear();
 
+    // And kept for what this flush will say it covered once its segments are written (#159): the
+    // checkpoint must claim these rows and nothing appended after them, and the WAL files before
+    // this one are the only ones whose records are all in this drain. Set only once the drain is
+    // complete, so a drain that throws part-way leaves the previous, smaller claim standing.
+    drained_up_to_ = wal_pos;
+
     // Update gauge: pending rows is now 0 after drain.
     registry_.set_gauge("ob_pending_rows", 0);
 
@@ -2387,14 +2399,20 @@ void Engine::flush_write_and_merge() {
         registry_.set_gauge("ob_segment_count",
                             static_cast<int64_t>(combined_store_.segment_count()));
 
-        // Record that everything written before now is durable in segments, so the
-        // next open() does not replay it. Appended AFTER the segments are on disk,
-        // never before: a checkpoint that claims more than is durable turns a crash
-        // into data loss, while one that claims less only costs a replay that the
-        // timestamp guard in replay_wal_tail() filters.
+        // Record how far the WAL is durable in segments, so the next open() does not replay it.
+        // Appended AFTER the segments are on disk, never before: a checkpoint that claims more
+        // than is durable turns a crash into data loss, while one that claims less only costs a
+        // replay that the per-symbol positions in replay_wal_tail() filter.
+        //
+        // **How far is the drain's position, not this record's** (#159). The segment I/O above
+        // ran without mtx_, so writers appended while it did, and their rows are still queued -
+        // this record comes after their records in the log. It said "everything before me" until
+        // #159, and a crash before the next flush then lost every row written during the segment
+        // I/O: answered `OK`, under every fsync policy.
         wal_.append_checkpoint(static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count()));
+                std::chrono::system_clock::now().time_since_epoch()).count()),
+            drained_up_to_);
 
         // And what this node holds, so a restart does not have to relearn it. Written next to
         // the checkpoint because that is where the WAL tail is cut: a vector after the last
