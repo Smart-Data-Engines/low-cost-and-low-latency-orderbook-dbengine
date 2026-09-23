@@ -169,6 +169,12 @@ ob_add_soa_test(test_soa_buffer
 )
 
 # ── Tasks 3.2–3.5: WAL property and unit tests ────────────────────────────────
+# How many CPUs this process can use (stage 3 of using the whole machine): the affinity mask and
+# the tightest cgroup CPU limit, as a pure function of what the process sees, plus the real reader.
+add_executable(test_machine test_machine.cpp)
+target_link_libraries(test_machine PRIVATE orderbook_machine GTest::gtest_main)
+gtest_discover_tests(test_machine PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
+
 ob_add_wal_test(test_wal
     test_wal.cpp
 )

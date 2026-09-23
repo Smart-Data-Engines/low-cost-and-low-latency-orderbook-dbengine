@@ -303,6 +303,12 @@ endif()
 
 # ── Metrics registry compiled library ──────────────────────────────────────────
 # ── Structured logger compiled library ─────────────────────────────────────────
+# ── Machine resources: how many CPUs this process can actually use ────────────
+# The affinity mask and the tightest cgroup CPU limit, as a pure function of what the process can
+# see, so the cases a container, a cpuset and a fractional quota produce are unit tests.
+add_library(orderbook_machine STATIC src/machine.cpp)
+target_link_libraries(orderbook_machine PUBLIC orderbook_core)
+
 add_library(orderbook_logger STATIC src/logger.cpp)
 target_link_libraries(orderbook_logger PUBLIC orderbook_core)
 
@@ -464,7 +470,7 @@ add_library(orderbook_tcp_server_lib STATIC
     src/session.cpp
     src/subscription_hub.cpp
 )
-target_link_libraries(orderbook_tcp_server_lib PUBLIC orderbook_engine orderbook_logger orderbook_metrics_server orderbook_shard_coordinator orderbook_auth orderbook_tls)
+target_link_libraries(orderbook_tcp_server_lib PUBLIC orderbook_engine orderbook_logger orderbook_metrics_server orderbook_shard_coordinator orderbook_auth orderbook_tls orderbook_machine)
 
 # ── Native C++ client library ──────────────────────────────────────────────────
 add_library(orderbook_client STATIC src/client.cpp)
