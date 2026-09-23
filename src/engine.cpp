@@ -11,6 +11,7 @@
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/level_payload.hpp"
 #include "orderbook/crc32c.hpp"
+#include "orderbook/durable_file.hpp"
 #include "orderbook/logger.hpp"
 
 #include <span>
@@ -42,6 +43,7 @@ Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
                size_t wal_rotate_bytes)
     : base_dir_(base_dir)
     , flush_interval_ns_(flush_interval_ns)
+    , fsync_policy_(fsync_policy)
     , wal_(base_dir, wal_rotate_bytes, fsync_policy)
     , combined_store_(base_dir)
     // The lookup takes mtx_ for one map read and releases it before the query runs. Handing
@@ -83,9 +85,34 @@ void Engine::open() {
     // deleted whole, and only below the slowest connected replica's file.
     OB_LOG_INFO("engine", "WAL rotation threshold: %zu bytes", wal_.rotate_threshold());
 
+    // The data directory, held open for syncfs() (#160). Before anything can flush, because the
+    // replay below ends in one, and refused rather than tolerated: a node that cannot sync its
+    // segments would write checkpoints claiming rows a power cut takes away.
+    if (data_dir_fd_ < 0) {
+        data_dir_fd_ = ::open(base_dir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (data_dir_fd_ < 0) {
+            const int err = errno;
+            throw std::runtime_error("Engine: cannot open the data directory " + base_dir_ +
+                                     " to sync its segments: " + std::strerror(err));
+        }
+    }
+    OB_LOG_INFO("engine", "Segments are %s before a checkpoint claims them (--fsync-policy %s)",
+                fsync_policy_ == FsyncPolicy::NONE ? "not synced" : "synced with syncfs()",
+                fsync_policy_ == FsyncPolicy::EVERY ? "every"
+                    : fsync_policy_ == FsyncPolicy::NONE ? "none" : "interval");
+
     // Rebuild the columnar segment index first: the replay below needs it to tell
     // which records are already durable.
     combined_store_.open_existing();
+
+    // Which WAL these segments' positions refer to, and which of them the log vouches for, before
+    // anything reads them (#160). A segment written after the last checkpoint that survived is
+    // removed here and rebuilt by the replay, so nothing below - the sequence counters, the replay
+    // filter - learns anything from a segment a power cut may have left short.
+    load_or_create_wal_identity();
+    WALReplayer tail_replayer(base_dir_);
+    const WALReplayer::LastCheckpoint last_checkpoint = tail_replayer.find_last_checkpoint();
+    remove_unvouched_segments(last_checkpoint);
 
     // Restore the sequence counters from what is already durable in segments, before the
     // replay below adds what is durable only in the WAL. Both only ever raise, so the order
@@ -107,9 +134,6 @@ void Engine::open() {
                     raised, seq_tracker_.symbol_count());
     }
 
-    // Which WAL these segments' positions refer to. Before the replay, which needs it.
-    load_or_create_wal_identity();
-
     // What the replication manager announces to a replica asking `STREAMID?` (#101). Set here
     // rather than at each `make_unique<ReplicationManager>` site, so the one inside
     // `promote_to_primary()` gets it too - and set as a value rather than reached through
@@ -124,7 +148,7 @@ void Engine::open() {
     // Replay the WAL tail — the records written after the last flush. Until this
     // existed, the replay callback was empty and every write acknowledged but not yet
     // flushed was lost on a crash, despite being in a fsynced WAL.
-    const uint64_t replayed = replay_wal_tail();
+    const uint64_t replayed = replay_wal_tail(tail_replayer, last_checkpoint);
 
     // Persist what was recovered before serving anything. Two reasons, and the first
     // is not optional: SELECT reads the columnar store and never the live SoA buffer,
@@ -282,13 +306,28 @@ void Engine::close() {
         }
 
         // Phase B: segment I/O + merge. This closes every active segment, so the
-        // second flush_segment() loop that used to follow was dead code.
-        flush_write_and_merge();
+        // second flush_segment() loop that used to follow was dead code. Reported rather than
+        // thrown, like the sync above: this runs from the destructor, and an exception out of it
+        // ends the process. The rows a failed write kept are in the WAL, which the next start
+        // replays.
+        try {
+            flush_write_and_merge();
+        } catch (const std::exception& e) {
+            OB_LOG_ERROR("engine", "close: the final flush could not write its segments (%s); the "
+                                   "next start replays their rows from the WAL", e.what());
+        }
     }
 
     // Flush WAL to disk. Same reasoning as above: shutdown reports, it does not throw.
     if (!wal_.flush()) {
         OB_LOG_ERROR("engine", "close: the closing WAL flush failed");
+    }
+
+    // Last, because the final flush above syncs through it (#160). -1 afterwards, since the
+    // destructor calls close() again.
+    if (data_dir_fd_ >= 0) {
+        ::close(data_dir_fd_);
+        data_dir_fd_ = -1;
     }
 }
 
@@ -488,15 +527,15 @@ void Engine::load_or_create_wal_identity() {
     if (value == 0) value = 1;   // 0 means "unknown" everywhere else
     wal_identity_ = value;
 
-    std::ofstream out(path, std::ios::trunc);
-    if (!out.is_open()) {
+    // Durably, before any segment records it (#160): a power cut once brought this file back
+    // empty, and the restart that followed stopped believing every position its segments carried.
+    if (const int err = write_file_atomically(path, std::to_string(wal_identity_)); err != 0) {
         OB_LOG_WARN("engine",
-                    "cannot write %s — recovery will fall back to comparing timestamps, which is "
-                    "exact only while a symbol's timestamps increase", path.c_str());
+                    "cannot write %s (%s) — recovery will fall back to comparing timestamps, which "
+                    "is exact only while a symbol's timestamps increase",
+                    path.c_str(), std::strerror(err));
         return;
     }
-    out << wal_identity_;
-    out.flush();
     OB_LOG_INFO("engine", "WAL identity %llu generated",
                 static_cast<unsigned long long>(wal_identity_));
 }
@@ -2252,10 +2291,13 @@ void Engine::flush_tick() {
                 // them out of the only place that still knows they were never synced.
                 throw std::runtime_error("Engine: WAL sync failed during the flush tick");
             }
+            note_wal_synced();
             flush_drain_pending();
         }
 
-        // Phase B: segment I/O + merge, outside mtx_ so writers are not blocked.
+        // Phase B: segment I/O + merge, outside mtx_ so writers are not blocked. A failed segment
+        // sync is counted and logged inside, and the tick goes on: the rows are merged and
+        // readable, and retention below stays where it was until a restart (#160).
         flush_write_and_merge();
 
         // Update gauge: WAL file index.
@@ -2266,15 +2308,20 @@ void Engine::flush_tick() {
         {
             std::unique_lock<std::mutex> lock(mtx_);
 
-            // WAL truncation: only files the last drain is past, and that ALL replicas have
-            // confirmed past, so lagging replicas can still catch up (Requirement 6.3).
+            // WAL truncation: only files the last synced drain is past, and that ALL replicas
+            // have confirmed past, so lagging replicas can still catch up (Requirement 6.3).
             //
             // **The drain, not the log's end** (#159). Phase B ran without mtx_, so writers
             // appended while it did and their rows are queued, not in segments. A rotation in that
             // window left their records in a file before the current one, which this used to
             // delete - and a crash before the next tick then had neither the segment nor the
             // record. Files before the one the drain reached hold only records it drained.
-            uint32_t safe_truncate = drained_up_to_.file_index;
+            //
+            // **And only what a checkpoint on the device vouches for** (#160): a record's WAL file
+            // is deleted once the segment holding its rows is synced *and* the checkpoint saying so
+            // is too. Either missing after a power cut, startup rebuilds those segments from the
+            // WAL - so the records must still be there.
+            uint32_t safe_truncate = retention_floor_.file_index;
             if (repl_mgr_) {
                 for (const auto& r : repl_mgr_->replica_states()) {
                     safe_truncate = std::min(safe_truncate, r.confirmed_file);
@@ -2328,14 +2375,32 @@ void Engine::flush_drain_pending() {
     const std::string* run_symbol   = nullptr;
     const std::string* run_exchange = nullptr;
     ColumnarStore*     store        = nullptr;
-    for (const auto& pr : pending_rows_) {
-        if (store == nullptr || *run_symbol != pr.symbol || *run_exchange != pr.exchange) {
-            store        = &get_or_create_store(pr.symbol, pr.exchange);
-            run_symbol   = &pr.symbol;
-            run_exchange = &pr.exchange;
-            store->set_wal_position(wal_identity_, wal_file, wal_offset);
+    size_t appended = 0;
+    try {
+        for (; appended < pending_rows_.size(); ++appended) {
+            const PendingRow& pr = pending_rows_[appended];
+            if (store == nullptr || *run_symbol != pr.symbol || *run_exchange != pr.exchange) {
+                store        = &get_or_create_store(pr.symbol, pr.exchange);
+                run_symbol   = &pr.symbol;
+                run_exchange = &pr.exchange;
+                store->set_wal_position(wal_identity_, wal_file, wal_offset);
+            }
+            store->append(pr.row);
         }
-        store->append(pr.row);
+    } catch (...) {
+        // An append that rolls a segment over writes it, and since #160 a write the disk refuses
+        // is an exception rather than a short file. The rows before this one are in their stores
+        // now, so they leave the queue: left there, the next drain would append them a second
+        // time, into storage that never removes a row. The one that threw was not appended - the
+        // rollover comes before the row is added - and stays first in line. No drain position is
+        // recorded, so no checkpoint claims any of it (#159).
+        pending_rows_.erase(pending_rows_.begin(),
+                            pending_rows_.begin() + static_cast<std::ptrdiff_t>(appended));
+        registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(pending_rows_.size()));
+        pending_cv_.notify_all();
+        OB_LOG_WARN("engine", "drain stopped after %zu row(s): %zu stay queued for the next flush",
+                    appended, pending_rows_.size());
+        throw;
     }
     pending_rows_.clear();
 
@@ -2352,7 +2417,7 @@ void Engine::flush_drain_pending() {
     pending_cv_.notify_all();
 }
 
-void Engine::flush_write_and_merge() {
+int Engine::flush_write_and_merge() {
     // Phase B: flush segments to disk and merge into combined_store_.
     // Caller holds flush_mtx_. Runs WITHOUT mtx_ (except the brief merge at the end)
     // so that disk I/O does not block writers.
@@ -2372,6 +2437,11 @@ void Engine::flush_write_and_merge() {
     }
 
     std::vector<SegmentMeta> new_segments;
+    // A store whose segment cannot be written keeps its rows in memory for the next flush, and the
+    // others are written and merged anyway (#160). Stopping at the first failure - which is what an
+    // exception out of this loop did - left the segments already written on disk and out of the
+    // index, so their rows vanished from every query until a restart found them.
+    std::exception_ptr write_failure;
     for (ColumnarStore* store : stores) {
         // Segments closed by a rollover inside append() come first: append() has no
         // reference to the query index, so it parks their metas here. Left
@@ -2379,13 +2449,33 @@ void Engine::flush_write_and_merge() {
         for (auto& rolled : store->take_rolled_segments()) {
             new_segments.push_back(std::move(rolled));
         }
-        auto meta = store->flush_segment();
-        if (meta.has_value()) {
-            new_segments.push_back(std::move(meta.value()));
+        try {
+            auto meta = store->flush_segment();
+            if (meta.has_value()) {
+                new_segments.push_back(std::move(meta.value()));
+            }
+        } catch (const std::exception& e) {
+            OB_LOG_WARN("engine", "segment for %s.%s not written, its rows stay in memory for the "
+                                  "next flush: %s",
+                        store->symbol().c_str(), store->exchange().c_str(), e.what());
+            if (!write_failure) write_failure = std::current_exception();
         }
     }
 
-    if (!new_segments.empty()) {
+    if (new_segments.empty()) {
+        if (write_failure) std::rethrow_exception(write_failure);
+        return 0;
+    }
+
+    // The segments reach the device before anything claims them (#160), and without mtx_, so the
+    // writers are not waiting on a sync that is not theirs. One syncfs() rather than an fsync per
+    // file: measured on the m9g.xlarge, a file each - eight per symbol, its directory and the
+    // parent - took a tick of 100 ms to 250 at sixteen symbols, while one syncfs() cost 16-60 ms
+    // however many symbols the tick wrote. Not when a write failed: no checkpoint can claim a
+    // flush that did not write all it drained, so there is nothing for the sync to vouch for.
+    const int sync_err = write_failure ? 0 : sync_segments();
+
+    {
         std::unique_lock<std::mutex> lock(mtx_);
         const size_t refused = combined_store_.merge_segments(new_segments);
         if (refused > 0) {
@@ -2400,25 +2490,158 @@ void Engine::flush_write_and_merge() {
                             static_cast<int64_t>(combined_store_.segment_count()));
 
         // Record how far the WAL is durable in segments, so the next open() does not replay it.
-        // Appended AFTER the segments are on disk, never before: a checkpoint that claims more
-        // than is durable turns a crash into data loss, while one that claims less only costs a
-        // replay that the per-symbol positions in replay_wal_tail() filter.
+        // Appended AFTER the segments are on the device, never before: a checkpoint that claims
+        // more than is durable turns a crash into data loss, while one that claims less only costs
+        // a replay that the per-symbol positions in replay_wal_tail() filter.
         //
         // **How far is the drain's position, not this record's** (#159). The segment I/O above
         // ran without mtx_, so writers appended while it did, and their rows are still queued -
         // this record comes after their records in the log. It said "everything before me" until
         // #159, and a crash before the next flush then lost every row written during the segment
         // I/O: answered `OK`, under every fsync policy.
-        wal_.append_checkpoint(static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count()),
-            drained_up_to_);
+        //
+        // **And only once the sync above succeeded** (#160). Segment files were never synced, so a
+        // power cut after a flush brought back all eight of a segment's files empty under a
+        // checkpoint that claimed them: 1 row of 201 answered, every one acknowledged as synced.
+        //
+        // **And never after a sync that failed**, this flush's or an earlier one, the WAL's or the
+        // segments'. The first design had the next successful syncfs() cover the failed flush's
+        // segments together with its own, and that is not what Linux does: a failed sync reports
+        // its error once and marks the pages it could not write clean, so the next one succeeds
+        // without writing them, and its checkpoint would vouch for files the device may not have.
+        // The segments stay merged and readable; what stops is the claim, and a restart - which
+        // replays from the last checkpoint synced before the failure - rebuilds them.
+        if (sync_err != 0) {
+            freeze_checkpoints(std::string("A flush's segment sync failed (") +
+                               std::strerror(sync_err) + ")");
+        }
+        if (!write_failure && !checkpoints_frozen()) {
+            durable_up_to_ = drained_up_to_;
+            wal_.append_checkpoint(static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count()),
+                durable_up_to_);
+            // `none` makes no promise a sync could keep, so retention need not wait for one.
+            if (fsync_policy_ == FsyncPolicy::NONE) retention_floor_ = durable_up_to_;
+        }
 
         // And what this node holds, so a restart does not have to relearn it. Written next to
         // the checkpoint because that is where the WAL tail is cut: a vector after the last
         // checkpoint is one the next replay would find anyway.
         persist_version_vector_if_changed();
     }
+
+    if (sync_err != 0) {
+        // Counted every time, said loudly once - by the freeze, which is the consequence an
+        // operator has to act on (#95's shape).
+        registry_.increment_counter("ob_segment_sync_errors_total");
+        OB_LOG_DEBUG("engine", "Segment sync failed: %s", std::strerror(sync_err));
+    }
+    // A write that failed is the flush loop's to count and FLUSH's to answer, as it always was;
+    // what changed is that the segments written beside it are in the index first.
+    if (write_failure) std::rethrow_exception(write_failure);
+    return sync_err;
+}
+
+void Engine::note_wal_synced() {
+    // Caller holds mtx_, and the WAL has just been synced to its end.
+    //
+    // **Unless a sync has failed** (#160). A sync that fails after a checkpoint was appended leaves
+    // that checkpoint's pages clean and possibly unwritten, and the next sync succeeds without
+    // touching them - so taking its success as the checkpoint being durable let retention delete a
+    // file whose records a power cut would then need. Measured with the fault injector: the second
+    // sync of a WAL file failed, the third succeeded, and the file before it was gone.
+    if (checkpoints_frozen()) return;
+    retention_floor_ = durable_up_to_;
+}
+
+bool Engine::checkpoints_frozen() {
+    // Caller holds mtx_.
+    //
+    // The WAL writer counts its own failed syncs, whichever path made them - a write under `every`,
+    // a rotation, a tick, a FLUSH - so reading its count rather than hooking each path is what
+    // keeps a fifth path from being missed. Under `none` there is no promise a failed sync could
+    // break, so a failed rotation sync there freezes nothing.
+    if (!checkpoints_frozen_ && fsync_policy_ != FsyncPolicy::NONE && wal_.fsync_failures() > 0) {
+        freeze_checkpoints("A WAL sync failed");
+    }
+    return checkpoints_frozen_;
+}
+
+void Engine::freeze_checkpoints(const std::string& what_failed) {
+    // Caller holds mtx_.
+    if (checkpoints_frozen_) return;
+    checkpoints_frozen_ = true;
+    registry_.set_gauge("ob_checkpoints_frozen", 1);
+    OB_LOG_ERROR("engine",
+                 "%s. Linux reports a failed sync once and marks the pages it could not write clean, "
+                 "so no later sync can vouch for them: from here no checkpoint claims anything and "
+                 "WAL retention stays at file %u until this node is restarted. The restart replays "
+                 "from the last checkpoint synced before the failure and rebuilds every segment "
+                 "written since; the rows are written and readable until then, and the WAL keeps "
+                 "every record they need",
+                 what_failed.c_str(), retention_floor_.file_index);
+}
+
+void Engine::remove_unvouched_segments(const WALReplayer::LastCheckpoint& last) {
+    // Runs from open(), before the replay filter is built from the index.
+    //
+    // A segment is trusted when a checkpoint that survived vouches for it: since #160 a checkpoint
+    // is appended only after the segments it claims were synced. A newer segment belongs to a
+    // flush whose checkpoint never made it - interrupted mid-write, or a sync that failed, or a
+    // power cut before the WAL sync that would have kept the checkpoint - and it may be whole or it
+    // may be what the cut left of it. Its position cannot be believed either way: a segment's
+    // position speaks for the whole drain that produced it, and a flush cut short can leave some of
+    // that drain's segments and not others. So it is removed, and replay rebuilds its rows from the
+    // WAL, which holds every one of them: its records are at or after the checkpoint's claim, and
+    // retention deletes nothing a synced checkpoint does not vouch for.
+    std::optional<WalPosition> vouched_to;
+    if (last.covered) {
+        vouched_to = *last.covered;
+    } else if (last.ordinal == 0 && (!last.any_record || last.first_file_index == 0)) {
+        // No checkpoint at all, and the log starts at its first file: every record is here, so a
+        // segment the log never vouched for can be rebuilt from it - a first flush interrupted.
+        vouched_to = WalPosition{0, 0};
+    } else {
+        // An older build's checkpoint, or a log whose first files retention has taken: the log's
+        // account of itself does not say which segments it covers. Taken as they always were.
+        OB_LOG_INFO("engine", "The last checkpoint says nothing of what it covered: every segment "
+                              "is taken as written");
+        return;
+    }
+
+    std::vector<std::string> dirs;
+    for (const auto& meta : combined_store_.index()) {
+        if (meta.wal_identity == 0 || meta.wal_identity != wal_identity_) continue;  // not this WAL's
+        if (meta.wal_file_index == 0 && meta.wal_byte_offset == 0) continue;         // no position
+        const WalPosition at{meta.wal_file_index, static_cast<uint32_t>(meta.wal_byte_offset)};
+        if (wal_position_before(*vouched_to, at)) dirs.push_back(meta.dir_path);
+    }
+    if (dirs.empty()) {
+        OB_LOG_DEBUG("engine", "Every segment of this WAL is vouched for by the last checkpoint");
+        return;
+    }
+    const size_t removed = combined_store_.remove_segments(dirs);
+    registry_.increment_counter("ob_segments_rebuilt_from_wal_total", removed);
+    OB_LOG_WARN("engine",
+                "%zu segment(s) written after the last checkpoint that survived were removed, and "
+                "replay rebuilds their rows from the WAL (%zu could not be removed): a flush cut short "
+                "by a crash leaves segments no checkpoint vouches for, whole or not",
+                removed, dirs.size() - removed);
+}
+
+int Engine::sync_segments() {
+    // Caller holds flush_mtx_ and not mtx_.
+    if (fsync_policy_ == FsyncPolicy::NONE) return 0;   // that policy promises nothing after a cut
+    if (data_dir_fd_ < 0) return EBADF;                 // open() has not run: nothing to vouch for
+    const auto started = std::chrono::steady_clock::now();
+    if (::syncfs(data_dir_fd_) != 0) {
+        return errno;
+    }
+    OB_LOG_DEBUG("engine", "Segments synced in %.2f ms",
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                           started).count());
+    return 0;
 }
 
 void Engine::apply_delta_replayed(const DeltaUpdate& delta, const Level* levels) {
@@ -2449,7 +2672,10 @@ void Engine::apply_delta_replayed(const DeltaUpdate& delta, const Level* levels)
     }
 }
 
-uint64_t Engine::replay_wal_tail() {
+uint64_t Engine::replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastCheckpoint& last) {
+    // `last` is the first pass, taken in open() before the segments it does not vouch for were
+    // removed (#160); the filter below is built from the segments that remain.
+
     // What each symbol already has on disk, so a record a segment covers is not applied twice.
     // This closes the window between writing segments and appending the checkpoint: a crash in
     // there replays records that are already durable, and duplicated rows are as wrong as lost
@@ -2497,8 +2723,7 @@ uint64_t Engine::replay_wal_tail() {
     uint64_t skipped_by_timestamp = 0;
     uint64_t records = 0;
 
-    WALReplayer replayer(base_dir_);
-    replayer.replay_after_checkpoint([&](const WALReplayContext& ctx) {
+    replayer.replay_after(last, [&](const WALReplayContext& ctx) {
         ++records;
         if (ctx.header.record_type != WAL_RECORD_DELTA) return;
         if (ctx.payload_len < sizeof(DeltaUpdate)) {
@@ -2598,10 +2823,16 @@ void Engine::flush_incremental() {
         if (!wal_.sync()) {
             throw std::runtime_error("Engine: WAL sync failed during FLUSH");
         }
+        note_wal_synced();
         flush_drain_pending();
     }
-    // Phase B: segment I/O + merge, outside mtx_ so writers are not blocked.
-    flush_write_and_merge();
+    // Phase B: segment I/O + merge, outside mtx_ so writers are not blocked. A client asked for
+    // this flush, so a client is told when its segments could not be made durable (#160) - the
+    // same rule as a failed WAL sync above.
+    if (const int err = flush_write_and_merge(); err != 0) {
+        throw std::runtime_error(std::string("Engine: segment sync failed during FLUSH: ") +
+                                 std::strerror(err));
+    }
 }
 
 } // namespace ob

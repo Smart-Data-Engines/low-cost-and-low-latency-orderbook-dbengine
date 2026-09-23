@@ -3305,6 +3305,42 @@ Learned the hard way. Check here before debugging.
      so `OB_FAULT_DELAY_MS` on a write **failed** it instead - a different fault. The tests' own
      premise ("the injector never slowed segment write number 1", log `action=fail`) refused. Pair
      the old server with the new injector.
+405. **A failed sync is not retried by the next one.** Linux reports a failed `fsync` or `syncfs`
+     once and marks the pages it could not write clean, so the next sync succeeds **without writing
+     them**. The first version of #160 let the next successful `syncfs()` cover a failed flush's
+     segments, and a checkpoint after it then vouched for files the device may not have; the WAL
+     had the same hole one record wide, a checkpoint whose sync failed promoted by the sync after.
+     A failed sync of any kind now freezes the checkpoints until a restart rebuilds from the log
+     (`ob_checkpoints_frozen`). This section's own entry on `fsync` already said the pages are
+     marked clean - the design was written beside the sentence that refuted it.
+406. **An injector that fails a call does not reproduce what the kernel does after a real
+     failure.** `OB_FAULT_OP=syncfs` returns `EIO` and marks nothing clean, so the test asserting
+     "the next flush claims both" passed while being false on real hardware: the instrument could
+     not model the one fact that decided the design. Reading the design against the kernel found
+     it, and then a test built on a consequence the injector *can* produce - retention moving after
+     a failed WAL sync - measured it. When a fault test agrees with a design, ask whether the
+     injector could have disagreed.
+407. **`syncfs()` answers for the whole filesystem.** From Linux 5.8 it reports a writeback error
+     anywhere on the superblock since the descriptor's last call - a WAL page, or another process's
+     file on a shared volume - and before 5.8 it reported none at all. Whose pages failed cannot be
+     told, so the only safe reading of a failure is the conservative one.
+408. **A cut's premise is checked on the device, after the remount and before the restart.** The
+     vouching test syncs each `meta.json` itself - a test process can `fsync` a file the node wrote,
+     through a read-only descriptor - and then asserts on the remounted filesystem that a column
+     came back empty. Without that check, a run in which writeback happened to reach every file
+     would pass with the rule doing nothing, and read as the rule working.
+409. **Writing the expected verdict before running a mutation table audits the tests.** #160's
+     table named four mutations nothing would kill before a single row ran: the vouching rule was
+     asserted only by its log line, `wal_identity`'s atomic write was covered in every existing test
+     by the flush's own `syncfs()`, the `none` exemption had no test, and a refused segment's
+     directory could stay. Each got a test first, and the run then matched 23 of 23 - including
+     the control that says why the old power-cut test could not see the identity.
+410. **Two renderings for three states lie about the third.** The replay line had "resuming at
+     file N offset M" and "after the checkpoint record, which says nothing of what it covered", so a
+     log with **no** checkpoint read as an older build's checkpoint. #160 made that state common -
+     a first flush cut short, or a failed sync, leaves none - and it is the one in which startup
+     removes every segment of this WAL. When an enum-shaped value goes into a log, count the states
+     before the strings.
 
 ## Current state and open problems
 
@@ -3330,9 +3366,9 @@ Read the sanitizer claims with #83 in mind: until it landed, `OB_ENABLE_ASAN`, `
 libraries**, because `add_compile_options()` only affects targets declared after it and those blocks
 sat below all of them.
 
-**One P0 is open, #160 — segment files are never synced, so a power cut after a flush loses rows
-a synced checkpoint claims (measured: 1 row of 201) — and the set is held mechanically by the `Open:` line in `docs/roadmap.md`; read it there
-rather than trusting this sentence, which has been wrong about it before.** The items
+**The open set is held mechanically by the `Open:` line in `docs/roadmap.md`; read it there rather
+than trusting any sentence here, which has been wrong about it before** - this one named an open P0
+until the change that closed it. The items
 below are the recent closures worth knowing because each changes what the engine promises; the list
 carries no count, because the previous version of this sentence said "four" above a list of six and
 omitted the newest one entirely - which is the rot pitfall 312 is about, in the paragraph that
@@ -3355,17 +3391,25 @@ that does not flatter is the control.
 accepted. 1,196,745 → 2,209,501 levels/s at four million levels and a one-second interval,
 unchanged at the 100 ms default the engine ships with.
 
+**#160 and #161**: a flush syncs its segment files - one `syncfs()` on the data directory, outside
+`mtx_` - before the checkpoint that claims them, and startup removes every segment no surviving
+checkpoint vouches for and rebuilds it from the WAL. Before it, a power cut after a flush lost the
+rows a synced checkpoint claimed: measured with dm-flakey, **0 of 201**, now 201. Retention follows
+only a checkpoint a WAL sync has covered, and **a failed sync of any kind freezes the checkpoints
+until a restart** (`ob_checkpoints_frozen`), because the next sync after a failed one proves
+nothing (pitfall 405). #161: a segment write the disk refuses is an error - it stored every price
+as zero and answered `OK`.
+
 **#159**: a flush's checkpoint claims the position its drain reached, not everything before
 itself. The segments are written without `mtx_`, so records appended meanwhile precede the
 checkpoint while their rows are still queued; replay skipped them, and a crash before the next flush
 lost them under every fsync policy (measured: 3 of 3 acknowledged rows). The checkpoint's 8-byte
 payload is that position, replay forwards everything after the last checkpoint plus what lies
-between the position and it, and the position can only add records. WAL retention reads the same
-value (`Engine::drained_up_to_`): it deletes the files before the drain's file, not before the
-current one, which a rotation during the segment write had made the file holding those records
-(measured: 600 of 600 gone). **#160 is open**: segment files are never synced, so after a power cut a
-checkpoint can claim rows the disk never received - measured with a power cut dm-flakey performs
-(`scripts/power_cut.sh`): 1 row of 201 came back, against 201 of 201 without the cut.
+between the position and it, and the position can only add records. WAL retention read the same
+value (`Engine::drained_up_to_`) - the files before the drain's file, not before the current one,
+which a rotation during the segment write had made the file holding those records (measured: 600
+of 600 gone) - until #160 moved it one step further back, to the newest checkpoint known to be on
+the device.
 
 **#158**: `boost` is the command line's default - one client event loop per usable CPU, and a
 10 µs spin window where the process may run on two CPUs or more and a cgroup limit leaves a CPU of
@@ -3745,7 +3789,16 @@ Things a newcomer should know, because they are real limits rather than bugs to 
   missing — deliberately, since everything they assert would otherwise pass without any fault being
   injected (pitfall 57). `OB_FAULT_DELAY_MS` makes the chosen write or sync **slow instead of
   failed** (#159): it holds a flush's segment write open for seconds, which is what made the window
-  between a drain and its checkpoint testable.
+  between a drain and its checkpoint testable. `OB_FAULT_OP=syncfs` is the flush's segment sync
+  (#160), matched by the data directory its descriptor names. It fails the call in userspace and
+  leaves every page as it was, where a real failure marks them clean - the one thing the injector
+  cannot reproduce (pitfall 406).
+- **A power cut is testable, and the instrument is `tests/integration/test_power_cut.py`** (#160):
+  dm-flakey over a loop device, switched to drop every write, the way xfstests simulate one. It needs
+  root and the module, so it runs with `OB_POWER_CUT_TESTS=1`, which both CI integration jobs set -
+  and with it set a missing prerequisite **fails**, because a power-cut test that skips looks
+  exactly like code that survives the cut. It is the only test here that is not a killed process:
+  the page cache survives a kill.
 - **A wire write can carry its event time** (#105). `INSERT` and `MINSERT` accept an optional
   trailing `event_time_ns`; absence asks for arrival time, while zero is refused. Both clients check
   the `insert_event_time` capability before sending a supplied time and refuse an older server

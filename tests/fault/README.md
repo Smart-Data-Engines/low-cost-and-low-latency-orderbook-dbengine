@@ -53,14 +53,14 @@ what says the injection happened. Read it before you believe anything about the 
 | Variable | Meaning |
 |---|---|
 | `OB_FAULT_PATH` | substring the file's path must contain. **Required**; empty disarms everything |
-| `OB_FAULT_OP` | `write`, `fsync`, `fdatasync` or `ftruncate` |
+| `OB_FAULT_OP` | `write`, `fsync`, `fdatasync`, `ftruncate` or `syncfs` — the last is the flush's segment sync (#160), matched by the directory its descriptor names |
 | `OB_FAULT_ERRNO` | which errno to report. The shim knows exactly three — `ENOSPC`, `EIO` and `EDQUOT` — and reads anything else, including a typo, as `EIO` |
 | `OB_FAULT_SIZE` | only calls whose byte count equals this. `-1` (default) means any |
 | `OB_FAULT_SKIP` | let this many matching calls succeed first |
 | `OB_FAULT_COUNT` | fail this many, then let the rest through. Default: all of them |
 | `OB_FAULT_SHORT` | `write`: return this many bytes **and write them**, instead of failing |
 | `OB_FAULT_SHORT_THEN_FAIL` | `1`: after the short write, fail the caller's retry |
-| `OB_FAULT_DELAY_MS` | make the chosen call **slow instead of failed**: sleep this long, then do it for real. `write`, `fsync` and `fdatasync` |
+| `OB_FAULT_DELAY_MS` | make the chosen call **slow instead of failed**: sleep this long, then do it for real. `write`, `fsync`, `fdatasync` and `syncfs` |
 | `OB_FAULT_LOG` | where the decisions go. Without it, nothing is recorded |
 
 **`OB_FAULT_SIZE` matters more than it looks.** This engine's WAL takes a 136-byte delta record from

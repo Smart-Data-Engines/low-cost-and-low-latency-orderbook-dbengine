@@ -461,17 +461,26 @@ a process ending, not about the platter. Under `every` the reply waits for the `
 share one `fsync` (#155), so a client that pipelines pays one sync per read rather than one per
 write — measured at 50× the throughput of one sync per write on an EBS volume — and a failed sync
 refuses every write it covered.
-The startup log states what happened, and it is worth reading after an unclean stop:
+The startup log states what happened, and it is worth reading after an unclean stop. After one that
+cut a flush short, three lines:
 
 ```
-{"component":"wal","msg":"Replay after checkpoint: records=15 last_checkpoint_ordinal=11 forwarded=4"}
-{"component":"engine","msg":"WAL replay: records=4 applied=4 skipped_already_flushed=0"}
+{"component":"engine","msg":"1 segment(s) written after the last checkpoint that survived were removed, and replay rebuilds their rows from the WAL (0 could not be removed): a flush cut short by a crash leaves segments no checkpoint vouches for, whole or not"}
+{"component":"wal","msg":"Replay after checkpoint: records=15 last_checkpoint_ordinal=11 resuming at file 0 offset 1496, forwarded=4 (of which 1 written before the checkpoint while its flush wrote segments)"}
+{"component":"engine","msg":"WAL replay: records=4 applied=4 skipped_by_position=0 skipped_by_timestamp=0"}
 ```
 
-`skipped_already_flushed` counts records whose rows a segment already holds. It is normally 0, and
-non-zero after a crash that landed between writing the segment files and recording that fact.
+The first is #160: a segment no surviving checkpoint vouches for is removed before the replay and
+rebuilt by it, because nothing about the segment says whether the crash left it whole.
+`skipped_by_position` counts forwarded records whose rows a segment startup kept already holds, and
+since that removal it is normally 0 - what could still hold one is a segment an older build wrote.
+`skipped_by_timestamp` is the same for segments written before positions were recorded (#63), and
+it is the one worth a second look: out-of-order timestamps can make it skip a record that was never
+stored.
 
-`FLUSH` and a clean shutdown both end in a checkpoint, so a restart after either replays nothing.
+`FLUSH` and a clean shutdown both end in a checkpoint, so a restart after either replays nothing -
+unless a failed sync froze the checkpoints, and then the restart is what rebuilds
+(`docs/operations.md`, "What a power cut keeps").
 
 On a **replica** the same restart also keeps what replication delivered. It saves how far it got in
 the primary's log and, on reconnecting, asks the primary which stream it serves before asking to
@@ -490,10 +499,12 @@ two happened is a line in the replica's log, and the three forms it takes are in
 Durability of the WAL write itself is `--fsync-policy`, which takes `every`, `interval` or `none`
 — lower case, compared exactly, and an unrecognised value is refused rather than read as the
 default. With anything other than `every`, an acknowledged write can be lost on a power cut: the
-replay described above cannot recover a record that never reached the platter. **With `every` as
-well, once a flush has claimed the write**: segment files are never synced, so a power cut can take
-a segment that a synced checkpoint says holds the row, and replay then skips its record (#160,
-open — measured with a simulated power cut: 1 row of 201 came back).
+replay described above cannot recover a record that never reached the platter. Under `every` it is
+not, and since #160 that holds after a flush has claimed the write too: a flush syncs its segment
+files before the checkpoint that claims them, and startup rebuilds any segment no surviving
+checkpoint vouches for. Before #160 the segment files were never synced, a power cut could take a
+segment a synced checkpoint said held the row, and replay then skipped its record - measured with a
+cut the kernel performs, 0 rows of 201 came back.
 
 How large the WAL grows before it starts a new file is `--wal-rotate-bytes`, and it is a **trigger
 rather than a file size**: rotation is checked after a write, so a file may exceed the threshold by

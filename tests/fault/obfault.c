@@ -1,8 +1,8 @@
 // Storage fault injection for the integration battery — roadmap #54.
 //
-// An LD_PRELOAD shim that makes a chosen write, fsync, fdatasync or ftruncate fail, on a chosen
-// file, after a chosen number of successful calls. It exists because the failure modes that lose
-// data in production are the ones a healthy machine never produces: ENOSPC mid-record, EIO from
+// An LD_PRELOAD shim that makes a chosen write, fsync, fdatasync, ftruncate or syncfs fail, on a
+// chosen file, after a chosen number of successful calls. It exists because the failure modes that
+// lose data in production are the ones a healthy machine never produces: ENOSPC mid-record, EIO from
 // fsync, a short write that leaves a torn record behind.
 //
 // `OB_FAULT_DELAY_MS=<n>` turns a chosen call into a slow one instead of a failed one: it sleeps n
@@ -58,6 +58,7 @@ enum fault_op {
     OP_FSYNC,
     OP_FDATASYNC,
     OP_FTRUNCATE,
+    OP_SYNCFS,
 };
 
 static struct {
@@ -92,6 +93,7 @@ static enum fault_op parse_op(const char *s) {
     if (strcmp(s, "fsync") == 0)      return OP_FSYNC;
     if (strcmp(s, "fdatasync") == 0)  return OP_FDATASYNC;
     if (strcmp(s, "ftruncate") == 0)  return OP_FTRUNCATE;
+    if (strcmp(s, "syncfs") == 0)     return OP_SYNCFS;
     return OP_NONE;
 }
 
@@ -265,6 +267,20 @@ int fdatasync(int fd) {
         return -1;
     }
     return (int)syscall(SYS_fdatasync, fd);
+}
+
+/// `syncfs` on a descriptor: the flush's segment sync (#160). The path matched is the directory the
+/// descriptor names - the data directory - so `OB_FAULT_PATH` can be the data directory's own name.
+int syncfs(int fd) {
+    if (should_fail(OP_SYNCFS, "syncfs", fd, 0)) {
+        if (cfg.delay_ms >= 0) {
+            stall();
+            return (int)syscall(SYS_syncfs, fd);
+        }
+        errno = cfg.err;
+        return -1;
+    }
+    return (int)syscall(SYS_syncfs, fd);
 }
 
 int ftruncate(int fd, off_t length) {

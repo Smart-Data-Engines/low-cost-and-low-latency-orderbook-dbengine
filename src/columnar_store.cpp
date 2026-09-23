@@ -84,13 +84,49 @@ std::string ColumnarStore::create_unique_segment_dir(const std::string& symbol,
                              "_" + std::to_string(end_ts) + " for " + symbol + "." + exchange);
 }
 
+
+namespace {
+
+/// Write `bytes` to a new file at `path`, and throw if any of it does not reach the file (#160).
+///
+/// The column files and meta.json went through `std::ofstream` and nothing read its state, so a
+/// full disk produced a short file, the segment was merged as if whole, and a checkpoint claimed
+/// its rows. Now a refused write, a short one, or a close that reports a deferred error (NFS does)
+/// is an exception, which the flush turns into a failed flush: the rows stay in memory, no
+/// checkpoint claims them, and the next flush writes a new segment. A raw write rather than a
+/// stream also makes one system call of a column that a stream would cut into buffer-sized pieces.
+void write_file_checked(const std::string& path, const void* data, size_t bytes) {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        throw std::runtime_error("ColumnarStore: cannot create " + path + ": " +
+                                 std::strerror(errno));
+    }
+    const char* p = static_cast<const char*>(data);
+    size_t left = bytes;
+    while (left > 0) {
+        const ssize_t n = ::write(fd, p, left);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            const int err = errno;
+            ::close(fd);
+            throw std::runtime_error("ColumnarStore: cannot write " + path + ": " +
+                                     std::strerror(err));
+        }
+        p += n;
+        left -= static_cast<size_t>(n);
+    }
+    if (::close(fd) != 0) {
+        throw std::runtime_error("ColumnarStore: cannot close " + path + ": " +
+                                 std::strerror(errno));
+    }
+}
+
+}  // namespace
+
 void ColumnarStore::write_meta_json(const std::string& dir,
                                      const SegmentMeta& meta) const {
     std::string path = dir + "/meta.json";
-    std::ofstream f(path, std::ios::out | std::ios::trunc);
-    if (!f.is_open()) {
-        throw std::runtime_error("ColumnarStore: cannot write meta.json: " + path);
-    }
+    std::ostringstream f;
     f << "{\"format_version\":" << meta.format_version
       << ",\"start_ts_ns\":" << meta.start_ts_ns
       << ",\"end_ts_ns\":"   << meta.end_ts_ns
@@ -104,7 +140,8 @@ void ColumnarStore::write_meta_json(const std::string& dir,
       << ",\"symbol\":\""    << meta.symbol   << "\""
       << ",\"exchange\":\""  << meta.exchange << "\""
       << "}";
-    f.flush();
+    const std::string content = f.str();
+    write_file_checked(path, content.data(), content.size());
 }
 
 bool ColumnarStore::parse_meta_json(const std::string& path,
@@ -283,6 +320,21 @@ std::optional<SegmentMeta> ColumnarStore::flush_segment() {
     std::string dir = create_unique_segment_dir(symbol_, exchange_,
                                                 active_segment_start_, end_ts);
 
+    // A write that fails part-way leaves no directory behind (#160): the exception goes to the
+    // flush, the rows stay in memory, and the next flush writes a new segment - so a half-written
+    // one would only be litter, and litter a later scan could mistake for data.
+    struct PartialSegment {
+        const std::string& dir;
+        bool complete{false};
+        ~PartialSegment() {
+            if (complete) return;
+            std::error_code ec;
+            fs::remove_all(dir, ec);
+            OB_LOG_DEBUG("columnar", "removed the partly written segment %s%s", dir.c_str(),
+                         ec ? " (and could not remove all of it)" : "");
+        }
+    } partial{dir, false};
+
     // Encode price column: delta + zigzag
     auto encoded_prices = encode_prices(price_buf_);
 
@@ -291,62 +343,32 @@ std::optional<SegmentMeta> ColumnarStore::flush_segment() {
 
     // Write price.col
     {
-        std::string path = dir + "/price.col";
-        std::ofstream f(path, std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!f.is_open())
-            throw std::runtime_error("ColumnarStore: cannot write price.col");
-        f.write(reinterpret_cast<const char*>(encoded_prices.data()),
-                static_cast<std::streamsize>(encoded_prices.size() * sizeof(uint64_t)));
+        write_file_checked(dir + "/price.col", encoded_prices.data(), encoded_prices.size() * sizeof(uint64_t));
     }
 
     // Write qty.col
     {
-        std::string path = dir + "/qty.col";
-        std::ofstream f(path, std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!f.is_open())
-            throw std::runtime_error("ColumnarStore: cannot write qty.col");
-        f.write(reinterpret_cast<const char*>(qty_result.words.data()),
-                static_cast<std::streamsize>(qty_result.words.size() * sizeof(uint64_t)));
+        write_file_checked(dir + "/qty.col", qty_result.words.data(), qty_result.words.size() * sizeof(uint64_t));
     }
 
     // Write ts.col (raw uint64)
     {
-        std::string path = dir + "/ts.col";
-        std::ofstream f(path, std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!f.is_open())
-            throw std::runtime_error("ColumnarStore: cannot write ts.col");
-        f.write(reinterpret_cast<const char*>(ts_buf_.data()),
-                static_cast<std::streamsize>(ts_buf_.size() * sizeof(uint64_t)));
+        write_file_checked(dir + "/ts.col", ts_buf_.data(), ts_buf_.size() * sizeof(uint64_t));
     }
 
     // Write cnt.col (raw uint32)
     {
-        std::string path = dir + "/cnt.col";
-        std::ofstream f(path, std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!f.is_open())
-            throw std::runtime_error("ColumnarStore: cannot write cnt.col");
-        f.write(reinterpret_cast<const char*>(cnt_buf_.data()),
-                static_cast<std::streamsize>(cnt_buf_.size() * sizeof(uint32_t)));
+        write_file_checked(dir + "/cnt.col", cnt_buf_.data(), cnt_buf_.size() * sizeof(uint32_t));
     }
 
     // Write side.col (raw uint8, one byte per row)
     {
-        std::string path = dir + "/side.col";
-        std::ofstream f(path, std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!f.is_open())
-            throw std::runtime_error("ColumnarStore: cannot write side.col");
-        f.write(reinterpret_cast<const char*>(side_buf_.data()),
-                static_cast<std::streamsize>(side_buf_.size() * sizeof(uint8_t)));
+        write_file_checked(dir + "/side.col", side_buf_.data(), side_buf_.size() * sizeof(uint8_t));
     }
 
     // Write level.col (raw uint16)
     {
-        std::string path = dir + "/level.col";
-        std::ofstream f(path, std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!f.is_open())
-            throw std::runtime_error("ColumnarStore: cannot write level.col");
-        f.write(reinterpret_cast<const char*>(level_buf_.data()),
-                static_cast<std::streamsize>(level_buf_.size() * sizeof(uint16_t)));
+        write_file_checked(dir + "/level.col", level_buf_.data(), level_buf_.size() * sizeof(uint16_t));
     }
 
     // Write seq.col (zigzag-delta, then Simple8b bit-packing).
@@ -361,12 +383,8 @@ std::optional<SegmentMeta> ColumnarStore::flush_segment() {
     {
         auto zigzag_seq = encode_prices(seq_buf_);
         auto packed_seq = encode_simple8b(zigzag_seq);
-        std::string path = dir + "/seq.col";
-        std::ofstream f(path, std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!f.is_open())
-            throw std::runtime_error("ColumnarStore: cannot write seq.col");
-        f.write(reinterpret_cast<const char*>(packed_seq.words.data()),
-                static_cast<std::streamsize>(packed_seq.words.size() * sizeof(uint64_t)));
+        write_file_checked(dir + "/seq.col", packed_seq.words.data(),
+                           packed_seq.words.size() * sizeof(uint64_t));
     }
 
     OB_LOG_DEBUG("columnar",
@@ -396,8 +414,9 @@ std::optional<SegmentMeta> ColumnarStore::flush_segment() {
     meta.wal_file_index  = wal_file_index_;
     meta.wal_byte_offset = wal_byte_offset_;
 
-    // Write meta.json
+    // Write meta.json - last, so that a segment with one is a segment with all of its columns.
     write_meta_json(dir, meta);
+    partial.complete = true;
 
     // Add to index (backward compatibility)
     {
@@ -762,6 +781,34 @@ std::pair<size_t, size_t> ColumnarStore::delete_expired_segments(uint64_t cutoff
 
     index_ = std::move(remaining);
     return {segments_deleted, bytes_reclaimed};
+}
+
+// ── remove_segments ───────────────────────────────────────────────────────────
+
+size_t ColumnarStore::remove_segments(const std::vector<std::string>& dirs) {
+    if (dirs.empty()) return 0;
+    std::unique_lock<std::shared_mutex> lock(index_mtx_);
+    size_t removed = 0;
+    std::vector<SegmentMeta> remaining;
+    remaining.reserve(index_.size());
+    for (auto& meta : index_) {
+        if (std::find(dirs.begin(), dirs.end(), meta.dir_path) == dirs.end()) {
+            remaining.push_back(std::move(meta));
+            continue;
+        }
+        std::error_code ec;
+        fs::remove_all(meta.dir_path, ec);
+        if (ec) {
+            OB_LOG_ERROR("columnar", "cannot remove segment %s: %s - it stays in the index",
+                         meta.dir_path.c_str(), ec.message().c_str());
+            remaining.push_back(std::move(meta));
+            continue;
+        }
+        OB_LOG_DEBUG("columnar", "removed segment %s", meta.dir_path.c_str());
+        ++removed;
+    }
+    index_ = std::move(remaining);
+    return removed;
 }
 
 // ── close ─────────────────────────────────────────────────────────────────────

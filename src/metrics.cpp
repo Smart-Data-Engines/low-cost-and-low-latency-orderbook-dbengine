@@ -95,6 +95,19 @@ MetricsRegistry::MetricsRegistry() {
     // two ask for different actions: a full disk is freed, a disk reporting EIO is replaced.
     counters_.push_back(make_counter("ob_wal_fsync_errors_total",
                                      "fsync calls on the WAL that failed"));
+    // Flushes whose segment sync failed (#160). Registered in the same change that writes it. Its
+    // consequence is not a lost row but no checkpoint from here on: the first failure freezes them
+    // for the rest of the process (`ob_checkpoints_frozen`), because no later sync can vouch for
+    // pages a failed one left clean. A number here is a disk that accepts writes and refuses to
+    // make them durable, which is the one state in which the WAL grows without anything failing.
+    counters_.push_back(make_counter("ob_segment_sync_errors_total",
+                                     "Flushes whose segment syncfs() failed, so no checkpoint claimed them"));
+    // Segments removed at startup because no surviving checkpoint vouched for them, their rows
+    // rebuilt from the WAL (#160). Registered in the same change that writes it. Nonzero after a
+    // crash that cut a flush short, which is expected, and after any restart of a node whose
+    // checkpoints were frozen - that restart is what the freeze waits for.
+    counters_.push_back(make_counter("ob_segments_rebuilt_from_wal_total",
+                                     "Segments removed at startup and rebuilt from the WAL"));
     // A writer that ran out of room in the pending queue, and one whose wait for room ran out
     // (#137). The pair matters: waits without refusals is backpressure working, and refusals
     // mean the flush itself is not making progress.
@@ -152,6 +165,12 @@ MetricsRegistry::MetricsRegistry() {
                                      "guarded by LoopGuard"));
 
     // Gauges
+    // 1 once a sync of any kind has failed in this process (#160): no checkpoint is appended from
+    // then on, WAL retention stays where it was, and a restart is what rebuilds the segments and
+    // ends it. Registered in the same change that writes it. The one gauge here whose value is an
+    // instruction: it means "fix the disk, then restart this node", and the WAL grows until then.
+    gauges_.push_back(make_gauge("ob_checkpoints_frozen",
+                                 "1 once a failed sync froze the checkpoints until a restart"));
     gauges_.push_back(make_gauge("ob_active_sessions", "Number of active TCP sessions"));
     gauges_.push_back(make_gauge("ob_session_pending_bytes",
                                  "Response bytes queued across sessions (a slow client shows up here)"));
