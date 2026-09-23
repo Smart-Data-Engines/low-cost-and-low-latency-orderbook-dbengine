@@ -17,7 +17,9 @@ after the run is not a prediction, and every one of these was too conservative.
 
 ## The finding that matters most: the engine does not size itself to the machine at all
 
-`grep -rn 'hardware_concurrency\|sysconf(_SC_NPROCESSORS' src include` → **zero hits.** Every
+`grep -rn 'hardware_concurrency\|sysconf(_SC_NPROCESSORS' src include` → **zero hits** when this
+page was written. (Since #156 `src/machine.cpp` reads how many CPUs the process can use, and
+nothing is sized to it until stage 4 of #151, so what follows is still the finding.) Every
 thread in this engine has a fixed role — flush loop, lease loop, monitor loop, io loop, replication,
 mesh, snapshot worker — and not one of them is a pool sized to cores. Roadmap #112 counted the
 entry points while giving each an exception boundary: **seventeen**, derived from the

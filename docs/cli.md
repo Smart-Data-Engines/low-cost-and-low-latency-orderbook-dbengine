@@ -691,6 +691,7 @@ file's arguments simply come first and the parser assigns.
 $ ob_tcp_server --config /etc/orderbook/ob.conf --port 9191 --print-config
 # Resolved configuration. Provenance in brackets: a list of values does not say which
 # of them you chose, and that is the question this flag exists to answer.
+# machine: 4 usable CPUs: affinity 4, no cgroup v2 CPU limit
   data-dir                         /var/lib/orderbook  (file)
   log-level                        INFO  (file)
   max-sessions                     256  (file)
@@ -701,6 +702,22 @@ $ ob_tcp_server --config /etc/orderbook/ob.conf --port 9191 --print-config
 
 `--print-config` prints and exits **without opening a port**, so it still works when the port is
 taken — which is one of the situations you reach for it in.
+
+The `# machine:` line is how many CPUs the node found it may use (#156), and the same sentence is
+logged at startup as `machine: …`. It is the smaller of two numbers, because either can be the one
+that binds: the **affinity mask** (`taskset`, a cpuset, systemd's `CPUAffinity=`) and the tightest
+**cgroup CPU limit** on the way from the process's cgroup to the root (a container's `--cpus`, a
+slice's `CPUQuota=`), rounded down — a limit of 1.5 CPUs is one CPU the engine can keep busy. The
+line says which it was and where the limit was read:
+
+```
+machine: 1 usable CPU: affinity 4, cgroup v2 limit 1.50 CPUs (/sys/fs/cgroup/…/cpu.max)
+```
+
+A cgroup file the node could not read is said rather than read as "no limit" — `… no cgroup v2 CPU
+limit - 1 of 3 levels could not be read, so a limit there is not known` — because a limit there
+would bind. A level with no `cpu.max` at all is not one of those: it is a cgroup the CPU controller
+is not enabled for, and it limits nothing.
 
 Every value it prints is one the server reads, except `profile`, which is the name of the set of
 values it decided. `--workers` used to be the other exception — parsed, printed here with a note

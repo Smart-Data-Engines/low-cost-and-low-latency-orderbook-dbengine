@@ -2212,6 +2212,87 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 156. The engine could not tell how many CPUs it had, so nothing in it could be sized to the machine ✅
+
+**Stage 3 of #151, and what stage 4 needs before it can exist.** Nothing in the engine asked how big
+the machine is — every thread count is a constant or a flag, and before this change
+`grep -rn 'hardware_concurrency\|_SC_NPROCESSORS\|sched_getaffinity' src include` found nothing —
+so a default sized to the machine had nothing to be sized from. (Three pages said so in the present
+tense: `benchmarks/before-a-bigger-machine.md`, `benchmarks/on-a-bigger-machine.md` and
+`scripts/measure_cpu_cost.py`. Each now says when it was true and what changed.) And the
+obvious answer is the wrong one in the two places an engine is most often run:
+`std::thread::hardware_concurrency()` says how many CPUs the kernel has, which is neither how many a
+process under `taskset` or a cpuset may be scheduled on, nor how much CPU **time** a container's
+cgroup lets it use wherever it is scheduled. Four spinning loops sized from the first number in a
+four-core container capped at one CPU would each get a quarter of one.
+
+**`detect_machine()`** is a pure function of what the process can see — the affinity mask, the text
+of `/proc/self/cgroup` and a reader for the cgroup files — so every case below is a unit test rather
+than a machine to go and find, and the answer is `max(1, min(mask, floor(limit)))`:
+
+- **Every ancestor's limit, up to the mount's root.** A parent's `cpu.max` binds its children, so
+  the leaf alone says "no limit" under a slice capped at one CPU.
+- **The mount's root as well as the named path**, which is where the limit is inside a container:
+  without a cgroup namespace `/proc/self/cgroup` names the host's path, and that path does not exist
+  in the container's view.
+- **Rounded down.** A CPU and a half is one CPU the engine can keep busy; two loops on it would get
+  three quarters each.
+- **cgroup v1** as quota over period, `-1` as no limit, and on a hybrid host the controller is read
+  in the hierarchy that holds it — the unified one has no `cpu.max` and would have said "no limit".
+- **A file that cannot be read is no information**, not "no limit", and the reason says how many
+  levels that was.
+
+**The last rule is the one the first version got wrong, and writing this entry found it.** The
+header promised it; the reason said it only when **no** level could be read, so a leaf saying `max`
+beside a parent whose `cpu.max` could not be read came out as "no cgroup v2 CPU limit" — more than
+was found, since a limit at the parent would bind. Two different things had one answer. A `cpu.max`
+that does **not exist** is a level where the CPU controller is not enabled — the hierarchy's root
+never has one, so on every real host at least one level was "unreadable" in the old sense — and it
+limits nothing. A file that exists and cannot be read could hold a limit. The reader now tells them
+apart by `open()`'s errno (`ENOENT` and `ENOTDIR` are "not there"), the reason counts the second kind
+whether or not a limit was found at the others, and under cgroup v1, whose files exist in every
+cgroup of the `cpu` hierarchy, none of them in view says where the hierarchy is not mounted rather
+than that it limits nothing.
+
+**Said where it is read**, in one line at startup and in `--print-config`:
+
+```
+machine: 1 usable CPU: affinity 4, cgroup v2 limit 1.50 CPUs (/sys/fs/cgroup/…/run-….scope/cpu.max)
+```
+
+**Checked on two real systems, not only on literals** — the development machine (Ubuntu 24.04,
+systemd 255) and the m9g.xlarge (Amazon Linux 2023, systemd 252), both cgroup v2, each started under
+the wrapper that produces the case:
+
+| started under | development machine | m9g.xlarge |
+|---|---|---|
+| nothing | 4 usable CPUs: affinity 4, no cgroup v2 CPU limit | the same |
+| `taskset -c 0,1` / `-c 0-2` | 2 usable CPUs: affinity 2, no cgroup v2 CPU limit | 3 usable CPUs: affinity 3, … |
+| `systemd-run --user --scope -p CPUQuota=150%` | 1 usable CPU: affinity 4, cgroup v2 limit 1.50 CPUs | the same |
+| `… -p CPUQuota=250%` | 2 usable CPUs: affinity 4, cgroup v2 limit 2.50 CPUs | the same |
+| `taskset -c 0-1` around `CPUQuota=350%` | — | 2 usable CPUs: affinity 2, cgroup v2 limit 3.50 CPUs |
+
+Nothing is sized to it yet. That is stage 4, whose rule for the default profile is to come out of a
+measurement, not out of this paragraph.
+
+**Mutation table: twenty-one rows, twenty killed and the control surviving**, against the committed
+code, sources restored from saved bytes after each row and both suites green after the last. Killed:
+only the process's own cgroup read, not its ancestors; the mount's root not read; a fractional limit
+rounded up; the first limit found winning instead of the tightest; the controller matched by
+substring (`cpuacct` is not `cpu`); the unified hierarchy preferred on a hybrid host; an absent
+`cpu.max` read as unreadable; an unreadable one taken as absent; the unreadable levels left unsaid
+beside the ones that were read; no readable level reported as no limit; a v1 hierarchy out of view
+reported as no limit; the reader reporting a missing file as unreadable, `ENOTDIR` as unreadable,
+and a failed `read()` as the file's text; a zero or negative quota read as a limit; v1's `-1` read
+as a limit; the larger of the mask and the limit taken; the online count used when the mask is
+known; the reader counting online CPUs instead of the mask; `--print-config` without the machine.
+The control — the startup line reworded — survives, because no test pins a log line's words. The
+first version of the substring row did not build (it left the helper unused) and was rewritten to
+make the mistake inside the helper, where it would be made.
+
+- Effort: S | Impact: the default profile can be sized to the machine the process actually has, and
+  an operator can read what the node found and where it found it
+
 ### 155. A read's writes took the engine's lock once each, so writes from several reactors queued on it ✅
 
 **Stage 2b of #151, and the answer to the half of it that did not scale.** #151 measured a convoy:

@@ -102,7 +102,7 @@ than listing them:
 |---|---|
 | `LimitMEMLOCK` | The engine locks no memory. No `mlock`, no `MAP_LOCKED`, no `MAP_HUGETLB` anywhere in the sources — checked, not assumed. Raising the limit would raise it for nothing, and in a unit file it reads as knowledge about the engine's requirements. |
 | Huge pages | `MADV_HUGEPAGE` does not appear in the engine. What transparent huge pages do to the mmap'd segment reads is a property of your kernel's defaults, not of a setting we expose, and **we have not measured it** — so there is no number here to justify changing it. |
-| `MemoryMax`, `CPUQuota` | An engine tuned for particular hardware and then capped below it is a contradiction. If the host is shared, the cap belongs to whatever else is on it. |
+| `MemoryMax`, `CPUQuota` | An engine tuned for particular hardware and then capped below it is a contradiction. If the host is shared, the cap belongs to whatever else is on it. If a CPU cap is there anyway — a container runtime's, a parent slice's — the node reads it, and its startup line says so: `machine: 1 usable CPU: affinity 4, cgroup v2 limit 1.50 CPUs (…)` (#156). |
 
 What does matter:
 
@@ -121,7 +121,9 @@ grep -E "$(ls /sys/class/net | grep -v lo | head -1)" /proc/interrupts
 
 Then pin the service away from those cores by uncommenting `CPUAffinity` in the unit. There is no
 default, deliberately: pinning to particular cores on an unknown machine is a mistake rather than a
-tuning.
+tuning. The node counts the mask it was given: its startup line `machine: N usable CPUs: affinity
+N, …` is the number of CPUs `CPUAffinity`, `taskset` or a cpuset left it, and `--print-config` prints
+the same sentence.
 
 For a dedicated host, going further — `isolcpus` on the kernel command line, then placing the
 service on the isolated cores — removes the scheduler from the picture. That is a decision about

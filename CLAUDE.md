@@ -3250,6 +3250,18 @@ Learned the hard way. Check here before debugging.
      number said twice. #155's first draft did exactly that; the claim now rests on two measurements
      that do not use it - eight connections giving what four gave, and the profile's time inside
      the lock (79% of the wall clock) - and that is the only form of it worth writing down.
+395. **`nullopt` from a reader is two answers.** Stage 3's cgroup reader returned "no such file" and
+     "a file that cannot be read" as the same `nullopt`, so the reason could not tell a level that
+     limits nothing (no `cpu.max`: the CPU controller is not enabled there, and the root never has
+     one) from a level that could hold a limit it did not read - and it said "no limit" beside a
+     parent it had not read (#156). #82 met the shape one class over, a `nullopt` that meant four
+     things. A reader returns what it knows in as many states as there are, and `open()`'s errno
+     is where the difference was.
+396. **A `grep` that found nothing is a claim about one commit.** Three pages quoted
+     `grep … hardware_concurrency … src include` returning nothing; stage 3 made it return a line in
+     `src/machine.cpp`, and none of the three would have noticed, because nobody re-runs a search
+     whose answer they have already published (#156). Say when it was true, and when you add the
+     thing a published search looked for, search the tree for the search.
 
 ## Current state and open problems
 
@@ -3298,6 +3310,12 @@ that does not flatter is the control.
 `--flush-interval-ms`, and its wait has a deadline after which the write is refused rather than
 accepted. 1,196,745 → 2,209,501 levels/s at four million levels and a one-second interval,
 unchanged at the 100 ms default the engine ships with.
+
+**#156**: the node works out how many CPUs it can use — the affinity mask and the tightest cgroup
+CPU limit on the way from its cgroup to the root, rounded down — and says so at startup and in
+`--print-config` (`machine: 1 usable CPU: affinity 4, cgroup v2 limit 1.50 CPUs (…)`). A cgroup file
+it could not read is said rather than taken as "no limit"; a level with no `cpu.max` limits
+nothing. Nothing is sized to it yet: that is stage 4 of #151, the default profile.
 
 **#155**: the writes of one read are applied under one acquisition of `mtx_`, and their WAL records
 reach the file with one `write()` per run - one `fsync` per run under `every`. One connection:
