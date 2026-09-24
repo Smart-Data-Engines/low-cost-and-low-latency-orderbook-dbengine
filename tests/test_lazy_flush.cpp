@@ -327,68 +327,92 @@ TEST(LazyFlush, ABlocksRangeHoldsRowsThatArrivedOutOfTimeOrder) {
     engine.close();
 }
 
-TEST(LazyFlush, StoresThatComeDueTogetherAreSealedOverSeveralTicks) {
-    // Three stores take 40 000 rows each in one tick and as many in the next, so all three come due
-    // in the second with 80 000 rows each. That tick drained 120 000 rows, so it seals one store and
-    // leaves two for later ticks - one each, since a tick that drains nothing still seals
-    // `kSealRows` - rather than 240 000 rows at once. Ticks a fifth of a second apart, so the
-    // counter is read between them.
-    TempDir dir;
-    ob::Engine engine(dir.path, 200'000'000ULL, ob::FsyncPolicy::NONE);
-    engine.open();
-    constexpr size_t kLevels = 1000;
-    constexpr size_t kWrites = 40;   // per store per batch: 40 000 rows
-    const char* symbols[] = {"A", "B", "C"};
-    uint64_t seq = 0;
-    const auto batch = [&] {
-        std::vector<ob::DeltaUpdate> deltas;
-        std::vector<ob::Level> lv(kLevels);
-        for (size_t l = 0; l < kLevels; ++l) {
-            lv[l] = ob::Level{};
-            lv[l].price = static_cast<int64_t>(1000 + l);
-            lv[l].qty   = 1;
-            lv[l].cnt   = 1;
+/// `writes` updates of `levels` levels to each of `symbols`, as one batch - queued under one hold of
+/// the engine's lock, so one drain takes all of it.
+void write_batch(ob::Engine& engine, const std::vector<const char*>& symbols, size_t writes,
+                 size_t levels, uint64_t& seq) {
+    std::vector<ob::Level> lv(levels);
+    for (size_t l = 0; l < levels; ++l) {
+        lv[l] = ob::Level{};
+        lv[l].price = static_cast<int64_t>(1000 + l);
+        lv[l].qty   = 1;
+        lv[l].cnt   = 1;
+    }
+    std::vector<ob::DeltaUpdate> deltas;
+    deltas.reserve(symbols.size() * writes);
+    for (const char* s : symbols) {
+        for (size_t w = 0; w < writes; ++w) {
+            ob::DeltaUpdate d{};
+            std::strncpy(d.symbol, s, sizeof(d.symbol) - 1);
+            std::strncpy(d.exchange, "EX", sizeof(d.exchange) - 1);
+            d.sequence_number = ++seq;
+            d.timestamp_ns    = 1'790'000'000'000'000'000ULL + seq;
+            d.side            = ob::SIDE_BID;
+            d.n_levels        = static_cast<uint16_t>(levels);
+            deltas.push_back(d);
         }
-        deltas.reserve(3 * kWrites);
-        for (const char* s : symbols) {
-            for (size_t w = 0; w < kWrites; ++w) {
-                ob::DeltaUpdate d{};
-                std::strncpy(d.symbol, s, sizeof(d.symbol) - 1);
-                std::strncpy(d.exchange, "EX", sizeof(d.exchange) - 1);
-                d.sequence_number = ++seq;
-                d.timestamp_ns    = 1'790'000'000'000'000'000ULL + seq;
-                d.side            = ob::SIDE_BID;
-                d.n_levels        = static_cast<uint16_t>(kLevels);
-                deltas.push_back(d);
-            }
-        }
-        std::vector<ob::ClientWrite> writes;
-        for (const auto& d : deltas) writes.push_back(ob::ClientWrite{&d, lv.data()});
-        std::vector<ob::WriteOutcome> outcomes(writes.size());
-        engine.apply_deltas(writes, outcomes);
-        for (const auto& o : outcomes) ASSERT_EQ(o.status, ob::OB_OK) << o.error;
-    };
-    batch();
-    ASSERT_TRUE(eventually([&] {
-        return engine.registry().gauge_value("ob_unsealed_rows") ==
-               static_cast<int64_t>(3 * kWrites * kLevels);
-    })) << "the first batch was not drained into blocks";
-    ASSERT_EQ(engine.registry().counter_value("ob_seals_total"), 0u) << "a store was due too soon";
-    batch();
-    // Every value the counter takes, until all three are sealed: one seal a tick.
-    std::vector<uint64_t> seen{0};
+    }
+    std::vector<ob::ClientWrite> batch;
+    for (const auto& d : deltas) batch.push_back(ob::ClientWrite{&d, lv.data()});
+    std::vector<ob::WriteOutcome> outcomes(batch.size());
+    engine.apply_deltas(batch, outcomes);
+    for (const auto& o : outcomes) ASSERT_EQ(o.status, ob::OB_OK) << o.error;
+}
+
+/// Every value `ob_seals_total` takes until it reaches `until`, read every 2 ms - for ticks a fifth
+/// of a second apart, which is every value a tick leaves.
+std::vector<uint64_t> seal_counts_until(ob::Engine& engine, uint64_t until) {
+    std::vector<uint64_t> seen{engine.registry().counter_value("ob_seals_total")};
     const auto deadline = Clock::now() + 10s;
-    while (seen.back() < 3 && Clock::now() < deadline) {
+    while (seen.back() < until && Clock::now() < deadline) {
         const uint64_t now_sealed = engine.registry().counter_value("ob_seals_total");
         if (now_sealed != seen.back()) seen.push_back(now_sealed);
         std::this_thread::sleep_for(2ms);
     }
-    EXPECT_EQ(seen, (std::vector<uint64_t>{0, 1, 2, 3}))
+    return seen;
+}
+
+TEST(LazyFlush, StoresThatComeDueTogetherAreSealedOverSeveralTicks) {
+    // Three stores take 40 000 rows each in one tick and as many in the next, so all three come due
+    // in the second with 80 000 rows each. That tick drained 120 000 rows, so it seals one store and
+    // leaves two for later ticks - one each, since a tick that drains nothing still seals
+    // `kSealRows` - rather than 240 000 rows at once.
+    TempDir dir;
+    ob::Engine engine(dir.path, 200'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    constexpr size_t kLevels = 1000;
+    const std::vector<const char*> symbols = {"A", "B", "C"};
+    uint64_t seq = 0;
+    write_batch(engine, symbols, 40, kLevels, seq);
+    ASSERT_TRUE(eventually([&] {
+        return engine.registry().gauge_value("ob_unsealed_rows") ==
+               static_cast<int64_t>(3 * 40 * kLevels);
+    })) << "the first batch was not drained into blocks";
+    ASSERT_EQ(engine.registry().counter_value("ob_seals_total"), 0u) << "a store was due too soon";
+    write_batch(engine, symbols, 40, kLevels, seq);
+    EXPECT_EQ(seal_counts_until(engine, 3), (std::vector<uint64_t>{0, 1, 2, 3}))
         << "stores that came due together were not spread over ticks";
     for (const char* s : symbols) {
         EXPECT_EQ(segments_on_disk(dir.path, s), 1u) << s;
-        EXPECT_EQ(rows_answered(engine, s), 2 * kWrites * kLevels) << s;
+        EXPECT_EQ(rows_answered(engine, s), 80 * kLevels) << s;
     }
+    engine.close();
+}
+
+TEST(LazyFlush, ATickSealsAsManyDueRowsAsItDrained) {
+    // The share is what the tick drained: three stores due with 80 000 rows each, all from the one
+    // tick that drained 240 000, are sealed by it together - a tick that sealed a store and waited
+    // would fall behind the writers it drains.
+    TempDir dir;
+    ob::Engine engine(dir.path, 200'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    constexpr size_t kLevels = 1000;
+    const std::vector<const char*> symbols = {"A", "B", "C"};
+    uint64_t seq = 0;
+    write_batch(engine, symbols, 80, kLevels, seq);
+    EXPECT_EQ(seal_counts_until(engine, 3), (std::vector<uint64_t>{0, 3}))
+        << "a tick sealed less than it drained";
+    for (const char* s : symbols) EXPECT_EQ(segments_on_disk(dir.path, s), 1u) << s;
     engine.close();
 }
 
