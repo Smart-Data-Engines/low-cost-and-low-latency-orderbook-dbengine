@@ -20,6 +20,7 @@
 
 #include <optional>
 #include <atomic>
+#include <deque>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
@@ -187,6 +188,44 @@ public:
 
     /// Access the metrics registry.
     MetricsRegistry& registry() { return registry_; }
+
+    /// Whether the last checkpoint vouches for a segment found at open (#160, #165 part 2a); one it
+    /// does not is removed there and its rows rebuilt from the WAL. Pure, so the rule is tested
+    /// without staging a crash:
+    ///   - a segment of another WAL - a snapshot's, a migration's - is not this log's to judge;
+    ///   - a checkpoint naming a seal epoch vouches for the segments sealed at or before it;
+    ///   - one naming only a position vouches for the segments at or before that position;
+    ///   - one that says nothing, or a log whose first files retention took, vouches for every one.
+    static bool segment_vouched_for(const SegmentMeta& meta,
+                                    const WALReplayer::LastCheckpoint& last,
+                                    uint64_t local_wal_identity);
+
+    /// When a store's drained rows are sealed into a segment (#165 part 2a): enough rows, or old
+    /// enough, at most `kSealsPerTick` a tick, oldest first - so a thousand symbols that started
+    /// together do not all seal in one tick - and, while every store's rows together are over the
+    /// budget, the oldest of the rest past that limit until they are not. Constants, not flags:
+    /// nothing yet says an operator has a reason to turn them.
+    static constexpr size_t kSealRows = 65'536;
+    static constexpr std::chrono::milliseconds kSealAge{10'000};
+    static constexpr size_t kUnsealedRowsBudget = 4'000'000;
+    static constexpr size_t kSealsPerTick = 64;
+
+    /// One store's standing for a seal: its rows in blocks, and when its oldest block was published.
+    struct SealCandidate {
+        size_t rows{0};
+        std::chrono::steady_clock::time_point oldest{};
+    };
+    enum class SealReason { kAll, kRows, kAge, kBudget };
+    struct SealPick {
+        size_t index{0};
+        SealReason why{SealReason::kAll};
+    };
+    /// The policy above, as a function of its inputs alone, so it is tested without a clock:
+    /// `candidates` oldest first, and the picks in the same order. `seal_all` is FLUSH, close() and
+    /// a snapshot, which take every one.
+    static std::vector<SealPick> pick_seals(const std::vector<SealCandidate>& candidates,
+                                            std::chrono::steady_clock::time_point now,
+                                            bool seal_all);
 
     /// Engine-level statistics for monitoring.
     struct Stats {
@@ -510,6 +549,30 @@ private:
 
     // Combined store used by QueryEngine for scanning
     ColumnarStore combined_store_;
+
+    /// Rows drained and published as blocks, waiting for their store's seal (#165 part 2a), oldest
+    /// first. A tick used to write a segment for every symbol with a row since the last one - at 256
+    /// symbols ~2 000 files and a syncfs() a tick, 84.7% of the flush thread in the kernel - so a
+    /// node gained a segment per active symbol per tick. Keyed by the store, whose pointer is stable
+    /// under `flush_mtx_`, which every path that drains, seals or replaces the stores holds; only
+    /// they touch this. `unsealed_rows_` is its total, for the readers that hold only mtx_.
+    struct UnsealedBlock {
+        std::shared_ptr<const RowBlock> block;
+        /// Every row's record is at or after `wal_from` and before `wal_to`, the drain's position.
+        /// A checkpoint may not claim `wal_from` while the block waits; the segment it seals into
+        /// records `wal_to`, like every segment's position since #63.
+        WalPosition wal_from{};
+        WalPosition wal_to{};
+        std::chrono::steady_clock::time_point published{};
+    };
+    struct Unsealed {
+        std::deque<UnsealedBlock> blocks;
+        size_t rows{0};
+    };
+    std::unordered_map<ColumnarStore*, Unsealed> unsealed_;
+    std::atomic<size_t> unsealed_rows_{0};
+    LogEpisode unsealed_budget_episode_{};
+
 
     std::unique_ptr<QueryEngine> query_engine_;
 
@@ -921,7 +984,32 @@ private:
     /// merged and visible, and no checkpoint claims them or anything after them in this process
     /// (#160). The flush tick counts and goes on; `FLUSH` answers `ERR`, because a client that
     /// asked is told.
-    int flush_write_and_merge();
+    int flush_write_and_merge(bool seal_all);
+
+    /// One store's seal: its first `count` blocks written into `metas` (#165 part 2a).
+    struct Seal {
+        ColumnarStore* store{nullptr};
+        size_t count{0};
+        size_t rows{0};
+        std::vector<SegmentMeta> metas;
+    };
+    /// Which stores to seal, oldest first: every store with blocks, or what is due. Holds
+    /// `flush_mtx_`.
+    std::vector<Seal> choose_seals(bool seal_all, ColumnarStore* only = nullptr);
+    /// Write each seal's segments from its blocks. A store whose write fails keeps its blocks and is
+    /// dropped from `seals`, with what it wrote removed. Returns the first failure, or null. Holds
+    /// `flush_mtx_`; `mtx_` or not.
+    std::exception_ptr write_seals(std::vector<Seal>& seals);
+    /// Replace the sealed blocks with their segments, in the index and in `unsealed_`. Returns the
+    /// segments refused as already indexed. Holds `flush_mtx_` and `mtx_`.
+    size_t merge_seals_locked(const std::vector<Seal>& seals);
+    /// What a checkpoint may claim: the drain's position, or the oldest unsealed block's start if
+    /// that is earlier - a checkpoint that claims less only costs a replay, which the per-symbol
+    /// positions filter (#159); one that claims a waiting block's rows loses them in a crash.
+    /// Holds `flush_mtx_` and `mtx_`.
+    WalPosition claim_locked() const;
+    /// Forget every unsealed block, for the paths that discard the stores. Holds both locks.
+    void drop_unsealed_locked();
     /// Sync what this flush wrote, before anything claims it (#160): one `syncfs()` on the data
     /// directory, without `mtx_`. Returns 0, or the `errno`; always 0 under `--fsync-policy none`.
     int sync_segments();
@@ -937,6 +1025,13 @@ private:
     void freeze_checkpoints(const std::string& what_failed);
     /// At startup, before replay: remove the segments no surviving checkpoint vouches for (#160).
     void remove_unvouched_segments(const WALReplayer::LastCheckpoint& last);
+
+    /// The seal epoch (#165 part 2a): bumped by every `write_seals()` that has something to write,
+    /// stamped on the segments it writes, and named by a checkpoint written while rows wait in
+    /// blocks. Restored at open to the highest the store or the last checkpoint knows, so a segment
+    /// sealed after a restart can never be taken for one an old checkpoint vouched for. Under
+    /// flush_mtx_.
+    uint64_t seal_epoch_{0};
 };
 
 } // namespace ob

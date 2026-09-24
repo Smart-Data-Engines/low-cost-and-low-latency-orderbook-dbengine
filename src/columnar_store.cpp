@@ -66,6 +66,47 @@ void ColumnarStore::publish_blocks(const std::vector<std::shared_ptr<const RowBl
                  blocks.size(), rows);
 }
 
+void ColumnarStore::drop_blocks() {
+    size_t blocks = 0;
+    size_t rows = 0;
+    {
+        std::unique_lock<std::shared_mutex> lock(index_mtx_);
+        for (auto it = by_symbol_.begin(); it != by_symbol_.end();) {
+            blocks += it->second.blocks.size();
+            it->second.blocks.clear();
+            it = it->second.tiers.empty() ? by_symbol_.erase(it) : std::next(it);
+        }
+        rows = unsealed_rows_;
+        unsealed_rows_ = 0;
+    }
+    OB_LOG_DEBUG("columnar", "dropped %zu unsealed block(s) of %zu row(s)", blocks, rows);
+}
+
+void ColumnarStore::abandon_active() {
+    std::vector<SegmentMeta> rolled;
+    {
+        std::unique_lock<std::shared_mutex> lock(index_mtx_);
+        rolled.swap(rolled_segments_);
+    }
+    for (const auto& meta : rolled) {
+        std::error_code ec;
+        fs::remove_all(meta.dir_path, ec);
+        OB_LOG_WARN("columnar", "removed %s, which a rollover wrote for a seal that then failed; its "
+                                "rows are written again by the next one%s",
+                    meta.dir_path.c_str(), ec ? " (and it could not be removed)" : "");
+    }
+    has_active_segment_ = false;
+    active_row_count_   = 0;
+    active_has_raw_qty_ = false;
+    price_buf_.clear();
+    qty_buf_.clear();
+    ts_buf_.clear();
+    cnt_buf_.clear();
+    side_buf_.clear();
+    level_buf_.clear();
+    seq_buf_.clear();
+}
+
 size_t ColumnarStore::seal_blocks(const std::string& symbol, const std::string& exchange,
                                   size_t count, const std::vector<SegmentMeta>& segments) {
     size_t refused = 0;
@@ -243,6 +284,7 @@ std::string ColumnarStore::meta_json(const SegmentMeta& meta) const {
       << ",\"wal_identity\":"        << meta.wal_identity
       << ",\"wal_file_index\":"      << meta.wal_file_index
       << ",\"wal_byte_offset\":"     << meta.wal_byte_offset
+      << ",\"seal_epoch\":"          << meta.seal_epoch
       << ",\"symbol\":\""    << meta.symbol   << "\""
       << ",\"exchange\":\""  << meta.exchange << "\""
       << ",\"last_row_ts_ns\":" << meta.last_row_ts_ns;
@@ -318,6 +360,8 @@ bool ColumnarStore::parse_meta_json(const std::string& path,
     out.wal_identity    = extract_uint64("wal_identity");
     out.wal_file_index  = static_cast<uint32_t>(extract_uint64("wal_file_index"));
     out.wal_byte_offset = extract_uint64("wal_byte_offset");
+    // Absent before #165 part 2a, and 0 then: sealed before any epoch a checkpoint can name.
+    out.seal_epoch      = extract_uint64("seal_epoch");
     out.symbol       = extract_string("symbol");
     out.exchange     = extract_string("exchange");
     // Both absent before #166. Then the recorded end WAS the last row's time - the number replay's
@@ -593,6 +637,7 @@ std::optional<SegmentMeta> ColumnarStore::flush_segment() {
     meta.wal_identity    = wal_identity_;
     meta.wal_file_index  = wal_file_index_;
     meta.wal_byte_offset = wal_byte_offset_;
+    meta.seal_epoch      = seal_epoch_;
 
     // Write meta.json - last, so that a segment with one is a segment with all of its columns.
     write_meta_json(dir, meta);

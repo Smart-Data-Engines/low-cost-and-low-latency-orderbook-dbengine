@@ -67,6 +67,10 @@ struct SegmentMeta {
     uint64_t wal_identity{0};
     uint32_t wal_file_index{0};
     uint64_t wal_byte_offset{0};
+    /// The seal epoch of the flush that wrote this segment (#165 part 2a): a checkpoint written
+    /// while rows wait in blocks vouches for the segments sealed at or before an epoch, because a
+    /// position cannot. 0 in a segment written before epochs existed, and in one no seal wrote.
+    uint64_t seal_epoch{0};
     std::string symbol;     ///< symbol this segment belongs to
     std::string exchange;   ///< exchange this segment belongs to
     std::string dir_path;   ///< full path to the segment directory
@@ -164,6 +168,10 @@ public:
         wal_file_index_  = file_index;
         wal_byte_offset_ = byte_offset;
     }
+
+    /// The seal epoch every segment closed from here on is stamped with, like the position above
+    /// (#165 part 2a).
+    void set_seal_epoch(uint64_t seal_epoch) { seal_epoch_ = seal_epoch; }
 
     /// Flush the active segment: encode buffers, write column files, write meta.json.
     /// Returns the SegmentMeta of the flushed segment, or std::nullopt if no active segment.
@@ -283,6 +291,16 @@ public:
     size_t seal_blocks(const std::string& symbol, const std::string& exchange, size_t count,
                        const std::vector<SegmentMeta>& segments);
 
+    /// Drop every published block, for a path that discards what this node holds - a resync, a
+    /// snapshot install. Their rows are in the WAL the discard is also giving up on.
+    void drop_blocks();
+
+    /// Give up on the segment being written from a seal that failed (#165 part 2a): the active
+    /// rows discarded, and any segment a rollover wrote in the meantime removed from the disk -
+    /// a seal is all or nothing, because its rows stay in the blocks it was written from, and a
+    /// retry writes them again.
+    void abandon_active();
+
     /// Rows in published blocks that no seal has replaced yet.
     size_t unsealed_rows() const {
         std::shared_lock<std::shared_mutex> lock(index_mtx_);
@@ -314,6 +332,7 @@ private:
 
     // Active segment state
     uint64_t    wal_identity_{0};
+    uint64_t    seal_epoch_{0};
     uint32_t    wal_file_index_{0};
     uint64_t    wal_byte_offset_{0};
     std::string symbol_;
