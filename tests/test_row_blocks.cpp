@@ -276,8 +276,8 @@ TEST(RowBufferPool, SparesPastTheBoundAreFreed) {
     pool.give_back(std::move(a));
     pool.give_back(std::move(b));
     EXPECT_EQ(pool.spare_rows(), 600u);
-    EXPECT_TRUE(pool.take(0).empty());
     EXPECT_EQ(pool.take(0).capacity(), 0u) << "a first block took a spare no size predicted";
+    EXPECT_EQ(pool.spare_rows(), 600u);
 }
 
 // Lent buffers write what a store's own write: a segment accumulated in buffers another store used
