@@ -144,8 +144,9 @@ TEST(SealPolicy, OverTheBudgetTheOldestAreSealedPastTheLimit) {
     const size_t stores = ob::Engine::kUnsealedRowsBudget / kEach * 3 / 2;
     std::vector<ob::Engine::SealCandidate> c;
     for (size_t i = 0; i < stores; ++i) c.push_back(candidate(kEach, 1s, now));
-    // A row limit below one store's rows: the budget is memory, and no share holds it back.
-    const auto picks = ob::Engine::pick_seals(c, now, false, kEach - 1);
+    // A tick that drained nothing, whose share is kSealRows - a couple of these stores: the budget
+    // is memory, and no share holds it back.
+    const auto picks = ob::Engine::pick_seals(c, now, false, 0);
     const size_t left = (stores - picks.size()) * kEach;
     EXPECT_LE(left, ob::Engine::kUnsealedRowsBudget);
     EXPECT_GT(left + kEach, ob::Engine::kUnsealedRowsBudget) << "sealed more than the budget asked";
@@ -165,6 +166,18 @@ TEST(SealPolicy, ATickTakesItsShareOfWhatIsDueOldestFirst) {
     const auto picks = ob::Engine::pick_seals(c, now, false, 1'000'000);
     ASSERT_EQ(indices(picks), (std::vector<size_t>{0, 1, 2, 3, 4, 5, 6, 7}));
     for (const auto& p : picks) EXPECT_EQ(p.why, ob::Engine::SealReason::kRows);
+}
+
+TEST(SealPolicy, ATickThatDrainedLittleStillSealsASealsWorthOfSmallStoresDueByAge) {
+    // Its share is kSealRows, not the rows it drained: 256 symbols trickling rows came due by age
+    // together in the soak, and a share of what a quiet tick drains would seal two of them a tick.
+    const auto now = Clock::now();
+    constexpr size_t kEach = 4'000;
+    std::vector<ob::Engine::SealCandidate> c;
+    for (size_t i = 0; i < 20; ++i) c.push_back(candidate(kEach, ob::Engine::kSealAge + 1s, now));
+    const auto picks = ob::Engine::pick_seals(c, now, false, 1'000);
+    EXPECT_EQ(picks.size(), ob::Engine::kSealRows / kEach);
+    for (const auto& p : picks) EXPECT_EQ(p.why, ob::Engine::SealReason::kAge);
 }
 
 TEST(SealPolicy, TheOldestDueStoreIsTakenWhateverItsRows) {

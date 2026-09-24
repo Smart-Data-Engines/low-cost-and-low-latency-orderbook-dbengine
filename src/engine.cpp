@@ -2371,7 +2371,7 @@ void Engine::flush_tick() {
         // sync is counted and logged inside, and the tick goes on: the rows are merged and
         // readable, and retention below stays where it was until a restart (#160). What it seals
         // is its share: about what it drained (#165 part 2a, kSealRows).
-        flush_write_and_merge(/*seal_all=*/false, std::max(kSealRows, taken));
+        flush_write_and_merge(/*seal_all=*/false, taken);
         const auto sealed = TickClock::now();
 
         // Update gauge: WAL file index.
@@ -2640,10 +2640,11 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
 
 std::vector<Engine::SealPick> Engine::pick_seals(const std::vector<SealCandidate>& candidates,
                                                  std::chrono::steady_clock::time_point now,
-                                                 bool seal_all, size_t row_limit) {
+                                                 bool seal_all, size_t drained_rows) {
     std::vector<SealPick> picks;
     size_t left = 0;
     for (const auto& c : candidates) left += c.rows;
+    const size_t share = std::max(kSealRows, drained_rows);
     size_t picked_rows = 0;
     for (size_t i = 0; i < candidates.size(); ++i) {
         const SealCandidate& c = candidates[i];
@@ -2658,8 +2659,8 @@ std::vector<Engine::SealPick> Engine::pick_seals(const std::vector<SealCandidate
         } else if (c.rows >= kSealRows || now - c.oldest >= kSealAge) {
             if (picks.size() >= kSealsPerTick) continue;
             // The tick's share (see kSealRows): a due store after the first waits for a later tick
-            // if it would take the rows picked past the limit.
-            if (!picks.empty() && picked_rows + c.rows > row_limit) continue;
+            // if it would take the rows picked past it.
+            if (!picks.empty() && picked_rows + c.rows > share) continue;
             why = c.rows >= kSealRows ? SealReason::kRows : SealReason::kAge;
         } else {
             continue;
@@ -2672,7 +2673,7 @@ std::vector<Engine::SealPick> Engine::pick_seals(const std::vector<SealCandidate
 }
 
 std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* only,
-                                               size_t row_limit) {
+                                               size_t drained_rows) {
     // Oldest first: the order a budget and a per-tick limit take them in.
     std::vector<std::pair<std::chrono::steady_clock::time_point, ColumnarStore*>> by_age;
     by_age.reserve(unsealed_.size());
@@ -2689,7 +2690,7 @@ std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* onl
     }
 
     const auto now = std::chrono::steady_clock::now();
-    const auto picks = pick_seals(candidates, now, seal_all || only != nullptr, row_limit);
+    const auto picks = pick_seals(candidates, now, seal_all || only != nullptr, drained_rows);
     std::vector<Seal> seals;
     seals.reserve(picks.size());
     size_t by_rows = 0, by_age_count = 0, by_budget = 0, sealed_rows = 0;
@@ -2725,8 +2726,9 @@ std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* onl
             OB_LOG_DEBUG("engine", "sealing %zu store(s): %zu by rows, %zu by age, %zu by the budget; "
                                    "%zu due store(s) wait past this tick's share of %zu row(s); "
                                    "%zu of %zu unsealed row(s) stay in memory",
-                         seals.size(), by_rows, by_age_count, by_budget, deferred, row_limit,
-                         total - std::min(total, sealed_rows), total);
+                         seals.size(), by_rows, by_age_count, by_budget, deferred,
+                         std::max(kSealRows, drained_rows), total - std::min(total, sealed_rows),
+                         total);
         }
     }
     return seals;
@@ -2810,7 +2812,7 @@ void Engine::drop_unsealed_locked() {
     registry_.set_gauge("ob_unsealed_rows", 0);
 }
 
-int Engine::flush_write_and_merge(bool seal_all, size_t row_limit) {
+int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows) {
     // Phase B: flush segments to disk and merge into combined_store_.
     // Caller holds flush_mtx_. Runs WITHOUT mtx_ (except the brief merge at the end)
     // so that disk I/O does not block writers.
@@ -2823,7 +2825,7 @@ int Engine::flush_write_and_merge(bool seal_all, size_t row_limit) {
     // and out of the index, so their rows vanished from every query until a restart found them.
     using SealClock = std::chrono::steady_clock;
     const auto started = SealClock::now();
-    std::vector<Seal> seals = choose_seals(seal_all, nullptr, row_limit);
+    std::vector<Seal> seals = choose_seals(seal_all, nullptr, drained_rows);
     const std::exception_ptr write_failure = write_seals(seals);
     const auto written = SealClock::now();
 
