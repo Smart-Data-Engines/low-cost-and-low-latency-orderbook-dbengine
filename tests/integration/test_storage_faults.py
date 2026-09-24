@@ -441,11 +441,20 @@ def test_a_flush_command_does_not_report_success_over_a_failed_sync():
 
 SEGMENT_COLUMN = "price.col"   # one column file every segment has; a flush writes it for each
 
+class Refused(Exception):
+    """A node answered a `SELECT` with a refusal other than "not found": not an answer about rows."""
+
+
 def select_prices(node: FaultNode) -> list[int]:
     """Every price `SYM.EX` holds, read to the end of the answer.
 
     Not `talk()`: that takes one `recv()`, and the rows the retention test counts are tens of
     kilobytes - an answer cut at a segment boundary would read as rows that were lost.
+
+    A symbol with nothing left answers `ERR ... not found`, and that is an answer: no rows. **Any
+    other refusal raises `Refused`** rather than reading as no rows too (#173): a replica finishing a
+    bootstrap answers `ERR bootstrapping`, and read as `[]` that made a replica holding every row
+    read as one that had lost them all.
     """
     with socket.create_connection(("127.0.0.1", node.port), timeout=patience(15)) as sock:
         reader = sock.makefile("rb")
@@ -455,12 +464,35 @@ def select_prices(node: FaultNode) -> list[int]:
         lines = []
         while True:
             line = reader.readline()
-            # `OK` ends in a blank line and `ERR` in one newline: a symbol with nothing left is
-            # `ERR ... not found`, which a reader waiting for a blank line would hang on.
-            if not line or line == b"\n" or line.startswith(b"ERR"):
+            # `OK` ends in a blank line and `ERR` in one newline, which a reader waiting for a
+            # blank line would hang on.
+            if line.startswith(b"ERR"):
+                text = line.decode(errors="replace").strip()
+                if "not found" not in text:
+                    raise Refused(text)
+                break
+            if not line or line == b"\n":
                 break
             lines.append(line.decode(errors="replace"))
     return prices_in("".join(lines))
+
+
+def select_prices_once_bootstrapped(node: FaultNode, timeout: float = 10.0) -> list[int]:
+    """`select_prices()`, asked again while the node says it is still bootstrapping.
+
+    A replica records a snapshot's position before its bootstrap ends: it removes its staging
+    directory next, and only then takes reads, answering `ERR bootstrapping` meanwhile (#173).
+    Measured on an idle machine: that answer 0.6-1.4 ms after the position appeared, and every row
+    by 6.1 ms. Any other refusal is final.
+    """
+    deadline = time.time() + patience(timeout)
+    while True:
+        try:
+            return select_prices(node)
+        except Refused as refused:
+            if "bootstrapping" not in str(refused) or time.time() > deadline:
+                raise
+        time.sleep(0.005)
 
 
 def delays_injected(node: FaultNode) -> int:
@@ -1122,17 +1154,25 @@ def test_a_snapshot_whose_install_could_not_sync_is_installed_again():
         # second bootstrap after it. Waited for as that, rather than for the rows: the first install
         # replaced the store, so every row is readable before the position is ever recorded - the
         # first version of this test waited for the rows and counted one install.
+        #
+        # Polled every millisecond, not every 200: the position is recorded a few milliseconds
+        # before the replica takes reads, and a poll that sees it at once reads in that window on
+        # every run - so the read below meets `ERR bootstrapping` by design rather than once in a
+        # few hundred runs under load, which is how it was found (#173).
         deadline = time.time() + patience(60)
         while time.time() < deadline and not position_recorded():
-            time.sleep(0.2)
+            time.sleep(0.001)
         assert position_recorded(), f"the replica never recorded a position:\n{replica.log()[-2000:]}"
+        # Read before anything else: the log assertions below read the whole log, which takes as
+        # long as the window this read is meant to land in.
+        rows = select_prices_once_bootstrapped(replica)
         assert node_count(replica, "action=fail", fault=True) == 1, replica.fault_log_text()
         assert replica.log().count("The installed snapshot could not be synced") == 1, (
             replica.log()[-2000:])
         assert replica.log().count("Installing a snapshot of") == 2, (
             f"the replica recorded the snapshot's position over an install whose sync failed, so it "
             f"never installed it again:\n{replica.log()[-2000:]}")
-        assert sorted(select_prices(replica)) == prices, (
+        assert sorted(rows) == prices, (
             f"the replica did not end with every row:\n{replica.log()[-2000:]}")
         assert replica.counter("ob_checkpoints_frozen") == 1
     finally:
