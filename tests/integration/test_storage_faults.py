@@ -1458,32 +1458,52 @@ def test_retention_moves_under_every_while_writes_flow():
     """The retention floor rises under `--fsync-policy every` while writes keep arriving (#160).
 
     Under `every` each write syncs the WAL itself, which also takes the checkpoint the last tick
-    appended to the device - so a tick usually finds **nothing owed**, and that is the path on which
-    the floor has to move. Stage 5 of #151 split the tick's sync out of the lock, and its first
-    version promoted the floor only on the path that synced: with writes flowing, retention under
-    `every` never moved and the WAL grew for as long as they did.
+    appended to the device - so a tick can find **nothing owed**, and that is a path on which the
+    floor has to move. Stage 5 of #151 split the tick's sync out of the lock, and its first version
+    promoted the floor only on the path that synced: with writes flowing, retention under `every`
+    stalled for as long as they did.
 
-    The directory is read the moment the writes stop, which is the window that decides it: with the
-    floor stuck, the first promotion comes two ticks later - one to append a checkpoint nobody's
-    write has synced, and one to find it owed.
+    **A tick finds nothing owed only if no rotation left a file since the last one**: the files a
+    rotation leaves go with the tick's ticket under every policy, and make it owed. This test's
+    first version rotated the WAL every 482 writes, and with a write a millisecond that was about
+    every other tick - so ticks synced, and moved the floor, often enough that it passed with the
+    nothing-owed promotion removed: three runs of three on master (#165 part 2a found it).
 
-    Since part 2a of #165 the floor also waits for rows that wait in blocks: their records are
-    what a crash would replay them from. So the writes that flow here are ones that make their store
-    due - a thousand levels an `MINSERT`, sealed by rows every tick or two - and the floor rises with
-    each seal; single rows would wait ten seconds for their age, and the floor with them.
+    So BULK goes first, rotating the WAL past its first file, with just enough rows to make its
+    store due - the tick that seals it is the one that drains the last of them. Since part 2a the
+    floor waits for rows in blocks, whose records are what a crash would replay them from, and only
+    that seal lets it pass BULK's files. Then, once that tick has written BULK's segment, single rows
+    flow, one every 20 ms for two seconds, into a file with most of a megabyte of room: every tick
+    after the seal finds the last checkpoint synced by a write and no file left by a rotation, so the
+    floor can pass `wal_000000.bin` only on the path that finds nothing owed. The directory is read
+    the moment the writes stop.
+
+    The flow waits for the seal because a block's replay starts where the drain before it ended: a
+    row drained with BULK's last would be replayed from inside BULK, and hold the floor there for
+    the ten seconds its block waits. The first version of this rewrite started at once and passed
+    one run in three.
     """
-    node = FaultNode(OB_FAULT_POLICY="every", OB_FAULT_FLUSH_MS="300", OB_FAULT_ROTATE_BYTES="65573")
-    levels = 1000
+    node = FaultNode(OB_FAULT_POLICY="every", OB_FAULT_FLUSH_MS="300",
+                     OB_FAULT_ROTATE_BYTES=str(1024 * 1024))
     try:
         node.wait_until_answering()
-        now = time.time_ns()
-        replies = {k: minsert_at(node, "SYM", 1_000_000 + k * levels, levels, now + k)
-                   for k in range(5 * SEAL_ROWS // levels)}
+        make_due(node, "BULK", time.time_ns())
+        deadline = time.time() + patience(10)
+        while segments_of(node, "BULK") == 0 and time.time() < deadline:
+            time.sleep(0.002)
+        assert segments_of(node, "BULK") == 1, node.log()[-1500:]
+        replies: dict[int, str] = {}
+        price = 1000
+        flowing_until = time.monotonic() + 2.0
+        while time.monotonic() < flowing_until:
+            replies.update(node.insert_each([price]))
+            price += 1
+            time.sleep(0.02)
         files = node.wal_files()
         assert all(r == "OK" for r in replies.values()), replies
-        assert any(f >= "wal_000003.bin" for f in files), (
-            f"the writes did not rotate the WAL past its third file, so there was nothing for "
-            f"retention to delete: {files}")
+        assert any(f >= "wal_000001.bin" for f in files), (
+            f"BULK did not rotate the WAL past its first file, so there was nothing for retention "
+            f"to delete: {files}")
         assert WAL_SEGMENT not in files, (
             f"retention kept every WAL file while writes flowed under `every`: {files}")
     finally:
