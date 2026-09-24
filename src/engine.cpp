@@ -2519,13 +2519,21 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
         size_t rows = 0;
         for (Collected& c : drained) {
             ColumnarStore* st = c.store;
-            if (c.rows.empty()) continue;
+            if (c.rows.empty()) {
+                block_rows_pool_->give_back(std::move(c.rows));
+                continue;
+            }
             block_rows_hint_[st] = c.rows.size();
             // A store that was busy and is quiet now got a reservation it does not need, which the
-            // block would hold until its seal; giving it back copies few rows, because there are.
-            if (c.rows.capacity() > 2 * c.rows.size() + 1024) c.rows.shrink_to_fit();
+            // block would hold until its seal: its rows are copied into one that fits - few, because
+            // there are few - and the big one goes back to the pool.
+            if (c.rows.capacity() > 2 * c.rows.size() + 1024) {
+                std::vector<SnapshotRow> fitted(c.rows.begin(), c.rows.end());
+                block_rows_pool_->give_back(std::move(c.rows));
+                c.rows = std::move(fitted);
+            }
             auto block = RowBlock::make(st->symbol(), st->exchange(), std::move(c.rows),
-                                        c.min_ts_ns, c.max_ts_ns);
+                                        c.min_ts_ns, c.max_ts_ns, block_rows_pool_);
             if (!block) continue;
             Unsealed& u = unsealed_[st];
             u.rows += block->rows.size();
@@ -2567,11 +2575,11 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
                     run_exchange = &pr.exchange;
                     auto [at, fresh] = slot_of.try_emplace(store, drained.size());
                     if (fresh) {
-                        drained.push_back(Collected{store, {}, pr.row.timestamp_ns,
-                                                    pr.row.timestamp_ns});
-                        if (auto hint = block_rows_hint_.find(store); hint != block_rows_hint_.end()) {
-                            drained.back().rows.reserve(hint->second);
-                        }
+                        const auto hint = block_rows_hint_.find(store);
+                        drained.push_back(Collected{
+                            store,
+                            block_rows_pool_->take(hint == block_rows_hint_.end() ? 0 : hint->second),
+                            pr.row.timestamp_ns, pr.row.timestamp_ns});
                     }
                     current = &drained[at->second];
                 }
@@ -2744,11 +2752,16 @@ std::exception_ptr Engine::write_seals(std::vector<Seal>& seals) {
     for (Seal& s : seals) {
         const Unsealed& u = unsealed_.at(s.store);
         const WalPosition to = u.blocks[s.count - 1].wal_to;
+        bool lent = false;
         try {
             // The position every row of these blocks has its record before, set before the first
             // append because a rollover inside it writes a segment too; and the epoch, likewise.
             s.store->set_wal_position(wal_identity_, to.file_index, static_cast<uint64_t>(to.offset));
             s.store->set_seal_epoch(epoch);
+            // The one set of column buffers every seal writes through, lent for this one and taken
+            // back after it: a store with no seal under way holds none.
+            s.store->swap_buffers(seal_buffers_);
+            lent = true;
             s.store->reserve_rows(s.rows);
             for (size_t i = 0; i < s.count; ++i) s.store->append_block(*u.blocks[i].block);
             auto meta = s.store->flush_segment();
@@ -2756,9 +2769,12 @@ std::exception_ptr Engine::write_seals(std::vector<Seal>& seals) {
             // parks their metas here. Left uncollected, those rows are on disk and invisible.
             s.metas = s.store->take_rolled_segments();
             if (meta.has_value()) s.metas.push_back(std::move(meta.value()));
+            s.store->swap_buffers(seal_buffers_);
+            lent = false;
             written.push_back(std::move(s));
         } catch (const std::exception& e) {
             s.store->abandon_active();
+            if (lent) s.store->swap_buffers(seal_buffers_);
             OB_LOG_WARN("engine", "segment for %s.%s not written, its %zu row(s) stay in %zu "
                                   "unsealed block(s) for the next seal: %s",
                         s.store->symbol().c_str(), s.store->exchange().c_str(), s.rows, s.count,

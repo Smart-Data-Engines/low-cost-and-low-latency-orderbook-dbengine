@@ -7,6 +7,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -76,6 +77,36 @@ struct SegmentMeta {
     std::string dir_path;   ///< full path to the segment directory
 };
 
+/// Spare storage for blocks' rows (#165 part 2a): a sealed block's vector, handed back when the
+/// block's last reference goes, and taken again by a later drain - which otherwise wrote every row
+/// of every tick into memory the kernel had to fault in first. Measured at four pipelining
+/// connections on the m9g.xlarge: 68% of the server's page faults were that, in `drain_batch()`.
+///
+/// Bounded: spares past `max_spare_rows` rows of capacity are freed rather than kept. Thread-safe,
+/// because the last reference to a block can be a query's.
+class RowBufferPool {
+public:
+    explicit RowBufferPool(size_t max_spare_rows) : max_spare_rows_(max_spare_rows) {}
+
+    /// An empty vector with room for `rows`: the smallest spare that holds them without being more
+    /// than about twice as big - a quiet store should not hold a busy one's buffer until its seal -
+    /// or a new one. None for `rows` 0, a store's first block, whose size nothing predicts.
+    std::vector<SnapshotRow> take(size_t rows);
+
+    /// Keep `rows`' storage for a later take(), cleared, if the spares stay under the bound;
+    /// otherwise leave it to be freed with `rows`.
+    void give_back(std::vector<SnapshotRow>&& rows) noexcept;
+
+    /// Rows of capacity held spare, for tests.
+    size_t spare_rows() const;
+
+private:
+    mutable std::mutex mtx_;
+    std::vector<std::vector<SnapshotRow>> spare_;
+    size_t spare_rows_{0};
+    const size_t max_spare_rows_;
+};
+
 /// The rows one drain gave one symbol, held in memory until the flush tick seals them into a
 /// segment (#165 part 2a).
 ///
@@ -100,10 +131,12 @@ struct RowBlock {
                                                 std::vector<SnapshotRow> rows);
     /// The same, with the range its caller computed while it collected the rows - the drain does,
     /// so the rows are not walked a second time for it. The range must be the rows': a query skips
-    /// a block by it, and a seal gives it to the segment.
+    /// a block by it, and a seal gives it to the segment. With a `pool`, the rows' storage goes
+    /// back to it when the block's last reference does.
     static std::shared_ptr<const RowBlock> make(std::string symbol, std::string exchange,
                                                 std::vector<SnapshotRow> rows,
-                                                uint64_t min_ts_ns, uint64_t max_ts_ns);
+                                                uint64_t min_ts_ns, uint64_t max_ts_ns,
+                                                std::shared_ptr<RowBufferPool> pool);
 };
 
 /// Columnar storage engine for SnapshotRow data.
@@ -163,6 +196,22 @@ public:
     /// Room in the active segment's buffers for `rows` more, so a seal of several blocks grows each
     /// buffer once rather than by doubling on the way. Changes nothing that is written.
     void reserve_rows(size_t rows);
+
+    /// The buffers a segment is accumulated in, one per column.
+    struct ColumnBuffers {
+        std::vector<int64_t>  price;
+        std::vector<uint64_t> qty;
+        std::vector<uint64_t> ts;
+        std::vector<uint32_t> cnt;
+        std::vector<uint8_t>  side;
+        std::vector<uint16_t> level;
+        std::vector<int64_t>  seq;
+    };
+    /// Exchange this store's buffers with `other`'s, so the engine lends one set to each seal in
+    /// turn (#165 part 2a): sixteen stores had each kept buffers as big as its biggest seal, for the
+    /// life of the process. Only with no active segment - what the buffers hold then is a written
+    /// segment's, which the next append() clears - and `std::logic_error` otherwise.
+    void swap_buffers(ColumnBuffers& other);
 
     /// Set the symbol and exchange for this store (used by C API wrapper).
     /// Must be called before the first append if symbol/exchange metadata is needed.

@@ -593,6 +593,12 @@ private:
     /// block is not grown - its rows copied again each time - on the way to its size. Under
     /// `flush_mtx_`, like `unsealed_`, and cleared wherever the stores are.
     std::unordered_map<ColumnarStore*, size_t> block_rows_hint_;
+    /// Where a sealed block's rows go back to and a drain takes them from (#165 part 2a); a
+    /// drain takes about the pending queue's ceiling at most, so that is what is kept spare.
+    std::shared_ptr<RowBufferPool> block_rows_pool_ = std::make_shared<RowBufferPool>(MAX_PENDING_ROWS);
+    /// The column buffers every seal writes through, lent to its store for the seal (#165 part 2a).
+    /// Under `flush_mtx_`, which every seal holds.
+    ColumnarStore::ColumnBuffers seal_buffers_;
     LogEpisode unsealed_budget_episode_{};
 
 

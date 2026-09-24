@@ -21,6 +21,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -224,6 +225,105 @@ TEST(RowBlocks, NoRowsMakeNoBlock) {
     ASSERT_NE(b, nullptr);
     EXPECT_EQ(b->min_ts_ns, kBase + 2 * kSec);
     EXPECT_EQ(b->max_ts_ns, kBase + 9 * kSec);
+}
+
+// ── Spare row storage (#165 part 2a) ─────────────────────────────────────────
+
+TEST(RowBufferPool, ASealedBlocksRowsAreTakenAgainByTheNextDrain) {
+    auto pool = std::make_shared<ob::RowBufferPool>(1'000'000);
+    std::vector<ob::SnapshotRow> rows(100, row_at(kBase, 1));
+    auto b = ob::RowBlock::make("S", "EX", std::move(rows), kBase, kBase, pool);
+    const ob::SnapshotRow* storage = b->rows.data();
+    const size_t cap = b->rows.capacity();
+    EXPECT_EQ(pool->spare_rows(), 0u);
+    b.reset();
+    EXPECT_EQ(pool->spare_rows(), cap);
+    auto again = pool->take(100);
+    EXPECT_TRUE(again.empty());
+    EXPECT_EQ(again.data(), storage) << "the next drain wrote into new memory again";
+    EXPECT_EQ(pool->spare_rows(), 0u);
+}
+
+TEST(RowBufferPool, ABlockAQueryStillHoldsGoesBackOnlyWhenTheQueryLetsGo) {
+    auto pool = std::make_shared<ob::RowBufferPool>(1'000'000);
+    auto b = ob::RowBlock::make("S", "EX", std::vector<ob::SnapshotRow>(10, row_at(kBase, 1)),
+                                kBase, kBase, pool);
+    auto held_by_a_query = b;
+    b.reset();
+    EXPECT_EQ(pool->spare_rows(), 0u) << "rows a query is reading were handed to a drain";
+    EXPECT_EQ(held_by_a_query->rows.size(), 10u);
+    held_by_a_query.reset();
+    EXPECT_GT(pool->spare_rows(), 0u);
+}
+
+TEST(RowBufferPool, ASpareMuchBiggerThanTheAskStaysSpare) {
+    ob::RowBufferPool pool(1'000'000);
+    std::vector<ob::SnapshotRow> big;
+    big.reserve(100'000);
+    pool.give_back(std::move(big));
+    const auto small = pool.take(100);
+    EXPECT_LT(small.capacity(), 100'000u) << "a quiet store took a busy one's buffer";
+    EXPECT_GE(small.capacity(), 100u);
+    EXPECT_EQ(pool.spare_rows(), 100'000u);
+    EXPECT_EQ(pool.take(60'000).capacity(), 100'000u) << "a spare that fits was not taken";
+}
+
+TEST(RowBufferPool, SparesPastTheBoundAreFreed) {
+    ob::RowBufferPool pool(1'000);
+    std::vector<ob::SnapshotRow> a, b;
+    a.reserve(600);
+    b.reserve(600);
+    pool.give_back(std::move(a));
+    pool.give_back(std::move(b));
+    EXPECT_EQ(pool.spare_rows(), 600u);
+    EXPECT_TRUE(pool.take(0).empty());
+    EXPECT_EQ(pool.take(0).capacity(), 0u) << "a first block took a spare no size predicted";
+}
+
+// Lent buffers write what a store's own write: a segment accumulated in buffers another store used
+// before - its capacity, and in three columns its rows, which flush_segment() does not clear and the
+// next append() does - is the same bytes as one accumulated in the store's own.
+TEST(ColumnarStoreBuffers, ASegmentWrittenThroughLentBuffersIsTheSameBytes) {
+    TempDir lent_dir, own_dir;
+    ob::ColumnarStore::ColumnBuffers scratch;
+    {
+        TempDir other_dir;
+        ob::ColumnarStore other(other_dir.str(), ob::ColumnarStore::kDefaultSegmentDurationNs,
+                                ob::ColumnarStore::OwnIndex::kNo);
+        other.set_symbol_exchange("O", "EX");
+        other.swap_buffers(scratch);
+        for (int i = 0; i < 500; ++i) other.append(row_at(kBase + static_cast<uint64_t>(i), 7000 + i));
+        ASSERT_TRUE(other.flush_segment().has_value());
+        other.swap_buffers(scratch);
+    }
+    ASSERT_GE(scratch.price.capacity(), 500u) << "the scratch should keep the other store's room";
+    ASSERT_EQ(scratch.seq.size(), 500u) << "the premise: the other store's rows are still there";
+    ob::ColumnarStore lent(lent_dir.str(), ob::ColumnarStore::kDefaultSegmentDurationNs,
+                           ob::ColumnarStore::OwnIndex::kNo);
+    ob::ColumnarStore own(own_dir.str(), ob::ColumnarStore::kDefaultSegmentDurationNs,
+                          ob::ColumnarStore::OwnIndex::kNo);
+    lent.set_symbol_exchange("S", "EX");
+    own.set_symbol_exchange("S", "EX");
+    lent.swap_buffers(scratch);
+    for (int i = 0; i < 40; ++i) {
+        lent.append(row_at(kBase + 10 + static_cast<uint64_t>(i), 100 + i));
+        own.append(row_at(kBase + 10 + static_cast<uint64_t>(i), 100 + i));
+    }
+    EXPECT_THROW(lent.swap_buffers(scratch), std::logic_error) << "swapped under an active segment";
+    ASSERT_TRUE(lent.flush_segment().has_value());
+    ASSERT_TRUE(own.flush_segment().has_value());
+    lent.swap_buffers(scratch);
+    const auto files_of = [](const fs::path& root) {
+        std::map<std::string, std::string> out;
+        for (const auto& e : fs::recursive_directory_iterator(root)) {
+            if (!e.is_regular_file()) continue;
+            std::ifstream in(e.path(), std::ios::binary);
+            out[fs::relative(e.path(), root).string()] =
+                std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        return out;
+    };
+    EXPECT_EQ(files_of(lent_dir.path), files_of(own_dir.path));
 }
 
 // A seal appends a block at once rather than row by row, and has to write the same thing (#165 part

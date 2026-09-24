@@ -43,20 +43,72 @@ std::shared_ptr<const RowBlock> RowBlock::make(std::string symbol, std::string e
         min_ts = std::min(min_ts, r.timestamp_ns);
         max_ts = std::max(max_ts, r.timestamp_ns);
     }
-    return make(std::move(symbol), std::move(exchange), std::move(rows), min_ts, max_ts);
+    return make(std::move(symbol), std::move(exchange), std::move(rows), min_ts, max_ts, nullptr);
 }
 
 std::shared_ptr<const RowBlock> RowBlock::make(std::string symbol, std::string exchange,
                                                std::vector<SnapshotRow> rows,
-                                               uint64_t min_ts_ns, uint64_t max_ts_ns) {
-    if (rows.empty()) return nullptr;
-    auto block = std::make_shared<RowBlock>();
+                                               uint64_t min_ts_ns, uint64_t max_ts_ns,
+                                               std::shared_ptr<RowBufferPool> pool) {
+    if (rows.empty()) {
+        if (pool) pool->give_back(std::move(rows));
+        return nullptr;
+    }
+    auto block = std::make_unique<RowBlock>();
     block->symbol    = std::move(symbol);
     block->exchange  = std::move(exchange);
     block->min_ts_ns = min_ts_ns;
     block->max_ts_ns = max_ts_ns;
     block->rows      = std::move(rows);
-    return block;
+    if (!pool) return std::shared_ptr<const RowBlock>(std::move(block));
+    // The deleter runs wherever the last reference goes - a seal, a snapshot install, or a query
+    // that copied the blocks before the seal took them out of the index.
+    return std::shared_ptr<const RowBlock>(block.release(), [pool = std::move(pool)](const RowBlock* b) {
+        std::unique_ptr<RowBlock> gone(const_cast<RowBlock*>(b));
+        pool->give_back(std::move(gone->rows));
+    });
+}
+
+std::vector<SnapshotRow> RowBufferPool::take(size_t rows) {
+    std::vector<SnapshotRow> out;
+    if (rows == 0) return out;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        size_t best = spare_.size();
+        for (size_t i = 0; i < spare_.size(); ++i) {
+            const size_t cap = spare_[i].capacity();
+            if (cap < rows || cap > 2 * rows + 4096) continue;
+            if (best == spare_.size() || cap < spare_[best].capacity()) best = i;
+        }
+        if (best != spare_.size()) {
+            std::swap(spare_[best], spare_.back());
+            out = std::move(spare_.back());
+            spare_.pop_back();
+            spare_rows_ -= std::min(spare_rows_, out.capacity());
+            return out;
+        }
+    }
+    out.reserve(rows);
+    return out;
+}
+
+void RowBufferPool::give_back(std::vector<SnapshotRow>&& rows) noexcept {
+    rows.clear();
+    const size_t cap = rows.capacity();
+    if (cap == 0) return;
+    try {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (spare_rows_ + cap > max_spare_rows_) return;
+        spare_.push_back(std::move(rows));
+        spare_rows_ += cap;
+    } catch (...) {
+        // A spare that cannot be kept is freed with `rows`; only the reuse is lost.
+    }
+}
+
+size_t RowBufferPool::spare_rows() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return spare_rows_;
 }
 
 void ColumnarStore::publish_blocks(const std::vector<std::shared_ptr<const RowBlock>>& blocks) {
@@ -503,6 +555,20 @@ void ColumnarStore::append_block(const RowBlock& block) {
     active_row_count_ += rows.size() - 1;
     if (block.min_ts_ns < active_min_ts_) active_min_ts_ = block.min_ts_ns;
     if (block.max_ts_ns > active_max_ts_) active_max_ts_ = block.max_ts_ns;
+}
+
+void ColumnarStore::swap_buffers(ColumnBuffers& other) {
+    if (has_active_segment_) {
+        throw std::logic_error("ColumnarStore: buffers swapped under an active segment of " +
+                               symbol_ + "." + exchange_);
+    }
+    price_buf_.swap(other.price);
+    qty_buf_.swap(other.qty);
+    ts_buf_.swap(other.ts);
+    cnt_buf_.swap(other.cnt);
+    side_buf_.swap(other.side);
+    level_buf_.swap(other.level);
+    seq_buf_.swap(other.seq);
 }
 
 void ColumnarStore::reserve_rows(size_t rows) {
