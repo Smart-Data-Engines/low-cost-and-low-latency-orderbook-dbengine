@@ -2212,7 +2212,95 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
-### 170. The Python pool client answers one thread's query with another's, and its own health check steals a write's reply **P0**
+### 172. The Python client's sharded pool replaces its routing state under its callers, and nothing tests it **P1**
+
+**Found fixing #171, by reading, and not measured**: no test constructs a pool with
+`coordinator_endpoints`, so there is nothing yet to measure it with, and building that is the first
+half of the fix. Three things, each in a function the health check runs while callers route:
+
+- `_rebuild_hash_ring()` assigns an **empty** ring and then fills it, so a lookup in between routes by
+  a partial one — for a symbol the shard map does not assign, to a shard chosen from the virtual
+  nodes added so far. Whether that shard then refuses a symbol it does not own is what this entry
+  cannot say without the fixture.
+- `_connect_shards()` deletes from the dictionary that `_route_query()`'s fan-out iterates, which
+  raises `RuntimeError: dictionary changed size during iteration` in the caller.
+- A shard connection is replaced only when the shard map changes, so one that #171 closes stays
+  closed until then. Before #171 it answered every later command with the previous reply instead,
+  which is worse and is what a client without that change still does.
+
+The fix is a sharded-pool fixture first — a shard map in the test etcd and nodes behind it — then
+routing state built beside the live one and swapped in whole, and closed shard connections
+replaced at every health check.
+
+- Effort: S–M | Impact: a sharded pool can route by a half-built ring, raise in a caller during a map
+  refresh, and not recover a shard connection after one timeout
+
+### 171. A Python client connection whose reply timed out answered the next command with it, and every command after that one behind ✅ **P0**
+
+**Found designing the fix for #170**, reading what `_TcpBackend` does when a read times out: it
+raises and keeps the socket, with what it has read of the reply still in its buffer and the rest
+still on its way. The next command is sent, and its read starts at the front of that buffer — the
+previous command's reply.
+
+Measured on the i3-7100U against one standalone node: `BIG` holding 100 000 rows, `SMALL` holding
+one, and a client with a 20 ms timeout. The query for `BIG` timed out; the next query, for `SMALL`,
+returned **100 000 rows, every one of them `BIG`'s**, with no error; the `PING` after it got `SMALL`'s
+reply. The control, on a connection that did not time out, answered `SMALL` with its one row. Every
+reply after a timeout was one behind for the life of the connection — in direct mode as much as in a
+pool, with one thread as much as with two. The default timeout is ten seconds, so in production it
+takes an answer slower than that: a large scan, a server behind a long flush, a network pause. And
+it happens to the caller that does the reasonable thing: catches the documented `OrderbookError`
+and carries on.
+
+**Fixed.** An exchange that does not finish — a timeout, a reset, an interrupt, a reply the client
+cannot read — closes the connection before anything else can use it, and every later call on that
+client raises, naming the exchange and saying that nothing was retried. Nothing reopens it: this
+client has never reopened a connection by itself, and the one this closes may carry subscriptions
+and a negotiated compression that a silent reconnect would drop. A new client does; a pool drops
+the connection at its next health check — a `ROLE` on a closed connection fails — and replaces it at
+the one after. `insert_batch()` already said a transport failure part-way leaves the batch
+indeterminate; it says now that the connection is closed as it raises, because the replies still on
+their way are exactly what the next command would have read.
+
+**Tests**: nine in `tests/integration/test_reply_attribution.py`, which holds #170 as well. The two
+for this item freeze a node of their own with `SIGSTOP`, so a reply arrives late by construction
+rather than by the speed of the machine: after a query or a pipelined batch times out, a query and
+a `PING` on the same client are refused with the reason, while a connection that did not time out
+gets the right row from the same server. Against the client before the fix both fail — the query
+**returned**. A third holds the pool's half: once the connection that timed out has been replaced, a
+query is never answered with anything but its own row. **That one passes against the old client**,
+because the old pool also dropped a connection whose `ROLE` timed out; it pins the replacement, not
+the defect. Against the old client the module gives **8 failed, 1 passed**, and the two tests that
+hold a connection's lock cannot run there at all, having no lock to hold.
+
+**Mutation table, #170 and #171 together** — twelve rows, the verdicts written before the run, the
+source restored from saved bytes, a fresh bytecode cache for every run so a restored file is not
+answered from a stale one, and a row counted as killed only when the test named for it failed.
+**12 of 12 as written down**: ten killed, both controls surviving.
+
+| # | Mutation | Verdict | Killed by |
+|---|----------|---------|-----------|
+| 1 | an exchange holds nothing — #170 as it was | killed | the two-thread race, the health check, the poll, `close()` |
+| 2 | an exchange that does not finish leaves the connection open — #171 as it was | killed | both timeout cases |
+| 3 | a closed connection is not refused before it is used | killed | both timeout cases: `AttributeError`, not the refusal |
+| 4 | the health check asks under the pool's lock | killed | the held-connection write, and the replacement test, which then waits for the lock the health check holds |
+| 5 | an answer about a replaced connection is written anyway | killed | the replacement test alone |
+| 6 | a connection whose `ROLE` failed is kept | killed | the pool-replacement test alone |
+| 7 | a poll holds nothing | killed | the poll and `close()` tests |
+| 8 | a pipelined batch holds nothing and closes nothing | killed | the batch timeout case alone |
+| 9 | `close()` waits its turn behind a poll | killed | the `close()` test alone |
+| 10 | a call `close()` interrupted reports the raw failure | killed | the `close()` test alone |
+| 11 | control: the warning's words changed | survives | — |
+| 12 | control: an abandoned connection keeps its buffer | survives | nothing reads it again: the refusal comes first |
+
+**What this does in the sharded pool is filed as #172, not fixed here**: shard connections are
+replaced only when the shard map changes, so one this closes stays closed until then — where it used
+to answer every later command with the previous reply — and nothing tests the sharded pool at all.
+
+- Effort: S | Impact: after one timeout, every reply on a connection belonged to the command before
+  it — wrong rows, returned normally, by the documented client in every mode
+
+### 170. The Python pool client answered one thread's query with another's, and its own health check stole a write's reply ✅ **P0**
 
 **Found verifying #167 and #168**: the local battery failed
 `test_failover.py::test_a_pool_client_follows_the_new_primary` once, with `Pool FLUSH failed:
@@ -2235,9 +2323,43 @@ write the server applied, and retrying it stores the rows twice, in storage that
 and the health check, reading a query's reply as a role, marks a healthy node unknown and sends the
 pool to re-discover.
 
-The fix is a lock per connection around every exchange on it — a command and its reply, a pipelined
-batch and its replies, the compression and authentication handshakes — so the pool's lock decides
-where a command goes and each connection carries one exchange at a time.
+**Fixed**, with #171 in the same change. Each connection carries one exchange at a time — a command
+and its reply, a pipelined batch and its replies, a poll, the handshake — under a lock of its own,
+so the pool's lock decides where a command goes and the connection's decides when.
+`tests/integration/test_reply_attribution.py` holds it: against the client before the fix the
+two-thread race fails with **2224 of 5374** answers carrying the other symbol's row, and the
+health-check test with `Pool FLUSH failed: unexpected response: PRIMARY 1`.
+
+**Two consequences of that lock had to be fixed with it, and the first is one the lock created.**
+The health check asked its `ROLE` questions holding the pool's lock. Once an exchange holds its
+connection, a `ROLE` waits for whatever a caller has in flight there — so one long read on a replica
+would have stalled **every** call through the pool, a write to the primary included, for as long as
+the read lasted. It asks without the pool's lock now and writes the answers under it, and an answer
+about a connection another thread has replaced meanwhile changes nothing: a write's retry reconnects
+on its own thread, and dropping the replacement would leave the pool without a node it can reach.
+The test holds a replica's connection the way a long read does and requires a write to the primary
+to finish; with the questions asked under the lock, the write waits until the connection is let go.
+
+The second is `close()`. Behind the lock it would wait its turn, and a poll's turn lasts as long as
+the poll was asked to wait. It shuts the socket under an exchange in flight instead, which ends the
+other thread's read at once — and that is also what makes closing safe, because closing a descriptor
+a read is blocked on frees a number the read may still be using. Measured against the client before
+the fix, `close()` under a poll returned at once and **the poll died with `AttributeError: 'NoneType'
+object has no attribute 'settimeout'`**; after it, `close()` takes **0.101 s** — the tenth of a
+second it waits for the connection to be free — and the poll raises `the connection … was closed
+while this call was in flight`.
+
+**A third symptom was on the connection all along and was not in this entry.** `poll()` waits by
+setting the socket's timeout to what is left of its own wait, and a socket's timeout is every
+thread's. A command whose reply took longer than a concurrent poll's wait failed as a timeout it
+never had: with the server frozen for half a second, a client whose timeout is ten seconds and a
+poll of 50 ms beside it, the query raised `TCP recv timeout`. **My prediction for that test was
+wrong**, and the first version of it measured nothing: I expected a poll and a command to swap
+replies, as two commands do. They do not — both take from the front of one buffer and a command has
+one reply outstanding — so the race version passed against the old client, and the test was
+rewritten around the shared timeout.
+
+The mutation table for both items is under #171.
 
 - Effort: S | Impact: silent wrong answers for a multi-threaded caller, and failed-but-applied writes
   for a single-threaded one, through the documented multi-host client
@@ -10537,11 +10659,13 @@ measures the harness.
 
 ## Recommended order
 
-**#165 and #170 are open P0s**, and **#169 is an open P1** — the mechanical list is the `Open:`
+**#165 is the open P0**, and **#169 and #172 are open P1s** — the mechanical list is the `Open:`
 line below; read it there rather than trusting this paragraph, which is prose and has been wrong
-about this before. **#170** is the Python pool client: it uses one socket from two threads, so a
-multi-threaded caller got another query's rows — 39% of them in the measurement, with no error — and
-its own health check can take a write's reply. **#165's first part is done**: the index is per symbol and in width tiers, so a
+about this before. **#170 and #171 are closed, and both were the Python client's**: a pool used one
+socket from two threads, so a multi-threaded caller got another query's rows — 39% of them in the
+measurement, with no error — and a connection whose reply timed out answered the next command with
+it, every reply after that one behind. **#172** is what fixing them turned up in the sharded pool,
+which no test constructs. **#165's first part is done**: the index is per symbol and in width tiers, so a
 tick's merge and a query no longer walk it — a writer's p99 flat at 0.71–0.76 ms through the soak
 where it grew to 94.66 ms — and what is left is the count itself, which grows faster now that ticks
 no longer slow: a cold start of that soak's node reads 1.44 GiB and takes 107 s after 90 seconds of
@@ -10592,7 +10716,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #165, #169, #170.** Every other item above #58 is marked closed, and
+**Open: #165, #169, #172.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -10731,8 +10855,8 @@ The capability items are in the table below.
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
 | **P0** | Segments merged, so their count stops growing with the tick rate (#165, part 2) | L | A node gains one segment per active symbol per tick - 1 550 a second at 256 symbols - and a cold start reads each one: 107 s and 1.44 GiB after 90 seconds of uptime. Part 1 took the slope off writes and queries |
-| **P0** | The Python pool client uses each connection from one thread at a time (#170) | S | Two callers got each other's rows 39% of the time, silently, and the health check takes writes' replies |
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
+| **P1** | The sharded Python pool swaps its routing state whole, under a test that builds one (#172) | S–M | A half-built hash ring routes writes, a map refresh raises in a caller, and a shard connection a timeout closed does not come back |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
