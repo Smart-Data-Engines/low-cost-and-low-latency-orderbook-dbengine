@@ -312,6 +312,32 @@ def test_a_pool_closed_during_a_refresh_leaves_no_shard_connection_open(shards, 
     assert left == [], f"shard connections open after close(): {left}"
 
 
+
+def test_a_refresh_that_starts_after_close_opens_nothing(shards, monkeypatch):
+    # The health check can be past its own "still running?" when close() comes, and fetch the map
+    # after: the refresh that follows must see the pool closed rather than open connections nothing
+    # will close again.
+    shards.put_map(shards=("s0",))
+    eng = engine(shards, 0.2)
+    pool = eng._pool
+    fetching, closed = threading.Event(), threading.Event()
+    real_fetch = pool._fetch_shard_map
+
+    def fetch_after_close():
+        fetching.set()
+        closed.wait(patience(10))
+        return real_fetch()
+
+    shards.put_map()   # s1 joins, for the fetch that comes after close() to find
+    monkeypatch.setattr(pool, "_fetch_shard_map", fetch_after_close)
+    assert fetching.wait(patience(10)), "the health check never fetched the map"
+    eng.close()
+    closed.set()
+    time.sleep(1.0)   # that health check's refresh, if any, has run by now
+    left = [sid for sid in ("s0", "s1")
+            if (b := shard_backend(pool, sid)) is not None and not pool._shard_connection_closed(b)]
+    assert left == [], f"a refresh after close() opened shard connections: {left}"
+
 class MigratedShard:
     """A shard connection that answers every write as a shard the symbol has moved away from."""
 
