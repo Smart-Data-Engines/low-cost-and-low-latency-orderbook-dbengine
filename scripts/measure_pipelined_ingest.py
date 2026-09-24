@@ -7,12 +7,13 @@ last, and a warm-cache or turbo effect that favours a position cannot read as a 
 builds. Prints one JSON line per run and a table of medians.
 
 **Each run starts on a quiet disk**: `sync`, then a wait until the data root's device has written
-nothing for a second, at most 30 s (`--no-settle` skips it). The run before deleted its data
-directory — a gigabyte of WAL and thousands of segment files — and the file system goes on retiring
-them after `unlink` returns, so a run started into that measures it too. Measured on the m9g.xlarge
-at four connections, six rounds of each, default policy (#165 part 2a): straight after the last run,
-master 9.39–11.77 M levels a second and part 2a 9.71–11.52 M; on a quiet disk 11.80–11.86 M and
-11.75–11.86 M. Figures before that change were measured without it.
+nothing for a second, at most 30 s (`--no-settle` skips it). The run before leaves writes behind it
+in the page cache - a gigabyte of WAL and thousands of segment files, written and then deleted - and
+a run started into them flushes them with its own syncs. Measured on the m9g.xlarge at four
+connections, six rounds of each, default policy (#165 part 2a): straight after the last run, master
+9.39–11.77 M levels a second and part 2a 9.71–11.52 M; on a quiet disk 11.80–11.86 M and
+11.75–11.86 M. The wait was hardly ever more than its one second - the `sync` is what does it.
+Figures before that change were measured without it.
 
 With `--count-syscalls` each run is also counted by the kernel: `perf stat` on the
 `sys_enter_sendto` and `sys_enter_read` tracepoints, divided by the number of batches. That is how
@@ -105,9 +106,8 @@ def sectors_written(device: str) -> int:
 def settle(device: str, quiet_s: float = 1.0, limit_s: float = 30.0) -> float:
     """`sync`, then wait until `device` has written nothing for `quiet_s`; the seconds it took.
 
-    The run before this one deleted its data directory - a gigabyte of WAL and thousands of segment
-    files - and the file system goes on retiring them after `unlink` returns; a run started into that
-    measures it too.
+    The run before this one left writes in the page cache that a run started into them would flush
+    with its own syncs.
     """
     started = time.monotonic()
     os.sync()
