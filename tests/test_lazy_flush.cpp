@@ -108,7 +108,8 @@ bool eventually(F&& done, std::chrono::milliseconds within = 5000ms) {
 
 TEST(SealPolicy, NothingIsDueBelowTheRowsAndTheAge) {
     const auto now = Clock::now();
-    EXPECT_TRUE(ob::Engine::pick_seals({candidate(ob::Engine::kSealRows - 1, 1s, now)}, now, false)
+    EXPECT_TRUE(ob::Engine::pick_seals({candidate(ob::Engine::kSealRows - 1, 1s, now)}, now, false,
+                                       ob::Engine::kNoRowLimit)
                     .empty());
 }
 
@@ -117,7 +118,7 @@ TEST(SealPolicy, EnoughRowsOrEnoughAgeIsDue) {
     const auto picks = ob::Engine::pick_seals(
         {candidate(ob::Engine::kSealRows, 0s, now), candidate(1, ob::Engine::kSealAge, now),
          candidate(1, ob::Engine::kSealAge - 1ms, now)},
-        now, false);
+        now, false, ob::Engine::kNoRowLimit);
     ASSERT_EQ(indices(picks), (std::vector<size_t>{0, 1}));
     EXPECT_EQ(picks[0].why, ob::Engine::SealReason::kRows);
     EXPECT_EQ(picks[1].why, ob::Engine::SealReason::kAge);
@@ -130,7 +131,7 @@ TEST(SealPolicy, AtMostTheLimitATickOldestFirst) {
     for (size_t i = 0; i < ob::Engine::kSealsPerTick + 10; ++i) {
         c.push_back(candidate(1, ob::Engine::kSealAge + std::chrono::seconds(100 - i), now));
     }
-    const auto picks = ob::Engine::pick_seals(c, now, false);
+    const auto picks = ob::Engine::pick_seals(c, now, false, ob::Engine::kNoRowLimit);
     ASSERT_EQ(picks.size(), ob::Engine::kSealsPerTick);
     for (size_t i = 0; i < picks.size(); ++i) EXPECT_EQ(picks[i].index, i);
 }
@@ -143,7 +144,8 @@ TEST(SealPolicy, OverTheBudgetTheOldestAreSealedPastTheLimit) {
     const size_t stores = ob::Engine::kUnsealedRowsBudget / kEach * 3 / 2;
     std::vector<ob::Engine::SealCandidate> c;
     for (size_t i = 0; i < stores; ++i) c.push_back(candidate(kEach, 1s, now));
-    const auto picks = ob::Engine::pick_seals(c, now, false);
+    // A row limit below one store's rows: the budget is memory, and no share holds it back.
+    const auto picks = ob::Engine::pick_seals(c, now, false, kEach - 1);
     const size_t left = (stores - picks.size()) * kEach;
     EXPECT_LE(left, ob::Engine::kUnsealedRowsBudget);
     EXPECT_GT(left + kEach, ob::Engine::kUnsealedRowsBudget) << "sealed more than the budget asked";
@@ -154,10 +156,38 @@ TEST(SealPolicy, OverTheBudgetTheOldestAreSealedPastTheLimit) {
     }
 }
 
+TEST(SealPolicy, ATickTakesItsShareOfWhatIsDueOldestFirst) {
+    // Sixteen stores that came due together, and a tick that drained a million rows: it seals about
+    // that many, and the rest wait for the next tick rather than doubling this one.
+    const auto now = Clock::now();
+    std::vector<ob::Engine::SealCandidate> c;
+    for (size_t i = 0; i < 16; ++i) c.push_back(candidate(125'000, std::chrono::milliseconds(100 - i), now));
+    const auto picks = ob::Engine::pick_seals(c, now, false, 1'000'000);
+    ASSERT_EQ(indices(picks), (std::vector<size_t>{0, 1, 2, 3, 4, 5, 6, 7}));
+    for (const auto& p : picks) EXPECT_EQ(p.why, ob::Engine::SealReason::kRows);
+}
+
+TEST(SealPolicy, TheOldestDueStoreIsTakenWhateverItsRows) {
+    // Bigger than the share on its own - and taken, or it would wait behind a limit forever.
+    const auto now = Clock::now();
+    const auto picks = ob::Engine::pick_seals(
+        {candidate(3'000'000, 2s, now), candidate(ob::Engine::kSealRows, 1s, now)}, now, false,
+        1'000'000);
+    ASSERT_EQ(indices(picks), (std::vector<size_t>{0}));
+}
+
+TEST(SealPolicy, AYoungerStoreThatFitsTheShareIsTakenPastAnOlderOneThatDoesNot) {
+    const auto now = Clock::now();
+    const auto picks = ob::Engine::pick_seals(
+        {candidate(600'000, 3s, now), candidate(600'000, 2s, now), candidate(300'000, 1s, now)}, now,
+        false, 1'000'000);
+    ASSERT_EQ(indices(picks), (std::vector<size_t>{0, 2}));
+}
+
 TEST(SealPolicy, SealAllTakesEveryOne) {
     const auto now = Clock::now();
     const auto picks = ob::Engine::pick_seals(
-        {candidate(1, 0s, now), candidate(2, 0s, now), candidate(3, 0s, now)}, now, true);
+        {candidate(1, 0s, now), candidate(2, 0s, now), candidate(3, 0s, now)}, now, true, 1);
     ASSERT_EQ(indices(picks), (std::vector<size_t>{0, 1, 2}));
     for (const auto& p : picks) EXPECT_EQ(p.why, ob::Engine::SealReason::kAll);
 }
@@ -281,6 +311,71 @@ TEST(LazyFlush, ABlocksRangeHoldsRowsThatArrivedOutOfTimeOrder) {
     engine.flush_incremental();
     EXPECT_EQ(engine.registry().gauge_value("ob_unsealed_rows"), 0);
     for (uint64_t ts : times) EXPECT_EQ(rows_at(ts), kLevels) << "sealed, at " << ts;
+    engine.close();
+}
+
+TEST(LazyFlush, StoresThatComeDueTogetherAreSealedOverSeveralTicks) {
+    // Three stores take 40 000 rows each in one tick and as many in the next, so all three come due
+    // in the second with 80 000 rows each. That tick drained 120 000 rows, so it seals one store and
+    // leaves two for later ticks - one each, since a tick that drains nothing still seals
+    // `kSealRows` - rather than 240 000 rows at once. Ticks a fifth of a second apart, so the
+    // counter is read between them.
+    TempDir dir;
+    ob::Engine engine(dir.path, 200'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    constexpr size_t kLevels = 1000;
+    constexpr size_t kWrites = 40;   // per store per batch: 40 000 rows
+    const char* symbols[] = {"A", "B", "C"};
+    uint64_t seq = 0;
+    const auto batch = [&] {
+        std::vector<ob::DeltaUpdate> deltas;
+        std::vector<ob::Level> lv(kLevels);
+        for (size_t l = 0; l < kLevels; ++l) {
+            lv[l] = ob::Level{};
+            lv[l].price = static_cast<int64_t>(1000 + l);
+            lv[l].qty   = 1;
+            lv[l].cnt   = 1;
+        }
+        deltas.reserve(3 * kWrites);
+        for (const char* s : symbols) {
+            for (size_t w = 0; w < kWrites; ++w) {
+                ob::DeltaUpdate d{};
+                std::strncpy(d.symbol, s, sizeof(d.symbol) - 1);
+                std::strncpy(d.exchange, "EX", sizeof(d.exchange) - 1);
+                d.sequence_number = ++seq;
+                d.timestamp_ns    = 1'790'000'000'000'000'000ULL + seq;
+                d.side            = ob::SIDE_BID;
+                d.n_levels        = static_cast<uint16_t>(kLevels);
+                deltas.push_back(d);
+            }
+        }
+        std::vector<ob::ClientWrite> writes;
+        for (const auto& d : deltas) writes.push_back(ob::ClientWrite{&d, lv.data()});
+        std::vector<ob::WriteOutcome> outcomes(writes.size());
+        engine.apply_deltas(writes, outcomes);
+        for (const auto& o : outcomes) ASSERT_EQ(o.status, ob::OB_OK) << o.error;
+    };
+    batch();
+    ASSERT_TRUE(eventually([&] {
+        return engine.registry().gauge_value("ob_unsealed_rows") ==
+               static_cast<int64_t>(3 * kWrites * kLevels);
+    })) << "the first batch was not drained into blocks";
+    ASSERT_EQ(engine.registry().counter_value("ob_seals_total"), 0u) << "a store was due too soon";
+    batch();
+    // Every value the counter takes, until all three are sealed: one seal a tick.
+    std::vector<uint64_t> seen{0};
+    const auto deadline = Clock::now() + 10s;
+    while (seen.back() < 3 && Clock::now() < deadline) {
+        const uint64_t now_sealed = engine.registry().counter_value("ob_seals_total");
+        if (now_sealed != seen.back()) seen.push_back(now_sealed);
+        std::this_thread::sleep_for(2ms);
+    }
+    EXPECT_EQ(seen, (std::vector<uint64_t>{0, 1, 2, 3}))
+        << "stores that came due together were not spread over ticks";
+    for (const char* s : symbols) {
+        EXPECT_EQ(segments_on_disk(dir.path, s), 1u) << s;
+        EXPECT_EQ(rows_answered(engine, s), 2 * kWrites * kLevels) << s;
+    }
     engine.close();
 }
 

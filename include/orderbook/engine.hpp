@@ -23,6 +23,7 @@
 #include <deque>
 #include <chrono>
 #include <condition_variable>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -201,14 +202,25 @@ public:
                                     uint64_t local_wal_identity);
 
     /// When a store's drained rows are sealed into a segment (#165 part 2a): enough rows, or old
-    /// enough, at most `kSealsPerTick` a tick, oldest first - so a thousand symbols that started
-    /// together do not all seal in one tick - and, while every store's rows together are over the
-    /// budget, the oldest of the rest past that limit until they are not. Constants, not flags:
-    /// nothing yet says an operator has a reason to turn them.
+    /// enough, oldest first, and a tick takes **its share** - at most `kSealsPerTick` stores, and
+    /// after the first no more rows than the tick's row limit, which is what it drained or
+    /// `kSealRows`, whichever is more - so stores that come due together are spread over ticks
+    /// rather than sealed in one; and, while every store's rows together are over the budget, the
+    /// oldest of the rest past both limits until they are not. Constants, not flags: nothing yet
+    /// says an operator has a reason to turn them.
+    ///
+    /// The share is measured. Without it, sixteen stores taking ~62 500 rows a tick at four
+    /// pipelining connections on the m9g.xlarge came due together every other tick - 39 sealing
+    /// ticks of 79, strictly alternating, read from the tick's DEBUG lines - and a sealing tick,
+    /// ~1.45 M rows written in 21 ms and synced in 39, took about as long as the four connections
+    /// take to fill the pending queue's million rows; the node wrote 10-11% fewer levels a second
+    /// than master.
     static constexpr size_t kSealRows = 65'536;
     static constexpr std::chrono::milliseconds kSealAge{10'000};
     static constexpr size_t kUnsealedRowsBudget = 4'000'000;
     static constexpr size_t kSealsPerTick = 64;
+    /// The row limit of FLUSH, close(), a snapshot and a store's own seal, which take every store.
+    static constexpr size_t kNoRowLimit = std::numeric_limits<size_t>::max();
 
     /// One store's standing for a seal: its rows in blocks, and when its oldest block was published.
     struct SealCandidate {
@@ -222,10 +234,13 @@ public:
     };
     /// The policy above, as a function of its inputs alone, so it is tested without a clock:
     /// `candidates` oldest first, and the picks in the same order. `seal_all` is FLUSH, close() and
-    /// a snapshot, which take every one.
+    /// a snapshot, which take every one. `row_limit` is the tick's: below the budget, a due store
+    /// after the first is taken only while the rows picked stay within it - a younger one that
+    /// fits after an older one that does not, so the share is filled, and the oldest due store is
+    /// always taken, so none waits behind a limit it is bigger than.
     static std::vector<SealPick> pick_seals(const std::vector<SealCandidate>& candidates,
                                             std::chrono::steady_clock::time_point now,
-                                            bool seal_all);
+                                            bool seal_all, size_t row_limit);
 
     /// Engine-level statistics for monitoring.
     struct Stats {
@@ -988,7 +1003,9 @@ private:
     /// merged and visible, and no checkpoint claims them or anything after them in this process
     /// (#160). The flush tick counts and goes on; `FLUSH` answers `ERR`, because a client that
     /// asked is told.
-    int flush_write_and_merge(bool seal_all);
+    ///
+    /// `row_limit` is the tick's share (`pick_seals()`), and `kNoRowLimit` for everything else.
+    int flush_write_and_merge(bool seal_all, size_t row_limit);
 
     /// One store's seal: its first `count` blocks written into `metas` (#165 part 2a).
     struct Seal {
@@ -997,9 +1014,9 @@ private:
         size_t rows{0};
         std::vector<SegmentMeta> metas;
     };
-    /// Which stores to seal, oldest first: every store with blocks, or what is due. Holds
-    /// `flush_mtx_`.
-    std::vector<Seal> choose_seals(bool seal_all, ColumnarStore* only = nullptr);
+    /// Which stores to seal, oldest first: every store with blocks, `only`'s, or what is due within
+    /// `row_limit` (`pick_seals()`). Holds `flush_mtx_`.
+    std::vector<Seal> choose_seals(bool seal_all, ColumnarStore* only, size_t row_limit);
     /// Write each seal's segments from its blocks. A store whose write fails keeps its blocks and is
     /// dropped from `seals`, with what it wrote removed. Returns the first failure, or null. Holds
     /// `flush_mtx_`; `mtx_` or not.
