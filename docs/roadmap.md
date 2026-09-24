@@ -2212,6 +2212,36 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 170. The Python pool client answers one thread's query with another's, and its own health check steals a write's reply **P0**
+
+**Found verifying #167 and #168**: the local battery failed
+`test_failover.py::test_a_pool_client_follows_the_new_primary` once, with `Pool FLUSH failed:
+unexpected response: PRIMARY 6`, and passed it 3 of 3 on a rerun — a reply to `ROLE` read as the
+reply to `FLUSH`. That is not a flicker; it is the pool using one socket from two threads.
+`_ClientPool.execute_write()` and `execute_read()` release the pool's lock before
+`backend.execute()`, `_TcpBackend` has no lock of its own, and the health-check thread sends `ROLE`
+down every connection every `health_check_interval` — 2 s by default — holding a lock the caller no
+longer holds. Two threads then write one socket and read one buffer.
+
+Measured on the i3-7100U against one standalone node through `hosts=[...]`: with one caller and the
+health check at 10 ms, the **first** `FLUSH` got `STANDALONE`. With two callers each asking only for
+its own symbol, one row each, and the health check off, **10 216 of 26 104** answers to `PA`'s query
+carried `PB`'s row — 39%, and **no error at all**. With the health check on as well: 32 of 82 foreign,
+194 errors.
+
+Three consequences, in the order they cost: a multi-threaded caller gets another query's rows and
+nothing says so; a single-threaded caller at the default interval sometimes gets an error for a
+write the server applied, and retrying it stores the rows twice, in storage that never removes one;
+and the health check, reading a query's reply as a role, marks a healthy node unknown and sends the
+pool to re-discover.
+
+The fix is a lock per connection around every exchange on it — a command and its reply, a pipelined
+batch and its replies, the compression and authentication handshakes — so the pool's lock decides
+where a command goes and each connection carries one exchange at a time.
+
+- Effort: S | Impact: silent wrong answers for a multi-threaded caller, and failed-but-applied writes
+  for a single-threaded one, through the documented multi-host client
+
 ### 169. An instrument whose exchange has a dot shares its book, its sequence numbers and its stored rows with another **P1**
 
 **Found writing part 2a of #165**, reading the key a per-symbol store is filed under. The engine
@@ -10507,9 +10537,11 @@ measures the harness.
 
 ## Recommended order
 
-**#165 is open, and a P0**, and **#169 is an open P1** — the mechanical list is the `Open:` line
-below; read it there rather than trusting this paragraph, which is prose and has been wrong about
-this before. **#165's first part is done**: the index is per symbol and in width tiers, so a
+**#165 and #170 are open P0s**, and **#169 is an open P1** — the mechanical list is the `Open:`
+line below; read it there rather than trusting this paragraph, which is prose and has been wrong
+about this before. **#170** is the Python pool client: it uses one socket from two threads, so a
+multi-threaded caller got another query's rows — 39% of them in the measurement, with no error — and
+its own health check can take a write's reply. **#165's first part is done**: the index is per symbol and in width tiers, so a
 tick's merge and a query no longer walk it — a writer's p99 flat at 0.71–0.76 ms through the soak
 where it grew to 94.66 ms — and what is left is the count itself, which grows faster now that ticks
 no longer slow: a cold start of that soak's node reads 1.44 GiB and takes 107 s after 90 seconds of
@@ -10560,7 +10592,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #165, #169.** Every other item above #58 is marked closed, and
+**Open: #165, #169, #170.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -10699,6 +10731,7 @@ The capability items are in the table below.
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
 | **P0** | Segments merged, so their count stops growing with the tick rate (#165, part 2) | L | A node gains one segment per active symbol per tick - 1 550 a second at 256 symbols - and a cold start reads each one: 107 s and 1.44 GiB after 90 seconds of uptime. Part 1 took the slope off writes and queries |
+| **P0** | The Python pool client uses each connection from one thread at a time (#170) | S | Two callers got each other's rows 39% of the time, silently, and the health check takes writes' replies |
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |

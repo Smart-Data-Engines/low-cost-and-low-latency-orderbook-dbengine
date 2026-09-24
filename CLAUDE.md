@@ -3463,6 +3463,16 @@ Learned the hard way. Check here before debugging.
      segment on disk. And the key is a format too: a version vector carries it into the WAL, the
      mesh handshake and a mesh snapshot, which is why the fix is a refusal of the separator where
      it cannot be ordinary - in an exchange name - rather than a new separator (#169).
+434. **A test that fails once and passes on the rerun is a measurement not yet taken.** The failover
+     test's one failure said `unexpected response: PRIMARY 6` - a reply to `ROLE` read as the reply
+     to `FLUSH` - and rerun it passed three times. Read as a symptom instead of a flake it was the
+     pool using one socket from two threads, and a probe built on that took ten seconds to show two
+     callers getting each other's rows 39% of the time, with no error (#170).
+435. **An editable install can win over `PYTHONPATH`.** The venv's scikit-build install puts a finder
+     first in `sys.meta_path` that sends `import orderbook_engine` to the main checkout whatever
+     `PYTHONPATH` says, so a local battery run against a branch tests the branch's server with the
+     main checkout's client - here a master four pull requests old. Print the module's `__file__`
+     before trusting a run, and verify branches in a venv without that install.
 
 ## Current state and open problems
 
@@ -3500,7 +3510,9 @@ warns about it.
 lookup and an insertion and a query searches only its symbol's windows - a writer's p99 flat at
 0.71-0.76 ms through a 90-second soak where it grew to 94.66 ms. **Part 2 is open and a P0**: the
 count still grows by one segment per active symbol per tick, faster now that ticks no longer slow,
-and a cold start reads every one - 107 s and 1.44 GiB after that soak. **#169 is an open P1**: an
+and a cold start reads every one - 107 s and 1.44 GiB after that soak. **#170 is an open P0**: the
+Python pool client uses one socket from two threads - two callers got each other's rows 39% of the
+time, silently, and the health check can take a write's reply. **#169 is an open P1**: an
 exchange name with a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live
 book, sequence numbers and stored rows, measured on the wire.
 
