@@ -2305,6 +2305,14 @@ void Engine::flush_tick() {
 
         // The whole tick is one flush, so a client FLUSH cannot interleave with it.
         std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+        // Where the tick's time goes, on DEBUG (#165 part 2a): at the write ceiling the cycle is
+        // what bounds a writer, and throughput alone does not say which of its phases grew.
+        using TickClock = std::chrono::steady_clock;
+        const auto tick_started = TickClock::now();
+        const auto ms_since = [](TickClock::time_point from, TickClock::time_point to) {
+            return std::chrono::duration<double, std::milli>(to - from).count();
+        };
+        size_t taken = 0;
 
         // Phase A: the WAL sync, and the rows it covers - both **outside** mtx_ (stage 5 of #151).
         // They were the longest things this tick did while holding the lock every writer needs:
@@ -2330,6 +2338,7 @@ void Engine::flush_tick() {
                 throw std::runtime_error("Engine: WAL sync failed during the flush tick");
             }
             batch = pending_rows_.take_all();
+            taken = batch.rows();
             detached_rows_.store(batch.rows(), std::memory_order_relaxed);
             if (!ticket.owed()) {
                 // Nothing to sync - `every` has synced each run, `none` never does, or nothing was
@@ -2354,12 +2363,15 @@ void Engine::flush_tick() {
             // holds `flush_mtx_`.
             note_wal_synced();
         }
+        const auto synced = TickClock::now();
         drain_batch(batch, ticket.position(), /*mtx_held=*/false);
+        const auto drained = TickClock::now();
 
         // Phase B: segment I/O + merge, outside mtx_ so writers are not blocked. A failed segment
         // sync is counted and logged inside, and the tick goes on: the rows are merged and
         // readable, and retention below stays where it was until a restart (#160).
         flush_write_and_merge(/*seal_all=*/false);
+        const auto sealed = TickClock::now();
 
         // Update gauge: WAL file index.
         registry_.set_gauge("ob_wal_file_index",
@@ -2435,6 +2447,14 @@ void Engine::flush_tick() {
                              static_cast<unsigned long long>(wall_now_ns),
                              static_cast<unsigned long long>(ttl_config_.ttl_hours));
             }
+        }
+        // Not for a tick that took nothing: an idle node would say so ten times a second.
+        if (taken > 0) {
+            const auto finished = TickClock::now();
+            OB_LOG_DEBUG("engine", "flush tick: %zu row(s) taken; WAL sync %.2f ms, drain %.2f ms, "
+                                   "seals %.2f ms, retention %.2f ms",
+                         taken, ms_since(tick_started, synced), ms_since(synced, drained),
+                         ms_since(drained, sealed), ms_since(sealed, finished));
         }
 }
 
@@ -2787,8 +2807,11 @@ int Engine::flush_write_and_merge(bool seal_all) {
     // segment cannot be written keeps its blocks for the next seal, and the others are written and
     // merged anyway (#160): stopping at the first failure left the segments already written on disk
     // and out of the index, so their rows vanished from every query until a restart found them.
+    using SealClock = std::chrono::steady_clock;
+    const auto started = SealClock::now();
     std::vector<Seal> seals = choose_seals(seal_all);
     const std::exception_ptr write_failure = write_seals(seals);
+    const auto written = SealClock::now();
 
     if (seals.empty()) {
         std::unique_lock<std::mutex> lock(mtx_);
@@ -2805,6 +2828,9 @@ int Engine::flush_write_and_merge(bool seal_all) {
     // however many symbols the tick wrote. Not when a write failed: no checkpoint can claim a
     // flush that did not write all it drained, so there is nothing for the sync to vouch for.
     const int sync_err = write_failure ? 0 : sync_segments();
+    const auto synced = SealClock::now();
+    size_t sealed_rows = 0;
+    for (const Seal& s : seals) sealed_rows += s.rows;
 
     {
         std::unique_lock<std::mutex> lock(mtx_);
@@ -2873,6 +2899,14 @@ int Engine::flush_write_and_merge(bool seal_all) {
         // checkpoint is one the next replay would find anyway.
         persist_version_vector_if_changed();
     }
+    const auto merged = SealClock::now();
+    const auto ms = [](SealClock::time_point from, SealClock::time_point to) {
+        return std::chrono::duration<double, std::milli>(to - from).count();
+    };
+    OB_LOG_DEBUG("engine", "sealed %zu store(s), %zu row(s): chosen and written in %.2f ms, "
+                           "synced in %.2f ms, merged and checkpointed in %.2f ms",
+                 seals.size(), sealed_rows, ms(started, written), ms(written, synced),
+                 ms(synced, merged));
 
     if (sync_err != 0) {
         // Counted every time, said loudly once - by the freeze, which is the consequence an
