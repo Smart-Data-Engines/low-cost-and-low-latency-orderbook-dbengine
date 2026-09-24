@@ -2796,7 +2796,9 @@ int Engine::flush_write_and_merge(bool seal_all) {
         // Record how far the WAL is durable in segments, so the next open() does not replay it.
         // Appended AFTER the segments are on the device, never before: a checkpoint that claims
         // more than is durable turns a crash into data loss, while one that claims less only costs
-        // a replay that the per-symbol positions in replay_wal_tail() filter.
+        // a replay that the per-symbol positions in replay_wal_tail() filter - as long as nothing
+        // waits in a block. With blocks waiting, claiming less is not enough on its own: which
+        // segments are durable is the seal epoch's to say (#165 part 2a, below).
         //
         // **How far is the drain's position, not this record's** (#159). The segment I/O above
         // ran without mtx_, so writers appended while it did, and their rows are still queued -

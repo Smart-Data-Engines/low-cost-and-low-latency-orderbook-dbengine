@@ -56,6 +56,10 @@ class Node:
                         return
             except OSError:
                 time.sleep(0.2)
+        # A start that failed leaves nothing running, whoever called it: the first version of the
+        # fixture called this outside its `try`, and three servers outlived their run by 11 hours.
+        self.proc.kill()
+        self.proc.wait(timeout=10)
         raise RuntimeError(f"server on port {self.port} did not come up")
 
     def ask(self, command: str, timeout: float = 30.0) -> list[str]:
@@ -112,8 +116,8 @@ def eventually(done, within: float = 20.0) -> bool:
 def node():
     with tempfile.TemporaryDirectory(prefix="ob_lazy_flush_") as d:
         n = Node(d)
-        n.start()
         try:
+            n.start()
             yield n
         finally:
             n.stop()

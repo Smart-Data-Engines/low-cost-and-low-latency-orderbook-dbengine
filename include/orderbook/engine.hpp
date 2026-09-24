@@ -1003,10 +1003,12 @@ private:
     /// Replace the sealed blocks with their segments, in the index and in `unsealed_`. Returns the
     /// segments refused as already indexed. Holds `flush_mtx_` and `mtx_`.
     size_t merge_seals_locked(const std::vector<Seal>& seals);
-    /// What a checkpoint may claim: the drain's position, or the oldest unsealed block's start if
-    /// that is earlier - a checkpoint that claims less only costs a replay, which the per-symbol
-    /// positions filter (#159); one that claims a waiting block's rows loses them in a crash.
-    /// Holds `flush_mtx_` and `mtx_`.
+    /// Where replay starts: the drain's position, or the oldest unsealed block's start if that is
+    /// earlier - claiming a waiting block's rows would lose them in a crash. **With blocks waiting
+    /// this position alone does not say which segments are durable** (#165 part 2a): a seal writes
+    /// several drains into one segment positioned at the last of them, so a start judging by it
+    /// removed segments whose earlier rows no replay from here brings back. The checkpoint names
+    /// the seal epoch too, and `segment_vouched_for()` reads it. Holds `flush_mtx_` and `mtx_`.
     WalPosition claim_locked() const;
     /// Forget every unsealed block, for the paths that discard the stores. Holds both locks.
     void drop_unsealed_locked();
