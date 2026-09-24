@@ -32,11 +32,6 @@ ColumnarStore::ColumnarStore(std::string_view base_dir, uint64_t segment_duratio
     , own_index_(own_index)
 {}
 
-namespace {
-/// The widest quantity Simple8b packs; a segment with a wider one stores its quantities raw.
-constexpr uint64_t kMaxSimple8bQty = (1ULL << 60) - 1;
-}  // namespace
-
 // ── Blocks: drained rows before a seal (#165 part 2a) ────────────────────────
 
 std::shared_ptr<const RowBlock> RowBlock::make(std::string symbol, std::string exchange,
@@ -466,7 +461,8 @@ void ColumnarStore::append(const SnapshotRow& row) {
     ++active_row_count_;
 
     // Check if qty needs fallback (> 2^60 - 1)
-    if (row.quantity > kMaxSimple8bQty) {
+    static constexpr uint64_t kMaxSimple8b = (1ULL << 60) - 1;
+    if (row.quantity > kMaxSimple8b) {
         active_has_raw_qty_ = true;
     }
 }
@@ -488,7 +484,12 @@ void ColumnarStore::append_block(const RowBlock& block) {
     }
     // Every other row stays in this segment - none is of a later period, and one of an earlier
     // period stays, as it does in append() - so the block's range is its rows' range here too.
-    bool raw_qty = false;
+    //
+    // No quantity is tested for Simple8b's width, as append() tests each: flush_segment() records
+    // a segment's quantities as raw when that flag says so *or* the encoder fell back, and the
+    // encoder falls back for exactly the quantities append() tests - so the flag changes no byte
+    // it writes. Found by the mutation table: dropping the test here was the one row it could not
+    // kill.
     for (size_t i = 1; i < rows.size(); ++i) {
         const SnapshotRow& row = rows[i];
         price_buf_.push_back(row.price);
@@ -498,12 +499,10 @@ void ColumnarStore::append_block(const RowBlock& block) {
         side_buf_.push_back(row.side);
         level_buf_.push_back(row.level_index);
         seq_buf_.push_back(static_cast<int64_t>(row.sequence_number));
-        raw_qty |= row.quantity > kMaxSimple8bQty;
     }
     active_row_count_ += rows.size() - 1;
     if (block.min_ts_ns < active_min_ts_) active_min_ts_ = block.min_ts_ns;
     if (block.max_ts_ns > active_max_ts_) active_max_ts_ = block.max_ts_ns;
-    if (raw_qty) active_has_raw_qty_ = true;
 }
 
 void ColumnarStore::reserve_rows(size_t rows) {
