@@ -3473,6 +3473,28 @@ Learned the hard way. Check here before debugging.
      `PYTHONPATH` says, so a local battery run against a branch tests the branch's server with the
      main checkout's client - here a master four pull requests old. Print the module's `__file__`
      before trusting a run, and verify branches in a venv without that install.
+436. **A reply is identified by nothing but where it sits on the connection, so an exchange that does
+     not finish shifts every reply after it by one.** The client raised a timeout and kept the
+     socket, and the next query got 100 000 rows of the previous one and no error, for the life of
+     the connection. Close the connection at the first failure rather than resynchronising it: a
+     reader cannot tell a late reply from its own (#171).
+437. **Making something wait turns every lock held across that wait into a wait for everyone who needs
+     the lock.** The pool's health check asked `ROLE` holding the pool's lock - harmless while an
+     exchange took no lock, and after #170's lock, one slow read on a replica would have stopped every
+     write to the primary. When a change makes a call wait, list what its callers hold while it does.
+438. **A socket's timeout belongs to the connection, not to the call.** `poll()` set it for its own
+     wait and another thread's read inherited it, so a reply slower than a 50 ms poll failed as a
+     timeout under a client configured for ten seconds. My test predicted swapped replies instead,
+     passed against the old client, and measured nothing until it was rewritten around the shared
+     timeout.
+439. **A close that queues behind an exchange waits as long as the exchange, and one that does not
+     frees a descriptor under a read.** Shut the socket down first - it wakes the thread blocked on
+     it - then close under the connection's lock. The old client's poll, closed under, died with an
+     `AttributeError` on the `None` that `close()` left in its socket's place.
+440. **`Path.resolve()` on a venv's interpreter is the system interpreter.** The mutation harness for
+     #170 resolved `venv/bin/python` through its link, ran pytest in a Python without it, and called
+     the baseline "not green" with no test failed. Use `absolute()`, and require the baseline to run
+     the count it should - the smart-data-engine skill records the same pitfall as 229.
 
 ## Current state and open problems
 
@@ -3510,11 +3532,16 @@ warns about it.
 lookup and an insertion and a query searches only its symbol's windows - a writer's p99 flat at
 0.71-0.76 ms through a 90-second soak where it grew to 94.66 ms. **Part 2 is open and a P0**: the
 count still grows by one segment per active symbol per tick, faster now that ticks no longer slow,
-and a cold start reads every one - 107 s and 1.44 GiB after that soak. **#170 is an open P0**: the
-Python pool client uses one socket from two threads - two callers got each other's rows 39% of the
-time, silently, and the health check can take a write's reply. **#169 is an open P1**: an
-exchange name with a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live
-book, sequence numbers and stored rows, measured on the wire.
+and a cold start reads every one - 107 s and 1.44 GiB after that soak. **#169 and #172 are open
+P1s**: an exchange name with a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C`
+share a live book, sequence numbers and stored rows, measured on the wire - and the Python client's
+sharded pool replaces its routing state under its callers, found by reading because nothing tests
+that pool.
+
+**#170 and #171**: a Python client connection carries one exchange at a time and is closed when one
+does not finish. A pool used one socket from two threads, so two callers got each other's rows 39%
+of the time, silently; and a connection whose reply timed out answered the next command with it -
+100 000 rows of another symbol, no error - and every command after that one behind.
 
 **#167 and #168**: a `SNAPSHOT` answers the columns it names over the wire - it answered none from
 #139 on - and for each level the row with the latest timestamp at or before its time, a tie going to

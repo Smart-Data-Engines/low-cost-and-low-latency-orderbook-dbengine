@@ -17,6 +17,7 @@ Both modes expose the same API: insert(), flush(), query(), close().
 """
 
 import base64
+import contextlib
 import ctypes
 import ctypes.util
 import hashlib
@@ -28,6 +29,7 @@ import socket
 import ssl
 import struct
 import sys
+import threading
 import time
 import warnings
 from dataclasses import dataclass
@@ -345,14 +347,102 @@ class _TcpBackend:
         # Rows pushed by subscriptions, taken off the front of the buffer before a response is
         # matched. See _take_pushes().
         self._pushes: List[Tuple[int, OrderbookRow]] = []
-        self._connect()
-        if compress:
-            self._negotiate_compression()
+        # One exchange at a time on this connection - a command and its reply, a pipelined batch
+        # and its replies, a poll, the handshake (#170). The pool releases its own lock before it
+        # executes, and its health check sends ROLE down every connection every couple of seconds,
+        # so without this two threads wrote one socket and read one buffer: measured, two callers
+        # got each other's rows 10 216 times in 26 104, with no error, and a caller's FLUSH got the
+        # health check's STANDALONE. Reentrant, because a poll hands back what it received through
+        # take_pushes(), which takes it too.
+        self._io_lock = threading.RLock()
+        # Why this connection was closed part-way through an exchange; None while it is open, and
+        # after close() (#171). A command whose reply did not arrive in full leaves the rest of that
+        # reply on its way, and the next command read it as its own: measured, the query after a
+        # timed-out one got 100 000 rows of another symbol with no error, and every reply after that
+        # was one behind, for the life of the connection. Nothing here reopens it - a new client
+        # does, and a pool replaces it at its next health check.
+        self._closed_because: Optional[str] = None
+        # Set by close() before it shuts the socket under an exchange another thread has in flight,
+        # so that exchange's end is not reported as a failure of the connection.
+        self._closing = False
+        with self._exchange("the handshake", opening=True):
+            self._connect()
+            if compress:
+                self._negotiate_compression()
+
+    @contextlib.contextmanager
+    def _exchange(self, label: str, *, opening: bool = False):
+        """One exchange on this connection, and only one at a time (#170).
+
+        If it does not finish - a timeout, a reset, an interrupt, a reply this client cannot read -
+        the connection is closed before anything else can use it (#171): the rest of that reply may
+        still arrive, and on an open connection the next command would read it as its own.
+        `opening` is the handshake, the one exchange there is no connection for yet.
+        """
+        with self._io_lock:
+            if not opening:
+                self._check_open()
+            try:
+                yield
+            except BaseException as e:
+                if self._closing:
+                    # close() shut the socket under this call: the connection ended because it was
+                    # asked to, not because it failed, and the call says so.
+                    self._abandon("", quietly=True)
+                    if isinstance(e, (OrderbookError, OSError)):
+                        raise OrderbookError(
+                            -1, f"the connection to {self._host}:{self._port} was closed while "
+                                f"this call was in flight") from e
+                    raise
+                self._abandon(f"an exchange ({label}) did not finish: {str(e) or type(e).__name__}",
+                              quietly=opening)
+                raise
+
+    def _check_open(self) -> None:
+        if self._sock is not None:
+            return
+        where = f"{self._host}:{self._port}"
+        if self._closed_because is None:
+            raise OrderbookError(-1, f"the connection to {where} is closed")
+        raise OrderbookError(
+            -1,
+            f"the connection to {where} was closed because {self._closed_because}. The rest of "
+            f"that exchange may still have been on its way, and the next command would have read "
+            f"it as its own reply, so nothing more is sent on this connection and nothing was "
+            f"retried. Open a new client; a pool replaces the connection at its next health "
+            f"check.")
+
+    def _abandon(self, reason: str, *, quietly: bool) -> None:
+        """Close the socket without a QUIT: the stream is out of step, so nothing more goes on it.
+
+        Quietly for the handshake, where a pool retrying a node that is down would otherwise log a
+        warning at every health check; the exception says it to whoever asked.
+        """
+        if reason and self._closed_because is None:
+            self._closed_because = reason
+        if self._sock is not None:
+            if quietly:
+                logger.debug("closing the connection to %s:%d: %s", self._host, self._port, reason)
+            else:
+                logger.warning("closing the connection to %s:%d: %s", self._host, self._port,
+                               reason)
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        # Nothing reads it again - _check_open() refuses first - and it may hold most of a large
+        # reply.
+        self._buf = b""
 
     def _connect(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(self._timeout)
-        sock.connect((self._host, self._port))
+        try:
+            sock.connect((self._host, self._port))
+        except BaseException:
+            sock.close()
+            raise
         if self._tls_ctx is not None:
             # Before the banner: the banner is the server's first application bytes and it sends
             # them once the handshake finishes, so a read here would consume a TLS record as text.
@@ -563,9 +653,10 @@ class _TcpBackend:
 
     def take_pushes(self) -> List[Tuple[int, OrderbookRow]]:
         """Every pushed row received so far, and clear the queue."""
-        out = self._pushes
-        self._pushes = []
-        return out
+        with self._io_lock:
+            out = self._pushes
+            self._pushes = []
+            return out
 
     def poll_pushes(self, timeout: float) -> List[Tuple[int, OrderbookRow]]:
         """Wait up to `timeout` for pushed rows, then return whatever arrived.
@@ -573,6 +664,10 @@ class _TcpBackend:
         A subscriber with no command in flight has to read the socket somewhere, and `execute()`
         would block waiting for a response that is not coming.
         """
+        with self._exchange("a poll for pushed rows"):
+            return self._poll_pushes_locked(timeout)
+
+    def _poll_pushes_locked(self, timeout: float) -> List[Tuple[int, OrderbookRow]]:
         deadline = time.monotonic() + timeout
         self._take_pushes()
         while not self._pushes and time.monotonic() < deadline:
@@ -643,8 +738,11 @@ class _TcpBackend:
 
     def execute(self, command: str) -> str:
         """Send a command and return the raw response string."""
-        self._send(command)
-        return self._recv_response()
+        # The verb and nothing else: the rest of an AUTH line is a digest.
+        verb = command.split(None, 1)[0] if command.strip() else "an empty command"
+        with self._exchange(verb):
+            self._send(command)
+            return self._recv_response()
 
     def execute_pipelined(self, commands: List[str]) -> List[str]:
         """Send every command in one write, then read one response per command, in order.
@@ -668,16 +766,43 @@ class _TcpBackend:
                 "pipelining is not available on a compressed connection: each command is its own "
                 "LZ4 frame, and whether the server reads several frames from one read has not "
                 "been measured. Nothing was sent.")
-        self._sock.sendall("".join(c if c.endswith("\n") else c + "\n"
-                                   for c in commands).encode("utf-8"))
-        return [self._recv_response() for _ in commands]
+        with self._exchange(f"a pipelined batch of {len(commands)} command(s)"):
+            self._sock.sendall("".join(c if c.endswith("\n") else c + "\n"
+                                       for c in commands).encode("utf-8"))
+            return [self._recv_response() for _ in commands]
 
     def close(self):
-        if self._sock:
+        """Close the connection, without waiting out an exchange another thread has in flight.
+
+        A poll waits for as long as it was asked to, and a close that took its turn behind one
+        would too. Free, the connection says QUIT and closes. In use, its socket is shut first:
+        the other thread's read ends at once and its call raises, and only then is the socket
+        closed - closing it under a read would free a descriptor number that read may still be
+        using.
+        """
+        if self._io_lock.acquire(timeout=0.1):
             try:
-                self._send("QUIT")
-            except Exception:
+                if self._sock:
+                    try:
+                        self._send("QUIT")
+                    except Exception:
+                        pass
+                self._close_socket()
+            finally:
+                self._io_lock.release()
+            return
+        self._closing = True
+        sock = self._sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
                 pass
+        with self._io_lock:
+            self._close_socket()
+
+    def _close_socket(self) -> None:
+        if self._sock:
             try:
                 self._sock.close()
             except Exception:
@@ -1097,23 +1222,42 @@ class _ClientPool:
         as primary for write routing purposes.
 
         Multi-master nodes: all nodes accept writes (round-robin routing).
+
+        The questions go out without the pool's lock (#170). Each ROLE waits for whatever exchange
+        a caller has in flight on that connection, and with the lock held across that wait every
+        other call through the pool - a write to another node included - waited for the slowest
+        exchange on any node. The lock guards what the answers are written into.
         """
         with self._lock:
-            for node in self._nodes:
+            asked = [(node, self._connections.get(self._node_key(node))) for node in self._nodes]
+        answers = []
+        for node, backend in asked:
+            raw = None
+            if backend is not None:
+                try:
+                    raw = backend.execute("ROLE")
+                except Exception:
+                    raw = None
+            answers.append((node, backend, raw))
+
+        with self._lock:
+            for node, backend, raw in answers:
                 key = self._node_key(node)
-                backend = self._connections.get(key)
+                if self._connections.get(key) is not backend:
+                    # Connected, replaced or dropped by another thread while the question was out:
+                    # the answer is about a connection this pool no longer has.
+                    continue
                 if backend is None:
                     node.connected = False
                     continue
-                try:
-                    raw = backend.execute("ROLE")
-                    self._parse_role_response(node, raw)
-                    node.last_check = time.monotonic()
-                except Exception:
+                if raw is None:
                     node.connected = False
                     node.role = "unknown"
-                    # Remove broken connection.
+                    # Remove broken connection. It is closed already if the ROLE did not finish.
                     self._connections.pop(key, None)
+                    continue
+                self._parse_role_response(node, raw)
+                node.last_check = time.monotonic()
 
             # Check if we're in multi-master mode (any node reports MULTI_MASTER)
             mm_nodes = [n for n in self._nodes
@@ -1837,7 +1981,8 @@ class OrderbookEngine:
         landed in full, in part, or not at all, and the only way to find out is to read. It is the
         same position a single `insert()` leaves you in when the connection drops on its reply,
         widened to the size of the batch, which is a reason to keep batches at a size whose
-        re-examination you can afford.
+        re-examination you can afford. The connection is closed as it raises (#171): the replies
+        still on their way would otherwise be read as the answers to whatever is sent next.
         """
         if self._closed:
             raise OrderbookError(-1, "Engine is closed")

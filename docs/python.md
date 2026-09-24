@@ -314,7 +314,22 @@ ServerHello was expected.
 
 #### engine.close()
 
-Shut down / disconnect. Called automatically by context manager.
+Shut down / disconnect. Called automatically by context manager. It does not wait for another
+thread's exchange: a call in flight on another thread raises `the connection … was closed while this
+call was in flight`.
+
+#### One client from several threads, and what a timeout leaves behind
+
+A client can be called from several threads. Every exchange — a command and its reply, a batch and
+its replies, a poll — holds the connection until it finishes, so one thread's reply never reaches
+another. Threads calling one client take turns on it, and a pool's threads take turns on each node's
+connection, so for parallel throughput give each thread a client of its own.
+
+**A timeout closes the connection.** The call that timed out raises `OrderbookError`, and so does
+every later call on that client, saying which exchange did not finish: its reply may still arrive,
+and on an open connection the next command would read it as its own. The command that timed out may
+or may not have been applied, and nothing is retried. Open a new client; a pool replaces the
+connection at its next health check.
 
 ### OrderbookRow
 
