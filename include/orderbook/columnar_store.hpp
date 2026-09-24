@@ -98,6 +98,12 @@ struct RowBlock {
     /// received no row this drain has no block.
     static std::shared_ptr<const RowBlock> make(std::string symbol, std::string exchange,
                                                 std::vector<SnapshotRow> rows);
+    /// The same, with the range its caller computed while it collected the rows - the drain does,
+    /// so the rows are not walked a second time for it. The range must be the rows': a query skips
+    /// a block by it, and a seal gives it to the segment.
+    static std::shared_ptr<const RowBlock> make(std::string symbol, std::string exchange,
+                                                std::vector<SnapshotRow> rows,
+                                                uint64_t min_ts_ns, uint64_t max_ts_ns);
 };
 
 /// Columnar storage engine for SnapshotRow data.
@@ -145,6 +151,18 @@ public:
 
     /// Append a row to the active segment, rolling over if needed.
     void append(const SnapshotRow& row);
+
+    /// Append a block's rows in their order, writing what append() on each in turn writes - a
+    /// property test holds the two to the same bytes on disk. For the seal (#165 part 2a), which
+    /// appends every row a second time, after the drain has put it in a block: when no row of the
+    /// block is of a later period than its first - a later one rolls the segment over part way -
+    /// the rollover is tested once, against the block's latest row, and the segment's range widened
+    /// once, by the block's, rather than both row by row.
+    void append_block(const RowBlock& block);
+
+    /// Room in the active segment's buffers for `rows` more, so a seal of several blocks grows each
+    /// buffer once rather than by doubling on the way. Changes nothing that is written.
+    void reserve_rows(size_t rows);
 
     /// Set the symbol and exchange for this store (used by C API wrapper).
     /// Must be called before the first append if symbol/exchange metadata is needed.

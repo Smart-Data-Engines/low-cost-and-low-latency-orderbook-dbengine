@@ -32,21 +32,35 @@ ColumnarStore::ColumnarStore(std::string_view base_dir, uint64_t segment_duratio
     , own_index_(own_index)
 {}
 
+namespace {
+/// The widest quantity Simple8b packs; a segment with a wider one stores its quantities raw.
+constexpr uint64_t kMaxSimple8bQty = (1ULL << 60) - 1;
+}  // namespace
+
 // ── Blocks: drained rows before a seal (#165 part 2a) ────────────────────────
 
 std::shared_ptr<const RowBlock> RowBlock::make(std::string symbol, std::string exchange,
                                                std::vector<SnapshotRow> rows) {
     if (rows.empty()) return nullptr;
-    auto block = std::make_shared<RowBlock>();
-    block->symbol   = std::move(symbol);
-    block->exchange = std::move(exchange);
-    block->min_ts_ns = rows.front().timestamp_ns;
-    block->max_ts_ns = rows.front().timestamp_ns;
+    uint64_t min_ts = rows.front().timestamp_ns;
+    uint64_t max_ts = rows.front().timestamp_ns;
     for (const auto& r : rows) {
-        block->min_ts_ns = std::min(block->min_ts_ns, r.timestamp_ns);
-        block->max_ts_ns = std::max(block->max_ts_ns, r.timestamp_ns);
+        min_ts = std::min(min_ts, r.timestamp_ns);
+        max_ts = std::max(max_ts, r.timestamp_ns);
     }
-    block->rows = std::move(rows);
+    return make(std::move(symbol), std::move(exchange), std::move(rows), min_ts, max_ts);
+}
+
+std::shared_ptr<const RowBlock> RowBlock::make(std::string symbol, std::string exchange,
+                                               std::vector<SnapshotRow> rows,
+                                               uint64_t min_ts_ns, uint64_t max_ts_ns) {
+    if (rows.empty()) return nullptr;
+    auto block = std::make_shared<RowBlock>();
+    block->symbol    = std::move(symbol);
+    block->exchange  = std::move(exchange);
+    block->min_ts_ns = min_ts_ns;
+    block->max_ts_ns = max_ts_ns;
+    block->rows      = std::move(rows);
     return block;
 }
 
@@ -452,10 +466,57 @@ void ColumnarStore::append(const SnapshotRow& row) {
     ++active_row_count_;
 
     // Check if qty needs fallback (> 2^60 - 1)
-    static constexpr uint64_t kMaxSimple8b = (1ULL << 60) - 1;
-    if (row.quantity > kMaxSimple8b) {
+    if (row.quantity > kMaxSimple8bQty) {
         active_has_raw_qty_ = true;
     }
+}
+
+void ColumnarStore::append_block(const RowBlock& block) {
+    const std::vector<SnapshotRow>& rows = block.rows;
+    if (rows.empty()) return;
+    // The first row opens the segment, or rolls it over, as it would on its own.
+    append(rows.front());
+    if (block.max_ts_ns >= active_segment_start_ + segment_duration_ns_) {
+        // A row of a later period is in the block and rolls the segment over where it stands, so
+        // the rest goes row by row. Rare: a block is one drain of one symbol - 100 ms of it at the
+        // default interval - and a period is an hour.
+        OB_LOG_DEBUG("columnar", "a block of %zu row(s) for %s.%s reaches past its segment's period; "
+                                 "appended row by row",
+                     rows.size(), symbol_.c_str(), exchange_.c_str());
+        for (size_t i = 1; i < rows.size(); ++i) append(rows[i]);
+        return;
+    }
+    // Every other row stays in this segment - none is of a later period, and one of an earlier
+    // period stays, as it does in append() - so the block's range is its rows' range here too.
+    bool raw_qty = false;
+    for (size_t i = 1; i < rows.size(); ++i) {
+        const SnapshotRow& row = rows[i];
+        price_buf_.push_back(row.price);
+        qty_buf_.push_back(row.quantity);
+        ts_buf_.push_back(row.timestamp_ns);
+        cnt_buf_.push_back(row.order_count);
+        side_buf_.push_back(row.side);
+        level_buf_.push_back(row.level_index);
+        seq_buf_.push_back(static_cast<int64_t>(row.sequence_number));
+        raw_qty |= row.quantity > kMaxSimple8bQty;
+    }
+    active_row_count_ += rows.size() - 1;
+    if (block.min_ts_ns < active_min_ts_) active_min_ts_ = block.min_ts_ns;
+    if (block.max_ts_ns > active_max_ts_) active_max_ts_ = block.max_ts_ns;
+    if (raw_qty) active_has_raw_qty_ = true;
+}
+
+void ColumnarStore::reserve_rows(size_t rows) {
+    // Without an active segment the buffers still hold the last written one's rows, which the next
+    // append() clears - so they are not what the room is added to.
+    const size_t base = has_active_segment_ ? price_buf_.size() : 0;
+    price_buf_.reserve(base + rows);
+    qty_buf_.reserve(base + rows);
+    ts_buf_.reserve(base + rows);
+    cnt_buf_.reserve(base + rows);
+    side_buf_.reserve(base + rows);
+    level_buf_.reserve(base + rows);
+    seq_buf_.reserve(base + rows);
 }
 
 

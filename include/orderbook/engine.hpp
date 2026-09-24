@@ -571,6 +571,10 @@ private:
     };
     std::unordered_map<ColumnarStore*, Unsealed> unsealed_;
     std::atomic<size_t> unsealed_rows_{0};
+    /// How many rows each store's last block held, reserved for its next one, so a busy store's
+    /// block is not grown - its rows copied again each time - on the way to its size. Under
+    /// `flush_mtx_`, like `unsealed_`, and cleared wherever the stores are.
+    std::unordered_map<ColumnarStore*, size_t> block_rows_hint_;
     LogEpisode unsealed_budget_episode_{};
 
 

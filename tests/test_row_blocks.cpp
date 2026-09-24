@@ -17,6 +17,9 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -221,6 +224,59 @@ TEST(RowBlocks, NoRowsMakeNoBlock) {
     ASSERT_NE(b, nullptr);
     EXPECT_EQ(b->min_ts_ns, kBase + 2 * kSec);
     EXPECT_EQ(b->max_ts_ns, kBase + 9 * kSec);
+}
+
+// A seal appends a block at once rather than row by row, and has to write the same thing (#165 part
+// 2a). Drawn here: rows over three short periods in any order, some quantities too wide for Simple8b,
+// cut into blocks anywhere, with segments closed between blocks at random - one store appending the
+// blocks, another every row in turn. Every file both write, meta.json included, must be the same
+// bytes under the same name.
+RC_GTEST_PROP(RowBlocksProperty, AppendingABlockWritesWhatAppendingItsRowsDoes, ()) {
+    constexpr uint64_t kPeriod = 10 * kSec;
+    const size_t n = *rc::gen::inRange<size_t>(1, 120);
+    std::vector<ob::SnapshotRow> rows;
+    for (size_t i = 0; i < n; ++i) {
+        const uint64_t ts = kBase + *rc::gen::inRange<uint64_t>(0, 3 * kPeriod);
+        ob::SnapshotRow r = row_at(ts, static_cast<int64_t>(1000 + i));
+        if (*rc::gen::inRange(0, 8) == 0) r.quantity = (1ULL << 61) + i;
+        rows.push_back(r);
+    }
+    TempDir by_block_dir, by_row_dir;
+    ob::ColumnarStore by_block(by_block_dir.str(), kPeriod, ob::ColumnarStore::OwnIndex::kNo);
+    ob::ColumnarStore by_row(by_row_dir.str(), kPeriod, ob::ColumnarStore::OwnIndex::kNo);
+    by_block.set_symbol_exchange("S", "EX");
+    by_row.set_symbol_exchange("S", "EX");
+    size_t at = 0;
+    while (at < n) {
+        const size_t len = *rc::gen::inRange<size_t>(1, n - at + 1);
+        std::vector<ob::SnapshotRow> part(rows.begin() + static_cast<std::ptrdiff_t>(at),
+                                          rows.begin() + static_cast<std::ptrdiff_t>(at + len));
+        if (*rc::gen::arbitrary<bool>()) by_block.reserve_rows(len);
+        by_block.append_block(*ob::RowBlock::make("S", "EX", part));
+        for (const auto& r : part) by_row.append(r);
+        at += len;
+        if (*rc::gen::inRange(0, 4) == 0) {
+            (void)by_block.flush_segment();
+            (void)by_row.flush_segment();
+        }
+    }
+    (void)by_block.flush_segment();
+    (void)by_row.flush_segment();
+
+    const auto files_of = [](const fs::path& root) {
+        std::map<std::string, std::string> out;
+        for (const auto& e : fs::recursive_directory_iterator(root)) {
+            if (!e.is_regular_file()) continue;
+            std::ifstream in(e.path(), std::ios::binary);
+            out[fs::relative(e.path(), root).string()] =
+                std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        return out;
+    };
+    const auto got = files_of(by_block_dir.path);
+    const auto want = files_of(by_row_dir.path);
+    RC_ASSERT(!want.empty());
+    RC_ASSERT(got == want);
 }
 
 // A scan answers with every row written for its symbol and range, whether a seal has written it or

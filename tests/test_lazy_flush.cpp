@@ -229,6 +229,61 @@ TEST(LazyFlush, CloseSealsEverythingAndAReopenedNodeHasEveryRow) {
     reopened.close();
 }
 
+TEST(LazyFlush, ABlocksRangeHoldsRowsThatArrivedOutOfTimeOrder) {
+    // The drain computes a block's range while it collects the rows, rather than walking them again
+    // afterwards (#165 part 2a). A row that is neither the drain's first nor in time order has to
+    // be inside it, or a query of its time skips the block - and, once sealed, the segment, whose
+    // range the seal takes from the block.
+    TempDir dir;
+    ob::Engine engine(dir.path, 20'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    constexpr uint64_t kT = 1'790'000'000'000'000'000ULL;
+    const std::vector<uint64_t> times = {kT + 5'000'000'000ULL, kT, kT + 10'000'000'000ULL};
+    constexpr size_t kLevels = 4;
+    std::vector<ob::DeltaUpdate> deltas(times.size());
+    std::vector<std::vector<ob::Level>> levels(times.size(), std::vector<ob::Level>(kLevels));
+    std::vector<ob::ClientWrite> writes;
+    for (size_t i = 0; i < times.size(); ++i) {
+        deltas[i] = ob::DeltaUpdate{};
+        std::strncpy(deltas[i].symbol, "A", sizeof(deltas[i].symbol) - 1);
+        std::strncpy(deltas[i].exchange, "EX", sizeof(deltas[i].exchange) - 1);
+        deltas[i].sequence_number = i + 1;
+        deltas[i].timestamp_ns    = times[i];
+        deltas[i].side            = ob::SIDE_BID;
+        deltas[i].n_levels        = static_cast<uint16_t>(kLevels);
+        for (size_t l = 0; l < kLevels; ++l) {
+            levels[i][l] = ob::Level{};
+            levels[i][l].price = static_cast<int64_t>(1000 + l);
+            levels[i][l].qty   = 1;
+            levels[i][l].cnt   = 1;
+        }
+        writes.push_back(ob::ClientWrite{&deltas[i], levels[i].data()});
+    }
+    // One batch is queued under one hold of the engine's lock, so one drain takes all of it: one
+    // block, its rows out of time order.
+    std::vector<ob::WriteOutcome> outcomes(writes.size());
+    engine.apply_deltas(writes, outcomes);
+    for (const auto& o : outcomes) ASSERT_EQ(o.status, ob::OB_OK) << o.error;
+    ASSERT_TRUE(eventually([&] {
+        return engine.registry().gauge_value("ob_unsealed_rows") ==
+               static_cast<int64_t>(times.size() * kLevels);
+    }));
+    const auto rows_at = [&](uint64_t ts) {
+        size_t n = 0;
+        const std::string err = engine.execute(
+            "SELECT * FROM 'A'.'EX' WHERE timestamp BETWEEN " + std::to_string(ts) + " AND " +
+                std::to_string(ts),
+            [&](const ob::QueryResult&) { ++n; });
+        EXPECT_TRUE(err.empty()) << err;
+        return n;
+    };
+    for (uint64_t ts : times) EXPECT_EQ(rows_at(ts), kLevels) << "in a block, at " << ts;
+    engine.flush_incremental();
+    EXPECT_EQ(engine.registry().gauge_value("ob_unsealed_rows"), 0);
+    for (uint64_t ts : times) EXPECT_EQ(rows_at(ts), kLevels) << "sealed, at " << ts;
+    engine.close();
+}
+
 TEST(LazyFlush, ANodeWithRowsOnlyInBlocksHoldsData) {
     // holds_no_data() decides whether a replica may be bootstrapped over what it has; a node whose
     // rows wait in blocks has them.

@@ -2477,15 +2477,34 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
     // The rows go to one block per store, published when the drain is done - or when it stops,
     // because the rows it took are out of the queue either way (#165 part 2a). A tick used to append
     // them to the store and write a segment of each; the seal does that now, when a store is due.
-    std::vector<std::pair<ColumnarStore*, std::vector<SnapshotRow>>> drained;
+    //
+    // A block's range is collected with its rows rather than in a second walk over them, and a
+    // store's block is reserved to the size of its last one. Measured before both, at four
+    // pipelining connections on the m9g.xlarge: the flush thread took 26% more CPU than when the
+    // drain appended straight into the stores (medians of five rounds), and the second walk alone
+    // was 0.6-0.7% of the server's CPU samples.
+    struct Collected {
+        ColumnarStore* store;
+        std::vector<SnapshotRow> rows;
+        uint64_t min_ts_ns;
+        uint64_t max_ts_ns;
+    };
+    std::vector<Collected> drained;
     std::unordered_map<ColumnarStore*, size_t> slot_of;
     const auto publish = [&] {
         std::vector<std::shared_ptr<const RowBlock>> blocks;
         blocks.reserve(drained.size());
         const auto now = std::chrono::steady_clock::now();
         size_t rows = 0;
-        for (auto& [st, st_rows] : drained) {
-            auto block = RowBlock::make(st->symbol(), st->exchange(), std::move(st_rows));
+        for (Collected& c : drained) {
+            ColumnarStore* st = c.store;
+            if (c.rows.empty()) continue;
+            block_rows_hint_[st] = c.rows.size();
+            // A store that was busy and is quiet now got a reservation it does not need, which the
+            // block would hold until its seal; giving it back copies few rows, because there are.
+            if (c.rows.capacity() > 2 * c.rows.size() + 1024) c.rows.shrink_to_fit();
+            auto block = RowBlock::make(st->symbol(), st->exchange(), std::move(c.rows),
+                                        c.min_ts_ns, c.max_ts_ns);
             if (!block) continue;
             Unsealed& u = unsealed_[st];
             u.rows += block->rows.size();
@@ -2517,19 +2536,27 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
         // the next row with a destroyed string. It costs one lookup per chunk of 4096 rows.
         const std::string* run_symbol   = nullptr;
         const std::string* run_exchange = nullptr;
-        std::vector<SnapshotRow>* rows  = nullptr;
+        Collected* current              = nullptr;
         try {
             for (; chunk.first < chunk.rows.size(); ++chunk.first) {
                 const PendingRow& pr = chunk.rows[chunk.first];
-                if (rows == nullptr || *run_symbol != pr.symbol || *run_exchange != pr.exchange) {
+                if (current == nullptr || *run_symbol != pr.symbol || *run_exchange != pr.exchange) {
                     ColumnarStore* store = &get_or_create_store(pr.symbol, pr.exchange, mtx_held);
                     run_symbol   = &pr.symbol;
                     run_exchange = &pr.exchange;
                     auto [at, fresh] = slot_of.try_emplace(store, drained.size());
-                    if (fresh) drained.emplace_back(store, std::vector<SnapshotRow>{});
-                    rows = &drained[at->second].second;
+                    if (fresh) {
+                        drained.push_back(Collected{store, {}, pr.row.timestamp_ns,
+                                                    pr.row.timestamp_ns});
+                        if (auto hint = block_rows_hint_.find(store); hint != block_rows_hint_.end()) {
+                            drained.back().rows.reserve(hint->second);
+                        }
+                    }
+                    current = &drained[at->second];
                 }
-                rows->push_back(pr.row);
+                current->rows.push_back(pr.row);
+                current->min_ts_ns = std::min(current->min_ts_ns, pr.row.timestamp_ns);
+                current->max_ts_ns = std::max(current->max_ts_ns, pr.row.timestamp_ns);
                 ++appended;
             }
         } catch (...) {
@@ -2686,9 +2713,8 @@ std::exception_ptr Engine::write_seals(std::vector<Seal>& seals) {
             // append because a rollover inside it writes a segment too; and the epoch, likewise.
             s.store->set_wal_position(wal_identity_, to.file_index, static_cast<uint64_t>(to.offset));
             s.store->set_seal_epoch(epoch);
-            for (size_t i = 0; i < s.count; ++i) {
-                for (const SnapshotRow& row : u.blocks[i].block->rows) s.store->append(row);
-            }
+            s.store->reserve_rows(s.rows);
+            for (size_t i = 0; i < s.count; ++i) s.store->append_block(*u.blocks[i].block);
             auto meta = s.store->flush_segment();
             // Segments a rollover closed first: append() has no reference to the query index, so it
             // parks their metas here. Left uncollected, those rows are on disk and invisible.
@@ -2744,6 +2770,7 @@ WalPosition Engine::claim_locked() const {
 
 void Engine::drop_unsealed_locked() {
     unsealed_.clear();
+    block_rows_hint_.clear();   // keyed by the stores these paths are about to destroy
     unsealed_rows_.store(0, std::memory_order_relaxed);
     combined_store_.drop_blocks();
     registry_.set_gauge("ob_unsealed_rows", 0);
