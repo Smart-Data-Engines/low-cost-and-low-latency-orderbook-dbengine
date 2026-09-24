@@ -217,8 +217,7 @@ public:
     /// pipelining connections on the m9g.xlarge came due together every other tick - 39 sealing
     /// ticks of 79, strictly alternating, read from the tick's DEBUG lines - and a sealing tick,
     /// ~1.45 M rows written in 21 ms and synced in 39, took about as long as the four connections
-    /// take to fill the pending queue's million rows; the node wrote 10-11% fewer levels a second
-    /// than master.
+    /// take to fill the pending queue's million rows.
     static constexpr size_t kSealRows = 65'536;
     static constexpr std::chrono::milliseconds kSealAge{10'000};
     static constexpr size_t kUnsealedRowsBudget = 4'000'000;

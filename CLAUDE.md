@@ -3530,15 +3530,18 @@ Learned the hard way. Check here before debugging.
      makes the ticket owed under every policy, the test rotated about every other tick, and it
      passed on master with the nothing-owed promotion removed, three runs of three. Found when part
      2a's first rewrite of it survived the same row.
-448. **Cutting a thread's CPU raises nothing unless that CPU was the bound.** The drain and the seal
-     took 9% less of the flush thread and the four-connection rate did not move. What bound it was
-     read from the tick's own timings, added then: two ticks' seals landing in one, every other
-     tick, about as long as the writers take to fill the pending queue.
+448. **A benchmark that starts each run straight after the last measures the last one's cleanup.**
+     Part 2a's first ingest table put it 10-11% behind master: each run began while the file system
+     was still retiring the gigabyte and the thousands of files the run before had deleted, and in
+     the rotation the new build's runs mostly followed master's. The engine work that followed found
+     real faults, but not that gap - on a quiet disk, a `sync` and a second of no writes, six rounds
+     of each were 11.75-11.86 M levels a second against master's 11.80-11.86 M. Measure a harness
+     both ways once before trusting a gap it reports.
 449. **A share of exactly the inflow keeps whatever backlog it finds.** Sealing what the tick
      drained spread the stores that came due together, and the ones the first wave deferred stayed
-     deferred for the whole run - four or five ticks late, 2.5-3.2 M rows waiting, rounds anywhere
-     from 10.5 to 12.2 M levels a second. A quarter more drained the backlog: six rounds of
-     11.72-11.83 M.
+     deferred for the whole run - four or five ticks late, 2.5-3.2 M rows waiting, the server's peak
+     RSS four times master's. A quarter more drained the backlog: 0.4-0.6 M rows waiting, and
+     275-299 MiB where it had been 668-771.
 450. **Memory handed back every tick is memory the kernel faults in again.** Each drain wrote its
      rows into blocks allocated for it, and the blocks the last seal freed had gone back to the
      system: 68% of the server's page faults, four times master's, found with `perf record -e
