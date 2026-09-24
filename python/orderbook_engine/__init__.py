@@ -1119,6 +1119,25 @@ def _parse_shard_error(raw: str):
     return None, None
 
 
+class _ShardRouting:
+    """What a sharded pool routes by (#172): the shard map, the hash ring built from it, and a
+    connection to each shard it names.
+
+    Built together, beside the one in use, and published by one assignment, so a caller that took
+    it once routes by one version from start to end. Never changed once published - a refresh
+    builds the next one. The pool used to replace these three in place under its callers: a lookup
+    between `_rebuild_hash_ring()`'s empty ring and its last shard routed by a partial ring, and
+    `_connect_shards()` deleted from the dictionary a fan-out query was iterating.
+    """
+
+    __slots__ = ("shard_map", "ring", "connections")
+
+    def __init__(self, shard_map: dict, ring: "_ConsistentHashRing", connections: dict):
+        self.shard_map = shard_map
+        self.ring = ring
+        self.connections = connections
+
+
 class _ClientPool:
     """
     Multi-host connection pool with automatic primary discovery and shard routing.
@@ -1161,12 +1180,18 @@ class _ClientPool:
         # Sharding fields
         self._coordinator_endpoints = coordinator_endpoints
         self._cluster_prefix = cluster_prefix
-        self._shard_map: Optional[dict] = None
-        self._shard_connections: dict = {}  # shard_id → _TcpBackend
-        self._hash_ring = _ConsistentHashRing()
+        # What shard mode routes by, swapped whole (#172); see _ShardRouting.
+        self._routing = _ShardRouting({}, _ConsistentHashRing(), {})
 
         import threading
         self._lock = threading.Lock()
+        # Taken by every refresh of the routing - the health check's, and a SYMBOL_MIGRATED
+        # retry's - so two do not build one each and publish the second over the first; never by
+        # a caller that only routes.
+        self._routing_lock = threading.Lock()
+        # Set by close() under that lock, so a refresh the health check was already in cannot
+        # publish connections after close() has closed the last ones.
+        self._routing_closed = False
 
         # Multi-master fields
         self._multi_master_mode = False
@@ -1397,11 +1422,15 @@ class _ClientPool:
             if self._coordinator_endpoints:
                 try:
                     new_map = self._fetch_shard_map()
-                    if new_map and new_map != self._shard_map:
+                    routing = self._routing
+                    if new_map and new_map != routing.shard_map:
                         logger.debug("Health check: refreshing shard map")
-                        self._shard_map = new_map
-                        self._connect_shards()
-                        self._rebuild_hash_ring()
+                        self._refresh_routing(new_map)
+                    elif any(self._shard_connection_closed(b) for b in routing.connections.values()):
+                        # A connection #171 closed after a timeout comes back here, not at the
+                        # next map change, which may never come (#172).
+                        logger.debug("Health check: replacing closed shard connections")
+                        self._refresh_routing(routing.shard_map)
                 except Exception:
                     logger.debug("Health check: shard map refresh failed, using cached")
 
@@ -1411,9 +1440,7 @@ class _ClientPool:
         """Fetch ShardMap from etcd and establish connections to shards."""
         logger.info("Shard mode enabled with %d coordinator endpoints",
                      len(self._coordinator_endpoints))
-        self._shard_map = self._fetch_shard_map()
-        self._connect_shards()
-        self._rebuild_hash_ring()
+        self._refresh_routing(self._fetch_shard_map())
 
     def _fetch_shard_map(self) -> dict:
         """Fetch ShardMap from etcd via HTTP GET to v3 REST API."""
@@ -1441,89 +1468,111 @@ class _ClientPool:
                 continue
         return {}
 
-    def _connect_shards(self):
-        """Establish _TcpBackend connections to each shard from ShardMap."""
-        if not self._shard_map or "shards" not in self._shard_map:
-            return
-        shards = self._shard_map["shards"]
-        # Close connections to shards no longer in the map
-        for sid in list(self._shard_connections.keys()):
-            if sid not in shards:
-                try:
-                    self._shard_connections[sid].close()
-                except Exception:
-                    pass
-                del self._shard_connections[sid]
-        # Connect to new/updated shards
-        for shard_id, shard_info in shards.items():
-            if shard_id in self._shard_connections:
-                continue
-            address = shard_info.get("address", "")
-            if not address:
-                continue
-            try:
-                if ":" in address:
-                    host, port_str = address.rsplit(":", 1)
-                    port = int(port_str)
+    @staticmethod
+    def _shard_connection_closed(backend: "_TcpBackend") -> bool:
+        """Whether #171 closed this connection - an exchange that did not finish - or close() did."""
+        return backend._closed_because is not None or backend._sock is None
+
+    def _open_shard(self, shard_id: str, shard_info: dict) -> Optional["_TcpBackend"]:
+        """A connection to the shard at `shard_info["address"]`, or None if it cannot be opened."""
+        address = shard_info.get("address", "")
+        if not address:
+            return None
+        if ":" in address:
+            host, port_str = address.rsplit(":", 1)
+            port = int(port_str)
+        else:
+            host, port = address, 5555
+        try:
+            backend = _TcpBackend(host, port, self._timeout, compress=self._compress,
+                                  auth=self._auth, tls_ctx=self._tls_ctx)
+        except Exception:
+            logger.debug("Failed to connect to shard %s at %s", shard_id, address)
+            return None
+        logger.debug("Connected to shard %s at %s", shard_id, address)
+        return backend
+
+    def _refresh_routing(self, shard_map: dict) -> None:
+        """Build the routing for `shard_map` beside the one in use, and publish it whole (#172).
+
+        A connection is kept while the map names its shard at its address and it is open; one the
+        map no longer names, names elsewhere, or #171 closed is replaced, and closed only after the
+        new routing is published - a caller that took the old one then fails on that shard as it
+        would on any connection closed under it, and the next call routes by the new one.
+        """
+        shards = (shard_map or {}).get("shards", {}) or {}
+        retired = []
+        with self._routing_lock:
+            if self._routing_closed:
+                return
+            connections = {}
+            for sid, backend in self._routing.connections.items():
+                info = shards.get(sid)
+                where = f"{backend._host}:{backend._port}"
+                if info is None or self._shard_connection_closed(backend) or \
+                        info.get("address", "") not in (where, backend._host):
+                    retired.append(backend)
                 else:
-                    host = address
-                    port = 5555
-                backend = _TcpBackend(host, port, self._timeout,
-                                      compress=self._compress, auth=self._auth,
-                                      tls_ctx=self._tls_ctx)
-                self._shard_connections[shard_id] = backend
-                logger.debug("Connected to shard %s at %s", shard_id, address)
+                    connections[sid] = backend
+            for sid, info in shards.items():
+                if sid not in connections:
+                    backend = self._open_shard(sid, info)
+                    if backend is not None:
+                        connections[sid] = backend
+            ring = _ConsistentHashRing()
+            for sid, info in shards.items():
+                ring.add_shard(sid, info.get("vnodes", 150))
+            self._routing = _ShardRouting(shard_map or {}, ring, connections)
+        for backend in retired:
+            try:
+                backend.close()
             except Exception:
-                logger.debug("Failed to connect to shard %s at %s",
-                             shard_id, address)
+                pass
 
-    def _rebuild_hash_ring(self):
-        """Rebuild the consistent hash ring from the current shard map."""
-        self._hash_ring = _ConsistentHashRing()
-        if not self._shard_map or "shards" not in self._shard_map:
-            return
-        for shard_id, shard_info in self._shard_map["shards"].items():
-            vnodes = shard_info.get("vnodes", 150)
-            self._hash_ring.add_shard(shard_id, vnodes)
-
-    def _resolve_shard(self, symbol: str, exchange: str) -> str:
-        """Find shard_id for a symbol. Fallback: consistent hashing."""
+    def _resolve_shard(self, symbol: str, exchange: str,
+                       routing: Optional[_ShardRouting] = None) -> str:
+        """Find shard_id for a symbol in `routing` (the current one if None). Fallback: consistent
+        hashing on the same routing's ring, so the map and the ring are one version (#172)."""
+        routing = routing or self._routing
         key = f"{symbol}.{exchange}"
-        if self._shard_map and "assignments" in self._shard_map:
-            shard_id = self._shard_map["assignments"].get(key)
+        if routing.shard_map and "assignments" in routing.shard_map:
+            shard_id = routing.shard_map["assignments"].get(key)
             if shard_id:
                 logger.debug("Resolved %s.%s → shard %s (map lookup)",
                              symbol, exchange, shard_id)
                 return shard_id
         # Fallback: consistent hashing
-        shard_id = self._consistent_hash_lookup(key)
+        shard_id = routing.ring.lookup(key)
         logger.debug("Resolved %s.%s → shard %s (consistent hash)",
                      symbol, exchange, shard_id)
         return shard_id
 
     def _consistent_hash_lookup(self, key: str) -> str:
-        """MurmurHash3 consistent hash ring lookup."""
-        return self._hash_ring.lookup(key)
+        """MurmurHash3 consistent hash ring lookup, on the current routing's ring."""
+        return self._routing.ring.lookup(key)
 
     def execute_write_sharded(self, symbol: str, exchange: str,
                                command: str) -> str:
         """Route write to the correct shard based on symbol."""
-        shard_id = self._resolve_shard(symbol, exchange)
-        backend = self._shard_connections.get(shard_id)
+        routing = self._routing
+        shard_id = self._resolve_shard(symbol, exchange, routing)
+        backend = routing.connections.get(shard_id)
         if backend is None:
             raise OrderbookError(-1, f"Shard {shard_id} not connected")
         try:
             raw = backend.execute(command)
             err_type, detail = _parse_shard_error(raw)
             if err_type == "SYMBOL_MIGRATED":
-                # Refresh shard map and retry 1x
+                # Refresh shard map and retry 1x. An empty fetch - etcd unreachable - keeps the
+                # routing there is rather than replacing it with none.
                 logger.warning("Symbol migrated: %s.%s, refreshing shard map",
                                symbol, exchange)
-                self._shard_map = self._fetch_shard_map()
-                self._connect_shards()
-                self._rebuild_hash_ring()
-                shard_id = self._resolve_shard(symbol, exchange)
-                backend = self._shard_connections.get(shard_id)
+                new_map = self._fetch_shard_map()
+                if new_map:
+                    self._refresh_routing(new_map)
+                routing = self._routing
+                shard_id = self._resolve_shard(symbol, exchange, routing)
+                backend = routing.connections.get(shard_id)
                 if backend is None:
                     raise OrderbookError(
                         -1, f"Shard {shard_id} not connected after refresh")
@@ -1547,19 +1596,22 @@ class _ClientPool:
         If not found → fan-out to all shards and return first non-empty result.
         """
         import re
+        # One routing for the whole call: a published one is never changed, so the fan-out below
+        # iterates a dictionary no refresh touches (#172).
+        routing = self._routing
         # Try to extract symbol.exchange from SQL: FROM 'symbol'.'exchange'
         match = re.search(r"FROM\s+'([^']+)'\s*\.\s*'([^']+)'", sql, re.IGNORECASE)
         if match:
             symbol, exchange = match.group(1), match.group(2)
-            shard_id = self._resolve_shard(symbol, exchange)
-            backend = self._shard_connections.get(shard_id)
+            shard_id = self._resolve_shard(symbol, exchange, routing)
+            backend = routing.connections.get(shard_id)
             if backend is not None:
                 try:
                     return backend.execute(sql)
                 except (OSError, socket.error):
                     pass
         # Fan-out: query all shards, return first non-error response
-        for sid, backend in self._shard_connections.items():
+        for sid, backend in routing.connections.items():
             try:
                 raw = backend.execute(sql)
                 if not raw.startswith("ERR "):
@@ -1578,13 +1630,17 @@ class _ClientPool:
             except Exception:
                 pass
         self._connections.clear()
-        # Close shard connections
-        for sid, backend in list(self._shard_connections.items()):
+        # Close shard connections - under the routing lock, so a refresh the health check is in
+        # finishes first and none publishes connections after these are closed.
+        with self._routing_lock:
+            self._routing_closed = True
+            routing = self._routing
+            self._routing = _ShardRouting({}, _ConsistentHashRing(), {})
+        for sid, backend in routing.connections.items():
             try:
                 backend.close()
             except Exception:
                 pass
-        self._shard_connections.clear()
 
 
 # ── Multi-master response parsers ──────────────────────────────────────────────
