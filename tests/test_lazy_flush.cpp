@@ -158,13 +158,13 @@ TEST(SealPolicy, OverTheBudgetTheOldestAreSealedPastTheLimit) {
 }
 
 TEST(SealPolicy, ATickTakesItsShareOfWhatIsDueOldestFirst) {
-    // Sixteen stores that came due together, and a tick that drained a million rows: it seals about
-    // that many, and the rest wait for the next tick rather than doubling this one.
+    // Sixteen stores that came due together, and a tick that drained a million rows: it seals a
+    // quarter more than that, and the rest wait for the next tick rather than doubling this one.
     const auto now = Clock::now();
     std::vector<ob::Engine::SealCandidate> c;
     for (size_t i = 0; i < 16; ++i) c.push_back(candidate(125'000, std::chrono::milliseconds(100 - i), now));
     const auto picks = ob::Engine::pick_seals(c, now, false, 1'000'000);
-    ASSERT_EQ(indices(picks), (std::vector<size_t>{0, 1, 2, 3, 4, 5, 6, 7}));
+    ASSERT_EQ(indices(picks), (std::vector<size_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}));
     for (const auto& p : picks) EXPECT_EQ(p.why, ob::Engine::SealReason::kRows);
 }
 
@@ -192,7 +192,7 @@ TEST(SealPolicy, TheOldestDueStoreIsTakenWhateverItsRows) {
 TEST(SealPolicy, AYoungerStoreThatFitsTheShareIsTakenPastAnOlderOneThatDoesNot) {
     const auto now = Clock::now();
     const auto picks = ob::Engine::pick_seals(
-        {candidate(600'000, 3s, now), candidate(600'000, 2s, now), candidate(300'000, 1s, now)}, now,
+        {candidate(700'000, 3s, now), candidate(700'000, 2s, now), candidate(500'000, 1s, now)}, now,
         false, 1'000'000);
     ASSERT_EQ(indices(picks), (std::vector<size_t>{0, 2}));
 }

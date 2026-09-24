@@ -2652,7 +2652,11 @@ std::vector<Engine::SealPick> Engine::pick_seals(const std::vector<SealCandidate
     std::vector<SealPick> picks;
     size_t left = 0;
     for (const auto& c : candidates) left += c.rows;
-    const size_t share = std::max(kSealRows, drained_rows);
+    // A quarter more than it drained, so a backlog drains rather than lasting (see kSealRows);
+    // kNoRowLimit is left alone rather than overflowed.
+    const size_t share = drained_rows > kNoRowLimit / 2
+                             ? kNoRowLimit
+                             : std::max(kSealRows, drained_rows + drained_rows / 4);
     size_t picked_rows = 0;
     for (size_t i = 0; i < candidates.size(); ++i) {
         const SealCandidate& c = candidates[i];

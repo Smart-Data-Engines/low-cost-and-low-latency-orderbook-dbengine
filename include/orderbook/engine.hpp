@@ -203,11 +203,15 @@ public:
 
     /// When a store's drained rows are sealed into a segment (#165 part 2a): enough rows, or old
     /// enough, oldest first, and a tick takes **its share** - at most `kSealsPerTick` stores, and
-    /// after the first no more rows than the tick's share, which is what it drained or
-    /// `kSealRows`, whichever is more - so stores that come due together are spread over ticks
+    /// after the first no more rows than the tick's share, which is a quarter more than it drained
+    /// or `kSealRows`, whichever is more - so stores that come due together are spread over ticks
     /// rather than sealed in one; and, while every store's rows together are over the budget, the
     /// oldest of the rest past both limits until they are not. Constants, not flags: nothing yet
     /// says an operator has a reason to turn them.
+    ///
+    /// A quarter more than it drained, because a share of exactly that keeps any backlog it finds:
+    /// what comes due each tick is what was drained, so stores the first wave deferred stayed
+    /// deferred - sealed four or five ticks late, 2.5-3.2 M rows waiting - for as long as it ran.
     ///
     /// The share is measured. Without it, sixteen stores taking ~62 500 rows a tick at four
     /// pipelining connections on the m9g.xlarge came due together every other tick - 39 sealing
@@ -236,7 +240,7 @@ public:
     /// The policy above, as a function of its inputs alone, so it is tested without a clock:
     /// `candidates` oldest first, and the picks in the same order. `seal_all` is FLUSH, close() and
     /// a snapshot, which take every one. `drained_rows` is what the tick drained, and its share is
-    /// that many rows or `kSealRows`, whichever is more - so a tick that drained little still seals
+    /// a quarter more rows or `kSealRows`, whichever is more - so a tick that drained little still seals
     /// small stores due by age in bulk. Below the budget a due store after the first is taken only
     /// while the rows picked stay within the share - a younger one that fits after an older one
     /// that does not, so the share is filled - and the oldest due store is always taken, so none
