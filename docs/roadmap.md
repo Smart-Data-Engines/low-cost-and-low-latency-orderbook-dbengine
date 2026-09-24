@@ -2212,6 +2212,29 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 174. A start reads the whole WAL twice, even when its last checkpoint covers every record **P2**
+
+**Found measuring part 2a of #165**, splitting a warm start by the timestamps in its own log. Both
+builds, after the same 90-second soak and a clean stop — whose last checkpoint covers every record,
+so the replay forwards **none** of them: a first pass over the WAL to find the last checkpoint, and
+a second to forward what it does not cover. On the m9g.xlarge, one 274 MB WAL file of about 463 000
+records: **about 0.3 s** for the first pass and **0.9–0.96 s** for the second, warm, in both builds.
+Cold, the WAL is most of what a start reads once part 2a has taken the segment count down: of the
+292 MiB this build's cold start read, about 261 are the WAL.
+
+What bounds it is the WAL on disk at start: the file being written, up to `--wal-rotate-bytes` (512
+MB by default), and every file retention has not yet deleted — since part 2a, back to the oldest
+record a waiting block still needs. So a node that writes a rotation's worth between restarts reads
+about twice this at every start.
+
+Why the second pass costs three times the first is not measured, and is not guessed at here. The
+first question is what a start needs to read at all: the last checkpoint's position is known when it
+is written, and a start that could find it without reading everything before it would read only the
+tail it replays.
+
+- Effort: S–M | Impact: after part 2a, the largest part of a start's cost for a node that writes,
+  and it grows with the WAL between rotations rather than with what is left to replay
+
 ### 173. A storage-fault test read a replica once, in the milliseconds between its recorded position and the end of its bootstrap ✅
 
 **Found verifying #170 and #171**: `test_a_snapshot_whose_install_could_not_sync_is_installed_again`
@@ -2693,7 +2716,8 @@ tick rate — a segment that stays open across ticks, or segments merged behind 
 is what startup, the inodes and every walk that remains need. Which of those is a design question
 with its own measurements, for its own spec.
 
-**Part 1, the index, is done; part 2, the count, is what keeps this item open.** Each symbol has its
+**Part 1, the index, is done, and so is part 2a, the count at the tick; part 2b, merging what is
+written, keeps this item open.** Each symbol has its
 own segments now, keyed with a NUL between symbol and exchange (a dot would make `"A.B"` on `"C"` and
 `"A"` on `"B.C"` one key). A tick's merge is a set lookup and an insertion, at the end almost always;
 a query finds its symbol and binary-searches its window; retention decides and takes the expired
@@ -2803,9 +2827,243 @@ Row 18 has a reader behind it that the tests did not name until then: a `LIMIT` 
 a scan delivers and a `SNAPSHOT` keeps the last, so the order candidates reach the callback in is
 part of the answer. Asking who else depends on it found **#168**, and measuring that found **#167**.
 
-- Effort: L | Impact: part 1 closed the slope from writes and queries; part 2 is a node's start time,
-  inodes and segment count, which grow with its uptime times its active symbols without bound
-  unless a TTL is set
+**Part 2a is done: a tick seals only the stores that are due, and about as many rows as it
+drained.** A tick used to write a segment for every symbol that had received a row since the last
+one — at 256 symbols about two thousand files and a `syncfs()` a tick, 84.7% of the flush thread's
+CPU in the kernel creating them. Rows now wait, readable, in the blocks a drain publishes to the
+query index, and a store is **sealed** — its blocks written into one segment and swapped for it in
+one step — when it has 65 536 rows, when its oldest block is ten seconds old, or when every block
+together is over four million rows. Below that budget a tick takes **its share**: at most 64 stores,
+and after the first no more rows than a quarter more than it drained (or 65 536, if it drained
+fewer), so stores that come due together are spread over ticks. `FLUSH`, `close()` and both
+snapshots seal everything.
+
+**The checkpoint was the hard part, and its first design lost rows before any test ran.** It said:
+claim only what no block still holds, and nothing more is needed. Walking the kill test through it —
+written for this part, not yet run — found the hole. A seal writes the blocks of several drains into
+one segment, positioned at the last of them; with another symbol's older block still waiting, the
+claim stands *before* that segment's position, so a start removes the segment as unvouched, and
+replay from the claim rebuilds only its rows recorded *after* the claim. The earlier ones are gone,
+and retention may already have deleted their records. And a position cannot vouch at all once a late
+seal of old blocks writes a segment positioned before the checkpoint it came after.
+
+So **every seal has an epoch.** Each `write_seals()` that writes anything bumps it, the segments it
+writes carry it in `meta.json`, and a checkpoint written while blocks wait is **sixteen bytes**:
+where replay starts — the oldest record a waiting block still needs — and the epoch the sync before
+it covered. At start a local segment sealed after that epoch is removed and rebuilt; whatever the
+replay brings back that a kept segment already holds is skipped by the per-symbol positions replay
+has filtered by since #63. With nothing waiting the checkpoint is the eight bytes it always was. The
+epoch continues at open from the highest the store or the last checkpoint names, because starting
+again at zero would stamp new seals with epochs an old checkpoint already vouches for. Which
+segments a checkpoint vouches for is a pure function, `Engine::segment_vouched_for()`, tested
+without staging a crash.
+
+**Going back to an older build is safe only from a clean stop.** `close()` seals everything, so the
+last checkpoint is the eight-byte form every build reads. After a crash, a build before this one
+reads the sixteen bytes as saying nothing and replays from the checkpoint record, which would skip
+the records of the rows that were waiting: start the node once with this build first.
+
+Measured on the m9g.xlarge against master (`4702cfa`; the same GCC 14 Release build of both, ABBA,
+each run on a fresh data root on the gp3 volume), with the soak of part 1 — 256 symbols, one
+20-level `MINSERT` each per round, 20 rounds a second — on `900ac7b`, whose C++ is this pull
+request's:
+
+| | master (`4702cfa`) | part 2a |
+|---|---|---|
+| segments on disk after 90 s and a clean stop | 141 312 – 143 104 | **2 304** |
+| flush ticks a second | 5.9 – 6.3 | **8.9 – 9.3** |
+| seals a second, per 15 s window | — | 17.1 or 34.1 — 25.6 on average, 256 symbols every ten seconds |
+| writer round, p50 / p99 | 0.59 – 0.62 / 0.70 – 0.76 ms | 0.59 – 0.62 / 0.62 – 0.76 ms |
+| narrow `SELECT` of the last second | 0.29 – 0.38 ms | 0.26 – 0.35 ms |
+| RSS at 90 s | 87.9 – 90.2 MiB, growing with the segments | 99.4 – 99.9 MiB, within 3 MiB of that from the forty-fifth second |
+| restart after a clean stop, warm | 3.25 – 3.33 s | **1.50 – 1.51 s** |
+| restart after a clean stop, cold (`drop_caches`) | 107.54 – 109.45 s, 1 456 – 1 474 MiB read | **4.38 – 4.42 s**, 291 – 293 MiB read |
+| restart after a kill, warm | 3.40 s | 1.70 s, replaying the rows that waited |
+
+**The prediction held on every line the soak measures**, and the tick's own work is read from its
+cadence rather than timed: the flush loop sleeps its interval and then ticks, so 8.9–9.3 ticks a
+second at 100 ms is an average tick of **8–12 ms**, where master's 5.9–6.3 is **59–70 ms** — the ~70
+ms the prediction started from. One cost it did not name is real: the rows waiting in blocks are
+memory. RSS is about 100 MiB from the forty-fifth second on, against master's 88–90 MiB at the
+ninetieth — which grows with master's segments, where this does not — and the budget bounds it at
+four million rows. The first version of this part, before the share and the row pool below, held
+170.7–171.9 MiB in the same soak.
+
+**Measuring it corrected part 1's own number.** Part 1 put a warm start at "about 24 µs a segment":
+the whole start divided by the segments. The start's own log splits it: on master, **2.12 s** to
+open 142 592 segments together with a first pass over the WAL, **0.96 s** for a second pass, and
+0.24 s to listening — about **13 µs a segment**, and roughly 1.2 s that both builds pay for reading
+the WAL twice. Which is now most of what a start costs: of the 292 MiB this part's cold start read
+in its first measurement, about 261 are the WAL. That is **#174**.
+
+**Measuring it found a harness problem before an engine one.** The first ingest table put part 2a
+10–11% behind master at four pipelining connections — medians of five rounds, 10.61 M levels a
+second against 11.77 M — with the two equal at one connection. It did not survive the question of
+what else was running: the harness started each run straight after the last, with the page cache
+still holding what that run had written and deleted — a gigabyte of WAL, thousands of segment files
+— for the next run's own syncs to flush, and in its rotation part 2a's runs mostly followed
+master's. Six rounds of each at four connections, default policy, without and with a quiet disk
+first:
+
+| before each run | master | part 2a |
+|---|---|---|
+| nothing — straight after the last | 10.24 M (9.39–11.77) | 10.01 M (9.71–11.52) |
+| `sync`, and a second of no writes on the data root's device | **11.84 M (11.80–11.86)** | **11.77 M (11.75–11.86)** |
+
+The wait after the `sync` was hardly ever more than its one second: the `sync` is what does it. The
+harness does both now (`--no-settle` measures without), and the pull request's table below was
+measured with them.
+
+**What the chase found on the way is real, and none of it is that gap.** The flush thread took 26%
+more CPU than master's; collecting each block's range in the drain, reserving the block to its
+store's last and appending a block at once (`ColumnarStore::append_block()`) took that to 17%. The
+tick's own lines, on `DEBUG` since then, showed its seals **strictly alternating**: sixteen stores
+taking about 62 500 rows a tick, just under the 65 536 that make a store due, came due together
+every other tick, and that tick wrote ~1.45 M rows in 21 ms and synced them in 39 — about as long as
+the four connections take to fill the pending queue's million rows. So a tick seals **its share**.
+The first share, exactly what the tick drained, kept whatever backlog it found — what comes due each
+tick is what was drained, so the stores the first wave deferred stayed deferred, four or five ticks
+late with 2.5–3.2 M rows waiting — and the server's peak RSS went from 164 to 668–771 MiB; a quarter
+more drains it. And `perf record -e page-faults` found the rest: the server faulted 5.5–5.7 pages a
+batch against master's 1.2–1.5, 68% of them in `drain_batch()` writing into blocks it had just
+allocated. A sealed block's rows go back to a pool the next drain takes from (`RowBufferPool`), and
+every seal writes through one set of column buffers lent to its store in turn, where sixteen stores
+had each kept buffers as big as their biggest seal. Six rounds of each, rotating, with two seconds
+between runs — before the harness settled the disk, which is why master's own rounds spread here:
+
+| build | levels a second, median (range) | peak RSS | minor faults | flush thread CPU |
+|---|---|---|---|---|
+| master | 11.56 M (11.18-11.73) | 162-165 MiB | 53 k | 1.26 s |
+| the share, of what a tick drained | 11.69 M (10.84-12.13) | 668-771 MiB | 223 k | 1.47 s |
+| + the row pool and the lent buffers | 11.94 M (11.15-12.07) | 442-500 MiB | 160 k | 1.40 s |
+| + a quarter more | **11.78 M (11.72-11.83)** | **275-299 MiB** | 129 k | 1.38 s |
+
+The last row's rounds are the only ones that did not spread, and it seals about half the segments
+master writes at this load (409–423 against 832–848 a run). The pull request's table — the harness
+of #164 on a quiet disk, five rounds on the same binary:
+
+| connections, fsync policy | master | part 2a |
+|---|---|---|
+| 4, the default | 11.79 M (11.13–11.82) | 11.76 M (11.48–11.80) |
+| 4, `every` | 586 k (583–588 k); p99 12.96 ms | **594 k (593–598 k); p99 11.13 ms** |
+| 1, the default | 6.66 M (6.41–6.71) | 6.70 M (6.67–6.72) |
+| 1, `every` | 563 k (562–567 k); p99 3.97 ms | **570 k (568–573 k); p99 3.48 ms** |
+| peak RSS, 4 and 1, the default | 166 and 159 MiB | 290 and 245 MiB |
+
+**Level with master under the default policy** — −0.3% and +0.5% on the medians, part 2a's ranges
+inside master's — **and ahead under `every`**: 1.2–1.4% more levels a second, 12–14% off p99, and 8%
+less server CPU at four connections. At that rate a store takes about eighteen ticks to reach its
+65 536 rows, so where master wrote a segment of it every tick, part 2a writes one in eighteen. The
+price is memory: the rows waiting in blocks, and the pool that keeps a drain's worth of their
+storage, 290 MiB at four connections against 166.
+
+**Four storage tests measured something else once a tick sealed only what was due, and one had never
+measured what it said.** A symbol the disk refuses now waits in a readable block, so both symbols
+answer after the failed `FLUSH`, each row once, and the disk tells them apart — one segment after
+the first flush, one each after the second. The tests of a writer during the tick's segment write
+and of rows written during it surviving a crash make their store due by rows (`make_due`); the first
+had passed only because the age seal came at about fifteen seconds, inside its fifteen-second
+patience. And **the retention test under `every` did not hold the path it was written for**: a tick
+that finds nothing owed must move the floor (#160), but the file a rotation leaves makes a ticket
+owed under every policy, and the test rotated the WAL about every other tick — with that promotion
+removed it passed three runs of three on master. It now rotates the WAL with a store sealed by rows
+and then writes single rows, one every 20 ms, into a file with room for all of them. Its first
+rewrite failed two runs of three and said why: a block's replay starts where the drain before it
+ended, so a row drained with the sealed store's last held the floor inside it.
+
+**Mutation tables: 47 rows, 45 as written down before the run.** Every instrument was green before
+and after each table, and each has a control that survives.
+
+The seal epochs, 12 rows, 12 as written; row 5 first came back INVALID — without the stamp the epoch
+is unused and `-Werror` refuses the build — so the row was rewritten to stamp 0 and keep the
+variable used: the mutation changed, not the code.
+
+| # | the epochs | caught by |
+|---|---|---|
+| 1 | the first design: the checkpoint claims less, in eight bytes | the epoch-form test, and **the kill test** — the one it was written for |
+| 2 | at start a position judges an epoch checkpoint | the rule's tests, and the kill test |
+| 3 | a segment sealed after the checkpoint is kept | the rule's test |
+| 4 | the epoch starts again at zero after a reopen | the continuity test |
+| 5 | a seal stamps no epoch | the epoch-form and continuity tests |
+| 6 | `meta.json` keeps no epoch | both engine tests |
+| 7 | `meta.json`'s epoch is not read back | the continuity test |
+| 8 | the last checkpoint's epoch is dropped | the epoch-form test, and the kill test |
+| 9 | the epoch read from the position's bytes | the payload test |
+| 10 | the epoch form when nothing waits too | the eight-byte test |
+| 11 | control: the epoch's INFO line reworded | survives |
+| 12 | every `write_seals()` bumps the epoch, one with nothing to write included | survives: an epoch only has to rise, and a gap is harmless |
+
+Row 3 is the one a kill cannot see: a killed process leaves the segment whole in the page cache, so
+keeping it gives the right answer. Its test is the rule's.
+
+The drain and the seal, 11 rows, 10 as written. Row 4's verdict was wrong, and the row is a finding:
+`flush_segment()` records a segment's quantities as raw when the store's flag says so **or** the
+encoder fell back, and the encoder falls back for exactly the quantities `append()` tests — so the
+flag changes no byte, no test can kill the row, and the test came out of `append_block()`.
+
+| # | the drain and the seal | caught by |
+|---|---|---|
+| 1 | the drain does not lower a block's minimum | the out-of-order range test |
+| 2 | the drain does not raise a block's maximum | the out-of-order range test |
+| 3 | `append_block()` never goes row by row, whatever period a row is of | the property test |
+| 4 | `append_block()` does not test quantities for Simple8b's width | **survives — the verdict was wrong** |
+| 5 | `append_block()` does not widen the segment's range by the block's | the property test, the range test |
+| 6 | `append_block()` does not count the rows after the first | the property test, four engine tests |
+| 7 | `RowBlock::make` ignores the range it is given | the property tests, the range test |
+| 8 | control: `reserve_rows()` reserves nothing | survives |
+| 9 | control: the drain does not reserve a block to its store's last one | survives |
+| 10 | control: a reservation a quiet store no longer needs is kept | survives |
+| 11 | the hints are not cleared with the stores | survives: a stale hint sizes a reservation |
+
+The share, 9 of 9; row 1 rewritten once, because its first form left `share` unused and `-Werror`
+refused the build. Row 7's test was written for it before the run, when no test there was could see
+it.
+
+| # | the share | caught by |
+|---|---|---|
+| 1 | not applied: every due store sealed in the tick | four policy tests, the spreading test |
+| 2 | the oldest due store bound by it too | the oldest-always test, two engine tests, an epoch test |
+| 3 | stops at the first store that does not fit | the younger-fits test |
+| 4 | no floor: a quiet tick seals what it drained | the quiet-tick test |
+| 5 | the rows picked not added up | four policy tests, the spreading test |
+| 6 | the tick passes no limit | the spreading test |
+| 7 | the tick passes nothing for what it drained | the drained-share test |
+| 8 | control: the deferred count in the `DEBUG` line zero | survives |
+| 9 | control: a comment reworded | survives |
+
+The pool, the lent buffers and the quarter, 10 of 10. Rows 8 and 9 survive by what they are: memory,
+not output — no test reads what a buffer's capacity is. Row 6 is the guard's reason: with it gone
+the lent-buffer test's `EXPECT_THROW` fails and the `flush_segment()` after it dies on the buffers
+swapped out from under its segment.
+
+| # | the pool, the lent buffers, the quarter | caught by |
+|---|---|---|
+| 1 | a block's rows not given back | the pool's reuse and query-holds tests |
+| 2 | `take()` never takes a spare | the reuse and far-bigger tests |
+| 3 | `take()` takes a spare however much bigger than the ask | the far-bigger test |
+| 4 | `give_back()` keeps spares past the bound | the bound test |
+| 5 | `take(0)` takes a spare | the bound test — tightened for this row before the run |
+| 6 | `swap_buffers()` swaps under an active segment | the lent-buffer test, and a crash after it |
+| 7 | the share what the tick drained, not a quarter more | two policy tests |
+| 8 | a successful seal keeps the lent buffers in its store | survives: memory |
+| 9 | a quiet store's block keeps the big buffer it took | survives: memory |
+| 10 | control: a comment reworded | survives |
+
+The storage tests, 5 rows and one again: row 1 survived the first rewrite of the retention test,
+which is how the test's old gap was found.
+
+| # | mutation | meant for | caught by |
+|---|---|---|---|
+| 1 | #160: the floor does not move on a tick that finds nothing owed | retention under `every` | **survived the first rewrite**; the second: that test |
+| 2 | #160: a failed seal skips the merge of the seals that were written | a symbol the disk refuses | that test |
+| 3 | #159: the checkpoint claims the log's position, not the drain's | rows written during the segment write | that test |
+| 4 | stage 5 of #151: the seal writes under the engine's lock | a writer during the segment write | that test |
+| 5 | control: a comment reworded | — | survives |
+
+- Effort: L | Impact: part 1 closed the slope from writes and queries; part 2a took the count to
+  about one segment per active symbol per ten seconds at a trickle and half of master's at the write
+  ceiling, and a cold start from minutes to seconds; merging the segments that are written is part
+  2b
 
 ### 164. The flush tick synced, drained and deleted under the engine's lock, and a rotation synced its whole file on a writer's thread ✅
 
@@ -10703,11 +10961,14 @@ about this before. **#170 and #171 are closed, and both were the Python client's
 socket from two threads, so a multi-threaded caller got another query's rows — 39% of them in the
 measurement, with no error — and a connection whose reply timed out answered the next command with
 it, every reply after that one behind. **#172** is what fixing them turned up in the sharded pool,
-which no test constructs. **#165's first part is done**: the index is per symbol and in width tiers, so a
-tick's merge and a query no longer walk it — a writer's p99 flat at 0.71–0.76 ms through the soak
-where it grew to 94.66 ms — and what is left is the count itself, which grows faster now that ticks
-no longer slow: a cold start of that soak's node reads 1.44 GiB and takes 107 s after 90 seconds of
-uptime. **#169**: an exchange name with a dot makes two instruments one key, so they share a live book,
+which no test constructs. **#165's first two parts are done**: the index is per symbol and in width
+tiers, so a tick's merge and a query no longer walk it — a writer's p99 flat at 0.71–0.76 ms through
+the soak where it grew to 94.66 ms — and a tick seals only the stores that are due, and about the
+rows it drained, so a node gains a segment per active symbol every ten seconds at a trickle and half
+of master's at the write ceiling, and a cold start of that soak's node takes 4.4 s rather than 108.
+What is left is merging what is written (part 2b). **#174** is what measuring part 2a found next: a
+start reads the whole WAL twice even when its last checkpoint covers every record.
+**#169**: an exchange name with a dot makes two instruments one key, so they share a live book,
 sequence numbers and stored rows. **#167 and #168 are closed**: a `SNAPSHOT` answers its columns
 over the wire again — it had answered none since #139 — and keeps the latest row at or before its
 time for each level rather than the last one a scan delivered. **#166 was a P0
@@ -10754,7 +11015,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #165, #169, #172.** Every other item above #58 is marked closed, and
+**Open: #165, #169, #172, #174.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -10892,9 +11153,10 @@ The capability items are in the table below.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **P0** | Segments merged, so their count stops growing with the tick rate (#165, part 2) | L | A node gains one segment per active symbol per tick - 1 550 a second at 256 symbols - and a cold start reads each one: 107 s and 1.44 GiB after 90 seconds of uptime. Part 1 took the slope off writes and queries |
+| **P0** | Segments already written merged, so their count stops growing with uptime (#165, part 2b) | L | Since part 2a a store is sealed when it is due - at a trickle one segment per active symbol per ten seconds, 2.2 M a day at 256 symbols - and nothing merges them; a cold start reads each one, about 0.75 ms a segment on a gp3 volume |
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
 | **P1** | The sharded Python pool swaps its routing state whole, under a test that builds one (#172) | S–M | A half-built hash ring routes writes, a map refresh raises in a caller, and a shard connection a timeout closed does not come back |
+| **P2** | A start finds its last checkpoint without reading the whole WAL twice (#174) | S–M | With part 2a's segment counts the WAL is most of what a start reads - about 261 of 292 MiB cold - and a start reads it twice even when the checkpoint covers every record |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |

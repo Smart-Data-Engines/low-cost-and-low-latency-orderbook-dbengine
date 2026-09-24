@@ -3581,15 +3581,18 @@ carries no count, because the previous version of this sentence said "four" abov
 omitted the newest one entirely - which is the rot pitfall 312 is about, in the paragraph that
 warns about it.
 
-**#165, part 1**: the segment index is per symbol and in width tiers, so a flush tick's merge is a
-lookup and an insertion and a query searches only its symbol's windows - a writer's p99 flat at
-0.71-0.76 ms through a 90-second soak where it grew to 94.66 ms. **Part 2 is open and a P0**: the
-count still grows by one segment per active symbol per tick, faster now that ticks no longer slow,
-and a cold start reads every one - 107 s and 1.44 GiB after that soak. **#169 and #172 are open
-P1s**: an exchange name with a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C`
-share a live book, sequence numbers and stored rows, measured on the wire - and the Python client's
-sharded pool replaces its routing state under its callers, found by reading because nothing tests
-that pool.
+**#165, parts 1 and 2a**: the segment index is per symbol and in width tiers, so a flush tick's
+merge is a lookup and an insertion and a query searches only its symbol's windows - a writer's p99
+flat at 0.71-0.76 ms through a 90-second soak where it grew to 94.66 ms - and a tick seals only the
+stores that are due, a quarter more rows than it drained at most, with a checkpoint that names the
+seal epoch it vouches for: after that soak 2 304 segments where master has 141 312-143 104, and a
+cold start of 4.4 s where master's takes 108. **Part 2b is open and a P0**: nothing merges the
+segments that are written, so they still grow with uptime. **#169 and #172 are open P1s**: an
+exchange name with a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live
+book, sequence numbers and stored rows, measured on the wire - and the Python client's sharded pool
+replaces its routing state under its callers, found by reading because nothing tests that pool.
+**#174 is an open P2**: a start reads the whole WAL twice even when its last checkpoint covers every
+record.
 
 **#170 and #171**: a Python client connection carries one exchange at a time and is closed when one
 does not finish. A pool used one socket from two threads, so two callers got each other's rows 39%
