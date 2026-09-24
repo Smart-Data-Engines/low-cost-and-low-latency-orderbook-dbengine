@@ -3495,6 +3495,11 @@ Learned the hard way. Check here before debugging.
      #170 resolved `venv/bin/python` through its link, ran pytest in a Python without it, and called
      the baseline "not green" with no test failed. Use `absolute()`, and require the baseline to run
      the count it should - the smart-data-engine skill records the same pitfall as 229.
+441. **A helper that reads every refusal as "no rows" turns "not yet" into "lost".** A replica
+     saves its snapshot position a few milliseconds before it takes reads, and answers `ERR
+     bootstrapping` meanwhile; `select_prices()` read that as an empty store and a correct replica
+     failed a required test, once in a few hundred runs under load (#173). Give each refusal the
+     meaning it has, and raise on the ones a caller did not ask to be told apart from an answer.
 
 ## Current state and open problems
 

@@ -2212,6 +2212,44 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 173. A storage-fault test read a replica once, in the milliseconds between its recorded position and the end of its bootstrap ✅
+
+**Found verifying #170 and #171**: `test_a_snapshot_whose_install_could_not_sync_is_installed_again`
+failed once in a full local battery — *the replica did not end with every row*, having read none —
+and passed **10 of 10** alone. The branch under test changed no C++, and the test reads through a raw
+socket rather than through the client that branch changed, so the failure was not that change's; it
+was not a flake either until it was measured.
+
+Measured with the same two nodes, the replica's state file polled every half millisecond and the
+first line of every answer kept: right after the position appears, `SELECT` answers **`ERR
+bootstrapping` for 0.6–1.4 ms**, and **every one of the 1100 rows by 4.9–6.1 ms**, three runs of
+three. `ReplicationClient::install_snapshot()` saves the position once the install has synced,
+removes its staging directory, and its caller clears the bootstrapping flag after that — so there
+is a window in which the position says the store is complete and the node, correctly, still
+refuses reads. The test polled every 200 ms and read once, and `select_prices()` read **every**
+`ERR` as no rows, so an honest "not yet" read as a replica that had lost everything. The window
+grows with the latency of the syncs around it, which a full battery supplies.
+
+**A test defect, not lost data** — the rows were there a few milliseconds later, every time.
+
+**Fixed in the test.** `select_prices()` reads only `ERR … not found` as no rows — its documented
+case, a symbol with nothing left — and raises on any other refusal; the replica test asks again
+while the answer is `ERR bootstrapping`, and reads **first**, before the assertions that read the
+whole log, because reading the log takes as long as the window. The state file is polled every
+millisecond instead of every 200, so the read lands in the window in most runs rather than once in
+a few hundred — **in most, not all**: the mutation reading once was killed in **4 of 5** runs, and the
+defect as it was, every refusal read as no rows, in **3 of 5**. Holding the window open would make it
+deterministic, and the fault injector can delay a call — but it takes one rule per node, and this
+node's rule is the failed sync the test is about.
+
+Mutation table: rows re-run five times where the answer depends on landing in the window; the poll
+back at 200 ms with one read **survives**, which is the reason the poll changed, and a wait that
+asks again after any refusal survives because nothing here produces another one. The docstring
+control survives.
+
+- Effort: S | Impact: a required check could fail on a correct replica, once in a few hundred runs
+  under load, with a message saying rows were lost
+
 ### 172. The Python client's sharded pool replaces its routing state under its callers, and nothing tests it **P1**
 
 **Found fixing #171, by reading, and not measured**: no test constructs a pool with
