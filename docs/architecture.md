@@ -107,23 +107,44 @@ only for bookkeeping (#164):
 2. **Without it**: the `fsync`s, the files rotation left first. Then **under `mtx_` again** the
    records stop being owed; a sync that failed puts the rows back in front of what was queued since,
    and the tick throws for #112's boundary to count.
-3. **Without it**: the drain, a chunk at a time into the rows' stores, stamped with the ticket's
-   position. Each chunk is given back, and released from the ceiling, as soon as its rows are in,
-   so a writer at the ceiling waits for a chunk rather than for the tick. A store the drain creates
-   takes `mtx_` for the insertion.
-4. **Without it**: every store's segment written, and one `syncfs()` on the data directory (#160).
-5. **Under `mtx_`**: the new segments merged into the query index, the checkpoint appended (#159),
-   and the WAL files below the retention floor chosen.
+3. **Without it**: the drain, a chunk at a time, into **one block per store** — immutable, and
+   published in the query index when the drain is done, so a query reads the rows at once (#165
+   part 2a). A block records where its rows' records start and end in the WAL. Each chunk is given
+   back, and released from the ceiling, as soon as its rows are taken, so a writer at the ceiling
+   waits for a chunk rather than for the tick. A store the drain creates takes `mtx_` for the
+   insertion.
+4. **Without it**: the stores that are **due** sealed — 65 536 rows in blocks, or an oldest block
+   ten seconds old, or every block together over four million rows — oldest first, and below that
+   budget the tick takes **its share**: at most 64 stores, and after the first no more rows than a
+   quarter more than it drained, or 65 536 if it drained fewer. So stores that come due together are
+   spread over ticks rather than sealed in one: at four pipelining connections that had made every
+   other tick last about as long as the writers take to fill the pending queue. Each store's blocks
+   go into one segment, stamped with the tick's **seal epoch**; then one `syncfs()` on the data
+   directory (#160). A tick that seals nothing writes nothing.
+5. **Under `mtx_`**: each sealed store's blocks swapped for its segment in the query index in one
+   step, so a query sees one or the other and never both; the checkpoint appended (#159) — the eight
+   bytes it always was when nothing waits, and when blocks still wait, sixteen: where replay starts
+   (the oldest record a waiting block needs) and the seal epoch the sync covered, because a position
+   cannot say which segments are durable once a segment holds several drains; and the WAL files
+   below the retention floor chosen.
 6. **Without it**: those files deleted and, on its own interval, the TTL sweep (#163).
 
 The rows being drained still count against the ceiling, and in `STATUS`, `holds_no_data()` and
 `ob_pending_rows`, so nothing reads as empty for the length of a sync. What bounds a fast writer is
 then the cycle itself rather than the lock: one pipelining connection writing 6.6 M levels a second
 on an m9g.xlarge meets the ceiling once a cycle of about 150 ms. `FLUSH`, `close()` and snapshot
-creation still drain under `mtx_`, straight after a sync under the same hold. Step 5's merge is a
-lookup and an insertion per new segment since part 1 of #165, which made the index per symbol and
-in width tiers; what still grows with the node's uptime is the number of segments, which a start
-reads one directory at a time (#165, part 2).
+creation still drain under `mtx_`, straight after a sync under the same hold, and they seal
+**everything**: after a `FLUSH` a store holds no block, which is what `FLUSH` has always meant.
+Step 5's merge is a lookup and an insertion per new segment since part 1 of #165, which made the
+index per symbol and in width tiers, and since part 2a a symbol gains a segment when it is due
+rather than on every tick. What a start reads is still one directory a segment; merging segments
+that are already written is part 2b.
+
+At start, a local segment the last checkpoint does not vouch for is removed and its rows replayed
+from the WAL: past the checkpoint's position when it has eight bytes, and sealed after its epoch
+when it has sixteen. Everything replay then brings back that a kept segment already holds is skipped
+by the per-symbol positions replay has filtered by since #63. `Engine::segment_vouched_for()` is
+that rule, as a pure function.
 
 ### Sequence numbers and who assigns them
 

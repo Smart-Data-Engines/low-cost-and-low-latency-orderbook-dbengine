@@ -425,6 +425,22 @@ logger, to confirm a start.
   room. Waits are not an error — a writer faster than a flush cycle meets the ceiling once a cycle,
   which one pipelining connection on an m9g.xlarge does at 6.6 M levels a second — and refusals
   are: the flush cannot make progress.
+- `ob_unsealed_rows` — rows drained, readable, and waiting in memory for their store's seal (#165
+  part 2a): a store is sealed at 65 536 rows or when its oldest are ten seconds old, and every store
+  together is held under four million rows. These are the rows a crash replays from the WAL, and
+  `ob_seals_total` counts the seals. A value that sits at the budget means seals cannot keep up —
+  the flush's write rate, not its interval, is what to look at. At `--log-level DEBUG` each seal
+  says what it wrote, and each tick that took rows, at its end, where its time went — two lines of
+  one tick at four pipelining connections on an m9g.xlarge:
+
+  ```
+  sealed 4 store(s), 785920 row(s): chosen and written in 11.59 ms, synced in 24.21 ms, merged and checkpointed in 0.49 ms
+  flush tick: 810240 row(s) taken; WAL sync 13.58 ms, drain 9.40 ms, seals 36.30 ms, retention 0.76 ms
+  ```
+
+  At the write ceiling the cycle is what bounds a writer, so these are the lines to read when
+  `ob_writer_backpressure_waits_total` climbs: a tick longer than the writers take to fill the
+  pending queue is time every writer waits.
 
 One counter is worth watching for a different reason: **`ob_refused_commands_total`** is the number
 of command lines the parser would not accept — an unknown word, or a known command carrying a token

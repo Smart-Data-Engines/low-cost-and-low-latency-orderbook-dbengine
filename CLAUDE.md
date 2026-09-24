@@ -3500,6 +3500,50 @@ Learned the hard way. Check here before debugging.
      bootstrapping` meanwhile; `select_prices()` read that as an empty store and a correct replica
      failed a required test, once in a few hundred runs under load (#173). Give each refusal the
      meaning it has, and raise on the ones a caller did not ask to be told apart from an answer.
+442. **A checkpoint that claims less stops being safe once one segment holds several drains.**
+     "Claiming less only costs a replay" held while every segment was one drain, positioned at its
+     own end. A seal writes several drains into one segment positioned at the last of them, so with
+     another store's older block waiting the claim stood before that segment's position: a start
+     removed it as unvouched, and a replay from the claim rebuilt only its later rows. Walking the
+     kill test through the design found it before any run; a checkpoint names a seal epoch now (#165
+     part 2a).
+443. **A fixture that starts a process outside its `try` leaks it when the start fails.** The
+     lazy-flush fixture called `start()` before its `try`, and a `start()` that timed out raised
+     without stopping what it had launched: three servers outlived the run by eleven hours, found by
+     listing every process. Start inside the `try`, and make a failed start stop what it launched.
+444. **A cost per item measured as the whole divided by the items includes everything else the whole
+     does.** Part 1 of #165 put a warm start at 24 µs a segment - the start divided by its segments.
+     The start's own log splits it: about 13 µs a segment, and 1.2 s that both builds spend reading
+     the WAL twice, which is #174.
+445. **A verdict that turns out wrong is a finding about the code, not a row to argue with.** The
+     row that dropped `append_block()`'s test of each quantity for Simple8b's width was written down
+     as killed and survived: `flush_segment()` ORs that flag with the encoder's own finding, and the
+     encoder falls back for exactly those quantities, so no test can kill it - the test was work for
+     nothing, and came out of the code (#165 part 2a).
+446. **A test can pass by its patience rather than by its premise.** Once a tick sealed only what
+     was due, the test of a writer during the tick's segment write still passed - because the age
+     seal came at about fifteen seconds, inside its fifteen-second patience, and the line its
+     premise check read is one the seal logs too. After a change to what a path does, read each test
+     of that path for what it now exercises, not only whether it is green.
+447. **A test's premise that a path runs needs a mutation that removes the path.** The retention
+     test for #160 said a tick under `every` usually finds nothing owed; the file a rotation leaves
+     makes the ticket owed under every policy, the test rotated about every other tick, and it
+     passed on master with the nothing-owed promotion removed, three runs of three. Found when part
+     2a's first rewrite of it survived the same row.
+448. **Cutting a thread's CPU raises nothing unless that CPU was the bound.** The drain and the seal
+     took 9% less of the flush thread and the four-connection rate did not move. What bound it was
+     read from the tick's own timings, added then: two ticks' seals landing in one, every other
+     tick, about as long as the writers take to fill the pending queue.
+449. **A share of exactly the inflow keeps whatever backlog it finds.** Sealing what the tick
+     drained spread the stores that came due together, and the ones the first wave deferred stayed
+     deferred for the whole run - four or five ticks late, 2.5-3.2 M rows waiting, rounds anywhere
+     from 10.5 to 12.2 M levels a second. A quarter more drained the backlog: six rounds of
+     11.72-11.83 M.
+450. **Memory handed back every tick is memory the kernel faults in again.** Each drain wrote its
+     rows into blocks allocated for it, and the blocks the last seal freed had gone back to the
+     system: 68% of the server's page faults, four times master's, found with `perf record -e
+     page-faults` rather than read from a CPU profile, where they hide inside the function that
+     touches the page.
 
 ## Current state and open problems
 
