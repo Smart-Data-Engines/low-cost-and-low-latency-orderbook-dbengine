@@ -329,7 +329,16 @@ connection, so for parallel throughput give each thread a client of its own.
 every later call on that client, saying which exchange did not finish: its reply may still arrive,
 and on an open connection the next command would read it as its own. The command that timed out may
 or may not have been applied, and nothing is retried. Open a new client; a pool replaces the
-connection at its next health check.
+connection at its next health check — a shard's too, in sharded mode (#172).
+
+**Sharded mode routes by one version of the shard map at a time.** With `coordinator_endpoints` the
+pool reads the map from etcd (`<prefix>shard_map`) and routes each symbol to the shard the map
+assigns it, or to the one the map's hash ring gives it. A refresh — the health check's, or a
+`SYMBOL_MIGRATED` retry's — builds the next routing beside the one in use and swaps it in whole, so
+a call routes by one version from start to end, and a refresh that cannot reach etcd keeps the
+routing there is. **No shard writes that map yet (#175)**: a node started with `--shard-id` neither
+registers itself nor publishes the map, so a sharded pool finds no shard until something else has
+written it.
 
 ### OrderbookRow
 
