@@ -213,6 +213,47 @@ inline std::optional<WalPosition> checkpoint_covered(const uint8_t* payload, siz
     return covered;
 }
 
+/// A CHECKPOINT's payload while rows wait in unsealed blocks (#165 part 2a): where replay starts,
+/// then the seal epoch whose segments the sync before it covered - the position as above, then the
+/// epoch as a little-endian 64-bit word.
+///
+/// A position cannot say which segments such a checkpoint vouches for: a seal writes the blocks of
+/// several drains into one segment positioned at the last of them, and a late seal of old blocks
+/// gives a segment positioned *before* the checkpoint it was written after. So the segments carry
+/// the epoch of the flush that sealed them, and a checkpoint names the epoch it vouches for.
+///
+/// `checkpoint_covered()` reads this form as saying nothing, which is what a build before it does
+/// - and why a node goes back to one only from a clean stop: `close()` seals everything, so its
+/// last checkpoint has the eight bytes.
+inline constexpr size_t CHECKPOINT_EPOCH_PAYLOAD_BYTES = 16;
+
+inline void checkpoint_epoch_payload(WalPosition replay_from, uint64_t seal_epoch,
+                                     uint8_t out[CHECKPOINT_EPOCH_PAYLOAD_BYTES]) {
+    checkpoint_payload(replay_from, out);
+    for (int i = 0; i < 8; ++i) out[8 + i] = static_cast<uint8_t>(seal_epoch >> (8 * i));
+}
+
+/// What a CHECKPOINT claims: where replay starts, and - in the sixteen-byte form - the seal epoch
+/// it vouches for. Empty for any other payload, as `checkpoint_covered()` is.
+struct CheckpointClaim {
+    WalPosition replay_from{};
+    std::optional<uint64_t> seal_epoch;
+};
+
+inline std::optional<CheckpointClaim> checkpoint_claim(const uint8_t* payload, size_t len) {
+    if (len == CHECKPOINT_PAYLOAD_BYTES) {
+        const auto covered = checkpoint_covered(payload, len);
+        if (!covered) return std::nullopt;
+        return CheckpointClaim{*covered, std::nullopt};
+    }
+    if (payload == nullptr || len != CHECKPOINT_EPOCH_PAYLOAD_BYTES) return std::nullopt;
+    CheckpointClaim claim{*checkpoint_covered(payload, CHECKPOINT_PAYLOAD_BYTES), std::nullopt};
+    uint64_t epoch = 0;
+    for (int i = 0; i < 8; ++i) epoch |= static_cast<uint64_t>(payload[8 + i]) << (8 * i);
+    claim.seal_epoch = epoch;
+    return claim;
+}
+
 /// Largest rotate threshold that keeps the offset inside 32 bits with room to spare.
 ///
 /// The offset is 32 bits so the pair fits one atomic. Rotation is checked *after* a write
@@ -348,7 +389,15 @@ public:
     /// told replay to skip them, and a crash before the next flush lost every one - each answered
     /// `OK`, under every fsync policy, `every` included. The position is the record's payload
     /// (`checkpoint_payload()`), and replay gives back the records between it and the checkpoint.
+    ///
+    /// This form is for a flush that leaves nothing waiting in a block; the other one is for a flush
+    /// that does (#165 part 2a).
     void append_checkpoint(uint64_t timestamp_ns, WalPosition covered);
+
+    /// Write the sixteen-byte CHECKPOINT (#165 part 2a): replay starts at `replay_from`, the oldest
+    /// record a row still waiting in a block needs, and every segment sealed at or before
+    /// `seal_epoch` is durable. See `checkpoint_epoch_payload()`.
+    void append_checkpoint(uint64_t timestamp_ns, WalPosition replay_from, uint64_t seal_epoch);
 
     /// Append this node's serialised version vector: what it holds, per (symbol, origin).
     ///
@@ -765,7 +814,12 @@ public:
     /// second pass - the engine sets aside the segments it does not vouch for (#160).
     struct LastCheckpoint {
         uint64_t ordinal{0};                 ///< 1-based, among every record replayed; 0 = none
-        std::optional<WalPosition> covered;  ///< what it says it covered; empty for an older build's
+        /// Where replay starts: what it says it covered, or in the sixteen-byte form the oldest
+        /// record a waiting block still needed (#165 part 2a). Empty for an older build's.
+        std::optional<WalPosition> covered;
+        /// The seal epoch it vouches for, in the sixteen-byte form only: segments sealed after it are
+        /// not (#165 part 2a).
+        std::optional<uint64_t> seal_epoch;
         uint64_t records{0};                 ///< every record the log holds
         bool     any_record{false};
         uint32_t first_file_index{0};        ///< the oldest WAL file a record came from

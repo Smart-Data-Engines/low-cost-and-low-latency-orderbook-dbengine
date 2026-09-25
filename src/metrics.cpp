@@ -117,6 +117,10 @@ MetricsRegistry::MetricsRegistry() {
     // and reports nothing.
     counters_.push_back(make_counter("ob_flush_ticks_total",
                                      "flush loop iterations that ran a tick"));
+    // #165 part 2a: a tick seals only the stores that are due, so ticks and seals differ - and the
+    // difference is the point.
+    counters_.push_back(make_counter("ob_seals_total",
+                                     "Stores whose unsealed rows a flush wrote into a segment"));
     counters_.push_back(make_counter("ob_writer_backpressure_waits_total",
                                      "writes that waited for room in the pending queue"));
     counters_.push_back(make_counter("ob_writer_backpressure_refusals_total",
@@ -186,6 +190,9 @@ MetricsRegistry::MetricsRegistry() {
     gauges_.push_back(make_gauge("ob_pending_rows",    "Number of rows pending flush"));
     gauges_.push_back(make_gauge("ob_wal_file_index",  "Current WAL file index"));
     gauges_.push_back(make_gauge("ob_segment_count",   "Number of columnar segments"));
+    // #165 part 2a: rows drained into blocks that no seal has written yet, and how many seals ran.
+    gauges_.push_back(make_gauge("ob_unsealed_rows",
+                                 "Rows drained and readable but not yet written to a segment"));
     gauges_.push_back(make_gauge("ob_segment_merge_refused",
                                  "Segments refused as already indexed (a flush race; should stay 0)"));
     gauges_.push_back(make_gauge("ob_symbol_count",    "Number of tracked symbols"));

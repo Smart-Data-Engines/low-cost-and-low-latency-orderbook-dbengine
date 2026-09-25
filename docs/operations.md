@@ -425,6 +425,22 @@ logger, to confirm a start.
   room. Waits are not an error — a writer faster than a flush cycle meets the ceiling once a cycle,
   which one pipelining connection on an m9g.xlarge does at 6.6 M levels a second — and refusals
   are: the flush cannot make progress.
+- `ob_unsealed_rows` — rows drained, readable, and waiting in memory for their store's seal (#165
+  part 2a): a store is sealed at 65 536 rows or when its oldest are ten seconds old, and every store
+  together is held under four million rows. These are the rows a crash replays from the WAL, and
+  `ob_seals_total` counts the seals. A value that sits at the budget means seals cannot keep up —
+  the flush's write rate, not its interval, is what to look at. At `--log-level DEBUG` each seal
+  says what it wrote, and each tick that took rows, at its end, where its time went — two lines of
+  one tick at four pipelining connections on an m9g.xlarge:
+
+  ```
+  sealed 4 store(s), 785920 row(s): chosen and written in 11.59 ms, synced in 24.21 ms, merged and checkpointed in 0.49 ms
+  flush tick: 810240 row(s) taken; WAL sync 13.58 ms, drain 9.40 ms, seals 36.30 ms, retention 0.76 ms
+  ```
+
+  At the write ceiling the cycle is what bounds a writer, so these are the lines to read when
+  `ob_writer_backpressure_waits_total` climbs: a tick longer than the writers take to fill the
+  pending queue is time every writer waits.
 
 One counter is worth watching for a different reason: **`ob_refused_commands_total`** is the number
 of command lines the parser would not accept — an unknown word, or a known command carrying a token
@@ -1039,23 +1055,46 @@ the last one.
 
 ## How long a start takes, and what makes it longer
 
-A start reads the `meta.json` of every segment in the data directory before it answers anything,
-and nothing merges segments yet: a node gains one per symbol that received rows in each flush tick
-(#165 in the roadmap, whose second part is that). So the start grows with the node's uptime times
-its active symbols, unless `--ttl-hours` bounds the store. `ob_segment_count` is the number to watch.
+A start reads the `meta.json` of every segment in the data directory, and reads the WAL twice,
+before it answers anything. Since part 2a of #165 a symbol gains a segment when it is **due** —
+65 536 rows, or ten seconds after its oldest waiting row — rather than on every flush tick, so at a
+steady write rate a node gains about one segment per active symbol every ten seconds. That still
+grows with uptime: nothing merges written segments yet (#165, part 2b), unless `--ttl-hours` bounds
+the store. `ob_segment_count` is the number to watch.
 
-What a segment costs a start depends on what the page cache kept, and the two cases are far apart.
-Measured on an m9g.xlarge with its data on a gp3 volume, after a soak writing 256 symbols for 90
-seconds, which left 139 776 segments:
+What a start costs depends on what the page cache kept. Measured on an m9g.xlarge with its data on a
+gp3 volume, after a soak writing 256 symbols for 90 seconds and a clean stop:
 
-| page cache | first answer after | read from storage | CPU |
-|---|---|---|---|
-| warm — a restart of a process whose files are still cached | **3.37–3.41 s** | 0 | 3.35–3.39 s |
-| cold — after a reboot, or on a new instance | **107.2–107.5 s** | 1.44 GiB | 4.3 s |
+| page cache | before part 2a: 141 312 – 143 104 segments | since part 2a: 2 304 segments |
+|---|---|---|
+| warm — a restart of a process whose files are still cached | 3.25 – 3.33 s | **1.50 – 1.51 s** |
+| cold — after a reboot, or on a new instance | 107.5 – 109.5 s, 1.42 – 1.44 GiB read | **4.38 – 4.42 s**, 291 – 293 MiB read |
 
-About 24 µs a segment warm and 0.77 ms cold, where the disk, not the engine, is the time. A restart
-in between can land anywhere: one in that run read 63 MiB from storage and took 12 s.
-If a node's start time matters, plan with the cold figure and its segment count, not the warm one.
+A start's own log splits it: on the build before part 2a, **2.12 s** to open 142 592 segments
+together with a first pass over the WAL, **0.96 s** for a second pass, and 0.24 s to listening. So a
+segment costs about **13 µs** warm and **0.75 ms** cold, where the disk, not the engine, is the time
+— and two passes over a 274 MB WAL cost about 1.2 s warm either way. With the segment count down,
+the WAL is most of what a start reads (#174). A restart in between can land anywhere: one in part
+1's run read 63 MiB from storage and took 12 s. If a node's start time matters, plan with the cold
+figure.
+
+### After a crash
+
+A crash loses the rows waiting in blocks from memory, not from the node: their records are in the
+WAL, retention keeps the WAL back to the oldest one a waiting block needs, and the start replays
+them. The last checkpoint then has sixteen bytes — where replay starts, and the seal epoch its sync
+covered — and a segment sealed after that epoch is removed and rebuilt, whole or not.
+
+In the soak above, a warm restart after a kill took **1.70 s** — 0.2 s more than after a clean stop,
+which is the replay of the rows that waited — against 3.40 s on the build before part 2a.
+
+### Going back to a build before part 2a of #165
+
+**Only from a clean stop.** `close()` seals everything, so the last checkpoint is the eight-byte
+form every build reads. After a crash, a build before part 2a reads the sixteen-byte form as saying
+nothing and replays from the checkpoint record, which would skip the records of the rows that were
+waiting — so start the node once with the newer build, let it replay, stop it cleanly, and then go
+back.
 
 ## Stopping a node
 

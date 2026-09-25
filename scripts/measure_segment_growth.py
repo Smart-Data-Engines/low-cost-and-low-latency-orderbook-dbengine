@@ -12,7 +12,14 @@ Measured for #165 on the m9g.xlarge before its index change: 105 472 segments af
 p99 14.7 -> 104 ms along the way, the narrow SELECT 2.85 -> 10.66 ms, PING flat, and a warm restart
 2.70 s. The port is below the ephemeral range, so the connect loop cannot connect to itself.
 
-    scripts/measure_segment_growth.py <ob_tcp_server> <data-root> <seconds>
+Each report also gives the flush ticks and the seals of the window, per second, from the node's
+metrics (part 2a of #165: a tick seals only the stores that are due, so the two differ), and `-`
+for a counter a build does not have.
+
+    scripts/measure_segment_growth.py <ob_tcp_server> <data-root> <seconds> [--kill]
+
+`--kill` ends the run with SIGKILL instead of a clean stop, so the restart replays what the node
+had not written - since part 2a of #165, the rows still waiting in blocks.
 """
 import os
 import socket
@@ -22,6 +29,7 @@ import sys
 import time
 
 SERVER, ROOT, SECONDS = sys.argv[1], sys.argv[2], int(sys.argv[3])
+KILL = len(sys.argv) > 4 and sys.argv[4] == "--kill"
 PORT, METRICS = 21992, 21993
 SYMBOLS = [f"S{i:03d}" for i in range(256)]
 DATA = os.path.join(ROOT, "soak")
@@ -64,6 +72,27 @@ def request(cmd, timeout=30.0):
             out.append(line.decode())
 
 
+def counter(name):
+    """A counter from the node's metrics endpoint, or None when this build has no such counter."""
+    try:
+        with socket.create_connection(("127.0.0.1", METRICS), timeout=5) as s:
+            s.sendall(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            body = b""
+            while chunk := s.recv(65536):
+                body += chunk
+    except OSError:
+        return None
+    for line in body.decode(errors="replace").splitlines():
+        # `name{labels} value` or `name value`: the name ends at a brace or a space.
+        if line.startswith(name + "{") or line.startswith(name + " "):
+            return float(line.rsplit(" ", 1)[1])
+    return None
+
+
+def rate(now, before, seconds):
+    return "-" if now is None or before is None else f"{(now - before) / seconds:.1f}"
+
+
 def rss_mib(pid):
     with open(f"/proc/{pid}/status") as f:
         for line in f:
@@ -96,9 +125,11 @@ levels = "\n".join(f"{1000 + i} 1 1" for i in range(20))
 round_payload = "".join(f"MINSERT {s} EX bid 20\n{levels}\n" for s in SYMBOLS).encode()
 
 print(f"{'t_s':>5} {'segments':>9} {'rss_mib':>8} {'select_ms':>10} {'ping_ms':>8} "
-      f"{'round_p50_ms':>12} {'round_p99_ms':>12} {'round_max_ms':>12}", flush=True)
+      f"{'round_p50_ms':>12} {'round_p99_ms':>12} {'round_max_ms':>12} {'ticks_s':>8} "
+      f"{'seals_s':>8}", flush=True)
 start_t = time.monotonic()
 next_report = start_t + 15
+last_ticks, last_seals, last_t = counter("ob_flush_ticks_total"), counter("ob_seals_total"), start_t
 window = []
 period = 1 / 20
 next_round = time.monotonic()
@@ -123,23 +154,29 @@ while time.monotonic() - start_t < SECONDS:
         request("PING")
         ping_ms = (time.monotonic() - p0) * 1000
         window.sort()
+        ticks, seals, t = counter("ob_flush_ticks_total"), counter("ob_seals_total"), time.monotonic()
         print(f"{time.monotonic() - start_t:5.0f} {segment_dirs():9d} {rss_mib(node.pid):8.1f} "
               f"{select_ms:10.2f} {ping_ms:8.2f} "
               f"{statistics.median(window):12.2f} {window[int(len(window) * 0.99)]:12.2f} "
-              f"{window[-1]:12.2f}", flush=True)
+              f"{window[-1]:12.2f} {rate(ticks, last_ticks, t - last_t):>8} "
+              f"{rate(seals, last_seals, t - last_t):>8}", flush=True)
+        last_ticks, last_seals, last_t = ticks, seals, t
         window = []
         # The report took time the writer did not use; starting the schedule again here keeps the
         # next window from being a burst that catches up on it.
         next_round = time.monotonic()
 w.close()
-node.terminate()
+if KILL:
+    node.kill()
+else:
+    node.terminate()
 node.wait(timeout=120)
 n = segment_dirs()
 node, startup = start()
 wall = time.time_ns()
 q0 = time.monotonic()
 request(f"SELECT price FROM 'S000'.'EX' WHERE timestamp BETWEEN {wall - 10**9} AND {wall}")
-print(f"restart with {n} segments: first answer after {startup:.2f} s; narrow SELECT "
-      f"{(time.monotonic() - q0) * 1000:.2f} ms", flush=True)
+print(f"restart after {'a kill' if KILL else 'a clean stop'} with {n} segments: first answer "
+      f"after {startup:.2f} s; narrow SELECT {(time.monotonic() - q0) * 1000:.2f} ms", flush=True)
 node.terminate()
 node.wait(timeout=120)

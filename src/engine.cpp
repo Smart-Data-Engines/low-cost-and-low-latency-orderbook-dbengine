@@ -115,6 +115,18 @@ void Engine::open() {
     const WALReplayer::LastCheckpoint last_checkpoint = tail_replayer.find_last_checkpoint();
     remove_unvouched_segments(last_checkpoint);
 
+    // The seal epoch continues from the highest anything names (#165 part 2a). Starting again at
+    // zero would stamp the next seals with epochs the last checkpoint already vouches for, and a
+    // crash before a new checkpoint would then keep segments nothing ever vouched for.
+    {
+        uint64_t highest = last_checkpoint.seal_epoch.value_or(0);
+        for (const auto& meta : combined_store_.index()) highest = std::max(highest, meta.seal_epoch);
+        std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+        seal_epoch_ = highest;
+        OB_LOG_INFO("engine", "Seal epoch continues from %llu",
+                    static_cast<unsigned long long>(seal_epoch_));
+    }
+
     // Restore the sequence counters from what is already durable in segments, before the
     // replay below adds what is durable only in the WAL. Both only ever raise, so the order
     // between them does not matter; skipping either hands out a number twice.
@@ -312,7 +324,7 @@ void Engine::close() {
         // ends the process. The rows a failed write kept are in the WAL, which the next start
         // replays.
         try {
-            flush_write_and_merge();
+            flush_write_and_merge(/*seal_all=*/true, kNoRowLimit);
         } catch (const std::exception& e) {
             OB_LOG_ERROR("engine", "close: the final flush could not write its segments (%s); the "
                                    "next start replays their rows from the WAL", e.what());
@@ -452,6 +464,7 @@ void Engine::discard_local_data_for_resync() {
     OB_LOG_INFO("engine", "clearing local data: it is not a prefix of the stream to be replayed");
 
     stores_.clear();
+    drop_unsealed_locked();
     buffers_.clear();
     pending_rows_.clear();
 
@@ -1365,18 +1378,15 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
         // must be merged, not dropped: SELECT reads combined_store_ only, so a
         // snapshot that flushed rows without merging them made the rows it had just
         // persisted disappear from every query until the next open_existing().
-        std::vector<SegmentMeta> flushed;
-        for (auto& [key, store] : stores_) {
-            for (auto& rolled : store->take_rolled_segments()) {
-                flushed.push_back(std::move(rolled));
-            }
-            auto meta = store->flush_segment();
-            if (meta.has_value()) {
-                flushed.push_back(std::move(meta.value()));
-            }
+        //
+        // Every store's blocks, since #165 part 2a: a snapshot is what is on the disk, and a row in
+        // a block is not yet. Thrown like the sync above, for the same reason.
+        std::vector<Seal> seals = choose_seals(/*seal_all=*/true, nullptr, kNoRowLimit);
+        if (const std::exception_ptr failure = write_seals(seals)) {
+            segment_merge_refused_.fetch_add(merge_seals_locked(seals), std::memory_order_relaxed);
+            std::rethrow_exception(failure);
         }
-        segment_merge_refused_.fetch_add(combined_store_.merge_segments(flushed),
-                                         std::memory_order_relaxed);
+        segment_merge_refused_.fetch_add(merge_seals_locked(seals), std::memory_order_relaxed);
 
         // Capture WAL position atomically with the flush.
         // One load: a manifest is what a joining peer catches up from, so a pair assembled from two
@@ -1606,6 +1616,7 @@ void Engine::adopt_store_on_disk() {
 
     // Clear all in-memory state.
     stores_.clear();
+    drop_unsealed_locked();
     // A query already in flight keeps its own buffer alive through the handle it holds (#92); the
     // buffer leaves the engine here and is destroyed when that query drops it.
     buffers_.clear();
@@ -1654,6 +1665,7 @@ bool Engine::install_snapshot(const std::string& staging_dir,
                     paths.size(), staging_dir.c_str());
 
         stores_.clear();
+        drop_unsealed_locked();
         buffers_.clear();
         pending_rows_.clear();
         seq_tracker_.reset();
@@ -1695,13 +1707,15 @@ bool Engine::install_snapshot(const std::string& staging_dir,
 
 bool Engine::holds_no_data() {
     std::lock_guard<std::mutex> lock(mtx_);
+    const size_t unsealed = unsealed_rows_.load(std::memory_order_relaxed);
     const bool empty = seq_tracker_.symbol_count() == 0 &&
                        queued_rows() == 0 &&
+                       unsealed == 0 &&
                        stores_.empty() &&
                        combined_store_.segment_count() == 0;
     OB_LOG_DEBUG("engine",
-                 "holds_no_data=%d (symbols=%zu pending=%zu stores=%zu segments=%zu)",
-                 empty ? 1 : 0, seq_tracker_.symbol_count(), queued_rows(),
+                 "holds_no_data=%d (symbols=%zu pending=%zu unsealed=%zu stores=%zu segments=%zu)",
+                 empty ? 1 : 0, seq_tracker_.symbol_count(), queued_rows(), unsealed,
                  stores_.size(), combined_store_.segment_count());
     return empty;
 }
@@ -1745,13 +1759,11 @@ SnapshotManifest Engine::create_symbol_snapshot(const std::string& symbol_key) {
         // rows it just wrote from every SELECT.
         auto it = stores_.find(symbol_key);
         if (it != stores_.end()) {
-            std::vector<SegmentMeta> flushed = it->second->take_rolled_segments();
-            auto meta = it->second->flush_segment();
-            if (meta.has_value()) {
-                flushed.push_back(std::move(meta.value()));
-            }
-            segment_merge_refused_.fetch_add(combined_store_.merge_segments(flushed),
-                                         std::memory_order_relaxed);
+            // This store's blocks, since #165 part 2a: what it holds in memory is not on the disk.
+            std::vector<Seal> seals = choose_seals(/*seal_all=*/false, it->second.get(), kNoRowLimit);
+            const std::exception_ptr failure = write_seals(seals);
+            segment_merge_refused_.fetch_add(merge_seals_locked(seals), std::memory_order_relaxed);
+            if (failure) std::rethrow_exception(failure);
         }
 
         // Capture WAL position atomically with the flush.
@@ -2293,6 +2305,14 @@ void Engine::flush_tick() {
 
         // The whole tick is one flush, so a client FLUSH cannot interleave with it.
         std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+        // Where the tick's time goes, on DEBUG (#165 part 2a): at the write ceiling the cycle is
+        // what bounds a writer, and throughput alone does not say which of its phases grew.
+        using TickClock = std::chrono::steady_clock;
+        const auto tick_started = TickClock::now();
+        const auto ms_since = [](TickClock::time_point from, TickClock::time_point to) {
+            return std::chrono::duration<double, std::milli>(to - from).count();
+        };
+        size_t taken = 0;
 
         // Phase A: the WAL sync, and the rows it covers - both **outside** mtx_ (stage 5 of #151).
         // They were the longest things this tick did while holding the lock every writer needs:
@@ -2318,6 +2338,7 @@ void Engine::flush_tick() {
                 throw std::runtime_error("Engine: WAL sync failed during the flush tick");
             }
             batch = pending_rows_.take_all();
+            taken = batch.rows();
             detached_rows_.store(batch.rows(), std::memory_order_relaxed);
             if (!ticket.owed()) {
                 // Nothing to sync - `every` has synced each run, `none` never does, or nothing was
@@ -2342,12 +2363,16 @@ void Engine::flush_tick() {
             // holds `flush_mtx_`.
             note_wal_synced();
         }
+        const auto synced = TickClock::now();
         drain_batch(batch, ticket.position(), /*mtx_held=*/false);
+        const auto drained = TickClock::now();
 
         // Phase B: segment I/O + merge, outside mtx_ so writers are not blocked. A failed segment
         // sync is counted and logged inside, and the tick goes on: the rows are merged and
-        // readable, and retention below stays where it was until a restart (#160).
-        flush_write_and_merge();
+        // readable, and retention below stays where it was until a restart (#160). What it seals
+        // is its share: about what it drained (#165 part 2a, kSealRows).
+        flush_write_and_merge(/*seal_all=*/false, taken);
+        const auto sealed = TickClock::now();
 
         // Update gauge: WAL file index.
         registry_.set_gauge("ob_wal_file_index",
@@ -2424,6 +2449,14 @@ void Engine::flush_tick() {
                              static_cast<unsigned long long>(ttl_config_.ttl_hours));
             }
         }
+        // Not for a tick that took nothing: an idle node would say so ten times a second.
+        if (taken > 0) {
+            const auto finished = TickClock::now();
+            OB_LOG_DEBUG("engine", "flush tick: %zu row(s) taken; WAL sync %.2f ms, drain %.2f ms, "
+                                   "seals %.2f ms, retention %.2f ms",
+                         taken, ms_since(tick_started, synced), ms_since(synced, drained),
+                         ms_since(drained, sealed), ms_since(sealed, finished));
+        }
 }
 
 
@@ -2446,9 +2479,6 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
     // at or before, and that a sync has reached. From the flush tick it is the sync ticket's
     // position rather than the current one, because the tick synced without the lock and the log
     // may have moved on since - by exactly the records whose rows are still in `pending_rows_`.
-    const uint32_t wal_file   = covered.file_index;
-    const uint64_t wal_offset = static_cast<uint64_t>(covered.offset);
-
     // mtx_ for a moment, unless the caller holds it for all of this.
     const auto under_mtx = [&](auto&& step) {
         if (mtx_held) {
@@ -2457,6 +2487,64 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
             std::lock_guard<std::mutex> lock(mtx_);
             step();
         }
+    };
+
+    // Where the records of the rows taken now begin: the last drain that finished, not the ticket of
+    // the tick before - a failed drain or WAL sync put its rows back, and their records are before
+    // that ticket (#165 part 2a). What the blocks below may not let a checkpoint claim.
+    WalPosition wal_from{};
+    under_mtx([&] { wal_from = drained_up_to_; });
+
+    // The rows go to one block per store, published when the drain is done - or when it stops,
+    // because the rows it took are out of the queue either way (#165 part 2a). A tick used to append
+    // them to the store and write a segment of each; the seal does that now, when a store is due.
+    //
+    // A block's range is collected with its rows rather than in a second walk over them, and a
+    // store's block is reserved to the size of its last one. Measured before both, at four
+    // pipelining connections on the m9g.xlarge: the flush thread took 26% more CPU than when the
+    // drain appended straight into the stores (medians of five rounds), and the second walk alone
+    // was 0.6-0.7% of the server's CPU samples.
+    struct Collected {
+        ColumnarStore* store;
+        std::vector<SnapshotRow> rows;
+        uint64_t min_ts_ns;
+        uint64_t max_ts_ns;
+    };
+    std::vector<Collected> drained;
+    std::unordered_map<ColumnarStore*, size_t> slot_of;
+    const auto publish = [&] {
+        std::vector<std::shared_ptr<const RowBlock>> blocks;
+        blocks.reserve(drained.size());
+        const auto now = std::chrono::steady_clock::now();
+        size_t rows = 0;
+        for (Collected& c : drained) {
+            ColumnarStore* st = c.store;
+            if (c.rows.empty()) {
+                block_rows_pool_->give_back(std::move(c.rows));
+                continue;
+            }
+            block_rows_hint_[st] = c.rows.size();
+            // A store that was busy and is quiet now got a reservation it does not need, which the
+            // block would hold until its seal: its rows are copied into one that fits - few, because
+            // there are few - and the big one goes back to the pool.
+            if (c.rows.capacity() > 2 * c.rows.size() + 1024) {
+                std::vector<SnapshotRow> fitted(c.rows.begin(), c.rows.end());
+                block_rows_pool_->give_back(std::move(c.rows));
+                c.rows = std::move(fitted);
+            }
+            auto block = RowBlock::make(st->symbol(), st->exchange(), std::move(c.rows),
+                                        c.min_ts_ns, c.max_ts_ns, block_rows_pool_);
+            if (!block) continue;
+            Unsealed& u = unsealed_[st];
+            u.rows += block->rows.size();
+            rows += block->rows.size();
+            u.blocks.push_back(UnsealedBlock{block, wal_from, covered, now});
+            blocks.push_back(std::move(block));
+        }
+        drained.clear();
+        slot_of.clear();
+        unsealed_rows_.fetch_add(rows, std::memory_order_relaxed);
+        combined_store_.publish_blocks(blocks);
     };
 
     size_t appended = 0;
@@ -2477,28 +2565,38 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
         // the next row with a destroyed string. It costs one lookup per chunk of 4096 rows.
         const std::string* run_symbol   = nullptr;
         const std::string* run_exchange = nullptr;
-        ColumnarStore*     store        = nullptr;
+        Collected* current              = nullptr;
         try {
             for (; chunk.first < chunk.rows.size(); ++chunk.first) {
                 const PendingRow& pr = chunk.rows[chunk.first];
-                if (store == nullptr || *run_symbol != pr.symbol || *run_exchange != pr.exchange) {
-                    store        = &get_or_create_store(pr.symbol, pr.exchange, mtx_held);
+                if (current == nullptr || *run_symbol != pr.symbol || *run_exchange != pr.exchange) {
+                    ColumnarStore* store = &get_or_create_store(pr.symbol, pr.exchange, mtx_held);
                     run_symbol   = &pr.symbol;
                     run_exchange = &pr.exchange;
-                    store->set_wal_position(wal_identity_, wal_file, wal_offset);
+                    auto [at, fresh] = slot_of.try_emplace(store, drained.size());
+                    if (fresh) {
+                        const auto hint = block_rows_hint_.find(store);
+                        drained.push_back(Collected{
+                            store,
+                            block_rows_pool_->take(hint == block_rows_hint_.end() ? 0 : hint->second),
+                            pr.row.timestamp_ns, pr.row.timestamp_ns});
+                    }
+                    current = &drained[at->second];
                 }
-                store->append(pr.row);
+                current->rows.push_back(pr.row);
+                current->min_ts_ns = std::min(current->min_ts_ns, pr.row.timestamp_ns);
+                current->max_ts_ns = std::max(current->max_ts_ns, pr.row.timestamp_ns);
                 ++appended;
             }
         } catch (...) {
-            // An append that rolls a segment over writes it, and since #160 a write the disk
-            // refuses is an exception rather than a short file. The rows before this one are in
-            // their stores now, so they leave the queue: left there, the next drain would append
-            // them a second time, into storage that never removes a row. The one that threw was
-            // not appended - the rollover comes before the row is added - and `chunk.first` still
-            // points at it, so it is first in line with the rest of this batch behind it, in front
-            // of whatever was queued meanwhile. No drain position is recorded, so no checkpoint
-            // claims any of it (#159).
+            // Since #165 part 2a a drain writes nothing - rows go to blocks, and a seal writes - so
+            // what can throw here is a store's creation or a row's copy, both allocations. The rows
+            // before this one are taken, so they are published and leave the queue: left there, the
+            // next drain would take them a second time, into storage that never removes a row. The
+            // one that threw was not taken, and `chunk.first` still points at it, so it is first in
+            // line with the rest of this batch behind it, in front of whatever was queued
+            // meanwhile. No drain position is recorded, so no checkpoint claims any of it (#159).
+            publish();
             size_t back = 0;
             under_mtx([&] {
                 PendingQueue::Batch rest;
@@ -2532,11 +2630,13 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
         // A chunk beyond what the queue keeps is freed here, at the end of this iteration.
     }
     batch.chunks.clear();
+    publish();
 
     // And kept for what this flush will say it covered once its segments are written (#159): the
     // checkpoint must claim these rows and nothing appended after them, and the WAL files before
     // this one are the only ones whose records are all in this drain. Set only once the drain is
-    // complete, so a drain that throws part-way leaves the previous, smaller claim standing.
+    // complete, so a drain that throws part-way leaves the previous, smaller claim standing. And
+    // claimed only once no block holds them (#165 part 2a) - `claim_locked()`.
     under_mtx([&] {
         drained_up_to_ = covered;
         registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(queued_rows()));
@@ -2546,52 +2646,213 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
     pending_cv_.notify_all();
 }
 
-int Engine::flush_write_and_merge() {
+std::vector<Engine::SealPick> Engine::pick_seals(const std::vector<SealCandidate>& candidates,
+                                                 std::chrono::steady_clock::time_point now,
+                                                 bool seal_all, size_t drained_rows) {
+    std::vector<SealPick> picks;
+    size_t left = 0;
+    for (const auto& c : candidates) left += c.rows;
+    // A quarter more than it drained, so a backlog drains rather than lasting (see kSealRows);
+    // kNoRowLimit is left alone rather than overflowed.
+    const size_t share = drained_rows > kNoRowLimit / 2
+                             ? kNoRowLimit
+                             : std::max(kSealRows, drained_rows + drained_rows / 4);
+    size_t picked_rows = 0;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const SealCandidate& c = candidates[i];
+        SealReason why;
+        if (seal_all) {
+            why = SealReason::kAll;
+        } else if (left > kUnsealedRowsBudget) {
+            // Oldest first and past the per-tick limit: memory is what this bounds.
+            why = c.rows >= kSealRows ? SealReason::kRows
+                : now - c.oldest >= kSealAge ? SealReason::kAge
+                : SealReason::kBudget;
+        } else if (c.rows >= kSealRows || now - c.oldest >= kSealAge) {
+            if (picks.size() >= kSealsPerTick) continue;
+            // The tick's share (see kSealRows): a due store after the first waits for a later tick
+            // if it would take the rows picked past it.
+            if (!picks.empty() && picked_rows + c.rows > share) continue;
+            why = c.rows >= kSealRows ? SealReason::kRows : SealReason::kAge;
+        } else {
+            continue;
+        }
+        picks.push_back(SealPick{i, why});
+        left -= std::min(left, c.rows);
+        picked_rows += c.rows;
+    }
+    return picks;
+}
+
+std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* only,
+                                               size_t drained_rows) {
+    // Oldest first: the order a budget and a per-tick limit take them in.
+    std::vector<std::pair<std::chrono::steady_clock::time_point, ColumnarStore*>> by_age;
+    by_age.reserve(unsealed_.size());
+    for (const auto& [store, u] : unsealed_) {
+        if (u.blocks.empty()) continue;
+        if (only != nullptr && store != only) continue;
+        by_age.emplace_back(u.blocks.front().published, store);
+    }
+    std::sort(by_age.begin(), by_age.end());
+    std::vector<SealCandidate> candidates;
+    candidates.reserve(by_age.size());
+    for (const auto& [oldest, store] : by_age) {
+        candidates.push_back(SealCandidate{unsealed_.at(store).rows, oldest});
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto picks = pick_seals(candidates, now, seal_all || only != nullptr, drained_rows);
+    std::vector<Seal> seals;
+    seals.reserve(picks.size());
+    size_t by_rows = 0, by_age_count = 0, by_budget = 0, sealed_rows = 0;
+    for (const SealPick& p : picks) {
+        ColumnarStore* store = by_age[p.index].second;
+        const Unsealed& u = unsealed_.at(store);
+        seals.push_back(Seal{store, u.blocks.size(), u.rows, {}});
+        sealed_rows += u.rows;
+        if (p.why == SealReason::kRows) ++by_rows;
+        if (p.why == SealReason::kAge) ++by_age_count;
+        if (p.why == SealReason::kBudget) ++by_budget;
+    }
+
+    if (!seal_all && only == nullptr) {
+        const size_t total = unsealed_rows_.load(std::memory_order_relaxed);
+        if (by_budget > 0) {
+            if (unsealed_budget_episode_.begin()) {
+                OB_LOG_INFO("engine", "%zu unsealed row(s) are over the budget of %zu, so the oldest "
+                                      "stores are sealed before they are due: %zu this tick",
+                            total, kUnsealedRowsBudget, by_budget);
+            }
+        } else if (const uint64_t ticks = unsealed_budget_episode_.end()) {
+            OB_LOG_INFO("engine", "unsealed rows back under the budget after %llu tick(s)",
+                        static_cast<unsigned long long>(ticks));
+        }
+        // Due and left for a later tick's share: what the row limit spread.
+        size_t due = 0;
+        for (const SealCandidate& c : candidates) {
+            if (c.rows >= kSealRows || now - c.oldest >= kSealAge) ++due;
+        }
+        const size_t deferred = due - std::min(due, by_rows + by_age_count);
+        if (!seals.empty() || deferred > 0) {
+            OB_LOG_DEBUG("engine", "sealing %zu store(s): %zu by rows, %zu by age, %zu by the budget; "
+                                   "%zu due store(s) wait past this tick's share of %zu row(s); "
+                                   "%zu of %zu unsealed row(s) stay in memory",
+                         seals.size(), by_rows, by_age_count, by_budget, deferred,
+                         std::max(kSealRows, drained_rows), total - std::min(total, sealed_rows),
+                         total);
+        }
+    }
+    return seals;
+}
+
+std::exception_ptr Engine::write_seals(std::vector<Seal>& seals) {
+    std::exception_ptr failure;
+    std::vector<Seal> written;
+    written.reserve(seals.size());
+    // One epoch per call that writes anything (#165 part 2a), here rather than at each of the three
+    // callers, so a fourth cannot seal without one.
+    const uint64_t epoch = seals.empty() ? seal_epoch_ : ++seal_epoch_;
+    for (Seal& s : seals) {
+        const Unsealed& u = unsealed_.at(s.store);
+        const WalPosition to = u.blocks[s.count - 1].wal_to;
+        bool lent = false;
+        try {
+            // The position every row of these blocks has its record before, set before the first
+            // append because a rollover inside it writes a segment too; and the epoch, likewise.
+            s.store->set_wal_position(wal_identity_, to.file_index, static_cast<uint64_t>(to.offset));
+            s.store->set_seal_epoch(epoch);
+            // The one set of column buffers every seal writes through, lent for this one and taken
+            // back after it: a store with no seal under way holds none.
+            s.store->swap_buffers(seal_buffers_);
+            lent = true;
+            s.store->reserve_rows(s.rows);
+            for (size_t i = 0; i < s.count; ++i) s.store->append_block(*u.blocks[i].block);
+            auto meta = s.store->flush_segment();
+            // Segments a rollover closed first: append() has no reference to the query index, so it
+            // parks their metas here. Left uncollected, those rows are on disk and invisible.
+            s.metas = s.store->take_rolled_segments();
+            if (meta.has_value()) s.metas.push_back(std::move(meta.value()));
+            s.store->swap_buffers(seal_buffers_);
+            lent = false;
+            written.push_back(std::move(s));
+        } catch (const std::exception& e) {
+            s.store->abandon_active();
+            if (lent) s.store->swap_buffers(seal_buffers_);
+            OB_LOG_WARN("engine", "segment for %s.%s not written, its %zu row(s) stay in %zu "
+                                  "unsealed block(s) for the next seal: %s",
+                        s.store->symbol().c_str(), s.store->exchange().c_str(), s.rows, s.count,
+                        e.what());
+            if (!failure) failure = std::current_exception();
+        }
+    }
+    seals = std::move(written);
+    return failure;
+}
+
+size_t Engine::merge_seals_locked(const std::vector<Seal>& seals) {
+    size_t refused = 0;
+    size_t rows = 0;
+    for (const Seal& s : seals) {
+        refused += combined_store_.seal_blocks(s.store->symbol(), s.store->exchange(), s.count,
+                                               s.metas);
+        auto it = unsealed_.find(s.store);
+        if (it == unsealed_.end()) continue;
+        for (size_t i = 0; i < s.count && !it->second.blocks.empty(); ++i) {
+            const size_t n = it->second.blocks.front().block->rows.size();
+            it->second.rows -= std::min(n, it->second.rows);
+            rows += n;
+            it->second.blocks.pop_front();
+        }
+        if (it->second.blocks.empty()) unsealed_.erase(it);
+    }
+    unsealed_rows_.fetch_sub(std::min(rows, unsealed_rows_.load(std::memory_order_relaxed)),
+                             std::memory_order_relaxed);
+    if (!seals.empty()) registry_.increment_counter("ob_seals_total", seals.size());
+    registry_.set_gauge("ob_unsealed_rows",
+                        static_cast<int64_t>(unsealed_rows_.load(std::memory_order_relaxed)));
+    return refused;
+}
+
+WalPosition Engine::claim_locked() const {
+    WalPosition claim = drained_up_to_;
+    for (const auto& [store, u] : unsealed_) {
+        if (!u.blocks.empty() && wal_position_before(u.blocks.front().wal_from, claim)) {
+            claim = u.blocks.front().wal_from;
+        }
+    }
+    return claim;
+}
+
+void Engine::drop_unsealed_locked() {
+    unsealed_.clear();
+    block_rows_hint_.clear();   // keyed by the stores these paths are about to destroy
+    unsealed_rows_.store(0, std::memory_order_relaxed);
+    combined_store_.drop_blocks();
+    registry_.set_gauge("ob_unsealed_rows", 0);
+}
+
+int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows) {
     // Phase B: flush segments to disk and merge into combined_store_.
     // Caller holds flush_mtx_. Runs WITHOUT mtx_ (except the brief merge at the end)
     // so that disk I/O does not block writers.
 
-    // Snapshot the store pointers under mtx_. stores_ is mutated by
-    // get_or_create_store(), the snapshot install and the REPLICA transition; iterating
-    // it unlocked risked an invalidated iterator on insert and a use-after-free on
-    // clear(). The raw pointers stay valid because every mutator of stores_ holds
-    // flush_mtx_, which this caller holds too.
-    std::vector<ColumnarStore*> stores;
-    {
+    // The stores to seal come from `unsealed_`, keyed by the store: its pointers stay valid because
+    // every mutator of stores_ holds flush_mtx_, which this caller holds too, and clears it with them.
+    // What is due, or everything for FLUSH, close() and a snapshot (#165 part 2a). A store whose
+    // segment cannot be written keeps its blocks for the next seal, and the others are written and
+    // merged anyway (#160): stopping at the first failure left the segments already written on disk
+    // and out of the index, so their rows vanished from every query until a restart found them.
+    using SealClock = std::chrono::steady_clock;
+    const auto started = SealClock::now();
+    std::vector<Seal> seals = choose_seals(seal_all, nullptr, drained_rows);
+    const std::exception_ptr write_failure = write_seals(seals);
+    const auto written = SealClock::now();
+
+    if (seals.empty()) {
         std::unique_lock<std::mutex> lock(mtx_);
-        stores.reserve(stores_.size());
-        for (auto& [key, store] : stores_) {
-            stores.push_back(store.get());
-        }
-    }
-
-    std::vector<SegmentMeta> new_segments;
-    // A store whose segment cannot be written keeps its rows in memory for the next flush, and the
-    // others are written and merged anyway (#160). Stopping at the first failure - which is what an
-    // exception out of this loop did - left the segments already written on disk and out of the
-    // index, so their rows vanished from every query until a restart found them.
-    std::exception_ptr write_failure;
-    for (ColumnarStore* store : stores) {
-        // Segments closed by a rollover inside append() come first: append() has no
-        // reference to the query index, so it parks their metas here. Left
-        // uncollected, those rows are on disk and invisible to SELECT.
-        for (auto& rolled : store->take_rolled_segments()) {
-            new_segments.push_back(std::move(rolled));
-        }
-        try {
-            auto meta = store->flush_segment();
-            if (meta.has_value()) {
-                new_segments.push_back(std::move(meta.value()));
-            }
-        } catch (const std::exception& e) {
-            OB_LOG_WARN("engine", "segment for %s.%s not written, its rows stay in memory for the "
-                                  "next flush: %s",
-                        store->symbol().c_str(), store->exchange().c_str(), e.what());
-            if (!write_failure) write_failure = std::current_exception();
-        }
-    }
-
-    if (new_segments.empty()) {
+        registry_.set_gauge("ob_unsealed_rows",
+                            static_cast<int64_t>(unsealed_rows_.load(std::memory_order_relaxed)));
         if (write_failure) std::rethrow_exception(write_failure);
         return 0;
     }
@@ -2603,10 +2864,13 @@ int Engine::flush_write_and_merge() {
     // however many symbols the tick wrote. Not when a write failed: no checkpoint can claim a
     // flush that did not write all it drained, so there is nothing for the sync to vouch for.
     const int sync_err = write_failure ? 0 : sync_segments();
+    const auto synced = SealClock::now();
+    size_t sealed_rows = 0;
+    for (const Seal& s : seals) sealed_rows += s.rows;
 
     {
         std::unique_lock<std::mutex> lock(mtx_);
-        const size_t refused = combined_store_.merge_segments(new_segments);
+        const size_t refused = merge_seals_locked(seals);
         if (refused > 0) {
             segment_merge_refused_.fetch_add(refused, std::memory_order_relaxed);
             registry_.set_gauge("ob_segment_merge_refused",
@@ -2621,7 +2885,9 @@ int Engine::flush_write_and_merge() {
         // Record how far the WAL is durable in segments, so the next open() does not replay it.
         // Appended AFTER the segments are on the device, never before: a checkpoint that claims
         // more than is durable turns a crash into data loss, while one that claims less only costs
-        // a replay that the per-symbol positions in replay_wal_tail() filter.
+        // a replay that the per-symbol positions in replay_wal_tail() filter - as long as nothing
+        // waits in a block. With blocks waiting, claiming less is not enough on its own: which
+        // segments are durable is the seal epoch's to say (#165 part 2a, below).
         //
         // **How far is the drain's position, not this record's** (#159). The segment I/O above
         // ran without mtx_, so writers appended while it did, and their rows are still queued -
@@ -2645,11 +2911,21 @@ int Engine::flush_write_and_merge() {
                                std::strerror(sync_err) + ")");
         }
         if (!write_failure && !checkpoints_frozen()) {
-            durable_up_to_ = drained_up_to_;
-            wal_.append_checkpoint(static_cast<uint64_t>(
+            // Replay starts at the oldest record a row still waiting in a block needs, and with
+            // rows waiting a position cannot say which segments are durable, so the checkpoint names
+            // the seal epoch the sync above covered (#165 part 2a) - every epoch before it being
+            // covered too, because a sync that failed freezes the checkpoints for good. With nothing
+            // waiting it is the eight bytes it always was, which is what makes a clean stop's last
+            // checkpoint one an older build can read.
+            durable_up_to_ = claim_locked();
+            const auto now_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count()),
-                durable_up_to_);
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+            if (unsealed_.empty()) {
+                wal_.append_checkpoint(now_ns, durable_up_to_);
+            } else {
+                wal_.append_checkpoint(now_ns, durable_up_to_, seal_epoch_);
+            }
             // `none` makes no promise a sync could keep, so retention need not wait for one.
             if (fsync_policy_ == FsyncPolicy::NONE) retention_floor_ = durable_up_to_;
         }
@@ -2659,6 +2935,14 @@ int Engine::flush_write_and_merge() {
         // checkpoint is one the next replay would find anyway.
         persist_version_vector_if_changed();
     }
+    const auto merged = SealClock::now();
+    const auto ms = [](SealClock::time_point from, SealClock::time_point to) {
+        return std::chrono::duration<double, std::milli>(to - from).count();
+    };
+    OB_LOG_DEBUG("engine", "sealed %zu store(s), %zu row(s): chosen and written in %.2f ms, "
+                           "synced in %.2f ms, merged and checkpointed in %.2f ms",
+                 seals.size(), sealed_rows, ms(started, written), ms(written, synced),
+                 ms(synced, merged));
 
     if (sync_err != 0) {
         // Counted every time, said loudly once - by the freeze, which is the consequence an
@@ -2712,6 +2996,23 @@ void Engine::freeze_checkpoints(const std::string& what_failed) {
                  what_failed.c_str(), retention_floor_.file_index);
 }
 
+bool Engine::segment_vouched_for(const SegmentMeta& meta, const WALReplayer::LastCheckpoint& last,
+                                 uint64_t local_wal_identity) {
+    if (meta.wal_identity == 0 || meta.wal_identity != local_wal_identity) return true;
+    if (last.seal_epoch) return meta.seal_epoch <= *last.seal_epoch;
+    if (meta.wal_file_index == 0 && meta.wal_byte_offset == 0) return true;   // no position
+    WalPosition vouched_to{};
+    if (last.covered) {
+        vouched_to = *last.covered;
+    } else if (last.ordinal == 0 && (!last.any_record || last.first_file_index == 0)) {
+        vouched_to = WalPosition{0, 0};
+    } else {
+        return true;
+    }
+    const WalPosition at{meta.wal_file_index, static_cast<uint32_t>(meta.wal_byte_offset)};
+    return !wal_position_before(vouched_to, at);
+}
+
 void Engine::remove_unvouched_segments(const WALReplayer::LastCheckpoint& last) {
     // Runs from open(), before the replay filter is built from the index.
     //
@@ -2724,14 +3025,13 @@ void Engine::remove_unvouched_segments(const WALReplayer::LastCheckpoint& last) 
     // that drain's segments and not others. So it is removed, and replay rebuilds its rows from the
     // WAL, which holds every one of them: its records are at or after the checkpoint's claim, and
     // retention deletes nothing a synced checkpoint does not vouch for.
-    std::optional<WalPosition> vouched_to;
-    if (last.covered) {
-        vouched_to = *last.covered;
-    } else if (last.ordinal == 0 && (!last.any_record || last.first_file_index == 0)) {
-        // No checkpoint at all, and the log starts at its first file: every record is here, so a
-        // segment the log never vouched for can be rebuilt from it - a first flush interrupted.
-        vouched_to = WalPosition{0, 0};
-    } else {
+    //
+    // With no checkpoint at all and a log that starts at its first file, every record is here, so a
+    // segment the log never vouched for can be rebuilt from it - a first flush interrupted. And a
+    // checkpoint written while rows waited in blocks names a seal epoch instead of a position,
+    // because a position cannot say it (#165 part 2a): `segment_vouched_for()` holds all of it.
+    if (!last.seal_epoch && !last.covered &&
+        !(last.ordinal == 0 && (!last.any_record || last.first_file_index == 0))) {
         // An older build's checkpoint, or a log whose first files retention has taken: the log's
         // account of itself does not say which segments it covers. Taken as they always were.
         OB_LOG_INFO("engine", "The last checkpoint says nothing of what it covered: every segment "
@@ -2741,10 +3041,7 @@ void Engine::remove_unvouched_segments(const WALReplayer::LastCheckpoint& last) 
 
     std::vector<std::string> dirs;
     for (const auto& meta : combined_store_.index()) {
-        if (meta.wal_identity == 0 || meta.wal_identity != wal_identity_) continue;  // not this WAL's
-        if (meta.wal_file_index == 0 && meta.wal_byte_offset == 0) continue;         // no position
-        const WalPosition at{meta.wal_file_index, static_cast<uint32_t>(meta.wal_byte_offset)};
-        if (wal_position_before(*vouched_to, at)) dirs.push_back(meta.dir_path);
+        if (!segment_vouched_for(meta, last, wal_identity_)) dirs.push_back(meta.dir_path);
     }
     if (dirs.empty()) {
         OB_LOG_DEBUG("engine", "Every segment of this WAL is vouched for by the last checkpoint");
@@ -2963,7 +3260,7 @@ void Engine::flush_incremental() {
     // Phase B: segment I/O + merge, outside mtx_ so writers are not blocked. A client asked for
     // this flush, so a client is told when its segments could not be made durable (#160) - the
     // same rule as a failed WAL sync above.
-    if (const int err = flush_write_and_merge(); err != 0) {
+    if (const int err = flush_write_and_merge(/*seal_all=*/true, kNoRowLimit); err != 0) {
         throw std::runtime_error(std::string("Engine: segment sync failed during FLUSH: ") +
                                  std::strerror(err));
     }

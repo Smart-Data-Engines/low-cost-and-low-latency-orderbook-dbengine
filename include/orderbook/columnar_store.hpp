@@ -4,8 +4,10 @@
 #include "orderbook/query_columns.hpp"
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -66,9 +68,75 @@ struct SegmentMeta {
     uint64_t wal_identity{0};
     uint32_t wal_file_index{0};
     uint64_t wal_byte_offset{0};
+    /// The seal epoch of the flush that wrote this segment (#165 part 2a): a checkpoint written
+    /// while rows wait in blocks vouches for the segments sealed at or before an epoch, because a
+    /// position cannot. 0 in a segment written before epochs existed, and in one no seal wrote.
+    uint64_t seal_epoch{0};
     std::string symbol;     ///< symbol this segment belongs to
     std::string exchange;   ///< exchange this segment belongs to
     std::string dir_path;   ///< full path to the segment directory
+};
+
+/// Spare storage for blocks' rows (#165 part 2a): a sealed block's vector, handed back when the
+/// block's last reference goes, and taken again by a later drain - which otherwise wrote every row
+/// of every tick into memory the kernel had to fault in first. Measured at four pipelining
+/// connections on the m9g.xlarge: 68% of the server's page faults were that, in `drain_batch()`.
+///
+/// Bounded: spares past `max_spare_rows` rows of capacity are freed rather than kept. Thread-safe,
+/// because the last reference to a block can be a query's.
+class RowBufferPool {
+public:
+    explicit RowBufferPool(size_t max_spare_rows) : max_spare_rows_(max_spare_rows) {}
+
+    /// An empty vector with room for `rows`: the smallest spare that holds them without being more
+    /// than about twice as big - a quiet store should not hold a busy one's buffer until its seal -
+    /// or a new one. None for `rows` 0, a store's first block, whose size nothing predicts.
+    std::vector<SnapshotRow> take(size_t rows);
+
+    /// Keep `rows`' storage for a later take(), cleared, if the spares stay under the bound;
+    /// otherwise leave it to be freed with `rows`.
+    void give_back(std::vector<SnapshotRow>&& rows) noexcept;
+
+    /// Rows of capacity held spare, for tests.
+    size_t spare_rows() const;
+
+private:
+    mutable std::mutex mtx_;
+    std::vector<std::vector<SnapshotRow>> spare_;
+    size_t spare_rows_{0};
+    const size_t max_spare_rows_;
+};
+
+/// The rows one drain gave one symbol, held in memory until the flush tick seals them into a
+/// segment (#165 part 2a).
+///
+/// A tick used to write a segment for every symbol that had received a row since the last one: at
+/// 256 symbols about two thousand files and a syncfs() each tick, with 84.7% of the flush thread's
+/// CPU in the kernel creating them, and a node gained one segment per active symbol per tick. Rows
+/// now wait in blocks until their symbol has enough of them or they are old enough, and a query
+/// reads them here meanwhile.
+///
+/// Immutable once published, so a query reads one with no lock held; shared, so an index that
+/// drops it - a seal, a snapshot install - does not free what a query is still reading (#92).
+struct RowBlock {
+    std::string symbol;
+    std::string exchange;
+    std::vector<SnapshotRow> rows;   ///< in the order they were drained
+    uint64_t min_ts_ns{0};
+    uint64_t max_ts_ns{0};
+
+    /// A block of these rows, its range computed from them; null for none, because a symbol that
+    /// received no row this drain has no block.
+    static std::shared_ptr<const RowBlock> make(std::string symbol, std::string exchange,
+                                                std::vector<SnapshotRow> rows);
+    /// The same, with the range its caller computed while it collected the rows - the drain does,
+    /// so the rows are not walked a second time for it. The range must be the rows': a query skips
+    /// a block by it, and a seal gives it to the segment. With a `pool`, the rows' storage goes
+    /// back to it when the block's last reference does.
+    static std::shared_ptr<const RowBlock> make(std::string symbol, std::string exchange,
+                                                std::vector<SnapshotRow> rows,
+                                                uint64_t min_ts_ns, uint64_t max_ts_ns,
+                                                std::shared_ptr<RowBufferPool> pool);
 };
 
 /// Columnar storage engine for SnapshotRow data.
@@ -117,6 +185,34 @@ public:
     /// Append a row to the active segment, rolling over if needed.
     void append(const SnapshotRow& row);
 
+    /// Append a block's rows in their order, writing what append() on each in turn writes - a
+    /// property test holds the two to the same bytes on disk. For the seal (#165 part 2a), which
+    /// appends every row a second time, after the drain has put it in a block: when no row of the
+    /// block is of a later period than its first - a later one rolls the segment over part way -
+    /// the rollover is tested once, against the block's latest row, and the segment's range widened
+    /// once, by the block's, rather than both row by row.
+    void append_block(const RowBlock& block);
+
+    /// Room in the active segment's buffers for `rows` more, so a seal of several blocks grows each
+    /// buffer once rather than by doubling on the way. Changes nothing that is written.
+    void reserve_rows(size_t rows);
+
+    /// The buffers a segment is accumulated in, one per column.
+    struct ColumnBuffers {
+        std::vector<int64_t>  price;
+        std::vector<uint64_t> qty;
+        std::vector<uint64_t> ts;
+        std::vector<uint32_t> cnt;
+        std::vector<uint8_t>  side;
+        std::vector<uint16_t> level;
+        std::vector<int64_t>  seq;
+    };
+    /// Exchange this store's buffers with `other`'s, so the engine lends one set to each seal in
+    /// turn (#165 part 2a): sixteen stores had each kept buffers as big as its biggest seal, for the
+    /// life of the process. Only with no active segment - what the buffers hold then is a written
+    /// segment's, which the next append() clears - and `std::logic_error` otherwise.
+    void swap_buffers(ColumnBuffers& other);
+
     /// Set the symbol and exchange for this store (used by C API wrapper).
     /// Must be called before the first append if symbol/exchange metadata is needed.
     /// The symbol and exchange this store holds, for a message that has to name them.
@@ -139,6 +235,10 @@ public:
         wal_file_index_  = file_index;
         wal_byte_offset_ = byte_offset;
     }
+
+    /// The seal epoch every segment closed from here on is stamped with, like the position above
+    /// (#165 part 2a).
+    void set_seal_epoch(uint64_t seal_epoch) { seal_epoch_ = seal_epoch; }
 
     /// Flush the active segment: encode buffers, write column files, write meta.json.
     /// Returns the SegmentMeta of the flushed segment, or std::nullopt if no active segment.
@@ -173,6 +273,8 @@ public:
     struct ScanCost {
         size_t compared{0};
         size_t candidates{0};
+        /// Published blocks whose range met the query, read from memory (#165 part 2a).
+        size_t blocks{0};
     };
     ScanCost scan(uint64_t start_ns, uint64_t end_ns,
                   std::string_view symbol, std::string_view exchange,
@@ -240,14 +342,43 @@ public:
     /// anything on a query's or a tick's path: that is the whole-index walk #165 took out of them.
     std::vector<SegmentMeta> index() const;
 
-    /// Whether any segment of this symbol is indexed. What a query asks before it answers "not
-    /// found" - which used to copy the whole index to find out (#165).
+    /// Whether any segment or published block of this symbol is indexed. What a query asks before
+    /// it answers "not found" - which used to copy the whole index to find out (#165).
     bool holds(std::string_view symbol, std::string_view exchange) const;
 
+    /// Publish drained rows, so a query reads them before they are sealed (#165 part 2a). A symbol's
+    /// blocks are read after its segments, in the order they were published - the order they were
+    /// written, which is what a tie between two rows of one level resolves by (#168).
+    void publish_blocks(const std::vector<std::shared_ptr<const RowBlock>>& blocks);
+
+    /// Replace the first `count` blocks published for a symbol with the segments written from them,
+    /// **in one step** under the index's lock: a query sees the blocks or the segments, never both
+    /// and never neither. Returns how many of `segments` were refused as already indexed, like
+    /// merge_segments().
+    size_t seal_blocks(const std::string& symbol, const std::string& exchange, size_t count,
+                       const std::vector<SegmentMeta>& segments);
+
+    /// Drop every published block, for a path that discards what this node holds - a resync, a
+    /// snapshot install. Their rows are in the WAL the discard is also giving up on.
+    void drop_blocks();
+
+    /// Give up on the segment being written from a seal that failed (#165 part 2a): the active
+    /// rows discarded, and any segment a rollover wrote in the meantime removed from the disk -
+    /// a seal is all or nothing, because its rows stay in the blocks it was written from, and a
+    /// retry writes them again.
+    void abandon_active();
+
+    /// Rows in published blocks that no seal has replaced yet.
+    size_t unsealed_rows() const {
+        std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        return unsealed_rows_;
+    }
+
     /// How many symbols, each with its exchange, the index holds. Every one of them holds a
-    /// segment: retention and remove_segments() erase a symbol whose last segment leaves, or a
-    /// store whose symbols come and go - a contract per expiry, an options chain - would keep an
-    /// entry for every symbol it ever saw. holds() cannot tell: it answers by segments.
+    /// segment or a published block: retention and remove_segments() erase a symbol whose last
+    /// segment leaves and which has no block, or a store whose symbols come and go - a contract per
+    /// expiry, an options chain - would keep an entry for every symbol it ever saw. holds() cannot
+    /// tell: it answers by what the entry holds.
     size_t symbols_indexed() const {
         std::shared_lock<std::shared_mutex> lock(index_mtx_);
         return by_symbol_.size();
@@ -268,6 +399,7 @@ private:
 
     // Active segment state
     uint64_t    wal_identity_{0};
+    uint64_t    seal_epoch_{0};
     uint32_t    wal_file_index_{0};
     uint64_t    wal_byte_offset_{0};
     std::string symbol_;
@@ -331,6 +463,8 @@ private:
     /// took 7.7 ms at 100 000 segments and a scan that found nothing 3.3 ms.
     struct SymbolIndex {
         std::vector<WidthTier> tiers;
+        /// Published and not yet sealed, oldest first: a drain appends, a seal takes from the front.
+        std::deque<std::shared_ptr<const RowBlock>> blocks;
     };
     static std::string index_key(std::string_view symbol, std::string_view exchange);
 
@@ -340,6 +474,7 @@ private:
     std::unordered_map<std::string, SymbolIndex> by_symbol_;
     std::unordered_set<std::string> indexed_dirs_;   // what the duplicate check asks, in O(1)
     size_t indexed_count_{0};
+    size_t unsealed_rows_{0};                        // rows in every symbol's blocks
 
     /// Index one segment: false, and nothing changed, if its directory is already indexed.
     /// Caller holds `index_mtx_` exclusively.

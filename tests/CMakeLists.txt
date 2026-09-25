@@ -233,6 +233,11 @@ ob_add_columnar_test(test_segment_index
 )
 target_compile_definitions(test_segment_index PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
 
+# ── #165 part 2a: drained rows in published blocks until a seal writes them ───
+ob_add_columnar_test(test_row_blocks
+    test_row_blocks.cpp
+)
+
 # ── Helper to register a test executable that needs the aggregation library ───
 function(ob_add_agg_test name)
     add_executable(${name} ${ARGN})
@@ -637,6 +642,24 @@ target_link_libraries(test_flush_race
         GTest::gtest_main
 )
 gtest_discover_tests(test_flush_race)
+
+# ── #165 part 2a: a tick seals only the stores that are due ──────────────────
+add_executable(test_lazy_flush test_lazy_flush.cpp)
+target_link_libraries(test_lazy_flush
+    PRIVATE
+        orderbook_engine
+        GTest::gtest_main
+)
+gtest_discover_tests(test_lazy_flush PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
+
+# ── #165 part 2a: which segments a checkpoint vouches for while rows wait ───
+add_executable(test_seal_epochs test_seal_epochs.cpp)
+target_link_libraries(test_seal_epochs
+    PRIVATE
+        orderbook_engine
+        GTest::gtest_main
+)
+gtest_discover_tests(test_seal_epochs PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
 
 # ── TTL retention tests (compression-and-ttl, Tasks 7.2, 8.3–8.5) ────────────
 add_executable(test_ttl_retention test_ttl_retention.cpp)

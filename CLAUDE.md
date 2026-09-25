@@ -3500,6 +3500,54 @@ Learned the hard way. Check here before debugging.
      bootstrapping` meanwhile; `select_prices()` read that as an empty store and a correct replica
      failed a required test, once in a few hundred runs under load (#173). Give each refusal the
      meaning it has, and raise on the ones a caller did not ask to be told apart from an answer.
+442. **A checkpoint that claims less stops being safe once one segment holds several drains.**
+     "Claiming less only costs a replay" held while every segment was one drain, positioned at its
+     own end. A seal writes several drains into one segment positioned at the last of them, so with
+     another store's older block waiting the claim stood before that segment's position: a start
+     removed it as unvouched, and a replay from the claim rebuilt only its later rows. Walking the
+     kill test through the design found it before any run; a checkpoint names a seal epoch now (#165
+     part 2a).
+443. **A fixture that starts a process outside its `try` leaks it when the start fails.** The
+     lazy-flush fixture called `start()` before its `try`, and a `start()` that timed out raised
+     without stopping what it had launched: three servers outlived the run by eleven hours, found by
+     listing every process. Start inside the `try`, and make a failed start stop what it launched.
+444. **A cost per item measured as the whole divided by the items includes everything else the whole
+     does.** Part 1 of #165 put a warm start at 24 µs a segment - the start divided by its segments.
+     The start's own log splits it: about 13 µs a segment, and 1.2 s that both builds spend reading
+     the WAL twice, which is #174.
+445. **A verdict that turns out wrong is a finding about the code, not a row to argue with.** The
+     row that dropped `append_block()`'s test of each quantity for Simple8b's width was written down
+     as killed and survived: `flush_segment()` ORs that flag with the encoder's own finding, and the
+     encoder falls back for exactly those quantities, so no test can kill it - the test was work for
+     nothing, and came out of the code (#165 part 2a).
+446. **A test can pass by its patience rather than by its premise.** Once a tick sealed only what
+     was due, the test of a writer during the tick's segment write still passed - because the age
+     seal came at about fifteen seconds, inside its fifteen-second patience, and the line its
+     premise check read is one the seal logs too. After a change to what a path does, read each test
+     of that path for what it now exercises, not only whether it is green.
+447. **A test's premise that a path runs needs a mutation that removes the path.** The retention
+     test for #160 said a tick under `every` usually finds nothing owed; the file a rotation leaves
+     makes the ticket owed under every policy, the test rotated about every other tick, and it
+     passed on master with the nothing-owed promotion removed, three runs of three. Found when part
+     2a's first rewrite of it survived the same row.
+448. **A benchmark that starts each run straight after the last measures the last one's cleanup.**
+     Part 2a's first ingest table put it 10-11% behind master: each run began with the page cache
+     still holding what the run before had written and deleted - a gigabyte of WAL, thousands of
+     segment files - for its own syncs to flush, and in the rotation the new build's runs mostly
+     followed master's. The engine work that followed found real faults, but not that gap - on a
+     quiet disk, a `sync` and a second of no writes, six rounds of each were 11.75-11.86 M levels a
+     second against master's 11.80-11.86 M. Measure a harness both ways once before trusting a gap
+     it reports.
+449. **A share of exactly the inflow keeps whatever backlog it finds.** Sealing what the tick
+     drained spread the stores that came due together, and the ones the first wave deferred stayed
+     deferred for the whole run - four or five ticks late, 2.5-3.2 M rows waiting, the server's peak
+     RSS four times master's. A quarter more drained the backlog: 0.4-0.6 M rows waiting, and
+     275-299 MiB where it had been 668-771.
+450. **Memory handed back every tick is memory the kernel faults in again.** Each drain wrote its
+     rows into blocks allocated for it, and the blocks the last seal freed had gone back to the
+     system: 68% of the server's page faults, four times master's, found with `perf record -e
+     page-faults` rather than read from a CPU profile, where they hide inside the function that
+     touches the page.
 
 ## Current state and open problems
 
@@ -3533,15 +3581,18 @@ carries no count, because the previous version of this sentence said "four" abov
 omitted the newest one entirely - which is the rot pitfall 312 is about, in the paragraph that
 warns about it.
 
-**#165, part 1**: the segment index is per symbol and in width tiers, so a flush tick's merge is a
-lookup and an insertion and a query searches only its symbol's windows - a writer's p99 flat at
-0.71-0.76 ms through a 90-second soak where it grew to 94.66 ms. **Part 2 is open and a P0**: the
-count still grows by one segment per active symbol per tick, faster now that ticks no longer slow,
-and a cold start reads every one - 107 s and 1.44 GiB after that soak. **#169 and #172 are open
-P1s**: an exchange name with a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C`
-share a live book, sequence numbers and stored rows, measured on the wire - and the Python client's
-sharded pool replaces its routing state under its callers, found by reading because nothing tests
-that pool.
+**#165, parts 1 and 2a**: the segment index is per symbol and in width tiers, so a flush tick's
+merge is a lookup and an insertion and a query searches only its symbol's windows - a writer's p99
+flat at 0.71-0.76 ms through a 90-second soak where it grew to 94.66 ms - and a tick seals only the
+stores that are due, a quarter more rows than it drained at most, with a checkpoint that names the
+seal epoch it vouches for: after that soak 2 304 segments where master has 141 312-143 104, and a
+cold start of 4.4 s where master's takes 108. **Part 2b is open and a P0**: nothing merges the
+segments that are written, so they still grow with uptime. **#169 and #172 are open P1s**: an
+exchange name with a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live
+book, sequence numbers and stored rows, measured on the wire - and the Python client's sharded pool
+replaces its routing state under its callers, found by reading because nothing tests that pool.
+**#174 is an open P2**: a start reads the whole WAL twice even when its last checkpoint covers every
+record.
 
 **#170 and #171**: a Python client connection carries one exchange at a time and is closed when one
 does not finish. A pool used one socket from two threads, so two callers got each other's rows 39%

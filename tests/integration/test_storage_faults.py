@@ -1193,6 +1193,34 @@ def insert_at(node: FaultNode, symbol: str, price: int, event_time_ns: int) -> s
     return node.talk(f"INSERT {symbol} EX bid {price} 1 1 {event_time_ns}")[0]
 
 
+def segments_of(node: FaultNode, symbol: str) -> int:
+    """How many whole segments `symbol` has on disk - directories with their `meta.json`."""
+    parent = os.path.join(node.data_dir, symbol, "EX")
+    if not os.path.isdir(parent):
+        return 0
+    return sum(1 for span in os.listdir(parent)
+               if os.path.exists(os.path.join(parent, span, "meta.json")))
+
+
+SEAL_ROWS = 65_536   # Engine::kSealRows: a store with this many rows waiting is sealed by the next tick
+
+
+def make_due(node: FaultNode, symbol: str, event_time_ns: int, first_price: int = 1_000_000) -> list[int]:
+    """Write enough rows of `symbol` at one event time for the next tick to seal its store.
+
+    Since part 2a of #165 a tick writes a segment only for a store that is due - by its rows, by the
+    age of its oldest, or by every store's rows together - so a test that needs a tick to write one
+    makes it due by rows rather than wait ten seconds for the age. Returns the prices written.
+    """
+    levels = 1000
+    prices: list[int] = []
+    for k in range((SEAL_ROWS + levels - 1) // levels):
+        first = first_price + k * levels
+        assert minsert_at(node, symbol, first, levels, event_time_ns + k) == "OK"
+        prices += range(first, first + levels)
+    return prices
+
+
 def partial_segment_dirs(node: FaultNode) -> list[str]:
     """Segment directories with no `meta.json` - what a refused write leaves if nothing removes it.
 
@@ -1259,7 +1287,14 @@ def test_a_symbol_the_disk_refuses_leaves_the_others_written_and_readable():
     Two symbols in one flush, and the first `price.col` the flush writes is refused - whichever
     symbol that is. The other's segment is written **and merged**: an exception out of the loop
     used to skip the merge, and a written segment outside the index is rows no query returns until
-    a restart finds them. The refused one's rows stay in memory and the next flush writes them.
+    a restart finds them. The refused one's rows stay where they wait, and the next flush writes
+    them.
+
+    Since part 2a of #165 they wait in a block a query reads, so both symbols answer after the
+    failed flush - each row once, which a merge that left the written symbol's block beside its
+    segment would not - and what tells the two apart is the disk: one segment after the first
+    flush, one each after the second. A merge skipped would seal the same block again, and a
+    restart would then find its row twice.
     """
     node = FaultNode(OB_FAULT_PATH="price.col", OB_FAULT_OP="write", OB_FAULT_ERRNO="ENOSPC",
                      OB_FAULT_COUNT="1", OB_FAULT_FLUSH_MS="3600000")
@@ -1269,12 +1304,18 @@ def test_a_symbol_the_disk_refuses_leaves_the_others_written_and_readable():
         assert node.talk("INSERT BBB EX bid 222 1 1")[0] == "OK"
         assert node.talk("FLUSH")[0].startswith("ERR"), "the refused segment was not reported"
         visible = {s: prices_of(node, s) for s in ("AAA", "BBB")}
-        assert sorted(len(v) for v in visible.values()) == [0, 1], (
-            f"exactly one symbol's segment should be readable after the first flush: {visible}")
+        assert visible == {"AAA": [111], "BBB": [222]}, (
+            f"each row should be answered once after the failed flush, sealed or waiting: {visible}")
+        written = {s: segments_of(node, s) for s in ("AAA", "BBB")}
+        assert sorted(written.values()) == [0, 1], (
+            f"exactly one symbol's segment should be written by the first flush: {written}")
         # And the refused one left nothing behind: a directory it began is removed, or a disk that
         # refused a write because it was full would keep what the write managed to put there.
         assert partial_segment_dirs(node) == [], partial_segment_dirs(node)
         assert node.talk("FLUSH")[0] == "OK"
+        written = {s: segments_of(node, s) for s in ("AAA", "BBB")}
+        assert written == {"AAA": 1, "BBB": 1}, (
+            f"the second flush should write the refused symbol and nothing else again: {written}")
         assert prices_of(node, "AAA") == [111] and prices_of(node, "BBB") == [222]
         node.kill_and_restart_without_faults()
         assert prices_of(node, "AAA") == [111] and prices_of(node, "BBB") == [222]
@@ -1417,24 +1458,52 @@ def test_retention_moves_under_every_while_writes_flow():
     """The retention floor rises under `--fsync-policy every` while writes keep arriving (#160).
 
     Under `every` each write syncs the WAL itself, which also takes the checkpoint the last tick
-    appended to the device - so a tick usually finds **nothing owed**, and that is the path on which
-    the floor has to move. Stage 5 of #151 split the tick's sync out of the lock, and its first
-    version promoted the floor only on the path that synced: with writes flowing, retention under
-    `every` never moved and the WAL grew for as long as they did.
+    appended to the device - so a tick can find **nothing owed**, and that is a path on which the
+    floor has to move. Stage 5 of #151 split the tick's sync out of the lock, and its first version
+    promoted the floor only on the path that synced: with writes flowing, retention under `every`
+    stalled for as long as they did.
 
-    The directory is read the moment the writes stop, which is the window that decides it: with the
-    floor stuck, the first promotion comes two ticks later - one to append a checkpoint nobody's
-    write has synced, and one to find it owed.
+    **A tick finds nothing owed only if no rotation left a file since the last one**: the files a
+    rotation leaves go with the tick's ticket under every policy, and make it owed. This test's
+    first version rotated the WAL every 482 writes, and with a write a millisecond that was about
+    every other tick - so ticks synced, and moved the floor, often enough that it passed with the
+    nothing-owed promotion removed: three runs of three on master (#165 part 2a found it).
+
+    So BULK goes first, rotating the WAL past its first file, with just enough rows to make its
+    store due - the tick that seals it is the one that drains the last of them. Since part 2a the
+    floor waits for rows in blocks, whose records are what a crash would replay them from, and only
+    that seal lets it pass BULK's files. Then, once that tick has written BULK's segment, single rows
+    flow, one every 20 ms for two seconds, into a file with most of a megabyte of room: every tick
+    after the seal finds the last checkpoint synced by a write and no file left by a rotation, so the
+    floor can pass `wal_000000.bin` only on the path that finds nothing owed. The directory is read
+    the moment the writes stop.
+
+    The flow waits for the seal because a block's replay starts where the drain before it ended: a
+    row drained with BULK's last would be replayed from inside BULK, and hold the floor there for
+    the ten seconds its block waits. The first version of this rewrite started at once and passed
+    one run in three.
     """
-    node = FaultNode(OB_FAULT_POLICY="every", OB_FAULT_FLUSH_MS="300", OB_FAULT_ROTATE_BYTES="65573")
+    node = FaultNode(OB_FAULT_POLICY="every", OB_FAULT_FLUSH_MS="300",
+                     OB_FAULT_ROTATE_BYTES=str(1024 * 1024))
     try:
         node.wait_until_answering()
-        replies = node.insert_each(range(1000, 4000))
+        make_due(node, "BULK", time.time_ns())
+        deadline = time.time() + patience(10)
+        while segments_of(node, "BULK") == 0 and time.time() < deadline:
+            time.sleep(0.002)
+        assert segments_of(node, "BULK") == 1, node.log()[-1500:]
+        replies: dict[int, str] = {}
+        price = 1000
+        flowing_until = time.monotonic() + 2.0
+        while time.monotonic() < flowing_until:
+            replies.update(node.insert_each([price]))
+            price += 1
+            time.sleep(0.02)
         files = node.wal_files()
-        assert all(r == "OK" for r in replies.values())
-        assert any(f >= "wal_000003.bin" for f in files), (
-            f"the writes did not rotate the WAL past its third file, so there was nothing for "
-            f"retention to delete: {files}")
+        assert all(r == "OK" for r in replies.values()), replies
+        assert any(f >= "wal_000001.bin" for f in files), (
+            f"BULK did not rotate the WAL past its first file, so there was nothing for retention "
+            f"to delete: {files}")
         assert WAL_SEGMENT not in files, (
             f"retention kept every WAL file while writes flowed under `every`: {files}")
     finally:
@@ -1442,14 +1511,16 @@ def test_retention_moves_under_every_while_writes_flow():
 
 
 def test_a_writer_does_not_wait_for_a_segment_the_ticks_drain_writes():
-    """Stage 5 of #151: the flush tick drains its rows without the engine's lock.
+    """Stage 5 of #151: the flush tick writes its segments without the engine's lock.
 
-    The drain appends each row to its store, and a row whose event time crosses its segment's hour
-    rolls the segment over - which **writes** it, from inside the drain. With the drain under the
-    lock, every writer waited for that write, and with only the tick's sync taken out of the lock
-    the drain was what was left: 11 ms at p99.9 on the m9g.xlarge. Here row 100 is in hour 1 and
-    row 200 in hour 2, both queued before the first tick, so that tick's drain rolls hour 1 over and
-    the injector makes that write - the first `price.col` this node writes - last three seconds.
+    The drain used to append each row to its store, and a row whose event time crossed its
+    segment's hour rolled the segment over - which **wrote** it, from inside the drain. With the
+    drain under the lock, every writer waited for that write: 11 ms at p99.9 on the m9g.xlarge.
+    Since part 2a of #165 the drain writes nothing - its rows go to blocks - and a store's segment
+    is written when the store is due, by the seal after the drain; the lock is held for neither.
+
+    Here ROLL is made due by rows, so the next tick seals it, and the injector makes that write -
+    the first `price.col` this node writes, because nothing was sealed before - last three seconds.
     Ten writes timed inside it must not wait for it; and after it, every row is there once.
     """
     stall_ms = 3000
@@ -1460,8 +1531,7 @@ def test_a_writer_does_not_wait_for_a_segment_the_ticks_drain_writes():
     base = 1_700_000_000 * 1_000_000_000 // HOUR_NS * HOUR_NS
     try:
         node.wait_until_answering()
-        assert insert_at(node, "ROLL", 100, base + 1) == "OK"
-        assert insert_at(node, "ROLL", 200, base + HOUR_NS + 1) == "OK"
+        roll = make_due(node, "ROLL", base + 1)
         deadline = time.time() + patience(15)
         while "action=delay" not in node.fault_log_text() and time.time() < deadline:
             time.sleep(0.02)
@@ -1477,35 +1547,32 @@ def test_a_writer_does_not_wait_for_a_segment_the_ticks_drain_writes():
             f"{stall_ms} ms to write - they waited for it, so the tick drains under the engine's lock")
 
         time.sleep(stall_ms / 1000 + 0.5)
-        # The premise, read once the slow write is over, because the rollover says so after it: the
-        # slow write was the drain's rollover rather than a segment the tick writes after the drain,
-        # which never held the lock. Nothing was flushed before this tick, so the first `price.col`
-        # this node wrote is the one that rolled over.
-        assert "Segment rolled over" in node.log(), (
-            "the first segment write was not a rollover inside the drain, so this measured nothing")
         assert node.talk("FLUSH")[0] == "OK"
-        assert sorted(prices_of(node, "ROLL")) == [100, 200]
+        assert sorted(prices_stored(node, "ROLL")) == sorted(roll)
         assert sorted(prices_of(node, "SYM")) == list(range(101, 111))
     finally:
         node.cleanup()
 
 
 def test_rows_written_during_a_ticks_drain_survive_a_crash_after_it():
-    """The drain without the lock, through a crash (stage 5 of #151).
+    """The tick's segment write without the lock, through a crash (stage 5 of #151).
 
-    Rows keep arriving while a tick drains now, and they are queued for the next tick rather than
-    drained into this one's segments - which carry the position of the tick's sync, before those
-    rows' records. Rows 100 and 200 are drained by a tick whose rollover write is made to last two
-    seconds, rows 101-103 are written during it, the node is killed after that tick has made its
-    segments readable and before the next one runs, and after a restart all five are back, each once.
+    Rows keep arriving while a tick writes its segments, and they are queued for the next tick
+    rather than taken by this one - whose segments carry the position of the tick's sync, before
+    those rows' records, and whose checkpoint claims no further. ROLL is made due by rows, so a tick
+    seals it, and its segment is made to take two seconds to write; rows 101-103 of another symbol
+    are written during it; the node is killed after that tick has written the segment and before
+    the next one runs; and after a restart every row is back, each once.
+
+    Since part 2a of #165 the drain writes nothing and ROLL's rows are readable from their blocks
+    before the seal, so the end of the slow tick is read from the disk: the segment whole.
     """
     node = FaultNode(OB_FAULT_PATH="price.col", OB_FAULT_OP="write", OB_FAULT_DELAY_MS="2000",
                      OB_FAULT_COUNT="1", OB_FAULT_POLICY="interval", OB_FAULT_FLUSH_MS="4000")
     base = 1_700_000_000 * 1_000_000_000 // HOUR_NS * HOUR_NS
     try:
         node.wait_until_answering()
-        assert insert_at(node, "ROLL", 100, base + 1) == "OK"
-        assert insert_at(node, "ROLL", 200, base + HOUR_NS + 1) == "OK"
+        roll = make_due(node, "ROLL", base + 1)
         deadline = time.time() + patience(15)
         while "action=delay" not in node.fault_log_text() and time.time() < deadline:
             time.sleep(0.02)
@@ -1513,19 +1580,23 @@ def test_rows_written_during_a_ticks_drain_survive_a_crash_after_it():
         replies = node.insert_each([101, 102, 103])
         assert all(r == "OK" for r in replies.values()), replies
 
-        # The slow tick merges ROLL's segments when its write ends; SYM's rows wait for the next.
+        # The slow tick writes ROLL's segment when its delayed write ends; SYM's rows wait for the
+        # next. The merge and the checkpoint follow the segment by milliseconds, and the next tick
+        # is four seconds away.
         deadline = time.time() + patience(10)
-        while sorted(prices_of(node, "ROLL")) != [100, 200] and time.time() < deadline:
+        while segments_of(node, "ROLL") < 1 and time.time() < deadline:
             time.sleep(0.05)
-        assert sorted(prices_of(node, "ROLL")) == [100, 200], node.log()[-1500:]
+        assert segments_of(node, "ROLL") == 1, node.log()[-1500:]
+        time.sleep(0.5)
         assert prices_of(node, "SYM") == [], (
-            "the rows written during the drain were drained by it - they have to wait for the next "
-            "tick, whose sync is the one that covers their records")
+            "the rows written during the tick's segment write were taken by it - they have to wait "
+            "for the next tick, whose sync is the one that covers their records")
 
         node.kill_and_restart_without_faults()
-        assert sorted(prices_of(node, "ROLL")) == [100, 200]
+        assert sorted(prices_stored(node, "ROLL")) == sorted(roll)
         assert sorted(prices_of(node, "SYM")) == [101, 102, 103], (
-            "a row written while the tick drained was lost or doubled by the replay after a crash")
+            "a row written while the tick wrote its segments was lost or doubled by the replay after "
+            "a crash")
     finally:
         node.cleanup()
 

@@ -20,8 +20,10 @@
 
 #include <optional>
 #include <atomic>
+#include <deque>
 #include <chrono>
 #include <condition_variable>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -187,6 +189,64 @@ public:
 
     /// Access the metrics registry.
     MetricsRegistry& registry() { return registry_; }
+
+    /// Whether the last checkpoint vouches for a segment found at open (#160, #165 part 2a); one it
+    /// does not is removed there and its rows rebuilt from the WAL. Pure, so the rule is tested
+    /// without staging a crash:
+    ///   - a segment of another WAL - a snapshot's, a migration's - is not this log's to judge;
+    ///   - a checkpoint naming a seal epoch vouches for the segments sealed at or before it;
+    ///   - one naming only a position vouches for the segments at or before that position;
+    ///   - one that says nothing, or a log whose first files retention took, vouches for every one.
+    static bool segment_vouched_for(const SegmentMeta& meta,
+                                    const WALReplayer::LastCheckpoint& last,
+                                    uint64_t local_wal_identity);
+
+    /// When a store's drained rows are sealed into a segment (#165 part 2a): enough rows, or old
+    /// enough, oldest first, and a tick takes **its share** - at most `kSealsPerTick` stores, and
+    /// after the first no more rows than the tick's share, which is a quarter more than it drained
+    /// or `kSealRows`, whichever is more - so stores that come due together are spread over ticks
+    /// rather than sealed in one; and, while every store's rows together are over the budget, the
+    /// oldest of the rest past both limits until they are not. Constants, not flags: nothing yet
+    /// says an operator has a reason to turn them.
+    ///
+    /// A quarter more than it drained, because a share of exactly that keeps any backlog it finds:
+    /// what comes due each tick is what was drained, so stores the first wave deferred stayed
+    /// deferred - sealed four or five ticks late, 2.5-3.2 M rows waiting - for as long as it ran.
+    ///
+    /// The share is measured. Without it, sixteen stores taking ~62 500 rows a tick at four
+    /// pipelining connections on the m9g.xlarge came due together every other tick - 39 sealing
+    /// ticks of 79, strictly alternating, read from the tick's DEBUG lines - and a sealing tick,
+    /// ~1.45 M rows written in 21 ms and synced in 39, took about as long as the four connections
+    /// take to fill the pending queue's million rows.
+    static constexpr size_t kSealRows = 65'536;
+    static constexpr std::chrono::milliseconds kSealAge{10'000};
+    static constexpr size_t kUnsealedRowsBudget = 4'000'000;
+    static constexpr size_t kSealsPerTick = 64;
+    /// What FLUSH, close(), a snapshot and a store's own seal say they drained: they take every
+    /// store, and no share limits them.
+    static constexpr size_t kNoRowLimit = std::numeric_limits<size_t>::max();
+
+    /// One store's standing for a seal: its rows in blocks, and when its oldest block was published.
+    struct SealCandidate {
+        size_t rows{0};
+        std::chrono::steady_clock::time_point oldest{};
+    };
+    enum class SealReason { kAll, kRows, kAge, kBudget };
+    struct SealPick {
+        size_t index{0};
+        SealReason why{SealReason::kAll};
+    };
+    /// The policy above, as a function of its inputs alone, so it is tested without a clock:
+    /// `candidates` oldest first, and the picks in the same order. `seal_all` is FLUSH, close() and
+    /// a snapshot, which take every one. `drained_rows` is what the tick drained, and its share is
+    /// a quarter more rows or `kSealRows`, whichever is more - so a tick that drained little still seals
+    /// small stores due by age in bulk. Below the budget a due store after the first is taken only
+    /// while the rows picked stay within the share - a younger one that fits after an older one
+    /// that does not, so the share is filled - and the oldest due store is always taken, so none
+    /// waits behind a share it is bigger than.
+    static std::vector<SealPick> pick_seals(const std::vector<SealCandidate>& candidates,
+                                            std::chrono::steady_clock::time_point now,
+                                            bool seal_all, size_t drained_rows);
 
     /// Engine-level statistics for monitoring.
     struct Stats {
@@ -510,6 +570,40 @@ private:
 
     // Combined store used by QueryEngine for scanning
     ColumnarStore combined_store_;
+
+    /// Rows drained and published as blocks, waiting for their store's seal (#165 part 2a), oldest
+    /// first. A tick used to write a segment for every symbol with a row since the last one - at 256
+    /// symbols ~2 000 files and a syncfs() a tick, 84.7% of the flush thread in the kernel - so a
+    /// node gained a segment per active symbol per tick. Keyed by the store, whose pointer is stable
+    /// under `flush_mtx_`, which every path that drains, seals or replaces the stores holds; only
+    /// they touch this. `unsealed_rows_` is its total, for the readers that hold only mtx_.
+    struct UnsealedBlock {
+        std::shared_ptr<const RowBlock> block;
+        /// Every row's record is at or after `wal_from` and before `wal_to`, the drain's position.
+        /// A checkpoint may not claim `wal_from` while the block waits; the segment it seals into
+        /// records `wal_to`, like every segment's position since #63.
+        WalPosition wal_from{};
+        WalPosition wal_to{};
+        std::chrono::steady_clock::time_point published{};
+    };
+    struct Unsealed {
+        std::deque<UnsealedBlock> blocks;
+        size_t rows{0};
+    };
+    std::unordered_map<ColumnarStore*, Unsealed> unsealed_;
+    std::atomic<size_t> unsealed_rows_{0};
+    /// How many rows each store's last block held, reserved for its next one, so a busy store's
+    /// block is not grown - its rows copied again each time - on the way to its size. Under
+    /// `flush_mtx_`, like `unsealed_`, and cleared wherever the stores are.
+    std::unordered_map<ColumnarStore*, size_t> block_rows_hint_;
+    /// Where a sealed block's rows go back to and a drain takes them from (#165 part 2a); a
+    /// drain takes about the pending queue's ceiling at most, so that is what is kept spare.
+    std::shared_ptr<RowBufferPool> block_rows_pool_ = std::make_shared<RowBufferPool>(MAX_PENDING_ROWS);
+    /// The column buffers every seal writes through, lent to its store for the seal (#165 part 2a).
+    /// Under `flush_mtx_`, which every seal holds.
+    ColumnarStore::ColumnBuffers seal_buffers_;
+    LogEpisode unsealed_budget_episode_{};
+
 
     std::unique_ptr<QueryEngine> query_engine_;
 
@@ -921,7 +1015,36 @@ private:
     /// merged and visible, and no checkpoint claims them or anything after them in this process
     /// (#160). The flush tick counts and goes on; `FLUSH` answers `ERR`, because a client that
     /// asked is told.
-    int flush_write_and_merge();
+    ///
+    /// `drained_rows` is what the tick drained (`pick_seals()`), and `kNoRowLimit` for the rest.
+    int flush_write_and_merge(bool seal_all, size_t drained_rows);
+
+    /// One store's seal: its first `count` blocks written into `metas` (#165 part 2a).
+    struct Seal {
+        ColumnarStore* store{nullptr};
+        size_t count{0};
+        size_t rows{0};
+        std::vector<SegmentMeta> metas;
+    };
+    /// Which stores to seal, oldest first: every store with blocks, `only`'s, or what is due within
+    /// the share of a tick that drained `drained_rows` (`pick_seals()`). Holds `flush_mtx_`.
+    std::vector<Seal> choose_seals(bool seal_all, ColumnarStore* only, size_t drained_rows);
+    /// Write each seal's segments from its blocks. A store whose write fails keeps its blocks and is
+    /// dropped from `seals`, with what it wrote removed. Returns the first failure, or null. Holds
+    /// `flush_mtx_`; `mtx_` or not.
+    std::exception_ptr write_seals(std::vector<Seal>& seals);
+    /// Replace the sealed blocks with their segments, in the index and in `unsealed_`. Returns the
+    /// segments refused as already indexed. Holds `flush_mtx_` and `mtx_`.
+    size_t merge_seals_locked(const std::vector<Seal>& seals);
+    /// Where replay starts: the drain's position, or the oldest unsealed block's start if that is
+    /// earlier - claiming a waiting block's rows would lose them in a crash. **With blocks waiting
+    /// this position alone does not say which segments are durable** (#165 part 2a): a seal writes
+    /// several drains into one segment positioned at the last of them, so a start judging by it
+    /// removed segments whose earlier rows no replay from here brings back. The checkpoint names
+    /// the seal epoch too, and `segment_vouched_for()` reads it. Holds `flush_mtx_` and `mtx_`.
+    WalPosition claim_locked() const;
+    /// Forget every unsealed block, for the paths that discard the stores. Holds both locks.
+    void drop_unsealed_locked();
     /// Sync what this flush wrote, before anything claims it (#160): one `syncfs()` on the data
     /// directory, without `mtx_`. Returns 0, or the `errno`; always 0 under `--fsync-policy none`.
     int sync_segments();
@@ -937,6 +1060,13 @@ private:
     void freeze_checkpoints(const std::string& what_failed);
     /// At startup, before replay: remove the segments no surviving checkpoint vouches for (#160).
     void remove_unvouched_segments(const WALReplayer::LastCheckpoint& last);
+
+    /// The seal epoch (#165 part 2a): bumped by every `write_seals()` that has something to write,
+    /// stamped on the segments it writes, and named by a checkpoint written while rows wait in
+    /// blocks. Restored at open to the highest the store or the last checkpoint knows, so a segment
+    /// sealed after a restart can never be taken for one an old checkpoint vouched for. Under
+    /// flush_mtx_.
+    uint64_t seal_epoch_{0};
 };
 
 } // namespace ob

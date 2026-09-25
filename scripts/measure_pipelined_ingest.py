@@ -6,6 +6,15 @@ Runs `benchmarks/pipelined_ingest` against a fresh node per run, for every build
 last, and a warm-cache or turbo effect that favours a position cannot read as a difference between
 builds. Prints one JSON line per run and a table of medians.
 
+**Each run starts on a quiet disk**: `sync`, then a wait until the data root's device has written
+nothing for a second, at most 30 s (`--no-settle` skips it). The run before leaves writes behind it
+in the page cache - a gigabyte of WAL and thousands of segment files, written and then deleted - and
+a run started into them flushes them with its own syncs. Measured on the m9g.xlarge at four
+connections, six rounds of each, default policy (#165 part 2a): straight after the last run, master
+9.39–11.77 M levels a second and part 2a 9.71–11.52 M; on a quiet disk 11.80–11.86 M and
+11.75–11.86 M. The wait was hardly ever more than its one second - the `sync` is what does it.
+Figures before that change were measured without it.
+
 With `--count-syscalls` each run is also counted by the kernel: `perf stat` on the
 `sys_enter_sendto` and `sys_enter_read` tracepoints, divided by the number of batches. That is how
 #146 was measured — one send per batch where there had been 64 — and it needs `sudo` and `perf`.
@@ -56,6 +65,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import socket
 import statistics
@@ -70,6 +80,47 @@ sys.path.insert(0, str(REPO / "benchmarks" / "comparative"))
 import hardware  # noqa: E402  - one definition of "Release" and of "durable", shared
 
 EVENTS = ("syscalls:sys_enter_sendto", "syscalls:sys_enter_read")
+
+
+def device_of(path: Path) -> str | None:
+    """The `/proc/diskstats` name of the block device holding `path`, or None if it has none."""
+    st = os.stat(path)
+    major, minor = os.major(st.st_dev), os.minor(st.st_dev)
+    with open("/proc/diskstats") as handle:
+        for line in handle:
+            fields = line.split()
+            if int(fields[0]) == major and int(fields[1]) == minor:
+                return fields[2]
+    return None
+
+
+def sectors_written(device: str) -> int:
+    with open("/proc/diskstats") as handle:
+        for line in handle:
+            fields = line.split()
+            if fields[2] == device:
+                return int(fields[9])
+    return 0
+
+
+def settle(device: str, quiet_s: float = 1.0, limit_s: float = 30.0) -> float:
+    """`sync`, then wait until `device` has written nothing for `quiet_s`; the seconds it took.
+
+    The run before this one left writes in the page cache that a run started into them would flush
+    with its own syncs.
+    """
+    started = time.monotonic()
+    os.sync()
+    last = sectors_written(device)
+    still_since = time.monotonic()
+    while time.monotonic() - started < limit_s:
+        time.sleep(0.1)
+        now = sectors_written(device)
+        if now != last:
+            last, still_since = now, time.monotonic()
+        elif time.monotonic() - still_since >= quiet_s:
+            break
+    return time.monotonic() - started
 
 
 def free_port() -> int:
@@ -181,6 +232,8 @@ def main() -> int:
                     help="batches of BOOK queries over seeded books instead of MINSERTs")
     ap.add_argument("--server-cpus", help="taskset list for the server, e.g. 0-1")
     ap.add_argument("--probe-cpus", help="taskset list for the probe, e.g. 2-3")
+    ap.add_argument("--no-settle", action="store_true",
+                    help="start each run straight after the last, rather than on a quiet disk")
     ap.add_argument("--data-root", type=Path, default=REPO / "build-release" / "bench-data",
                     help="where each run's node keeps its data; refused if it is memory")
     args = ap.parse_args()
@@ -221,10 +274,17 @@ def main() -> int:
 
     print(f"loadavg at start: {loadavg()}", file=sys.stderr)
     runs: dict[str, list[dict]] = {name: [] for name, _ in servers}
+    device = None if args.no_settle else device_of(args.data_root)
+    if not args.no_settle and device is None:
+        raise SystemExit(f"no block device in /proc/diskstats holds {args.data_root}; "
+                         f"--no-settle measures without waiting for a quiet disk")
     for r in range(args.rounds):
         for k in range(len(servers)):
             name, path = servers[(r + k) % len(servers)]
+            settled = settle(device) if device else None
             row = one_run(name, path, args)
+            if settled is not None:
+                row["settle_s"] = round(settled, 2)
             row["round"] = r + 1
             runs[name].append(row)
             print(json.dumps(row), flush=True)

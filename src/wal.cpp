@@ -568,6 +568,30 @@ void WALWriter::append_checkpoint(uint64_t timestamp_ns, WalPosition covered) {
                  ckpt_pos.file_index, ckpt_pos.offset, covered.file_index, covered.offset);
 }
 
+void WALWriter::append_checkpoint(uint64_t timestamp_ns, WalPosition replay_from,
+                                  uint64_t seal_epoch) {
+    uint8_t payload[CHECKPOINT_EPOCH_PAYLOAD_BYTES];
+    checkpoint_epoch_payload(replay_from, seal_epoch, payload);
+
+    WALRecord hdr{};
+    hdr.sequence_number = 0;
+    hdr.timestamp_ns    = timestamp_ns;
+    hdr.checksum        = crc32c(payload, sizeof(payload));
+    hdr.payload_len     = static_cast<uint16_t>(sizeof(payload));
+    hdr.record_type     = WAL_RECORD_CHECKPOINT;
+    hdr._pad            = 0;
+
+    // Not fsynced, for the reason the eight-byte form is not: a lost checkpoint costs a replay.
+    write_record(hdr, payload, sizeof(payload), /*allow_fsync=*/false);
+
+    const WalPosition ckpt_pos = current_position();
+    OB_LOG_DEBUG("wal",
+                 "Checkpoint appended (not fsynced) at file=%u offset=%u: replay from file=%u "
+                 "offset=%u, segments sealed up to epoch %llu durable",
+                 ckpt_pos.file_index, ckpt_pos.offset, replay_from.file_index, replay_from.offset,
+                 static_cast<unsigned long long>(seal_epoch));
+}
+
 void WALWriter::append_epoch(const EpochValue& epoch) {
     uint8_t payload[8];
     epoch_to_payload(epoch, payload);
@@ -971,7 +995,9 @@ WALReplayer::LastCheckpoint WALReplayer::find_last_checkpoint()
             last.ordinal = ordinal;
             // Reset by every checkpoint, so a last one written by an older build - empty payload -
             // is read by ordinal even after newer ones (#159).
-            last.covered = checkpoint_covered(ctx.payload, ctx.payload_len);
+            const auto claim = checkpoint_claim(ctx.payload, ctx.payload_len);
+            last.covered    = claim ? std::optional<WalPosition>(claim->replay_from) : std::nullopt;
+            last.seal_epoch = claim ? claim->seal_epoch : std::nullopt;
         }
     });
     last.records = ordinal;
@@ -1009,7 +1035,10 @@ uint64_t WALReplayer::replay_after(const LastCheckpoint& last, WALReplayCallback
     // one is common, because a first flush cut short, or a failed sync, leaves no checkpoint.
     const std::string resuming =
         last.covered      ? "at file " + std::to_string(last.covered->file_index) + " offset " +
-                                std::to_string(last.covered->offset)
+                                std::to_string(last.covered->offset) +
+                                (last.seal_epoch ? " for rows sealed after epoch " +
+                                                       std::to_string(*last.seal_epoch)
+                                                 : std::string())
         : last.ordinal == 0 ? std::string("from the start of the log, which holds no checkpoint")
                             : std::string("after the checkpoint record, which says nothing of "
                                           "what it covered");
