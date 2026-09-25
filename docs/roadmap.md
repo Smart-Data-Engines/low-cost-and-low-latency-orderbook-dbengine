@@ -2325,7 +2325,6 @@ The fix is a sharded-pool fixture first — a shard map in the test etcd and nod
 routing state built beside the live one and swapped in whole, and closed shard connections
 replaced at every health check.
 
-
 **Fixed, with the instrument first.** `tests/integration/test_sharded_pool.py` builds what nothing
 had: a native etcd, two standalone nodes, and the shard map in `<prefix>shard_map`, written by the
 test in the shape `ShardMap::to_json()` produces — because a node started as a shard writes neither
