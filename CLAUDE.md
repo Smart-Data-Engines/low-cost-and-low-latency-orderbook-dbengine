@@ -3548,6 +3548,17 @@ Learned the hard way. Check here before debugging.
      system: 68% of the server's page faults, four times master's, found with `perf record -e
      page-faults` rather than read from a CPU profile, where they hide inside the function that
      touches the page.
+451. **A message that promises a recovery is a claim, and one path may not keep it.** #171's error
+     told the caller that a pool replaces the connection at its next health check - true of a node's
+     connection and false of a shard's, which stayed closed until the shard map changed, which it
+     may never do. The sharded pool's first test found it (#172). Read what an error says happens
+     next as something a test has to hold.
+452. **Parts that each pass their tests are not a feature until something runs them together.**
+     Roadmap #22 marked sharding done: the hash ring, the map's format, ownership, `SYMBOL_MIGRATED`
+     and the migration commands each had tests, and no integration test had ever started a shard.
+     Started, two wrote nothing to etcd, each owned every symbol, and the second became the first
+     one's replica - while each logged `Registered shard=…` over a function that registers nothing
+     (#175).
 
 ## Current state and open problems
 
@@ -3587,10 +3598,13 @@ flat at 0.71-0.76 ms through a 90-second soak where it grew to 94.66 ms - and a 
 stores that are due, a quarter more rows than it drained at most, with a checkpoint that names the
 seal epoch it vouches for: after that soak 2 304 segments where master has 141 312-143 104, and a
 cold start of 4.4 s where master's takes 108. **Part 2b is open and a P0**: nothing merges the
-segments that are written, so they still grow with uptime. **#169 and #172 are open P1s**: an
+segments that are written, so they still grow with uptime. **#169 and #175 are open P1s**: an
 exchange name with a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live
-book, sequence numbers and stored rows, measured on the wire - and the Python client's sharded pool
-replaces its routing state under its callers, found by reading because nothing tests that pool.
+book, sequence numbers and stored rows, measured on the wire - and sharding by symbol has no control
+plane: no shard writes itself or the map to etcd, each owns every symbol, and a second on the same
+etcd becomes the first one's replica, measured against a native etcd. **#172 is closed**: the
+Python client's sharded pool swaps its routing whole and replaces a shard connection a timeout
+closed, under a test that builds a sharded pool against a map in etcd.
 **#174 is an open P2**: a start reads the whole WAL twice even when its last checkpoint covers every
 record.
 
