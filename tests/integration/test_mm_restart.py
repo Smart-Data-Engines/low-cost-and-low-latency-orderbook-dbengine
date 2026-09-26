@@ -118,7 +118,11 @@ def test_a_node_restarted_before_its_vector_was_written_holds_each_row_once(mesh
         raise Duplicated(f"the restarted node holds {got} rows where the writer holds {expected}")
 
 
-@pytest.mark.xfail(strict=True, raises=Late,
+# Not strict, unlike #179's: what this reproduces is a window - the writer sealing nothing between
+# the kill and the reconnect - and a slow enough runner closes it by the node's slowness alone. The
+# TSan job did, on PR #187's tree: the writer sealed inside the window, its vector was fresh, and
+# the test passed with the defect in place. A strict marker there reads a timing as a fix.
+@pytest.mark.xfail(strict=False, raises=Late,
                    reason="#180: a node's vector is refreshed at a checkpoint, so a peer that comes "
                           "back within the seal interval is judged to hold what it missed")
 def test_a_node_restarted_after_missing_writes_gets_them_when_it_reconnects(mesh):
