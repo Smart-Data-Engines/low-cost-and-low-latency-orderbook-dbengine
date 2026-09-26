@@ -3635,17 +3635,23 @@ carries no count, because the previous version of this sentence said "four" abov
 omitted the newest one entirely - which is the rot pitfall 312 is about, in the paragraph that
 warns about it.
 
-**#165, parts 1 and 2a**: the segment index is per symbol and in width tiers, so a flush tick's
-merge is a lookup and an insertion and a query searches only its symbol's windows - a writer's p99
-flat at 0.71-0.76 ms through a 90-second soak where it grew to 94.66 ms - and a tick seals only the
-stores that are due, a quarter more rows than it drained at most, with a checkpoint that names the
-seal epoch it vouches for: after that soak 2 304 segments where master has 141 312-143 104, and a
-cold start of 4.4 s where master's takes 108. **Part 2b is open and a P0**: nothing merges the
-segments that are written, so they still grow with uptime. **#169 and #175 are open P1s**: an
-exchange name with a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live
-book, sequence numbers and stored rows, measured on the wire - and sharding by symbol has no control
-plane: no shard writes itself or the map to etcd, each owns every symbol, and a second on the same
-etcd becomes the first one's replica, measured against a native etcd. **#172 is closed**: the
+**#165 is closed, in three parts**: the segment index is per symbol and in width tiers, so a flush
+tick's merge is a lookup and an insertion and a query searches only its symbol's windows - a
+writer's p99 flat at 0.71-0.76 ms through a 90-second soak where it grew to 94.66 ms - and a tick
+seals only the stores that are due, a quarter more rows than it drained at most, with a checkpoint
+that names the seal epoch it vouches for (part 2a); and the flush tick merges a symbol's small
+segments - eight of a level in one symbol's hour into one of the next, up to 262 144 rows, and an
+hour's leftovers a minute after it ends - in five steps across ticks that a crash in any of keeps
+each row once (part 2b, pitfalls 453-461). After a twenty-minute soak of 256 symbols a node holds
+1 957-3 238 segments where part 2a's held 30 208-30 464, and a cold start answers in 5.9-6.8 s
+rather than 26.4-26.9; a narrow query into history reads a merged segment whole, 1.8-2.3 ms against
+0.14-0.25. **No P0 is open. #169, #175 and #176 are open P1s**: an exchange name with a dot makes
+two instruments one key - `A.B` on `C` and `A` on `B.C` share a live book, sequence numbers and
+stored rows, measured on the wire; sharding by symbol has no control plane: no shard writes itself
+or the map to etcd, each owns every symbol, and a second on the same etcd becomes the first one's
+replica, measured against a native etcd; and a mesh snapshot names each file by a 16-bit index, so
+a node of 8 192 segments cannot bootstrap a peer that joins it (found reading the sender, not yet
+measured). **#172 is closed**: the
 Python client's sharded pool swaps its routing whole and replaces a shard connection a timeout
 closed, under a test that builds a sharded pool against a map in etcd.
 **#174 is an open P2**: a start reads the whole WAL twice even when its last checkpoint covers every

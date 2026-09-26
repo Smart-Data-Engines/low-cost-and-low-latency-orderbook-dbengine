@@ -2747,7 +2747,7 @@ what its log line means — and the `--ttl-hours` row of `docs/cli.md`. Spec:
   `--ttl-hours` could delete rows younger than the retention, whenever one symbol's rows reached a
   flush out of time order
 
-### 165. Nothing merges segments, so the index grows by one per active symbol per tick, and everything that reads it walks it whole **P0**
+### 165. Nothing merges segments, so the index grows by one per active symbol per tick, and everything that reads it walks it whole ✅ **P0**
 
 **Found while measuring stage 5 of #151 (#164).** A flush tick closes the active segment of every
 symbol that received rows since the last tick, so a node gains **one segment per active symbol per
@@ -2807,8 +2807,8 @@ tick rate — a segment that stays open across ticks, or segments merged behind 
 is what startup, the inodes and every walk that remains need. Which of those is a design question
 with its own measurements, for its own spec.
 
-**Part 1, the index, is done, and so is part 2a, the count at the tick; part 2b, merging what is
-written, keeps this item open.** Each symbol has its
+**Part 1, the index, is done, and so are part 2a, the count at the tick, and part 2b, merging what
+is written — both below.** Each symbol has its
 own segments now, keyed with a NUL between symbol and exchange (a dot would make `"A.B"` on `"C"` and
 `"A"` on `"B.C"` one key). A tick's merge is a set lookup and an insertion, at the end almost always;
 a query finds its symbol and binary-searches its window; retention decides and takes the expired
@@ -3160,7 +3160,10 @@ since merges what is left into as few segments as fit. A merge moves one step a 
 lock in place of its inputs, in one step; synced again; and only then are the inputs removed, once
 every query that copied them has finished. A tick that drained more than 65 536 rows merges nothing new
 unless none has for ten seconds, and a lighter one merges for up to 10 ms. `--compaction off` is
-the valve. [SOAK SUMMARY]
+the valve. In part 1's soak on the m9g.xlarge a node held **1 957 – 3 238 segments after twenty
+minutes where master held 30 208 – 30 464**, and a cold start answered in **5.9 – 6.8 s rather
+than 26.4 – 26.9 s**; the write ceiling and a writer's latency did not move, and what it costs is
+a narrow query into history, which reads a bigger segment: 1.8 – 2.3 ms against 0.14 – 0.25.
 
 **The size a merge stops at was measured before it was chosen.** A query reads a segment whole —
 price and sequence are delta-encoded from its first row, quantities are Simple8b words that decode
@@ -3213,7 +3216,59 @@ snapshot pins the segment files from before its flush until its sender finishes 
 manifest names files, and a merge or a sweep removing one mid-transfer failed the transfer, and
 the replica started again. That was true of the sweep before merges existed.
 
-[MEASUREMENT: SOAK TABLE, RESTARTS, INGEST CEILING]
+Measured on the m9g.xlarge against master (`3174ec0`, part 2a; the same GCC 14 Release build of
+both, each run on a fresh data root on the gp3 volume and started only once the load was under 0.3
+with no process not ours running, both read again at the end of every run), on
+`16bb1ed`, whose C++ is this pull request's. Part 1's soak — 256 symbols, one 20-level `MINSERT`
+each per round, 20 rounds a second — twenty minutes a run, ABBA:
+
+| | master (`3174ec0`) | part 2b |
+|---|---|---|
+| segments on disk after 20 minutes | 30 208 – 30 464, 25.2 seals a second from the start | **1 957 – 3 238**, between 512 and 3 584 from the second minute on |
+| after a clean stop | 30 464 – 30 720 | **2 213 – 3 509** |
+| merges a second, over the run | — | 3.2 – 3.4 |
+| writer round, p50 / p99, medians of the 80 windows | 0.60 / 0.63 ms | 0.59 – 0.60 / 0.63 – 0.64 ms |
+| narrow `SELECT` of the last second, median | 0.26 ms | 0.26 ms |
+| narrow `SELECT` of one second a minute into the run | 0.14 – 0.25 ms, from a segment of ten seconds | 0.25 – 0.55 ms to minute 11, from one of 80 seconds; **1.78 – 2.33 ms** after, from one of 640 seconds — 256 000 rows |
+| RSS after 20 minutes | 115.5 – 116.3 MiB, 14.6 – 15.0 more than at the second minute | 117.3 – 118.0 MiB, flat from minute 11 |
+| restart after a clean stop, warm | 2.77 – 2.81 s | **2.45 – 2.49 s** |
+| restart after a clean stop, cold (`drop_caches`) | 26.41 – 26.91 s, 693 – 695 MiB read | **5.89 – 6.83 s**, 456 – 471 MiB read |
+| of which the index, cold / warm | 22.47 – 22.96 s / 0.36 – 0.37 s | **1.90 – 2.87 s** / 0.05 – 0.08 s |
+
+**The count follows the data now, not the uptime.** Master's grew by a segment per symbol every ten
+seconds, and a start reads each one: 0.74 – 0.75 ms a segment cold, 22.5 – 23.0 s of its 26.4 –
+26.9. Part 2b's rose and fell inside the hour — every 80 seconds eight seals of a symbol became one
+of 32 000 rows, and at minute 11 eight of those became one of 256 000 — and fell again when the hour
+ended: the fourth run crossed 13:00, and in the report window from about 13:01:01 to 13:01:16 the
+count went from 3 476 to 768, at 32.7 merges a second — the hour's leftovers, merged once it had
+been over for a minute. The index column is read from the start's own log, between the line before
+`open_existing()` and the one after it; what is left of a start — 3.8 – 3.9 s cold and 2.4 s warm,
+in both builds — is mostly two passes over the WAL, which is #174.
+
+**Memory is within 2.5 MiB of master's at twenty minutes, and its shape is the other way round.**
+Master's grows with its segments, about 560 bytes each. Part 2b's rose once, by 13.1 – 13.6 MiB at minute
+11, with the first merges of 256 000 rows — a merge writes through the seal buffers and leaves them
+the size it needed — and did not move again; a merge is 262 144 rows at most, so that is as far as
+it goes.
+
+**What it costs is the query into history.** One second of rows a minute into the run was read in
+0.14 – 0.25 ms from master's ten-second segment and in 1.78 – 2.33 ms from part 2b's merged one,
+because a query reads a segment whole: the trade `segment_size_cost` measured before the cap was
+chosen, and the reason the cap is not higher.
+
+**The write ceiling did not move.** At it a tick drains more than 65 536 rows, and such a tick
+merges nothing new unless none has for ten seconds. Medians of five rounds, alternated, 40 000
+batches of 64 twenty-level `MINSERT`s a run:
+
+| connections, `--fsync-policy` | master (`3174ec0`) | part 2b |
+|---|---|---|
+| 4, `interval` | 11.80 M levels/s (11.77 – 11.89) | 11.81 M (11.78 – 11.84) |
+| 4, `every` | 582 454 (582 250 – 582 908) | 582 595 (582 306 – 583 383) |
+| 1, `interval` | 6.80 M (6.79 – 6.97) | 6.81 M (6.77 – 6.83) |
+| 1, `every` | 557 886 (557 209 – 558 118) | 558 207 (558 037 – 558 344) |
+
+A batch's p99 at four connections was 620.1 µs on master and 612.9 on part 2b, at one 197.5 and
+197.2.
 
 **An independent review found what the tests had not, twice.** A separate agent read the whole
 branch, changing nothing, and reported four real defects: merges under `--fsync-policy none` went
@@ -11216,9 +11271,11 @@ measures the harness.
 
 ## Recommended order
 
-**#165 is the open P0**, and **#169 and #175 are open P1s** — the mechanical list is the `Open:`
+**No P0 is open**, and **#169, #175 and #176 are open P1s** — the mechanical list is the `Open:`
 line below; read it there rather than trusting this paragraph, which is prose and has been wrong
-about this before. **#175**: sharding by symbol has no control plane — no shard writes itself or
+about this before. **#176** was found writing part 2b of #165: a mesh snapshot names each file by a
+16-bit index, so a node of 8 192 segments — 8 192 instruments, whatever merging does — cannot
+bootstrap a peer that joins it. **#175**: sharding by symbol has no control plane — no shard writes itself or
 the shard map to etcd, each owns every symbol, and a second one on the same etcd becomes the first
 one's replica — so neither client can find a shard, and roadmap #22's "done" is true only of its
 parts. It was found fixing **#172, which is closed**: the Python pool's sharded mode replaced its
@@ -11228,13 +11285,17 @@ map in etcd holds all three. **#170 and #171 are closed, and both were the Pytho
 used one socket from two threads, so a multi-threaded caller got another query's rows — 39% of them
 in the measurement, with no error — and a connection whose reply timed out answered the next command
 with it, every reply after that one behind.
-**#165's first two parts are done**: the index is per symbol and in width
+**#165 was a P0 and is closed**: the index is per symbol and in width
 tiers, so a tick's merge and a query no longer walk it — a writer's p99 flat at 0.71–0.76 ms through
-the soak where it grew to 94.66 ms — and a tick seals only the stores that are due, and about the
-rows it drained, so a node gains a segment per active symbol every ten seconds at a trickle and half
-of master's at the write ceiling, and a cold start of that soak's node takes 4.4 s rather than 108.
-What is left is merging what is written (part 2b). **#174** is what measuring part 2a found next: a
-start reads the whole WAL twice even when its last checkpoint covers every record.
+the soak where it grew to 94.66 ms — a tick seals only the stores that are due, and about the rows
+it drained, so a node gains a segment per active symbol every ten seconds at a trickle and half of
+master's at the write ceiling (part 2a) — and the flush tick merges a symbol's small segments, so
+the count follows the data rather than the uptime: after twenty minutes of that soak a node holds
+1 957 – 3 238 segments where part 2a's held 30 208 – 30 464, and a cold start answers in 5.9 – 6.8 s
+rather than 26.4 – 26.9 (part 2b), at the price of a narrow query into history, 1.8 – 2.3 ms
+against 0.14 – 0.25. **#174** is what measuring part 2a found next, and most of what is left of a
+start after part 2b: a start reads the whole WAL twice even when its last checkpoint covers every
+record.
 **#169**: an exchange name with a dot makes two instruments one key, so they share a live book,
 sequence numbers and stored rows. **#167 and #168 are closed**: a `SNAPSHOT` answers its columns
 over the wire again — it had answered none since #139 — and keeps the latest row at or before its
@@ -11282,7 +11343,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #165, #169, #174, #175, #176.** Every other item above #58 is marked closed, and
+**Open: #169, #174, #175, #176.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -11420,10 +11481,10 @@ The capability items are in the table below.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **P0** | Segments already written merged, so their count stops growing with uptime (#165, part 2b) | L | Since part 2a a store is sealed when it is due - at a trickle one segment per active symbol per ten seconds, 2.2 M a day at 256 symbols - and nothing merges them; a cold start reads each one, about 0.75 ms a segment on a gp3 volume |
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
 | **P1** | Sharding by symbol gains its control plane: the shards write the map, and both clients read it (#175) | M–L | A shard writes neither itself nor the map to etcd, owns every symbol, and a second one on the same etcd becomes the first one's replica; neither client can find a shard |
-| **P2** | A start finds its last checkpoint without reading the whole WAL twice (#174) | S–M | With part 2a's segment counts the WAL is most of what a start reads - about 261 of 292 MiB cold - and a start reads it twice even when the checkpoint covers every record |
+| **P1** | A mesh snapshot carries any number of files, so a peer can join a node of 8 192 segments or more (#176) | M | A mesh snapshot names a file by a 16-bit index, so a node of 8 192 segments - 8 192 instruments, whatever part 2b merges - cannot bootstrap a peer that joins it; found reading the sender, not yet measured |
+| **P2** | A start finds its last checkpoint without reading the whole WAL twice (#174) | S–M | Since part 2b of #165 the index is 1.9 - 2.9 s of a cold start after a twenty-minute soak, 5.9 - 6.8 s, and the WAL most of the rest - and a start reads it twice even when the checkpoint covers every record |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |

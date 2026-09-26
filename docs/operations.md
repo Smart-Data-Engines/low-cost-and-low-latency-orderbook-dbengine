@@ -1087,6 +1087,16 @@ the WAL is most of what a start reads (#174). A restart in between can land anyw
 1's run read 63 MiB from storage and took 12 s. If a node's start time matters, plan with the cold
 figure.
 
+After twenty minutes of the same soak, merging is what the count follows:
+
+| page cache | part 2a: 30 464 – 30 720 segments | since part 2b: 2 213 – 3 509 segments |
+|---|---|---|
+| warm | 2.77 – 2.81 s | **2.45 – 2.49 s** |
+| cold | 26.41 – 26.91 s, 693 – 695 MiB read | **5.89 – 6.83 s**, 456 – 471 MiB read |
+
+Of the cold start, opening the index took 22.5 – 23.0 s before part 2b and 1.9 – 2.9 s since; the
+rest, 3.8 – 3.9 s in both, is mostly the two passes over the WAL.
+
 ### After a crash
 
 A crash loses the rows waiting in blocks from memory, not from the node: their records are in the
