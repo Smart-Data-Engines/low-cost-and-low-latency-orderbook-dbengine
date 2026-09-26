@@ -749,8 +749,9 @@ private:
     std::vector<SequenceTracker::VectorEntry> vector_cache_;
     bool                                 vector_cache_truncated_{false};
 
-    /// Refresh the snapshot above from the tracker. Caller must hold mtx_.
-    void refresh_version_vector_cache();
+    /// Refresh the snapshot above from the tracker, and say how many entries it holds now - 0 for
+    /// a vector too large to state. Caller must hold mtx_.
+    std::size_t refresh_version_vector_cache();
     /// The same, when the tracker moved since the last refresh (#180): the flush tick calls it
     /// whether or not it seals, so what peers are told is at most one tick old. Caller holds mtx_,
     /// on the flush thread — never from under the mesh manager's lock, which is what the cache is

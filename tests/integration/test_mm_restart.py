@@ -12,6 +12,11 @@ Found measuring #178. Two defects, both older than it - the same numbers on the 
   compared against a vector without the writes it missed, judged to hold everything, and caught up
   only at the next reconciliation. Measured: the rows it missed arrived 20 s after its restart.
 
+Both fixed together: replay seeds each record under the origin its header names, the vector is
+written before the checkpoint rather than after it, and every flush tick refreshes the vector peers
+are told whenever the tracker moved, sealing or not. The single-engine account of each part is
+`tests/test_mm_restart_origins.cpp`.
+
 A mesh of its own for each test, reconciling every 5 s: both kill and restart a node, and what
 the first leaves behind - rows stored twice, a vector claiming them for the wrong origin - would
 start the catch-up the second one is about.
@@ -86,9 +91,6 @@ def mesh():
     cm.shutdown()
 
 
-@pytest.mark.xfail(strict=True, raises=Duplicated,
-                   reason="#179: a replayed record is seeded with this node's origin, so a node "
-                          "restarted before its vector reached the WAL is sent its rows again")
 def test_a_node_restarted_before_its_vector_was_written_holds_each_row_once(mesh):
     writer, restarted = mesh.nodes[0], mesh.nodes[2]
     write(writer, BASE_TS, 10)
@@ -118,13 +120,6 @@ def test_a_node_restarted_before_its_vector_was_written_holds_each_row_once(mesh
         raise Duplicated(f"the restarted node holds {got} rows where the writer holds {expected}")
 
 
-# Not strict, unlike #179's: what this reproduces is a window - the writer sealing nothing between
-# the kill and the reconnect - and a slow enough runner closes it by the node's slowness alone. The
-# TSan job did, on PR #187's tree: the writer sealed inside the window, its vector was fresh, and
-# the test passed with the defect in place. A strict marker there reads a timing as a fix.
-@pytest.mark.xfail(strict=False, raises=Late,
-                   reason="#180: a node's vector is refreshed at a checkpoint, so a peer that comes "
-                          "back within the seal interval is judged to hold what it missed")
 def test_a_node_restarted_after_missing_writes_gets_them_when_it_reconnects(mesh):
     writer = mesh.nodes[0]
     write(writer, BASE_TS, 10)

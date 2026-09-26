@@ -374,16 +374,18 @@ std::vector<SequenceTracker::VectorEntry> Engine::export_version_vector(std::siz
     return vector_cache_;
 }
 
-void Engine::refresh_version_vector_cache() {
+std::size_t Engine::refresh_version_vector_cache() {
     // Caller holds mtx_.
     bool truncated = false;
     auto entries = seq_tracker_.export_vector(kMaxPersistedVectorEntries, truncated);
+    const std::size_t count = entries.size();
     vector_cache_generation_ = seq_tracker_.generation();
     {
         std::lock_guard<std::mutex> lock(vector_cache_mtx_);
         vector_cache_           = std::move(entries);
         vector_cache_truncated_ = truncated;
     }
+    return count;
 }
 
 void Engine::refresh_version_vector_cache_if_changed() {
@@ -391,9 +393,14 @@ void Engine::refresh_version_vector_cache_if_changed() {
     // costs nothing to read; the export it guards is a pass over every (symbol, origin).
     const uint64_t generation = seq_tracker_.generation();
     if (generation == vector_cache_generation_) return;
-    refresh_version_vector_cache();
-    OB_LOG_DEBUG("engine", "Version vector cache refreshed at tracker generation %llu",
-                 static_cast<unsigned long long>(generation));
+    const auto started = std::chrono::steady_clock::now();
+    const std::size_t entries = refresh_version_vector_cache();
+    const auto took_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - started).count();
+    OB_LOG_DEBUG("engine",
+                 "Version vector cache refreshed at tracker generation %llu: %zu entries in %lld us",
+                 static_cast<unsigned long long>(generation), entries,
+                 static_cast<long long>(took_us));
 }
 
 void Engine::persist_version_vector_if_changed() {
