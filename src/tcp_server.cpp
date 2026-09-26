@@ -986,6 +986,7 @@ const std::vector<std::string>& known_flags() {
         "coordinator-lease-ttl",
         "auth-secret-file",
         "cluster-secret-file",
+        "compaction",
         "data-dir",
         "drain-timeout-ms",
         "election-deference-ms",
@@ -1063,6 +1064,8 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"failover-enabled", {"<BOOL>", "Participate in automatic failover: true/1/yes or false/0/no (default: true)"}},
         {"auth-secret-file", {"<PATH>", "Client credentials, '<identity> <secret>' per line; mode 600. Empty disables client authentication"}},
         {"cluster-secret-file", {"<PATH>", "Shared secret for replication and multi-master links, one line; mode 600"}},
+        {"compaction", {"on|off", "Whether the flush tick merges small segments into bigger ones "
+                                  "(default: on)"}},
         {"drain-timeout-ms", {"<N>", "On shutdown, how long to wait for open client sessions before closing them (default: 10000; 0 waits indefinitely)"}},
         {"io-spin-us", {"<N>", "Keep polling for this many microseconds after the last event before blocking again (default: set by the profile - 10 under boost where the process has a CPU to spare, 0 under eco). Costs up to one core per loop while traffic flows and takes ~17% off the round trip on loopback"}},
         {"io-threads", {"<N>", "Client event loops, 1 to 64 (default: set by the profile - one per usable CPU under boost, 1 under eco). Connections are dealt to them in turn and stay on one for life"}},
@@ -1482,6 +1485,19 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.auth_secret_file = std::string{cursor.value()};
         } else if (arg == "--cluster-secret-file") {
             config.cluster_secret_file = std::string{cursor.value()};
+        } else if (arg == "--compaction") {
+            const std::string val{cursor.value()};
+            if (val == "on") {
+                config.compaction = true;
+            } else if (val == "off") {
+                config.compaction = false;
+            } else {
+                // Refused rather than defaulted, like --fsync-policy: an operator who turned off a
+                // process that rewrites the store must not find it running because of a typo.
+                std::fprintf(stderr, "Error: --compaction expects on or off, got '%s'\n",
+                             val.c_str());
+                std::exit(1);
+            }
         } else if (arg == "--drain-timeout-ms") {
             config.drain_timeout_ms = cursor.value_as<uint64_t>();
         } else if (arg == "--io-spin-us") {
@@ -1793,6 +1809,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     // ServerConfig. `--print-config` exists to be pasted into a ticket.
     line("auth-secret-file", c.auth_secret_file.empty() ? "(none)" : c.auth_secret_file);
     line("cluster-secret-file", c.cluster_secret_file.empty() ? "(none)" : c.cluster_secret_file);
+    line("compaction", c.compaction ? "on" : "off");
     line("fsync-policy",
          c.fsync_policy == FsyncPolicy::EVERY ? "every"
              : c.fsync_policy == FsyncPolicy::NONE ? "none" : "interval");
@@ -2824,6 +2841,7 @@ void Reactor::run_loop() {
 void TcpServer::run() {
     // Wire up the dynamic read-only flag so failover transitions toggle it.
     engine_->set_read_only_flag(&read_only_);
+    engine_->set_compaction_enabled(config_.compaction);
 
     // Open the engine (replay WAL, start flush thread).
     engine_->open();

@@ -3,6 +3,7 @@
 #include "orderbook/aggregation.hpp"
 #include "orderbook/chunked_queue.hpp"
 #include "orderbook/columnar_store.hpp"
+#include "orderbook/compaction.hpp"
 #include "orderbook/data_model.hpp"
 #include "orderbook/epoch.hpp"
 #include "orderbook/failover.hpp"
@@ -24,6 +25,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -189,6 +191,17 @@ public:
 
     /// Access the metrics registry.
     MetricsRegistry& registry() { return registry_; }
+
+    /// Whether the flush tick merges small segments (#165 part 2b): on unless `--compaction off`.
+    /// Not a tuning knob - a valve on a process that rewrites what is stored. Before open().
+    void set_compaction_enabled(bool enabled) { compaction_enabled_ = enabled; }
+
+    /// Keep every segment's files where they are for as long as the returned handle lives (#165 part
+    /// 2b): while one is held, the tick neither merges segments nor sweeps retention. A snapshot
+    /// takes one before its flush, and whoever sends it holds it until the transfer ends - the
+    /// manifest names files, and a merge or a sweep removing one mid-transfer failed it, and the
+    /// replica started again.
+    std::shared_ptr<const void> pin_segment_files();
 
     /// Whether the last checkpoint vouches for a segment found at open (#160, #165 part 2a); one it
     /// does not is removed there and its rows rebuilt from the WAL. Pure, so the rule is tested
@@ -600,9 +613,68 @@ private:
     /// drain takes about the pending queue's ceiling at most, so that is what is kept spare.
     std::shared_ptr<RowBufferPool> block_rows_pool_ = std::make_shared<RowBufferPool>(MAX_PENDING_ROWS);
     /// The column buffers every seal writes through, lent to its store for the seal (#165 part 2a).
-    /// Under `flush_mtx_`, which every seal holds.
+    /// Under `flush_mtx_`, which every seal holds - and so does every merge (#165 part 2b).
     ColumnarStore::ColumnBuffers seal_buffers_;
     LogEpisode unsealed_budget_episode_{};
+
+    // ── Compaction (#165 part 2b) ─────────────────────────────────────────────
+    //
+    // Every field below is the flush thread's, under `flush_mtx_`, unless it says otherwise. A merge
+    // moves through five steps across ticks - written, synced, published, synced, inputs removed -
+    // and each field is one step's list.
+    bool compaction_enabled_{true};
+    /// A symbol's segments whose end falls in one period: what a merge may take from.
+    struct CompactionKey {
+        uint64_t    period_start{0};
+        std::string symbol;
+        std::string exchange;
+        bool operator<(const CompactionKey& o) const {
+            if (period_start != o.period_start) return period_start < o.period_start;
+            if (symbol != o.symbol) return symbol < o.symbol;
+            return exchange < o.exchange;
+        }
+    };
+    struct CompactionPartition {
+        /// When a seal last added a segment, which a partition must be quiet since to settle.
+        std::chrono::steady_clock::time_point last_added{};
+        /// When to look at it again: now after a change, its settling time after a look that found
+        /// nothing to merge.
+        std::chrono::steady_clock::time_point next_look{};
+    };
+    std::map<CompactionKey, CompactionPartition> compaction_partitions_;
+    /// Where the last tick's looks stopped, so the next resumes after it.
+    CompactionKey compaction_cursor_{};
+    /// Written into a working directory, waiting for a sync before it is published.
+    struct StagedMerge {
+        std::vector<SegmentMeta> inputs;
+        SegmentMeta output;
+        uint64_t    synced_before{0};   ///< `segment_syncs_` when written
+    };
+    std::vector<StagedMerge> staged_merges_;
+    /// Published, their inputs waiting for a sync - which takes the rename to the device - and for
+    /// every scan that copied them before the swap.
+    struct RetiredInputs {
+        std::vector<std::string>  dirs;
+        std::weak_ptr<const void> readers;
+        uint64_t                  synced_before{0};   ///< `segment_syncs_` when published
+    };
+    std::vector<RetiredInputs> retired_inputs_;
+    /// Segments a merge could not read whole, left as they are for the life of the process.
+    std::unordered_set<std::string> unmergeable_;
+    std::chrono::steady_clock::time_point last_merge_{};
+    std::chrono::steady_clock::time_point merge_backoff_until_{};
+    LogEpisode merge_failures_{};
+    /// Successful `sync_segments()`: what a step compares with the count it recorded to know that a
+    /// sync has come since.
+    uint64_t segment_syncs_{0};
+    /// The seal epoch the last checkpoint appended vouches for, and the one the last checkpoint known
+    /// to be on the device does: a merge takes a segment of this WAL only at or below the second.
+    /// Under `mtx_`, like the checkpoint's position.
+    uint64_t checkpoint_seal_epoch_{0};
+    uint64_t durable_seal_epoch_{0};
+    /// Held snapshots' pins (`pin_segment_files()`); any thread. Shared with the handles, which a
+    /// sender may release after this engine is gone.
+    std::shared_ptr<std::atomic<int>> segment_file_pins_ = std::make_shared<std::atomic<int>>(0);
 
 
     std::unique_ptr<QueryEngine> query_engine_;
@@ -1060,6 +1132,33 @@ private:
     void freeze_checkpoints(const std::string& what_failed);
     /// At startup, before replay: remove the segments no surviving checkpoint vouches for (#160).
     void remove_unvouched_segments(const WALReplayer::LastCheckpoint& last);
+
+    /// The flush tick's merges (#165 part 2b), after retention: a sync if something written or
+    /// published since the last one waits for it, the inputs whose replacement is on the device and
+    /// that no scan reads removed, what is on the device published, and more merged - in a tick
+    /// that drained no more than `kSealRows` rows, for `compaction::kTickBudget`. Holds
+    /// `flush_mtx_`, not `mtx_`.
+    void compaction_step(size_t drained_rows);
+    /// Read `inputs` whole and write them as one segment into a working directory beside them.
+    bool stage_merge(const std::vector<SegmentMeta>& inputs);
+    void publish_staged_merges();
+    void remove_retired_inputs();
+    /// Rename a merge's working directory to a segment's name no directory has.
+    bool publish_merged_dir(SegmentMeta& output);
+    /// What a partition may merge now - up to `max_merges` in all, within `budget_end` - and when
+    /// to look at it again.
+    void look_at_partition(std::map<CompactionKey, CompactionPartition>::iterator it,
+                           std::chrono::steady_clock::time_point now, uint64_t vouched_epoch,
+                           size_t& merges, size_t max_merges,
+                           std::chrono::steady_clock::time_point budget_end);
+    /// A segment a seal (`arrived`), a merge or a rebuild added: its partition is looked at next.
+    void note_segment_for_compaction(const SegmentMeta& meta,
+                                     std::chrono::steady_clock::time_point now, bool arrived);
+    /// Every indexed segment's partition, after open() and an install replaced the store.
+    void note_store_for_compaction();
+    /// Forget every merge in flight, for the paths that replace or discard the store: a name a
+    /// retired input had may come back with the new store. Holds `flush_mtx_`.
+    void drop_compaction_locked();
 
     /// The seal epoch (#165 part 2a): bumped by every `write_seals()` that has something to write,
     /// stamped on the segments it writes, and named by a checkpoint written while rows wait in

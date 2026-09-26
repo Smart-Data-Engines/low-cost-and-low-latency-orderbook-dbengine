@@ -387,7 +387,7 @@ add_library(orderbook_compaction STATIC src/compaction.cpp)
 target_link_libraries(orderbook_compaction PUBLIC orderbook_core)
 
 # ── Engine facade compiled library ────────────────────────────────────────────
-add_library(orderbook_engine STATIC src/engine.cpp src/replication.cpp)
+add_library(orderbook_engine STATIC src/engine.cpp src/engine_compaction.cpp src/replication.cpp)
 target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression orderbook_metrics orderbook_logger orderbook_multi_master orderbook_sequence orderbook_auth orderbook_tls orderbook_compaction)
 
 # ── C API compiled library ────────────────────────────────────────────────────
