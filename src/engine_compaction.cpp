@@ -217,22 +217,22 @@ void Engine::look_at_partition(std::map<CompactionKey, CompactionPartition>::ite
         c.level        = m.merge_level;
         c.member       = view.member[i];
         c.wal_identity = m.wal_identity;
-        c.eligible = m.wal_identity != 0 && m.time_range_is_rows &&
-                     m.format_version == kColumnarFormatVersion &&
-                     (m.wal_identity != wal_identity_ || m.seal_epoch <= vouched_epoch) &&
-                     taken.count(m.dir_path) == 0 && unmergeable_.count(m.dir_path) == 0;
+        c.eligible =
+            compaction::may_merge(compaction::SegmentFacts{m.wal_identity, m.time_range_is_rows,
+                                                           m.format_version == kColumnarFormatVersion,
+                                                           m.seal_epoch},
+                                  wal_identity_, vouched_epoch) &&
+            taken.count(m.dir_path) == 0 && unmergeable_.count(m.dir_path) == 0;
         candidates.push_back(c);
     }
 
     // Settled: the period is over, by the wall clock rows are stamped with, and nothing has been
     // sealed into it for as long - so the levels no longer have anything to wait for.
-    const uint64_t wall_now = wall_clock_ns();
-    const uint64_t settle_ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(compaction::kSettle).count());
-    const uint64_t settles_at = key.period_start + kPeriodNs + settle_ns;
-    const bool over = wall_now >= settles_at;
-    const bool quiet = now - part.last_added >= compaction::kSettle;
-    const bool settled = over && quiet;
+    const auto since_added =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - part.last_added);
+    const auto until_settled =
+        compaction::until_settled(key.period_start + kPeriodNs, wall_clock_ns(), since_added);
+    const bool settled = until_settled == std::chrono::nanoseconds::zero();
     const std::vector<compaction::Run> runs = compaction::plan(candidates, settled);
 
     for (const compaction::Run& run : runs) {
@@ -256,15 +256,7 @@ void Engine::look_at_partition(std::map<CompactionKey, CompactionPartition>::ite
         return;
     }
     // Nothing yet. A seal into it brings the next look forward; otherwise it is its settling.
-    const auto until_over =
-        over ? SteadyClock::duration::zero()
-             : std::chrono::duration_cast<SteadyClock::duration>(
-                   std::chrono::nanoseconds(settles_at - wall_now));
-    const auto until_quiet =
-        quiet ? SteadyClock::duration::zero()
-              : std::chrono::duration_cast<SteadyClock::duration>(compaction::kSettle) -
-                    (now - part.last_added);
-    part.next_look = now + std::max(until_over, until_quiet);
+    part.next_look = now + std::chrono::duration_cast<SteadyClock::duration>(until_settled);
 }
 
 // ── Step 1: a merge written ───────────────────────────────────────────────────

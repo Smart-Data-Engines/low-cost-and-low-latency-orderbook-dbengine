@@ -55,6 +55,30 @@ struct Candidate {
     uint64_t wal_identity{0};
 };
 
+/// What decides whether one segment may be a merge's input.
+struct SegmentFacts {
+    uint64_t wal_identity{0};
+    bool     range_is_rows{false};    ///< its range is its rows' (#166), not repaired from a guess
+    bool     current_format{false};   ///< the format this build writes
+    uint64_t seal_epoch{0};
+};
+
+/// Whether a segment may be merged now: of a known WAL, its range its rows', of this build's format -
+/// and, if it is of this node's WAL, vouched for by a checkpoint known to be on the device
+/// (`vouched_epoch`). A merged segment takes its inputs' highest epoch, and a start keeps a segment
+/// of this WAL only if the last checkpoint vouches for its epoch: merging one no checkpoint on the
+/// device vouches for would make the merged segment one a power cut removes, with the inputs it
+/// replaced already gone. A segment of another WAL - a snapshot's - is vouched for as it stands.
+bool may_merge(const SegmentFacts& segment, uint64_t local_wal_identity, uint64_t vouched_epoch);
+
+/// Whether a partition is settled: its period ended `kSettle` ago by the wall clock rows are stamped
+/// with, and nothing has been added to it for `kSettle`.
+bool settled(uint64_t period_end_ns, uint64_t wall_now_ns, std::chrono::nanoseconds since_added);
+/// How long until an unsettled partition settles, if nothing is added to it meanwhile; zero once it
+/// has.
+std::chrono::nanoseconds until_settled(uint64_t period_end_ns, uint64_t wall_now_ns,
+                                       std::chrono::nanoseconds since_added);
+
 /// Consecutive candidates to merge into one segment: [first, first + count).
 struct Run {
     size_t first{0};

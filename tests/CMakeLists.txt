@@ -671,6 +671,15 @@ target_link_libraries(test_seal_epochs
 )
 gtest_discover_tests(test_seal_epochs PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
 
+# ── #165 part 2b: the flush tick merges a symbol's small segments ────────────
+add_executable(test_compaction test_compaction.cpp)
+target_link_libraries(test_compaction
+    PRIVATE
+        orderbook_engine
+        GTest::gtest_main
+)
+gtest_discover_tests(test_compaction PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
+
 # ── TTL retention tests (compression-and-ttl, Tasks 7.2, 8.3–8.5) ────────────
 add_executable(test_ttl_retention test_ttl_retention.cpp)
 target_link_libraries(test_ttl_retention
