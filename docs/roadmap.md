@@ -2227,8 +2227,8 @@ one scan sent the whole catch-up at once; it was hidden there behind the liveloc
 The loop walks an offset now and removes the bytes before it once. The same run: the returning node
 held every row **1.8 s** after its restart. `tests/test_mm_receive.cpp` holds the answer - every
 whole frame handled, the part of one that has not arrived kept - and a time a quadratic version
-cannot meet: 400 000 frames in one buffer, [RECEIVE TIME], where erasing each from the front is
-terabytes of moves.
+cannot meet: 100 000 frames in one buffer handled in 0.016 s in a Debug build, where erasing each
+from the front moves about 210 GB.
 
 - Effort: S | Impact: a mesh node caught up after an outage, or bootstrapped, applied what it was sent
   at a few thousand records a second
@@ -2245,7 +2245,9 @@ three-node mesh reconciling every 5 s: a node killed after the mesh flushed, whi
 2 000 rows, held **238 of 2 100** three seconds after it reconnected; with the default interval and
 nothing flushed, the rows it missed arrived 20 s after its restart. Nothing is lost - the next
 reconciliation sends it - but the catch-up at a reconnect, which is what a reconnect is for, does
-not.
+not. And it works the other way round too: the node that was caught up says, until it seals, that it
+lacks what it was sent. In #178's measurement the writer sent 312 985 records a second time, twelve
+rounds after the first catch-up, every one of them a duplicate the receiver dropped.
 
 A fix refreshes the cache when the tracker changes rather than when a store seals, without taking
 the engine's lock from under the manager's - which is why there is a cache at all. Its test is the
@@ -2320,9 +2322,66 @@ does.
 The same test, on the fix: **20 100 of 20 100 rows**, the writer's catch-up `finished in 3 round(s),
 0.2 s: read=20104 record(s) (3015956 bytes) sent=20000 skipped_peer_has=100`.
 
-[MEASUREMENT: WRITES DURING A CATCH-UP]
+**Measured in Release builds on the i3-7100U**, master `1eb78aa` against this branch, with
+`scripts/measure_mesh_catchup.py`: three nodes; one killed while its peer wrote 300 000
+single-level rows to ten symbols; the writer flushed, so its vector names them (#180 otherwise);
+the node restarted - and all along, a probe on the writer sending one `INSERT` at a time. ABAB, two
+rounds of each:
 
-[MUTATION TABLE]
+| | master (`1eb78aa`) | this branch |
+|---|---|---|
+| the returning node held every row | **never** in 300 s: 189 686 and 238 997 of 300 100 | **4.5 and 4.3 s** after its restart |
+| the writer's probe during the catch-up, p50 / p99 / max | 0.19 / 0.90 / **6 499** ms; 0.19 / 0.80 / **6 187** ms | 0.14 / 0.95 / 131 ms; 0.15 / 1.05 / 9.6 ms |
+| the same before the kill | 0.26 / 0.39 / 0.96 ms; 0.25 / 0.43 / 2.74 ms | 0.25 / 0.41 / 1.25 ms; 0.25 / 0.42 / 2.49 ms |
+| the writer's catch-up | the batch at once, 46 MB into the peer's buffer; the peer dropped at the 64 MB send-buffer ceiling, four times in the second run, and sent it all again each time | 16 and 17 rounds, 2.9 and 3.6 s; the longest a round held the lock 4.2 and 4.6 ms |
+
+On master the returning node was dropped for not draining, came back, and was sent everything again
+- a livelock, slowed further by #181, which it shares - and the writer's own writes waited for each
+scan, 6.5 s at the longest. The one probe of 131 ms on the branch came 4.3 s after the restart,
+when the catch-up had finished; the longest the catch-up held the lock in that run was 4.2 ms. The
+returning node holds 100 rows more than the writer in every run of both builds: the rows it had
+before the kill, stored twice after it, which is #179.
+
+**Mutation table: 28 runs, 25 as written down before them** - 18 killed and 7 surviving where the
+verdict said, in two passes. The first pass had 25 rows; four written as killed survived, and each
+was a finding rather than a verdict to move: a connection that changes *while* a round reads (row
+12) is held by a second check no single-threaded test reaches - the first, where a round is picked,
+is what the test meets; the deciding loop's check of the peer's room (13) could not fire, because
+the reading already stops there, so it is gone and the room is tested where it is enforced (13b);
+the one test with two (symbol, origin) pairs gave the peer an empty vector, so a pair whose frontier
+was never looked up read 0 and was right by accident (19), and a test with two pairs held to
+different frontiers is new; and the quadratic receive took 10.1 s against a bound of 10 s at 100 000
+frames (22), so the test has 300 000 - the quadratic version about 90 s, the linear one 0.048 s. The
+second pass: 13b, 19 and 22 as written.
+
+| # | mutation | caught by |
+|---|---|---|
+| 1 | the cursor delivers a record whose checksum does not match | the torn-record test |
+| 2 | a torn record in a file that is not the last ends the whole read | the torn-record test |
+| 3 | a ROTATE record is delivered | the replay_v2() test, and three more |
+| 4 | a record not all written moves the position before the cursor waits | the tail test |
+| 5 | seek() says it passed over no files | the retention test |
+| 6 | the next file is only ever the one numbered after | the retention test |
+| 7 | a fill reads only what it needs | survives: cost only |
+| 8 | a round reads past its budget | the budget test, and two more |
+| 9 | the position does not advance | the budget test, and three more |
+| 10 | the peer's vector is not consulted | the newest-vector test, and two more |
+| 11 | a vector arriving mid-way starts the catch-up again | the newest-vector test |
+| 12 | a round does not check the connection it was picked for | **written as killed; survives**: the pick-time check holds the test's case |
+| 13 | the deciding loop ignores the peer's room | **written as killed; survives**: it could not fire - removed |
+| 13b | the reading ignores the peer's room | the full-buffer test |
+| 14 | a round stopped at its budget says nothing more can run | the budget test and the full-buffer test |
+| 15 | a range counted unfillable although its first number was sent | the control of the unfillable test |
+| 16 | the end ignores a range's first number the peer got elsewhere | survives: no test has it get one elsewhere |
+| 17 | the unfillable warning is not an episode | the unfillable test |
+| 18 | a disconnect leaves the catch-up in place | survives: a round drops it by the connection, twice by design |
+| 19 | the pairs' frontiers are looked up for the first pair only | **written as killed; survived** the first pass; the two-pair test, new, in the second |
+| 20 | no drain after a round hands its bytes over | written as uncertain: `test_mm_catchup_ceiling.py` |
+| 21 | control: a comment reworded | survives |
+| 22 | each frame erased from the front again (#181) | **written as killed; survived** at 100 000 frames; the linear-time test at 300 000 |
+| 23 | the check that a handler did not empty the buffer is dropped | survives: no handler empties the buffer of a connection it keeps |
+| 24 | the consumed bytes are never removed | the partial-frame test, and the linear-time one |
+| 25 | the offset does not advance | the linear-time test hangs; the harness's timeout |
 
 - Effort: M | Impact: a mesh node that was down long enough held less than its peers for good, and
   answered queries with it

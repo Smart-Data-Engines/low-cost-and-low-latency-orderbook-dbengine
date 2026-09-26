@@ -246,6 +246,22 @@ TEST(MMCatchupRounds, WhatThePeerHoldsIsSkippedByItsNewestVector) {
     EXPECT_EQ(got.back().seq, 3000u);
 }
 
+TEST(MMCatchupRounds, EachPairIsFilteredByWhatThePeerHoldsOfIt) {
+    // Two (symbol, origin) pairs in one round, the peer holding different amounts of each: what the
+    // peer holds is looked up once a round for every pair the round read, not once for the first.
+    CatchupNode node(1 << 20, 64 << 20);
+    node.write("TWO", kSelf, 1, 600);
+    node.write("TWO", 3, 1, 600);
+    WiredPeer to(kPeer);
+    to.mgr(*node.mm).peer_vector = vector_of({{"TWO.EX", kSelf, 500}, {"TWO.EX", 3, 100}});
+    node.mm->start_catchup_for_test(to.mgr(*node.mm));
+
+    auto want = expected("TWO", kSelf, 501, 600);
+    const auto other = expected("TWO", 3, 101, 600);
+    want.insert(want.end(), other.begin(), other.end());
+    EXPECT_EQ(run_to_end(node, to), want);
+}
+
 TEST(MMCatchupRounds, ACatchupBelongsToItsConnection) {
     CatchupNode node(16 << 10, 64 << 20);
     node.write("CON", kSelf, 1, 2000);

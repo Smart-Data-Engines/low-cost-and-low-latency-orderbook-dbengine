@@ -2465,7 +2465,9 @@ bool MultiMasterManager::run_catchup_rounds() {
         bool   at_end     = false;
         WALReplayContext ctx;
         // At least one record a round whatever the budget, or a budget of zero would be a loop that
-        // never moves; and no more frames than the peer has room for, or the rest is read again.
+        // never moves; and no more frames than the peer has room for below the low watermark - the
+        // one that paces a snapshot - so the rest waits for the socket to drain, live deltas queued
+        // meanwhile go out promptly, and the buffer never nears the size that drops the peer.
         while ((read_bytes < config_.max_catchup_bytes && catchup_frames_.size() < job.room) ||
                catchup_reads_.empty()) {
             if (catchup_cursor_->next(ctx) != WALRecordCursor::Step::Record) {
@@ -2552,11 +2554,9 @@ bool MultiMasterManager::run_catchup_rounds() {
         uint64_t sent_now = 0, skipped_have = 0, skipped_type = 0;
         size_t   done     = 0;
         WalPosition next  = job.from;
+        // Everything read is decided: the reading already stopped at the peer's room below the
+        // watermark, and what is not sent was not wanted.
         for (; done < catchup_reads_.size(); ++done) {
-            // The same watermark that paces a snapshot: the rest waits for the socket to drain,
-            // so live deltas queued meanwhile go out promptly and the buffer never nears the size
-            // that drops the peer.
-            if (catchup_out_.size() >= job.room) break;
             const CatchupRead& r = catchup_reads_[done];
             next = r.end;
             if (r.frame_len == 0) {                  // GAP, EPOCH, CHECKPOINT, a vector

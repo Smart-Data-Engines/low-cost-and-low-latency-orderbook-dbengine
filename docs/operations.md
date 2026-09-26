@@ -710,7 +710,13 @@ Starting catch-up to peer 3 (connection 3): vector entries=11 received=1 truncat
 — and once when it has read to the end of its WAL:
 
 ```
-Catch-up to peer 3 finished in 3 round(s), 0.2 s: read=20104 record(s) (3015956 bytes) sent=20000 skipped_peer_has=100 skipped_type=4; reading took [READ] ms off the lock, and the longest a round held it [HOLD] ms
+Catch-up to peer 3 finished in 17 round(s), 3.6 s: read=310212 record(s) (46532932 bytes) sent=310202 skipped_peer_has=0 skipped_type=10; reading took 131.4 ms off the lock, and the longest a round held it 4.6 ms
+```
+
+and, while it runs, every ten seconds:
+
+```
+Catch-up to peer 3 under way: 4 round(s), 62 s, read=84260 record(s) (12639000 bytes) sent=66415 skipped_peer_has=17845, at file 0 offset 12639000, send_buf=1446885
 ```
 
 Since #178 a catch-up is **rounds**, each reading at most `--mm-max-catchup-bytes` (8 MiB) of this

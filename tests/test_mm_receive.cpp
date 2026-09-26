@@ -84,19 +84,21 @@ TEST(MMReceiveBuffer, EveryWholeFrameIsHandledAndThePartOfOneThatHasNotArrivedIs
 }
 
 TEST(MMReceiveBuffer, AReadOfManyFramesIsHandledInLinearTime) {
-    // 100 000 frames, 4.2 MB in one buffer. Erasing each from the front moves about 2.1 MB each
-    // time, some 210 GB in all - tens of seconds at memory speed, far more under a sanitizer;
-    // consumed by an offset it is one pass. The bound sits in that gap, not at a guess of a machine.
+    // 300 000 frames, 12.6 MB in one buffer. Erasing each from the front moves about 6.3 MB each
+    // time, some 1.9 TB in all - about 90 s at the 21 GB/s the development machine moves memory,
+    // far more under a sanitizer; consumed by an offset it is one pass, hundredths of a second. The
+    // bound sits in that gap. The first version of this test had 100 000 frames and the quadratic
+    // version took 10.1 s against a bound of 10: a mutation row survived it once.
     ReceivingNode node;
     WiredPeer from(2);
     ob::PeerConnection& peer = from.mgr(*node.mm);
-    peer.recv_buf = skipped_frames(100'000);
+    peer.recv_buf = skipped_frames(300'000);
 
     const auto started = std::chrono::steady_clock::now();
     node.mm->process_recv_buf_for_test(peer);
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 
     EXPECT_TRUE(peer.recv_buf.empty());
-    EXPECT_LT(seconds, 10.0) << "handling one read of 100 000 frames took " << seconds << " s";
-    std::printf("100 000 frames handled in %.3f s\n", seconds);
+    EXPECT_LT(seconds, 10.0) << "handling one read of 300 000 frames took " << seconds << " s";
+    std::printf("300 000 frames handled in %.3f s\n", seconds);
 }
