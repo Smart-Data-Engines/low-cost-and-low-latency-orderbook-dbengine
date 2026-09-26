@@ -3156,9 +3156,9 @@ steps keeps each row once.** Eight segments of one merge level in one symbol's h
 the next level, up to 262 144 rows; a segment of 65 536 rows or more — what a seal at the write
 ceiling writes — merges with nothing; and an hour that ended a minute ago and has received nothing
 since merges what is left into as few segments as fit. A merge moves one step a tick: written into
-`<start>_<end>.compacting` beside its inputs; synced; published by a rename under the index's lock
-in place of its inputs, in one step; synced again; and only then are the inputs removed, once every
-query that copied them has finished. A tick that drained more than 65 536 rows merges nothing new
+`<start>_<end>_<n>.compacting` beside its inputs; synced; published by a rename under the index's
+lock in place of its inputs, in one step; synced again; and only then are the inputs removed, once
+every query that copied them has finished. A tick that drained more than 65 536 rows merges nothing new
 unless none has for ten seconds, and a lighter one merges for up to 10 ms. `--compaction off` is
 the valve. [SOAK SUMMARY]
 

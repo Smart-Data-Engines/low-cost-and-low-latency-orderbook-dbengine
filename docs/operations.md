@@ -1114,9 +1114,9 @@ one merges for up to 10 ms. A query reads a segment whole, so a narrow query int
 merged segment of up to 262 144 rows: measured at 3.2 – 3.5 ms for one second of rows, where a
 segment sealed at a trickle is read in 0.06 ms.
 
-On the disk a merge is written into `<start>_<end>.compacting` beside its inputs, synced, renamed
-to a segment's name in place of its inputs under the index's lock, synced again, and only then are
-the inputs removed — once every query that was reading them has finished. A crash anywhere leaves
+On the disk a merge is written into `<start>_<end>_<n>.compacting` beside its inputs, synced,
+renamed to a segment's name in place of its inputs under the index's lock, synced again, and only
+then are the inputs removed — once every query that was reading them has finished. A crash anywhere leaves
 the inputs, the merged segment (whose `meta.json` names its inputs in `compacted_from`), or both;
 the start removes a working directory and every input it finds beside the merged segment that
 names it, and says so once:
