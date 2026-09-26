@@ -3639,6 +3639,13 @@ Learned the hard way. Check here before debugging.
      verification script printed the path and nobody read it for two branches. Harmless while the
      two clients are the same file (`diff -rq`); a branch that changes the client needs a venv of its
      own, or the battery tests the wrong code and says it passed.
+471. **pytest's JUnit report files an xfail as a skip.** `<skipped type="pytest.xfail">`, beside
+     `type="pytest.skip"` - so the integration job's gate, which reads that report and allows only
+     the Binance skips, turned PR #187 red over `407 passed, 5 xfailed`: the battery's first strict
+     xfails since the gate was written. A local `pytest` run cannot show it; the summary line says
+     `xfailed`, which is also what the TSan job's grep reads. The gate is
+     `scripts/check_integration_skips.py` now, and an xfail passes it only when its reason names an
+     item the roadmap's Open line lists - so a marker that outlives its item fails the job.
 
 ## Current state and open problems
 
@@ -3687,7 +3694,7 @@ without the lock every local write takes and paced by the peer's send buffer - a
 more than `--mm-max-catchup-bytes` used to stop at the first ceiling's worth for good (6 990 of 20
 100 rows), and a 300 000-record catch-up livelocked on the send-buffer ceiling; and **#181 is
 closed**: a node applied a burst of frames in quadratic time, erasing each from the front of its
-receive buffer (pitfalls 462-470). **#179 is the open P0**: a mesh node restarted before its version
+receive buffer (pitfalls 462-471). **#179 is the open P0**: a mesh node restarted before its version
 vector reached the WAL replays the rows a peer sent it as its own origin's, is sent them again and
 stores them twice (200 where the writer holds 100). **#169, #175, #176, #177, #180 and #182 are open
 P1s**: an exchange name with a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C`

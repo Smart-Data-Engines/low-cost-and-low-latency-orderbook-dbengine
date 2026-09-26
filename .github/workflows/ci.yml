@@ -210,30 +210,16 @@ jobs:
 
       # A skip is a test that did not run, and the only ones this job accepts are the two Binance
       # tests that need a live feed. Anything else — a binary the build step forgot, a fixture that
-      # gave up, a marker added without thinking — would otherwise pass as green.
-      - name: No test may skip except the two opt-in Binance ones
+      # gave up, a marker added without thinking — would otherwise pass as green. A strict xfail is
+      # a test that ran and failed the way an open roadmap item says it does, and the report files
+      # it as a skip all the same, so the gate reads its reason: it has to name an item the
+      # roadmap's Open line lists (PR #187, whose five xfails turned this red over 407 passes).
+      # The gate tests itself first, so a change that makes it accept everything fails here.
+      - name: No test may skip except the two opt-in Binance ones, or xfail but for an open item
         if: always()
         run: |
-          python3 - <<'PY'
-          import sys, xml.etree.ElementTree as ET
-          tree = ET.parse("integration-report.xml")
-          skipped = [
-              (case.get("classname", ""), case.get("name", ""),
-               (case.find("skipped").get("message") or "").splitlines()[0][:160])
-              for case in tree.iter("testcase")
-              if case.find("skipped") is not None
-          ]
-          for classname, name, why in skipped:
-              print(f"skipped: {classname}::{name} — {why}")
-          # Matched on classname *and* name: a module skipped at collection time — which is how
-          # the Binance ones skip, on a marker — lands in the report with an empty classname.
-          allowed = [s for s in skipped if "binance" in (s[0] + " " + s[1]).lower()]
-          if len(skipped) != len(allowed):
-              print(f"\n{len(skipped) - len(allowed)} unexpected skip(s); only the Binance "
-                    f"tests may skip in this job")
-              sys.exit(1)
-          print(f"\n{len(skipped)} skipped, all of them Binance opt-ins")
-          PY
+          python3 scripts/check_integration_skips.py --self-test
+          python3 scripts/check_integration_skips.py integration-report.xml docs/roadmap.md
 
   release-build:
     name: release-build
