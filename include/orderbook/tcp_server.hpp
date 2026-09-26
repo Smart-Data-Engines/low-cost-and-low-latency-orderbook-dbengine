@@ -185,6 +185,10 @@ struct ServerConfig {
     uint64_t ttl_hours{0};                    // --ttl-hours (0 = disabled)
     uint64_t ttl_scan_interval_seconds{300};  // --ttl-scan-interval-seconds
 
+    /// --compaction on|off: whether the flush tick merges small segments (#165 part 2b). A valve on
+    /// a process that rewrites what is stored, not a tuning knob.
+    bool compaction{true};
+
     // ── Authentication (#30) ──────────────────────────────────────────────────
     //
     // Paths, never secrets. `--print-config` renders every value in this struct, so a secret held

@@ -72,10 +72,58 @@ struct SegmentMeta {
     /// while rows wait in blocks vouches for the segments sealed at or before an epoch, because a
     /// position cannot. 0 in a segment written before epochs existed, and in one no seal wrote.
     uint64_t seal_epoch{0};
+    /// How many merges made this segment (#165 part 2b): 0 from a seal, and from a merge one more
+    /// than the highest of its inputs'. Merging segments of one level with each other is what keeps a
+    /// row from being written again by every merge of the segment it is in.
+    uint32_t merge_level{0};
     std::string symbol;     ///< symbol this segment belongs to
     std::string exchange;   ///< exchange this segment belongs to
     std::string dir_path;   ///< full path to the segment directory
 };
+
+/// One segment a merge wrote another from (#165 part 2b), as the merged segment's meta.json names
+/// it: its directory under the symbol's, and what its own meta.json said.
+///
+/// A start that finds a merged segment and one of its inputs both on the disk - a crash after the
+/// merge was published and before its inputs were removed - removes the input. The fields past the
+/// name are what tells an input from a later segment that took the name once the input was gone: a
+/// directory is named after its range, so the name comes back, and a later seal of this WAL has a
+/// later epoch.
+struct SegmentInput {
+    std::string dir_name;
+    uint64_t wal_identity{0};
+    uint32_t wal_file_index{0};
+    uint64_t wal_byte_offset{0};
+    uint64_t seal_epoch{0};
+    uint64_t row_count{0};
+    uint64_t start_ts_ns{0};
+    uint64_t end_ts_ns{0};
+
+    static SegmentInput of(const SegmentMeta& meta);
+    /// Whether `meta` is this input: its directory's name and everything else recorded.
+    bool names(const SegmentMeta& meta) const;
+};
+
+namespace detail {
+
+/// A link in the chain of reader generations a store keeps (`ColumnarStore::replace_segments()`,
+/// #165 part 2b): each holds the one after it, so the generation current before a replacement is
+/// gone exactly when every scan that took it, or an older one, has finished.
+///
+/// Released without recursion. A scan that outlived many publications holds the start of a chain
+/// of every generation since, and a destructor releasing the next recursed once per publication on
+/// that scan's thread; peeking at the next link's count instead is a read the count does not order.
+/// The destructor that starts a release drains the chain itself, and one it causes only hands its
+/// successor over.
+struct ReaderGeneration {
+    std::shared_ptr<ReaderGeneration> next;
+    ReaderGeneration() = default;
+    ReaderGeneration(const ReaderGeneration&) = delete;
+    ReaderGeneration& operator=(const ReaderGeneration&) = delete;
+    ~ReaderGeneration();
+};
+
+}  // namespace detail
 
 /// Spare storage for blocks' rows (#165 part 2a): a sealed block's vector, handed back when the
 /// block's last reference goes, and taken again by a later drain - which otherwise wrote every row
@@ -243,6 +291,98 @@ public:
     /// Flush the active segment: encode buffers, write column files, write meta.json.
     /// Returns the SegmentMeta of the flushed segment, or std::nullopt if no active segment.
     std::optional<SegmentMeta> flush_segment();
+
+    /// What the next segment written is a merge of (#165 part 2b): its level, its inputs, and the
+    /// latest of their `last_row_ts_ns` - replay's fallback compares a record with the highest of a
+    /// symbol's, so a merge must not lower it, and the row appended last need not be the latest.
+    /// The next write consumes it.
+    void set_lineage(uint32_t merge_level, std::vector<SegmentInput> inputs, uint64_t last_row_ts_ns);
+
+    /// Write the active segment into `dir`, which this creates and which must not exist, rather than
+    /// into a directory of its own choosing: a merge writes beside the segments it replaces, under a
+    /// name no reader takes for a segment (`kCompactingSuffix`), and publishes it by renaming it once
+    /// it is on the device. Indexes nothing. nullopt with nothing active; throws, and leaves no
+    /// directory, where flush_segment() would.
+    std::optional<SegmentMeta> flush_segment_into(const std::string& dir);
+
+    /// The suffix of a merge's working directory (#165 part 2b). A rebuild removes one, and a
+    /// snapshot leaves it out.
+    static constexpr std::string_view kCompactingSuffix = ".compacting";
+    /// Whether `name` is one a merge gives its working directory - `<start>_<end>_<n>.compacting`,
+    /// digits all three - and nothing a client names: a symbol or an exchange may end in the suffix
+    /// too, and taking one for a working directory removed it, and every row under it, at the next
+    /// start. Its callers ask it only of a directory at a segment's depth or deeper.
+    static bool is_compacting_dir(std::string_view name) {
+        if (name.size() <= kCompactingSuffix.size() ||
+            name.substr(name.size() - kCompactingSuffix.size()) != kCompactingSuffix) {
+            return false;
+        }
+        const std::string_view stem = name.substr(0, name.size() - kCompactingSuffix.size());
+        int fields = 1;
+        bool digit_seen = false;
+        for (const char c : stem) {
+            if (c == '_') {
+                if (!digit_seen) return false;
+                ++fields;
+                digit_seen = false;
+            } else if (c >= '0' && c <= '9') {
+                digit_seen = true;
+            } else {
+                return false;
+            }
+        }
+        return fields == 3 && digit_seen;
+    }
+    /// How deep below the data directory a segment's directory is: `<symbol>/<exchange>/<segment>`,
+    /// the depth a recursive walk from the data directory reports for it.
+    static constexpr int kSegmentDepth = 2;
+
+    /// Every row of one segment, all seven columns, in the order it holds them (#165 part 2b: what a
+    /// merge reads). False, having handed over no row, when a column is missing or short or the
+    /// format is not this build's - the segments scan() skips.
+    bool read_segment(const SegmentMeta& meta,
+                      const std::function<void(const SnapshotRow&)>& cb) const;
+
+    /// One symbol's segments whose end is in [end_from, end_to) - a merge's partition - with every
+    /// segment of the symbol that lies between them, in the order a scan delivers them. `member`
+    /// says which are the partition's: a merge may take only segments no other lies between.
+    struct PartitionView {
+        std::vector<SegmentMeta> segments;
+        std::vector<bool> member;
+    };
+    PartitionView partition_view(std::string_view symbol, std::string_view exchange,
+                                 uint64_t end_from, uint64_t end_to) const;
+
+    /// Replace `inputs` with `output` in one step under the index's lock (#165 part 2b), so a query
+    /// sees the inputs or the output and never both or neither - if every input is still indexed,
+    /// they are still consecutive in their symbol's delivery order, and `output`'s range sorts
+    /// strictly between the segments before and after them, so no row is delivered in another order
+    /// than before. `publish` runs under the lock once those hold, and moves the output's files to
+    /// where it then sets `output.dir_path`; false from it leaves everything as it was.
+    ///
+    /// On success `readers_before` expires once every scan that may have copied an input before the
+    /// swap has finished. The inputs' files have to stay until it does: such a scan reads them after
+    /// the swap.
+    enum class Replaced { kYes, kInputGone, kNotConsecutive, kWouldMove, kPublishFailed };
+    struct ReplaceResult {
+        Replaced outcome{Replaced::kInputGone};
+        std::weak_ptr<const void> readers_before;
+    };
+    ReplaceResult replace_segments(const std::vector<SegmentMeta>& inputs, SegmentMeta output,
+                                   const std::function<bool(SegmentMeta&)>& publish);
+
+    /// What the last index rebuild removed (#165 part 2b): merges' working directories, and inputs
+    /// found beside the merged segment that replaced them.
+    struct RebuildRemoved {
+        size_t staging{0};
+        size_t superseded{0};
+        /// Merged segments short of their rows whose inputs were all there to hold them.
+        size_t short_merges{0};
+    };
+    RebuildRemoved last_rebuild_removed() const {
+        std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        return last_rebuild_removed_;
+    }
 
     /// Return and clear the metas of segments closed by a rollover inside append().
     ///
@@ -413,6 +553,12 @@ private:
     bool        active_has_raw_qty_{false};
     bool        has_active_segment_{false};
 
+    // What the next segment written is a merge of (set_lineage()).
+    bool                      has_lineage_{false};
+    uint32_t                  lineage_level_{0};
+    std::vector<SegmentInput> lineage_inputs_;
+    uint64_t                  lineage_last_row_ts_{0};
+
     // Accumulation buffers for the active segment
     std::vector<int64_t>  price_buf_;
     std::vector<uint64_t> qty_buf_;
@@ -489,6 +635,34 @@ private:
 
     // What the last rebuild read to repair ranges written before #166. Guarded by index_mtx_.
     size_t last_rebuild_ranges_read_{0};
+    // And what it removed (#165 part 2b). Guarded by index_mtx_.
+    RebuildRemoved last_rebuild_removed_{};
+
+    /// What a scan holds while it reads files outside the lock (#165 part 2b). A replacement starts
+    /// a new generation, and each generation holds the one after it - an older one keeps every
+    /// younger one alive - so the generation current before a replacement is gone exactly when every
+    /// scan that took it, or an older one, has finished. Assigned under `index_mtx_` exclusively,
+    /// copied under it shared.
+    using ReaderGeneration = detail::ReaderGeneration;
+    std::shared_ptr<ReaderGeneration> reader_generation_ = std::make_shared<ReaderGeneration>();
+
+    /// Take one segment out of the index; false if it is not there. Caller holds `index_mtx_`
+    /// exclusively, and erases the symbol's entry if this leaves it empty.
+    bool erase_locked(const SegmentMeta& meta);
+
+    /// Encode the active segment's buffers into `dir`, which exists and is empty, and reset the
+    /// active state: what flush_segment() and flush_segment_into() share.
+    SegmentMeta write_active_segment(const std::string& dir);
+
+    /// What reading one segment came to: its rows handed over, or none because a column was
+    /// missing or short (logged), or none because retention removed it while this read it.
+    enum class SegmentRead { kRead, kUnreadable, kRemoved };
+    /// A query's read may find its segment removed by retention, and pads a short column the way it
+    /// always has; a merge's finds nothing removed under it and takes a segment whole or not at all.
+    enum class ReadMode { kQuery, kMerge };
+    SegmentRead read_segment_rows(const SegmentMeta& meta, ColumnSet columns, uint64_t start_ns,
+                                  uint64_t end_ns, const std::function<void(const SnapshotRow&)>& cb,
+                                  ReadMode mode) const;
 
     // Helpers
     /// Rebuild `index_` from the `meta.json` files under `base_dir_`. Caller holds `index_mtx_`
@@ -522,9 +696,14 @@ private:
     std::string segment_dir(const std::string& symbol, const std::string& exchange,
                             uint64_t start_ts, uint64_t end_ts) const;
     void ensure_dirs(const std::string& path) const;
-    void write_meta_json(const std::string& dir, const SegmentMeta& meta) const;
-    std::string meta_json(const SegmentMeta& meta) const;
-    bool parse_meta_json(const std::string& path, SegmentMeta& out) const;
+    /// `inputs`, when given, is what a merged segment's meta.json names (#165 part 2b).
+    void write_meta_json(const std::string& dir, const SegmentMeta& meta,
+                         const std::vector<SegmentInput>* inputs = nullptr) const;
+    std::string meta_json(const SegmentMeta& meta,
+                          const std::vector<SegmentInput>* inputs = nullptr) const;
+    /// `inputs`, when given, receives what a merged segment's `compacted_from` names.
+    bool parse_meta_json(const std::string& path, SegmentMeta& out,
+                         std::vector<SegmentInput>* inputs = nullptr) const;
 };
 
 } // namespace ob

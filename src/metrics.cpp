@@ -121,6 +121,17 @@ MetricsRegistry::MetricsRegistry() {
     // difference is the point.
     counters_.push_back(make_counter("ob_seals_total",
                                      "Stores whose unsealed rows a flush wrote into a segment"));
+    // #165 part 2b: merges published, the segments they replaced, the rows they wrote again, and
+    // the ones that could not be written or published - the ratio of the second to the first is
+    // the fan-in, and of the third to what was written, the rewriting a node pays for its count.
+    counters_.push_back(make_counter("ob_compactions_total",
+                                     "Merged segments published in place of their inputs"));
+    counters_.push_back(make_counter("ob_compaction_inputs_total",
+                                     "Segments replaced by merged segments"));
+    counters_.push_back(make_counter("ob_compaction_rows_total",
+                                     "Rows written again by merges"));
+    counters_.push_back(make_counter("ob_compaction_errors_total",
+                                     "Merges that could not be written or published"));
     counters_.push_back(make_counter("ob_writer_backpressure_waits_total",
                                      "writes that waited for room in the pending queue"));
     counters_.push_back(make_counter("ob_writer_backpressure_refusals_total",
@@ -193,6 +204,9 @@ MetricsRegistry::MetricsRegistry() {
     // #165 part 2a: rows drained into blocks that no seal has written yet, and how many seals ran.
     gauges_.push_back(make_gauge("ob_unsealed_rows",
                                  "Rows drained and readable but not yet written to a segment"));
+    // #165 part 2b: replaced segments whose files wait for a sync or for a scan still reading them.
+    gauges_.push_back(make_gauge("ob_segments_awaiting_removal",
+                                 "Segments a merge replaced whose files are not yet removed"));
     gauges_.push_back(make_gauge("ob_segment_merge_refused",
                                  "Segments refused as already indexed (a flush race; should stay 0)"));
     gauges_.push_back(make_gauge("ob_symbol_count",    "Number of tracked symbols"));

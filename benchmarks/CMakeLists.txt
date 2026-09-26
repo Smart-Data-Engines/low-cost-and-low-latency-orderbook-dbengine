@@ -68,3 +68,10 @@ target_link_libraries(pipelined_ingest PRIVATE Threads::Threads)
 # the roadmap came from it on the m9g.xlarge.
 add_executable(segment_index_cost segment_index_cost.cpp)
 target_link_libraries(segment_index_cost PRIVATE orderbook_columnar)
+
+# ── What a segment's size costs a query, and a merge (#165 part 2b) ──────────
+#
+# Compiled, deliberately not run, like the one above: it prints a table, and it writes and syncs
+# a store on the disk it is given.
+add_executable(segment_size_cost segment_size_cost.cpp)
+target_link_libraries(segment_size_cost PRIVATE orderbook_columnar)

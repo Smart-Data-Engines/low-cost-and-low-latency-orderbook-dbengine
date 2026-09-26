@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -124,6 +125,9 @@ struct SnapshotTransferState {
     bool                begin_sent{false};
     std::string         base_dir;
     size_t              chunk_size{262144};
+    /// Keeps the files the manifest names where they are until the transfer ends (#165 part 2b):
+    /// released where `active` goes false, and with the replica when it goes.
+    std::shared_ptr<const void> pin;
 };
 
 struct ReplicaInfo;   // defined below; these two only take a reference to it
@@ -575,7 +579,8 @@ private:
     void handle_snapshot_request(ReplicaInfo& replica);
 
     /// Begin streaming a snapshot a worker has finished creating.
-    void begin_snapshot_transfer(ReplicaInfo& replica, SnapshotManifest&& manifest);
+    void begin_snapshot_transfer(ReplicaInfo& replica, SnapshotManifest&& manifest,
+                                 std::shared_ptr<const void> pin);
 
     /// Collect a finished snapshot, if there is one, and act on it.
     ///

@@ -350,6 +350,8 @@ struct MMSnapshotSend {
     int              fd{-1};
     uint64_t         bytes_sent{0};
     std::chrono::steady_clock::time_point started_at{};
+    /// Keeps the files the manifest names where they are until the send ends (#165 part 2b).
+    std::shared_ptr<const void> pin;
 };
 
 /// Sending side, before there is anything to send: a snapshot being created on a worker thread for

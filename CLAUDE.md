@@ -3559,6 +3559,49 @@ Learned the hard way. Check here before debugging.
      Started, two wrote nothing to etcd, each owned every symbol, and the second became the first
      one's replica - while each logged `Registered shard=…` over a function that registers nothing
      (#175).
+453. **A merge must not change the order a scan delivers rows in.** A `SNAPSHOT` tie keeps the row
+     delivered last and a `LIMIT` the rows delivered first, and a scan delivers segments in their
+     order by range. So a merge takes only segments consecutive in that order, and publishes only
+     if its range sorts strictly between the segments before and after them - checked when it is
+     planned and again under the index's lock, because a seal in between can put a segment in the
+     middle (#165 part 2b).
+454. **A name is not an identity once things are removed.** A segment directory is named after its
+     range, so an input a merge removed gives its name back, and the next seal with rows over the
+     same range takes it. A start that removed every directory a merged segment names would remove
+     that one: it compares what each input recorded - identity, epoch, position, rows, range - and
+     a test builds exactly that case (#165 part 2b).
+455. **A gauge set on one path reads stale on the others.** `ob_segments_awaiting_removal` was set
+     only where inputs were removed, so the tick that retired them left it at zero; the test that
+     read it straight after a publication found it. And a heavy tick that found nothing to merge did
+     not note that it had looked, so every later one looked again, each copying a partition's
+     segments.
+456. **An acknowledged write is not yet a row a `SELECT` returns.** A query reads what the flush
+     tick has drained - into blocks since part 2a - so a write answered `OK` a moment ago appears at
+     the next tick, or at once after `FLUSH`: measured, a `SELECT` from another connection straight
+     after a `MINSERT` returned nothing. A test that counts rows counts what was flushed.
+457. **After a restart, the first tick redoes what the crash interrupted - under the same name.** A
+     merge cut short by a kill is written again from the same inputs into a working directory of
+     the same name within one tick of the start, so a directory seen after the start does not show
+     the start left it: the start's own log line does. A window a tick wide is found by polling the
+     disk every millisecond, and asserted again after the kill - no fault injector needed.
+458. **A policy that syncs nothing turns every "after the sync" into a claim.** Under
+     `--fsync-policy none` the segment sync returns at once, and it was counted as a sync that had
+     run: a merge wrote, "synced", published and removed its inputs with none of it on the device,
+     so a power cut could take history that had been on the disk for hours. A step that removes
+     what was durable syncs for itself, whatever the policy. Found by an independent review of part
+     2b of #165, like the three after it.
+459. **A name a client chooses can match a name the engine chooses.** A rebuild took any directory
+     ending `.compacting` for a merge's working directory, at any depth, so a symbol named like one
+     was removed with its rows at the next start. Recognise only the exact shape the engine writes,
+     at the depth it writes it.
+460. **A plan the next step will refuse is a loop.** The planner did not know ranges, so a run
+     whose merged range tied a neighbour was written, refused at publication, and written again
+     every tick; and a partition whose run waited for a checkpoint of the same tick was set to its
+     settling, so its merge waited for the next seal or the end of the hour. What a later step
+     checks, the plan checks; what the next tick fixes, the next tick looks at.
+461. **A reader that trusts a file's own claim trusts the storage that wrote it.** A start removed a
+     merged segment's inputs on its `meta.json` alone; it checks now that its `ts.col` holds its
+     rows, and keeps the inputs when it does not.
 
 ## Current state and open problems
 
@@ -3592,17 +3635,23 @@ carries no count, because the previous version of this sentence said "four" abov
 omitted the newest one entirely - which is the rot pitfall 312 is about, in the paragraph that
 warns about it.
 
-**#165, parts 1 and 2a**: the segment index is per symbol and in width tiers, so a flush tick's
-merge is a lookup and an insertion and a query searches only its symbol's windows - a writer's p99
-flat at 0.71-0.76 ms through a 90-second soak where it grew to 94.66 ms - and a tick seals only the
-stores that are due, a quarter more rows than it drained at most, with a checkpoint that names the
-seal epoch it vouches for: after that soak 2 304 segments where master has 141 312-143 104, and a
-cold start of 4.4 s where master's takes 108. **Part 2b is open and a P0**: nothing merges the
-segments that are written, so they still grow with uptime. **#169 and #175 are open P1s**: an
-exchange name with a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live
-book, sequence numbers and stored rows, measured on the wire - and sharding by symbol has no control
-plane: no shard writes itself or the map to etcd, each owns every symbol, and a second on the same
-etcd becomes the first one's replica, measured against a native etcd. **#172 is closed**: the
+**#165 is closed, in three parts**: the segment index is per symbol and in width tiers, so a flush
+tick's merge is a lookup and an insertion and a query searches only its symbol's windows - a
+writer's p99 flat at 0.71-0.76 ms through a 90-second soak where it grew to 94.66 ms - and a tick
+seals only the stores that are due, a quarter more rows than it drained at most, with a checkpoint
+that names the seal epoch it vouches for (part 2a); and the flush tick merges a symbol's small
+segments - eight of a level in one symbol's hour into one of the next, up to 262 144 rows, and an
+hour's leftovers a minute after it ends - in five steps across ticks that a crash in any of keeps
+each row once (part 2b, pitfalls 453-461). After a twenty-minute soak of 256 symbols a node holds
+1 957-3 238 segments where part 2a's held 30 208-30 464, and a cold start answers in 5.9-6.8 s
+rather than 26.4-26.9; a narrow query into history reads a merged segment whole, 1.8-2.3 ms against
+0.14-0.25. **No P0 is open. #169, #175 and #176 are open P1s**: an exchange name with a dot makes
+two instruments one key - `A.B` on `C` and `A` on `B.C` share a live book, sequence numbers and
+stored rows, measured on the wire; sharding by symbol has no control plane: no shard writes itself
+or the map to etcd, each owns every symbol, and a second on the same etcd becomes the first one's
+replica, measured against a native etcd; and a mesh snapshot names each file by a 16-bit index, so
+a node of 8 192 segments cannot bootstrap a peer that joins it (found reading the sender, not yet
+measured). **#172 is closed**: the
 Python client's sharded pool swaps its routing whole and replaces a shard connection a timeout
 closed, under a test that builds a sharded pool against a map in etcd.
 **#174 is an open P2**: a start reads the whole WAL twice even when its last checkpoint covers every
