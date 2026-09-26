@@ -3633,6 +3633,12 @@ Learned the hard way. Check here before debugging.
      erased every frame from the front of its receive buffer; one read of a catch-up was megabytes,
      and a node spent 96% of its time in memmove - 78 s for 100 000 records (#181). Walk an offset
      and compact once. `perf` found it in one run where reasoning about the sender had not.
+470. **An editable install answers `import` before `PYTHONPATH` does.** The shared venv holds the
+     main checkout's client installed editable, whose finder sits in `sys.meta_path`, so a worktree's
+     battery imported the main checkout's client with `PYTHONPATH` pointing at the worktree - the
+     verification script printed the path and nobody read it for two branches. Harmless while the
+     two clients are the same file (`diff -rq`); a branch that changes the client needs a venv of its
+     own, or the battery tests the wrong code and says it passed.
 
 ## Current state and open problems
 
@@ -3681,7 +3687,7 @@ without the lock every local write takes and paced by the peer's send buffer - a
 more than `--mm-max-catchup-bytes` used to stop at the first ceiling's worth for good (6 990 of
 20 100 rows), and a 300 000-record catch-up livelocked on the send-buffer ceiling; and **#181 is
 closed**: a node applied a burst of frames in quadratic time, erasing each from the front of its
-receive buffer (pitfalls 462-469). **#179 is the open P0**: a mesh node restarted before its version vector reached the WAL
+receive buffer (pitfalls 462-470). **#179 is the open P0**: a mesh node restarted before its version vector reached the WAL
 replays the rows a peer sent it as its own origin's, is sent them again and stores them twice (200
 where the writer holds 100). **#169, #175, #176, #177, #180 and #182 are open P1s**: an exchange name with
 a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live book, sequence
