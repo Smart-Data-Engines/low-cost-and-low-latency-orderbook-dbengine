@@ -2213,6 +2213,23 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 182. A mesh node logs every replicated update of a level it already holds as a conflict, at INFO **P1**
+
+**Found measuring #178.** `ConflictResolver::resolve()` compares a remote update with the state it
+holds for the same (symbol, exchange, side, price) and, whenever there is one, records a conflict and
+writes `Conflict detected: REMOTE wins ...` at INFO - including for the next update of that level
+**from the same origin**, in HLC order, which is not a conflict but the ordinary life of a book. In
+#178's measurement, 300 000 single-level writes to 1 000 price levels of ten symbols: **301 985 such
+lines, 61 MB of log**, on the node that received them live, and 304 671 on the one caught up. A book
+updates the levels it holds, so on a mesh this is a line of log for nearly every replicated update:
+at the rates this engine ingests, tens of megabytes of log a second, with the CPU to format them.
+
+A fix does not call a same-origin, newer update a conflict, and logs the ones it does call conflicts
+as a count and an episode rather than a line each; `ob_mm_conflicts_total` and `MM_CONFLICTS` keep
+what an operator needs.
+
+- Effort: S | Impact: a mesh logs at the rate it writes, until the disk is full
+
 ### 181. A mesh node applied a burst of frames in quadratic time: every frame was erased from the front of its receive buffer ✅ **P1**
 
 **Found measuring #178.** With the catch-up in rounds the sender of a 100 000-record catch-up
@@ -11490,9 +11507,9 @@ measures the harness.
 
 ## Recommended order
 
-**#179 is the open P0**, and **#169, #175, #176, #177 and #180 are open P1s** — the mechanical
+**#179 is the open P0**, and **#169, #175, #176, #177, #180 and #182 are open P1s** — the mechanical
 list is the `Open:` line below; read it there rather than trusting this paragraph, which is prose and
-has been wrong about this before. All four mesh items were found measuring the first of them, and so
+has been wrong about this before. All five mesh items were found measuring the first of them, and so
 were two that are closed: **#178 was a P0** - a mesh node that missed more than
 `--mm-max-catchup-bytes` of its peers' WAL never got the rest, 6 990 of 20 100 rows for good,
 because every catch-up started at the first record and stopped where the first had; a catch-up is
@@ -11504,6 +11521,8 @@ sent them again and stores them twice - 200 rows where the writer holds 100. **#
 vector past 1 561 entries asks for everything, so every reconciliation resends the whole retained WAL
 and a joining node never asks for a snapshot. **#180**: a node's vector is refreshed only when a
 store seals, so a peer that comes back within the seal interval is judged to hold what it missed.
+**#182**: every replicated update of a level a node holds is logged at INFO as a conflict - 61 MB of
+log for 300 000 writes.
 **#176** was found writing part 2b of #165: a mesh snapshot names each file by a 16-bit index, so a
 node of 8 192 segments — 8 192 instruments, whatever merging does — cannot bootstrap a peer that
 joins it; measuring it found #177 first. **#175**: sharding by symbol has no control plane — no shard writes itself or
@@ -11574,7 +11593,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #174, #175, #176, #177, #179, #180.** Every other item above #58 is marked closed, and
+**Open: #169, #174, #175, #176, #177, #179, #180, #182.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -11716,6 +11735,7 @@ The capability items are in the table below.
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
 | **P1** | Sharding by symbol gains its control plane: the shards write the map, and both clients read it (#175) | M–L | A shard writes neither itself nor the map to etcd, owns every symbol, and a second one on the same etcd becomes the first one's replica; neither client can find a shard |
 | **P1** | A version vector of any size, so a mesh of thousands of instruments neither resends its WAL every reconciliation nor refuses a joiner its snapshot (#177) | M | Past 1 561 (symbol, origin) entries a vector is sent as "send everything": 9 600 - 20 800 duplicates a node in a 16 s window where 1 500 entries cost none, and a joiner that never asks for a snapshot |
+| **P1** | A mesh logs a conflict only where two origins wrote one level, and as a count rather than a line each (#182) | S | Every replicated update of a level the node holds is logged at INFO as a conflict, same origin or not: 301 985 lines, 61 MB, for 300 000 writes |
 | **P1** | A returning mesh peer is caught up at its reconnect, whatever this node wrote since its last seal (#180) | S–M | A node's vector is refreshed only when a store seals, so a peer back within ten seconds is judged to hold what it missed: 238 of 2 100 rows three seconds after it reconnected |
 | **P1** | A mesh snapshot carries any number of files, so a peer can join a node of 8 192 segments or more (#176) | M | A mesh snapshot names a file by a 16-bit index, so a node of 8 192 segments - 8 192 instruments, whatever part 2b merges - cannot bootstrap a peer that joins it; found reading the sender, not yet measured |
 | **P2** | A start finds its last checkpoint without reading the whole WAL twice (#174) | S–M | Since part 2b of #165 the index is 1.9 - 2.9 s of a cold start after a twenty-minute soak, 5.9 - 6.8 s, and the WAL most of the rest - and a start reads it twice even when the checkpoint covers every record |

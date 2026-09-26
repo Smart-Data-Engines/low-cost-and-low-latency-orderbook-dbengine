@@ -3683,15 +3683,16 @@ more than `--mm-max-catchup-bytes` used to stop at the first ceiling's worth for
 closed**: a node applied a burst of frames in quadratic time, erasing each from the front of its
 receive buffer (pitfalls 462-469). **#179 is the open P0**: a mesh node restarted before its version vector reached the WAL
 replays the rows a peer sent it as its own origin's, is sent them again and stores them twice (200
-where the writer holds 100). **#169, #175, #176, #177 and #180 are open P1s**: an exchange name with
+where the writer holds 100). **#169, #175, #176, #177, #180 and #182 are open P1s**: an exchange name with
 a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live book, sequence
 numbers and stored rows, measured on the wire; sharding by symbol has no control plane: no shard
 writes itself or the map to etcd, each owns every symbol, and a second on the same etcd becomes the
 first one's replica, measured against a native etcd; a mesh snapshot names each file by a 16-bit
 index, so a node of 8 192 segments cannot bootstrap a peer that joins it; a version vector past
 1 561 entries asks for everything, so every reconciliation resends the whole retained WAL and a
-joiner never asks for a snapshot; and a node's vector is refreshed only when a store seals, so a peer
-back within the seal interval is judged to hold what it missed. **#172 is closed**: the
+joiner never asks for a snapshot; a node's vector is refreshed only when a store seals, so a peer
+back within the seal interval is judged to hold what it missed; and every replicated update of a
+level a node holds is logged at INFO as a conflict, same origin or not. **#172 is closed**: the
 Python client's sharded pool swaps its routing whole and replaces a shard connection a timeout
 closed, under a test that builds a sharded pool against a map in etcd.
 **#174 is an open P2**: a start reads the whole WAL twice even when its last checkpoint covers every
