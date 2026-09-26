@@ -3584,6 +3584,24 @@ Learned the hard way. Check here before debugging.
      the same name within one tick of the start, so a directory seen after the start does not show
      the start left it: the start's own log line does. A window a tick wide is found by polling the
      disk every millisecond, and asserted again after the kill - no fault injector needed.
+458. **A policy that syncs nothing turns every "after the sync" into a claim.** Under
+     `--fsync-policy none` the segment sync returns at once, and it was counted as a sync that had
+     run: a merge wrote, "synced", published and removed its inputs with none of it on the device,
+     so a power cut could take history that had been on the disk for hours. A step that removes
+     what was durable syncs for itself, whatever the policy. Found by an independent review of part
+     2b of #165, like the three after it.
+459. **A name a client chooses can match a name the engine chooses.** A rebuild took any directory
+     ending `.compacting` for a merge's working directory, at any depth, so a symbol named like one
+     was removed with its rows at the next start. Recognise only the exact shape the engine writes,
+     at the depth it writes it.
+460. **A plan the next step will refuse is a loop.** The planner did not know ranges, so a run
+     whose merged range tied a neighbour was written, refused at publication, and written again
+     every tick; and a partition whose run waited for a checkpoint of the same tick was set to its
+     settling, so its merge waited for the next seal or the end of the hour. What a later step
+     checks, the plan checks; what the next tick fixes, the next tick looks at.
+461. **A reader that trusts a file's own claim trusts the storage that wrote it.** A start removed a
+     merged segment's inputs on its `meta.json` alone; it checks now that its `ts.col` holds its
+     rows, and keeps the inputs when it does not.
 
 ## Current state and open problems
 

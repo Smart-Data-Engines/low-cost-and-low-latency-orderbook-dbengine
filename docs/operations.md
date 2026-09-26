@@ -449,7 +449,7 @@ logger, to confirm a start.
   written or published — a disk that refuses them pauses merging for ten seconds each time — and
   `ob_segments_awaiting_removal` the replaced segments whose files wait for a sync or for a query
   still reading them: it goes back to zero on its own, and one that does not is a query that does
-  not end.
+  not end — or a sync that failed, after which nothing is removed until a restart.
 
 One counter is worth watching for a different reason: **`ob_refused_commands_total`** is the number
 of command lines the parser would not accept — an unknown word, or a known command carrying a token
@@ -1124,6 +1124,11 @@ names it, and says so once:
 ```
 a merge was cut short: removed 0 working director(ies) nothing published and 8 segment(s) a merged segment beside them had replaced
 ```
+
+**A merge syncs for itself, whatever `--fsync-policy` says**: it removes segments that were on
+the device, so it does so only once what replaces them is. Under `none` that sync — once a second
+at most, and only in a tick that may merge — is also what puts a checkpoint on the device, and a
+merge takes only the segments a checkpoint there vouches for.
 
 **While a snapshot is being made or sent, nothing merges and retention does not sweep**: the
 snapshot's manifest names files, and a merge or a sweep that removed one mid-transfer failed it,

@@ -133,8 +133,9 @@ only for bookkeeping (#164):
    directory beside its inputs; synced; published by a rename under the index's lock in place of
    its inputs, in one step, only while they are still indexed and consecutive in their symbol's
    delivery order; synced again; and the inputs removed once no query that copied them is reading
-   — and the step syncs on its own when the tick sealed nothing. A merge takes a segment of this
-   node's WAL only once a checkpoint on the device vouches for it, keeps its inputs' highest epoch
+   — and the step syncs on its own when the tick sealed nothing, and under `--fsync-policy none`
+   always, since nothing else syncs there. A merge takes a segment of this node's WAL only once a
+   checkpoint on the device vouches for it, keeps its inputs' highest epoch
    and position, and never takes a segment of 65 536 rows or more; a tick that drained more rows
    than that merges nothing new unless none has for ten seconds. Nothing merges while a snapshot's
    pin is held — from before its flush until its sender finishes — and the paths that replace or
