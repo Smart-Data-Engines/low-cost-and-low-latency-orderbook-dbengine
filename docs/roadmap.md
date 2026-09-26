@@ -2213,6 +2213,119 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 186. A mesh node holding 4 000 symbols stalls a write for up to 0.6 s at a trickle, and refuses writes at the pipelined ceiling **P1**
+
+**Found measuring what #180's per-tick update costs, and on master as much as on the branch.** One
+mesh node, 4 000 symbols prefilled with a row each, 500 of them written once each every 100 ms, and
+`benchmarks/command_latency` timing one `INSERT` at a time, 300 000 of them (i3-7100U, Release):
+p50 45 - 50 us and p99 91 - 100 us on every build, and the largest round trip of a run 7 - 12 ms -
+or **169 - 623 ms, in six runs of twelve**, three of master's four among them, a run with one taking
+2 s longer than one without. The writer's log says nothing at INFO. And the same node under
+`benchmarks/pipelined_ingest` at two connections refused writes on master - `The pending queue did
+not free room in 5 s, so this write is refused` twice, after three waits for room that each ended in
+0.2 - 2.6 s - which is the outcome `kBackpressureDeadline` is justified in `engine.hpp` as one "a
+healthy flush never reaches even on a machine an order of magnitude slower". Both are measured and
+unexplained. Candidates, in the order to rule them out: a tick sealing many stores at once (the
+trickle makes ~40 due a tick), a merge of part 2b of #165, `syncfs()` against ext4's journal while a
+write of the WAL waits under the engine's lock, the vector's serialisation warning of #177 logged
+at every seal of a 4 008-entry vector. What decides it is the tick's locked sections timed on the
+writer (WARN above 20 ms), and the same run against a standalone node and a mesh node of 40 symbols.
+The evidence of #179 holds the runs and the writer's log of each.
+
+- Effort: M | Impact: a write that waits for over half a second, now and then, on a node an
+  exchange-sized symbol list makes large - and writes refused at a ceiling the deadline was sized
+  never to meet
+
+### 185. A restarted mesh node claims, from its segments, to have written the numbers its peers wrote, and every reconciliation scans its whole WAL for them **P1**
+
+**Found reading the start for #179, and measured with a probe (the evidence of #179).**
+`Engine::open()` declares this node's own frontier for every symbol it holds a segment of, up to the
+highest sequence number in it - sound on one node, where every row is its own, and wrong in a mesh,
+where a segment holds every origin's rows. A node that only ever received a symbol comes back from
+a restart - a clean one - claiming records of its own origin that nobody wrote. Its peers do not have
+them, so every vector it is sent says they lack them; a catch-up starts, reads this node's whole
+retained WAL looking for them, sends nothing, and counts the ranges as unfillable. Measured on three
+nodes reconciling every 5 s, ten symbols written only by node 0 and sealed on node 2, node 2 stopped
+and started: **14 catch-ups from node 2 in 30 s**, one per peer per reconciliation, each reading
+all 2 002 records of its WAL and sending none, and `ob_mm_catchup_unfillable_total` at **140** - ten
+ranges nobody wrote, fourteen times. The code this skips a scan with says what that costs at size:
+"a 1 GB WAL at the 94 MB/s this scan runs at would spend most of every interval reading itself".
+
+The declaration stays in #179's fix on purpose: without it this node's own frontier for a symbol
+several nodes write would stop at the first number another node took (#184). What would let it
+declare exactly what it wrote is the highest number of **its own** origin in each segment - the same
+fact #184's fix needs to restore its counter.
+
+- Effort: M (with #184) | Impact: a full WAL scan per peer at every reconciliation on any mesh node
+  restarted with segments of symbols it does not write, and an unfillable-range warning and counter
+  that report ranges nobody wrote
+
+### 184. A symbol two mesh nodes write gets numbers with holes in each origin's stream, so every node's frontier stops at the first, and a node that missed rows is judged to hold them **P0**
+
+**Found reading the tracker for #179, and measured with `tests/integration/test_mm_multi_writer.py`
+and the probe it was built from.** A sequence number belongs to the origin that minted it, and the
+receive path drops a record when `has_seen(key, origin, seq)` - but the counter that mints them is
+one per symbol, raised by every origin's numbers (`observe()`: "a node that both accepts client
+writes and receives a stream would hand out a number already in use"). So when two nodes write one
+symbol, neither origin's numbers for it are contiguous: node 0 writes 1-500, node 1 then 501-1 000,
+node 0 1 001-1 500. A frontier is "everything up to here", so every node's frontier for node 0 stops
+at 500 and for node 1 at 0, and everything above lives in the held set, capped at 4 096 per
+(symbol, origin). Every node then states the same frontiers, and a node that missed writes during an
+outage is compared against a vector that says it lacks nothing.
+
+Measured on three nodes reconciling every 5 s: twenty rounds of 500 rows of one symbol, taking turns
+on node 0 and node 1, then node 2 killed, two more rounds, node 2 restarted. On the branch that
+fixed #179, node 2 holds **10 000 of 11 000 rows**, forty seconds and eight reconciliations later -
+nothing is sent it, because nothing looks missing. On the build before it, **12 308**: the replay
+remembered every record as node 2's own, so node 2 looked empty, was sent everything above the
+stuck frontiers, and the numbers past the held set's cap - 404 of node 0's, 904 of node 1's - were
+stored twice. The same outage with one writer: 11 000 of 11 000 within 5.4 s, on both. And a node
+that is disconnected without a restart states the tracker it kept, which is the branch's case on
+either build. The module's second test is a strict xfail; its first, one writer, is the control.
+
+A fix numbers each origin's records for a symbol from its own counter - in a mesh, a number another
+origin minted does not raise this node's, which is what the dedup key already assumes; the replica's
+case the raise is for is origin 0 on both sides and keeps it. It also needs a restart to find that
+counter without the segments' highest number, which is every origin's: a segment that records the
+highest number of this node's own origin, which #185 needs as well. Data a mesh wrote before the fix
+keeps its holes, and a frontier cannot pass them; the repair for a node holding such a symbol is the
+one there is, a wipe and a snapshot.
+
+- Effort: M-L | Impact: a mesh node that misses writes of a symbol another node also writes never
+  gets them - silently, for as long as it runs
+
+### 183. A reconciliation took a peer's own timer for silence, and treated the peer as holding nothing ✅ **P1**
+
+**Found measuring #180, by lining up the two nodes' logs.** `reconcile_with_peers()` sends this node's
+vector to every peer and armed a deadline, `MM_VV_GRACE_MS` (2 s), for the peer's answer - but a peer
+does not answer a vector with one of its own: it sends its vector when its own reconciliation runs.
+Whenever the two nodes' timers were more than two seconds apart, the deadline expired first, and the
+peer was "treated as holding nothing and sending everything retained": a catch-up from its last
+vector, which is up to an interval old. Every such reconciliation resent what had been written since
+that vector, and after a large catch-up - whose records the last vector predates - the whole of it.
+Measured with `scripts/measure_mesh_catchup.py`, three nodes reconciling every 5 s, 300 000
+records, the build with #180's fix: 6-7 deadline catch-ups a run, and in two runs of three the whole
+catch-up sent again, 307 307 and 306 557 records, every one a duplicate the receiver dropped. It is
+also what #178's measurement recorded as "312 985 records sent a second time", which #180's first
+account attributed to a stale vector: the writer's log says `Peer 3 sent no version vector within
+2000 ms` right before it. Whether a run is hit depends only on the phase of the two timers, so it
+was in master all along - and at the default 30 s interval a peer whose timer runs more than 2 s
+after this node's is resent, at every reconciliation, what was written in the up to 30 s since its
+last vector.
+
+**Fixed:** the deadline is the handshake's only - where a peer that has stated nothing really is
+unknown and everything retained is the safe direction; a reconciliation sends the vector and waits
+for nothing. Every connected peer does send vectors: the handshake refuses any protocol but 2, which
+also makes the warning about protocol 1 after it dead code. Tests in `tests/test_mm_catchup_rounds.cpp`:
+`AReconciliationDoesNotTakeAPeersOwnTimerForSilence`, and the deadline's own case, which must stay,
+`APeerSilentSinceItsHandshakeIsSentEverything`. Measured on the tree with all three fixes, the same
+run of four rounds ABAB: the writer sent the returning node **305 895 - 306 794 records**, the batch
+once, and not one catch-up came from the deadline; master sent **317 342 - 1 916 787**, and 0 - 7 of
+a run's catch-ups came from it.
+
+- Effort: S | Impact: duplicate traffic on every reconciliation between nodes whose timers are more
+  than two seconds apart, and a second full catch-up after a large one
+
 ### 182. A mesh node logs every replicated update of a level it already holds as a conflict, at INFO **P1**
 
 **Found measuring #178.** `ConflictResolver::resolve()` compares a remote update with the state it
@@ -2252,51 +2365,126 @@ from the front moves about 210 GB.
 - Effort: S | Impact: a mesh node caught up after an outage, or bootstrapped, applied what it was sent
   at a few thousand records a second
 
-### 180. A mesh node's version vector is refreshed only when a store seals, so a peer that comes back within the seal interval is judged to hold what it missed **P1**
+### 180. A mesh node's version vector was refreshed only when a store sealed, so a peer that came back within the seal interval was judged to hold what it missed ✅ **P1**
 
 **Found measuring #178, and measured with `tests/integration/test_mm_restart.py`.** The vector a node
 compares a returning peer's against is a cache, refreshed when a checkpoint is written - and
-`flush_write_and_merge()` returns before the checkpoint when the tick sealed nothing, which since
+`flush_write_and_merge()` returned before the checkpoint when the tick sealed nothing, which since
 part 2a of #165 is most ticks: a store at a trickle seals every ten seconds. So a peer that was down
-while this node wrote, and comes back within that window, is compared against a vector without those
+while this node wrote, and came back within that window, was compared against a vector without those
 writes, judged to hold everything, and caught up only by a later reconciliation. Measured on a fresh
 three-node mesh reconciling every 5 s: a node killed after the mesh flushed, while its peer wrote
 2 000 rows, held **238 of 2 100** three seconds after it reconnected; with the default interval and
-nothing flushed, the rows it missed arrived 20 s after its restart. Nothing is lost - the next
-reconciliation sends it - but the catch-up at a reconnect, which is what a reconnect is for, does
-not. And it works the other way round too: the node that was caught up says, until it seals, that it
-lacks what it was sent. In #178's measurement the writer sent 312 985 records a second time, twelve
-rounds after the first catch-up, every one of them a duplicate the receiver dropped.
+nothing flushed, the rows it missed arrived 20 s after its restart. And the other way round: the node
+that was caught up said, until it sealed, that it lacked what it was sent, so every reconciliation in
+that window sent it all again.
 
-A fix refreshes the cache when the tracker changes rather than when a store seals, without taking
-the engine's lock from under the manager's - which is why there is a cache at all. Its test is the
-module's second strict xfail.
+**Fixed:** every flush tick, sealing or not, brings the vector peers are told up to date - at
+most one tick old, under the engine's lock the tick holds anyway and never from under the manager's,
+which is what the cache is for. **Not** by exporting it again: the first version of the fix did,
+and measured before it was kept, `export_vector()` costs **286 us at 4 000 entries** (p50, Release,
+i3-7100U; 67 us at 1 500) - a stall of every write, ten times a second, whenever anything moved. The
+tracker lists each (symbol, origin) whose frontier moved since the last take, once
+(`take_moved_frontiers()`), and the tick applies them to the cache through an index
+(`update_version_vector_cache()`): **0.6 us for 8 moved pairs at 4 000 entries**, 4.6 us for 64,
+48 us for 512, 530 us when every one moved - a tick that drains rows of all 4 000 symbols pays more
+than that for the drain. It rebuilds only after a reset, and the persist path uses the same update
+instead of the second whole export it made before. A RapidCheck property holds a copy kept from the
+moves equal to the export, whatever the tracker is asked in between, and an engine test holds what a
+peer is told equal to the whole export a flush writes into the WAL.
 
-- Effort: S-M | Impact: a returning mesh peer serves stale reads for up to a seal interval and a
-  reconciliation longer than it has to
+Measured: the module's second test passes without its marker - the returning node holds all 2 100
+rows within the three seconds. `scripts/measure_mesh_catchup.py` with reconciliation every 5 s and
+30 s of watching after the returning node caught up, Release, 300 000 records, i3-7100U, four rounds
+ABAB: master sent the returning node **317 342 - 1 916 787 records**, the batch again whenever a
+vector it sent inside the seal window reached the writer - `Peer 3 is missing 11 (symbol, origin)
+ranges` 5 s after the first catch-up began and 2.2 s after it ended - and whenever #183's deadline
+fired; the branch, with #183 fixed too, **305 895 - 306 794**, the batch once. #180's first account
+put the 312 985 records #178's measurement sent twice down to a stale vector; the writer's log says
+they were #183's.
 
-### 179. A mesh node restarted before its version vector reached the WAL stores the rows a peer sent it twice **P0**
+What the per-tick update costs a write, measured on one mesh node holding 4 000 entries, 500 of its
+frontiers moved every 100 ms by a trickle, and `benchmarks/command_latency` timing 300 000 `INSERT`s
+one at a time (it reports p99.9 since this): four runs each of master, the branch, and the branch
+without the update, **p50 45.3 - 49.7 us, p99 90.8 - 99.6 us and p99.9 0.91 - 1.33 ms across all
+twelve**, the three builds' ranges overlapping. The largest round trip of a run was 7 - 12 ms, or
+169 - 623 ms in six runs of the twelve, on every build, master included - a stall this did not bring,
+filed as #186. The same measurement with a probe in Python read the branch's p99.9 as 2.65 - 5.89 ms
+against master's 2.39 - 2.57: its clock runs in the interpreter it shares with the trickle, and it is
+why the probe is `command_latency` now. Its tests are
+`APeerIsToldWhatArrivedAfterOneTickThatSealsNothing` and `WhatAPeerIsToldIsWhatAWholeExportSays` in
+`tests/test_mm_restart_origins.cpp`, and the moved-frontier contract and a RapidCheck property that
+a copy kept from the moves is the export in `tests/test_sequence_tracker.cpp`; the mutation table is
+#179's.
+
+- Effort: S-M | Impact: a returning mesh peer served stale reads for up to a seal interval and a
+  reconciliation longer than it had to
+
+### 179. A mesh node restarted before its version vector reached the WAL stored the rows a peer sent it twice ✅ **P0**
 
 **Found measuring #178, and measured with `tests/integration/test_mm_restart.py`, on both the build
-before #178 and after it.** `apply_delta_replayed()` seeds the sequence tracker with this node's own
-origin for every record the start replays - `seq_tracker_.seed(key, mm_config_.node_id, seq)` -
-whatever origin the record's header names. A record a peer sent is therefore remembered as one this
-node wrote. The version vector that would say otherwise reaches the WAL with a checkpoint, and a
-store at a trickle seals every ten seconds, so a node killed within that window comes back saying it
-holds nothing from the record's real origin; its peers send the records again, the receive path finds
-their numbers unseen for that origin, and applies them into append-only storage a second time.
+before #178 and after it.** `apply_delta_replayed()` seeded the sequence tracker with this node's own
+origin for every record the start replayed - `seq_tracker_.seed(key, mm_config_.node_id, seq)` -
+whatever origin the record's header named. A record a peer sent was therefore remembered as one this
+node wrote. The version vector that would have said otherwise reaches the WAL with a checkpoint, and
+a store at a trickle seals every ten seconds, so a node killed within that window came back saying it
+held nothing from the record's real origin; its peers sent the records again, the receive path found
+their numbers unseen for that origin, and applied them into append-only storage a second time.
 Measured on a fresh three-node mesh: 100 rows written, delivered, the node killed 1.5 s later and
-restarted - it replayed the 100 (`WAL replay: records=100 applied=100`, `No version vector in the
-WAL`) and then held **200 rows where the writer held 100**; in #178's measurement, 20 200 of 20 100.
-The same seed raises this node's local counter and claims a frontier of its own origin for records it
-never wrote, which its peers then look for and cannot find - one way #178's new warning about ranges
-older than the WAL fires without a real gap.
+restarted - it replayed the 100 and then held **200 rows where the writer held 100**; in #178's
+measurement, 300 200 of 300 100 in every round of both builds.
 
-A fix seeds a replayed record with the origin in its header and raises the local counter only for
-this node's own, and holds the segment-restored counters to the same rule; its test is the module's
-first strict xfail.
+Reading the replay for the fix found two more ways to the same duplicates. The records a restart
+reads again and **skips as stored** were not seeded at all - and since part 2a of #165 that is every
+record of every store sealed after the oldest row still waiting, whose numbers only a vector knew,
+while a vector of more than 4 096 entries is never written (#177). And the vector was written
+**after** the checkpoint: a crash between the two appends left the checkpoint, which cuts the replay,
+and not the vector that covered the records before it.
 
-- Effort: S-M | Impact: duplicate rows on any mesh node that restarts within a seal interval of
+**Fixed:** `replay_wal_tail()` seeds every DELTA of the tail - applied, or skipped as stored - under
+the origin its header names, a legacy record without one being this node's own, and
+`apply_delta_replayed()` seeds nothing; the replay line says how many were another origin's
+(`other_origins=N`). The vector is written before the checkpoint, in the same critical section. Two
+things stay as they were, on purpose: `seed()` still raises the symbol's one local counter with any
+origin's number, as a live `observe()` does, and a start still declares this node's own frontier from
+the highest number in its segments - without that declaration a node's own frontier for a symbol
+several nodes write would stop at the first number another node took. What both cost is #183 and
+#184.
+
+Measured: the module's first test passes without its marker. `scripts/measure_mesh_catchup.py`,
+Release, 300 000 records, i3-7100U, ABAB, two rounds: master **300 200 of 300 100** in both, the
+branch **300 100 of 300 100** in both - and the writer's catch-up skipped the 3 760 - 3 824 records
+the returning node had replayed, where master skipped none and sent them again. Seven tests in the
+new `tests/test_mm_restart_origins.cpp` take the restart apart on one engine: a crash is a copy of
+the data directory taken while nothing writes, a tick runs on the test's thread
+(`flush_tick_for_test()`), and each case - the WAL alone, a vector and a tail, records skipped as
+stored behind a vector too large to write, a crash straight after the checkpoint, a record from
+before the mesh - has a peer redeliver what the node held and counts the rows after a flush.
+
+**For a symbol more than one node writes, this changes what a restart gets wrong rather than fixing
+it**, and #184 is why: every origin's numbers for such a symbol have holes, so every node's frontier
+stops at the first, and a node that states them truthfully - as it does now - is judged to hold what
+it missed. Measured: 10 000 of 11 000 rows after an outage and a restart on the branch, 12 308 on
+master, where the replay's own-origin seeding made the node look empty and it was sent everything
+above the stuck frontiers. A disconnect without a restart was the branch's case on master too.
+
+**Mutation table - #179's, #180's and #183's: 30 runs in two passes, 27 as written down before
+them.** The first pass had 20 rows, and three written as killed survived; each was a finding about
+the tests rather than a verdict to move. Four restart tests counted rows straight after a
+redelivery, and a redelivered record's rows wait in the pending queue, which a query does not read -
+so a mutation that stored duplicates was invisible to the counts (rows 2 and 4; row 1 was killed by
+the tests' other assertions only), where `test_mm_dedup.cpp` had always flushed first. And the
+too-large vector only ever went through the first update after open, a whole rebuild, so the
+update's own overflow was never reached (row 14). The tests flush before they count and tick before
+the vector grows now, and the second pass reran the ten rows on that file: ten as written. Killed
+in the integration test as well: seeding this node's origin again stores 200 rows where the writer
+holds 100, and no update in a tick that seals nothing leaves the returning node 100 of 2 100 rows
+three seconds after it reconnected. Surviving as written: the update the persist path makes, which
+the sealing tick makes again straight after it; a redelivery listed as a move, which only the
+moved-frontier contract catches, the property holding because the value listed is the value held;
+and the control. Verdicts, harness and both passes' logs are in the evidence.
+
+- Effort: S-M | Impact: duplicate rows on any mesh node that restarted within a seal interval of
   receiving them - silently, and in append-only storage
 
 ### 178. A mesh node that missed more than `--mm-max-catchup-bytes` of its peers' WAL never got the rest: every catch-up stopped where the first one did ✅ **P0**
@@ -2343,7 +2531,7 @@ The same test, on the fix: **20 100 of 20 100 rows**, the writer's catch-up `fin
 
 **Measured in Release builds on the i3-7100U**, master `1eb78aa` against this branch, with
 `scripts/measure_mesh_catchup.py`: three nodes; one killed while its peer wrote 300 000
-single-level rows to ten symbols; the writer flushed, so its vector names them (#180 otherwise);
+single-level rows to ten symbols; the writer flushed, so its vector names them (#180 otherwise, since fixed);
 the node restarted - and all along, a probe on the writer sending one `INSERT` at a time. ABAB, two
 rounds of each:
 
@@ -2359,7 +2547,7 @@ On master the returning node was dropped for not draining, came back, and was se
 scan, 6.5 s at the longest. The one probe of 131 ms on the branch came 4.3 s after the restart,
 when the catch-up had finished; the longest the catch-up held the lock in that run was 4.2 ms. The
 returning node holds 100 rows more than the writer in every run of both builds: the rows it had
-before the kill, stored twice after it, which is #179.
+before the kill, stored twice after it, which was #179 - fixed since, and 300 100 of 300 100 in the same measurement now.
 
 **Mutation table: 28 runs, 24 as written down before them** - 19 killed and 5 surviving where the
 verdict said, in two passes. The first pass had 25 rows; four written as killed survived, and each
@@ -11509,22 +11697,32 @@ measures the harness.
 
 ## Recommended order
 
-**#179 is the open P0**, and **#169, #175, #176, #177, #180 and #182 are open P1s** — the mechanical
-list is the `Open:` line below; read it there rather than trusting this paragraph, which is prose and
-has been wrong about this before. All five mesh items were found measuring the first of them, and so
-were two that are closed: **#178 was a P0** - a mesh node that missed more than
-`--mm-max-catchup-bytes` of its peers' WAL never got the rest, 6 990 of 20 100 rows for good,
-because every catch-up started at the first record and stopped where the first had; a catch-up is
-rounds from a cursor now, read without the lock every local write takes - and **#181**: a node
-applied a burst of frames in quadratic time, erasing each from the front of its receive buffer, 123 s
-for a catch-up its peer sent in 0.1 s; 1.8 s now. **#179**: a mesh node
-restarted before its version vector reached the WAL remembers the rows it replayed as its own, is
-sent them again and stores them twice - 200 rows where the writer holds 100. **#177**: a version
-vector past 1 561 entries asks for everything, so every reconciliation resends the whole retained WAL
-and a joining node never asks for a snapshot. **#180**: a node's vector is refreshed only when a
-store seals, so a peer that comes back within the seal interval is judged to hold what it missed.
-**#182**: every replicated update of a level a node holds is logged at INFO as a conflict - 61 MB of
-log for 300 000 writes.
+**#184 is the open P0**, and **#169, #175, #176, #177, #182, #185 and #186 are open P1s** — the
+mechanical list is the `Open:` line below; read it there rather than trusting this paragraph, which
+is prose and has been wrong about this before. **#184**: when two mesh nodes write one symbol, the
+one counter per symbol gives each origin's numbers holes, so every node's frontier for it stops at
+the first and a node that missed rows is judged to hold them - 10 000 of 11 000 after an outage, for
+good; it is the next piece of work, with **#185** beside it, which the same fix closes: a restarted
+node claims from its segments the numbers its peers wrote, and every reconciliation scans its whole
+WAL for them. The mesh items were found measuring #178, and so were five that are closed: **#178
+was a P0** - a mesh node that missed more than `--mm-max-catchup-bytes` of its peers' WAL never got
+the rest, 6 990 of 20 100 rows for good, because every catch-up started at the first record and
+stopped where the first had; a catch-up is rounds from a cursor now, read without the lock every
+local write takes - **#181**: a node applied a burst of frames in quadratic time, erasing each from
+the front of its receive buffer, 123 s for a catch-up its peer sent in 0.1 s; 1.8 s now - **#179 was
+a P0**: a mesh node restarted before its version vector reached the WAL remembered the rows it
+replayed as its own, was sent them again and stored them twice, 200 rows where the writer held 100;
+replay seeds each record under the origin its header names now, the records it skips as stored
+included, and the vector goes into the WAL before the checkpoint - **#180**: a node's vector was
+refreshed only when a store sealed, so a peer back within the seal interval was judged to hold what
+it missed; every tick brings it up to date now, at the cost of the frontiers that moved - and
+**#183**, found measuring #180: a reconciliation took a peer's own timer for silence and treated the
+peer as holding nothing, resending everything since its last vector. **#186** was found measuring
+#180's cost, on master too: a mesh node of 4 000 symbols stalls a write for up to 0.6 s at a
+trickle, and refuses writes at the pipelined ceiling. **#177**: a version vector past 1 561 entries
+asks for everything, so every reconciliation resends the whole retained WAL and a joining node never
+asks for a snapshot. **#182**: every replicated update of a level a node holds is logged at INFO as
+a conflict - 61 MB of log for 300 000 writes.
 **#176** was found writing part 2b of #165: a mesh snapshot names each file by a 16-bit index, so a
 node of 8 192 segments — 8 192 instruments, whatever merging does — cannot bootstrap a peer that
 joins it; measuring it found #177 first. **#175**: sharding by symbol has no control plane — no shard writes itself or
@@ -11595,7 +11793,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #174, #175, #176, #177, #179, #180, #182.** Every other item above #58 is marked closed, and
+**Open: #169, #174, #175, #176, #177, #182, #184, #185, #186.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -11733,12 +11931,13 @@ The capability items are in the table below.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **P0** | A mesh node restarted within a seal interval of receiving rows stores each of them once (#179) | S–M | The replay seeds every record with this node's origin, so a node restarted before its version vector reached the WAL is sent the rows it replayed again and applies them into append-only storage: 200 rows where the writer holds 100 |
+| **P0** | A mesh node that missed writes of a symbol another node also writes gets them back (#184) | M–L | One counter per symbol gives each origin's numbers holes when two nodes write it, so every node's frontier stops at the first and a node that missed rows is judged to hold them: 10 000 of 11 000 after an outage, for good |
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
 | **P1** | Sharding by symbol gains its control plane: the shards write the map, and both clients read it (#175) | M–L | A shard writes neither itself nor the map to etcd, owns every symbol, and a second one on the same etcd becomes the first one's replica; neither client can find a shard |
 | **P1** | A version vector of any size, so a mesh of thousands of instruments neither resends its WAL every reconciliation nor refuses a joiner its snapshot (#177) | M | Past 1 561 (symbol, origin) entries a vector is sent as "send everything": 9 600 - 20 800 duplicates a node in a 16 s window where 1 500 entries cost none, and a joiner that never asks for a snapshot |
 | **P1** | A mesh logs a conflict only where two origins wrote one level, and as a count rather than a line each (#182) | S | Every replicated update of a level the node holds is logged at INFO as a conflict, same origin or not: 301 985 lines, 61 MB, for 300 000 writes |
-| **P1** | A returning mesh peer is caught up at its reconnect, whatever this node wrote since its last seal (#180) | S–M | A node's vector is refreshed only when a store seals, so a peer back within ten seconds is judged to hold what it missed: 238 of 2 100 rows three seconds after it reconnected |
+| **P1** | A restarted mesh node declares from its segments only the numbers it wrote (#185) | M (with #184) | It claims the numbers its peers wrote, so every reconciliation scans its whole WAL for ranges nobody wrote: 14 catch-ups in 30 s that sent nothing, 140 ranges counted unfillable |
+| **P1** | A mesh node of 4 000 symbols neither stalls a write for half a second nor refuses writes at the pipelined ceiling (#186) | M | Measured on master and the branch alike and not yet explained: the largest round trip of a run 169–623 ms in six runs of twelve, and writes refused when the pending queue did not free room in 5 s |
 | **P1** | A mesh snapshot carries any number of files, so a peer can join a node of 8 192 segments or more (#176) | M | A mesh snapshot names a file by a 16-bit index, so a node of 8 192 segments - 8 192 instruments, whatever part 2b merges - cannot bootstrap a peer that joins it; found reading the sender, not yet measured |
 | **P2** | A start finds its last checkpoint without reading the whole WAL twice (#174) | S–M | Since part 2b of #165 the index is 1.9 - 2.9 s of a cold start after a twenty-minute soak, 5.9 - 6.8 s, and the WAL most of the rest - and a start reads it twice even when the checkpoint covers every record |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
