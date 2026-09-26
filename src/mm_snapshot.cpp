@@ -952,6 +952,16 @@ void MultiMasterManager::abort_bootstrap(const char* reason) {
 }
 
 void MultiMasterManager::on_peer_disconnected(PeerConnection& peer) {
+    // A catch-up belongs to the connection: the next one compares vectors again and starts its own
+    // from the first record (#178).
+    if (peer.catchup.active) {
+        OB_LOG_DEBUG("mm", "Catch-up to peer %u ends with its connection, after %llu round(s) and "
+                           "%llu record(s) sent", peer.node_id,
+                     static_cast<unsigned long long>(peer.catchup.rounds),
+                     static_cast<unsigned long long>(peer.catchup.sent));
+    }
+    peer.catchup = CatchupState{};
+
     // A snapshot being created for this connection is now pointless, but it is not stoppable: the
     // producer is a flush and a checksum pass, and abandoning either half-way is worse than
     // finishing work whose result gets thrown away. So the request is marked dead and

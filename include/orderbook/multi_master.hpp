@@ -208,7 +208,10 @@ struct MultiMasterConfig {
     uint16_t    replication_port{0};              // --mm-replication-port
     bool        enabled{false};                   // --multi-master
     bool        compress{false};                  // --replication-compress
-    size_t      max_catchup_bytes{512ULL << 20};  // --mm-max-catchup-bytes (512MB)
+    /// --mm-max-catchup-bytes: how much of this node's WAL one catch-up round reads before the io
+    /// loop handles its other events (#178). It was the whole of a catch-up, with a snapshot said
+    /// to take over past it that nothing ever sent to a node holding data.
+    size_t      max_catchup_bytes{8ULL << 20};
     uint32_t    anti_entropy_interval_sec{30};    // --anti-entropy-interval-seconds
     /// Queued output one peer may hold before the connection is dropped
     /// (--mm-max-peer-send-buffer). Same ceiling a client session gets since #59.
@@ -235,6 +238,40 @@ struct MultiMasterConfig {
     // Null = plaintext. Both are set or neither is; `load_tls_or_exit()` refuses the halves.
     std::shared_ptr<TlsContext> tls_server;
     std::shared_ptr<TlsContext> tls_client;
+};
+
+// ── Catch-up state (#178) ─────────────────────────────────────────────────────
+
+/// One (symbol, origin) range a peer lacks when its catch-up starts, and whether the first number
+/// it lacks has gone out since - or reached it some other way. One that has not by the end begins
+/// before this node's retained WAL, which no catch-up can send.
+struct CatchupLack {
+    std::string key;            ///< "SYMBOL.EXCHANGE"
+    uint16_t    origin{0};
+    uint64_t    first_missing{0};
+    bool        filled{false};
+};
+
+/// A catch-up of one connection: rounds, each reading on from where the last one stopped.
+///
+/// It used to be one call that read the whole retained WAL on the io loop, under the manager's
+/// lock, and stopped *sending* after `max_catchup_bytes` - counting records the peer already had -
+/// so every later catch-up stopped at the same place and the peer never got the rest (#178).
+struct CatchupState {
+    bool        active{false};
+    uint64_t    conn_id{0};             ///< the connection it is for (#128)
+    WalPosition next{};                 ///< where the next record to read starts, in our WAL
+    bool        wants_everything{false};
+    uint64_t    started_ms{0};
+    uint64_t    rounds{0};
+    uint64_t    read_records{0};
+    uint64_t    read_bytes{0};
+    uint64_t    sent{0};
+    uint64_t    skipped_have{0};
+    uint64_t    skipped_type{0};
+    std::vector<CatchupLack> lacks;
+    /// Index into `lacks` by "key" + '\x1f' + origin, so a record finds its range in one lookup.
+    std::unordered_map<std::string, size_t> lack_index;
 };
 
 // ── Peer connection state ─────────────────────────────────────────────────────
@@ -318,9 +355,12 @@ struct PeerConnection {
     ReconnectBackoff backoff;
     std::chrono::steady_clock::time_point next_reconnect_time{};
 
-    // Catch-up state
-    bool catching_up{false};
-    bool needs_snapshot{false};
+    /// The catch-up of this connection, if one is under way (#178). Reset with the connection.
+    CatchupState catchup;
+    /// Open while this peer lacks ranges that begin before our retained WAL: reconciliation finds
+    /// them again every interval, so they are one episode, not a warning an interval. Touched only
+    /// by the io loop.
+    LogEpisode unfillable_ranges;
 };
 
 // ── Snapshot transfer state ───────────────────────────────────────────────────
@@ -875,14 +915,36 @@ private:
     /// Reconnect thread loop: periodically attempts to reconnect disconnected peers.
     void reconnect_loop();
 
-    // Catch-up streaming (task 8.1)
-    /// Start streaming WAL records from peer's confirmed position to current.
+    // Catch-up (#178)
+    /// Start a catch-up of this connection from the first record of our retained WAL, unless one
+    /// is already under way for it - a vector arriving mid-way changes what a round sends, not
+    /// where it reads. Caller holds `mtx_`. Nothing is read here: the rounds do that.
     void start_catchup_to_peer(PeerConnection& peer);
 
-    // Backpressure (task 11.1)
-    /// Check if peer's send_buf exceeds max_catchup_bytes threshold.
-    /// If so: clear send_buf, set needs_snapshot = true, set catching_up = false.
-    void check_backpressure(PeerConnection& peer);
+    /// Run a round of every catch-up whose peer has room below the low watermark: read up to
+    /// `max_catchup_bytes` of WAL from its position **without** `mtx_`, then, under it, send the
+    /// records the peer lacks until its buffer reaches the watermark. Called by the io loop between
+    /// its passes; true while a catch-up could run another round now, so the loop does not wait.
+    bool run_catchup_rounds();
+
+    /// Close a catch-up that read to the end of the WAL: the summary line, and the ranges the peer
+    /// lacks that begin before the retained WAL. Caller holds `mtx_`.
+    void finish_catchup(PeerConnection& peer);
+
+    /// A round's reading, done off the lock: the records from one position on, each rebuilt as the
+    /// frame it would go out as. Touched only by the io loop.
+    struct CatchupRead {
+        uint8_t     record_type{0};
+        uint64_t    sequence_number{0};
+        uint16_t    origin{0};
+        std::string key;                  ///< "SYMBOL.EXCHANGE" of a DELTA; empty otherwise
+        size_t      frame_offset{0};      ///< into catchup_frames_
+        size_t      frame_len{0};         ///< 0 when it is not a record to send
+        WalPosition end{};                ///< where the record after it starts
+    };
+    std::vector<CatchupRead>        catchup_reads_;
+    std::vector<uint8_t>            catchup_frames_;
+    std::unique_ptr<WALRecordCursor> catchup_cursor_;
 };
 
 } // namespace ob

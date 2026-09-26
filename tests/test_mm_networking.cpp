@@ -380,53 +380,11 @@ RC_GTEST_PROP(StreamFrameParsingArbitrarySplits,
 }
 
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Property 8: Backpressure threshold enforcement
-// **Validates: Requirements 7.1**
-//
-// For any PeerConnection with send_buf of size exceeding max_catchup_bytes,
-// after applying the backpressure logic (check_backpressure), send_buf SHALL
-// be empty (cleared), peer.needs_snapshot SHALL be true, and peer.catching_up
-// SHALL be false.
-//
-// Test approach: Since check_backpressure is a private method on
-// MultiMasterManager, we test the PROPERTY (invariant) directly on
-// PeerConnection state — generate a threshold T, fill send_buf with > T bytes,
-// apply the backpressure logic inline, and verify the postconditions.
-// ═══════════════════════════════════════════════════════════════════════════════
-
-RC_GTEST_PROP(BackpressureThresholdEnforcement,
-              prop_send_buf_exceeding_threshold_triggers_snapshot, ()) {
-    // Generate random max_catchup_bytes threshold T ∈ [1, 10000].
-    const auto threshold = *rc::gen::inRange<size_t>(1, 10001);
-
-    // Generate random send_buf size S > T (i.e., S ∈ [T+1, T+10000]).
-    const auto buf_size = *rc::gen::inRange<size_t>(threshold + 1, threshold + 10001);
-
-    // Create a PeerConnection and fill send_buf with buf_size random bytes.
-    ob::PeerConnection peer;
-    peer.node_id = *rc::gen::inRange<uint16_t>(1, 100);
-    peer.catching_up = true;       // Typically true during catch-up streaming.
-    peer.needs_snapshot = false;   // Not yet triggered.
-    peer.send_buf = *rc::gen::container<std::vector<uint8_t>>(
-        buf_size, rc::gen::arbitrary<uint8_t>());
-
-    // Precondition: send_buf.size() > threshold.
-    RC_PRE(peer.send_buf.size() > threshold);
-
-    // Apply backpressure logic inline (mirrors check_backpressure behavior):
-    // if send_buf.size() > threshold → clear send_buf, set needs_snapshot, clear catching_up.
-    if (peer.send_buf.size() > threshold) {
-        peer.send_buf.clear();
-        peer.needs_snapshot = true;
-        peer.catching_up = false;
-    }
-
-    // Postconditions: the backpressure invariant.
-    RC_ASSERT(peer.send_buf.empty());
-    RC_ASSERT(peer.needs_snapshot == true);
-    RC_ASSERT(peer.catching_up == false);
-}
+// Property 8, backpressure threshold enforcement, is gone with what it described (#178). It
+// restated `check_backpressure()` inline - clear the buffer, mark the peer for a snapshot - and
+// asserted the restatement, so it could not fail; and the behaviour it pinned was the defect: a
+// catch-up that gave up past a byte count, for a snapshot nothing sent. A catch-up is paced by the
+// peer's send buffer now, which `tests/test_mm_catchup_rounds.cpp` drives through the real manager.
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Property 6: Catch-up ordering invariant

@@ -1,11 +1,14 @@
-"""A mesh node that missed more than a catch-up may scan gets back what it missed.
+"""A mesh node that missed more than a catch-up round reads gets back what it missed (#178).
 
-`--mm-max-catchup-bytes` bounds how much of its retained WAL a node reads to catch one peer up,
-because the scan runs on the io loop that carries live traffic. `docs/cli.md` says a snapshot is
-used past it. This module measures what a peer that missed more than that gets: a node is killed,
-its peers write more than the ceiling, and it comes back - with data of its own, so it may not wipe
-itself for a snapshot, which is the case the ceiling has to answer.
+`--mm-max-catchup-bytes` bounds how much of its WAL a node reads for one peer at a time, because
+the reading shares the io loop with live traffic. It used to bound the whole catch-up: past it the
+catch-up stopped sending, said it was "falling back to snapshot sync", and nothing ever sent a
+snapshot to a node that holds data - nor may anything, since installing one discards what is
+there. The next catch-up read from the first record again and stopped at the same place. Measured
+before the fix with the ceiling at 1 MiB: the returning node stopped at 6 990 of 20 100 rows, and
+every catch-up after the first read the whole WAL and sent nothing.
 
+A node is killed, its peers write more than the ceiling, and it comes back with data of its own.
 Its own mesh, because the ceiling is set for every node and one node is killed.
 """
 from __future__ import annotations
@@ -70,9 +73,6 @@ def ceiling_mesh():
     cm.shutdown()
 
 
-@pytest.mark.xfail(strict=True, raises=NotCaughtUp,
-                   reason="#178: a catch-up past --mm-max-catchup-bytes gives up, and the snapshot it "
-                          "says it falls back to is never sent to a node that holds data")
 def test_a_node_that_missed_more_than_the_ceiling_gets_it_all_back(ceiling_mesh):
     cm = ceiling_mesh
     writer, returning = cm.nodes[0], cm.nodes[2]
@@ -116,3 +116,10 @@ def test_a_node_that_missed_more_than_the_ceiling_gets_it_all_back(ceiling_mesh)
             f"the returning node stopped at {sum(got.values())} of "
             f"{sum(expected.values())} rows ({got}); what each node said about catching up, "
             f"first and last three lines:\n" + "\n".join(said))
+
+    # What it took, from the peers' own summary lines: a catch-up of more than the ceiling is
+    # several rounds of it now, not one that stops.
+    for n in cm.nodes[:2]:
+        for line in node_log_since(n, offsets.get(n.index, 0)).splitlines():
+            if "Catch-up to peer 3 finished" in line:
+                print(f"node {n.index}: {line[line.find('Catch-up'):][:200]}")

@@ -705,6 +705,9 @@ std::string MultiMasterManager::handle_mm_conflicts_command(size_t limit) const 
 void MultiMasterManager::io_loop() {
     OB_LOG_DEBUG("mm", "io_loop started");
 
+    // How long the next wait may be: 500 ms when nothing is owed, none while a catch-up could run
+    // another round at once (#178) - the loop handles what arrived and comes straight back.
+    int wait_ms = 500;
     while (running_.load(std::memory_order_acquire)) {
         if (epoll_fd_ < 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -712,7 +715,7 @@ void MultiMasterManager::io_loop() {
         }
 
         struct epoll_event events[64];
-        int nfds = ::epoll_wait(epoll_fd_, events, 64, 500 /*ms timeout*/);
+        int nfds = ::epoll_wait(epoll_fd_, events, 64, wait_ms);
         if (nfds < 0) {
             if (errno == EINTR) continue;
             break;
@@ -837,7 +840,7 @@ void MultiMasterManager::io_loop() {
                     if (!peer_ptr) {
                         // The connection this event is about is gone, which is routine: `epoll_wait()`
                         // harvests before this loop takes `mtx_`, and `handle_topology_change()`,
-                        // `check_backpressure()` and the reconnect loop all close peer sockets under
+                        // the send-buffer ceiling and the reconnect loop all close peer sockets under
                         // that lock. Closing the socket removed its registration, so there is nothing
                         // left to do and nothing to disarm.
                         //
@@ -1031,6 +1034,20 @@ void MultiMasterManager::io_loop() {
         {
             std::lock_guard<std::mutex> lock(mtx_);
             start_overdue_catchups();
+        }
+
+        // Between passes rather than inside an event's handling: a round reads the WAL without
+        // `mtx_`, which every local write takes (#178). Its own boundary, for the reason each
+        // event has one - this thread staying alive is the point (#112).
+        try {
+            wait_ms = run_catchup_rounds() ? 0 : 500;
+        } catch (const std::exception& e) {
+            engine_.registry().increment_counter("ob_mm_io_errors_total");
+            wait_ms = 500;
+            if (io_errors_.begin()) {
+                OB_LOG_ERROR("mm", "a catch-up round threw and is abandoned; the io loop "
+                                   "continues: %s", e.what());
+            }
         }
     }
 
@@ -1326,8 +1343,9 @@ void MultiMasterManager::enqueue_frame(PeerConnection& peer,
 
     // And refuse to hold an unbounded backlog for a peer that is not reading. Before this check
     // existed, one unreachable peer grew the writer at about 113 MB/s at the rate this engine
-    // advertises, with nothing to stop it: check_backpressure() only ever ran inside the catch-up
-    // loop.
+    // advertises, with nothing to stop it: the check that existed ran only inside the catch-up
+    // loop. That check is gone since #178 - a catch-up is paced by this buffer now - and this is
+    // the one ceiling.
     drop_peer_if_send_buf_too_large(peer);
 }
 
@@ -1354,8 +1372,7 @@ bool MultiMasterManager::drop_peer_if_send_buf_too_large(PeerConnection& peer) {
     peer.peer_proved = false;
     peer.auth_nonce.clear();
     peer.we_accepted = false;
-    peer.catching_up    = false;
-    peer.needs_snapshot = true;
+    peer.catchup        = CatchupState{};
     peer.send_buf.clear();          // safe now: nobody is reading this socket any more
     peer.recv_buf.clear();
     on_peer_disconnected(peer);
@@ -1406,8 +1423,7 @@ bool MultiMasterManager::drop_peer_if_clock_is_implausible(PeerConnection& peer,
     peer.peer_proved    = false;
     peer.auth_nonce.clear();
     peer.we_accepted    = false;
-    peer.catching_up    = false;
-    peer.needs_snapshot = true;
+    peer.catchup        = CatchupState{};
     // Both buffers go, for the reason the slow-peer drop gives: after a partial write the send
     // buffer can start mid-frame, and this socket is closed, so nobody is reading either one.
     peer.send_buf.clear();
@@ -2190,7 +2206,7 @@ void MultiMasterManager::start_overdue_catchups() {
     const uint64_t now = now_ms();
     for (auto& [node_id, peer] : peers_) {
         if (!peer.connected || !peer.handshake_done) continue;
-        if (peer.catchup_started || peer.catching_up) continue;
+        if (peer.catchup_started || peer.catchup.active) continue;
         if (peer.vector_deadline_ms == 0 || now < peer.vector_deadline_ms) continue;
 
         OB_LOG_WARN("mm",
@@ -2330,149 +2346,279 @@ void MultiMasterManager::reconnect_loop() {
     OB_LOG_DEBUG("mm", "reconnect_loop exited");
 }
 
-// ── Catch-up streaming (task 8.1) ─────────────────────────────────────────────
+// ── Catch-up (#178) ───────────────────────────────────────────────────────────
+
+namespace {
+
+/// The key a record looks its lack up by: "SYMBOL.EXCHANGE", a unit separator, the origin.
+std::string lack_key(const std::string& key, uint16_t origin) {
+    std::string k = key;
+    k.push_back('\x1f');
+    k += std::to_string(origin);
+    return k;
+}
+
+}  // namespace
 
 void MultiMasterManager::start_catchup_to_peer(PeerConnection& peer) {
-    peer.catching_up    = true;
     peer.catchup_started = true;
-    peer.needs_snapshot = false;
+    if (peer.catchup.active && peer.catchup.conn_id == peer.conn_id) {
+        // Reconciliation sends a vector every interval, and starting again from the first record
+        // on each would be the loop #178 was. The rounds read the peer's newest vector anyway.
+        OB_LOG_DEBUG("mm", "Catch-up to peer %u is under way at file %u offset %u; the vector that "
+                           "arrived is what its next round filters by",
+                     peer.node_id, peer.catchup.next.file_index, peer.catchup.next.offset);
+        return;
+    }
+
+    CatchupState st;
+    st.active           = true;
+    st.conn_id          = peer.conn_id;
+    st.next             = WalPosition{0, 0};
+    st.wants_everything = peer.peer_vector.wants_everything();
+    st.started_ms       = now_ms();
+    // What the peer lacks as it starts, so the end can say which of it this WAL could not send.
+    // Nothing to say about a peer that said nothing about itself.
+    if (!st.wants_everything) {
+        bool truncated = false;
+        const auto ours = engine_.export_version_vector(MM_MAX_VV_ENTRIES, truncated);
+        const VectorDiff diff = compare_vectors(ours, peer.peer_vector, peer.node_id);
+        st.lacks.reserve(diff.peer_lacks.size());
+        for (const auto& gap : diff.peer_lacks) {
+            st.lack_index.emplace(lack_key(gap.key, gap.origin), st.lacks.size());
+            st.lacks.push_back(CatchupLack{gap.key, gap.origin, gap.from_seq, false});
+        }
+    }
 
     const PeerVector& pv = peer.peer_vector;
     OB_LOG_INFO("mm",
-                "Starting catch-up to peer %u: vector entries=%zu received=%d truncated=%d",
-                peer.node_id, pv.entry_count(), pv.received() ? 1 : 0,
-                pv.truncated() ? 1 : 0);
+                "Starting catch-up to peer %u (connection %llu): vector entries=%zu received=%d "
+                "truncated=%d, %zu (symbol, origin) range(s) it lacks; reading this node's WAL "
+                "from its first record, %zu bytes a round",
+                peer.node_id, static_cast<unsigned long long>(peer.conn_id), pv.entry_count(),
+                pv.received() ? 1 : 0, pv.truncated() ? 1 : 0, st.lacks.size(),
+                config_.max_catchup_bytes);
+    peer.catchup = std::move(st);
+}
 
-    // Read the whole retained WAL through the same parser everything else uses, and decide
-    // per record. Two things this deliberately does not do:
-    //
-    //   - it does not seek to a byte offset derived from the peer's position. That was #61:
-    //     the offsets belong to different logs, and a seek into the middle of a record reads
-    //     a header out of payload bytes.
-    //   - it does not restrict itself to records this node originated. If the peer is missing
-    //     records from a third origin that is currently unreachable, we have them and it does
-    //     not, so we send them. That is what makes this a version vector rather than a
-    //     per-link cursor.
-    uint64_t scanned = 0, sent = 0, skipped_have = 0, skipped_type = 0;
-    size_t bytes_sent = 0, bytes_scanned = 0;
-
-    WALReplayer replayer(wal_.dir());
-    replayer.replay_v2([&](const WALReplayContext& ctx) {
-        ++scanned;
-        bytes_scanned += MM_WALRECORD_V2_SIZE + ctx.payload_len;
-
-        if (peer.needs_snapshot) return;                       // backpressure already gave up
-
-        // This scan runs on the io_loop thread, which also carries live traffic to every other
-        // peer. Measured on machine B: 94 MB/s, so a 1 GB WAL would stall the loop for about
-        // ten seconds. A catch-up that has to read more than the send-buffer ceiling is a
-        // snapshot, not a catch-up.
-        if (bytes_scanned > config_.max_catchup_bytes) {
-            OB_LOG_WARN("mm",
-                        "Catch-up scan for peer %u exceeded %zu bytes — falling back to "
-                        "snapshot sync instead of holding the io_loop",
-                        peer.node_id, config_.max_catchup_bytes);
-            peer.needs_snapshot = true;
-            peer.send_buf.clear();
-            return;
+bool MultiMasterManager::run_catchup_rounds() {
+    struct Job {
+        uint16_t    node_id;
+        uint64_t    conn_id;
+        WalPosition from;
+        size_t      room;       // below the low watermark, when the round was picked
+    };
+    std::vector<Job> jobs;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        for (auto& [node_id, peer] : peers_) {
+            if (!peer.catchup.active) continue;
+            if (!peer.connected || peer.catchup.conn_id != peer.conn_id) {
+                // Left behind by a connection that is gone: the next one starts its own.
+                peer.catchup = CatchupState{};
+                continue;
+            }
+            if (peer.send_buf.size() >= config_.snapshot_low_watermark_bytes) continue;
+            jobs.push_back(Job{node_id, peer.conn_id, peer.catchup.next,
+                               config_.snapshot_low_watermark_bytes - peer.send_buf.size()});
         }
-        if (ctx.header.record_type != WAL_RECORD_DELTA) {       // GAP, EPOCH, CHECKPOINT, vector
-            ++skipped_type;
-            return;
+    }
+    if (jobs.empty()) return false;
+    if (!catchup_cursor_) catchup_cursor_ = std::make_unique<WALRecordCursor>(std::string(wal_.dir()));
+
+    bool more = false;
+    for (const Job& job : jobs) {
+        // ── The reading, without the lock ─────────────────────────────────────────────────────
+        // The retained WAL from the first record, a round's worth at a time, decided per record
+        // below. Two things this deliberately does not do:
+        //
+        //   - it does not seek to a byte offset derived from the peer's position. That was #61:
+        //     the offsets belong to different logs, and a seek into the middle of a record reads a
+        //     header out of payload bytes. The position here is in this node's own WAL.
+        //   - it does not restrict itself to records this node originated. If the peer is missing
+        //     records from a third origin that is currently unreachable, we have them and it does
+        //     not, so we send them. That is what makes this a version vector rather than a
+        //     per-link cursor.
+        //
+        // Off the lock because the lock is what `broadcast_local()` - every local write - takes:
+        // the whole scan used to hold it.
+        catchup_reads_.clear();
+        catchup_frames_.clear();
+        const uint32_t passed = catchup_cursor_->seek(job.from);
+        size_t read_bytes = 0;
+        bool   at_end     = false;
+        WALReplayContext ctx;
+        // At least one record a round whatever the budget, or a budget of zero would be a loop that
+        // never moves; and no more frames than the peer has room for, or the rest is read again.
+        while ((read_bytes < config_.max_catchup_bytes && catchup_frames_.size() < job.room) ||
+               catchup_reads_.empty()) {
+            if (catchup_cursor_->next(ctx) != WALRecordCursor::Step::Record) {
+                at_end = true;
+                break;
+            }
+            const size_t header = ctx.header._pad == 1 ? sizeof(WALRecordV2) : sizeof(WALRecord);
+            read_bytes += header + ctx.payload_len;
+            CatchupRead r;
+            r.record_type     = ctx.header.record_type;
+            r.sequence_number = ctx.header.sequence_number;
+            r.origin          = ctx.origin_node_id;
+            r.end             = catchup_cursor_->position();
+            if (ctx.header.record_type == WAL_RECORD_DELTA && ctx.payload_len >= sizeof(DeltaUpdate)) {
+                DeltaUpdate delta{};
+                std::memcpy(&delta, ctx.payload, sizeof(DeltaUpdate));
+                r.key = std::string(delta.symbol) + "." + delta.exchange;
+                // The V2 header rebuilt for the wire: the WAL can hold legacy headers, without the
+                // origin and HLC the envelope carries.
+                WALRecordV2 hdr{};
+                hdr.sequence_number = ctx.header.sequence_number;
+                hdr.timestamp_ns    = ctx.header.timestamp_ns;
+                hdr.checksum        = ctx.header.checksum;
+                hdr.payload_len     = static_cast<uint16_t>(ctx.payload_len);
+                hdr.record_type     = WAL_RECORD_DELTA;
+                hdr.version         = 1;
+                hdr.origin_node_id  = ctx.origin_node_id;
+                ctx.hlc.serialize(hdr.hlc_data);
+                r.frame_offset = catchup_frames_.size();
+                r.frame_len    = MM_WALRECORD_V2_SIZE + ctx.payload_len;
+                const auto* hb = reinterpret_cast<const uint8_t*>(&hdr);
+                catchup_frames_.insert(catchup_frames_.end(), hb, hb + MM_WALRECORD_V2_SIZE);
+                catchup_frames_.insert(catchup_frames_.end(), ctx.payload,
+                                       ctx.payload + ctx.payload_len);
+            }
+            catchup_reads_.push_back(std::move(r));
         }
-        if (ctx.payload_len < sizeof(DeltaUpdate)) {
-            ++skipped_type;
-            return;
+
+        // ── The sending, under the lock ───────────────────────────────────────────────────────
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto it = peers_.find(job.node_id);
+        if (it == peers_.end()) continue;
+        PeerConnection& peer = it->second;
+        CatchupState&   st   = peer.catchup;
+        if (!peer.connected || !st.active || peer.conn_id != job.conn_id ||
+            st.conn_id != job.conn_id || st.next.file_index != job.from.file_index ||
+            st.next.offset != job.from.offset) {
+            OB_LOG_DEBUG("mm", "Catch-up round for peer %u set aside: the connection or its "
+                               "catch-up changed while the round read", job.node_id);
+            continue;
         }
-
-        DeltaUpdate delta{};
-        std::memcpy(&delta, ctx.payload, sizeof(DeltaUpdate));
-        const std::string key = std::string(delta.symbol) + "." + delta.exchange;
-
-        // 0 for anything the peer never mentioned, which reads as "it holds nothing here".
-        const uint64_t peer_frontier = pv.wants_everything()
-                                       ? 0
-                                       : pv.frontier_for(key, ctx.origin_node_id);
-        if (ctx.header.sequence_number <= peer_frontier) {
-            ++skipped_have;
-            return;
+        if (passed > 0) {
+            OB_LOG_WARN("mm", "Catch-up to peer %u: %u WAL file(s) from %u are gone (retention); "
+                              "continuing at file %u",
+                        peer.node_id, passed, job.from.file_index,
+                        catchup_cursor_->position().file_index);
         }
+        ++st.rounds;
+        st.read_bytes += read_bytes;
+        const PeerVector& pv = peer.peer_vector;
+        const bool everything = st.wants_everything || pv.wants_everything();
+        uint64_t sent_now = 0;
+        size_t   done     = 0;
+        for (; done < catchup_reads_.size(); ++done) {
+            // The same watermark that paces a snapshot: the rest waits for the socket to drain,
+            // so live deltas queued meanwhile go out promptly and the buffer never nears the size
+            // that drops the peer.
+            if (peer.send_buf.size() >= config_.snapshot_low_watermark_bytes) break;
+            const CatchupRead& r = catchup_reads_[done];
+            ++st.read_records;
+            st.next = r.end;
+            if (r.frame_len == 0) {                  // GAP, EPOCH, CHECKPOINT, a vector
+                ++st.skipped_type;
+                continue;
+            }
+            // 0 for anything the peer never mentioned, which reads as "it holds nothing here".
+            const uint64_t frontier = everything ? 0 : pv.frontier_for(r.key, r.origin);
+            if (r.sequence_number <= frontier) {
+                ++st.skipped_have;
+                continue;
+            }
+            enqueue_frame(peer, catchup_frames_.data() + r.frame_offset, r.frame_len);
+            ++st.sent;
+            ++sent_now;
+            if (!st.lack_index.empty()) {
+                const auto lack = st.lack_index.find(lack_key(r.key, r.origin));
+                if (lack != st.lack_index.end() &&
+                    r.sequence_number == st.lacks[lack->second].first_missing) {
+                    st.lacks[lack->second].filled = true;
+                }
+            }
+            OB_LOG_DEBUG("mm", "Catch-up: sent %s origin=%u seq=%llu (peer had %llu) to peer %u",
+                         r.key.c_str(), r.origin, static_cast<unsigned long long>(r.sequence_number),
+                         static_cast<unsigned long long>(frontier), peer.node_id);
+            // enqueue_frame() drops a peer that stopped draining (#69); a closed socket is not
+            // written to again, and its catch-up goes with it.
+            if (!peer.connected) break;
+        }
+        if (sent_now > 0) {
+            engine_.registry().increment_counter("ob_mm_catchup_records_sent_total", sent_now);
+        }
+        engine_.registry().increment_counter("ob_mm_catchup_rounds_total");
+        OB_LOG_DEBUG("mm", "Catch-up to peer %u, round %llu: read %zu record(s) (%zu bytes), used "
+                           "%zu, sent %llu; next at file %u offset %u, send_buf=%zu",
+                     peer.node_id, static_cast<unsigned long long>(st.rounds),
+                     catchup_reads_.size(), read_bytes, done,
+                     static_cast<unsigned long long>(sent_now), st.next.file_index, st.next.offset,
+                     peer.send_buf.size());
+        if (!peer.connected) {
+            st = CatchupState{};
+            continue;
+        }
+        if (at_end && done == catchup_reads_.size()) {
+            finish_catchup(peer);
+            continue;
+        }
+        if (peer.send_buf.size() < config_.snapshot_low_watermark_bytes) more = true;
+    }
+    return more;
+}
 
-        // Rebuild the V2 header for the wire: the replay context carries the legacy header
-        // plus the origin and HLC that the V2 envelope needs.
-        WALRecordV2 hdr{};
-        hdr.sequence_number = ctx.header.sequence_number;
-        hdr.timestamp_ns    = ctx.header.timestamp_ns;
-        hdr.checksum        = ctx.header.checksum;
-        hdr.payload_len     = static_cast<uint16_t>(ctx.payload_len);
-        hdr.record_type     = WAL_RECORD_DELTA;
-        hdr.version         = 1;
-        hdr.origin_node_id  = ctx.origin_node_id;
-        ctx.hlc.serialize(hdr.hlc_data);
-
-        std::vector<uint8_t> frame;
-        frame.reserve(MM_WALRECORD_V2_SIZE + ctx.payload_len);
-        const auto* hdr_bytes = reinterpret_cast<const uint8_t*>(&hdr);
-        frame.insert(frame.end(), hdr_bytes, hdr_bytes + MM_WALRECORD_V2_SIZE);
-        frame.insert(frame.end(), ctx.payload, ctx.payload + ctx.payload_len);
-
-        enqueue_frame(peer, frame.data(), frame.size());
-        ++sent;
-        bytes_sent += frame.size();
-
-        OB_LOG_DEBUG("mm",
-                     "Catch-up: sent %s origin=%u seq=%lu (peer had %lu) to peer %u",
-                     key.c_str(), ctx.origin_node_id,
-                     static_cast<unsigned long>(ctx.header.sequence_number),
-                     static_cast<unsigned long>(peer_frontier), peer.node_id);
-
-        check_backpressure(peer);
-    });
+void MultiMasterManager::finish_catchup(PeerConnection& peer) {
+    CatchupState& st = peer.catchup;
+    const PeerVector& pv = peer.peer_vector;
+    size_t unfillable = 0;
+    const CatchupLack* example = nullptr;
+    if (!st.wants_everything && !pv.wants_everything()) {
+        for (const CatchupLack& lack : st.lacks) {
+            // Sent here, or the peer has it by now from someone else.
+            if (lack.filled || pv.frontier_for(lack.key, lack.origin) >= lack.first_missing) continue;
+            ++unfillable;
+            if (example == nullptr) example = &lack;
+        }
+    }
 
     // These numbers are the whole point of the log line: a catch-up that sends nothing looks
     // identical to one that had nothing to send, and #61 lived in exactly that ambiguity.
     OB_LOG_INFO("mm",
-                "Catch-up to peer %u finished: scanned=%llu (%zu bytes) sent=%llu "
-                "skipped_peer_has=%llu skipped_type=%llu bytes_sent=%zu snapshot_needed=%d",
-                peer.node_id,
-                static_cast<unsigned long long>(scanned), bytes_scanned,
-                static_cast<unsigned long long>(sent),
-                static_cast<unsigned long long>(skipped_have),
-                static_cast<unsigned long long>(skipped_type),
-                bytes_sent, peer.needs_snapshot ? 1 : 0);
+                "Catch-up to peer %u finished in %llu round(s), %.1f s: read=%llu record(s) "
+                "(%llu bytes) sent=%llu skipped_peer_has=%llu skipped_type=%llu",
+                peer.node_id, static_cast<unsigned long long>(st.rounds),
+                static_cast<double>(now_ms() - st.started_ms) / 1000.0,
+                static_cast<unsigned long long>(st.read_records),
+                static_cast<unsigned long long>(st.read_bytes),
+                static_cast<unsigned long long>(st.sent),
+                static_cast<unsigned long long>(st.skipped_have),
+                static_cast<unsigned long long>(st.skipped_type));
 
-    peer.catching_up = false;
-}
-
-// ── Backpressure check (task 11.1) ────────────────────────────────────────────
-
-void MultiMasterManager::check_backpressure(PeerConnection& peer) {
-    if (peer.send_buf.size() > config_.max_catchup_bytes) {
-        OB_LOG_WARN("mm",
-                    "Backpressure: peer %u send_buf=%zu > max_catchup_bytes=%zu — dropping the "
-                    "connection instead of abandoning a partial frame",
-                    peer.node_id, peer.send_buf.size(), config_.max_catchup_bytes);
-        engine_.registry().increment_counter("ob_mm_backpressure_snapshot_total");
-
-        // This used to clear the buffer and keep the socket. After a partial write the buffer can
-        // begin mid-frame, so that left the peer waiting for the rest of a frame nobody would send
-        // and reading the next frames as its tail. Closing the connection is the only answer that
-        // does not lie about the state of the stream.
-        if (peer.fd >= 0) {
-            release_tls(peer);
-            ::close(peer.fd);
-            peer.fd = -1;
+    if (unfillable > 0) {
+        engine_.registry().increment_counter("ob_mm_catchup_unfillable_total", unfillable);
+        // The same ranges come back at every reconciliation, so once an episode and not once an
+        // interval. Nothing here can send them: a node with data takes no snapshot (#57).
+        if (peer.unfillable_ranges.begin()) {
+            OB_LOG_WARN("mm",
+                        "Catch-up to peer %u: %zu (symbol, origin) range(s) it lacks begin before "
+                        "this node's retained WAL - e.g. %s origin %u from %llu - and no catch-up "
+                        "from here can send them",
+                        peer.node_id, unfillable, example->key.c_str(), example->origin,
+                        static_cast<unsigned long long>(example->first_missing));
+        } else {
+            OB_LOG_DEBUG("mm", "Catch-up to peer %u: still %zu range(s) older than this WAL",
+                         peer.node_id, unfillable);
         }
-        peer.connected      = false;
-        peer.handshake_done = false;
-        peer.peer_proved = false;
-        peer.auth_nonce.clear();
-        peer.we_accepted = false;
-        peer.send_buf.clear();
-        peer.recv_buf.clear();
-        peer.needs_snapshot = true;
-        peer.catching_up    = false;
+    } else if (const uint64_t held = peer.unfillable_ranges.end()) {
+        OB_LOG_INFO("mm", "Catch-up to peer %u: every range it lacks is in this node's WAL again, "
+                          "after %llu catch-up(s) that could not send some",
+                    peer.node_id, static_cast<unsigned long long>(held));
     }
+    st = CatchupState{};
 }
 
 void MultiMasterManager::handle_catchup_request(PeerConnection& peer,

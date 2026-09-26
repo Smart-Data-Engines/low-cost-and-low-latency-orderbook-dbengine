@@ -290,8 +290,14 @@ MetricsRegistry::MetricsRegistry() {
                                      "Peers dropped for not draining their queued output"));
     gauges_.push_back(make_gauge("ob_mm_reconcile_we_lack",
                                  "Of those, the pairs where this node is the one behind"));
-    counters_.push_back(make_counter("ob_mm_backpressure_snapshot_total",
-                                     "Times a peer fell back to snapshot sync under backpressure"));
+    // Catch-up in rounds (#178). What was here - "times a peer fell back to snapshot sync under
+    // backpressure" - counted connections dropped by a check that no snapshot ever followed.
+    counters_.push_back(make_counter("ob_mm_catchup_rounds_total",
+                                     "Catch-up rounds run: each reads a bounded part of this node's WAL for one peer"));
+    counters_.push_back(make_counter("ob_mm_catchup_records_sent_total",
+                                     "Records catch-up sent to peers that lacked them"));
+    counters_.push_back(make_counter("ob_mm_catchup_unfillable_total",
+                                     "(symbol, origin) ranges a peer lacked that begin before this node's retained WAL, per catch-up"));
     // Snapshot bootstrap over the multi-master protocol (#76).
     counters_.push_back(make_counter("ob_mm_snapshot_requested_total",
                                      "Snapshots this node asked a peer for"));
