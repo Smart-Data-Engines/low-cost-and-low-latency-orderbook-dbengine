@@ -2213,6 +2213,26 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 181. A mesh node applied a burst of frames in quadratic time: every frame was erased from the front of its receive buffer ✅ **P1**
+
+**Found measuring #178.** With the catch-up in rounds the sender of a 100 000-record catch-up
+finished in 0.1 s, and the node it caught up took **78 s** to apply what it had received - about
+2 000 records a second, in a build that writes millions of levels a second. `perf` on that node:
+**96% of its time in `memmove`**. `process_recv_buf()` handled a frame and then erased it from the
+front of the receive buffer, moving the rest of the buffer every time; the io loop reads everything
+the socket has before parsing, so one read of a catch-up was megabytes, and a read of *n* frames cost
+*n* moves of what was left - 16 MB of frames is about 750 GB moved. It was as true before #178, whose
+one scan sent the whole catch-up at once; it was hidden there behind the livelock of #178 itself.
+
+The loop walks an offset now and removes the bytes before it once. The same run: the returning node
+held every row **1.8 s** after its restart. `tests/test_mm_receive.cpp` holds the answer - every
+whole frame handled, the part of one that has not arrived kept - and a time a quadratic version
+cannot meet: 400 000 frames in one buffer, [RECEIVE TIME], where erasing each from the front is
+terabytes of moves.
+
+- Effort: S | Impact: a mesh node caught up after an outage, or bootstrapped, applied what it was sent
+  at a few thousand records a second
+
 ### 180. A mesh node's version vector is refreshed only when a store seals, so a peer that comes back within the seal interval is judged to hold what it missed **P1**
 
 **Found measuring #178, and measured with `tests/integration/test_mm_restart.py`.** The vector a node
@@ -11414,10 +11434,12 @@ measures the harness.
 **#179 is the open P0**, and **#169, #175, #176, #177 and #180 are open P1s** — the mechanical
 list is the `Open:` line below; read it there rather than trusting this paragraph, which is prose and
 has been wrong about this before. All four mesh items were found measuring the first of them, and so
-was **#178, which was a P0 and is closed**: a mesh node that missed more than
-`--mm-max-catchup-bytes` of its peers' WAL never got the rest - 6 990 of 20 100 rows, for good -
+were two that are closed: **#178 was a P0** - a mesh node that missed more than
+`--mm-max-catchup-bytes` of its peers' WAL never got the rest, 6 990 of 20 100 rows for good,
 because every catch-up started at the first record and stopped where the first had; a catch-up is
-rounds from a cursor now, read without the lock every local write takes. **#179**: a mesh node
+rounds from a cursor now, read without the lock every local write takes - and **#181**: a node
+applied a burst of frames in quadratic time, erasing each from the front of its receive buffer, 78 s
+for a catch-up its peer sent in 0.1 s; 1.8 s now. **#179**: a mesh node
 restarted before its version vector reached the WAL remembers the rows it replayed as its own, is
 sent them again and stores them twice - 200 rows where the writer holds 100. **#177**: a version
 vector past 1 561 entries asks for everything, so every reconciliation resends the whole retained WAL

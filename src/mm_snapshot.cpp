@@ -273,6 +273,11 @@ bool MultiMasterManager::try_drain_send_buf_for_test(PeerConnection& peer) {
     return try_drain_send_buf(peer);
 }
 
+void MultiMasterManager::process_recv_buf_for_test(PeerConnection& peer) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    process_recv_buf(peer);
+}
+
 PeerConnection& MultiMasterManager::install_peer_for_test(PeerConnection peer) {
     std::lock_guard<std::mutex> lock(mtx_);
     if (peer.conn_id == 0) peer.conn_id = next_conn_id_++;

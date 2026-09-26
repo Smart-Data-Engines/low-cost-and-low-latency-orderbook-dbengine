@@ -617,6 +617,9 @@ public:
     bool run_catchup_rounds_for_test() { return run_catchup_rounds(); }
     /// What the EPOLLOUT branch does first: write what the socket takes of the peer's buffer.
     bool try_drain_send_buf_for_test(PeerConnection& peer);
+    /// What the EPOLLIN branch does with what it read: handle every whole frame in the peer's
+    /// receive buffer and keep the rest (#181). Takes the lock, as the io loop holds it there.
+    void process_recv_buf_for_test(PeerConnection& peer);
 
     /// Enter the bootstrap state: this node holds no data yet and must not serve as though it did.
     ///

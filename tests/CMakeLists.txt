@@ -368,6 +368,11 @@ ob_add_engine_test(test_mm_catchup_rounds
     test_mm_catchup_rounds.cpp
 )
 
+# A mesh node's receive buffer, consumed by an offset rather than a frame at a time (#181).
+ob_add_engine_test(test_mm_receive
+    test_mm_receive.cpp
+)
+
 ob_add_engine_test(test_mm_stats
     test_mm_stats.cpp
 )
