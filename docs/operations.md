@@ -743,9 +743,10 @@ to them — and catch-up sends only from the WAL. It comes once an episode, howe
 reconciliations find the same ranges, and `ob_mm_catchup_unfillable_total` counts the ranges at
 every catch-up. Anti-entropy that could repair it is #57 and not built; a peer that holds nothing
 takes a snapshot when it joins, so wiping and re-joining one is the repair there is. One known way to
-produce this warning without a real gap: a node restarted before its version vector reached the WAL
-claims the records it replayed as its own origin's (#179), and the ranges it then says its peers lack
-are ranges nobody wrote.
+produce this warning without a real gap: a node restarted with segments of a symbol only its peers
+write declares its own frontier from the highest number in them, and the ranges it then says its
+peers lack are ranges nobody wrote (#185) - every reconciliation reads the whole retained WAL for
+them and counts them again. Until #179 the replay did the same for every record it replayed.
 
 **How far behind a replica is** is a different question with a different answer, in the section
 below.

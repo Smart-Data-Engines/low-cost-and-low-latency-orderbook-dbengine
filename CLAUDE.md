@@ -3651,6 +3651,66 @@ Learned the hard way. Check here before debugging.
      Open line lists, so a marker that outlives its item fails the job - and the plugin counts
      xfails as themselves.
 
+472. **A replayed record keeps the origin its header names.** Replay seeded this node's own origin
+     for every record of the WAL tail, so after a restart a record a peer had sent was unseen for
+     that peer: the peer sent it again and it was stored twice - 200 rows where the writer held 100
+     (#179). And the records replay reads and **skips as stored** are held too, so they are seeded
+     as well: since part 2a of #165 that is every store sealed after the oldest waiting row, and
+     nothing else knows their numbers when the vector is too large to write (#177). The replay line
+     counts them, `other_origins=N`.
+473. **Write down what a checkpoint cuts off before appending the checkpoint.** A restart replays
+     from the last checkpoint and learns everything before it from the last version vector - so a
+     vector appended after the checkpoint leaves a crash window in which the checkpoint is on the
+     disk and the vector covering the records it cut off is not (#179). Same critical section, the
+     vector first; a restart takes the last vector anywhere in the WAL, so the order changes
+     nothing it finds.
+474. **A cache refreshed where the data is written down is as stale as the writing is lazy.** The
+     vector peers are told was exported at every checkpoint, which was every tick until part 2a of
+     #165 made seals lazy - and from then on up to ten seconds old: a peer back inside that window
+     was told this node lacked nothing, and every reconciliation in it resent the whole catch-up
+     (#180). Making a write lazy means finding what was refreshed on its schedule. And refreshing it
+     more often is not the same thing as refreshing it cheaply: the first version exported the
+     vector again at every tick that moved, 286 us at 4 000 entries under the engine's lock; the
+     tick applies the frontiers that moved since the last one, microseconds.
+475. **A crash image is a copy of the data directory taken while nothing writes to it.** Leaking an
+     engine (`release()`) leaves its threads running into the next engine's directory, and a mesh
+     engine's io thread into LeakSanitizer's view of the exit. With the flush loop's interval out of
+     the way and every tick run on the test's own thread (`flush_tick_for_test()`), the copy is the
+     directory at one instant - which is what `kill -9` leaves - and the original closes normally
+     (`tests/test_mm_restart_origins.cpp`).
+476. **An `ERR` reply is one line, with no blank line after it.** A helper that reads a reply to its
+     blank line waits out its socket's timeout on an error: `has_row_at()` polling a symbol not yet
+     delivered took 60 s and raised, which read as a node that stopped answering. Return on the
+     first line when it starts with `ERR`.
+477. **Past 1 561 (symbol, origin) entries a mesh measurement measures #177.** A vector that size
+     does not fit the record that carries it and is sent as "send everything", so every
+     reconciliation resends the whole WAL; whatever else a run with 4 000 symbols was meant to
+     measure, the resends are what it pays. Keep measurement symbol counts under it until #177.
+478. **A count taken straight after a write reads only what a flush has drained.** A record's rows
+     wait in the pending queue until the flush tick takes them, and a query reads stores, segments
+     and the book - not that queue. Four of #179's restart tests counted right after a redelivery,
+     so the duplicates they exist to catch could not show: two mutations that stored them survived
+     the first pass. `test_mm_dedup.cpp` had flushed before every count all along; the restart
+     tests' `rows()` flushes first now.
+479. **A deadline for an answer nobody sends fires on the other side's schedule.** A reconciliation
+     sent its vector and gave the peer two seconds to answer, and a peer does not answer a vector -
+     it sends its own when its own timer fires. So the deadline expired whenever the two timers
+     were more than two seconds apart, and the peer was treated as holding nothing (#183). One node's
+     log showed a catch-up from nowhere; the two nodes' logs side by side showed the peer's vector
+     arriving 0.25 s after the deadline, on its timer. Before waiting for a reply, find the code
+     that sends it.
+480. **A fix that makes a node tell the truth can turn one wrong answer into another.** #179's fix
+     made a restarted node's vector accurate - and for a symbol two nodes write, accurate means the
+     frontiers every node already had stuck at the first hole #184 leaves, so the node is judged to
+     hold what it missed: 10 000 of 11 000 rows, where master's wrong vector had fetched everything
+     and stored 1 308 twice. Measure the neighbouring case before calling a fix an improvement, and
+     say in the fix what it moves from one failure to another.
+481. **A probe that shares a process with its load measures both.** The Python latency probe, whose
+     clock ran in the interpreter the load's thread shared, read the branch's p99.9 as twice
+     master's; `command_latency`, in a process of its own, read the three builds alike. The first
+     reading was never explained and did not need to be: a tail is read by a probe that shares
+     nothing with what it is measuring, and the one that did is kept only as why.
+
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -3698,18 +3758,27 @@ without the lock every local write takes and paced by the peer's send buffer - a
 more than `--mm-max-catchup-bytes` used to stop at the first ceiling's worth for good (6 990 of 20
 100 rows), and a 300 000-record catch-up livelocked on the send-buffer ceiling; and **#181 is
 closed**: a node applied a burst of frames in quadratic time, erasing each from the front of its
-receive buffer (pitfalls 462-471). **#179 is the open P0**: a mesh node restarted before its version
-vector reached the WAL replays the rows a peer sent it as its own origin's, is sent them again and
-stores them twice (200 where the writer holds 100). **#169, #175, #176, #177, #180 and #182 are open
-P1s**: an exchange name with a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C`
-share a live book, sequence numbers and stored rows, measured on the wire; sharding by symbol has no
-control plane: no shard writes itself or the map to etcd, each owns every symbol, and a second on
-the same etcd becomes the first one's replica, measured against a native etcd; a mesh snapshot names
-each file by a 16-bit index, so a node of 8 192 segments cannot bootstrap a peer that joins it; a
-version vector past 1 561 entries asks for everything, so every reconciliation resends the whole
-retained WAL and a joiner never asks for a snapshot; a node's vector is refreshed only when a store
-seals, so a peer back within the seal interval is judged to hold what it missed; and every
-replicated update of a level a node holds is logged at INFO as a conflict, same origin or not.
+receive buffer (pitfalls 462-471). **#179, #180 and #183 are closed**: a restarted mesh node seeds
+each replayed record - the ones a segment holds included - under the origin its header names, and
+writes its vector before the checkpoint, so it stops storing a peer's rows twice (200 where the
+writer held 100); every flush tick brings the vector peers are told up to date from the frontiers
+that moved, microseconds where a whole export cost 286 us at 4 000 entries; and a reconciliation no
+longer arms a deadline for an answer no peer sends, which treated a peer as empty whenever the two
+timers were more than 2 s apart (pitfalls 472-481). **#184 is the open P0**: when two nodes write
+one symbol the one counter per symbol gives each origin's numbers holes, every node's frontier stops
+at the first, and a node that missed rows is judged to hold them - 10 000 of 11 000 for good, which
+#179's fix made the restart's outcome as well as the disconnect's. **#169, #175, #176, #177, #182,
+#185 and #186 are open P1s**: an exchange name with a dot makes two instruments one key - `A.B` on
+`C` and `A` on `B.C` share a live book, sequence numbers and stored rows, measured on the wire;
+sharding by symbol has no control plane: no shard writes itself or the map to etcd, each owns every
+symbol, and a second on the same etcd becomes the first one's replica, measured against a native
+etcd; a mesh snapshot names each file by a 16-bit index, so a node of 8 192 segments cannot
+bootstrap a peer that joins it; a version vector past 1 561 entries asks for everything, so every
+reconciliation resends the whole retained WAL and a joiner never asks for a snapshot; every
+replicated update of a level a node holds is logged at INFO as a conflict, same origin or not; a
+restarted node claims from its segments the numbers its peers wrote, and every reconciliation scans
+its whole WAL for them; and a mesh node of 4 000 symbols stalls a write for up to 0.6 s at a
+trickle and refuses writes at the pipelined ceiling, on master as much as on this branch.
 **#172 is closed**: the Python client's sharded pool swaps its routing whole and replaces a shard
 connection a timeout closed, under a test that builds a sharded pool against a map in etcd. **#174
 is an open P2**: a start reads the whole WAL twice even when its last checkpoint covers every
