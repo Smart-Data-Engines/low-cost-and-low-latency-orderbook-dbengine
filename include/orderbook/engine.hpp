@@ -749,16 +749,18 @@ private:
     std::vector<SequenceTracker::VectorEntry> vector_cache_;
     bool                                 vector_cache_truncated_{false};
 
-    /// Refresh the snapshot above from the tracker, and say how many entries it holds now - 0 for
-    /// a vector too large to state. Caller must hold mtx_.
-    std::size_t refresh_version_vector_cache();
-    /// The same, when the tracker moved since the last refresh (#180): the flush tick calls it
-    /// whether or not it seals, so what peers are told is at most one tick old. Caller holds mtx_,
-    /// on the flush thread — never from under the mesh manager's lock, which is what the cache is
-    /// for.
-    void refresh_version_vector_cache_if_changed();
-    /// `SequenceTracker::generation()` at the last refresh. Guarded by mtx_.
-    uint64_t                             vector_cache_generation_{0};
+    /// Rebuild the snapshot above from the tracker, whole. Caller must hold mtx_.
+    void refresh_version_vector_cache();
+    /// Bring it up to date with the frontiers that moved since the last update or rebuild (#180):
+    /// the flush tick calls it whether or not it seals, so what peers are told is at most one tick
+    /// old - at the cost of what moved, not of the vector, which is the difference between a few
+    /// microseconds a tick and 286 us at 4 000 entries. Caller holds mtx_, on the flush thread -
+    /// never from under the mesh manager's lock, which is what the cache is for.
+    void update_version_vector_cache();
+    /// Where each (symbol, origin) sits in `vector_cache_`, so an update finds it. Guarded by mtx_
+    /// (only the flush thread and the rebuilds, all under it, touch it); `vector_cache_` itself is
+    /// also written under `vector_cache_mtx_`, which the mesh manager reads it under.
+    std::unordered_map<std::string, std::unordered_map<uint16_t, std::size_t>> vector_cache_index_;
     std::unique_ptr<HybridLogicalClock>  hlc_;
     std::unique_ptr<MultiMasterManager>  mm_mgr_;
 

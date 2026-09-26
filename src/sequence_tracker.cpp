@@ -32,14 +32,36 @@ bool SequenceTracker::note_seen(OriginState& st, uint64_t seq) {
     // a cap: holding is an optimisation, and a long outage must not grow memory without
     // bound. Dropping it means the frontier stays put and the next catch-up asks again.
     if (st.above_frontier.size() < kMaxAboveFrontier) {
-        return st.above_frontier.insert(seq).second;
+        st.above_frontier.insert(seq);
     }
     return false;
 }
 
+void SequenceTracker::mark_moved(const std::string& key, uint16_t origin, OriginState& st) {
+    if (st.listed) return;
+    st.listed = true;
+    moved_.push_back(Moved{&key, origin, &st});
+}
+
+SequenceTracker::MovedFrontiers SequenceTracker::take_moved_frontiers() {
+    MovedFrontiers out;
+    out.all    = moved_all_;
+    moved_all_ = false;
+    if (!out.all) out.moved.reserve(moved_.size());
+    for (const Moved& m : moved_) {
+        if (!out.all) out.moved.push_back(VectorEntry{*m.key, m.origin, m.state->frontier});
+        m.state->listed = false;
+    }
+    moved_.clear();
+    return out;
+}
+
 SequenceTracker::Decision SequenceTracker::observe(const std::string& key, uint16_t origin,
                                                    uint64_t sequence_number) {
-    SymbolState& st = symbols_[key];
+    const auto [sym, created] = symbols_.try_emplace(key);
+    (void)created;
+    const std::string& stored_key = sym->first;
+    SymbolState& st = sym->second;
 
     Decision d{};
     d.sequence_number = sequence_number;
@@ -62,16 +84,16 @@ SequenceTracker::Decision SequenceTracker::observe(const std::string& key, uint1
         // critical section. Checking it against the frontier would report a gap on every
         // local write whenever a remote hole is holding the frontier down — a GAP record per
         // insert, which is noise, not signal.
-        if (note_seen(st.origins[origin], d.sequence_number)) ++generation_;
+        OriginState& ost = st.origins[origin];
+        if (note_seen(ost, d.sequence_number)) mark_moved(stored_key, origin, ost);
         return d;
     }
 
     auto it = st.origins.find(origin);
     if (it == st.origins.end()) {
         // First record from this origin. Not a gap: there is nothing to be one past.
-        OriginState fresh{};
-        if (note_seen(fresh, d.sequence_number)) ++generation_;
-        st.origins.emplace(origin, std::move(fresh));
+        OriginState& fresh = st.origins[origin];
+        if (note_seen(fresh, d.sequence_number)) mark_moved(stored_key, origin, fresh);
         OB_LOG_DEBUG("sequence", "First record from origin: key=%s origin=%u seq=%llu",
                      key.c_str(), static_cast<unsigned>(origin),
                      static_cast<unsigned long long>(d.sequence_number));
@@ -97,23 +119,28 @@ SequenceTracker::Decision SequenceTracker::observe(const std::string& key, uint1
                     static_cast<unsigned long long>(it->second.high_water));
     }
 
-    if (note_seen(it->second, d.sequence_number)) ++generation_;
+    if (note_seen(it->second, d.sequence_number)) mark_moved(stored_key, origin, it->second);
     return d;
 }
 
 void SequenceTracker::seed(const std::string& key, uint16_t origin, uint64_t seq) {
     if (seq == 0) return;          // a record from before numbers existed says nothing
-    SymbolState& st = symbols_[key];
+    const auto [sym, created] = symbols_.try_emplace(key);
+    (void)created;
+    SymbolState& st = sym->second;
     st.next_local = std::max(st.next_local, seq + 1);
-    if (note_seen(st.origins[origin], seq)) ++generation_;
+    OriginState& ost = st.origins[origin];
+    if (note_seen(ost, seq)) mark_moved(sym->first, origin, ost);
 }
 
 void SequenceTracker::declare_frontier(const std::string& key, uint16_t origin, uint64_t seq) {
     if (seq == 0) return;
-    OriginState& st = symbols_[key].origins[origin];
+    const auto [sym, created] = symbols_.try_emplace(key);
+    (void)created;
+    OriginState& st = sym->second.origins[origin];
     if (seq <= st.frontier) return;
 
-    ++generation_;
+    mark_moved(sym->first, origin, st);
     st.frontier   = seq;
     st.high_water = std::max(st.high_water, seq);
     // Anything held below the declared frontier is now covered.
@@ -193,8 +220,9 @@ void SequenceTracker::import_own_vector(const std::vector<VectorEntry>& entries)
 
 void SequenceTracker::reset() {
     const std::size_t had = symbols_.size();
+    moved_.clear();                // the states it points at go next
     symbols_.clear();
-    ++generation_;
+    moved_all_ = true;
     OB_LOG_INFO("sequence", "Reset: dropped state for %zu symbols", had);
 }
 
@@ -267,14 +295,15 @@ std::vector<SequenceTracker::HeldRanges> SequenceTracker::export_held(std::size_
 
 void SequenceTracker::import_held(const std::vector<HeldRanges>& held) {
     for (const auto& entry : held) {
-        auto& st  = symbols_[entry.key];
-        auto& ost = st.origins[entry.origin];
+        const auto [sym, created] = symbols_.try_emplace(entry.key);
+        (void)created;
+        auto& ost = sym->second.origins[entry.origin];
         for (const auto& [first, last] : entry.ranges) {
             for (uint64_t seq = first; seq <= last; ++seq) {
                 // note_seen() also advances the frontier when a range turns out to close a hole,
                 // which is correct: if the gap below was filled in a previous run and recorded in
                 // the frontier, these numbers now sit right above it.
-                if (note_seen(ost, seq)) ++generation_;
+                if (note_seen(ost, seq)) mark_moved(sym->first, entry.origin, ost);
             }
         }
     }

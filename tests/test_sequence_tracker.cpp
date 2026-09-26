@@ -8,6 +8,12 @@
 #include "orderbook/sequence_tracker.hpp"
 
 #include <gtest/gtest.h>
+#include <rapidcheck/gtest.h>
+
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -425,52 +431,100 @@ TEST(SequenceTracker, ImportAfterResetDoesNotResurrectTheOldFrontier) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// The generation: what the flush tick asks before exporting the vector again (#180)
+// Moved frontiers: what the flush tick brings the vector peers are told up to date with (#180)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-TEST(SequenceTracker, TheGenerationMovesWithEveryFrontierOrHeldChangeAndWithNothingElse) {
-    // Both halves matter. A change that does not move it leaves a peer told a stale vector until
-    // something else moves it; a non-change that does costs an export of up to 4 096 entries under
-    // the engine's lock on a tick that had nothing to say - a redelivery, which catch-up produces on
-    // purpose, is the common case of that.
+namespace {
+
+using Frontiers = std::map<std::pair<std::string, uint16_t>, uint64_t>;
+
+Frontiers as_map(const std::vector<ob::SequenceTracker::VectorEntry>& entries) {
+    Frontiers out;
+    for (const auto& e : entries) out[{e.key, e.origin}] = e.frontier;
+    return out;
+}
+
+Frontiers moved_now(ob::SequenceTracker& t) {
+    const auto moved = t.take_moved_frontiers();
+    EXPECT_FALSE(moved.all);
+    return as_map(moved.moved);
+}
+
+}  // namespace
+
+TEST(SequenceTracker, TheMovedFrontiersAreEachThatMovedOnceAndNothingElse) {
+    // Both halves matter. A frontier that moved and is not listed leaves a peer told a stale
+    // vector until something else moves it; a listing of what did not move costs the tick a copy,
+    // and a redelivery - which catch-up produces on purpose - is the common case of that.
     ob::SequenceTracker t;
-    uint64_t g = t.generation();
-    const auto moved = [&](const char* what) {
-        const uint64_t now = t.generation();
-        EXPECT_NE(now, g) << what << " did not move the generation";
-        g = now;
-    };
-    const auto still = [&](const char* what) {
-        EXPECT_EQ(t.generation(), g) << what << " moved the generation";
-    };
+    EXPECT_TRUE(t.take_moved_frontiers().all) << "a copy kept from nothing must start by rebuilding";
+    EXPECT_TRUE(moved_now(t).empty());
 
     (void)t.observe("A.EX", 1, 0);                 // assigned: frontier 1
-    moved("a locally assigned number");
-    (void)t.observe("A.EX", 2, 1);                 // first from an origin
-    moved("the first number from an origin");
-    (void)t.observe("A.EX", 2, 2);                 // in order
-    moved("the next number in order");
-    (void)t.observe("A.EX", 2, 5);                 // held above the frontier
-    moved("a number held above the frontier");
-    EXPECT_EQ(t.frontier("A.EX", 2), 2u);
-    (void)t.observe("A.EX", 2, 2);                 // a redelivery below the frontier
-    still("a redelivery below the frontier");
-    (void)t.observe("A.EX", 2, 5);                 // a redelivery of a held number
-    still("a redelivery of a held number");
-    t.seed("A.EX", 2, 3);                          // replay fills part of the hole
-    moved("a seeded number");
-    t.seed("A.EX", 2, 3);
-    still("a number seeded twice");
+    (void)t.observe("A.EX", 1, 0);                 // and 2: listed once, with where it is now
+    (void)t.observe("A.EX", 2, 1);                 // the first number from an origin
+    EXPECT_EQ(moved_now(t), (Frontiers{{{"A.EX", 1}, 2}, {{"A.EX", 2}, 1}}));
+
+    (void)t.observe("A.EX", 2, 1);                 // a redelivery
+    (void)t.observe("A.EX", 2, 5);                 // held above the frontier: not in the vector
+    EXPECT_TRUE(moved_now(t).empty()) << "a redelivery or a held number was listed as a move";
+    (void)t.observe("A.EX", 2, 5);                 // the held number again
+    EXPECT_TRUE(moved_now(t).empty());
+
+    t.seed("A.EX", 2, 2);                          // fills part of the hole
+    EXPECT_EQ(moved_now(t), (Frontiers{{{"A.EX", 2}, 2}}));
+    t.seed("A.EX", 2, 2);
     t.raise_local("A.EX", 100);                    // the local counter is not in the vector
-    still("raising the local counter");
-    t.declare_frontier("A.EX", 1, 10);
-    moved("a declared frontier");
-    t.declare_frontier("A.EX", 1, 4);              // below it: nothing to declare
-    still("a declaration below the frontier");
-    t.import_held({ob::SequenceTracker::HeldRanges{"B.EX", 3, {{7, 9}}}});
-    moved("imported held numbers");
-    t.import_own_vector({ob::SequenceTracker::VectorEntry{"B.EX", 3, 6}});
-    moved("an imported vector");
+    t.declare_frontier("A.EX", 1, 1);              // below it: nothing to declare
+    EXPECT_TRUE(moved_now(t).empty());
+
+    t.seed("A.EX", 2, 4);                          // held, then the hole closes over it
+    t.seed("A.EX", 2, 3);
+    EXPECT_EQ(moved_now(t), (Frontiers{{{"A.EX", 2}, 5}}))
+        << "the frontier drained the held numbers, so it is listed where the drain left it";
+
+    t.declare_frontier("B.EX", 1, 10);
+    t.import_held({ob::SequenceTracker::HeldRanges{"C.EX", 3, {{1, 2}}}});
+    t.import_own_vector({ob::SequenceTracker::VectorEntry{"D.EX", 4, 6}});
+    EXPECT_EQ(moved_now(t), (Frontiers{{{"B.EX", 1}, 10}, {{"C.EX", 3}, 2}, {{"D.EX", 4}, 6}}));
+
+    (void)t.observe("A.EX", 1, 0);
     t.reset();
-    moved("a reset");
+    const auto after_reset = t.take_moved_frontiers();
+    EXPECT_TRUE(after_reset.all) << "after a reset a copy holds frontiers the tracker no longer does";
+    EXPECT_TRUE(after_reset.moved.empty());
+}
+
+// A copy kept only from `take_moved_frontiers()` - rebuilt from `export_vector()` when told to -
+// is the export, whatever the tracker was asked in between: the property the engine's cache of the
+// vector rests on, since it never exports the whole vector again while nothing is reset.
+RC_GTEST_PROP(SequenceTrackerProperty, ACopyKeptFromTheMovedFrontiersIsTheExport, ()) {
+    ob::SequenceTracker t;
+    Frontiers copy;
+    const auto sync = [&] {
+        auto moved = t.take_moved_frontiers();
+        if (moved.all) {
+            bool truncated = false;
+            copy = as_map(t.export_vector(1u << 20, truncated));
+            return;
+        }
+        for (const auto& e : moved.moved) copy[{e.key, e.origin}] = e.frontier;
+    };
+    const auto steps = *rc::gen::inRange<int>(1, 200);
+    for (int i = 0; i < steps; ++i) {
+        const std::string key = std::string(1, static_cast<char>('A' + *rc::gen::inRange(0, 4))) + ".EX";
+        const auto origin = static_cast<uint16_t>(*rc::gen::inRange(1, 4));
+        const auto seq = static_cast<uint64_t>(*rc::gen::inRange(0, 12));
+        switch (*rc::gen::inRange(0, 9)) {
+            case 0: case 1: case 2: (void)t.observe(key, origin, seq); break;
+            case 3: case 4: t.seed(key, origin, seq); break;
+            case 5: t.declare_frontier(key, origin, seq); break;
+            case 6: t.import_held({ob::SequenceTracker::HeldRanges{key, origin, {{seq + 1, seq + 3}}}}); break;
+            case 7: if (*rc::gen::inRange(0, 10) == 0) t.reset(); break;
+            default: sync(); break;
+        }
+    }
+    sync();
+    bool truncated = false;
+    RC_ASSERT(copy == as_map(t.export_vector(1u << 20, truncated)));
 }

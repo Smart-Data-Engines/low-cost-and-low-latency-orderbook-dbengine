@@ -20,6 +20,7 @@
 #include "test_ports.hpp"
 #include "orderbook/data_model.hpp"
 #include "orderbook/types.hpp"
+#include "orderbook/version_vector.hpp"
 #include "orderbook/wal.hpp"
 
 #include <gtest/gtest.h>
@@ -28,8 +29,10 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <optional>
+#include <random>
 #include <regex>
 #include <string>
 #include <utility>
@@ -156,6 +159,34 @@ std::optional<uint64_t> told(ob::Engine& engine, const std::string& key, uint16_
         if (e.key == key && e.origin == origin) return e.frontier;
     }
     return std::nullopt;
+}
+
+/// Every (key, origin) -> frontier this node would state to a peer now.
+std::map<std::pair<std::string, uint16_t>, uint64_t> told_all(ob::Engine& engine) {
+    bool truncated = false;
+    std::map<std::pair<std::string, uint16_t>, uint64_t> out;
+    for (const auto& e : engine.export_version_vector(1u << 20, truncated)) {
+        out[{e.key, e.origin}] = e.frontier;
+    }
+    return out;
+}
+
+/// The last version vector the WAL holds - what a flush wrote down, from a whole export.
+std::map<std::pair<std::string, uint16_t>, uint64_t> written_down(const std::string& dir) {
+    std::vector<uint8_t> last;
+    ob::WALReplayer replayer(dir);
+    replayer.replay_v2([&](const ob::WALReplayContext& ctx) {
+        if (ctx.header.record_type != ob::WAL_RECORD_VERSION_VECTOR) return;
+        last.assign(ctx.payload, ctx.payload + ctx.payload_len);
+    });
+    std::map<std::pair<std::string, uint16_t>, uint64_t> out;
+    ob::PeerVector vector;
+    if (last.empty() || !vector.deserialize(last.data(), last.size()) || vector.truncated()) {
+        ADD_FAILURE() << "no usable version vector in the WAL";
+        return out;
+    }
+    for (const auto& e : vector.entries()) out[{e.key, e.origin}] = e.frontier;
+    return out;
 }
 
 /// The number and the origin of every DELTA record for `symbol` in the WAL, in file order.
@@ -443,5 +474,41 @@ TEST(MeshRestartOrigins, APeerIsToldWhatArrivedAfterOneTickThatSealsNothing) {
     // And one that has nothing new leaves it as it is.
     node->flush_tick_for_test();
     EXPECT_EQ(told(*node, "THEIRS.EX", kPeer), std::optional<uint64_t>(3));
+    node->close();
+}
+
+TEST(MeshRestartOrigins, WhatAPeerIsToldIsWhatAWholeExportSays) {
+    // A tick does not export the vector again: it brings its copy up to date with the frontiers
+    // that moved, which is what makes a refresh at every tick affordable. So the copy is checked
+    // against a whole export - the one a flush writes into the WAL - after records from several
+    // origins arriving in order, out of it, twice, and with holes, between ticks.
+    TempDir dir("mm_origins_copy_");
+    auto node = open_node(dir.path, ob::FsyncPolicy::INTERVAL);
+    std::mt19937 rng(179);
+    std::map<std::pair<int, uint16_t>, uint64_t> next;   // (symbol, origin) -> next number to send
+    uint64_t ts = 1'000'000'000ULL;
+    for (int step = 0; step < 3000; ++step) {
+        const int sym = static_cast<int>(rng() % 40);
+        const auto origin = static_cast<uint16_t>(2 + rng() % 4);
+        const std::string symbol = "COPY" + std::to_string(sym);
+        uint64_t& n = next[{sym, origin}];
+        if (n == 0) n = 1;
+        uint64_t seq = n;
+        switch (rng() % 6) {
+            case 0: seq = n + 1 + rng() % 3; break;              // ahead of a hole
+            case 1: seq = n > 1 ? 1 + rng() % (n - 1) : 1; break; // a redelivery
+            default: ++n; break;                                  // in order
+        }
+        ASSERT_EQ(deliver(*node, record(symbol.c_str(), seq, ++ts), origin), ob::OB_OK);
+        if (rng() % 3 == 0) write_own(*node, record(symbol.c_str(), 0, ++ts));
+        if (step % 97 == 0) node->flush_tick_for_test();
+    }
+    node->flush_tick_for_test();
+    const auto told_before = told_all(*node);
+    node->flush_incremental();                    // writes the whole export down
+    EXPECT_EQ(told_before, written_down(dir.path))
+        << "the copy kept from the frontiers that moved is not the vector a whole export gives";
+    EXPECT_EQ(told_all(*node), told_before) << "the flush found something the ticks had not";
+    EXPECT_GT(told_before.size(), 100u) << "the case is too small to say anything";
     node->close();
 }

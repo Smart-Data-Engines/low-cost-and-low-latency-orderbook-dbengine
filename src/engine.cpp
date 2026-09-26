@@ -374,32 +374,64 @@ std::vector<SequenceTracker::VectorEntry> Engine::export_version_vector(std::siz
     return vector_cache_;
 }
 
-std::size_t Engine::refresh_version_vector_cache() {
-    // Caller holds mtx_.
+void Engine::refresh_version_vector_cache() {
+    // Caller holds mtx_. What moved is in what this exports, so the list is dropped with it.
     bool truncated = false;
     auto entries = seq_tracker_.export_vector(kMaxPersistedVectorEntries, truncated);
-    const std::size_t count = entries.size();
-    vector_cache_generation_ = seq_tracker_.generation();
+    (void)seq_tracker_.take_moved_frontiers();
+    vector_cache_index_.clear();
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        vector_cache_index_[entries[i].key][entries[i].origin] = i;
+    }
     {
         std::lock_guard<std::mutex> lock(vector_cache_mtx_);
         vector_cache_           = std::move(entries);
         vector_cache_truncated_ = truncated;
     }
-    return count;
 }
 
-void Engine::refresh_version_vector_cache_if_changed() {
-    // Caller holds mtx_. The tracker's generation moves whenever a frontier or a held set does, and
-    // costs nothing to read; the export it guards is a pass over every (symbol, origin).
-    const uint64_t generation = seq_tracker_.generation();
-    if (generation == vector_cache_generation_) return;
+void Engine::update_version_vector_cache() {
+    // Caller holds mtx_. A frontier only ever rises, and one that has risen from 0 never goes back
+    // until reset() - which asks for the rebuild - so an update only changes an entry or appends
+    // one, and a vector too large to state stays too large: nothing below needs doing for it.
+    auto moved = seq_tracker_.take_moved_frontiers();
+    if (moved.all) {
+        refresh_version_vector_cache();
+        OB_LOG_DEBUG("engine", "Version vector cache rebuilt: the tracker was reset or is new");
+        return;
+    }
+    if (moved.moved.empty()) return;
     const auto started = std::chrono::steady_clock::now();
-    const std::size_t entries = refresh_version_vector_cache();
+    std::size_t entries = 0;
+    bool truncated = false;
+    {
+        std::lock_guard<std::mutex> lock(vector_cache_mtx_);
+        if (!vector_cache_truncated_) {
+            for (auto& e : moved.moved) {
+                auto& origins = vector_cache_index_[e.key];
+                const auto at = origins.find(e.origin);
+                if (at != origins.end()) {
+                    vector_cache_[at->second].frontier = e.frontier;
+                } else {
+                    origins.emplace(e.origin, vector_cache_.size());
+                    vector_cache_.push_back(std::move(e));
+                }
+            }
+            if (vector_cache_.size() > kMaxPersistedVectorEntries) {
+                // What the whole export says past the limit: nothing, rather than part of it.
+                vector_cache_.clear();
+                vector_cache_index_.clear();
+                vector_cache_truncated_ = true;
+            }
+        }
+        entries   = vector_cache_.size();
+        truncated = vector_cache_truncated_;
+    }
     const auto took_us = std::chrono::duration_cast<std::chrono::microseconds>(
                              std::chrono::steady_clock::now() - started).count();
     OB_LOG_DEBUG("engine",
-                 "Version vector cache refreshed at tracker generation %llu: %zu entries in %lld us",
-                 static_cast<unsigned long long>(generation), entries,
+                 "Version vector cache updated: %zu frontier(s) moved, %zu entries%s, %lld us",
+                 moved.moved.size(), entries, truncated ? " (too many to state)" : "",
                  static_cast<long long>(took_us));
 }
 
@@ -413,7 +445,7 @@ void Engine::persist_version_vector_if_changed() {
 
     bool truncated = false;
     auto entries = seq_tracker_.export_vector(kMaxPersistedVectorEntries, truncated);
-    refresh_version_vector_cache();
+    update_version_vector_cache();
 
     if (truncated) {
         // Too many entries to write down. A node with that many symbols will relearn by
@@ -2935,7 +2967,7 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows) {
         // seal (#180): a tick that seals nothing writes no checkpoint, and since part 2a of #165 most
         // ticks seal nothing, so a peer back within the seal interval was judged to hold the writes
         // it missed - 238 of 2 100 rows three seconds after it reconnected.
-        refresh_version_vector_cache_if_changed();
+        update_version_vector_cache();
         if (write_failure) std::rethrow_exception(write_failure);
         return 0;
     }
@@ -2998,7 +3030,7 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows) {
         // the records before it, which the replay skips and nothing else tells the tracker about.
         // A restart takes the last vector anywhere in the WAL, so the order changes nothing it finds.
         persist_version_vector_if_changed();
-        refresh_version_vector_cache_if_changed();   // a no-op when the persist just did it
+        update_version_vector_cache();   // nothing to do when the persist just did it
         if (!write_failure && !checkpoints_frozen()) {
             // Replay starts at the oldest record a row still waiting in a block needs, and with
             // rows waiting a position cannot say which segments are durable, so the checkpoint names

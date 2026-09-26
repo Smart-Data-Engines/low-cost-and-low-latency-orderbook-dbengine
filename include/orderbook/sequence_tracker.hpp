@@ -120,12 +120,19 @@ public:
     /// the vector down" without serialising it each time.
     uint64_t fingerprint() const;
 
-    /// A counter that moves whenever a frontier or a held set does, and never otherwise.
+    /// Every (symbol, origin) whose frontier moved since the last call, with the frontier it has now
+    /// - each once, however often it moved - or `all` when a copy kept from these must be rebuilt
+    /// from `export_vector()` instead: before the first call, and after `reset()`.
     ///
-    /// O(1), unlike `fingerprint()`, which is a pass over every (symbol, origin): the flush tick
-    /// asks it on every tick, sealing or not, to decide whether the vector peers see needs
-    /// exporting again (#180). Only equality with an earlier reading means anything.
-    uint64_t generation() const { return generation_; }
+    /// For the copy of the vector peers are told (#180), which the flush tick keeps up to date at
+    /// every tick under the engine's lock. Exporting the whole vector there cost 286 us at 4 000
+    /// entries (p50, Release, i3-7100U) - a stall of every write, every tick anything moved; this
+    /// costs what moved. A held number is not in the vector, so only a frontier counts.
+    struct MovedFrontiers {
+        bool                     all{false};
+        std::vector<VectorEntry> moved;
+    };
+    MovedFrontiers take_moved_frontiers();
 
     /// Records above the frontier held per (key, origin) before the set stops growing.
     ///
@@ -173,6 +180,7 @@ private:
         uint64_t           high_water{0};      ///< largest number seen; drives gap detection
         uint64_t           frontier{0};        ///< everything up to here has been seen
         std::set<uint64_t> above_frontier;     ///< seen but not contiguous yet
+        bool               listed{false};      ///< in `moved_` since the last take
     };
 
     struct SymbolState {
@@ -181,11 +189,23 @@ private:
     };
 
     /// Record `seq` as seen from `origin` and advance the frontier as far as it now reaches.
-    /// Returns whether the frontier or the held set moved — a redelivery moves neither.
+    /// Returns whether the frontier moved - a redelivery, and a number held above it, do not.
     static bool note_seen(OriginState& st, uint64_t seq);
 
+    /// List `st` for the next `take_moved_frontiers()`, once. `key` is the map's own key: the
+    /// maps are node-based, so it and `st` stay where they are until `reset()`, which drops the
+    /// list with them.
+    void mark_moved(const std::string& key, uint16_t origin, OriginState& st);
+
+    struct Moved {
+        const std::string* key;
+        uint16_t           origin;
+        OriginState*       state;
+    };
+
     std::unordered_map<std::string, SymbolState> symbols_;
-    uint64_t generation_{0};   ///< see generation()
+    std::vector<Moved> moved_;         ///< see take_moved_frontiers()
+    bool               moved_all_{true};
 };
 
 }  // namespace ob

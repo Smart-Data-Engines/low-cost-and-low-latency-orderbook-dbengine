@@ -11,8 +11,14 @@ against the first node, whose writes move the tracker between any two ticks. Eac
 ingest's rate in levels per second and its batch round trip at p50, p99, p99.9 and max - a lock
 held once a tick is a tail, not a median.
 
+**Keep `--symbols` under 1 561** for the rounds of a mesh: past that a vector does not fit the
+record that carries it and is sent as "send everything" (#177), so every reconciliation resends the
+whole WAL and that, not the refresh, is what the ingest pays. The refresh itself still exports up to
+4 096 entries, and `--nodes 1` measures that: a mesh node with no peer broadcasts and resends
+nothing, so what differs between builds is the tick.
+
     scripts/measure_vector_refresh.py --server before=<ob_tcp_server> --server after=<ob_tcp_server> \\
-        --probe build-release/benchmarks/pipelined_ingest [--symbols 4000] [--rounds 3]
+        --probe build-release/benchmarks/pipelined_ingest [--symbols 1500] [--rounds 4]
 
 Builds alternate ABAB... over `--rounds`. `--refresh-log LABEL` adds one run of that build with its
 nodes at DEBUG and reports what each refresh took from the engine's own line - the cost itself,
@@ -61,7 +67,7 @@ def one_run(label: str, server: str, probe: str, symbols: int, args, root: str,
     shutil.rmtree(root, ignore_errors=True)
     os.makedirs(root)
     etcd, url = M.start_etcd(root)
-    nodes = [M.Node(server, root, i, url, log_level) for i in range(3)]
+    nodes = [M.Node(server, root, i, url, log_level) for i in range(args.nodes)]
     try:
         for n in nodes:
             n.start()
@@ -78,13 +84,21 @@ def one_run(label: str, server: str, probe: str, symbols: int, args, root: str,
         before = os.path.getsize(writer.log)
         out = subprocess.run([probe, str(writer.tcp), str(writer.proc.pid), str(args.connections),
                               str(args.batches), str(args.levels), str(args.batch)],
-                             capture_output=True, text=True, timeout=900, check=True)
-        result = json.loads(out.stdout.strip().splitlines()[-1])
+                             capture_output=True, text=True, timeout=900)
+        if out.returncode == 0:
+            result = json.loads(out.stdout.strip().splitlines()[-1])
+        else:
+            result = {"failed": (out.stderr.strip().splitlines() or ["?"])[-1][:160]}
         result["label"] = label
+        with open(writer.log, "rb") as f:
+            f.seek(before)
+            text = f.read().decode(errors="replace")
+        # What the writer said while the ingest ran: a write waiting for room in the pending queue,
+        # one refused because no room came, and a peer dropped for not draining its send buffer.
+        result["queue_waits"] = text.count("is waiting for room in the pending queue")
+        result["refused"] = text.count("did not free room in 5 s")
+        result["peer_drops"] = text.count("is not draining")
         if log_level == "DEBUG":
-            with open(writer.log, "rb") as f:
-                f.seek(before)
-                text = f.read().decode(errors="replace")
             took = [(int(m.group(1)), int(m.group(2))) for m in re.finditer(
                 r"Version vector cache refreshed at tracker generation \d+: (\d+) entries in "
                 r"(\d+) us", text)]
@@ -107,23 +121,26 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--server", action="append", required=True, help="label=path")
     ap.add_argument("--probe", required=True, help="benchmarks/pipelined_ingest")
-    ap.add_argument("--symbols", type=int, default=4000)
-    ap.add_argument("--rounds", type=int, default=3)
+    ap.add_argument("--symbols", type=int, default=1500)
+    ap.add_argument("--rounds", type=int, default=4)
     ap.add_argument("--connections", type=int, default=2)
     ap.add_argument("--batches", type=int, default=2000, help="per connection")
     ap.add_argument("--levels", type=int, default=20)
     ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--nodes", type=int, default=3,
+                    help="1 measures the refresh alone: no peer, so no broadcast and no resend")
     ap.add_argument("--refresh-log", metavar="LABEL")
     ap.add_argument("--root", default=os.path.join(os.getcwd(), "vector-refresh-runs"))
     args = ap.parse_args()
     servers = [s.split("=", 1) for s in args.server]
     keys = ("levels_per_s", "batch_p50_us", "batch_p99_us", "batch_p999_us", "batch_max_us",
-            "server_cores")
+            "server_cores", "queue_waits", "refused", "peer_drops", "failed")
     for r in range(args.rounds):
         for label, path in (servers if r % 2 == 0 else list(reversed(servers))):
             res = one_run(label, path, args.probe, args.symbols, args,
                           os.path.join(args.root, label))
-            print(f"round {r + 1} {label}: " + " ".join(f"{k}={res[k]}" for k in keys), flush=True)
+            print(f"round {r + 1} {label}: " + " ".join(f"{k}={res[k]}" for k in keys if k in res),
+                  flush=True)
     if args.refresh_log:
         path = dict(servers)[args.refresh_log]
         res = one_run(args.refresh_log, path, args.probe, args.symbols, args,

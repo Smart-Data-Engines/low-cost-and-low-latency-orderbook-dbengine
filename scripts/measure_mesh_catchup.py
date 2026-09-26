@@ -13,8 +13,10 @@ with every row.
     scripts/measure_mesh_catchup.py --server before=<ob_tcp_server> --server after=<ob_tcp_server> \\
         [--records 300000] [--rounds 2] [--flush-writer-before-restart]
 
-It also counts the writer's catch-ups to the returning node after its restart: one is the answer,
-and a second one is the returning node telling the writer it lacks what it was just sent (#180).
+It also counts the writer's catch-ups to the returning node after its restart, and the records
+they sent: one is the answer, and another is the returning node telling the writer it lacks what it
+was just sent (#180) - which a reconciliation sees only if one runs while that is still so, so
+`--reconcile-seconds 5 --watch-seconds 30` is what makes it certain to be looked at.
 
 Builds are alternated ABAB... over `--rounds`. Needs a native etcd on PATH (or ETCD).
 """
@@ -57,7 +59,8 @@ class Conn:
         return self.r.readline().rstrip(b"\n")
 
     def request(self, text: str) -> list[bytes]:
-        """A command answered by lines and a blank one: OK, a header, rows."""
+        """A command answered by lines and a blank one: OK, a header, rows. An error is one line,
+        `ERR ...`, with no blank one after it - waiting for one waited out the socket's timeout."""
         self.s.sendall(text.encode())
         lines = []
         while True:
@@ -65,6 +68,8 @@ class Conn:
             if not line:
                 raise ConnectionError("closed")
             line = line.rstrip(b"\n")
+            if not lines and line.startswith(b"ERR"):
+                return [line]
             if not line:
                 return lines
             lines.append(line)
@@ -88,8 +93,10 @@ def start_etcd(root: str) -> tuple[subprocess.Popen, str]:
 
 
 class Node:
-    def __init__(self, server: str, root: str, index: int, etcd: str, log_level: str = "INFO"):
+    def __init__(self, server: str, root: str, index: int, etcd: str, log_level: str = "INFO",
+                 extra: list[str] | None = None):
         self.server, self.index, self.etcd, self.log_level = server, index, etcd, log_level
+        self.extra = list(extra or [])
         self.dir = os.path.join(root, f"node{index}")
         self.log = os.path.join(root, f"node{index}.log")
         os.makedirs(self.dir, exist_ok=True)
@@ -106,7 +113,7 @@ class Node:
             self.server, "--port", str(tcp), "--data-dir", self.dir, "--metrics-port", str(metrics),
             "--replication-port", str(repl), "--coordinator-endpoints", self.etcd,
             "--node-id", f"node-{self.index}", "--multi-master", "--mm-node-id", str(self.index + 1),
-            "--mm-replication-port", str(mm), "--log-level", self.log_level,
+            "--mm-replication-port", str(mm), "--log-level", self.log_level, *self.extra,
         ], stdout=open(self.log, "ab"), stderr=subprocess.STDOUT)
         deadline = time.time() + 60
         while time.time() < deadline:
@@ -211,11 +218,13 @@ def summary(samples: list[tuple[float, float]], a: float, b: float) -> str:
             f"max={xs[-1]:.2f} ms")
 
 
-def one_run(label: str, server: str, records: int, root: str, flush_writer: bool) -> None:
+def one_run(label: str, server: str, records: int, root: str, flush_writer: bool,
+            reconcile_s: int | None = None, watch_s: float = 0.0) -> None:
     shutil.rmtree(root, ignore_errors=True)
     os.makedirs(root)
     etcd, url = start_etcd(root)
-    nodes = [Node(server, root, i, url) for i in range(3)]
+    extra = ["--anti-entropy-interval-seconds", str(reconcile_s)] if reconcile_s else []
+    nodes = [Node(server, root, i, url, extra=extra) for i in range(3)]
     try:
         for n in nodes:
             n.start()
@@ -255,7 +264,9 @@ def one_run(label: str, server: str, records: int, root: str, flush_writer: bool
                 break
             time.sleep(0.25)
         caught_up = time.monotonic()
-        time.sleep(1.0)                          # the last tick's drain, and the other peer's copy
+        # Past the catch-up, what a node says it holds is compared again at every reconciliation;
+        # a vector that has not caught up with the catch-up is sent it all over again (#180).
+        time.sleep(1.0 + watch_s)                # the last tick's drain, and the other peer's copy
         expected = rows(writer.tcp)
         got = rows(returning.tcp)
         time.sleep(2)
@@ -271,7 +282,10 @@ def one_run(label: str, server: str, records: int, root: str, flush_writer: bool
         print(f"{label}: probe before the kill   {summary(probe.samples, base_a, base_b)}", flush=True)
         print(f"{label}: probe during catch-up   {summary(probe.samples, restart, caught_up)}",
               flush=True)
-        print(f"{label}: catch-ups to the returning node: {len(finished)}", flush=True)
+        resent = sum(int(m.group(1)) for m in
+                     re.finditer(r"Catch-up to peer 3 finished[^\"]*? sent=(\d+)", log))
+        print(f"{label}: catch-ups to the returning node: {len(finished)}, records sent in them: "
+              f"{resent}", flush=True)
         for line in finished[:2]:
             print(f"{label}: writer said: {line[:220]}", flush=True)
         slowest = sorted((ms, t) for t, ms in probe.samples if restart <= t < caught_up)[-5:]
@@ -290,6 +304,10 @@ def main() -> int:
     ap.add_argument("--records", type=int, default=300_000)
     ap.add_argument("--rounds", type=int, default=2)
     ap.add_argument("--root", default=os.path.join(os.getcwd(), "mesh-catchup-runs"))
+    ap.add_argument("--reconcile-seconds", type=int, default=None,
+                    help="--anti-entropy-interval-seconds for every node (the default is 30)")
+    ap.add_argument("--watch-seconds", type=float, default=0.0,
+                    help="how long to keep watching after the returning node caught up")
     ap.add_argument("--flush-writer-before-restart", action="store_true",
                     help="FLUSH the writer before the returning node starts, as #178's binding "
                          "measurement did (needed before #180's fix)")
@@ -299,7 +317,7 @@ def main() -> int:
         for label, path in (servers if r % 2 == 0 else list(reversed(servers))):
             print(f"== round {r + 1} {label}", flush=True)
             one_run(label, path, args.records, os.path.join(args.root, label),
-                    args.flush_writer_before_restart)
+                    args.flush_writer_before_restart, args.reconcile_seconds, args.watch_seconds)
     return 0
 
 
