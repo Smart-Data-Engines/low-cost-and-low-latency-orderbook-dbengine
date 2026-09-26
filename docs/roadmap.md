@@ -2213,6 +2213,25 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 176. A mesh node that holds 8 192 segments or more cannot send a snapshot, so no peer can join it **P1**
+
+**Found reading the mesh's snapshot sender for #165 part 2b, and not yet measured.** A mesh
+snapshot names each file by a 16-bit index in its chunk header, and 0xFFFF is the metadata blob's,
+so `begin_snapshot_send()` refuses a manifest of 65 535 files or more — loudly, `too_many_files`,
+counted in `ob_mm_snapshot_failed_total`. A segment is eight files. So a node holding 8 192
+segments cannot bootstrap a peer that joins the mesh, or one too far behind to catch up, and that
+is not a store the mesh reaches only by neglect: part 2b merges a symbol's segments, but not below
+one a symbol an hour, so **8 192 instruments** — an options chain — is past the limit whatever
+merging does, and before part 2b a node writing 256 symbols at the soak's rate reached it in about
+five minutes. The replication link's snapshot names each file by its path, and has no such limit.
+
+A fix widens the index — a 32-bit one in a versioned frame — or sends the file list in parts, and
+its test is a mesh node past the limit and a peer that joins it, which would today be a strict
+xfail beside #60 and #61.
+
+- Effort: M | Impact: a mesh cannot take a new peer once one node holds a few thousand segments —
+  a few thousand instruments, or a few hours of a few hundred
+
 ### 175. Sharding by symbol has no control plane: no shard writes itself or the shard map to etcd, and neither client finds a shard **P1**
 
 **Found reading the shard coordinator for #172, then measured** against a native etcd, with two
@@ -3131,6 +3150,176 @@ which is how the test's old gap was found.
 | 3 | #159: the checkpoint claims the log's position, not the drain's | rows written during the segment write | that test |
 | 4 | stage 5 of #151: the seal writes under the engine's lock | a writer during the segment write | that test |
 | 5 | control: a comment reworded | — | survives |
+
+**Part 2b is done: the flush tick merges a symbol's small segments, and a crash in any of a merge's
+steps keeps each row once.** Eight segments of one merge level in one symbol's hour become one of
+the next level, up to 262 144 rows; a segment of 65 536 rows or more — what a seal at the write
+ceiling writes — merges with nothing; and an hour that ended a minute ago and has received nothing
+since merges what is left into as few segments as fit. A merge moves one step a tick: written into
+`<start>_<end>.compacting` beside its inputs; synced; published by a rename under the index's lock
+in place of its inputs, in one step; synced again; and only then are the inputs removed, once every
+query that copied them has finished. A tick that drained more than 65 536 rows merges nothing new
+unless none has for ten seconds, and a lighter one merges for up to 10 ms. `--compaction off` is
+the valve. [SOAK SUMMARY]
+
+**The size a merge stops at was measured before it was chosen.** A query reads a segment whole —
+price and sequence are delta-encoded from its first row, quantities are Simple8b words that decode
+from the first — so a bigger segment is a slower narrow query, and the cap is a trade between the
+number of files and what one reads. `benchmarks/segment_size_cost` on the m9g.xlarge, p50 of each of
+three runs:
+
+| rows | bytes | one second, every column | ts + price | whole segment | merged from segments of 4 096 | `syncfs()` after |
+|---|---|---|---|---|---|---|
+| 4 096 | 101 095 | 0.059 ms | 0.013 ms | 0.07 – 0.08 ms | — | — |
+| 16 384 | 403 384 | 0.19 ms | 0.057 – 0.059 ms | 0.25 – 0.26 ms | 0.80 – 0.84 ms (49 – 51 ns a row) | 2.5 – 3.4 ms |
+| 65 536 | 1 612 521 | 0.79 ms | 0.34 – 0.35 ms | 1.05 – 1.11 ms | 3.1 – 3.2 ms (47 – 49 ns) | 3.7 – 4.5 ms |
+| 262 144 | 6 449 083 | 3.2 – 3.5 ms | 1.5 ms | 4.2 – 4.7 ms | 12.3 – 13.4 ms (47 – 51 ns) | 7.5 – 9.3 ms |
+| 1 048 576 | 25 795 300 | 14.3 – 14.5 ms | 6.2 – 6.5 ms | 18.8 – 19.8 ms | 52 – 55 ms (50 – 52 ns) | 15.9 – 17.3 ms |
+
+A merge costs about 50 ns a row whatever its size, so the cap is chosen by the query: 262 144 rows
+keep a narrow query into history under ~3.5 ms. A segment with chunks and a chunk index would have
+both — merges by concatenation, narrow queries reading a chunk — and is a format change with its
+own story for going back to an older build; it is not this part.
+
+**A merge must not change the order a scan delivers rows in**, because a `SNAPSHOT` keeps the row
+delivered last on a timestamp tie and a `LIMIT` the rows delivered first. So a merge takes only
+segments consecutive in their symbol's delivery order — no segment of another hour lies between
+them — and publishes only if its range sorts strictly between the segments before and after them,
+checked when it is planned and again under the index's lock, because a seal in between can put a
+segment in the middle.
+
+**A query that copied an input reads it after the swap**, so its files stay until that query ends.
+A scan holds the reader generation current when it copied the index; a publication starts a new
+one, and each generation holds the one after it, so the generation a publication retired is gone
+exactly when every scan that could have copied its inputs has finished — including scans of older
+generations, which could have copied a later publication's inputs too. Retention still removes at
+once: those rows are past the window.
+
+**A merge takes a segment of this node's WAL only once a checkpoint on the device vouches for it.**
+The merged segment keeps its inputs' highest epoch and position, and a start keeps a segment of
+this WAL only if the last checkpoint vouches for its epoch — so merging one sealed after the last
+checkpoint known synced would make a merged segment a power cut removes, with the inputs it
+replaced already gone. The epoch the last synced checkpoint names moves with the retention floor.
+
+**What a start finds after a crash, it cleans before anything reads it.** A working directory is
+removed; a segment that a merged segment beside it names in `compacted_from` is removed — named by
+its directory *and* what its own `meta.json` recorded, because a directory is named after its
+range, and once an input is gone the next seal with rows over the same range takes its name. A
+clean stop leaves neither, and a snapshot's walk leaves both out, because a build before part 2b
+takes both for segments and holds their rows twice.
+
+**While a snapshot is being made or sent, nothing merges and retention does not sweep.** The
+snapshot pins the segment files from before its flush until its sender finishes the transfer: the
+manifest names files, and a merge or a sweep removing one mid-transfer failed the transfer, and
+the replica started again. That was true of the sweep before merges existed.
+
+[MEASUREMENT: SOAK TABLE, RESTARTS, INGEST CEILING]
+
+**An independent review found what the tests had not, twice.** A separate agent read the whole
+branch, changing nothing, and reported four real defects: merges under `--fsync-policy none` went
+through all five steps with nothing on the device, because the segment sync that policy skips was
+counted as run; a symbol named like a working directory was removed with its rows at the next
+start; a run whose merged range tied a neighbour was written, refused at publication and written
+again every tick; and a start trusted a merged segment's `meta.json` alone. Writing the fixes
+found a fifth by test — a partition whose run waited only for the checkpoint of its own tick was
+left to its hour's settling. The same agent then reviewed the fixes and found what they introduced
+or left: the vouching sync `none` needs still ran at the write ceiling through the heavy tick's
+allowance; a failed sync under `none` froze checkpoints that policy never freezes; a partition
+could be looked at every tick after a snapshot sealed without a checkpoint; the start removed a
+short merged segment that was the only copy of its rows; and the destructor that released the
+chain of generations a link at a time peeked at a count that does not order the read. Each has a
+test or a row in the table below.
+
+**Found on the way:**
+
+- **A bound resting on a condition several lines away.** `plan()` took up to `kFanIn` segments
+  after a check that at least `kFanIn` were there; the mutation that weakened the check made it
+  read past the stretch, and the engine test binary died of it (signal 11). The bound stops at the
+  stretch's end itself now, and the mutation is a clean kill.
+- **A gauge set on one path.** `ob_segments_awaiting_removal` was set only where inputs were
+  removed, so the tick that retired them left it at zero for a tick.
+- **A look is not free.** A tick at the write ceiling that found nothing to merge looked again the
+  next tick, copying a partition's segments each time; it looks once every ten seconds now.
+- **A write acknowledged is not yet a row a `SELECT` returns** — measured writing the tests: a
+  `SELECT` from another connection straight after a `MINSERT` returned nothing, and `BOOK` the five
+  levels, five times of five. Documented in `docs/cli.md`; a test counts what was flushed.
+- **#176**: a mesh snapshot cannot carry more than 65 534 files.
+
+**Mutation table: 62 rows, 62 as written down before each run** — 41 killed, 21 survived where the
+verdict said they would; one verdict (row 43) was written as uncertain, depending on the order the
+directory walk meets two merged segments, and came out killed, and one row (52) first came back
+INVALID — `-Werror` refused a mutation that left a parameter unused — and was rewritten to keep it
+used: the mutation changed, not the code. The table ran in four passes, each written before it ran:
+rows 1–32 against the first complete tree, rows 33–37 for the stop's cleanup and the snapshot's
+exclusion that the first pass led to, rows 38–51 for the fixes an independent review of the branch
+found, and rows 52–62 for the fixes the review of those fixes found. Every instrument was green
+before and after each pass, and the restored tree too. Most of the 21 that survive say why in the
+row: a power cut, the fault injector, or cost alone — each a property no test here can reach.
+
+| # | mutation | caught by |
+|---|---|---|
+| 1 | the swap does not check that the inputs are consecutive | the store's refusal test |
+| 2 | nor that the merged range sorts where the inputs were | the store's refusal test |
+| 3 | the swap hands back a generation nobody holds | three reader tests |
+| 4 | a generation does not hold the one after it | the younger-generation test |
+| 5 | a scan takes no generation | three reader tests |
+| 6 | a rebuild leaves a working directory | the rebuild test |
+| 7 | a rebuild descends into one | the rebuild test |
+| 8 | a rebuild takes an input by its name alone | the name-reuse test |
+| 9 | a rebuild removes no input | the rebuild test |
+| 10 | a merge's read pads a short column | the short-column test |
+| 11 | a merged segment's last row is the row appended last | the lineage test |
+| 12 | a partition's view holds only its members | the view test |
+| 13 | runs ignore the level | the level test |
+| 14 | one short of the fan-in merges | the fan-in test (and a read past the stretch: row 36) |
+| 15 | a full segment merges | the full-segment test and the property |
+| 16 | runs ignore the WAL identity | the identity test and the property |
+| 17 | a segment of this WAL merges whatever the checkpoint on the device vouches for | the vouching test |
+| 18 | a partition settles without being quiet | the settling test and three engine tests |
+| 19 | the step ignores a snapshot's pin | the pin test |
+| 20 | the retention sweep ignores a snapshot's pin | the pin test |
+| 21 | inputs removed while a scan reads them | the engine's reader test |
+| 22 | inputs removed before the sync after the publication | survives: a power cut only |
+| 23 | a merge published before the sync after its write | survives: a power cut only |
+| 24 | the step never syncs on its own | seven engine tests |
+| 25 | a merged segment's level is its inputs' | the eight-seals test |
+| 26 | a merged segment's position is its first input's | the latest-of-its-inputs test |
+| 27 | its epoch is its first input's | the latest-of-its-inputs test |
+| 28 | a discarded store's retired inputs are kept | the discard test |
+| 29 | a seal does not note its partition | seven engine tests |
+| 30 | a tick at the ceiling merges like a light one | survives: measured instead |
+| 31 | the step goes on after the checkpoints froze | survives: needs the fault injector |
+| 32 | control: a comment reworded | survives |
+| 33 | close() leaves what merges wrote | the clean-stop test |
+| 34 | a snapshot walks replaced inputs | the snapshot test |
+| 35 | close() removes inputs before the sync after their publication | survives: a power cut only |
+| 36 | row 14 again, with the bound at the stretch's end | the fan-in test and two engine tests, no crash |
+| 37 | the bound without the stretch's end | survives: equivalent before a partition settles |
+| 38 | a run taken whatever its merged range ties | the tie test and the property |
+| 39 | a settled merge takes any number of inputs | the input-cap test |
+| 40 | a working directory recognised at any depth | the name test |
+| 41 | any name ending in `.compacting` is one | the name test |
+| 42 | a start trusts a merged segment short of its rows | the torn-merge test |
+| 43 | one fingerprint per path | the two-merges-one-path test (uncertain verdict; killed) |
+| 44 | inputs told apart before the range repair | the repaired-range test |
+| 45 | the chain of generations released recursively | survives: no chain long enough to exhaust a stack |
+| 46 | a full seal wakes its partition | survives: cost only |
+| 47 | a partition waiting only for vouching left to its settling | the fan-in engine test |
+| 48 | under `none` a seal's sync is counted | survives: a power cut only |
+| 49 | under `none` the appended checkpoint taken as durable | survives: a power cut only |
+| 50 | working directories not numbered | survives: runs of one range are no longer planned |
+| 51 | under `none` the vouching sync every tick | survives: cost only |
+| 52 | a partition waits for vouching whatever checkpoint was appended | survives: cost only |
+| 53 | ...whatever its segment's size | survives: cost only |
+| 54 | under `none` a tick at the write ceiling runs the step | survives: cost only |
+| 55 | under `none` the vouching sync without a look that wanted it | survives: cost only |
+| 56 | a short merged segment removed whatever its inputs | the gone-inputs test |
+| 57 | a short merged segment kept although every input is there | the torn-merge test |
+| 58 | the chain of generations released by recursion | the million-link test (the binary dies) |
+| 59 | a refused rename not backed off | survives: nothing here makes a rename fail |
+| 60 | under `none` a failed WAL sync not seen by merges | survives: needs the fault injector |
+| 61 | under `none` a failed merge sync freezes the checkpoints | survives: needs the fault injector |
+| 62 | close() removes inputs after merging stopped | survives: needs a failed sync |
 
 - Effort: L | Impact: part 1 closed the slope from writes and queries; part 2a took the count to
   about one segment per active symbol per ten seconds at a trickle and half of master's at the write
@@ -11093,7 +11282,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #165, #169, #174, #175.** Every other item above #58 is marked closed, and
+**Open: #165, #169, #174, #175, #176.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
