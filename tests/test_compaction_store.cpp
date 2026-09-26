@@ -559,8 +559,33 @@ TEST(CompactionStore, ARebuildKeepsTheInputsOfAMergedSegmentWhoseColumnsAreShort
     reopened.open_existing();
     EXPECT_EQ(reopened.last_rebuild_removed().superseded, 0u)
         << "the inputs of a merged segment short of its rows were removed";
+    EXPECT_EQ(reopened.last_rebuild_removed().short_merges, 1u);
     EXPECT_FALSE(fs::exists(merged_dir)) << "the short merged segment was kept";
     EXPECT_TRUE(same_rows(delivered(reopened, "A"), rows_before));
+}
+
+TEST(CompactionStore, AShortMergedSegmentWhoseInputsAreGoneIsKept) {
+    TempDir dir;
+    std::string merged_dir;
+    {
+        ob::ColumnarStore store(dir.str());
+        const auto a = written(dir.str(), "A", {{kBase + 1 * kSec, 1}}, {77, 1, 10, 1});
+        const auto b = written(dir.str(), "A", {{kBase + 2 * kSec, 2}}, {77, 1, 20, 2});
+        store.merge_segments({a, b});
+        auto out = merged(store, dir.str(), {a, b});
+        ASSERT_TRUE(rename_to_segment(out));
+        merged_dir = out.dir_path;
+        // A merge that finished: its inputs removed.
+        fs::remove_all(a.dir_path);
+        fs::remove_all(b.dir_path);
+    }
+    fs::resize_file(merged_dir + "/ts.col", sizeof(uint64_t));
+    ob::ColumnarStore reopened(dir.str());
+    reopened.open_existing();
+    EXPECT_TRUE(fs::exists(merged_dir + "/price.col"))
+        << "the only copy of its rows was removed for one short column";
+    EXPECT_EQ(reopened.last_rebuild_removed().short_merges, 0u);
+    EXPECT_EQ(reopened.segment_count(), 1u);
 }
 
 TEST(CompactionStore, ARebuildTellsAnInputFromEveryMergedSegmentThatNamesItsPath) {
@@ -629,4 +654,21 @@ TEST(CompactionStore, AnInputIsComparedWithTheRangeItWasMergedWith) {
         << "an input compared with the range its old meta.json says, rather than its rows', stayed";
     EXPECT_FALSE(fs::exists(input_dir));
     EXPECT_EQ(delivered(reopened, "A").size(), 2u);
+}
+
+TEST(CompactionStore, AChainOfManyGenerationsIsReleasedWithoutRecursion) {
+    // What a scan that outlived a million publications holds: the start of a chain of every
+    // generation since. Released by recursion, this is a million nested destructors on that scan's
+    // thread; released a link at a time, it is one.
+    auto head = std::make_shared<ob::detail::ReaderGeneration>();
+    auto tail = head;
+    for (int i = 0; i < 1'000'000; ++i) {
+        auto link = std::make_shared<ob::detail::ReaderGeneration>();
+        tail->next = link;
+        tail = std::move(link);
+    }
+    std::weak_ptr<ob::detail::ReaderGeneration> last = tail;
+    tail.reset();
+    head.reset();
+    EXPECT_TRUE(last.expired()) << "a generation at the end of the chain outlived its release";
 }

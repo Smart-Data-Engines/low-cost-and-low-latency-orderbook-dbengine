@@ -104,6 +104,27 @@ struct SegmentInput {
     bool names(const SegmentMeta& meta) const;
 };
 
+namespace detail {
+
+/// A link in the chain of reader generations a store keeps (`ColumnarStore::replace_segments()`,
+/// #165 part 2b): each holds the one after it, so the generation current before a replacement is
+/// gone exactly when every scan that took it, or an older one, has finished.
+///
+/// Released without recursion. A scan that outlived many publications holds the start of a chain
+/// of every generation since, and a destructor releasing the next recursed once per publication on
+/// that scan's thread; peeking at the next link's count instead is a read the count does not order.
+/// The destructor that starts a release drains the chain itself, and one it causes only hands its
+/// successor over.
+struct ReaderGeneration {
+    std::shared_ptr<ReaderGeneration> next;
+    ReaderGeneration() = default;
+    ReaderGeneration(const ReaderGeneration&) = delete;
+    ReaderGeneration& operator=(const ReaderGeneration&) = delete;
+    ~ReaderGeneration();
+};
+
+}  // namespace detail
+
 /// Spare storage for blocks' rows (#165 part 2a): a sealed block's vector, handed back when the
 /// block's last reference goes, and taken again by a later drain - which otherwise wrote every row
 /// of every tick into memory the kernel had to fault in first. Measured at four pipelining
@@ -355,6 +376,8 @@ public:
     struct RebuildRemoved {
         size_t staging{0};
         size_t superseded{0};
+        /// Merged segments short of their rows whose inputs were all there to hold them.
+        size_t short_merges{0};
     };
     RebuildRemoved last_rebuild_removed() const {
         std::shared_lock<std::shared_mutex> lock(index_mtx_);
@@ -620,16 +643,7 @@ private:
     /// younger one alive - so the generation current before a replacement is gone exactly when every
     /// scan that took it, or an older one, has finished. Assigned under `index_mtx_` exclusively,
     /// copied under it shared.
-    struct ReaderGeneration {
-        std::shared_ptr<ReaderGeneration> next;
-        /// Released a link at a time: a scan that outlived many publications holds the start of a
-        /// chain of every generation since, and letting each destructor release the next would
-        /// recurse once per publication on that scan's thread.
-        ~ReaderGeneration() {
-            std::shared_ptr<ReaderGeneration> link = std::move(next);
-            while (link && link.use_count() == 1) link = std::move(link->next);
-        }
-    };
+    using ReaderGeneration = detail::ReaderGeneration;
     std::shared_ptr<ReaderGeneration> reader_generation_ = std::make_shared<ReaderGeneration>();
 
     /// Take one segment out of the index; false if it is not there. Caller holds `index_mtx_`

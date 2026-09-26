@@ -667,6 +667,10 @@ private:
     /// When a merge's own sync last ran: under `none`, the only thing that puts a checkpoint on the
     /// device.
     std::chrono::steady_clock::time_point last_merge_sync_{};
+    /// The last step's looks found a run waiting only for a checkpoint on the device.
+    bool vouching_seen_{false};
+    /// Under `none`, after a failed sync: merging stops until a restart, and nothing else does.
+    bool merges_stopped_{false};
     /// Numbers the merges' working directories, so no two share one.
     uint64_t merge_seq_{0};
     std::chrono::steady_clock::time_point merge_backoff_until_{};
@@ -1161,8 +1165,13 @@ private:
     /// to look at it again.
     void look_at_partition(std::map<CompactionKey, CompactionPartition>::iterator it,
                            std::chrono::steady_clock::time_point now, uint64_t vouched_epoch,
-                           size_t& merges, size_t max_merges,
+                           uint64_t appended_epoch, size_t& merges, size_t max_merges,
                            std::chrono::steady_clock::time_point budget_end);
+    /// A merge's sync failed: under a policy that syncs, the checkpoints freeze (#160); under
+    /// `none`, which freezes nothing, merging stops.
+    void merge_sync_failed(int err);
+    /// Stop merging for the life of the process, and say why, once.
+    void stop_merging(const std::string& why);
     /// A segment a seal (`arrived`), a merge or a rebuild added: its partition is looked at next.
     void note_segment_for_compaction(const SegmentMeta& meta,
                                      std::chrono::steady_clock::time_point now, bool arrived);

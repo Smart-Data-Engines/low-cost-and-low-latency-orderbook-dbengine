@@ -32,6 +32,36 @@ ColumnarStore::ColumnarStore(std::string_view base_dir, uint64_t segment_duratio
     , own_index_(own_index)
 {}
 
+// ── Reader generations (#165 part 2b) ─────────────────────────────────────────
+
+namespace detail {
+
+namespace {
+// The links a release on this thread still has to let go of; set while one is draining.
+thread_local std::vector<std::shared_ptr<ReaderGeneration>>* releasing = nullptr;
+}  // namespace
+
+ReaderGeneration::~ReaderGeneration() {
+    if (!next) return;
+    if (releasing != nullptr) {
+        releasing->push_back(std::move(next));
+        return;
+    }
+    std::vector<std::shared_ptr<ReaderGeneration>> pending;
+    pending.reserve(1);
+    releasing = &pending;
+    pending.push_back(std::move(next));
+    while (!pending.empty()) {
+        std::shared_ptr<ReaderGeneration> link = std::move(pending.back());
+        pending.pop_back();
+        // The last reference, or not: if it is, its destructor hands its successor to `pending`.
+        link.reset();
+    }
+    releasing = nullptr;
+}
+
+}  // namespace detail
+
 // ── A merge's inputs, as its segment names them (#165 part 2b) ───────────────
 
 SegmentInput SegmentInput::of(const SegmentMeta& meta) {
@@ -1356,6 +1386,8 @@ void ColumnarStore::rebuild_index_locked() {
     std::unordered_multimap<std::string, SegmentInput> replaced;
     std::vector<SegmentMeta> found;
     std::vector<SegmentInput> inputs;
+    // Merged segments short of their rows, with what they name: decided once every segment is found.
+    std::vector<std::pair<SegmentMeta, std::vector<SegmentInput>>> short_merges;
     for (auto it = fs::recursive_directory_iterator(base_dir_);
          it != fs::recursive_directory_iterator(); ++it) {
         const auto& entry = *it;
@@ -1379,17 +1411,17 @@ void ColumnarStore::rebuild_index_locked() {
         meta.dir_path = entry.path().parent_path().string();
         if (!inputs.empty()) {
             // A merged segment is published only once its files are on the device, so a short one
-            // is a storage that did not keep what it acknowledged. Then the inputs are what holds
-            // the rows, and the merge is what goes: it is written again from them.
+            // is a storage that did not keep what it acknowledged - and its inputs, where they are
+            // still here, are what holds the rows. Decided below, once every segment is found.
             std::error_code ec;
             const auto ts_bytes = fs::file_size(fs::path(meta.dir_path) / "ts.col", ec);
             if (ec || ts_bytes != meta.row_count * sizeof(uint64_t)) {
                 OB_LOG_WARN("columnar", "%s names %zu segment(s) it replaced and its ts.col holds %llu "
-                                        "byte(s) for %llu row(s); it is removed and they are kept",
+                                        "byte(s) for %llu row(s)",
                             meta.dir_path.c_str(), inputs.size(),
                             static_cast<unsigned long long>(ec ? 0 : ts_bytes),
                             static_cast<unsigned long long>(meta.row_count));
-                staging.push_back(meta.dir_path);
+                short_merges.emplace_back(std::move(meta), std::move(inputs));
                 continue;
             }
         }
@@ -1417,6 +1449,36 @@ void ColumnarStore::rebuild_index_locked() {
     // that could not reach the disk is redone here first, so the input is compared with the range it
     // was merged with.
     repair_ranges_locked(found);
+
+    // A short merged segment goes only when every input it names is here to hold its rows; with one
+    // missing it is kept as it is - a scan skips what it cannot read whole, and what can be read of
+    // it by hand is still on the disk. Its inputs stay either way.
+    if (!short_merges.empty()) {
+        std::unordered_map<std::string, const SegmentMeta*> by_dir;
+        for (const SegmentMeta& m : found) by_dir.emplace(m.dir_path, &m);
+        std::vector<SegmentMeta> kept_short;
+        for (auto& [merged, named] : short_merges) {
+            const fs::path parent = fs::path(merged.dir_path).parent_path();
+            const bool all_here = std::all_of(named.begin(), named.end(), [&](const SegmentInput& in) {
+                const auto m = by_dir.find((parent / in.dir_name).string());
+                return m != by_dir.end() && in.names(*m->second);
+            });
+            if (all_here) {
+                std::error_code ec;
+                fs::remove_all(merged.dir_path, ec);
+                ++last_rebuild_removed_.short_merges;
+                OB_LOG_WARN("columnar", "removed %s: short of its rows, and every segment it replaced is "
+                                        "here to hold them%s",
+                            merged.dir_path.c_str(), ec ? " (and it could not all be removed)" : "");
+            } else {
+                OB_LOG_ERROR("columnar", "%s is short of its rows and not every segment it replaced is "
+                                         "here: it is kept as it is, and a scan skips what it cannot "
+                                         "read whole", merged.dir_path.c_str());
+                kept_short.push_back(std::move(merged));
+            }
+        }
+        for (auto& m : kept_short) found.push_back(std::move(m));
+    }
 
     if (!replaced.empty()) {
         // An input is the directory the merged segment names *and* the segment it recorded: the
