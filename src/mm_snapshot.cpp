@@ -263,6 +263,16 @@ void MultiMasterManager::handle_snapshot_request(PeerConnection& peer) {
                 static_cast<unsigned long long>(peer.conn_id));
 }
 
+void MultiMasterManager::start_catchup_for_test(PeerConnection& peer) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    start_catchup_to_peer(peer);
+}
+
+bool MultiMasterManager::try_drain_send_buf_for_test(PeerConnection& peer) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return try_drain_send_buf(peer);
+}
+
 PeerConnection& MultiMasterManager::install_peer_for_test(PeerConnection peer) {
     std::lock_guard<std::mutex> lock(mtx_);
     if (peer.conn_id == 0) peer.conn_id = next_conn_id_++;

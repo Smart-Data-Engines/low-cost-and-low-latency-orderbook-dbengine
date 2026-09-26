@@ -605,6 +605,14 @@ public:
     /// worker thread, and the peer may be gone by then (#79).
     PeerConnection& install_peer_for_test(PeerConnection peer);
 
+    /// Start a catch-up of an installed peer, as a vector showing it lacks something does, and run
+    /// one pass of rounds, as the io loop does between its passes (#178). Test seams, like the
+    /// snapshot ones: they take the lock themselves, and the rounds read the WAL without it.
+    void start_catchup_for_test(PeerConnection& peer);
+    bool run_catchup_rounds_for_test() { return run_catchup_rounds(); }
+    /// What the EPOLLOUT branch does first: write what the socket takes of the peer's buffer.
+    bool try_drain_send_buf_for_test(PeerConnection& peer);
+
     /// Enter the bootstrap state: this node holds no data yet and must not serve as though it did.
     ///
     /// Always paired with `finish_bootstrap()`. A flag that gates writes and has no way out is a

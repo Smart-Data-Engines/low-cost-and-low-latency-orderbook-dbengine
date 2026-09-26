@@ -363,6 +363,11 @@ ob_add_engine_test(test_mm_snapshot
     test_mm_snapshot.cpp
 )
 
+# A mesh catch-up in rounds from a cursor in the sender's WAL (#178), through the real manager.
+ob_add_engine_test(test_mm_catchup_rounds
+    test_mm_catchup_rounds.cpp
+)
+
 ob_add_engine_test(test_mm_stats
     test_mm_stats.cpp
 )
