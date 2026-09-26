@@ -448,6 +448,10 @@ void Engine::publish_staged_merges() {
     if (published > 0) {
         registry_.set_gauge("ob_segment_count",
                             static_cast<int64_t>(combined_store_.segment_count()));
+        // The inputs just retired wait from now, not from the next step's look at them.
+        size_t waiting = 0;
+        for (const RetiredInputs& r : retired_inputs_) waiting += r.dirs.size();
+        registry_.set_gauge("ob_segments_awaiting_removal", static_cast<int64_t>(waiting));
     }
 }
 

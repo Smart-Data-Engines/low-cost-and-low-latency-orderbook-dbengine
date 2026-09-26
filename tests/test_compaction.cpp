@@ -151,6 +151,24 @@ std::string merged_meta(const std::string& dir) {
     return {};
 }
 
+/// A number from a meta.json by its first occurrence, as the engine's own parser reads it.
+uint64_t meta_number(const std::string& json, const std::string& key) {
+    const std::string search = "\"" + key + "\":";
+    const auto at = json.find(search);
+    if (at == std::string::npos) return 0;
+    return std::stoull(json.substr(at + search.size()));
+}
+
+std::vector<std::string> metas_of(const std::string& dir, const std::string& symbol) {
+    std::vector<std::string> out;
+    for (const auto& path : meta_files(dir)) {
+        if (path.string().find("/" + symbol + "/") == std::string::npos) continue;
+        std::ifstream f(path);
+        out.emplace_back((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    }
+    return out;
+}
+
 }  // namespace
 
 TEST(Compaction, EightSealsOfASymbolMergeIntoOneAndEveryRowAnswersInOrder) {
@@ -223,8 +241,9 @@ TEST(Compaction, AScanReadingTheInputsKeepsTheirFilesUntilItEnds) {
         std::unique_lock<std::mutex> lock(m);
         cv.wait(lock, [&] { return in_scan; });
     }
-    // The merge is published under the scan, and its inputs wait for it.
-    ASSERT_TRUE(eventually([&] { return engine.registry().counter_value("ob_compactions_total") == 1; }));
+    // The merge is published under the scan, and its inputs wait for it. EXPECT, not ASSERT, until
+    // the join: a test that returned with the scan still held would end the process.
+    EXPECT_TRUE(eventually([&] { return engine.registry().counter_value("ob_compactions_total") == 1; }));
     std::this_thread::sleep_for(200ms);   // ticks enough to have removed them, were nothing reading
     EXPECT_EQ(segments_on_disk(dir.path, "A"), ob::compaction::kFanIn + 1)
         << "a merge removed the files of segments a running scan had copied";
@@ -303,5 +322,87 @@ TEST(Compaction, AnIdleNodeFinishesAMergeWithSyncsOfItsOwn) {
     EXPECT_TRUE(eventually([&] { return segments_on_disk(dir.path, "A") == 1; }))
         << segments_on_disk(dir.path, "A") << " segment(s) of A on an idle node";
     EXPECT_EQ(rows_answered(engine, "A"), rows_written(1, ob::compaction::kFanIn));
+    engine.close();
+}
+
+TEST(Compaction, AMergedSegmentKeepsTheLatestOfWhatItsInputsRecorded) {
+    TempDir dir;
+    ob::Engine engine(dir.path, 20'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    // Held while the inputs are read off the disk, so no merge takes them first.
+    auto pin = engine.pin_segment_files();
+    seal_n(engine, "A", 1, ob::compaction::kFanIn);
+    const auto inputs = metas_of(dir.path, "A");
+    ASSERT_EQ(inputs.size(), ob::compaction::kFanIn);
+    uint64_t file = 0, offset = 0, epoch = 0, seq = 0, last_row = 0;
+    for (const auto& json : inputs) {
+        const uint64_t f = meta_number(json, "wal_file_index");
+        const uint64_t o = meta_number(json, "wal_byte_offset");
+        if (f > file || (f == file && o > offset)) {
+            file = f;
+            offset = o;
+        }
+        epoch = std::max(epoch, meta_number(json, "seal_epoch"));
+        seq = std::max(seq, meta_number(json, "max_sequence_number"));
+        last_row = std::max(last_row, meta_number(json, "last_row_ts_ns"));
+    }
+    pin.reset();
+    ASSERT_TRUE(eventually([&] { return segments_on_disk(dir.path, "A") == 1; }));
+    const auto merged = metas_of(dir.path, "A");
+    ASSERT_EQ(merged.size(), 1u);
+    // The replay filter reads a symbol's latest position and a start judges a segment by its epoch:
+    // a merge that lowered either would have a restart apply a record twice or drop a segment.
+    EXPECT_EQ(meta_number(merged[0], "wal_file_index"), file);
+    EXPECT_EQ(meta_number(merged[0], "wal_byte_offset"), offset);
+    EXPECT_EQ(meta_number(merged[0], "seal_epoch"), epoch);
+    EXPECT_EQ(meta_number(merged[0], "max_sequence_number"), seq);
+    EXPECT_EQ(meta_number(merged[0], "last_row_ts_ns"), last_row);
+    engine.close();
+}
+
+TEST(Compaction, AStoreDiscardedWhileAMergesInputsWaitKeepsWhatIsWrittenAfterIt) {
+    TempDir dir;
+    ob::Engine engine(dir.path, 20'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    seal_n(engine, "A", 1, ob::compaction::kFanIn);
+
+    // A scan holding the inputs, so they wait past their merge's publication.
+    std::mutex m;
+    std::condition_variable cv;
+    bool in_scan = false;
+    bool go_on = false;
+    std::thread reader([&] {
+        engine.execute("SELECT * FROM 'A'.'EX'", [&](const ob::QueryResult&) {
+            std::unique_lock<std::mutex> lock(m);
+            if (in_scan) return;
+            in_scan = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return go_on; });
+        });
+    });
+    {
+        std::unique_lock<std::mutex> lock(m);
+        cv.wait(lock, [&] { return in_scan; });
+    }
+    // EXPECT, not ASSERT, from here to the join: a test that returned with the scan still held
+    // would end the process.
+    EXPECT_TRUE(eventually([&] { return engine.registry().counter_value("ob_compactions_total") == 1; }));
+    EXPECT_EQ(engine.registry().gauge_value("ob_segments_awaiting_removal"),
+              static_cast<int64_t>(ob::compaction::kFanIn));
+
+    // A resync discards the store; the same writes then give their segments the very directory names
+    // the waiting inputs had - their times are the same.
+    engine.discard_local_data_for_resync();
+    seal_n(engine, "A", 1, ob::compaction::kFanIn - 1);
+    {
+        std::lock_guard<std::mutex> lock(m);
+        go_on = true;
+    }
+    cv.notify_all();
+    reader.join();
+    std::this_thread::sleep_for(300ms);   // ticks enough for a removal that must not come
+    EXPECT_EQ(segments_on_disk(dir.path, "A"), ob::compaction::kFanIn - 1)
+        << "a merge's inputs, forgotten with the store they were in, took segments written after it";
+    EXPECT_EQ(rows_answered(engine, "A"), rows_written(1, ob::compaction::kFanIn - 1));
     engine.close();
 }
