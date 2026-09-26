@@ -191,6 +191,8 @@ struct ReconnectBackoff {
 
 /// Encode a single frame: appends [4B LE length | payload] to `out`.
 void encode_frame(const void* payload, size_t len, std::vector<uint8_t>& out);
+/// Only the length prefix `encode_frame()` writes, for a caller that appends the payload itself.
+void encode_frame_header(size_t len, std::vector<uint8_t>& out);
 
 /// Parse complete frames from recv_buf.
 /// On success, fills frames_out with (offset, length) pairs pointing to payload
@@ -269,6 +271,8 @@ struct CatchupState {
     uint64_t    sent{0};
     uint64_t    skipped_have{0};
     uint64_t    skipped_type{0};
+    uint64_t    read_us{0};             ///< the rounds' reading, off the lock, in total
+    uint64_t    longest_locked_us{0};   ///< the longest a round held the lock to send
     std::vector<CatchupLack> lacks;
     /// Index into `lacks` by "key" + '\x1f' + origin, so a record finds its range in one lookup.
     std::unordered_map<std::string, size_t> lack_index;
@@ -942,17 +946,26 @@ private:
     /// A round's reading, done off the lock: the records from one position on, each rebuilt as the
     /// frame it would go out as. Touched only by the io loop.
     struct CatchupRead {
-        uint8_t     record_type{0};
         uint64_t    sequence_number{0};
-        uint16_t    origin{0};
-        std::string key;                  ///< "SYMBOL.EXCHANGE" of a DELTA; empty otherwise
-        size_t      frame_offset{0};      ///< into catchup_frames_
+        uint32_t    pair{0};              ///< into catchup_pairs_, for a DELTA
+        size_t      frame_offset{0};      ///< into catchup_frames_: its length prefix
         size_t      frame_len{0};         ///< 0 when it is not a record to send
         WalPosition end{};                ///< where the record after it starts
     };
-    std::vector<CatchupRead>        catchup_reads_;
-    std::vector<uint8_t>            catchup_frames_;
-    std::unique_ptr<WALRecordCursor> catchup_cursor_;
+    /// One (symbol, origin) of a round, and what the peer holds of it - looked up once a round.
+    struct CatchupPair {
+        std::string key;
+        uint16_t    origin{0};
+        uint64_t    frontier{0};
+        uint64_t    first_missing{0};     ///< of the range it lacked at the start; 0 if none
+        bool        filled{false};
+    };
+    std::vector<CatchupRead>                catchup_reads_;
+    std::vector<uint8_t>                    catchup_frames_;   ///< framed, as they go out
+    std::vector<uint8_t>                    catchup_out_;      ///< the ones the peer lacks
+    std::vector<CatchupPair>                catchup_pairs_;
+    std::unordered_map<std::string, size_t> catchup_pair_index_;
+    std::unique_ptr<WALRecordCursor>        catchup_cursor_;
 };
 
 } // namespace ob
