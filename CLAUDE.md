@@ -3679,29 +3679,29 @@ seals only the stores that are due, a quarter more rows than it drained at most,
 that names the seal epoch it vouches for (part 2a); and the flush tick merges a symbol's small
 segments - eight of a level in one symbol's hour into one of the next, up to 262 144 rows, and an
 hour's leftovers a minute after it ends - in five steps across ticks that a crash in any of keeps
-each row once (part 2b, pitfalls 453-461). After a twenty-minute soak of 256 symbols a node holds
-1 957-3 238 segments where part 2a's held 30 208-30 464, and a cold start answers in 5.9-6.8 s
-rather than 26.4-26.9; a narrow query into history reads a merged segment whole, 1.8-2.3 ms against
+each row once (part 2b, pitfalls 453-461). After a twenty-minute soak of 256 symbols a node holds 1
+957-3 238 segments where part 2a's held 30 208-30 464, and a cold start answers in 5.9-6.8 s rather
+than 26.4-26.9; a narrow query into history reads a merged segment whole, 1.8-2.3 ms against
 0.14-0.25. **#178 is closed**: a mesh catch-up is rounds from a cursor in the sender's own WAL, read
 without the lock every local write takes and paced by the peer's send buffer - a node that missed
-more than `--mm-max-catchup-bytes` used to stop at the first ceiling's worth for good (6 990 of
-20 100 rows), and a 300 000-record catch-up livelocked on the send-buffer ceiling; and **#181 is
+more than `--mm-max-catchup-bytes` used to stop at the first ceiling's worth for good (6 990 of 20
+100 rows), and a 300 000-record catch-up livelocked on the send-buffer ceiling; and **#181 is
 closed**: a node applied a burst of frames in quadratic time, erasing each from the front of its
-receive buffer (pitfalls 462-470). **#179 is the open P0**: a mesh node restarted before its version vector reached the WAL
-replays the rows a peer sent it as its own origin's, is sent them again and stores them twice (200
-where the writer holds 100). **#169, #175, #176, #177, #180 and #182 are open P1s**: an exchange name with
-a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live book, sequence
-numbers and stored rows, measured on the wire; sharding by symbol has no control plane: no shard
-writes itself or the map to etcd, each owns every symbol, and a second on the same etcd becomes the
-first one's replica, measured against a native etcd; a mesh snapshot names each file by a 16-bit
-index, so a node of 8 192 segments cannot bootstrap a peer that joins it; a version vector past
-1 561 entries asks for everything, so every reconciliation resends the whole retained WAL and a
-joiner never asks for a snapshot; a node's vector is refreshed only when a store seals, so a peer
-back within the seal interval is judged to hold what it missed; and every replicated update of a
-level a node holds is logged at INFO as a conflict, same origin or not. **#172 is closed**: the
-Python client's sharded pool swaps its routing whole and replaces a shard connection a timeout
-closed, under a test that builds a sharded pool against a map in etcd.
-**#174 is an open P2**: a start reads the whole WAL twice even when its last checkpoint covers every
+receive buffer (pitfalls 462-470). **#179 is the open P0**: a mesh node restarted before its version
+vector reached the WAL replays the rows a peer sent it as its own origin's, is sent them again and
+stores them twice (200 where the writer holds 100). **#169, #175, #176, #177, #180 and #182 are open
+P1s**: an exchange name with a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C`
+share a live book, sequence numbers and stored rows, measured on the wire; sharding by symbol has no
+control plane: no shard writes itself or the map to etcd, each owns every symbol, and a second on
+the same etcd becomes the first one's replica, measured against a native etcd; a mesh snapshot names
+each file by a 16-bit index, so a node of 8 192 segments cannot bootstrap a peer that joins it; a
+version vector past 1 561 entries asks for everything, so every reconciliation resends the whole
+retained WAL and a joiner never asks for a snapshot; a node's vector is refreshed only when a store
+seals, so a peer back within the seal interval is judged to hold what it missed; and every
+replicated update of a level a node holds is logged at INFO as a conflict, same origin or not.
+**#172 is closed**: the Python client's sharded pool swaps its routing whole and replaces a shard
+connection a timeout closed, under a test that builds a sharded pool against a map in etcd. **#174
+is an open P2**: a start reads the whole WAL twice even when its last checkpoint covers every
 record.
 
 **#170 and #171**: a Python client connection carries one exchange at a time and is closed when one
