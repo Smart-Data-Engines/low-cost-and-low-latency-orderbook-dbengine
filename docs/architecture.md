@@ -183,8 +183,11 @@ origin is never a gap.
 Counters are restored at startup from two places, both of which only ever raise them: the highest
 number in each segment (`SegmentMeta::max_sequence_number`, published in `meta.json`) and every record
 replayed from the WAL tail. Replay *seeds* the tracker rather than assigning, so a gap recorded when
-the records were first written is not reported again on every restart. A `meta.json` without the field
-was written before numbers existed, and 0 is then the truth about that data rather than a fallback.
+the records were first written is not reported again on every restart - and it seeds every DELTA of
+the tail, the ones a segment already holds and it skips included, **under the origin its header
+names** (#179): a record a peer sent is remembered as seen from that peer, and a record without an
+origin, from before the mesh, as this node's own. A `meta.json` without the field was written before
+numbers existed, and 0 is then the truth about that data rather than a fallback.
 
 Until August 2026 none of this happened: `tcp_server.cpp` set the field to 0 with a comment saying the
 engine assigned it, and the engine copied the zero into the WAL header and the stored row. So every
@@ -258,12 +261,25 @@ nothing sends a node holding data: a node that missed more than the ceiling neve
 the scan. The end of a catch-up names the ranges the peer lacks that begin before the retained WAL,
 once an episode: nothing from here can send those.
 
-Two things do not hold yet, both found measuring #178. A node restarted before its vector reached
-the WAL replays the records a peer sent it as though they were its own — the replay seeds this
-node's origin — so it is sent them again and stores them twice (#179). And a node's vector is
-refreshed when a checkpoint is written, which a tick that seals nothing does not do, so a peer that
-comes back within the seal interval is compared against a vector without the writes it missed and
-caught up only at a later reconciliation (#180).
+**What a restarted node knows, and from whom** (#179). The last vector in the WAL and the held set
+beside it, then the tail's records seeded as above, then - for this node's own origin - the highest
+number in each segment. The vector is written **before** the checkpoint it goes with, in the same
+critical section: the checkpoint cuts the replay, so the records before it are known only to a
+vector, and with the checkpoint first a crash between the two appends left them known to nothing.
+Until #179 the replay seeded this node's origin for every record, so a node restarted before its
+vector reached the WAL was sent what it had replayed again and stored it twice - 200 rows where the
+writer held 100.
+
+**What a peer is told is at most one tick old** (#180). The manager reads the vector from a cache
+rather than from the tracker, because it reads it under its own lock, and the write path takes the
+engine's before the manager's. The cache used to be refreshed where the vector is written down, at
+a checkpoint, and since part 2a of #165 a tick that seals nothing writes none - so for up to ten
+seconds a returning peer was compared against a vector without the writes it missed, and a node
+just caught up told every reconciliation it lacked what it had been sent, and was sent it again.
+Every tick now brings the cache up to date, under the engine's lock it holds anyway: the tracker
+lists the (symbol, origin) pairs whose frontier moved since the last tick, and the tick applies
+them through an index - microseconds for the few a tick moves, where exporting the vector again
+cost 286 us at 4 000 entries.
 
 A node that joined an origin's stream in the middle used to be the other limit: it saw sequence 5000
 before it ever saw 1, so it could not claim "everything up to here" for that origin and kept
@@ -387,7 +403,8 @@ connection delivers in order, and an `iptables DROP` does not reset it — TCP r
 once traffic is allowed again, so a partitioned node reconverges without reconciliation doing
 anything. What is left for anti-entropy is divergence that outlives a healthy connection: a record the
 receiver dropped rather than lost (above the held-set cap in `SequenceTracker`, or refused), a peer
-whose vector was missing or stale when catch-up ran (#180), and a range a peer lacks that begins
+whose vector was missing when catch-up ran - or a tick old, which is as stale as it gets since #180 -
+and a range a peer lacks that begins
 before every sender's retained WAL, which a catch-up names and cannot send (#178). A backlog the
 sender discarded under backpressure used to be on this list; since #178 nothing discards one: a
 catch-up is paced by the peer's send buffer, and a peer that stops draining is disconnected with its
