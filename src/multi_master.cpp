@@ -2200,11 +2200,15 @@ ReconcileReport MultiMasterManager::reconcile_with_peers() {
             report.peers_position_unknown.push_back(peer.node_id);
         }
 
-        // Send ours again and let the peer's returning vector re-run our filter, so both
-        // directions get closed by one exchange.
+        // Send ours, so the peer can run its filter against it and catch us up. The other
+        // direction is the peer's: its own reconciliation sends its vector, and that is what runs
+        // our filter for what it lacks. Nothing here waits for that vector (#183). A peer does not
+        // answer a vector with one of its own, so a deadline armed here expired whenever the two
+        // timers were more than MM_VV_GRACE_MS apart, and the peer was then treated as holding
+        // nothing - a catch-up from its last vector, up to an interval old: every reconciliation
+        // resent what had been written since, and after a large catch-up, the whole of it again.
+        // The deadline is the handshake's, where a peer that says nothing really is unknown.
         send_version_vector(peer);
-        peer.catchup_started    = false;
-        peer.vector_deadline_ms = now_ms() + MM_VV_GRACE_MS;
         ++report.vectors_sent;
     }
 

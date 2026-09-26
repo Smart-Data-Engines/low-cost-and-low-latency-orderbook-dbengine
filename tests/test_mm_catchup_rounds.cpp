@@ -22,10 +22,12 @@
 
 #include "mm_test_peer.hpp"
 
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <ostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -318,4 +320,49 @@ TEST(MMCatchupRounds, ARangeWhoseFirstNumberIsInTheWalIsNotCalledUnfillable) {
     EXPECT_EQ(run_to_end(node, to), expected("NEW", 3, 101, 1000));
     EXPECT_EQ(node.engine->registry().counter_value("ob_mm_catchup_unfillable_total"), 0u);
     EXPECT_EQ(to.mgr(*node.mm).unfillable_ranges.ticks(), 0u);
+}
+
+TEST(MMCatchupRounds, AReconciliationDoesNotTakeAPeersOwnTimerForSilence) {
+    // #183. A reconciliation sends this node's vector; the peer's own reconciliation sends its, on
+    // its own timer, and a peer does not answer a vector with one of its own. A deadline armed by
+    // the reconciliation expired whenever the two timers were more than the grace apart, and the
+    // peer was treated as holding nothing - a catch-up from its last vector, which here is an
+    // interval old and says 500 where live traffic has since given it everything. Measured on three
+    // nodes reconciling every 5 s: 6-7 such catch-ups a run, each sending everything written since
+    // the peer's last vector, and the whole of a 300 000-record catch-up again in two runs of three.
+    CatchupNode node(1 << 20, 64 << 20);
+    node.write("QUIET", kSelf, 1, 1000);
+    WiredPeer to(kPeer);
+    ob::PeerConnection& peer = to.mgr(*node.mm);
+    peer.peer_vector     = vector_of({{"QUIET.EX", kSelf, 500}});   // its last vector
+    peer.catchup_started = true;                                     // acted on when it came
+
+    (void)node.mm->reconcile_with_peers();
+    to.collect();
+    const auto sent = take_frames(to.inbox);
+    ASSERT_EQ(sent.size(), 1u) << "the premise: the reconciliation sends this node's vector";
+    EXPECT_EQ(sent.front().hdr.record_type, ob::WAL_RECORD_VERSION_VECTOR);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(ob::MM_VV_GRACE_MS + 200));
+    node.mm->start_overdue_catchups_for_test();
+    EXPECT_FALSE(peer.catchup.active)
+        << "the peer's silence since the reconciliation was taken for holding nothing";
+    std::vector<Delivered> got;
+    node.mm->run_catchup_rounds_for_test();
+    drain(node, to, got);
+    EXPECT_TRUE(got.empty()) << got.size() << " records sent again from a vector an interval old";
+}
+
+TEST(MMCatchupRounds, APeerSilentSinceItsHandshakeIsSentEverything) {
+    // The control of the one above, and the deadline's own case, which stays: after a handshake a
+    // peer that has stated nothing is unknown, and everything retained is the safe direction.
+    CatchupNode node(1 << 20, 64 << 20);
+    node.write("MUTE", kSelf, 1, 300);
+    WiredPeer to(kPeer);
+    ob::PeerConnection& peer = to.mgr(*node.mm);
+    peer.catchup_started    = false;   // as a handshake leaves it
+    peer.vector_deadline_ms = 1;       // and its grace long past
+    node.mm->start_overdue_catchups_for_test();
+    ASSERT_TRUE(peer.catchup.active) << "a peer silent since its handshake was not caught up";
+    EXPECT_EQ(run_to_end(node, to), expected("MUTE", kSelf, 1, 300));
 }

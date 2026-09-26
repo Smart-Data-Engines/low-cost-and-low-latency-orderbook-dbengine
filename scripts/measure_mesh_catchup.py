@@ -316,7 +316,9 @@ def main() -> int:
     for r in range(args.rounds):
         for label, path in (servers if r % 2 == 0 else list(reversed(servers))):
             print(f"== round {r + 1} {label}", flush=True)
-            one_run(label, path, args.records, os.path.join(args.root, label),
+            # A directory per run, not per build: the log of a run that went differently is read
+            # after the next run of the same build, which used to remove it first.
+            one_run(label, path, args.records, os.path.join(args.root, f"{label}-round{r + 1}"),
                     args.flush_writer_before_restart, args.reconcile_seconds, args.watch_seconds)
     return 0
 

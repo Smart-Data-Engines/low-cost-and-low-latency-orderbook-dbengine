@@ -335,7 +335,8 @@ struct PeerConnection {
 
     /// What the peer says it holds. Until it arrives, the peer is assumed to hold nothing.
     PeerVector   peer_vector;
-    /// Monotonic milliseconds after which a silent peer is treated as holding nothing.
+    /// Monotonic milliseconds after which a silent peer is treated as holding nothing. Armed by the
+    /// handshake only: a reconciliation that armed it too took a peer's own timer for silence (#183).
     uint64_t     vector_deadline_ms{0};
     /// Set once catch-up has been started for this connection, so a late vector does not
     /// start a second stream.
@@ -615,6 +616,8 @@ public:
     /// snapshot ones: they take the lock themselves, and the rounds read the WAL without it.
     void start_catchup_for_test(PeerConnection& peer);
     bool run_catchup_rounds_for_test() { return run_catchup_rounds(); }
+    /// What the io loop does when a peer's vector is overdue after its handshake (#183). Test seam.
+    void start_overdue_catchups_for_test() { start_overdue_catchups(); }
     /// What the EPOLLOUT branch does first: write what the socket takes of the peer's buffer.
     bool try_drain_send_buf_for_test(PeerConnection& peer);
     /// What the EPOLLIN branch does with what it read: handle every whole frame in the peer's
