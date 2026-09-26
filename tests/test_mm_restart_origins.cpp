@@ -124,7 +124,12 @@ void write_own(ob::Engine& engine, const Record& r) {
     ASSERT_EQ(engine.apply_delta_mm(r.delta, r.levels.data()), ob::OB_OK);
 }
 
+/// Every row the node holds for `symbol`. Flushed first: a record applied since the last flush
+/// has its rows in the pending queue, which a query does not read - so a count taken straight after
+/// a redelivery cannot see the duplicate it is there to catch (test_mm_dedup.cpp flushes for the
+/// same reason, and the first pass of this file's mutation table is how it was found here).
 int rows(ob::Engine& engine, const char* symbol) {
+    engine.flush_incremental();
     int n = 0;
     const std::string sql = std::string("SELECT * FROM '") + symbol +
                             "'.'EX' WHERE timestamp BETWEEN 0 AND 9999999999999999999";
@@ -374,6 +379,10 @@ TEST(MeshRestartOrigins, RecordsASegmentAlreadyHoldsAreRememberedFromTheirOrigin
     };
     {
         auto node = open_node(live.path, ob::FsyncPolicy::INTERVAL);
+        // A tick before anything arrives, so the cache is built while it is empty and goes past
+        // 4 096 entries by updates: the first update after open is a whole rebuild, which would
+        // otherwise be the only thing this test's vector ever went through.
+        node->flush_tick_for_test();
         for (uint16_t k = 0; k < kWideOrigins; ++k) {
             ASSERT_EQ(deliver(*node, record("WIDE", 1, 1'000'000'000ULL + k),
                               static_cast<uint16_t>(kFirstWide + k)),
