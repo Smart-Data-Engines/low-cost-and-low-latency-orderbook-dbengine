@@ -1676,7 +1676,7 @@ void MultiMasterManager::process_recv_buf(PeerConnection& peer) {
     // Frames are consumed by an offset, and the bytes before it removed once, after the loop (#181).
     // Erasing each frame from the front moved the rest of the buffer every time: a catch-up delivers
     // megabytes in one read, and a node caught up at 100 000 records spent 96% of its time in
-    // memmove - 78 s to apply what its peer sent in 0.1 s.
+    // memmove - 123 s to apply what its peer sent in 0.1 s.
     size_t offset = 0;
     const auto consume = [&]() {
         if (offset > 0 && offset <= peer.recv_buf.size()) {

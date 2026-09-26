@@ -3631,7 +3631,7 @@ Learned the hard way. Check here before debugging.
      got a mesh of its own, and then both failed as measured.
 469. **A buffer consumed from the front one message at a time is quadratic in a read.** The mesh
      erased every frame from the front of its receive buffer; one read of a catch-up was megabytes,
-     and a node spent 96% of its time in memmove - 78 s for 100 000 records (#181). Walk an offset
+     and a node spent 96% of its time in memmove - 123 s for 100 000 records (#181). Walk an offset
      and compact once. `perf` found it in one run where reasoning about the sender had not.
 470. **An editable install answers `import` before `PYTHONPATH` does.** The shared venv holds the
      main checkout's client installed editable, whose finder sits in `sys.meta_path`, so a worktree's

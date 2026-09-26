@@ -2,7 +2,7 @@
 //
 // A catch-up delivers megabytes in one read, and `process_recv_buf()` erased every frame from the
 // front of the buffer, moving the rest of it each time: quadratic in the frames of one read. A node
-// being caught up at 100 000 records spent 96% of its time in memmove and took 78 s to apply what
+// being caught up at 100 000 records spent 96% of its time in memmove and took 123 s to apply what
 // its peer had sent in 0.1 s. These tests hold the linear version to its answer - every whole frame
 // handled, the part of one that has not arrived kept - and to a time a quadratic one cannot meet.
 

@@ -2233,8 +2233,10 @@ what an operator needs.
 ### 181. A mesh node applied a burst of frames in quadratic time: every frame was erased from the front of its receive buffer ✅ **P1**
 
 **Found measuring #178.** With the catch-up in rounds the sender of a 100 000-record catch-up
-finished in 0.1 s, and the node it caught up took **78 s** to apply what it had received - about
-2 000 records a second, in a build that writes millions of levels a second. `perf` on that node:
+finished in 0.1 s, and the node it caught up held the last of it **123 s** after its restart - under
+a thousand records a second, in a build that writes millions of levels a second (78 s in the first
+run, which counted rows and stopped early on #179's duplicates; 123 s in the Release run kept, which
+waits for the last row). `perf` on that node:
 **96% of its time in `memmove`**. `process_recv_buf()` handled a frame and then erased it from the
 front of the receive buffer, moving the rest of the buffer every time; the io loop reads everything
 the socket has before parsing, so one read of a catch-up was megabytes, and a read of *n* frames cost
@@ -11514,7 +11516,7 @@ were two that are closed: **#178 was a P0** - a mesh node that missed more than
 `--mm-max-catchup-bytes` of its peers' WAL never got the rest, 6 990 of 20 100 rows for good,
 because every catch-up started at the first record and stopped where the first had; a catch-up is
 rounds from a cursor now, read without the lock every local write takes - and **#181**: a node
-applied a burst of frames in quadratic time, erasing each from the front of its receive buffer, 78 s
+applied a burst of frames in quadratic time, erasing each from the front of its receive buffer, 123 s
 for a catch-up its peer sent in 0.1 s; 1.8 s now. **#179**: a mesh node
 restarted before its version vector reached the WAL remembers the rows it replayed as its own, is
 sent them again and stores them twice - 200 rows where the writer holds 100. **#177**: a version
