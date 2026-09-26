@@ -3218,8 +3218,12 @@ the replica started again. That was true of the sweep before merges existed.
 
 Measured on the m9g.xlarge against master (`3174ec0`, part 2a; the same GCC 14 Release build of
 both, each run on a fresh data root on the gp3 volume and started only once the load was under 0.3
-with no process not ours running, both read again at the end of every run), on
-`16bb1ed`, whose C++ is this pull request's. Part 1's soak — 256 symbols, one 20-level `MINSERT`
+with no process not ours running, both read again at the end of every run), on `16bb1ed`. One
+change to the C++ followed it, and it was not measured on the box: CodeQL flagged the release of a
+chain of reader generations for keeping a stack address in a thread-local, and the release now keeps
+the one link it still has to let go of in the dying generation's own `next` — a link hands over at
+most its successor, so one slot is the whole queue, and nothing is allocated in a destructor; its
+mutation table is four rows, four as written. Part 1's soak — 256 symbols, one 20-level `MINSERT`
 each per round, 20 rounds a second — twenty minutes a run, ABBA:
 
 | | master (`3174ec0`) | part 2b |

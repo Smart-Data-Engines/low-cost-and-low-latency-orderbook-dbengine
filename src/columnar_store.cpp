@@ -37,24 +37,23 @@ ColumnarStore::ColumnarStore(std::string_view base_dir, uint64_t segment_duratio
 namespace detail {
 
 namespace {
-// The links a release on this thread still has to let go of; set while one is draining.
-thread_local std::vector<std::shared_ptr<ReaderGeneration>>* releasing = nullptr;
+// While a release on this thread lets go of a chain: the one link it still has to let go of. A
+// link's release hands over at most its own successor, and the slot is empty whenever a link is
+// let go of, so one slot is the whole queue. It is the `next` of the generation whose destructor
+// drains the chain - memory that lives until that destructor returns, and nothing to allocate.
+thread_local std::shared_ptr<ReaderGeneration>* releasing = nullptr;
 }  // namespace
 
 ReaderGeneration::~ReaderGeneration() {
     if (!next) return;
     if (releasing != nullptr) {
-        releasing->push_back(std::move(next));
+        *releasing = std::move(next);
         return;
     }
-    std::vector<std::shared_ptr<ReaderGeneration>> pending;
-    pending.reserve(1);
-    releasing = &pending;
-    pending.push_back(std::move(next));
-    while (!pending.empty()) {
-        std::shared_ptr<ReaderGeneration> link = std::move(pending.back());
-        pending.pop_back();
-        // The last reference, or not: if it is, its destructor hands its successor to `pending`.
+    releasing = &next;
+    while (next) {
+        std::shared_ptr<ReaderGeneration> link = std::move(next);
+        // The last reference, or not: if it is, its destructor hands its successor to the slot.
         link.reset();
     }
     releasing = nullptr;
