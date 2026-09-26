@@ -3639,13 +3639,17 @@ Learned the hard way. Check here before debugging.
      verification script printed the path and nobody read it for two branches. Harmless while the
      two clients are the same file (`diff -rq`); a branch that changes the client needs a venv of its
      own, or the battery tests the wrong code and says it passed.
-471. **pytest's JUnit report files an xfail as a skip.** `<skipped type="pytest.xfail">`, beside
-     `type="pytest.skip"` - so the integration job's gate, which reads that report and allows only
-     the Binance skips, turned PR #187 red over `407 passed, 5 xfailed`: the battery's first strict
-     xfails since the gate was written. A local `pytest` run cannot show it; the summary line says
-     `xfailed`, which is also what the TSan job's grep reads. The gate is
-     `scripts/check_integration_skips.py` now, and an xfail passes it only when its reason names an
-     item the roadmap's Open line lists - so a marker that outlives its item fails the job.
+471. **An xfail is filed as a skip twice over, and both CI gates read one of them.** pytest's JUnit
+     report writes `<skipped type="pytest.xfail">` beside `type="pytest.skip"`, so the integration
+     job's gate, which read that report and allowed only the Binance skips, turned PR #187 red over
+     `407 passed, 5 xfailed` - the battery's first strict xfails since the gate was written. The fix
+     for it went green there, and the TSan job then went red on the second: our own report plugin
+     in `conftest.py` counted an xfail's call phase as `skipped` and printed `5 skipped`, which is
+     the count the TSan guard grepped. pytest's own line says `xfailed`, so a local run shows
+     neither. Both jobs run `scripts/check_integration_skips.py` over their JUnit report now: a
+     skip passes only if it is Binance's, an xfail only when its reason names an item the roadmap's
+     Open line lists, so a marker that outlives its item fails the job - and the plugin counts
+     xfails as themselves.
 
 ## Current state and open problems
 

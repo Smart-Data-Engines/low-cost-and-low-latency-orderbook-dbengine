@@ -12,6 +12,10 @@ gate was written, five of them in PR #187, turned the job red over 407 passing t
 accepted when its reason names an item the roadmap's `**Open: ...**` line lists, and refused when it
 names none, or only closed ones: a marker that outlived its item is a skip with a better excuse.
 
+Both integration jobs run it, the uninstrumented one and the TSan one, each over its own report:
+the TSan job's guard used to grep a count out of the battery's summary line, and that line counted
+the same five xfails as skips.
+
     scripts/check_integration_skips.py integration-report.xml [docs/roadmap.md]
     scripts/check_integration_skips.py --self-test
 

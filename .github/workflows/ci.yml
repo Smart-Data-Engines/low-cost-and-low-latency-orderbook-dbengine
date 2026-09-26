@@ -671,6 +671,7 @@ jobs:
           PYTHONPATH=$PWD/python .venv/bin/python -m pytest -q -rs \
             --ignore=tests/integration/test_binance_live.py \
             --ignore=tests/integration/test_binance_failover_sync.py \
+            --junitxml=tsan-integration-report.xml \
             tests/integration/ | tee tsan-pytest.log
 
       # A skip in this job is a failure, and that is not pedantry — it is the defect this job just
@@ -681,24 +682,21 @@ jobs:
       # its PostgreSQL cross-section did not skip.
       # `if: always()`, and this is not belt-and-braces — a step placed after a failing step is
       # **skipped**, so this guard and the report below only ever ran when they had nothing to say.
-      - name: Fail if anything skipped
+      - name: Fail if anything skipped, or xfailed but for an open item
         if: always()
         run: |
-          if [ ! -f tsan-pytest.log ]; then
-            echo "No pytest log: the battery step did not get far enough to produce one."
+          if [ ! -f tsan-integration-report.xml ]; then
+            echo "No report: the battery step did not get far enough to produce one."
             exit 0
           fi
-          # A non-zero count, not the word. The first version matched "[0-9]+ skipped" and the
-          # summary line reads "0 skipped", so the guard against a false negative produced a false
-          # positive on its first run — with the battery green underneath it. Worth the two lines of
-          # comment: a check that fires on the *presence of a word* rather than on a *count* is the
-          # same class of mistake as the thing it was added to catch.
-          if grep -qE "[1-9][0-9]* skipped" tsan-pytest.log; then
-            echo "Tests skipped in the sanitizer battery. A skip here reads as a pass:"
-            grep -E "^SKIPPED|[1-9][0-9]* skipped" tsan-pytest.log
-            exit 1
-          fi
-          echo "No skips."
+          # The report, not a count read out of the summary. That count was the guard until PR
+          # #187, and it was right to be a count rather than the word - the first version matched
+          # "[0-9]+ skipped", and the summary reads "0 skipped" - but a count in a summary line is
+          # whatever the line's author counted: this battery's own summary filed the first strict
+          # xfails as "5 skipped". The same script as the uninstrumented job's gate, so both jobs
+          # hold a skip and an xfail to one rule.
+          python3 scripts/check_integration_skips.py --self-test
+          python3 scripts/check_integration_skips.py tsan-integration-report.xml docs/roadmap.md
 
       # Evidence for the leading hypothesis about #86, and it costs two seconds. ThreadSanitizer
       # multiplies a process's footprint, this job runs three nodes plus etcd on one shared runner,
