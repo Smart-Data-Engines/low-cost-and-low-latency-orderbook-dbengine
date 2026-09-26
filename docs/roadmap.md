@@ -2342,7 +2342,7 @@ when the catch-up had finished; the longest the catch-up held the lock in that r
 returning node holds 100 rows more than the writer in every run of both builds: the rows it had
 before the kill, stored twice after it, which is #179.
 
-**Mutation table: 28 runs, 25 as written down before them** - 18 killed and 7 surviving where the
+**Mutation table: 28 runs, 24 as written down before them** - 19 killed and 5 surviving where the
 verdict said, in two passes. The first pass had 25 rows; four written as killed survived, and each
 was a finding rather than a verdict to move: a connection that changes *while* a round reads (row
 12) is held by a second check no single-threaded test reaches - the first, where a round is picked,
