@@ -273,6 +273,7 @@ struct CatchupState {
     uint64_t    skipped_type{0};
     uint64_t    read_us{0};             ///< the rounds' reading, off the lock, in total
     uint64_t    longest_locked_us{0};   ///< the longest a round held the lock to send
+    uint64_t    last_progress_ms{0};    ///< when the last progress line was written
     std::vector<CatchupLack> lacks;
     /// Index into `lacks` by "key" + '\x1f' + origin, so a record finds its range in one lookup.
     std::unordered_map<std::string, size_t> lack_index;

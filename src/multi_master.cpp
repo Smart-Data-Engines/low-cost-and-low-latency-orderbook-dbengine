@@ -1673,15 +1673,27 @@ void MultiMasterManager::disarm_epollout(PeerConnection& peer) {
 // ── Frame receive/parse methods (task 6.1) ────────────────────────────────────
 
 void MultiMasterManager::process_recv_buf(PeerConnection& peer) {
+    // Frames are consumed by an offset, and the bytes before it removed once, after the loop (#181).
+    // Erasing each frame from the front moved the rest of the buffer every time: a catch-up delivers
+    // megabytes in one read, and a node caught up at 100 000 records spent 96% of its time in
+    // memmove - 78 s to apply what its peer sent in 0.1 s.
+    size_t offset = 0;
+    const auto consume = [&]() {
+        if (offset > 0 && offset <= peer.recv_buf.size()) {
+            peer.recv_buf.erase(peer.recv_buf.begin(),
+                                peer.recv_buf.begin() + static_cast<std::ptrdiff_t>(offset));
+        }
+    };
     while (true) {
+        const size_t available = peer.recv_buf.size() - offset;
         // Need at least 4 bytes for the frame header.
-        if (peer.recv_buf.size() < MM_FRAME_HEADER_SIZE) {
+        if (available < MM_FRAME_HEADER_SIZE) {
             break;
         }
 
         // Read length (uint32 LE) from first 4 bytes.
         uint32_t length = 0;
-        std::memcpy(&length, peer.recv_buf.data(), sizeof(uint32_t));
+        std::memcpy(&length, peer.recv_buf.data() + offset, sizeof(uint32_t));
 
         // Validate: length must not exceed MM_MAX_FRAME_PAYLOAD.
         if (length > MM_MAX_FRAME_PAYLOAD) {
@@ -1698,24 +1710,24 @@ void MultiMasterManager::process_recv_buf(PeerConnection& peer) {
         }
 
         // Check if the full frame (header + payload) is available.
-        if (peer.recv_buf.size() < MM_FRAME_HEADER_SIZE + length) {
+        if (available < MM_FRAME_HEADER_SIZE + length) {
             break;  // Incomplete frame — wait for more data.
         }
 
-        // Extract payload pointer and call handle_frame.
-        const uint8_t* payload_ptr = peer.recv_buf.data() + MM_FRAME_HEADER_SIZE;
+        // Extract payload pointer and call handle_frame. Nothing below changes the buffer while the
+        // loop runs, so the pointer - and every frame after it - stays where it is.
+        const uint8_t* payload_ptr = peer.recv_buf.data() + offset + MM_FRAME_HEADER_SIZE;
+        const size_t   consumed    = MM_FRAME_HEADER_SIZE + length;
         handle_frame(peer, payload_ptr, static_cast<size_t>(length));
 
-        // If peer was disconnected during handle_frame, stop processing.
-        if (!peer.connected) {
+        // If peer was disconnected during handle_frame, stop processing: the connection's buffer
+        // went with it. A handler that emptied the buffer of a connection it kept is the same case.
+        if (!peer.connected || peer.recv_buf.size() < offset + consumed) {
             return;
         }
-
-        // Remove processed bytes (header + payload) from recv_buf.
-        size_t consumed = MM_FRAME_HEADER_SIZE + length;
-        peer.recv_buf.erase(peer.recv_buf.begin(),
-                            peer.recv_buf.begin() + static_cast<std::ptrdiff_t>(consumed));
+        offset += consumed;
     }
+    consume();
 }
 
 void MultiMasterManager::handle_frame(PeerConnection& peer,
@@ -2601,6 +2613,22 @@ bool MultiMasterManager::run_catchup_rounds() {
             engine_.registry().increment_counter("ob_mm_catchup_records_sent_total", sent_now);
         }
         engine_.registry().increment_counter("ob_mm_catchup_rounds_total");
+        // A long catch-up says where it is every ten seconds: the start and end lines alone leave
+        // an operator guessing whether one that has not ended is moving.
+        const uint64_t now = now_ms();
+        if (now - std::max(st.started_ms, st.last_progress_ms) >= 10'000) {
+            st.last_progress_ms = now;
+            OB_LOG_INFO("mm", "Catch-up to peer %u under way: %llu round(s), %.0f s, read=%llu "
+                              "record(s) (%llu bytes) sent=%llu skipped_peer_has=%llu, at file %u "
+                              "offset %u, send_buf=%zu",
+                        peer.node_id, static_cast<unsigned long long>(st.rounds),
+                        static_cast<double>(now - st.started_ms) / 1000.0,
+                        static_cast<unsigned long long>(st.read_records),
+                        static_cast<unsigned long long>(st.read_bytes),
+                        static_cast<unsigned long long>(st.sent),
+                        static_cast<unsigned long long>(st.skipped_have), st.next.file_index,
+                        st.next.offset, peer.send_buf.size());
+        }
         longest_locked_us = std::max(longest_locked_us, held_for(locked_at));
         st.longest_locked_us = std::max(st.longest_locked_us, longest_locked_us);
         OB_LOG_DEBUG("mm", "Catch-up to peer %u, round %llu: read %zu record(s) (%zu bytes) in "

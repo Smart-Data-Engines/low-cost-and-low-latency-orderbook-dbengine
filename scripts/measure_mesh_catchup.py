@@ -154,6 +154,7 @@ def write(port: int, first_ts: int, per_symbol: int, batch: int = 256) -> None:
 
 
 def rows(port: int) -> int:
+    """Every row of the measured symbols, fetched: exact, and heavy - so only at the ends of a run."""
     c = Conn(port)
     try:
         c.request("FLUSH\n")
@@ -162,6 +163,18 @@ def rows(port: int) -> int:
             reply = c.request(f"SELECT price FROM '{sym}'.'EX'\n")
             total += max(0, len(reply) - 2)     # "OK" and the header
         return total
+    finally:
+        c.close()
+
+
+def has_row_at(port: int, sym: str, ts: int) -> bool:
+    """Whether the row written at `ts` has arrived. A catch-up sends in the WAL's order, so the last
+    row of the batch arriving means the batch has; polling for one row costs one row, where counting
+    every row every second was itself the heaviest load on the node being caught up."""
+    c = Conn(port)
+    try:
+        reply = c.request(f"SELECT price FROM '{sym}'.'EX' WHERE timestamp BETWEEN {ts} AND {ts}\n")
+        return len(reply) >= 3 and reply[0] == b"OK"
     finally:
         c.close()
 
@@ -224,14 +237,22 @@ def one_run(label: str, server: str, records: int, root: str) -> None:
         restart = time.monotonic()
         returning.start()
 
-        expected = rows(writer.tcp)
-        got, deadline = -1, time.monotonic() + 300
+        # The batch's last row: `write()` numbers them first_ts + k * symbols + s.
+        per_symbol = records // len(SYMBOLS)
+        last_ts = 1_700_000_001_000_000_000 + (per_symbol - 1) * len(SYMBOLS) + len(SYMBOLS) - 1
+        arrived, deadline = False, time.monotonic() + 300
         while time.monotonic() < deadline:
-            got = rows(returning.tcp)
-            if got >= expected:
+            try:
+                arrived = has_row_at(returning.tcp, SYMBOLS[-1], last_ts)
+            except (OSError, ConnectionError):
+                arrived = False                  # still starting
+            if arrived:
                 break
-            time.sleep(1.0)
+            time.sleep(0.25)
         caught_up = time.monotonic()
+        time.sleep(1.0)                          # the last tick's drain, and the other peer's copy
+        expected = rows(writer.tcp)
+        got = rows(returning.tcp)
         time.sleep(2)
         probe.stop_flag.set()
         probe.join(timeout=5)
