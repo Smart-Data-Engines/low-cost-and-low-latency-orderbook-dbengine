@@ -108,8 +108,10 @@ ob::SegmentMeta merged(const ob::ColumnarStore& store, const std::string& base,
     writer.set_seal_epoch(epoch);
     writer.set_lineage(level + 1, std::move(named), last_row);
     const fs::path parent = fs::path(inputs.front().dir_path).parent_path();
-    const std::string dir = (parent / ("merge" + std::string(ob::ColumnarStore::kCompactingSuffix)))
-                                .string();
+    static int seq = 0;
+    const std::string dir =
+        (parent / ("1_1_" + std::to_string(++seq) + std::string(ob::ColumnarStore::kCompactingSuffix)))
+            .string();
     auto meta = writer.flush_segment_into(dir);
     EXPECT_TRUE(meta.has_value());
     return meta.value_or(ob::SegmentMeta{});
@@ -508,4 +510,123 @@ TEST(CompactionStore, ARebuildKeepsASegmentThatTookAnInputsName) {
     EXPECT_TRUE(fs::exists(name + "/meta.json"));
     EXPECT_EQ(reopened.segment_count(), 2u);
     EXPECT_EQ(delivered(reopened, "A").size(), 3u);
+}
+
+TEST(CompactionStore, OnlyAMergesOwnNameAtASegmentsDepthIsAWorkingDirectory) {
+    using ob::ColumnarStore;
+    EXPECT_TRUE(ColumnarStore::is_compacting_dir("1790000000_1790000001_7.compacting"));
+    EXPECT_FALSE(ColumnarStore::is_compacting_dir("X.compacting"));
+    EXPECT_FALSE(ColumnarStore::is_compacting_dir("1_2.compacting"));
+    EXPECT_FALSE(ColumnarStore::is_compacting_dir("1_2_x.compacting"));
+    EXPECT_FALSE(ColumnarStore::is_compacting_dir("1__2.compacting"));
+    EXPECT_FALSE(ColumnarStore::is_compacting_dir(".compacting"));
+
+    // A symbol and an exchange a client named like one: their rows stay through a rebuild.
+    TempDir dir;
+    {
+        ob::ColumnarStore store(dir.str());
+        ob::ColumnarStore writer(dir.str(), ob::ColumnarStore::kDefaultSegmentDurationNs,
+                                 ob::ColumnarStore::OwnIndex::kNo);
+        writer.set_symbol_exchange("X.compacting", "1_2_3.compacting");
+        writer.append(row_at(kBase + 1 * kSec, 1));
+        ASSERT_TRUE(writer.flush_segment().has_value());
+    }
+    ob::ColumnarStore reopened(dir.str());
+    reopened.open_existing();
+    EXPECT_EQ(reopened.segment_count(), 1u)
+        << "a symbol whose name ends like a working directory was removed with its rows";
+    EXPECT_EQ(reopened.last_rebuild_removed().staging, 0u);
+}
+
+TEST(CompactionStore, ARebuildKeepsTheInputsOfAMergedSegmentWhoseColumnsAreShort) {
+    TempDir dir;
+    std::vector<ob::SnapshotRow> rows_before;
+    std::string merged_dir;
+    {
+        ob::ColumnarStore store(dir.str());
+        const auto a = written(dir.str(), "A", {{kBase + 1 * kSec, 1}}, {77, 1, 10, 1});
+        const auto b = written(dir.str(), "A", {{kBase + 2 * kSec, 2}}, {77, 1, 20, 2});
+        store.merge_segments({a, b});
+        rows_before = delivered(store, "A");
+        auto out = merged(store, dir.str(), {a, b});
+        ASSERT_TRUE(rename_to_segment(out));
+        merged_dir = out.dir_path;
+    }
+    // What a storage that did not keep what it acknowledged leaves: the merged segment's timestamps
+    // short of its rows.
+    fs::resize_file(merged_dir + "/ts.col", sizeof(uint64_t));
+    ob::ColumnarStore reopened(dir.str());
+    reopened.open_existing();
+    EXPECT_EQ(reopened.last_rebuild_removed().superseded, 0u)
+        << "the inputs of a merged segment short of its rows were removed";
+    EXPECT_FALSE(fs::exists(merged_dir)) << "the short merged segment was kept";
+    EXPECT_TRUE(same_rows(delivered(reopened, "A"), rows_before));
+}
+
+TEST(CompactionStore, ARebuildTellsAnInputFromEveryMergedSegmentThatNamesItsPath) {
+    TempDir dir;
+    std::vector<ob::SnapshotRow> rows_before;
+    {
+        ob::ColumnarStore store(dir.str());
+        // A first merge, its inputs gone as a merge leaves them...
+        const auto a = written(dir.str(), "A", {{kBase + 1 * kSec, 1}}, {77, 1, 10, 1});
+        const auto b = written(dir.str(), "A", {{kBase + 2 * kSec, 2}}, {77, 1, 20, 2});
+        store.merge_segments({a, b});
+        auto first = merged(store, dir.str(), {a, b});
+        ASSERT_TRUE(rename_to_segment(first));
+        store.replace_segments({a, b}, first, [](ob::SegmentMeta&) { return true; });
+        fs::remove_all(a.dir_path);
+        fs::remove_all(b.dir_path);
+        // ...then later segments that took the same names, merged in turn, and the process gone
+        // before their removal.
+        const auto a2 = written(dir.str(), "A", {{kBase + 1 * kSec, 100}}, {77, 2, 30, 3});
+        const auto b2 = written(dir.str(), "A", {{kBase + 2 * kSec, 200}}, {77, 2, 40, 4});
+        ASSERT_EQ(a2.dir_path, a.dir_path);
+        store.merge_segments({a2, b2});
+        auto second = merged(store, dir.str(), {a2, b2});
+        const fs::path from(second.dir_path);
+        const fs::path to = from.parent_path() / (std::to_string(second.start_ts_ns) + "_" +
+                                                  std::to_string(second.end_ts_ns) + "_merged2");
+        fs::rename(from, to);
+        rows_before = delivered(store, "A");   // a2 and b2, indexed; the first merge
+    }
+    ob::ColumnarStore reopened(dir.str());
+    reopened.open_existing();
+    EXPECT_EQ(reopened.last_rebuild_removed().superseded, 2u)
+        << "an input one merged segment names was kept because another names its path too";
+    EXPECT_EQ(delivered(reopened, "A").size(), rows_before.size());
+}
+
+TEST(CompactionStore, AnInputIsComparedWithTheRangeItWasMergedWith) {
+    TempDir dir;
+    std::string input_dir;
+    {
+        ob::ColumnarStore store(dir.str());
+        const auto a = written(dir.str(), "A", {{kBase + 5 * kSec, 1}}, {77, 1, 10, 1});
+        const auto b = written(dir.str(), "A", {{kBase + 6 * kSec, 2}}, {77, 1, 20, 2});
+        store.merge_segments({a, b});
+        auto out = merged(store, dir.str(), {a, b});
+        ASSERT_TRUE(rename_to_segment(out));
+        input_dir = a.dir_path;
+    }
+    // The input's meta.json as a build before #166 left it, whose repair the merge's process made
+    // in memory only: a range from the start of its hour, and no word that it is the rows'.
+    {
+        std::ifstream f(input_dir + "/meta.json");
+        std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        const std::string rows = ",\"time_range\":\"rows\"";
+        ASSERT_NE(json.find(rows), std::string::npos) << json;
+        json.erase(json.find(rows), rows.size());
+        const std::string start = "\"start_ts_ns\":" + std::to_string(kBase + 5 * kSec);
+        const uint64_t hour = (kBase / (3600 * kSec)) * (3600 * kSec);
+        ASSERT_NE(json.find(start), std::string::npos) << json;
+        json.replace(json.find(start), start.size(), "\"start_ts_ns\":" + std::to_string(hour));
+        std::ofstream(input_dir + "/meta.json", std::ios::trunc) << json;
+    }
+    ob::ColumnarStore reopened(dir.str());
+    reopened.open_existing();
+    EXPECT_EQ(reopened.last_rebuild_removed().superseded, 2u)
+        << "an input compared with the range its old meta.json says, rather than its rows', stayed";
+    EXPECT_FALSE(fs::exists(input_dir));
+    EXPECT_EQ(delivered(reopened, "A").size(), 2u);
 }

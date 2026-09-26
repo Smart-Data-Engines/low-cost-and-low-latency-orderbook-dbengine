@@ -1453,7 +1453,8 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
             // would remove the first after carrying it over the wire, and a replica of an older
             // build would hold the second's rows twice.
             if (entry.is_directory()) {
-                if (ColumnarStore::is_compacting_dir(entry.path().filename().string()) ||
+                if ((it.depth() >= ColumnarStore::kSegmentDepth &&
+                     ColumnarStore::is_compacting_dir(entry.path().filename().string())) ||
                     (!replaced.empty() &&
                      replaced.count(entry.path().lexically_normal().string()) != 0)) {
                     it.disable_recursion_pending();
@@ -2988,11 +2989,9 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows) {
             // The seals it vouches for (#165 part 2b) - every one so far, by epoch with blocks
             // waiting and by position without - which a merge takes once it is on the device.
             checkpoint_seal_epoch_ = seal_epoch_;
-            // `none` makes no promise a sync could keep, so retention need not wait for one.
-            if (fsync_policy_ == FsyncPolicy::NONE) {
-                retention_floor_ = durable_up_to_;
-                durable_seal_epoch_ = checkpoint_seal_epoch_;
-            }
+            // `none` makes no promise a sync could keep, so retention need not wait for one. A merge
+            // does wait for one, which it makes itself (sync_for_merge()).
+            if (fsync_policy_ == FsyncPolicy::NONE) retention_floor_ = durable_up_to_;
         }
 
         // And what this node holds, so a restart does not have to relearn it. Written next to
@@ -3031,7 +3030,9 @@ void Engine::note_wal_synced() {
     // sync of a WAL file failed, the third succeeded, and the file before it was gone.
     if (checkpoints_frozen()) return;
     retention_floor_ = durable_up_to_;
-    durable_seal_epoch_ = checkpoint_seal_epoch_;   // what a merge may take (#165 part 2b)
+    // What a merge may take (#165 part 2b) - except under `none`, where nothing was synced and the
+    // merges' own sync says it instead.
+    if (fsync_policy_ != FsyncPolicy::NONE) durable_seal_epoch_ = checkpoint_seal_epoch_;
 }
 
 bool Engine::checkpoints_frozen() {
@@ -3125,12 +3126,9 @@ void Engine::remove_unvouched_segments(const WALReplayer::LastCheckpoint& last) 
 int Engine::sync_segments() {
     // Caller holds flush_mtx_ and not mtx_.
     //
-    // Counted, so a merge knows a sync has come since it wrote (#165 part 2b); `none` counts too,
-    // having nothing to wait for.
-    if (fsync_policy_ == FsyncPolicy::NONE) {      // that policy promises nothing after a cut
-        ++segment_syncs_;
-        return 0;
-    }
+    // Counted when it ran, so a merge knows a sync has come since it wrote (#165 part 2b); under
+    // `none` nothing runs here, and a merge syncs for itself.
+    if (fsync_policy_ == FsyncPolicy::NONE) return 0;   // that policy promises nothing after a cut
     if (data_dir_fd_ < 0) return EBADF;                 // open() has not run: nothing to vouch for
     const auto started = std::chrono::steady_clock::now();
     if (::syncfs(data_dir_fd_) != 0) {

@@ -29,6 +29,10 @@ inline constexpr size_t kFullRows = 65'536;
 /// How many segments of one level make a merge: each row is written once per level it climbs,
 /// log8 of the ratio between a merged segment and a sealed one.
 inline constexpr size_t kFanIn = 8;
+/// At most this many inputs to one merge of a settled partition, whatever their rows: a partition
+/// of tiny segments - a quiet symbol's, or ones merging was kept from - would otherwise be one merge
+/// opening thousands of files in the tick writers wait on. What is left merges at the next look.
+inline constexpr size_t kMaxInputs = 64;
 /// A partition whose period ended this long ago, and which has received nothing for as long, is
 /// settled: its segments that are not full merge whatever their levels, into as few as fit.
 inline constexpr std::chrono::seconds kSettle{60};
@@ -36,6 +40,9 @@ inline constexpr std::chrono::seconds kSettle{60};
 /// heavier one - the write ceiling - merges nothing, unless none has for `kMaxDelay`, and then one.
 inline constexpr std::chrono::milliseconds kTickBudget{10};
 inline constexpr std::chrono::seconds kMaxDelay{10};
+/// Under `--fsync-policy none`, how often at most a merge syncs so that a checkpoint vouches for
+/// the segments it would take (`Engine::sync_for_merge()`).
+inline constexpr std::chrono::seconds kVouchInterval{1};
 /// How many partitions one tick looks at, so ten thousand symbols' partitions are not all read
 /// in one tick; the next tick resumes after the last.
 inline constexpr size_t kLooksPerTick = 128;
@@ -53,6 +60,9 @@ struct Candidate {
     bool eligible{false};
     /// Which WAL its position refers to: a merge's inputs share one, which the merged segment keeps.
     uint64_t wal_identity{0};
+    /// Its range: the order a scan delivers segments in, which a merge must not change.
+    uint64_t start_ts_ns{0};
+    uint64_t end_ts_ns{0};
 };
 
 /// What decides whether one segment may be a merge's input.
@@ -89,7 +99,10 @@ struct Run {
 /// The merges a partition calls for, in order and disjoint. A run is at least two consecutive
 /// members that are eligible, not full and of one WAL, at most `kMaxRows` rows together; and, until
 /// the partition is `settled`, of one level and taken `kFanIn` at a time - fewer only when that many
-/// would pass `kMaxRows`. A settled partition's runs ignore the level and take as many as fit.
+/// would pass `kMaxRows`. A settled partition's runs ignore the level and take as many as fit, up to
+/// `kMaxInputs`. And a run's merged range - its first start, its last end - sorts strictly between
+/// the segments before and after it, or it is not a run: publication refuses one that does not, so
+/// planning it would rewrite its rows every tick for nothing.
 std::vector<Run> plan(const std::vector<Candidate>& segments, bool settled);
 
 }  // namespace ob::compaction

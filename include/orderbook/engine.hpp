@@ -664,10 +664,16 @@ private:
     std::chrono::steady_clock::time_point last_merge_{};
     /// When a tick at the write ceiling last looked for a merge (compaction_step()).
     std::chrono::steady_clock::time_point last_heavy_look_{};
+    /// When a merge's own sync last ran: under `none`, the only thing that puts a checkpoint on the
+    /// device.
+    std::chrono::steady_clock::time_point last_merge_sync_{};
+    /// Numbers the merges' working directories, so no two share one.
+    uint64_t merge_seq_{0};
     std::chrono::steady_clock::time_point merge_backoff_until_{};
     LogEpisode merge_failures_{};
-    /// Successful `sync_segments()`: what a step compares with the count it recorded to know that a
-    /// sync has come since.
+    /// Syncs of the data directory that ran - a seal's under a policy that syncs, and every one of the
+    /// merges' own: what a step compares with the count it recorded to know that a sync has come
+    /// since. Not `none`'s, which sync nothing.
     uint64_t segment_syncs_{0};
     /// The seal epoch the last checkpoint appended vouches for, and the one the last checkpoint known
     /// to be on the device does: a merge takes a segment of this WAL only at or below the second.
@@ -1147,6 +1153,10 @@ private:
     void remove_retired_inputs();
     /// Rename a merge's working directory to a segment's name no directory has.
     bool publish_merged_dir(SegmentMeta& output);
+    /// A syncfs() of the data directory whatever `--fsync-policy` says: a merge removes segments
+    /// that were on the device, so it may do so only once what replaces them is (#165 part 2b).
+    /// Under `none` it is also what makes the last checkpoint durable. Holds `flush_mtx_`.
+    int sync_for_merge();
     /// What a partition may merge now - up to `max_merges` in all, within `budget_end` - and when
     /// to look at it again.
     void look_at_partition(std::map<CompactionKey, CompactionPartition>::iterator it,

@@ -15,6 +15,25 @@ uint64_t settle_ns() {
     return static_cast<uint64_t>(std::chrono::nanoseconds(kSettle).count());
 }
 
+/// (start, end) of `a` before (start, end) of `b`, strictly.
+bool range_before(uint64_t a_start, uint64_t a_end, uint64_t b_start, uint64_t b_end) {
+    return a_start < b_start || (a_start == b_start && a_end < b_end);
+}
+
+/// Whether merging [first, first + count) keeps every segment of the view where it was in the order
+/// a scan delivers them: the merged range after the segment before the run and before the one after
+/// it, both strictly - the directory's name, which breaks a tie, is the publication's to choose.
+bool sorts_where_it_was(const std::vector<Candidate>& s, size_t first, size_t count) {
+    const uint64_t start = s[first].start_ts_ns;
+    uint64_t end = 0;
+    for (size_t i = first; i < first + count; ++i) end = std::max(end, s[i].end_ts_ns);
+    if (first > 0 && !range_before(s[first - 1].start_ts_ns, s[first - 1].end_ts_ns, start, end)) {
+        return false;
+    }
+    const size_t after = first + count;
+    return after >= s.size() || range_before(start, end, s[after].start_ts_ns, s[after].end_ts_ns);
+}
+
 }  // namespace
 
 bool may_merge(const SegmentFacts& segment, uint64_t local_wal_identity, uint64_t vouched_epoch) {
@@ -64,19 +83,23 @@ std::vector<Run> plan(const std::vector<Candidate>& segments, bool settled) {
             // Never past the stretch: the break above keeps k + kFanIn inside it before a partition
             // settles, and a bound that rests on a condition several lines away is one edit from a
             // read past the segments (a mutation of that condition found it).
-            const size_t limit = settled ? j : std::min(j, k + kFanIn);
+            const size_t limit = std::min(j, k + (settled ? kMaxInputs : kFanIn));
             uint64_t rows = 0;
             size_t m = k;
             while (m < limit && rows + segments[m].rows <= kMaxRows) {
                 rows += segments[m].rows;
                 ++m;
             }
-            if (m - k >= 2) {
+            // A settled run gives up its last inputs until it sorts where they were; a run of a
+            // level is taken whole or not at all, the fan-in being what it waits for.
+            while (settled && m - k > 2 && !sorts_where_it_was(segments, k, m - k)) --m;
+            if (m - k >= 2 && sorts_where_it_was(segments, k, m - k)) {
                 runs.push_back(Run{k, m - k});
                 k = m;
             } else {
-                // One that fits with nothing after it: it stays, and the next may start a run.
-                k = m > k ? m : k + 1;
+                // One that fits with nothing after it, or a run whose range would move: the first
+                // stays, and the next may start a run.
+                k = k + 1;
             }
         }
         i = j;

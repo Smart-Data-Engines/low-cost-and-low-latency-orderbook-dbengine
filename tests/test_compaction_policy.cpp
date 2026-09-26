@@ -10,6 +10,7 @@
 #include <rapidcheck.h>
 #include <rapidcheck/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -35,35 +36,49 @@ std::vector<Candidate> operator+(std::vector<Candidate> a, const std::vector<Can
     return a;
 }
 
+/// What a partition's view gives the policy: segments in delivery order, each after the last -
+/// the ranges the helpers above leave at zero.
+std::vector<Candidate> in_order(std::vector<Candidate> segs) {
+    for (size_t i = 0; i < segs.size(); ++i) {
+        segs[i].start_ts_ns = 1000 * (i + 1);
+        segs[i].end_ts_ns = 1000 * (i + 1) + 500;
+    }
+    return segs;
+}
+
+std::vector<Merge> plan_of(const std::vector<Candidate>& segs, bool settled) {
+    return plan(in_order(segs), settled);
+}
+
 }  // namespace
 
 TEST(CompactionPolicy, EightSegmentsOfOneLevelMakeAMerge) {
-    EXPECT_EQ(plan(repeat(kFanIn, small()), false), (std::vector<Merge>{{0, kFanIn}}));
-    EXPECT_TRUE(plan(repeat(kFanIn - 1, small()), false).empty())
+    EXPECT_EQ(plan_of(repeat(kFanIn, small()), false), (std::vector<Merge>{{0, kFanIn}}));
+    EXPECT_TRUE(plan_of(repeat(kFanIn - 1, small()), false).empty())
         << "a partition still receiving rows merged fewer than the fan-in";
-    EXPECT_EQ(plan(repeat(2 * kFanIn + 1, small()), false),
+    EXPECT_EQ(plan_of(repeat(2 * kFanIn + 1, small()), false),
               (std::vector<Merge>{{0, kFanIn}, {kFanIn, kFanIn}}));
 }
 
 TEST(CompactionPolicy, ASettledPartitionMergesWhatIsLeftIntoAsFewAsFit) {
-    EXPECT_EQ(plan(repeat(kFanIn - 1, small()), true), (std::vector<Merge>{{0, kFanIn - 1}}));
+    EXPECT_EQ(plan_of(repeat(kFanIn - 1, small()), true), (std::vector<Merge>{{0, kFanIn - 1}}));
     // Levels do not matter once nothing more arrives.
-    EXPECT_EQ(plan(repeat(3, small(32'000, 1)) + repeat(2, small()), true),
+    EXPECT_EQ(plan_of(repeat(3, small(32'000, 1)) + repeat(2, small()), true),
               (std::vector<Merge>{{0, 5}}));
     // And a single segment is not a merge.
-    EXPECT_TRUE(plan({small()}, true).empty());
+    EXPECT_TRUE(plan_of({small()}, true).empty());
     // As many as fit, then again: five of 60 000 rows are two segments, the second alone.
-    EXPECT_EQ(plan(repeat(5, small(60'000)), true), (std::vector<Merge>{{0, 4}}));
+    EXPECT_EQ(plan_of(repeat(5, small(60'000)), true), (std::vector<Merge>{{0, 4}}));
 }
 
 TEST(CompactionPolicy, AFullSegmentMergesWithNothing) {
     const Candidate full{kFullRows, 0, true, true, 7};
-    EXPECT_TRUE(plan(repeat(kFanIn, full), false).empty());
-    EXPECT_TRUE(plan(repeat(kFanIn, full), true).empty());
+    EXPECT_TRUE(plan_of(repeat(kFanIn, full), false).empty());
+    EXPECT_TRUE(plan_of(repeat(kFanIn, full), true).empty());
     // And it ends a stretch: four small ones on either side are not eight.
-    EXPECT_TRUE(plan(repeat(4, small()) + std::vector<Candidate>{full} + repeat(4, small()), false)
+    EXPECT_TRUE(plan_of(repeat(4, small()) + std::vector<Candidate>{full} + repeat(4, small()), false)
                     .empty());
-    EXPECT_EQ(plan(repeat(4, small()) + std::vector<Candidate>{full} + repeat(4, small()), true),
+    EXPECT_EQ(plan_of(repeat(4, small()) + std::vector<Candidate>{full} + repeat(4, small()), true),
               (std::vector<Merge>{{0, 4}, {5, 4}}));
 }
 
@@ -76,26 +91,26 @@ TEST(CompactionPolicy, WhatLiesBetweenTwoMembersEndsARun) {
     foreign.wal_identity = 9;   // a snapshot's
     for (const Candidate& gap : {other, pending, foreign}) {
         const auto split = repeat(4, small()) + std::vector<Candidate>{gap} + repeat(4, small());
-        EXPECT_EQ(plan(split, true), (std::vector<Merge>{{0, 4}, {5, 4}}));
-        EXPECT_TRUE(plan(split, false).empty());
+        EXPECT_EQ(plan_of(split, true), (std::vector<Merge>{{0, 4}, {5, 4}}));
+        EXPECT_TRUE(plan_of(split, false).empty());
     }
     // Two WALs' segments merge, each with their own.
-    EXPECT_EQ(plan(repeat(kFanIn, small()) + repeat(kFanIn, foreign), false),
+    EXPECT_EQ(plan_of(repeat(kFanIn, small()) + repeat(kFanIn, foreign), false),
               (std::vector<Merge>{{0, kFanIn}, {kFanIn, kFanIn}}));
 }
 
 TEST(CompactionPolicy, EachLevelMergesWithItsOwn) {
     // What a partition holds a while into its period: merged segments before the newest sealed ones.
-    EXPECT_EQ(plan(repeat(kFanIn, small(32'000, 1)) + repeat(3, small()), false),
+    EXPECT_EQ(plan_of(repeat(kFanIn, small(32'000, 1)) + repeat(3, small()), false),
               (std::vector<Merge>{{0, kFanIn}}));
-    EXPECT_EQ(plan(repeat(3, small(32'000, 1)) + repeat(kFanIn, small()), false),
+    EXPECT_EQ(plan_of(repeat(3, small(32'000, 1)) + repeat(kFanIn, small()), false),
               (std::vector<Merge>{{3, kFanIn}}));
 }
 
 TEST(CompactionPolicy, AMergeStopsAtTheRowCap) {
     // Eight of 40 000 rows would be 320 000: six are what fit, and two wait for more of their level.
-    EXPECT_EQ(plan(repeat(kFanIn, small(40'000, 1)), false), (std::vector<Merge>{{0, 6}}));
-    EXPECT_EQ(plan(repeat(kFanIn, small(32'768, 1)), false), (std::vector<Merge>{{0, kFanIn}}))
+    EXPECT_EQ(plan_of(repeat(kFanIn, small(40'000, 1)), false), (std::vector<Merge>{{0, 6}}));
+    EXPECT_EQ(plan_of(repeat(kFanIn, small(32'768, 1)), false), (std::vector<Merge>{{0, kFanIn}}))
         << "eight that make exactly the cap are one merge";
 }
 
@@ -138,6 +153,31 @@ TEST(CompactionPolicy, APartitionSettlesOnceItsPeriodIsOverAndNothingIsAddedToIt
     EXPECT_FALSE(settled(UINT64_MAX - 1, UINT64_MAX - 1, quiet));
 }
 
+TEST(CompactionPolicy, ARunWhoseMergedRangeWouldMoveIsNotPlanned) {
+    // Nine segments of one range - client event times, a retried write - and the ninth not yet
+    // mergeable. Merged, the eight would have the ninth's range, and which of the two a scan delivers
+    // first would come down to a directory's name: not a merge, because publication would refuse it,
+    // and a plan of it would rewrite their rows every tick for nothing.
+    std::vector<Candidate> same(ob::compaction::kFanIn + 1, small());
+    for (auto& c : same) {
+        c.start_ts_ns = 1000;
+        c.end_ts_ns = 1500;
+    }
+    same.back().eligible = false;
+    EXPECT_TRUE(plan(same, false).empty());
+    EXPECT_TRUE(plan(same, true).empty()) << "identical ranges merged, which changes their order";
+    // Whereas one segment of another range after them leaves the eight nothing to tie with.
+    same.back().start_ts_ns = 2000;
+    same.back().end_ts_ns = 2500;
+    EXPECT_EQ(plan(same, false), (std::vector<Merge>{{0, ob::compaction::kFanIn}}));
+}
+
+TEST(CompactionPolicy, ASettledMergeTakesAtMostItsInputCap) {
+    const auto runs = plan_of(repeat(3 * ob::compaction::kMaxInputs, small(1)), true);
+    ASSERT_EQ(runs.size(), 3u);
+    for (const Merge& r : runs) EXPECT_EQ(r.count, ob::compaction::kMaxInputs);
+}
+
 RC_GTEST_PROP(CompactionPolicy, RunsAreDisjointOrderedAndWithinTheirBounds, ()) {
     const auto n = *rc::gen::inRange<size_t>(0, 40);
     std::vector<Candidate> segs;
@@ -152,6 +192,18 @@ RC_GTEST_PROP(CompactionPolicy, RunsAreDisjointOrderedAndWithinTheirBounds, ()) 
         c.wal_identity = *rc::gen::element<uint64_t>(uint64_t{7}, uint64_t{9});
         segs.push_back(c);
     }
+    // Ranges in delivery order, some of them equal to their neighbour's, as out-of-order rows and
+    // client event times leave them.
+    uint64_t at = 1000;
+    for (auto& c : segs) {
+        if (*rc::gen::weightedElement<bool>({{8, true}, {2, false}})) at += 1000;
+        c.start_ts_ns = at;
+        c.end_ts_ns = at + *rc::gen::element<uint64_t>(uint64_t{0}, uint64_t{500});
+    }
+    std::sort(segs.begin(), segs.end(), [](const Candidate& a, const Candidate& b) {
+        return a.start_ts_ns < b.start_ts_ns ||
+               (a.start_ts_ns == b.start_ts_ns && a.end_ts_ns < b.end_ts_ns);
+    });
     const bool settled = *rc::gen::arbitrary<bool>();
     const auto runs = plan(segs, settled);
     size_t after = 0;
@@ -171,6 +223,21 @@ RC_GTEST_PROP(CompactionPolicy, RunsAreDisjointOrderedAndWithinTheirBounds, ()) 
         }
         RC_ASSERT(rows <= kMaxRows);
         if (!settled) RC_ASSERT(r.count <= kFanIn);
+        RC_ASSERT(r.count <= ob::compaction::kMaxInputs);
+        // The merged range sorts strictly between the segments either side.
+        uint64_t end = 0;
+        for (size_t i = r.first; i < r.first + r.count; ++i) end = std::max(end, segs[i].end_ts_ns);
+        const uint64_t start = segs[r.first].start_ts_ns;
+        auto before = [](uint64_t as, uint64_t ae, uint64_t bs, uint64_t be) {
+            return as < bs || (as == bs && ae < be);
+        };
+        if (r.first > 0) {
+            RC_ASSERT(before(segs[r.first - 1].start_ts_ns, segs[r.first - 1].end_ts_ns, start, end));
+        }
+        if (r.first + r.count < segs.size()) {
+            RC_ASSERT(before(start, end, segs[r.first + r.count].start_ts_ns,
+                             segs[r.first + r.count].end_ts_ns));
+        }
         after = r.first + r.count;
     }
 }

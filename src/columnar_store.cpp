@@ -1351,14 +1351,16 @@ void ColumnarStore::rebuild_index_locked() {
     // its publication and their removal leaves beside it. Keyed by the path the input had.
     std::vector<fs::path> leftovers;
     std::vector<fs::path> staging;
-    std::unordered_map<std::string, SegmentInput> replaced;
+    // More than one merged segment can name one path: a name comes back once its input is gone,
+    // and the segment that took it can be merged in turn.
+    std::unordered_multimap<std::string, SegmentInput> replaced;
     std::vector<SegmentMeta> found;
     std::vector<SegmentInput> inputs;
     for (auto it = fs::recursive_directory_iterator(base_dir_);
          it != fs::recursive_directory_iterator(); ++it) {
         const auto& entry = *it;
         if (entry.is_directory()) {
-            if (is_compacting_dir(entry.path().filename().string())) {
+            if (it.depth() >= kSegmentDepth && is_compacting_dir(entry.path().filename().string())) {
                 staging.push_back(entry.path());
                 it.disable_recursion_pending();
             }
@@ -1375,6 +1377,22 @@ void ColumnarStore::rebuild_index_locked() {
         if (!parse_meta_json(entry.path().string(), meta, &inputs)) continue;
 
         meta.dir_path = entry.path().parent_path().string();
+        if (!inputs.empty()) {
+            // A merged segment is published only once its files are on the device, so a short one
+            // is a storage that did not keep what it acknowledged. Then the inputs are what holds
+            // the rows, and the merge is what goes: it is written again from them.
+            std::error_code ec;
+            const auto ts_bytes = fs::file_size(fs::path(meta.dir_path) / "ts.col", ec);
+            if (ec || ts_bytes != meta.row_count * sizeof(uint64_t)) {
+                OB_LOG_WARN("columnar", "%s names %zu segment(s) it replaced and its ts.col holds %llu "
+                                        "byte(s) for %llu row(s); it is removed and they are kept",
+                            meta.dir_path.c_str(), inputs.size(),
+                            static_cast<unsigned long long>(ec ? 0 : ts_bytes),
+                            static_cast<unsigned long long>(meta.row_count));
+                staging.push_back(meta.dir_path);
+                continue;
+            }
+        }
         const fs::path parent = entry.path().parent_path().parent_path();
         for (auto& in : inputs) {
             const std::string at = (parent / in.dir_name).string();
@@ -1395,14 +1413,19 @@ void ColumnarStore::rebuild_index_locked() {
         OB_LOG_DEBUG("columnar", "removed %s, a merge nothing published%s", dir.string().c_str(),
                      ec ? " (and could not remove all of it)" : "");
     }
+    // Before the inputs are told apart: a merge took an input with its range repaired, and a repair
+    // that could not reach the disk is redone here first, so the input is compared with the range it
+    // was merged with.
+    repair_ranges_locked(found);
+
     if (!replaced.empty()) {
         // An input is the directory the merged segment names *and* the segment it recorded: the
         // name alone comes back once an input is gone, with a later seal's rows under it.
         std::vector<SegmentMeta> kept;
         kept.reserve(found.size());
         for (auto& meta : found) {
-            const auto r = replaced.find(meta.dir_path);
-            if (r == replaced.end() || !r->second.names(meta)) {
+            const auto [first, last] = replaced.equal_range(meta.dir_path);
+            if (std::none_of(first, last, [&](const auto& r) { return r.second.names(meta); })) {
                 kept.push_back(std::move(meta));
                 continue;
             }
@@ -1420,8 +1443,6 @@ void ColumnarStore::rebuild_index_locked() {
                     "%zu segment(s) a merged segment beside them had replaced",
                     last_rebuild_removed_.staging, last_rebuild_removed_.superseded);
     }
-
-    repair_ranges_locked(found);
 
     // Sorted after the repair, because the repair moves the ranges the order is taken from - and
     // sorted once, before being handed out per symbol, so building the index is not a sorted

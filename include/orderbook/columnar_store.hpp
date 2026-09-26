@@ -287,10 +287,34 @@ public:
     /// The suffix of a merge's working directory (#165 part 2b). A rebuild removes one, and a
     /// snapshot leaves it out.
     static constexpr std::string_view kCompactingSuffix = ".compacting";
+    /// Whether `name` is one a merge gives its working directory - `<start>_<end>_<n>.compacting`,
+    /// digits all three - and nothing a client names: a symbol or an exchange may end in the suffix
+    /// too, and taking one for a working directory removed it, and every row under it, at the next
+    /// start. Its callers ask it only of a directory at a segment's depth or deeper.
     static bool is_compacting_dir(std::string_view name) {
-        return name.size() > kCompactingSuffix.size() &&
-               name.substr(name.size() - kCompactingSuffix.size()) == kCompactingSuffix;
+        if (name.size() <= kCompactingSuffix.size() ||
+            name.substr(name.size() - kCompactingSuffix.size()) != kCompactingSuffix) {
+            return false;
+        }
+        const std::string_view stem = name.substr(0, name.size() - kCompactingSuffix.size());
+        int fields = 1;
+        bool digit_seen = false;
+        for (const char c : stem) {
+            if (c == '_') {
+                if (!digit_seen) return false;
+                ++fields;
+                digit_seen = false;
+            } else if (c >= '0' && c <= '9') {
+                digit_seen = true;
+            } else {
+                return false;
+            }
+        }
+        return fields == 3 && digit_seen;
     }
+    /// How deep below the data directory a segment's directory is: `<symbol>/<exchange>/<segment>`,
+    /// the depth a recursive walk from the data directory reports for it.
+    static constexpr int kSegmentDepth = 2;
 
     /// Every row of one segment, all seven columns, in the order it holds them (#165 part 2b: what a
     /// merge reads). False, having handed over no row, when a column is missing or short or the
@@ -597,7 +621,14 @@ private:
     /// scan that took it, or an older one, has finished. Assigned under `index_mtx_` exclusively,
     /// copied under it shared.
     struct ReaderGeneration {
-        std::shared_ptr<const ReaderGeneration> next;
+        std::shared_ptr<ReaderGeneration> next;
+        /// Released a link at a time: a scan that outlived many publications holds the start of a
+        /// chain of every generation since, and letting each destructor release the next would
+        /// recurse once per publication on that scan's thread.
+        ~ReaderGeneration() {
+            std::shared_ptr<ReaderGeneration> link = std::move(next);
+            while (link && link.use_count() == 1) link = std::move(link->next);
+        }
     };
     std::shared_ptr<ReaderGeneration> reader_generation_ = std::make_shared<ReaderGeneration>();
 

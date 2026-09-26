@@ -80,12 +80,16 @@ std::shared_ptr<const void> Engine::pin_segment_files() {
 void Engine::note_segment_for_compaction(const SegmentMeta& meta, SteadyClock::time_point now,
                                          bool arrived) {
     if (!compaction_enabled_) return;
-    CompactionPartition& p =
-        compaction_partitions_[CompactionKey{period_of(meta), meta.symbol, meta.exchange}];
+    const auto [it, added] =
+        compaction_partitions_.try_emplace(CompactionKey{period_of(meta), meta.symbol, meta.exchange});
+    CompactionPartition& p = it->second;
     // A merge's own output is not new data: a partition settles once no seal has added to it for a
     // while, however many merges it took to get there.
     if (arrived) p.last_added = now;
-    p.next_look = now;
+    // And a full segment gives it nothing to merge - it merges with nothing, and it ends no run it
+    // is sealed after - so it wakes nothing up: at a rate just below the write ceiling a symbol
+    // seals one every couple of ticks, and each look copies every segment of its hour.
+    if (added || !arrived || meta.row_count < compaction::kFullRows) p.next_look = now;
 }
 
 void Engine::note_store_for_compaction() {
@@ -139,7 +143,7 @@ void Engine::finish_compaction_on_close() {
         const bool wants_sync =
             std::any_of(retired_inputs_.begin(), retired_inputs_.end(),
                         [&](const RetiredInputs& r) { return r.synced_before == segment_syncs_; });
-        if (!frozen && (!wants_sync || sync_segments() == 0)) remove_retired_inputs();
+        if (!frozen && (!wants_sync || sync_for_merge() == 0)) remove_retired_inputs();
     }
     size_t waiting = 0;
     for (const RetiredInputs& r : retired_inputs_) waiting += r.dirs.size();
@@ -164,13 +168,11 @@ void Engine::compaction_step(size_t drained_rows) {
     // Nothing moves while a snapshot's manifest names these files: not a merge, not a removal.
     if (segment_file_pins_->load(std::memory_order_acquire) > 0) return;
 
-    uint64_t vouched_epoch = 0;
     {
         std::lock_guard<std::mutex> lock(mtx_);
         // A node receiving a store is about to replace this one; and after a failed sync no later
         // sync can be trusted to have written what a merge would publish or remove (#160).
         if (is_bootstrapping() || checkpoints_frozen()) return;
-        vouched_epoch = durable_seal_epoch_;
     }
 
     // A sync, if what was written or published since the last one waits for it. A tick that sealed
@@ -181,7 +183,7 @@ void Engine::compaction_step(size_t drained_rows) {
         std::any_of(retired_inputs_.begin(), retired_inputs_.end(),
                     [&](const RetiredInputs& r) { return r.synced_before == segment_syncs_; });
     if (wants_sync) {
-        if (const int err = sync_segments(); err != 0) {
+        if (const int err = sync_for_merge(); err != 0) {
             registry_.increment_counter("ob_segment_sync_errors_total");
             std::lock_guard<std::mutex> lock(mtx_);
             freeze_checkpoints(std::string("A merge's segment sync failed (") + std::strerror(err) +
@@ -209,6 +211,32 @@ void Engine::compaction_step(size_t drained_rows) {
     }
     if (now < merge_backoff_until_) return;
     const auto budget_end = now + compaction::kTickBudget;
+
+    // Under `none` a checkpoint reaches the device only when something syncs, and the merges' own
+    // syncs are all that do: without one now and then no new segment of this WAL would be vouched
+    // for, and none would merge. Once a second at most, only while a checkpoint waits for it, and
+    // only in a tick that may merge - not at the write ceiling, which `none` is chosen for.
+    if (fsync_policy_ == FsyncPolicy::NONE && now - last_merge_sync_ >= compaction::kVouchInterval) {
+        bool waiting = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            waiting = checkpoint_seal_epoch_ > durable_seal_epoch_;
+        }
+        if (waiting) {
+            if (const int err = sync_for_merge(); err != 0) {
+                registry_.increment_counter("ob_segment_sync_errors_total");
+                std::lock_guard<std::mutex> lock(mtx_);
+                freeze_checkpoints(std::string("A merge's segment sync failed (") +
+                                   std::strerror(err) + ")");
+                return;
+            }
+        }
+    }
+    uint64_t vouched_epoch = 0;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        vouched_epoch = durable_seal_epoch_;
+    }
 
     // The partitions due, from where the last tick stopped, so ten thousand of them are looked at
     // over ticks rather than in one.
@@ -257,6 +285,10 @@ void Engine::look_at_partition(std::map<CompactionKey, CompactionPartition>::ite
     }
     std::vector<compaction::Candidate> candidates;
     candidates.reserve(view.segments.size());
+    // A member that waits only for a checkpoint on the device - a seal of this tick, whose checkpoint
+    // the next tick's WAL sync takes there, or under `none` the merges' next sync. Looked at again
+    // next tick: left to the partition's settling, the last seals of an hour waited for it.
+    bool vouching = false;
     for (size_t i = 0; i < view.segments.size(); ++i) {
         const SegmentMeta& m = view.segments[i];
         compaction::Candidate c;
@@ -264,12 +296,15 @@ void Engine::look_at_partition(std::map<CompactionKey, CompactionPartition>::ite
         c.level        = m.merge_level;
         c.member       = view.member[i];
         c.wal_identity = m.wal_identity;
-        c.eligible =
-            compaction::may_merge(compaction::SegmentFacts{m.wal_identity, m.time_range_is_rows,
-                                                           m.format_version == kColumnarFormatVersion,
-                                                           m.seal_epoch},
-                                  wal_identity_, vouched_epoch) &&
-            taken.count(m.dir_path) == 0 && unmergeable_.count(m.dir_path) == 0;
+        c.start_ts_ns  = m.start_ts_ns;
+        c.end_ts_ns    = m.end_ts_ns;
+        const compaction::SegmentFacts facts{m.wal_identity, m.time_range_is_rows,
+                                             m.format_version == kColumnarFormatVersion,
+                                             m.seal_epoch};
+        const bool free = taken.count(m.dir_path) == 0 && unmergeable_.count(m.dir_path) == 0;
+        c.eligible = free && compaction::may_merge(facts, wal_identity_, vouched_epoch);
+        vouching = vouching || (c.member && free && !c.eligible &&
+                                compaction::may_merge(facts, wal_identity_, UINT64_MAX));
         candidates.push_back(c);
     }
 
@@ -292,8 +327,9 @@ void Engine::look_at_partition(std::map<CompactionKey, CompactionPartition>::ite
         ++merges;
     }
 
-    if (!runs.empty()) {
-        // What the budget left, and what the merges just written make possible once published.
+    if (!runs.empty() || vouching) {
+        // What the budget left, what the merges just written make possible once published, and what
+        // a checkpoint on the device is about to make mergeable.
         part.next_look = now;
         return;
     }
@@ -304,6 +340,31 @@ void Engine::look_at_partition(std::map<CompactionKey, CompactionPartition>::ite
     }
     // Nothing yet. A seal into it brings the next look forward; otherwise it is its settling.
     part.next_look = now + std::chrono::duration_cast<SteadyClock::duration>(until_settled);
+}
+
+int Engine::sync_for_merge() {
+    // Caller holds flush_mtx_ and not mtx_.
+    if (data_dir_fd_ < 0) return EBADF;
+    // The checkpoint appended last, read before the sync so the sync covers it: a checkpoint is
+    // written to the file when it is appended, and only ever appended under flush_mtx_.
+    uint64_t appended_epoch = 0;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        appended_epoch = checkpoint_seal_epoch_;
+    }
+    const auto started = SteadyClock::now();
+    if (::syncfs(data_dir_fd_) != 0) return errno;
+    ++segment_syncs_;
+    last_merge_sync_ = SteadyClock::now();
+    if (fsync_policy_ == FsyncPolicy::NONE) {
+        // Nothing else syncs under `none`, so this is what puts a checkpoint on the device - and
+        // what may say so to the merges (#165 part 2b).
+        std::lock_guard<std::mutex> lock(mtx_);
+        durable_seal_epoch_ = std::max(durable_seal_epoch_, appended_epoch);
+    }
+    OB_LOG_DEBUG("engine", "compaction: synced the data directory in %.2f ms", ms_between(started,
+                                                                                    last_merge_sync_));
+    return 0;
 }
 
 // ── Step 1: a merge written ───────────────────────────────────────────────────
@@ -334,7 +395,10 @@ bool Engine::stage_merge(const std::vector<SegmentMeta>& inputs) {
         }
         named.push_back(SegmentInput::of(in));
     }
-    const std::string name = std::to_string(start) + "_" + std::to_string(end) +
+    // Its own number, so no two merges - two runs of one range, or one whose working directory a
+    // failed removal left - share a working directory.
+    const std::string name = std::to_string(start) + "_" + std::to_string(end) + "_" +
+                             std::to_string(++merge_seq_) +
                              std::string(ColumnarStore::kCompactingSuffix);
     const std::string dir = (fs::path(first.dir_path).parent_path() / name).string();
 
