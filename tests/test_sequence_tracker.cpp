@@ -423,3 +423,54 @@ TEST(SequenceTracker, ImportAfterResetDoesNotResurrectTheOldFrontier) {
     EXPECT_FALSE(t.has_seen("A.EX", 1, 50))
         << "50 was in the discarded contents; claiming it is a hole that never gets filled";
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// The generation: what the flush tick asks before exporting the vector again (#180)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(SequenceTracker, TheGenerationMovesWithEveryFrontierOrHeldChangeAndWithNothingElse) {
+    // Both halves matter. A change that does not move it leaves a peer told a stale vector until
+    // something else moves it; a non-change that does costs an export of up to 4 096 entries under
+    // the engine's lock on a tick that had nothing to say - a redelivery, which catch-up produces on
+    // purpose, is the common case of that.
+    ob::SequenceTracker t;
+    uint64_t g = t.generation();
+    const auto moved = [&](const char* what) {
+        const uint64_t now = t.generation();
+        EXPECT_NE(now, g) << what << " did not move the generation";
+        g = now;
+    };
+    const auto still = [&](const char* what) {
+        EXPECT_EQ(t.generation(), g) << what << " moved the generation";
+    };
+
+    (void)t.observe("A.EX", 1, 0);                 // assigned: frontier 1
+    moved("a locally assigned number");
+    (void)t.observe("A.EX", 2, 1);                 // first from an origin
+    moved("the first number from an origin");
+    (void)t.observe("A.EX", 2, 2);                 // in order
+    moved("the next number in order");
+    (void)t.observe("A.EX", 2, 5);                 // held above the frontier
+    moved("a number held above the frontier");
+    EXPECT_EQ(t.frontier("A.EX", 2), 2u);
+    (void)t.observe("A.EX", 2, 2);                 // a redelivery below the frontier
+    still("a redelivery below the frontier");
+    (void)t.observe("A.EX", 2, 5);                 // a redelivery of a held number
+    still("a redelivery of a held number");
+    t.seed("A.EX", 2, 3);                          // replay fills part of the hole
+    moved("a seeded number");
+    t.seed("A.EX", 2, 3);
+    still("a number seeded twice");
+    t.raise_local("A.EX", 100);                    // the local counter is not in the vector
+    still("raising the local counter");
+    t.declare_frontier("A.EX", 1, 10);
+    moved("a declared frontier");
+    t.declare_frontier("A.EX", 1, 4);              // below it: nothing to declare
+    still("a declaration below the frontier");
+    t.import_held({ob::SequenceTracker::HeldRanges{"B.EX", 3, {{7, 9}}}});
+    moved("imported held numbers");
+    t.import_own_vector({ob::SequenceTracker::VectorEntry{"B.EX", 3, 6}});
+    moved("an imported vector");
+    t.reset();
+    moved("a reset");
+}

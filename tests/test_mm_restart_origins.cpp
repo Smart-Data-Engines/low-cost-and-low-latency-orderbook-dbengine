@@ -266,6 +266,35 @@ TEST(MeshRestartOrigins, APeersRecordsReplayedFromTheWalAreRememberedAsThePeers)
     EXPECT_EQ(mine.back().second, kSelf);
 }
 
+TEST(MeshRestartOrigins, ARecordWrittenBeforeTheMeshIsThisNodesOwn) {
+    // A record without an origin in its header - written by a node that was not in a mesh - is
+    // this node's own: nobody else could have written it into this WAL.
+    TempDir live("mm_origins_legacy_live_");
+    TempDir crashed("mm_origins_legacy_crash_");
+    {
+        ob::Engine plain(live.path, kNoAutoFlush, ob::FsyncPolicy::EVERY);
+        plain.open();
+        for (uint64_t i = 1; i <= 3; ++i) {
+            const Record r = record("MINE", 0, 6'000'000'000ULL + i);
+            ASSERT_EQ(plain.apply_delta(r.delta, r.levels.data()), ob::OB_OK);
+        }
+        crash_image(live.path, crashed.path);
+        plain.close();
+    }
+    const auto before = wal_numbers(crashed.path, "MINE");
+    ASSERT_EQ(before.size(), 3u);
+    ASSERT_EQ(before.back().second, 0u) << "the record names an origin, so it is not the case here";
+
+    auto node = open_node(crashed.path);
+    ASSERT_EQ(rows(*node, "MINE"), 3);
+    write_own(*node, record("MINE", 0, 6'000'000'010ULL));
+    node->flush_tick_for_test();
+    EXPECT_EQ(told(*node, "MINE.EX", kSelf), std::optional<uint64_t>(4))
+        << "the records from before the mesh were not remembered as this node's own, so the "
+           "node's own frontier cannot reach past them";
+    node->close();
+}
+
 TEST(MeshRestartOrigins, APeersRecordsAfterTheLastVectorAreRememberedToo) {
     // A vector in the WAL and a tail after it: the vector names what was held at the last seal, the
     // tail is what arrived since, and both are the peer's.
