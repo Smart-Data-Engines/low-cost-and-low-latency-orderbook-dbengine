@@ -525,8 +525,8 @@ and the pair is what separates them.
 `ob_mm_peer_dropped_slow_total` counts it. Dropping is deliberate: the alternative measured before
 this ceiling existed (#69) was one unreachable peer growing the writer at about **113 MB/s** with
 nothing to stop it. The connection is closed **without** clearing the queued bytes, because a buffer
-that starts mid-frame would desynchronise the peer's parser; the peer reconnects and catch-up
-streams from the position it acknowledged. `--mm-max-peer-send-buffer` is the ceiling (64 MB by
+that starts mid-frame would desynchronise the peer's parser; the peer reconnects, and catch-up
+sends it what its version vector says it lacks ([catching a peer up](#catching-a-peer-up)). `--mm-max-peer-send-buffer` is the ceiling (64 MB by
 default) and lowering it makes the drop happen sooner, not the buffering safer.
 
 **What the engine does not promise here.** Nothing is refused while a peer is unreachable, so the
@@ -697,6 +697,49 @@ byte position to compute it from (#118). `STATUS`'s `replication_lag_peer_<id>` 
 the same reason — they carried this node's own WAL offset minus a byte position in the peer's own
 WAL frozen at handshake, which on a converged mesh equals this node's WAL size. And `MM_PEERS`'
 `lag_bytes` column is now `send_queue_bytes`, which is what it always held.
+
+### Catching a peer up
+
+A peer that reconnects is caught up by every node that holds something it lacks, and each says so
+twice: once when it starts, with what the peer's vector said —
+
+```
+Starting catch-up to peer 3 (connection 3): vector entries=11 received=1 truncated=0, 11 (symbol, origin) range(s) it lacks; reading this node's WAL from its first record, 8388608 bytes a round
+```
+
+— and once when it has read to the end of its WAL:
+
+```
+Catch-up to peer 3 finished in 3 round(s), 0.2 s: read=20104 record(s) (3015956 bytes) sent=20000 skipped_peer_has=100 skipped_type=4; reading took [READ] ms off the lock, and the longest a round held it [HOLD] ms
+```
+
+Since #178 a catch-up is **rounds**, each reading at most `--mm-max-catchup-bytes` (8 MiB) of this
+node's WAL from where the last one stopped, and pausing while the peer's send buffer is at the
+snapshot's low watermark. The reading is done without the lock every local write takes, so "the
+longest a round held it" is the most a catch-up added to a write on this node. A catch-up that is
+long in rounds and short in records sent is one passing over what the peer already holds; one that
+never finishes while the peer's buffer stays full is a slow peer, which the send-buffer ceiling above
+drops. Before #178 a catch-up past `--mm-max-catchup-bytes` said it was "falling back to snapshot
+sync" and stopped sending; nothing sent a snapshot, and the peer never got the rest.
+
+`ob_mm_catchup_rounds_total` and `ob_mm_catchup_records_sent_total` count the work.
+`ob_mm_backpressure_snapshot_total` is **removed**: it counted peers dropped by the check that
+preceded the rounds, under a name that promised a snapshot nothing sent.
+
+**One warning means a peer lacks what no catch-up here can send:**
+
+```
+Catch-up to peer 2: 10 (symbol, origin) range(s) it lacks begin before this node's retained WAL - e.g. MC07.EX origin 3 from 1 - and no catch-up from here can send them
+```
+
+The peer is missing records that this node holds only in segments — its WAL no longer reaches back
+to them — and catch-up sends only from the WAL. It comes once an episode, however many
+reconciliations find the same ranges, and `ob_mm_catchup_unfillable_total` counts the ranges at
+every catch-up. Anti-entropy that could repair it is #57 and not built; a peer that holds nothing
+takes a snapshot when it joins, so wiping and re-joining one is the repair there is. One known way to
+produce this warning without a real gap: a node restarted before its version vector reached the WAL
+claims the records it replayed as its own origin's (#179), and the ranges it then says its peers lack
+are ranges nobody wrote.
 
 **How far behind a replica is** is a different question with a different answer, in the section
 below.
