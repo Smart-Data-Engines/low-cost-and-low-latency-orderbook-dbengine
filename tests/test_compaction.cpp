@@ -75,12 +75,28 @@ void seal_n(ob::Engine& engine, const char* symbol, uint64_t first_seq, size_t n
     }
 }
 
+/// Every meta.json under `dir`, read while the flush thread removes directories: a walk that meets a
+/// directory going away starts again rather than throwing - which a range-for over the iterator
+/// does, from its increment.
+std::vector<fs::path> meta_files(const std::string& dir) {
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        std::vector<fs::path> out;
+        std::error_code ec;
+        fs::recursive_directory_iterator it(dir, ec), end;
+        while (!ec && it != end) {
+            if (it->path().filename() == "meta.json") out.push_back(it->path());
+            it.increment(ec);
+        }
+        if (!ec) return out;
+    }
+    ADD_FAILURE() << "could not walk " << dir;
+    return {};
+}
+
 size_t segments_on_disk(const std::string& dir, const std::string& symbol = "") {
     size_t n = 0;
-    std::error_code ec;
-    for (auto& e : fs::recursive_directory_iterator(dir, ec)) {
-        if (e.path().filename() != "meta.json") continue;
-        if (!symbol.empty() && e.path().string().find("/" + symbol + "/") == std::string::npos) continue;
+    for (const auto& path : meta_files(dir)) {
+        if (!symbol.empty() && path.string().find("/" + symbol + "/") == std::string::npos) continue;
         ++n;
     }
     return n;
@@ -127,9 +143,8 @@ bool eventually(F&& done, std::chrono::milliseconds within = 10000ms) {
 }
 
 std::string merged_meta(const std::string& dir) {
-    for (auto& e : fs::recursive_directory_iterator(dir)) {
-        if (e.path().filename() != "meta.json") continue;
-        std::ifstream f(e.path());
+    for (const auto& path : meta_files(dir)) {
+        std::ifstream f(path);
         const std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         if (json.find("\"merge_level\":") != std::string::npos) return json;
     }

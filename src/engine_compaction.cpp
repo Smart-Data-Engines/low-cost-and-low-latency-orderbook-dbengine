@@ -159,7 +159,15 @@ void Engine::compaction_step(size_t drained_rows) {
     // quiet still merges.
     const auto now = SteadyClock::now();
     const bool heavy = drained_rows > kSealRows;
-    if (heavy && now - last_merge_ < compaction::kMaxDelay) return;
+    if (heavy) {
+        // Looked for at most that often too: a look copies a partition's segments, and at the
+        // ceiling a partition holds a full segment for every seal of the hour.
+        if (now - last_merge_ < compaction::kMaxDelay ||
+            now - last_heavy_look_ < compaction::kMaxDelay) {
+            return;
+        }
+        last_heavy_look_ = now;
+    }
     if (now < merge_backoff_until_) return;
     const auto budget_end = now + compaction::kTickBudget;
 

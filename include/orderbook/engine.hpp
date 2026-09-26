@@ -662,6 +662,8 @@ private:
     /// Segments a merge could not read whole, left as they are for the life of the process.
     std::unordered_set<std::string> unmergeable_;
     std::chrono::steady_clock::time_point last_merge_{};
+    /// When a tick at the write ceiling last looked for a merge (compaction_step()).
+    std::chrono::steady_clock::time_point last_heavy_look_{};
     std::chrono::steady_clock::time_point merge_backoff_until_{};
     LogEpisode merge_failures_{};
     /// Successful `sync_segments()`: what a step compares with the count it recorded to know that a
