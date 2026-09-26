@@ -118,6 +118,45 @@ void Engine::drop_compaction_locked() {
     }
 }
 
+void Engine::finish_compaction_on_close() {
+    size_t working = 0;
+    for (const StagedMerge& s : staged_merges_) {
+        std::error_code ec;
+        fs::remove_all(s.output.dir_path, ec);
+        if (!ec) ++working;
+    }
+    staged_merges_.clear();
+    size_t waiting_before = 0;
+    for (const RetiredInputs& r : retired_inputs_) waiting_before += r.dirs.size();
+    if (waiting_before > 0) {
+        bool frozen = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            frozen = checkpoints_frozen();
+        }
+        // After a failed sync no later one can be trusted to have written the renames, so the inputs
+        // stay for the next start, which removes the ones a merged segment beside them holds.
+        const bool wants_sync =
+            std::any_of(retired_inputs_.begin(), retired_inputs_.end(),
+                        [&](const RetiredInputs& r) { return r.synced_before == segment_syncs_; });
+        if (!frozen && (!wants_sync || sync_segments() == 0)) remove_retired_inputs();
+    }
+    size_t waiting = 0;
+    for (const RetiredInputs& r : retired_inputs_) waiting += r.dirs.size();
+    if (working > 0 || waiting_before > 0) {
+        OB_LOG_INFO("engine", "close: removed %zu merge(s) nothing published and %zu segment(s) merged "
+                              "segments replaced; %zu wait for a query or a sync, and the next start "
+                              "removes them",
+                    working, waiting_before - waiting, waiting);
+    }
+}
+
+std::vector<std::string> Engine::replaced_input_dirs() const {
+    std::vector<std::string> dirs;
+    for (const RetiredInputs& r : retired_inputs_) dirs.insert(dirs.end(), r.dirs.begin(), r.dirs.end());
+    return dirs;
+}
+
 // ── The step ──────────────────────────────────────────────────────────────────
 
 void Engine::compaction_step(size_t drained_rows) {
@@ -295,10 +334,9 @@ bool Engine::stage_merge(const std::vector<SegmentMeta>& inputs) {
         }
         named.push_back(SegmentInput::of(in));
     }
-    const std::string dir =
-        (fs::path(first.dir_path).parent_path() /
-         (std::to_string(start) + "_" + std::to_string(end) + std::string(ColumnarStore::kCompactingSuffix)))
-            .string();
+    const std::string name = std::to_string(start) + "_" + std::to_string(end) +
+                             std::string(ColumnarStore::kCompactingSuffix);
+    const std::string dir = (fs::path(first.dir_path).parent_path() / name).string();
 
     // A period no row rolls over at: every input's rows are in the one period this partition is.
     ColumnarStore writer(base_dir_, std::numeric_limits<uint64_t>::max(),

@@ -1161,6 +1161,14 @@ private:
     /// Forget every merge in flight, for the paths that replace or discard the store: a name a
     /// retired input had may come back with the new store. Holds `flush_mtx_`.
     void drop_compaction_locked();
+    /// At close(), after the final flush: remove every merge's working directory, and every
+    /// replaced input no query still reads once the rename that replaced it is on the device, so a
+    /// clean stop leaves nothing a build before part 2b would take for a segment and hold twice.
+    /// Holds `flush_mtx_`, not `mtx_`.
+    void finish_compaction_on_close();
+    /// The directories of replaced inputs whose files are still on the disk, for a snapshot to
+    /// leave out: a replica of any build then holds each row once. Holds `flush_mtx_`.
+    std::vector<std::string> replaced_input_dirs() const;
 
     /// The seal epoch (#165 part 2a): bumped by every `write_seals()` that has something to write,
     /// stamped on the segments it writes, and named by a checkpoint written while rows wait in

@@ -340,6 +340,8 @@ void Engine::close() {
             OB_LOG_ERROR("engine", "close: the final flush could not write its segments (%s); the "
                                    "next start replays their rows from the WAL", e.what());
         }
+        // Nothing a merge left behind that a build before part 2b would hold twice (#165 part 2b).
+        finish_compaction_on_close();
     }
 
     // Flush WAL to disk. Same reasoning as above: shutdown reports, it does not throw.
@@ -1370,6 +1372,10 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
     // Before the flush, so no merge or sweep moves a file between it and the walk below, and held by
     // whoever sends this until the transfer ends (#165 part 2b).
     out.pin = pin_segment_files();
+    // Inputs merged segments replaced whose files wait for a query still reading them: on the disk,
+    // and not a replica's to hold beside the segment that holds their rows. Read under flush_mtx_
+    // below; with the pin held no step changes them after that.
+    std::unordered_set<std::string> replaced;
 
     // Phase 1: flush + capture under lock (< 100ms).
     {
@@ -1410,6 +1416,10 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
         manifest.wal_file_index  = manifest_pos.file_index;
         manifest.wal_byte_offset = manifest_pos.offset;
 
+        for (const std::string& dir : replaced_input_dirs()) {
+            replaced.insert(fs::path(dir).lexically_normal().string());
+        }
+
         // And the sequence state, in the same critical section. See the header for why the
         // boundary has to be exactly here and not a line later.
         out.vector = seq_tracker_.export_vector(kMaxPersistedVectorEntries, out.vector_truncated);
@@ -1438,10 +1448,14 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
         for (auto it = fs::recursive_directory_iterator(base_dir_);
              it != fs::recursive_directory_iterator(); ++it) {
             const auto& entry = *it;
-            // A merge's working directory holds no segment until a rename publishes it (#165 part
-            // 2b): a replica would only remove it, after carrying it over the wire.
+            // A merge's working directory holds no segment until a rename publishes it, and a
+            // replaced input is a segment whose rows a merged one holds (#165 part 2b): a replica
+            // would remove the first after carrying it over the wire, and a replica of an older
+            // build would hold the second's rows twice.
             if (entry.is_directory()) {
-                if (ColumnarStore::is_compacting_dir(entry.path().filename().string())) {
+                if (ColumnarStore::is_compacting_dir(entry.path().filename().string()) ||
+                    (!replaced.empty() &&
+                     replaced.count(entry.path().lexically_normal().string()) != 0)) {
                     it.disable_recursion_pending();
                 }
                 continue;

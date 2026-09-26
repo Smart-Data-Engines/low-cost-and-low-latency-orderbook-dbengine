@@ -440,7 +440,16 @@ logger, to confirm a start.
 
   At the write ceiling the cycle is what bounds a writer, so these are the lines to read when
   `ob_writer_backpressure_waits_total` climbs: a tick longer than the writers take to fill the
-  pending queue is time every writer waits.
+  pending queue is time every writer waits. Since part 2b the tick line ends with `merges … ms`,
+  the time the tick spent merging segments ([merging segments](#merging-segments)).
+- `ob_compactions_total`, `ob_compaction_inputs_total`, `ob_compaction_rows_total` — merged
+  segments published, the segments they replaced, and the rows they wrote again (#165 part 2b).
+  The second over the first is the fan-in; the third over the rows written is what a node pays in
+  rewriting for its segment count. `ob_compaction_errors_total` counts merges that could not be
+  written or published — a disk that refuses them pauses merging for ten seconds each time — and
+  `ob_segments_awaiting_removal` the replaced segments whose files wait for a sync or for a query
+  still reading them: it goes back to zero on its own, and one that does not is a query that does
+  not end.
 
 One counter is worth watching for a different reason: **`ob_refused_commands_total`** is the number
 of command lines the parser would not accept — an unknown word, or a known command carrying a token
@@ -1058,9 +1067,9 @@ the last one.
 A start reads the `meta.json` of every segment in the data directory, and reads the WAL twice,
 before it answers anything. Since part 2a of #165 a symbol gains a segment when it is **due** —
 65 536 rows, or ten seconds after its oldest waiting row — rather than on every flush tick, so at a
-steady write rate a node gains about one segment per active symbol every ten seconds. That still
-grows with uptime: nothing merges written segments yet (#165, part 2b), unless `--ttl-hours` bounds
-the store. `ob_segment_count` is the number to watch.
+steady write rate a node gains about one segment per active symbol every ten seconds. Since part 2b
+the flush tick merges them ([merging segments](#merging-segments)), so the count follows the data
+rather than uptime. `ob_segment_count` is the number to watch.
 
 What a start costs depends on what the page cache kept. Measured on an m9g.xlarge with its data on a
 gp3 volume, after a soak writing 256 symbols for 90 seconds and a clean stop:
@@ -1087,6 +1096,51 @@ covered — and a segment sealed after that epoch is removed and rebuilt, whole 
 
 In the soak above, a warm restart after a kill took **1.70 s** — 0.2 s more than after a clean stop,
 which is the replay of the rows that waited — against 3.40 s on the build before part 2a.
+
+### Merging segments
+
+Since part 2b of #165 the flush tick merges a symbol's small segments into bigger ones, after
+retention and without the lock writers take. Eight segments of one merge level in one symbol's
+hour become one of the next level, up to 262 144 rows; a segment of 65 536 rows or more — what a
+seal at the write ceiling writes — merges with nothing; and an hour that ended a minute ago and
+has received nothing since merges what is left into as few segments as fit. A merged segment ends
+in the hour its inputs did, so retention frees it at most an hour after it would have freed the
+first of them.
+
+What it costs, and when it runs: a merge rewrites every row it takes, about 50 ns a row on an
+m9g.xlarge, so a row is written again once or twice at a steady trickle; a tick that drained more
+than 65 536 rows — the write ceiling — merges nothing unless none has for ten seconds, and a lighter
+one merges for up to 10 ms. A query reads a segment whole, so a narrow query into history reads a
+merged segment of up to 262 144 rows: measured at 3.2 – 3.5 ms for one second of rows, where a
+segment sealed at a trickle is read in 0.06 ms.
+
+On the disk a merge is written into `<start>_<end>.compacting` beside its inputs, synced, renamed
+to a segment's name in place of its inputs under the index's lock, synced again, and only then are
+the inputs removed — once every query that was reading them has finished. A crash anywhere leaves
+the inputs, the merged segment (whose `meta.json` names its inputs in `compacted_from`), or both;
+the start removes a working directory and every input it finds beside the merged segment that
+names it, and says so once:
+
+```
+a merge was cut short: removed 0 working director(ies) nothing published and 8 segment(s) a merged segment beside them had replaced
+```
+
+**While a snapshot is being made or sent, nothing merges and retention does not sweep**: the
+snapshot's manifest names files, and a merge or a sweep that removed one mid-transfer failed it,
+and the replica started again. Both resume at the first tick after the transfer ends. A failed
+sync stops merging until a restart, like the checkpoints
+([when an fsync fails](#when-an-fsync-fails)).
+
+`--compaction off` turns it off — a valve, not a tuning knob: every segment then stays as its seal
+wrote it, and the count grows with uptime again.
+
+### Going back to a build before part 2b of #165
+
+A merged segment is an ordinary segment to a build before part 2b, which ignores the two keys a
+merge adds to `meta.json`. What that build cannot do is tell a working directory or a replaced
+input from a segment, so it would hold their rows twice. **Only from a clean stop**, which removes
+both; after a crash, start once with this build — its start removes them — stop it cleanly, and
+then go back.
 
 ### Going back to a build before part 2a of #165
 

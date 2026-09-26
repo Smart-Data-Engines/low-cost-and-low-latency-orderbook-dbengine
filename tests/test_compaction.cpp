@@ -406,3 +406,94 @@ TEST(Compaction, AStoreDiscardedWhileAMergesInputsWaitKeepsWhatIsWrittenAfterIt)
     EXPECT_EQ(rows_answered(engine, "A"), rows_written(1, ob::compaction::kFanIn - 1));
     engine.close();
 }
+
+TEST(Compaction, ACleanStopLeavesNothingABuildBeforeMergesWouldHoldTwice) {
+    TempDir dir;
+    {
+        // A tick a second, so the stop comes between two of a merge's steps.
+        ob::Engine engine(dir.path, 1'000'000'000ULL, ob::FsyncPolicy::NONE);
+        engine.open();
+        seal_n(engine, "A", 1, ob::compaction::kFanIn);
+        ASSERT_TRUE(eventually([&] {
+            bool working = false;
+            std::error_code ec;
+            for (auto& e : fs::directory_iterator(fs::path(dir.path) / "A" / "EX", ec)) {
+                working = working || ob::ColumnarStore::is_compacting_dir(e.path().filename().string());
+            }
+            return working || engine.registry().counter_value("ob_compactions_total") == 1;
+        })) << "no merge was under way to stop";
+        engine.close();
+    }
+    // What a build before part 2b reads: every meta.json under the data directory, a working
+    // directory's and a replaced input's included - it can tell neither from a segment.
+    const size_t metas = meta_files(dir.path).size();
+    EXPECT_TRUE(metas == ob::compaction::kFanIn || metas == 1)
+        << metas << " meta.json file(s) after a clean stop: a working directory or a replaced input "
+                    "was left for an older build to read beside what holds its rows";
+    ob::Engine reopened(dir.path, 20'000'000ULL, ob::FsyncPolicy::NONE);
+    reopened.open();
+    EXPECT_EQ(rows_answered(reopened, "A"), rows_written(1, ob::compaction::kFanIn));
+    reopened.close();
+}
+
+TEST(Compaction, ASnapshotCarriesNoInputAMergedSegmentReplaced) {
+    TempDir dir;
+    ob::Engine engine(dir.path, 20'000'000ULL, ob::FsyncPolicy::NONE);
+    engine.open();
+    seal_n(engine, "A", 1, ob::compaction::kFanIn);
+
+    // A scan holding the inputs, so their files are on the disk when the snapshot walks it.
+    std::mutex m;
+    std::condition_variable cv;
+    bool in_scan = false;
+    bool go_on = false;
+    std::thread reader([&] {
+        engine.execute("SELECT * FROM 'A'.'EX'", [&](const ob::QueryResult&) {
+            std::unique_lock<std::mutex> lock(m);
+            if (in_scan) return;
+            in_scan = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return go_on; });
+        });
+    });
+    {
+        std::unique_lock<std::mutex> lock(m);
+        cv.wait(lock, [&] { return in_scan; });
+    }
+    // EXPECT, not ASSERT, until the join.
+    EXPECT_TRUE(eventually([&] { return engine.registry().counter_value("ob_compactions_total") == 1; }));
+    const std::string json = merged_meta(dir.path);
+    std::vector<std::string> inputs;
+    for (size_t at = json.find("\"dir\":\""); at != std::string::npos;
+         at = json.find("\"dir\":\"", at + 1)) {
+        const size_t from = at + 7;
+        inputs.push_back(json.substr(from, json.find('"', from) - from));
+    }
+    EXPECT_EQ(inputs.size(), ob::compaction::kFanIn) << json;
+    size_t on_disk = 0;
+    for (const auto& name : inputs) {
+        on_disk += fs::exists(fs::path(dir.path) / "A" / "EX" / name / "meta.json") ? 1 : 0;
+    }
+    EXPECT_EQ(on_disk, ob::compaction::kFanIn) << "the inputs were not on the disk for the walk";
+
+    const ob::SnapshotManifest manifest = engine.create_snapshot();
+    size_t carried = 0;
+    size_t merged_files = 0;
+    for (const auto& f : manifest.files) {
+        for (const auto& name : inputs) {
+            if (f.path.find("/" + name + "/") != std::string::npos) ++carried;
+        }
+        if (f.path.find(".compacting") != std::string::npos) ++carried;
+        merged_files += f.path.find("/EX/") != std::string::npos ? 1 : 0;
+    }
+    EXPECT_EQ(carried, 0u) << "a snapshot carried a replaced input: a replica of a build before part "
+                              "2b would hold its rows twice";
+    EXPECT_GT(merged_files, 0u) << "the snapshot carried no segment at all";
+    {
+        std::lock_guard<std::mutex> lock(m);
+        go_on = true;
+    }
+    cv.notify_all();
+    reader.join();
+    engine.close();
+}

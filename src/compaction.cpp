@@ -61,7 +61,10 @@ std::vector<Run> plan(const std::vector<Candidate>& segments, bool settled) {
         size_t k = i;
         while (k < j) {
             if (!settled && j - k < kFanIn) break;
-            const size_t limit = settled ? j : k + kFanIn;
+            // Never past the stretch: the break above keeps k + kFanIn inside it before a partition
+            // settles, and a bound that rests on a condition several lines away is one edit from a
+            // read past the segments (a mutation of that condition found it).
+            const size_t limit = settled ? j : std::min(j, k + kFanIn);
             uint64_t rows = 0;
             size_t m = k;
             while (m < limit && rows + segments[m].rows <= kMaxRows) {

@@ -3559,6 +3559,31 @@ Learned the hard way. Check here before debugging.
      Started, two wrote nothing to etcd, each owned every symbol, and the second became the first
      one's replica - while each logged `Registered shard=…` over a function that registers nothing
      (#175).
+453. **A merge must not change the order a scan delivers rows in.** A `SNAPSHOT` tie keeps the row
+     delivered last and a `LIMIT` the rows delivered first, and a scan delivers segments in their
+     order by range. So a merge takes only segments consecutive in that order, and publishes only
+     if its range sorts strictly between the segments before and after them - checked when it is
+     planned and again under the index's lock, because a seal in between can put a segment in the
+     middle (#165 part 2b).
+454. **A name is not an identity once things are removed.** A segment directory is named after its
+     range, so an input a merge removed gives its name back, and the next seal with rows over the
+     same range takes it. A start that removed every directory a merged segment names would remove
+     that one: it compares what each input recorded - identity, epoch, position, rows, range - and
+     a test builds exactly that case (#165 part 2b).
+455. **A gauge set on one path reads stale on the others.** `ob_segments_awaiting_removal` was set
+     only where inputs were removed, so the tick that retired them left it at zero; the test that
+     read it straight after a publication found it. And a heavy tick that found nothing to merge did
+     not note that it had looked, so every later one looked again, each copying a partition's
+     segments.
+456. **An acknowledged write is not yet a row a `SELECT` returns.** A query reads what the flush
+     tick has drained - into blocks since part 2a - so a write answered `OK` a moment ago appears at
+     the next tick, or at once after `FLUSH`: measured, a `SELECT` from another connection straight
+     after a `MINSERT` returned nothing. A test that counts rows counts what was flushed.
+457. **After a restart, the first tick redoes what the crash interrupted - under the same name.** A
+     merge cut short by a kill is written again from the same inputs into a working directory of
+     the same name within one tick of the start, so a directory seen after the start does not show
+     the start left it: the start's own log line does. A window a tick wide is found by polling the
+     disk every millisecond, and asserted again after the kill - no fault injector needed.
 
 ## Current state and open problems
 

@@ -101,6 +101,10 @@ ob> flush
 
 Execute a SQL query against the columnar store.
 
+A query reads what the flush tick has drained, so a write acknowledged a moment ago appears at the
+next tick — within `--flush-interval-ms`, 100 ms by default — or at once after `flush`. `book`
+reads the live book, which a write updates before it is acknowledged.
+
 ```
 query <SQL>
 ```

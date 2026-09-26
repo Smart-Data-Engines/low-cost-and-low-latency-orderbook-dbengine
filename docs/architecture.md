@@ -127,7 +127,18 @@ only for bookkeeping (#164):
    (the oldest record a waiting block needs) and the seal epoch the sync covered, because a position
    cannot say which segments are durable once a segment holds several drains; and the WAL files
    below the retention floor chosen.
-6. **Without it**: those files deleted and, on its own interval, the TTL sweep (#163).
+6. **Without it**: those files deleted and, on its own interval, the TTL sweep (#163) — not while a
+   snapshot's pin is held (#165 part 2b).
+7. **Without it**: the merges (#165 part 2b). Each moves one step a tick — written into a working
+   directory beside its inputs; synced; published by a rename under the index's lock in place of
+   its inputs, in one step, only while they are still indexed and consecutive in their symbol's
+   delivery order; synced again; and the inputs removed once no query that copied them is reading
+   — and the step syncs on its own when the tick sealed nothing. A merge takes a segment of this
+   node's WAL only once a checkpoint on the device vouches for it, keeps its inputs' highest epoch
+   and position, and never takes a segment of 65 536 rows or more; a tick that drained more rows
+   than that merges nothing new unless none has for ten seconds. Nothing merges while a snapshot's
+   pin is held — from before its flush until its sender finishes — and the paths that replace or
+   discard the store forget every merge in flight.
 
 The rows being drained still count against the ceiling, and in `STATUS`, `holds_no_data()` and
 `ob_pending_rows`, so nothing reads as empty for the length of a sync. What bounds a fast writer is
@@ -137,14 +148,17 @@ creation still drain under `mtx_`, straight after a sync under the same hold, an
 **everything**: after a `FLUSH` a store holds no block, which is what `FLUSH` has always meant.
 Step 5's merge is a lookup and an insertion per new segment since part 1 of #165, which made the
 index per symbol and in width tiers, and since part 2a a symbol gains a segment when it is due
-rather than on every tick. What a start reads is still one directory a segment; merging segments
-that are already written is part 2b.
+rather than on every tick; since part 2b step 7 merges the segments it writes, so a start reads a
+directory for every merged segment rather than for every seal.
 
 At start, a local segment the last checkpoint does not vouch for is removed and its rows replayed
 from the WAL: past the checkpoint's position when it has eight bytes, and sealed after its epoch
 when it has sixteen. Everything replay then brings back that a kept segment already holds is skipped
 by the per-symbol positions replay has filtered by since #63. `Engine::segment_vouched_for()` is
-that rule, as a pure function.
+that rule, as a pure function. Before it, the index's rebuild removes what a merge cut short left:
+a working directory, and an input found beside the merged segment that names it in
+`compacted_from` — named by its directory and what its own `meta.json` said, because a directory
+is named after its range and the name comes back once the input is gone.
 
 ### Sequence numbers and who assigns them
 
