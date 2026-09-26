@@ -149,7 +149,7 @@ TEST(CliMultiMaster, DefaultsWhenNoMultiMasterArgs) {
     EXPECT_EQ(config.mm_node_id, 0);
     EXPECT_EQ(config.mm_replication_port, 0);
     EXPECT_EQ(config.anti_entropy_interval_sec, 30u);
-    EXPECT_EQ(config.mm_max_catchup_bytes, 512ULL << 20);
+    EXPECT_EQ(config.mm_max_catchup_bytes, 8ULL << 20);    // one catch-up round's WAL, since #178
 }
 
 // ── MM Port Isolation death tests (Properties 2 & 3) ─────────────────────────

@@ -214,6 +214,11 @@ def one_run(label: str, server: str, records: int, root: str) -> None:
 
         returning.kill()
         write(writer.tcp, 1_700_000_001_000_000_000, records // len(SYMBOLS))
+        # The writer's vector is refreshed at a checkpoint (#180), so without this the catch-up at
+        # the reconnect could find nothing to send and wait for a reconciliation - in either build.
+        c = Conn(writer.tcp)
+        c.request("FLUSH\n")
+        c.close()
         time.sleep(2)
         before_restart = os.path.getsize(writer.log)
         restart = time.monotonic()

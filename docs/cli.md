@@ -576,7 +576,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--max-subscriptions-per-session` | `<N>` | Subscription limit per session (default: 16) |
 | `--metrics-bind` | `<ADDR>` | Address the metrics listener binds to (default: every interface) |
 | `--metrics-port` | `<PORT>` | Prometheus metrics port; 0 disables the endpoint |
-| `--mm-max-catchup-bytes` | `<N>` | WAL bytes a peer may scan before a snapshot is used |
+| `--mm-max-catchup-bytes` | `<N>` | WAL bytes one catch-up round reads for a peer before the io loop turns to its other work (default: 8 MiB); a longer catch-up is more rounds |
 | `--mm-max-peer-send-buffer` | `<N>` | Per-peer send buffer ceiling; past it the peer is dropped |
 | `--mm-node-id` | `<N>` | Multi-master node id, unique in the mesh |
 | `--mm-replication-port` | `<PORT>` | Multi-master peer port |
@@ -821,7 +821,7 @@ Multi-master mode allows multiple nodes to accept writes simultaneously. All nod
 | `--mm-node-id <uint16>` | yes (in MM mode) | — | Unique node identifier in the cluster (1–65535) |
 | `--mm-replication-port <port>` | yes (in MM mode) | — | TCP port for inter-node WAL replication |
 | `--anti-entropy-interval-seconds <N>` | no | 30 | Interval for anti-entropy consistency checks |
-| `--mm-max-catchup-bytes <N>` | no | 536870912 (512MB) | Max catch-up buffer before the peer is dropped and re-synced |
+| `--mm-max-catchup-bytes <N>` | no | 8388608 (8 MiB) | WAL bytes one catch-up round reads for a peer, without the lock every local write takes, before the io loop handles its other events. A catch-up of more is more rounds, each continuing where the last one stopped, paced by the peer's send buffer (#178). Until #178 this bounded the whole catch-up at 512 MB, and a snapshot said to take over past it was never sent to a node holding data: a peer that missed more never got the rest |
 | `--mm-max-peer-send-buffer <N>` | no | 67108864 (64MB) | Queued output one peer may hold before its connection is dropped. A peer that stops reading — partitioned, paused or merely slow — otherwise grows the writer without bound: measured at about 113 MB/s per unreachable peer before this ceiling existed. Same ceiling a client session gets |
 
 Multi-master mode also requires:
