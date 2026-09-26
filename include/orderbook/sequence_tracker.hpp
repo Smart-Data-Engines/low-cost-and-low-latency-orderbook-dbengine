@@ -120,6 +120,13 @@ public:
     /// the vector down" without serialising it each time.
     uint64_t fingerprint() const;
 
+    /// A counter that moves whenever a frontier or a held set does, and never otherwise.
+    ///
+    /// O(1), unlike `fingerprint()`, which is a pass over every (symbol, origin): the flush tick
+    /// asks it on every tick, sealing or not, to decide whether the vector peers see needs
+    /// exporting again (#180). Only equality with an earlier reading means anything.
+    uint64_t generation() const { return generation_; }
+
     /// Records above the frontier held per (key, origin) before the set stops growing.
     ///
     /// Holding them is an optimisation — it lets a filled hole drain in one step. Dropping
@@ -174,9 +181,11 @@ private:
     };
 
     /// Record `seq` as seen from `origin` and advance the frontier as far as it now reaches.
-    static void note_seen(OriginState& st, uint64_t seq);
+    /// Returns whether the frontier or the held set moved — a redelivery moves neither.
+    static bool note_seen(OriginState& st, uint64_t seq);
 
     std::unordered_map<std::string, SymbolState> symbols_;
+    uint64_t generation_{0};   ///< see generation()
 };
 
 }  // namespace ob

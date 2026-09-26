@@ -471,7 +471,7 @@ cut a flush short, three lines:
 ```
 {"component":"engine","msg":"1 segment(s) written after the last checkpoint that survived were removed, and replay rebuilds their rows from the WAL (0 could not be removed): a flush cut short by a crash leaves segments no checkpoint vouches for, whole or not"}
 {"component":"wal","msg":"Replay after checkpoint: records=15 last_checkpoint_ordinal=11 resuming at file 0 offset 1496, forwarded=4 (of which 1 written before the checkpoint while its flush wrote segments)"}
-{"component":"engine","msg":"WAL replay: records=4 applied=4 skipped_by_position=0 skipped_by_timestamp=0"}
+{"component":"engine","msg":"WAL replay: records=4 applied=4 skipped_by_position=0 skipped_by_timestamp=0 other_origins=0"}
 ```
 
 The first is #160: a segment no surviving checkpoint vouches for is removed before the replay and
@@ -480,7 +480,10 @@ rebuilt by it, because nothing about the segment says whether the crash left it 
 since that removal it is normally 0 - what could still hold one is a segment an older build wrote.
 `skipped_by_timestamp` is the same for segments written before positions were recorded (#63), and
 it is the one worth a second look: out-of-order timestamps can make it skip a record that was never
-stored.
+stored. `other_origins` counts the replayed records another mesh node wrote, applied or skipped:
+each is remembered as seen from that node (#179), which is what stops a peer sending it again after
+the restart - before, they were remembered as this node's own, and a returning node stored its
+peers' rows twice.
 
 `FLUSH` and a clean shutdown both end in a checkpoint, so a restart after either replays nothing -
 unless a failed sync froze the checkpoints, and then the restart is what rebuilds

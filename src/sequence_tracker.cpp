@@ -6,13 +6,13 @@
 
 namespace ob {
 
-void SequenceTracker::note_seen(OriginState& st, uint64_t seq) {
+bool SequenceTracker::note_seen(OriginState& st, uint64_t seq) {
     st.high_water = std::max(st.high_water, seq);
 
     if (seq <= st.frontier) {
         // Already covered: a redelivery, which catch-up produces on purpose whenever it is
         // unsure. Nothing to do, and nothing to complain about.
-        return;
+        return false;
     }
 
     if (seq == st.frontier + 1) {
@@ -25,15 +25,16 @@ void SequenceTracker::note_seen(OriginState& st, uint64_t seq) {
             st.frontier = *it;
             it = st.above_frontier.erase(it);
         }
-        return;
+        return true;
     }
 
     // Out of order. Hold it so the frontier can jump when the hole is filled, but only up to
     // a cap: holding is an optimisation, and a long outage must not grow memory without
     // bound. Dropping it means the frontier stays put and the next catch-up asks again.
     if (st.above_frontier.size() < kMaxAboveFrontier) {
-        st.above_frontier.insert(seq);
+        return st.above_frontier.insert(seq).second;
     }
+    return false;
 }
 
 SequenceTracker::Decision SequenceTracker::observe(const std::string& key, uint16_t origin,
@@ -61,7 +62,7 @@ SequenceTracker::Decision SequenceTracker::observe(const std::string& key, uint1
         // critical section. Checking it against the frontier would report a gap on every
         // local write whenever a remote hole is holding the frontier down — a GAP record per
         // insert, which is noise, not signal.
-        note_seen(st.origins[origin], d.sequence_number);
+        if (note_seen(st.origins[origin], d.sequence_number)) ++generation_;
         return d;
     }
 
@@ -69,7 +70,7 @@ SequenceTracker::Decision SequenceTracker::observe(const std::string& key, uint1
     if (it == st.origins.end()) {
         // First record from this origin. Not a gap: there is nothing to be one past.
         OriginState fresh{};
-        note_seen(fresh, d.sequence_number);
+        if (note_seen(fresh, d.sequence_number)) ++generation_;
         st.origins.emplace(origin, std::move(fresh));
         OB_LOG_DEBUG("sequence", "First record from origin: key=%s origin=%u seq=%llu",
                      key.c_str(), static_cast<unsigned>(origin),
@@ -96,7 +97,7 @@ SequenceTracker::Decision SequenceTracker::observe(const std::string& key, uint1
                     static_cast<unsigned long long>(it->second.high_water));
     }
 
-    note_seen(it->second, d.sequence_number);
+    if (note_seen(it->second, d.sequence_number)) ++generation_;
     return d;
 }
 
@@ -104,7 +105,7 @@ void SequenceTracker::seed(const std::string& key, uint16_t origin, uint64_t seq
     if (seq == 0) return;          // a record from before numbers existed says nothing
     SymbolState& st = symbols_[key];
     st.next_local = std::max(st.next_local, seq + 1);
-    note_seen(st.origins[origin], seq);
+    if (note_seen(st.origins[origin], seq)) ++generation_;
 }
 
 void SequenceTracker::declare_frontier(const std::string& key, uint16_t origin, uint64_t seq) {
@@ -112,6 +113,7 @@ void SequenceTracker::declare_frontier(const std::string& key, uint16_t origin, 
     OriginState& st = symbols_[key].origins[origin];
     if (seq <= st.frontier) return;
 
+    ++generation_;
     st.frontier   = seq;
     st.high_water = std::max(st.high_water, seq);
     // Anything held below the declared frontier is now covered.
@@ -192,6 +194,7 @@ void SequenceTracker::import_own_vector(const std::vector<VectorEntry>& entries)
 void SequenceTracker::reset() {
     const std::size_t had = symbols_.size();
     symbols_.clear();
+    ++generation_;
     OB_LOG_INFO("sequence", "Reset: dropped state for %zu symbols", had);
 }
 
@@ -271,7 +274,7 @@ void SequenceTracker::import_held(const std::vector<HeldRanges>& held) {
                 // note_seen() also advances the frontier when a range turns out to close a hole,
                 // which is correct: if the gap below was filled in a previous run and recorded in
                 // the frontier, these numbers now sit right above it.
-                note_seen(ost, seq);
+                if (note_seen(ost, seq)) ++generation_;
             }
         }
     }

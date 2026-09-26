@@ -118,6 +118,13 @@ public:
     /// then write segments to disk and merge index (Phase B, no mutex).
     void flush_incremental();
 
+    /// One flush tick on the calling thread: what the flush loop runs every interval - drain, seal
+    /// the stores that are due and only those, refresh what the mesh is told. A test seam: a test
+    /// that needs a tick's decisions rather than `flush_incremental()`'s seal-everything runs one
+    /// with the loop's interval out of the way, and knows when it has finished. Serialised with the
+    /// loop and with `flush_incremental()` by `flush_mtx_`, which the tick takes.
+    void flush_tick_for_test() { flush_tick(); }
+
     /// Apply a delta update: WAL → SoA buffer (gap detection) → enqueue for columnar flush.
     /// Returns OB_OK on success, error code on failure.
     ob_status_t apply_delta(const DeltaUpdate& delta, const Level* levels);
@@ -744,6 +751,13 @@ private:
 
     /// Refresh the snapshot above from the tracker. Caller must hold mtx_.
     void refresh_version_vector_cache();
+    /// The same, when the tracker moved since the last refresh (#180): the flush tick calls it
+    /// whether or not it seals, so what peers are told is at most one tick old. Caller holds mtx_,
+    /// on the flush thread — never from under the mesh manager's lock, which is what the cache is
+    /// for.
+    void refresh_version_vector_cache_if_changed();
+    /// `SequenceTracker::generation()` at the last refresh. Guarded by mtx_.
+    uint64_t                             vector_cache_generation_{0};
     std::unique_ptr<HybridLogicalClock>  hlc_;
     std::unique_ptr<MultiMasterManager>  mm_mgr_;
 

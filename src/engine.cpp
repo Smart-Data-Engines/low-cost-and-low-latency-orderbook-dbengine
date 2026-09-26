@@ -378,11 +378,22 @@ void Engine::refresh_version_vector_cache() {
     // Caller holds mtx_.
     bool truncated = false;
     auto entries = seq_tracker_.export_vector(kMaxPersistedVectorEntries, truncated);
+    vector_cache_generation_ = seq_tracker_.generation();
     {
         std::lock_guard<std::mutex> lock(vector_cache_mtx_);
         vector_cache_           = std::move(entries);
         vector_cache_truncated_ = truncated;
     }
+}
+
+void Engine::refresh_version_vector_cache_if_changed() {
+    // Caller holds mtx_. The tracker's generation moves whenever a frontier or a held set does, and
+    // costs nothing to read; the export it guards is a pass over every (symbol, origin).
+    const uint64_t generation = seq_tracker_.generation();
+    if (generation == vector_cache_generation_) return;
+    refresh_version_vector_cache();
+    OB_LOG_DEBUG("engine", "Version vector cache refreshed at tracker generation %llu",
+                 static_cast<unsigned long long>(generation));
 }
 
 void Engine::persist_version_vector_if_changed() {
@@ -2913,6 +2924,11 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows) {
         std::unique_lock<std::mutex> lock(mtx_);
         registry_.set_gauge("ob_unsealed_rows",
                             static_cast<int64_t>(unsealed_rows_.load(std::memory_order_relaxed)));
+        // What the mesh compares a returning peer against, fresh at every tick rather than at every
+        // seal (#180): a tick that seals nothing writes no checkpoint, and since part 2a of #165 most
+        // ticks seal nothing, so a peer back within the seal interval was judged to hold the writes
+        // it missed - 238 of 2 100 rows three seconds after it reconnected.
+        refresh_version_vector_cache_if_changed();
         if (write_failure) std::rethrow_exception(write_failure);
         return 0;
     }
@@ -2970,6 +2986,12 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows) {
             freeze_checkpoints(std::string("A flush's segment sync failed (") +
                                std::strerror(sync_err) + ")");
         }
+        // What this node holds, so a restart does not have to relearn it - written **before** the
+        // checkpoint (#179): a crash between the two left a checkpoint on the disk and no vector for
+        // the records before it, which the replay skips and nothing else tells the tracker about.
+        // A restart takes the last vector anywhere in the WAL, so the order changes nothing it finds.
+        persist_version_vector_if_changed();
+        refresh_version_vector_cache_if_changed();   // a no-op when the persist just did it
         if (!write_failure && !checkpoints_frozen()) {
             // Replay starts at the oldest record a row still waiting in a block needs, and with
             // rows waiting a position cannot say which segments are durable, so the checkpoint names
@@ -2993,11 +3015,6 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows) {
             // does wait for one, which it makes itself (sync_for_merge()).
             if (fsync_policy_ == FsyncPolicy::NONE) retention_floor_ = durable_up_to_;
         }
-
-        // And what this node holds, so a restart does not have to relearn it. Written next to
-        // the checkpoint because that is where the WAL tail is cut: a vector after the last
-        // checkpoint is one the next replay would find anyway.
-        persist_version_vector_if_changed();
     }
     const auto merged = SealClock::now();
     const auto ms = [](SealClock::time_point from, SealClock::time_point to) {
@@ -3142,14 +3159,14 @@ int Engine::sync_segments() {
 }
 
 void Engine::apply_delta_replayed(const DeltaUpdate& delta, const Level* levels) {
-    // Caller holds mtx_.
+    // Caller holds mtx_, and has seeded the record's number under the origin that wrote it
+    // (#179) - replay_wal_tail() does, for the records it skips as stored too.
     //
     // No number is assigned here: this record was written once already and carries its
     // number. seed() restores the counters from it without reporting a gap — the gap, if
     // there was one, was recorded when the records were first written, and re-reporting it
     // would append a second GAP for the same hole on every restart.
     const std::string symbol_key = std::string(delta.symbol) + "." + delta.exchange;
-    seq_tracker_.seed(symbol_key, /*origin=*/mm_config_.node_id, delta.sequence_number);
 
     SoABuffer& buf = get_or_create_buffer(symbol_key, delta.symbol, delta.exchange);
     bool gap_detected = false;
@@ -3224,6 +3241,7 @@ uint64_t Engine::replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastC
     uint64_t skipped = 0;
     uint64_t skipped_by_timestamp = 0;
     uint64_t records = 0;
+    uint64_t seeded_other_origins = 0;
 
     replayer.replay_after(last, [&](const WALReplayContext& ctx) {
         ++records;
@@ -3246,6 +3264,20 @@ uint64_t Engine::replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastC
         }
 
         const std::string key = std::string(delta.symbol) + "." + delta.exchange;
+
+        // Every DELTA of the tail is a record this node holds - stored already, or applied below -
+        // so its number is seen, and seen **from the origin its header names** (#179). Seeding this
+        // node's own origin for all of them made a record a peer sent into one this node wrote: after
+        // a restart that peer, asked what it holds, sent it again, and the receive path found its
+        // number unseen for that origin and applied it into append-only storage a second time -
+        // 200 rows where the writer held 100. A legacy record carries no origin and is this node's.
+        // Seeded here rather than in apply_delta_replayed(), so the records a segment already holds
+        // are seen too: they were skipped without a trace before.
+        std::unique_lock<std::mutex> lock(mtx_);
+        const uint16_t origin = ctx.origin_node_id != 0 ? ctx.origin_node_id : mm_config_.node_id;
+        seq_tracker_.seed(key, origin, delta.sequence_number);
+        if (origin != mm_config_.node_id) ++seeded_other_origins;
+
         auto it = durable.find(key);
         if (it != durable.end()) {
             const auto& d = it->second;
@@ -3271,7 +3303,6 @@ uint64_t Engine::replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastC
         std::vector<Level> level_scratch;
         const Level* levels = levels_from_payload(ctx.payload, delta.n_levels, level_scratch);
 
-        std::unique_lock<std::mutex> lock(mtx_);
         apply_delta_replayed(delta, levels);
         ++applied;
     });
@@ -3280,11 +3311,12 @@ uint64_t Engine::replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastC
     // landed between writing segments and recording that fact.
     OB_LOG_INFO("engine",
                 "WAL replay: records=%llu applied=%llu skipped_by_position=%llu "
-                "skipped_by_timestamp=%llu",
+                "skipped_by_timestamp=%llu other_origins=%llu",
                 static_cast<unsigned long long>(records),
                 static_cast<unsigned long long>(applied),
                 static_cast<unsigned long long>(skipped),
-                static_cast<unsigned long long>(skipped_by_timestamp));
+                static_cast<unsigned long long>(skipped_by_timestamp),
+                static_cast<unsigned long long>(seeded_other_origins));
     if (replayer.tears_skipped() > 0) {
         // Only reachable for a WAL an **older build** left behind: since #126 a writer that tears a
         // record abandons the file, and such a file ends mid-record, which every reader here has
