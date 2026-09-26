@@ -125,6 +125,11 @@ void Engine::open() {
         seal_epoch_ = highest;
         OB_LOG_INFO("engine", "Seal epoch continues from %llu",
                     static_cast<unsigned long long>(seal_epoch_));
+        // Every segment left now is vouched for by a checkpoint that survived - the ones none did
+        // were removed above - so a merge may take any of them (#165 part 2b).
+        std::lock_guard<std::mutex> lock(mtx_);
+        checkpoint_seal_epoch_ = highest;
+        durable_seal_epoch_ = highest;
     }
 
     // Restore the sequence counters from what is already durable in segments, before the
@@ -172,6 +177,12 @@ void Engine::open() {
         OB_LOG_INFO("engine", "Persisting %llu recovered records before serving",
                     static_cast<unsigned long long>(replayed));
         flush_incremental();
+    }
+
+    // What the flush tick's merges look at first: every partition the store holds (#165 part 2b).
+    {
+        std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+        note_store_for_compaction();
     }
 
     // Restore epoch from WAL replay.
@@ -329,6 +340,8 @@ void Engine::close() {
             OB_LOG_ERROR("engine", "close: the final flush could not write its segments (%s); the "
                                    "next start replays their rows from the WAL", e.what());
         }
+        // Nothing a merge left behind that a build before part 2b would hold twice (#165 part 2b).
+        finish_compaction_on_close();
     }
 
     // Flush WAL to disk. Same reasoning as above: shutdown reports, it does not throw.
@@ -465,6 +478,7 @@ void Engine::discard_local_data_for_resync() {
 
     stores_.clear();
     drop_unsealed_locked();
+    drop_compaction_locked();
     buffers_.clear();
     pending_rows_.clear();
 
@@ -1355,6 +1369,13 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
 
     SnapshotWithSequenceState out;
     SnapshotManifest& manifest = out.manifest;
+    // Before the flush, so no merge or sweep moves a file between it and the walk below, and held by
+    // whoever sends this until the transfer ends (#165 part 2b).
+    out.pin = pin_segment_files();
+    // Inputs merged segments replaced whose files wait for a query still reading them: on the disk,
+    // and not a replica's to hold beside the segment that holds their rows. Read under flush_mtx_
+    // below; with the pin held no step changes them after that.
+    std::unordered_set<std::string> replaced;
 
     // Phase 1: flush + capture under lock (< 100ms).
     {
@@ -1395,6 +1416,10 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
         manifest.wal_file_index  = manifest_pos.file_index;
         manifest.wal_byte_offset = manifest_pos.offset;
 
+        for (const std::string& dir : replaced_input_dirs()) {
+            replaced.insert(fs::path(dir).lexically_normal().string());
+        }
+
         // And the sequence state, in the same critical section. See the header for why the
         // boundary has to be exactly here and not a line later.
         out.vector = seq_tracker_.export_vector(kMaxPersistedVectorEntries, out.vector_truncated);
@@ -1420,7 +1445,22 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
 
     // Walk the data directory for segment files.
     if (fs::exists(base_dir_)) {
-        for (auto& entry : fs::recursive_directory_iterator(base_dir_)) {
+        for (auto it = fs::recursive_directory_iterator(base_dir_);
+             it != fs::recursive_directory_iterator(); ++it) {
+            const auto& entry = *it;
+            // A merge's working directory holds no segment until a rename publishes it, and a
+            // replaced input is a segment whose rows a merged one holds (#165 part 2b): a replica
+            // would remove the first after carrying it over the wire, and a replica of an older
+            // build would hold the second's rows twice.
+            if (entry.is_directory()) {
+                if ((it.depth() >= ColumnarStore::kSegmentDepth &&
+                     ColumnarStore::is_compacting_dir(entry.path().filename().string())) ||
+                    (!replaced.empty() &&
+                     replaced.count(entry.path().lexically_normal().string()) != 0)) {
+                    it.disable_recursion_pending();
+                }
+                continue;
+            }
             if (!entry.is_regular_file()) continue;
 
             const auto& path = entry.path();
@@ -1617,6 +1657,7 @@ void Engine::adopt_store_on_disk() {
     // Clear all in-memory state.
     stores_.clear();
     drop_unsealed_locked();
+    drop_compaction_locked();
     // A query already in flight keeps its own buffer alive through the handle it holds (#92); the
     // buffer leaves the engine here and is destroyed when that query drops it.
     buffers_.clear();
@@ -1640,6 +1681,7 @@ void Engine::adopt_store_on_disk() {
     // Rebuild columnar index from the new files on disk.
     combined_store_.close();
     combined_store_.open_existing();
+    note_store_for_compaction();
 
     // Discarding the pending rows made room, and since #137 there can be a writer asleep waiting
     // for exactly that. Without this it waits out the five-second deadline and is **refused**,
@@ -1666,6 +1708,7 @@ bool Engine::install_snapshot(const std::string& staging_dir,
 
         stores_.clear();
         drop_unsealed_locked();
+        drop_compaction_locked();
         buffers_.clear();
         pending_rows_.clear();
         seq_tracker_.reset();
@@ -1702,6 +1745,8 @@ bool Engine::install_snapshot(const std::string& staging_dir,
         return false;
     }
     OB_LOG_DEBUG("engine", "The installed snapshot is on the device");
+    // Its segments merge like any others, once it is on the device (#165 part 2b).
+    note_store_for_compaction();
     return true;
 }
 
@@ -2425,7 +2470,11 @@ void Engine::flush_tick() {
         // for both, so the cutoff was a count from boot compared with nanoseconds since 1970 -
         // on a machine up for less than the retention it wrapped past every timestamp and the
         // first sweep deleted everything, and on one up for longer nothing ever expired.
-        if (ttl_config_.ttl_hours > 0) {
+        // Not while a snapshot's pin is held (#165 part 2b): its manifest names files a sweep would
+        // remove mid-transfer, which failed the transfer, and the replica started again. The sweep
+        // runs at the first tick after the pin goes.
+        if (ttl_config_.ttl_hours > 0 &&
+            segment_file_pins_->load(std::memory_order_acquire) == 0) {
             const auto now = std::chrono::steady_clock::now();
             // Compared in whole seconds, so a large `--ttl-scan-interval-seconds` is a long
             // wait rather than a duration that overflows on its way to nanoseconds.
@@ -2449,13 +2498,19 @@ void Engine::flush_tick() {
                              static_cast<unsigned long long>(ttl_config_.ttl_hours));
             }
         }
+        // Merges, after retention (#165 part 2b): the step waits on no writer, and in a tick that
+        // drained more than kSealRows rows - the write ceiling - it merges nothing new.
+        const auto retained = TickClock::now();
+        compaction_step(taken);
+
         // Not for a tick that took nothing: an idle node would say so ten times a second.
         if (taken > 0) {
             const auto finished = TickClock::now();
             OB_LOG_DEBUG("engine", "flush tick: %zu row(s) taken; WAL sync %.2f ms, drain %.2f ms, "
-                                   "seals %.2f ms, retention %.2f ms",
+                                   "seals %.2f ms, retention %.2f ms, merges %.2f ms",
                          taken, ms_since(tick_started, synced), ms_since(synced, drained),
-                         ms_since(drained, sealed), ms_since(sealed, finished));
+                         ms_since(drained, sealed), ms_since(sealed, retained),
+                         ms_since(retained, finished));
         }
 }
 
@@ -2793,9 +2848,14 @@ std::exception_ptr Engine::write_seals(std::vector<Seal>& seals) {
 size_t Engine::merge_seals_locked(const std::vector<Seal>& seals) {
     size_t refused = 0;
     size_t rows = 0;
+    const auto now = std::chrono::steady_clock::now();
     for (const Seal& s : seals) {
         refused += combined_store_.seal_blocks(s.store->symbol(), s.store->exchange(), s.count,
                                                s.metas);
+        // Each segment written is looked at by the next tick's merges (#165 part 2b).
+        for (const SegmentMeta& meta : s.metas) {
+            note_segment_for_compaction(meta, now, /*arrived=*/true);
+        }
         auto it = unsealed_.find(s.store);
         if (it == unsealed_.end()) continue;
         for (size_t i = 0; i < s.count && !it->second.blocks.empty(); ++i) {
@@ -2926,7 +2986,11 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows) {
             } else {
                 wal_.append_checkpoint(now_ns, durable_up_to_, seal_epoch_);
             }
-            // `none` makes no promise a sync could keep, so retention need not wait for one.
+            // The seals it vouches for (#165 part 2b) - every one so far, by epoch with blocks
+            // waiting and by position without - which a merge takes once it is on the device.
+            checkpoint_seal_epoch_ = seal_epoch_;
+            // `none` makes no promise a sync could keep, so retention need not wait for one. A merge
+            // does wait for one, which it makes itself (sync_for_merge()).
             if (fsync_policy_ == FsyncPolicy::NONE) retention_floor_ = durable_up_to_;
         }
 
@@ -2966,6 +3030,9 @@ void Engine::note_wal_synced() {
     // sync of a WAL file failed, the third succeeded, and the file before it was gone.
     if (checkpoints_frozen()) return;
     retention_floor_ = durable_up_to_;
+    // What a merge may take (#165 part 2b) - except under `none`, where nothing was synced and the
+    // merges' own sync says it instead.
+    if (fsync_policy_ != FsyncPolicy::NONE) durable_seal_epoch_ = checkpoint_seal_epoch_;
 }
 
 bool Engine::checkpoints_frozen() {
@@ -3058,12 +3125,16 @@ void Engine::remove_unvouched_segments(const WALReplayer::LastCheckpoint& last) 
 
 int Engine::sync_segments() {
     // Caller holds flush_mtx_ and not mtx_.
+    //
+    // Counted when it ran, so a merge knows a sync has come since it wrote (#165 part 2b); under
+    // `none` nothing runs here, and a merge syncs for itself.
     if (fsync_policy_ == FsyncPolicy::NONE) return 0;   // that policy promises nothing after a cut
     if (data_dir_fd_ < 0) return EBADF;                 // open() has not run: nothing to vouch for
     const auto started = std::chrono::steady_clock::now();
     if (::syncfs(data_dir_fd_) != 0) {
         return errno;
     }
+    ++segment_syncs_;
     OB_LOG_DEBUG("engine", "Segments synced in %.2f ms",
                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                            started).count());

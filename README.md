@@ -148,7 +148,8 @@ installs anything, and a containerised competitor would measure the container.
 - **Write-Ahead Log (WAL)** with CRC32C checksums and crash recovery
 - **Columnar storage** with delta+zigzag price compression and Simple8b volume packing
 - **Columnar segments on disk** — time-partitioned, one file per column, written whole when a
-  flush completes
+  symbol has enough rows or its oldest are ten seconds old, and merged in the background into
+  segments of up to 262 144 rows, so their number follows the data rather than uptime
 - **Aggregation engine** (VWAP, spread, mid-price, imbalance, etc.) with optional AVX2/AVX-512 SIMD,
   reachable over the wire protocol: every result carries its scale factor and distinguishes an empty
   aggregate from a zero

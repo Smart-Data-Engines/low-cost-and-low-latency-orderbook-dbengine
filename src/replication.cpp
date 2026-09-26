@@ -1699,8 +1699,12 @@ void ReplicationManager::handle_snapshot_request(ReplicaInfo& replica) {
     // worker never touches state this manager can change under it.
     Engine* engine = engine_;
     if (!snapshot_builder_.start(token, [engine] {
+            // The manifest, and the pin that keeps the files it names until the transfer ends
+            // (#165 part 2b); the sequence state is the mesh's, and this link does not send it.
+            SnapshotWithSequenceState full = engine->create_snapshot_with_sequence_state();
             SnapshotWithSequenceState out;
-            out.manifest = engine->create_snapshot();
+            out.manifest = std::move(full.manifest);
+            out.pin = std::move(full.pin);
             return out;
         })) {
         OB_LOG_ERROR("repl_mgr", "could not start a snapshot worker for fd=%d (token %llu)",
@@ -1781,16 +1785,19 @@ void ReplicationManager::poll_snapshot_preparation() {
                 replica->fd, prepare_ms, static_cast<unsigned long long>(result->token));
 
     prep = ReplicaSnapshotPrepare{};
-    begin_snapshot_transfer(*replica, std::move(result->snap.manifest));
+    begin_snapshot_transfer(*replica, std::move(result->snap.manifest),
+                            std::move(result->snap.pin));
 }
 
 void ReplicationManager::begin_snapshot_transfer(ReplicaInfo& replica,
-                                                 SnapshotManifest&& manifest_in) {
+                                                 SnapshotManifest&& manifest_in,
+                                                 std::shared_ptr<const void> pin) {
     SnapshotManifest manifest = std::move(manifest_in);
 
     // Initialize snapshot transfer state.
     auto& st = replica.snapshot_transfer;
     st.active            = true;
+    st.pin               = std::move(pin);
     st.manifest          = std::move(manifest);
     st.current_file_idx  = 0;
     st.current_file_offset = 0;
@@ -1840,6 +1847,7 @@ bool ReplicationManager::continue_snapshot_transfer(ReplicaInfo& replica) {
                 const char* err = "ERR SNAPSHOT_FAILED file_read_error\n";
                 enqueue_send(replica, err, std::strlen(err));
                 st.active = false;
+                st.pin.reset();
                 return true;
             }
         }
@@ -1863,6 +1871,7 @@ bool ReplicationManager::continue_snapshot_transfer(ReplicaInfo& replica) {
                 const char* err = "ERR SNAPSHOT_FAILED file_read_error\n";
                 enqueue_send(replica, err, std::strlen(err));
                 st.active = false;
+                st.pin.reset();
                 return true;
             }
 
@@ -1892,6 +1901,7 @@ bool ReplicationManager::continue_snapshot_transfer(ReplicaInfo& replica) {
     enqueue_send(replica, line, static_cast<size_t>(line_len));
 
     st.active = false;
+    st.pin.reset();
 
     // Anything that arrived while the snapshot streamed goes out now, after its last byte. The
     // snapshot carries the WAL position it was taken at, so what waited is what this replica needs

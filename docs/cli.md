@@ -101,6 +101,10 @@ ob> flush
 
 Execute a SQL query against the columnar store.
 
+A query reads what the flush tick has drained, so a write acknowledged a moment ago appears at the
+next tick — within `--flush-interval-ms`, 100 ms by default — or at once after `flush`. `book`
+reads the live book, which a write updates before it is acknowledged.
+
 ```
 query <SQL>
 ```
@@ -550,6 +554,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--anti-entropy-interval-seconds` | `<N>` | Multi-master reconciliation interval (default: 60) |
 | `--auth-secret-file` | `<PATH>` | Client credentials, `<identity> <secret>` per line; mode 600. Empty disables client authentication |
 | `--cluster-secret-file` | `<PATH>` | Shared secret for replication and multi-master links, one line; mode 600 |
+| `--compaction` | `on\|off` | Whether the flush tick merges a symbol's small segments into bigger ones (default: on). A valve, not a tuning knob: `off` leaves every segment as its seal wrote it, so their number grows with uptime again (#165 part 2b) |
 | `--config` | `<FILE>` | Read `key = value` settings from FILE; command line wins |
 | `--coordinator-endpoints` | `<URLS>` | Comma-separated etcd endpoints for HA and failover |
 | `--coordinator-lease-ttl` | `<N>` | Leader lease TTL in seconds (default: 10) |

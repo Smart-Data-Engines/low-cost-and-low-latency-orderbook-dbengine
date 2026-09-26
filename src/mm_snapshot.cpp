@@ -418,6 +418,7 @@ void MultiMasterManager::begin_snapshot_send(PeerConnection& peer,
 
     auto& st = snapshot_send_;
     st = MMSnapshotSend{};
+    st.pin            = std::move(snap.pin);
     st.manifest       = std::move(snap.manifest);
     st.target_node_id = peer.node_id;
     st.started_at     = std::chrono::steady_clock::now();
