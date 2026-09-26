@@ -32,6 +32,29 @@ ColumnarStore::ColumnarStore(std::string_view base_dir, uint64_t segment_duratio
     , own_index_(own_index)
 {}
 
+// ── A merge's inputs, as its segment names them (#165 part 2b) ───────────────
+
+SegmentInput SegmentInput::of(const SegmentMeta& meta) {
+    SegmentInput in;
+    in.dir_name        = fs::path(meta.dir_path).filename().string();
+    in.wal_identity    = meta.wal_identity;
+    in.wal_file_index  = meta.wal_file_index;
+    in.wal_byte_offset = meta.wal_byte_offset;
+    in.seal_epoch      = meta.seal_epoch;
+    in.row_count       = meta.row_count;
+    in.start_ts_ns     = meta.start_ts_ns;
+    in.end_ts_ns       = meta.end_ts_ns;
+    return in;
+}
+
+bool SegmentInput::names(const SegmentMeta& meta) const {
+    return fs::path(meta.dir_path).filename().string() == dir_name &&
+           meta.wal_identity == wal_identity && meta.wal_file_index == wal_file_index &&
+           meta.wal_byte_offset == wal_byte_offset && meta.seal_epoch == seal_epoch &&
+           meta.row_count == row_count && meta.start_ts_ns == start_ts_ns &&
+           meta.end_ts_ns == end_ts_ns;
+}
+
 // ── Blocks: drained rows before a seal (#165 part 2a) ────────────────────────
 
 std::shared_ptr<const RowBlock> RowBlock::make(std::string symbol, std::string exchange,
@@ -327,13 +350,14 @@ void write_file_checked(const std::string& path, const void* data, size_t bytes)
 
 }  // namespace
 
-void ColumnarStore::write_meta_json(const std::string& dir,
-                                     const SegmentMeta& meta) const {
-    const std::string content = meta_json(meta);
+void ColumnarStore::write_meta_json(const std::string& dir, const SegmentMeta& meta,
+                                    const std::vector<SegmentInput>* inputs) const {
+    const std::string content = meta_json(meta, inputs);
     write_file_checked(dir + "/meta.json", content.data(), content.size());
 }
 
-std::string ColumnarStore::meta_json(const SegmentMeta& meta) const {
+std::string ColumnarStore::meta_json(const SegmentMeta& meta,
+                                     const std::vector<SegmentInput>* inputs) const {
     std::ostringstream f;
     f << "{\"format_version\":" << meta.format_version
       << ",\"start_ts_ns\":" << meta.start_ts_ns
@@ -352,12 +376,31 @@ std::string ColumnarStore::meta_json(const SegmentMeta& meta) const {
     // Only ever written as "rows": a meta.json without the key is one written before #166, and
     // that absence is what the repair at open looks for.
     if (meta.time_range_is_rows) f << ",\"time_range\":\"rows\"";
+    // A merge's (#165 part 2b), last, and in keys no reader of the ones above searches for: the
+    // parser finds a key by its first occurrence, and an older build parses this file too.
+    if (meta.merge_level > 0) f << ",\"merge_level\":" << meta.merge_level;
+    if (inputs != nullptr && !inputs->empty()) {
+        f << ",\"compacted_from\":[";
+        for (size_t i = 0; i < inputs->size(); ++i) {
+            const SegmentInput& in = (*inputs)[i];
+            f << (i == 0 ? "" : ",")
+              << "{\"dir\":\"" << in.dir_name << "\""
+              << ",\"identity\":" << in.wal_identity
+              << ",\"file\":" << in.wal_file_index
+              << ",\"offset\":" << in.wal_byte_offset
+              << ",\"epoch\":" << in.seal_epoch
+              << ",\"rows\":" << in.row_count
+              << ",\"from\":" << in.start_ts_ns
+              << ",\"to\":" << in.end_ts_ns << "}";
+        }
+        f << "]";
+    }
     f << "}";
     return f.str();
 }
 
-bool ColumnarStore::parse_meta_json(const std::string& path,
-                                     SegmentMeta& out) const {
+bool ColumnarStore::parse_meta_json(const std::string& path, SegmentMeta& out,
+                                    std::vector<SegmentInput>* inputs) const {
     std::ifstream f(path);
     if (!f.is_open()) return false;
 
@@ -430,6 +473,48 @@ bool ColumnarStore::parse_meta_json(const std::string& path,
     // the end to the rows' maximum.
     out.time_range_is_rows = extract_string("time_range") == "rows";
     out.last_row_ts_ns     = find_uint64("last_row_ts_ns").value_or(out.end_ts_ns);
+    // Absent unless a merge wrote the segment (#165 part 2b).
+    out.merge_level = static_cast<uint32_t>(extract_uint64("merge_level"));
+    if (inputs != nullptr) {
+        inputs->clear();
+        const std::string list = "\"compacted_from\":[";
+        auto pos = content.find(list);
+        if (pos != std::string::npos) pos += list.size();
+        while (pos != std::string::npos && pos < content.size() && content[pos] == '{') {
+            const auto close = content.find('}', pos);
+            if (close == std::string::npos) break;
+            const std::string_view obj(content.data() + pos, close - pos + 1);
+            auto number = [&](std::string_view key) -> uint64_t {
+                const std::string search = "\"" + std::string(key) + "\":";
+                auto at = obj.find(search);
+                if (at == std::string_view::npos) return 0;
+                at += search.size();
+                uint64_t val = 0;
+                while (at < obj.size() && obj[at] >= '0' && obj[at] <= '9') {
+                    val = val * 10 + static_cast<uint64_t>(obj[at] - '0');
+                    ++at;
+                }
+                return val;
+            };
+            SegmentInput in;
+            const std::string dir_key = "\"dir\":\"";
+            if (auto at = obj.find(dir_key); at != std::string_view::npos) {
+                at += dir_key.size();
+                const auto end = obj.find('"', at);
+                if (end != std::string_view::npos) in.dir_name = std::string(obj.substr(at, end - at));
+            }
+            in.wal_identity    = number("identity");
+            in.wal_file_index  = static_cast<uint32_t>(number("file"));
+            in.wal_byte_offset = number("offset");
+            in.seal_epoch      = number("epoch");
+            in.row_count       = number("rows");
+            in.start_ts_ns     = number("from");
+            in.end_ts_ns       = number("to");
+            if (!in.dir_name.empty()) inputs->push_back(std::move(in));
+            pos = close + 1;
+            if (pos < content.size() && content[pos] == ',') ++pos;
+        }
+    }
 
     // Validate: must have at least start_ts_ns and row_count
     return out.row_count > 0 || out.start_ts_ns > 0;
@@ -630,6 +715,173 @@ bool ColumnarStore::insert_locked(SegmentMeta meta) {
     return true;
 }
 
+bool ColumnarStore::erase_locked(const SegmentMeta& meta) {
+    const auto it = by_symbol_.find(index_key(meta.symbol, meta.exchange));
+    if (it == by_symbol_.end()) return false;
+    const uint64_t width =
+        meta.end_ts_ns > meta.start_ts_ns ? meta.end_ts_ns - meta.start_ts_ns : 0;
+    const auto bits = static_cast<unsigned>(std::bit_width(width));
+    auto& tiers = it->second.tiers;
+    const auto tier = std::lower_bound(tiers.begin(), tiers.end(), bits,
+                                       [](const WidthTier& t, unsigned b) { return t.width_bits < b; });
+    if (tier == tiers.end() || tier->width_bits != bits) return false;
+    auto& v = tier->segments;
+    const auto pos = std::lower_bound(v.begin(), v.end(), meta, segment_order_less);
+    if (pos == v.end() || pos->dir_path != meta.dir_path) return false;
+    indexed_dirs_.erase(pos->dir_path);
+    v.erase(pos);
+    --indexed_count_;
+    if (v.empty()) tiers.erase(tier);
+    return true;
+}
+
+ColumnarStore::PartitionView ColumnarStore::partition_view(std::string_view symbol,
+                                                           std::string_view exchange,
+                                                           uint64_t end_from,
+                                                           uint64_t end_to) const {
+    PartitionView view;
+    std::shared_lock<std::shared_mutex> lock(index_mtx_);
+    const auto it = by_symbol_.find(index_key(symbol, exchange));
+    if (it == by_symbol_.end()) return view;
+    const auto& tiers = it->second.tiers;
+    auto by_start = [](const SegmentMeta& m, uint64_t at) { return m.start_ts_ns < at; };
+
+    // The members: a segment that ends in the range starts no earlier than the range's start less
+    // the widest segment of its tier, so each tier is searched in that window, as a scan's is.
+    bool any = false;
+    uint64_t lo = UINT64_MAX;
+    uint64_t hi = 0;
+    for (const WidthTier& tier : tiers) {
+        const auto& v = tier.segments;
+        const uint64_t from = end_from > tier.widest_ns ? end_from - tier.widest_ns : 0;
+        for (auto i = std::lower_bound(v.begin(), v.end(), from, by_start);
+             i != v.end() && i->start_ts_ns < end_to; ++i) {
+            if (i->end_ts_ns < end_from || i->end_ts_ns >= end_to) continue;
+            any = true;
+            lo = std::min(lo, i->start_ts_ns);
+            hi = std::max(hi, i->start_ts_ns);
+        }
+    }
+    if (!any) return view;
+
+    // And everything that starts where they do - the stretch of the delivery order they span,
+    // which is where a segment of another partition can lie between two of them.
+    for (const WidthTier& tier : tiers) {
+        const auto& v = tier.segments;
+        for (auto i = std::lower_bound(v.begin(), v.end(), lo, by_start);
+             i != v.end() && i->start_ts_ns <= hi; ++i) {
+            view.segments.push_back(*i);
+        }
+    }
+    std::sort(view.segments.begin(), view.segments.end(), segment_order_less);
+    view.member.reserve(view.segments.size());
+    for (const SegmentMeta& m : view.segments) {
+        view.member.push_back(m.end_ts_ns >= end_from && m.end_ts_ns < end_to);
+    }
+    return view;
+}
+
+ColumnarStore::ReplaceResult ColumnarStore::replace_segments(
+        const std::vector<SegmentMeta>& inputs, SegmentMeta output,
+        const std::function<bool(SegmentMeta&)>& publish) {
+    ReplaceResult result;
+    if (inputs.empty()) return result;
+    // Kept past the lock, so the generation it names is not destroyed while the lock is held.
+    std::shared_ptr<ReaderGeneration> before;
+    const char* refused = nullptr;
+    {
+        std::unique_lock<std::shared_mutex> lock(index_mtx_);
+        for (const SegmentMeta& in : inputs) {
+            if (indexed_dirs_.count(in.dir_path) == 0) {
+                result.outcome = Replaced::kInputGone;
+                refused = "an input is no longer indexed";
+                break;
+            }
+        }
+        const auto it = refused ? by_symbol_.end()
+                                : by_symbol_.find(index_key(output.symbol, output.exchange));
+        if (!refused && it == by_symbol_.end()) {
+            result.outcome = Replaced::kInputGone;
+            refused = "the symbol is no longer indexed";
+        }
+        if (!refused) {
+            // Every segment from the first input to the last, in delivery order, and the segments
+            // just before and after them.
+            std::vector<const SegmentMeta*> stretch;
+            const SegmentMeta* prev = nullptr;
+            const SegmentMeta* next = nullptr;
+            for (const WidthTier& tier : it->second.tiers) {
+                const auto& v = tier.segments;
+                const auto first = std::lower_bound(v.begin(), v.end(), inputs.front(),
+                                                    segment_order_less);
+                const auto past = std::upper_bound(v.begin(), v.end(), inputs.back(),
+                                                   segment_order_less);
+                if (first != v.begin()) {
+                    const SegmentMeta* p = &*std::prev(first);
+                    if (prev == nullptr || segment_order_less(*prev, *p)) prev = p;
+                }
+                if (past != v.end()) {
+                    const SegmentMeta* n = &*past;
+                    if (next == nullptr || segment_order_less(*n, *next)) next = n;
+                }
+                for (auto i = first; i < past; ++i) stretch.push_back(&*i);
+            }
+            std::sort(stretch.begin(), stretch.end(),
+                      [](const SegmentMeta* a, const SegmentMeta* b) {
+                          return segment_order_less(*a, *b);
+                      });
+            bool consecutive = stretch.size() == inputs.size();
+            for (size_t i = 0; consecutive && i < inputs.size(); ++i) {
+                consecutive = stretch[i]->dir_path == inputs[i].dir_path;
+            }
+            // Strictly between its neighbours by range, so the order does not come down to the
+            // directory's name, which the publication below chooses.
+            auto range_less = [](const SegmentMeta& a, const SegmentMeta& b) {
+                return a.start_ts_ns < b.start_ts_ns ||
+                       (a.start_ts_ns == b.start_ts_ns && a.end_ts_ns < b.end_ts_ns);
+            };
+            if (!consecutive) {
+                result.outcome = Replaced::kNotConsecutive;
+                refused = "another segment lies between the inputs";
+            } else if ((prev != nullptr && !range_less(*prev, output)) ||
+                       (next != nullptr && !range_less(output, *next))) {
+                result.outcome = Replaced::kWouldMove;
+                refused = "the merged range would not sort where the inputs were";
+            } else if (!publish(output)) {
+                result.outcome = Replaced::kPublishFailed;
+                refused = "the merged segment could not be published";
+            } else if (indexed_dirs_.count(output.dir_path) != 0) {
+                // A rename that does not replace cannot land on an indexed directory, which exists.
+                result.outcome = Replaced::kPublishFailed;
+                refused = "the merged segment was published over an indexed directory";
+                OB_LOG_ERROR("columnar", "merge of %zu segment(s) of %s.%s was published at %s, which "
+                                         "is already indexed; the inputs stay",
+                             inputs.size(), output.symbol.c_str(), output.exchange.c_str(),
+                             output.dir_path.c_str());
+            } else {
+                for (const SegmentMeta& in : inputs) erase_locked(in);
+                insert_locked(output);
+                auto fresh = std::make_shared<ReaderGeneration>();
+                reader_generation_->next = fresh;
+                before = std::move(reader_generation_);
+                reader_generation_ = std::move(fresh);
+                result.readers_before = before;
+                result.outcome = Replaced::kYes;
+            }
+        }
+    }
+    if (refused != nullptr) {
+        OB_LOG_DEBUG("columnar", "merge of %zu segment(s) of %s.%s into %s not published: %s",
+                     inputs.size(), output.symbol.c_str(), output.exchange.c_str(),
+                     output.dir_path.c_str(), refused);
+    } else {
+        OB_LOG_DEBUG("columnar", "published %s, the merge of %zu segment(s) of %s.%s, %llu row(s)",
+                     output.dir_path.c_str(), inputs.size(), output.symbol.c_str(),
+                     output.exchange.c_str(), static_cast<unsigned long long>(output.row_count));
+    }
+    return result;
+}
+
 std::vector<SegmentMeta> ColumnarStore::index() const {
     std::vector<SegmentMeta> all;
     {
@@ -653,6 +905,44 @@ std::optional<SegmentMeta> ColumnarStore::flush_segment() {
         return std::nullopt;
     }
 
+    // Build segment directory path. Unique per segment rather than per span, so a second flush
+    // covering the same event-time range is a second segment instead of a collision (#136).
+    const std::string dir =
+        create_unique_segment_dir(symbol_, exchange_, active_min_ts_, active_max_ts_);
+    SegmentMeta meta = write_active_segment(dir);
+
+    // A store on its own is its own index; one whose segments are handed to a combined store keeps
+    // none (#165), because nothing would read them here.
+    if (own_index_ == OwnIndex::kYes) {
+        std::unique_lock<std::shared_mutex> lock(index_mtx_);
+        insert_locked(meta);
+    }
+    return meta;
+}
+
+void ColumnarStore::set_lineage(uint32_t merge_level, std::vector<SegmentInput> inputs,
+                                uint64_t last_row_ts_ns) {
+    has_lineage_         = true;
+    lineage_level_       = merge_level;
+    lineage_inputs_      = std::move(inputs);
+    lineage_last_row_ts_ = last_row_ts_ns;
+}
+
+std::optional<SegmentMeta> ColumnarStore::flush_segment_into(const std::string& dir) {
+    if (!has_active_segment_ || active_row_count_ == 0) {
+        has_active_segment_ = false;
+        return std::nullopt;
+    }
+    ensure_dirs(fs::path(dir).parent_path().string());
+    std::error_code ec;
+    if (!fs::create_directory(dir, ec)) {
+        throw std::runtime_error("ColumnarStore: cannot create '" + dir + "' for a merged segment: " +
+                                 (ec ? ec.message() : std::string("it already exists")));
+    }
+    return write_active_segment(dir);
+}
+
+SegmentMeta ColumnarStore::write_active_segment(const std::string& dir) {
     // The range this segment records is its rows' - the earliest and the latest timestamp - and
     // not the period it belongs to and its last row, which is what it was until #166. The two
     // agree only while rows arrive in time order; when they did not, a query skipped rows this
@@ -660,10 +950,6 @@ std::optional<SegmentMeta> ColumnarStore::flush_segment() {
     // retention deleted a row one second old with a two-day-old one written after it.
     const uint64_t first_ts = active_min_ts_;
     const uint64_t last_ts  = active_max_ts_;
-
-    // Build segment directory path. Unique per segment rather than per span, so a second flush
-    // covering the same event-time range is a second segment instead of a collision (#136).
-    std::string dir = create_unique_segment_dir(symbol_, exchange_, first_ts, last_ts);
 
     // A write that fails part-way leaves no directory behind (#160): the exception goes to the
     // flush, the rows stay in memory, and the next flush writes a new segment - so a half-written
@@ -764,17 +1050,18 @@ std::optional<SegmentMeta> ColumnarStore::flush_segment() {
     meta.wal_file_index  = wal_file_index_;
     meta.wal_byte_offset = wal_byte_offset_;
     meta.seal_epoch      = seal_epoch_;
+    if (has_lineage_) {
+        // A merge's (#165 part 2b): the latest of its inputs' last rows, which the row appended
+        // last need not be, and its level. The inputs go into meta.json only.
+        meta.last_row_ts_ns = lineage_last_row_ts_;
+        meta.merge_level    = lineage_level_;
+    }
 
     // Write meta.json - last, so that a segment with one is a segment with all of its columns.
-    write_meta_json(dir, meta);
+    write_meta_json(dir, meta, has_lineage_ ? &lineage_inputs_ : nullptr);
     partial.complete = true;
-
-    // A store on its own is its own index; one whose segments are handed to a combined store keeps
-    // none (#165), because nothing would read them here.
-    if (own_index_ == OwnIndex::kYes) {
-        std::unique_lock<std::shared_mutex> lock(index_mtx_);
-        insert_locked(meta);
-    }
+    has_lineage_ = false;
+    lineage_inputs_.clear();
 
     // Reset active segment state
     has_active_segment_ = false;
@@ -813,6 +1100,142 @@ bool read_column_file(const std::string& dir, const char* name, std::vector<T>& 
 
 }  // namespace
 
+ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
+        const SegmentMeta& meta, ColumnSet columns, uint64_t start_ns, uint64_t end_ns,
+        const std::function<void(const SnapshotRow&)>& cb, ReadMode mode) const {
+    const bool want_price = columns.has(QueryColumn::Price);
+    const bool want_qty   = columns.has(QueryColumn::Quantity);
+    const bool want_cnt   = columns.has(QueryColumn::OrderCount);
+    const bool want_side  = columns.has(QueryColumn::Side);
+    const bool want_level = columns.has(QueryColumn::Level);
+    const bool want_seq   = columns.has(QueryColumn::SequenceNumber);
+
+    const std::string& dir = meta.dir_path;
+
+    // A segment written by an older format lacks side, level_index and
+    // sequence_number. Reading it anyway would hand back rows with those
+    // fields silently zeroed, which is the defect this version exists to
+    // fix. Refuse it loudly instead.
+    if (meta.format_version != kColumnarFormatVersion) {
+        OB_LOG_ERROR("columnar",
+                     "Skipping segment %s: unsupported format_version=%u "
+                     "(this build reads %u)",
+                     dir.c_str(), meta.format_version, kColumnarFormatVersion);
+        return SegmentRead::kUnreadable;
+    }
+
+    std::vector<uint64_t> timestamps, enc_prices, enc_qtys, enc_seq;
+    std::vector<uint32_t> counts;
+    std::vector<uint8_t>  sides;
+    std::vector<uint16_t> levels;
+
+    // A missing file is fatal for the segment only when the query needs that column. Before
+    // the read set existed every column was needed, so a segment missing any one of the seven
+    // was dropped from every query - including queries that would never have looked at it.
+    bool missing = false;
+    bool removed = false;
+    auto need = [&](bool wanted, const char* file, auto& dest) {
+        if (!wanted || removed) return;
+        if (!read_column_file(dir, file, dest)) {
+            // Retention takes a segment out of the index and then deletes its directory
+            // without the lock (#165), so a scan that copied it first can find it going.
+            // Its rows are past the retention, and leaving them out is the right answer.
+            if (mode == ReadMode::kQuery && !still_indexed(dir)) {
+                OB_LOG_DEBUG("columnar", "segment %s was removed while this query read it; "
+                                         "its rows are past the retention", dir.c_str());
+                removed = true;
+                return;
+            }
+            OB_LOG_ERROR("columnar", "Skipping segment %s: missing column %s",
+                         dir.c_str(), file);
+            missing = true;
+        }
+    };
+    // Every column is opened through the set, the timestamp included - the widening at the
+    // top of scan() is what puts it there. A hardcoded `true` here reads as belt and
+    // braces and is worse than that: it makes that widening unobservable, so a mutation
+    // deleting it survived the test written to catch exactly that.
+    need(columns.has(QueryColumn::TimestampNs), "ts.col", timestamps);
+    need(want_price, "price.col", enc_prices);
+    need(want_qty,   "qty.col",   enc_qtys);
+    need(want_cnt,   "cnt.col",   counts);
+    need(want_side,  "side.col",  sides);
+    need(want_level, "level.col", levels);
+    need(want_seq,   "seq.col",   enc_seq);
+    if (removed) return SegmentRead::kRemoved;
+    if (missing) return SegmentRead::kUnreadable;
+
+    // Decoding follows the set too, and the sequence number is the expensive one: it is
+    // Simple8b **and** zigzag-delta, so a query that does not ask for it skips two of the
+    // four decode passes a segment would otherwise cost.
+    std::vector<int64_t>  prices;
+    std::vector<uint64_t> qtys;
+    std::vector<int64_t>  seqs;
+    if (want_price) prices = decode_prices(enc_prices);
+    if (want_qty)   qtys   = decode_simple8b(enc_qtys, meta.row_count);
+    if (want_seq) {
+        auto zigzag_seq = decode_simple8b(enc_seq, meta.row_count);
+        seqs = decode_prices(zigzag_seq);
+    }
+
+    // A short column means a truncated or corrupt segment. Emitting the rows
+    // it does have, padded with zeros, is what produced the lost-order-side
+    // defect this format version fixes, so refuse the segment instead. Only the columns
+    // being read can be short here; one that was never opened is empty by construction.
+    const size_t expected = static_cast<size_t>(meta.row_count);
+    if ((want_side  && sides.size()  < expected) ||
+        (want_level && levels.size() < expected) ||
+        (want_seq   && seqs.size()   < expected)) {
+        OB_LOG_ERROR("columnar",
+                     "Skipping segment %s: short column(s) for row_count=%zu "
+                     "(side=%zu level=%zu seq=%zu)",
+                     dir.c_str(), expected,
+                     sides.size(), levels.size(), seqs.size());
+        return SegmentRead::kUnreadable;
+    }
+    // A merge writes every row it reads into a segment that outlives this one, so it reads a
+    // segment whole or not at all (#165 part 2b): the padding below is a query's, and a merged row
+    // with a zero timestamp would widen the merged segment's range to the epoch.
+    if (mode == ReadMode::kMerge &&
+        (timestamps.size() < expected || prices.size() < expected ||
+         qtys.size() < expected || counts.size() < expected)) {
+        OB_LOG_ERROR("columnar",
+                     "segment %s cannot be merged: short column(s) for row_count=%zu "
+                     "(ts=%zu price=%zu qty=%zu cnt=%zu)",
+                     dir.c_str(), expected, timestamps.size(), prices.size(), qtys.size(),
+                     counts.size());
+        return SegmentRead::kUnreadable;
+    }
+
+    // Emit rows within time range
+    size_t n = meta.row_count;
+    for (size_t i = 0; i < n; ++i) {
+        uint64_t ts = (i < timestamps.size()) ? timestamps[i] : 0;
+        if (ts < start_ns || ts > end_ns) continue;
+
+        // Value-initialised, so a field whose column was not read is zero rather than
+        // whatever the last row left there.
+        SnapshotRow row{};
+        row.timestamp_ns = ts;
+        if (want_seq)   row.sequence_number = static_cast<uint64_t>(seqs[i]);
+        if (want_side)  row.side            = sides[i];
+        if (want_level) row.level_index     = levels[i];
+        if (want_price) row.price           = (i < prices.size()) ? prices[i] : 0;
+        if (want_qty)   row.quantity        = (i < qtys.size())   ? qtys[i]   : 0;
+        if (want_cnt)   row.order_count     = (i < counts.size()) ? counts[i] : 0;
+        cb(row);
+    }
+    return SegmentRead::kRead;
+}
+
+bool ColumnarStore::read_segment(const SegmentMeta& meta,
+                                 const std::function<void(const SnapshotRow&)>& cb) const {
+    // Nothing removes a segment a merge is reading - retention and the merge run on one thread -
+    // so a missing file here is the corruption it is everywhere else.
+    return read_segment_rows(meta, ColumnSet::all(), 0, UINT64_MAX, cb, ReadMode::kMerge) ==
+           SegmentRead::kRead;
+}
+
 ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
                                              std::string_view symbol, std::string_view exchange,
                                              ColumnSet columns,
@@ -829,8 +1252,12 @@ ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
     ScanCost cost;
     std::vector<SegmentMeta> index_snapshot;
     std::vector<std::shared_ptr<const RowBlock>> block_snapshot;
+    // Held until the files are read (#165 part 2b): a merge that replaces a segment this copied
+    // removes its files only once every scan that took this generation has let it go.
+    std::shared_ptr<const void> reading;
     {
         std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        reading = reader_generation_;
         const auto it = by_symbol_.find(index_key(symbol, exchange));
         if (it == by_symbol_.end()) return cost;
         for (const auto& b : it->second.blocks) {
@@ -866,116 +1293,16 @@ ColumnarStore::ScanCost ColumnarStore::scan(uint64_t start_ns, uint64_t end_ns,
                  static_cast<unsigned long long>(end_ns), cost.compared, cost.candidates,
                  cost.blocks);
 
+    for (const auto& meta : index_snapshot) {
+        read_segment_rows(meta, columns, start_ns, end_ns, cb, ReadMode::kQuery);
+    }
+
     const bool want_price = columns.has(QueryColumn::Price);
     const bool want_qty   = columns.has(QueryColumn::Quantity);
     const bool want_cnt   = columns.has(QueryColumn::OrderCount);
     const bool want_side  = columns.has(QueryColumn::Side);
     const bool want_level = columns.has(QueryColumn::Level);
     const bool want_seq   = columns.has(QueryColumn::SequenceNumber);
-
-    for (const auto& meta : index_snapshot) {
-        const std::string& dir = meta.dir_path;
-
-        // A segment written by an older format lacks side, level_index and
-        // sequence_number. Reading it anyway would hand back rows with those
-        // fields silently zeroed, which is the defect this version exists to
-        // fix. Refuse it loudly instead.
-        if (meta.format_version != kColumnarFormatVersion) {
-            OB_LOG_ERROR("columnar",
-                         "Skipping segment %s: unsupported format_version=%u "
-                         "(this build reads %u)",
-                         dir.c_str(), meta.format_version, kColumnarFormatVersion);
-            continue;
-        }
-
-        std::vector<uint64_t> timestamps, enc_prices, enc_qtys, enc_seq;
-        std::vector<uint32_t> counts;
-        std::vector<uint8_t>  sides;
-        std::vector<uint16_t> levels;
-
-        // A missing file is fatal for the segment only when the query needs that column. Before
-        // the read set existed every column was needed, so a segment missing any one of the seven
-        // was dropped from every query - including queries that would never have looked at it.
-        bool missing = false;
-        bool removed = false;
-        auto need = [&](bool wanted, const char* file, auto& dest) {
-            if (!wanted || removed) return;
-            if (!read_column_file(dir, file, dest)) {
-                // Retention takes a segment out of the index and then deletes its directory
-                // without the lock (#165), so a scan that copied it first can find it going.
-                // Its rows are past the retention, and leaving them out is the right answer.
-                if (!still_indexed(dir)) {
-                    OB_LOG_DEBUG("columnar", "segment %s was removed while this query read it; "
-                                             "its rows are past the retention", dir.c_str());
-                    removed = true;
-                    return;
-                }
-                OB_LOG_ERROR("columnar", "Skipping segment %s: missing column %s",
-                             dir.c_str(), file);
-                missing = true;
-            }
-        };
-        // Every column is opened through the set, the timestamp included - the widening at the
-        // top of this function is what puts it there. A hardcoded `true` here reads as belt and
-        // braces and is worse than that: it makes that widening unobservable, so a mutation
-        // deleting it survived the test written to catch exactly that.
-        need(columns.has(QueryColumn::TimestampNs), "ts.col", timestamps);
-        need(want_price, "price.col", enc_prices);
-        need(want_qty,   "qty.col",   enc_qtys);
-        need(want_cnt,   "cnt.col",   counts);
-        need(want_side,  "side.col",  sides);
-        need(want_level, "level.col", levels);
-        need(want_seq,   "seq.col",   enc_seq);
-        if (missing || removed) continue;
-
-        // Decoding follows the set too, and the sequence number is the expensive one: it is
-        // Simple8b **and** zigzag-delta, so a query that does not ask for it skips two of the
-        // four decode passes a segment would otherwise cost.
-        std::vector<int64_t>  prices;
-        std::vector<uint64_t> qtys;
-        std::vector<int64_t>  seqs;
-        if (want_price) prices = decode_prices(enc_prices);
-        if (want_qty)   qtys   = decode_simple8b(enc_qtys, meta.row_count);
-        if (want_seq) {
-            auto zigzag_seq = decode_simple8b(enc_seq, meta.row_count);
-            seqs = decode_prices(zigzag_seq);
-        }
-
-        // A short column means a truncated or corrupt segment. Emitting the rows
-        // it does have, padded with zeros, is what produced the lost-order-side
-        // defect this format version fixes, so refuse the segment instead. Only the columns
-        // being read can be short here; one that was never opened is empty by construction.
-        const size_t expected = static_cast<size_t>(meta.row_count);
-        if ((want_side  && sides.size()  < expected) ||
-            (want_level && levels.size() < expected) ||
-            (want_seq   && seqs.size()   < expected)) {
-            OB_LOG_ERROR("columnar",
-                         "Skipping segment %s: short column(s) for row_count=%zu "
-                         "(side=%zu level=%zu seq=%zu)",
-                         dir.c_str(), expected,
-                         sides.size(), levels.size(), seqs.size());
-            continue;
-        }
-
-        // Emit rows within time range
-        size_t n = meta.row_count;
-        for (size_t i = 0; i < n; ++i) {
-            uint64_t ts = (i < timestamps.size()) ? timestamps[i] : 0;
-            if (ts < start_ns || ts > end_ns) continue;
-
-            // Value-initialised, so a field whose column was not read is zero rather than
-            // whatever the last row left there.
-            SnapshotRow row{};
-            row.timestamp_ns = ts;
-            if (want_seq)   row.sequence_number = static_cast<uint64_t>(seqs[i]);
-            if (want_side)  row.side            = sides[i];
-            if (want_level) row.level_index     = levels[i];
-            if (want_price) row.price           = (i < prices.size()) ? prices[i] : 0;
-            if (want_qty)   row.quantity        = (i < qtys.size())   ? qtys[i]   : 0;
-            if (want_cnt)   row.order_count     = (i < counts.size()) ? counts[i] : 0;
-            cb(row);
-        }
-    }
 
     // Then the rows no seal has written yet, after every segment and in the order they were
     // drained: they are this symbol's newest writes, so a reader that keeps the last row of a tie
@@ -1011,15 +1338,32 @@ void ColumnarStore::rebuild_index_locked() {
     indexed_count_ = 0;
     unsealed_rows_ = 0;
     last_rebuild_ranges_read_ = 0;
+    last_rebuild_removed_ = {};
 
     if (!fs::exists(base_dir_)) return;
 
     // Recursively scan for meta.json files, and for what a range repair that did not finish left
     // beside them. Those are always safe to delete: the repair changes a meta.json only by renaming
     // one of them over it, so the meta.json beside it is the old one or the new one and whole.
+    //
+    // And for what a merge leaves (#165 part 2b): a working directory, which nothing published and
+    // which is not descended into, and the inputs each merged segment names, which a crash between
+    // its publication and their removal leaves beside it. Keyed by the path the input had.
     std::vector<fs::path> leftovers;
+    std::vector<fs::path> staging;
+    std::unordered_map<std::string, SegmentInput> replaced;
     std::vector<SegmentMeta> found;
-    for (auto& entry : fs::recursive_directory_iterator(base_dir_)) {
+    std::vector<SegmentInput> inputs;
+    for (auto it = fs::recursive_directory_iterator(base_dir_);
+         it != fs::recursive_directory_iterator(); ++it) {
+        const auto& entry = *it;
+        if (entry.is_directory()) {
+            if (is_compacting_dir(entry.path().filename().string())) {
+                staging.push_back(entry.path());
+                it.disable_recursion_pending();
+            }
+            continue;
+        }
         if (!entry.is_regular_file()) continue;
         if (entry.path().filename() == kRangeRepairFile) {
             leftovers.push_back(entry.path());
@@ -1028,9 +1372,14 @@ void ColumnarStore::rebuild_index_locked() {
         if (entry.path().filename() != "meta.json") continue;
 
         SegmentMeta meta;
-        if (!parse_meta_json(entry.path().string(), meta)) continue;
+        if (!parse_meta_json(entry.path().string(), meta, &inputs)) continue;
 
         meta.dir_path = entry.path().parent_path().string();
+        const fs::path parent = entry.path().parent_path().parent_path();
+        for (auto& in : inputs) {
+            const std::string at = (parent / in.dir_name).string();
+            replaced.emplace(at, std::move(in));
+        }
         found.push_back(std::move(meta));
     }
     for (const auto& leftover : leftovers) {
@@ -1038,6 +1387,38 @@ void ColumnarStore::rebuild_index_locked() {
         fs::remove(leftover, ec);
         OB_LOG_DEBUG("columnar", "removed %s, left by a range repair that did not finish%s",
                      leftover.string().c_str(), ec ? " (and could not remove it)" : "");
+    }
+    for (const auto& dir : staging) {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        ++last_rebuild_removed_.staging;
+        OB_LOG_DEBUG("columnar", "removed %s, a merge nothing published%s", dir.string().c_str(),
+                     ec ? " (and could not remove all of it)" : "");
+    }
+    if (!replaced.empty()) {
+        // An input is the directory the merged segment names *and* the segment it recorded: the
+        // name alone comes back once an input is gone, with a later seal's rows under it.
+        std::vector<SegmentMeta> kept;
+        kept.reserve(found.size());
+        for (auto& meta : found) {
+            const auto r = replaced.find(meta.dir_path);
+            if (r == replaced.end() || !r->second.names(meta)) {
+                kept.push_back(std::move(meta));
+                continue;
+            }
+            std::error_code ec;
+            fs::remove_all(meta.dir_path, ec);
+            ++last_rebuild_removed_.superseded;
+            OB_LOG_DEBUG("columnar", "removed %s: a merged segment beside it holds its rows%s",
+                         meta.dir_path.c_str(), ec ? " (and could not remove all of it)" : "");
+        }
+        found.swap(kept);
+    }
+    if (last_rebuild_removed_.staging > 0 || last_rebuild_removed_.superseded > 0) {
+        OB_LOG_INFO("columnar",
+                    "a merge was cut short: removed %zu working director(ies) nothing published and "
+                    "%zu segment(s) a merged segment beside them had replaced",
+                    last_rebuild_removed_.staging, last_rebuild_removed_.superseded);
     }
 
     repair_ranges_locked(found);

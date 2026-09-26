@@ -1420,7 +1420,17 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
 
     // Walk the data directory for segment files.
     if (fs::exists(base_dir_)) {
-        for (auto& entry : fs::recursive_directory_iterator(base_dir_)) {
+        for (auto it = fs::recursive_directory_iterator(base_dir_);
+             it != fs::recursive_directory_iterator(); ++it) {
+            const auto& entry = *it;
+            // A merge's working directory holds no segment until a rename publishes it (#165 part
+            // 2b): a replica would only remove it, after carrying it over the wire.
+            if (entry.is_directory()) {
+                if (ColumnarStore::is_compacting_dir(entry.path().filename().string())) {
+                    it.disable_recursion_pending();
+                }
+                continue;
+            }
             if (!entry.is_regular_file()) continue;
 
             const auto& path = entry.path();

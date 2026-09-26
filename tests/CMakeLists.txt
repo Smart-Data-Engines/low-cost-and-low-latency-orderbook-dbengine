@@ -238,6 +238,16 @@ ob_add_columnar_test(test_row_blocks
     test_row_blocks.cpp
 )
 
+# #165 part 2b: what a merge reads, writes and publishes, and what a rebuild after a crash keeps.
+ob_add_columnar_test(test_compaction_store
+    test_compaction_store.cpp
+)
+
+# #165 part 2b: which segments merge, as a pure function.
+add_executable(test_compaction_policy test_compaction_policy.cpp)
+target_link_libraries(test_compaction_policy PRIVATE orderbook_compaction GTest::gtest_main rapidcheck rapidcheck_gtest)
+gtest_discover_tests(test_compaction_policy PROPERTIES ENVIRONMENT "${RC_TEST_ENV}" TIMEOUT ${OB_TEST_TIMEOUT})
+
 # ── Helper to register a test executable that needs the aggregation library ───
 function(ob_add_agg_test name)
     add_executable(${name} ${ARGN})
