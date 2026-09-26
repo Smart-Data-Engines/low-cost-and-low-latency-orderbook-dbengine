@@ -194,6 +194,11 @@ target_compile_definitions(test_wal_position
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 
+# ── A WAL read forward from a position, while it is written (#178) ───────────
+ob_add_wal_test(test_wal_cursor
+    test_wal_cursor.cpp
+)
+
 # ── Tasks 5.3–5.6: Codec property and unit tests ──────────────────────────────
 ob_add_codec_test(test_codec
     test_codec.cpp

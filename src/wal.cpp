@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace ob {
@@ -1212,6 +1213,180 @@ uint64_t WALReplayer::replay_v2(WALReplayCallbackV2 cb)
     }
 
     return last_good_seq;
+}
+
+// ── WALRecordCursor (#178) ────────────────────────────────────────────────────
+
+WALRecordCursor::WALRecordCursor(std::string dir, size_t buffer_bytes)
+    : dir_(std::move(dir))
+    , buffer_bytes_(std::max(buffer_bytes, sizeof(WALRecordV2) + WAL_MAX_PAYLOAD_LEN))
+{}
+
+WALRecordCursor::~WALRecordCursor() { close_file(); }
+
+std::optional<uint32_t> WALRecordCursor::first_file_from(uint32_t from) const {
+    // Almost always `from` itself: rotation numbers files one after another and retention removes
+    // them from the bottom. The directory is listed only when that fails, so a cursor waiting at
+    // the tail pays a stat() a call rather than a listing.
+    struct stat st{};
+    if (::stat(wal_filename(dir_, from).c_str(), &st) == 0) return from;
+    std::optional<uint32_t> best;
+    std::error_code ec;
+    for (auto it = std::filesystem::directory_iterator(dir_, ec);
+         !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (name.size() != 14 || name.compare(0, 4, "wal_") != 0 ||
+            name.compare(10, 4, ".bin") != 0) {
+            continue;
+        }
+        uint32_t idx = 0;
+        bool digits = true;
+        for (size_t i = 4; i < 10; ++i) {
+            if (name[i] < '0' || name[i] > '9') { digits = false; break; }
+            idx = idx * 10 + static_cast<uint32_t>(name[i] - '0');
+        }
+        if (!digits || idx < from) continue;
+        if (!best || idx < *best) best = idx;
+    }
+    return best;
+}
+
+void WALRecordCursor::close_file() {
+    if (fd_ >= 0) ::close(fd_);
+    fd_        = -1;
+    buf_start_ = 0;
+    buf_len_   = 0;
+}
+
+bool WALRecordCursor::open_file(uint32_t index) {
+    close_file();
+    fd_ = ::open(wal_filename(dir_, index).c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd_ < 0) {
+        OB_LOG_DEBUG("wal", "cursor: cannot open WAL file %u in %s: %s", index, dir_.c_str(),
+                     std::strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+uint32_t WALRecordCursor::seek(WalPosition pos) {
+    close_file();
+    pos_ = pos;
+    const std::optional<uint32_t> there = first_file_from(pos.file_index);
+    if (!there) {
+        // Nothing at or after it yet: the next call looks again from here.
+        OB_LOG_DEBUG("wal", "cursor: no WAL file at or after %u in %s yet", pos.file_index,
+                     dir_.c_str());
+        return 0;
+    }
+    uint32_t passed = 0;
+    if (*there != pos.file_index) {
+        passed = *there - pos.file_index;
+        pos_   = WalPosition{*there, 0};
+    }
+    open_file(pos_.file_index);
+    OB_LOG_DEBUG("wal", "cursor: at file %u offset %u in %s%s", pos_.file_index, pos_.offset,
+                 dir_.c_str(), passed > 0 ? " (the files before it are gone)" : "");
+    return passed;
+}
+
+bool WALRecordCursor::fill(uint64_t at, size_t need) {
+    if (fd_ < 0) return false;
+    if (at >= buf_start_ && at + need <= buf_start_ + buf_len_) return true;
+    const size_t want = std::max(buffer_bytes_, need);
+    if (buf_.size() < want) buf_.resize(want);
+    size_t got = 0;
+    while (got < want) {
+        const ssize_t n = ::pread(fd_, buf_.data() + got, want - got,
+                                  static_cast<off_t>(at + got));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            OB_LOG_WARN("wal", "cursor: read of WAL file %u at %llu failed: %s", pos_.file_index,
+                        static_cast<unsigned long long>(at + got), std::strerror(errno));
+            break;
+        }
+        if (n == 0) break;
+        got += static_cast<size_t>(n);
+    }
+    buf_start_ = at;
+    buf_len_   = got;
+    return got >= need;
+}
+
+bool WALRecordCursor::advance_file() {
+    const std::optional<uint32_t> after = first_file_from(pos_.file_index + 1);
+    if (!after) return false;
+    pos_ = WalPosition{*after, 0};
+    open_file(pos_.file_index);
+    return true;
+}
+
+WALRecordCursor::Step WALRecordCursor::next(WALReplayContext& ctx) {
+    constexpr size_t kBase = sizeof(WALRecord);
+    constexpr size_t kExt  = sizeof(WALRecordV2) - sizeof(WALRecord);   // origin + HLC
+
+    for (;;) {
+        if (fd_ < 0) {
+            // Not open yet, or the file it stood at is gone.
+            const std::optional<uint32_t> there = first_file_from(pos_.file_index);
+            if (!there) return Step::End;
+            if (*there != pos_.file_index) pos_ = WalPosition{*there, 0};
+            if (!open_file(pos_.file_index)) return Step::End;
+        }
+
+        const uint64_t at = pos_.offset;
+        // A record that is not all here, or does not check, ends a file that is not the last, and
+        // is the writer's tail in the one that is. Which of the two has to be asked every time: the
+        // writer can rotate between two calls.
+        const auto move_on = [&](bool torn) -> bool {
+            if (!first_file_from(pos_.file_index + 1).has_value()) return false;
+            if (torn) {
+                ++tears_skipped_;
+                OB_LOG_WARN("wal", "cursor: WAL file %u has a record at %llu that does not check, "
+                                   "and it is not the last file: continuing with the next one",
+                            pos_.file_index, static_cast<unsigned long long>(at));
+            }
+            return advance_file();
+        };
+
+        if (!fill(at, kBase)) {
+            if (move_on(false)) continue;
+            return Step::End;
+        }
+        WALRecord base{};
+        std::memcpy(&base, buf_.data() + (at - buf_start_), kBase);
+        const size_t header = kBase + (base._pad == 1 ? kExt : 0);
+        const size_t total  = header + base.payload_len;
+        if (!fill(at, total)) {
+            if (move_on(false)) continue;
+            return Step::End;
+        }
+        const uint8_t* rec     = buf_.data() + (at - buf_start_);
+        const uint8_t* payload = rec + header;
+        if (crc32c(payload, base.payload_len) != base.checksum) {
+            if (move_on(true)) continue;
+            return Step::End;
+        }
+        if (base.record_type == WAL_RECORD_ROTATE) {
+            // Not delivered, as replay_v2() does not deliver it: its file ends here.
+            pos_.offset = static_cast<uint32_t>(at + total);
+            if (advance_file()) continue;
+            return Step::End;
+        }
+
+        ctx = WALReplayContext{};
+        ctx.header = base;
+        if (base._pad == 1) {
+            std::memcpy(&ctx.origin_node_id, rec + kBase, sizeof(uint16_t));
+            ctx.hlc = HLCTimestamp::deserialize(rec + kBase + sizeof(uint16_t));
+        }
+        ctx.payload         = base.payload_len > 0 ? payload : nullptr;
+        ctx.payload_len     = base.payload_len;
+        ctx.wal_file_index  = pos_.file_index;
+        ctx.wal_byte_offset = at;
+        pos_.offset = static_cast<uint32_t>(at + total);
+        return Step::Record;
+    }
 }
 
 } // namespace ob
