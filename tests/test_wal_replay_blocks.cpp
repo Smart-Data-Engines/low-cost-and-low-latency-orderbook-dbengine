@@ -102,10 +102,10 @@ std::vector<ob::Level> levels_of(uint64_t seq, uint16_t count) {
 /// Append DELTA records of the given level counts - every third one with an origin unless
 /// `origins` is false, so both header sizes cross blocks - and return what was written, in order.
 std::vector<Written> write_records(ob::WALWriter& writer, const std::vector<uint16_t>& counts,
-                                   bool origins = true) {
+                                   bool origins = true, uint64_t first_seq = 1) {
     ob::HybridLogicalClock clock(7);
     std::vector<Written> out;
-    uint64_t seq = 1;
+    uint64_t seq = first_seq;
     for (const uint16_t count : counts) {
         ob::DeltaUpdate d{};
         std::strncpy(d.symbol, "BLOCKS", sizeof(d.symbol) - 1);
@@ -447,4 +447,129 @@ TEST(WalReplayBlocks, TheCheckpointPassHandsOnEveryRecordItReads) {
     EXPECT_EQ(last.records, expected.size());
     EXPECT_GT(last.ordinal, 0u);
     EXPECT_EQ(scan.last_epoch(), 11u);
+}
+
+// ── The tail pass from a mark (#174) ─────────────────────────────────────────
+
+namespace {
+
+/// Everything a replay delivers, as (type, seq, file, offset): enough to tell the records apart.
+struct Delivered {
+    uint8_t  type;
+    uint64_t seq;
+    uint32_t file;
+    uint64_t offset;
+    bool operator==(const Delivered&) const = default;
+};
+
+Delivered delivered(const ob::WALReplayContext& ctx) {
+    return {ctx.header.record_type, ctx.header.sequence_number, ctx.wal_file_index, ctx.wal_byte_offset};
+}
+
+/// A WAL of several files with checkpoints between the records - the eight-byte form, and the
+/// sixteen-byte one whose position is a record some way back, as a flush with a block waiting
+/// writes it - so the last checkpoint gives records back from before itself.
+std::vector<Written> write_with_checkpoints(const std::string& dir, unsigned salt, size_t records) {
+    TestWriter w(dir, 3 * kLeastBlock + salt % kLeastBlock);
+    std::vector<Written> written;
+    uint32_t x = salt | 1u;
+    for (size_t i = 0; i < records; ++i) {
+        x = x * 1664525u + 1013904223u;
+        const uint16_t count = x % 13 == 0 ? kMostLevels : static_cast<uint16_t>(1 + (x >> 8) % 300);
+        written.push_back(write_records(w.writer, {count}, true, written.size() + 1).front());
+        if ((x >> 4) % 23 == 0) {
+            if ((x >> 12) % 2 == 0 || written.size() < 3) {
+                w.writer.append_checkpoint(1, w.writer.current_position());
+            } else {
+                // Back to a record some way before this one, as a block that still waits needs it.
+                const size_t back = 1 + (x >> 16) % std::min<size_t>(written.size() - 1, 40);
+                w.writer.append_checkpoint(1, written[written.size() - 1 - back].at, 3);
+            }
+        }
+    }
+    EXPECT_TRUE(w.writer.sync());
+    return written;
+}
+
+}  // namespace
+
+TEST(WalReplayBlocks, AReplayFromAMarkReadsWhatTheWholeReplayReadsFromThere) {
+    TempDir dir("from_mark");
+    (void)write_with_checkpoints(dir.str(), 17, 900);
+    std::vector<Delivered> whole;
+    ob::WALReplayer all(dir.str(), kLeastBlock);
+    all.replay_v2([&](const ob::WALReplayContext& ctx) { whole.push_back(delivered(ctx)); });
+
+    ob::WALReplayer scan(dir.str(), kLeastBlock);
+    const auto last = scan.find_last_checkpoint();
+    ASSERT_GT(last.marks.size(), 20u) << "the premise: marks in many files and blocks";
+    ASSERT_GT(last.marks.back().at.file_index, 2u);
+    for (const auto& mark : last.marks) {
+        std::vector<Delivered> from_mark;
+        ob::WALReplayer tail(dir.str(), kLeastBlock);
+        tail.replay_v2_from(mark.at, [&](const ob::WALReplayContext& ctx) { from_mark.push_back(delivered(ctx)); });
+        ASSERT_LE(mark.ordinal, whole.size());
+        const std::vector<Delivered> expected(whole.begin() + static_cast<long>(mark.ordinal - 1), whole.end());
+        ASSERT_TRUE(from_mark == expected)
+            << "from the mark at " << mark.at.file_index << ":" << mark.at.offset << " (ordinal "
+            << mark.ordinal << "): " << from_mark.size() << " records, " << expected.size() << " expected";
+    }
+}
+
+RC_GTEST_PROP(WalReplayBlocksProperty, TheTailPassForwardsWhatAReadFromTheStartForwards,
+              (unsigned salt)) {
+    // The tail pass from the last mark against the same pass without marks, which reads from the
+    // start of the log as it always did: the same records forwarded, in the same order.
+    TempDir dir("tail_prop");
+    const size_t n = 100 + salt % 700;
+    (void)write_with_checkpoints(dir.str(), salt, n);
+
+    ob::WALReplayer scan(dir.str(), kLeastBlock);
+    const auto last = scan.find_last_checkpoint();
+    auto without_marks = last;
+    without_marks.marks.clear();
+
+    // What the runs cover, said with the result: a checkpoint that gives records back, and a pass
+    // that begins past the start of the log.
+    const bool gives_back = last.covered && ob::wal_position_before(*last.covered, last.at);
+    const bool seeks = last.ordinal > 0 && last.marks.size() > 1 &&
+                       !ob::wal_position_before(last.at, last.marks[1].at);
+    RC_TAG(gives_back ? "gives records back" : "covers all before it");
+    RC_TAG(seeks ? "begins past the first mark" : "begins at the start");
+
+    std::vector<Delivered> from_mark, from_start;
+    ob::WALReplayer a(dir.str(), kLeastBlock);
+    a.replay_after(last, [&](const ob::WALReplayContext& ctx) { from_mark.push_back(delivered(ctx)); });
+    ob::WALReplayer b(dir.str(), kLeastBlock);
+    b.replay_after(without_marks, [&](const ob::WALReplayContext& ctx) { from_start.push_back(delivered(ctx)); });
+    RC_ASSERT(from_mark == from_start);
+}
+
+TEST(WalReplayBlocks, TheTailPassReadsFromTheLastMarkBeforeWhatItForwards) {
+    // A long log whose last checkpoint covers all but its last records: the tail pass reads those
+    // and at most a block before them, where it read the whole log.
+    TempDir dir("tail_bytes");
+    uint64_t tail_from = 0;
+    {
+        TestWriter w(dir.str(), kOneFile);
+        (void)write_records(w.writer, varied_counts(1500));
+        w.writer.append_checkpoint(1, w.writer.current_position());
+        tail_from = w.writer.current_position().offset;
+        (void)write_records(w.writer, {3, 9, 27});
+        ASSERT_TRUE(w.writer.sync());
+    }
+    const uint64_t size = file_size((dir.path / wal_name(0)).string());
+    ASSERT_GT(size, 40 * kLeastBlock);
+
+    ob::WALReplayer scan(dir.str(), kLeastBlock);
+    const auto last = scan.find_last_checkpoint();
+    size_t forwarded = 0;
+    ob::WALReplayer tail(dir.str(), kLeastBlock);
+    const uint64_t before = ob::WALReplayer::bytes_read_for_test();
+    tail.replay_after(last, [&](const ob::WALReplayContext& ctx) {
+        if (ctx.header.record_type == ob::WAL_RECORD_DELTA) ++forwarded;
+    });
+    const uint64_t read = ob::WALReplayer::bytes_read_for_test() - before;
+    EXPECT_EQ(forwarded, 3u);
+    EXPECT_LE(read, (size - tail_from) + 2 * kLeastBlock) << "the tail pass read " << read << " of " << size;
 }

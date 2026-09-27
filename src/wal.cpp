@@ -109,9 +109,9 @@ void encode_gap(const DeltaUpdate& update, std::vector<uint8_t>& buf, size_t& us
 class BufferedWalFile {
 public:
     /// `block_bytes` holds any record: WALReplayer's constructor sees to that. Not zeroed - every
-    /// byte take() returns was read into it first.
-    BufferedWalFile(int fd, size_t block_bytes)
-        : fd_(fd), block_bytes_(block_bytes), buf_(new uint8_t[block_bytes]) {}
+    /// byte take() returns was read into it first. Read from `start`, a record's offset or 0.
+    BufferedWalFile(int fd, size_t block_bytes, uint64_t start)
+        : fd_(fd), block_bytes_(block_bytes), buf_(new uint8_t[block_bytes]), file_off_(start) {}
 
     /// The file offset of the next byte a take() returns.
     uint64_t offset() const { return file_off_ + start_; }
@@ -132,6 +132,9 @@ public:
         return take(n, ignored);
     }
 
+    /// Bytes read from the file so far.
+    uint64_t bytes_read() const { return bytes_read_; }
+
 private:
     /// At least `need` bytes buffered from start_, reading more after moving what is left to the
     /// front. A pointer take() returned before this call is not valid after it.
@@ -144,13 +147,15 @@ private:
             start_ = 0;
         }
         while (end_ - start_ < need && !eof_) {
-            const ssize_t r = ::read(fd_, buf_.get() + end_, block_bytes_ - end_);
+            const ssize_t r = ::pread(fd_, buf_.get() + end_, block_bytes_ - end_,
+                                      static_cast<off_t>(file_off_ + end_));
             if (r < 0 && errno == EINTR) continue;
             if (r <= 0) {
                 eof_ = true;
                 break;
             }
             end_ += static_cast<size_t>(r);
+            bytes_read_ += static_cast<uint64_t>(r);
         }
         return end_ - start_ >= need;
     }
@@ -158,10 +163,11 @@ private:
     int                        fd_;
     size_t                     block_bytes_;
     std::unique_ptr<uint8_t[]> buf_;
-    size_t                     start_{0};     ///< the next byte to take, in buf_
-    size_t                     end_{0};       ///< one past the last byte read into buf_
-    uint64_t                   file_off_{0};  ///< the file offset of buf_[0]
+    uint64_t                   file_off_;      ///< the file offset of buf_[0]
+    size_t                     start_{0};      ///< the next byte to take, in buf_
+    size_t                     end_{0};        ///< one past the last byte read into buf_
     bool                       eof_{false};
+    uint64_t                   bytes_read_{0};
 };
 
 } // anonymous namespace
@@ -976,14 +982,24 @@ WALReplayer::LastCheckpoint WALReplayer::find_last_checkpoint(const WALReplayCal
     // one format eventually disagree, and this one only needs record types and ordering.
     LastCheckpoint last;
     uint64_t ordinal = 0;
+    uint64_t next_mark = 0;   // in the file of the last mark
     replay_v2([&](const WALReplayContext& ctx) {
         ++ordinal;
         if (!last.any_record || ctx.wal_file_index < last.first_file_index) {
             last.first_file_index = ctx.wal_file_index;
         }
         last.any_record = true;
+        const WalPosition here{ctx.wal_file_index, static_cast<uint32_t>(ctx.wal_byte_offset)};
+        // A mark at each file's first record and then a block apart: the most the second pass reads
+        // that it forwards nothing of is one block, and a WAL of 422 MB has about 420 marks.
+        if (last.marks.empty() || here.file_index != last.marks.back().at.file_index ||
+            ctx.wal_byte_offset >= next_mark) {
+            last.marks.push_back(LastCheckpoint::Mark{here, ordinal});
+            next_mark = ctx.wal_byte_offset + read_block_bytes_;
+        }
         if (ctx.header.record_type == WAL_RECORD_CHECKPOINT) {
             last.ordinal = ordinal;
+            last.at      = here;
             // Reset by every checkpoint, so a last one written by an older build - empty payload -
             // is read by ordinal even after newer ones (#159).
             const auto claim = checkpoint_claim(ctx.payload, ctx.payload_len);
@@ -992,7 +1008,8 @@ WALReplayer::LastCheckpoint WALReplayer::find_last_checkpoint(const WALReplayCal
         }
         if (also) also(ctx);
     });
-    last.records = ordinal;
+    last.records       = ordinal;
+    last.tears_skipped = tears_skipped_;
     return last;
 }
 
@@ -1007,7 +1024,22 @@ uint64_t WALReplayer::replay_after(const LastCheckpoint& last, WALReplayCallback
     // everything before the checkpoint, which is the most an older build's checkpoint ever claimed.
     // One written before #159 says nothing and is read as it always was, by ordinal; the records it
     // wrongly covered are not in the log's own account of itself, so they cannot be told apart here.
-    uint64_t seen = 0;
+    // Where to begin (#174): at the last mark at or before the first record this pass can forward -
+    // where the checkpoint says it covered from, if that is before the checkpoint, or the checkpoint
+    // itself. Every record before that is one the loop below reads and forwards none of, and a mark
+    // is a record start the first pass read, so from it the records are the ones a read from the
+    // start of the log finds there. Without marks, or with no checkpoint, from the start.
+    LastCheckpoint::Mark from{WalPosition{0, 0}, 1};
+    if (last.ordinal > 0) {
+        const WalPosition first_forwardable =
+            last.covered && wal_position_before(*last.covered, last.at) ? *last.covered : last.at;
+        for (const auto& mark : last.marks) {
+            if (wal_position_before(first_forwardable, mark.at)) break;
+            from = mark;
+        }
+    }
+
+    uint64_t seen = from.ordinal - 1;
     uint64_t forwarded = 0;
     // Rows given back: DELTA records before the last checkpoint, forwarded because of its position.
     // Only those, because that is what the count tells an operator - how many acknowledged writes
@@ -1015,7 +1047,7 @@ uint64_t WALReplayer::replay_after(const LastCheckpoint& last, WALReplayCallback
     // vector (and held set) are appended in front of it, inside the same range: counted, they made
     // "the three records it gave back" read four.
     uint64_t given_back = 0;
-    uint64_t last_seq = replay_v2([&](const WALReplayContext& ctx) {
+    uint64_t last_seq = replay_v2_from(from.at, [&](const WALReplayContext& ctx) {
         ++seen;
         if (seen <= last.ordinal) {
             if (!last.covered || seen == last.ordinal) return;
@@ -1060,8 +1092,11 @@ uint64_t WALReplayer::replay_after_checkpoint(WALReplayCallbackV2 cb)
 
 uint64_t WALReplayer::replay_v2(WALReplayCallbackV2 cb)
 {
-    passes_.fetch_add(1, std::memory_order_relaxed);
+    return replay_v2_from(WalPosition{0, 0}, std::move(cb));
+}
 
+uint64_t WALReplayer::replay_v2_from(WalPosition from, WALReplayCallbackV2 cb)
+{
     // Reset epoch tracking for this replay.
     last_epoch_ = 0;
     tears_skipped_ = 0;
@@ -1089,13 +1124,14 @@ uint64_t WALReplayer::replay_v2(WALReplayCallbackV2 cb)
     uint64_t last_good_seq = 0;
 
     for (auto& [idx, path] : files) {
+        if (idx < from.file_index) continue;   // before the first record asked for: not read
         // Whether this is the highest-numbered file, which is what separates a crash tail from a
         // torn record. Taken from the sorted list rather than from the writer's current position:
         // a replay reads a directory, and the writer that produced it is gone.
         const bool is_last = (idx == files.back().first);
         int fd = ::open(path.c_str(), O_RDONLY);
         if (fd < 0) continue;
-        BufferedWalFile file(fd, read_block_bytes_);
+        BufferedWalFile file(fd, read_block_bytes_, idx == from.file_index ? from.offset : 0);
 
         while (true) {
             // Where this record starts, before anything is read from it. Recovery compares this
@@ -1199,6 +1235,7 @@ uint64_t WALReplayer::replay_v2(WALReplayCallbackV2 cb)
         }
 
         done_file_v2:
+        bytes_read_.fetch_add(file.bytes_read(), std::memory_order_relaxed);
         ::close(fd);
     }
 

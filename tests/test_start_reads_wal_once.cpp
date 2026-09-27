@@ -3,8 +3,9 @@
 // Each reader a start had - the last checkpoint, the version vector, the held numbers, the tail,
 // the epoch - replayed the whole WAL on its own, a record at a time: 23 s to start on a WAL of
 // 422 MB, which is how long a node that crashed stays out. The replay reads blocks now, and a start
-// makes two passes: the last checkpoint's, which gathers everything else the start takes from the
-// whole log, and the tail's. The first test holds the start to that number.
+// reads the WAL once - the last checkpoint's pass, which gathers everything else the start takes
+// from the whole log - and then what that checkpoint does not cover, from the pass's last mark
+// before it. The first tests hold a start to that, by the bytes it reads.
 //
 // The epoch was read by `replay()`, which had a parser of its own and read a mesh node's 38-byte
 // headers as 24-byte ones: every restart of a mesh node logged that a record had been cut short by
@@ -24,6 +25,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <filesystem>
 #include <memory>
 #include <string>
 
@@ -40,39 +42,87 @@ std::unique_ptr<ob::Engine> single_node(const std::string& dir) {
                                         ob::MultiMasterConfig{});
 }
 
-void write_rows(ob::Engine& engine, const char* symbol, uint64_t first_ts, int count) {
+/// `count` records of `levels` levels each, one row a level.
+void write_rows(ob::Engine& engine, const char* symbol, uint64_t first_ts, int count,
+                uint16_t levels = 1) {
     for (int i = 0; i < count; ++i) {
-        const Record r = record(symbol, 0, first_ts + static_cast<uint64_t>(i));
+        const Record r = record(symbol, 0, first_ts + static_cast<uint64_t>(i), levels);
         ASSERT_EQ(engine.apply_delta(r.delta, r.levels.data()), ob::OB_OK);
     }
 }
 
+uint64_t wal_bytes(const std::string& dir) {
+    uint64_t n = 0;
+    for (const auto& e : std::filesystem::directory_iterator(dir)) {
+        const std::string name = e.path().filename().string();
+        if (name.rfind("wal_", 0) == 0 && e.path().extension() == ".bin") n += e.file_size();
+    }
+    return n;
+}
+
+/// The most a start reads past one reading of its WAL when nothing is left to replay: from the
+/// last mark before its checkpoint - a block apart - to the end.
+constexpr uint64_t kSlack = 2 * ob::WALReplayer::kDefaultReadBlockBytes;
+
+/// What open() read from the WAL.
+uint64_t bytes_to_open(ob::Engine& engine) {
+    const uint64_t before = ob::WALReplayer::bytes_read_for_test();
+    engine.open();
+    return ob::WALReplayer::bytes_read_for_test() - before;
+}
+
 }  // namespace
 
-TEST(StartReadsWalOnce, AStartPassesOverTheWalTwice) {
-    // A WAL with everything a start reads from it: sealed rows and the checkpoint that covers them,
-    // a vector beside it, a promotion's epoch, and a tail no checkpoint covers - the directory a
-    // crash leaves.
+TEST(StartReadsWalOnce, ACleanStopsStartReadsItsWalOnce) {
+    // Eight megabytes of WAL, every record of it covered by the last checkpoint: a start read it
+    // five times whole, then twice in blocks, and reads it once now.
+    TempDir dir("start_once_clean_");
+    {
+        auto engine = single_node(dir.path);
+        engine->open();
+        write_rows(*engine, "ONCE", 1'000'000'000ULL, 8000, 40);
+        engine->close();
+    }
+    const uint64_t wal = wal_bytes(dir.path);
+    ASSERT_GT(wal, 4 * kSlack) << "the premise: a WAL much longer than the slack";
+
+    auto engine = single_node(dir.path);
+    const uint64_t read = bytes_to_open(*engine);
+    EXPECT_GE(read, wal) << "a start that did not read its whole WAL cannot have found its last "
+                            "checkpoint";
+    EXPECT_LE(read, wal + kSlack) << "a start read " << read << " bytes of a WAL of " << wal;
+    EXPECT_EQ(rows(*engine, "ONCE"), 8000 * 40);
+    engine->close();
+}
+
+TEST(StartReadsWalOnce, ACrashedNodesStartReadsItsWalOnceAndThenTheTail) {
+    // A WAL with everything a start takes from it - sealed rows and the checkpoint that covers them,
+    // a vector beside it, a promotion's epoch - and a tail no checkpoint covers: the directory a
+    // crash leaves. The tail is read twice, once in the first pass and once to replay it.
     TempDir live("start_once_live_");
     TempDir crashed("start_once_crash_");
+    uint64_t tail_from = 0;
     {
         auto engine = single_node(live.path);
         engine->open();
-        write_rows(*engine, "ONCE", 1'000'000'000ULL, 20);
+        write_rows(*engine, "ONCE", 1'000'000'000ULL, 8000, 40);
         engine->flush_incremental();
         engine->promote_to_primary(ob::EpochValue{5});
-        write_rows(*engine, "ONCE", 2'000'000'000ULL, 7);
+        tail_from = wal_bytes(live.path);
+        write_rows(*engine, "ONCE", 2'000'000'000ULL, 700, 40);
         crash_image(live.path, crashed.path);
         engine->close();
     }
+    const uint64_t wal  = wal_bytes(crashed.path);
+    const uint64_t tail = wal - tail_from;
+    ASSERT_GT(wal, 4 * kSlack) << "the premise: a WAL much longer than the slack";
 
     auto engine = single_node(crashed.path);
-    const uint64_t before = ob::WALReplayer::passes_for_test();
-    engine->open();
-    const uint64_t passes = ob::WALReplayer::passes_for_test() - before;
-
-    EXPECT_EQ(passes, 2u) << "a start read the whole WAL " << passes << " times";
-    EXPECT_EQ(rows(*engine, "ONCE"), 27) << "the tail was not replayed";
+    const uint64_t read = bytes_to_open(*engine);
+    EXPECT_GE(read, wal + tail);
+    EXPECT_LE(read, wal + tail + kSlack) << "a start read " << read << " bytes of a WAL of " << wal
+                                         << " with a tail of " << tail;
+    EXPECT_EQ(rows(*engine, "ONCE"), 8700 * 40) << "the tail was not replayed";
     EXPECT_EQ(engine->current_epoch(), 5u) << "the epoch was not read from the one pass";
     engine->close();
 }

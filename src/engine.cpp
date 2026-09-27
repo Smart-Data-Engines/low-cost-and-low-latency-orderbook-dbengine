@@ -3759,7 +3759,9 @@ uint64_t Engine::replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastC
                 static_cast<unsigned long long>(skipped),
                 static_cast<unsigned long long>(skipped_by_timestamp),
                 static_cast<unsigned long long>(seeded_other_origins));
-    if (replayer.tears_skipped() > 0) {
+    // The first pass's count: this one begins where the checkpoint does not cover, and reads only
+    // the files from there (#174).
+    if (last.tears_skipped > 0) {
         // Only reachable for a WAL an **older build** left behind: since #126 a writer that tears a
         // record abandons the file, and such a file ends mid-record, which every reader here has
         // always tolerated without a checksum ever being compared. So this line means "this
@@ -3771,7 +3773,7 @@ uint64_t Engine::replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastC
                     "successors were replayed. A file in this state was written by a build from "
                     "before the writer abandoned a file it tore, and on that build the records "
                     "behind the tear did not survive a restart",
-                    replayer.tears_skipped());
+                    last.tears_skipped);
     }
     if (skipped_by_timestamp > 0) {
         OB_LOG_WARN("engine",

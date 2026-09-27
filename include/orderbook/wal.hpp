@@ -804,6 +804,13 @@ public:
     /// Returns the last good sequence_number.
     uint64_t replay_v2(WALReplayCallbackV2 cb);
 
+    /// `replay_v2()` from `from`: the files before its file are not read, and its file is read from
+    /// its offset (#174). `from` is the start of the log, or a record start a whole replay of this
+    /// directory read - a mark of `find_last_checkpoint()`'s - and from one of those the records are
+    /// the ones that replay read from there on. The epoch, the torn files and the sequence number
+    /// returned are of what this replay read.
+    uint64_t replay_v2_from(WalPosition from, WALReplayCallbackV2 cb);
+
     /// Replay the records the last CHECKPOINT does not cover: every record after it, and - when it
     /// says what it covered (#159) - the records before it that start at or after that position.
     ///
@@ -837,6 +844,17 @@ public:
         uint64_t records{0};                 ///< every record the log holds
         bool     any_record{false};
         uint32_t first_file_index{0};        ///< the oldest WAL file a record came from
+        WalPosition at{};                    ///< where the last checkpoint record starts, if ordinal
+        /// A record start every block or so of the log, and its ordinal (#174). The second pass
+        /// begins at the last one before the first record it can forward, so it does not read the
+        /// records before that, of which it forwards none. Empty in a LastCheckpoint made any other
+        /// way, which the second pass reads from the start of the log.
+        struct Mark {
+            WalPosition at{};
+            uint64_t    ordinal{0};
+        };
+        std::vector<Mark> marks;
+        size_t tears_skipped{0};             ///< files the pass stepped over a torn record in (#126)
     };
     ///
     /// Every record the pass reads is handed to `also` as well, so that a start takes everything it
@@ -861,13 +879,13 @@ public:
     /// Reset at the start of every replay, so a caller that replays twice reads the second pass.
     size_t tears_skipped() const { return tears_skipped_; }
 
-    /// Replays - passes over a whole directory - this process has made (#174). A start makes two:
-    /// the last checkpoint's, which gathers everything else it takes from the whole log, and the
-    /// tail's. It made five, and a test holds it to the number.
-    static uint64_t passes_for_test() { return passes_.load(std::memory_order_relaxed); }
+    /// Bytes every replay in this process has read from WAL files (#174). A start reads its WAL once
+    /// and then what its last checkpoint does not cover - it read it five times - and a test holds
+    /// it to that.
+    static uint64_t bytes_read_for_test() { return bytes_read_.load(std::memory_order_relaxed); }
 
 private:
-    static inline std::atomic<uint64_t> passes_{0};
+    static inline std::atomic<uint64_t> bytes_read_{0};
 
     std::string dir_;
     size_t      read_block_bytes_;
