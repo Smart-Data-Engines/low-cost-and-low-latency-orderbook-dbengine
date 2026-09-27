@@ -3731,6 +3731,13 @@ Learned the hard way. Check here before debugging.
 484. **A mutation that takes away a parameter's last use measures the compiler.** Under `-Werror`
      an unused parameter is an error, so "never defer" written as `if (false)` did not build and the
      row read INVALID; write the mutation with a `(void)` of what it leaves unused.
+485. **A test seam that runs a thread's work on the test's thread is a second thread for that work.**
+     `flush_tick_for_test()` promised it was serialised with the flush loop by `flush_mtx_` - true of
+     everything after the lock, and not of the counter publications before it, which had only ever
+     run on the flush thread. Nothing woke the loop during a test until #180 part D asked it for a
+     tick; then two ticks ran at once and ThreadSanitizer reported `published_*` in CI, two reports in
+     three local runs of three (under `setarch -R`: TSan and a 6.x kernel's ASLR do not mix). The tick
+     takes the lock first now. A seam's promise covers the whole function or says where it stops.
 
 ## Current state and open problems
 
@@ -3787,7 +3794,7 @@ that moved, microseconds where a whole export cost 286 us at 4 000 entries, and 
 nothing" is drawn from a copy older than the tracker - found in the fix's own CI run, a node back
 within a tick of the writes it missed held 100 of 2 100 rows until the next reconciliation; and a
 reconciliation no longer arms a deadline for an answer no peer sends, which treated a peer as empty
-whenever the two timers were more than 2 s apart (pitfalls 472-484). **#184 is the open P0**: when two nodes write
+whenever the two timers were more than 2 s apart (pitfalls 472-485). **#184 is the open P0**: when two nodes write
 one symbol the one counter per symbol gives each origin's numbers holes, every node's frontier stops
 at the first, and a node that missed rows is judged to hold them - 10 000 of 11 000 for good, which
 #179's fix made the restart's outcome as well as the disconnect's. **#169, #175, #176, #177, #182,
