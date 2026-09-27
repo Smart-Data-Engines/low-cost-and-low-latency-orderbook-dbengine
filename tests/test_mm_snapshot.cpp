@@ -36,6 +36,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -104,9 +105,25 @@ void deliver(ob::MultiMasterManager& to, ob::PeerConnection& from_peer, const Fr
     switch (f.hdr.record_type) {
         case ob::MM_MSG_SNAPSHOT_BEGIN: to.handle_snapshot_begin(from_peer, p, f.payload.size()); break;
         case ob::MM_MSG_SNAPSHOT_CHUNK: to.handle_snapshot_chunk(from_peer, p, f.payload.size()); break;
+        case ob::MM_MSG_SNAPSHOT_CHUNK_WIDE:
+            to.handle_snapshot_chunk_wide(from_peer, p, f.payload.size());
+            break;
         case ob::MM_MSG_SNAPSHOT_END:   to.handle_snapshot_end(from_peer, p, f.payload.size());   break;
         default: break;
     }
+}
+
+/// What a node asks with: a node of this build says it takes wide chunks (#176), and one of a build
+/// before it sends nothing at all.
+std::vector<uint8_t> request_of(uint8_t takes) {
+    return takes != 0 ? ob::encode_snapshot_request(takes) : std::vector<uint8_t>{};
+}
+
+/// A peer's snapshot request arriving at `sender`, as handle_frame() hands it over.
+void ask(Node& sender, ob::PeerConnection& peer, uint8_t takes = ob::MM_SNAPSHOT_TAKES_LARGE) {
+    const auto request = request_of(takes);
+    sender.mm->handle_snapshot_request(peer, request.empty() ? nullptr : request.data(),
+                                       request.size());
 }
 
 /// Ask for a snapshot and let the worker finish, the way io_loop() does.
@@ -114,9 +131,8 @@ void deliver(ob::MultiMasterManager& to, ob::PeerConnection& from_peer, const Fr
 /// Since #79 handle_snapshot_request() only starts a worker thread: the SNAPSHOT_BEGIN frame appears
 /// when the io loop collects the result. A test that stops after the request observes nothing, which
 /// is the whole point of the change — the loop is free in between.
-void request_snapshot_and_settle(Node& sender, WiredPeer& to) {
-    sender.mm->handle_snapshot_request(to.mgr(*sender.mm));
-
+/// Let the snapshot worker finish and the sender collect it, the way io_loop() does.
+void settle(Node& sender) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (sender.mm->snapshot_preparing()) {
         sender.mm->poll_snapshot_preparation();
@@ -128,16 +144,22 @@ void request_snapshot_and_settle(Node& sender, WiredPeer& to) {
     }
 }
 
+void request_snapshot_and_settle(Node& sender, WiredPeer& to,
+                                 uint8_t takes = ob::MM_SNAPSHOT_TAKES_LARGE) {
+    ask(sender, to.mgr(*sender.mm), takes);
+    settle(sender);
+}
+
 /// Run a whole transfer: request, then pump until the sender has nothing left.
 /// `mutate` gets a chance to damage each frame before it is delivered.
 template <typename Mutate>
 void run_transfer(Node& sender, WiredPeer& to_receiver,
                   Node& receiver, ob::PeerConnection& sender_peer,
-                  Mutate mutate) {
+                  Mutate mutate, uint8_t takes = ob::MM_SNAPSHOT_TAKES_LARGE) {
     // The receiver takes a BEGIN only from the connection it asked (#188); this drives the sender's
     // side of the request directly, so it records the receiver's side of it.
     receiver.mm->note_snapshot_asked_for_test(sender_peer);
-    request_snapshot_and_settle(sender, to_receiver);
+    request_snapshot_and_settle(sender, to_receiver, takes);
 
     // What the socket did not take stays in the sender's buffer, as the EPOLLOUT branch would find
     // it: a snapshot larger than the socket pair's buffer - a vector of thousands of entries is
@@ -169,7 +191,54 @@ void run_transfer(Node& sender, WiredPeer& to_receiver,
 
 auto pass_through = [](Frame&) { return true; };
 
+/// A chunk frame's header, in whichever width it was sent (#176).
+struct ChunkHeader {
+    bool     meta{false};
+    uint32_t index{0};
+    size_t   offset_at{0};   // where the byte offset sits in the payload
+    size_t   size{0};        // bytes before the chunk's data
+};
+
+std::optional<ChunkHeader> chunk_header(const Frame& f) {
+    uint64_t offset = 0;
+    const uint8_t* bytes = nullptr;
+    size_t n = 0;
+    if (f.hdr.record_type == ob::MM_MSG_SNAPSHOT_CHUNK_WIDE) {
+        uint32_t index = 0;
+        if (!ob::decode_snapshot_chunk_wide(f.payload.data(), f.payload.size(), index, offset, bytes,
+                                            n)) {
+            return std::nullopt;
+        }
+        return ChunkHeader{index == ob::MM_SNAPSHOT_WIDE_META_INDEX, index, sizeof(uint32_t),
+                           ob::MM_SNAPSHOT_WIDE_CHUNK_HEADER_SIZE};
+    }
+    if (f.hdr.record_type == ob::MM_MSG_SNAPSHOT_CHUNK) {
+        uint16_t index = 0;
+        if (!ob::decode_snapshot_chunk(f.payload.data(), f.payload.size(), index, offset, bytes, n)) {
+            return std::nullopt;
+        }
+        return ChunkHeader{index == ob::MM_SNAPSHOT_META_INDEX, index, sizeof(uint16_t),
+                           ob::MM_SNAPSHOT_CHUNK_HEADER_SIZE};
+    }
+    return std::nullopt;
+}
+
+/// The whole transfer, and each refusal of a damaged one, in both widths (#176): as between two
+/// nodes of this build, in 32-bit chunks, and as a sender of this build answers a node of an older
+/// one, in 16-bit chunks - which is also what a sender of an older build sends a node of this one.
+std::string width_name(const ::testing::TestParamInfo<uint8_t>& info) {
+    return info.param != 0 ? "WideChunks" : "AsBefore176";
+}
+
+class MMSnapshotTransfer : public ::testing::TestWithParam<uint8_t> {};
+class MMSnapshotDamage : public ::testing::TestWithParam<uint8_t> {};
+
 }  // namespace
+
+INSTANTIATE_TEST_SUITE_P(EitherWidth, MMSnapshotTransfer,
+                         ::testing::Values(ob::MM_SNAPSHOT_TAKES_LARGE, uint8_t{0}), width_name);
+INSTANTIATE_TEST_SUITE_P(EitherWidth, MMSnapshotDamage,
+                         ::testing::Values(ob::MM_SNAPSHOT_TAKES_LARGE, uint8_t{0}), width_name);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Codecs
@@ -211,9 +280,17 @@ TEST(MMSnapshotCodec, BeginRefusesWhatItCannotAct0n) {
     // The blob is assembled in memory, so its announced size is an allocation the peer chose.
     ob::SnapshotBegin huge{};
     huge.manifest_len = 1;
-    huge.vector_len   = static_cast<uint32_t>(ob::MM_SNAPSHOT_MAX_META_BYTES);
+    huge.vector_len   = static_cast<uint32_t>(ob::MM_SNAPSHOT_MAX_META_BYTES_LARGE);
     const auto p2 = ob::encode_snapshot_begin(huge);
     EXPECT_FALSE(ob::decode_snapshot_begin(p2.data(), p2.size(), out));
+
+    // And what a build before #176 refused, this one takes: its request says so.
+    ob::SnapshotBegin past_eight{};
+    past_eight.manifest_len = static_cast<uint32_t>(ob::MM_SNAPSHOT_MAX_META_BYTES);
+    past_eight.vector_len   = 1;
+    const auto p3 = ob::encode_snapshot_begin(past_eight);
+    EXPECT_TRUE(ob::decode_snapshot_begin(p3.data(), p3.size(), out));
+    EXPECT_EQ(out.total(), ob::MM_SNAPSHOT_MAX_META_BYTES + 1);
 }
 
 TEST(MMSnapshotCodec, ChunkHeaderBytesAreLittleEndianAtFixedOffsets) {
@@ -239,6 +316,70 @@ TEST(MMSnapshotCodec, ChunkHeaderBytesAreLittleEndianAtFixedOffsets) {
     EXPECT_EQ(std::vector<uint8_t>(framed.begin() + ob::MM_SNAPSHOT_CHUNK_HEADER_SIZE,
                                    framed.end()),
               data);
+}
+
+TEST(MMSnapshotCodec, WideChunkHeaderBytesAreLittleEndianAtFixedOffsets) {
+    // The twelve header bytes of the chunk #176 added, by hand, for the reason the test above gives:
+    // a node of another build reads them. The index is past what 16 bits hold.
+    const std::vector<uint8_t> data = {0xAA, 0xBB};
+    const auto framed = ob::encode_snapshot_chunk_wide(0x04030201u, 0x0807060504030201ULL,
+                                                       data.data(), data.size());
+
+    ASSERT_EQ(framed.size(), ob::MM_SNAPSHOT_WIDE_CHUNK_HEADER_SIZE + data.size());
+    const std::vector<uint8_t> expected_header = {
+        0x01, 0x02, 0x03, 0x04,                          // file_index, little-endian
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,  // byte_offset, little-endian
+    };
+    EXPECT_EQ(std::vector<uint8_t>(framed.begin(),
+                                   framed.begin() + ob::MM_SNAPSHOT_WIDE_CHUNK_HEADER_SIZE),
+              expected_header);
+    EXPECT_EQ(std::vector<uint8_t>(framed.begin() + ob::MM_SNAPSHOT_WIDE_CHUNK_HEADER_SIZE,
+                                   framed.end()),
+              data);
+}
+
+TEST(MMSnapshotCodec, WideChunkRoundTripsPastSixteenBitsAndRefusesAShortPayload) {
+    std::vector<uint8_t> data(ob::MM_SNAPSHOT_CHUNK_BYTES);
+    for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<uint8_t>((i * 13u + 5u) & 0xFFu);
+
+    // 65 536 is the first file a 16-bit index cannot name, and 65 535 was the metadata's.
+    for (const uint32_t index : {0u, 65'535u, 65'536u, 1'000'000u, ob::MM_SNAPSHOT_WIDE_META_INDEX}) {
+        const auto framed = ob::encode_snapshot_chunk_wide(index, 123'456'789ULL, data.data(),
+                                                           data.size());
+        uint32_t file_index = 0;
+        uint64_t offset = 0;
+        const uint8_t* bytes = nullptr;
+        size_t n = 0;
+        ASSERT_TRUE(ob::decode_snapshot_chunk_wide(framed.data(), framed.size(), file_index, offset,
+                                                   bytes, n));
+        EXPECT_EQ(file_index, index);
+        EXPECT_EQ(offset, 123'456'789ULL);
+        ASSERT_EQ(n, data.size());
+        EXPECT_EQ(std::memcmp(bytes, data.data(), n), 0);
+    }
+
+    const std::vector<uint8_t> tiny(ob::MM_SNAPSHOT_WIDE_CHUNK_HEADER_SIZE - 1, 0);
+    uint32_t file_index = 0;
+    uint64_t offset = 0;
+    const uint8_t* bytes = nullptr;
+    size_t n = 0;
+    EXPECT_FALSE(ob::decode_snapshot_chunk_wide(tiny.data(), tiny.size(), file_index, offset, bytes,
+                                                n));
+    EXPECT_FALSE(ob::decode_snapshot_chunk_wide(nullptr, 0, file_index, offset, bytes, n));
+}
+
+TEST(MMSnapshotCodec, TheRequestSaysWhatTheAskingNodeTakes) {
+    // One byte of flags where the payload was empty (#176). Empty is what every build before it
+    // sends, and takes nothing; a flag or a byte this build does not know is a later build's.
+    EXPECT_EQ(ob::encode_snapshot_request(ob::MM_SNAPSHOT_TAKES_LARGE),
+              std::vector<uint8_t>{0x01});
+    EXPECT_EQ(ob::decode_snapshot_request(nullptr, 0), 0u);
+    const uint8_t large[] = {0x01};
+    EXPECT_EQ(ob::decode_snapshot_request(large, sizeof(large)), ob::MM_SNAPSHOT_TAKES_LARGE);
+    const uint8_t later[] = {0x81, 0x07};
+    EXPECT_EQ(ob::decode_snapshot_request(later, sizeof(later)), ob::MM_SNAPSHOT_TAKES_LARGE);
+    const uint8_t unknown_only[] = {0x80};
+    EXPECT_EQ(ob::decode_snapshot_request(unknown_only, sizeof(unknown_only)), 0u);
 }
 
 TEST(MMSnapshotCodec, AFullSizeChunkIsEncodedWithoutCorruption) {
@@ -305,6 +446,9 @@ TEST(MMSnapshotCodec, ChunkNeverExceedsWhatAFrameHeaderCanDescribe) {
     static_assert(ob::MM_SNAPSHOT_CHUNK_BYTES + ob::MM_SNAPSHOT_CHUNK_HEADER_SIZE <=
                       ob::WAL_MAX_PAYLOAD_LEN,
                   "a snapshot chunk must fit in one frame");
+    static_assert(ob::MM_SNAPSHOT_CHUNK_BYTES + ob::MM_SNAPSHOT_WIDE_CHUNK_HEADER_SIZE <=
+                      ob::WAL_MAX_PAYLOAD_LEN,
+                  "a wide snapshot chunk must fit in one frame as well (#176)");
     static_assert(ob::MM_SNAPSHOT_BEGIN_SIZE <= ob::WAL_MAX_PAYLOAD_LEN, "");
     SUCCEED();
 }
@@ -336,7 +480,7 @@ TEST(MMSnapshotCodec, AbortReasonIsBoundedAndCannotBreakALogLine) {
 // A whole transfer
 // ═══════════════════════════════════════════════════════════════════════════════
 
-TEST(MMSnapshotTransfer, AnEmptyNodeEndsUpAbleToStateWhatItHolds) {
+TEST_P(MMSnapshotTransfer, AnEmptyNodeEndsUpAbleToStateWhatItHolds) {
     // The claim #67 makes is that a node joining mid-stream can never declare a contiguous
     // frontier for a foreign origin, so its peers keep resending records it already has. A
     // snapshot carries the sender's frontiers, and this is the check that the receiver comes out
@@ -352,7 +496,7 @@ TEST(MMSnapshotTransfer, AnEmptyNodeEndsUpAbleToStateWhatItHolds) {
 
     ASSERT_TRUE(receiver.engine->holds_no_data());
 
-    run_transfer(sender, to_receiver, receiver, sender_peer, pass_through);
+    run_transfer(sender, to_receiver, receiver, sender_peer, pass_through, GetParam());
 
     EXPECT_FALSE(receiver.mm->snapshot_recv_active());
     EXPECT_FALSE(receiver.mm->is_bootstrapping()) << "the flag must be cleared, not left set";
@@ -373,7 +517,7 @@ TEST(MMSnapshotTransfer, AnEmptyNodeEndsUpAbleToStateWhatItHolds) {
     EXPECT_FALSE(receiver.engine->holds_no_data());
 }
 
-TEST(MMSnapshotTransfer, AVectorPastOneRecordReachesTheReceiverWhole) {
+TEST_P(MMSnapshotTransfer, AVectorPastOneRecordReachesTheReceiverWhole) {
     // A snapshot's metadata carried the sender's vector in the single-record format, so past 1 560
     // entries it carried "send everything" and the receiver refused the bootstrap - a node joining a
     // mesh of a few thousand instruments could not be given a snapshot even when it asked (#177).
@@ -390,7 +534,7 @@ TEST(MMSnapshotTransfer, AVectorPastOneRecordReachesTheReceiverWhole) {
     ob::PeerConnection sender_peer;
     sender_peer.node_id = 1;
     sender_peer.handshake_done = true;
-    run_transfer(sender, to_receiver, receiver, sender_peer, pass_through);
+    run_transfer(sender, to_receiver, receiver, sender_peer, pass_through, GetParam());
 
     EXPECT_FALSE(receiver.mm->snapshot_recv_active());
     bool truncated = false;
@@ -406,7 +550,7 @@ TEST(MMSnapshotTransfer, AVectorPastOneRecordReachesTheReceiverWhole) {
     EXPECT_EQ(btc, 12u);
 }
 
-TEST(MMSnapshotTransfer, StagingIsGoneAndNoDescriptorLeaks) {
+TEST_P(MMSnapshotTransfer, StagingIsGoneAndNoDescriptorLeaks) {
     Node sender(1);
     Node receiver(2);
     sender.write_rows("ETH", 5, 2'000'000);
@@ -427,7 +571,7 @@ TEST(MMSnapshotTransfer, StagingIsGoneAndNoDescriptorLeaks) {
         ob::PeerConnection sender_peer;
         sender_peer.node_id = 1;
         sender_peer.handshake_done = true;
-        run_transfer(sender, to_receiver, receiver, sender_peer, pass_through);
+        run_transfer(sender, to_receiver, receiver, sender_peer, pass_through, GetParam());
     }
 
     // Completion, not just absence of staging: abort_bootstrap() also removes staging, so this
@@ -443,7 +587,7 @@ TEST(MMSnapshotTransfer, StagingIsGoneAndNoDescriptorLeaks) {
 // Refusals
 // ═══════════════════════════════════════════════════════════════════════════════
 
-TEST(MMSnapshotRefusal, AChunkAtTheWrongOffsetAbandonsTheBootstrap) {
+TEST_P(MMSnapshotDamage, AChunkAtTheWrongOffsetAbandonsTheBootstrap) {
     Node sender(1);
     Node receiver(2);
     sender.write_rows("BTC", 8, 3'000'000);
@@ -458,17 +602,14 @@ TEST(MMSnapshotRefusal, AChunkAtTheWrongOffsetAbandonsTheBootstrap) {
     // that.
     bool damaged = false;
     run_transfer(sender, to_receiver, receiver, sender_peer, [&](Frame& f) {
-        if (!damaged && f.hdr.record_type == ob::MM_MSG_SNAPSHOT_CHUNK) {
-            uint16_t idx = 0;
-            std::memcpy(&idx, f.payload.data(), sizeof(idx));
-            if (idx != ob::MM_SNAPSHOT_META_INDEX) {
-                const uint64_t bogus = 999'999;
-                std::memcpy(f.payload.data() + 2, &bogus, sizeof(bogus));
-                damaged = true;
-            }
+        const auto chunk = chunk_header(f);
+        if (!damaged && chunk && !chunk->meta) {
+            const uint64_t bogus = 999'999;
+            std::memcpy(f.payload.data() + chunk->offset_at, &bogus, sizeof(bogus));
+            damaged = true;
         }
         return true;
-    });
+    }, GetParam());
 
     ASSERT_TRUE(damaged) << "the mutation never fired, so this test proved nothing";
     EXPECT_FALSE(receiver.mm->snapshot_recv_active());
@@ -478,7 +619,7 @@ TEST(MMSnapshotRefusal, AChunkAtTheWrongOffsetAbandonsTheBootstrap) {
     EXPECT_FALSE(fs::exists(receiver.tmp.path + "/mm_snapshot_staging"));
 }
 
-TEST(MMSnapshotRefusal, AFileWhoseBytesDoNotMatchTheManifestIsNotInstalled) {
+TEST_P(MMSnapshotDamage, AFileWhoseBytesDoNotMatchTheManifestIsNotInstalled) {
     Node sender(1);
     Node receiver(2);
     sender.write_rows("BTC", 8, 4'000'000);
@@ -490,24 +631,20 @@ TEST(MMSnapshotRefusal, AFileWhoseBytesDoNotMatchTheManifestIsNotInstalled) {
 
     bool damaged = false;
     run_transfer(sender, to_receiver, receiver, sender_peer, [&](Frame& f) {
-        if (!damaged && f.hdr.record_type == ob::MM_MSG_SNAPSHOT_CHUNK &&
-            f.payload.size() > ob::MM_SNAPSHOT_CHUNK_HEADER_SIZE + 4) {
-            uint16_t idx = 0;
-            std::memcpy(&idx, f.payload.data(), sizeof(idx));
-            if (idx != ob::MM_SNAPSHOT_META_INDEX) {
-                f.payload[ob::MM_SNAPSHOT_CHUNK_HEADER_SIZE] ^= 0xFF;   // flip one byte
-                damaged = true;
-            }
+        const auto chunk = chunk_header(f);
+        if (!damaged && chunk && !chunk->meta && f.payload.size() > chunk->size + 4) {
+            f.payload[chunk->size] ^= 0xFF;   // flip one byte
+            damaged = true;
         }
         return true;
-    });
+    }, GetParam());
 
     ASSERT_TRUE(damaged);
     EXPECT_FALSE(receiver.mm->is_bootstrapping());
     EXPECT_TRUE(receiver.engine->holds_no_data());
 }
 
-TEST(MMSnapshotRefusal, DamagedMetadataIsCaughtBeforeAnyFileIsWritten) {
+TEST_P(MMSnapshotDamage, DamagedMetadataIsCaughtBeforeAnyFileIsWritten) {
     Node sender(1);
     Node receiver(2);
     sender.write_rows("BTC", 8, 5'000'000);
@@ -519,24 +656,20 @@ TEST(MMSnapshotRefusal, DamagedMetadataIsCaughtBeforeAnyFileIsWritten) {
 
     bool damaged = false;
     run_transfer(sender, to_receiver, receiver, sender_peer, [&](Frame& f) {
-        if (!damaged && f.hdr.record_type == ob::MM_MSG_SNAPSHOT_CHUNK &&
-            f.payload.size() > ob::MM_SNAPSHOT_CHUNK_HEADER_SIZE) {
-            uint16_t idx = 0;
-            std::memcpy(&idx, f.payload.data(), sizeof(idx));
-            if (idx == ob::MM_SNAPSHOT_META_INDEX) {
-                f.payload[ob::MM_SNAPSHOT_CHUNK_HEADER_SIZE] ^= 0x01;
-                damaged = true;
-            }
+        const auto chunk = chunk_header(f);
+        if (!damaged && chunk && chunk->meta && f.payload.size() > chunk->size) {
+            f.payload[chunk->size] ^= 0x01;
+            damaged = true;
         }
         return true;
-    });
+    }, GetParam());
 
     ASSERT_TRUE(damaged);
     EXPECT_FALSE(receiver.mm->is_bootstrapping());
     EXPECT_TRUE(receiver.engine->holds_no_data());
 }
 
-TEST(MMSnapshotRefusal, AVectorThatSaysSendEverythingIsNotInstalled) {
+TEST_P(MMSnapshotDamage, AVectorThatSaysSendEverythingIsNotInstalled) {
     // A sender refuses to send a vector past what it states; a receiver that installed one would
     // discard what it holds and adopt no frontier at all, and every peer would resend it the
     // snapshot's worth of records into append-only storage. Since #177 the vector is read from the
@@ -560,13 +693,13 @@ TEST(MMSnapshotRefusal, AVectorThatSaysSendEverythingIsNotInstalled) {
             begin_frame = f;
             return false;                          // delivered with the metadata it describes
         }
-        if (!held_begin || rewritten || f.hdr.record_type != ob::MM_MSG_SNAPSHOT_CHUNK) return true;
-        uint16_t index = 0;
+        const auto chunk = chunk_header(f);
+        if (!held_begin || rewritten || !chunk) return true;
         uint64_t offset = 0;
-        const uint8_t* bytes = nullptr;
-        size_t n = 0;
-        if (!ob::decode_snapshot_chunk(f.payload.data(), f.payload.size(), index, offset, bytes, n) ||
-            index != ob::MM_SNAPSHOT_META_INDEX || offset != 0 || n != begin.total()) {
+        std::memcpy(&offset, f.payload.data() + chunk->offset_at, sizeof(offset));
+        const uint8_t* bytes = f.payload.data() + chunk->size;
+        const size_t n = f.payload.size() - chunk->size;
+        if (!chunk->meta || offset != 0 || n != begin.total()) {
             return true;                           // not the one chunk this small metadata is
         }
         const auto marker = ob::serialize_version_vector({}, /*truncated=*/true);
@@ -577,17 +710,21 @@ TEST(MMSnapshotRefusal, AVectorThatSaysSendEverythingIsNotInstalled) {
         begin.meta_crc   = ob::crc32c(meta.data(), meta.size());
         begin_frame.payload = ob::encode_snapshot_begin(begin);
         deliver(*receiver.mm, sender_peer, begin_frame);
-        f.payload = ob::encode_snapshot_chunk(ob::MM_SNAPSHOT_META_INDEX, 0, meta.data(), meta.size());
+        f.payload = f.hdr.record_type == ob::MM_MSG_SNAPSHOT_CHUNK_WIDE
+                        ? ob::encode_snapshot_chunk_wide(ob::MM_SNAPSHOT_WIDE_META_INDEX, 0,
+                                                         meta.data(), meta.size())
+                        : ob::encode_snapshot_chunk(ob::MM_SNAPSHOT_META_INDEX, 0, meta.data(),
+                                                    meta.size());
         rewritten = true;
         return true;
-    });
+    }, GetParam());
 
     ASSERT_TRUE(rewritten);
     EXPECT_FALSE(receiver.mm->is_bootstrapping());
     EXPECT_TRUE(receiver.engine->holds_no_data()) << "a snapshot whose vector says nothing was installed";
 }
 
-TEST(MMSnapshotRefusal, AnEndWithFilesStillMissingIsRefused) {
+TEST_P(MMSnapshotDamage, AnEndWithFilesStillMissingIsRefused) {
     Node sender(1);
     Node receiver(2);
     sender.write_rows("BTC", 8, 6'000'000);
@@ -601,7 +738,7 @@ TEST(MMSnapshotRefusal, AnEndWithFilesStillMissingIsRefused) {
     // would install a manifest it never fully received.
     std::vector<Frame> seen;
     receiver.mm->note_snapshot_asked_for_test(sender_peer);   // or its BEGIN is refused (#188)
-    request_snapshot_and_settle(sender, to_receiver);
+    request_snapshot_and_settle(sender, to_receiver, GetParam());
     for (int round = 0; round < 10'000 && sender.mm->snapshot_send_active(); ++round) {
         to_receiver.collect();
         for (auto& f : take_frames(to_receiver.inbox)) seen.push_back(std::move(f));
@@ -612,7 +749,7 @@ TEST(MMSnapshotRefusal, AnEndWithFilesStillMissingIsRefused) {
 
     size_t last_chunk = 0;
     for (size_t i = 0; i < seen.size(); ++i) {
-        if (seen[i].hdr.record_type == ob::MM_MSG_SNAPSHOT_CHUNK) last_chunk = i;
+        if (chunk_header(seen[i])) last_chunk = i;
     }
     ASSERT_GT(last_chunk, 0u);
 
@@ -685,7 +822,7 @@ TEST(MMSnapshotRefusal, ASecondRequestToASenderAlreadyStreamingIsRefused) {
     ASSERT_TRUE(sender.mm->snapshot_send_active())
         << "the transfer should have paused on a full socket, not run to completion";
 
-    sender.mm->handle_snapshot_request(b.mgr(*sender.mm));
+    ask(sender, b.mgr(*sender.mm));
     EXPECT_TRUE(sender.mm->snapshot_send_active())
         << "the transfer in flight must survive the second request";
 
@@ -754,7 +891,8 @@ TEST(MMSnapshotRequest, AnEmptyNodeAsks) {
     const auto frames = take_frames(peer.inbox);
     ASSERT_EQ(frames.size(), 1u);
     EXPECT_EQ(frames[0].hdr.record_type, ob::MM_MSG_SNAPSHOT_REQUEST);
-    EXPECT_TRUE(frames[0].payload.empty());
+    // Saying that it takes wide chunks and large metadata (#176).
+    EXPECT_EQ(frames[0].payload, std::vector<uint8_t>{ob::MM_SNAPSHOT_TAKES_LARGE});
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1097,7 +1235,7 @@ TEST(MMSnapshotPreparation, TheRequestItselfSendsNothing) {
     sender.write_rows("BTC", 8, 20'000'000);
     WiredPeer to_receiver(2);
 
-    sender.mm->handle_snapshot_request(to_receiver.mgr(*sender.mm));
+    ask(sender, to_receiver.mgr(*sender.mm));
 
     EXPECT_TRUE(sender.mm->snapshot_preparing());
     EXPECT_FALSE(sender.mm->snapshot_send_active());
@@ -1126,7 +1264,7 @@ TEST(MMSnapshotPreparation, APeerThatLeftBeforeCollectionGetsNothing) {
     WiredPeer to_receiver(2);
 
     auto& stored = to_receiver.mgr(*sender.mm);
-    sender.mm->handle_snapshot_request(stored);
+    ask(sender, stored);
     ASSERT_TRUE(sender.mm->snapshot_preparing());
 
     stored.connected = false;
@@ -1160,7 +1298,7 @@ TEST(MMSnapshotPreparation, TheSameNodeOnANewConnectionGetsNothing) {
         WiredPeer first(2);
         auto& stored = first.mgr(*sender.mm);
         asked_on     = stored.conn_id;
-        sender.mm->handle_snapshot_request(stored);
+        ask(sender, stored);
         ASSERT_TRUE(sender.mm->snapshot_preparing());
     }   // the socket goes away without the manager ever being told
 
@@ -1190,10 +1328,10 @@ TEST(MMSnapshotPreparation, ASecondRequestWhileOneIsBeingCreatedIsRefused) {
     WiredPeer a(2);
     WiredPeer b(3);
 
-    sender.mm->handle_snapshot_request(a.mgr(*sender.mm));
+    ask(sender, a.mgr(*sender.mm));
     ASSERT_TRUE(sender.mm->snapshot_preparing());
 
-    sender.mm->handle_snapshot_request(b.mgr(*sender.mm));
+    ask(sender, b.mgr(*sender.mm));
 
     b.collect();
     const auto frames = take_frames(b.inbox);
@@ -1213,7 +1351,7 @@ TEST(MMSnapshotPreparation, TearingDownWithASnapshotInFlightIsClean) {
     sender->write_rows("BTC", 8, 24'000'000);
     WiredPeer to_receiver(2);
 
-    sender->mm->handle_snapshot_request(to_receiver.mgr(*sender->mm));
+    ask(*sender, to_receiver.mgr(*sender->mm));
     ASSERT_TRUE(sender->mm->snapshot_preparing());
 
     sender.reset();   // ~MultiMasterManager → ~AsyncSnapshotBuilder → join
@@ -1398,7 +1536,7 @@ TEST(MMSnapshotMeasurement, DISABLED_SnapshotCreationCost) {
         auto& stored = peer.mgr(*node.mm);
 
         const auto t0 = std::chrono::steady_clock::now();
-        node.mm->handle_snapshot_request(stored);
+        ask(node, stored);
         const double accept_ms = std::chrono::duration<double, std::milli>(
                                      std::chrono::steady_clock::now() - t0).count();
 
@@ -1438,6 +1576,272 @@ TEST(MMSnapshotRefusal, AManifestTooLargeToAddressIsRefusedRatherThanWrapped) {
     request_snapshot_and_settle(sender, peer);
     EXPECT_FALSE(sender.mm->snapshot_send_active())
         << "a two-row store fits in one pass, so the transfer should already be complete";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Past the 16-bit index and the 8 MiB of metadata (#176)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// A chunk named its file with 16 bits and 0xFFFF was the metadata's, so a manifest of 65 535 files
+// or more was refused (`too_many_files`) - a node of 8 192 segments could bootstrap no peer - and
+// the metadata blob past 8 MiB (`metadata_too_large`) - about 10 000. A node of this build says in
+// its request that it takes 32-bit chunks and up to 1 GiB, and one of an older build, which says
+// nothing, is sent what it was sent before and refused what it was refused before.
+
+namespace {
+
+/// Every frame `sender` puts on the wire for one request, the transfer run to its end.
+std::vector<Frame> everything_sent(Node& sender, WiredPeer& to, uint8_t takes) {
+    request_snapshot_and_settle(sender, to, takes);
+    std::vector<Frame> seen;
+    for (int round = 0; round < 10'000; ++round) {
+        sender.mm->try_drain_send_buf_for_test(to.mgr(*sender.mm));
+        to.collect();
+        for (auto& f : take_frames(to.inbox)) seen.push_back(std::move(f));
+        if (!sender.mm->snapshot_send_active() && to.mgr(*sender.mm).send_buf.empty()) break;
+        sender.mm->advance_snapshot_send(to.mgr(*sender.mm));
+    }
+    to.collect();
+    for (auto& f : take_frames(to.inbox)) seen.push_back(std::move(f));
+    return seen;
+}
+
+/// A store's worth of manifest without the store: `files` entries of one byte each under paths
+/// `pad` characters long, which nothing on the disk backs - so a sender reaches its first file and
+/// stops there, which is past everything these tests are about.
+ob::SnapshotWithSequenceState synthetic_snapshot(size_t files, size_t pad) {
+    ob::SnapshotWithSequenceState snap{};
+    const std::string dirs(pad, 'd');
+    const uint8_t byte = 0x5A;
+    const uint32_t crc = ob::crc32c(&byte, 1);
+    snap.manifest.files.reserve(files);
+    for (size_t i = 0; i < files; ++i) {
+        char name[32];
+        std::snprintf(name, sizeof(name), "%07zu", i);
+        snap.manifest.files.push_back({"S" + dirs + "/" + name + "/price.col", 1, crc});
+    }
+    snap.manifest.total_bytes = files;
+    snap.vector.push_back({"BTC.USDT", 1, 1});
+    return snap;
+}
+
+std::vector<Frame> frames_in(WiredPeer& peer) {
+    peer.collect();
+    return take_frames(peer.inbox);
+}
+
+}  // namespace
+
+TEST(MMSnapshotLarge, ANodeOfThisBuildIsSentWideChunksAndAnOlderOneWhatItWasSentBefore) {
+    Node sender(1);
+    sender.write_rows("BTC", 8, 30'000'000);
+
+    WiredPeer current(2), older(3);
+    const auto wide = everything_sent(sender, current, ob::MM_SNAPSHOT_TAKES_LARGE);
+    const auto narrow = everything_sent(sender, older, 0);
+
+    const auto chunks_of = [](const std::vector<Frame>& frames, uint8_t type) {
+        size_t n = 0;
+        for (const auto& f : frames) n += f.hdr.record_type == type;
+        return n;
+    };
+    ASSERT_FALSE(wide.empty());
+    ASSERT_FALSE(narrow.empty());
+    EXPECT_EQ(wide.front().hdr.record_type, ob::MM_MSG_SNAPSHOT_BEGIN);
+    EXPECT_EQ(narrow.front().hdr.record_type, ob::MM_MSG_SNAPSHOT_BEGIN);
+    EXPECT_EQ(wide.back().hdr.record_type, ob::MM_MSG_SNAPSHOT_END);
+    EXPECT_EQ(narrow.back().hdr.record_type, ob::MM_MSG_SNAPSHOT_END);
+
+    EXPECT_GT(chunks_of(wide, ob::MM_MSG_SNAPSHOT_CHUNK_WIDE), 1u);
+    EXPECT_EQ(chunks_of(wide, ob::MM_MSG_SNAPSHOT_CHUNK), 0u)
+        << "a node of this build was sent a 16-bit chunk";
+    EXPECT_EQ(chunks_of(narrow, ob::MM_MSG_SNAPSHOT_CHUNK_WIDE), 0u)
+        << "a node of an older build was sent a chunk type it skips";
+    EXPECT_EQ(chunks_of(narrow, ob::MM_MSG_SNAPSHOT_CHUNK),
+              chunks_of(wide, ob::MM_MSG_SNAPSHOT_CHUNK_WIDE));
+
+    // The older node's first chunk is the one it was always sent, header byte for byte: the
+    // metadata's 0xFFFF and offset zero.
+    ASSERT_GE(narrow.size(), 2u);
+    const std::vector<uint8_t> old_header = {0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0};
+    EXPECT_EQ(std::vector<uint8_t>(narrow[1].payload.begin(),
+                                   narrow[1].payload.begin() + ob::MM_SNAPSHOT_CHUNK_HEADER_SIZE),
+              old_header);
+    const std::vector<uint8_t> wide_header = {0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0};
+    EXPECT_EQ(std::vector<uint8_t>(wide[1].payload.begin(),
+                                   wide[1].payload.begin() + ob::MM_SNAPSHOT_WIDE_CHUNK_HEADER_SIZE),
+              wide_header);
+}
+
+TEST(MMSnapshotLarge, TheRequestAFrameCarriesDecidesTheChunksAndTheyAreInstalled) {
+    // Through the frame dispatch both ways: the request's byte reaches the sender, and the wide
+    // chunks it answers with reach the receiver's handler - the path every bootstrap between two
+    // nodes of this build takes.
+    Node sender(1);
+    Node receiver(2);
+    sender.write_rows("BTC", 12, 31'000'000);
+
+    WiredPeer to_receiver(2);
+    auto& stored = to_receiver.mgr(*sender.mm);
+    arrive_snapshot_frame(*sender.mm, stored, ob::MM_MSG_SNAPSHOT_REQUEST,
+                          ob::encode_snapshot_request(ob::MM_SNAPSHOT_TAKES_LARGE));
+    settle(sender);
+    std::vector<Frame> seen;
+    for (int round = 0; round < 10'000; ++round) {
+        sender.mm->try_drain_send_buf_for_test(stored);
+        for (auto& f : frames_in(to_receiver)) seen.push_back(std::move(f));
+        if (!sender.mm->snapshot_send_active() && stored.send_buf.empty()) break;
+        sender.mm->advance_snapshot_send(stored);
+    }
+    for (auto& f : frames_in(to_receiver)) seen.push_back(std::move(f));
+    ASSERT_GE(seen.size(), 3u);
+
+    WiredPeer from_sender(1);
+    auto& source = from_sender.mgr(*receiver.mm);
+    receiver.mm->note_snapshot_asked_for_test(source);
+    size_t wide = 0;
+    for (const auto& f : seen) {
+        wide += f.hdr.record_type == ob::MM_MSG_SNAPSHOT_CHUNK_WIDE;
+        arrive_snapshot_frame(*receiver.mm, source, f.hdr.record_type, f.payload);
+    }
+    EXPECT_GT(wide, 0u) << "the request's byte did not reach the sender";
+    EXPECT_FALSE(receiver.mm->is_bootstrapping());
+    EXPECT_FALSE(receiver.engine->holds_no_data()) << "the wide chunks were not installed";
+    bool truncated = false;
+    uint64_t frontier = 0;
+    for (const auto& e : receiver.engine->export_version_vector(64, truncated)) {
+        if (e.key == "BTC.USDT") frontier = e.frontier;
+    }
+    EXPECT_EQ(frontier, 12u);
+}
+
+TEST(MMSnapshotLarge, PastTheSixteenBitIndexAnOlderNodeIsRefusedAndOneOfThisBuildIsNot) {
+    constexpr size_t kFiles = 70'000;   // past 65 534, as a node of 8 750 segments
+    Node sender(1);
+
+    // A node of an older build is refused as it was, with the reason.
+    WiredPeer older(2);
+    auto& older_conn = older.mgr(*sender.mm);
+    sender.mm->begin_snapshot_send(older_conn, synthetic_snapshot(kFiles, 8), 0);
+    const auto refused = frames_in(older);
+    ASSERT_EQ(refused.size(), 1u);
+    EXPECT_EQ(refused[0].hdr.record_type, ob::MM_MSG_SNAPSHOT_ABORT);
+    EXPECT_EQ(ob::decode_snapshot_abort(refused[0].payload.data(), refused[0].payload.size()),
+              "too_many_files");
+    EXPECT_FALSE(sender.mm->snapshot_send_active());
+
+    // One of this build is sent the metadata in wide chunks, and a receiver of this build takes it:
+    // every file the manifest names is next.
+    Node receiver(3);
+    WiredPeer current(3);
+    auto& current_conn = current.mgr(*sender.mm);
+    WiredPeer from_sender(1);
+    auto& source = from_sender.mgr(*receiver.mm);
+    receiver.mm->note_snapshot_asked_for_test(source);
+
+    sender.mm->begin_snapshot_send(current_conn, synthetic_snapshot(kFiles, 8),
+                                   ob::MM_SNAPSHOT_TAKES_LARGE);
+    // The sender stops at the first file, which nothing on the disk backs - after the metadata,
+    // which is what this is about, and which may still be in its buffer when it stops.
+    size_t chunks = 0;
+    bool began = false;
+    for (int round = 0; round < 10'000 && !receiver.mm->snapshot_recv_has_metadata(); ++round) {
+        sender.mm->try_drain_send_buf_for_test(current_conn);
+        for (const auto& f : frames_in(current)) {
+            if (f.hdr.record_type == ob::MM_MSG_SNAPSHOT_BEGIN) began = true;
+            if (f.hdr.record_type == ob::MM_MSG_SNAPSHOT_CHUNK_WIDE) ++chunks;
+            ASSERT_NE(f.hdr.record_type, ob::MM_MSG_SNAPSHOT_CHUNK) << "a 16-bit chunk past 65 534";
+            deliver(*receiver.mm, source, f);
+        }
+        if (sender.mm->snapshot_send_active()) {
+            sender.mm->advance_snapshot_send(current_conn);
+        } else if (current_conn.send_buf.empty() && current.inbox.empty()) {
+            break;
+        }
+    }
+    EXPECT_TRUE(began);
+    EXPECT_GT(chunks, 1u);
+    EXPECT_TRUE(receiver.mm->snapshot_recv_has_metadata())
+        << "a receiver of this build did not take the metadata of " << kFiles << " files";
+    receiver.mm->abort_bootstrap("test_cleanup");
+    if (sender.mm->snapshot_send_active()) sender.mm->on_peer_disconnected(current_conn);
+}
+
+TEST(MMSnapshotLarge, MetadataPastEightMegabytesGoesOnlyToANodeThatTakesIt) {
+    // Fewer files than the 16-bit index names, and more manifest than a build before #176
+    // assembles: 50 000 paths of about 180 characters are about 11 MB of JSON.
+    constexpr size_t kFiles = 50'000;
+    Node sender(1);
+
+    WiredPeer older(2);
+    auto& older_conn = older.mgr(*sender.mm);
+    sender.mm->begin_snapshot_send(older_conn, synthetic_snapshot(kFiles, 160), 0);
+    const auto refused = frames_in(older);
+    ASSERT_EQ(refused.size(), 1u);
+    EXPECT_EQ(ob::decode_snapshot_abort(refused[0].payload.data(), refused[0].payload.size()),
+              "metadata_too_large");
+
+    WiredPeer current(3);
+    auto& current_conn = current.mgr(*sender.mm);
+    sender.mm->begin_snapshot_send(current_conn, synthetic_snapshot(kFiles, 160),
+                                   ob::MM_SNAPSHOT_TAKES_LARGE);
+    EXPECT_TRUE(sender.mm->snapshot_send_active());
+    sender.mm->try_drain_send_buf_for_test(current_conn);
+    const auto frames = frames_in(current);
+    ASSERT_GE(frames.size(), 2u);
+    ASSERT_EQ(frames[0].hdr.record_type, ob::MM_MSG_SNAPSHOT_BEGIN);
+    ob::SnapshotBegin begin{};
+    ASSERT_TRUE(ob::decode_snapshot_begin(frames[0].payload.data(), frames[0].payload.size(), begin))
+        << "a receiver of this build refuses the BEGIN a sender of this build sends it";
+    EXPECT_GT(begin.total(), ob::MM_SNAPSHOT_MAX_META_BYTES);
+    EXPECT_EQ(frames[1].hdr.record_type, ob::MM_MSG_SNAPSHOT_CHUNK_WIDE);
+    sender.mm->on_peer_disconnected(current_conn);
+    EXPECT_FALSE(sender.mm->snapshot_send_active());
+}
+
+TEST(MMSnapshotLarge, TheWireOnlyTypesAreDistinctAndAboveTheWalRange) {
+    const std::vector<uint8_t> types = {
+        ob::MM_MSG_SNAPSHOT_REQUEST, ob::MM_MSG_SNAPSHOT_BEGIN, ob::MM_MSG_SNAPSHOT_CHUNK,
+        ob::MM_MSG_SNAPSHOT_END,     ob::MM_MSG_SNAPSHOT_ABORT, ob::MM_MSG_AUTH_CHALLENGE,
+        ob::MM_MSG_AUTH_RESPONSE,    ob::MM_MSG_SNAPSHOT_CHUNK_WIDE,
+    };
+    for (size_t i = 0; i < types.size(); ++i) {
+        EXPECT_GE(types[i], ob::WAL_RECORD_WIRE_ONLY_BASE);
+        for (size_t j = i + 1; j < types.size(); ++j) EXPECT_NE(types[i], types[j]);
+    }
+}
+
+TEST(MMSnapshotLarge, TheSegmentGaugeSaysWhatTheStoreHoldsAfterAnInstallAndARestart) {
+    // `ob_segment_count` was set by a flush's merge and a compaction only: after a snapshot install
+    // of 8 200 segments it read 0 - found by #176's integration test - and after a restart it read 0
+    // until the next flush.
+    Node sender(1);
+    for (int i = 0; i < 3; ++i) {
+        const std::string symbol = "G" + std::to_string(i);
+        sender.write_rows(symbol.c_str(), 4, 40'000'000 + static_cast<uint64_t>(i) * 100);
+    }
+    const int64_t held = sender.engine->registry().gauge_value("ob_segment_count");
+    ASSERT_GE(held, 3);
+
+    Node receiver(2);
+    WiredPeer to_receiver(2);
+    ob::PeerConnection sender_peer;
+    sender_peer.node_id = 1;
+    sender_peer.handshake_done = true;
+    run_transfer(sender, to_receiver, receiver, sender_peer, pass_through);
+    ASSERT_FALSE(receiver.engine->holds_no_data());
+    EXPECT_EQ(receiver.engine->registry().gauge_value("ob_segment_count"), held)
+        << "after the install";
+
+    // And after a restart, before any flush.
+    const std::string dir = receiver.tmp.path;
+    receiver.mm.reset();
+    receiver.engine->close();
+    receiver.engine.reset();
+    ob::Engine reopened(dir);
+    reopened.open();
+    EXPECT_EQ(reopened.registry().gauge_value("ob_segment_count"), held) << "after a restart";
+    reopened.close();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

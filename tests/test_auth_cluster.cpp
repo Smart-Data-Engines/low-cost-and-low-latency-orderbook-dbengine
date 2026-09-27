@@ -442,6 +442,7 @@ TEST(ClusterAuthFrames, TheTwoFrameTypesAreDistinctAndOutsideTheWalRange) {
         EXPECT_NE(t, ob::MM_MSG_SNAPSHOT_REQUEST);
         EXPECT_NE(t, ob::MM_MSG_SNAPSHOT_BEGIN);
         EXPECT_NE(t, ob::MM_MSG_SNAPSHOT_CHUNK);
+        EXPECT_NE(t, ob::MM_MSG_SNAPSHOT_CHUNK_WIDE);
         EXPECT_NE(t, ob::MM_MSG_SNAPSHOT_END);
         EXPECT_NE(t, ob::MM_MSG_SNAPSHOT_ABORT);
     }

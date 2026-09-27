@@ -8,9 +8,13 @@ reaches only by neglect: part 2b of #165 merges a symbol's segments, but not bel
 hour, so 8 192 instruments are past it whatever merging does.
 
 Measured before the fix, the joiner of this test never got as far as the refusal: at 8 200
-(symbol, origin) entries a version vector is sent as "send everything", and a joiner asks for a
+(symbol, origin) entries a version vector was sent as "send everything", and a joiner asks for a
 snapshot only from a peer whose vector says what it holds (#177). It caught up from the WAL
-instead, which its peers still held. So the marker names both, and the test says which one it met.
+instead, which its peers still held. Since #177 it asked, and was refused - the module's strict
+xfail until #176, which is what the test still says when it fails: which of the two it met.
+
+Since #176 a joiner says in its request that it takes chunks with a 32-bit file index and up to
+1 GiB of metadata, and a peer of the same build sends it both.
 
 The module has its own three-node mesh, as `test_mm_snapshot_bootstrap.py` does, because the test
 adds a fourth node for good and fills every node with 8 200 segments.
@@ -37,10 +41,11 @@ BOOTSTRAP_TIMEOUT = 180.0
 
 
 class NotBootstrapped(AssertionError):
-    """The joiner received no snapshot. The one failure the #176 marker is about.
+    """The joiner received no snapshot, and what the nodes said about it.
 
-    Its own type so the strict xfail below covers only it: a premise that did not hold - a node
-    with fewer segments than the test needs - fails as itself rather than as the defect.
+    Its own type, as it was while the strict xfail of #176 covered only it: a premise that did not
+    hold - a node with fewer segments than the test needs - fails as itself rather than as the
+    defect.
     """
 
 
@@ -69,9 +74,6 @@ def metric(node, name: str) -> float:
         return -1.0
 
 
-@pytest.mark.xfail(strict=True, raises=NotBootstrapped,
-                   reason="#176: a snapshot of 65 535 files or more is refused - the joiner asks "
-                          "for one since #177, and is refused")
 def test_a_node_of_more_than_8192_segments_bootstraps_a_joiner(mm_cluster):
     writer = mm_cluster.nodes[0]
     client = client_for(writer)
