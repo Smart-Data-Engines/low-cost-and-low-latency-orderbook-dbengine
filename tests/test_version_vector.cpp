@@ -506,17 +506,34 @@ TEST(VectorParts, APartOutOfSequenceDropsTheAssemblyAndTheVectorBeforeItStands) 
     const auto part = [&pv](const ob::VectorRecord& r) {
         return pv.deserialize_part(r.payload.data(), r.payload.size());
     };
+    // Each refused part is followed by the parts that would complete an assembly that took it: every
+    // step answers false until a vector completes, so the answer to the bad part alone says nothing.
     EXPECT_FALSE(part(a[0]));
     EXPECT_FALSE(part(a[2])) << "a part was skipped";
     EXPECT_FALSE(part(a[3])) << "nothing is open, and the last part completed a vector";
+    EXPECT_FALSE(part(a[1])) << "the parts left completed a vector, the skipped one last";
     EXPECT_EQ(pv.entry_count(), 100u) << "an incomplete vector replaced the one before it";
 
     EXPECT_FALSE(part(a[0]));
-    EXPECT_FALSE(part(b[1])) << "another generation's part continued this one";
+    EXPECT_FALSE(part(b[1]));
+    EXPECT_FALSE(part(a[2]));
+    EXPECT_FALSE(part(a[3])) << "another generation's part continued this one, and they completed it";
     EXPECT_EQ(pv.entry_count(), 100u);
 
     EXPECT_TRUE(receive(pv, b)) << "a whole vector after all that was not taken";
     EXPECT_EQ(pv.entry_count(), 5'000u);
+}
+
+TEST(VectorParts, AVectorInPartsReplacesTheOneBeforeIt) {
+    // What the peer says now is all it holds: a pair it listed before and not now reads as nothing.
+    ob::PeerVector pv;
+    ASSERT_TRUE(receive(pv, ob::serialize_version_vector_records(entries_of(5'000), false, 1)));
+    std::vector<ob::SequenceTracker::VectorEntry> other;
+    for (uint64_t i = 0; i < 3'000; ++i) other.push_back({"T" + std::to_string(i) + ".EX", 2, i + 1});
+    ASSERT_TRUE(receive(pv, ob::serialize_version_vector_records(other, false, 2)));
+    EXPECT_EQ(pv.entry_count(), 3'000u) << "the vector before it was kept alongside";
+    EXPECT_EQ(pv.frontier_for("S0.EX", 1), 0u) << "a pair only the vector before listed still reads";
+    EXPECT_EQ(as_map(pv.entries()), as_map(other));
 }
 
 TEST(VectorParts, APartWhoseLengthDoesNotAddUpIsRefused) {
@@ -525,6 +542,10 @@ TEST(VectorParts, APartWhoseLengthDoesNotAddUpIsRefused) {
     cut.pop_back();
     ob::PeerVector pv;
     EXPECT_FALSE(pv.deserialize_part(cut.data(), cut.size()));
+    for (size_t i = 1; i < parts.size(); ++i) {
+        EXPECT_FALSE(pv.deserialize_part(parts[i].payload.data(), parts[i].payload.size()))
+            << "the parts after one that did not add up completed a vector with it";
+    }
     EXPECT_FALSE(pv.deserialize_part(parts[0].payload.data(), 5)) << "shorter than a part's header";
     EXPECT_FALSE(pv.received());
     // And the vector it belonged to arrives whole afterwards.
