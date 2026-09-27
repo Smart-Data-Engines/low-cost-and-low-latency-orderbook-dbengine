@@ -136,14 +136,22 @@ void run_transfer(Node& sender, WiredPeer& to_receiver,
                   Mutate mutate) {
     request_snapshot_and_settle(sender, to_receiver);
 
+    // What the socket did not take stays in the sender's buffer, as the EPOLLOUT branch would find
+    // it: a snapshot larger than the socket pair's buffer - a vector of thousands of entries is
+    // 210 kB of metadata (#177) - arrives only as the buffer drains.
+    const auto drain_into_socket = [&] {
+        sender.mm->try_drain_send_buf_for_test(to_receiver.mgr(*sender.mm));
+    };
     for (int round = 0; round < 10'000; ++round) {
+        drain_into_socket();
         to_receiver.collect();
         auto frames = take_frames(to_receiver.inbox);
         for (auto& f : frames) {
             if (!mutate(f)) continue;              // dropped by the mutation
             deliver(*receiver.mm, sender_peer, f);
         }
-        if (!sender.mm->snapshot_send_active()) {
+        if (!sender.mm->snapshot_send_active() &&
+            to_receiver.mgr(*sender.mm).send_buf.empty()) {
             // One last pass so the END frame that finished the send is delivered too.
             to_receiver.collect();
             for (auto& f : take_frames(to_receiver.inbox)) {
@@ -362,6 +370,39 @@ TEST(MMSnapshotTransfer, AnEmptyNodeEndsUpAbleToStateWhatItHolds) {
     EXPECT_FALSE(receiver.engine->holds_no_data());
 }
 
+TEST(MMSnapshotTransfer, AVectorPastOneRecordReachesTheReceiverWhole) {
+    // A snapshot's metadata carried the sender's vector in the single-record format, so past 1 560
+    // entries it carried "send everything" and the receiver refused the bootstrap - a node joining a
+    // mesh of a few thousand instruments could not be given a snapshot even when it asked (#177).
+    Node sender(1);
+    Node receiver(2);
+    std::vector<ob::SequenceTracker::VectorEntry> wide;
+    for (uint64_t i = 0; i < 5'000; ++i) {
+        wide.push_back({"V" + std::to_string(i) + ".EX", 3, i + 1});
+    }
+    sender.engine->adopt_snapshot_sequence_state(wide, {});
+    sender.write_rows("BTC", 12, 1'000'000);
+
+    WiredPeer to_receiver(/*node_id=*/2);
+    ob::PeerConnection sender_peer;
+    sender_peer.node_id = 1;
+    sender_peer.handshake_done = true;
+    run_transfer(sender, to_receiver, receiver, sender_peer, pass_through);
+
+    EXPECT_FALSE(receiver.mm->snapshot_recv_active());
+    bool truncated = false;
+    const auto vector = receiver.engine->export_version_vector(ob::VV_MAX_ENTRIES, truncated);
+    ASSERT_FALSE(truncated);
+    EXPECT_EQ(vector.size(), 5'001u) << "the receiver did not take the sender's whole vector";
+    uint64_t last = 0, btc = 0;
+    for (const auto& e : vector) {
+        if (e.key == "V4999.EX" && e.origin == 3) last = e.frontier;
+        if (e.key == "BTC.USDT") btc = e.frontier;
+    }
+    EXPECT_EQ(last, 5'000u);
+    EXPECT_EQ(btc, 12u);
+}
+
 TEST(MMSnapshotTransfer, StagingIsGoneAndNoDescriptorLeaks) {
     Node sender(1);
     Node receiver(2);
@@ -490,6 +531,57 @@ TEST(MMSnapshotRefusal, DamagedMetadataIsCaughtBeforeAnyFileIsWritten) {
     ASSERT_TRUE(damaged);
     EXPECT_FALSE(receiver.mm->is_bootstrapping());
     EXPECT_TRUE(receiver.engine->holds_no_data());
+}
+
+TEST(MMSnapshotRefusal, AVectorThatSaysSendEverythingIsNotInstalled) {
+    // A sender refuses to send a vector past what it states; a receiver that installed one would
+    // discard what it holds and adopt no frontier at all, and every peer would resend it the
+    // snapshot's worth of records into append-only storage. Since #177 the vector is read from the
+    // block that carries one of any size, so the refusal is that reader's answer too: the BEGIN and
+    // the metadata are rewritten here to carry the old "send everything" marker, CRC and all.
+    Node sender(1);
+    Node receiver(2);
+    sender.write_rows("BTC", 8, 6'000'000);
+
+    WiredPeer to_receiver(2);
+    ob::PeerConnection sender_peer;
+    sender_peer.node_id = 1;
+    sender_peer.handshake_done = true;
+
+    Frame begin_frame;
+    ob::SnapshotBegin begin{};
+    bool held_begin = false, rewritten = false;
+    run_transfer(sender, to_receiver, receiver, sender_peer, [&](Frame& f) {
+        if (f.hdr.record_type == ob::MM_MSG_SNAPSHOT_BEGIN) {
+            held_begin = ob::decode_snapshot_begin(f.payload.data(), f.payload.size(), begin);
+            begin_frame = f;
+            return false;                          // delivered with the metadata it describes
+        }
+        if (!held_begin || rewritten || f.hdr.record_type != ob::MM_MSG_SNAPSHOT_CHUNK) return true;
+        uint16_t index = 0;
+        uint64_t offset = 0;
+        const uint8_t* bytes = nullptr;
+        size_t n = 0;
+        if (!ob::decode_snapshot_chunk(f.payload.data(), f.payload.size(), index, offset, bytes, n) ||
+            index != ob::MM_SNAPSHOT_META_INDEX || offset != 0 || n != begin.total()) {
+            return true;                           // not the one chunk this small metadata is
+        }
+        const auto marker = ob::serialize_version_vector({}, /*truncated=*/true);
+        std::vector<uint8_t> meta(bytes, bytes + begin.manifest_len);
+        meta.insert(meta.end(), marker.begin(), marker.end());
+        meta.insert(meta.end(), bytes + begin.manifest_len + begin.vector_len, bytes + n);
+        begin.vector_len = static_cast<uint32_t>(marker.size());
+        begin.meta_crc   = ob::crc32c(meta.data(), meta.size());
+        begin_frame.payload = ob::encode_snapshot_begin(begin);
+        deliver(*receiver.mm, sender_peer, begin_frame);
+        f.payload = ob::encode_snapshot_chunk(ob::MM_SNAPSHOT_META_INDEX, 0, meta.data(), meta.size());
+        rewritten = true;
+        return true;
+    });
+
+    ASSERT_TRUE(rewritten);
+    EXPECT_FALSE(receiver.mm->is_bootstrapping());
+    EXPECT_TRUE(receiver.engine->holds_no_data()) << "a snapshot whose vector says nothing was installed";
 }
 
 TEST(MMSnapshotRefusal, AnEndWithFilesStillMissingIsRefused) {

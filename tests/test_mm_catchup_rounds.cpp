@@ -496,6 +496,30 @@ TEST(MMCatchupRounds, APeerThatHoldsEverythingIsNotScannedWhateverTheCopy) {
     EXPECT_FALSE(other.catchup.active) << "a peer lacking nothing was sent a scan after the tick";
 }
 
+TEST(MMCatchupRounds, ANodePastTheVectorItStatesCatchesAPeerUpRatherThanJudgingIt) {
+    // A copy past the bound exports nothing, and nothing compared with a peer's vector read as "it
+    // lacks nothing": a node past it never caught up a peer whose vector fit - a joiner above all
+    // (#177). Such a node cannot say what the peer lacks, so it catches the peer up, and the rounds
+    // send only what the peer's own vector does not hold. The bound is a million entries; the test
+    // lowers it below this node's three.
+    CatchupNode node(1 << 20, 64 << 20, 64 << 10, kNoAutoFlush);
+    write_rows(*node.engine, "ALL", 300, 1'000'000'000ULL);
+    write_rows(*node.engine, "TWO", 10, 2'000'000'000ULL);
+    write_rows(*node.engine, "SIX", 10, 3'000'000'000ULL);
+    node.engine->flush_tick_for_test();
+    node.write("ALL", 0, 1, 300);
+    node.mm->set_vector_limit_for_test(2);
+    WiredPeer from(kPeer);
+    ob::PeerConnection& peer = from.mgr(*node.mm);
+    peer.catchup_started = false;
+
+    arrive(node, from, {{"ALL.EX", 0, 300}, {"TWO.EX", 0, 10}, {"SIX.EX", 0, 10}});
+    EXPECT_TRUE(peer.catchup_started);
+    ASSERT_TRUE(peer.catchup.active)
+        << "a node that cannot state what it holds judged the peer to lack nothing";
+    EXPECT_TRUE(run_to_end(node, from).empty()) << "the peer was sent what its vector says it holds";
+}
+
 TEST(MMCatchupRounds, ACopyThatDoesNotCatchUpIsWaitedForOnlyTheGrace) {
     // The tick it asks for does not come - a flush stuck on a device, say. The wait is bounded, and
     // what ends it is the catch-up: the safe direction, since the rounds filter by the peer's vector
@@ -551,4 +575,51 @@ TEST(MMCatchupRounds, AWriteAfterTheVectorDoesNotPutTheDecisionOffAgain) {
     EXPECT_FALSE(node.mm->recheck_deferred_vectors_for_test());
     EXPECT_TRUE(peer.catchup_started) << "a write after the vector put the decision off again";
     EXPECT_FALSE(peer.catchup.active);
+}
+
+// #177: a vector too large for one frame - past 1 560 entries - was sent as "send everything", and
+// every reconciliation had the receiver send it the whole retained WAL. It goes in parts now, and the
+// receiver decides nothing until the last one has arrived.
+TEST(MMCatchupRounds, AVectorPastOneFrameGoesInPartsAndIsDecidedWhole) {
+    CatchupNode sender(1 << 20, 64 << 20, 64 << 10, kNoAutoFlush);
+    std::vector<ob::SequenceTracker::VectorEntry> wide;
+    for (uint64_t i = 0; i < 5'000; ++i) wide.push_back({"W" + std::to_string(i) + ".EX", 3, i + 1});
+    sender.engine->adopt_snapshot_sequence_state(wide, {});
+    WiredPeer out(kPeer);
+    (void)out.mgr(*sender.mm);
+    (void)sender.mm->reconcile_with_peers();
+    out.collect();
+    const auto frames = take_frames(out.inbox);
+    size_t parts = 0;
+    for (const auto& f : frames) {
+        EXPECT_NE(f.hdr.record_type, ob::WAL_RECORD_VERSION_VECTOR)
+            << "a vector this size went as one frame - the \"send everything\" it used to be";
+        if (f.hdr.record_type == ob::WAL_RECORD_VERSION_VECTOR_PART) ++parts;
+    }
+    ASSERT_EQ(parts, 4u) << "5 000 entries are four parts of 1 560";
+
+    // The receiver holds all of it already: it decides "no scan" - and only at the last part.
+    CatchupNode receiver(1 << 20, 64 << 20, 64 << 10, kNoAutoFlush);
+    receiver.engine->adopt_snapshot_sequence_state(wide, {});
+    WiredPeer from(kPeer);
+    ob::PeerConnection& peer = from.mgr(*receiver.mm);
+    peer.catchup_started    = false;
+    peer.vector_deadline_ms = 0;
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const auto& f = frames[i];
+        std::vector<uint8_t> frame;
+        ob::encode_frame_header(ob::MM_WALRECORD_V2_SIZE + f.payload.size(), frame);
+        const auto* hb = reinterpret_cast<const uint8_t*>(&f.hdr);
+        frame.insert(frame.end(), hb, hb + ob::MM_WALRECORD_V2_SIZE);
+        frame.insert(frame.end(), f.payload.begin(), f.payload.end());
+        peer.recv_buf.insert(peer.recv_buf.end(), frame.begin(), frame.end());
+        receiver.mm->process_recv_buf_for_test(peer);
+        if (i + 1 < frames.size()) {
+            EXPECT_FALSE(peer.catchup_started) << "decided on part " << i << " of the vector";
+        }
+    }
+    EXPECT_EQ(peer.peer_vector.entry_count(), 5'000u);
+    EXPECT_FALSE(peer.peer_vector.wants_everything());
+    EXPECT_TRUE(peer.catchup_started) << "the whole vector was not decided";
+    EXPECT_FALSE(peer.catchup.active) << "a peer holding everything was sent a scan";
 }

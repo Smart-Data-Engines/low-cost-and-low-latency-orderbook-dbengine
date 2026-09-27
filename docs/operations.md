@@ -748,6 +748,19 @@ sync" and stopped sending; nothing sent a snapshot, and the peer never got the r
 `ob_mm_backpressure_snapshot_total` is **removed**: it counted peers dropped by the check that
 preceded the rounds, under a name that promised a snapshot nothing sent.
 
+**A vector past 1 560 entries arrives in parts** (#177), and the receiver says so when the last part
+completes it:
+
+```
+Peer 3 version vector: entries=5000, in parts
+```
+
+`truncated=1` in the line a catch-up starts with means the peer could not state what it holds - since
+#177 a peer of an older build past 1 560 entries, or one past a million, which says so at `WARN` -
+and such a peer is sent everything retained, a round at a time. Before #177 every node past 1 560
+entries was one: each reconciliation resent the whole retained WAL, and a node that joined its mesh
+never asked for a snapshot.
+
 **One warning means a peer lacks what no catch-up here can send:**
 
 ```

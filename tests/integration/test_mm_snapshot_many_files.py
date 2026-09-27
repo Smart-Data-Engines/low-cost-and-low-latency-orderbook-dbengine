@@ -70,8 +70,8 @@ def metric(node, name: str) -> float:
 
 
 @pytest.mark.xfail(strict=True, raises=NotBootstrapped,
-                   reason="#177: past 1 561 vector entries a joiner never asks for a snapshot; "
-                          "#176: a snapshot of 65 535 files or more is refused")
+                   reason="#176: a snapshot of 65 535 files or more is refused - the joiner asks "
+                          "for one since #177, and is refused")
 def test_a_node_of_more_than_8192_segments_bootstraps_a_joiner(mm_cluster):
     writer = mm_cluster.nodes[0]
     client = client_for(writer)

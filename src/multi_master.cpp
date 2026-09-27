@@ -399,6 +399,15 @@ void MultiMasterManager::stop() {
         peer_registry_->deregister_self();
     }
 
+    // Anti-entropy next, before anything below closes what it uses. A pass sends each peer its
+    // vector under mtx_, and a send that drains a peer's buffer disarms EPOLLOUT on epoll_fd_ - and
+    // it was stopped last, after epoll_fd_ was closed: ThreadSanitizer caught a pass calling
+    // epoll_ctl() on the descriptor this function was closing (#177's CI, where a vector in parts
+    // made the pass longer). Its thread takes mtx_, so this must not hold it; stop() joins it.
+    if (anti_entropy_) {
+        anti_entropy_->stop();
+    }
+
     // Wake the io thread, then join it, and only then close anything it might be holding.
     //
     // The order matters and the previous one was wrong: closing listen_fd_ and epoll_fd_ here was
@@ -464,11 +473,6 @@ void MultiMasterManager::stop() {
         }
         peers_.clear();
         pending_.clear();
-    }
-
-    // Stop anti-entropy if running.
-    if (anti_entropy_) {
-        anti_entropy_->stop();
     }
 
     OB_LOG_INFO("mm", "MultiMasterManager stopped: node_id=%u", config_.node_id);
@@ -1818,6 +1822,20 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
             break;
     }
 
+    if (hdr.record_type == WAL_RECORD_VERSION_VECTOR_PART) {
+        // One part of a vector too large for one frame (#177). Nothing is decided until the last
+        // part completes it: until then the peer's vector is what it said before, and a handshake's
+        // deadline for its silence still runs.
+        if (!peer.peer_vector.deserialize_part(static_cast<const uint8_t*>(payload_ptr),
+                                               expected_payload_len)) {
+            return;
+        }
+        OB_LOG_INFO("mm", "Peer %u version vector: entries=%zu, in parts",
+                    peer.node_id, peer.peer_vector.entry_count());
+        on_peer_vector(peer);
+        return;
+    }
+
     if (hdr.record_type == WAL_RECORD_VERSION_VECTOR) {
         // The peer told us what it holds. This is what replaced the byte-offset comparison
         // that #61 was built on.
@@ -1830,38 +1848,7 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
             OB_LOG_WARN("mm", "Peer %u sent an unusable version vector — sending everything",
                         peer.node_id);
         }
-        // It has said something, so the handshake's deadline for its silence is over - and has to
-        // be, now that the decision below can be put off with `catchup_started` still false: the
-        // deadline would take the wait for a tick for silence and send everything (#180 part D).
-        peer.vector_deadline_ms = 0;
-        // Only scan the WAL if this peer is actually missing something. Reconciliation (#57)
-        // sends a vector to every peer on a timer, and a vector arriving used to start a full
-        // scan of the retained WAL — measured in the harness as `scanned=543 (9662010 bytes)
-        // sent=0`, repeated per peer per interval, on the io_loop thread that also carries live
-        // traffic. A 1 GB WAL at the 94 MB/s this scan runs at would spend most of every interval
-        // reading itself to discover there was nothing to send.
-        //
-        // Skipping is safe because every route by which a peer can be missing data leaves
-        // evidence in the comparison or forces a reconnect: a peer that was disconnected comes
-        // back through the handshake, a backlog dropped for not draining now closes the
-        // connection (#69), and a record the receiver refused leaves its own frontier behind, so
-        // peer_lacks is not empty. If a future change can drop a record while both sides stay
-        // connected and both frontiers keep moving, this shortcut has to go with it. The evidence
-        // is read from the copy of our vector, though, so it is only evidence once the copy has
-        // what the tracker had when the vector arrived - which decide_catchup_from_vector() waits
-        // for (#180 part D).
-        // A node that holds nothing cannot be caught up honestly: it will see sequence 5000
-        // before it ever sees 1, so it can never claim contiguity for a foreign origin and its
-        // peers keep resending records it already has (#67). A snapshot carries the sender's own
-        // frontiers, which is a base it may legitimately declare. Gated inside
-        // request_snapshot_from() on holding nothing at all, because the install discards
-        // whatever is here.
-        if (!peer.peer_vector.wants_everything() && peer.peer_vector.entry_count() > 0 &&
-            request_snapshot_from(peer)) {
-            return;
-        }
-
-        decide_catchup_from_vector(peer, /*may_defer=*/true);
+        on_peer_vector(peer);
         return;
     }
 
@@ -2144,28 +2131,34 @@ void MultiMasterManager::process_handshake(PeerConnection& peer,
 
 void MultiMasterManager::send_version_vector(PeerConnection& peer) {
     bool truncated = false;
-    const auto entries = engine_.export_version_vector(MM_MAX_VV_ENTRIES, truncated);
-    const auto payload = serialize_version_vector(entries, truncated);
+    const auto entries = engine_.export_version_vector(vector_limit(), truncated);
+    // One frame when it fits, parts of one generation when it does not (#177), enqueued together and
+    // in order - which is what the receiver's assembly relies on. Past one frame this used to be the
+    // "send everything" marker, and every reconciliation resent the whole retained WAL.
+    const auto records = serialize_version_vector_records(entries, truncated,
+                                                          ++vector_generation_sent_);
+    size_t bytes = 0;
+    for (const auto& r : records) {
+        WALRecordV2 hdr{};
+        hdr.sequence_number = 0;
+        hdr.timestamp_ns    = 0;
+        hdr.checksum        = crc32c(r.payload.data(), r.payload.size());
+        hdr.payload_len     = static_cast<uint16_t>(r.payload.size());
+        hdr.record_type     = r.record_type;
+        hdr.version         = 1;
+        hdr.origin_node_id  = config_.node_id;
+        std::memset(hdr.hlc_data, 0, sizeof(hdr.hlc_data));
 
-    WALRecordV2 hdr{};
-    hdr.sequence_number = 0;
-    hdr.timestamp_ns    = 0;
-    hdr.checksum        = crc32c(payload.data(), payload.size());
-    hdr.payload_len     = static_cast<uint16_t>(payload.size());
-    hdr.record_type     = WAL_RECORD_VERSION_VECTOR;
-    hdr.version         = 1;
-    hdr.origin_node_id  = config_.node_id;
-    std::memset(hdr.hlc_data, 0, sizeof(hdr.hlc_data));
-
-    std::vector<uint8_t> frame;
-    frame.reserve(MM_WALRECORD_V2_SIZE + payload.size());
-    const auto* hdr_bytes = reinterpret_cast<const uint8_t*>(&hdr);
-    frame.insert(frame.end(), hdr_bytes, hdr_bytes + MM_WALRECORD_V2_SIZE);
-    frame.insert(frame.end(), payload.begin(), payload.end());
-
-    enqueue_frame(peer, frame.data(), frame.size());
-    OB_LOG_INFO("mm", "Sent version vector to peer %u: entries=%zu truncated=%d bytes=%zu",
-                peer.node_id, entries.size(), truncated ? 1 : 0, frame.size());
+        std::vector<uint8_t> frame;
+        frame.reserve(MM_WALRECORD_V2_SIZE + r.payload.size());
+        const auto* hdr_bytes = reinterpret_cast<const uint8_t*>(&hdr);
+        frame.insert(frame.end(), hdr_bytes, hdr_bytes + MM_WALRECORD_V2_SIZE);
+        frame.insert(frame.end(), r.payload.begin(), r.payload.end());
+        enqueue_frame(peer, frame.data(), frame.size());
+        bytes += frame.size();
+    }
+    OB_LOG_INFO("mm", "Sent version vector to peer %u: entries=%zu truncated=%d frames=%zu bytes=%zu",
+                peer.node_id, entries.size(), truncated ? 1 : 0, records.size(), bytes);
 }
 
 ReconcileReport MultiMasterManager::reconcile_with_peers() {
@@ -2174,7 +2167,7 @@ ReconcileReport MultiMasterManager::reconcile_with_peers() {
     // The vector snapshot comes from the engine's cache, so this does not touch the engine mutex
     // while holding MM's — the cycle that deadlocked the flush thread once already.
     bool truncated = false;
-    const auto ours = engine_.export_version_vector(MM_MAX_VV_ENTRIES, truncated);
+    const auto ours = engine_.export_version_vector(vector_limit(), truncated);
 
     std::lock_guard<std::mutex> lock(mtx_);
     for (auto& [node_id, peer] : peers_) {
@@ -2215,10 +2208,56 @@ ReconcileReport MultiMasterManager::reconcile_with_peers() {
     return report;
 }
 
+void MultiMasterManager::on_peer_vector(PeerConnection& peer) {
+    // Caller holds mtx_: a whole vector has just arrived from `peer`, in one frame or in parts.
+    // It has said something, so the handshake's deadline for its silence is over - and has to
+    // be, now that the decision below can be put off with `catchup_started` still false: the
+    // deadline would take the wait for a tick for silence and send everything (#180 part D).
+    peer.vector_deadline_ms = 0;
+    // Only scan the WAL if this peer is actually missing something. Reconciliation (#57)
+    // sends a vector to every peer on a timer, and a vector arriving used to start a full
+    // scan of the retained WAL — measured in the harness as `scanned=543 (9662010 bytes)
+    // sent=0`, repeated per peer per interval, on the io_loop thread that also carries live
+    // traffic. A 1 GB WAL at the 94 MB/s this scan runs at would spend most of every interval
+    // reading itself to discover there was nothing to send.
+    //
+    // Skipping is safe because every route by which a peer can be missing data leaves
+    // evidence in the comparison or forces a reconnect: a peer that was disconnected comes
+    // back through the handshake, a backlog dropped for not draining now closes the
+    // connection (#69), and a record the receiver refused leaves its own frontier behind, so
+    // peer_lacks is not empty. If a future change can drop a record while both sides stay
+    // connected and both frontiers keep moving, this shortcut has to go with it. The evidence
+    // is read from the copy of our vector, though, so it is only evidence once the copy has
+    // what the tracker had when the vector arrived - which decide_catchup_from_vector() waits
+    // for (#180 part D).
+    // A node that holds nothing cannot be caught up honestly: it will see sequence 5000
+    // before it ever sees 1, so it can never claim contiguity for a foreign origin and its
+    // peers keep resending records it already has (#67). A snapshot carries the sender's own
+    // frontiers, which is a base it may legitimately declare. Gated inside
+    // request_snapshot_from() on holding nothing at all, because the install discards
+    // whatever is here.
+    if (!peer.peer_vector.wants_everything() && peer.peer_vector.entry_count() > 0 &&
+        request_snapshot_from(peer)) {
+        return;
+    }
+
+    decide_catchup_from_vector(peer, /*may_defer=*/true);
+}
+
 void MultiMasterManager::decide_catchup_from_vector(PeerConnection& peer, bool may_defer) {
     bool truncated = false;
     uint64_t covers = 0;
-    const auto ours = engine_.export_version_vector(MM_MAX_VV_ENTRIES, truncated, &covers);
+    const auto ours = engine_.export_version_vector(vector_limit(), truncated, &covers);
+    if (truncated) {
+        // A copy past the bound exports nothing, and nothing compared with the peer's vector reads
+        // as "it lacks nothing" - so a peer whose vector fits was never caught up from here (#177).
+        // Unknown is not nothing: the rounds filter by the peer's vector anyway.
+        OB_LOG_DEBUG("mm", "Peer %u: this node's vector is past what it states; catching the peer "
+                           "up from its own vector", peer.node_id);
+        peer.vector_recheck_listings = 0;
+        start_catchup_to_peer(peer);
+        return;
+    }
     const VectorDiff diff = compare_vectors(ours, peer.peer_vector, peer.node_id);
 
     if (!peer.peer_vector.wants_everything() && diff.peer_lacks.empty()) {
@@ -2470,7 +2509,7 @@ void MultiMasterManager::start_catchup_to_peer(PeerConnection& peer) {
     // Nothing to say about a peer that said nothing about itself.
     if (!st.wants_everything) {
         bool truncated = false;
-        const auto ours = engine_.export_version_vector(MM_MAX_VV_ENTRIES, truncated);
+        const auto ours = engine_.export_version_vector(vector_limit(), truncated);
         const VectorDiff diff = compare_vectors(ours, peer.peer_vector, peer.node_id);
         st.lacks.reserve(diff.peer_lacks.size());
         for (const auto& gap : diff.peer_lacks) {

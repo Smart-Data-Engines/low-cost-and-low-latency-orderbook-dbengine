@@ -103,15 +103,17 @@ TEST(MeshPerOriginNumbering, OwnNumbersStayContiguousWhateverAPeerWrote) {
 }
 
 TEST(MeshPerOriginNumbering, ARestartContinuesFromThisNodesOwnHighestNotEveryOrigins) {
-    // The segment is the only source here: a vector of more than 4 096 entries is never written
-    // (#177), and a flush leaves nothing for the replay. So what the restart continues this node's
-    // counter from is what the segment says about its own rows - where every origin's highest,
-    // which is all it used to say, is the peer's 100.
+    // The segment is the only source here: no vector reached the WAL (skip_vector_persistence_for_
+    // test(); until #177 this test made one of 4 097 origins, too large to write), and a flush leaves
+    // nothing for the replay. So what the restart continues this node's counter from is what the
+    // segment says about its own rows - where every origin's highest, which is all it used to say,
+    // is the peer's 100.
     TempDir live("mm_numbering_restart_live_");
     TempDir crashed("mm_numbering_restart_crash_");
     constexpr uint16_t kWideOrigins = 4097;
     {
         auto node = open_node(live.path, ob::FsyncPolicy::INTERVAL);
+        node->skip_vector_persistence_for_test();
         for (uint16_t k = 0; k < kWideOrigins; ++k) {
             ASSERT_EQ(deliver(*node, record("WIDE", 1, 1'000'000'000ULL + k),
                               static_cast<uint16_t>(3 + k)), ob::OB_OK);
@@ -121,10 +123,8 @@ TEST(MeshPerOriginNumbering, ARestartContinuesFromThisNodesOwnHighestNotEveryOri
         }
         for (uint64_t i = 1; i <= 3; ++i) write_own(*node, record("S", 0, 3'000'000'000ULL + i));
         node->flush_incremental();
-        bool truncated = false;
-        (void)node->export_version_vector(1u << 20, truncated);
-        ASSERT_TRUE(truncated) << "the vector fits, so it was written, and it would say how far "
-                                  "this node's own went instead of the segment";
+        ASSERT_FALSE(vector_in_wal(live.path)) << "a vector was written, and it would say how far "
+                                                   "this node's own went instead of the segment";
         const auto metas = metas_of(live.path, "S");
         ASSERT_FALSE(metas.empty());
         EXPECT_NE(metas.front().find("\"own_origin\":1,\"own_max_sequence\":3"), std::string::npos)

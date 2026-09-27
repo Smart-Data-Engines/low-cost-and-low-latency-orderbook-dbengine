@@ -7,8 +7,15 @@
 #include "orderbook/version_vector.hpp"
 
 #include <gtest/gtest.h>
+#include <rapidcheck/gtest.h>
 
 #include <cstring>
+#include <map>
+#include <set>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
 
 TEST(VersionVector, RoundTripsEntries) {
     std::vector<ob::SequenceTracker::VectorEntry> entries{
@@ -319,7 +326,7 @@ TEST(HeldRanges, ExportTruncatesAndSaysSoRatherThanDroppingSilently) {
 //
 // `payload_len` is a uint16_t in both the WAL record header and the multi-master frame header,
 // and the writers cast a size_t into it. A version vector of 4096 entries — the documented
-// maximum — is 172 kB, so the cast wrapped and produced a header claiming 40962 bytes for a
+// maximum until #177 — is 172 kB, so the cast wrapped and produced a header claiming 40962 bytes for a
 // 172034-byte payload. In the WAL that makes every later record unreadable, because replay takes
 // the header at its word and lands in the middle of this payload. On the wire the peer compares
 // `payload_len` against the frame it received, disagrees, and disconnects — again on every
@@ -380,4 +387,270 @@ TEST(VersionVectorLimits, HeldRangesAreTrimmedToFitRatherThanRefused) {
         EXPECT_EQ(e.ranges[0].first, 10u);
         EXPECT_EQ(e.ranges[1].second, 22u);
     }
+}
+
+// ── A vector of any size, in parts (#177) ─────────────────────────────────────
+//
+// Past 1 560 entries the single-record format has no room, and the vector used to be sent as "send
+// everything": every reconciliation resent the whole retained WAL, a restart wrote the marker down
+// and came back with no vector, and a joiner never asked for a snapshot.
+
+namespace {
+
+std::vector<ob::SequenceTracker::VectorEntry> entries_of(size_t n) {
+    std::vector<ob::SequenceTracker::VectorEntry> out;
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        out.push_back({"S" + std::to_string(i / 3) + ".EX", static_cast<uint16_t>(1 + i % 3),
+                       1000 + i});
+    }
+    return out;
+}
+
+std::map<std::pair<std::string, uint16_t>, uint64_t> as_map(
+        const std::vector<ob::SequenceTracker::VectorEntry>& entries) {
+    std::map<std::pair<std::string, uint16_t>, uint64_t> out;
+    for (const auto& e : entries) out[{e.key, e.origin}] = e.frontier;
+    return out;
+}
+
+/// Feed `records` to `pv` as a receiver does: the old type whole, a part through the assembly. True
+/// when the last record left a complete vector.
+bool receive(ob::PeerVector& pv, const std::vector<ob::VectorRecord>& records) {
+    bool complete = false;
+    for (const auto& r : records) {
+        complete = r.record_type == ob::WAL_RECORD_VERSION_VECTOR_PART
+                       ? pv.deserialize_part(r.payload.data(), r.payload.size())
+                       : pv.deserialize(r.payload.data(), r.payload.size());
+    }
+    return complete;
+}
+
+}  // namespace
+
+TEST(VectorParts, AVectorThatFitsOneRecordGoesAsOneRecordOfTheOldType) {
+    // A mesh below the old limit sees nothing new, and a node of a build before this reads it.
+    const auto records = ob::serialize_version_vector_records(entries_of(ob::VV_MAX_SINGLE_ENTRIES),
+                                                              false, 7);
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_EQ(records[0].record_type, ob::WAL_RECORD_VERSION_VECTOR);
+    ob::PeerVector pv;
+    ASSERT_TRUE(pv.deserialize(records[0].payload.data(), records[0].payload.size()));
+    EXPECT_FALSE(pv.truncated());
+    EXPECT_EQ(pv.entry_count(), ob::VV_MAX_SINGLE_ENTRIES);
+}
+
+TEST(VectorParts, OneEntryPastItGoesInPartsThatPutItBackTogether) {
+    const auto entries = entries_of(ob::VV_MAX_SINGLE_ENTRIES + 1);
+    const auto records = ob::serialize_version_vector_records(entries, false, 7);
+    ASSERT_EQ(records.size(), 2u);
+    for (const auto& r : records) {
+        EXPECT_EQ(r.record_type, ob::WAL_RECORD_VERSION_VECTOR_PART);
+        EXPECT_LE(r.payload.size(), ob::WAL_MAX_PAYLOAD_LEN);
+    }
+    ob::PeerVector pv;
+    EXPECT_FALSE(pv.deserialize_part(records[0].payload.data(), records[0].payload.size()))
+        << "a vector was taken from its first part";
+    EXPECT_TRUE(pv.wants_everything()) << "part of a vector was taken for what the peer holds";
+    ASSERT_TRUE(pv.deserialize_part(records[1].payload.data(), records[1].payload.size()));
+    EXPECT_FALSE(pv.wants_everything());
+    EXPECT_EQ(as_map(pv.entries()), as_map(entries));
+}
+
+TEST(VectorParts, AKeyAtTheWireLimitSurvivesParts) {
+    auto entries = entries_of(ob::VV_MAX_SINGLE_ENTRIES + 1);
+    const std::string key = "123456789012345.123456789012345";
+    ASSERT_EQ(key.size(), 31u);
+    entries.back().key = key;
+    const auto records = ob::serialize_version_vector_records(entries, false, 7);
+    ASSERT_EQ(records.size(), 2u);
+    ob::PeerVector pv;
+    ASSERT_TRUE(receive(pv, records));
+    EXPECT_EQ(pv.frontier_for(key, entries.back().origin), entries.back().frontier)
+        << "the longest possible key was clipped";
+}
+
+TEST(VectorParts, AVectorInPartsAfterTheSendEverythingMarkerReplacesIt) {
+    // A peer whose vector could not be stated - a build before this one, past 1 560 entries - and
+    // then could: what it says now is what it holds.
+    ob::PeerVector pv;
+    const auto marker = ob::serialize_version_vector({}, /*truncated=*/true);
+    ASSERT_TRUE(pv.deserialize(marker.data(), marker.size()));
+    ASSERT_TRUE(pv.wants_everything());
+    ASSERT_TRUE(receive(pv, ob::serialize_version_vector_records(entries_of(5'000), false, 1)));
+    EXPECT_FALSE(pv.wants_everything()) << "the peer was still read as unable to state its vector";
+    EXPECT_EQ(pv.entry_count(), 5'000u);
+}
+
+RC_GTEST_PROP(VectorPartsProperty, AnyVectorSentAndReceivedIsItself, ()) {
+    const auto n = *rc::gen::inRange<size_t>(0, 12'000);
+    const auto entries = entries_of(n);
+    const auto records =
+        ob::serialize_version_vector_records(entries, false, *rc::gen::arbitrary<uint32_t>());
+    for (const auto& r : records) RC_ASSERT(r.payload.size() <= ob::WAL_MAX_PAYLOAD_LEN);
+    RC_ASSERT((records.size() == 1) == (n <= ob::VV_MAX_SINGLE_ENTRIES));
+    ob::PeerVector pv;
+    RC_ASSERT(receive(pv, records));
+    RC_ASSERT(!pv.wants_everything());
+    RC_ASSERT(as_map(pv.entries()) == as_map(entries));
+}
+
+TEST(VectorParts, APartOutOfSequenceDropsTheAssemblyAndTheVectorBeforeItStands) {
+    // Parts of one vector are written and sent together and in order, so a gap, a part of another
+    // generation or a part with nothing open means that assembly will not complete.
+    ob::PeerVector pv;
+    ASSERT_TRUE(receive(pv, ob::serialize_version_vector_records(entries_of(100), false, 1)));
+    const auto a = ob::serialize_version_vector_records(entries_of(5'000), false, 2);
+    const auto b = ob::serialize_version_vector_records(entries_of(5'000), false, 3);
+    ASSERT_EQ(a.size(), 4u);
+    const auto part = [&pv](const ob::VectorRecord& r) {
+        return pv.deserialize_part(r.payload.data(), r.payload.size());
+    };
+    // Each refused part is followed by the parts that would complete an assembly that took it: every
+    // step answers false until a vector completes, so the answer to the bad part alone says nothing.
+    EXPECT_FALSE(part(a[0]));
+    EXPECT_FALSE(part(a[2])) << "a part was skipped";
+    EXPECT_FALSE(part(a[3])) << "nothing is open, and the last part completed a vector";
+    EXPECT_FALSE(part(a[1])) << "the parts left completed a vector, the skipped one last";
+    EXPECT_EQ(pv.entry_count(), 100u) << "an incomplete vector replaced the one before it";
+
+    EXPECT_FALSE(part(a[0]));
+    EXPECT_FALSE(part(b[1]));
+    EXPECT_FALSE(part(a[2]));
+    EXPECT_FALSE(part(a[3])) << "another generation's part continued this one, and they completed it";
+    EXPECT_EQ(pv.entry_count(), 100u);
+
+    EXPECT_TRUE(receive(pv, b)) << "a whole vector after all that was not taken";
+    EXPECT_EQ(pv.entry_count(), 5'000u);
+}
+
+TEST(VectorParts, AVectorInPartsReplacesTheOneBeforeIt) {
+    // What the peer says now is all it holds: a pair it listed before and not now reads as nothing.
+    ob::PeerVector pv;
+    ASSERT_TRUE(receive(pv, ob::serialize_version_vector_records(entries_of(5'000), false, 1)));
+    std::vector<ob::SequenceTracker::VectorEntry> other;
+    for (uint64_t i = 0; i < 3'000; ++i) other.push_back({"T" + std::to_string(i) + ".EX", 2, i + 1});
+    ASSERT_TRUE(receive(pv, ob::serialize_version_vector_records(other, false, 2)));
+    EXPECT_EQ(pv.entry_count(), 3'000u) << "the vector before it was kept alongside";
+    EXPECT_EQ(pv.frontier_for("S0.EX", 1), 0u) << "a pair only the vector before listed still reads";
+    EXPECT_EQ(as_map(pv.entries()), as_map(other));
+}
+
+TEST(VectorParts, APartWhoseLengthDoesNotAddUpIsRefused) {
+    auto parts = ob::serialize_version_vector_records(entries_of(5'000), false, 2);
+    auto cut = parts[0].payload;
+    cut.pop_back();
+    ob::PeerVector pv;
+    EXPECT_FALSE(pv.deserialize_part(cut.data(), cut.size()));
+    for (size_t i = 1; i < parts.size(); ++i) {
+        EXPECT_FALSE(pv.deserialize_part(parts[i].payload.data(), parts[i].payload.size()))
+            << "the parts after one that did not add up completed a vector with it";
+    }
+    EXPECT_FALSE(pv.deserialize_part(parts[0].payload.data(), 5)) << "shorter than a part's header";
+    EXPECT_FALSE(pv.received());
+    // And the vector it belonged to arrives whole afterwards.
+    EXPECT_TRUE(receive(pv, parts));
+}
+
+TEST(VectorParts, TheSnapshotsBlockCarriesAVectorOfAnySize) {
+    for (const size_t n : {size_t{0}, size_t{100}, ob::VV_MAX_SINGLE_ENTRIES,
+                           ob::VV_MAX_SINGLE_ENTRIES + 1, size_t{12'000}}) {
+        const auto entries = entries_of(n);
+        const auto blob = ob::serialize_version_vector_blob(entries);
+        std::vector<ob::SequenceTracker::VectorEntry> out;
+        bool says_send_everything = true;
+        ASSERT_TRUE(ob::deserialize_version_vector_blob(blob.data(), blob.size(), out,
+                                                        says_send_everything)) << n;
+        EXPECT_FALSE(says_send_everything) << n;
+        EXPECT_EQ(as_map(out), as_map(entries)) << n;
+    }
+    // A receiver of a build before this reads the marker as an entry count, and refuses the block -
+    // as it refused the "send everything" a vector that size was before.
+    const auto large = ob::serialize_version_vector_blob(entries_of(5'000));
+    ob::PeerVector older;
+    EXPECT_FALSE(older.deserialize(large.data(), large.size()));
+    std::vector<ob::SequenceTracker::VectorEntry> out;
+    bool says = false;
+    auto torn = large;
+    torn.resize(torn.size() - 1);
+    EXPECT_FALSE(ob::deserialize_version_vector_blob(torn.data(), torn.size(), out, says))
+        << "a block cut short was taken for a vector";
+    auto longer = large;
+    longer.push_back(0);
+    EXPECT_FALSE(ob::deserialize_version_vector_blob(longer.data(), longer.size(), out, says))
+        << "a block with bytes after its vector was taken for one";
+    auto more_parts = large;
+    uint32_t parts = 0;
+    std::memcpy(&parts, more_parts.data() + sizeof(uint16_t), sizeof(parts));
+    ++parts;
+    std::memcpy(more_parts.data() + sizeof(uint16_t), &parts, sizeof(parts));
+    EXPECT_FALSE(ob::deserialize_version_vector_blob(more_parts.data(), more_parts.size(), out, says))
+        << "a block that says it holds a part more than its vector was taken for one";
+}
+
+TEST(CompareVectors, FiveThousandEntriesEachWayAreComparedEntryForEntry) {
+    // "What this node lacks" is found by the walk over ours now, and a pair only the peer lists
+    // through a set of ours; what it finds is the same.
+    auto ours = entries_of(5'000);
+    auto theirs_entries = entries_of(5'000);
+    theirs_entries[17].frontier += 5;        // they hold more of one
+    theirs_entries.push_back({"ONLY.THEIRS", 9, 3});
+    const auto payload_records = ob::serialize_version_vector_records(theirs_entries, false, 1);
+    ob::PeerVector theirs;
+    ASSERT_TRUE(receive(theirs, payload_records));
+    const auto diff = ob::compare_vectors(ours, theirs, 2);
+    ASSERT_EQ(diff.we_lack.size(), 2u);
+    EXPECT_TRUE(diff.peer_lacks.empty());
+}
+
+RC_GTEST_PROP(CompareVectorsProperty, BothDirectionsAreWhatComparingEveryPairFinds, ()) {
+    // Two vectors over one pool of (key, origin) pairs, each side listing any part of it - the peer
+    // with frontiers of 0 too, which its wire can carry: the walk over ours, the count that says the
+    // peer listed nothing else, and the walk over theirs when it did must find what comparing every
+    // pair of one side with every pair of the other finds (#177).
+    const auto symbols = *rc::gen::inRange<size_t>(0, 30);
+    std::vector<ob::SequenceTracker::VectorEntry> ours;
+    std::vector<ob::SequenceTracker::VectorEntry> theirs_entries;
+    for (size_t s = 0; s < symbols; ++s) {
+        const std::string key = "K" + std::to_string(s) + ".EX";
+        for (uint16_t origin = 1; origin <= 3; ++origin) {
+            if (*rc::gen::arbitrary<bool>()) {
+                ours.push_back({key, origin, *rc::gen::inRange<uint64_t>(1, 20)});
+            }
+            if (*rc::gen::arbitrary<bool>()) {
+                theirs_entries.push_back({key, origin, *rc::gen::inRange<uint64_t>(0, 20)});
+            }
+        }
+    }
+    const auto theirs = make_peer_vector(theirs_entries);
+    const auto diff = ob::compare_vectors(ours, theirs, 7);
+
+    using Gap = std::tuple<std::string, uint16_t, uint64_t, uint64_t>;
+    std::multiset<Gap> peer_lacks;
+    std::multiset<Gap> we_lack;
+    for (const auto& o : ours) {
+        uint64_t t = 0;
+        for (const auto& e : theirs_entries) {
+            if (e.key == o.key && e.origin == o.origin) t = e.frontier;
+        }
+        if (t < o.frontier) peer_lacks.insert(Gap{o.key, o.origin, t + 1, o.frontier});
+    }
+    for (const auto& e : theirs_entries) {
+        uint64_t mine = 0;
+        for (const auto& o : ours) {
+            if (o.key == e.key && o.origin == e.origin) mine = o.frontier;
+        }
+        if (mine < e.frontier) we_lack.insert(Gap{e.key, e.origin, mine + 1, e.frontier});
+    }
+
+    const auto as_set = [](const std::vector<ob::VectorGap>& gaps) {
+        std::multiset<Gap> out;
+        for (const auto& g : gaps) {
+            RC_ASSERT(g.peer_node_id == 7u);
+            out.insert(Gap{g.key, g.origin, g.from_seq, g.to_seq});
+        }
+        return out;
+    };
+    RC_ASSERT(as_set(diff.peer_lacks) == peer_lacks);
+    RC_ASSERT(as_set(diff.we_lack) == we_lack);
 }

@@ -37,6 +37,9 @@ inline constexpr uint8_t WAL_RECORD_VERSION_VECTOR = 7;
 /// was holding, and the next redelivery — which catch-up performs on purpose — is applied a second
 /// time into append-only storage. Catch-up forwards only DELTA records, so peers never see this.
 inline constexpr uint8_t WAL_RECORD_HELD_SEQUENCES = 8;
+/// One part of a version vector too large for one record (#177): see `VectorAssembler`. A build that
+/// does not know the type skips it, in a WAL and on a mesh link, as it skips any it does not know.
+inline constexpr uint8_t WAL_RECORD_VERSION_VECTOR_PART = 9;
 
 /// Reserved: 200 and above are wire-only message types, never written to a WAL file.
 ///
@@ -405,6 +408,10 @@ public:
     /// a lower frontier, asks a peer for more than it needs and drops the duplicates. Losing
     /// it cannot cost data.
     void append_version_vector(const uint8_t* payload, size_t payload_len);
+    /// The same for one part of a vector in parts (#177, WAL_RECORD_VERSION_VECTOR_PART). The parts of
+    /// one vector go in one critical section, one after another, which is what lets a restart put them
+    /// back together by their order.
+    void append_version_vector_part(const uint8_t* payload, size_t payload_len);
 
     /// Write a HELD_SEQUENCES record (type 8). Not fsynced, for the same reason as the vector:
     /// losing it costs redeliveries and duplicate drops, never data.

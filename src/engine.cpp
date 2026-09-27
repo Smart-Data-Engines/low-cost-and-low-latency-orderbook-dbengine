@@ -502,6 +502,10 @@ void Engine::persist_version_vector_if_changed() {
     // thread waiting on a mutex it already held while every client write queued behind it.
     const uint64_t fp = seq_tracker_.fingerprint();
     if (fp == vector_fingerprint_written_) return;      // nothing moved
+    if (skip_vector_persistence_.load(std::memory_order_relaxed)) {
+        update_version_vector_cache();                  // what peers are told still moves
+        return;
+    }
 
     bool truncated = false;
     auto entries = seq_tracker_.export_vector(kMaxPersistedVectorEntries, truncated);
@@ -517,8 +521,19 @@ void Engine::persist_version_vector_if_changed() {
         return;
     }
 
-    const auto payload = serialize_version_vector(entries, /*truncated=*/false);
-    wal_.append_version_vector(payload.data(), payload.size());
+    // One record when it fits, parts of one generation when it does not (#177) - one after another,
+    // in this critical section, which is what lets a restart put them back together by their order.
+    const auto records = serialize_version_vector_records(entries, /*truncated=*/false,
+                                                          ++vector_generation_written_);
+    size_t bytes = 0;
+    for (const auto& r : records) {
+        if (r.record_type == WAL_RECORD_VERSION_VECTOR_PART) {
+            wal_.append_version_vector_part(r.payload.data(), r.payload.size());
+        } else {
+            wal_.append_version_vector(r.payload.data(), r.payload.size());
+        }
+        bytes += r.payload.size();
+    }
 
     // The held set goes with it. The frontier alone describes a node that followed every origin's
     // stream from its first record; anything that arrived out of order lives above the frontier,
@@ -540,8 +555,8 @@ void Engine::persist_version_vector_if_changed() {
     }
     vector_fingerprint_written_ = fp;
 
-    OB_LOG_DEBUG("engine", "Persisted version vector: entries=%zu bytes=%zu",
-                 entries.size(), payload.size());
+    OB_LOG_DEBUG("engine", "Persisted version vector: entries=%zu bytes=%zu records=%zu",
+                 entries.size(), bytes, records.size());
 }
 
 void Engine::restore_held_sequences() {
@@ -681,27 +696,44 @@ void Engine::load_or_create_wal_identity() {
 bool Engine::restore_version_vector() {
     // Caller holds nothing: this runs from open() before the flush thread exists.
     // A full pass, like the epoch restore: the vector is written next to a checkpoint, so
-    // replay_after_checkpoint() would usually skip it. Keep the last one seen.
-    std::vector<uint8_t> last;
+    // replay_after_checkpoint() would usually skip it. Keep the last one seen - one record, or parts of
+    // one generation put back together in their order (#177); a set of parts a crash cut short is not
+    // a vector, and the one before it stands.
+    std::optional<std::vector<SequenceTracker::VectorEntry>> last;
+    bool last_unusable = false;
+    VectorAssembler parts;
     WALReplayer replayer(base_dir_);
-    replayer.replay_v2([&last](const WALReplayContext& ctx) {
-        if (ctx.header.record_type != WAL_RECORD_VERSION_VECTOR) return;
-        last.assign(ctx.payload, ctx.payload + ctx.payload_len);
+    replayer.replay_v2([&](const WALReplayContext& ctx) {
+        if (ctx.header.record_type == WAL_RECORD_VERSION_VECTOR) {
+            PeerVector one;
+            if (one.deserialize(ctx.payload, ctx.payload_len) && !one.truncated()) {
+                last = one.entries();
+                last_unusable = false;
+            } else {
+                last.reset();
+                last_unusable = true;
+            }
+            return;
+        }
+        if (ctx.header.record_type == WAL_RECORD_VERSION_VECTOR_PART) {
+            if (parts.add(ctx.payload, ctx.payload_len) == VectorAssembler::Step::Complete) {
+                last = parts.take();
+                last_unusable = false;
+            }
+        }
     });
 
-    if (last.empty()) {
-        OB_LOG_INFO("engine", "No version vector in the WAL — this node will ask peers for "
-                              "everything they have");
+    if (!last) {
+        if (last_unusable) {
+            OB_LOG_WARN("engine", "Persisted version vector unusable — asking peers for everything");
+        } else {
+            OB_LOG_INFO("engine", "No version vector in the WAL — this node will ask peers for "
+                                  "everything they have");
+        }
         return false;
     }
 
-    PeerVector own;
-    if (!own.deserialize(last.data(), last.size()) || own.truncated()) {
-        OB_LOG_WARN("engine", "Persisted version vector unusable — asking peers for everything");
-        return false;
-    }
-
-    std::vector<SequenceTracker::VectorEntry> entries = own.entries();
+    std::vector<SequenceTracker::VectorEntry> entries = std::move(*last);
     size_t own_raised = 0;
     {
         std::unique_lock<std::mutex> lock(mtx_);

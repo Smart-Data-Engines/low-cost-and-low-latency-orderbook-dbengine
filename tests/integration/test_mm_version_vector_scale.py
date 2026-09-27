@@ -139,9 +139,10 @@ def test_below_the_limit_a_converged_mesh_resends_nothing(vv_mesh):
     assert all(v < BELOW // 10 for v in dropped.values()), dropped
 
 
-@pytest.mark.xfail(strict=True, reason="#177: a vector past 1 561 entries is sent as 'send "
-                                       "everything', so every reconciliation resends the WAL")
 def test_above_the_limit_a_converged_mesh_resends_nothing(vv_mesh):
+    """#177: from 1 561 entries on, a vector was sent as 'send everything', and every reconciliation
+    had the receiver resend its whole retained WAL - 9 600 to 20 800 duplicates a node in this window.
+    It goes in parts now."""
     write_symbols(vv_mesh.nodes[0], BELOW, ABOVE)
     wait_until_every_node_has(vv_mesh.nodes, ABOVE)
     flush_everywhere(vv_mesh.nodes)
@@ -151,9 +152,9 @@ def test_above_the_limit_a_converged_mesh_resends_nothing(vv_mesh):
     assert all(v < ABOVE // 10 for v in dropped.values()), dropped
 
 
-@pytest.mark.xfail(strict=True, reason="#177: a node that joins a mesh whose vectors are past "
-                                       "1 561 entries never asks for a snapshot")
 def test_a_node_that_joins_above_the_limit_asks_for_a_snapshot(vv_mesh):
+    """#177: a joiner asks for a snapshot only from a peer whose vector says what it holds, and from
+    1 561 entries on none did."""
     if len(vv_mesh.nodes) != 3:
         pytest.skip("runs on the mesh the two tests above filled; select the whole module")
     joiner = vv_mesh.add_multi_master_node(timeout=60)
