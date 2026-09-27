@@ -8,9 +8,13 @@ reaches only by neglect: part 2b of #165 merges a symbol's segments, but not bel
 hour, so 8 192 instruments are past it whatever merging does.
 
 Measured before the fix, the joiner of this test never got as far as the refusal: at 8 200
-(symbol, origin) entries a version vector is sent as "send everything", and a joiner asks for a
+(symbol, origin) entries a version vector was sent as "send everything", and a joiner asks for a
 snapshot only from a peer whose vector says what it holds (#177). It caught up from the WAL
-instead, which its peers still held. So the marker names both, and the test says which one it met.
+instead, which its peers still held. Since #177 it asked, and was refused - the module's strict
+xfail until #176, which is what the test still says when it fails: which of the two it met.
+
+Since #176 a joiner says in its request that it takes chunks with a 32-bit file index and up to
+1 GiB of metadata, and a peer of the same build sends it both.
 
 The module has its own three-node mesh, as `test_mm_snapshot_bootstrap.py` does, because the test
 adds a fourth node for good and fills every node with 8 200 segments.
@@ -37,10 +41,11 @@ BOOTSTRAP_TIMEOUT = 180.0
 
 
 class NotBootstrapped(AssertionError):
-    """The joiner received no snapshot. The one failure the #176 marker is about.
+    """The joiner received no snapshot, and what the nodes said about it.
 
-    Its own type so the strict xfail below covers only it: a premise that did not hold - a node
-    with fewer segments than the test needs - fails as itself rather than as the defect.
+    Its own type, as it was while the strict xfail of #176 covered only it: a premise that did not
+    hold - a node with fewer segments than the test needs - fails as itself rather than as the
+    defect.
     """
 
 
@@ -69,9 +74,10 @@ def metric(node, name: str) -> float:
         return -1.0
 
 
-@pytest.mark.xfail(strict=True, raises=NotBootstrapped,
-                   reason="#176: a snapshot of 65 535 files or more is refused - the joiner asks "
-                          "for one since #177, and is refused")
+# Above the battery's 120 s: filling the nodes takes about half of that, and a joiner that never gets
+# its snapshot has to reach the test's own deadlines - which say what the nodes said - before pytest's
+# ends it with nothing but "Timeout".
+@pytest.mark.timeout(480)
 def test_a_node_of_more_than_8192_segments_bootstraps_a_joiner(mm_cluster):
     writer = mm_cluster.nodes[0]
     client = client_for(writer)
@@ -110,9 +116,10 @@ def test_a_node_of_more_than_8192_segments_bootstraps_a_joiner(mm_cluster):
     joiner = mm_cluster.add_multi_master_node(timeout=60)
     mm_cluster.wait_for_mm_mesh(timeout=90)
 
-    # Three ways out, and each says which: the snapshot arrives; a peer refuses it (#176); or the
-    # joiner never asks (#177) - which it would have done within the handshake's two-second grace,
-    # so twenty seconds of silence is an answer rather than a slow machine.
+    # Four ways out, and each says which: the snapshot arrives; a peer refuses it (#176); the joiner
+    # abandons one part-way; or it never asks (#177) - which it would have done within the
+    # handshake's two-second grace, so twenty seconds of silence is an answer rather than a slow
+    # machine.
     peers = mm_cluster.nodes[:-1]
     failed_before = sum(metric(n, "ob_mm_snapshot_failed_total") for n in peers)
     formed = time.monotonic()
@@ -123,6 +130,9 @@ def test_a_node_of_more_than_8192_segments_bootstraps_a_joiner(mm_cluster):
             break
         if sum(metric(n, "ob_mm_snapshot_failed_total") for n in peers) > failed_before:
             outcome = "a peer refused the snapshot (#176)"
+            break
+        if metric(joiner, "ob_mm_snapshot_failed_total") > 0.0:
+            outcome = "the joiner abandoned a snapshot part-way"
             break
         if (metric(joiner, "ob_mm_snapshot_requested_total") < 1.0
                 and time.monotonic() - formed > 20.0):

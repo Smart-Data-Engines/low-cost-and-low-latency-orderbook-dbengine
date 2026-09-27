@@ -9,8 +9,10 @@
 // Nothing new was needed on the wire. Frames after the handshake are untagged: each carries a
 // WALRecordV2 header whose `record_type` is the only discriminator, `handle_frame()` branches on
 // it, and an unknown value falls through to `handle_remote_record()`, which skips it and stays
-// connected. That is the door the version vector went through, and these five messages go
-// through it too — so a node running the older build stays in the cluster.
+// connected. That is the door the version vector went through, and these messages go through it
+// too — so a node running the older build stays in the cluster. The one #176 added, a chunk with a
+// 32-bit file index, goes only to a node whose request says it takes one: a node that skipped
+// every chunk would wait for bytes that never come.
 
 #include "orderbook/multi_master.hpp"
 
@@ -94,15 +96,20 @@ bool decode_snapshot_begin(const uint8_t* data, size_t len, SnapshotBegin& out) 
     // A manifest of zero bytes cannot describe anything, and there is no reason to open staging
     // for it.
     if (b.manifest_len == 0) return false;
-    // The blob is assembled in memory, so the announced size is an allocation this peer chose.
-    if (b.total() > MM_SNAPSHOT_MAX_META_BYTES) return false;
+    // The blob is assembled in memory, so the announced size is an allocation this peer chose. A
+    // build before #176 took 8 MiB at most, and this one says in its request that it takes more.
+    if (b.total() > MM_SNAPSHOT_MAX_META_BYTES_LARGE) return false;
 
     out = b;
     return true;
 }
 
-std::vector<uint8_t> encode_snapshot_chunk(uint16_t file_index, uint64_t byte_offset,
-                                           const uint8_t* bytes, size_t n) {
+namespace {
+
+/// The chunk encoder of both widths (#176): the index is the one field in which they differ.
+template <typename Index>
+std::vector<uint8_t> encode_chunk(Index file_index, uint64_t byte_offset, const uint8_t* bytes,
+                                  size_t n) {
     // Sized once at its final length and written by index, rather than reserved and pushed into.
     //
     // The shape this replaces was correct: reserve() covered the header and the payload, so none of
@@ -118,14 +125,29 @@ std::vector<uint8_t> encode_snapshot_chunk(uint16_t file_index, uint64_t byte_of
     // snapshot transfer path. One allocation and no copy is the better answer as well as the quiet
     // one, which is the only reason this file changed at all rather than the diagnostic being
     // switched off.
-    static_assert(MM_SNAPSHOT_CHUNK_HEADER_SIZE == sizeof(uint16_t) + sizeof(uint64_t),
-                  "the two offsets written below and the header constant are one fact; a header "
-                  "that grows a field must move them together");
-    std::vector<uint8_t> out(MM_SNAPSHOT_CHUNK_HEADER_SIZE + n);
-    put_le_at<uint16_t>(out.data(), file_index);
-    put_le_at<uint64_t>(out.data() + sizeof(uint16_t), byte_offset);
-    if (n > 0 && bytes) std::memcpy(out.data() + MM_SNAPSHOT_CHUNK_HEADER_SIZE, bytes, n);
+    constexpr size_t header = sizeof(Index) + sizeof(uint64_t);
+    std::vector<uint8_t> out(header + n);
+    put_le_at<Index>(out.data(), file_index);
+    put_le_at<uint64_t>(out.data() + sizeof(Index), byte_offset);
+    if (n > 0 && bytes) std::memcpy(out.data() + header, bytes, n);
     return out;
+}
+
+}  // namespace
+
+std::vector<uint8_t> encode_snapshot_chunk(uint16_t file_index, uint64_t byte_offset,
+                                           const uint8_t* bytes, size_t n) {
+    static_assert(MM_SNAPSHOT_CHUNK_HEADER_SIZE == sizeof(uint16_t) + sizeof(uint64_t),
+                  "the two offsets written by encode_chunk() and the header constant are one fact; "
+                  "a header that grows a field must move them together");
+    return encode_chunk<uint16_t>(file_index, byte_offset, bytes, n);
+}
+
+std::vector<uint8_t> encode_snapshot_chunk_wide(uint32_t file_index, uint64_t byte_offset,
+                                                const uint8_t* bytes, size_t n) {
+    static_assert(MM_SNAPSHOT_WIDE_CHUNK_HEADER_SIZE == sizeof(uint32_t) + sizeof(uint64_t),
+                  "the two offsets written by encode_chunk() and the header constant are one fact");
+    return encode_chunk<uint32_t>(file_index, byte_offset, bytes, n);
 }
 
 bool decode_snapshot_chunk(const uint8_t* data, size_t len,
@@ -137,6 +159,26 @@ bool decode_snapshot_chunk(const uint8_t* data, size_t len,
     n           = len - MM_SNAPSHOT_CHUNK_HEADER_SIZE;
     bytes       = (n > 0) ? data + MM_SNAPSHOT_CHUNK_HEADER_SIZE : nullptr;
     return true;
+}
+
+bool decode_snapshot_chunk_wide(const uint8_t* data, size_t len,
+                                uint32_t& file_index, uint64_t& byte_offset,
+                                const uint8_t*& bytes, size_t& n) {
+    if (!data || len < MM_SNAPSHOT_WIDE_CHUNK_HEADER_SIZE) return false;
+    file_index  = get_u32(data);
+    byte_offset = get_u64(data + 4);
+    n           = len - MM_SNAPSHOT_WIDE_CHUNK_HEADER_SIZE;
+    bytes       = (n > 0) ? data + MM_SNAPSHOT_WIDE_CHUNK_HEADER_SIZE : nullptr;
+    return true;
+}
+
+std::vector<uint8_t> encode_snapshot_request(uint8_t takes) {
+    return {takes};
+}
+
+uint8_t decode_snapshot_request(const uint8_t* data, size_t len) {
+    if (!data || len == 0) return 0;
+    return static_cast<uint8_t>(data[0] & MM_SNAPSHOT_TAKES_LARGE);
 }
 
 std::vector<uint8_t> encode_snapshot_end() {
@@ -201,7 +243,8 @@ void MultiMasterManager::send_snapshot_abort(PeerConnection& peer, const char* r
     OB_LOG_WARN("mm", "Snapshot aborted towards peer %u: %s", peer.node_id, reason);
 }
 
-void MultiMasterManager::handle_snapshot_request(PeerConnection& peer) {
+void MultiMasterManager::handle_snapshot_request(PeerConnection& peer, const uint8_t* payload,
+                                                 size_t len) {
     // Reached from io_loop() with MM's mtx_ held. Since #79 nothing here calls into the engine: the
     // flush and the checksum pass over every stored file happen on a worker thread, and this
     // function's whole job is to decide whether to start one. Two consequences worth naming. The io
@@ -209,8 +252,14 @@ void MultiMasterManager::handle_snapshot_request(PeerConnection& peer) {
     // which puts a gigabyte at about 1.7 seconds. And the edge
     // MM::mtx_ → Engine::flush_mtx_ → Engine::mtx_ is gone from this path, so the cycle #80 was
     // about is one caller shorter; request_snapshot_from() below still has it.
-    OB_LOG_INFO("mm", "Peer %u requested a snapshot (connection %llu)", peer.node_id,
-                static_cast<unsigned long long>(peer.conn_id));
+    // What the peer takes decides the chunks it is sent and how much metadata (#176); a build
+    // before #176 says nothing, and is sent what that build takes.
+    const uint8_t takes = decode_snapshot_request(payload, len);
+    OB_LOG_INFO("mm", "Peer %u requested a snapshot (connection %llu, %s)", peer.node_id,
+                static_cast<unsigned long long>(peer.conn_id),
+                (takes & MM_SNAPSHOT_TAKES_LARGE) != 0
+                    ? "takes wide chunks"
+                    : "asks as a build before #176 does: 16-bit chunks, 8 MiB of metadata");
 
     if (snapshot_send_.active) {
         OB_LOG_WARN("mm", "Refusing snapshot for peer %u: already sending one to peer %u",
@@ -254,6 +303,7 @@ void MultiMasterManager::handle_snapshot_request(PeerConnection& peer) {
     snapshot_prepare_.target_node_id = peer.node_id;
     snapshot_prepare_.target_conn_id = peer.conn_id;
     snapshot_prepare_.token          = token;
+    snapshot_prepare_.receiver_takes = takes;
     snapshot_prepare_.started_at     = std::chrono::steady_clock::now();
 
     OB_LOG_INFO("mm",
@@ -375,13 +425,16 @@ void MultiMasterManager::poll_snapshot_preparation() {
                 "Snapshot for peer %u is ready after %.1f ms on the worker (token %llu)",
                 peer->node_id, prepare_ms, static_cast<unsigned long long>(result->token));
 
+    const uint8_t takes = prep.receiver_takes;
     prep = MMSnapshotPrepare{};
-    begin_snapshot_send(*peer, std::move(result->snap));
+    begin_snapshot_send(*peer, std::move(result->snap), takes);
 }
 
 void MultiMasterManager::begin_snapshot_send(PeerConnection& peer,
-                                             SnapshotWithSequenceState&& snap_in) {
+                                             SnapshotWithSequenceState&& snap_in,
+                                             uint8_t receiver_takes) {
     SnapshotWithSequenceState snap = std::move(snap_in);
+    const bool large = (receiver_takes & MM_SNAPSHOT_TAKES_LARGE) != 0;
 
     engine_.registry().set_gauge("ob_mm_snapshot_create_ms",
                                  static_cast<int64_t>(snap.create_ms));
@@ -416,16 +469,21 @@ void MultiMasterManager::begin_snapshot_send(PeerConnection& peer,
               [](const SnapshotFileEntry& a, const SnapshotFileEntry& b) {
                   return a.path < b.path;
               });
-    // A chunk names its file with a uint16_t, and 0xFFFF is taken by the metadata blob. So a
-    // manifest of 65535 files or more cannot be addressed at all — the index would wrap, or
-    // collide with MM_SNAPSHOT_META_INDEX, and the receiver would write one file's bytes into
-    // another. Refusing with a reason beats either.
-    if (snap.manifest.files.size() >= MM_SNAPSHOT_META_INDEX) {
+    // A chunk names its file by its index in the manifest, and the largest index is the metadata
+    // blob's. So a manifest of that many files or more cannot be addressed at all — the index would
+    // wrap, or collide with the metadata's, and the receiver would write one file's bytes into
+    // another. Refusing with a reason beats either. A 16-bit index was every build's before #176,
+    // and a node of 8 192 segments could bootstrap no peer; a receiver that takes wide chunks is
+    // sent 32 bits.
+    const size_t addressable = large ? size_t{MM_SNAPSHOT_WIDE_META_INDEX}
+                                     : size_t{MM_SNAPSHOT_META_INDEX};
+    if (snap.manifest.files.size() >= addressable) {
         OB_LOG_ERROR("mm",
-                     "Refusing snapshot for peer %u: %zu files cannot be addressed by a 16-bit "
-                     "index (limit %u)",
-                     peer.node_id, snap.manifest.files.size(),
-                     static_cast<unsigned>(MM_SNAPSHOT_META_INDEX));
+                     "Refusing snapshot for peer %u: %zu files cannot be addressed by a %s-bit "
+                     "index (limit %zu)%s",
+                     peer.node_id, snap.manifest.files.size(), large ? "32" : "16", addressable,
+                     large ? "" : " - it asked as a build before #176 does, which takes no wider "
+                                  "one; a node of this build or later takes up to 32 bits");
         engine_.registry().increment_counter("ob_mm_snapshot_failed_total");
         send_snapshot_abort(peer, "too_many_files");
         return;
@@ -449,11 +507,14 @@ void MultiMasterManager::begin_snapshot_send(PeerConnection& peer,
     st.meta.insert(st.meta.end(), vv_payload.begin(), vv_payload.end());
     st.meta.insert(st.meta.end(), held_payload.begin(), held_payload.end());
 
-    if (st.meta.size() > MM_SNAPSHOT_MAX_META_BYTES) {
+    const size_t meta_cap = large ? MM_SNAPSHOT_MAX_META_BYTES_LARGE : MM_SNAPSHOT_MAX_META_BYTES;
+    if (st.meta.size() > meta_cap) {
         OB_LOG_ERROR("mm",
-                     "Refusing snapshot for peer %u: metadata is %zu bytes, over the %zu a "
-                     "receiver will assemble",
-                     peer.node_id, st.meta.size(), MM_SNAPSHOT_MAX_META_BYTES);
+                     "Refusing snapshot for peer %u: metadata is %zu bytes, over the %zu it will "
+                     "assemble%s",
+                     peer.node_id, st.meta.size(), meta_cap,
+                     large ? "" : " - it asked as a build before #176 does; a node of this build "
+                                  "or later assembles more");
         engine_.registry().increment_counter("ob_mm_snapshot_failed_total");
         st = MMSnapshotSend{};
         send_snapshot_abort(peer, "metadata_too_large");
@@ -467,6 +528,7 @@ void MultiMasterManager::begin_snapshot_send(PeerConnection& peer,
     begin.meta_crc     = crc32c(st.meta.data(), st.meta.size());
 
     st.active = true;
+    st.wide   = large;
 
     const auto frame = wrap_snapshot_frame(MM_MSG_SNAPSHOT_BEGIN, config_.node_id,
                                            encode_snapshot_begin(begin));
@@ -474,10 +536,10 @@ void MultiMasterManager::begin_snapshot_send(PeerConnection& peer,
 
     OB_LOG_INFO("mm",
                 "Snapshot begins towards peer %u: files=%zu bytes=%zu meta=%zu "
-                "(manifest=%u vector=%u held=%u) created in %.1f ms",
+                "(manifest=%u vector=%u held=%u) in %s chunks, created in %.1f ms",
                 peer.node_id, st.manifest.files.size(), st.manifest.total_bytes,
                 st.meta.size(), begin.manifest_len, begin.vector_len, begin.held_len,
-                snap.create_ms);
+                st.wide ? "32-bit" : "16-bit", snap.create_ms);
 
     advance_snapshot_send(peer);
 }
@@ -490,6 +552,19 @@ void MultiMasterManager::advance_snapshot_send(PeerConnection& peer) {
         return;
     }
 
+    // A chunk in the width the receiver takes (#176); `file_idx` is below the metadata's index in
+    // it, which begin_snapshot_send() checked.
+    const auto encode = [&st](bool meta, size_t file_idx, uint64_t offset, const uint8_t* bytes,
+                              size_t n) {
+        return st.wide ? encode_snapshot_chunk_wide(
+                             meta ? MM_SNAPSHOT_WIDE_META_INDEX : static_cast<uint32_t>(file_idx),
+                             offset, bytes, n)
+                       : encode_snapshot_chunk(
+                             meta ? MM_SNAPSHOT_META_INDEX : static_cast<uint16_t>(file_idx),
+                             offset, bytes, n);
+    };
+    const uint8_t chunk_type = st.wide ? MM_MSG_SNAPSHOT_CHUNK_WIDE : MM_MSG_SNAPSHOT_CHUNK;
+
     // Stop while the peer's buffer is still holding a backlog. Chunks resume from the EPOLLOUT
     // branch as the socket drains, so live deltas enqueued in between go out in order and the
     // buffer never approaches the size that drops the connection.
@@ -498,8 +573,7 @@ void MultiMasterManager::advance_snapshot_send(PeerConnection& peer) {
 
         if (st.meta_offset < st.meta.size()) {
             const size_t n = std::min(MM_SNAPSHOT_CHUNK_BYTES, st.meta.size() - st.meta_offset);
-            payload = encode_snapshot_chunk(MM_SNAPSHOT_META_INDEX, st.meta_offset,
-                                            st.meta.data() + st.meta_offset, n);
+            payload = encode(/*meta=*/true, 0, st.meta_offset, st.meta.data() + st.meta_offset, n);
             st.meta_offset += n;
             st.bytes_sent  += n;
         } else if (st.file_idx < st.manifest.files.size()) {
@@ -543,8 +617,8 @@ void MultiMasterManager::advance_snapshot_send(PeerConnection& peer) {
                 return;
             }
 
-            payload = encode_snapshot_chunk(static_cast<uint16_t>(st.file_idx), st.file_offset,
-                                            buf, static_cast<size_t>(got));
+            payload = encode(/*meta=*/false, st.file_idx, st.file_offset, buf,
+                             static_cast<size_t>(got));
             st.file_offset += static_cast<size_t>(got);
             st.bytes_sent  += static_cast<uint64_t>(got);
         } else {
@@ -556,7 +630,7 @@ void MultiMasterManager::advance_snapshot_send(PeerConnection& peer) {
             return;
         }
 
-        const auto frame = wrap_snapshot_frame(MM_MSG_SNAPSHOT_CHUNK, config_.node_id, payload);
+        const auto frame = wrap_snapshot_frame(chunk_type, config_.node_id, payload);
         enqueue_frame(peer, frame.data(), frame.size());
         engine_.registry().increment_counter("ob_mm_snapshot_bytes_sent_total",
                                              static_cast<uint64_t>(payload.size()));
@@ -681,6 +755,16 @@ void MultiMasterManager::handle_snapshot_begin(PeerConnection& peer,
 
 void MultiMasterManager::handle_snapshot_chunk(PeerConnection& peer,
                                               const uint8_t* payload, size_t len) {
+    accept_snapshot_chunk(peer, payload, len, /*wide=*/false);
+}
+
+void MultiMasterManager::handle_snapshot_chunk_wide(PeerConnection& peer,
+                                                   const uint8_t* payload, size_t len) {
+    accept_snapshot_chunk(peer, payload, len, /*wide=*/true);
+}
+
+void MultiMasterManager::accept_snapshot_chunk(PeerConnection& peer, const uint8_t* payload,
+                                               size_t len, bool wide) {
     auto& st = snapshot_recv_;
     if (!st.active) {
         OB_LOG_WARN("mm", "Peer %u sent a snapshot chunk with no bootstrap in progress",
@@ -693,20 +777,34 @@ void MultiMasterManager::handle_snapshot_chunk(PeerConnection& peer,
         return;
     }
 
-    uint16_t file_index = 0;
+    // Either width, from either kind of sender (#176): one of this build sends 32-bit chunks to a
+    // node that says it takes them, and one of an older build sends 16-bit chunks to every node.
+    uint32_t file_index = 0;
     uint64_t offset     = 0;
     const uint8_t* bytes = nullptr;
     size_t n = 0;
-    if (!decode_snapshot_chunk(payload, len, file_index, offset, bytes, n)) {
-        abort_bootstrap("bad_chunk");
-        return;
+    bool meta = false;
+    if (wide) {
+        if (!decode_snapshot_chunk_wide(payload, len, file_index, offset, bytes, n)) {
+            abort_bootstrap("bad_chunk");
+            return;
+        }
+        meta = file_index == MM_SNAPSHOT_WIDE_META_INDEX;
+    } else {
+        uint16_t narrow = 0;
+        if (!decode_snapshot_chunk(payload, len, narrow, offset, bytes, n)) {
+            abort_bootstrap("bad_chunk");
+            return;
+        }
+        file_index = narrow;
+        meta       = narrow == MM_SNAPSHOT_META_INDEX;
     }
 
     engine_.registry().increment_counter("ob_mm_snapshot_bytes_received_total",
                                          static_cast<uint64_t>(n));
 
     if (st.phase == MMSnapshotRecv::Phase::META) {
-        if (file_index != MM_SNAPSHOT_META_INDEX) {
+        if (!meta) {
             abort_bootstrap("file_chunk_before_metadata");
             return;
         }
@@ -798,7 +896,7 @@ void MultiMasterManager::handle_snapshot_chunk(PeerConnection& peer,
     }
 
     // ── File data ─────────────────────────────────────────────────────────────
-    if (file_index == MM_SNAPSHOT_META_INDEX) {
+    if (meta) {
         abort_bootstrap("metadata_chunk_after_metadata");
         return;
     }
@@ -919,13 +1017,30 @@ void MultiMasterManager::handle_snapshot_end(PeerConnection& peer,
                 peer.node_id, st.manifest.files.size(),
                 static_cast<unsigned long long>(st.bytes_received),
                 st.manifest.total_rows, elapsed);
+
+    // Writes are taken from here, and only then is the snapshot counted as received. The store is
+    // installed and its frontiers adopted; what the staging directory still holds is the empty
+    // skeleton of the directories its files were renamed out of, which is no reason to refuse
+    // anything - and at 65 600 files removing it took 1.2 s, in which a node that said it had
+    // received its snapshot refused every read and write (#176; Debug, i3-7100U).
+    const std::string staging = std::move(st.staging_dir);
+    st = MMSnapshotRecv{};
+    finish_bootstrap(/*succeeded=*/true);
     engine_.registry().increment_counter("ob_mm_snapshot_received_total");
 
     std::error_code ec;
-    fs::remove_all(st.staging_dir, ec);
-    st = MMSnapshotRecv{};
-
-    finish_bootstrap(/*succeeded=*/true);
+    const auto cleared_at = std::chrono::steady_clock::now();
+    fs::remove_all(staging, ec);
+    const double clear_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - cleared_at).count();
+    if (ec) {
+        // Harmless for this bootstrap, and the next one clears it before staging anything.
+        OB_LOG_WARN("mm", "Could not remove staging '%s' after the bootstrap: %s", staging.c_str(),
+                    ec.message().c_str());
+    } else {
+        OB_LOG_DEBUG("mm", "Staging '%s' removed after the bootstrap in %.1f ms", staging.c_str(),
+                     clear_ms);
+    }
 }
 
 bool MultiMasterManager::install_snapshot_files() {
@@ -1140,7 +1255,10 @@ bool MultiMasterManager::request_snapshot_from(PeerConnection& peer) {
         return false;
     }
 
-    const auto frame = wrap_snapshot_frame(MM_MSG_SNAPSHOT_REQUEST, config_.node_id, {});
+    // Saying what it takes (#176): a sender of this build answers in 32-bit chunks, with up to 1 GiB
+    // of metadata; an older one ignores the byte and answers as it always has.
+    const auto frame = wrap_snapshot_frame(MM_MSG_SNAPSHOT_REQUEST, config_.node_id,
+                                           encode_snapshot_request(MM_SNAPSHOT_TAKES_LARGE));
     enqueue_frame(peer, frame.data(), frame.size());
     snapshot_ask_ = MMSnapshotAsk{true, peer.node_id, peer.conn_id, std::chrono::steady_clock::now()};
     snapshot_round_.insert(peer.node_id);

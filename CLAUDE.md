@@ -3816,6 +3816,19 @@ Learned the hard way. Check here before debugging.
      nobody, and its sender streamed the rest - 448 chunks dropped, each with a `WARN`, at the end of
      a transfer of 65 600 files (#192). #188 had built the other half: a sender that stops when its
      target refuses the `BEGIN`.
+500. **Widen a mesh message with a flag the older build ignores, not with a version.** The handshake
+     requires `MM_PROTOCOL_VERSION` to be equal on both ends, so a bump disconnects a mesh in the
+     middle of an upgrade. The snapshot request's payload was empty and every build ignored it, so one
+     byte there says what the joiner takes, and a sender answers each joiner in what its build takes
+     (#176).
+501. **Send the new form to everyone who takes it, not only where it is needed.** A 32-bit chunk sent
+     only past 65 535 files would be a path one slow integration test takes; sent to every joiner of
+     this build, every bootstrap in every test takes it, and the 16-bit one stays tested by the same
+     tests run as an older joiner asks (#176, `EitherWidth/...`).
+502. **The lines after a strict xfail's failure point have never run.** When #176's marker came off,
+     the test's last assertions found two defects nothing else had: the snapshot counted as received
+     1.2 s before the joiner took writes, and `ob_segment_count` at 0 after an install - and after
+     every restart - being set only by a flush. Expect them to find something.
 
 ## Current state and open problems
 
@@ -3895,19 +3908,27 @@ stalled (pitfalls 495-497). **#191 and #192 are closed**, found measuring #176: 
 peer refused, or whose every snapshot failed, asked them in turn for ever and refused writes the
 whole time - 36 requests in 90 s and not one write, on a live mesh - and asks each peer once a
 bootstrap now; and a joiner that abandoned a transfer tells its sender to stop (pitfalls 498-499).
-**#169, #175, #176 and #187 are open P1s**: #187 is the holes the old numbering left in every node's
+**#176 is closed**: a mesh snapshot named each file by a 16-bit index with the metadata at 0xFFFF,
+so a node of 8 192 segments could bootstrap no peer, and 8 MiB of metadata stopped one of about
+10 000; a joiner says in its request that it takes a 32-bit index and up to 1 GiB, a sender of this
+build answers it so whatever the store's size, and an older joiner is sent what it was sent before
+(pitfalls 500-502). Its test found two more on its last lines, fixed with it: the snapshot counted as
+received before the joiner took writes, and `ob_segment_count` at 0 after an install or a restart.
+**#169, #175 and #187 are open P1s**: #187 is the holes the old numbering left in every node's
 tracker, which a snapshot carries and nothing clears but a new mesh; an exchange name with a dot
 makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live book, sequence numbers
 and stored rows, measured on the wire; sharding by symbol has no control plane: no shard writes
 itself or the map to etcd, each owns every symbol, and a second on the same etcd becomes the first
-one's replica, measured against a native etcd; and a mesh snapshot names each file by a 16-bit
-index, so a node of 8 192 segments cannot bootstrap a peer that joins it.
+one's replica, measured against a native etcd.
 **#172 is closed**: the Python client's sharded pool swaps its routing whole and replaces a shard
 connection a timeout closed, under a test that builds a sharded pool against a map in etcd. **#174,
-#189 and #190 are open P2s**: a start reads the whole WAL twice even when its last checkpoint covers
-every record; since #177 a node of 50 000 (symbol, origin) pairs holds writes for 9 - 13 ms at every
-checkpoint, writing its whole vector down; and at the write ceiling a flush tick's WAL sync takes 1 -
-3 s on a device the segments keep busy, and writers wait that long for room in the pending queue.
+#189, #190 and #193 are open P2s**: a start reads the whole WAL twice even when its last checkpoint
+covers every record; since #177 a node of 50 000 (symbol, origin) pairs holds writes for 9 - 13 ms at
+every checkpoint, writing its whole vector down; at the write ceiling a flush tick's WAL sync takes
+1 - 3 s on a device the segments keep busy, and writers wait that long for room in the pending queue;
+and a joiner checks every path of a snapshot's manifest against the filesystem on its mesh io thread,
+5 s for 70 000 files. **#194 (P3)**: a snapshot holding a file of zero bytes cannot be installed,
+though the engine writes no such file.
 
 **#170 and #171**: a Python client connection carries one exchange at a time and is closed when one
 does not finish. A pool used one socket from two threads, so two callers got each other's rows 39%

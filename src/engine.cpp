@@ -351,6 +351,7 @@ void Engine::open() {
         std::lock_guard<std::mutex> flush_lock(flush_mtx_);
         note_store_for_compaction();
     }
+    publish_segment_count();
 
     // Restore epoch from WAL replay.
     {
@@ -755,6 +756,7 @@ void Engine::discard_local_data_for_resync() {
     }
 
     combined_store_.open_existing();
+    publish_segment_count();
 }
 
 std::string Engine::replication_state_path() const {
@@ -2005,6 +2007,7 @@ void Engine::adopt_store_on_disk() {
     combined_store_.close();
     combined_store_.open_existing();
     note_store_for_compaction();
+    publish_segment_count();
 
     // Discarding the pending rows made room, and since #137 there can be a writer asleep waiting
     // for exactly that. Without this it waits out the five-second deadline and is **refused**,
@@ -2046,6 +2049,7 @@ bool Engine::install_snapshot(const std::string& staging_dir,
 
         OB_LOG_INFO("engine", "Snapshot installed: the store now holds %zu segment(s)",
                     combined_store_.segment_count());
+        publish_segment_count();
         pending_cv_.notify_all();          // see adopt_store_on_disk() for why
     }
 
@@ -2071,6 +2075,12 @@ bool Engine::install_snapshot(const std::string& staging_dir,
     // Its segments merge like any others, once it is on the device (#165 part 2b).
     note_store_for_compaction();
     return true;
+}
+
+void Engine::publish_segment_count() {
+    const size_t segments = combined_store_.segment_count();
+    registry_.set_gauge("ob_segment_count", static_cast<int64_t>(segments));
+    OB_LOG_DEBUG("engine", "ob_segment_count = %zu", segments);
 }
 
 bool Engine::holds_no_data() {
@@ -3293,8 +3303,7 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows) {
         }
 
         // Update gauge: segment count after merge.
-        registry_.set_gauge("ob_segment_count",
-                            static_cast<int64_t>(combined_store_.segment_count()));
+        publish_segment_count();
 
         // Record how far the WAL is durable in segments, so the next open() does not replay it.
         // Appended AFTER the segments are on the device, never before: a checkpoint that claims

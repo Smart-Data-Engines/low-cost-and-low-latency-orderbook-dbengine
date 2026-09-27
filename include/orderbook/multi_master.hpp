@@ -100,6 +100,22 @@ inline constexpr uint8_t MM_MSG_SNAPSHOT_ABORT   = 204;
 inline constexpr uint8_t MM_MSG_AUTH_CHALLENGE  = 205;
 inline constexpr uint8_t MM_MSG_AUTH_RESPONSE   = 206;
 
+/// A snapshot chunk that names its file with 32 bits rather than 16 (#176): see
+/// MM_SNAPSHOT_WIDE_CHUNK_HEADER_SIZE. Sent only to a node whose request said it takes one
+/// (MM_SNAPSHOT_TAKES_LARGE), because a build before #176 skips a type it does not know - and a
+/// bootstrap whose every chunk is skipped waits for bytes that never come.
+inline constexpr uint8_t MM_MSG_SNAPSHOT_CHUNK_WIDE = 207;
+
+/// The one flag a SNAPSHOT_REQUEST carries today (#176): the asking node takes wide chunks
+/// (MM_MSG_SNAPSHOT_CHUNK_WIDE) and metadata up to MM_SNAPSHOT_MAX_META_BYTES_LARGE.
+///
+/// The request's payload was empty, and a build before #176 still sends it empty and ignores what
+/// one carries - so each side of a mesh in the middle of an upgrade does what its build did: a
+/// sender answers a request without the flag in 16-bit chunks, refusing what does not fit them as
+/// before, and an older sender refuses what it always refused. Not a protocol version, which the
+/// handshake requires to be equal on both ends, and a mesh of two builds would not connect.
+inline constexpr uint8_t MM_SNAPSHOT_TAKES_LARGE = 0x01;
+
 /// Bytes of file content per chunk frame.
 ///
 /// Bounded above by the frame header, not by taste: `WALRecordV2::payload_len` is a uint16_t and
@@ -117,9 +133,21 @@ inline constexpr size_t MM_SNAPSHOT_CHUNK_BYTES = 32ULL << 10;
 /// case bootstrap exists for. Streaming it reuses the offset discipline and the checksum.
 inline constexpr uint16_t MM_SNAPSHOT_META_INDEX = 0xFFFF;
 
-/// Upper bound on the metadata blob, which is assembled in memory. Roughly a hundred thousand
-/// files' worth of manifest; a peer claiming more is refused rather than trusted.
+/// The metadata blob's index in a wide chunk (#176).
+inline constexpr uint32_t MM_SNAPSHOT_WIDE_META_INDEX = 0xFFFFFFFF;
+
+/// Upper bound on the metadata blob a build before #176 assembles, in memory: it refuses a BEGIN
+/// that announces more. A sender keeps to it for a node that did not ask with
+/// MM_SNAPSHOT_TAKES_LARGE.
+///
+/// About 800 bytes of manifest a segment, so about 10 000 segments - a few thousand instruments
+/// after a few hours, at one segment an instrument an hour (#165 part 2b).
 inline constexpr size_t MM_SNAPSHOT_MAX_META_BYTES = 8ULL << 20;
+
+/// Upper bound on the metadata blob this build assembles, and sends to a node that asked with
+/// MM_SNAPSHOT_TAKES_LARGE (#176): about 1.3 million segments' worth of manifest. The sender holds
+/// the same manifest in memory to send it, so a store this size costs its receiver no more.
+inline constexpr size_t MM_SNAPSHOT_MAX_META_BYTES_LARGE = 1ULL << 30;
 
 /// SNAPSHOT_BEGIN payload: three uint32 lengths and a uint32 CRC32C of the metadata blob.
 inline constexpr size_t MM_SNAPSHOT_BEGIN_SIZE = 16;
@@ -137,6 +165,12 @@ inline constexpr size_t MM_SNAPSHOT_ABORT_REASON_MAX = 128;
 
 /// Fixed part of a chunk payload: uint16 file_index + uint64 byte_offset.
 inline constexpr size_t MM_SNAPSHOT_CHUNK_HEADER_SIZE = 10;
+
+/// Fixed part of a wide chunk payload (#176): uint32 file_index + uint64 byte_offset.
+///
+/// A 16-bit index with 0xFFFF taken by the metadata named 65 534 files at most, and a segment is
+/// eight: a node of 8 192 segments could bootstrap no peer.
+inline constexpr size_t MM_SNAPSHOT_WIDE_CHUNK_HEADER_SIZE = 12;
 
 // ── HandshakeMessage ──────────────────────────────────────────────────────────
 //
@@ -402,6 +436,8 @@ struct SnapshotBegin {
 /// Sending side: one at a time per node, streamed as the peer's socket drains.
 struct MMSnapshotSend {
     bool             active{false};
+    /// Chunks go as MM_MSG_SNAPSHOT_CHUNK_WIDE: the receiver asked with MM_SNAPSHOT_TAKES_LARGE.
+    bool             wide{false};
     uint16_t         target_node_id{0};
     /// Which connection it goes to: an abort from that connection ends it (#188).
     uint64_t         target_conn_id{0};
@@ -428,6 +464,8 @@ struct MMSnapshotPrepare {
     /// Which connection asked. The node returning on a new connection has asked for nothing.
     uint64_t target_conn_id{0};
     uint64_t token{0};
+    /// What its request said it takes, MM_SNAPSHOT_TAKES_* (#176).
+    uint8_t  receiver_takes{0};
     std::chrono::steady_clock::time_point started_at{};
 };
 
@@ -477,8 +515,17 @@ struct MMSnapshotRecv {
 
 std::vector<uint8_t> encode_snapshot_begin(const SnapshotBegin& begin);
 
-/// False on a payload of the wrong length, or one announcing more metadata than we will hold.
+/// False on a payload of the wrong length, or one announcing more metadata than this build
+/// assembles (MM_SNAPSHOT_MAX_META_BYTES_LARGE).
 bool decode_snapshot_begin(const uint8_t* data, size_t len, SnapshotBegin& out);
+
+/// SNAPSHOT_REQUEST (#176): the MM_SNAPSHOT_TAKES_* flags of the asking node, in one byte.
+std::vector<uint8_t> encode_snapshot_request(uint8_t takes);
+
+/// The flags a request carries: none from an empty payload, which is what a build before #176
+/// sends. A flag this build does not know, and a byte after the first, are a later build's and are
+/// ignored.
+uint8_t decode_snapshot_request(const uint8_t* data, size_t len);
 
 std::vector<uint8_t> encode_snapshot_chunk(uint16_t file_index, uint64_t byte_offset,
                                            const uint8_t* bytes, size_t n);
@@ -486,6 +533,14 @@ std::vector<uint8_t> encode_snapshot_chunk(uint16_t file_index, uint64_t byte_of
 bool decode_snapshot_chunk(const uint8_t* data, size_t len,
                            uint16_t& file_index, uint64_t& byte_offset,
                            const uint8_t*& bytes, size_t& n);
+
+/// The same with a 32-bit file index (#176), MM_SNAPSHOT_WIDE_META_INDEX for the metadata.
+std::vector<uint8_t> encode_snapshot_chunk_wide(uint32_t file_index, uint64_t byte_offset,
+                                                const uint8_t* bytes, size_t n);
+
+bool decode_snapshot_chunk_wide(const uint8_t* data, size_t len,
+                                uint32_t& file_index, uint64_t& byte_offset,
+                                const uint8_t*& bytes, size_t& n);
 
 /// END carries nothing. Every byte is already covered by a per-file CRC from the manifest and by
 /// the metadata CRC from BEGIN; a third checksum could only fail where one of those already has.
@@ -580,14 +635,17 @@ public:
     // the same reason.
 
     /// A peer asked us for a snapshot. Creates one and starts streaming, or aborts with a reason.
-    void handle_snapshot_request(PeerConnection& peer);
+    /// `payload` is the request's, which says what the peer takes (#176).
+    void handle_snapshot_request(PeerConnection& peer, const uint8_t* payload, size_t len);
 
     /// Start sending a snapshot that a worker thread has finished creating.
     ///
     /// Every refusal that used to happen inside handle_snapshot_request() lives here now, because
     /// each one needs the created snapshot to decide: an untransportable version vector, a manifest
-    /// too large to address with a 16-bit index, metadata beyond what a receiver will assemble.
-    void begin_snapshot_send(PeerConnection& peer, SnapshotWithSequenceState&& snap);
+    /// too large for the index the receiver takes, metadata beyond what it will assemble.
+    /// `receiver_takes` is what its request said, MM_SNAPSHOT_TAKES_* (#176).
+    void begin_snapshot_send(PeerConnection& peer, SnapshotWithSequenceState&& snap,
+                             uint8_t receiver_takes);
 
     /// Collect a finished snapshot, if there is one, and act on it. Called from io_loop() once per
     /// pass — after a wake-up from wakeup_fd_, and also after a plain epoll timeout.
@@ -605,6 +663,9 @@ public:
 
     /// One chunk of one file. Must be the expected file at the expected offset.
     void handle_snapshot_chunk(PeerConnection& peer, const uint8_t* payload, size_t len);
+
+    /// The same, from a chunk with a 32-bit file index (#176).
+    void handle_snapshot_chunk_wide(PeerConnection& peer, const uint8_t* payload, size_t len);
 
     /// Every file has arrived. Verifies, installs, adopts the sequence state.
     void handle_snapshot_end(PeerConnection& peer, const uint8_t* payload, size_t len);
@@ -631,6 +692,10 @@ public:
     /// protocol handlers directly; production code asks `is_bootstrapping()`, which is atomic.
     bool snapshot_send_active() const { return snapshot_send_.active; }
     bool snapshot_recv_active() const { return snapshot_recv_.active; }
+    /// True once an inbound snapshot's metadata has been checked and taken, and its files are next.
+    bool snapshot_recv_has_metadata() const {
+        return snapshot_recv_.active && snapshot_recv_.phase == MMSnapshotRecv::Phase::FILES;
+    }
     /// True between accepting a snapshot request and collecting the worker's result.
     bool snapshot_preparing() const { return snapshot_prepare_.active; }
     /// True while a worker is running or its result is still uncollected. Distinct from the above:
@@ -881,6 +946,10 @@ private:
 
     /// Send an abort frame and log it. Does not touch inbound state.
     void send_snapshot_abort(PeerConnection& peer, const char* reason);
+
+    /// Both chunk handlers (#176): `wide` says which header the payload begins with.
+    void accept_snapshot_chunk(PeerConnection& peer, const uint8_t* payload, size_t len,
+                               bool wide);
 
     /// Move the staged files into the data directory. Returns false if any rename failed.
     bool install_snapshot_files();

@@ -355,7 +355,7 @@ joiner                                            peer
   │  handshake + version vector  ───────────────►  │
   │  ◄──────────────  handshake + version vector   │
   │                                                │
-  │  SNAPSHOT_REQUEST  ──────────────────────────► │   (one peer, and only if the joiner holds
+  │  SNAPSHOT_REQUEST (what it takes) ───────────► │   (one peer, and only if the joiner holds
   │  bootstrap starts: writes refused              │    nothing at all)
   │  ◄──────────  SNAPSHOT_BEGIN (lengths + CRC)   │   flush + checksum, vector captured with it
   │  ◄──────────  SNAPSHOT_CHUNK × n  (metadata)   │   manifest ++ version vector ++ held set
@@ -395,6 +395,21 @@ a redelivery of any of them is recognised.
 65535 bytes on its own, and so does a version vector past 1 560 entries, which the block carries in
 parts. Metadata in a single frame would have put a store-size limit on the one case bootstrap exists
 for.
+
+**A chunk names its file with 32 bits, for a joiner that says it takes them** (#176). A chunk's
+header is the file's index in the manifest and the offset in it, and the index was 16 bits with
+`0xFFFF` the metadata's - so a manifest of 65 535 files was refused (`too_many_files`), and a
+segment is eight: a node of 8 192 segments, a few thousand instruments after a few hours at one
+segment an instrument an hour, could bootstrap no peer. Right behind it, the metadata blob a receiver
+assembles was capped at 8 MiB (`metadata_too_large`), about 10 000 segments of manifest. A joiner
+now says in its request - the request's payload was empty - that it takes a chunk with a 32-bit
+index (`SNAPSHOT_CHUNK_WIDE`, `record_type = 207`, the metadata at `0xFFFFFFFF`) and up to 1 GiB of
+metadata, and a sender answers such a request in wide chunks whatever the store's size, so every
+bootstrap between two nodes of this build takes the path a large store needs. A build before #176
+sends an empty request and ignores what one carries, so a mesh in the middle of an upgrade does what
+each build did: a sender of this build answers an older joiner in 16-bit chunks and refuses it what
+does not fit them, and an older sender refuses what it always refused. Not a protocol version, which
+the handshake requires to be equal, so a mesh of two builds would not connect.
 
 **Chunks are pushed only while the peer's send buffer has room**, and resume from the `EPOLLOUT`
 branch of the io loop as the socket drains. So live deltas enqueued between chunks go out promptly,

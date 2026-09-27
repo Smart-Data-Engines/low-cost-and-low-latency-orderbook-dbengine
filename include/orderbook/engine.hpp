@@ -1256,6 +1256,11 @@ private:
                                      std::chrono::steady_clock::time_point now, bool arrived);
     /// Every indexed segment's partition, after open() and an install replaced the store.
     void note_store_for_compaction();
+    /// `ob_segment_count` from the store itself, wherever the store is loaded or replaced (#176):
+    /// set only after a flush's merge and a compaction, it read 0 after a restart, and after a
+    /// snapshot install of 8 200 segments, until the next flush. Takes no engine lock: the store's
+    /// index has its own.
+    void publish_segment_count();
     /// Forget every merge in flight, for the paths that replace or discard the store: a name a
     /// retired input had may come back with the new store. Holds `flush_mtx_`.
     void drop_compaction_locked();

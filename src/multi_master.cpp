@@ -1813,7 +1813,8 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
     // chunk is never mistaken for something to replay.
     switch (hdr.record_type) {
         case MM_MSG_SNAPSHOT_REQUEST:
-            handle_snapshot_request(peer);
+            handle_snapshot_request(peer, static_cast<const uint8_t*>(payload_ptr),
+                                    expected_payload_len);
             return;
         case MM_MSG_SNAPSHOT_BEGIN:
             handle_snapshot_begin(peer, static_cast<const uint8_t*>(payload_ptr),
@@ -1822,6 +1823,10 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
         case MM_MSG_SNAPSHOT_CHUNK:
             handle_snapshot_chunk(peer, static_cast<const uint8_t*>(payload_ptr),
                                   expected_payload_len);
+            return;
+        case MM_MSG_SNAPSHOT_CHUNK_WIDE:
+            handle_snapshot_chunk_wide(peer, static_cast<const uint8_t*>(payload_ptr),
+                                       expected_payload_len);
             return;
         case MM_MSG_SNAPSHOT_END:
             handle_snapshot_end(peer, static_cast<const uint8_t*>(payload_ptr),
