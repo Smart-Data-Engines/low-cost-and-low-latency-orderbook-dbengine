@@ -176,6 +176,38 @@ Put the data directory on the fastest local device you have, and **not** on the 
 journal of a busy filesystem: the WAL is sequential and small-record, so it is exactly the workload
 that suffers from sharing a queue.
 
+### The WAL on a filesystem of its own
+
+A write is answered after its record is written to the WAL, under the lock every write takes, and on
+ext4 that `write()` waits for the filesystem's journal. A data directory of thousands of instruments
+keeps the journal busy by itself - every segment is a directory of files, and one 50 s run of 4 001
+symbols left 74 274 of them - so on a node that size a one-level write is answered now and then a
+tenth of a second late or more: 0.13 - 0.31 s in four runs of six, measured on a node of 4 000
+symbols (i3-7100U, ext4 over LUKS, #186). The node says so:
+
+```
+A batch of 1 write(s) waited 0.0 ms for the engine lock and held it 305.4 ms - 0.0 ms of it waiting for room in the pending queue, 305.4 ms in the WAL append; a WAL on a filesystem of its own (--wal-dir) does not wait for the data directory's journal
+```
+
+`--wal-dir <DIR>` (`wal-dir` in the configuration file) puts the WAL files and `wal_identity` there;
+on an ext4 of its own the same runs had no write slower than 11 ms. A separate filesystem isolates
+the `write()`; a separate **device** isolates the WAL's `fsync` too, which at the write ceiling a
+device the segments keep busy stretches to seconds (#190):
+
+```
+A flush tick took 3307 ms for 875520 row(s): WAL sync 3030.7 ms, drain 127.6 ms, seals 148.5 ms, retention 0.0 ms, merges 0.0 ms - writers at the ceiling wait for the room it frees
+```
+
+The directory must be outside the data directory - installing a snapshot clears the data directory of
+everything not named `wal_*`. To move an existing WAL: stop the node, move its `wal_*.bin` files and
+`wal_identity` to the new directory, and start it with `--wal-dir`. The data directory records where
+its WAL is (`wal_location`), and a start that would begin an empty WAL beside the real one is refused
+with what to do: `--wal-dir` naming an empty directory while the WAL is still in the data directory
+(`the WAL is in ... and --wal-dir names ...: move its wal_*.bin files and wal_identity there first`),
+or a start without `--wal-dir` - or with another, empty, directory - while `wal_location` names one
+that holds it (`the WAL of ... is in ..., where --wal-dir put it; start with --wal-dir ...`). Back
+into the data directory is the same move, with `wal_location` removed before the start.
+
 ### A client that pipelines writes
 
 Every `INSERT` and `MINSERT` a client sends in one read is applied as one batch: one acquisition of

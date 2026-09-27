@@ -3790,6 +3790,23 @@ Learned the hard way. Check here before debugging.
      empty vector, and the rows landed in the 8 ms before the answer - so the fix refused the
      snapshot it had asked for, which the unit tests, fed no catch-up, could not show. Starting the
      bootstrap at the question closed the window the guard was guarding.
+495. **Before naming a kernel mechanism, read its precondition.** The writer's stack in #186 waited in
+     `ext4_da_write_begin -> __filemap_get_folio -> folio_wait_bit_common`, which reads like stable
+     pages under dm-crypt, and the first write-up said so; `/sys/block/*/queue/stable_writes` was 0 on
+     every layer, and the wait was for a page lock a writeback held while it allocated under the
+     journal. The fix does not change, the record of why it works does.
+496. **Four clean runs of an effect that shows in half the runs are a 6% accident.** Preallocating the
+     WAL gave four runs of four without a stall; the ABAB of six each then found stalls in three of
+     six against four of six without it - no effect (#186). A mitigation is measured against its
+     baseline in one ABAB, with rounds enough that the effect's absence would show - and the one that
+     works (`--wal-dir`, 0 of 6 against 4 of 6) was measured the same way twice, through a symlink
+     and through the option.
+497. **A `write()` under a lock holds the lock for as long as the kernel keeps the call.** Every client
+     write appends its WAL record under the engine's lock, and on ext4 that append waits for the
+     journal - so a filesystem busy with the data directory's segment files held every writer 0.2 -
+     1.1 s while each section of the engine's own code held the lock 40 ms at most. What told the two
+     apart - a slow hold split into its wait for room and its WAL append, and the flush tick's
+     sections named - stays in the product, and says which it was.
 
 ## Current state and open problems
 
@@ -3862,20 +3879,22 @@ two vectors are compared in one walk, 4.9 ms at 50 000 entries (pitfalls 490-491
 closed**: a joiner asked every peer for a snapshot and installed each one it was sent, in turn -
 three from three peers, writes refused 21.6 s where one bootstrap took 6.8 - and asks one peer now,
 refusing writes from its request, so the other peers' catch-ups do not make it a node with data by
-the BEGIN (pitfall 494). **#169, #175, #176, #186 and #187 are open P1s**: #187 is the holes the old numbering left in every node's
+the BEGIN (pitfall 494). **#186 is closed**: a node of 4 000 symbols answered a write up to 1.1 s
+late, all of it in the WAL append waiting for the ext4 journal its segments' files keep busy - and
+`--wal-dir` gives the WAL a filesystem of its own, no write slower than 11 ms in six runs where four
+stalled (pitfalls 495-497). **#169, #175, #176 and #187 are open P1s**: #187 is the holes the old numbering left in every node's
 tracker, which a snapshot carries and nothing clears but a new mesh; an exchange name with a dot
 makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live book, sequence numbers
 and stored rows, measured on the wire; sharding by symbol has no control plane: no shard writes
 itself or the map to etcd, each owns every symbol, and a second on the same etcd becomes the first
-one's replica, measured against a native etcd; a mesh snapshot names each file by a 16-bit index, so
-a node of 8 192 segments cannot bootstrap a peer that joins it; and a mesh node of 4 000 symbols stalls a write for
-up to 0.6 s at a trickle and refuses writes at the pipelined ceiling, on master as much as on this
-branch.
+one's replica, measured against a native etcd; and a mesh snapshot names each file by a 16-bit
+index, so a node of 8 192 segments cannot bootstrap a peer that joins it.
 **#172 is closed**: the Python client's sharded pool swaps its routing whole and replaces a shard
-connection a timeout closed, under a test that builds a sharded pool against a map in etcd. **#174
-and #189 are open P2s**: a start reads the whole WAL twice even when its last checkpoint covers every
-record; and since #177 a node of 50 000 (symbol, origin) pairs holds writes for 9 - 13 ms at every
-checkpoint, writing its whole vector down.
+connection a timeout closed, under a test that builds a sharded pool against a map in etcd. **#174,
+#189 and #190 are open P2s**: a start reads the whole WAL twice even when its last checkpoint covers
+every record; since #177 a node of 50 000 (symbol, origin) pairs holds writes for 9 - 13 ms at every
+checkpoint, writing its whole vector down; and at the write ceiling a flush tick's WAL sync takes 1 -
+3 s on a device the segments keep busy, and writers wait that long for room in the pending queue.
 
 **#170 and #171**: a Python client connection carries one exchange at a time and is closed when one
 does not finish. A pool used one socket from two threads, so two callers got each other's rows 39%

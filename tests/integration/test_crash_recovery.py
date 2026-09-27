@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import glob
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -45,8 +46,10 @@ def free_port() -> int:
 class Node:
     """A single ob_tcp_server on its own data dir, killable."""
 
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, extra: list[str] | None = None, wal_dir: str | None = None):
         self.data_dir = data_dir
+        self.extra = list(extra or [])
+        self.wal_dir = wal_dir or data_dir
         self.port = free_port()
         self.proc: subprocess.Popen | None = None
 
@@ -57,7 +60,7 @@ class Node:
         # the ordinary way, which proves nothing about recovery.
         self.proc = subprocess.Popen(
             [SERVER, "--port", str(self.port), "--data-dir", self.data_dir,
-             "--flush-interval-ms", "600000"],
+             "--flush-interval-ms", "600000", *self.extra],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -110,7 +113,7 @@ class Node:
 
     def wal_bytes(self) -> int:
         return sum(os.path.getsize(p)
-                   for p in glob.glob(os.path.join(self.data_dir, "wal_*.bin")))
+                   for p in glob.glob(os.path.join(self.wal_dir, "wal_*.bin")))
 
 
 @pytest.fixture
@@ -217,3 +220,40 @@ def test_writes_after_recovery_are_also_durable(node):
     assert node.row_count("CRASH5") == 4, (
         f"the node holds {node.row_count('CRASH5')} of 4: writes made after a recovery "
         f"are not being recovered themselves")
+
+
+def test_a_wal_in_a_directory_of_its_own_is_replayed_after_sigkill():
+    """#186: `--wal-dir` puts the WAL and its identity in a directory of their own - on ext4 a WAL
+    append waits for the journal, which a data directory of thousands of instruments keeps busy. The
+    WAL there is the one a crash replays, and a start without the option, which would begin an empty
+    WAL beside it and lose every row not yet in a segment, is refused."""
+    if not os.path.isfile(SERVER):
+        pytest.skip(f"server binary not built: {SERVER}")
+    data_dir = tempfile.mkdtemp(prefix="ob_crash_")
+    wal_dir = tempfile.mkdtemp(prefix="ob_crash_wal_")
+    node = Node(data_dir, extra=["--wal-dir", wal_dir], wal_dir=wal_dir)
+    try:
+        node.start()
+        insert_batch(node, "CRASH6", 5, 600_000)
+        assert node.segments_on_disk() == 0, "rows reached a segment before the kill"
+        assert node.wal_bytes() > 0, "no WAL in the directory --wal-dir named"
+        assert not glob.glob(os.path.join(data_dir, "wal_*.bin")), "a WAL in the data directory"
+        assert os.path.isfile(os.path.join(wal_dir, "wal_identity"))
+
+        node.kill()
+        without = subprocess.run(
+            [SERVER, "--port", str(free_port()), "--data-dir", data_dir,
+             "--flush-interval-ms", "600000"],
+            capture_output=True, text=True, timeout=30)
+        assert without.returncode != 0, "a start without --wal-dir began an empty WAL"
+        assert "start with --wal-dir" in without.stdout + without.stderr, without.stderr[-400:]
+        assert not glob.glob(os.path.join(data_dir, "wal_*.bin"))
+
+        node.start()
+        assert node.row_count("CRASH6") == 5, (
+            f"five acknowledged writes, and {node.row_count('CRASH6')} came back from the WAL in "
+            f"{wal_dir}")
+    finally:
+        node.stop()
+        shutil.rmtree(data_dir, ignore_errors=True)
+        shutil.rmtree(wal_dir, ignore_errors=True)

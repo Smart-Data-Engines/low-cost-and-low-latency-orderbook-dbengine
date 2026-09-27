@@ -513,6 +513,15 @@ checkpoint vouches for. Before #160 the segment files were never synced, a power
 segment a synced checkpoint said held the row, and replay then skipped its record - measured with a
 cut the kernel performs, 0 rows of 201 came back.
 
+**Where the WAL lives is `--wal-dir`**, and the data directory unless it says otherwise (#186). A write
+is answered after its record is written to the WAL, under the lock every write takes, and on ext4 that
+`write()` waits for the filesystem's journal - which a data directory of thousands of instruments keeps
+busy with its segments' files: measured on a node of 4 000 symbols (i3-7100U, ext4 over LUKS), a
+one-level `INSERT` answered 0.13 - 0.3 s late in four runs of six, all of it in the WAL append, and
+with `--wal-dir` on an ext4 of its own not once in six, the slowest 11 ms. A WAL moved to a new
+directory is moved with its `wal_identity`; the node refuses to start on an empty WAL while the old
+one is in the data directory, or while the directory `wal_location` names holds it.
+
 How large the WAL grows before it starts a new file is `--wal-rotate-bytes`, and it is a **trigger
 rather than a file size**: rotation is checked after a write, so a file may exceed the threshold by
 one record — by more only while the disk refuses the ROTATE record that would end it, which
@@ -605,6 +614,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--tls-replication` | — (boolean) | TLS with mutual certificate verification on the replication link, in both roles; needs `--tls-ca-file` |
 | `--ttl-hours` | `<N>` | Retention in hours; 0 keeps everything. Counted from **the record's own event time**, per segment, against the node's wall clock — so a backfill written with `[event_time_ns]` arrives with its age, and a segment is expired on the next sweep once its **newest** row is past the window — its last-written row decided that until #166, which deleted a row younger than the retention written before an older one. One row dated in the future keeps its whole segment |
 | `--ttl-scan-interval-seconds` | `<N>` | How often retention scans for expired rows |
+| `--wal-dir` | `<DIR>` | Where the WAL files and `wal_identity` live (default: the data directory). Outside `--data-dir` if it is not the data directory itself, and noted there in `wal_location`, so a start that names another directory, or none, while the WAL is elsewhere is refused rather than begun on an empty WAL. Give the WAL a filesystem of its own when the data directory holds thousands of instruments (#186) |
 | `--wal-rotate-bytes` | `<N>` | WAL bytes before the next file is opened (default: 536870912). A **trigger**, not a file size: rotation is checked after a write, so a file may exceed it by one record. Refused below 65573 (one maximal record) and above 2 GiB |
 
 ## Argument handling

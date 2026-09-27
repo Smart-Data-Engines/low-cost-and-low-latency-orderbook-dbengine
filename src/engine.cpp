@@ -8,6 +8,7 @@
 // close(): stop flush thread + final flush + flush_segment + WAL flush.
 
 #include "orderbook/engine.hpp"
+#include "orderbook/timed_lock.hpp"
 #include "orderbook/wall_clock.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/level_payload.hpp"
@@ -15,6 +16,7 @@
 #include "orderbook/durable_file.hpp"
 #include "orderbook/logger.hpp"
 
+#include <algorithm>
 #include <span>
 #include <cerrno>
 #include <chrono>
@@ -23,16 +25,129 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <thread>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace ob {
 
 namespace fs = std::filesystem;
+
+namespace {
+
+/// The data directory's note of where its WAL lives, when that is not the data directory itself
+/// (#186): what lets a start without --wal-dir, or with another one, see that the WAL is elsewhere
+/// rather than begin an empty one. Not a directory, so no sweep of the data directory removes it,
+/// and neither .col nor meta.json, so no snapshot carries it.
+constexpr const char* kWalLocationFile = "wal_location";
+
+/// A WAL is in `dir`: a wal_*.bin file or the identity beside them.
+bool holds_wal(const std::filesystem::path& dir) {
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string name = entry.path().filename().string();
+        if ((name.rfind("wal_", 0) == 0 && entry.path().extension() == ".bin") ||
+            name == "wal_identity") {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Where the WAL lives, and the refusals that keep a moved WAL from being a lost one (#186). Runs
+/// before the WAL writer is built, since that opens - and creates - its first file.
+///
+/// A WAL on a filesystem of its own is the reason the option exists: on ext4 a write() of the WAL
+/// waits for the journal, and a data directory of thousands of instruments keeps the journal busy
+/// with the metadata of its segments' files - a one-level INSERT answered 1.1 s late, all of it in
+/// the WAL append; with the WAL on an ext4 of its own, the same run's slowest was 11 ms.
+std::string resolve_wal_dir(std::string_view base_dir, std::string_view wal_dir) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path data  = fs::weakly_canonical(fs::absolute(fs::path(base_dir)), ec);
+    const fs::path named = wal_dir.empty() ? data
+                                           : fs::weakly_canonical(fs::absolute(fs::path(wal_dir)), ec);
+
+    std::optional<fs::path> recorded;
+    if (std::ifstream in(data / kWalLocationFile); in.is_open()) {
+        std::string line;
+        std::getline(in, line);
+        if (line.empty()) {
+            throw std::runtime_error("Engine: " + (data / kWalLocationFile).string() +
+                                     " says nothing - it names the directory this data directory's "
+                                     "WAL is in; restore it, or remove it if the WAL is here");
+        }
+        recorded = fs::path(line);
+    }
+
+    if (named == data) {
+        // Without --wal-dir, or with the data directory itself: the WAL is here - unless the last
+        // start put it elsewhere, and then an empty WAL here would lose every row not in a segment.
+        if (recorded && *recorded != data) {
+            throw std::runtime_error("Engine: the WAL of " + data.string() + " is in " +
+                                     recorded->string() + ", where --wal-dir put it; start with "
+                                     "--wal-dir " + recorded->string() + ", or move its wal_*.bin "
+                                     "files and wal_identity here and remove " +
+                                     (data / kWalLocationFile).string());
+        }
+        return std::string(base_dir);
+    }
+
+    // Inside the data directory, a WAL would be taken for a segment's directory: installing a
+    // snapshot clears the data directory of everything not named wal_*, and so does a replica's
+    // reset (#142).
+    const auto [in_data, in_named] = std::mismatch(data.begin(), data.end(), named.begin(), named.end());
+    (void)in_named;
+    if (in_data == data.end()) {
+        throw std::runtime_error("Engine: --wal-dir " + named.string() + " is inside --data-dir " +
+                                 data.string() + ", which installing a snapshot clears of "
+                                 "everything not named wal_*; give the WAL a directory outside it");
+    }
+    // A WAL in the data directory is this node's WAL: started on an empty one elsewhere, the node
+    // would replay nothing, lose every row not in a segment yet, and take a new identity.
+    if (holds_wal(data)) {
+        throw std::runtime_error("Engine: the WAL is in " + data.string() + " and --wal-dir names " +
+                                 named.string() + ": move its wal_*.bin files and wal_identity "
+                                 "there first, or start without --wal-dir");
+    }
+    // And one the last start put somewhere else, unless it has been moved to the directory named.
+    if (recorded && *recorded != named && !holds_wal(named)) {
+        throw std::runtime_error("Engine: the WAL of " + data.string() + " is in " +
+                                 recorded->string() + ", where --wal-dir put it, and " +
+                                 named.string() + " holds none; start with --wal-dir " +
+                                 recorded->string() + ", or move its files to " + named.string());
+    }
+
+    fs::create_directories(named, ec);
+    if (ec) {
+        throw std::runtime_error("Engine: cannot create --wal-dir " + named.string() + ": " +
+                                 ec.message());
+    }
+    if (!recorded || *recorded != named) {
+        fs::create_directories(data, ec);
+        if (const int err = write_file_atomically((data / kWalLocationFile).string(), named.string());
+            err != 0) {
+            throw std::runtime_error("Engine: cannot write " + (data / kWalLocationFile).string() +
+                                     ": " + std::strerror(err) + " - without it a start without "
+                                     "--wal-dir could not tell the WAL is elsewhere");
+        }
+    }
+    struct stat data_st{}, wal_st{};
+    const bool own_filesystem = ::stat(data.c_str(), &data_st) == 0 &&
+                                ::stat(named.c_str(), &wal_st) == 0 && data_st.st_dev != wal_st.st_dev;
+    OB_LOG_INFO("engine", "WAL in %s - %s", named.c_str(),
+                own_filesystem ? "a filesystem of its own, not the data directory's"
+                               : "on the data directory's filesystem, so a WAL append still waits "
+                                 "for the journal its segments' files keep busy");
+    return named.string();
+}
+
+}  // namespace
 
 Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
                FsyncPolicy fsync_policy,
@@ -41,11 +156,13 @@ Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
                FailoverConfig failover_config,
                TTLConfig ttl_config,
                MultiMasterConfig mm_config,
-               size_t wal_rotate_bytes)
+               size_t wal_rotate_bytes,
+               std::string_view wal_dir)
     : base_dir_(base_dir)
+    , wal_dir_(resolve_wal_dir(base_dir, wal_dir))
     , flush_interval_ns_(flush_interval_ns)
     , fsync_policy_(fsync_policy)
-    , wal_(base_dir, wal_rotate_bytes, fsync_policy)
+    , wal_(wal_dir_, wal_rotate_bytes, fsync_policy)
     , combined_store_(base_dir)
     // The lookup takes mtx_ for one map read and releases it before the query runs. Handing
     // QueryEngine a reference to the buffer map instead was a data race: every write path inserts
@@ -115,7 +232,7 @@ void Engine::open() {
     // removed here and rebuilt by the replay, so nothing below - the sequence counters, the replay
     // filter - learns anything from a segment a power cut may have left short.
     load_or_create_wal_identity();
-    WALReplayer tail_replayer(base_dir_);
+    WALReplayer tail_replayer(wal_dir_);
     const WALReplayer::LastCheckpoint last_checkpoint = tail_replayer.find_last_checkpoint();
     remove_unvouched_segments(last_checkpoint);
 
@@ -237,7 +354,7 @@ void Engine::open() {
 
     // Restore epoch from WAL replay.
     {
-        WALReplayer epoch_replayer(base_dir_);
+        WALReplayer epoch_replayer(wal_dir_);
         epoch_replayer.replay([](const WALRecord&, const uint8_t*) {});
         current_epoch_.store(epoch_replayer.last_epoch(), std::memory_order_relaxed);
     }
@@ -561,7 +678,7 @@ void Engine::persist_version_vector_if_changed() {
 
 void Engine::restore_held_sequences() {
     std::vector<uint8_t> last;
-    WALReplayer replayer(base_dir_);
+    WALReplayer replayer(wal_dir_);
     replayer.replay_v2([&last](const WALReplayContext& ctx) {
         if (ctx.header.record_type != WAL_RECORD_HELD_SEQUENCES) return;
         last.assign(ctx.payload, ctx.payload + ctx.payload_len);
@@ -657,7 +774,8 @@ void Engine::discard_saved_replication_position() {
 }
 
 void Engine::load_or_create_wal_identity() {
-    const std::string path = base_dir_ + "/wal_identity";
+    // With the WAL it names (#186): an empty WAL of a new directory is a new stream.
+    const std::string path = wal_dir_ + "/wal_identity";
 
     std::ifstream in(path);
     if (in.is_open()) {
@@ -702,7 +820,7 @@ bool Engine::restore_version_vector() {
     std::optional<std::vector<SequenceTracker::VectorEntry>> last;
     bool last_unusable = false;
     VectorAssembler parts;
-    WALReplayer replayer(base_dir_);
+    WALReplayer replayer(wal_dir_);
     replayer.replay_v2([&](const WALReplayContext& ctx) {
         if (ctx.header.record_type == WAL_RECORD_VERSION_VECTOR) {
             PeerVector one;
@@ -896,7 +1014,42 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
     };
 
     s.state.assign(n, WriteState::Undecided);
+
+    // Where a slow write's time went (#186): the wait for the lock, the hold, and inside the hold
+    // the wait for room in the pending queue and the WAL append. Declared before the lock, so it
+    // says it after the lock is released.
+    struct WriteTiming {
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point asked{Clock::now()};
+        Clock::time_point held{}, room_from{}, room_to{}, wal_from{}, wal_to{}, released{};
+        size_t writes{0};
+        bool wal_beside_data{false};
+        ~WriteTiming() {
+            const auto end = released == Clock::time_point{} ? Clock::now() : released;
+            const auto ms = [](Clock::time_point a, Clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            if (held == Clock::time_point{}) return;
+            const double waited = ms(asked, held), total = ms(held, end);
+            if (waited < kSlowLockMs && total < kSlowLockMs) return;
+            const double room = room_to == Clock::time_point{} ? 0.0 : ms(room_from, room_to);
+            const double wal  = wal_to == Clock::time_point{} ? 0.0 : ms(wal_from, wal_to);
+            // A WAL append that long is the filesystem's (#186): on ext4 write() waits for the
+            // journal, which a data directory's segments keep busy - unless the WAL has one of its own.
+            const bool hint = wal_beside_data && wal >= kSlowLockMs;
+            OB_LOG_WARN("engine", "A batch of %zu write(s) waited %.1f ms for the engine lock and "
+                                  "held it %.1f ms - %.1f ms of it waiting for room in the pending "
+                                  "queue, %.1f ms in the WAL append%s",
+                        writes, waited, total, room, wal,
+                        hint ? "; a WAL on a filesystem of its own (--wal-dir) does not wait for "
+                               "the data directory's journal"
+                             : "");
+        }
+    } timing;
+    timing.writes = n;
+    timing.wal_beside_data = wal_dir_ == base_dir_;
     std::unique_lock<std::mutex> lock(mtx_);
+    timing.held = WriteTiming::Clock::now();
 
     // 1. What a single write checked before it waited for room, per write and in order.
     size_t admitted = 0;
@@ -964,7 +1117,10 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
     // 2. Backpressure: one wait for the batch, with the predicate a single write uses. This is
     //    the one place the lock may be released before the batch is in the WAL - and nothing is
     //    numbered yet, so nothing numbered can be waited on.
-    if (!await_pending_room(lock)) {
+    timing.room_from = WriteTiming::Clock::now();
+    const bool room = await_pending_room(lock);
+    timing.room_to = WriteTiming::Clock::now();
+    if (!room) {
         for (size_t i = 0; i < n; ++i) {
             if (s.state[i] == WriteState::Admitted) {
                 outcomes[i].status = OB_ERR_FULL;
@@ -1015,7 +1171,9 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
 
     // 4. The WAL: one write() per run. Nothing below runs for a record it did not write.
     try {
+        timing.wal_from = WriteTiming::Clock::now();
         (void)wal_.append_batch(s.records, s.wal);
+        timing.wal_to = WriteTiming::Clock::now();
     } catch (const std::exception& e) {
         abandon(e);
         return;
@@ -1066,6 +1224,7 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
     // over-delivers and delivers out of order on purpose, records above the frontier are held
     // rather than rejected, and conflicts are resolved by HLC rather than by arrival. Nothing on
     // the receiving side reads arrival order as meaning anything.
+    timing.released = WriteTiming::Clock::now();
     lock.unlock();
     if (!mm_mgr_) return;
     for (size_t k = 0; k < s.records.size(); ++k) {
@@ -2546,7 +2705,7 @@ void Engine::flush_tick() {
         WALWriter::SyncTicket ticket;
         PendingQueue::Batch batch;
         {
-            std::unique_lock<std::mutex> lock(mtx_);
+            TimedLock timed(mtx_, "flush tick: the WAL sync ticket and the rows it covers");
             auto prepared = wal_.prepare_sync();
             ticket = std::move(prepared.first);
             if (prepared.second != 0) {
@@ -2567,7 +2726,7 @@ void Engine::flush_tick() {
         }
         if (ticket.owed()) {
             const int sync_err = wal_.perform_sync(ticket);
-            std::unique_lock<std::mutex> lock(mtx_);
+            TimedLock timed(mtx_, "flush tick: completing the WAL sync");
             wal_.complete_sync(ticket, sync_err);
             if (sync_err != 0) {
                 detached_rows_.store(0, std::memory_order_relaxed);
@@ -2601,7 +2760,7 @@ void Engine::flush_tick() {
         // and the combined store has its own lock, which queries take and writers do not.
         uint32_t safe_truncate = 0;
         {
-            std::unique_lock<std::mutex> lock(mtx_);
+            TimedLock timed(mtx_, "flush tick: what retention may remove");
 
             // WAL truncation: only files the last synced drain is past, and that ALL replicas
             // have confirmed past, so lagging replicas can still catch up (Requirement 6.3).
@@ -2683,6 +2842,17 @@ void Engine::flush_tick() {
                          ms_since(drained, sealed), ms_since(sealed, retained),
                          ms_since(retained, finished));
         }
+        // And said at WARN when a tick takes a second (#186): writers at the ceiling wait for the room
+        // a tick frees in the pending queue - up to 3.4 s, measured, with every section this tick
+        // holds the lock in short - and which phase it was is what an operator needs to know.
+        if (const double total = ms_since(tick_started, TickClock::now()); total >= kSlowTickMs) {
+            OB_LOG_WARN("engine", "A flush tick took %.0f ms for %zu row(s): WAL sync %.1f ms, drain "
+                                  "%.1f ms, seals %.1f ms, retention %.1f ms, merges %.1f ms - writers "
+                                  "at the ceiling wait for the room it frees",
+                        total, taken, ms_since(tick_started, synced), ms_since(synced, drained),
+                        ms_since(drained, sealed), ms_since(sealed, retained),
+                        ms_since(retained, TickClock::now()));
+        }
 }
 
 
@@ -2710,7 +2880,7 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
         if (mtx_held) {
             step();
         } else {
-            std::lock_guard<std::mutex> lock(mtx_);
+            TimedLock timed(mtx_, "flush tick: a step of the drain");
             step();
         }
     };
@@ -3089,7 +3259,7 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows) {
     const auto written = SealClock::now();
 
     if (seals.empty()) {
-        std::unique_lock<std::mutex> lock(mtx_);
+        TimedLock timed(mtx_, "flush tick: no seal - gauges and the vector copy");
         registry_.set_gauge("ob_unsealed_rows",
                             static_cast<int64_t>(unsealed_rows_.load(std::memory_order_relaxed)));
         // What the mesh compares a returning peer against, fresh at every tick rather than at every
@@ -3113,7 +3283,7 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows) {
     for (const Seal& s : seals) sealed_rows += s.rows;
 
     {
-        std::unique_lock<std::mutex> lock(mtx_);
+        TimedLock timed(mtx_, "flush tick: merging the seals, the checkpoint and the vector");
         const size_t refused = merge_seals_locked(seals);
         if (refused > 0) {
             segment_merge_refused_.fetch_add(refused, std::memory_order_relaxed);

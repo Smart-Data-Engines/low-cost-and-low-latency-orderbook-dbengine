@@ -1031,6 +1031,7 @@ const std::vector<std::string>& known_flags() {
         "tls-replication",
         "ttl-hours",
         "ttl-scan-interval-seconds",
+        "wal-dir",
         "wal-rotate-bytes",
     };
     return flags;
@@ -1111,6 +1112,10 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
                                  "link, in both roles; needs --tls-ca-file"}},
         {"ttl-hours", {"<N>", "Retention in hours; 0 keeps everything"}},
         {"ttl-scan-interval-seconds", {"<N>", "How often retention scans for expired rows"}},
+        {"wal-dir", {"<DIR>", "Where the WAL files live (default: the data directory). Give the WAL "
+                              "a filesystem of its own when the data directory holds thousands of "
+                              "instruments: on ext4 a WAL append waits for the journal, which "
+                              "their segments' files keep busy"}},
         {"wal-rotate-bytes", {"<N>", "WAL bytes before the next file is opened; a file may "
                                      "exceed it by one record (default: 536870912)"}},
     };
@@ -1535,6 +1540,8 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.mm_max_catchup_bytes = cursor.value_as<size_t>();
         } else if (arg == "--wal-rotate-bytes") {
             config.wal_rotate_bytes = cursor.value_as<size_t>();
+        } else if (arg == "--wal-dir") {
+            config.wal_dir = std::string{cursor.value()};
         } else {
             // Previously ignored in silence, which meant a typo started a server on the default
             // port: `--prot 5599` was accepted, and so was `--port` with no value at all.
@@ -1853,6 +1860,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     line("tls-replication", c.tls_replication ? "true" : "false");
     line("ttl-hours", std::to_string(c.ttl_hours));
     line("ttl-scan-interval-seconds", std::to_string(c.ttl_scan_interval_seconds));
+    line("wal-dir", c.wal_dir.empty() ? c.data_dir : c.wal_dir);
     line("wal-rotate-bytes", std::to_string(c.wal_rotate_bytes));
     return out;
 }
@@ -1931,7 +1939,8 @@ TcpServer::TcpServer(ServerConfig config)
                                            .tls_server = tls_.mesh_server,
                                            .tls_client = tls_.mesh_client
                                        },
-                                       config_.wal_rotate_bytes);
+                                       config_.wal_rotate_bytes,
+                                       config_.wal_dir);
 }
 
 TcpServer::~TcpServer() {

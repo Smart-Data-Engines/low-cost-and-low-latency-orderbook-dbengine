@@ -35,7 +35,7 @@ The engine is composed of six subsystems, each responsible for a specific concer
 
 ### Write Path (apply_delta)
 
-1. **WAL write** — The delta update is serialized and appended to the WAL file with a CRC32C checksum, before any state mutation. Whether that append is also `fsync`ed at this point is `--fsync-policy`: under `every` it is, and a failed `fsync` refuses the write (#113); under the default `interval` the sync follows within the flush interval.
+1. **WAL write** — The delta update is serialized and appended to the WAL file with a CRC32C checksum, before any state mutation. Whether that append is also `fsync`ed at this point is `--fsync-policy`: under `every` it is, and a failed `fsync` refuses the write (#113); under the default `interval` the sync follows within the flush interval. The append is a `write()` under the engine's lock, so the lock is held as long as the kernel keeps that call: on ext4 it waits for the journal, which a data directory of thousands of instruments keeps busy with its segments' files - measured up to 1.1 s on a node of 4 000 symbols, and gone with the WAL on a filesystem of its own (`--wal-dir`, #186). A batch that waited or held the lock 20 ms or more says how much of it was the WAL append.
 
 2. **SoA buffer update** — The seqlock writer protocol increments the version to odd, writes the new price levels, then increments to even. Readers spin-wait on even versions for consistent snapshots.
 

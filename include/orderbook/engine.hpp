@@ -98,7 +98,8 @@ public:
                     FailoverConfig failover_config = {},
                     TTLConfig ttl_config = {},
                     MultiMasterConfig mm_config = {},
-                    size_t wal_rotate_bytes = 512ULL << 20);
+                    size_t wal_rotate_bytes = 512ULL << 20,
+                    std::string_view wal_dir = {});
 
     ~Engine();
 
@@ -470,6 +471,9 @@ public:
 
     /// Access the base data directory path.
     const std::string& base_dir() const { return base_dir_; }
+    /// Where the WAL files and `wal_identity` live: the data directory unless `--wal-dir` names one
+    /// of its own (#186).
+    const std::string& wal_dir() const { return wal_dir_; }
 
     // ── Failover / role management ────────────────────────────────────────────
 
@@ -604,6 +608,9 @@ public:
 
 private:
     std::string base_dir_;
+    /// Where the WAL lives (#186). Before `wal_`, which opens its first file as it is built, because
+    /// the refusals that keep a moved WAL from being a lost one run as this is resolved.
+    std::string wal_dir_;
     uint64_t    flush_interval_ns_;
     /// The policy the WAL was given, kept here as well because it decides a second thing: whether a
     /// flush syncs the segments it wrote (#160). `none` promises nothing after a power cut, so it
