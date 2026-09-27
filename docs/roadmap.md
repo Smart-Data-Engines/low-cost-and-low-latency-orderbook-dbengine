@@ -2388,7 +2388,7 @@ a run's catch-ups came from it.
 - Effort: S | Impact: duplicate traffic on every reconciliation between nodes whose timers are more
   than two seconds apart, and a second full catch-up after a large one
 
-### 182. A mesh node logs every replicated update of a level it already holds as a conflict, at INFO **P1**
+### 182. A mesh node logs every replicated update of a level it already holds as a conflict, at INFO ✅ **P1**
 
 **Found measuring #178.** `ConflictResolver::resolve()` compares a remote update with the state it
 holds for the same (symbol, exchange, side, price) and, whenever there is one, records a conflict and
@@ -2402,6 +2402,21 @@ at the rates this engine ingests, tens of megabytes of log a second, with the CP
 A fix does not call a same-origin, newer update a conflict, and logs the ones it does call conflicts
 as a count and an episode rather than a line each; `ob_mm_conflicts_total` and `MM_CONFLICTS` keep
 what an operator needs.
+
+**Fixed:** the origin that wrote a level last, writing it again, is not a conflict - a newer update is
+`NO_CONFLICT`, anything else the new `REJECT_STALE`, a late copy the engine skips - and neither enters
+`MM_CONFLICTS`, `ob_mm_conflicts_total` or a line. Two origins writing one level are a conflict, decided
+as before, and said by the window: the first at INFO with its details, the ones within ten seconds
+counted and said as one line with the next after them. Measured with the new
+`scripts/measure_conflict_log.py` (three nodes, Release, i3-7100U): one writer, 300 000 single-level
+writes to 1 000 levels of ten symbols - #178's shape - counted and logged **290 000** conflicts on each
+receiver, 60.6 MB of log, before, and **0, 0 and 0.0 MB** after; with a second writer to the same
+levels, 300 000 and 590 000 counted and logged before, and **10 000** after - each a level whose writer
+changed - with **one** line and, on the tree with #184's fix, 0.0 MB of log: before it, the second
+writer's numbers set off 84 MB of `Gap:` warnings on each receiver, which #184 is. The mutation table,
+verdicts written down before each pass: 11 mutations in 13 runs, every one as written; one survived its
+first pass as predicted, the engine counting a late copy as a conflict, because no test sent one - the
+counter test does now - and one did not build, pitfall 484 a third time.
 
 - Effort: S | Impact: a mesh logs at the rate it writes, until the disk is full
 
@@ -11809,7 +11824,7 @@ measures the harness.
 
 ## Recommended order
 
-**No P0 is open**, and **#169, #175, #176, #177, #182, #186 and #187 are open P1s** — the mechanical
+**No P0 is open**, and **#169, #175, #176, #177, #186 and #187 are open P1s** — the mechanical
 list is the `Open:` line below; read it there rather than trusting this paragraph, which is prose
 and has been wrong about this before. **#184 was the P0**: when two mesh nodes wrote one symbol, the
 one counter per symbol gave each origin's numbers holes, so every node's frontier for it stopped at
@@ -11836,8 +11851,9 @@ peer as holding nothing, resending everything since its last vector. **#186** wa
 #180's cost, on master too: a mesh node of 4 000 symbols stalls a write for up to 0.6 s at a
 trickle, and refuses writes at the pipelined ceiling. **#177**: a version vector past 1 561 entries
 asks for everything, so every reconciliation resends the whole retained WAL and a joining node never
-asks for a snapshot. **#182**: every replicated update of a level a node holds is logged at INFO as
-a conflict - 61 MB of log for 300 000 writes.
+asks for a snapshot. **#182 is closed**: every replicated update of a level a node held was logged at
+INFO as a conflict, 61 MB of log for 300 000 writes; only two origins writing one level are one now,
+said by the window.
 **#176** was found writing part 2b of #165: a mesh snapshot names each file by a 16-bit index, so a
 node of 8 192 segments — 8 192 instruments, whatever merging does — cannot bootstrap a peer that
 joins it; measuring it found #177 first. **#175**: sharding by symbol has no control plane — no shard writes itself or
@@ -11908,7 +11924,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #174, #175, #176, #177, #182, #186, #187.** Every other item above #58 is marked closed, and
+**Open: #169, #174, #175, #176, #177, #186, #187.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -12049,7 +12065,6 @@ The capability items are in the table below.
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
 | **P1** | Sharding by symbol gains its control plane: the shards write the map, and both clients read it (#175) | M–L | A shard writes neither itself nor the map to etcd, owns every symbol, and a second one on the same etcd becomes the first one's replica; neither client can find a shard |
 | **P1** | A version vector of any size, so a mesh of thousands of instruments neither resends its WAL every reconciliation nor refuses a joiner its snapshot (#177) | M | Past 1 561 (symbol, origin) entries a vector is sent as "send everything": 9 600 - 20 800 duplicates a node in a 16 s window where 1 500 entries cost none, and a joiner that never asks for a snapshot |
-| **P1** | A mesh logs a conflict only where two origins wrote one level, and as a count rather than a line each (#182) | S | Every replicated update of a level the node holds is logged at INFO as a conflict, same origin or not: 301 985 lines, 61 MB, for 300 000 writes |
 | **P1** | A mesh can close the holes the old one-counter numbering left, so catch-up works again for the symbols two nodes wrote before per-origin numbers (#187) | M | Every node's tracker holds them - the vector writes them down, a snapshot carries them - so for those symbols a node that misses writes is still judged to hold them, and only a new mesh clears it |
 | **P1** | A mesh node of 4 000 symbols neither stalls a write for half a second nor refuses writes at the pipelined ceiling (#186) | M | Measured on master and the branch alike and not yet explained: the largest round trip of a run 169–623 ms in six runs of twelve, and writes refused when the pending queue did not free room in 5 s |
 | **P1** | A mesh snapshot carries any number of files, so a peer can join a node of 8 192 segments or more (#176) | M | A mesh snapshot names a file by a 16-bit index, so a node of 8 192 segments - 8 192 instruments, whatever part 2b merges - cannot bootstrap a peer that joins it; found reading the sender, not yet measured |
