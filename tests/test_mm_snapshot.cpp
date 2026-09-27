@@ -134,6 +134,9 @@ template <typename Mutate>
 void run_transfer(Node& sender, WiredPeer& to_receiver,
                   Node& receiver, ob::PeerConnection& sender_peer,
                   Mutate mutate) {
+    // The receiver takes a BEGIN only from the connection it asked (#188); this drives the sender's
+    // side of the request directly, so it records the receiver's side of it.
+    receiver.mm->note_snapshot_asked_for_test(sender_peer);
     request_snapshot_and_settle(sender, to_receiver);
 
     // What the socket did not take stays in the sender's buffer, as the EPOLLOUT branch would find
@@ -597,6 +600,7 @@ TEST(MMSnapshotRefusal, AnEndWithFilesStillMissingIsRefused) {
     // Drop the last file chunk, then let END through. Without the completeness check the receiver
     // would install a manifest it never fully received.
     std::vector<Frame> seen;
+    receiver.mm->note_snapshot_asked_for_test(sender_peer);   // or its BEGIN is refused (#188)
     request_snapshot_and_settle(sender, to_receiver);
     for (int round = 0; round < 10'000 && sender.mm->snapshot_send_active(); ++round) {
         to_receiver.collect();
@@ -652,6 +656,7 @@ TEST(MMSnapshotRefusal, ASecondBeginDoesNotDisturbTheFirstTransfer) {
     ASSERT_FALSE(frames.empty());
     ASSERT_EQ(frames[0].hdr.record_type, ob::MM_MSG_SNAPSHOT_BEGIN);
 
+    receiver.mm->note_snapshot_asked_for_test(first);
     deliver(*receiver.mm, first, frames[0]);
     ASSERT_TRUE(receiver.mm->snapshot_recv_active());
 
@@ -707,6 +712,7 @@ TEST(MMSnapshotRefusal, LosingTheSourceMidTransferClearsTheFlag) {
     to_receiver.collect();
     auto frames = take_frames(to_receiver.inbox);
     ASSERT_FALSE(frames.empty());
+    receiver.mm->note_snapshot_asked_for_test(source);
     deliver(*receiver.mm, source, frames[0]);
     ASSERT_TRUE(receiver.mm->is_bootstrapping());
 
@@ -749,6 +755,251 @@ TEST(MMSnapshotRequest, AnEmptyNodeAsks) {
     ASSERT_EQ(frames.size(), 1u);
     EXPECT_EQ(frames[0].hdr.record_type, ob::MM_MSG_SNAPSHOT_REQUEST);
     EXPECT_TRUE(frames[0].payload.empty());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// One snapshot, from one peer (#188)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// A node that held nothing asked every peer whose vector arrived before the first SNAPSHOT_BEGIN -
+// on a join, all of them - each prepared and sent a whole snapshot, and the node installed each one
+// that arrived after a bootstrap had finished: three installs from three peers, writes refused
+// 21.6 s where one took 6.8.
+
+namespace {
+
+/// A snapshot frame arriving on `peer`'s connection, as the io loop reads it off the socket.
+void arrive_snapshot_frame(ob::MultiMasterManager& mm, ob::PeerConnection& peer, uint8_t type,
+                           const std::vector<uint8_t>& payload) {
+    ob::WALRecordV2 hdr{};
+    hdr.record_type    = type;
+    hdr.version        = 1;
+    hdr.payload_len    = static_cast<uint16_t>(payload.size());
+    hdr.origin_node_id = peer.node_id;
+    hdr.checksum       = ob::crc32c(payload.data(), payload.size());
+    std::vector<uint8_t> frame;
+    ob::encode_frame_header(ob::MM_WALRECORD_V2_SIZE + payload.size(), frame);
+    const auto* hb = reinterpret_cast<const uint8_t*>(&hdr);
+    frame.insert(frame.end(), hb, hb + ob::MM_WALRECORD_V2_SIZE);
+    frame.insert(frame.end(), payload.begin(), payload.end());
+    peer.recv_buf.insert(peer.recv_buf.end(), frame.begin(), frame.end());
+    mm.process_recv_buf_for_test(peer);
+}
+
+size_t requests_in(WiredPeer& peer) {
+    peer.collect();
+    size_t n = 0;
+    for (const auto& f : take_frames(peer.inbox)) n += f.hdr.record_type == ob::MM_MSG_SNAPSHOT_REQUEST;
+    return n;
+}
+
+std::string refusal_in(WiredPeer& peer) {
+    peer.collect();
+    for (const auto& f : take_frames(peer.inbox)) {
+        if (f.hdr.record_type == ob::MM_MSG_SNAPSHOT_ABORT) {
+            return ob::decode_snapshot_abort(f.payload.data(), f.payload.size());
+        }
+    }
+    return "";
+}
+
+}  // namespace
+
+TEST(MMSnapshotOnePeer, ANodeThatHoldsNothingAsksOnePeerAtATime) {
+    Node node(1);
+    WiredPeer a(2), b(3), c(4);
+    EXPECT_TRUE(node.mm->request_snapshot_from(a.mgr(*node.mm)));
+    EXPECT_FALSE(node.mm->request_snapshot_from(b.mgr(*node.mm)))
+        << "a second peer was asked while the first had not answered";
+    EXPECT_FALSE(node.mm->request_snapshot_from(c.mgr(*node.mm)));
+    EXPECT_EQ(requests_in(a), 1u);
+    EXPECT_EQ(requests_in(b), 0u);
+    EXPECT_EQ(requests_in(c), 0u);
+    const auto ask = node.mm->snapshot_ask_for_test();
+    EXPECT_TRUE(ask.active);
+    EXPECT_EQ(ask.node_id, 2u);
+}
+
+TEST(MMSnapshotOnePeer, ANodeRefusesWritesFromItsRequestUntilTheLastPeerRefuses) {
+    // Between the request and the BEGIN the other peers' catch-ups arrive, and a client may write: a
+    // node that took either held data by the BEGIN - and was refused the snapshot, or lost what it
+    // held to the install. Measured: a joiner held its peers' catch-ups 8 ms after asking, when the
+    // BEGIN came. And a node no peer can serve takes writes again rather than refuse them for ever.
+    Node node(1);
+    WiredPeer a(2);
+    ob::PeerConnection& pa = a.mgr(*node.mm);
+    ASSERT_FALSE(node.mm->is_bootstrapping());
+    ASSERT_TRUE(node.mm->request_snapshot_from(pa));
+    EXPECT_TRUE(node.mm->is_bootstrapping()) << "a node waiting for its snapshot takes writes";
+    arrive_snapshot_frame(*node.mm, pa, ob::MM_MSG_SNAPSHOT_ABORT, ob::encode_snapshot_abort("busy"));
+    EXPECT_FALSE(node.mm->is_bootstrapping()) << "a node no peer can serve refuses writes for good";
+}
+
+TEST(MMSnapshotOnePeer, APeerThatRefusesOrGoesAwayLetsTheNextBeAsked) {
+    Node node(1);
+    WiredPeer a(2), b(3), c(4);
+    ob::PeerConnection& pa = a.mgr(*node.mm);
+    ob::PeerConnection& pb = b.mgr(*node.mm);
+    ob::PeerConnection& pc = c.mgr(*node.mm);
+    ASSERT_TRUE(node.mm->request_snapshot_from(pa));
+
+    arrive_snapshot_frame(*node.mm, pb, ob::MM_MSG_SNAPSHOT_ABORT, ob::encode_snapshot_abort("busy"));
+    EXPECT_TRUE(node.mm->snapshot_ask_for_test().active)
+        << "a refusal from a peer this node did not ask ended the request to another";
+    arrive_snapshot_frame(*node.mm, pa, ob::MM_MSG_SNAPSHOT_ABORT, ob::encode_snapshot_abort("busy"));
+    EXPECT_FALSE(node.mm->snapshot_ask_for_test().active);
+    ASSERT_TRUE(node.mm->request_snapshot_from(pb)) << "a refusal kept the next peer from being asked";
+
+    node.mm->on_peer_disconnected(pa);
+    EXPECT_TRUE(node.mm->snapshot_ask_for_test().active)
+        << "a peer that was not asked going away ended the request to another";
+    node.mm->on_peer_disconnected(pb);
+    EXPECT_FALSE(node.mm->snapshot_ask_for_test().active);
+    EXPECT_TRUE(node.mm->request_snapshot_from(pc)) << "a peer gone kept the next from being asked";
+}
+
+TEST(MMSnapshotOnePeer, ARefusalAsksTheNextPeerThatStatesWhatItHoldsAtOnce) {
+    // Not at that peer's next vector, a reconciliation interval later: before #188 every peer was
+    // asked at once, so one refusing cost nothing, and one at a time must not make it cost 30 s.
+    Node node(1);
+    WiredPeer a(2), b(3);
+    ob::PeerConnection& pa = a.mgr(*node.mm);
+    ob::PeerConnection& pb = b.mgr(*node.mm);
+    const auto bytes = ob::serialize_version_vector({{"BTC.USDT", 3, 8}}, false);
+    ASSERT_TRUE(pb.peer_vector.deserialize(bytes.data(), bytes.size()));
+    ASSERT_TRUE(node.mm->request_snapshot_from(pa));
+    EXPECT_EQ(requests_in(b), 0u);
+
+    arrive_snapshot_frame(*node.mm, pa, ob::MM_MSG_SNAPSHOT_ABORT, ob::encode_snapshot_abort("busy"));
+    EXPECT_EQ(requests_in(b), 1u) << "the peer that states what it holds was not asked in its place";
+    EXPECT_EQ(node.mm->snapshot_ask_for_test().node_id, 3u);
+}
+
+TEST(MMSnapshotOnePeer, ABootstrapAbandonedPartWayAsksTheNextPeer) {
+    // Before #188 the other peers had been asked too, and a BEGIN from one of them was the retry.
+    Node node(1);
+    WiredPeer a(2), b(3);
+    ob::PeerConnection& pa = a.mgr(*node.mm);
+    ob::PeerConnection& pb = b.mgr(*node.mm);
+    const auto bytes = ob::serialize_version_vector({{"BTC.USDT", 3, 8}}, false);
+    ASSERT_TRUE(pb.peer_vector.deserialize(bytes.data(), bytes.size()));
+    ASSERT_TRUE(node.mm->request_snapshot_from(pa));
+    ob::SnapshotBegin begin{};
+    begin.manifest_len = 10;
+    begin.vector_len   = 2;
+    const auto payload = ob::encode_snapshot_begin(begin);
+    node.mm->handle_snapshot_begin(pa, payload.data(), payload.size());
+    ASSERT_TRUE(node.mm->snapshot_recv_active());
+    EXPECT_EQ(requests_in(b), 0u);
+
+    arrive_snapshot_frame(*node.mm, pa, ob::MM_MSG_SNAPSHOT_ABORT,
+                          ob::encode_snapshot_abort("file_read_failed"));
+    EXPECT_FALSE(node.mm->snapshot_recv_active());
+    EXPECT_EQ(requests_in(b), 1u) << "an abandoned bootstrap waited for the next vector to ask again";
+}
+
+TEST(MMSnapshotOnePeer, ARequestNobodyAnswersIsForgottenAtItsDeadline) {
+    Node node(1);
+    WiredPeer a(2), b(3);
+    ASSERT_TRUE(node.mm->request_snapshot_from(a.mgr(*node.mm)));
+    const auto asked = node.mm->snapshot_ask_for_test().asked_at;
+    node.mm->expire_snapshot_ask_for_test(
+        asked + std::chrono::milliseconds(ob::MM_SNAPSHOT_ASK_DEADLINE_MS - 1));
+    EXPECT_TRUE(node.mm->snapshot_ask_for_test().active) << "forgotten before its deadline";
+    node.mm->expire_snapshot_ask_for_test(
+        asked + std::chrono::milliseconds(ob::MM_SNAPSHOT_ASK_DEADLINE_MS));
+    EXPECT_FALSE(node.mm->snapshot_ask_for_test().active);
+    EXPECT_TRUE(node.mm->request_snapshot_from(b.mgr(*node.mm)))
+        << "a peer that said nothing kept the next from being asked";
+}
+
+TEST(MMSnapshotOnePeer, ABeginThisNodeDidNotAskForIsRefusedAndInstallsNothing) {
+    Node sender(1);
+    Node receiver(2);
+    sender.write_rows("BTC", 8, 11'000'000);
+    WiredPeer to_receiver(2);
+    WiredPeer back(1);                     // the receiver's connection to the sender
+    ob::PeerConnection& sender_peer = back.mgr(*receiver.mm);
+
+    request_snapshot_and_settle(sender, to_receiver);   // the sender answers a request ...
+    to_receiver.collect();
+    const auto frames = take_frames(to_receiver.inbox);
+    ASSERT_FALSE(frames.empty());
+    ASSERT_EQ(frames[0].hdr.record_type, ob::MM_MSG_SNAPSHOT_BEGIN);
+    deliver(*receiver.mm, sender_peer, frames[0]);     // ... this node never sent
+    EXPECT_FALSE(receiver.mm->snapshot_recv_active());
+    EXPECT_FALSE(receiver.mm->is_bootstrapping());
+    EXPECT_EQ(refusal_in(back), "not_requested");
+}
+
+TEST(MMSnapshotOnePeer, ABeginFromTheNodeAskedOnAnotherConnectionIsRefused) {
+    // The request belongs to the connection it went on, as the sender's answer does (#79): the node
+    // on a connection of its own has asked this one for nothing.
+    Node sender(1);
+    Node receiver(2);
+    sender.write_rows("BTC", 8, 15'000'000);
+    WiredPeer to_receiver(2);
+    WiredPeer back(1);
+    ob::PeerConnection& asked = back.mgr(*receiver.mm);
+    ASSERT_TRUE(receiver.mm->request_snapshot_from(asked));
+    ob::PeerConnection other;                  // the same node, on another connection
+    other.node_id        = asked.node_id;
+    other.conn_id        = asked.conn_id + 1000;
+    other.fd             = back.local_fd;      // so its refusal is read where the request was
+    other.connected      = true;
+    other.handshake_done = true;
+
+    request_snapshot_and_settle(sender, to_receiver);
+    to_receiver.collect();
+    const auto frames = take_frames(to_receiver.inbox);
+    ASSERT_FALSE(frames.empty());
+    ASSERT_EQ(frames[0].hdr.record_type, ob::MM_MSG_SNAPSHOT_BEGIN);
+    deliver(*receiver.mm, other, frames[0]);
+    EXPECT_FALSE(receiver.mm->snapshot_recv_active())
+        << "a BEGIN on a connection that asked for nothing was taken";
+    EXPECT_EQ(refusal_in(back), "not_requested");
+    EXPECT_TRUE(receiver.mm->snapshot_ask_for_test().active) << "it ended the request it did not answer";
+}
+
+TEST(MMSnapshotOnePeer, ABeginThatArrivesOnceThisNodeHoldsDataIsRefused) {
+    // Asked while it held nothing, and written to before the answer came: installing would replace
+    // what the client was told was stored.
+    Node sender(1);
+    Node receiver(2);
+    sender.write_rows("BTC", 8, 12'000'000);
+    WiredPeer to_receiver(2);
+    WiredPeer back(1);
+    ob::PeerConnection& sender_peer = back.mgr(*receiver.mm);
+    ASSERT_TRUE(receiver.mm->request_snapshot_from(sender_peer));
+    receiver.write_rows("ETH", 3, 13'000'000);
+    ASSERT_FALSE(receiver.engine->holds_no_data());
+
+    request_snapshot_and_settle(sender, to_receiver);
+    to_receiver.collect();
+    const auto frames = take_frames(to_receiver.inbox);
+    ASSERT_FALSE(frames.empty());
+    deliver(*receiver.mm, sender_peer, frames[0]);
+    EXPECT_FALSE(receiver.mm->snapshot_recv_active());
+    EXPECT_EQ(refusal_in(back), "holds_data");
+    EXPECT_FALSE(receiver.mm->snapshot_ask_for_test().active) << "the request was answered";
+}
+
+TEST(MMSnapshotOnePeer, ASenderItsTargetRefusedStopsSending) {
+    // A refused sender used to stream every file, and the receiver drop each chunk.
+    Node sender(1, /*snapshot_watermark=*/256);   // pauses on a full socket rather than finishing
+    sender.write_rows("BTC", 8, 14'000'000);
+    WiredPeer a(2, /*tiny_buffers=*/true);
+    WiredPeer other(3);
+    request_snapshot_and_settle(sender, a);
+    ASSERT_TRUE(sender.mm->snapshot_send_active());
+
+    arrive_snapshot_frame(*sender.mm, other.mgr(*sender.mm), ob::MM_MSG_SNAPSHOT_ABORT,
+                          ob::encode_snapshot_abort("not_requested"));
+    EXPECT_TRUE(sender.mm->snapshot_send_active())
+        << "a refusal from another peer ended this transfer";
+    arrive_snapshot_frame(*sender.mm, a.mgr(*sender.mm), ob::MM_MSG_SNAPSHOT_ABORT,
+                          ob::encode_snapshot_abort("not_requested"));
+    EXPECT_FALSE(sender.mm->snapshot_send_active()) << "a refused sender went on sending";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

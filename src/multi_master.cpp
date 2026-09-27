@@ -390,6 +390,7 @@ void MultiMasterManager::start() {
 
 void MultiMasterManager::stop() {
     if (!running_.exchange(false, std::memory_order_acq_rel)) return;
+    stopping_.store(true, std::memory_order_release);   // a bootstrap ended now asks no one (#188)
 
     OB_LOG_INFO("mm", "Stopping MultiMasterManager: node_id=%u", config_.node_id);
 
@@ -610,11 +611,23 @@ size_t MultiMasterManager::connected_peer_count() const {
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 
 void MultiMasterManager::start_bootstrap() {
-    bootstrapping_.store(true, std::memory_order_release);
+    // Since #188 a bootstrap starts when the snapshot is asked for, and the BEGIN that answers it
+    // finds it started: said once.
+    if (bootstrapping_.exchange(true, std::memory_order_acq_rel)) return;
     OB_LOG_INFO("mm",
                 "Bootstrap started for node %u — writes are refused with ERR BOOTSTRAPPING until "
                 "finish_bootstrap() is called",
                 config_.node_id);
+}
+
+void MultiMasterManager::end_snapshot_wait(const char* why) {
+    // Not a failed bootstrap - nothing was received, and nothing here was touched: no peer is left
+    // to give this node the snapshot it asked for. Refusing writes until one appears would be #73's
+    // node that refuses them for ever; the next peer's vector asks again while it still holds nothing.
+    if (!bootstrapping_.exchange(false, std::memory_order_acq_rel)) return;
+    OB_LOG_WARN("mm", "No peer gave node %u the snapshot it asked for (%s); accepting writes until "
+                      "one can - the next peer whose vector says what it holds is asked",
+                config_.node_id, why);
 }
 
 void MultiMasterManager::finish_bootstrap(bool succeeded) {
@@ -730,6 +743,8 @@ void MultiMasterManager::io_loop() {
         // notification is what makes it prompt; this is what makes a lost notification cost half a
         // second instead of a stuck bootstrap.
         poll_snapshot_preparation();
+        // And has a snapshot request gone unanswered too long? Then the next peer is asked (#188).
+        expire_snapshot_ask(std::chrono::steady_clock::now());
 
         // Whether any event in this pass threw. Without it the recovery line below fires in the
         // **same** pass as the ERROR it is supposed to close - measured, the log alternated
@@ -1815,6 +1830,20 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
             OB_LOG_WARN("mm", "Peer %u aborted the snapshot: %s", peer.node_id, reason.c_str());
             if (snapshot_recv_.active && snapshot_recv_.source_node_id == peer.node_id) {
                 abort_bootstrap("peer_aborted");
+            }
+            // The peer this node asked refused: the next one that states its vector is asked (#188).
+            if (snapshot_ask_.active && snapshot_ask_.node_id == peer.node_id &&
+                snapshot_ask_.conn_id == peer.conn_id) {
+                OB_LOG_INFO("mm", "Peer %u refused the snapshot this node asked it for: %s",
+                            peer.node_id, reason.c_str());
+                snapshot_ask_ = MMSnapshotAsk{};
+                if (!ask_another_peer_for_snapshot(peer.node_id)) end_snapshot_wait("refused");
+            }
+            // And a receiver that refused this node's snapshot does not want the rest of it: a
+            // refused sender used to stream every file, and the receiver drop each chunk (#188).
+            if (snapshot_send_.active && snapshot_send_.target_node_id == peer.node_id &&
+                snapshot_send_.target_conn_id == peer.conn_id) {
+                finish_snapshot_send(false, "peer_refused");
             }
             return;
         }
