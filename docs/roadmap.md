@@ -2213,6 +2213,49 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 192. A mesh node that abandons a snapshot part-way does not tell its sender, which streams it the rest ✅ **P2**
+
+**Found measuring #176, with the same probe as #191.** A joiner that abandons a transfer - a chunk at
+the wrong offset, a checksum that does not match, a staging write that fails - removed its staging
+and asked the next peer, and said nothing to the one sending: that peer streamed the rest of the
+snapshot to a node that dropped every chunk and said so at `WARN` for each, `Peer 3 sent a snapshot
+chunk with no bootstrap in progress`. Measured, a joiner that abandoned each snapshot at its
+65 536th file of 65 600: every sender logged `Snapshot sent to peer 4: files=65600 ... (complete)`,
+and the joiner 448 such lines - a transfer abandoned at its start would stream the whole snapshot.
+
+**Fixed**: the receiver sends its source `SNAPSHOT_ABORT` with the reason, on the connection the
+`SNAPSHOT_BEGIN` came on, and the sender ends the transfer as #188's does for a refusal
+(`peer_refused`) - and says the reason, which was the sender's operator's only clue. Not when the
+source went away, or aborted the transfer itself.
+
+- Effort: S | Impact: a failed bootstrap costs its sender the whole transfer and its joiner a log
+  line a chunk
+
+### 191. A joiner that every peer refuses, or whose every snapshot fails, asks them in turn for ever and refuses writes the whole time ✅ **P1**
+
+**Found measuring #176.** Since #188 a node that joins asks one peer at a time, and when that peer
+refuses, drops its connection, says nothing for ten minutes or sends a snapshot the node abandons,
+`ask_another_peer_for_snapshot()` asks the next - the first connected peer other than the one that
+had just failed, with nothing to say which had failed before. So with two peers or more that all
+fail, the joiner asked them in turn for ever, each refusal after a snapshot's whole preparation on
+the peer, and refused writes the whole time: #188's `No peer gave node 4 the snapshot it asked for`,
+and the writes it takes after, were reached only when no other peer stated its vector at all.
+Measured on a live mesh (`evidence/2026-09-27-mesh-snapshot-rounds/probe-rounds/`): three nodes of
+8 200 segments, which a build without #176 refuses to snapshot (`too_many_files`), and a fourth
+joining - **36 requests and 35 refusals in 90 s, and not one write taken**. The peers refused
+because of #176, but a node of this build meets the same loop wherever every peer refuses or every
+transfer fails: peers of an older build past 65 534 files, all of them busy with other joiners - where
+the refusals were immediate and the asking a hot loop - or a store none of them can send.
+
+**Fixed**: a bootstrap asks each peer at most once (`snapshot_round_`), and when no peer it has not
+asked states what it holds, it ends its wait and takes writes, as #188 says it does. The round ends
+with the bootstrap, however it ends, and the next vector a peer sends while the node still holds
+nothing begins the next. The same probe: **3 requests, 3 refusals, and a write taken 7.1 s after the
+joiner started**.
+
+- Effort: S | Impact: a node joining a mesh that cannot serve it refuses writes for as long as it
+  runs, and keeps every peer preparing snapshots
+
 ### 190. At the write ceiling a flush tick's WAL sync takes 1 - 3 s on a device the segments keep busy, and writers wait that long for room in the pending queue **P2**
 
 **Found measuring #186's fix.** One node of 4 000 symbols under `benchmarks/pipelined_ingest` at two
@@ -12045,7 +12088,9 @@ peer as holding nothing, resending everything since its last vector. **#186 is c
 measuring #180's cost: a node of 4 000 symbols answered a write up to 1.1 s late, all of it in the WAL
 append waiting for the ext4 journal its segments keep busy, and `--wal-dir` gives the WAL a
 filesystem of its own - no write slower than 11 ms in six runs where four stalled; **#190** is what
-remains at the ceiling, a WAL sync of 1 - 3 s on a device the segments share. **#177 is closed**: a version vector past
+remains at the ceiling, a WAL sync of 1 - 3 s on a device the segments share. **#191 and #192 are closed**, found measuring #176: a joiner that every peer refused asked them in
+turn for ever and refused writes the whole time - 36 requests in 90 s, not one write - and asks each
+once now; and one that abandoned a transfer let its sender stream the rest. **#177 is closed**: a version vector past
 1 560 entries asked for everything, so every reconciliation resent the whole retained WAL and a
 joining node never asked for a snapshot; a vector of any size goes in parts now. **#188 is closed**,
 found probing #177's joiner and on master below that size too: a node that joined asked every peer

@@ -3807,6 +3807,15 @@ Learned the hard way. Check here before debugging.
      1.1 s while each section of the engine's own code held the lock 40 ms at most. What told the two
      apart - a slow hold split into its wait for room and its WAL append, and the flush tick's
      sections named - stays in the product, and says which it was.
+498. **"Ask the next one" needs a memory of who was asked.** #188's retry asked the first peer other
+     than the one that had just failed, so two that both failed were asked in turn for ever - 36
+     requests in 90 s, writes refused the whole time - and the "no peer left" branch its tests reached
+     had one peer to fail (#191). A retry over a set ends when the set is spent, and its test has two
+     members that both fail.
+499. **A receiver that gives up says so to the sender.** A joiner that abandoned a transfer told
+     nobody, and its sender streamed the rest - 448 chunks dropped, each with a `WARN`, at the end of
+     a transfer of 65 600 files (#192). #188 had built the other half: a sender that stops when its
+     target refuses the `BEGIN`.
 
 ## Current state and open problems
 
@@ -3882,7 +3891,11 @@ refusing writes from its request, so the other peers' catch-ups do not make it a
 the BEGIN (pitfall 494). **#186 is closed**: a node of 4 000 symbols answered a write up to 1.1 s
 late, all of it in the WAL append waiting for the ext4 journal its segments' files keep busy - and
 `--wal-dir` gives the WAL a filesystem of its own, no write slower than 11 ms in six runs where four
-stalled (pitfalls 495-497). **#169, #175, #176 and #187 are open P1s**: #187 is the holes the old numbering left in every node's
+stalled (pitfalls 495-497). **#191 and #192 are closed**, found measuring #176: a joiner that every
+peer refused, or whose every snapshot failed, asked them in turn for ever and refused writes the
+whole time - 36 requests in 90 s and not one write, on a live mesh - and asks each peer once a
+bootstrap now; and a joiner that abandoned a transfer tells its sender to stop (pitfalls 498-499).
+**#169, #175, #176 and #187 are open P1s**: #187 is the holes the old numbering left in every node's
 tracker, which a snapshot carries and nothing clears but a new mesh; an exchange name with a dot
 makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live book, sequence numbers
 and stored rows, measured on the wire; sharding by symbol has no control plane: no shard writes
