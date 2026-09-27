@@ -133,7 +133,8 @@ SequenceTracker::Decision SequenceTracker::observe(const std::string& key, uint1
         // nothing is filling: numbers above it are no longer held, so a redelivery of one is stored
         // twice, and the frontier every vector states stops here. Data a mesh wrote before #184,
         // where each origin's numbers of a symbol two nodes write have holes, looks exactly like
-        // this, and the repair for it is a wipe and a snapshot.
+        // this - and a wipe and a snapshot do not repair it, since the snapshot carries the sender's
+        // frontiers: the first start on a build with #187 closes that numbering.
         it->second.held_full = true;
         OB_LOG_WARN("sequence", "Held set full: key=%s origin=%u frontier=%llu high_water=%llu - %zu "
                                 "numbers above a hole nothing is filling; a redelivery past them is "

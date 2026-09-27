@@ -2398,7 +2398,7 @@ and was killed, and the control survived again.
   refusing writes that many times as long, while each peer prepares a snapshot of everything it
   holds; and a write in the window between two installs can be lost
 
-### 187. A symbol two mesh nodes wrote before #184 keeps its frontiers stuck on every node, and nothing can clear them but a new mesh **P1**
+### 187. A symbol two mesh nodes wrote before #184 keeps its frontiers stuck on every node, and a mesh upgraded across #184 stores its rows again on every node ✅ **P0**
 
 **Found writing #184's operations notes, and not measured.** #184 makes the numbers a node mints for a
 symbol its own and without holes, from its fix on. The holes the old numbering left - each origin's
@@ -2417,8 +2417,56 @@ the same symbol - so a one-shot declaration at the upgrade, of every frontier up
 number for the symbols those segments hold, run on every node before any new outage, is the likely
 shape; its cost is that a record genuinely missing at that moment is declared held.
 
+**Measured, and worse than written: rows stored again, on every node** (P1 → P0;
+`evidence/2026-09-27-mesh-legacy-numbering/`). Three nodes of the build before #184 (`b1e32fa`)
+write two symbols - LH01 in turns from nodes 0 and 1, 20 rounds of 500, and LH02 from node 0 alone -
+and are stopped cleanly and started again on master (`02f92ee`) on the same directories; node 2 is
+killed, two more rounds are written, node 2 comes back, and six reconciliations later:
+
+| | LH01, two writers | LH02, one (control) |
+|---|---|---|
+| node 0 | **11 904** | 11 000 |
+| node 1 | **11 404** | 11 000 |
+| node 2 | **16 232** | 11 000 |
+
+11 000 written of each, and the same numbers in three runs. Not a node judged to hold what it missed,
+as this entry said: every node stored rows again, the writers too, and storage is append-only. Two
+causes, each making the other worse. The frontiers stop at the old holes - `Held set full:
+key=LH01.LEG origin=2 frontier=0 high_water=8597 - 4096 numbers above a hole nothing is filling; a
+redelivery past them is stored twice` - so a catch-up sends everything above them and the receiver
+takes the numbers past its held set for new ones. And every start declared the node's own frontier of
+a segment from before #184 from its highest number - every origin's - so a node that never wrote LH01
+stated `LH01.LEG origin 3 from 1`, #185 for data from before #184, and the catch-ups ran at every
+reconciliation.
+
+**Fixed** (spec `kiro-workspace/specs/mesh-legacy-numbering/`). A mesh node whose store holds
+segments from before #184 closes their numbering once, at its first start, after the tail replay:
+every origin of every symbol it knows is declared up to `kClosedNumberingBase - 1` (2^48 - 1), its
+own numbers of them go on from the base, the vector goes into the WAL and onto the device, and only
+then does the data directory note it (`numbering_closed`) - a later start does nothing, since a node
+that joined since numbers the symbol from 1. A constant rather than each node's highest old number,
+which a node not in step at the close would not share: an origin numbers on from its own highest, so a
+node that held more would take its next records for ones it had, and one that held fewer would wait
+for numbers nothing sends. A record at or past the base from an origin still below it closes that
+origin where it arrives - one the node did not know at its close, or a node with no segment from
+before. A segment from before #184 no longer declares the node's own frontier in a mesh, and an
+installed snapshot notes whether its sender's numbering was closed, which its frontiers say and its
+files do not. The cost, said at `WARN` once: a record a node really lacks below the base at the close
+is not asked for again - so a mesh upgraded across #184 is upgraded with writes stopped, once every
+node holds every row (`docs/operations.md`).
+
+The same probe on the fix, three runs: **11 000 and 11 000 on every node**, each saying `Closed the
+numbering of 2 symbol(s) written before per-origin numbers (#184, #187): 3 frontier(s) of their origins
+declared up to 281474976710655 ...`. Tests: `tests/test_mm_legacy_numbering.cpp`, eight on a store made
+as that build made one - the old numbering applied, flushed, and every `meta.json` without #184's
+fields - seven of which fail on master (the redelivery stored again, **12 308 rows where 12 300**, the
+node's own frontier claimed for a symbol it never wrote, no close, no note), and the control, a store
+written since #184, passes on both; and five in `tests/test_sequence_tracker.cpp` for the base. The
+probe needs the build before #184, so it is not in the battery; its script is in the evidence.
+
 - Effort: M | Impact: on a mesh upgraded across #184, catch-up stays broken for every symbol more
-  than one node wrote before it, for as long as the mesh lives
+  than one node wrote before it, for as long as the mesh lives, and every outage stores its rows
+  again on every node
 
 ### 186. A mesh node holding 4 000 symbols stalls a write for up to 0.6 s at a trickle, and refuses writes at the pipelined ceiling ✅ **P1**
 
@@ -12177,7 +12225,9 @@ peer as holding nothing, resending everything since its last vector. **#186 is c
 measuring #180's cost: a node of 4 000 symbols answered a write up to 1.1 s late, all of it in the WAL
 append waiting for the ext4 journal its segments keep busy, and `--wal-dir` gives the WAL a
 filesystem of its own - no write slower than 11 ms in six runs where four stalled; **#190** is what
-remains at the ceiling, a WAL sync of 1 - 3 s on a device the segments share. **#191 and #192 are closed**, found measuring #176: a joiner that every peer refused asked them in
+remains at the ceiling, a WAL sync of 1 - 3 s on a device the segments share. **#187 is closed, and was a P0**: a mesh upgraded across #184 stored the rows of a symbol two nodes
+wrote again on every node after an outage - 11 904, 11 404 and 16 232 where 11 000 were written -
+and closes that numbering once at a fixed base now; 11 000 everywhere. **#191 and #192 are closed**, found measuring #176: a joiner that every peer refused asked them in
 turn for ever and refused writes the whole time - 36 requests in 90 s, not one write - and asks each
 once now; and one that abandoned a transfer let its sender stream the rest. **#177 is closed**: a version vector past
 1 560 entries asked for everything, so every reconciliation resent the whole retained WAL and a
@@ -12258,7 +12308,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #174, #175, #187, #189, #190, #193, #194.** Every other item above #58 is marked closed, and
+**Open: #169, #174, #175, #189, #190, #193, #194.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -12398,7 +12448,6 @@ The capability items are in the table below.
 |----------|------|--------|---------|
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
 | **P1** | Sharding by symbol gains its control plane: the shards write the map, and both clients read it (#175) | M–L | A shard writes neither itself nor the map to etcd, owns every symbol, and a second one on the same etcd becomes the first one's replica; neither client can find a shard |
-| **P1** | A mesh can close the holes the old one-counter numbering left, so catch-up works again for the symbols two nodes wrote before per-origin numbers (#187) | M | Every node's tracker holds them - the vector writes them down, a snapshot carries them - so for those symbols a node that misses writes is still judged to hold them, and only a new mesh clears it |
 | **P2** | A start finds its last checkpoint without reading the whole WAL twice (#174) | S–M | Since part 2b of #165 the index is 1.9 - 2.9 s of a cold start after a twenty-minute soak, 5.9 - 6.8 s, and the WAL most of the rest - and a start reads it twice even when the checkpoint covers every record |
 | **P2** | A node writes its vector down without holding writes for its whole size (#189) | M | Since #177 every checkpoint after a frontier moved writes the whole vector under the engine's lock: 8.95 - 12.7 ms and 2 MB of WAL at 50 000 (symbol, origin) entries |
 | **P2** | A flush tick's WAL sync at the ceiling does not keep writers waiting seconds for room (#190) | M | On a device the segments keep busy the tick's WAL sync took 1.2 - 3.0 s at the pipelined ceiling, and writers waited up to 3.4 s for room in the pending queue - 1.6 s from the refusal |

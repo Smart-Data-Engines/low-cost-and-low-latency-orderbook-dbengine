@@ -878,11 +878,34 @@ The held set is what a node keeps of the numbers above a frontier, until the hol
 at its cap (4 096 a symbol and origin) it stops growing, and a number past it that arrives again is
 stored again. Nothing fills a hole the old numbering left, so the line is the sign of one.
 
-**There is no repair for it yet** (#187). The stuck frontiers are the tracker's state, not the data's:
-every node that received those numbers holds them, the version vector writes them down, retention
-does not touch them, and a snapshot carries them to the node it bootstraps - so wiping one node and
-letting it rejoin gives it its peer's stuck frontiers back. For such a symbol, mesh catch-up does not
-work until every node's data directory is removed together, which is a new mesh.
+**Upgrading a mesh across #184** closes that numbering, once (#187). Left as it was, the stuck
+frontiers did worse than hide what a node missed: after an outage every catch-up sent the numbers
+above them, the ones past a held set were stored again, and measured on a mesh upgraded with a symbol
+two nodes wrote, the writers held 11 904 and 11 404 rows and the node back 16 232 where 11 000 were
+written. A mesh node whose data directory has segments from before #184 declares, at its first start
+on a build with #187, every origin of every symbol it holds up to 2^48 - 1, and numbers its own from
+2^48 on; a record numbered past that from an origin closes that origin wherever it arrives. It says
+so once, and notes it in `numbering_closed` in the data directory, which keeps a later start from
+doing it again:
+
+```
+Closed the numbering of 2 symbol(s) written before per-origin numbers (#184, #187): 3 frontier(s) of their origins declared up to 281474976710655, and this node's own numbers of them go on from 281474976710656 - a record missing here below that now is not caught up
+```
+
+That last clause is the procedure: a record a node really lacks when it closes is declared held and
+never sent again. So upgrade such a mesh with writes stopped:
+
+1. Stop the writes, and wait until every node holds every row - the same count of every symbol on
+   every node.
+2. Stop every node, start every node on the new build - in any order, as long as nothing writes.
+3. Check each node said `Closed the numbering ...` (or, started again, `... closed at an earlier
+   start`), and resume the writes.
+
+A mesh upgraded with writes in flight mixes the numberings as a mesh before #184 did, and the rows of
+such a symbol can be stored again as measured above. A node that joins afterwards takes the closed
+numbering with its snapshot; do not remove `numbering_closed` from a data directory, because a start
+without it closes again, and would take the records of a node that joined since - numbered from 1 -
+for ones it holds.
 
 **How far behind a replica is** is a different question with a different answer, in the section
 below.
