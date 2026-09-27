@@ -3095,10 +3095,14 @@ Tests: `tests/test_mm_snapshot.cpp` - the transfer and damage tests in both widt
 70 000 and of 11 MB of synthetic manifest refusing an older joiner and sending a joiner of this build
 what a receiver of this build takes, the request's byte through the frame dispatch both ways, and the
 segment gauge after an install and a restart; `test_mm_snapshot_many_files.py` without its marker.
-**Mutation table, written down before each pass: 20 mutations in 25 runs, every one as predicted** -
-16 killed by `test_mm_snapshot`, the control surviving, and three that only a store past 65 535 files
-or a concurrent reader can tell - the receiver or the sender keeping 16 bits of a wide index, and the
-snapshot counted before the node takes writes - surviving it and killed by the integration test.
+**Mutation table, written down before each pass: 20 mutations, and on the final tree every one as
+predicted** - 16 killed by `test_mm_snapshot`, the control surviving, and three that only a store past
+65 535 files or a concurrent reader can tell - the receiver or the sender keeping 16 bits of a wide
+index, and the snapshot counted before the node takes writes - surviving it and killed by the
+integration test, the first two by its own outcome, a joiner that abandoned its snapshot. The same
+table before the rebase onto #191 gave the same, after one row was rewritten in a form that builds;
+there the two were killed by pytest's timeout, with nothing said, which is why the test watches the
+joiner now.
 
 - Effort: M | Impact: a mesh cannot take a new peer once one node holds a few thousand segments —
   a few thousand instruments, or a few hours of a few hundred
