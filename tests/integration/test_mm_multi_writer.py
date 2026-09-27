@@ -1,4 +1,5 @@
-"""A symbol more than one mesh node writes, and a node that missed some of it (#184).
+"""A symbol more than one mesh node writes, and a node that missed some of it (#184); and a restarted
+node that claims numbers it did not write (#185).
 
 A sequence number belongs to the origin that minted it, and a frontier is "every number up to here
 from that origin". But the counter that mints them is one per symbol, raised by every origin's
@@ -12,14 +13,22 @@ replay's own-origin seeding made the node look empty and every number above the 
 (4 096 per origin) was stored twice.
 
 The single-writer case is the control: the same outage, one writer, and the node catches up.
+
+Fixed together: in a mesh another origin's number no longer raises this node's counter, and a
+segment records the highest number of this node's own rows, which a restart continues from and
+declares its own frontier up to - not every origin's highest, which also made a node restarted with
+segments of a symbol only its peers write claim their numbers as its own (#185): every
+reconciliation then scanned its WAL for records nobody wrote.
 """
 from __future__ import annotations
 
+import re
 import time
+import urllib.request
 
 import pytest
 
-from conftest import ClusterManager
+from conftest import ClusterManager, node_log_since, node_log_size
 from orderbook_engine import BookUpdate, OrderbookEngine
 
 pytestmark = pytest.mark.multi_master
@@ -34,6 +43,13 @@ INTERVAL_S = 5
 
 class Diverged(AssertionError):
     """A node that missed writes does not hold what the writers hold once it is back."""
+
+
+def metric(node, name: str) -> float:
+    with urllib.request.urlopen(f"http://127.0.0.1:{node.metrics_port}/metrics", timeout=6) as resp:
+        body = resp.read().decode(errors="replace")
+    match = re.search(rf"^{re.escape(name)}(?:\{{[^}}]*\}})?\s+([0-9.eE+-]+)$", body, re.M)
+    return float(match.group(1)) if match else 0.0
 
 
 def client_for(node, timeout: float = 30.0) -> OrderbookEngine:
@@ -107,11 +123,39 @@ def test_a_node_that_missed_one_writers_rows_gets_them_back(mesh):
     assert got == expected, f"node 2 holds {got} rows where the writer holds {expected}"
 
 
-@pytest.mark.xfail(strict=True, raises=Diverged,
-                   reason="#184: a symbol two nodes write has holes in each origin's numbers, so "
-                          "every node's frontier stops at the first and a node that missed rows is "
-                          "judged to hold them")
 def test_a_node_that_missed_two_writers_rows_gets_them_back(mesh):
     expected, got = outage(mesh, writers=[0, 1])
     if got != expected:
         raise Diverged(f"node 2 holds {got} rows where the writers hold {expected}")
+
+
+def test_a_restarted_node_claims_nothing_it_did_not_write(mesh):
+    """#185: a clean restart of a node holding segments of a symbol only node 0 writes. It used to
+    declare its own frontier for the symbol from the highest number in them - node 0's - so it said
+    it held records of its own origin nobody wrote; its peers lacked them, and every reconciliation
+    started a catch-up that read its whole WAL for them and counted them unfillable. Measured with
+    the probe this is built from: 14 catch-ups in 30 s, 140 ranges counted."""
+    writer, restarted = mesh.nodes[0], mesh.nodes[2]
+    write(writer, BASE_TS, PER_ROUND)
+    deadline = time.monotonic() + 30
+    while rows(restarted) < PER_ROUND and time.monotonic() < deadline:
+        time.sleep(0.5)
+    assert rows(restarted) == PER_ROUND, "the premise: the restarted node holds the rows"
+    for node in mesh.nodes:
+        client = client_for(node)
+        try:
+            client.flush()     # in segments, which is what the start read the claim from
+        finally:
+            client.close()
+
+    mesh._stop_node(restarted)          # clean: its vector and its checkpoint are written
+    offset = node_log_size(restarted)
+    mesh.restart_node(2)
+    mesh.wait_for_mm_mesh(timeout=90)
+    time.sleep(3 * INTERVAL_S + 2)      # three reconciliations
+    said = node_log_since(mesh.nodes[2], offset)
+    started = len(re.findall(r"Starting catch-up to peer", said))
+    unfillable = metric(mesh.nodes[2], "ob_mm_catchup_unfillable_total")
+    assert started == 0 and unfillable == 0, (
+        f"the restarted node started {started} catch-up(s) and counted {unfillable:.0f} unfillable "
+        "range(s): it claims records of its own origin that nobody wrote")

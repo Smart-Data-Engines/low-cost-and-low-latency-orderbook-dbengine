@@ -3738,6 +3738,23 @@ Learned the hard way. Check here before debugging.
      tick; then two ticks ran at once and ThreadSanitizer reported `published_*` in CI, two reports in
      three local runs of three (under `setarch -R`: TSan and a 6.x kernel's ASLR do not mix). The tick
      takes the lock first now. A seam's promise covers the whole function or says where it stops.
+486. **A number whose meaning is (key, origin) needs everything that mints, raises or restores it
+     per (key, origin) too.** One counter per symbol minted this node's numbers and was raised by
+     every origin's - right on a replica, where there is one origin, and on a mesh the source of
+     #184: each origin's numbers of a symbol two nodes wrote had holes where the other's were, and a
+     frontier, "everything from this origin up to here", stopped at the first on every node. The
+     dedup key was `(symbol, origin, seq)` all along; the counter was the one place that was not.
+487. **A restore that has to be exact needs the fact written down, not derived.** A restart must
+     continue this node's counter from exactly its own highest number: too high leaves a hole every
+     peer's frontier stops at, too low hands a number out twice and every peer drops the second
+     record as the first. Every origin's highest, which is all a segment said, is neither - so a
+     segment records its own rows' highest now (`own_origin`, `own_max_sequence`), a merge its
+     inputs', and a start reads what it says rather than inferring it.
+488. **Before promising a repair, find where the broken state lives and what copies it.** #184's
+     entry said, when it was filed, that a wipe and a snapshot repair a node holding the old holes.
+     The holes are in the tracker's frontiers and held sets, which the vector writes down and a
+     snapshot carries - so the rejoined node takes its peer's stuck state back (#187). Found writing
+     the operations notes, by following `adopt_snapshot_sequence_state()`, not by running the repair.
 
 ## Current state and open problems
 
@@ -3794,11 +3811,14 @@ that moved, microseconds where a whole export cost 286 us at 4 000 entries, and 
 nothing" is drawn from a copy older than the tracker - found in the fix's own CI run, a node back
 within a tick of the writes it missed held 100 of 2 100 rows until the next reconciliation; and a
 reconciliation no longer arms a deadline for an answer no peer sends, which treated a peer as empty
-whenever the two timers were more than 2 s apart (pitfalls 472-485). **#184 is the open P0**: when two nodes write
-one symbol the one counter per symbol gives each origin's numbers holes, every node's frontier stops
-at the first, and a node that missed rows is judged to hold them - 10 000 of 11 000 for good, which
-#179's fix made the restart's outcome as well as the disconnect's. **#169, #175, #176, #177, #182,
-#185 and #186 are open P1s**: an exchange name with a dot makes two instruments one key - `A.B` on
+whenever the two timers were more than 2 s apart (pitfalls 472-485). **#184 and #185 are closed**:
+each origin numbers its own records of a symbol - one counter per symbol, raised by every origin's
+numbers, gave each origin's stream holes when two nodes wrote it, every node's frontier stopped at
+the first, and a node that missed rows was judged to hold them, 10 000 of 11 000 for good - and a
+segment records how far this node's own numbers go, so a restart continues from exactly there and
+declares only what it wrote (pitfalls 486-488). **#169, #175, #176, #177, #182, #186 and #187 are
+open P1s**: #187 is the holes the old numbering left in every node's tracker, which a snapshot
+carries and nothing clears but a new mesh; an exchange name with a dot makes two instruments one key - `A.B` on
 `C` and `A` on `B.C` share a live book, sequence numbers and stored rows, measured on the wire;
 sharding by symbol has no control plane: no shard writes itself or the map to etcd, each owns every
 symbol, and a second on the same etcd becomes the first one's replica, measured against a native

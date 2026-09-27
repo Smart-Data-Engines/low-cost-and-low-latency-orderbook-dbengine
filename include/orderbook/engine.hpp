@@ -873,6 +873,10 @@ private:
         std::string symbol;
         std::string exchange;
         SnapshotRow row;
+        /// Whether this node wrote it (#184): a segment records its own rows' highest number, which
+        /// a restart continues this node's counter from - every origin's highest, which is all a row
+        /// could say, put holes in the stream a peer's frontier cannot pass.
+        bool own{true};
     };
     /// A queue of fixed-size chunks rather than a vector (stage 5 of #151): a flush tick takes
     /// every row queued so far in one short hold of mtx_, drains them without it, and gives each
@@ -1056,7 +1060,9 @@ private:
     void load_or_create_wal_identity();
     uint64_t wal_identity_{0};
 
-    void restore_version_vector();
+    /// True when a usable vector was restored - which a segment received from a peer relies on
+    /// to leave this node's counter where the vector puts it (#184).
+    bool restore_version_vector();
 
     /// Restore the numbers held above the frontiers from the last HELD_SEQUENCES record.
     ///
@@ -1127,7 +1133,7 @@ private:
     /// peers (each node replays its own WAL, so re-sending duplicates on the other
     /// side), notifying subscribers (nothing is subscribed before open() returns), or
     /// waiting on backpressure (nobody is competing for the buffer yet).
-    void apply_delta_replayed(const DeltaUpdate& delta, const Level* levels);
+    void apply_delta_replayed(const DeltaUpdate& delta, const Level* levels, bool own);
 
     /// Replay the WAL tail into memory. Returns records applied.
     ///

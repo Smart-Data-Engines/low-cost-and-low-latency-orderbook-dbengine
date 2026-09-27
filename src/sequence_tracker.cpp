@@ -16,7 +16,8 @@ bool SequenceTracker::note_seen(OriginState& st, uint64_t seq) {
     }
 
     if (seq == st.frontier + 1) {
-        st.frontier = seq;
+        st.frontier  = seq;
+        st.held_full = false;
         // Drain whatever arrived early and is now contiguous. Without this, filling one hole
         // would advance the frontier by one and leave a run of already-delivered records
         // looking undelivered.
@@ -74,10 +75,12 @@ SequenceTracker::Decision SequenceTracker::observe(const std::string& key, uint1
         OB_LOG_DEBUG("sequence", "Assigned: key=%s origin=%u seq=%llu",
                      key.c_str(), static_cast<unsigned>(origin),
                      static_cast<unsigned long long>(d.sequence_number));
-    } else {
-        // A number minted elsewhere still has to keep the local counter ahead of it, or a
-        // node that both accepts client writes and receives a stream would hand out a
-        // number already in use.
+    } else if (origin == local_origin_) {
+        // A number of this node's own origin minted elsewhere - a replica's primary, without a
+        // mesh, where everything is origin 0 - keeps the counter ahead of it, or a node that both
+        // accepts client writes and receives that stream would hand out a number already in use.
+        // Another origin's number does not (#184): it is not in this counter's sequence, and
+        // raising the counter by it put holes in this node's own stream.
         st.next_local = std::max(st.next_local, sequence_number + 1);
     }
 
@@ -122,6 +125,21 @@ SequenceTracker::Decision SequenceTracker::observe(const std::string& key, uint1
     }
 
     if (note_seen(it->second, d.sequence_number)) mark_moved(stored_key, origin, it->second);
+    if (!it->second.held_full && it->second.above_frontier.size() >= kMaxAboveFrontier) {
+        // Said once per episode - until the frontier moves again. A held set at its cap is a hole
+        // nothing is filling: numbers above it are no longer held, so a redelivery of one is stored
+        // twice, and the frontier every vector states stops here. Data a mesh wrote before #184,
+        // where each origin's numbers of a symbol two nodes write have holes, looks exactly like
+        // this, and the repair for it is a wipe and a snapshot.
+        it->second.held_full = true;
+        OB_LOG_WARN("sequence", "Held set full: key=%s origin=%u frontier=%llu high_water=%llu - %zu "
+                                "numbers above a hole nothing is filling; a redelivery past them is "
+                                "stored twice",
+                    key.c_str(), static_cast<unsigned>(origin),
+                    static_cast<unsigned long long>(it->second.frontier),
+                    static_cast<unsigned long long>(it->second.high_water),
+                    it->second.above_frontier.size());
+    }
     return d;
 }
 
@@ -130,7 +148,7 @@ void SequenceTracker::seed(const std::string& key, uint16_t origin, uint64_t seq
     const auto [sym, created] = symbols_.try_emplace(key);
     (void)created;
     SymbolState& st = sym->second;
-    st.next_local = std::max(st.next_local, seq + 1);
+    if (origin == local_origin_) st.next_local = std::max(st.next_local, seq + 1);   // see observe()
     OriginState& ost = st.origins[origin];
     if (note_seen(ost, seq)) mark_moved(sym->first, origin, ost);
 }

@@ -47,6 +47,16 @@ public:
     /// be one past.
     Decision observe(const std::string& key, uint16_t origin, uint64_t sequence_number);
 
+    /// Which origin this tracker's own numbers are (#184): the mesh node's id, or 0 without a mesh.
+    ///
+    /// A number another origin minted does not raise the local counter. The counter is one per
+    /// symbol, and a sequence number means something only with its origin - so when two mesh nodes
+    /// write one symbol, raising it by each other's numbers left holes in each origin's stream, every
+    /// receiver's frontier stopped at the first, and a node that missed rows was judged to hold
+    /// them. Without a mesh every record is origin 0, a replica's included, so a promoted replica
+    /// still numbers on from its primary's numbers.
+    void set_local_origin(uint16_t origin) { local_origin_ = origin; }
+
     /// Raise the local counter so the next assigned number is greater than `seq`.
     ///
     /// Called with what is already durable — the highest number in each segment, and every
@@ -197,6 +207,7 @@ private:
         uint64_t           frontier{0};        ///< everything up to here has been seen
         std::set<uint64_t> above_frontier;     ///< seen but not contiguous yet
         bool               listed{false};      ///< in `moved_` since the last take
+        bool               held_full{false};   ///< said so once; cleared when the frontier moves
     };
 
     struct SymbolState {
@@ -226,6 +237,7 @@ private:
     }
 
     std::unordered_map<std::string, SymbolState> symbols_;
+    uint16_t           local_origin_{0};   ///< see set_local_origin()
     std::vector<Moved> moved_;         ///< see take_moved_frontiers()
     bool               moved_all_{true};
     std::atomic<uint64_t> listings_{0};   ///< see listings()

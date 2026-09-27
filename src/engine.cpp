@@ -72,6 +72,10 @@ Engine::~Engine() {
 }
 
 void Engine::open() {
+    // Before anything restores a counter: the replay below seeds the tracker, and a record of this
+    // node's own origin raises its counter while another origin's does not (#184).
+    seq_tracker_.set_local_origin(mm_config_.enabled ? mm_config_.node_id : 0);
+
     // Which CRC32C runs is worth one line: it is a factor of twenty to fifty on the write path, and
     // there is no other way to tell from outside whether this binary found the instruction.
     //
@@ -132,24 +136,71 @@ void Engine::open() {
         durable_seal_epoch_ = highest;
     }
 
+    // The vector first, so the segments below know whether one was there: a segment received from
+    // a peer needs it (#184, below). Both only ever raise, so the order changes nothing else.
+    const bool vector_restored = restore_version_vector();
+
     // Restore the sequence counters from what is already durable in segments, before the
     // replay below adds what is durable only in the WAL. Both only ever raise, so the order
     // between them does not matter; skipping either hands out a number twice.
+    //
+    // From this node's own highest number in each segment (#184): the highest of every origin's,
+    // which is all an older segment says, put holes in this node's stream when its peers wrote the
+    // symbol too, and a peer's frontier does not pass a hole. And the frontier this node declares
+    // for itself is the same number (#185): declared from every origin's highest, it claimed the
+    // numbers its peers wrote, and every reconciliation scanned the WAL for records nobody wrote.
     {
-        size_t raised = 0;
+        const uint16_t self = mm_config_.enabled ? mm_config_.node_id : 0;
+        size_t own = 0, legacy = 0, received = 0;
         for (const auto& meta : combined_store_.index()) {
             if (meta.max_sequence_number == 0) continue;   // written before numbers existed
             const std::string key = meta.symbol + "." + meta.exchange;
-            seq_tracker_.raise_local(key, meta.max_sequence_number);
-            // Everything this node minted up to that number is held: it assigned and applied
-            // those records itself. Without saying so, a hole in a remote origin's stream
-            // would hold the frontier down and every local write after a restart would be
-            // reported as a gap.
-            seq_tracker_.declare_frontier(key, mm_config_.node_id, meta.max_sequence_number);
-            ++raised;
+            if (!meta.has_own_max) {
+                // Written before a segment said whose its rows were: as it always was.
+                seq_tracker_.raise_local(key, meta.max_sequence_number);
+                seq_tracker_.declare_frontier(key, self, meta.max_sequence_number);
+                ++legacy;
+                continue;
+            }
+            if (meta.own_origin == self) {
+                // Everything this node minted up to that number is held: it assigned and applied
+                // those records itself, so a hole in another origin's stream cannot hold its own
+                // frontier down and report every write after a restart as a gap.
+                if (meta.own_max_sequence > 0) {
+                    seq_tracker_.raise_local(key, meta.own_max_sequence);
+                    seq_tracker_.declare_frontier(key, self, meta.own_max_sequence);
+                }
+                // A merge that took in a peer's segment holds rows of this node's the number
+                // above does not cover: as for a peer's segment, below.
+                if (meta.has_received_rows && !vector_restored) {
+                    seq_tracker_.raise_local(key, meta.max_sequence_number);
+                    ++received;
+                }
+                ++own;
+                continue;
+            }
+            // A peer's segment - a snapshot's, a migration's. Its own numbers are the sender's, not
+            // this node's; but this node's earlier records can be in it, after a wipe and a
+            // snapshot, and a counter continued from below them hands their numbers out again -
+            // which every peer drops as the records it already holds. The vector says how far this
+            // node's own went, and raised the counter from it above; without one, every origin's
+            // highest is the only safe number, holes and all - the lesser harm until #177.
+            if (!vector_restored) seq_tracker_.raise_local(key, meta.max_sequence_number);
+            ++received;
         }
-        OB_LOG_INFO("engine", "Sequence counters restored from segments: segments=%zu symbols=%zu",
-                    raised, seq_tracker_.symbol_count());
+        if (vector_restored) {
+            std::unique_lock<std::mutex> lock(mtx_);
+            // What the WAL holds is what the vector said, and the declarations above are derived
+            // from segments at every start: not a change the next checkpoint has to write down.
+            vector_fingerprint_written_ = seq_tracker_.fingerprint();
+        }
+        OB_LOG_INFO("engine", "Sequence counters restored from segments: own=%zu legacy=%zu "
+                              "received=%zu symbols=%zu%s",
+                    own, legacy, received, seq_tracker_.symbol_count(),
+                    received > 0 && !vector_restored
+                        ? " (the received ones raised the counter by every origin's numbers: no "
+                          "vector said how far this node's own went)"
+                        : "");
     }
 
     // What the replication manager announces to a replica asking `STREAMID?` (#101). Set here
@@ -160,7 +211,6 @@ void Engine::open() {
 
     // What this node holds, from the last vector it wrote down. Before the tail replay, so
     // the tail can only raise it.
-    restore_version_vector();
     restore_held_sequences();
 
     // Replay the WAL tail — the records written after the last flush. Until this
@@ -628,7 +678,7 @@ void Engine::load_or_create_wal_identity() {
                 static_cast<unsigned long long>(wal_identity_));
 }
 
-void Engine::restore_version_vector() {
+bool Engine::restore_version_vector() {
     // Caller holds nothing: this runs from open() before the flush thread exists.
     // A full pass, like the epoch restore: the vector is written next to a checkpoint, so
     // replay_after_checkpoint() would usually skip it. Keep the last one seen.
@@ -642,23 +692,36 @@ void Engine::restore_version_vector() {
     if (last.empty()) {
         OB_LOG_INFO("engine", "No version vector in the WAL — this node will ask peers for "
                               "everything they have");
-        return;
+        return false;
     }
 
     PeerVector own;
     if (!own.deserialize(last.data(), last.size()) || own.truncated()) {
         OB_LOG_WARN("engine", "Persisted version vector unusable — asking peers for everything");
-        return;
+        return false;
     }
 
     std::vector<SequenceTracker::VectorEntry> entries = own.entries();
+    size_t own_raised = 0;
     {
         std::unique_lock<std::mutex> lock(mtx_);
         seq_tracker_.import_own_vector(entries);
+        // This node's own frontier is a number it minted, so its counter continues above it - as an
+        // adopted snapshot's does (#184). Needed now that a segment received from a peer no longer
+        // raises the counter by every origin's numbers: after a wipe and a snapshot, this node's
+        // earlier records are in those segments, and only the vector says how far its own went.
+        const uint16_t self = mm_config_.enabled ? mm_config_.node_id : 0;
+        for (const auto& e : entries) {
+            if (e.origin != self) continue;
+            seq_tracker_.raise_local(e.key, e.frontier);
+            ++own_raised;
+        }
         vector_fingerprint_written_ = seq_tracker_.fingerprint();
         refresh_version_vector_cache();   // safe: refresh does not touch mtx_
     }
-    OB_LOG_INFO("engine", "Restored version vector from WAL: entries=%zu", entries.size());
+    OB_LOG_INFO("engine", "Restored version vector from WAL: entries=%zu, %zu of them this node's own",
+                entries.size(), own_raised);
+    return true;
 }
 
 bool Engine::observe_sequence(DeltaUpdate& delta, uint16_t origin, const std::string& key) {
@@ -1038,7 +1101,7 @@ ob_status_t Engine::apply_in_memory(const std::string& key, const DeltaUpdate& d
         row.quantity        = levels[i].qty;
         row.order_count     = levels[i].cnt;
 
-        pending_rows_.push_back({delta.symbol, delta.exchange, row});
+        pending_rows_.push_back({delta.symbol, delta.exchange, row, /*own=*/true});
     }
 
     // Notify streaming subscribers synchronously (within 1 µs budget, Requirement 10.9).
@@ -1232,7 +1295,7 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
             row.quantity        = levels[idx].qty;
             row.order_count     = levels[idx].cnt;
 
-            pending_rows_.push_back({delta.symbol, delta.exchange, row});
+            pending_rows_.push_back({delta.symbol, delta.exchange, row, /*own=*/false});
         }
 
         if (query_engine_->has_subscribers() && pending_rows_.size() > rows_before) {
@@ -2236,6 +2299,8 @@ ColumnarStore& Engine::get_or_create_store(const std::string& symbol,
     auto store = std::make_unique<ColumnarStore>(base_dir_, ColumnarStore::kDefaultSegmentDurationNs,
                                                  ColumnarStore::OwnIndex::kNo);
     store->set_symbol_exchange(symbol, exchange);
+    // Whose rows are its own (#184): the segments it seals record their highest number.
+    store->set_own_origin(mm_config_.enabled ? mm_config_.node_id : 0);
     auto& ref = *store;
     if (mtx_held) {
         stores_[key] = std::move(store);
@@ -2629,6 +2694,8 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
         std::vector<SnapshotRow> rows;
         uint64_t min_ts_ns;
         uint64_t max_ts_ns;
+        uint64_t max_own_seq;   ///< the highest number of a row this node wrote (#184); 0 for none
+        bool all_own;           ///< and whether every row is one
     };
     std::vector<Collected> drained;
     std::unordered_map<ColumnarStore*, size_t> slot_of;
@@ -2653,7 +2720,8 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
                 c.rows = std::move(fitted);
             }
             auto block = RowBlock::make(st->symbol(), st->exchange(), std::move(c.rows),
-                                        c.min_ts_ns, c.max_ts_ns, block_rows_pool_);
+                                        c.min_ts_ns, c.max_ts_ns, block_rows_pool_, c.max_own_seq,
+                                        c.all_own);
             if (!block) continue;
             Unsealed& u = unsealed_[st];
             u.rows += block->rows.size();
@@ -2699,13 +2767,18 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
                         drained.push_back(Collected{
                             store,
                             block_rows_pool_->take(hint == block_rows_hint_.end() ? 0 : hint->second),
-                            pr.row.timestamp_ns, pr.row.timestamp_ns});
+                            pr.row.timestamp_ns, pr.row.timestamp_ns, 0, true});
                     }
                     current = &drained[at->second];
                 }
                 current->rows.push_back(pr.row);
                 current->min_ts_ns = std::min(current->min_ts_ns, pr.row.timestamp_ns);
                 current->max_ts_ns = std::max(current->max_ts_ns, pr.row.timestamp_ns);
+                if (pr.own) {
+                    current->max_own_seq = std::max(current->max_own_seq, pr.row.sequence_number);
+                } else {
+                    current->all_own = false;
+                }
                 ++appended;
             }
         } catch (...) {
@@ -3212,9 +3285,10 @@ int Engine::sync_segments() {
     return 0;
 }
 
-void Engine::apply_delta_replayed(const DeltaUpdate& delta, const Level* levels) {
+void Engine::apply_delta_replayed(const DeltaUpdate& delta, const Level* levels, bool own) {
     // Caller holds mtx_, and has seeded the record's number under the origin that wrote it
-    // (#179) - replay_wal_tail() does, for the records it skips as stored too.
+    // (#179) - replay_wal_tail() does, for the records it skips as stored too - and says whether
+    // that origin is this node's, which the rows carry to their segment (#184).
     //
     // No number is assigned here: this record was written once already and carries its
     // number. seed() restores the counters from it without reporting a gap — the gap, if
@@ -3236,7 +3310,7 @@ void Engine::apply_delta_replayed(const DeltaUpdate& delta, const Level* levels)
         row.quantity        = levels[i].qty;
         row.order_count     = levels[i].cnt;
 
-        pending_rows_.push_back({delta.symbol, delta.exchange, row});
+        pending_rows_.push_back({delta.symbol, delta.exchange, row, own});
     }
 }
 
@@ -3357,7 +3431,7 @@ uint64_t Engine::replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastC
         std::vector<Level> level_scratch;
         const Level* levels = levels_from_payload(ctx.payload, delta.n_levels, level_scratch);
 
-        apply_delta_replayed(delta, levels);
+        apply_delta_replayed(delta, levels, origin == mm_config_.node_id);
         ++applied;
     });
 
