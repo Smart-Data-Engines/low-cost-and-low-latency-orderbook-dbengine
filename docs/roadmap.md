@@ -2378,6 +2378,17 @@ while the note says the WAL is elsewhere - is refused; a WAL moved with its file
 WAL append beside the data directory now names the option, and a flush tick of a second says which
 of its phases it was.
 
+**Tests**: `tests/test_wal_dir.cpp` (new, 7) - the WAL and its identity where `--wal-dir` says, the
+data directory without it, an abandoned engine's tail and the epoch back from that WAL, and the
+three refusals, with the WAL moved to a directory taken; `tests/test_mm_restart_origins.cpp` - the
+vector and the held numbers a restart takes up from it; `tests/test_cli_config.cpp` - the flag and
+the file key; `tests/integration/test_crash_recovery.py` - a node with `--wal-dir` killed with
+SIGKILL comes back with its rows, and started without the option is refused. The flush tick's shape
+test reads a `TimedLock` as the lock it is. **Mutation table: 14 mutations in 17 runs, every one as
+written down before its pass** - pass 1: 11 killed, and the two controls and one predicted gap
+survived, the held numbers read back after a restart; pass 2: it got its test and was killed, and
+the controls survived again.
+
 - Effort: M | Impact: a write that waits for over half a second, now and then, on a node an
   exchange-sized symbol list makes large - and writes refused at a ceiling the deadline was sized
   never to meet
