@@ -164,41 +164,30 @@ inline std::map<std::pair<std::string, uint16_t>, uint64_t> told_all(ob::Engine&
     return out;
 }
 
-/// The last version vector the WAL holds - what a flush wrote down, from a whole export.
+/// The version vector the WAL states - what flushes wrote down: the last whole one (one record, or
+/// parts put back together, #177) and the changes written after it (#189), as a restart reads it.
 inline std::map<std::pair<std::string, uint16_t>, uint64_t> written_down(const std::string& dir) {
-    // The last vector in the WAL, one record or parts put back together (#177), as a restart reads it.
-    std::optional<std::vector<ob::SequenceTracker::VectorEntry>> last;
-    ob::VectorAssembler parts;
+    ob::VectorFromWal from_wal;
     ob::WALReplayer replayer(dir);
-    replayer.replay_v2([&](const ob::WALReplayContext& ctx) {
-        if (ctx.header.record_type == ob::WAL_RECORD_VERSION_VECTOR) {
-            ob::PeerVector one;
-            if (one.deserialize(ctx.payload, ctx.payload_len) && !one.truncated()) {
-                last = one.entries();
-            } else {
-                last.reset();
-            }
-        } else if (ctx.header.record_type == ob::WAL_RECORD_VERSION_VECTOR_PART &&
-                   parts.add(ctx.payload, ctx.payload_len) == ob::VectorAssembler::Step::Complete) {
-            last = parts.take();
-        }
-    });
+    replayer.replay_v2([&](const ob::WALReplayContext& ctx) { from_wal.add(ctx); });
     std::map<std::pair<std::string, uint16_t>, uint64_t> out;
-    if (!last) {
+    if (!from_wal.vector()) {
         ADD_FAILURE() << "no usable version vector in the WAL";
         return out;
     }
-    for (const auto& e : *last) out[{e.key, e.origin}] = e.frontier;
+    for (const auto& e : *from_wal.vector()) out[{e.key, e.origin}] = e.frontier;
     return out;
 }
 
-/// Whether any version vector - one record or a part of one - is in the WAL under `dir`.
+/// Whether any version vector - one record, a part of one, or changes to one - is in the WAL under
+/// `dir`.
 inline bool vector_in_wal(const std::string& dir) {
     bool found = false;
     ob::WALReplayer replayer(dir);
     replayer.replay_v2([&](const ob::WALReplayContext& ctx) {
         found = found || ctx.header.record_type == ob::WAL_RECORD_VERSION_VECTOR ||
-                ctx.header.record_type == ob::WAL_RECORD_VERSION_VECTOR_PART;
+                ctx.header.record_type == ob::WAL_RECORD_VERSION_VECTOR_PART ||
+                ctx.header.record_type == ob::WAL_RECORD_VERSION_VECTOR_CHANGES;
     });
     return found;
 }

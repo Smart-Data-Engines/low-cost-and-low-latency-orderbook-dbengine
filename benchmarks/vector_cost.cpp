@@ -9,8 +9,11 @@
 // which takes a second walk, over theirs. The loop over ours for each of theirs that walk replaced is
 // timed at 1 500 by building this program against the tree before #177, where 1 560 was as large as
 // a compared vector got. And what a checkpoint pays to write the vector down, under the engine's
-// lock - the export from the tracker, the serialisation and the WAL records, not fsynced: before
-// #177 a vector past one record was never written down at all.
+// lock, not fsynced: before #177 a vector past one record was never written down at all, and until
+// #189 every checkpoint after a frontier moved paid the tracker's fingerprint, an export from it, and
+// the whole vector serialised and written ("was"). Since #189 it writes what moved, from the copy the
+// engine keeps - timed here with 1% of the entries moved - and a whole vector, from the same copy,
+// where a restart needs one ("whole").
 //
 // Usage: vector_cost [repetitions]     (default 20; prints the median of each, in ms)
 #include "orderbook/logger.hpp"
@@ -72,8 +75,9 @@ ob::PeerVector received(const std::vector<ob::VectorRecord>& records) {
 int main(int argc, char** argv) {
     const int reps = argc > 1 ? std::atoi(argv[1]) : 20;
     ob::StructuredLogger::instance().set_level(ob::LogLevel::WARN);   // a line per vector received
-    std::printf("%10s %8s %14s %14s %14s %20s %14s %10s\n", "entries", "records", "serialise ms",
-                "receive ms", "compare ms", "compare, +10% ms", "persist ms", "WAL kB");
+    std::printf("%10s %8s %14s %14s %14s %20s %10s %10s %10s %10s %10s\n", "entries", "records",
+                "serialise ms", "receive ms", "compare ms", "compare, +10% ms", "was ms", "whole ms",
+                "1% ms", "whole kB", "1% kB");
     const auto dir = std::filesystem::temp_directory_path() /
                      ("vector_cost_" + std::to_string(static_cast<long>(::getpid())));
     std::filesystem::create_directories(dir);
@@ -106,28 +110,45 @@ int main(int argc, char** argv) {
 
         ob::SequenceTracker tracker;
         tracker.import_own_vector(ours);
-        size_t wal_bytes = 0;
-        double persist = 0;
+        size_t whole_bytes = 0, changes_bytes = 0;
+        double was = 0, whole = 0, one_percent = 0;
         {
             ob::WALWriter wal((dir / std::to_string(n)).string());
-            persist = median_ms(reps, [&] {
-                bool truncated = false;
-                const auto entries = tracker.export_vector(ob::VV_MAX_ENTRIES, truncated);
-                const auto recs = ob::serialize_version_vector_records(entries, truncated, ++generation);
-                wal_bytes = 0;
+            const auto append = [&](const std::vector<ob::VectorRecord>& recs) {
+                size_t bytes = 0;
                 for (const auto& r : recs) {
                     if (r.record_type == ob::WAL_RECORD_VERSION_VECTOR_PART) {
                         wal.append_version_vector_part(r.payload.data(), r.payload.size());
+                    } else if (r.record_type == ob::WAL_RECORD_VERSION_VECTOR_CHANGES) {
+                        wal.append_version_vector_changes(r.payload.data(), r.payload.size());
                     } else {
                         wal.append_version_vector(r.payload.data(), r.payload.size());
                     }
-                    wal_bytes += r.payload.size();
+                    bytes += r.payload.size();
                 }
+                return bytes;
+            };
+            uint64_t fingerprint = 0;
+            was = median_ms(reps, [&] {
+                fingerprint += tracker.fingerprint();
+                bool truncated = false;
+                const auto entries = tracker.export_vector(ob::VV_MAX_ENTRIES, truncated);
+                (void)append(ob::serialize_version_vector_records(entries, truncated, ++generation));
             });
+            whole = median_ms(reps, [&] {
+                whole_bytes = append(ob::serialize_version_vector_records(ours, false, ++generation));
+            });
+            std::vector<size_t> moved;
+            for (size_t i = 0; i < n; i += 100) moved.push_back(i);
+            one_percent = median_ms(reps, [&] {
+                changes_bytes = append(ob::serialize_version_vector_changes(ours, moved, ++generation));
+            });
+            if (fingerprint == 1) std::printf("\n");   // keeps the fingerprint's work in the timing
         }
 
-        std::printf("%10zu %8zu %14.3f %14.3f %14.3f %20.3f %14.3f %10.1f%s\n", n, records.size(), ser,
-                    rec, cmp, cmp_more, persist, static_cast<double>(wal_bytes) / 1024.0,
+        std::printf("%10zu %8zu %14.3f %14.3f %14.3f %20.3f %10.3f %10.3f %10.3f %10.1f %10.1f%s\n", n,
+                    records.size(), ser, rec, cmp, cmp_more, was, whole, one_percent,
+                    static_cast<double>(whole_bytes) / 1024.0, static_cast<double>(changes_bytes) / 1024.0,
                     gaps == 0 && more_gaps == n / 10 ? "" : "  (not the vectors this means to time)");
     }
     std::filesystem::remove_all(dir);

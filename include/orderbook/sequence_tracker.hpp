@@ -226,6 +226,13 @@ public:
     /// Number of symbols with any state. Logged at startup.
     std::size_t symbol_count() const { return symbols_.size(); }
 
+    /// Changes to the numbers held above any frontier so far (#189). A writer that compares it with
+    /// the count at its last write knows whether the held set moved without walking every frontier,
+    /// which is what `fingerprint()` does.
+    uint64_t held_version() const { return held_version_; }
+    /// How many (symbol, origin) hold numbers above their frontier.
+    std::size_t holding_count() const { return holding_.size(); }
+
 private:
     struct OriginState {
         uint64_t           high_water{0};      ///< largest number seen; drives gap detection
@@ -255,6 +262,11 @@ private:
     void close_if_past_base(const std::string& key, uint16_t origin, OriginState& st,
                             uint64_t seq);
 
+    /// After anything that may have changed `st.above_frontier`, whose size was `held_before`: the
+    /// count held_version() says, and the index export_held() reads (#189). `key` is the map's own
+    /// key, as for mark_moved().
+    void note_held(const std::string& key, uint16_t origin, OriginState& st, std::size_t held_before);
+
     /// List `st` for the next `take_moved_frontiers()`, once. `key` is the map's own key: the
     /// maps are node-based, so it and `st` stay where they are until `reset()`, which drops the
     /// list with them.
@@ -277,6 +289,15 @@ private:
     std::vector<Moved> moved_;         ///< see take_moved_frontiers()
     bool               moved_all_{true};
     std::atomic<uint64_t> listings_{0};   ///< see listings()
+
+    struct Holding {
+        const std::string* key;
+        uint16_t           origin;
+    };
+    /// Every state whose above_frontier is not empty, and whose it is (#189). The maps are
+    /// node-based, so a state stays where it is until `reset()`, which empties this with them.
+    std::unordered_map<const OriginState*, Holding> holding_;
+    uint64_t held_version_{0};   ///< see held_version()
 };
 
 }  // namespace ob

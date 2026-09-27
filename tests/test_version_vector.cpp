@@ -5,6 +5,7 @@
 // Any of them meaning "the peer has it" would be roadmap #61 again.
 
 #include "orderbook/version_vector.hpp"
+#include "orderbook/wal.hpp"
 
 #include <gtest/gtest.h>
 #include <rapidcheck/gtest.h>
@@ -653,4 +654,184 @@ RC_GTEST_PROP(CompareVectorsProperty, BothDirectionsAreWhatComparingEveryPairFin
     };
     RC_ASSERT(as_set(diff.peer_lacks) == peer_lacks);
     RC_ASSERT(as_set(diff.we_lack) == we_lack);
+}
+
+// ── What moved since the last vector, and the vector a WAL states (#189) ─────
+
+namespace {
+
+using Entries = std::vector<ob::SequenceTracker::VectorEntry>;
+using Frontiers = std::map<std::pair<std::string, uint16_t>, uint64_t>;
+
+ob::WALReplayContext record_at(const ob::VectorRecord& r, uint32_t file) {
+    ob::WALReplayContext ctx{};
+    ctx.header.record_type = r.record_type;
+    ctx.payload            = r.payload.empty() ? nullptr : r.payload.data();
+    ctx.payload_len        = r.payload.size();
+    ctx.wal_file_index     = file;
+    return ctx;
+}
+
+void add_all(ob::VectorFromWal& from_wal, const std::vector<ob::VectorRecord>& records, uint32_t file = 0) {
+    for (const auto& r : records) from_wal.add(record_at(r, file));
+}
+
+Frontiers frontiers_of(const Entries& entries) {
+    Frontiers out;
+    for (const auto& e : entries) out[{e.key, e.origin}] = e.frontier;
+    return out;
+}
+
+Entries numbered(size_t n, uint64_t base) {
+    Entries out;
+    for (size_t i = 0; i < n; ++i) {
+        out.push_back({"SYM" + std::to_string(i) + ".EX", static_cast<uint16_t>(1 + i % 3), base + i});
+    }
+    return out;
+}
+
+std::vector<size_t> all_of(const Entries& entries) {
+    std::vector<size_t> which(entries.size());
+    for (size_t i = 0; i < which.size(); ++i) which[i] = i;
+    return which;
+}
+
+}  // namespace
+
+TEST(VectorChanges, ChangesPutOnAWholeVectorAreTheVectorTheyDescribe) {
+    Entries now{{"A.EX", 1, 10}, {"B.EX", 1, 20}, {"B.EX", 2, 5}};
+    ob::VectorFromWal from_wal;
+    add_all(from_wal, ob::serialize_version_vector_records(now, false, 1));
+
+    // B from origin 1 moved, and C appeared: the cache lists the moved entries by index.
+    now[1].frontier = 27;
+    now.push_back({"C.EX", 3, 1});
+    add_all(from_wal, ob::serialize_version_vector_changes(now, {1, 3}, 2));
+
+    ASSERT_TRUE(from_wal.vector().has_value());
+    EXPECT_EQ(frontiers_of(*from_wal.vector()), frontiers_of(now));
+    EXPECT_EQ(from_wal.changes_applied(), 1u);
+    EXPECT_FALSE(from_wal.unusable());
+}
+
+TEST(VectorChanges, ChangesInPartsGoOnAVectorInParts) {
+    Entries now = numbered(5000, 100);
+    ob::VectorFromWal from_wal;
+    const auto whole = ob::serialize_version_vector_records(now, false, 1);
+    ASSERT_GT(whole.size(), 1u) << "the premise: a whole vector in parts";
+    add_all(from_wal, whole);
+
+    std::vector<size_t> moved;
+    for (size_t i = 0; i < now.size(); i += 2) {
+        now[i].frontier += 1000;
+        moved.push_back(i);
+    }
+    const auto changes = ob::serialize_version_vector_changes(now, moved, 2);
+    ASSERT_GT(changes.size(), 1u) << "the premise: changes in parts";
+    for (const auto& r : changes) EXPECT_EQ(r.record_type, ob::WAL_RECORD_VERSION_VECTOR_CHANGES);
+    add_all(from_wal, changes);
+
+    ASSERT_TRUE(from_wal.vector().has_value());
+    EXPECT_EQ(frontiers_of(*from_wal.vector()), frontiers_of(now));
+}
+
+TEST(VectorChanges, ChangesACrashCutShortAreNotPutOn) {
+    Entries was = numbered(10, 1);
+    ob::VectorFromWal from_wal;
+    add_all(from_wal, ob::serialize_version_vector_records(was, false, 1));
+
+    Entries now = numbered(2000, 500);   // every entry moved, and more appeared: two parts
+    const auto changes = ob::serialize_version_vector_changes(now, all_of(now), 2);
+    ASSERT_EQ(changes.size(), 2u);
+    from_wal.add(record_at(changes[0], 0));   // the crash came before the second part
+    ASSERT_TRUE(from_wal.vector().has_value());
+    EXPECT_EQ(frontiers_of(*from_wal.vector()), frontiers_of(was)) << "half a set of changes was put on";
+
+    // After the restart, a whole set goes on as usual - the half one does not come back.
+    add_all(from_wal, ob::serialize_version_vector_changes(now, all_of(now), 3));
+    EXPECT_EQ(frontiers_of(*from_wal.vector()), frontiers_of(now));
+}
+
+TEST(VectorChanges, ChangesWithNoWholeVectorBeforeThemStateNothing) {
+    const Entries now = numbered(3, 1);
+    ob::VectorFromWal from_wal;
+    add_all(from_wal, ob::serialize_version_vector_changes(now, all_of(now), 1));
+    EXPECT_FALSE(from_wal.vector().has_value()) << "changes on their own read as a vector";
+    EXPECT_TRUE(from_wal.unusable());
+
+    // And a whole vector after them is the vector.
+    add_all(from_wal, ob::serialize_version_vector_records(now, false, 2), 4);
+    ASSERT_TRUE(from_wal.vector().has_value());
+    EXPECT_FALSE(from_wal.unusable());
+    EXPECT_EQ(from_wal.base_file(), 4u);
+}
+
+TEST(VectorChanges, AWholeVectorReplacesTheChangesBeforeIt) {
+    ob::VectorFromWal from_wal;
+    add_all(from_wal, ob::serialize_version_vector_records(numbered(4, 1), false, 1), 0);
+    Entries grown = numbered(6, 50);
+    add_all(from_wal, ob::serialize_version_vector_changes(grown, {4, 5}, 2), 0);
+    const Entries later{{"Z.EX", 9, 99}};
+    add_all(from_wal, ob::serialize_version_vector_records(later, false, 3), 2);
+
+    EXPECT_EQ(frontiers_of(*from_wal.vector()), frontiers_of(later));
+    EXPECT_EQ(from_wal.changes_applied(), 0u);
+    EXPECT_EQ(from_wal.base_file(), 2u);
+    EXPECT_EQ(from_wal.changes_bytes(), 0u);
+}
+
+TEST(VectorChanges, TheBaseIsTheFileTheWholeVectorBeginsIn) {
+    // A rotation inside a whole vector in parts: it begins in file 3 and ends in 4, and the changes
+    // after it stand on file 3 too.
+    const Entries now = numbered(4000, 1);
+    const auto whole = ob::serialize_version_vector_records(now, false, 1);
+    ASSERT_GE(whole.size(), 2u);
+    ob::VectorFromWal from_wal;
+    from_wal.add(record_at(whole[0], 3));
+    for (size_t i = 1; i < whole.size(); ++i) from_wal.add(record_at(whole[i], 4));
+    EXPECT_EQ(from_wal.base_file(), 3u);
+    size_t bytes = 0;
+    for (const auto& r : whole) bytes += r.payload.size();
+    EXPECT_EQ(from_wal.whole_bytes(), bytes);
+}
+
+RC_GTEST_PROP(VectorChangesProperty, AWalOfWholeVectorsAndChangesStatesTheLastState, ()) {
+    // Any run of whole vectors and changes, as a writer that keeps a copy and lists what moved in it
+    // writes them: what the log states is the copy at its last write.
+    const auto steps = *rc::gen::inRange<size_t>(1, 12);
+    Entries copy;
+    std::map<std::pair<std::string, uint16_t>, size_t> where;
+    ob::VectorFromWal from_wal;
+    bool any_whole = false;
+    uint32_t generation = 0;
+    for (size_t step = 0; step < steps; ++step) {
+        const auto moves = *rc::gen::inRange<size_t>(0, 2500);
+        std::vector<size_t> which;
+        std::set<size_t> listed;
+        for (size_t m = 0; m < moves; ++m) {
+            const auto key = *rc::gen::inRange<size_t>(0, 1800);
+            const auto origin = static_cast<uint16_t>(*rc::gen::inRange(1, 4));
+            const std::pair<std::string, uint16_t> k{"K" + std::to_string(key), origin};
+            auto it = where.find(k);
+            size_t i = 0;
+            if (it == where.end()) {
+                i = copy.size();
+                where[k] = i;
+                copy.push_back({k.first, origin, 1});
+            } else {
+                i = it->second;
+                copy[i].frontier += 1;
+            }
+            if (listed.insert(i).second) which.push_back(i);
+        }
+        const bool whole = !any_whole || *rc::gen::inRange(0, 4) == 0;
+        if (whole) {
+            add_all(from_wal, ob::serialize_version_vector_records(copy, false, ++generation));
+            any_whole = true;
+        } else if (!which.empty()) {
+            add_all(from_wal, ob::serialize_version_vector_changes(copy, which, ++generation));
+        }
+    }
+    RC_ASSERT(from_wal.vector().has_value());
+    RC_ASSERT(frontiers_of(*from_wal.vector()) == frontiers_of(copy));
 }

@@ -71,6 +71,16 @@ void write_entries(const std::vector<SequenceTracker::VectorEntry>& entries, siz
     }
 }
 
+void write_part_header(uint8_t* out, uint32_t generation, size_t part, size_t parts, size_t count) {
+    const uint16_t part16  = static_cast<uint16_t>(part);
+    const uint16_t parts16 = static_cast<uint16_t>(parts);
+    const uint16_t count16 = static_cast<uint16_t>(count);
+    std::memcpy(out, &generation, sizeof(generation));
+    std::memcpy(out + 4, &part16, sizeof(part16));
+    std::memcpy(out + 6, &parts16, sizeof(parts16));
+    std::memcpy(out + 8, &count16, sizeof(count16));
+}
+
 void read_entries(const uint8_t* data, size_t count,
                   std::vector<SequenceTracker::VectorEntry>& out) {
     size_t off = 0;
@@ -117,19 +127,119 @@ std::vector<VectorRecord> serialize_version_vector_records(
         VectorRecord r;
         r.record_type = WAL_RECORD_VERSION_VECTOR_PART;
         r.payload.resize(VV_PART_HEADER_SIZE + count * VV_ENTRY_SIZE, 0);
-        const uint16_t part16 = static_cast<uint16_t>(part);
-        const uint16_t parts16 = static_cast<uint16_t>(parts);
-        const uint16_t count16 = static_cast<uint16_t>(count);
-        std::memcpy(r.payload.data(), &generation, sizeof(generation));
-        std::memcpy(r.payload.data() + 4, &part16, sizeof(part16));
-        std::memcpy(r.payload.data() + 6, &parts16, sizeof(parts16));
-        std::memcpy(r.payload.data() + 8, &count16, sizeof(count16));
+        write_part_header(r.payload.data(), generation, part, parts, count);
         write_entries(entries, first, count, r.payload.data() + VV_PART_HEADER_SIZE);
         out.push_back(std::move(r));
     }
     OB_LOG_DEBUG("version_vector", "Vector of %zu entries serialised as %zu parts, generation %u",
                  entries.size(), parts, generation);
     return out;
+}
+
+std::vector<VectorRecord> serialize_version_vector_changes(
+        const std::vector<SequenceTracker::VectorEntry>& entries, const std::vector<size_t>& which,
+        uint32_t generation) {
+    const size_t parts = std::max<size_t>(1, (which.size() + VV_MAX_PART_ENTRIES - 1) / VV_MAX_PART_ENTRIES);
+    std::vector<VectorRecord> out;
+    out.reserve(parts);
+    for (size_t part = 0; part < parts; ++part) {
+        const size_t first = std::min(part * VV_MAX_PART_ENTRIES, which.size());
+        const size_t count = std::min(VV_MAX_PART_ENTRIES, which.size() - first);
+        VectorRecord r;
+        r.record_type = WAL_RECORD_VERSION_VECTOR_CHANGES;
+        r.payload.resize(VV_PART_HEADER_SIZE + count * VV_ENTRY_SIZE, 0);
+        write_part_header(r.payload.data(), generation, part, parts, count);
+        uint8_t* at = r.payload.data() + VV_PART_HEADER_SIZE;
+        for (size_t i = first; i < first + count; ++i) {
+            write_entries(entries, which[i], 1, at);
+            at += VV_ENTRY_SIZE;
+        }
+        out.push_back(std::move(r));
+    }
+    OB_LOG_DEBUG("version_vector", "%zu changed entries of %zu serialised as %zu part(s), generation %u",
+                 which.size(), entries.size(), parts, generation);
+    return out;
+}
+
+void VectorFromWal::add(const WALReplayContext& ctx) {
+    switch (ctx.header.record_type) {
+    case WAL_RECORD_VERSION_VECTOR: {
+        PeerVector one;
+        if (one.deserialize(ctx.payload, ctx.payload_len) && !one.truncated()) {
+            take_whole(one.entries(), ctx.wal_file_index, ctx.payload_len);
+        } else {
+            vector_.reset();
+            index_.clear();
+            base_file_.reset();
+            unusable_ = true;
+        }
+        return;
+    }
+    case WAL_RECORD_VERSION_VECTOR_PART: {
+        uint16_t part = 1;
+        if (ctx.payload_len >= VV_PART_HEADER_SIZE) std::memcpy(&part, ctx.payload + 4, sizeof(part));
+        if (part == 0) {
+            whole_first_file_       = ctx.wal_file_index;
+            whole_assembling_bytes_ = 0;
+        }
+        whole_assembling_bytes_ += ctx.payload_len;
+        if (whole_parts_.add(ctx.payload, ctx.payload_len) == VectorAssembler::Step::Complete) {
+            take_whole(whole_parts_.take(), whole_first_file_, whole_assembling_bytes_);
+        }
+        return;
+    }
+    case WAL_RECORD_VERSION_VECTOR_CHANGES: {
+        uint16_t part = 1;
+        if (ctx.payload_len >= VV_PART_HEADER_SIZE) std::memcpy(&part, ctx.payload + 4, sizeof(part));
+        if (part == 0) change_assembling_bytes_ = 0;
+        change_assembling_bytes_ += ctx.payload_len;
+        if (change_parts_.add(ctx.payload, ctx.payload_len) != VectorAssembler::Step::Complete) return;
+        if (!vector_) {
+            // Nothing to put them on: the whole vector they were written against is not in the log.
+            OB_LOG_WARN("version_vector",
+                        "Changes to a version vector the WAL does not hold, in file %u - they state "
+                        "nothing on their own",
+                        ctx.wal_file_index);
+            unusable_ = true;
+            (void)change_parts_.take();
+            return;
+        }
+        apply(change_parts_.take());
+        changes_bytes_ += change_assembling_bytes_;
+        return;
+    }
+    default:
+        return;
+    }
+}
+
+void VectorFromWal::take_whole(std::vector<SequenceTracker::VectorEntry> entries, uint32_t file,
+                               size_t bytes) {
+    vector_    = std::move(entries);
+    index_.clear();
+    base_file_ = file;
+    unusable_  = false;
+    changes_applied_ = 0;
+    whole_bytes_     = bytes;
+    changes_bytes_   = 0;
+}
+
+void VectorFromWal::apply(std::vector<SequenceTracker::VectorEntry> changes) {
+    auto& v = *vector_;
+    if (index_.empty()) {
+        for (size_t i = 0; i < v.size(); ++i) index_[v[i].key][v[i].origin] = i;
+    }
+    for (auto& c : changes) {
+        auto& origins = index_[c.key];
+        const auto at = origins.find(c.origin);
+        if (at != origins.end()) {
+            v[at->second].frontier = c.frontier;
+        } else {
+            origins.emplace(c.origin, v.size());
+            v.push_back(std::move(c));
+        }
+    }
+    ++changes_applied_;
 }
 
 VectorAssembler::Step VectorAssembler::add(const uint8_t* data, size_t len) {

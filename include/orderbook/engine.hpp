@@ -784,9 +784,23 @@ private:
 
     /// Per-symbol sequence counters and per-origin high-water marks. Guarded by mtx_.
     SequenceTracker                      seq_tracker_;
-    /// Fingerprint of the frontiers as last written to the WAL, so an unchanged vector is not
-    /// rewritten ten times a second.
-    uint64_t                             vector_fingerprint_written_{0};
+    /// What the WAL's vector lacks since the one last written down (#189): the entries of
+    /// `vector_cache_` whose frontier moved since, each once, and a flag per entry saying which are
+    /// listed. Filled from the tracker's list of what moved, as the cache is. Guarded by mtx_.
+    std::vector<std::size_t>             vector_unwritten_;
+    std::vector<uint8_t>                 vector_unwritten_flag_;
+    /// The next vector written down is whole: the first after a start, after the cache was rebuilt,
+    /// after one that a rotation cut across, and the last before a clean stop that wrote changes
+    /// (#189). Guarded by mtx_.
+    bool                                 vector_whole_due_{true};
+    /// The WAL file the last whole vector written down begins in: the changes after it stand on it,
+    /// so retention keeps it (#189). kNoVectorBase when there is none. Guarded by mtx_.
+    static constexpr uint32_t            kNoVectorBase = std::numeric_limits<uint32_t>::max();
+    uint32_t                             vector_base_file_{kNoVectorBase};
+    std::size_t                          vector_whole_bytes_{0};     ///< the last whole vector's size
+    std::size_t                          vector_changes_bytes_{0};   ///< the changes' since
+    /// The tracker's held_version() when the held set was last written down (#189). Guarded by mtx_.
+    uint64_t                             held_version_written_{0};
 
     /// Snapshot of the vector for MM to read without touching mtx_. Its own small mutex,
     /// because the point is to be reachable from the MM io_loop under MM's lock.
@@ -1098,12 +1112,8 @@ private:
     /// finds it (#174). The vector, the held numbers and the epoch were a pass each, and a pass over
     /// a WAL of 422 MB took 4.9 s before it was read in blocks; each is still the last of its kind.
     struct WalStartRecords {
-        /// The last version vector: one record, or the parts of one generation put back together
-        /// in their order (#177). A set of parts a crash cut short is not a vector, and the one
-        /// before it stands.
-        std::optional<std::vector<SequenceTracker::VectorEntry>> vector;
-        bool            vector_unusable{false};   ///< the last vector record did not read
-        VectorAssembler parts;
+        /// The last whole vector with the changes written after it (#177, #189).
+        VectorFromWal vector;
         /// The payload of the last HELD_SEQUENCES record: empty when there is none.
         std::vector<uint8_t> held;
 
