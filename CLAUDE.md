@@ -3854,8 +3854,9 @@ up to 0.6 s at a trickle and refuses writes at the pipelined ceiling, on master 
 branch.
 **#172 is closed**: the Python client's sharded pool swaps its routing whole and replaces a shard
 connection a timeout closed, under a test that builds a sharded pool against a map in etcd. **#174
-is an open P2**: a start reads the whole WAL twice even when its last checkpoint covers every
-record.
+and #189 are open P2s**: a start reads the whole WAL twice even when its last checkpoint covers every
+record; and since #177 a node of 50 000 (symbol, origin) pairs holds writes for 9 - 13 ms at every
+checkpoint, writing its whole vector down.
 
 **#170 and #171**: a Python client connection carries one exchange at a time and is closed when one
 does not finish. A pool used one socket from two threads, so two callers got each other's rows 39%

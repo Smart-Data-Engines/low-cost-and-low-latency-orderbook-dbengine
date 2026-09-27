@@ -8,17 +8,24 @@
 // one walk over ours - and with one that also lists a tenth more that this node has never heard of,
 // which takes a second walk, over theirs. The loop over ours for each of theirs that walk replaced is
 // timed at 1 500 by building this program against the tree before #177, where 1 560 was as large as
-// a compared vector got.
+// a compared vector got. And what a checkpoint pays to write the vector down, under the engine's
+// lock - the export from the tracker, the serialisation and the WAL records, not fsynced: before
+// #177 a vector past one record was never written down at all.
 //
 // Usage: vector_cost [repetitions]     (default 20; prints the median of each, in ms)
 #include "orderbook/logger.hpp"
+#include "orderbook/sequence_tracker.hpp"
 #include "orderbook/version_vector.hpp"
+#include "orderbook/wal.hpp"
+
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -65,8 +72,12 @@ ob::PeerVector received(const std::vector<ob::VectorRecord>& records) {
 int main(int argc, char** argv) {
     const int reps = argc > 1 ? std::atoi(argv[1]) : 20;
     ob::StructuredLogger::instance().set_level(ob::LogLevel::WARN);   // a line per vector received
-    std::printf("%10s %8s %14s %14s %14s %20s\n", "entries", "records", "serialise ms", "receive ms",
-                "compare ms", "compare, +10% ms");
+    std::printf("%10s %8s %14s %14s %14s %20s %14s %10s\n", "entries", "records", "serialise ms",
+                "receive ms", "compare ms", "compare, +10% ms", "persist ms", "WAL kB");
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("vector_cost_" + std::to_string(static_cast<long>(::getpid())));
+    std::filesystem::create_directories(dir);
+    uint32_t generation = 1;
     for (const size_t n : {size_t{1'500}, size_t{5'000}, size_t{50'000}}) {
         const auto ours = entries_of(n);
         std::vector<ob::VectorRecord> records;
@@ -93,9 +104,32 @@ int main(int argc, char** argv) {
             more_gaps = ob::compare_vectors(ours, more, 2).we_lack.size();
         });
 
-        std::printf("%10zu %8zu %14.3f %14.3f %14.3f %20.3f%s\n", n, records.size(), ser, rec, cmp,
-                    cmp_more,
+        ob::SequenceTracker tracker;
+        tracker.import_own_vector(ours);
+        size_t wal_bytes = 0;
+        double persist = 0;
+        {
+            ob::WALWriter wal((dir / std::to_string(n)).string());
+            persist = median_ms(reps, [&] {
+                bool truncated = false;
+                const auto entries = tracker.export_vector(ob::VV_MAX_ENTRIES, truncated);
+                const auto recs = ob::serialize_version_vector_records(entries, truncated, ++generation);
+                wal_bytes = 0;
+                for (const auto& r : recs) {
+                    if (r.record_type == ob::WAL_RECORD_VERSION_VECTOR_PART) {
+                        wal.append_version_vector_part(r.payload.data(), r.payload.size());
+                    } else {
+                        wal.append_version_vector(r.payload.data(), r.payload.size());
+                    }
+                    wal_bytes += r.payload.size();
+                }
+            });
+        }
+
+        std::printf("%10zu %8zu %14.3f %14.3f %14.3f %20.3f %14.3f %10.1f%s\n", n, records.size(), ser,
+                    rec, cmp, cmp_more, persist, static_cast<double>(wal_bytes) / 1024.0,
                     gaps == 0 && more_gaps == n / 10 ? "" : "  (not the vectors this means to time)");
     }
+    std::filesystem::remove_all(dir);
     return 0;
 }

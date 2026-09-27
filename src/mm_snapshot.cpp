@@ -391,9 +391,9 @@ void MultiMasterManager::begin_snapshot_send(PeerConnection& peer,
         // all — so every peer would resend everything and append it a second time into
         // append-only storage. Refusing costs a bootstrap; accepting costs duplicate rows.
         OB_LOG_ERROR("mm",
-                     "Refusing snapshot for peer %u: our version vector does not fit a frame, "
-                     "so the receiver could not declare any frontier from it",
-                     peer.node_id);
+                     "Refusing snapshot for peer %u: our version vector is past the %zu entries "
+                     "this node states, so the receiver could not declare any frontier from it",
+                     peer.node_id, VV_MAX_ENTRIES);
         engine_.registry().increment_counter("ob_mm_snapshot_failed_total");
         send_snapshot_abort(peer, "vector_untransportable");
         return;

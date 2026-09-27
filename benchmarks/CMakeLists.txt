@@ -80,4 +80,4 @@ target_link_libraries(segment_size_cost PRIVATE orderbook_columnar)
 #
 # Compiled, deliberately not run: it prints a table, and the numbers in the roadmap came from it.
 add_executable(vector_cost vector_cost.cpp)
-target_link_libraries(vector_cost PRIVATE orderbook_sequence)
+target_link_libraries(vector_cost PRIVATE orderbook_sequence orderbook_wal)

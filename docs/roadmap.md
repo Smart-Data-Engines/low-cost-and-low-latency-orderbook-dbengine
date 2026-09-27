@@ -2213,6 +2213,25 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 189. A mesh node of tens of thousands of (symbol, origin) pairs holds writes for 9 - 13 ms at every checkpoint, writing its whole vector down **P2**
+
+**Found measuring #177, which caused it.** Since #177 a vector of any size is written into the WAL
+before each checkpoint that follows a frontier moving - #179's order - and under the engine's lock:
+the tracker's export, the serialisation and the records. `benchmarks/vector_cost` (Release,
+i3-7100U, median of 20, three runs): 0.10 ms and 61.5 kB at 1 500 entries, 0.48 - 0.62 ms and 205 kB
+at 5 000, **8.95 - 12.7 ms and 2 051 kB at 50 000** - so a write that waits for the lock waits that
+long, once a checkpoint. Before #177 a vector past one record was written as the "send everything"
+marker, and past 4 096 entries not at all, which was #177's defect rather than a saving.
+
+A fix writes less under the lock: serialise from the tracker without the copy the export makes, and
+- the larger step - write what moved since the last vector rather than all of it (the tracker lists
+the frontiers that moved, since #180), with a whole vector now and then for a restart to start from.
+Its test is a restart that restores a whole vector and the changes written after it; its measure,
+this table.
+
+- Effort: M | Impact: a node with tens of thousands of instrument-origin pairs holds every write for
+  about 10 ms at each checkpoint, and writes 2 MB of WAL each time
+
 ### 188. A node that joins a mesh asks every peer for a snapshot, and installs each one it is sent, in turn **P1**
 
 **Found probing #177's joiner, and on master below #177's size too**
@@ -2813,7 +2832,12 @@ against the branch before its last change, whose numbers are in parentheses -
 
 The first version walked ours, then built an index of ours - copying every key - and walked theirs
 through it; a lookup in the peer's vector copied the key it looked for, and a vector received copied
-its keys into the table rather than move them. A profile put 17% of the
+its keys into the table rather than move them.
+
+Writing the vector down now costs what it did not: at every checkpoint after a frontier moved, under
+the engine's lock, 0.10 ms and 61.5 kB of WAL at 1 500 entries, 0.48 - 0.62 ms and 205 kB at 5 000,
+and 8.95 - 12.7 ms and 2 051 kB at 50 000 (the same program, three runs); before #177 a vector past
+one record was written as the marker, and past 4 096 entries not at all. That is #189. A profile put 17% of the
 time in the table's chains; counted, they held 1.47 probes a lookup under that hash and under a mixed
 one alike (pitfall 490), and the cost was a node and a key copy per entry.
 
@@ -11617,8 +11641,8 @@ Two details worth keeping, because both are ways to get this wrong while looking
   records as duplicates — of rows this node no longer has. `adopt_snapshot_sequence_state()` raises
   the counter past any adopted frontier for its own origin.
 - **A sender that cannot state what it holds must refuse to be a bootstrap source.** If the version
-  vector does not fit a frame, the receiver would install the files and then declare no frontier at
-  all — so every peer resends the whole snapshot's worth of records into append-only storage. The
+  vector does not fit a frame - since #177, if it is past the million entries a node states - the
+  receiver would install the files and then declare no frontier at all — so every peer resends the whole snapshot's worth of records into append-only storage. The
   sender refuses with a reason rather than sending a "send everything" marker, and the receiver
   refuses such a marker too, in case an older sender ever produces one.
 
@@ -12007,7 +12031,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #174, #175, #176, #186, #187, #188.** Every other item above #58 is marked closed, and
+**Open: #169, #174, #175, #176, #186, #187, #188, #189.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -12152,6 +12176,7 @@ The capability items are in the table below.
 | **P1** | A mesh snapshot carries any number of files, so a peer can join a node of 8 192 segments or more (#176) | M | A mesh snapshot names a file by a 16-bit index, so a node of 8 192 segments - 8 192 instruments, whatever part 2b merges - cannot bootstrap a peer that joins it; found reading the sender, not yet measured |
 | **P1** | A node that joins a mesh takes one snapshot, from one peer (#188) | S-M | A joiner asks every peer for a snapshot, each sends one, and it installs them in turn - three from three peers, writes refused 21.6 s where one bootstrap took 6.8 - accepting writes between two installs that the next may discard |
 | **P2** | A start finds its last checkpoint without reading the whole WAL twice (#174) | S–M | Since part 2b of #165 the index is 1.9 - 2.9 s of a cold start after a twenty-minute soak, 5.9 - 6.8 s, and the WAL most of the rest - and a start reads it twice even when the checkpoint covers every record |
+| **P2** | A node writes its vector down without holding writes for its whole size (#189) | M | Since #177 every checkpoint after a frontier moved writes the whole vector under the engine's lock: 8.95 - 12.7 ms and 2 MB of WAL at 50 000 (symbol, origin) entries |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |

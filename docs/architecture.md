@@ -279,7 +279,8 @@ both ways there, and when that was every pair the peer listed - a mesh at rest -
 walk; only pairs the peer alone lists are walked again, through a set of views into this node's
 entries. At 50 000 entries (Release, i3-7100U, `benchmarks/vector_cost`) a vector costs 1.8 ms to
 serialise, 15 ms to receive and 4.9 ms to compare with an equal one - 23 ms with a tenth more pairs on
-the peer's side - on the io loop, at every reconciliation. Before #177 the direction "what this node
+the peer's side - on the io loop, at every reconciliation; and writing it down, before a checkpoint
+and under the engine's lock, 9 - 13 ms and 2 MB of WAL (#189). Before #177 the direction "what this node
 lacks" was a loop over this node's pairs for each of the peer's: 2.8 ms at 1 500 entries, where it is
 0.08 ms now.
 
