@@ -127,6 +127,7 @@ pytest auto-discovers `test_*.py` files — no registry or config changes requir
 | `OB_INTEGRATION_FILTER` | No | Comma-separated category names (e.g. `smoke,replication`). Runs only matching categories. Empty = run all. |
 | `OB_BINANCE_TESTS` | No | Set to `1` to run the live Binance modules. Without it they hard-skip: a third-party exchange being unreachable must never fail this suite. |
 | `OB_STRESS_SECONDS` | No | Duration of the sustained-load window. Defaults to `5`; the documented long run is `30`. The duration used is printed in the report. |
+| `OB_KEEP_FAILED_NODE_LOGS` | No | A directory. When a test fails, every cluster that saw it copies its nodes' and etcd's logs there on shutdown, under the failed test's id, before the temporary directories go. Both CI integration jobs set it and upload the directory (`failed-node-logs`, `failed-node-logs-tsan`). A green run writes nothing. |
 
 ## Console Report
 
@@ -172,9 +173,10 @@ The `test_cpp_client.py` module runs the `ob_integration_test` binary (built by 
 ## When the suite says rows are missing but not why
 
 `scripts/mm_harness.py` runs three multi-master nodes with each node's log on disk, kills one in a
-loop, and checks exact row counts after every restart. The fixtures here keep node stdout in a pipe,
-which is fine until the thing you need is the line where the engine decided what to send — that is how
-roadmap #61 stayed hidden while a single-outage test passed.
+loop, and checks exact row counts after every restart. The fixtures here write each node's output to
+`node.log` in its data directory, which `shutdown()` removes - so the line where the engine decided what
+to send is gone with a passing test, and kept for a failing one only with `OB_KEEP_FAILED_NODE_LOGS` -
+and a single outage can pass by luck: that is how roadmap #61 stayed hidden.
 
 ```bash
 MMH_CYCLES=4 python3 scripts/mm_harness.py     # logs under /tmp/ob_mm_harness

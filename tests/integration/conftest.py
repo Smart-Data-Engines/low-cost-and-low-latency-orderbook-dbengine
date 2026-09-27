@@ -140,6 +140,45 @@ def patience(seconds: float) -> float:
     return seconds * (3.0 if instrumented_run() else 1.0)
 
 
+# ── The node logs of a failed test ───────────────────────────────────────────
+
+#: Every test whose setup, call or teardown failed, in order. `ClusterManager.shutdown()` runs in a
+#: fixture's teardown, after the report of the call it follows, so it knows whether that failed.
+FAILED_TESTS: list[str] = []
+
+
+def pytest_runtest_logreport(report) -> None:
+    if report.failed and report.nodeid not in FAILED_TESTS:
+        FAILED_TESTS.append(report.nodeid)
+
+
+def keep_logs_of(dirs: list[str], failed: list[str], root: str) -> Path:
+    """Copy every `*.log` under `dirs` to `root/<first failed test>/<dir>/`, before the dirs go.
+
+    A failure in CI used to leave its assertion and nothing else: the nodes' own logs are in the
+    temporary directories `shutdown()` removes. PR #188's first run is what that cost - "100 of 2100
+    rows" in the integration job, no log to say why, and a reproduction that needed a one-second tick
+    to land in the window at all. Only after a failure, so a green battery writes nothing here.
+    """
+    name = "".join(c if c.isalnum() or c in "-_." else "_" for c in failed[0])[:150]
+    if len(failed) > 1:
+        name += f"__and_{len(failed) - 1}_more"
+    dest = Path(root) / name
+    n = 1
+    while dest.exists():   # a second cluster in the same test
+        n += 1
+        dest = Path(root) / f"{name}__{n}"
+    for d in dirs:
+        for path in Path(d).rglob("*.log"):   # node.log, etcd.log; a WAL file is .bin
+            target = dest / Path(d).name / path.relative_to(d)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target)
+            except OSError:
+                pass   # a file gone under a stopped node's directory; the rest are still worth it
+    return dest
+
+
 def open_node_log(data_dir: str) -> "io.TextIOWrapper":
     """A file for a node's stdout and stderr, in its own data directory.
 
@@ -484,6 +523,8 @@ class ClusterManager:
         self.nodes: list[NodeInfo] = []
         self.temp_dirs: list[str] = []
         self._started = False
+        # Failures before this cluster existed are not its to keep logs for.
+        self._failures_before = len(FAILED_TESTS)
 
     # ── Public lifecycle ──────────────────────────────────────────
 
@@ -552,6 +593,17 @@ class ClusterManager:
             self._stop_etcd()
         except Exception:
             pass
+
+        # After the nodes and etcd are stopped, so every log is complete; before the directories go.
+        # `OB_KEEP_FAILED_NODE_LOGS` is set by CI, which uploads what lands there.
+        keep = os.environ.get("OB_KEEP_FAILED_NODE_LOGS")
+        failed = FAILED_TESTS[self._failures_before:]
+        if keep and failed:
+            try:
+                where = keep_logs_of(self.temp_dirs, failed, keep)
+                print(f"\nNode logs of {failed[0]} kept in {where}")
+            except Exception as exc:  # noqa: BLE001 - a copy that fails must not fail teardown
+                print(f"\nNode logs of {failed[0]} could not be kept: {exc!r}")
 
         for d in self.temp_dirs:
             try:
