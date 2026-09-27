@@ -822,8 +822,9 @@ public:
     ///
     /// Two passes rather than buffering the tail in memory: the first finds the last
     /// checkpoint, the second invokes cb for the records it does not cover. The tail can be
-    /// arbitrarily large if flushing fell behind, and open() is not on a latency
-    /// path, so bounded memory is worth more than one pass.
+    /// arbitrarily large if flushing fell behind, so bounded memory is worth reading the tail
+    /// twice - and only the tail: the second pass begins at the first pass's last mark before it
+    /// (#174), so the log is read once whole.
     ///
     /// With no checkpoint in the log, every record is replayed — which is correct for
     /// a log written before checkpoints existed, and for one whose first flush has

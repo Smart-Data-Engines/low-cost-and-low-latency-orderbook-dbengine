@@ -1086,7 +1086,8 @@ uint64_t WALReplayer::replay_after(const LastCheckpoint& last, WALReplayCallback
 uint64_t WALReplayer::replay_after_checkpoint(WALReplayCallbackV2 cb)
 {
     // Two passes rather than buffering the tail in memory: the first finds the last checkpoint,
-    // the second invokes cb for the records it does not cover.
+    // the second invokes cb for the records it does not cover, from the first's last mark before
+    // them (#174).
     return replay_after(find_last_checkpoint(), std::move(cb));
 }
 
