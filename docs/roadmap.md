@@ -2450,13 +2450,15 @@ of them, the writer logging the wait at the handshake, the decision 10 - 91 ms a
 catch-up of 2 000 records done 20 - 102 ms after it - with a flush interval of 5 s.
 The C++ tests are six in `tests/test_mm_catchup_rounds.cpp`, and in `tests/test_sequence_tracker.cpp`
 what `listings()` counts and a RapidCheck property that a copy whose listing is current is the export.
-Part D's mutation table, written down before it ran: **20 mutations in 22 runs, every one as
-written** - 15 killed, and the 5 that were to survive did: the second look not dropping a
-disconnected peer's wait (the rounds drop a catch-up for a connection that is gone), the io loop
-waiting 500 ms whatever waits (latency: the writer's log has the decision 3 - 9 ms after the tick's
-update), the two resets with the connection (equivalent: the second look and the next vector do the
-same), and a control. Two rows did not build at first - "never wait" written as `if (false)` took a
-parameter's last use away under `-Werror` - and ran again with a `(void)` (pitfall 484).
+Part D's mutation table, its verdicts written down before each pass: **21 mutations on the final
+tree, every one as written** - 16 killed, and the 5 that were to survive did: the second look not
+dropping a disconnected peer's wait (the rounds drop a catch-up for a connection that is gone), the
+io loop waiting 500 ms whatever waits (latency; the C++ tests take the second look themselves, and
+the writer's log has the decision 10 - 91 ms after the handshake), the two resets with the
+connection (equivalent: the second look and the next vector do the same), and a control. The row
+the requested tick adds - a wait that asks for nothing - is killed by two tests whose flush interval
+is an hour. The first two passes ran on the version that waited for the interval's tick: 20
+mutations in 22 runs, as written, two of them run again after they did not build (pitfall 484).
 
 - Effort: S-M | Impact: a returning mesh peer served stale reads for up to a seal interval and a
   reconciliation longer than it had to
