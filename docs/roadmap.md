@@ -2213,6 +2213,40 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 196. Moving a symbol between shards moves none of its rows **P2**
+
+**Found fixing #175.** `MIGRATE <symbol> <shard>` marked the symbol migrated on its shard - every
+write of it refused `SYMBOL_MIGRATED` from then on - reassigned it in that shard's copy of the map, and
+moved nothing: `Engine::create_symbol_snapshot()` returns a manifest that names no files, the WAL delta
+`get_symbol_wal_delta()` returns is empty, and `load_symbol_snapshot()` loads nothing - three stubs
+marked as such. Before #175 no shard knew another, so it was unreachable; with the map in etcd, which
+every client routes by and which `MIGRATE` did not write, the symbol could be written nowhere: its
+shard refused it, and the map still named that shard. `MIGRATE` is refused now (`ERR MIGRATE is not
+implemented: it would move none of <symbol>'s rows (#196)`), and adding a shard moves ownership of its
+share of the ring without the rows.
+
+A fix moves a symbol's segments and the WAL records after them to the target, switches the map's
+assignment by a compare-and-swap once the target holds them, and only then refuses writes at the
+source; its test is a symbol written, moved and read back whole from the target.
+
+- Effort: L | Impact: a sharded cluster cannot be rebalanced, and a shard added while writes flow
+  splits the symbols it takes over across two shards
+
+### 195. A node publishes 127.0.0.1 as its address to the coordinator, so a replica or a mesh peer on another host dials itself ✅ **P1**
+
+**Found reading #175's code.** The address a primary writes into the leader key, and every replica
+reads to replicate from (`demote_to_replica(leader_address)`), was `"127.0.0.1:" + replication_port`,
+set in `tcp_server.cpp` with no flag to change it - true on one machine, where every test runs, and a
+replica on another host would connect to its own port. A mesh node registers itself for its peers the
+same way (`MultiMasterManager::start()`: `"127.0.0.1:" + mm_replication_port`), so the three-host mesh
+`docs/operations.md` describes could not have formed. **Fixed with #175**: `--advertise-host`
+(`advertise-host` in the file), 127.0.0.1 by default, names the host in the leader key, the mesh
+registration and the shard map. Tested in `tests/test_cli_config.cpp`, by a shard with
+`--advertise-host 127.0.0.2` whose leader key and map entry say so, and by a mesh node whose
+registration does.
+
+- Effort: S | Impact: automatic failover and a mesh across machines could not have worked
+
 ### 194. A mesh snapshot holding a file of zero bytes cannot be installed: its sender sends no chunk for it, and its receiver waits for one **P3**
 
 **Found reading the sender for #176, and not measured.** `advance_snapshot_send()` sends a file's
@@ -3164,7 +3198,7 @@ joiner now.
 - Effort: M | Impact: a mesh cannot take a new peer once one node holds a few thousand segments —
   a few thousand instruments, or a few hours of a few hundred
 
-### 175. Sharding by symbol has no control plane: no shard writes itself or the shard map to etcd, and neither client finds a shard **P1**
+### 175. Sharding by symbol has no control plane: no shard writes itself or the shard map to etcd, and neither client finds a shard ✅ **P1**
 
 **Found reading the shard coordinator for #172, then measured** against a native etcd, with two
 servers started as `--shard-id s0` and `s1` and the same `--coordinator-endpoints`. Each logs
@@ -3191,6 +3225,32 @@ integration test starts a shard. A fix has to decide who writes the map and how 
 together do not overwrite each other (a compare-and-swap on the key's revision), what a shard that
 leaves does to it (its lease), how a shard's failover keys are its own, and how both clients read
 the map.
+
+**Fixed** (spec `kiro-workspace/specs/shard-control-plane/`). A node started with `--shard-id` writes
+its node under its lease (`<prefix>shards/<id>`), reads `<prefix>shard_map`, puts itself in it and
+writes it back only on the revision it read - a compare-and-swap, `/v3/kv/txn` on the key's
+`mod_revision`, tried again on a conflict - so two shards starting together both end up in it; and it
+reads the map every 2 s, so a shard that joins later is in every ring. A shard etcd could not reach at
+its start tries again every pass: it was `JOINING` for good. A shard's group elects under
+`<prefix>shards/<id>/`, and a replica of it takes the map as it is - the map names the group's
+primary, which writes its address when it becomes one. The address is `--advertise-host` and
+`--port`: it was `--node-id`. The C++ router reads the map from etcd and connects to each shard - and
+again to one whose address changed - and the Python pool, which read the right key all along, takes
+the bare `ERR SYMBOL_MIGRATED` the server sends. `CoordinatorClient` gained `get()`, `put()` and
+`compare_and_put()`. `MIGRATE` is refused until it moves data (#196).
+
+Measured, `tests/integration/test_shard_control_plane.py` (native etcd, servers with `--shard-id`,
+eleven tests): two shards started together are both in the map; each symbol is taken by the one shard
+the ring gives it and refused `ERR NOT_OWNER` by the other; each shard has its own leader key and
+there is no `/ob/leader`; the Python pool and the C++ pool write each symbol to its owner; a shard that
+joins later is in the others' rings within a read of the map; a shard's replica leaves the map naming
+its primary; the advertised host is what the map and the leader key say (#195). **All of them fail on
+master**, on their first premise: no shard map in etcd.
+
+A shard added while writes flow takes its share of the ring from the others without their rows -
+moving them is #196 - and until each of them has read the map, for up to 2 s, they still take its
+symbols' writes. So shards are added before the writes, or with the symbols that must stay put
+assigned in the map (`docs/operations.md`).
 
 - Effort: M–L | Impact: a documented feature that cannot be used, whose nodes say they registered; a
   shard that takes every symbol, and a second shard that silently becomes the first one's replica
@@ -12249,10 +12309,12 @@ said by the window.
 **#176 is closed**: a mesh snapshot named each file by a 16-bit index, so a node of 8 192 segments
 could bootstrap no peer; a joiner says in its request that it takes a 32-bit index and 1 GiB of
 metadata now, and a node of 8 200 segments bootstraps one - measuring it found #177, #191, #192 and
-#193. **#175**: sharding by symbol has no control plane — no shard writes itself or
-the shard map to etcd, each owns every symbol, and a second one on the same etcd becomes the first
-one's replica — so neither client can find a shard, and roadmap #22's "done" is true only of its
-parts. It was found fixing **#172, which is closed**: the Python pool's sharded mode replaced its
+#193. **#175 is closed**: sharding by symbol had no control plane — no shard wrote itself or
+the shard map to etcd, each owned every symbol, and a second one on the same etcd became the first
+one's replica; shards write the map by compare-and-swap and read it every 2 s now, each group elects
+under its own keys, and both clients route by it - and **#195**, a primary publishing 127.0.0.1 as its
+address to replicas on other hosts, is closed with it (`--advertise-host`); moving a symbol's rows
+between shards is **#196**. #175 was found fixing **#172, which is closed**: the Python pool's sharded mode replaced its
 routing under its callers — a write routed by a half-built ring, a fan-out that raised, a shard
 connection a timeout closed that never came back — and a test that builds a sharded pool against a
 map in etcd holds all three. **#170 and #171 are closed, and both were the Python client's**: a pool
@@ -12317,7 +12379,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #174, #175, #189, #190, #193, #194.** Every other item above #58 is marked closed, and
+**Open: #169, #174, #189, #190, #193, #194, #196.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -12456,11 +12518,11 @@ The capability items are in the table below.
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
-| **P1** | Sharding by symbol gains its control plane: the shards write the map, and both clients read it (#175) | M–L | A shard writes neither itself nor the map to etcd, owns every symbol, and a second one on the same etcd becomes the first one's replica; neither client can find a shard |
 | **P2** | A start finds its last checkpoint without reading the whole WAL twice (#174) | S–M | Since part 2b of #165 the index is 1.9 - 2.9 s of a cold start after a twenty-minute soak, 5.9 - 6.8 s, and the WAL most of the rest - and a start reads it twice even when the checkpoint covers every record |
 | **P2** | A node writes its vector down without holding writes for its whole size (#189) | M | Since #177 every checkpoint after a frontier moved writes the whole vector under the engine's lock: 8.95 - 12.7 ms and 2 MB of WAL at 50 000 (symbol, origin) entries |
 | **P2** | A flush tick's WAL sync at the ceiling does not keep writers waiting seconds for room (#190) | M | On a device the segments keep busy the tick's WAL sync took 1.2 - 3.0 s at the pipelined ceiling, and writers waited up to 3.4 s for room in the pending queue - 1.6 s from the refusal |
 | **P2** | A joiner checks a snapshot's paths off its mesh io thread, once a directory (#193) | S | At 70 000 files the check took 5.1 s of the joiner's io thread (Debug), 83% of it resolving every path against the filesystem twice; a week of 4 000 instruments would make it a minute |
+| **P2** | A symbol moves between shards with its rows (#196) | L | MIGRATE marked a symbol migrated and moved nothing - it is refused now - and a shard added while writes flow takes ownership of its share without the rows |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |

@@ -3842,6 +3842,20 @@ Learned the hard way. Check here before debugging.
      records below the base - so the data directory notes it; and a snapshot carries the closed
      frontiers but not the note, so installing one sets the note from what its frontiers say (#187).
 
+506. **A local integration run imports the client the venv's editable install names, not
+     PYTHONPATH's.** The main checkout's venv carries scikit-build-core's editable install of the
+     client: a `sys.meta_path` finder mapping `orderbook_engine` to that checkout's `python/`, which
+     wins over PYTHONPATH - so a worktree's battery ran the main checkout's client, and a fix to the
+     client in the worktree was not what ran (found at #175). A venv with the test dependencies and no
+     install of the client (`worktrees/venv-it`) runs the worktree's.
+507. **A feature whose every part is tested can still be missing.** Sharding by symbol had tests for
+     its ring, its map's JSON, its ownership and its commands, and none that started a shard: nothing
+     wrote the map, and the C++ router read nothing and answered success (#175). The test of a control
+     plane starts the processes it controls, and asks the store they share.
+508. **An address a node publishes is right only where it was tested.** `127.0.0.1` in the leader key
+     and in the mesh registration is correct on the one machine every test runs on, and wrong on every
+     other (#195). What a node advertises is configuration, and a test says it is published as
+     configured.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -3930,14 +3944,16 @@ received before the joiner took writes, and `ob_segment_count` at 0 after an ins
 numbering left stopped every frontier of a symbol two nodes wrote, and after an outage every node
 stored its rows again - 11 904, 11 404 and 16 232 where 11 000 were written; a mesh node closes that
 numbering once at its first start now, at the fixed base 2^48, and the same probe holds 11 000 on
-every node (pitfalls 503-505). **#169 and #175 are open P1s**: an exchange name with a dot
+every node (pitfalls 503-505). **#175 is closed**: shards write themselves into the map in etcd by
+compare-and-swap and read it every 2 s, each group elects under its own keys, and both clients route
+by the map; with it **#195**, a node publishing 127.0.0.1 as its address in the leader key and the mesh
+registration (`--advertise-host`, pitfalls 506-508). **#169 is an open P1**: an exchange name with a dot
 makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live book, sequence numbers
-and stored rows, measured on the wire; sharding by symbol has no control plane: no shard writes
-itself or the map to etcd, each owns every symbol, and a second on the same etcd becomes the first
-one's replica, measured against a native etcd.
+and stored rows, measured on the wire.
 **#172 is closed**: the Python client's sharded pool swaps its routing whole and replaces a shard
 connection a timeout closed, under a test that builds a sharded pool against a map in etcd. **#174,
-#189, #190 and #193 are open P2s**: a start reads the whole WAL twice even when its last checkpoint
+#189, #190, #193 and #196 are open P2s** - #196 a symbol moved between shards without its rows, and
+`MIGRATE` refused until it is not: a start reads the whole WAL twice even when its last checkpoint
 covers every record; since #177 a node of 50 000 (symbol, origin) pairs holds writes for 9 - 13 ms at
 every checkpoint, writing its whole vector down; at the write ceiling a flush tick's WAL sync takes
 1 - 3 s on a device the segments keep busy, and writers wait that long for room in the pending queue;

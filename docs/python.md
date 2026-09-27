@@ -336,9 +336,8 @@ pool reads the map from etcd (`<prefix>shard_map`) and routes each symbol to the
 assigns it, or to the one the map's hash ring gives it. A refresh — the health check's, or a
 `SYMBOL_MIGRATED` retry's — builds the next routing beside the one in use and swaps it in whole, so
 a call routes by one version from start to end, and a refresh that cannot reach etcd keeps the
-routing there is. **No shard writes that map yet (#175)**: a node started with `--shard-id` neither
-registers itself nor publishes the map, so a sharded pool finds no shard until something else has
-written it.
+routing there is. The shards write the map themselves since #175 (`docs/operations.md`, Sharding by
+symbol), and a `SYMBOL_MIGRATED` the server sends bare is read as one.
 
 ### OrderbookRow
 
