@@ -1560,14 +1560,76 @@ TEST(MMSnapshotEachPeerOnce, AReceiverThatAbandonsATransferTellsItsSourceToStop)
 }
 
 TEST(MMSnapshotEachPeerOnce, ASourceThatWentAwayOrAbortedIsNotToldAnything) {
+    {
+        Node node(1);
+        WiredPeer a(2);
+        ob::PeerConnection& pa = a.mgr(*node.mm);
+        ASSERT_TRUE(node.mm->request_snapshot_from(pa));
+        (void)requests_in(a);
+        begin_from(node, pa);
+        arrive_snapshot_frame(*node.mm, pa, ob::MM_MSG_SNAPSHOT_ABORT,
+                              ob::encode_snapshot_abort("file_read_failed"));
+        EXPECT_FALSE(node.mm->snapshot_recv_active());
+        EXPECT_EQ(refusal_in(a), "") << "a source that aborted was told to stop what it had stopped";
+    }
+    {
+        Node node(1);
+        WiredPeer a(2);
+        ob::PeerConnection& pa = a.mgr(*node.mm);
+        ASSERT_TRUE(node.mm->request_snapshot_from(pa));
+        (void)requests_in(a);
+        begin_from(node, pa);
+        node.mm->on_peer_disconnected(pa);
+        EXPECT_FALSE(node.mm->snapshot_recv_active());
+        EXPECT_EQ(refusal_in(a), "") << "a source that went away was written to";
+    }
+}
+
+TEST(MMSnapshotEachPeerOnce, TheSameNodeOnANewConnectionIsNotTold) {
+    // Its connection, not its node: the node back on a new connection is sending nothing.
     Node node(1);
     WiredPeer a(2);
     ob::PeerConnection& pa = a.mgr(*node.mm);
     ASSERT_TRUE(node.mm->request_snapshot_from(pa));
     (void)requests_in(a);
     begin_from(node, pa);
-    arrive_snapshot_frame(*node.mm, pa, ob::MM_MSG_SNAPSHOT_ABORT,
-                          ob::encode_snapshot_abort("file_read_failed"));
-    EXPECT_FALSE(node.mm->snapshot_recv_active());
-    EXPECT_EQ(refusal_in(a), "") << "a source that aborted was told to stop what it had stopped";
+    WiredPeer again(2);
+    ob::PeerConnection& returned = again.mgr(*node.mm);   // the record of node 2, a new connection
+    ASSERT_NE(returned.conn_id, 0u);
+    node.mm->abort_bootstrap("file_crc_mismatch");
+    EXPECT_EQ(refusal_in(again), "") << "a connection that sent nothing was told to stop";
+}
+
+TEST(MMSnapshotEachPeerOnce, TheNextRoundAsksEveryPeerAgain) {
+    // After a round every peer refused, and after one whose every transfer failed: the next round -
+    // begun by a vector - asks each of them again, and not only the one whose vector began it.
+    for (const bool refused : {true, false}) {
+        SCOPED_TRACE(refused ? "a round of refusals" : "a round of failed transfers");
+        Node node(1);
+        WiredPeer a(2), b(3);
+        ob::PeerConnection& pa = a.mgr(*node.mm);
+        ob::PeerConnection& pb = b.mgr(*node.mm);
+        state_a_vector(pa);
+        state_a_vector(pb);
+        const auto fail = [&](ob::PeerConnection& p) {
+            if (refused) {
+                arrive_snapshot_frame(*node.mm, p, ob::MM_MSG_SNAPSHOT_ABORT,
+                                      ob::encode_snapshot_abort("busy"));
+            } else {
+                begin_from(node, p);
+                node.mm->abort_bootstrap("file_crc_mismatch");
+            }
+        };
+        ASSERT_TRUE(node.mm->request_snapshot_from(pa));
+        fail(pa);
+        ASSERT_EQ(requests_in(b), 1u);
+        fail(pb);
+        ASSERT_FALSE(node.mm->is_bootstrapping());
+        ASSERT_EQ(requests_in(a), 1u);                   // the first round's, and no other
+
+        ASSERT_TRUE(node.mm->request_snapshot_from(pa)) << "the next vector began no round";
+        ASSERT_EQ(requests_in(a), 1u);
+        fail(pa);
+        EXPECT_EQ(requests_in(b), 1u) << "the next round did not ask a peer the last one had";
+    }
 }
