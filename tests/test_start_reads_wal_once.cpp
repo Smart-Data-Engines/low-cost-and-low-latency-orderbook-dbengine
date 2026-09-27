@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 
@@ -35,11 +36,11 @@ using namespace mm_engine;
 
 std::atomic<uint16_t> g_port{ob::test::kPortsStartReadsWalOnce};
 
-std::unique_ptr<ob::Engine> single_node(const std::string& dir) {
+std::unique_ptr<ob::Engine> single_node(const std::string& dir, size_t rotate_bytes = 512ULL << 20) {
     return std::make_unique<ob::Engine>(dir, kNoAutoFlush, ob::FsyncPolicy::INTERVAL,
                                         ob::ReplicationConfig{}, ob::ReplicationClientConfig{},
                                         ob::FailoverConfig{}, ob::TTLConfig{},
-                                        ob::MultiMasterConfig{});
+                                        ob::MultiMasterConfig{}, rotate_bytes);
 }
 
 /// `count` records of `levels` levels each, one row a level.
@@ -148,4 +149,49 @@ TEST(StartReadsWalOnce, AMeshNodeRestartsWithoutReportingARecordCutShort) {
         << "a restart reported a record cut short in a WAL that holds none:\n" << said;
     EXPECT_EQ(rows(*node, "MESH"), 7);
     node->close();
+}
+
+TEST(StartReadsWalOnce, AStartReportsTheTornFilesItsFirstPassSteppedOver) {
+    // A file before the last torn in its middle, as a build before #126 left one, and a clean stop
+    // after it: the tail pass begins in the last file and reads none of the first, so what the start
+    // says it stepped over is the first pass's count.
+    TempDir dir("start_once_torn_");
+    {
+        auto engine = single_node(dir.path, 1u << 20);
+        engine->open();
+        write_rows(*engine, "TORN", 1'000'000'000ULL, 3000, 40);
+        engine->close();
+    }
+    const std::string first = dir.path + "/wal_000000.bin";
+    ASSERT_TRUE(std::filesystem::exists(dir.path + "/wal_000002.bin")) << "the premise: three files";
+    ASSERT_TRUE(std::filesystem::exists(first)) << "the premise: the first file is still there";
+    {
+        // A byte of the payload of a record half way through the file, changed: its checksum no
+        // longer holds. The checksum covers the payload alone, so the byte is found by a replay.
+        const uint64_t half = std::filesystem::file_size(first) / 2;
+        uint64_t payload_at = 0;
+        ob::WALReplayer replayer(dir.path);
+        replayer.replay_v2([&](const ob::WALReplayContext& ctx) {
+            if (payload_at == 0 && ctx.wal_file_index == 0 && ctx.wal_byte_offset > half &&
+                ctx.header.record_type == ob::WAL_RECORD_DELTA) {
+                payload_at = ctx.wal_byte_offset + sizeof(ob::WALRecord) + ctx.payload_len / 2;
+            }
+        });
+        ASSERT_GT(payload_at, 0u);
+        std::fstream f(first, std::ios::in | std::ios::out | std::ios::binary);
+        char byte = 0;
+        f.seekg(static_cast<std::streamoff>(payload_at));
+        f.read(&byte, 1);
+        byte = static_cast<char>(byte ^ 0x5a);
+        f.seekp(static_cast<std::streamoff>(payload_at));
+        f.write(&byte, 1);
+    }
+
+    auto engine = single_node(dir.path, 1u << 20);
+    testing::internal::CaptureStderr();
+    engine->open();
+    const std::string said = testing::internal::GetCapturedStderr();
+    EXPECT_NE(said.find("1 WAL file(s) ended in a torn record and were stepped over"), std::string::npos)
+        << said;
+    engine->close();
 }
