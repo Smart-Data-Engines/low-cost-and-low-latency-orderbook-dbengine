@@ -742,11 +742,37 @@ The peer is missing records that this node holds only in segments — its WAL no
 to them — and catch-up sends only from the WAL. It comes once an episode, however many
 reconciliations find the same ranges, and `ob_mm_catchup_unfillable_total` counts the ranges at
 every catch-up. Anti-entropy that could repair it is #57 and not built; a peer that holds nothing
-takes a snapshot when it joins, so wiping and re-joining one is the repair there is. One known way to
-produce this warning without a real gap: a node restarted with segments of a symbol only its peers
-write declares its own frontier from the highest number in them, and the ranges it then says its
-peers lack are ranges nobody wrote (#185) - every reconciliation reads the whole retained WAL for
-them and counts them again. Until #179 the replay did the same for every record it replayed.
+takes a snapshot when it joins, so wiping and re-joining one is the repair there is. Until #185 there
+was a known way to produce this warning without a real gap: a node restarted with segments of a
+symbol only its peers write declared its own frontier from the highest number in them, and the ranges
+it then said its peers lacked were ranges nobody wrote - every reconciliation read the whole retained
+WAL for them and counted them again. A segment records this node's own highest number since, and a
+start declares that far and no further. Until #179 the replay did the same for every record it
+replayed.
+
+### A symbol two nodes wrote before #184
+
+Before #184 one counter per symbol minted every origin's numbers, and was raised by every origin's -
+so when two nodes wrote one symbol, each node's numbers for it had holes where the other's were. A
+frontier is "everything from this origin up to here", so every node's frontier for such a symbol
+stopped at the first hole, and a node that missed writes was compared against a vector that said it
+lacked nothing: it never got them. The numbers a node mints now are its own, without holes, and a
+restart continues them from its own highest; **the holes already in the data stay**, and no frontier
+passes them. A node holding such a symbol says so, once until the frontier moves again:
+
+```
+Held set full: key=BTCUSDT.BINANCE origin=2 frontier=500 high_water=11000 - 4096 numbers above a hole nothing is filling; a redelivery past them is stored twice
+```
+
+The held set is what a node keeps of the numbers above a frontier, until the hole under them fills;
+at its cap (4 096 a symbol and origin) it stops growing, and a number past it that arrives again is
+stored again. Nothing fills a hole the old numbering left, so the line is the sign of one.
+
+**There is no repair for it yet** (#187). The stuck frontiers are the tracker's state, not the data's:
+every node that received those numbers holds them, the version vector writes them down, retention
+does not touch them, and a snapshot carries them to the node it bootstraps - so wiping one node and
+letting it rejoin gives it its peer's stuck frontiers back. For such a symbol, mesh catch-up does not
+work until every node's data directory is removed together, which is a new mesh.
 
 **How far behind a replica is** is a different question with a different answer, in the section
 below.

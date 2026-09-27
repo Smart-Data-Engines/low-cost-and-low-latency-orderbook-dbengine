@@ -180,14 +180,31 @@ that is not exactly one past the previous one **for that origin** appends a `GAP
 `ob_sequence_gaps_detected` and logs the symbol, origin and expected number. The first record from an
 origin is never a gap.
 
-Counters are restored at startup from two places, both of which only ever raise them: the highest
-number in each segment (`SegmentMeta::max_sequence_number`, published in `meta.json`) and every record
-replayed from the WAL tail. Replay *seeds* the tracker rather than assigning, so a gap recorded when
-the records were first written is not reported again on every restart - and it seeds every DELTA of
-the tail, the ones a segment already holds and it skips included, **under the origin its header
-names** (#179): a record a peer sent is remembered as seen from that peer, and a record without an
-origin, from before the mesh, as this node's own. A `meta.json` without the field was written before
-numbers existed, and 0 is then the truth about that data rather than a fallback.
+**The counter is this node's origin's, and only its numbers raise it** (#184). A sequence number
+means something only with the origin that minted it, and the tracker knows which origin is this
+node's (`set_local_origin()`: the mesh node id, or 0 without a mesh). A number another origin minted
+is not in this counter's sequence, so it raises nothing - one counter raised by every origin's
+numbers gave each origin's stream holes when two mesh nodes wrote one symbol, and every receiver's
+frontier stopped at the first. A number of this node's own origin minted elsewhere still raises it:
+without a mesh that is a replica's primary, whose numbers a promoted replica continues.
+
+Counters are restored at startup from three places, all of which only ever raise them, and they have
+to arrive at this node's own highest number **exactly**: too high leaves a hole in its stream that no
+peer's frontier passes, too low hands a number out twice and every peer drops the second record as
+the first. The segments: each seal records the highest number of this node's own rows in it
+(`own_origin`, `own_max_sequence` in `meta.json`, from `PendingRow::own` on the write, receive and
+replay paths), a merge its own inputs' highest and whether any input was sealed by another node
+(`received_rows`) - a start continues from a segment of its own origin's own highest, raises by
+every origin's highest only for a peer's segment with no vector to say better, and reads a segment
+from before these keys by its `max_sequence_number`, as it always did. The vector: this node's own
+frontier in it raises the counter, which after a wipe and a snapshot is the only place this node's
+earlier numbers are stated. And every record replayed from the WAL tail. Replay *seeds* the tracker
+rather than assigning, so a gap recorded when the records were first written is not reported again
+on every restart - and it seeds every DELTA of the tail, the ones a segment already holds and it
+skips included, **under the origin its header names** (#179): a record a peer sent is remembered as
+seen from that peer, and a record without an origin, from before the mesh, as this node's own. A
+`meta.json` without `max_sequence_number` was written before numbers existed, and 0 is then the truth
+about that data rather than a fallback.
 
 Until August 2026 none of this happened: `tcp_server.cpp` set the field to 0 with a comment saying the
 engine assigned it, and the engine copied the zero into the WAL header and the stored row. So every
@@ -263,7 +280,9 @@ once an episode: nothing from here can send those.
 
 **What a restarted node knows, and from whom** (#179). The last vector in the WAL and the held set
 beside it, then the tail's records seeded as above, then - for this node's own origin - the highest
-number in each segment. The vector is written **before** the checkpoint it goes with, in the same
+of its own numbers in each segment, which is as far as it declares its own frontier (#185: declared
+from every origin's highest, it claimed the numbers its peers wrote, and every reconciliation read
+the whole WAL for records nobody had). The vector is written **before** the checkpoint it goes with, in the same
 critical section: the checkpoint cuts the replay, so the records before it are known only to a
 vector, and with the checkpoint first a crash between the two appends left them known to nothing.
 Until #179 the replay seeded this node's origin for every record, so a node restarted before its

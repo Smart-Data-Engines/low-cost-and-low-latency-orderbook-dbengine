@@ -2213,6 +2213,28 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 187. A symbol two mesh nodes wrote before #184 keeps its frontiers stuck on every node, and nothing can clear them but a new mesh **P1**
+
+**Found writing #184's operations notes, and not measured.** #184 makes the numbers a node mints for a
+symbol its own and without holes, from its fix on. The holes the old numbering left - each origin's
+numbers of a symbol two nodes wrote, gapped where the other's were - stay in what every node's
+tracker holds: a frontier stopped at the first, and the numbers above it in the held set, up to its
+cap. Those are not the data's: the version vector writes them down, retention leaves them, and a
+snapshot carries the sender's to the node it bootstraps, so a node wiped and rejoined takes its peer's
+stuck frontiers back - which is what #184's entry said, when it was filed, would repair it. For such a
+symbol a node that misses writes is judged to hold them, after the upgrade as before it, and new
+numbers only grow the held set until it is full (`Held set full: ...`, `docs/operations.md`).
+
+What would close them is a statement the tracker cannot make by itself: that a hole below a held set
+is an artefact of the old numbering and not a record that never arrived. The node can say which
+segments are from before #184 (no `own_origin`), and the holes are exactly other origins' numbers of
+the same symbol - so a one-shot declaration at the upgrade, of every frontier up to its highest held
+number for the symbols those segments hold, run on every node before any new outage, is the likely
+shape; its cost is that a record genuinely missing at that moment is declared held.
+
+- Effort: M | Impact: on a mesh upgraded across #184, catch-up stays broken for every symbol more
+  than one node wrote before it, for as long as the mesh lives
+
 ### 186. A mesh node holding 4 000 symbols stalls a write for up to 0.6 s at a trickle, and refuses writes at the pipelined ceiling **P1**
 
 **Found measuring what #180's per-tick update costs, and on master as much as on the branch.** One
@@ -2236,7 +2258,7 @@ The evidence of #179 holds the runs and the writer's log of each.
   exchange-sized symbol list makes large - and writes refused at a ceiling the deadline was sized
   never to meet
 
-### 185. A restarted mesh node claims, from its segments, to have written the numbers its peers wrote, and every reconciliation scans its whole WAL for them **P1**
+### 185. A restarted mesh node claims, from its segments, to have written the numbers its peers wrote, and every reconciliation scans its whole WAL for them ✅ **P1**
 
 **Found reading the start for #179, and measured with a probe (the evidence of #179).**
 `Engine::open()` declares this node's own frontier for every symbol it holds a segment of, up to the
@@ -2256,11 +2278,17 @@ several nodes write would stop at the first number another node took (#184). Wha
 declare exactly what it wrote is the highest number of **its own** origin in each segment - the same
 fact #184's fix needs to restore its counter.
 
+**Fixed with #184:** a start declares this node's own frontier from a segment's `own_max_sequence`,
+the highest number of its own rows, which for a symbol only its peers write is none. The same probe
+on the fixed build (Release, i3-7100U): **0 catch-ups in 30 s** where the build before it started
+14, and `ob_mm_catchup_unfillable_total` at **0** where it was 140. `test_mm_multi_writer.py` has the restart that must claim nothing, and
+the C++ test a symbol only a peer writes and one both write, claimed as far as this node wrote.
+
 - Effort: M (with #184) | Impact: a full WAL scan per peer at every reconciliation on any mesh node
   restarted with segments of symbols it does not write, and an unfillable-range warning and counter
   that report ranges nobody wrote
 
-### 184. A symbol two mesh nodes write gets numbers with holes in each origin's stream, so every node's frontier stops at the first, and a node that missed rows is judged to hold them **P0**
+### 184. A symbol two mesh nodes write gets numbers with holes in each origin's stream, so every node's frontier stops at the first, and a node that missed rows is judged to hold them ✅ **P0**
 
 **Found reading the tracker for #179, and measured with `tests/integration/test_mm_multi_writer.py`
 and the probe it was built from.** A sequence number belongs to the origin that minted it, and the
@@ -2290,6 +2318,40 @@ counter without the segments' highest number, which is every origin's: a segment
 highest number of this node's own origin, which #185 needs as well. Data a mesh wrote before the fix
 keeps its holes, and a frontier cannot pass them; the repair for a node holding such a symbol is the
 one there is, a wipe and a snapshot.
+
+**Fixed (with #185):** each origin numbers its own records of a symbol. `SequenceTracker` knows this
+node's origin (`set_local_origin()`, the mesh node id, or 0 without a mesh, where every number is the
+local origin's as before - a promoted replica numbers on from its primary's), and a number another
+origin minted no longer raises the local counter, in `observe()` or in `seed()`. A restart has to
+continue that counter **exactly** from this node's own highest number - too high leaves a hole every
+peer's frontier stops at, which is this defect in small; too low hands a number out twice, and every
+peer drops the second record as the first - so a segment now records it: a row carries whether it is
+this node's own from the write, the receive and the replay (`PendingRow::own`, 112 to 120 bytes), a
+block its own highest, and a seal writes `own_origin` and `own_max_sequence` into `meta.json`, in
+keys no older reader searches for. A merge (part 2b of #165) writes its inputs' answer instead of its
+rows' - this node's own highest over its own inputs, and `received_rows` when one of them was sealed
+by another node, whose rows include this node's without saying so. `open()` reads a segment by what
+it says: this node's - the counter continues from its own highest, and its own frontier is declared
+that far, no further (#185); a peer's, a snapshot's - the counter is raised by every origin's highest
+only when no vector said how far this node's own went; one from before this - as it always was. And
+the vector a restart restores raises the counter from this node's own entries, since after a wipe and
+a snapshot its earlier records are in segments that name the peer.
+
+Measured with the probe the module's second test was built from, three nodes, Release, i3-7100U:
+the build before this held **10 000 of 11 000** rows on the node that missed two rounds, forty
+seconds after its restart; this one **11 000 of 11 000** 5.4 s after it, like the one-writer control.
+The test runs without its marker. Data a mesh wrote before this keeps its holes, and a frontier does
+not pass them; a node holding such a symbol says so - `Held set full: key=... origin=... - N numbers
+above a hole nothing is filling`, once until the frontier moves (`docs/operations.md`). What this
+item said when it was filed - that a wipe and a snapshot repair such a node - is wrong: the stuck
+frontiers are the tracker's, which the vector writes down and a snapshot carries, so the node that
+rejoins is given them back. That is #187. The mutation table, its verdicts written down before it ran: **22 mutations in 23 runs,
+every one as written** - 20 killed, and the 2 that were to survive did: the conservative raise for a
+merge that took in a peer's segment applied with a vector too (no test restarts on such a merge with
+a vector), and a control. One row did not build at first - pitfall 484 again, a lambda's parameter
+left unused - and ran again. One was killed by other tests than the one its verdict named: a drain
+that never marks a block mixed changes only a block's first row and a period's rollover, since the
+rest of a block takes the own highest the drain counted from each row's flag.
 
 - Effort: M-L | Impact: a mesh node that misses writes of a symbol another node also writes never
   gets them - silently, for as long as it runs
@@ -11747,14 +11809,17 @@ measures the harness.
 
 ## Recommended order
 
-**#184 is the open P0**, and **#169, #175, #176, #177, #182, #185 and #186 are open P1s** — the
-mechanical list is the `Open:` line below; read it there rather than trusting this paragraph, which
-is prose and has been wrong about this before. **#184**: when two mesh nodes write one symbol, the
-one counter per symbol gives each origin's numbers holes, so every node's frontier for it stops at
-the first and a node that missed rows is judged to hold them - 10 000 of 11 000 after an outage, for
-good; it is the next piece of work, with **#185** beside it, which the same fix closes: a restarted
-node claims from its segments the numbers its peers wrote, and every reconciliation scans its whole
-WAL for them. The mesh items were found measuring #178, and so were five that are closed: **#178
+**No P0 is open**, and **#169, #175, #176, #177, #182, #186 and #187 are open P1s** — the mechanical
+list is the `Open:` line below; read it there rather than trusting this paragraph, which is prose
+and has been wrong about this before. **#184 was the P0**: when two mesh nodes wrote one symbol, the
+one counter per symbol gave each origin's numbers holes, so every node's frontier for it stopped at
+the first and a node that missed rows was judged to hold them - 10 000 of 11 000 after an outage,
+for good; each origin numbers its own records now, and a segment says how far this node's went, so a
+restart continues from there - and with it **#185**: a restarted node claimed from its segments the
+numbers its peers wrote, and every reconciliation scanned its whole WAL for them. **#187** is what
+#184 leaves: the holes the old numbering put in the data stay in every node's tracker, a snapshot
+carries them, and nothing clears them but a new mesh. The mesh items were found measuring #178, and
+so were five that are closed: **#178
 was a P0** - a mesh node that missed more than `--mm-max-catchup-bytes` of its peers' WAL never got
 the rest, 6 990 of 20 100 rows for good, because every catch-up started at the first record and
 stopped where the first had; a catch-up is rounds from a cursor now, read without the lock every
@@ -11843,7 +11908,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #174, #175, #176, #177, #182, #184, #185, #186.** Every other item above #58 is marked closed, and
+**Open: #169, #174, #175, #176, #177, #182, #186, #187.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -11981,12 +12046,11 @@ The capability items are in the table below.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **P0** | A mesh node that missed writes of a symbol another node also writes gets them back (#184) | M–L | One counter per symbol gives each origin's numbers holes when two nodes write it, so every node's frontier stops at the first and a node that missed rows is judged to hold them: 10 000 of 11 000 after an outage, for good |
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
 | **P1** | Sharding by symbol gains its control plane: the shards write the map, and both clients read it (#175) | M–L | A shard writes neither itself nor the map to etcd, owns every symbol, and a second one on the same etcd becomes the first one's replica; neither client can find a shard |
 | **P1** | A version vector of any size, so a mesh of thousands of instruments neither resends its WAL every reconciliation nor refuses a joiner its snapshot (#177) | M | Past 1 561 (symbol, origin) entries a vector is sent as "send everything": 9 600 - 20 800 duplicates a node in a 16 s window where 1 500 entries cost none, and a joiner that never asks for a snapshot |
 | **P1** | A mesh logs a conflict only where two origins wrote one level, and as a count rather than a line each (#182) | S | Every replicated update of a level the node holds is logged at INFO as a conflict, same origin or not: 301 985 lines, 61 MB, for 300 000 writes |
-| **P1** | A restarted mesh node declares from its segments only the numbers it wrote (#185) | M (with #184) | It claims the numbers its peers wrote, so every reconciliation scans its whole WAL for ranges nobody wrote: 14 catch-ups in 30 s that sent nothing, 140 ranges counted unfillable |
+| **P1** | A mesh can close the holes the old one-counter numbering left, so catch-up works again for the symbols two nodes wrote before per-origin numbers (#187) | M | Every node's tracker holds them - the vector writes them down, a snapshot carries them - so for those symbols a node that misses writes is still judged to hold them, and only a new mesh clears it |
 | **P1** | A mesh node of 4 000 symbols neither stalls a write for half a second nor refuses writes at the pipelined ceiling (#186) | M | Measured on master and the branch alike and not yet explained: the largest round trip of a run 169–623 ms in six runs of twelve, and writes refused when the pending queue did not free room in 5 s |
 | **P1** | A mesh snapshot carries any number of files, so a peer can join a node of 8 192 segments or more (#176) | M | A mesh snapshot names a file by a 16-bit index, so a node of 8 192 segments - 8 192 instruments, whatever part 2b merges - cannot bootstrap a peer that joins it; found reading the sender, not yet measured |
 | **P2** | A start finds its last checkpoint without reading the whole WAL twice (#174) | S–M | Since part 2b of #165 the index is 1.9 - 2.9 s of a cold start after a twenty-minute soak, 5.9 - 6.8 s, and the WAL most of the rest - and a start reads it twice even when the checkpoint covers every record |
