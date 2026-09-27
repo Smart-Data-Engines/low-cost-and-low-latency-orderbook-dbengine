@@ -2213,6 +2213,39 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 194. A mesh snapshot holding a file of zero bytes cannot be installed: its sender sends no chunk for it, and its receiver waits for one **P3**
+
+**Found reading the sender for #176, and not measured.** `advance_snapshot_send()` sends a file's
+bytes as chunks and moves on at its end, so a file of zero bytes gets no chunk at all - its comment
+says an empty file is legal - while the receiver waits for a chunk of every file the manifest names,
+in order: the next file's first chunk is refused as `file_out_of_order`, and a store whose last file
+is empty ends with `end_with_files_missing`. The codec test's note that "an empty meta.json produces"
+a zero-length chunk is wrong about the sender. P3 because the engine writes no such file: a segment
+is written only with a row in it, and every column holds one entry a row.
+
+A fix has the receiver take an empty file without a chunk, as every build's sender sends it; its test
+is a store with a file of zero bytes in it, transferred.
+
+- Effort: S | Impact: a store with an empty file in it bootstraps no peer
+
+### 193. A joiner checks every path of a snapshot's manifest against the filesystem on its mesh io thread: 5 s for 70 000 files **P2**
+
+**Found measuring #176** (Debug, i3-7100U, `perf` over `MMSnapshotLarge.PastTheSixteenBitIndex...`).
+A joiner that takes the metadata of 70 000 files spends 5.1 s on it, 83% in `path_stays_within()`,
+which resolves the directory and the path joined to it with `std::filesystem::weakly_canonical()` - a
+walk of the filesystem, component by component - twice a file, once against the data directory and
+once against staging; the install checks every path again. It runs on the thread that reads every
+peer's frames, so for those seconds the joiner reads nothing from its mesh. In the bootstrap of
+65 600 files this took 5.2 s of 25; at 700 000 files - a week of 4 000 instruments at one segment
+an instrument an hour - it would be about a minute.
+
+A fix resolves the directories once a manifest rather than once a file, checks a directory's paths
+against the filesystem once rather than once a file in it, and does it off the io thread; its measure
+is this one.
+
+- Effort: S | Impact: a large bootstrap stalls the joiner's mesh for seconds, and a larger one for
+  minutes
+
 ### 192. A mesh node that abandons a snapshot part-way does not tell its sender, which streams it the rest ✅ **P2**
 
 **Found measuring #176, with the same probe as #191.** A joiner that abandons a transfer - a chunk at
@@ -3001,7 +3034,7 @@ and was killed, and the controls survived again.
 - Effort: M | Impact: a mesh of a few hundred instruments resends its whole retained WAL to every
   peer every reconciliation, and a node that joins it cannot bootstrap from a snapshot
 
-### 176. A mesh node that holds 8 192 segments or more cannot send a snapshot, so no peer can join it **P1**
+### 176. A mesh node that holds 8 192 segments or more cannot send a snapshot, so no peer can join it ✅ **P1**
 
 **Found reading the mesh's snapshot sender for #165 part 2b, and not yet measured.** A mesh
 snapshot names each file by a 16-bit index in its chunk header, and 0xFFFF is the metadata blob's,
@@ -3026,6 +3059,46 @@ rate - and the test says which of the two it met. **Since #177 the joiner asks, 
 xfail is #176's alone. A second limit sits just past the first: the
 metadata blob is capped at 8 MiB, and the manifest is about 800 bytes of JSON a segment, so a 32-bit
 index alone would move the refusal from 8 192 segments to about 10 000.
+
+**Fixed** (spec `kiro-workspace/specs/mesh-snapshot-many-files/`). A joiner says in its request - whose
+payload was empty - that it takes `SNAPSHOT_CHUNK_WIDE` (`record_type` 207: a 32-bit file index, the
+metadata at `0xFFFFFFFF`) and up to 1 GiB of metadata (`MM_SNAPSHOT_MAX_META_BYTES_LARGE`, about
+1.3 million segments of manifest), and a sender answers such a request in wide chunks whatever the
+store's size, so every bootstrap between two nodes of this build takes the path a large store needs.
+A build before #176 sends an empty request and ignores what one carries: a sender of this build
+answers it in 16-bit chunks, byte for byte what it was sent before, and refuses it what does not fit
+them, with a line that says it asked as an older build does; an older sender refuses what it always
+refused. No protocol version: the handshake requires it to be equal, and a mesh of two builds would
+not connect.
+
+Measured, `test_mm_snapshot_many_files.py` without its marker - three nodes of 8 200 segments and a
+fourth joining - on the Release build, three runs on the i3-7100U
+(`evidence/2026-09-27-mesh-snapshot-many-files/`): **from asking to taking writes 15.4 - 26.6 s** for
+65 600 files and 10.4 MB - the sender's flush and checksum 1.6 - 4.5 s, the joiner's check of the
+metadata 3.9 s (#193), staging the files 4.6 - 4.7 s, installing them 3.2 - 11.8 s and the sync
+1.6 - 1.9 s; the sender enqueues all of it in 0.6 - 1.1 s. Across two builds (Debug, the same
+machine): a small store bootstraps either way - an older sender ignores the byte and sends 16-bit
+chunks a joiner of this build takes, and a sender of this build answers an older joiner in them; past
+65 534 files a mesh of this build refuses an older joiner with the reason, and an older mesh refuses
+a joiner of this build, which asks each peer once and takes writes (#191).
+
+**Found by the test's last lines, which the strict xfail had never let run**, and fixed here: the
+snapshot was counted as received 1.2 s before the joiner took writes - it cleared its staging
+directory's empty skeleton first - and `ob_segment_count` read 0 on the joiner, as on any node after
+a restart, until the next flush, being set by a flush's merge and a compaction only. **Found by its
+mutation table** and fixed before it, as #191 and #192: a joiner every peer failed asked them in turn
+for ever, and one that abandoned a transfer let its sender stream the rest. **Filed from its
+measurement**: #193.
+
+Tests: `tests/test_mm_snapshot.cpp` - the transfer and damage tests in both widths
+(`EitherWidth/...`), the codecs of the new chunk and of the request by hand-written bytes, a sender of
+70 000 and of 11 MB of synthetic manifest refusing an older joiner and sending a joiner of this build
+what a receiver of this build takes, the request's byte through the frame dispatch both ways, and the
+segment gauge after an install and a restart; `test_mm_snapshot_many_files.py` without its marker.
+**Mutation table, written down before each pass: 20 mutations in 25 runs, every one as predicted** -
+16 killed by `test_mm_snapshot`, the control surviving, and three that only a store past 65 535 files
+or a concurrent reader can tell - the receiver or the sender keeping 16 bits of a wide index, and the
+snapshot counted before the node takes writes - surviving it and killed by the integration test.
 
 - Effort: M | Impact: a mesh cannot take a new peer once one node holds a few thousand segments —
   a few thousand instruments, or a few hours of a few hundred
@@ -12110,9 +12183,10 @@ for a snapshot and installed each one it was sent, in turn; it asks one peer now
 its bootstrap starts. **#182 is closed**: every replicated update of a level a node held was logged at
 INFO as a conflict, 61 MB of log for 300 000 writes; only two origins writing one level are one now,
 said by the window.
-**#176** was found writing part 2b of #165: a mesh snapshot names each file by a 16-bit index, so a
-node of 8 192 segments — 8 192 instruments, whatever merging does — cannot bootstrap a peer that
-joins it; measuring it found #177 first. **#175**: sharding by symbol has no control plane — no shard writes itself or
+**#176 is closed**: a mesh snapshot named each file by a 16-bit index, so a node of 8 192 segments
+could bootstrap no peer; a joiner says in its request that it takes a 32-bit index and 1 GiB of
+metadata now, and a node of 8 200 segments bootstraps one - measuring it found #177, #191, #192 and
+#193. **#175**: sharding by symbol has no control plane — no shard writes itself or
 the shard map to etcd, each owns every symbol, and a second one on the same etcd becomes the first
 one's replica — so neither client can find a shard, and roadmap #22's "done" is true only of its
 parts. It was found fixing **#172, which is closed**: the Python pool's sharded mode replaced its
@@ -12180,7 +12254,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #174, #175, #176, #187, #189, #190.** Every other item above #58 is marked closed, and
+**Open: #169, #174, #175, #187, #189, #190, #193, #194.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -12321,14 +12395,15 @@ The capability items are in the table below.
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
 | **P1** | Sharding by symbol gains its control plane: the shards write the map, and both clients read it (#175) | M–L | A shard writes neither itself nor the map to etcd, owns every symbol, and a second one on the same etcd becomes the first one's replica; neither client can find a shard |
 | **P1** | A mesh can close the holes the old one-counter numbering left, so catch-up works again for the symbols two nodes wrote before per-origin numbers (#187) | M | Every node's tracker holds them - the vector writes them down, a snapshot carries them - so for those symbols a node that misses writes is still judged to hold them, and only a new mesh clears it |
-| **P1** | A mesh snapshot carries any number of files, so a peer can join a node of 8 192 segments or more (#176) | M | A mesh snapshot names a file by a 16-bit index, so a node of 8 192 segments - 8 192 instruments, whatever part 2b merges - cannot bootstrap a peer that joins it; found reading the sender, not yet measured |
 | **P2** | A start finds its last checkpoint without reading the whole WAL twice (#174) | S–M | Since part 2b of #165 the index is 1.9 - 2.9 s of a cold start after a twenty-minute soak, 5.9 - 6.8 s, and the WAL most of the rest - and a start reads it twice even when the checkpoint covers every record |
 | **P2** | A node writes its vector down without holding writes for its whole size (#189) | M | Since #177 every checkpoint after a frontier moved writes the whole vector under the engine's lock: 8.95 - 12.7 ms and 2 MB of WAL at 50 000 (symbol, origin) entries |
 | **P2** | A flush tick's WAL sync at the ceiling does not keep writers waiting seconds for room (#190) | M | On a device the segments keep busy the tick's WAL sync took 1.2 - 3.0 s at the pipelined ceiling, and writers waited up to 3.4 s for room in the pending queue - 1.6 s from the refusal |
+| **P2** | A joiner checks a snapshot's paths off its mesh io thread, once a directory (#193) | S | At 70 000 files the check took 5.1 s of the joiner's io thread (Debug), 83% of it resolving every path against the filesystem twice; a week of 4 000 instruments would make it a minute |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
 | **P2** | Release engineering + PyPI wheels (#42) | S | `pip install` is the shortest path to a first user |
+| **P3** | A mesh snapshot with a file of zero bytes in it installs (#194) | S | Its sender sends no chunk for an empty file and its receiver waits for one; the engine writes no such file |
 | **P3** | Time-bucketed aggregation (#44) | L | The most-requested analytical capability for this data |
 | **P3** | Arrow output (#46) | M | Near-zero integration cost for analytics teams |
 | **P3** | Backup and restore (#34) | M | Table stakes for a database |
