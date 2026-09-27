@@ -432,7 +432,7 @@ void MultiMasterManager::begin_snapshot_send(PeerConnection& peer,
     }
 
     const std::string manifest_json = snap.manifest.to_json();
-    const auto vv_payload   = serialize_version_vector(snap.vector, /*truncated=*/false);
+    const auto vv_payload   = serialize_version_vector_blob(snap.vector);   // any size (#177)
     const auto held_payload = snap.held.empty() ? std::vector<uint8_t>{}
                                                 : serialize_held_ranges(snap.held);
 
@@ -724,20 +724,20 @@ void MultiMasterManager::handle_snapshot_chunk(PeerConnection& peer,
         }
 
         const uint8_t* vv_ptr = st.meta.data() + st.announced.manifest_len;
-        PeerVector pv;
         if (st.announced.vector_len > 0) {
-            if (!pv.deserialize(vv_ptr, st.announced.vector_len)) {
+            bool says_send_everything = false;
+            if (!deserialize_version_vector_blob(vv_ptr, st.announced.vector_len, st.vector,
+                                                 says_send_everything)) {
                 abort_bootstrap("vector_unparseable");
                 return;
             }
-            if (pv.truncated()) {
+            if (says_send_everything) {
                 // The sender should have refused rather than sent this. Adopting an empty vector
                 // after discarding our contents would leave every frontier at zero, so peers
                 // would resend the whole snapshot's worth of records into append-only storage.
                 abort_bootstrap("vector_says_send_everything");
                 return;
             }
-            st.vector = pv.entries();
         }
         if (st.announced.held_len > 0) {
             if (!deserialize_held_ranges(vv_ptr + st.announced.vector_len,

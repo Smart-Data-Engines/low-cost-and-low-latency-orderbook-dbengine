@@ -39,7 +39,6 @@ namespace ob {
 // ── Protocol constants ────────────────────────────────────────────────────────
 
 inline constexpr uint16_t MM_PROTOCOL_VERSION   = 2;   // 2 = exchanges version vectors
-inline constexpr size_t   MM_MAX_VV_ENTRIES     = 4096; // ~172 kB on the wire
 /// How much queued output one peer may hold before it is dropped. Same ceiling as a client
 /// session gets since #59, and for the same reason: a peer that stops reading otherwise grows
 /// the writer without bound — measured at ~113 MB/s per unreachable peer.
@@ -781,6 +780,9 @@ private:
 
     /// Source of PeerConnection::conn_id. Read and bumped under mtx_, like peers_ itself.
     uint64_t next_conn_id_{1};
+    /// The generation of the vector in parts this node last sent (#177): what ties a vector's parts
+    /// together on the receiving side. Guarded by `mtx_`.
+    uint32_t vector_generation_sent_{0};
 
     /// One condition, one pair of log lines, however long it holds: an event whose handling threw.
     ///
@@ -947,6 +949,10 @@ private:
     /// one without the writes a returning peer missed judged it to hold them until the next
     /// reconciliation. Caller holds `mtx_`.
     void decide_catchup_from_vector(PeerConnection& peer, bool may_defer);
+    /// A whole vector has arrived from `peer` - in one frame or in parts (#177): the handshake's
+    /// deadline ends, a node that holds nothing asks for a snapshot, and otherwise the vector is
+    /// decided (`decide_catchup_from_vector()`). Caller holds `mtx_`.
+    void on_peer_vector(PeerConnection& peer);
     /// Take up the decisions put off above: decided with the copy once it reaches the listing it
     /// had to, and a catch-up after MM_VV_GRACE_MS without it - the safe direction, since the rounds
     /// filter by the peer's vector anyway. True while one still waits. Caller holds `mtx_`.

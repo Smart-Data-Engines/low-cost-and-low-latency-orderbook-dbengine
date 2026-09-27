@@ -132,6 +132,14 @@ public:
         return std::unique_lock<std::mutex>(flush_mtx_);
     }
 
+    /// Write no version vector into the WAL from now on: a restart then learns what it holds from the
+    /// segments and the replay alone, as after a crash between a seal's sync and the vector that goes
+    /// with it. Tests used a vector too large to write for this until #177 made every vector
+    /// writable. A test seam.
+    void skip_vector_persistence_for_test() {
+        skip_vector_persistence_.store(true, std::memory_order_relaxed);
+    }
+
     /// Apply a delta update: WAL → SoA buffer (gap detection) → enqueue for columnar flush.
     /// Returns OB_OK on success, error code on failure.
     ob_status_t apply_delta(const DeltaUpdate& delta, const Level* levels);
@@ -985,9 +993,15 @@ private:
     [[nodiscard]] bool observe_sequence(DeltaUpdate& delta, uint16_t origin,
                                         const std::string& key);
 
-    /// Cap on what gets written down. Above it the node relearns by over-asking, which costs
-    /// traffic and duplicate drops, never data.
-    static constexpr std::size_t kMaxPersistedVectorEntries = 4096;
+    /// Cap on what gets written down, and on the copy peers are told: the memory bound a vector in
+    /// parts has (#177). It was 4 096, and the single-record format stopped at 1 560 below it - so a
+    /// node of a few thousand instruments wrote "send everything" down, restarted with no vector, and
+    /// exported nothing, which the mesh read as "the peer lacks nothing".
+    static constexpr std::size_t kMaxPersistedVectorEntries = VV_MAX_ENTRIES;
+    /// The generation of the vector in parts last written down (#177); a restart puts parts back
+    /// together by their order, and this says which parts belong together. Guarded by `mtx_`.
+    uint32_t vector_generation_written_{0};
+    std::atomic<bool> skip_vector_persistence_{false};   ///< see skip_vector_persistence_for_test()
     /// Held ranges written down per persist. The WAL payload length is 16-bit, so this is a hard
     /// ceiling rather than a preference: 3000 ranges is ~48 KB of payload plus entry headers.
     static constexpr std::size_t kMaxPersistedHeldRanges = 3000;
