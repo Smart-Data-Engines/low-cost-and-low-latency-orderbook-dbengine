@@ -204,9 +204,24 @@ jobs:
         env:
           OB_INTEGRATION_TESTS: "1"
           OB_POWER_CUT_TESTS: "1"
+          OB_KEEP_FAILED_NODE_LOGS: ${{ github.workspace }}/failed-node-logs
         run: |
           PYTHONPATH=$PWD/python .venv/bin/python -m pytest tests/integration/ -q \
             --junitxml=integration-report.xml
+
+      # The nodes' own logs of a test that failed, which otherwise go with the harness's temporary
+      # directories: PR #188's first run failed here with an assertion and nothing else, and its
+      # reproduction had to find the window again from scratch. `always()` by the rule the TSan
+      # job's report step states - evidence that exists only on the runner - and a green run keeps
+      # nothing, so there is nothing to upload.
+      - name: Upload the node logs of a failed test
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: failed-node-logs
+          path: failed-node-logs/
+          if-no-files-found: ignore
+          retention-days: 14
 
       # A skip is a test that did not run, and the only ones this job accepts are the two Binance
       # tests that need a live feed. Anything else — a binary the build step forgot, a fixture that
@@ -665,6 +680,7 @@ jobs:
           OB_INTEGRATION_TESTS: "1"
           OB_POWER_CUT_TESTS: "1"
           OB_SERVER_BINARY: ${{ github.workspace }}/build-tsan/ob_tcp_server
+          OB_KEEP_FAILED_NODE_LOGS: ${{ github.workspace }}/failed-node-logs
           TSAN_OPTIONS: detect_deadlocks=1:second_deadlock_stack=1:halt_on_error=0:log_path=${{ github.workspace }}/tsan-report
         run: |
           set -o pipefail
@@ -703,6 +719,16 @@ jobs:
       # and an OOM kill arrives as SIGKILL with no report of any kind — indistinguishable, from the
       # test's side, from a node that closed its listener on purpose. The kernel says so plainly if
       # anybody asks it.
+      # As in the uninstrumented job.
+      - name: Upload the node logs of a failed test
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: failed-node-logs-tsan
+          path: failed-node-logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Memory, and whether the kernel killed anything
         if: always()
         run: |
