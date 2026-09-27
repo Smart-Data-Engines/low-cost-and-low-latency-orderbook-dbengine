@@ -3784,6 +3784,12 @@ Learned the hard way. Check here before debugging.
      a reconciliation in flight sends each peer its vector, and a send that drains a buffer calls
      `epoll_ctl()` - on a descriptor number the kernel may have handed on. ThreadSanitizer caught it
      in #177's CI, once a vector in parts made a pass long enough to be in flight at a shutdown.
+494. **A guard at the answer judges what arrived since the question.** #188's first fix refused a
+     `SNAPSHOT_BEGIN` once the joiner held data, so no install could replace a client's write. In
+     the integration test the joiner then held data at its BEGIN - its peers start a catch-up at its
+     empty vector, and the rows landed in the 8 ms before the answer - so the fix refused the
+     snapshot it had asked for, which the unit tests, fed no catch-up, could not show. Starting the
+     bootstrap at the question closed the window the guard was guarding.
 
 ## Current state and open problems
 
@@ -3852,16 +3858,17 @@ level a node held was logged at INFO as a conflict - 290 000 lines, 60.6 MB, on 
 WAL and in a snapshot's metadata - where past 1 560 entries it was "send everything", so every
 reconciliation resent the whole retained WAL (9 600 to 20 800 duplicates a node in 16 s, none now)
 and a node that joined never asked for a snapshot; the copy peers are told has no 4 096 bound, and
-two vectors are compared in one walk, 4.9 ms at 50 000 entries (pitfalls 490-491). **#169, #175,
-#176, #186, #187 and #188 are open P1s**: #187 is the holes the old numbering left in every node's
+two vectors are compared in one walk, 4.9 ms at 50 000 entries (pitfalls 490-491). **#188 is
+closed**: a joiner asked every peer for a snapshot and installed each one it was sent, in turn -
+three from three peers, writes refused 21.6 s where one bootstrap took 6.8 - and asks one peer now,
+refusing writes from its request, so the other peers' catch-ups do not make it a node with data by
+the BEGIN (pitfall 493). **#169, #175, #176, #186 and #187 are open P1s**: #187 is the holes the old numbering left in every node's
 tracker, which a snapshot carries and nothing clears but a new mesh; an exchange name with a dot
 makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live book, sequence numbers
 and stored rows, measured on the wire; sharding by symbol has no control plane: no shard writes
 itself or the map to etcd, each owns every symbol, and a second on the same etcd becomes the first
 one's replica, measured against a native etcd; a mesh snapshot names each file by a 16-bit index, so
-a node of 8 192 segments cannot bootstrap a peer that joins it; a node that joins a mesh asks every
-peer for a snapshot and installs each one it is sent, in turn - three installs from three peers,
-writes refused 21.6 s where one took 6.8 (#188); and a mesh node of 4 000 symbols stalls a write for
+a node of 8 192 segments cannot bootstrap a peer that joins it; and a mesh node of 4 000 symbols stalls a write for
 up to 0.6 s at a trickle and refuses writes at the pipelined ceiling, on master as much as on this
 branch.
 **#172 is closed**: the Python client's sharded pool swaps its routing whole and replaces a shard

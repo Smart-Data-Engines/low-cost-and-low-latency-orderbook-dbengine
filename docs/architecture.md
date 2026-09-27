@@ -355,7 +355,8 @@ joiner                                            peer
   │  handshake + version vector  ───────────────►  │
   │  ◄──────────────  handshake + version vector   │
   │                                                │
-  │  SNAPSHOT_REQUEST  ──────────────────────────► │   (only if the joiner holds nothing at all)
+  │  SNAPSHOT_REQUEST  ──────────────────────────► │   (one peer, and only if the joiner holds
+  │  bootstrap starts: writes refused              │    nothing at all)
   │  ◄──────────  SNAPSHOT_BEGIN (lengths + CRC)   │   flush + checksum, vector captured with it
   │  ◄──────────  SNAPSHOT_CHUNK × n  (metadata)   │   manifest ++ version vector ++ held set
   │  ◄──────────  SNAPSHOT_CHUNK × n  (file data)  │   pushed as the socket drains
@@ -363,6 +364,19 @@ joiner                                            peer
   │                                                │
   │  stage → verify → install → adopt frontiers    │
 ```
+
+**One snapshot, from one peer** (#188). A joiner asks the first peer whose vector says it holds
+something, and nobody else until that one answers: a refusal, the connection dropping or ten minutes
+of silence (`MM_SNAPSHOT_ASK_DEADLINE_MS`) asks the next such peer at once. It takes a
+`SNAPSHOT_BEGIN` only from the connection it asked, and only while it still holds nothing - anything
+else is refused (`not_requested`, `holds_data`), and a sender that is refused stops sending. And the
+bootstrap starts with the request, not with the BEGIN: between the two, every peer's catch-up of the
+joiner arrives - they start at its empty vector - and so may a client's write, and a node that took
+either held data when the BEGIN came. Until #188 a joiner asked every peer at once, each prepared
+and sent a whole snapshot, and it installed each one that arrived after a bootstrap had finished
+over the data that bootstrap installed: three installs from three peers, and writes refused 21.6 s
+where one bootstrap took 6.8 (Debug, i3-7100U, 1 600 symbols). One request takes 6.85 s from asking
+to accepting writes, the peer's preparation included.
 
 Four properties are worth stating, because each is a way to get this wrong:
 

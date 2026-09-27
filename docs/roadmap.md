@@ -2232,7 +2232,7 @@ this table.
 - Effort: M | Impact: a node with tens of thousands of instrument-origin pairs holds every write for
   about 10 ms at each checkpoint, and writes 2 MB of WAL each time
 
-### 188. A node that joins a mesh asks every peer for a snapshot, and installs each one it is sent, in turn **P1**
+### 188. A node that joins a mesh asks every peer for a snapshot, and installs each one it is sent, in turn ✅ **P1**
 
 **Found probing #177's joiner, and on master below #177's size too**
 (`evidence/2026-09-27-mesh-vector-parts/probe-join/`). A node that holds nothing asks a peer for a
@@ -2259,6 +2259,34 @@ store the next install replaces.
 A fix asks one peer, and the next only if that one refuses or fails; refuses a `BEGIN` it did not ask
 for, or once it holds data; and tells a peer when its snapshot is no longer wanted. Its test is a
 joiner of three peers that installs one snapshot.
+
+**Fixed** (spec `kiro-workspace/specs/mesh-joiner-one-snapshot/`). A joiner asks the first peer whose
+vector says it holds something, and nobody else until that one answers; a refusal, the connection
+dropping or `MM_SNAPSHOT_ASK_DEADLINE_MS` (ten minutes) of silence asks the next such peer at once,
+as does a bootstrap abandoned part-way - a second peer's BEGIN used to be the retry. A `BEGIN` is
+taken only from the connection asked (`not_requested`) and only while the joiner holds nothing
+(`holds_data`), and a sender its target refused stops sending (`peer_refused`). And the bootstrap
+starts with the request: the first version started it at the `BEGIN`, as before, and its own
+integration test showed the joiner holding its peers' catch-ups - they start at its empty vector -
+8 ms after asking, when the `BEGIN` came, and so refusing the snapshot it had asked for (pitfall 493).
+With no peer left to ask, the joiner takes writes again rather than refuse them for ever.
+
+Measured, the same probe (Debug, i3-7100U, 1 600 symbols): **1 / 1 / 1** snapshots asked for, sent and
+installed where #177's branch had 3 / 3 / 3, and writes refused 6.85 s from the request to the
+install's end - the peer's preparation and the `BEGIN` 1.3 s later included - where they were
+refused 21.6 s from the first `BEGIN` to the last install's end. `test_mm_snapshot_bootstrap.py`
+checks the counts on its own cluster - 3, 3 and 3 on the build before, and 1, 1 and 1 after.
+
+**Tests**: `tests/test_mm_snapshot.cpp`, ten - one peer asked at a time; a refusal or the asked peer
+leaving lets the next be asked, and a refusal asks the next that states its vector at once; a request
+nobody answers is forgotten at its deadline; the bootstrap runs from the request until the last peer
+refuses; a bootstrap abandoned part-way asks the next; a BEGIN not asked for, one from the node asked
+on another connection, and one once the node holds data are refused; a sender its target refused
+stops. The transfer tests record the request their receiver would have made (`note_snapshot_asked_
+for_test()`), since they drive the sender's side of it directly. **Mutation table: 17 mutations in 19
+runs, every one as written down before its pass** - pass 1: 15 killed, and the control and one
+predicted gap survived, a BEGIN from the peer asked on another connection; pass 2: it got its test
+and was killed, and the control survived again.
 
 - Effort: S-M | Impact: a node that joins a mesh of three or more is bootstrapped once a peer,
   refusing writes that many times as long, while each peer prepares a snapshot of everything it
@@ -11934,7 +11962,7 @@ measures the harness.
 
 ## Recommended order
 
-**No P0 is open**, and **#169, #175, #176, #186, #187 and #188 are open P1s** — the mechanical
+**No P0 is open**, and **#169, #175, #176, #186 and #187 are open P1s** — the mechanical
 list is the `Open:` line below; read it there rather than trusting this paragraph, which is prose
 and has been wrong about this before. **#184 was the P0**: when two mesh nodes wrote one symbol, the
 one counter per symbol gave each origin's numbers holes, so every node's frontier for it stopped at
@@ -11961,9 +11989,10 @@ peer as holding nothing, resending everything since its last vector. **#186** wa
 #180's cost, on master too: a mesh node of 4 000 symbols stalls a write for up to 0.6 s at a
 trickle, and refuses writes at the pipelined ceiling. **#177 is closed**: a version vector past
 1 560 entries asked for everything, so every reconciliation resent the whole retained WAL and a
-joining node never asked for a snapshot; a vector of any size goes in parts now. **#188** was found
-probing #177's joiner, and is on master below that size too: a node that joins asks every peer for a
-snapshot and installs each one it is sent, in turn. **#182 is closed**: every replicated update of a level a node held was logged at
+joining node never asked for a snapshot; a vector of any size goes in parts now. **#188 is closed**,
+found probing #177's joiner and on master below that size too: a node that joined asked every peer
+for a snapshot and installed each one it was sent, in turn; it asks one peer now, from whose request
+its bootstrap starts. **#182 is closed**: every replicated update of a level a node held was logged at
 INFO as a conflict, 61 MB of log for 300 000 writes; only two origins writing one level are one now,
 said by the window.
 **#176** was found writing part 2b of #165: a mesh snapshot names each file by a 16-bit index, so a
@@ -12036,7 +12065,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #174, #175, #176, #186, #187, #188, #189.** Every other item above #58 is marked closed, and
+**Open: #169, #174, #175, #176, #186, #187, #189.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -12179,7 +12208,6 @@ The capability items are in the table below.
 | **P1** | A mesh can close the holes the old one-counter numbering left, so catch-up works again for the symbols two nodes wrote before per-origin numbers (#187) | M | Every node's tracker holds them - the vector writes them down, a snapshot carries them - so for those symbols a node that misses writes is still judged to hold them, and only a new mesh clears it |
 | **P1** | A mesh node of 4 000 symbols neither stalls a write for half a second nor refuses writes at the pipelined ceiling (#186) | M | Measured on master and the branch alike and not yet explained: the largest round trip of a run 169–623 ms in six runs of twelve, and writes refused when the pending queue did not free room in 5 s |
 | **P1** | A mesh snapshot carries any number of files, so a peer can join a node of 8 192 segments or more (#176) | M | A mesh snapshot names a file by a 16-bit index, so a node of 8 192 segments - 8 192 instruments, whatever part 2b merges - cannot bootstrap a peer that joins it; found reading the sender, not yet measured |
-| **P1** | A node that joins a mesh takes one snapshot, from one peer (#188) | S-M | A joiner asks every peer for a snapshot, each sends one, and it installs them in turn - three from three peers, writes refused 21.6 s where one bootstrap took 6.8 - accepting writes between two installs that the next may discard |
 | **P2** | A start finds its last checkpoint without reading the whole WAL twice (#174) | S–M | Since part 2b of #165 the index is 1.9 - 2.9 s of a cold start after a twenty-minute soak, 5.9 - 6.8 s, and the WAL most of the rest - and a start reads it twice even when the checkpoint covers every record |
 | **P2** | A node writes its vector down without holding writes for its whole size (#189) | M | Since #177 every checkpoint after a frontier moved writes the whole vector under the engine's lock: 8.95 - 12.7 ms and 2 MB of WAL at 50 000 (symbol, origin) entries |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |

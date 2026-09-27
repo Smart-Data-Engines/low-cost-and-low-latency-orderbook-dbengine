@@ -779,6 +779,35 @@ WAL for them and counted them again. A segment records this node's own highest n
 start declares that far and no further. Until #179 the replay did the same for every record it
 replayed.
 
+### A node that joins a mesh
+
+A node that holds nothing asks one peer for a snapshot when that peer's vector says it holds
+something, and refuses writes from that moment until the snapshot is installed (#188):
+
+```
+Bootstrap started for node 4 — writes are refused with ERR BOOTSTRAPPING until finish_bootstrap() is called
+Asked peer 3 for a snapshot: this node holds nothing, and the peer reports 1600 version-vector entries
+Bootstrap from peer 3 begins: metadata=1330545 bytes (manifest=1263311 vector=67234 held=0), staging='...'
+Bootstrap from peer 3 complete: files=12800 bytes=2012044 rows=1600 in 5.3 s
+Bootstrap finished for node 4 — accepting writes
+```
+
+`ob_mm_snapshot_requested_total` on the joiner, `ob_mm_snapshot_sent_total` on its peers and
+`ob_mm_snapshot_received_total` on the joiner each go up by one. A peer that cannot serve it -
+`busy` with another joiner, `too_many_files` (#176) - says so, and the next peer that states its
+vector is asked at once; so is one after the peer asked drops its connection, or has not answered in
+ten minutes. With no peer left to ask the joiner takes writes again, and says so once:
+
+```
+No peer gave node 4 the snapshot it asked for (refused); accepting writes until one can - the next peer whose vector says what it holds is asked
+```
+
+A `SNAPSHOT_BEGIN` the joiner did not ask for is refused (`Snapshot aborted towards peer 2:
+not_requested`), and so is the one it asked for if it holds data by then (`holds_data`); a sender
+refused this way ends its transfer (`Snapshot to peer 4 ended early ...: peer_refused`). Until #188 a
+joiner asked every peer at once and installed each snapshot that arrived after a bootstrap had
+finished, one after another - on three peers, writes refused 21.6 s where one bootstrap took 6.8.
+
 ### A symbol two nodes wrote before #184
 
 Before #184 one counter per symbol minted every origin's numbers, and was raised by every origin's -
