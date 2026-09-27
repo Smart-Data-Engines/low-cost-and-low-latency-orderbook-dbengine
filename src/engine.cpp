@@ -2367,6 +2367,13 @@ void Engine::publish_counter_delta(const char* name, uint64_t total, uint64_t& p
 }
 
 void Engine::flush_tick() {
+        // The whole tick is one flush, so a client FLUSH cannot interleave with it - and neither can
+        // another tick, the publications below included: `flush_tick_for_test()` runs one on a test's
+        // thread while the loop can run its own, which a mesh decision waiting for the copy of the
+        // vector asks it to (#180 part D). Taken after them, it left the `published_*` totals to two
+        // threads, which ThreadSanitizer reported as soon as a test did both.
+        std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+
         // Publish the failed syncs **first**, as a delta, because everything below this can throw.
         //
         // This was after the WAL sync at first, with a comment saying a tick that throws would
@@ -2408,8 +2415,6 @@ void Engine::flush_tick() {
                                   published_repl_replayed_);
         }
 
-        // The whole tick is one flush, so a client FLUSH cannot interleave with it.
-        std::lock_guard<std::mutex> flush_lock(flush_mtx_);
         // Where the tick's time goes, on DEBUG (#165 part 2a): at the write ceiling the cycle is
         // what bounds a writer, and throughput alone does not say which of its phases grew.
         using TickClock = std::chrono::steady_clock;
