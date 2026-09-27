@@ -517,4 +517,29 @@ ShardMapDiff compute_shard_map_diff(const ShardMap& old_map, const ShardMap& new
     return diff;
 }
 
+bool upsert_shard(ShardMap& map, const ShardNode& node) {
+    auto it = map.shards.find(node.shard_id);
+    if (it == map.shards.end()) {
+        map.shards[node.shard_id] = node;
+        ++map.version;
+        return true;
+    }
+    // The address and the vnodes are the shard's own to say; its status is what the map's operations
+    // - a drain - made it, and a shard starting again must not undo one.
+    ShardNode& have = it->second;
+    if (have.address == node.address && have.vnodes == node.vnodes) return false;
+    have.address = node.address;
+    have.vnodes  = node.vnodes;
+    ++map.version;
+    return true;
+}
+
+ConsistentHashRing ring_of(const ShardMap& map) {
+    ConsistentHashRing ring;
+    for (const auto& [id, node] : map.shards) {
+        if (node.status != ShardStatus::DRAINING) ring.add_shard(id, node.vnodes);
+    }
+    return ring;
+}
+
 } // namespace ob

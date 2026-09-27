@@ -283,6 +283,10 @@ struct MultiMasterConfig {
     // Null = plaintext. Both are set or neither is; `load_tls_or_exit()` refuses the halves.
     std::shared_ptr<TlsContext> tls_server;
     std::shared_ptr<TlsContext> tls_client;
+
+    /// The host this node's peers reach it by, in what it registers for them (#195): `127.0.0.1`
+    /// was fixed, and a mesh across hosts could not form - each node dialled its own port.
+    std::string advertise_host{"127.0.0.1"};  // --advertise-host
 };
 
 // ── Catch-up state (#178) ─────────────────────────────────────────────────────

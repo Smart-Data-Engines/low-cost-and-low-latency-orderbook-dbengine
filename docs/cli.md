@@ -563,6 +563,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 
 | Flag | Argument | Meaning |
 |------|----------|---------|
+| `--advertise-host` | `<HOST>` | The host clients and peers reach this node by, in what it publishes to the coordinator (default: 127.0.0.1) |
 | `--anti-entropy-interval-seconds` | `<N>` | Multi-master reconciliation interval (default: 60) |
 | `--auth-secret-file` | `<PATH>` | Client credentials, `<identity> <secret>` per line; mode 600. Empty disables client authentication |
 | `--cluster-secret-file` | `<PATH>` | Shared secret for replication and multi-master links, one line; mode 600 |

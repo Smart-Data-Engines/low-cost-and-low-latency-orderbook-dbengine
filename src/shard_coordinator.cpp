@@ -42,73 +42,178 @@ ShardCoordinator::~ShardCoordinator() {
 // ── start() ───────────────────────────────────────────────────────────────────
 
 void ShardCoordinator::start() {
-    OB_LOG_INFO("shard_coord", "Starting coordinator for shard=%s vnodes=%u",
-                config_.shard_id.c_str(), config_.vnodes);
+    OB_LOG_INFO("shard_coord", "Starting coordinator for shard=%s vnodes=%u address=%s",
+                config_.shard_id.c_str(), config_.vnodes, config_.advertise_address.c_str());
 
-    // Connect to etcd
     coordinator_ = std::make_unique<CoordinatorClient>(config_.coordinator);
-    if (!coordinator_->connect()) {
-        OB_LOG_ERROR("shard_coord", "Failed to connect to etcd for shard=%s",
-                     config_.shard_id.c_str());
-        return;
-    }
+    // Once here, and in the watch loop until it succeeds: a shard that could not reach etcd at its
+    // start stayed JOINING for good, refusing every write as not its own (#175).
+    joined_ = connect_and_join();
 
-    // Grant lease for shard registration
-    lease_id_ = coordinator_->grant_lease();
-    if (lease_id_ == 0) {
-        OB_LOG_ERROR("shard_coord", "Failed to grant lease for shard=%s",
-                     config_.shard_id.c_str());
-        return;
-    }
-    OB_LOG_INFO("shard_coord", "Granted lease=%ld for shard=%s",
-                static_cast<long>(lease_id_), config_.shard_id.c_str());
-
-    // Register this shard in etcd
-    if (!register_shard()) {
-        OB_LOG_ERROR("shard_coord", "Failed to register shard=%s in etcd",
-                     config_.shard_id.c_str());
-        return;
-    }
-
-    // Fetch or create ShardMap from etcd
-    {
-        std::string key = shard_map_key(config_.coordinator.cluster_prefix);
-        std::string key_b64 = base64_encode(key);
-
-        // Try to read existing shard map
-        // Use the coordinator's internal http_post via get_cluster_state pattern
-        // We'll use a simplified approach: try to read the key
-        // For now, initialize with empty map if not found
-        std::lock_guard<std::mutex> lock(mtx_);
-
-        // Add ourselves to the shard map
-        ShardNode self_node;
-        self_node.shard_id = config_.shard_id;
-        self_node.address = config_.coordinator.node_id; // node_id holds address
-        self_node.status = ShardStatus::ACTIVE;
-        self_node.vnodes = config_.vnodes;
-
-        shard_map_.shards[config_.shard_id] = self_node;
-        shard_map_.version++;
-
-        // Build hash ring from all known shards
-        hash_ring_ = ConsistentHashRing{};
-        for (const auto& [id, node] : shard_map_.shards) {
-            hash_ring_.add_shard(id, node.vnodes);
-        }
-
-        status_.store(ShardStatus::ACTIVE, std::memory_order_release);
-    }
-
-    // Start watch thread
     running_.store(true, std::memory_order_release);
     watch_thread_ = std::thread([this]() {
         run_thread_body("shard_coord", "watch_loop", [this] { watch_loop(); });
     });
 
-    OB_LOG_INFO("shard_coord", "Coordinator started for shard=%s, map version=%lu",
-                config_.shard_id.c_str(),
-                static_cast<unsigned long>(shard_map_.version));
+    OB_LOG_INFO("shard_coord", "Coordinator started for shard=%s: %s, map version=%lu",
+                config_.shard_id.c_str(), joined_ ? "in the shard map" : "not registered yet",
+                static_cast<unsigned long>(shard_map().version));
+}
+
+bool ShardCoordinator::connect_and_join() {
+    const auto give_up = [this](const char* why) {
+        if (!join_warned_) {
+            OB_LOG_WARN("shard_coord", "Shard %s is not registered yet (%s): every write is refused "
+                                       "as not its own until it is - trying again every 2 s",
+                        config_.shard_id.c_str(), why);
+            join_warned_ = true;
+        } else {
+            OB_LOG_DEBUG("shard_coord", "Shard %s still not registered: %s", config_.shard_id.c_str(),
+                         why);
+        }
+        return false;
+    };
+    if (!coordinator_->is_connected() && !coordinator_->connect()) return give_up("etcd unreachable");
+    if (lease_id_ == 0) {
+        lease_id_ = coordinator_->grant_lease();
+        if (lease_id_ == 0) return give_up("no lease granted");
+        OB_LOG_INFO("shard_coord", "Granted lease=%ld for shard=%s", static_cast<long>(lease_id_),
+                    config_.shard_id.c_str());
+    }
+    if (!register_shard()) return give_up("its node key was not written");
+    if (!join_map()) return give_up("the shard map was not written");
+    if (join_warned_) {
+        OB_LOG_INFO("shard_coord", "Shard %s is registered now", config_.shard_id.c_str());
+        join_warned_ = false;
+    }
+    return true;
+}
+
+ShardNode ShardCoordinator::self_node() const {
+    ShardNode node;
+    node.shard_id = config_.shard_id;
+    node.address  = config_.advertise_address;
+    node.status   = ShardStatus::ACTIVE;
+    node.vnodes   = config_.vnodes;
+    return node;
+}
+
+bool ShardCoordinator::advertises() const {
+    return engine_.node_role() != NodeRole::REPLICA;
+}
+
+bool ShardCoordinator::join_map() {
+    // Two shards starting together read the same map; each writes it back only on the revision it
+    // read, and the one that loses reads it again - with the other already in it.
+    constexpr int kAttempts = 16;
+    const std::string key = shard_map_key(config_.coordinator.cluster_prefix);
+    for (int attempt = 1; attempt <= kAttempts; ++attempt) {
+        CoordinatorClient::KeyValue kv;
+        const auto read = coordinator_->get(key, kv);
+        if (read == CoordinatorClient::KeyRead::Unavailable) return false;
+        ShardMap map;
+        if (read == CoordinatorClient::KeyRead::Present) {
+            std::string error;
+            if (!ShardMap::from_json(kv.value, map, error)) {
+                OB_LOG_ERROR("shard_coord", "The shard map in etcd (%s) does not parse: %s - shard %s "
+                                            "leaves it as it is", key.c_str(), error.c_str(),
+                             config_.shard_id.c_str());
+                return false;
+            }
+        }
+        if (!advertises()) {
+            // A replica of this shard's group: its primary is the one the map names.
+            if (read == CoordinatorClient::KeyRead::Absent) return false;
+            adopt_map(std::move(map), kv.mod_revision);
+            return true;
+        }
+        if (!upsert_shard(map, self_node())) {
+            adopt_map(std::move(map), kv.mod_revision);
+            return true;
+        }
+        const auto cas = coordinator_->compare_and_put(
+            key, read == CoordinatorClient::KeyRead::Present ? kv.mod_revision : 0, map.to_json());
+        if (cas == CoordinatorClient::CasOutcome::Swapped) {
+            OB_LOG_INFO("shard_coord", "Shard %s joined the shard map at %s (version %lu, %zu "
+                                       "shard(s))", config_.shard_id.c_str(),
+                        config_.advertise_address.c_str(), static_cast<unsigned long>(map.version),
+                        map.shards.size());
+            // The revision of this write is the next poll's to learn: it reads the map again once.
+            adopt_map(std::move(map), 0);
+            return true;
+        }
+        if (cas == CoordinatorClient::CasOutcome::Unavailable) return false;
+        OB_LOG_WARN("shard_coord", "The shard map changed under shard %s since revision %lld - "
+                                   "reading it again (%d of %d)", config_.shard_id.c_str(),
+                    static_cast<long long>(kv.mod_revision), attempt, kAttempts);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10 * attempt));
+    }
+    OB_LOG_WARN("shard_coord", "The shard map kept changing under shard %s for %d attempts",
+                config_.shard_id.c_str(), kAttempts);
+    return false;
+}
+
+void ShardCoordinator::adopt_map(ShardMap map, int64_t revision) {
+    ShardMapChangeCallback cb;
+    ShardMap copy;
+    bool moved = false;
+    bool member = false;
+    size_t shards = 0;
+    uint64_t version = 0;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        moved         = map.version != shard_map_.version;
+        shard_map_    = std::move(map);
+        map_revision_ = revision;
+        hash_ring_    = ring_of(shard_map_);
+        member        = shard_map_.shards.count(config_.shard_id) != 0;
+        shards        = shard_map_.shards.size();
+        version       = shard_map_.version;
+        cb            = change_cb_;
+        copy          = shard_map_;
+    }
+    // A shard the map does not name owns nothing, and says so as it did before it joined.
+    status_.store(member ? ShardStatus::ACTIVE : ShardStatus::JOINING, std::memory_order_release);
+    if (moved) {
+        OB_LOG_INFO("shard_coord", "Shard map version %lu: %zu shard(s), the ring rebuilt - shard %s "
+                                   "%s", static_cast<unsigned long>(version), shards,
+                    config_.shard_id.c_str(), member ? "is in it" : "is not in it");
+    }
+    if (cb) cb(copy);
+}
+
+void ShardCoordinator::poll_map() {
+    const std::string key = shard_map_key(config_.coordinator.cluster_prefix);
+    CoordinatorClient::KeyValue kv;
+    const auto read = coordinator_->get(key, kv);
+    if (read == CoordinatorClient::KeyRead::Unavailable) return;
+    if (read == CoordinatorClient::KeyRead::Absent) {
+        OB_LOG_WARN("shard_coord", "The shard map is gone from etcd (%s); shard %s writes it again",
+                    key.c_str(), config_.shard_id.c_str());
+        joined_ = join_map();
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (kv.mod_revision == map_revision_) return;          // nothing new
+    }
+    ShardMap map;
+    std::string error;
+    if (!ShardMap::from_json(kv.value, map, error)) {
+        OB_LOG_WARN("shard_coord", "The shard map in etcd no longer parses (%s): shard %s keeps its "
+                                   "own copy", error.c_str(), config_.shard_id.c_str());
+        return;
+    }
+    // The map says something else of this shard than this node would - another node of its group
+    // wrote it, or the map was written without it - and this node is the one it should name.
+    if (advertises()) {
+        ShardMap mine = map;
+        if (upsert_shard(mine, self_node())) {
+            joined_ = join_map();
+            return;
+        }
+    }
+    adopt_map(std::move(map), kv.mod_revision);
 }
 
 // ── stop() ────────────────────────────────────────────────────────────────────
@@ -217,32 +322,13 @@ ShardCoordinator::MigrationMetrics ShardCoordinator::migration_metrics() const {
 // ── register_shard() ──────────────────────────────────────────────────────────
 
 bool ShardCoordinator::register_shard() {
-    ShardNode node;
-    node.shard_id = config_.shard_id;
-    node.address = config_.coordinator.node_id;  // node_id holds host:port
-    node.status = ShardStatus::ACTIVE;
-    node.vnodes = config_.vnodes;
-
-    std::string key = shard_node_key(config_.coordinator.cluster_prefix,
-                                     config_.shard_id);
-    std::string key_b64 = base64_encode(key);
-    std::string value_b64 = base64_encode(node.to_json());
-
-    // PUT with lease
-    if (!coordinator_ || !coordinator_->is_connected()) {
-        OB_LOG_ERROR("shard_coord", "Cannot register shard=%s: not connected to etcd",
-                     config_.shard_id.c_str());
-        return false;
-    }
-
-    // Use publish_wal_position pattern — direct PUT via etcd REST
-    // We reuse the coordinator's connection by publishing the shard node info
-    // For a proper implementation, CoordinatorClient would need a generic put() method.
-    // Here we use the existing infrastructure.
-    (void)coordinator_->publish_wal_position(0, 0);  // verify connectivity
-
-    OB_LOG_INFO("shard_coord", "Registered shard=%s address=%s status=active",
-                config_.shard_id.c_str(), node.address.c_str());
+    // This node, under its lease: gone on its own when the node stops keeping the lease alive, which
+    // the map's entry - the shard's, and its symbols' - is not.
+    const ShardNode node = self_node();
+    const std::string key = shard_node_key(config_.coordinator.cluster_prefix, config_.shard_id);
+    if (!coordinator_->put(key, node.to_json(), lease_id_)) return false;
+    OB_LOG_INFO("shard_coord", "Registered shard=%s address=%s under lease %ld", config_.shard_id.c_str(),
+                node.address.c_str(), static_cast<long>(lease_id_));
     return true;
 }
 
@@ -273,26 +359,28 @@ void ShardCoordinator::watch_loop() {
 
     while (running_.load(std::memory_order_acquire)) {
         try {
-            // Keep-alive for the lease
-            if (coordinator_ && lease_id_ != 0) {
-                coordinator_->refresh_lease(lease_id_);
+            // Keep-alive for the lease. One that etcd no longer knows - the node was away longer
+            // than its TTL - is granted again, and the node key written again, below.
+            if (coordinator_ && lease_id_ != 0 && !coordinator_->refresh_lease(lease_id_)) {
+                OB_LOG_WARN("shard_coord", "Shard %s lost its lease %ld; registering again",
+                            config_.shard_id.c_str(), static_cast<long>(lease_id_));
+                lease_id_ = 0;
+                joined_   = false;
             }
 
-            // Poll for shard map changes
-            // In a production system, this would use etcd watch API.
-            // Here we use periodic polling with sleep.
-            // The watch interval is ~2 seconds.
             for (int i = 0; i < 20 && running_.load(std::memory_order_acquire); ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
-
             if (!running_.load(std::memory_order_acquire)) break;
 
-            // Try to read updated shard map from etcd and propagate mm_peers topology
-            OB_LOG_DEBUG("shard_coord", "Watch loop: checking for shard map updates, shard=%s",
-                         config_.shard_id.c_str());
+            // Not in the map yet: try again. In it: read it, and take what changed - a shard that
+            // joined since is in this shard's ring from here on (#175).
+            if (!joined_) {
+                joined_ = connect_and_join();
+            } else {
+                poll_map();
+            }
 
-            // Read mm_peers for this shard from etcd and propagate to ShardMap
             propagate_mm_topology();
             guard.ok();
         } catch (const std::exception& e) {
@@ -656,11 +744,15 @@ std::string ShardCoordinator::handle_migrate_command(const std::string& symbol_k
         }
     }
 
-    if (initiate_migration(symbol_key, target_shard_id)) {
-        return "OK\n\n";
-    }
-
-    return "ERR migration failed: " + symbol_key + "\n";
+    // Refused rather than run (#196): initiate_migration() marks the symbol migrated here - every
+    // write of it refused with SYMBOL_MIGRATED from then on - and moves none of its rows, since the
+    // symbol snapshot names no files and the WAL delta is empty; and the map in etcd, which every
+    // client routes by since #175, still names this shard. A symbol MIGRATE ran on could be written
+    // nowhere.
+    OB_LOG_WARN("shard_coord", "MIGRATE refused for symbol=%s to shard=%s: moving a symbol's rows "
+                               "between shards is not implemented (#196)",
+                symbol_key.c_str(), target_shard_id.c_str());
+    return "ERR MIGRATE is not implemented: it would move none of " + symbol_key + "'s rows (#196)\n";
 }
 
 // ── pin_symbol() / unpin_symbol() ─────────────────────────────────────────────

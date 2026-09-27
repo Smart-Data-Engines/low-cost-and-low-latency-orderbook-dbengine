@@ -345,7 +345,9 @@ void MultiMasterManager::start() {
 
     // Initialize PeerRegistry for etcd-based peer discovery.
     if (!config_.coordinator_config.endpoints.empty()) {
-        std::string repl_addr = "127.0.0.1:" + std::to_string(config_.replication_port);
+        // The host peers reach this node by, not 127.0.0.1: each node of a mesh across hosts dialled
+        // its own port (#195).
+        std::string repl_addr = config_.advertise_host + ":" + std::to_string(config_.replication_port);
         peer_registry_ = std::make_unique<PeerRegistry>(
             config_.coordinator_config, config_.node_id, repl_addr, engine_.registry(),
             config_.shard_id);

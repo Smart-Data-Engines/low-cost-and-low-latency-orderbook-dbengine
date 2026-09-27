@@ -26,6 +26,9 @@ struct ShardCoordinatorConfig {
     std::string shard_id;                    // unique shard identifier
     uint32_t    vnodes{150};                 // --shard-vnodes
     CoordinatorConfig coordinator;           // etcd endpoints, prefix, node_id
+    /// "host:port" the shard's clients connect to - what the map says of it (#175): --advertise-host
+    /// and --port.
+    std::string advertise_address;
 };
 
 // ── Callback for shard map changes ────────────────────────────────────────────
@@ -132,9 +135,35 @@ private:
     // Lease
     int64_t lease_id_{0};
 
+    /// In the map in etcd, with its node key under the lease (#175). Touched by start() and then only
+    /// by the watch thread.
+    bool joined_{false};
+    /// The revision of the map this shard last took, so a poll that finds it again does nothing.
+    /// Guarded by mtx_.
+    int64_t map_revision_{0};
+    /// Said once until a registration succeeds: a shard etcd cannot reach retries every pass.
+    bool join_warned_{false};
+
     // Shard registration in etcd
     bool register_shard();
     void deregister_shard();
+
+    /// Connect, take a lease, write the node key and join the map; what start() tries once and the
+    /// watch loop until it succeeds.
+    bool connect_and_join();
+    /// Read the map, put this shard in it, and write it back only on the revision read - read again
+    /// on a conflict (#175). A replica of the shard's group takes the map as it is: its primary is
+    /// the address the map names.
+    bool join_map();
+    /// Take `map` as this shard's: ring, ownership, status, callback.
+    void adopt_map(ShardMap map, int64_t revision);
+    /// Read the map, and take it when it changed; join it again when it is gone or says something
+    /// else of this shard than this node would.
+    void poll_map();
+    /// This shard as it says itself in the map.
+    ShardNode self_node() const;
+    /// Whether this node is the one the map names for its shard: not a replica (#175).
+    bool advertises() const;
 
     // Watch loop on shard_map
     void watch_loop();

@@ -1114,7 +1114,10 @@ def _parse_shard_error(raw: str):
     msg = raw[4:].rstrip("\n")
     if msg.startswith("NOT_OWNER "):
         return "NOT_OWNER", msg[len("NOT_OWNER "):]
-    if msg.startswith("SYMBOL_MIGRATED "):
+    # The server says it bare - `ERR SYMBOL_MIGRATED` - and a detail after it is optional (#175):
+    # matching only the form with one left the refresh and the retry it exists for unreached
+    # against every real server.
+    if msg == "SYMBOL_MIGRATED" or msg.startswith("SYMBOL_MIGRATED "):
         return "SYMBOL_MIGRATED", msg[len("SYMBOL_MIGRATED "):]
     return None, None
 

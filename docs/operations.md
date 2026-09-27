@@ -93,6 +93,48 @@ Two things that bite here and are not obvious:
   `etcd → PeerRegistry::start_watch → handle_topology_change → connect_to_peer → send_handshake`,
   and a node that cannot read etcd stays alone without saying anything louder than a log line.
 
+## Sharding by symbol
+
+Each shard is a node - or a failover group of them - started with the same `--shard-id`, and every
+shard of a cluster points at the same etcd (#175):
+
+```bash
+ob_tcp_server --shard-id s0 --node-id s0-a --port 9090 --replication-port 9091 \
+    --coordinator-endpoints http://10.0.0.1:2379 --advertise-host 10.0.0.11
+```
+
+`--advertise-host` is the host clients and the shard's replicas reach the node by: what it writes into
+the shard map and into its group's leader key. It is `127.0.0.1` by default, which is right on one
+machine only - and was the only choice before #195, for failover as for the map.
+
+What a shard does with etcd, and what each line of its log means:
+
+- **It joins the map** (`<prefix>shard_map`, `/ob/shard_map` by default) by a compare-and-swap on the
+  key's revision, so two shards starting together both end up in it:
+  `Shard s0 joined the shard map at 10.0.0.11:9090 (version 3, 2 shard(s))`. The map lists shards and
+  the symbols assigned to one explicitly; every other symbol goes to the shard the map's hash ring
+  gives it, and a shard refuses a write of another's with `ERR NOT_OWNER <symbol>.<exchange>`.
+- **It reads the map every 2 s**: a shard that joins later is in every other shard's ring at its next
+  read - `Shard map version 4: 3 shard(s), the ring rebuilt`.
+- **It elects under its own keys**: `<prefix>shards/<id>/leader`, `.../nodes/...`, `.../handover`. A
+  second node started with the same `--shard-id` becomes that shard's replica; the map names the
+  group's primary, which writes its address there when it becomes one.
+- **It keeps a node key under its lease** (`<prefix>shards/<id>`), gone when the node stops. The map's
+  entry stays: a shard that is down is a shard whose symbols are unavailable, not one whose symbols
+  move to another.
+- A shard etcd cannot reach at its start says so once - `Shard s0 is not registered yet (etcd
+  unreachable): every write is refused as not its own until it is - trying again every 2 s` - and
+  registers when it can.
+
+Clients find the shards through the map: the Python pool with `coordinator_endpoints`, and the C++
+`OrderbookPool` with `PoolConfig::coordinator_endpoints`, each reading it at every health check.
+
+**Add shards before the writes flow.** A shard added to a running cluster takes its share of the ring
+from the others, and nothing moves those symbols' rows to it: `MIGRATE` is refused until it does
+(#196), and for up to 2 s, until each shard has read the new map, the others still take its symbols'
+writes. Symbols that must stay where their history is can be assigned in the map before the shard is
+added.
+
 ## Tuning that is real for this engine
 
 Three of the knobs people expect are **not** tuning for this engine, and saying so is more useful

@@ -588,3 +588,60 @@ TEST(ShardMapJsonUnit, InvalidJsonSyntaxReturnsFalse) {
     EXPECT_FALSE(ok);
     EXPECT_FALSE(error.empty());
 }
+
+// ── A shard in the map as it says itself (#175) ──────────────────────────────
+
+TEST(ShardMapUpsert, AShardThatIsNotThereIsAddedAndTheVersionRaised) {
+    ob::ShardMap map;
+    map.version = 4;
+    ob::ShardNode s1;
+    s1.shard_id = "s1";
+    s1.address  = "10.0.0.2:9090";
+    s1.vnodes   = 150;
+    EXPECT_TRUE(ob::upsert_shard(map, s1));
+    EXPECT_EQ(map.version, 5u);
+    ASSERT_EQ(map.shards.count("s1"), 1u);
+    EXPECT_EQ(map.shards["s1"].address, "10.0.0.2:9090");
+}
+
+TEST(ShardMapUpsert, AShardAlreadyAsItSaysChangesNothing) {
+    ob::ShardMap map;
+    ob::ShardNode s1;
+    s1.shard_id = "s1";
+    s1.address  = "10.0.0.2:9090";
+    ASSERT_TRUE(ob::upsert_shard(map, s1));
+    const uint64_t v = map.version;
+    EXPECT_FALSE(ob::upsert_shard(map, s1)) << "a map written back unchanged rebuilds every ring";
+    EXPECT_EQ(map.version, v);
+}
+
+TEST(ShardMapUpsert, AnAddressIsTheShardsToSayAndAStatusIsNot) {
+    // A shard that starts again at another address - its group's primary moved - says so; a drain
+    // the map's operations put it in stays.
+    ob::ShardMap map;
+    ob::ShardNode s1;
+    s1.shard_id = "s1";
+    s1.address  = "10.0.0.2:9090";
+    ASSERT_TRUE(ob::upsert_shard(map, s1));
+    map.shards["s1"].status = ob::ShardStatus::DRAINING;
+    s1.address = "10.0.0.3:9090";
+    s1.status  = ob::ShardStatus::ACTIVE;
+    EXPECT_TRUE(ob::upsert_shard(map, s1));
+    EXPECT_EQ(map.shards["s1"].address, "10.0.0.3:9090");
+    EXPECT_EQ(map.shards["s1"].status, ob::ShardStatus::DRAINING);
+}
+
+TEST(ShardMapUpsert, TheRingOfAMapLeavesOutADrainingShard) {
+    ob::ShardMap map;
+    for (const char* id : {"s0", "s1", "s2"}) {
+        ob::ShardNode n;
+        n.shard_id = id;
+        n.address  = std::string(id) + ":1";
+        n.vnodes   = 50;
+        map.shards[id] = n;
+    }
+    map.shards["s2"].status = ob::ShardStatus::DRAINING;
+    const auto ring = ob::ring_of(map);
+    EXPECT_EQ(ring.shard_count(), 2u);
+    for (int i = 0; i < 200; ++i) EXPECT_NE(ring.lookup("K" + std::to_string(i)), "s2");
+}

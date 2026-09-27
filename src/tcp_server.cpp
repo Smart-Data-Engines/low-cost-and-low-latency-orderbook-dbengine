@@ -980,6 +980,7 @@ private:
 const std::vector<std::string>& known_flags() {
     // Sorted, and checked against the parser's own source by CliConfigStatic.KnownFlagsMatchTheParser.
     static const std::vector<std::string> flags = {
+        "advertise-host",
         "anti-entropy-interval-seconds",
         "config",
         "coordinator-endpoints",
@@ -1055,6 +1056,7 @@ namespace {
 const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
     // flag -> (argument placeholder, description). An empty placeholder means a boolean flag.
     static const std::map<std::string, std::pair<std::string, std::string>> help = {
+        {"advertise-host", {"<HOST>", "The host clients and peers reach this node by, in what it publishes to the coordinator (default: 127.0.0.1)"}},
         {"anti-entropy-interval-seconds", {"<N>", "Multi-master reconciliation interval (default: 30)"}},
         {"config", {"<FILE>", "Read `key = value` settings from FILE; command line wins"}},
         {"coordinator-endpoints", {"<URLS>", "Comma-separated etcd endpoints for HA and failover"}},
@@ -1365,6 +1367,8 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
 
         if (arg == "--port") {
             config.port = cursor.value_as<uint16_t>();
+        } else if (arg == "--advertise-host") {
+            config.advertise_host = std::string{cursor.value()};
         } else if (arg == "--data-dir") {
             config.data_dir = std::string{cursor.value()};
         } else if (arg == "--max-sessions") {
@@ -1793,6 +1797,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     out += "# of them you chose, and that is the question this flag exists to answer.\n";
     out += "# machine: " + resolved.machine.reason + "\n";
     if (!resolved.profile_choice.empty()) out += "# profile " + resolved.profile_choice + "\n";
+    line("advertise-host", c.advertise_host);
     line("anti-entropy-interval-seconds", std::to_string(c.anti_entropy_interval_sec));
     {
         std::string joined;
@@ -1906,7 +1911,15 @@ TcpServer::TcpServer(ServerConfig config)
         failover_config.coordinator.node_id = config_.node_id;
         failover_config.failover_enabled = config_.failover_enabled;
         failover_config.replication_port = config_.replication_port;
-        failover_config.replication_address = "127.0.0.1:" + std::to_string(config_.replication_port);
+        // What a replica dials once this node is primary: the host it is reached by, which was
+        // 127.0.0.1 whatever that was - a replica on another host dialled itself (#195).
+        failover_config.replication_address =
+            config_.advertise_host + ":" + std::to_string(config_.replication_port);
+        // A shard's group elects its own primary, under its own keys: two shards on one etcd shared
+        // /ob/leader, and the second became the first one's replica (#175).
+        if (!config_.shard_id.empty()) {
+            failover_config.coordinator.cluster_prefix = "/ob/shards/" + config_.shard_id + "/";
+        }
     }
 
     engine_ = std::make_unique<Engine>(config_.data_dir,
@@ -1937,7 +1950,8 @@ TcpServer::TcpServer(ServerConfig config)
                                            },
                                            .cluster_secret = secrets_.cluster,
                                            .tls_server = tls_.mesh_server,
-                                           .tls_client = tls_.mesh_client
+                                           .tls_client = tls_.mesh_client,
+                                           .advertise_host = config_.advertise_host
                                        },
                                        config_.wal_rotate_bytes,
                                        config_.wal_dir);
@@ -2880,6 +2894,7 @@ void TcpServer::run() {
         sc_config.coordinator.lease_ttl_seconds = config_.coordinator_lease_ttl;
         sc_config.coordinator.node_id = config_.node_id;
         sc_config.coordinator.cluster_prefix = "/ob/";
+        sc_config.advertise_address = config_.advertise_host + ":" + std::to_string(config_.port);
 
         shard_coord = std::make_unique<ShardCoordinator>(sc_config, *engine_);
         shard_coord->start();

@@ -180,6 +180,9 @@ struct ServerConfig {
     /// margin in proportion.
     int64_t election_lease_wait_ms{0};
     std::string node_id;                             // --node-id
+    /// The host clients and peers reach this node by (#175, #195): in the shard map, and in the
+    /// leader key a replica dials. `127.0.0.1` by default, which is what both were, fixed.
+    std::string advertise_host{"127.0.0.1"};         // --advertise-host
     bool failover_enabled{true};                     // --failover-enabled
 
     // TTL / data retention

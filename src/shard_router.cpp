@@ -115,8 +115,28 @@ void ShardRouter::update_connections(const ShardMap& new_map) {
                     client->disconnect();
                 }
             }
-            it = mm_clients_.erase(it);
+            // The counter by the key before the entry goes: erasing first read the key through the
+            // iterator erase() had just returned - the next entry's, or end().
             rr_counters_.erase(it->first);
+            it = mm_clients_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // A shard whose address changed - its group's primary is another node now - is connected to
+    // again, at the new one (#175).
+    for (auto it = clients_.begin(); it != clients_.end(); ) {
+        const auto was = shard_map_.shards.find(it->first);
+        const auto now = new_map.shards.find(it->first);
+        if (was != shard_map_.shards.end() && now != new_map.shards.end() &&
+            was->second.address != now->second.address) {
+            OB_LOG_INFO("shard_router", "Shard %s moved from %s to %s; connecting again",
+                        it->first.c_str(), was->second.address.c_str(),
+                        now->second.address.c_str());
+            if (it->second && it->second->connected()) it->second->disconnect();
+            it = clients_.erase(it);
+            ++removed;
         } else {
             ++it;
         }
@@ -259,46 +279,45 @@ void ShardRouter::watch_loop() {
 // ── 11.3  refresh_shard_map() ────────────────────────────────────────────────
 
 Result<void> ShardRouter::refresh_shard_map() {
-    if (!coordinator_ || !coordinator_->is_connected()) {
+    // From etcd, where the shards write it (#175). This read nothing and answered success, so a
+    // router built from coordinator endpoints routed every symbol to the empty shard id: "shard
+    // unreachable" for every write, "no shards available" for every query.
+    if (!coordinator_) return Result<void>::err(OB_ERR_IO, "no coordinator");
+    if (!coordinator_->is_connected() && !coordinator_->connect()) {
         OB_LOG_WARN("shard_router", "etcd unreachable, using cached shard map version=%lu",
-                    static_cast<unsigned long>(shard_map_.version));
+                    static_cast<unsigned long>(shard_map().version));
         return Result<void>::err(OB_ERR_IO, "etcd unreachable");
     }
-
-    // Fetch shard_map key from etcd via range query
-    // We reuse the coordinator's internal HTTP to read the shard_map key.
-    // Since CoordinatorClient doesn't expose a generic get(), we use
-    // get_cluster_state()-style approach but for the shard_map key.
-    // For now, we'll use a simpler approach: read via the coordinator's
-    // existing infrastructure by constructing the key manually.
-
-    // The CoordinatorClient doesn't have a generic KV get, so we'll
-    // build a minimal fetch using the same pattern as get_cluster_state.
-    // We store the shard map JSON in etcd under <prefix>shard_map.
-
-    // For the MVP, we poll the shard map by reading it from any connected
-    // shard via the SHARD_MAP wire command, which is simpler and doesn't
-    // require extending CoordinatorClient.
-
-    std::lock_guard<std::mutex> lock(mtx_);
-
-    // Try to get shard map from any connected client
-    for (auto& [shard_id, client] : clients_) {
-        if (!client || !client->connected()) continue;
-        // We have at least one connected shard — can potentially refresh
-        break;
+    const std::string key = config_.cluster_prefix + "shard_map";
+    CoordinatorClient::KeyValue kv;
+    const auto read = coordinator_->get(key, kv);
+    if (read == CoordinatorClient::KeyRead::Unavailable) {
+        return Result<void>::err(OB_ERR_IO, "the shard map could not be read");
     }
-
-    // For a robust implementation, we read directly from etcd.
-    // Since CoordinatorClient doesn't expose generic KV read, we'll
-    // attempt to read from connected shards via SHARD_MAP command.
-    // If no shards are connected yet, we can't refresh.
-
-    // If we have no clients yet, this is initial load — nothing to refresh from
-    if (clients_.empty() && shard_map_.shards.empty()) {
+    if (read == CoordinatorClient::KeyRead::Absent) {
+        OB_LOG_WARN("shard_router", "No shard map in etcd yet (%s): no shard has joined", key.c_str());
         return Result<void>::ok();
     }
+    ShardMap map;
+    std::string error;
+    if (!ShardMap::from_json(kv.value, map, error)) {
+        OB_LOG_WARN("shard_router", "The shard map in etcd does not parse (%s); keeping version %lu",
+                    error.c_str(), static_cast<unsigned long>(shard_map().version));
+        return Result<void>::err(OB_ERR_INVALID_ARG, "unparseable shard map");
+    }
 
+    std::lock_guard<std::mutex> lock(mtx_);
+    const uint64_t was = shard_map_.version;
+    // Every refresh, not only a new version: a shard this router could not reach last time is
+    // tried again.
+    update_connections(map);
+    hash_ring_ = ring_of(map);
+    shard_map_ = std::move(map);
+    if (shard_map_.version != was) {
+        OB_LOG_INFO("shard_router", "Shard map version %lu: %zu shard(s), %zu connected",
+                    static_cast<unsigned long>(shard_map_.version), shard_map_.shards.size(),
+                    clients_.size());
+    }
     return Result<void>::ok();
 }
 
