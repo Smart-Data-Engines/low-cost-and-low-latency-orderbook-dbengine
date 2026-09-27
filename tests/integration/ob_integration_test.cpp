@@ -264,18 +264,53 @@ static int run_query_agg(const std::string& host, uint16_t port) {
     return 0;
 }
 
+// ── shard_pool (#175): a pool that finds its shards in etcd ──────────────────
+
+/// One `ask` row of each symbol, through a pool built from coordinator endpoints alone: the shard
+/// map it routes by is the one the shards wrote to etcd.
+static int run_shard_pool(const std::string& coordinator, const std::string& symbols) {
+    ob::PoolConfig pc;
+    pc.coordinator_endpoints = {coordinator};
+    pc.health_check_interval_sec = 0.5;
+    ob::OrderbookPool pool(pc);
+    size_t written = 0;
+    size_t start = 0;
+    while (start <= symbols.size()) {
+        const size_t comma = symbols.find(',', start);
+        const std::string sym = symbols.substr(start, comma == std::string::npos ? std::string::npos
+                                                                                 : comma - start);
+        if (!sym.empty()) {
+            auto res = pool.insert(sym, "EX", ob::Side::ASK, 300, 3, 1, 1'700'000'000'000'000'002ULL);
+            if (!res) {
+                print_result("shard_pool", "fail", sym + ": " + res.error_message());
+                pool.close();
+                return 1;
+            }
+            ++written;
+        }
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    pool.close();
+    print_result("shard_pool", "pass", std::to_string(written) + " written");
+    return 0;
+}
+
 // ── CLI argument parsing ─────────────────────────────────────────────────────
 
 static void usage(const char* prog) {
     std::cerr << "Usage: " << prog
               << " --host <host> --port <port>"
-              << " --test <ping|insert_query|minsert|query_agg>\n";
+              << " --test <ping|insert_query|minsert|query_agg>\n"
+              << "       " << prog << " --test shard_pool --coordinator <URL> --symbols <A,B,...>\n";
 }
 
 int main(int argc, char* argv[]) {
     std::string host = "127.0.0.1";
     uint16_t port = 9090;
     std::string test_name;
+    std::string coordinator;
+    std::string symbols;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
@@ -284,6 +319,10 @@ int main(int argc, char* argv[]) {
             port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--test") == 0 && i + 1 < argc) {
             test_name = argv[++i];
+        } else if (std::strcmp(argv[i], "--coordinator") == 0 && i + 1 < argc) {
+            coordinator = argv[++i];
+        } else if (std::strcmp(argv[i], "--symbols") == 0 && i + 1 < argc) {
+            symbols = argv[++i];
         } else {
             usage(argv[0]);
             return 1;
@@ -299,6 +338,7 @@ int main(int argc, char* argv[]) {
     if (test_name == "insert_query") return run_insert_query(host, port);
     if (test_name == "minsert")      return run_minsert(host, port);
     if (test_name == "query_agg")    return run_query_agg(host, port);
+    if (test_name == "shard_pool")   return run_shard_pool(coordinator, symbols);
 
     std::cerr << "Unknown test: " << test_name << "\n";
     usage(argv[0]);
