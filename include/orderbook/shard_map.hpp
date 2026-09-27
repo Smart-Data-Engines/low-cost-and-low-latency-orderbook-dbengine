@@ -153,4 +153,13 @@ struct ShardMapDiff {
 /// Compute the diff between two ShardMaps.
 ShardMapDiff compute_shard_map_diff(const ShardMap& old_map, const ShardMap& new_map);
 
+/// Put `node` into `map` as that shard says it is (#175): added when absent, and its address and
+/// vnodes brought up to date when present - its status is the map's operations', and its
+/// multi-master nodes the watch loop's. Returns whether the map changed, and raises its version when
+/// it did: a map written back unchanged would make every other shard rebuild its ring for nothing.
+bool upsert_shard(ShardMap& map, const ShardNode& node);
+
+/// The ring a map's shards make: every shard's vnodes, less the draining ones.
+ConsistentHashRing ring_of(const ShardMap& map);
+
 } // namespace ob
