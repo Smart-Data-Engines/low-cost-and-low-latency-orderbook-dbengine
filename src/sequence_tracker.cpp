@@ -41,12 +41,14 @@ void SequenceTracker::mark_moved(const std::string& key, uint16_t origin, Origin
     if (st.listed) return;
     st.listed = true;
     moved_.push_back(Moved{&key, origin, &st});
+    count_listing();
 }
 
 SequenceTracker::MovedFrontiers SequenceTracker::take_moved_frontiers() {
     MovedFrontiers out;
-    out.all    = moved_all_;
-    moved_all_ = false;
+    out.all      = moved_all_;
+    out.listings = listings_.load(std::memory_order_relaxed);
+    moved_all_   = false;
     if (!out.all) out.moved.reserve(moved_.size());
     for (const Moved& m : moved_) {
         if (!out.all) out.moved.push_back(VectorEntry{*m.key, m.origin, m.state->frontier});
@@ -223,6 +225,7 @@ void SequenceTracker::reset() {
     moved_.clear();                // the states it points at go next
     symbols_.clear();
     moved_all_ = true;
+    count_listing();               // a copy kept from before this is behind it
     OB_LOG_INFO("sequence", "Reset: dropped state for %zu symbols", had);
 }
 

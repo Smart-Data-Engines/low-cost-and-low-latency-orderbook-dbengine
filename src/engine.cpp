@@ -363,8 +363,10 @@ std::size_t Engine::above_frontier_size(const std::string& key, uint16_t origin)
 }
 
 std::vector<SequenceTracker::VectorEntry> Engine::export_version_vector(std::size_t limit,
-                                                                       bool& truncated) const {
+                                                                       bool& truncated,
+                                                                       uint64_t* covers) const {
     std::lock_guard<std::mutex> lock(vector_cache_mtx_);
+    if (covers != nullptr) *covers = vector_cache_covers_;
     truncated = vector_cache_truncated_ || vector_cache_.size() > limit;
     if (truncated) {
         OB_LOG_DEBUG("engine", "Version vector not exportable: cached=%zu limit=%zu",
@@ -374,11 +376,17 @@ std::vector<SequenceTracker::VectorEntry> Engine::export_version_vector(std::siz
     return vector_cache_;
 }
 
+uint64_t Engine::version_vector_covers() const {
+    std::lock_guard<std::mutex> lock(vector_cache_mtx_);
+    return vector_cache_covers_;
+}
+
 void Engine::refresh_version_vector_cache() {
-    // Caller holds mtx_. What moved is in what this exports, so the list is dropped with it.
+    // Caller holds mtx_. What moved is in what this exports, so the list is dropped with it - and
+    // how far the list had got is how far the copy reaches.
     bool truncated = false;
     auto entries = seq_tracker_.export_vector(kMaxPersistedVectorEntries, truncated);
-    (void)seq_tracker_.take_moved_frontiers();
+    const uint64_t covers = seq_tracker_.take_moved_frontiers().listings;
     vector_cache_index_.clear();
     for (std::size_t i = 0; i < entries.size(); ++i) {
         vector_cache_index_[entries[i].key][entries[i].origin] = i;
@@ -387,6 +395,7 @@ void Engine::refresh_version_vector_cache() {
         std::lock_guard<std::mutex> lock(vector_cache_mtx_);
         vector_cache_           = std::move(entries);
         vector_cache_truncated_ = truncated;
+        vector_cache_covers_    = covers;
     }
 }
 
@@ -424,6 +433,7 @@ void Engine::update_version_vector_cache() {
                 vector_cache_truncated_ = true;
             }
         }
+        vector_cache_covers_ = moved.listings;
         entries   = vector_cache_.size();
         truncated = vector_cache_truncated_;
     }

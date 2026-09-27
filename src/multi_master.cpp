@@ -1031,16 +1031,18 @@ void MultiMasterManager::io_loop() {
         // epoll_wait above returns at least every 500 ms, so this runs regularly without a
         // timer of its own: a peer that completed the handshake and never sent a version
         // vector (protocol 1, or a version it could not state) must still get its catch-up.
+        bool rechecks = false;
         {
             std::lock_guard<std::mutex> lock(mtx_);
             start_overdue_catchups();
+            rechecks = recheck_deferred_vectors();
         }
 
         // Between passes rather than inside an event's handling: a round reads the WAL without
         // `mtx_`, which every local write takes (#178). Its own boundary, for the reason each
         // event has one - this thread staying alive is the point (#112).
         try {
-            wait_ms = run_catchup_rounds() ? 0 : 500;
+            wait_ms = run_catchup_rounds() ? 0 : (rechecks ? MM_VV_RECHECK_POLL_MS : 500);
         } catch (const std::exception& e) {
             engine_.registry().increment_counter("ob_mm_io_errors_total");
             wait_ms = 500;
@@ -1091,6 +1093,7 @@ void MultiMasterManager::close_connection_socket(PeerConnection& conn, const cha
     conn.auth_nonce.clear();
     conn.recv_buf.clear();
     conn.send_buf.clear();
+    conn.vector_recheck_listings = 0;
     on_peer_disconnected(conn);
 }
 
@@ -1827,6 +1830,10 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
             OB_LOG_WARN("mm", "Peer %u sent an unusable version vector — sending everything",
                         peer.node_id);
         }
+        // It has said something, so the handshake's deadline for its silence is over - and has to
+        // be, now that the decision below can be put off with `catchup_started` still false: the
+        // deadline would take the wait for a tick for silence and send everything (#180 part D).
+        peer.vector_deadline_ms = 0;
         // Only scan the WAL if this peer is actually missing something. Reconciliation (#57)
         // sends a vector to every peer on a timer, and a vector arriving used to start a full
         // scan of the retained WAL — measured in the harness as `scanned=543 (9662010 bytes)
@@ -1839,7 +1846,10 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
         // back through the handshake, a backlog dropped for not draining now closes the
         // connection (#69), and a record the receiver refused leaves its own frontier behind, so
         // peer_lacks is not empty. If a future change can drop a record while both sides stay
-        // connected and both frontiers keep moving, this shortcut has to go with it.
+        // connected and both frontiers keep moving, this shortcut has to go with it. The evidence
+        // is read from the copy of our vector, though, so it is only evidence once the copy has
+        // what the tracker had when the vector arrived - which decide_catchup_from_vector() waits
+        // for (#180 part D).
         // A node that holds nothing cannot be caught up honestly: it will see sequence 5000
         // before it ever sees 1, so it can never claim contiguity for a foreign origin and its
         // peers keep resending records it already has (#67). A snapshot carries the sender's own
@@ -1851,21 +1861,7 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
             return;
         }
 
-        bool truncated = false;
-        const auto ours = engine_.export_version_vector(MM_MAX_VV_ENTRIES, truncated);
-        const VectorDiff diff = compare_vectors(ours, peer.peer_vector, peer.node_id);
-
-        if (!peer.peer_vector.wants_everything() && diff.peer_lacks.empty()) {
-            peer.catchup_started = true;
-            OB_LOG_DEBUG("mm",
-                         "Peer %u holds everything we do (%zu entries compared) — no scan",
-                         peer.node_id, ours.size());
-            return;
-        }
-
-        OB_LOG_INFO("mm", "Peer %u is missing %zu (symbol, origin) ranges — scanning",
-                    peer.node_id, diff.peer_lacks.size());
-        start_catchup_to_peer(peer);
+        decide_catchup_from_vector(peer, /*may_defer=*/true);
         return;
     }
 
@@ -2134,8 +2130,9 @@ void MultiMasterManager::process_handshake(PeerConnection& peer,
     // starts when its vector arrives, or when MM_VV_GRACE_MS passes and we assume it holds
     // nothing.
     send_version_vector(peer);
-    peer.vector_deadline_ms = now_ms() + MM_VV_GRACE_MS;
-    peer.catchup_started    = false;
+    peer.vector_deadline_ms      = now_ms() + MM_VV_GRACE_MS;
+    peer.catchup_started         = false;
+    peer.vector_recheck_listings = 0;
 
     if (msg.protocol_version < 2) {
         OB_LOG_WARN("mm",
@@ -2216,6 +2213,78 @@ ReconcileReport MultiMasterManager::reconcile_with_peers() {
                  report.peers_contacted, report.vectors_sent,
                  report.we_lack.size(), report.peer_lacks.size());
     return report;
+}
+
+void MultiMasterManager::decide_catchup_from_vector(PeerConnection& peer, bool may_defer) {
+    bool truncated = false;
+    uint64_t covers = 0;
+    const auto ours = engine_.export_version_vector(MM_MAX_VV_ENTRIES, truncated, &covers);
+    const VectorDiff diff = compare_vectors(ours, peer.peer_vector, peer.node_id);
+
+    if (!peer.peer_vector.wants_everything() && diff.peer_lacks.empty()) {
+        // "Lacks nothing" is only as good as the copy it was read from, which a tick brings up to
+        // date: a peer back within a tick of the writes it missed was compared with a copy that
+        // did not have them, judged to hold them, and sent them at the next reconciliation - 100 of
+        // 2 100 rows 3 s after it reconnected (#180 part D, PR #188's CI). The listing is read after
+        // the copy, so a tick between the two can only make this more careful.
+        const uint64_t listed = engine_.frontier_listings();
+        if (may_defer && listed > covers) {
+            if (peer.vector_recheck_listings == 0) peer.vector_recheck_since_ms = now_ms();
+            peer.vector_recheck_listings = listed;
+            OB_LOG_DEBUG("mm",
+                         "Peer %u holds everything the copy of this node's vector says it holds, "
+                         "but the copy is behind the tracker (listing %llu of %llu); deciding "
+                         "after the next tick",
+                         peer.node_id, static_cast<unsigned long long>(covers),
+                         static_cast<unsigned long long>(listed));
+            return;
+        }
+        peer.vector_recheck_listings = 0;
+        peer.catchup_started = true;
+        OB_LOG_DEBUG("mm",
+                     "Peer %u holds everything we do (%zu entries compared) — no scan",
+                     peer.node_id, ours.size());
+        return;
+    }
+
+    peer.vector_recheck_listings = 0;
+    OB_LOG_INFO("mm", "Peer %u is missing %zu (symbol, origin) ranges — scanning",
+                peer.node_id, diff.peer_lacks.size());
+    start_catchup_to_peer(peer);
+}
+
+bool MultiMasterManager::recheck_deferred_vectors() {
+    bool waiting = false;
+    const uint64_t now = now_ms();
+    for (auto& [node_id, peer] : peers_) {
+        if (peer.vector_recheck_listings == 0) continue;
+        if (!peer.connected || !peer.handshake_done) {
+            peer.vector_recheck_listings = 0;
+            continue;
+        }
+        const uint64_t covers = engine_.version_vector_covers();
+        if (covers >= peer.vector_recheck_listings) {
+            OB_LOG_DEBUG("mm", "Peer %u: deciding with the copy a tick brought up to date "
+                               "(listing %llu)",
+                         node_id, static_cast<unsigned long long>(covers));
+            peer.vector_recheck_listings = 0;
+            decide_catchup_from_vector(peer, /*may_defer=*/false);
+            continue;
+        }
+        const uint64_t waited = now - peer.vector_recheck_since_ms;
+        if (waited >= MM_VV_GRACE_MS) {
+            OB_LOG_WARN("mm",
+                        "The copy of this node's vector has not caught up with the tracker in "
+                        "%llu ms; catching peer %u up from its own vector rather than waiting "
+                        "longer",
+                        static_cast<unsigned long long>(waited), node_id);
+            peer.vector_recheck_listings = 0;
+            start_catchup_to_peer(peer);
+            continue;
+        }
+        waiting = true;
+    }
+    return waiting;
 }
 
 void MultiMasterManager::start_overdue_catchups() {

@@ -545,15 +545,31 @@ public:
     /// close that cycle — measured as a node that stopped answering writes entirely.
     ///
     /// A stale cache understates what we hold, so a peer sends more than it needs to and the
-    /// duplicates are dropped on arrival. The staleness window is one flush interval.
+    /// duplicates are dropped on arrival. The staleness window is one flush interval. And it
+    /// understates what a peer **lacks** - the direction that costs: compared with a copy
+    /// without the writes a returning peer missed, the peer holds everything, so the mesh manager
+    /// does not conclude that from a copy behind the tracker (`covers`, #180 part D).
     /// How many sequence numbers from `origin` are held above the frontier for this symbol key.
     ///
     /// A test seam, and a diagnostic: a non-zero count means this node has seen records it cannot
     /// yet claim contiguity for, which is exactly the state a restart used to lose (#75).
     std::size_t above_frontier_size(const std::string& key, uint16_t origin);
 
+    ///
+    /// `covers`, when given, is the tracker's `listings()` the copy reaches: a copy is exact when
+    /// `frontier_listings()` is not past it, and a peer's vector compared with one that is behind
+    /// can be judged to hold writes it missed (#180 part D).
     std::vector<SequenceTracker::VectorEntry> export_version_vector(std::size_t limit,
-                                                                    bool& truncated) const;
+                                                                    bool& truncated,
+                                                                    uint64_t* covers = nullptr) const;
+
+    /// The tracker's `SequenceTracker::listings()` now: readable without `mtx_`, and so from under
+    /// the mesh manager's lock, which `export_version_vector()` is for (#180 part D).
+    uint64_t frontier_listings() const { return seq_tracker_.listings(); }
+
+    /// The `covers` of `export_version_vector()` without the copy: what the mesh manager waits
+    /// for when a decision was put off until the copy caught up. Under `vector_cache_mtx_` only.
+    uint64_t version_vector_covers() const;
 
     /// Get the HLC clock (nullptr if multi-master is not enabled).
     HybridLogicalClock* hlc() const { return hlc_.get(); }
@@ -748,6 +764,9 @@ private:
     mutable std::mutex                   vector_cache_mtx_;
     std::vector<SequenceTracker::VectorEntry> vector_cache_;
     bool                                 vector_cache_truncated_{false};
+    /// The tracker's `listings()` at the take the copy was last brought up to date from (#180
+    /// part D). Under `vector_cache_mtx_`, with the copy.
+    uint64_t                             vector_cache_covers_{0};
 
     /// Rebuild the snapshot above from the tracker, whole. Caller must hold mtx_.
     void refresh_version_vector_cache();

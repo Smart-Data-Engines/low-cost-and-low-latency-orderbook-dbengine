@@ -273,6 +273,11 @@ bool MultiMasterManager::try_drain_send_buf_for_test(PeerConnection& peer) {
     return try_drain_send_buf(peer);
 }
 
+bool MultiMasterManager::recheck_deferred_vectors_for_test() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return recheck_deferred_vectors();
+}
+
 void MultiMasterManager::process_recv_buf_for_test(PeerConnection& peer) {
     std::lock_guard<std::mutex> lock(mtx_);
     process_recv_buf(peer);

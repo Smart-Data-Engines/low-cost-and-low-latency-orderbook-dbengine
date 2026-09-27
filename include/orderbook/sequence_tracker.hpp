@@ -15,6 +15,7 @@
 // off by a zero rather than merely forgotten — nothing filled the field in, so
 // `prev_seq != 0` never held and the check never ran.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <set>
@@ -131,8 +132,23 @@ public:
     struct MovedFrontiers {
         bool                     all{false};
         std::vector<VectorEntry> moved;
+        /// `listings()` as this take left it: a copy built from it holds every frontier that moved
+        /// up to that listing, and whether one moved since is `listings()` being past it.
+        uint64_t                 listings{0};
     };
     MovedFrontiers take_moved_frontiers();
+
+    /// How many times a (symbol, origin) has gone onto the list `take_moved_frontiers()` hands out,
+    /// and `reset()`s: monotonic, and readable **without** the engine's lock - the one thing here
+    /// that is (#180 part D).
+    ///
+    /// After a take, the first frontier of any pair to move lists that pair, so "nothing listed
+    /// since the take" is "no frontier moved since the take": a copy of the vector kept from the
+    /// takes knows it is exact when this still equals the `listings` of its last one. The mesh
+    /// manager asks that before it tells a peer it lacks nothing, from under its own lock, which
+    /// the write path takes after the engine's - so it cannot ask the tracker itself. It rises at
+    /// most once a pair a take, not once a record.
+    uint64_t listings() const { return listings_.load(std::memory_order_acquire); }
 
     /// Records above the frontier held per (key, origin) before the set stops growing.
     ///
@@ -203,9 +219,16 @@ private:
         OriginState*       state;
     };
 
+    /// One more listing; see listings(). Its only writer holds the engine's lock, so a load and a
+    /// store, not a read-modify-write.
+    void count_listing() {
+        listings_.store(listings_.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+    }
+
     std::unordered_map<std::string, SymbolState> symbols_;
     std::vector<Moved> moved_;         ///< see take_moved_frontiers()
     bool               moved_all_{true};
+    std::atomic<uint64_t> listings_{0};   ///< see listings()
 };
 
 }  // namespace ob
