@@ -536,6 +536,22 @@ decide what convergence means when both sides wrote. And the first few megabytes
 are invisible in the per-peer queue gauge, as measured above: the records lag is the number to alert
 on, not `ob_mm_peer_send_buf_bytes`.
 
+### Conflicts, and what counts as one
+
+A conflict is two nodes writing one price level; last-writer-wins by the hybrid clock decides it
+(`docs/architecture.md`). `ob_mm_conflicts_total` counts them and `MM_CONFLICTS` lists the latest.
+The log says them by the window, not a line each:
+
+```
+Conflict detected: REMOTE wins for BTCUSDT/BINANCE/0/6500000 (origin 2 against 1, remote_hlc={...} local_hlc={...}); more within 10 s are counted, not logged
+1523 more conflict(s) between origins in the 12 s since the last line, and now: LOCAL wins for BTCUSDT/BINANCE/1/6500100 (origin 3 against 1)
+```
+
+A steady rate of these is the mesh doing what it is for - two writers of one instrument - and the
+counter is the thing to graph. The node that wrote a level last, writing it again, is **not** a
+conflict: until #182 it was, and a mesh logged one for nearly every replicated update (60 MB of log
+on each receiver for 300 000 writes from one node).
+
 ### A replica that is slow, rather than one that is behind
 
 `replica fd=9 is not draining: queued=16780544 > 16777216 - dropping the connection` means this
