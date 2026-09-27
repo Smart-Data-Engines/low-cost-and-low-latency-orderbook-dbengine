@@ -656,10 +656,19 @@ When a node receives a WAL record from a peer:
 resolve(key, remote_hlc, remote_origin):
     local_state = level_states[key]
     if not found → NO_CONFLICT (first write)
+    if local_state.origin == remote_origin:              # the level's last writer, again (#182)
+        remote_hlc > local_state.hlc → NO_CONFLICT       # the book's next update
+        otherwise                    → REJECT_STALE      # a late copy
     if remote_hlc > local_state.hlc → APPLY_REMOTE
     if remote_hlc < local_state.hlc → REJECT_REMOTE
     if equal physical + logical → tie-break by node_id (higher wins)
 ```
+
+A conflict is two origins writing one level; only those enter `MM_CONFLICTS` and
+`ob_mm_conflicts_total`, and the log says them by the window: the first at INFO with its details,
+the ones within ten seconds counted and said as one line with the next after it. Until #182 the
+level's last writer updating it again was a conflict too, which on a mesh is nearly every replicated
+update: 290 000 counted and logged for 300 000 writes from one node, 60.6 MB of log on each receiver.
 
 ### Anti-Entropy Protocol
 

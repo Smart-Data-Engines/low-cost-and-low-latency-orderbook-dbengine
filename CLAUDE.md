@@ -3755,6 +3755,12 @@ Learned the hard way. Check here before debugging.
      The holes are in the tracker's frontiers and held sets, which the vector writes down and a
      snapshot carries - so the rejoined node takes its peer's stuck state back (#187). Found writing
      the operations notes, by following `adopt_snapshot_sequence_state()`, not by running the repair.
+489. **A condition that is the common case is not a condition.** "Conflict detected" was written for
+     two nodes writing one price level, and fired for the next update of a level from the node that
+     wrote it last - on a mesh, nearly every replicated update: 290 000 lines for 300 000 writes. The
+     counter beside it said the same. Before logging or counting a condition, ask what fraction of
+     events it will be; and a test that pins the numbers it produced (`RingBufferEviction` counted one
+     origin writing after itself as conflicts) pins the defect with them.
 
 ## Current state and open problems
 
@@ -3816,8 +3822,10 @@ each origin numbers its own records of a symbol - one counter per symbol, raised
 numbers, gave each origin's stream holes when two nodes wrote it, every node's frontier stopped at
 the first, and a node that missed rows was judged to hold them, 10 000 of 11 000 for good - and a
 segment records how far this node's own numbers go, so a restart continues from exactly there and
-declares only what it wrote (pitfalls 486-488). **#169, #175, #176, #177, #182, #186 and #187 are
-open P1s**: #187 is the holes the old numbering left in every node's tracker, which a snapshot
+declares only what it wrote (pitfalls 486-488). **#182 is closed**: every replicated update of a
+level a node held was logged at INFO as a conflict - 290 000 lines, 60.6 MB, on each receiver of
+300 000 writes from one node - and only two origins writing one level are one now, said by the window
+(pitfall 489). **#169, #175, #176, #177, #186 and #187 are open P1s**: #187 is the holes the old numbering left in every node's tracker, which a snapshot
 carries and nothing clears but a new mesh; an exchange name with a dot makes two instruments one key - `A.B` on
 `C` and `A` on `B.C` share a live book, sequence numbers and stored rows, measured on the wire;
 sharding by symbol has no control plane: no shard writes itself or the map to etcd, each owns every

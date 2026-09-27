@@ -24,6 +24,15 @@ ConflictResolver::ConflictResolver(size_t max_log_entries)
 ConflictResolution ConflictResolver::resolve(const ConflictKey& key,
                                              const HLCTimestamp& remote_hlc,
                                              uint16_t remote_origin) {
+    // Wall-clock time for the conflict entry - which this comment promised while the line under it
+    // read `steady_clock`, a count from this machine's boot (#163).
+    return resolve(key, remote_hlc, remote_origin, wall_clock_ns());
+}
+
+ConflictResolution ConflictResolver::resolve(const ConflictKey& key,
+                                             const HLCTimestamp& remote_hlc,
+                                             uint16_t remote_origin,
+                                             uint64_t now_ns) {
     std::lock_guard<std::mutex> lock(mtx_);
 
     auto it = level_states_.find(key);
@@ -38,115 +47,99 @@ ConflictResolution ConflictResolver::resolve(const ConflictKey& key,
     const auto& local_state = it->second;
     const auto& local_hlc = local_state.hlc;
 
-    // Wall-clock time for the conflict entry - which this comment promised while the line under it
-    // read `steady_clock`, a count from this machine's boot (#163).
-    const uint64_t now_ns = wall_clock_ns();
-
     // Compare using HLC total order (physical_ns → logical → node_id).
     // But for tie-break we only compare physical_ns and logical first,
     // then use node_id as the tie-breaker (higher node_id wins).
+    const bool remote_newer = remote_hlc.physical_ns > local_hlc.physical_ns ||
+                              (remote_hlc.physical_ns == local_hlc.physical_ns &&
+                               remote_hlc.logical > local_hlc.logical);
+    const bool remote_older = remote_hlc.physical_ns < local_hlc.physical_ns ||
+                              (remote_hlc.physical_ns == local_hlc.physical_ns &&
+                               remote_hlc.logical < local_hlc.logical);
 
-    if (remote_hlc.physical_ns > local_hlc.physical_ns ||
-        (remote_hlc.physical_ns == local_hlc.physical_ns &&
-         remote_hlc.logical > local_hlc.logical)) {
-        // Remote is strictly newer (ignoring node_id).
-        ConflictEntry entry{};
-        entry.key = key;
-        entry.local_hlc = local_hlc;
-        entry.remote_hlc = remote_hlc;
-        entry.local_origin = local_state.origin;
-        entry.remote_origin = remote_origin;
-        entry.result = ConflictEntry::REMOTE_WINS;
-        entry.detected_at_ns = now_ns;
-        log_conflict(entry);
-
-        OB_LOG_INFO("conflict",
-                    "Conflict detected: REMOTE wins for %s/%s/%u/%ld "
-                    "(remote_hlc={%lu,%u,%u} > local_hlc={%lu,%u,%u})",
-                    key.symbol.c_str(), key.exchange.c_str(),
-                    static_cast<unsigned>(key.side), static_cast<long>(key.price),
-                    static_cast<unsigned long>(remote_hlc.physical_ns),
-                    static_cast<unsigned>(remote_hlc.logical),
-                    static_cast<unsigned>(remote_hlc.node_id),
-                    static_cast<unsigned long>(local_hlc.physical_ns),
-                    static_cast<unsigned>(local_hlc.logical),
-                    static_cast<unsigned>(local_hlc.node_id));
-
-        return ConflictResolution::APPLY_REMOTE;
+    // The origin that wrote this level last, writing it again: in the order its own clock gives,
+    // the next update of a level is the ordinary life of a book, not two writers disagreeing - and
+    // counting it as a conflict logged one for nearly every replicated update (#182). Newer applies;
+    // anything else from it is a late copy of what it already said.
+    if (local_state.origin == remote_origin) {
+        OB_LOG_DEBUG("conflict", "resolve: key=%s/%s/%u/%ld origin %u again, %s",
+                     key.symbol.c_str(), key.exchange.c_str(),
+                     static_cast<unsigned>(key.side), static_cast<long>(key.price),
+                     static_cast<unsigned>(remote_origin), remote_newer ? "newer" : "not newer");
+        return remote_newer ? ConflictResolution::NO_CONFLICT : ConflictResolution::REJECT_STALE;
     }
 
-    if (remote_hlc.physical_ns < local_hlc.physical_ns ||
-        (remote_hlc.physical_ns == local_hlc.physical_ns &&
-         remote_hlc.logical < local_hlc.logical)) {
-        // Local is strictly newer (ignoring node_id).
-        ConflictEntry entry{};
-        entry.key = key;
-        entry.local_hlc = local_hlc;
-        entry.remote_hlc = remote_hlc;
-        entry.local_origin = local_state.origin;
-        entry.remote_origin = remote_origin;
-        entry.result = ConflictEntry::LOCAL_WINS;
-        entry.detected_at_ns = now_ns;
-        log_conflict(entry);
-
-        OB_LOG_INFO("conflict",
-                    "Conflict detected: LOCAL wins for %s/%s/%u/%ld "
-                    "(local_hlc={%lu,%u,%u} > remote_hlc={%lu,%u,%u})",
-                    key.symbol.c_str(), key.exchange.c_str(),
-                    static_cast<unsigned>(key.side), static_cast<long>(key.price),
-                    static_cast<unsigned long>(local_hlc.physical_ns),
-                    static_cast<unsigned>(local_hlc.logical),
-                    static_cast<unsigned>(local_hlc.node_id),
-                    static_cast<unsigned long>(remote_hlc.physical_ns),
-                    static_cast<unsigned>(remote_hlc.logical),
-                    static_cast<unsigned>(remote_hlc.node_id));
-
-        return ConflictResolution::REJECT_REMOTE;
-    }
-
-    // Equal physical_ns and logical — tie-break by node_id (higher wins).
-    if (remote_hlc.node_id > local_hlc.node_id) {
-        ConflictEntry entry{};
-        entry.key = key;
-        entry.local_hlc = local_hlc;
-        entry.remote_hlc = remote_hlc;
-        entry.local_origin = local_state.origin;
-        entry.remote_origin = remote_origin;
-        entry.result = ConflictEntry::REMOTE_WINS;
-        entry.detected_at_ns = now_ns;
-        log_conflict(entry);
-
-        OB_LOG_INFO("conflict",
-                    "Conflict detected: REMOTE wins (tie-break) for %s/%s/%u/%ld "
-                    "(remote_node=%u > local_node=%u)",
-                    key.symbol.c_str(), key.exchange.c_str(),
-                    static_cast<unsigned>(key.side), static_cast<long>(key.price),
-                    static_cast<unsigned>(remote_hlc.node_id),
-                    static_cast<unsigned>(local_hlc.node_id));
-
-        return ConflictResolution::APPLY_REMOTE;
-    }
-
-    // local node_id >= remote node_id → local wins.
+    // Two origins wrote this level: a conflict, decided last-writer-wins, with the higher node id
+    // winning a tie.
     ConflictEntry entry{};
     entry.key = key;
     entry.local_hlc = local_hlc;
     entry.remote_hlc = remote_hlc;
     entry.local_origin = local_state.origin;
     entry.remote_origin = remote_origin;
-    entry.result = ConflictEntry::LOCAL_WINS;
     entry.detected_at_ns = now_ns;
+    const bool remote_wins = remote_newer || (!remote_older && remote_hlc.node_id > local_hlc.node_id);
+    entry.result = remote_wins ? ConflictEntry::REMOTE_WINS : ConflictEntry::LOCAL_WINS;
     log_conflict(entry);
+    say(entry, now_ns);
+    return remote_wins ? ConflictResolution::APPLY_REMOTE : ConflictResolution::REJECT_REMOTE;
+}
 
-    OB_LOG_INFO("conflict",
-                "Conflict detected: LOCAL wins (tie-break) for %s/%s/%u/%ld "
-                "(local_node=%u >= remote_node=%u)",
-                key.symbol.c_str(), key.exchange.c_str(),
-                static_cast<unsigned>(key.side), static_cast<long>(key.price),
-                static_cast<unsigned>(local_hlc.node_id),
-                static_cast<unsigned>(remote_hlc.node_id));
+// ── say ───────────────────────────────────────────────────────────────────────
 
-    return ConflictResolution::REJECT_REMOTE;
+void ConflictResolver::say(const ConflictEntry& e, uint64_t now_ns) {
+    // Caller holds mtx_.
+    const char* winner = e.result == ConflictEntry::REMOTE_WINS ? "REMOTE" : "LOCAL";
+    const bool tie = e.remote_hlc.physical_ns == e.local_hlc.physical_ns &&
+                     e.remote_hlc.logical == e.local_hlc.logical;
+    if (window_open_ && now_ns - window_started_ns_ < kLogWindowNs) {
+        ++unsaid_;
+        OB_LOG_DEBUG("conflict",
+                     "Conflict: %s wins%s for %s/%s/%u/%ld (origin %u against %u, "
+                     "remote_hlc={%lu,%u,%u} local_hlc={%lu,%u,%u})",
+                     winner, tie ? " (tie-break)" : "", e.key.symbol.c_str(),
+                     e.key.exchange.c_str(), static_cast<unsigned>(e.key.side),
+                     static_cast<long>(e.key.price), static_cast<unsigned>(e.remote_origin),
+                     static_cast<unsigned>(e.local_origin),
+                     static_cast<unsigned long>(e.remote_hlc.physical_ns),
+                     static_cast<unsigned>(e.remote_hlc.logical),
+                     static_cast<unsigned>(e.remote_hlc.node_id),
+                     static_cast<unsigned long>(e.local_hlc.physical_ns),
+                     static_cast<unsigned>(e.local_hlc.logical),
+                     static_cast<unsigned>(e.local_hlc.node_id));
+        return;
+    }
+    if (unsaid_ > 0) {
+        // The window's count, said with the conflict that ends it; the counter and MM_CONFLICTS
+        // have every one.
+        OB_LOG_INFO("conflict",
+                    "%llu more conflict(s) between origins in the %.0f s since the last line, and "
+                    "now: %s wins%s for %s/%s/%u/%ld (origin %u against %u)",
+                    static_cast<unsigned long long>(unsaid_),
+                    static_cast<double>(now_ns - window_started_ns_) / 1e9, winner,
+                    tie ? " (tie-break)" : "", e.key.symbol.c_str(), e.key.exchange.c_str(),
+                    static_cast<unsigned>(e.key.side), static_cast<long>(e.key.price),
+                    static_cast<unsigned>(e.remote_origin), static_cast<unsigned>(e.local_origin));
+    } else {
+        OB_LOG_INFO("conflict",
+                    "Conflict detected: %s wins%s for %s/%s/%u/%ld (origin %u against %u, "
+                    "remote_hlc={%lu,%u,%u} local_hlc={%lu,%u,%u}); more within %.0f s are "
+                    "counted, not logged",
+                    winner, tie ? " (tie-break)" : "", e.key.symbol.c_str(),
+                    e.key.exchange.c_str(), static_cast<unsigned>(e.key.side),
+                    static_cast<long>(e.key.price), static_cast<unsigned>(e.remote_origin),
+                    static_cast<unsigned>(e.local_origin),
+                    static_cast<unsigned long>(e.remote_hlc.physical_ns),
+                    static_cast<unsigned>(e.remote_hlc.logical),
+                    static_cast<unsigned>(e.remote_hlc.node_id),
+                    static_cast<unsigned long>(e.local_hlc.physical_ns),
+                    static_cast<unsigned>(e.local_hlc.logical),
+                    static_cast<unsigned>(e.local_hlc.node_id),
+                    static_cast<double>(kLogWindowNs) / 1e9);
+    }
+    window_open_       = true;
+    window_started_ns_ = now_ns;
+    unsaid_            = 0;
 }
 
 // ── update_hlc ────────────────────────────────────────────────────────────────

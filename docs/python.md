@@ -496,7 +496,7 @@ The `multi_master` dict contains:
 - `node_id` (int) — this node's identifier
 - `peer_count` (int) — total known peers
 - `connected_peers` (int) — currently connected peers
-- `mm_conflicts_total` (int) — total conflicts resolved
+- `mm_conflicts_total` (int) — conflicts resolved: two origins writing one level (an origin updating a level it wrote last is not one, #182)
 - `anti_entropy_runs` (int) — anti-entropy cycles completed
 - `hlc_physical_ns` (int) — current HLC physical time
 - `hlc_logical` (int) — current HLC logical counter

@@ -68,6 +68,8 @@ RC_GTEST_PROP(ConflictResolverProperty,
     // tested separately.
     RC_PRE(local_hlc.physical_ns != remote_hlc.physical_ns ||
            local_hlc.logical != remote_hlc.logical);
+    // And when one origin wrote both: that is not a conflict (#182), and has its own property.
+    RC_PRE(local_hlc.node_id != remote_hlc.node_id);
 
     ob::ConflictResolver resolver;
     resolver.update_hlc(conflict_key, local_hlc, local_hlc.node_id);
@@ -219,12 +221,14 @@ TEST(ConflictResolverUnit, RingBufferEviction) {
     ob::HLCTimestamp local_ts{1000, 0, 1};
     resolver.update_hlc(key, local_ts, 1);
 
-    // Generate max_entries + 3 conflicts to overflow the ring buffer.
+    // Generate max_entries + 3 conflicts to overflow the ring buffer - each from the origin that did
+    // not write the level last, which is what makes it one (#182: origin 2 writing again after
+    // itself was counted, and this test counted it).
     for (size_t i = 0; i < max_entries + 3; ++i) {
-        ob::HLCTimestamp remote_ts{2000 + i, 0, 2};
-        resolver.resolve(key, remote_ts, 2);
-        // Update local state so next resolve also detects a conflict.
-        resolver.update_hlc(key, remote_ts, 2);
+        const uint16_t origin = (i % 2 == 0) ? 2 : 3;
+        ob::HLCTimestamp remote_ts{2000 + i, 0, origin};
+        resolver.resolve(key, remote_ts, origin);
+        resolver.update_hlc(key, remote_ts, origin);
     }
 
     const auto log = resolver.get_log(max_entries + 10);
@@ -286,4 +290,102 @@ TEST(ConflictResolverUnit, ClearLogPreservesLevelStates) {
     // should still detect a conflict (not NO_CONFLICT).
     const auto result = resolver.resolve(key, {3000, 0, 3}, 3);
     EXPECT_NE(result, ob::ConflictResolution::NO_CONFLICT);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// #182: the origin that wrote a level last, writing it again, is not a conflict
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Whatever the two timestamps: newer applies, anything else is a late copy, and neither is logged
+// or counted as a conflict - a book updating a level it holds is its ordinary life.
+RC_GTEST_PROP(ConflictResolverProperty, OneOriginWritingALevelAgainIsNeverAConflict, ()) {
+    const auto conflict_key = *rc::gen::arbitrary<ob::ConflictKey>();
+    const auto local_hlc = *rc::gen::arbitrary<ob::HLCTimestamp>();
+    const auto remote_hlc = *rc::gen::arbitrary<ob::HLCTimestamp>();
+    const auto origin = *rc::gen::arbitrary<uint16_t>();
+
+    ob::ConflictResolver resolver;
+    resolver.update_hlc(conflict_key, local_hlc, origin);
+    const auto result = resolver.resolve(conflict_key, remote_hlc, origin);
+
+    const bool remote_newer =
+        (remote_hlc.physical_ns > local_hlc.physical_ns) ||
+        (remote_hlc.physical_ns == local_hlc.physical_ns &&
+         remote_hlc.logical > local_hlc.logical);
+    RC_ASSERT(result == (remote_newer ? ob::ConflictResolution::NO_CONFLICT
+                                      : ob::ConflictResolution::REJECT_STALE));
+    RC_ASSERT(resolver.total_conflicts() == 0u);
+    RC_ASSERT(resolver.get_log(10).empty());
+}
+
+TEST(ConflictResolverUnit, TheOriginThatWroteALevelLastWritingItAgainIsNotAConflict) {
+    // #178's measurement: 300 000 single-level writes from one node, 301 985 lines of "Conflict
+    // detected" on the node that received them - one for nearly every replicated update.
+    ob::ConflictResolver resolver;
+    const ob::ConflictKey key{"BTCUSD", "BINANCE", 0, 50000};
+    resolver.update_hlc(key, {1000, 0, 1}, 1);
+
+    EXPECT_EQ(resolver.resolve(key, {2000, 0, 1}, 1), ob::ConflictResolution::NO_CONFLICT)
+        << "the next update from the origin that wrote the level is not applied as a plain update";
+    EXPECT_EQ(resolver.resolve(key, {500, 0, 1}, 1), ob::ConflictResolution::REJECT_STALE)
+        << "a late copy of an older update from the same origin is not refused as stale";
+    EXPECT_EQ(resolver.resolve(key, {1000, 0, 1}, 1), ob::ConflictResolution::REJECT_STALE)
+        << "the same update again is not refused as stale";
+    EXPECT_EQ(resolver.total_conflicts(), 0u);
+    EXPECT_TRUE(resolver.get_log(10).empty());
+    EXPECT_TRUE(resolver.per_symbol_conflicts().empty());
+
+    // And another origin's is one, as it always was.
+    EXPECT_EQ(resolver.resolve(key, {3000, 0, 2}, 2), ob::ConflictResolution::APPLY_REMOTE);
+    EXPECT_EQ(resolver.total_conflicts(), 1u);
+}
+
+TEST(ConflictResolverUnit, ConflictsBetweenOriginsAreLoggedAsAWindowNotALineEach) {
+    // The first opens a window and is said with its details; the ones inside it are counted, and
+    // said as one line with the first after it. The counter and MM_CONFLICTS keep every one.
+    constexpr uint64_t kSecond = 1'000'000'000ULL;
+    const uint64_t t0 = 1'700'000'000ULL * kSecond;
+    ob::ConflictResolver resolver;
+    const ob::ConflictKey key{"ETHUSD", "BINANCE", 1, 3000};
+    testing::internal::CaptureStderr();
+    for (uint64_t i = 0; i < 6; ++i) {
+        const uint16_t origin = (i % 2 == 0) ? 2 : 3;
+        resolver.update_hlc(key, {1000 + i, 0, static_cast<uint16_t>(5 - origin)},
+                            static_cast<uint16_t>(5 - origin));      // the other origin wrote it
+        resolver.resolve(key, {2000 + i, 0, origin}, origin, t0 + i * kSecond);
+    }
+    resolver.update_hlc(key, {9000, 0, 3}, 3);
+    resolver.resolve(key, {9500, 0, 2}, 2, t0 + 11 * kSecond);   // past the window
+    for (uint64_t i = 0; i < 2; ++i) {                             // two inside the next one
+        resolver.update_hlc(key, {10000 + i, 0, 3}, 3);
+        resolver.resolve(key, {11000 + i, 0, 2}, 2, t0 + (12 + i) * kSecond);
+    }
+    resolver.update_hlc(key, {20000, 0, 3}, 3);
+    resolver.resolve(key, {21000, 0, 2}, 2, t0 + 25 * kSecond);   // and past that one
+    const std::string said = testing::internal::GetCapturedStderr();
+
+    size_t info = 0, first = 0, summary = 0, second = 0;
+    for (size_t at = said.find('\n'), from = 0; at != std::string::npos;
+         from = at + 1, at = said.find('\n', from)) {
+        const std::string line = said.substr(from, at - from);
+        if (line.find("\"component\":\"conflict\"") == std::string::npos) continue;
+        if (line.find("\"level\":\"INFO\"") == std::string::npos) continue;
+        ++info;
+        if (line.find("Conflict detected: REMOTE wins for ETHUSD/BINANCE/1/3000") != std::string::npos) {
+            ++first;
+        }
+        if (line.find("5 more conflict(s) between origins in the 11 s since the last line") !=
+            std::string::npos) {
+            ++summary;
+        }
+        if (line.find("2 more conflict(s) between origins in the 14 s since the last line") !=
+            std::string::npos) {
+            ++second;
+        }
+    }
+    EXPECT_EQ(info, 3u) << said;
+    EXPECT_EQ(first, 1u) << "the window's first conflict was not said with its details";
+    EXPECT_EQ(summary, 1u) << "the conflicts inside the window were not said as one count";
+    EXPECT_EQ(second, 1u) << "the next window did not count from its own start";
+    EXPECT_EQ(resolver.total_conflicts(), 10u) << "a conflict inside a window was not counted";
 }
