@@ -376,6 +376,11 @@ ob_add_engine_test(test_mm_per_origin_numbering
     test_mm_per_origin_numbering.cpp
 )
 
+# A mesh node's numbering from before per-origin numbers, closed once at the upgrade (#187).
+ob_add_engine_test(test_mm_legacy_numbering
+    test_mm_legacy_numbering.cpp
+)
+
 ob_add_engine_test(test_mm_snapshot
     test_mm_snapshot.cpp
 )
