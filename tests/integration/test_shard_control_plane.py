@@ -40,6 +40,7 @@ class Cluster:
         self.dir = tempfile.mkdtemp(prefix="ob_shard_cp_")
         self.procs: dict[str, subprocess.Popen] = {}
         self.ports: dict[str, int] = {}
+        self.repl_ports: dict[str, int] = {}
         self._etcd_proc = None
         try:
             client, peer = free_port(), free_port()
@@ -67,14 +68,15 @@ class Cluster:
                 time.sleep(0.05)
         raise RuntimeError(f"nothing listens on port {port}")
 
-    def start(self, sid: str, wait: bool = True) -> None:
+    def start(self, sid: str, wait: bool = True, host: str = "127.0.0.1") -> None:
         port = free_port()
         self.ports[sid] = port
+        self.repl_ports[sid] = free_port()
         log = open(f"{self.dir}/{sid}.log", "ab")
         self.procs[sid] = subprocess.Popen(
             [SERVER, "--port", str(port), "--metrics-port", "0", "--data-dir", f"{self.dir}/{sid}",
              "--shard-id", sid, "--node-id", f"node-{sid}", "--coordinator-endpoints", self.etcd,
-             "--replication-port", str(free_port()), "--advertise-host", "127.0.0.1"],
+             "--replication-port", str(self.repl_ports[sid]), "--advertise-host", host],
             stdout=log, stderr=subprocess.STDOUT)
         if wait:
             self._wait_port(port)
@@ -296,3 +298,18 @@ def test_the_cpp_pool_writes_each_symbol_to_its_owner(cluster):
         for i, sym in enumerate(syms):
             assert count_rows(cluster, sid, sym) == (2 if i == 0 else 1), (
                 f"{sym} did not reach its owner {sid} through the C++ pool: {out.stdout}")
+
+
+def test_a_node_publishes_the_host_it_is_reached_by(cluster):
+    # #195: the leader key a replica dials, and the map a client routes by, said 127.0.0.1 whatever
+    # the host - a replica on another machine dialled itself.
+    cluster.start("s0", host="127.0.0.2")
+    doc = cluster.wait_for_map(("s0",))
+    assert doc["shards"]["s0"]["address"] == f"127.0.0.2:{cluster.ports['s0']}"
+    deadline = time.time() + patience(20)
+    leader = None
+    while time.time() < deadline and not leader:
+        leader = cluster.get(f"{PREFIX}shards/s0/leader")
+        time.sleep(0.2)
+    assert leader, "shard s0 elected no primary"
+    assert json.loads(leader)["address"] == f"127.0.0.2:{cluster.repl_ports['s0']}", leader

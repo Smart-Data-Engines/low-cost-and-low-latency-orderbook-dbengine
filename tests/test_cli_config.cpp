@@ -258,6 +258,18 @@ TEST(WalDirInConfig, TheFlagAndTheFileNameTheWalsDirectory) {
     EXPECT_NE(printed.find("/srv/ob"), std::string::npos) << printed;
 }
 
+TEST(AdvertiseHostInConfig, TheFlagAndTheFileNameTheHostPublished) {
+    // #175, #195: the host this node publishes to the coordinator - in the shard map and the leader
+    // key - was 127.0.0.1, fixed. It still is by default.
+    EXPECT_EQ(resolve({}).config.advertise_host, "127.0.0.1");
+    EXPECT_EQ(resolve({"--advertise-host", "10.1.2.3"}).config.advertise_host, "10.1.2.3");
+    const auto path = write_config("advertise-host = db-7.internal\n", "advertise");
+    EXPECT_EQ(resolve({"--config", path.string()}).config.advertise_host, "db-7.internal");
+    const std::string printed = ob::format_config(resolve({"--advertise-host", "10.1.2.3"}));
+    EXPECT_NE(printed.find("advertise-host"), std::string::npos) << printed;
+    EXPECT_NE(printed.find("10.1.2.3"), std::string::npos) << printed;
+}
+
 TEST(MachineInConfig, ResolvingTheConfigurationReadsTheMachine) {
     // Stage 3: the CPUs this process can use are read where the rest of the configuration is
     // resolved, so the log line and --print-config describe what the node was sized against. The
