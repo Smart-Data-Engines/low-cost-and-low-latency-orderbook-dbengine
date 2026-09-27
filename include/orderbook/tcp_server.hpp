@@ -267,7 +267,7 @@ struct ServerConfig {
     uint16_t    mm_node_id{0};                        // --mm-node-id
     uint16_t    mm_replication_port{0};               // --mm-replication-port
     uint32_t    anti_entropy_interval_sec{30};        // --anti-entropy-interval-seconds
-    size_t      mm_max_catchup_bytes{512ULL << 20};   // --mm-max-catchup-bytes (512MB)
+    size_t      mm_max_catchup_bytes{8ULL << 20};     // --mm-max-catchup-bytes: one catch-up round's WAL (#178)
     /// --mm-max-peer-send-buffer: queued output one peer may hold before it is dropped. Lower it
     /// in tests to reach the ceiling without generating 64 MB of traffic.
     size_t      mm_max_peer_send_buf_bytes{64ULL << 20};

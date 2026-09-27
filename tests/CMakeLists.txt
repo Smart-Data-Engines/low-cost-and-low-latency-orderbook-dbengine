@@ -194,6 +194,11 @@ target_compile_definitions(test_wal_position
     PRIVATE OB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 
+# ── A WAL read forward from a position, while it is written (#178) ───────────
+ob_add_wal_test(test_wal_cursor
+    test_wal_cursor.cpp
+)
+
 # ── Tasks 5.3–5.6: Codec property and unit tests ──────────────────────────────
 ob_add_codec_test(test_codec
     test_codec.cpp
@@ -356,6 +361,16 @@ ob_add_engine_test(test_mm_dedup
 
 ob_add_engine_test(test_mm_snapshot
     test_mm_snapshot.cpp
+)
+
+# A mesh catch-up in rounds from a cursor in the sender's WAL (#178), through the real manager.
+ob_add_engine_test(test_mm_catchup_rounds
+    test_mm_catchup_rounds.cpp
+)
+
+# A mesh node's receive buffer, consumed by an offset rather than a frame at a time (#181).
+ob_add_engine_test(test_mm_receive
+    test_mm_receive.cpp
 )
 
 ob_add_engine_test(test_mm_stats

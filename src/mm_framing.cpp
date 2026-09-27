@@ -6,10 +6,14 @@
 
 namespace ob {
 
-void encode_frame(const void* payload, size_t len, std::vector<uint8_t>& out) {
+void encode_frame_header(size_t len, std::vector<uint8_t>& out) {
     const uint32_t length = static_cast<uint32_t>(len);
     const auto* len_bytes = reinterpret_cast<const uint8_t*>(&length);
     out.insert(out.end(), len_bytes, len_bytes + sizeof(uint32_t));
+}
+
+void encode_frame(const void* payload, size_t len, std::vector<uint8_t>& out) {
+    encode_frame_header(len, out);
 
     if (payload && len > 0) {
         const auto* payload_bytes = static_cast<const uint8_t*>(payload);

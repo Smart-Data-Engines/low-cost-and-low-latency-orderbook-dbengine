@@ -1492,7 +1492,12 @@ class IntegrationReportPlugin:
                 category = cat
                 break
 
-        if report.passed:
+        # An xfail is not a skip: the test ran and failed the way an open roadmap item says it does.
+        # Counting it as one made this summary say "5 skipped" over a battery that skipped nothing,
+        # and the TSan job's skip guard read exactly that line (PR #187).
+        if hasattr(report, "wasxfail") and report.skipped:
+            outcome = "xfailed"
+        elif report.passed:
             outcome = "passed"
         elif report.failed:
             outcome = "failed"
@@ -1534,6 +1539,8 @@ class IntegrationReportPlugin:
                     icon = f"{G}✓{RST}"
                 elif r["outcome"] == "failed":
                     icon = f"{R}✗{RST}"
+                elif r["outcome"] == "xfailed":
+                    icon = f"{Y}x{RST}"
                 else:
                     icon = f"{Y}⚠{RST}"
 
@@ -1548,9 +1555,11 @@ class IntegrationReportPlugin:
         passed = sum(1 for r in self.results if r["outcome"] == "passed")
         failed = sum(1 for r in self.results if r["outcome"] == "failed")
         skipped = sum(1 for r in self.results if r["outcome"] == "skipped")
+        xfailed = sum(1 for r in self.results if r["outcome"] == "xfailed")
 
         print(f"\n{'─' * 70}")
-        print(f"  Summary: {G}{passed} passed{RST}, {R}{failed} failed{RST}, {Y}{skipped} skipped{RST}")
+        print(f"  Summary: {G}{passed} passed{RST}, {R}{failed} failed{RST}, {Y}{skipped} skipped{RST}, "
+              f"{Y}{xfailed} xfailed{RST}")
         print(f"  Total time: {total_time:.2f}s")
 
         # ── Environment info ──────────────────────────────────────

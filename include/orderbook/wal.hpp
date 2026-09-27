@@ -850,4 +850,63 @@ private:
     size_t      tears_skipped_{0};
 };
 
+// ── WALRecordCursor ───────────────────────────────────────────────────────────
+// Reads a WAL that is still being written forward from a position, a record at a time (#178): a
+// multi-master catch-up is rounds, each continuing where the last one stopped, and a replay from
+// the first record every round is what kept a peer behind for good.
+//
+// What a record is, is `WALReplayer::replay_v2()`'s answer - the 24- or 38-byte header, a ROTATE
+// ending its file and not delivered, a checksum that does not match or a record cut short ending a
+// file that is not the last - and a test holds the two to the same sequence. What differs is the
+// last file, which the writer is appending to: a record there that is not whole yet, or does not
+// check yet, is where the cursor waits rather than where the log ends. `next()` answers `End` and
+// leaves the position where it was, and the next call looks again.
+class WALRecordCursor {
+public:
+    enum class Step { Record, End };
+
+    static constexpr size_t kDefaultBufferBytes = 256u << 10;
+
+    explicit WALRecordCursor(std::string dir, size_t buffer_bytes = kDefaultBufferBytes);
+    ~WALRecordCursor();
+    WALRecordCursor(const WALRecordCursor&) = delete;
+    WALRecordCursor& operator=(const WALRecordCursor&) = delete;
+
+    /// Stand at `pos`, which is the start of a record or of a file. When retention removed that
+    /// file, the cursor stands at the start of the first one after it that exists, and the return
+    /// value is how many file indexes it passed over; 0 otherwise.
+    uint32_t seek(WalPosition pos);
+
+    /// The next whole, checked record, or `End` at the tail of the last file. `ctx.payload` points
+    /// into the cursor and is valid until the next call.
+    Step next(WALReplayContext& ctx);
+
+    /// Where the next record starts - what a caller keeps to continue later.
+    WalPosition position() const { return pos_; }
+
+    /// Files that are not the last whose remainder was skipped past a torn record, as
+    /// `WALReplayer::tears_skipped()` counts them.
+    size_t tears_skipped() const { return tears_skipped_; }
+
+private:
+    /// The lowest WAL file index present that is `>= from`, if any.
+    std::optional<uint32_t> first_file_from(uint32_t from) const;
+    /// Open file `index` at offset 0 of the buffer; false if it cannot be opened.
+    bool open_file(uint32_t index);
+    void close_file();
+    /// Make the file's bytes [at, at + need) readable at `buf_`; false if the file is shorter.
+    bool fill(uint64_t at, size_t need);
+    /// The current file is done: go to the next one there is. False if there is none yet.
+    bool advance_file();
+
+    std::string          dir_;
+    size_t               buffer_bytes_;
+    int                  fd_{-1};
+    WalPosition          pos_{};
+    std::vector<uint8_t> buf_;
+    uint64_t             buf_start_{0};   ///< file offset of buf_[0]
+    size_t               buf_len_{0};
+    size_t               tears_skipped_{0};
+};
+
 } // namespace ob

@@ -3602,6 +3602,54 @@ Learned the hard way. Check here before debugging.
 461. **A reader that trusts a file's own claim trusts the storage that wrote it.** A start removed a
      merged segment's inputs on its `meta.json` alone; it checks now that its `ts.col` holds its
      rows, and keeps the inputs when it does not.
+462. **A bound that counts what it skipped, and starts again from the top, never lets the work
+     finish.** The mesh catch-up stopped after `--mm-max-catchup-bytes` of WAL read - counting the
+     records the peer already had - and the next one started at the first record, so every catch-up
+     after the first stopped at the same place and the rest never went (#178). A budget that is
+     spent in rounds has to resume where the last round stopped.
+463. **A fall-back that a log line names is a claim until something reads its flag.** The catch-up
+     set `needs_snapshot` and logged "falling back to snapshot sync"; nothing read the flag, and a
+     node with data may not take a snapshot anyway. Find the reader of a flag before believing the
+     line that sets it.
+464. **Work done under a lock is work every waiter on that lock does.** The catch-up read the WAL
+     under the mesh manager's lock, and every local write broadcasts under it: the serving node's
+     writes waited for the scan. A round now reads, decides and frames without it, and takes it to
+     look up the few (symbol, origin) pairs it read and to hand over its bytes - 81 ms held became
+     4.5 ms in the same Debug build (#178).
+465. **A helper that drains after every frame is a system call per frame.** `enqueue_frame()` tries a
+     `send()` each time; 25 000 frames of a catch-up round were 25 000 calls under the lock. Frame
+     into the buffer and drain once.
+466. **A latency measured in a Debug build is the build's.** A catch-up loop at 3.6 us a record was
+     unoptimised maps and strings, not the design - cheap to see, easy to mistake for the answer.
+     Numbers that will be quoted come from Release.
+467. **A test that counts by flushing can refresh the thing it tests.** Counting rows flushes, a flush
+     writes a checkpoint, and a checkpoint refreshes the node's version vector - the refresh #180 is
+     about. The first version of its test counted the writer before the restart and passed. Count on
+     a node only where a flush cannot be the cause.
+468. **Two tests on one cluster share what the first one broke.** #180's test passed on #179's module
+     cluster, because the rows #179 stored twice made the writer start a catch-up of its own. Each
+     got a mesh of its own, and then both failed as measured.
+469. **A buffer consumed from the front one message at a time is quadratic in a read.** The mesh
+     erased every frame from the front of its receive buffer; one read of a catch-up was megabytes,
+     and a node spent 96% of its time in memmove - 123 s for 100 000 records (#181). Walk an offset
+     and compact once. `perf` found it in one run where reasoning about the sender had not.
+470. **An editable install answers `import` before `PYTHONPATH` does.** The shared venv holds the
+     main checkout's client installed editable, whose finder sits in `sys.meta_path`, so a worktree's
+     battery imported the main checkout's client with `PYTHONPATH` pointing at the worktree - the
+     verification script printed the path and nobody read it for two branches. Harmless while the
+     two clients are the same file (`diff -rq`); a branch that changes the client needs a venv of its
+     own, or the battery tests the wrong code and says it passed.
+471. **An xfail is filed as a skip twice over, and both CI gates read one of them.** pytest's JUnit
+     report writes `<skipped type="pytest.xfail">` beside `type="pytest.skip"`, so the integration
+     job's gate, which read that report and allowed only the Binance skips, turned PR #187 red over
+     `407 passed, 5 xfailed` - the battery's first strict xfails since the gate was written. The fix
+     for it went green there, and the TSan job then went red on the second: our own report plugin
+     in `conftest.py` counted an xfail's call phase as `skipped` and printed `5 skipped`, which is
+     the count the TSan guard grepped. pytest's own line says `xfailed`, so a local run shows
+     neither. Both jobs run `scripts/check_integration_skips.py` over their JUnit report now: a
+     skip passes only if it is Binance's, an xfail only when its reason names an item the roadmap's
+     Open line lists, so a marker that outlives its item fails the job - and the plugin counts
+     xfails as themselves.
 
 ## Current state and open problems
 
@@ -3642,19 +3690,29 @@ seals only the stores that are due, a quarter more rows than it drained at most,
 that names the seal epoch it vouches for (part 2a); and the flush tick merges a symbol's small
 segments - eight of a level in one symbol's hour into one of the next, up to 262 144 rows, and an
 hour's leftovers a minute after it ends - in five steps across ticks that a crash in any of keeps
-each row once (part 2b, pitfalls 453-461). After a twenty-minute soak of 256 symbols a node holds
-1 957-3 238 segments where part 2a's held 30 208-30 464, and a cold start answers in 5.9-6.8 s
-rather than 26.4-26.9; a narrow query into history reads a merged segment whole, 1.8-2.3 ms against
-0.14-0.25. **No P0 is open. #169, #175 and #176 are open P1s**: an exchange name with a dot makes
-two instruments one key - `A.B` on `C` and `A` on `B.C` share a live book, sequence numbers and
-stored rows, measured on the wire; sharding by symbol has no control plane: no shard writes itself
-or the map to etcd, each owns every symbol, and a second on the same etcd becomes the first one's
-replica, measured against a native etcd; and a mesh snapshot names each file by a 16-bit index, so
-a node of 8 192 segments cannot bootstrap a peer that joins it (found reading the sender, not yet
-measured). **#172 is closed**: the
-Python client's sharded pool swaps its routing whole and replaces a shard connection a timeout
-closed, under a test that builds a sharded pool against a map in etcd.
-**#174 is an open P2**: a start reads the whole WAL twice even when its last checkpoint covers every
+each row once (part 2b, pitfalls 453-461). After a twenty-minute soak of 256 symbols a node holds 1
+957-3 238 segments where part 2a's held 30 208-30 464, and a cold start answers in 5.9-6.8 s rather
+than 26.4-26.9; a narrow query into history reads a merged segment whole, 1.8-2.3 ms against
+0.14-0.25. **#178 is closed**: a mesh catch-up is rounds from a cursor in the sender's own WAL, read
+without the lock every local write takes and paced by the peer's send buffer - a node that missed
+more than `--mm-max-catchup-bytes` used to stop at the first ceiling's worth for good (6 990 of 20
+100 rows), and a 300 000-record catch-up livelocked on the send-buffer ceiling; and **#181 is
+closed**: a node applied a burst of frames in quadratic time, erasing each from the front of its
+receive buffer (pitfalls 462-471). **#179 is the open P0**: a mesh node restarted before its version
+vector reached the WAL replays the rows a peer sent it as its own origin's, is sent them again and
+stores them twice (200 where the writer holds 100). **#169, #175, #176, #177, #180 and #182 are open
+P1s**: an exchange name with a dot makes two instruments one key - `A.B` on `C` and `A` on `B.C`
+share a live book, sequence numbers and stored rows, measured on the wire; sharding by symbol has no
+control plane: no shard writes itself or the map to etcd, each owns every symbol, and a second on
+the same etcd becomes the first one's replica, measured against a native etcd; a mesh snapshot names
+each file by a 16-bit index, so a node of 8 192 segments cannot bootstrap a peer that joins it; a
+version vector past 1 561 entries asks for everything, so every reconciliation resends the whole
+retained WAL and a joiner never asks for a snapshot; a node's vector is refreshed only when a store
+seals, so a peer back within the seal interval is judged to hold what it missed; and every
+replicated update of a level a node holds is logged at INFO as a conflict, same origin or not.
+**#172 is closed**: the Python client's sharded pool swaps its routing whole and replaces a shard
+connection a timeout closed, under a test that builds a sharded pool against a map in etcd. **#174
+is an open P2**: a start reads the whole WAL twice even when its last checkpoint covers every
 record.
 
 **#170 and #171**: a Python client connection carries one exchange at a time and is closed when one

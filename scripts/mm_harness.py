@@ -105,8 +105,10 @@ class Node:
             # Short enough that a reconciliation pass happens inside a test rather than in half
             # a minute; the production default is 30 s.
             "--anti-entropy-interval-seconds", os.environ.get("MMH_AE_INTERVAL", "3"),
-            # A small catch-up ceiling on purpose: the partition scenario needs backpressure to
-            # discard a peer's backlog, which is the one divergence TCP cannot undo by itself.
+            # Small rounds on purpose, so a catch-up here is many of them (#178). Until #178 this was
+            # a ceiling on the whole catch-up, which the partition scenario leaned on to discard a
+            # peer's backlog; nothing discards one now, and the send-buffer ceiling below drops a
+            # peer that stops draining, with its queued bytes - the divergence TCP cannot undo.
             "--mm-max-catchup-bytes", os.environ.get("MMH_MAX_CATCHUP", "8192"),
             "--mm-max-peer-send-buffer", os.environ.get("MMH_MAX_SEND_BUF", "262144"),
         ], stdout=log, stderr=subprocess.STDOUT)

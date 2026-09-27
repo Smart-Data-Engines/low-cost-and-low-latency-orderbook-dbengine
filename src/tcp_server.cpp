@@ -1054,7 +1054,7 @@ namespace {
 const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
     // flag -> (argument placeholder, description). An empty placeholder means a boolean flag.
     static const std::map<std::string, std::pair<std::string, std::string>> help = {
-        {"anti-entropy-interval-seconds", {"<N>", "Multi-master reconciliation interval (default: 60)"}},
+        {"anti-entropy-interval-seconds", {"<N>", "Multi-master reconciliation interval (default: 30)"}},
         {"config", {"<FILE>", "Read `key = value` settings from FILE; command line wins"}},
         {"coordinator-endpoints", {"<URLS>", "Comma-separated etcd endpoints for HA and failover"}},
         {"coordinator-lease-ttl", {"<N>", "Leader lease TTL in seconds (default: 10)"}},
@@ -1080,7 +1080,7 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"max-subscriptions-per-session", {"<N>", "Subscription limit per session (default: 16)"}},
         {"metrics-bind", {"<ADDR>", "Address the metrics listener binds to (default: every interface)"}},
         {"metrics-port", {"<PORT>", "Prometheus metrics port; 0 disables the endpoint"}},
-        {"mm-max-catchup-bytes", {"<N>", "WAL bytes a peer may scan before a snapshot is used"}},
+        {"mm-max-catchup-bytes", {"<N>", "WAL bytes one catch-up round reads for a peer (default: 8 MiB)"}},
         {"mm-max-peer-send-buffer", {"<N>", "Per-peer send buffer ceiling; past it the peer is dropped"}},
         {"mm-node-id", {"<N>", "Multi-master node id, unique in the mesh"}},
         {"mm-replication-port", {"<PORT>", "Multi-master peer port"}},

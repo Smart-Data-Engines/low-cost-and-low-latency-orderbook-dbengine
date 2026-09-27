@@ -235,7 +235,35 @@ record, while the rows it had missed sat earlier in the log (roadmap #61).
 One limit worth knowing, and it is about size. The vector travels in a record header whose
 `payload_len` is a `uint16_t`, so a vector above 65535 bytes — 1561 entries at 42 bytes each — cannot
 be described by the header that carries it. It is not sent and not written down; the node falls back
-to asking for everything, which costs bandwidth and never costs data.
+to asking for everything. This said that costs bandwidth and never data, and it costs more than
+bandwidth (#177): every reconciliation then makes each peer send the node its whole retained WAL
+again — 9 600 to 20 800 duplicates dropped in a 16 s window at 1 600 entries, none at 1 500 — and a
+node that joins such a mesh never asks for a snapshot, because a peer that wants everything says
+nothing about what it holds.
+
+**A catch-up is rounds, from a position in the sender's own WAL** (#178). It is state of the
+connection it serves: where the next record to read starts. A round reads up to
+`--mm-max-catchup-bytes` (8 MiB) through `WALRecordCursor` — which answers what a record is exactly
+as replay does, and treats the last file's tail as a wait, since the writer is appending to it —
+**without** the manager's lock, which every local write takes to broadcast. Under the lock it only
+looks up what the peer holds of each (symbol, origin) the round read, a few pairs rather than a
+record's worth; it decides and frames off it, and takes the lock again to hand the peer the round's
+bytes in one append. A round stops at the snapshot's low watermark of the peer's send buffer, and the
+io loop runs the next at once when one can run, or when the socket drains. A vector that arrives
+mid-way — reconciliation sends one every interval — changes what the rounds send, not where they
+read. Until #178 a catch-up was one scan of the whole WAL under that lock, which stopped sending at
+the ceiling while counting records the peer already had, and logged a fall-back to a snapshot that
+nothing sends a node holding data: a node that missed more than the ceiling never got the rest —
+6 990 of 20 100 rows, for good, in the test that found it — and the serving node's writes waited for
+the scan. The end of a catch-up names the ranges the peer lacks that begin before the retained WAL,
+once an episode: nothing from here can send those.
+
+Two things do not hold yet, both found measuring #178. A node restarted before its vector reached
+the WAL replays the records a peer sent it as though they were its own — the replay seeds this
+node's origin — so it is sent them again and stores them twice (#179). And a node's vector is
+refreshed when a checkpoint is written, which a tick that seals nothing does not do, so a peer that
+comes back within the seal interval is compared against a vector without the writes it missed and
+caught up only at a later reconciliation (#180).
 
 A node that joined an origin's stream in the middle used to be the other limit: it saw sequence 5000
 before it ever saw 1, so it could not claim "everything up to here" for that origin and kept
@@ -359,8 +387,11 @@ connection delivers in order, and an `iptables DROP` does not reset it — TCP r
 once traffic is allowed again, so a partitioned node reconverges without reconciliation doing
 anything. What is left for anti-entropy is divergence that outlives a healthy connection: a record the
 receiver dropped rather than lost (above the held-set cap in `SequenceTracker`, or refused), a peer
-whose vector was missing or stale when catch-up ran, and a backlog the sender discarded under
-backpressure.
+whose vector was missing or stale when catch-up ran (#180), and a range a peer lacks that begins
+before every sender's retained WAL, which a catch-up names and cannot send (#178). A backlog the
+sender discarded under backpressure used to be on this list; since #178 nothing discards one: a
+catch-up is paced by the peer's send buffer, and a peer that stops draining is disconnected with its
+queued bytes, never left reading the middle of a frame.
 
 `ob_mm_anti_entropy_runs_total` and `ob_mm_reconcile_gaps_detected` are reported separately on
 purpose: a zero in the second one means "checked, nothing to repair" only if the first one is moving.
