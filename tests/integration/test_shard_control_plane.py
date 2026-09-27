@@ -68,14 +68,17 @@ class Cluster:
                 time.sleep(0.05)
         raise RuntimeError(f"nothing listens on port {port}")
 
-    def start(self, sid: str, wait: bool = True, host: str = "127.0.0.1") -> None:
+    def start(self, sid: str, wait: bool = True, host: str = "127.0.0.1",
+              shard: str | None = None) -> None:
+        """Node `sid`, of shard `shard` - its own name unless a second node of a shard's group."""
         port = free_port()
         self.ports[sid] = port
         self.repl_ports[sid] = free_port()
         log = open(f"{self.dir}/{sid}.log", "ab")
         self.procs[sid] = subprocess.Popen(
             [SERVER, "--port", str(port), "--metrics-port", "0", "--data-dir", f"{self.dir}/{sid}",
-             "--shard-id", sid, "--node-id", f"node-{sid}", "--coordinator-endpoints", self.etcd,
+             "--shard-id", shard or sid, "--node-id", f"node-{sid}",
+             "--coordinator-endpoints", self.etcd,
              "--replication-port", str(self.repl_ports[sid]), "--advertise-host", host],
             stdout=log, stderr=subprocess.STDOUT)
         if wait:
@@ -95,6 +98,14 @@ class Cluster:
     def shard_map(self) -> dict:
         raw = self.get(f"{PREFIX}shard_map")
         return json.loads(raw) if raw else {}
+
+    def put(self, key: str, value: str) -> None:
+        body = json.dumps({"key": base64.b64encode(key.encode()).decode(),
+                           "value": base64.b64encode(value.encode()).decode()}).encode()
+        req = urllib.request.Request(f"{self.etcd}/v3/kv/put", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
 
     def wait_for_map(self, sids: tuple[str, ...]) -> dict:
         deadline = time.time() + patience(20)
@@ -143,14 +154,19 @@ def symbols_of(owner: str, sids, n: int = 3) -> list[str]:
     return out[:n]
 
 
-def insert(cluster: Cluster, sid: str, symbol: str) -> str:
-    """One INSERT straight to shard `sid`: "OK", or the error it answers."""
+def command(cluster: Cluster, sid: str, line: str) -> str:
+    """One command straight to node `sid`: the first line it answers."""
     with socket.create_connection(("127.0.0.1", cluster.ports[sid]), timeout=10) as s:
         f = s.makefile("rb")
         while f.readline().strip():       # the greeting
             pass
-        s.sendall(f"INSERT {symbol} {EXCHANGE} bid 100 1 1\n".encode())
+        s.sendall(f"{line}\n".encode())
         return f.readline().decode(errors="replace").strip()
+
+
+def insert(cluster: Cluster, sid: str, symbol: str) -> str:
+    """One INSERT straight to shard `sid`: "OK", or the error it answers."""
+    return command(cluster, sid, f"INSERT {symbol} {EXCHANGE} bid 100 1 1")
 
 
 def count_rows(cluster: Cluster, sid: str, symbol: str) -> int:
@@ -313,3 +329,47 @@ def test_a_node_publishes_the_host_it_is_reached_by(cluster):
         time.sleep(0.2)
     assert leader, "shard s0 elected no primary"
     assert json.loads(leader)["address"] == f"127.0.0.2:{cluster.repl_ports['s0']}", leader
+
+
+def test_a_replica_of_a_shards_group_leaves_the_map_naming_its_primary(cluster):
+    # The map names the node a client writes to: a shard's primary. Its replica starts as one - the
+    # group's leader key is there - and writes nothing into the map.
+    cluster.start("s0a", shard="s0")
+    doc = cluster.wait_for_map(("s0",))
+    assert doc["shards"]["s0"]["address"] == cluster.address("s0a")
+    cluster.start("s0b", shard="s0")
+    deadline = time.time() + patience(10)
+    seen = set()
+    while time.time() < deadline:          # several of each node's reads of the map
+        seen.add(cluster.shard_map()["shards"]["s0"]["address"])
+        time.sleep(0.25)
+    assert seen == {cluster.address("s0a")}, f"the map named {seen} for shard s0"
+    assert insert(cluster, "s0b", "ANY") == "ERR read-only replica"
+
+
+def test_migrate_is_refused_and_the_symbol_stays_writable(cluster):
+    # #196: MIGRATE marked the symbol migrated and moved none of its rows, and the map still named
+    # the source - so the symbol could be written nowhere. Refused, until it moves data.
+    for sid in ("s0", "s1"):
+        cluster.start(sid)
+    doc = cluster.wait_for_map(("s0", "s1"))
+    doc["assignments"] = {f"PIN.{EXCHANGE}": "s0"}
+    doc["version"] += 1
+    cluster.put(f"{PREFIX}shard_map", json.dumps(doc))
+    answer = ""
+    deadline = time.time() + patience(20)
+    while time.time() < deadline:          # until s0 has read the assignment
+        answer = command(cluster, "s0", f"MIGRATE PIN.{EXCHANGE} s1")
+        if "not implemented" in answer:
+            break
+        time.sleep(0.3)
+    assert answer.startswith("ERR MIGRATE is not implemented"), answer
+    assert wait_until_writable(cluster, "s0", "PIN") == "OK", "the symbol MIGRATE was refused for is not writable"
+
+
+def test_the_pool_reads_a_bare_symbol_migrated():
+    # The server says it bare; the pool matched only the form with a detail, so the refresh and
+    # the retry it exists for never happened against a real server.
+    assert ob._parse_shard_error("ERR SYMBOL_MIGRATED\n") == ("SYMBOL_MIGRATED", "")
+    assert ob._parse_shard_error("ERR SYMBOL_MIGRATED s1") == ("SYMBOL_MIGRATED", "s1")
+    assert ob._parse_shard_error(f"ERR NOT_OWNER A.{EXCHANGE}") == ("NOT_OWNER", f"A.{EXCHANGE}")
