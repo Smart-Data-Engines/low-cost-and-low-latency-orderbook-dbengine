@@ -2213,6 +2213,38 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 188. A node that joins a mesh asks every peer for a snapshot, and installs each one it is sent, in turn **P1**
+
+**Found probing #177's joiner, and on master below #177's size too**
+(`evidence/2026-09-27-mesh-vector-parts/probe-join/`). A node that holds nothing asks a peer for a
+snapshot when that peer's vector arrives, and the only gate is a bootstrap in progress
+(`snapshot_recv_.active`) - so it asks every peer whose vector arrives before the first
+`SNAPSHOT_BEGIN`, which on a join is all of them, milliseconds apart. Each peer flushes, checksums and
+sends a whole snapshot. The joiner takes the first `BEGIN`; one that arrives while that bootstrap runs
+is refused (`already_bootstrapping`), and one that arrives after it finished is taken:
+`handle_snapshot_begin()` does not ask whether this node still holds nothing, and an install replaces
+the store. Three nodes and a fourth joining, Debug build, i3-7100U:
+
+| tree | symbols | snapshots asked for / sent / installed | writes refused, first `BEGIN` to last finish | one bootstrap |
+|---|---|---|---|---|
+| master (`f3ac440`'s tree) | 1 500 | 3 / 3 / 2 | 13.1 s | 6.1 s |
+| #177's branch | 1 600 | 3 / 3 / 3 | 21.6 s | 6.8 s |
+
+A bootstrap whose bytes are already in the socket runs in one pass of the io loop - on the branch the
+whole 6.8 s, in which the joiner handled no other peer's frame (its log says nothing else in that
+window, not even the vectors reconciliation sends every 5 s) - so whether a second `BEGIN` is refused
+is timing: read in that pass, it is; read after it, it is installed. Between two installs the node
+accepts writes, for 12 to 73 ms here; from reading and not measured, a write taken there goes into a
+store the next install replaces.
+
+A fix asks one peer, and the next only if that one refuses or fails; refuses a `BEGIN` it did not ask
+for, or once it holds data; and tells a peer when its snapshot is no longer wanted. Its test is a
+joiner of three peers that installs one snapshot.
+
+- Effort: S-M | Impact: a node that joins a mesh of three or more is bootstrapped once a peer,
+  refusing writes that many times as long, while each peer prepares a snapshot of everything it
+  holds; and a write in the window between two installs can be lost
+
 ### 187. A symbol two mesh nodes wrote before #184 keeps its frontiers stuck on every node, and nothing can clear them but a new mesh **P1**
 
 **Found writing #184's operations notes, and not measured.** #184 makes the numbers a node mints for a
@@ -2713,7 +2745,7 @@ second pass: 13b, 19 and 22 as written.
 - Effort: M | Impact: a mesh node that was down long enough held less than its peers for good, and
   answered queries with it
 
-### 177. A mesh node whose version vector passes 1 561 entries asks every peer for everything: every reconciliation resends the whole retained WAL, and a node that joins never asks for a snapshot **P1**
+### 177. A mesh node whose version vector passes 1 561 entries asks every peer for everything: every reconciliation resends the whole retained WAL, and a node that joins never asks for a snapshot ✅ **P1**
 
 **Found measuring #176, on a three-node mesh on the i3-7100U, and measured with
 `tests/integration/test_mm_version_vector_scale.py`.** A version vector travels in one record
@@ -2750,6 +2782,54 @@ A fix carries a vector of any size - in parts, on the wire and in the WAL - and 
 vectors without a loop inside a loop, which `compare_vectors()` has for the direction this node
 lacks. Its test is this module's two strict xfails.
 
+**Fixed** (spec `kiro-workspace/specs/mesh-vector-parts/`). A vector that fits one record goes as
+before, one record of type 7. Past 1 560 entries it goes as parts, `WAL_RECORD_VERSION_VECTOR_PART`
+(9) - a generation, the part's number, the number of parts and up to 1 560 entries each - on the
+wire, where the receiver takes it when the last part of one generation arrives in sequence and until
+then keeps what the peer said before, and into the WAL, where a restart takes the last complete set.
+A snapshot's metadata carries it as a block of parts behind a marker (`0xFFFE`) that a receiver of an
+older build refuses, as it refused "send everything"; a node of an older build skips the unknown
+type and sends such a peer everything, as it did. The copy peers are told lost its 4 096 bound:
+`VV_MAX_ENTRIES`, a million, is memory's, said at `WARN`, and a node past it catches a peer up rather
+than judging it to lack nothing - the rounds send only what the peer's vector does not hold. And the
+comparison is one walk over this node's vector, with a second, over the peer's, only for the pairs it
+alone lists.
+
+Measured, the same module (three nodes, the battery's Debug build, i3-7100U): at 1 600 entries **0,
+0 and 0** duplicates dropped in the window where the build before dropped 20 800, 14 400 and 9 600,
+and the joiner asked for a snapshot - asking every peer for one, which is #188. The two tests run
+without their markers, and `test_mm_snapshot_many_files.py`'s joiner now reaches the refusal its
+strict xfail is about, #176's alone.
+
+What a vector costs (`benchmarks/vector_cost`, Release, i3-7100U, median of 20, three runs each way
+against the branch before its last change, whose numbers are in parentheses -
+`evidence/2026-09-27-mesh-vector-parts/benchmarks/`):
+
+| entries | serialise | receive | compare, equal vectors | compare, a tenth more pairs on the peer's side |
+|---|---|---|---|---|
+| 1 500 | 0.01 ms | 0.20 ms | **0.08 ms** (before #177, a loop in a loop: 2.71 - 2.83 ms) | 0.37 - 0.38 ms |
+| 5 000 | 0.03 ms | 0.92 - 0.96 ms | **0.29 - 0.30 ms** | 1.34 - 1.39 ms |
+| 50 000 | 1.79 - 1.81 ms | 14.8 - 15.3 ms (17.9 - 18.2) | **4.92 - 4.94 ms** (28.7 - 29.7) | 22.5 - 23.9 ms (31.1 - 52.4) |
+
+The first version walked ours, then built an index of ours - copying every key - and walked theirs
+through it; a lookup in the peer's vector copied the key it looked for, and a vector received copied
+its keys into the table rather than move them. A profile put 17% of the
+time in the table's chains; counted, they held 1.47 probes a lookup under that hash and under a mixed
+one alike (pitfall 490), and the cost was a node and a key copy per entry.
+
+**Tests**: the format, the assembly and its refusals, the snapshot's block and the comparison in
+`tests/test_version_vector.cpp`, with a RapidCheck property that any vector sent is the vector
+received and one that the comparison finds what comparing every pair with every pair finds; the mesh
+deciding a vector at its last part, and a node past its bound catching a peer up, in
+`tests/test_mm_catchup_rounds.cpp`; a snapshot carrying 5 000 entries whole, and refusing one whose
+vector says "send everything", in `tests/test_mm_snapshot.cpp`; a restart restoring a vector written
+in parts in `tests/test_mm_restart_origins.cpp`. **Mutation table: 25 mutations in 32 runs, every one
+as written down before its pass** - pass 1: 18 killed, and the two controls and five predicted gaps
+survived: an assembly's three refusals answered `false` as a part that continues one does, and the
+tests looked at that answer alone (pitfall 491); a vector in parts was never shown to replace the one
+before it; and nothing sent a snapshot whose vector says "send everything"; pass 2: each got its test
+and was killed, and the controls survived again.
+
 - Effort: M | Impact: a mesh of a few hundred instruments resends its whole retained WAL to every
   peer every reconciliation, and a node that joins it cannot bootstrap from a snapshot
 
@@ -2774,7 +2854,8 @@ fills three nodes with 8 200 segments - one symbol each - and adds a fourth, and
 reached the refusal: at 8 200 entries its peers' vectors want everything, so it never asked for a
 snapshot (#177), and caught up from their WALs instead. So the refusal is reached below 1 561 vector
 entries with 8 192 segments or more - a thousand symbols after a couple of hours at part 2b's merged
-rate - and the test says which of the two it met. A second limit sits just past the first: the
+rate - and the test says which of the two it met. **Since #177 the joiner asks, and is refused**: the module's strict
+xfail is #176's alone. A second limit sits just past the first: the
 metadata blob is capped at 8 MiB, and the manifest is about 800 bytes of JSON a segment, so a 32-bit
 index alone would move the refusal from 8 192 segments to about 10 000.
 
@@ -11824,7 +11905,7 @@ measures the harness.
 
 ## Recommended order
 
-**No P0 is open**, and **#169, #175, #176, #177, #186 and #187 are open P1s** — the mechanical
+**No P0 is open**, and **#169, #175, #176, #186, #187 and #188 are open P1s** — the mechanical
 list is the `Open:` line below; read it there rather than trusting this paragraph, which is prose
 and has been wrong about this before. **#184 was the P0**: when two mesh nodes wrote one symbol, the
 one counter per symbol gave each origin's numbers holes, so every node's frontier for it stopped at
@@ -11849,9 +11930,11 @@ it missed; every tick brings it up to date now, at the cost of the frontiers tha
 **#183**, found measuring #180: a reconciliation took a peer's own timer for silence and treated the
 peer as holding nothing, resending everything since its last vector. **#186** was found measuring
 #180's cost, on master too: a mesh node of 4 000 symbols stalls a write for up to 0.6 s at a
-trickle, and refuses writes at the pipelined ceiling. **#177**: a version vector past 1 561 entries
-asks for everything, so every reconciliation resends the whole retained WAL and a joining node never
-asks for a snapshot. **#182 is closed**: every replicated update of a level a node held was logged at
+trickle, and refuses writes at the pipelined ceiling. **#177 is closed**: a version vector past
+1 560 entries asked for everything, so every reconciliation resent the whole retained WAL and a
+joining node never asked for a snapshot; a vector of any size goes in parts now. **#188** was found
+probing #177's joiner, and is on master below that size too: a node that joins asks every peer for a
+snapshot and installs each one it is sent, in turn. **#182 is closed**: every replicated update of a level a node held was logged at
 INFO as a conflict, 61 MB of log for 300 000 writes; only two origins writing one level are one now,
 said by the window.
 **#176** was found writing part 2b of #165: a mesh snapshot names each file by a 16-bit index, so a
@@ -11924,7 +12007,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #174, #175, #176, #177, #186, #187.** Every other item above #58 is marked closed, and
+**Open: #169, #174, #175, #176, #186, #187, #188.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -12064,10 +12147,10 @@ The capability items are in the table below.
 |----------|------|--------|---------|
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
 | **P1** | Sharding by symbol gains its control plane: the shards write the map, and both clients read it (#175) | M–L | A shard writes neither itself nor the map to etcd, owns every symbol, and a second one on the same etcd becomes the first one's replica; neither client can find a shard |
-| **P1** | A version vector of any size, so a mesh of thousands of instruments neither resends its WAL every reconciliation nor refuses a joiner its snapshot (#177) | M | Past 1 561 (symbol, origin) entries a vector is sent as "send everything": 9 600 - 20 800 duplicates a node in a 16 s window where 1 500 entries cost none, and a joiner that never asks for a snapshot |
 | **P1** | A mesh can close the holes the old one-counter numbering left, so catch-up works again for the symbols two nodes wrote before per-origin numbers (#187) | M | Every node's tracker holds them - the vector writes them down, a snapshot carries them - so for those symbols a node that misses writes is still judged to hold them, and only a new mesh clears it |
 | **P1** | A mesh node of 4 000 symbols neither stalls a write for half a second nor refuses writes at the pipelined ceiling (#186) | M | Measured on master and the branch alike and not yet explained: the largest round trip of a run 169–623 ms in six runs of twelve, and writes refused when the pending queue did not free room in 5 s |
 | **P1** | A mesh snapshot carries any number of files, so a peer can join a node of 8 192 segments or more (#176) | M | A mesh snapshot names a file by a 16-bit index, so a node of 8 192 segments - 8 192 instruments, whatever part 2b merges - cannot bootstrap a peer that joins it; found reading the sender, not yet measured |
+| **P1** | A node that joins a mesh takes one snapshot, from one peer (#188) | S-M | A joiner asks every peer for a snapshot, each sends one, and it installs them in turn - three from three peers, writes refused 21.6 s where one bootstrap took 6.8 - accepting writes between two installs that the next may discard |
 | **P2** | A start finds its last checkpoint without reading the whole WAL twice (#174) | S–M | Since part 2b of #165 the index is 1.9 - 2.9 s of a cold start after a twenty-minute soak, 5.9 - 6.8 s, and the WAL most of the rest - and a start reads it twice even when the checkpoint covers every record |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
 | **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
