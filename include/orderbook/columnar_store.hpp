@@ -76,6 +76,20 @@ struct SegmentMeta {
     /// than the highest of its inputs'. Merging segments of one level with each other is what keeps a
     /// row from being written again by every merge of the segment it is in.
     uint32_t merge_level{0};
+    /// The highest sequence number of `own_origin`'s own rows in this segment (#184, #185): what a
+    /// restart continues that origin's counter from and declares its own frontier up to. Not
+    /// `max_sequence_number`, which is every origin's - a mesh segment holds its peers' rows too, and
+    /// continuing from their numbers left a hole in this node's stream that no receiver's frontier
+    /// passes. `has_own_max` is false for a segment written before this was recorded, and for a
+    /// merge of such a segment: a start then falls back to `max_sequence_number`, as it always did.
+    bool     has_own_max{false};
+    uint16_t own_origin{0};           ///< the node the numbers below are of: 0 without a mesh
+    uint64_t own_max_sequence{0};     ///< 0: none of this segment's rows is `own_origin`'s
+    /// Some of its rows were sealed by another node - it is a snapshot's segment, or a merge of
+    /// one - so `own_max_sequence` does not cover what of `own_origin`'s own records they hold. A
+    /// start without a vector raises the counter by `max_sequence_number` for such a segment, the
+    /// only number that cannot hand one out twice.
+    bool     has_received_rows{false};
     std::string symbol;     ///< symbol this segment belongs to
     std::string exchange;   ///< exchange this segment belongs to
     std::string dir_path;   ///< full path to the segment directory
@@ -172,6 +186,14 @@ struct RowBlock {
     std::vector<SnapshotRow> rows;   ///< in the order they were drained
     uint64_t min_ts_ns{0};
     uint64_t max_ts_ns{0};
+    /// The highest sequence number among the rows this node wrote itself (#184); 0 for none. A row
+    /// does not say whose it is, so the drain, which knows, says it for the block.
+    uint64_t max_own_seq{0};
+    /// Every row is this node's own - always without a mesh. Then a block that rolls a segment
+    /// over gives each segment its own rows' highest, exactly as appending the rows one by one
+    /// does; a block of mixed rows gives both its highest, which a start, taking the highest over a
+    /// symbol's segments, reads the same.
+    bool all_own{true};
 
     /// A block of these rows, its range computed from them; null for none, because a symbol that
     /// received no row this drain has no block.
@@ -184,7 +206,8 @@ struct RowBlock {
     static std::shared_ptr<const RowBlock> make(std::string symbol, std::string exchange,
                                                 std::vector<SnapshotRow> rows,
                                                 uint64_t min_ts_ns, uint64_t max_ts_ns,
-                                                std::shared_ptr<RowBufferPool> pool);
+                                                std::shared_ptr<RowBufferPool> pool,
+                                                uint64_t max_own_seq = 0, bool all_own = false);
 };
 
 /// Columnar storage engine for SnapshotRow data.
@@ -230,7 +253,8 @@ public:
     ColumnarStore(ColumnarStore&&)                 = delete;
     ColumnarStore& operator=(ColumnarStore&&)      = delete;
 
-    /// Append a row to the active segment, rolling over if needed.
+    /// Append a row to the active segment, rolling over if needed. The row counts as this store's
+    /// own for the segment's highest own number (#184); a block says its own instead.
     void append(const SnapshotRow& row);
 
     /// Append a block's rows in their order, writing what append() on each in turn writes - a
@@ -287,6 +311,23 @@ public:
     /// The seal epoch every segment closed from here on is stamped with, like the position above
     /// (#165 part 2a).
     void set_seal_epoch(uint64_t seal_epoch) { seal_epoch_ = seal_epoch; }
+
+    /// The origin this store's own rows are of (#184): the mesh node's id, 0 without a mesh. Every
+    /// segment it closes records the highest number among them - a row appended alone counts as
+    /// own, and a block says its own highest.
+    void set_own_origin(uint16_t origin) { own_origin_ = origin; }
+
+    /// What the next segment written records as its own highest number instead of what its rows
+    /// say (#184) - for a merge, whose rows are its inputs' and whose answer is theirs: the highest
+    /// of the inputs', when every input knows it for the same origin, `known = false` otherwise.
+    /// The next write consumes it, like the lineage.
+    void set_own_max(bool known, uint16_t origin, uint64_t max_own, bool received_rows) {
+        has_own_override_      = true;
+        own_override_known_    = known;
+        own_override_origin_   = origin;
+        own_override_max_      = max_own;
+        own_override_received_ = received_rows;
+    }
 
     /// Flush the active segment: encode buffers, write column files, write meta.json.
     /// Returns the SegmentMeta of the flushed segment, or std::nullopt if no active segment.
@@ -539,6 +580,16 @@ private:
 
     // Active segment state
     uint64_t    wal_identity_{0};
+    /// append() with the number that counts as own for this row - its own for a row appended
+    /// alone, 0 for a block's rows, whose own highest append_block() sets itself.
+    void append_row(const SnapshotRow& row, uint64_t own_seq);
+    uint16_t    own_origin_{0};          ///< see set_own_origin()
+    uint64_t    active_own_max_{0};      ///< own rows' highest number in the active segment
+    bool        has_own_override_{false};   ///< see set_own_max()
+    bool        own_override_known_{false};
+    uint16_t    own_override_origin_{0};
+    uint64_t    own_override_max_{0};
+    bool        own_override_received_{false};
     uint64_t    seal_epoch_{0};
     uint32_t    wal_file_index_{0};
     uint64_t    wal_byte_offset_{0};

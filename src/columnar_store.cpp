@@ -91,26 +91,35 @@ std::shared_ptr<const RowBlock> RowBlock::make(std::string symbol, std::string e
     if (rows.empty()) return nullptr;
     uint64_t min_ts = rows.front().timestamp_ns;
     uint64_t max_ts = rows.front().timestamp_ns;
+    uint64_t max_seq = 0;
     for (const auto& r : rows) {
         min_ts = std::min(min_ts, r.timestamp_ns);
         max_ts = std::max(max_ts, r.timestamp_ns);
+        max_seq = std::max(max_seq, r.sequence_number);
     }
-    return make(std::move(symbol), std::move(exchange), std::move(rows), min_ts, max_ts, nullptr);
+    // Rows whose owner nobody states count as own, as a row appended alone does: a counter
+    // continued from too low a number would hand a number out twice, and a peer drops the second
+    // record as the first.
+    return make(std::move(symbol), std::move(exchange), std::move(rows), min_ts, max_ts, nullptr,
+                max_seq, /*all_own=*/true);
 }
 
 std::shared_ptr<const RowBlock> RowBlock::make(std::string symbol, std::string exchange,
                                                std::vector<SnapshotRow> rows,
                                                uint64_t min_ts_ns, uint64_t max_ts_ns,
-                                               std::shared_ptr<RowBufferPool> pool) {
+                                               std::shared_ptr<RowBufferPool> pool,
+                                               uint64_t max_own_seq, bool all_own) {
     if (rows.empty()) {
         if (pool) pool->give_back(std::move(rows));
         return nullptr;
     }
     auto block = std::make_unique<RowBlock>();
-    block->symbol    = std::move(symbol);
-    block->exchange  = std::move(exchange);
-    block->min_ts_ns = min_ts_ns;
-    block->max_ts_ns = max_ts_ns;
+    block->symbol      = std::move(symbol);
+    block->exchange    = std::move(exchange);
+    block->min_ts_ns   = min_ts_ns;
+    block->max_ts_ns   = max_ts_ns;
+    block->max_own_seq = max_own_seq;
+    block->all_own     = all_own;
     block->rows      = std::move(rows);
     if (!pool) return std::shared_ptr<const RowBlock>(std::move(block));
     // The deleter runs wherever the last reference goes - a seal, a snapshot install, or a query
@@ -211,6 +220,7 @@ void ColumnarStore::abandon_active() {
     has_active_segment_ = false;
     active_row_count_   = 0;
     active_has_raw_qty_ = false;
+    active_own_max_     = 0;
     price_buf_.clear();
     qty_buf_.clear();
     ts_buf_.clear();
@@ -408,6 +418,13 @@ std::string ColumnarStore::meta_json(const SegmentMeta& meta,
     // A merge's (#165 part 2b), last, and in keys no reader of the ones above searches for: the
     // parser finds a key by its first occurrence, and an older build parses this file too.
     if (meta.merge_level > 0) f << ",\"merge_level\":" << meta.merge_level;
+    // #184's, likewise last and in keys no older reader searches for. Absent means unknown - a
+    // segment written before them, or a merge of one - and a start then does what it always did.
+    if (meta.has_own_max) {
+        f << ",\"own_origin\":" << meta.own_origin
+          << ",\"own_max_sequence\":" << meta.own_max_sequence;
+        if (meta.has_received_rows) f << ",\"received_rows\":true";
+    }
     if (inputs != nullptr && !inputs->empty()) {
         f << ",\"compacted_from\":[";
         for (size_t i = 0; i < inputs->size(); ++i) {
@@ -495,6 +512,13 @@ bool ColumnarStore::parse_meta_json(const std::string& path, SegmentMeta& out,
     out.wal_byte_offset = extract_uint64("wal_byte_offset");
     // Absent before #165 part 2a, and 0 then: sealed before any epoch a checkpoint can name.
     out.seal_epoch      = extract_uint64("seal_epoch");
+    // Absent before #184, and then unknown: a start falls back to max_sequence_number.
+    const auto own_origin = find_uint64("own_origin");
+    const auto own_max    = find_uint64("own_max_sequence");
+    out.has_own_max      = own_origin.has_value() && own_max.has_value();
+    out.own_origin       = static_cast<uint16_t>(own_origin.value_or(0));
+    out.own_max_sequence = own_max.value_or(0);
+    out.has_received_rows = out.has_own_max && extract_bool("received_rows");
     out.symbol       = extract_string("symbol");
     out.exchange     = extract_string("exchange");
     // Both absent before #166. Then the recorded end WAS the last row's time - the number replay's
@@ -552,6 +576,13 @@ bool ColumnarStore::parse_meta_json(const std::string& path, SegmentMeta& out,
 // ── append ────────────────────────────────────────────────────────────────────
 
 void ColumnarStore::append(const SnapshotRow& row) {
+    // A row appended alone counts as this store's own (#184) - the C API's, which has no mesh, and a
+    // merge's, whose answer set_own_max() gives instead. Counted as someone else's, a start would
+    // continue the counter from too low a number and hand one out twice.
+    append_row(row, row.sequence_number);
+}
+
+void ColumnarStore::append_row(const SnapshotRow& row, uint64_t own_seq) {
     // Determine segment boundary (round down to segment duration)
     uint64_t seg_start = (row.timestamp_ns / segment_duration_ns_) * segment_duration_ns_;
 
@@ -631,21 +662,33 @@ void ColumnarStore::append(const SnapshotRow& row) {
     if (row.quantity > kMaxSimple8b) {
         active_has_raw_qty_ = true;
     }
+    // After any rollover above, so the number is the segment's the row is in.
+    active_own_max_ = std::max(active_own_max_, own_seq);
 }
 
 void ColumnarStore::append_block(const RowBlock& block) {
     const std::vector<SnapshotRow>& rows = block.rows;
     if (rows.empty()) return;
-    // The first row opens the segment, or rolls it over, as it would on its own.
-    append(rows.front());
+    // The first row opens the segment, or rolls it over, as it would on its own - through the path
+    // that counts a row as own, so the block's own highest is what counts instead, set on whichever
+    // segment the rows end in (below). A block that rolls a segment over sets it on both: a start
+    // takes the highest over all of a symbol's segments, so it is the same number either way.
+    const auto own_seq_of = [&block](const SnapshotRow& r) -> uint64_t {
+        return block.all_own ? r.sequence_number : 0;
+    };
+    append_row(rows.front(), own_seq_of(rows.front()));
     if (block.max_ts_ns >= active_segment_start_ + segment_duration_ns_) {
+        // A block of mixed rows cannot say which of its own rows went where, so the segment its
+        // first row is in and the one its last is in both get its own highest.
+        if (!block.all_own) active_own_max_ = std::max(active_own_max_, block.max_own_seq);
         // A row of a later period is in the block and rolls the segment over where it stands, so
         // the rest goes row by row. Rare: a block is one drain of one symbol - 100 ms of it at the
         // default interval - and a period is an hour.
         OB_LOG_DEBUG("columnar", "a block of %zu row(s) for %s.%s reaches past its segment's period; "
                                  "appended row by row",
                      rows.size(), symbol_.c_str(), exchange_.c_str());
-        for (size_t i = 1; i < rows.size(); ++i) append(rows[i]);
+        for (size_t i = 1; i < rows.size(); ++i) append_row(rows[i], own_seq_of(rows[i]));
+        if (!block.all_own) active_own_max_ = std::max(active_own_max_, block.max_own_seq);
         return;
     }
     // Every other row stays in this segment - none is of a later period, and one of an earlier
@@ -669,6 +712,8 @@ void ColumnarStore::append_block(const RowBlock& block) {
     active_row_count_ += rows.size() - 1;
     if (block.min_ts_ns < active_min_ts_) active_min_ts_ = block.min_ts_ns;
     if (block.max_ts_ns > active_max_ts_) active_max_ts_ = block.max_ts_ns;
+    // Every row is in this segment, so the block's own highest is the segment's.
+    active_own_max_ = std::max(active_own_max_, block.max_own_seq);
 }
 
 void ColumnarStore::swap_buffers(ColumnBuffers& other) {
@@ -1079,6 +1124,19 @@ SegmentMeta ColumnarStore::write_active_segment(const std::string& dir) {
     meta.wal_file_index  = wal_file_index_;
     meta.wal_byte_offset = wal_byte_offset_;
     meta.seal_epoch      = seal_epoch_;
+    // This node's own highest number here (#184), or a merge's inputs' answer for it.
+    if (has_own_override_) {
+        meta.has_own_max       = own_override_known_;
+        meta.own_origin        = own_override_origin_;
+        meta.own_max_sequence  = own_override_known_ ? own_override_max_ : 0;
+        meta.has_received_rows = own_override_known_ && own_override_received_;
+        has_own_override_      = false;
+    } else {
+        meta.has_own_max       = true;
+        meta.own_origin        = own_origin_;
+        meta.own_max_sequence  = active_own_max_;
+        meta.has_received_rows = false;
+    }
     if (has_lineage_) {
         // A merge's (#165 part 2b): the latest of its inputs' last rows, which the row appended
         // last need not be, and its level. The inputs go into meta.json only.
@@ -1096,6 +1154,7 @@ SegmentMeta ColumnarStore::write_active_segment(const std::string& dir) {
     has_active_segment_ = false;
     active_row_count_   = 0;
     active_has_raw_qty_ = false;
+    active_own_max_     = 0;
     price_buf_.clear();
     qty_buf_.clear();
     ts_buf_.clear();

@@ -441,6 +441,34 @@ bool Engine::stage_merge(const std::vector<SegmentMeta>& inputs) {
     writer.set_wal_position(first.wal_identity, file, offset);
     writer.set_seal_epoch(epoch);
     writer.set_lineage(level + 1, std::move(named), last_row);
+    // The merge's own highest number (#184): this node's, the highest its own inputs say - and
+    // whether any input's rows were sealed by another node, whose own numbers for this node none
+    // of them says. Unknown only when an input was written before segments said any of it; a
+    // start then falls back for this segment as it does for such an input.
+    {
+        const uint16_t self = mm_config_.enabled ? mm_config_.node_id : 0;
+        bool known = true;
+        bool received = false;
+        uint64_t own_max = 0;
+        for (const SegmentMeta& in : inputs) {
+            if (!in.has_own_max) {
+                known = false;
+                break;
+            }
+            if (in.own_origin == self) {
+                own_max  = std::max(own_max, in.own_max_sequence);
+                received = received || in.has_received_rows;
+            } else {
+                received = true;
+            }
+        }
+        writer.set_own_max(known, self, own_max, received);
+        if (!known) {
+            OB_LOG_DEBUG("engine", "compaction: an input of a merge of %s.%s was written before "
+                                   "segments said whose rows are their own, so the merge does not "
+                                   "say either", first.symbol.c_str(), first.exchange.c_str());
+        }
+    }
     // Through the seals' buffers, as a seal writes: the flush thread holds them, and a merge of the
     // cap's rows is as big as a seal.
     writer.swap_buffers(seal_buffers_);
