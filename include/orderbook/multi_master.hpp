@@ -26,6 +26,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include "orderbook/version_vector.hpp"
@@ -451,6 +452,9 @@ struct MMSnapshotRecv {
     bool             active{false};
     Phase            phase{Phase::META};
     uint16_t         source_node_id{0};
+    /// The connection the BEGIN came on - the one a receiver that abandons the transfer tells to
+    /// stop (#192).
+    uint64_t         source_conn_id{0};
     SnapshotBegin    announced{};
     std::vector<uint8_t> meta;         // assembled manifest ++ vector ++ held
     SnapshotManifest manifest;
@@ -606,7 +610,10 @@ public:
     void handle_snapshot_end(PeerConnection& peer, const uint8_t* payload, size_t len);
 
     /// Give up on the inbound snapshot: staging removed, data directory untouched, flag cleared.
-    void abort_bootstrap(const char* reason);
+    ///
+    /// `tell_source`: send the source an abort with the reason, so it stops sending (#192) - not
+    /// when the source went away, or aborted the transfer itself.
+    void abort_bootstrap(const char* reason, bool tell_source = true);
 
     /// Ask a peer for a snapshot. Refuses unless this node holds nothing at all.
     bool request_snapshot_from(PeerConnection& peer);
@@ -820,14 +827,20 @@ private:
     /// Forget a request unanswered for MM_SNAPSHOT_ASK_DEADLINE_MS and ask another peer. Takes the
     /// lock; the io loop calls it every pass.
     void expire_snapshot_ask(std::chrono::steady_clock::time_point now);
-    /// The request to `gone_node` ended without a snapshot - refused, dropped or expired: ask the
-    /// first other connected peer whose vector says it holds something, at once, rather than at its
-    /// next vector - a reconciliation interval later (#188). True when one was asked. Caller holds
-    /// `mtx_`.
+    /// The request to `gone_node` ended without a snapshot - refused, dropped, expired or abandoned
+    /// part-way: ask the first other connected peer whose vector says it holds something and that
+    /// this round has not asked, at once, rather than at its next vector - a reconciliation interval
+    /// later (#188). True when one was asked. Caller holds `mtx_`.
     bool ask_another_peer_for_snapshot(uint16_t gone_node);
     /// The wait for a snapshot this node asked for ends with no peer left to ask: it accepts writes
-    /// again, and says why (#188). Caller holds `mtx_`.
+    /// again, and says why (#188). Ends the round. Caller holds `mtx_`.
     void end_snapshot_wait(const char* why);
+    /// The peers asked for a snapshot since this bootstrap began (#191): each at most once, so a
+    /// joiner every peer refuses, or whose every transfer fails, ends its wait and takes writes. It
+    /// asked the first peer other than the one that had just failed, and so asked them in turn for
+    /// ever. Emptied when the bootstrap ends, however it ends; the next round is asked for by the
+    /// next vector. Guarded by `mtx_`.
+    std::set<uint16_t> snapshot_round_;
 
     /// Source of PeerConnection::conn_id. Read and bumped under mtx_, like peers_ itself.
     uint64_t next_conn_id_{1};

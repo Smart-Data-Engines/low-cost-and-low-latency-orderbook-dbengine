@@ -367,7 +367,11 @@ joiner                                            peer
 
 **One snapshot, from one peer** (#188). A joiner asks the first peer whose vector says it holds
 something, and nobody else until that one answers: a refusal, the connection dropping or ten minutes
-of silence (`MM_SNAPSHOT_ASK_DEADLINE_MS`) asks the next such peer at once. It takes a
+of silence (`MM_SNAPSHOT_ASK_DEADLINE_MS`) asks the next such peer at once - each peer once a
+bootstrap (#191): the next was the first peer other than the one that had just failed, so a joiner
+two peers failed asked them in turn for ever, refusing writes, and when none is left unasked it takes
+writes and the next vector asks again. A joiner that abandons a transfer tells its sender, which
+stops (#192). It takes a
 `SNAPSHOT_BEGIN` only from the connection it asked, and only while it still holds nothing - anything
 else is refused (`not_requested`, `holds_data`), and a sender that is refused stops sending. And the
 bootstrap starts with the request, not with the BEGIN: between the two, every peer's catch-up of the

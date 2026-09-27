@@ -650,6 +650,7 @@ void MultiMasterManager::handle_snapshot_begin(PeerConnection& peer,
     st.active         = true;
     st.phase          = MMSnapshotRecv::Phase::META;
     st.source_node_id = peer.node_id;
+    st.source_conn_id = peer.conn_id;
     st.announced      = begin;
     st.started_at     = std::chrono::steady_clock::now();
     st.meta.reserve(begin.total());
@@ -966,7 +967,7 @@ bool MultiMasterManager::install_snapshot_files() {
     return engine_.install_snapshot(st.staging_dir, st.manifest);
 }
 
-void MultiMasterManager::abort_bootstrap(const char* reason) {
+void MultiMasterManager::abort_bootstrap(const char* reason, bool tell_source) {
     auto& st = snapshot_recv_;
     if (!st.active) return;
 
@@ -975,13 +976,30 @@ void MultiMasterManager::abort_bootstrap(const char* reason) {
         st.fd = -1;
     }
 
+    // The source is told, so it stops (#192): it streamed the rest of the snapshot to a node that
+    // dropped every chunk, and said so at WARN for each - 448 at the end of one of 65 600 files, and
+    // a whole snapshot's worth for a transfer abandoned at its start. Its connection, not merely its
+    // node: the node back on a new connection is sending nothing.
+    bool told = false;
+    if (tell_source) {
+        for (auto& [key, conn] : peers_) {
+            (void)key;
+            if (conn.node_id == st.source_node_id && conn.conn_id == st.source_conn_id &&
+                conn.connected && conn.fd >= 0) {
+                send_snapshot_abort(conn, reason);
+                told = true;
+                break;
+            }
+        }
+    }
+
     const auto elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - st.started_at).count();
     OB_LOG_ERROR("mm",
                  "Bootstrap from peer %u abandoned after %llu bytes in %.1f s: %s — the data "
-                 "directory is untouched",
+                 "directory is untouched%s",
                  st.source_node_id, static_cast<unsigned long long>(st.bytes_received),
-                 elapsed, reason);
+                 elapsed, reason, told ? ", and the peer is told to stop sending" : "");
     engine_.registry().increment_counter("ob_mm_snapshot_failed_total");
 
     std::error_code ec;
@@ -1031,7 +1049,7 @@ void MultiMasterManager::on_peer_disconnected(PeerConnection& peer) {
         finish_snapshot_send(false, "peer_disconnected");
     }
     if (snapshot_recv_.active && snapshot_recv_.source_node_id == peer.node_id) {
-        abort_bootstrap("source_disconnected");
+        abort_bootstrap("source_disconnected", /*tell_source=*/false);
     }
     if (snapshot_ask_.active && snapshot_ask_.node_id == peer.node_id &&
         snapshot_ask_.conn_id == peer.conn_id) {
@@ -1046,6 +1064,13 @@ bool MultiMasterManager::ask_another_peer_for_snapshot(uint16_t gone_node) {
     for (auto& [node_id, other] : peers_) {
         if (node_id == gone_node || !other.connected || !other.handshake_done) continue;
         if (other.peer_vector.wants_everything() || other.peer_vector.entry_count() == 0) continue;
+        // Once a round (#191): the first peer other than the one that had just failed was asked, so
+        // two that both failed were asked in turn for ever.
+        if (snapshot_round_.count(node_id) != 0) {
+            OB_LOG_DEBUG("mm", "Not asking peer %u for a snapshot again: this bootstrap asked it "
+                               "already", node_id);
+            continue;
+        }
         // Whatever request_snapshot_from() refuses for now - data of this node's own - it refuses
         // for every peer, so the first one it is asked about decides.
         const bool asked = request_snapshot_from(other);
@@ -1055,8 +1080,9 @@ bool MultiMasterManager::ask_another_peer_for_snapshot(uint16_t gone_node) {
         }
         return asked;
     }
-    OB_LOG_INFO("mm", "No other peer states what it holds to ask for the snapshot peer %u did not "
-                      "send", gone_node);
+    OB_LOG_INFO("mm", "No other peer states what it holds, and has not been asked by this bootstrap "
+                      "(%zu asked), to ask for the snapshot peer %u did not send",
+                snapshot_round_.size(), gone_node);
     return false;
 }
 
@@ -1117,6 +1143,7 @@ bool MultiMasterManager::request_snapshot_from(PeerConnection& peer) {
     const auto frame = wrap_snapshot_frame(MM_MSG_SNAPSHOT_REQUEST, config_.node_id, {});
     enqueue_frame(peer, frame.data(), frame.size());
     snapshot_ask_ = MMSnapshotAsk{true, peer.node_id, peer.conn_id, std::chrono::steady_clock::now()};
+    snapshot_round_.insert(peer.node_id);
     // The bootstrap starts here, not at the BEGIN that answers (#188): the other peers' catch-ups
     // arrive in between, and a node that applied them - or a client's write - held data by then, to
     // be refused the snapshot or to lose what it held to the install.

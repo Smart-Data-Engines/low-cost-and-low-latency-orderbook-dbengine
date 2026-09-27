@@ -624,13 +624,16 @@ void MultiMasterManager::end_snapshot_wait(const char* why) {
     // Not a failed bootstrap - nothing was received, and nothing here was touched: no peer is left
     // to give this node the snapshot it asked for. Refusing writes until one appears would be #73's
     // node that refuses them for ever; the next peer's vector asks again while it still holds nothing.
+    const size_t asked = snapshot_round_.size();
+    snapshot_round_.clear();                    // the next vector begins the next round (#191)
     if (!bootstrapping_.exchange(false, std::memory_order_acq_rel)) return;
-    OB_LOG_WARN("mm", "No peer gave node %u the snapshot it asked for (%s); accepting writes until "
-                      "one can - the next peer whose vector says what it holds is asked",
-                config_.node_id, why);
+    OB_LOG_WARN("mm", "No peer gave node %u the snapshot it asked for (%s; %zu asked); accepting "
+                      "writes until one can - the next peer whose vector says what it holds is asked",
+                config_.node_id, why, asked);
 }
 
 void MultiMasterManager::finish_bootstrap(bool succeeded) {
+    snapshot_round_.clear();                    // however it ended (#191)
     const bool was = bootstrapping_.exchange(false, std::memory_order_acq_rel);
     if (!was) {
         OB_LOG_DEBUG("mm", "finish_bootstrap() with no bootstrap in progress on node %u",
@@ -1829,7 +1832,7 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
                 static_cast<const uint8_t*>(payload_ptr), expected_payload_len);
             OB_LOG_WARN("mm", "Peer %u aborted the snapshot: %s", peer.node_id, reason.c_str());
             if (snapshot_recv_.active && snapshot_recv_.source_node_id == peer.node_id) {
-                abort_bootstrap("peer_aborted");
+                abort_bootstrap("peer_aborted", /*tell_source=*/false);
             }
             // The peer this node asked refused: the next one that states its vector is asked (#188).
             if (snapshot_ask_.active && snapshot_ask_.node_id == peer.node_id &&
