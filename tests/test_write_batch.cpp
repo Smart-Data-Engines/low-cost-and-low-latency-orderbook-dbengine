@@ -443,7 +443,8 @@ bool inside_a_lock_of(const std::string& body, std::size_t at, const std::string
             const std::string head = body.substr(line == std::string::npos ? 0 : line + 1,
                                                  i - (line == std::string::npos ? 0 : line + 1));
             if (head.find("unique_lock") != std::string::npos ||
-                head.find("lock_guard") != std::string::npos) {
+                head.find("lock_guard") != std::string::npos ||
+                head.find("TimedLock") != std::string::npos) {   // a lock that times itself (#186)
                 held.back() = true;
             }
         }
@@ -552,15 +553,20 @@ TEST(FlushTickStatic, TheTicksSyncDrainAndDeletingRunWithoutTheEnginesLock) {
     const std::string tick = definition_body(src, "void Engine::flush_tick(");
     ASSERT_FALSE(tick.empty()) << "Engine::flush_tick moved; this test would check nothing";
 
+    // Taken as a plain lock or as a TimedLock (#186), which names the section a slow hold was in.
     const std::string lock = "lock(mtx_)";
+    const std::string timed = "timed(mtx_";
+    const auto locked = [&](const std::string& body_text, std::size_t at) {
+        return inside_a_lock_of(body_text, at, lock) || inside_a_lock_of(body_text, at, timed);
+    };
     const std::size_t perform = tick.find("wal_.perform_sync(");
     ASSERT_NE(perform, std::string::npos) << "the tick does not perform a sync ticket";
-    EXPECT_FALSE(inside_a_lock_of(tick, perform, lock))
+    EXPECT_FALSE(locked(tick, perform))
         << "the flush tick syncs the WAL with the engine's lock held, so every writer waits for "
            "the fsync (7.9 ms at p50 and 25.8 at worst, measured)";
     const std::size_t drain = tick.find("drain_batch(batch, ticket.position(), /*mtx_held=*/false)");
     ASSERT_NE(drain, std::string::npos) << "the tick does not drain its batch without the lock";
-    EXPECT_FALSE(inside_a_lock_of(tick, drain, lock))
+    EXPECT_FALSE(locked(tick, drain))
         << "the flush tick drains with the engine's lock held, so every writer waits for ~640k rows "
            "to reach their stores (11 ms at p99.9 with only the sync outside, measured)";
 
@@ -570,18 +576,18 @@ TEST(FlushTickStatic, TheTicksSyncDrainAndDeletingRunWithoutTheEnginesLock) {
                                "combined_store_.delete_expired_segments(cutoff_ns)"}) {
         const std::size_t at = tick.find(unlink);
         ASSERT_NE(at, std::string::npos) << unlink << " moved; this test would check nothing";
-        EXPECT_FALSE(inside_a_lock_of(tick, at, lock))
+        EXPECT_FALSE(locked(tick, at))
             << unlink << " deletes files with the engine's lock held, so every writer waits for it";
     }
     const std::size_t floor = tick.find("safe_truncate = retention_floor_.file_index");
     ASSERT_NE(floor, std::string::npos) << "the truncation no longer reads the retention floor";
-    EXPECT_TRUE(inside_a_lock_of(tick, floor, lock))
+    EXPECT_TRUE(locked(tick, floor))
         << "the retention floor is read without the engine's lock";
 
     for (const char* step : {"wal_.prepare_sync(", "wal_.complete_sync(", "pending_rows_.take_all()"}) {
         const std::size_t at = tick.find(step);
         ASSERT_NE(at, std::string::npos) << step;
-        EXPECT_TRUE(inside_a_lock_of(tick, at, lock))
+        EXPECT_TRUE(locked(tick, at))
             << step << " runs without the engine's lock, and a writer appends to the WAL and the "
                        "queue under it";
     }
@@ -593,4 +599,8 @@ TEST(FlushTickStatic, TheTicksSyncDrainAndDeletingRunWithoutTheEnginesLock) {
     const std::string released = "{ { std::unique_lock<std::mutex> lock(mtx_); } x(); }";
     EXPECT_TRUE(inside_a_lock_of(held, held.find("x()"), lock));
     EXPECT_FALSE(inside_a_lock_of(released, released.find("x()"), lock));
+    const std::string held_timed = "{ TimedLock timed(mtx_, \"a\"); x(); }";
+    const std::string released_timed = "{ { TimedLock timed(mtx_, \"a\"); } x(); }";
+    EXPECT_TRUE(locked(held_timed, held_timed.find("x()")));
+    EXPECT_FALSE(locked(released_timed, released_timed.find("x()")));
 }
