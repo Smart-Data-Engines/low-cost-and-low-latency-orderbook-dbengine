@@ -1439,3 +1439,135 @@ TEST(MMSnapshotRefusal, AManifestTooLargeToAddressIsRefusedRatherThanWrapped) {
     EXPECT_FALSE(sender.mm->snapshot_send_active())
         << "a two-row store fits in one pass, so the transfer should already be complete";
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Each peer once (#191), and a source told to stop (#192)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// The next peer asked after a refusal, a drop, a deadline or a bootstrap abandoned part-way was the
+// first one other than the peer that had just failed - so with two peers or more that all fail, the
+// joiner asked them in turn for ever, refusing writes the whole time: measured with a receiver that
+// abandoned every snapshot at its 65 536th file, three peers each sent the joiner three whole
+// snapshots of 65 600 files in 90 s, and the joiner never took a write. And a receiver that abandoned
+// a transfer did not say so: the sender streamed the rest to a node that dropped every chunk, with a
+// WARN for each.
+
+namespace {
+
+void state_a_vector(ob::PeerConnection& peer) {
+    const auto bytes = ob::serialize_version_vector({{"BTC.USDT", 3, 8}}, false);
+    ASSERT_TRUE(peer.peer_vector.deserialize(bytes.data(), bytes.size()));
+}
+
+/// The BEGIN of a small snapshot from `peer`, which this node asked.
+void begin_from(Node& node, ob::PeerConnection& peer) {
+    ob::SnapshotBegin begin{};
+    begin.manifest_len = 10;
+    begin.vector_len   = 2;
+    const auto payload = ob::encode_snapshot_begin(begin);
+    node.mm->handle_snapshot_begin(peer, payload.data(), payload.size());
+}
+
+}  // namespace
+
+TEST(MMSnapshotEachPeerOnce, ANodeEveryPeerRefusesAsksEachOnceAndTakesWrites) {
+    Node node(1);
+    WiredPeer a(2), b(3);
+    ob::PeerConnection& pa = a.mgr(*node.mm);
+    ob::PeerConnection& pb = b.mgr(*node.mm);
+    state_a_vector(pa);
+    state_a_vector(pb);
+    ASSERT_TRUE(node.mm->request_snapshot_from(pa));
+    EXPECT_EQ(requests_in(a), 1u);
+
+    arrive_snapshot_frame(*node.mm, pa, ob::MM_MSG_SNAPSHOT_ABORT,
+                          ob::encode_snapshot_abort("too_many_files"));
+    EXPECT_EQ(requests_in(b), 1u) << "the other peer was not asked";
+    arrive_snapshot_frame(*node.mm, pb, ob::MM_MSG_SNAPSHOT_ABORT,
+                          ob::encode_snapshot_abort("too_many_files"));
+    EXPECT_EQ(requests_in(a), 0u) << "a peer that refused was asked again in the same round";
+    EXPECT_FALSE(node.mm->snapshot_ask_for_test().active);
+    EXPECT_FALSE(node.mm->is_bootstrapping()) << "a node every peer refused refuses writes";
+}
+
+TEST(MMSnapshotEachPeerOnce, ABootstrapEveryPeerFailsEndsOnceEachWasTried) {
+    Node node(1);
+    WiredPeer a(2), b(3);
+    ob::PeerConnection& pa = a.mgr(*node.mm);
+    ob::PeerConnection& pb = b.mgr(*node.mm);
+    state_a_vector(pa);
+    state_a_vector(pb);
+    ASSERT_TRUE(node.mm->request_snapshot_from(pa));
+    ASSERT_EQ(requests_in(a), 1u);
+    begin_from(node, pa);
+    ASSERT_TRUE(node.mm->snapshot_recv_active());
+    node.mm->abort_bootstrap("file_crc_mismatch");
+    EXPECT_EQ(requests_in(b), 1u) << "the other peer was not asked";
+    begin_from(node, pb);
+    ASSERT_TRUE(node.mm->snapshot_recv_active());
+    node.mm->abort_bootstrap("file_crc_mismatch");
+    EXPECT_EQ(requests_in(a), 0u) << "a peer whose snapshot failed was asked again in the same round";
+    EXPECT_FALSE(node.mm->is_bootstrapping());
+}
+
+TEST(MMSnapshotEachPeerOnce, AnUnansweredOrDroppedPeerIsNotAskedAgainInTheRound) {
+    Node node(1);
+    WiredPeer a(2), b(3);
+    ob::PeerConnection& pa = a.mgr(*node.mm);
+    ob::PeerConnection& pb = b.mgr(*node.mm);
+    state_a_vector(pa);
+    state_a_vector(pb);
+    ASSERT_TRUE(node.mm->request_snapshot_from(pa));
+    ASSERT_EQ(requests_in(a), 1u);
+    node.mm->expire_snapshot_ask_for_test(
+        node.mm->snapshot_ask_for_test().asked_at +
+        std::chrono::milliseconds(ob::MM_SNAPSHOT_ASK_DEADLINE_MS + 1));
+    EXPECT_EQ(requests_in(b), 1u) << "the other peer was not asked at the deadline";
+    node.mm->on_peer_disconnected(pb);
+    EXPECT_EQ(requests_in(a), 0u) << "the peer that did not answer was asked again in the same round";
+    EXPECT_FALSE(node.mm->is_bootstrapping());
+}
+
+TEST(MMSnapshotEachPeerOnce, TheNextRoundAsksAgain) {
+    // What #188 says a node no peer served does: take writes, and ask at the next vector while it
+    // still holds nothing. The round ends with the wait, so its peers can be asked in the next one.
+    Node node(1);
+    WiredPeer a(2);
+    ob::PeerConnection& pa = a.mgr(*node.mm);
+    state_a_vector(pa);
+    ASSERT_TRUE(node.mm->request_snapshot_from(pa));
+    arrive_snapshot_frame(*node.mm, pa, ob::MM_MSG_SNAPSHOT_ABORT, ob::encode_snapshot_abort("busy"));
+    ASSERT_FALSE(node.mm->is_bootstrapping());
+    EXPECT_EQ(requests_in(a), 1u);
+    EXPECT_TRUE(node.mm->request_snapshot_from(pa)) << "the round that ended kept the peer from the next";
+    EXPECT_EQ(requests_in(a), 1u);
+}
+
+TEST(MMSnapshotEachPeerOnce, AReceiverThatAbandonsATransferTellsItsSourceToStop) {
+    Node node(1);
+    WiredPeer a(2);
+    ob::PeerConnection& pa = a.mgr(*node.mm);
+    ASSERT_TRUE(node.mm->request_snapshot_from(pa));
+    (void)requests_in(a);
+    begin_from(node, pa);
+    ASSERT_TRUE(node.mm->snapshot_recv_active());
+    // A chunk of a file before the metadata is a transfer the receiver cannot take.
+    const uint8_t byte = 1;
+    const auto chunk = ob::encode_snapshot_chunk(0, 0, &byte, 1);
+    arrive_snapshot_frame(*node.mm, pa, ob::MM_MSG_SNAPSHOT_CHUNK, chunk);
+    EXPECT_FALSE(node.mm->snapshot_recv_active());
+    EXPECT_EQ(refusal_in(a), "file_chunk_before_metadata") << "the source was not told to stop";
+}
+
+TEST(MMSnapshotEachPeerOnce, ASourceThatWentAwayOrAbortedIsNotToldAnything) {
+    Node node(1);
+    WiredPeer a(2);
+    ob::PeerConnection& pa = a.mgr(*node.mm);
+    ASSERT_TRUE(node.mm->request_snapshot_from(pa));
+    (void)requests_in(a);
+    begin_from(node, pa);
+    arrive_snapshot_frame(*node.mm, pa, ob::MM_MSG_SNAPSHOT_ABORT,
+                          ob::encode_snapshot_abort("file_read_failed"));
+    EXPECT_FALSE(node.mm->snapshot_recv_active());
+    EXPECT_EQ(refusal_in(a), "") << "a source that aborted was told to stop what it had stopped";
+}
