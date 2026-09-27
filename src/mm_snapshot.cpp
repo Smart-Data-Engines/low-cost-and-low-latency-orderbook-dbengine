@@ -1018,13 +1018,29 @@ void MultiMasterManager::handle_snapshot_end(PeerConnection& peer,
                 static_cast<unsigned long long>(st.bytes_received),
                 st.manifest.total_rows, elapsed);
 
+    // Writes are taken from here, and only then is the snapshot counted as received. The store is
+    // installed and its frontiers adopted; what the staging directory still holds is the empty
+    // skeleton of the directories its files were renamed out of, which is no reason to refuse
+    // anything - and at 65 600 files removing it took 1.2 s, in which a node that said it had
+    // received its snapshot refused every read and write (#176; Debug, i3-7100U).
+    const std::string staging = std::move(st.staging_dir);
+    st = MMSnapshotRecv{};
+    finish_bootstrap(/*succeeded=*/true);
     engine_.registry().increment_counter("ob_mm_snapshot_received_total");
 
     std::error_code ec;
-    fs::remove_all(st.staging_dir, ec);
-    st = MMSnapshotRecv{};
-
-    finish_bootstrap(/*succeeded=*/true);
+    const auto cleared_at = std::chrono::steady_clock::now();
+    fs::remove_all(staging, ec);
+    const double clear_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - cleared_at).count();
+    if (ec) {
+        // Harmless for this bootstrap, and the next one clears it before staging anything.
+        OB_LOG_WARN("mm", "Could not remove staging '%s' after the bootstrap: %s", staging.c_str(),
+                    ec.message().c_str());
+    } else {
+        OB_LOG_DEBUG("mm", "Staging '%s' removed after the bootstrap in %.1f ms", staging.c_str(),
+                     clear_ms);
+    }
 }
 
 bool MultiMasterManager::install_snapshot_files() {
