@@ -122,3 +122,52 @@ TEST(LeaderRead, TheThreeAnswersAreDistinct) {
     EXPECT_NE(present, unavailable);
     EXPECT_NE(absent, unavailable);
 }
+
+// ── Any key, and a compare-and-swap (#175) ────────────────────────────────────
+
+TEST(CoordinatorKeyRead, AnEmptyResponseIsNoInformation) {
+    ob::CoordinatorClient::KeyValue kv;
+    EXPECT_EQ(ob::CoordinatorClient::interpret_range_response("", kv),
+              ob::CoordinatorClient::KeyRead::Unavailable);
+}
+
+TEST(CoordinatorKeyRead, ARangeWithoutKvsIsAnAbsentKey) {
+    ob::CoordinatorClient::KeyValue kv;
+    EXPECT_EQ(ob::CoordinatorClient::interpret_range_response(
+                  R"({"header":{"cluster_id":"1","member_id":"2","revision":"9","raft_term":"2"}})",
+                  kv),
+              ob::CoordinatorClient::KeyRead::Absent);
+}
+
+TEST(CoordinatorKeyRead, AKeyComesWithItsValueAndTheRevisionItWasWrittenAt) {
+    const std::string value = R"({"version":3})";
+    const std::string resp =
+        R"({"header":{"revision":"12"},"kvs":[{"key":")" + ob::base64_encode("/ob/shard_map") +
+        R"(","create_revision":"5","mod_revision":"11","version":"3","value":")" +
+        ob::base64_encode(value) + R"("}],"count":"1"})";
+    ob::CoordinatorClient::KeyValue kv;
+    ASSERT_EQ(ob::CoordinatorClient::interpret_range_response(resp, kv),
+              ob::CoordinatorClient::KeyRead::Present);
+    EXPECT_EQ(kv.value, value);
+    EXPECT_EQ(kv.mod_revision, 11) << "the header's revision was taken for the key's";
+}
+
+TEST(CoordinatorKeyRead, AKeyWithoutARevisionIsNotUnderstood) {
+    // A CAS against revision 0 means "absent": a key read without one must not be written back as
+    // if it were.
+    const std::string resp = R"({"kvs":[{"key":"x","value":")" + ob::base64_encode("v") + R"("}]})";
+    ob::CoordinatorClient::KeyValue kv;
+    EXPECT_EQ(ob::CoordinatorClient::interpret_range_response(resp, kv),
+              ob::CoordinatorClient::KeyRead::Unavailable);
+}
+
+TEST(CoordinatorCas, ATransactionSaysWhetherItSwapped) {
+    EXPECT_EQ(ob::CoordinatorClient::interpret_txn_response(""),
+              ob::CoordinatorClient::CasOutcome::Unavailable);
+    EXPECT_EQ(ob::CoordinatorClient::interpret_txn_response(
+                  R"({"header":{"revision":"13"},"succeeded":true,"responses":[{}]})"),
+              ob::CoordinatorClient::CasOutcome::Swapped);
+    // A failed compare leaves `succeeded` out of the JSON, as proto3 leaves out a false.
+    EXPECT_EQ(ob::CoordinatorClient::interpret_txn_response(R"({"header":{"revision":"13"}})"),
+              ob::CoordinatorClient::CasOutcome::Conflict);
+}

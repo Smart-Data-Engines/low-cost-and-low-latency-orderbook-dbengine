@@ -223,6 +223,49 @@ public:
     /// never there.
     bool clear_handover_intent();
 
+    // ── Any key (#175) ───────────────────────────────────────────────────────────
+    //
+    // The operations above are each one key's, failover's. The shard map is a document every shard
+    // of a cluster writes into, so it needs a read that says which revision it saw and a write that
+    // lands only on that revision.
+
+    /// One key's value, and the revision it was last written at.
+    struct KeyValue {
+        std::string value;
+        int64_t     mod_revision{0};
+    };
+
+    /// What a read of one key found, as `LeaderRead` says for the leader key.
+    enum class KeyRead {
+        Present,      ///< the read succeeded and the key is there; `out` is filled in
+        Absent,       ///< the read succeeded and the key is not there
+        Unavailable,  ///< no information: unreachable, or an empty response
+    };
+
+    /// Read `key` (the full key, prefix included).
+    KeyRead get(const std::string& key, KeyValue& out);
+
+    /// What a range response over one key means - the socket's half kept apart, as for the leader.
+    static KeyRead interpret_range_response(const std::string& resp, KeyValue& out);
+
+    /// Write `value` under `key`, under `lease_id` when it is not 0. True when etcd took it.
+    bool put(const std::string& key, const std::string& value, int64_t lease_id = 0);
+
+    /// What a compare-and-swap did.
+    enum class CasOutcome {
+        Swapped,      ///< the key was as expected, and holds `value` now
+        Conflict,     ///< somebody wrote the key since the read: read it again
+        Unavailable,  ///< no answer, or an empty one: nothing is known to have been written
+    };
+
+    /// Write `value` under `key` only if the key was last written at `expected_mod_revision` - or,
+    /// when that is 0, only if the key does not exist. One etcd transaction.
+    CasOutcome compare_and_put(const std::string& key, int64_t expected_mod_revision,
+                               const std::string& value);
+
+    /// What a transaction's response means.
+    static CasOutcome interpret_txn_response(const std::string& resp);
+
     /// Start watching the leader key for changes.  Calls cb on change.
     void watch_leader(LeaseEventCallback cb);
 

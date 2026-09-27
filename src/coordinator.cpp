@@ -688,6 +688,88 @@ bool CoordinatorClient::publish_wal_position(uint32_t file_index,
     return !resp.empty();
 }
 
+// ── Any key (#175) ──────────────────────────────────────────────────────────
+
+CoordinatorClient::KeyRead CoordinatorClient::get(const std::string& key, KeyValue& out) {
+    if (!impl_->connected) {
+        OB_LOG_DEBUG("coordinator", "get %s: not connected - Unavailable", key.c_str());
+        return KeyRead::Unavailable;
+    }
+    const std::string url  = impl_->active_endpoint + "/v3/kv/range";
+    const std::string body = "{\"key\":\"" + base64_encode(key) + "\"}";
+    const KeyRead read = interpret_range_response(impl_->http_post(url, body), out);
+    OB_LOG_DEBUG("coordinator", "get %s: %s (mod_revision=%lld, %zu bytes)", key.c_str(),
+                 read == KeyRead::Present ? "present" : read == KeyRead::Absent ? "absent"
+                                                                                : "unavailable",
+                 static_cast<long long>(read == KeyRead::Present ? out.mod_revision : 0),
+                 read == KeyRead::Present ? out.value.size() : 0);
+    return read;
+}
+
+CoordinatorClient::KeyRead CoordinatorClient::interpret_range_response(const std::string& resp,
+                                                                       KeyValue& out) {
+    // As for the leader key: an empty string is a transport failure or a status of 400 or more,
+    // and a successful range over a missing key has no `kvs` at all.
+    if (resp.empty()) return KeyRead::Unavailable;
+    if (resp.find("\"kvs\"") == std::string::npos) return KeyRead::Absent;
+    KeyValue kv;
+    kv.value        = base64_decode(json_extract_string(resp, "value"));
+    kv.mod_revision = json_extract_int64(resp, "mod_revision");
+    if (kv.mod_revision <= 0) {
+        // Every key etcd holds was written at some revision: a range that returns one without it is
+        // not a response this client understands, and a CAS against revision 0 would mean "absent".
+        OB_LOG_WARN("coordinator", "A range response with a key and no mod_revision (%zu bytes) - "
+                                   "read as unavailable", resp.size());
+        return KeyRead::Unavailable;
+    }
+    out = std::move(kv);
+    return KeyRead::Present;
+}
+
+bool CoordinatorClient::put(const std::string& key, const std::string& value, int64_t lease_id) {
+    if (!impl_->connected) return false;
+    const std::string url = impl_->active_endpoint + "/v3/kv/put";
+    std::string body = "{\"key\":\"" + base64_encode(key) + "\",\"value\":\"" +
+                       base64_encode(value) + "\"";
+    if (lease_id != 0) body += ",\"lease\":" + std::to_string(lease_id);
+    body += "}";
+    const bool ok = !impl_->http_post(url, body).empty();
+    if (!ok) {
+        OB_LOG_WARN("coordinator", "put %s (%zu bytes, lease %lld) was not taken", key.c_str(),
+                    value.size(), static_cast<long long>(lease_id));
+    }
+    return ok;
+}
+
+CoordinatorClient::CasOutcome CoordinatorClient::compare_and_put(const std::string& key,
+                                                                 int64_t expected_mod_revision,
+                                                                 const std::string& value) {
+    if (!impl_->connected) return CasOutcome::Unavailable;
+    const std::string key_b64 = base64_encode(key);
+    // "Absent" is compared as a create revision of 0 - what the leader's CAS does - and "as read"
+    // as the revision the read returned.
+    const std::string compare =
+        expected_mod_revision == 0
+            ? "{\"key\":\"" + key_b64 + "\",\"target\":\"CREATE\",\"create_revision\":\"0\"}"
+            : "{\"key\":\"" + key_b64 + "\",\"target\":\"MOD\",\"mod_revision\":\"" +
+                  std::to_string(expected_mod_revision) + "\"}";
+    const std::string body = "{\"compare\":[" + compare + "],\"success\":[{\"request_put\":{"
+                             "\"key\":\"" + key_b64 + "\",\"value\":\"" +
+                             base64_encode(value) + "\"}}],\"failure\":[]}";
+    const CasOutcome outcome =
+        interpret_txn_response(impl_->http_post(impl_->active_endpoint + "/v3/kv/txn", body));
+    OB_LOG_DEBUG("coordinator", "compare_and_put %s at revision %lld: %s", key.c_str(),
+                 static_cast<long long>(expected_mod_revision),
+                 outcome == CasOutcome::Swapped ? "swapped"
+                     : outcome == CasOutcome::Conflict ? "conflict" : "unavailable");
+    return outcome;
+}
+
+CoordinatorClient::CasOutcome CoordinatorClient::interpret_txn_response(const std::string& resp) {
+    if (resp.empty()) return CasOutcome::Unavailable;
+    return json_extract_succeeded(resp) ? CasOutcome::Swapped : CasOutcome::Conflict;
+}
+
 bool CoordinatorClient::publish_handover_intent(const HandoverIntent& intent) {
     if (!impl_->connected) {
         OB_LOG_WARN("coordinator",
