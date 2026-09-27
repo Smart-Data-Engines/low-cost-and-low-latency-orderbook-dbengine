@@ -932,6 +932,35 @@ TEST(MMSnapshotOnePeer, ABeginThisNodeDidNotAskForIsRefusedAndInstallsNothing) {
     EXPECT_EQ(refusal_in(back), "not_requested");
 }
 
+TEST(MMSnapshotOnePeer, ABeginFromTheNodeAskedOnAnotherConnectionIsRefused) {
+    // The request belongs to the connection it went on, as the sender's answer does (#79): the node
+    // on a connection of its own has asked this one for nothing.
+    Node sender(1);
+    Node receiver(2);
+    sender.write_rows("BTC", 8, 15'000'000);
+    WiredPeer to_receiver(2);
+    WiredPeer back(1);
+    ob::PeerConnection& asked = back.mgr(*receiver.mm);
+    ASSERT_TRUE(receiver.mm->request_snapshot_from(asked));
+    ob::PeerConnection other;                  // the same node, on another connection
+    other.node_id        = asked.node_id;
+    other.conn_id        = asked.conn_id + 1000;
+    other.fd             = back.local_fd;      // so its refusal is read where the request was
+    other.connected      = true;
+    other.handshake_done = true;
+
+    request_snapshot_and_settle(sender, to_receiver);
+    to_receiver.collect();
+    const auto frames = take_frames(to_receiver.inbox);
+    ASSERT_FALSE(frames.empty());
+    ASSERT_EQ(frames[0].hdr.record_type, ob::MM_MSG_SNAPSHOT_BEGIN);
+    deliver(*receiver.mm, other, frames[0]);
+    EXPECT_FALSE(receiver.mm->snapshot_recv_active())
+        << "a BEGIN on a connection that asked for nothing was taken";
+    EXPECT_EQ(refusal_in(back), "not_requested");
+    EXPECT_TRUE(receiver.mm->snapshot_ask_for_test().active) << "it ended the request it did not answer";
+}
+
 TEST(MMSnapshotOnePeer, ABeginThatArrivesOnceThisNodeHoldsDataIsRefused) {
     // Asked while it held nothing, and written to before the answer came: installing would replace
     // what the client was told was stored.
