@@ -334,6 +334,11 @@ ob_add_engine_test(test_wal_recovery
     test_wal_recovery.cpp
 )
 
+# The WAL on a directory of its own, and the starts that would lose it (#186).
+ob_add_engine_test(test_wal_dir
+    test_wal_dir.cpp
+)
+
 # The pending rows' container since stage 5 of #151: a FIFO in fixed-size chunks, which a flush
 # tick takes in one short hold of the engine's lock and drains without it.
 # A header and nothing else, so it links nothing of the engine's.

@@ -16,6 +16,7 @@
 #include "orderbook/durable_file.hpp"
 #include "orderbook/logger.hpp"
 
+#include <algorithm>
 #include <span>
 #include <cerrno>
 #include <chrono>
@@ -24,16 +25,129 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <thread>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace ob {
 
 namespace fs = std::filesystem;
+
+namespace {
+
+/// The data directory's note of where its WAL lives, when that is not the data directory itself
+/// (#186): what lets a start without --wal-dir, or with another one, see that the WAL is elsewhere
+/// rather than begin an empty one. Not a directory, so no sweep of the data directory removes it,
+/// and neither .col nor meta.json, so no snapshot carries it.
+constexpr const char* kWalLocationFile = "wal_location";
+
+/// A WAL is in `dir`: a wal_*.bin file or the identity beside them.
+bool holds_wal(const std::filesystem::path& dir) {
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string name = entry.path().filename().string();
+        if ((name.rfind("wal_", 0) == 0 && entry.path().extension() == ".bin") ||
+            name == "wal_identity") {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Where the WAL lives, and the refusals that keep a moved WAL from being a lost one (#186). Runs
+/// before the WAL writer is built, since that opens - and creates - its first file.
+///
+/// A WAL on a filesystem of its own is the reason the option exists: on ext4 a write() of the WAL
+/// waits for the journal, and a data directory of thousands of instruments keeps the journal busy
+/// with the metadata of its segments' files - a one-level INSERT answered 1.1 s late, all of it in
+/// the WAL append; with the WAL on an ext4 of its own, the same run's slowest was 11 ms.
+std::string resolve_wal_dir(std::string_view base_dir, std::string_view wal_dir) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path data  = fs::weakly_canonical(fs::absolute(fs::path(base_dir)), ec);
+    const fs::path named = wal_dir.empty() ? data
+                                           : fs::weakly_canonical(fs::absolute(fs::path(wal_dir)), ec);
+
+    std::optional<fs::path> recorded;
+    if (std::ifstream in(data / kWalLocationFile); in.is_open()) {
+        std::string line;
+        std::getline(in, line);
+        if (line.empty()) {
+            throw std::runtime_error("Engine: " + (data / kWalLocationFile).string() +
+                                     " says nothing - it names the directory this data directory's "
+                                     "WAL is in; restore it, or remove it if the WAL is here");
+        }
+        recorded = fs::path(line);
+    }
+
+    if (named == data) {
+        // Without --wal-dir, or with the data directory itself: the WAL is here - unless the last
+        // start put it elsewhere, and then an empty WAL here would lose every row not in a segment.
+        if (recorded && *recorded != data) {
+            throw std::runtime_error("Engine: the WAL of " + data.string() + " is in " +
+                                     recorded->string() + ", where --wal-dir put it; start with "
+                                     "--wal-dir " + recorded->string() + ", or move its wal_*.bin "
+                                     "files and wal_identity here and remove " +
+                                     (data / kWalLocationFile).string());
+        }
+        return std::string(base_dir);
+    }
+
+    // Inside the data directory, a WAL would be taken for a segment's directory: installing a
+    // snapshot clears the data directory of everything not named wal_*, and so does a replica's
+    // reset (#142).
+    const auto [in_data, in_named] = std::mismatch(data.begin(), data.end(), named.begin(), named.end());
+    (void)in_named;
+    if (in_data == data.end()) {
+        throw std::runtime_error("Engine: --wal-dir " + named.string() + " is inside --data-dir " +
+                                 data.string() + ", which installing a snapshot clears of "
+                                 "everything not named wal_*; give the WAL a directory outside it");
+    }
+    // A WAL in the data directory is this node's WAL: started on an empty one elsewhere, the node
+    // would replay nothing, lose every row not in a segment yet, and take a new identity.
+    if (holds_wal(data)) {
+        throw std::runtime_error("Engine: the WAL is in " + data.string() + " and --wal-dir names " +
+                                 named.string() + ": move its wal_*.bin files and wal_identity "
+                                 "there first, or start without --wal-dir");
+    }
+    // And one the last start put somewhere else, unless it has been moved to the directory named.
+    if (recorded && *recorded != named && !holds_wal(named)) {
+        throw std::runtime_error("Engine: the WAL of " + data.string() + " is in " +
+                                 recorded->string() + ", where --wal-dir put it, and " +
+                                 named.string() + " holds none; start with --wal-dir " +
+                                 recorded->string() + ", or move its files to " + named.string());
+    }
+
+    fs::create_directories(named, ec);
+    if (ec) {
+        throw std::runtime_error("Engine: cannot create --wal-dir " + named.string() + ": " +
+                                 ec.message());
+    }
+    if (!recorded || *recorded != named) {
+        fs::create_directories(data, ec);
+        if (const int err = write_file_atomically((data / kWalLocationFile).string(), named.string());
+            err != 0) {
+            throw std::runtime_error("Engine: cannot write " + (data / kWalLocationFile).string() +
+                                     ": " + std::strerror(err) + " - without it a start without "
+                                     "--wal-dir could not tell the WAL is elsewhere");
+        }
+    }
+    struct stat data_st{}, wal_st{};
+    const bool own_filesystem = ::stat(data.c_str(), &data_st) == 0 &&
+                                ::stat(named.c_str(), &wal_st) == 0 && data_st.st_dev != wal_st.st_dev;
+    OB_LOG_INFO("engine", "WAL in %s - %s", named.c_str(),
+                own_filesystem ? "a filesystem of its own, not the data directory's"
+                               : "on the data directory's filesystem, so a WAL append still waits "
+                                 "for the journal its segments' files keep busy");
+    return named.string();
+}
+
+}  // namespace
 
 Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
                FsyncPolicy fsync_policy,
@@ -42,11 +156,13 @@ Engine::Engine(std::string_view base_dir, uint64_t flush_interval_ns,
                FailoverConfig failover_config,
                TTLConfig ttl_config,
                MultiMasterConfig mm_config,
-               size_t wal_rotate_bytes)
+               size_t wal_rotate_bytes,
+               std::string_view wal_dir)
     : base_dir_(base_dir)
+    , wal_dir_(resolve_wal_dir(base_dir, wal_dir))
     , flush_interval_ns_(flush_interval_ns)
     , fsync_policy_(fsync_policy)
-    , wal_(base_dir, wal_rotate_bytes, fsync_policy)
+    , wal_(wal_dir_, wal_rotate_bytes, fsync_policy)
     , combined_store_(base_dir)
     // The lookup takes mtx_ for one map read and releases it before the query runs. Handing
     // QueryEngine a reference to the buffer map instead was a data race: every write path inserts
@@ -116,7 +232,7 @@ void Engine::open() {
     // removed here and rebuilt by the replay, so nothing below - the sequence counters, the replay
     // filter - learns anything from a segment a power cut may have left short.
     load_or_create_wal_identity();
-    WALReplayer tail_replayer(base_dir_);
+    WALReplayer tail_replayer(wal_dir_);
     const WALReplayer::LastCheckpoint last_checkpoint = tail_replayer.find_last_checkpoint();
     remove_unvouched_segments(last_checkpoint);
 
@@ -238,7 +354,7 @@ void Engine::open() {
 
     // Restore epoch from WAL replay.
     {
-        WALReplayer epoch_replayer(base_dir_);
+        WALReplayer epoch_replayer(wal_dir_);
         epoch_replayer.replay([](const WALRecord&, const uint8_t*) {});
         current_epoch_.store(epoch_replayer.last_epoch(), std::memory_order_relaxed);
     }
@@ -562,7 +678,7 @@ void Engine::persist_version_vector_if_changed() {
 
 void Engine::restore_held_sequences() {
     std::vector<uint8_t> last;
-    WALReplayer replayer(base_dir_);
+    WALReplayer replayer(wal_dir_);
     replayer.replay_v2([&last](const WALReplayContext& ctx) {
         if (ctx.header.record_type != WAL_RECORD_HELD_SEQUENCES) return;
         last.assign(ctx.payload, ctx.payload + ctx.payload_len);
@@ -658,7 +774,8 @@ void Engine::discard_saved_replication_position() {
 }
 
 void Engine::load_or_create_wal_identity() {
-    const std::string path = base_dir_ + "/wal_identity";
+    // With the WAL it names (#186): an empty WAL of a new directory is a new stream.
+    const std::string path = wal_dir_ + "/wal_identity";
 
     std::ifstream in(path);
     if (in.is_open()) {
@@ -703,7 +820,7 @@ bool Engine::restore_version_vector() {
     std::optional<std::vector<SequenceTracker::VectorEntry>> last;
     bool last_unusable = false;
     VectorAssembler parts;
-    WALReplayer replayer(base_dir_);
+    WALReplayer replayer(wal_dir_);
     replayer.replay_v2([&](const WALReplayContext& ctx) {
         if (ctx.header.record_type == WAL_RECORD_VERSION_VECTOR) {
             PeerVector one;

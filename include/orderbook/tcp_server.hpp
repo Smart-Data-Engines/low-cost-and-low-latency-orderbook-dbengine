@@ -127,6 +127,7 @@ struct ServerConfig {
     /// Documented as a *trigger*, not a file size: rotation is checked after a write, so a file may
     /// exceed this by one record.
     size_t      wal_rotate_bytes{512ULL << 20};   // 512 MB
+    std::string wal_dir;                          // empty: the data directory (#186)
 
     /// Background flush interval. Shorter means less unflushed data at any moment and
     /// more segment writes; longer means the opposite. Configurable because it decides
