@@ -8,6 +8,7 @@
 // close(): stop flush thread + final flush + flush_segment + WAL flush.
 
 #include "orderbook/engine.hpp"
+#include "orderbook/timed_lock.hpp"
 #include "orderbook/wall_clock.hpp"
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/level_payload.hpp"
@@ -896,7 +897,34 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
     };
 
     s.state.assign(n, WriteState::Undecided);
+
+    // Where a slow write's time went (#186): the wait for the lock, the hold, and inside the hold
+    // the wait for room in the pending queue and the WAL append. Declared before the lock, so it
+    // says it after the lock is released.
+    struct WriteTiming {
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point asked{Clock::now()};
+        Clock::time_point held{}, room_from{}, room_to{}, wal_from{}, wal_to{}, released{};
+        size_t writes{0};
+        ~WriteTiming() {
+            const auto end = released == Clock::time_point{} ? Clock::now() : released;
+            const auto ms = [](Clock::time_point a, Clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            if (held == Clock::time_point{}) return;
+            const double waited = ms(asked, held), total = ms(held, end);
+            if (waited < kSlowLockMs && total < kSlowLockMs) return;
+            const double room = room_to == Clock::time_point{} ? 0.0 : ms(room_from, room_to);
+            const double wal  = wal_to == Clock::time_point{} ? 0.0 : ms(wal_from, wal_to);
+            OB_LOG_WARN("engine", "A batch of %zu write(s) waited %.1f ms for the engine lock and "
+                                  "held it %.1f ms - %.1f ms of it waiting for room in the pending "
+                                  "queue, %.1f ms in the WAL append",
+                        writes, waited, total, room, wal);
+        }
+    } timing;
+    timing.writes = n;
     std::unique_lock<std::mutex> lock(mtx_);
+    timing.held = WriteTiming::Clock::now();
 
     // 1. What a single write checked before it waited for room, per write and in order.
     size_t admitted = 0;
@@ -964,7 +992,10 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
     // 2. Backpressure: one wait for the batch, with the predicate a single write uses. This is
     //    the one place the lock may be released before the batch is in the WAL - and nothing is
     //    numbered yet, so nothing numbered can be waited on.
-    if (!await_pending_room(lock)) {
+    timing.room_from = WriteTiming::Clock::now();
+    const bool room = await_pending_room(lock);
+    timing.room_to = WriteTiming::Clock::now();
+    if (!room) {
         for (size_t i = 0; i < n; ++i) {
             if (s.state[i] == WriteState::Admitted) {
                 outcomes[i].status = OB_ERR_FULL;
@@ -1015,7 +1046,9 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
 
     // 4. The WAL: one write() per run. Nothing below runs for a record it did not write.
     try {
+        timing.wal_from = WriteTiming::Clock::now();
         (void)wal_.append_batch(s.records, s.wal);
+        timing.wal_to = WriteTiming::Clock::now();
     } catch (const std::exception& e) {
         abandon(e);
         return;
@@ -1066,6 +1099,7 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
     // over-delivers and delivers out of order on purpose, records above the frontier are held
     // rather than rejected, and conflicts are resolved by HLC rather than by arrival. Nothing on
     // the receiving side reads arrival order as meaning anything.
+    timing.released = WriteTiming::Clock::now();
     lock.unlock();
     if (!mm_mgr_) return;
     for (size_t k = 0; k < s.records.size(); ++k) {
@@ -2546,7 +2580,7 @@ void Engine::flush_tick() {
         WALWriter::SyncTicket ticket;
         PendingQueue::Batch batch;
         {
-            std::unique_lock<std::mutex> lock(mtx_);
+            TimedLock timed(mtx_, "flush tick: the WAL sync ticket and the rows it covers");
             auto prepared = wal_.prepare_sync();
             ticket = std::move(prepared.first);
             if (prepared.second != 0) {
@@ -2567,7 +2601,7 @@ void Engine::flush_tick() {
         }
         if (ticket.owed()) {
             const int sync_err = wal_.perform_sync(ticket);
-            std::unique_lock<std::mutex> lock(mtx_);
+            TimedLock timed(mtx_, "flush tick: completing the WAL sync");
             wal_.complete_sync(ticket, sync_err);
             if (sync_err != 0) {
                 detached_rows_.store(0, std::memory_order_relaxed);
@@ -2601,7 +2635,7 @@ void Engine::flush_tick() {
         // and the combined store has its own lock, which queries take and writers do not.
         uint32_t safe_truncate = 0;
         {
-            std::unique_lock<std::mutex> lock(mtx_);
+            TimedLock timed(mtx_, "flush tick: what retention may remove");
 
             // WAL truncation: only files the last synced drain is past, and that ALL replicas
             // have confirmed past, so lagging replicas can still catch up (Requirement 6.3).
@@ -2710,7 +2744,7 @@ void Engine::drain_batch(PendingQueue::Batch& batch, WalPosition covered, bool m
         if (mtx_held) {
             step();
         } else {
-            std::lock_guard<std::mutex> lock(mtx_);
+            TimedLock timed(mtx_, "flush tick: a step of the drain");
             step();
         }
     };
@@ -3089,7 +3123,7 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows) {
     const auto written = SealClock::now();
 
     if (seals.empty()) {
-        std::unique_lock<std::mutex> lock(mtx_);
+        TimedLock timed(mtx_, "flush tick: no seal - gauges and the vector copy");
         registry_.set_gauge("ob_unsealed_rows",
                             static_cast<int64_t>(unsealed_rows_.load(std::memory_order_relaxed)));
         // What the mesh compares a returning peer against, fresh at every tick rather than at every
@@ -3113,7 +3147,7 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows) {
     for (const Seal& s : seals) sealed_rows += s.rows;
 
     {
-        std::unique_lock<std::mutex> lock(mtx_);
+        TimedLock timed(mtx_, "flush tick: merging the seals, the checkpoint and the vector");
         const size_t refused = merge_seals_locked(seals);
         if (refused > 0) {
             segment_merge_refused_.fetch_add(refused, std::memory_order_relaxed);
