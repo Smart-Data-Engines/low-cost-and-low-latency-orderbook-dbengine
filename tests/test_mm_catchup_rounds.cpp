@@ -497,3 +497,37 @@ TEST(MMCatchupRounds, ACopyThatDoesNotCatchUpIsWaitedForOnlyTheGrace) {
     ASSERT_TRUE(peer.catchup.active) << "nothing ended a wait for a tick that did not come";
     EXPECT_EQ(run_to_end(node, from), expected("STUCK", 0, 101, 300));
 }
+
+TEST(MMCatchupRounds, ACopyRebuiltWholeIsUpToDate) {
+    // A copy rebuilt from the whole vector - at a start, or when a snapshot replaces what the node
+    // holds - reaches every listing so far, so what is compared with it is decided at once.
+    CatchupNode node(1 << 20, 64 << 20, 64 << 10, kNoAutoFlush);
+    write_rows(*node.engine, "OLD", 10, 1'000'000'000ULL);
+    node.engine->adopt_snapshot_sequence_state({{"SNAP.EX", 3, 500}}, {});
+    WiredPeer from(kPeer);
+    ob::PeerConnection& peer = from.mgr(*node.mm);
+    peer.catchup_started = false;
+    arrive(node, from, {{"SNAP.EX", 3, 500}});
+    EXPECT_TRUE(peer.catchup_started) << "a copy rebuilt whole was taken for one behind";
+    EXPECT_FALSE(peer.catchup.active);
+}
+
+TEST(MMCatchupRounds, AWriteAfterTheVectorDoesNotPutTheDecisionOffAgain) {
+    // What the wait is for is the tracker as the vector found it: a write after that goes to the
+    // connected peer live, so the tick that brings the copy past it decides, whatever came since -
+    // with writes that never stop, waiting for a copy with nothing newer would wait for good.
+    CatchupNode node(1 << 20, 64 << 20, 64 << 10, kNoAutoFlush);
+    write_rows(*node.engine, "LIVE", 300, 1'000'000'000ULL);
+    node.engine->flush_tick_for_test();
+    write_rows(*node.engine, "LIVE", 1, 2'000'000'000ULL);    // the tracker 301, the copy 300
+    WiredPeer from(kPeer);
+    ob::PeerConnection& peer = from.mgr(*node.mm);
+    peer.catchup_started = false;
+    arrive(node, from, {{"LIVE.EX", 0, 301}});
+    ASSERT_FALSE(peer.catchup_started) << "the premise: behind the tracker, it waits";
+    node.engine->flush_tick_for_test();
+    write_rows(*node.engine, "LIVE", 1, 3'000'000'000ULL);    // after the tick: 302, the copy 301
+    EXPECT_FALSE(node.mm->recheck_deferred_vectors_for_test());
+    EXPECT_TRUE(peer.catchup_started) << "a write after the vector put the decision off again";
+    EXPECT_FALSE(peer.catchup.active);
+}

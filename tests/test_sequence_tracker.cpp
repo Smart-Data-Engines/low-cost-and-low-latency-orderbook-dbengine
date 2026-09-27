@@ -495,6 +495,32 @@ TEST(SequenceTracker, TheMovedFrontiersAreEachThatMovedOnceAndNothingElse) {
     EXPECT_TRUE(after_reset.moved.empty());
 }
 
+TEST(SequenceTracker, TheListingsSayWhetherACopyFromTheLastTakeIsExact) {
+    // What the mesh manager asks before it tells a peer it lacks nothing, from under a lock that
+    // keeps it out of the tracker (#180 part D): has any frontier moved since the copy was brought
+    // up to date? A pair counts once a take, so the answer costs nothing a record.
+    ob::SequenceTracker t;
+    const auto first = t.take_moved_frontiers();
+    EXPECT_EQ(first.listings, t.listings()) << "a take does not reach the listing it hands out";
+    (void)t.observe("A.EX", 1, 0);                 // frontier 1: listed
+    (void)t.observe("A.EX", 1, 0);                 // 2: listed already
+    EXPECT_EQ(t.listings(), first.listings + 1) << "a pair was counted once a record";
+    (void)t.observe("B.EX", 2, 5);                 // held above the frontier: nothing moved
+    EXPECT_EQ(t.listings(), first.listings + 1) << "a held number was counted as a move";
+
+    const auto second = t.take_moved_frontiers();
+    EXPECT_EQ(second.listings, t.listings());
+    (void)t.observe("A.EX", 1, 1);                 // a redelivery
+    EXPECT_EQ(t.listings(), second.listings) << "a redelivery was counted as a move";
+    (void)t.observe("A.EX", 1, 0);                 // 3: moved again since the take
+    EXPECT_EQ(t.listings(), second.listings + 1) << "a move after a take was not counted";
+
+    const uint64_t before_reset = t.listings();
+    t.reset();
+    EXPECT_GT(t.listings(), before_reset)
+        << "a copy from before a reset holds frontiers the tracker no longer does";
+}
+
 // A copy kept only from `take_moved_frontiers()` - rebuilt from `export_vector()` when told to -
 // is the export, whatever the tracker was asked in between: the property the engine's cache of the
 // vector rests on, since it never exports the whole vector again while nothing is reset.
@@ -527,4 +553,43 @@ RC_GTEST_PROP(SequenceTrackerProperty, ACopyKeptFromTheMovedFrontiersIsTheExport
     sync();
     bool truncated = false;
     RC_ASSERT(copy == as_map(t.export_vector(1u << 20, truncated)));
+}
+
+// The half of #180 part D the tracker owns: a copy whose last take reached the tracker's listing is
+// the export, whatever the tracker was asked in between - so "the copy is exact" is never said of
+// one that is not. (The other way round need not hold: a reset of an empty tracker changes nothing
+// a copy holds, and still says the copy is behind, which costs a wait and never a record.)
+RC_GTEST_PROP(SequenceTrackerProperty, ACopyWhoseListingIsCurrentIsTheExport, ()) {
+    ob::SequenceTracker t;
+    Frontiers copy;
+    uint64_t covers = 0;
+    const auto sync = [&] {
+        auto moved = t.take_moved_frontiers();
+        covers = moved.listings;
+        if (moved.all) {
+            bool truncated = false;
+            copy = as_map(t.export_vector(1u << 20, truncated));
+            return;
+        }
+        for (const auto& e : moved.moved) copy[{e.key, e.origin}] = e.frontier;
+    };
+    const auto steps = *rc::gen::inRange<int>(1, 200);
+    for (int i = 0; i < steps; ++i) {
+        const std::string key = std::string(1, static_cast<char>('A' + *rc::gen::inRange(0, 4))) + ".EX";
+        const auto origin = static_cast<uint16_t>(*rc::gen::inRange(1, 4));
+        const auto seq = static_cast<uint64_t>(*rc::gen::inRange(0, 12));
+        switch (*rc::gen::inRange(0, 9)) {
+            case 0: case 1: case 2: (void)t.observe(key, origin, seq); break;
+            case 3: case 4: t.seed(key, origin, seq); break;
+            case 5: t.declare_frontier(key, origin, seq); break;
+            case 6: t.import_held({ob::SequenceTracker::HeldRanges{key, origin, {{seq + 1, seq + 3}}}}); break;
+            case 7: if (*rc::gen::inRange(0, 10) == 0) t.reset(); break;
+            default: sync(); break;
+        }
+        RC_ASSERT(t.listings() >= covers);
+        if (t.listings() == covers) {
+            bool truncated = false;
+            RC_ASSERT(copy == as_map(t.export_vector(1u << 20, truncated)));
+        }
+    }
 }
