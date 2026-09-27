@@ -7,6 +7,7 @@
 // nothing ever constructed it. A single STATUS command killed the node with SIGSEGV.
 
 #include "orderbook/engine.hpp"
+#include "orderbook/wall_clock.hpp"
 #include "test_ports.hpp"
 
 #include <gtest/gtest.h>
@@ -110,6 +111,37 @@ TEST(MultiMasterStats, WithoutAPeerRegistryThereIsNoSchedulerAndThatIsNotACrash)
 // tests/integration/test_mm_stats.py against a real node.
 
 // ── The two mesh peer gauges come from one place ─────────────────────────────
+
+TEST(MultiMasterStats, ConflictsCountTwoOriginsWritingALevelNotOneWritingItAgain) {
+    // #182: the counter, and the log with it, took every replicated update of a level this node
+    // held for a conflict - the next one from the same origin included: 301 985 for 300 000 writes.
+    TempDir tmp("mm_stats_conflicts_");
+    ob::Engine engine(tmp.path, kNoAutoFlush, ob::FsyncPolicy::EVERY, {}, {}, {}, {},
+                      mm_config(1));
+    engine.open();
+    const uint64_t now = ob::wall_clock_ns();   // a clock the receive path finds plausible (#121)
+    const auto deliver = [&](uint64_t seq, uint16_t origin, uint64_t ts) {
+        ob::DeltaUpdate d{};
+        std::strncpy(d.symbol, "C", sizeof(d.symbol) - 1);
+        std::strncpy(d.exchange, "EX", sizeof(d.exchange) - 1);
+        d.sequence_number = seq;
+        d.timestamp_ns    = ts;
+        d.side            = ob::SIDE_BID;
+        d.n_levels        = 1;
+        ob::Level level{};
+        level.price = 100'000;
+        level.qty   = seq;
+        level.cnt   = 1;
+        return engine.apply_remote_delta(d, &level, origin, ob::HLCTimestamp{ts, 0, origin});
+    };
+    for (uint64_t i = 1; i <= 50; ++i) ASSERT_EQ(deliver(i, 2, now + i), ob::OB_OK);
+    EXPECT_EQ(engine.registry().counter_value("ob_mm_conflicts_total"), 0u)
+        << "one origin updating the level it holds was counted as conflicts";
+    ASSERT_EQ(deliver(1, 3, now + 100), ob::OB_OK);
+    EXPECT_EQ(engine.registry().counter_value("ob_mm_conflicts_total"), 1u)
+        << "another origin writing the level was not counted";
+    engine.close();
+}
 
 TEST(MultiMasterStatsStatic, BothMeshPeerGaugesArePublishedFromOneFunction) {
     // `ob_mm_peers_connected` was recomputed inline at three sites - connect_to_peer(),
