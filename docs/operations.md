@@ -826,15 +826,29 @@ Bootstrap finished for node 4 — accepting writes
 
 `ob_mm_snapshot_requested_total` on the joiner, `ob_mm_snapshot_sent_total` on its peers and
 `ob_mm_snapshot_received_total` on the joiner each go up by one. A peer that cannot serve it -
-`busy` with another joiner, `too_many_files` (#176) - says so, and the next peer that states its
-vector is asked at once; so is one after the peer asked drops its connection, has not answered in
-ten minutes, or sent a snapshot the joiner abandoned, which tells that peer to stop sending (#192).
-Each peer is asked once a bootstrap (#191), and with no peer left that it has not asked the joiner
-takes writes again, and says so once:
+`busy` with another joiner - says so, and the next peer that states its vector is asked at once; so
+is one after the peer asked drops its connection, has not answered in ten minutes, or sent a snapshot
+the joiner abandoned, which tells that peer to stop sending (#192). Each peer is asked once a
+bootstrap (#191), and with no peer left that it has not asked the joiner takes writes again, and says
+so once:
 
 ```
 No peer gave node 4 the snapshot it asked for (refused; 3 asked); accepting writes until one can - the next peer whose vector says what it holds is asked
 ```
+
+**A store of 65 535 files or more, or 8 MiB of manifest** - about 8 000 to 10 000 segments - goes
+only between nodes of a build with #176, which say in their request that they take it:
+
+```
+Peer 4 requested a snapshot (connection 12, takes wide chunks)
+Snapshot begins towards peer 4: files=65608 bytes=... meta=... (manifest=... vector=... held=0) in 32-bit chunks, created in ... ms
+```
+
+A joiner of an older build is refused it with the reason, and so is any joiner by a peer of an older
+build (`too_many_files`, `metadata_too_large`, and on the peer `Refusing snapshot for peer 4: 65608
+files cannot be addressed by a 16-bit index (limit 65535) - it asked as a build before #176 does`).
+So in a mesh being upgraded, upgrade the peers a joiner will ask before the joiner, and let a node of
+the new build be the one that joins; a small store goes between any two builds as it always has.
 
 A `SNAPSHOT_BEGIN` the joiner did not ask for is refused (`Snapshot aborted towards peer 2:
 not_requested`), and so is the one it asked for if it holds data by then (`holds_data`); a sender
