@@ -287,9 +287,9 @@ reconciliation, and drawn from a cache without the writes a returning peer misse
 at 100 of 2 100 rows for as long. So the tracker counts listings on its moved list, readably without
 the engine's lock (a pair's first move after a take lists it, so an unchanged count means nothing
 moved), the cache records the count it reaches, and a "lacks nothing" from a cache behind the count
-waits for the tick that brings it past - at most `MM_VV_GRACE_MS`, after which the catch-up starts,
-its rounds filtering by the peer's vector anyway. A decision that says the peer lacks something needs
-no wait: the rounds read the WAL, not the cache.
+asks the engine for a tick and waits for it to bring the cache past - at most `MM_VV_GRACE_MS`, after
+which the catch-up starts, its rounds filtering by the peer's vector anyway. A decision that says the
+peer lacks something needs no wait: the rounds read the WAL, not the cache.
 
 A node that joined an origin's stream in the middle used to be the other limit: it saw sequence 5000
 before it ever saw 1, so it could not claim "everything up to here" for that origin and kept

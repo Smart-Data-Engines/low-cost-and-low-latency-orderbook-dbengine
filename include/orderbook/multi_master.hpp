@@ -942,9 +942,10 @@ private:
     /// What a peer's vector means for a catch-up to it: one when it lacks anything the copy of this
     /// node's vector holds, or asks for everything; none when it lacks nothing - but only from a
     /// copy that has every frontier the tracker moved before the vector arrived, and with
-    /// `may_defer`, a copy behind the tracker puts the decision off until a tick brings it up to
-    /// date (#180 part D). A copy is up to a tick behind, and one without the writes a returning
-    /// peer missed judged it to hold them until the next reconciliation. Caller holds `mtx_`.
+    /// `may_defer`, a copy behind the tracker asks the engine for a tick and puts the decision off
+    /// until the tick has brought it up to date (#180 part D). A copy is up to a tick behind, and
+    /// one without the writes a returning peer missed judged it to hold them until the next
+    /// reconciliation. Caller holds `mtx_`.
     void decide_catchup_from_vector(PeerConnection& peer, bool may_defer);
     /// Take up the decisions put off above: decided with the copy once it reaches the listing it
     /// had to, and a catch-up after MM_VV_GRACE_MS without it - the safe direction, since the rounds

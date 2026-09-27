@@ -3718,7 +3718,9 @@ Learned the hard way. Check here before debugging.
      peer back within a tick of what it missed was held at 100 of 2 100 rows for as long. A decision
      nothing revisits is drawn from state as fresh as the event that asked for it; where it cannot
      be, the copy says how far it reaches (`covers`, against `SequenceTracker::listings()`) and the
-     decision waits for it, bounded (#180 part D).
+     decision asks for the refresh and waits for it, bounded (#180 part D). Waiting for the refresh's
+     own schedule instead is the same mistake one level down: past the bound, the wait ends in the
+     cost the decision exists to avoid.
 483. **Ten local passes of a race are not evidence; the logs of the ten are.** The test CI failed
      once had passed ten runs of ten here, and their logs said the handshake came 2-96 ms after the
      tick that saved it. A test whose failure depends on landing in a window has to place itself

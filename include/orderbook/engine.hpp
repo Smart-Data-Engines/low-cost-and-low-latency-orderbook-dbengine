@@ -125,6 +125,13 @@ public:
     /// loop and with `flush_incremental()` by `flush_mtx_`, which the tick takes.
     void flush_tick_for_test() { flush_tick(); }
 
+    /// Hold `flush_mtx_` until the returned lock goes: no tick and no `FLUSH` runs meanwhile, which is
+    /// how a test stands for a flush that is stuck - on a device, say - without the flush loop being
+    /// told anything. Release it before `close()`, which needs it. A test seam.
+    [[nodiscard]] std::unique_lock<std::mutex> hold_flush_for_test() {
+        return std::unique_lock<std::mutex>(flush_mtx_);
+    }
+
     /// Apply a delta update: WAL → SoA buffer (gap detection) → enqueue for columnar flush.
     /// Returns OB_OK on success, error code on failure.
     ob_status_t apply_delta(const DeltaUpdate& delta, const Level* levels);
@@ -571,6 +578,13 @@ public:
     /// for when a decision was put off until the copy caught up. Under `vector_cache_mtx_` only.
     uint64_t version_vector_covers() const;
 
+    /// Ask for the tick that brings the copy of the vector up to date, now rather than at the end
+    /// of the interval: what a mesh decision put off until the copy catches up asks for (#180 part
+    /// D), so that the wait is a tick's work and not up to `--flush-interval-ms` of nothing - and not
+    /// the grace after which it gives up waiting. Callable from under the mesh manager's lock: all it
+    /// takes is `flush_stop_mtx_`, a leaf.
+    void request_vector_refresh() { request_flush(); }
+
     /// Get the HLC clock (nullptr if multi-master is not enabled).
     HybridLogicalClock* hlc() const { return hlc_.get(); }
 
@@ -814,9 +828,11 @@ private:
     /// thirteenfold wait for the same work (#137).
     ///
     /// **Lock order.** `request_flush()` takes `flush_stop_mtx_` while the caller holds `mtx_`,
-    /// which adds `mtx_ → flush_stop_mtx_` to the order documented above. It is safe because
-    /// `flush_stop_mtx_` is a leaf: it is taken in exactly two places — the wait in
-    /// `flush_loop()` and the wake in `close()` — and neither holds `mtx_` while doing so.
+    /// which adds `mtx_ → flush_stop_mtx_` to the order documented above - and the mesh manager's
+    /// `request_vector_refresh()` from under its own lock, which adds that one's too (#180 part D).
+    /// It is safe because `flush_stop_mtx_` is a leaf: besides these wakes it is taken in exactly
+    /// two places — the wait in `flush_loop()` and the wake in `close()` — and nothing is taken while
+    /// it is held.
     /// Taking it is not optional: setting the flag without it loses the wake-up when the flush
     /// loop has evaluated its predicate and not yet slept.
     std::atomic<bool> flush_now_{false};

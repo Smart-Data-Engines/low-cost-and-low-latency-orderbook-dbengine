@@ -36,7 +36,7 @@ import urllib.request
 
 import pytest
 
-from conftest import ClusterManager, node_log_since, node_log_size
+from conftest import ClusterManager, node_log_since, node_log_size, patience
 from orderbook_engine import BookUpdate, OrderbookEngine
 
 pytestmark = pytest.mark.multi_master
@@ -48,9 +48,9 @@ INTERVAL_S = 5
 # For the node back within a tick: wide enough that the writes and the restart after one of the
 # writer's ticks land before the next - together they take about half a second here - and a
 # reconciliation interval far wider, so that the only thing to send the rows within the wait after
-# the tick is the tick.
-SLOW_TICK_MS = 5000
-SLOW_TICK_INTERVAL_S = 30
+# the tick is the tick. Three times both under a sanitizer, which slows a restart as much (patience()).
+SLOW_TICK_S = patience(5.0)
+SLOW_TICK_INTERVAL_S = int(patience(30.0))
 
 
 class Duplicated(AssertionError):
@@ -121,7 +121,7 @@ def mesh():
 
 @pytest.fixture
 def slow_tick_pair():
-    cm = start_mesh("--flush-interval-ms", str(SLOW_TICK_MS), nodes=2,
+    cm = start_mesh("--flush-interval-ms", str(int(SLOW_TICK_S * 1000)), nodes=2,
                     interval_s=SLOW_TICK_INTERVAL_S)
     yield cm
     cm.shutdown()
@@ -178,7 +178,7 @@ def held_after_missing_writes(mesh, returning: int, just_after_a_tick: bool = Fa
         # Straight after one of the writer's ticks, so that what follows lands before its next one.
         # The counter rises as a tick starts; the pause is for that tick to end.
         ticks = metric(writer, "ob_flush_ticks_total")
-        deadline = time.monotonic() + 3 * SLOW_TICK_MS / 1000
+        deadline = time.monotonic() + 3 * SLOW_TICK_S
         while metric(writer, "ob_flush_ticks_total") == ticks and time.monotonic() < deadline:
             time.sleep(0.01)
         assert metric(writer, "ob_flush_ticks_total") > ticks, "the premise: the writer ticks"
@@ -194,9 +194,9 @@ def held_after_missing_writes(mesh, returning: int, just_after_a_tick: bool = Fa
     mesh.restart_node(returning)
     if just_after_a_tick:
         took = time.monotonic() - started
-        assert took < SLOW_TICK_MS / 1000 - 1.0, (
+        assert took < SLOW_TICK_S - patience(1.0), (
             f"the premise: the writes and the restart fit in a tick, with a second to spare "
-            f"({took:.2f} s)")
+            f"({took:.2f} s of a {SLOW_TICK_S:.0f} s tick)")
     mesh.wait_for_mm_mesh(timeout=90)
     # A catch-up at the reconnect sends what the peer lacks in well under a second here; the
     # three seconds are room, and far less than a seal interval and a reconciliation.
@@ -214,12 +214,12 @@ def test_a_node_restarted_after_missing_writes_gets_them_when_it_reconnects(mesh
 def test_a_node_back_within_a_tick_of_the_writes_it_missed_gets_them_when_it_reconnects(
         slow_tick_pair):
     # The same, with the writes and the restart inside one of the writer's ticks: the copy of its
-    # vector the returning node is compared with has none of the writes. They come with the tick
-    # that brings it up to date, at most a tick after the reconnect, and the wait is that and two
-    # seconds - which end long before the returning node's first reconciliation, the only other
+    # vector the returning node is compared with has none of the writes. The decision asks for a
+    # tick and the rows come with it, milliseconds after the reconnect; the wait is a tick and two
+    # seconds anyway, and ends long before the returning node's first reconciliation, the only other
     # thing that would send them. Two nodes: a third would hold the writes too, in a copy its own
     # tick refreshes on a clock this test does not follow.
-    wait_s = SLOW_TICK_MS / 1000 + 2
+    wait_s = SLOW_TICK_S + patience(2.0)
     got, expected = held_after_missing_writes(slow_tick_pair, returning=1, just_after_a_tick=True,
                                               wait_s=wait_s)
     if got < expected:

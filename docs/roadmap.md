@@ -2433,17 +2433,21 @@ caught up, and the rows coming with the reconciliation 5 s later.
 **Fixed:** the tracker counts listings on its moved list - a pair's first move after a take lists
 it, so "nothing listed since the take" is "no frontier moved since" - in an atomic the manager reads
 without the engine's lock (`SequenceTracker::listings()`). The copy records the listing it reaches,
-and a "lacks nothing" from a copy behind the tracker waits for the tick that brings it past the
-listing the vector found (`decide_catchup_from_vector()`, and `recheck_deferred_vectors()` between
-the io loop's passes, which wait 10 ms while a decision does) - at most `MM_VV_GRACE_MS`, after which
-the catch-up starts, its rounds filtering by the peer's vector anyway. A scan whenever the copy is
-behind would not do: under writes that do not stop nearly every vector finds it behind, and that is
-the whole-WAL read every reconciliation that #57 removed. A vector's arrival also disarms the
+and a "lacks nothing" from a copy behind the tracker asks the engine for a tick now
+(`request_vector_refresh()`, the wake a writer at the pending ceiling uses) and waits for the one
+that brings the copy past the listing the vector found (`decide_catchup_from_vector()`, and
+`recheck_deferred_vectors()` between the io loop's passes, which wait 10 ms while a decision does) -
+at most `MM_VV_GRACE_MS`, after which the catch-up starts, its rounds filtering by the peer's vector
+anyway. The first version waited for the interval's tick instead, and at a flush interval past the
+grace nearly every wait would have ended in that scan. A scan whenever the copy is behind would not
+do at all: under writes that do not stop nearly every vector finds it behind, and that is the
+whole-WAL read every reconciliation that #57 removed. A vector's arrival also disarms the
 handshake's deadline for a silent peer, which a waiting decision would otherwise meet. Measured with
 the module's third test - two nodes ticking every 5 s and reconciling every 30 s, the writes and the
 restart straight after one of the writer's ticks (`ob_flush_ticks_total`): on the build before this,
 **six runs of six** held 100 of 2 100 rows 7 s after the reconnect; with it, **six of six** held all
-of them, the writer logging the wait at the handshake and the decision 0.7 s later, with its tick.
+of them, the writer logging the wait at the handshake, the decision 10 - 91 ms after it and the
+catch-up of 2 000 records done 20 - 102 ms after it - with a flush interval of 5 s.
 The C++ tests are six in `tests/test_mm_catchup_rounds.cpp`, and in `tests/test_sequence_tracker.cpp`
 what `listings()` counts and a RapidCheck property that a copy whose listing is current is the export.
 Part D's mutation table, written down before it ran: **20 mutations in 22 runs, every one as

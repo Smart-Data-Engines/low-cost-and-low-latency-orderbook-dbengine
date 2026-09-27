@@ -2231,10 +2231,14 @@ void MultiMasterManager::decide_catchup_from_vector(PeerConnection& peer, bool m
         if (may_defer && listed > covers) {
             if (peer.vector_recheck_listings == 0) peer.vector_recheck_since_ms = now_ms();
             peer.vector_recheck_listings = listed;
+            // The tick now, not at the end of the interval: waiting for the interval, a flush
+            // interval past the grace below ended nearly every wait in the scan this shortcut is
+            // there to avoid - at every reconciliation, under writes that do not stop.
+            engine_.request_vector_refresh();
             OB_LOG_DEBUG("mm",
                          "Peer %u holds everything the copy of this node's vector says it holds, "
-                         "but the copy is behind the tracker (listing %llu of %llu); deciding "
-                         "after the next tick",
+                         "but the copy is behind the tracker (listing %llu of %llu); asked for a "
+                         "tick, deciding after it",
                          peer.node_id, static_cast<unsigned long long>(covers),
                          static_cast<unsigned long long>(listed));
             return;
