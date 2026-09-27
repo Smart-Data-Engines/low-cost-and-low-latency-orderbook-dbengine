@@ -848,7 +848,11 @@ A joiner of an older build is refused it with the reason, and so is any joiner b
 build (`too_many_files`, `metadata_too_large`, and on the peer `Refusing snapshot for peer 4: 65608
 files cannot be addressed by a 16-bit index (limit 65535) - it asked as a build before #176 does`).
 So in a mesh being upgraded, upgrade the peers a joiner will ask before the joiner, and let a node of
-the new build be the one that joins; a small store goes between any two builds as it always has.
+the new build be the one that joins; a small store goes between any two builds as it always has. A
+joiner of this build that no peer can serve asks each once and takes writes holding nothing (#191),
+and asks again at the next vector while it still holds nothing - so it bootstraps once a peer of this
+build is up, as long as no client wrote to it in between. A joiner of a build with #188 and without
+#191 asks such peers in turn for as long as it runs, refusing every write.
 
 A `SNAPSHOT_BEGIN` the joiner did not ask for is refused (`Snapshot aborted towards peer 2:
 not_requested`), and so is the one it asked for if it holds data by then (`holds_data`); a sender
