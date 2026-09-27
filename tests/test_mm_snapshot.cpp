@@ -136,14 +136,22 @@ void run_transfer(Node& sender, WiredPeer& to_receiver,
                   Mutate mutate) {
     request_snapshot_and_settle(sender, to_receiver);
 
+    // What the socket did not take stays in the sender's buffer, as the EPOLLOUT branch would find
+    // it: a snapshot larger than the socket pair's buffer - a vector of thousands of entries is
+    // 210 kB of metadata (#177) - arrives only as the buffer drains.
+    const auto drain_into_socket = [&] {
+        sender.mm->try_drain_send_buf_for_test(to_receiver.mgr(*sender.mm));
+    };
     for (int round = 0; round < 10'000; ++round) {
+        drain_into_socket();
         to_receiver.collect();
         auto frames = take_frames(to_receiver.inbox);
         for (auto& f : frames) {
             if (!mutate(f)) continue;              // dropped by the mutation
             deliver(*receiver.mm, sender_peer, f);
         }
-        if (!sender.mm->snapshot_send_active()) {
+        if (!sender.mm->snapshot_send_active() &&
+            to_receiver.mgr(*sender.mm).send_buf.empty()) {
             // One last pass so the END frame that finished the send is delivered too.
             to_receiver.collect();
             for (auto& f : take_frames(to_receiver.inbox)) {
@@ -360,6 +368,39 @@ TEST(MMSnapshotTransfer, AnEmptyNodeEndsUpAbleToStateWhatItHolds) {
 
     // And the rows themselves arrived, not just the claim about them.
     EXPECT_FALSE(receiver.engine->holds_no_data());
+}
+
+TEST(MMSnapshotTransfer, AVectorPastOneRecordReachesTheReceiverWhole) {
+    // A snapshot's metadata carried the sender's vector in the single-record format, so past 1 560
+    // entries it carried "send everything" and the receiver refused the bootstrap - a node joining a
+    // mesh of a few thousand instruments could not be given a snapshot even when it asked (#177).
+    Node sender(1);
+    Node receiver(2);
+    std::vector<ob::SequenceTracker::VectorEntry> wide;
+    for (uint64_t i = 0; i < 5'000; ++i) {
+        wide.push_back({"V" + std::to_string(i) + ".EX", 3, i + 1});
+    }
+    sender.engine->adopt_snapshot_sequence_state(wide, {});
+    sender.write_rows("BTC", 12, 1'000'000);
+
+    WiredPeer to_receiver(/*node_id=*/2);
+    ob::PeerConnection sender_peer;
+    sender_peer.node_id = 1;
+    sender_peer.handshake_done = true;
+    run_transfer(sender, to_receiver, receiver, sender_peer, pass_through);
+
+    EXPECT_FALSE(receiver.mm->snapshot_recv_active());
+    bool truncated = false;
+    const auto vector = receiver.engine->export_version_vector(ob::VV_MAX_ENTRIES, truncated);
+    ASSERT_FALSE(truncated);
+    EXPECT_EQ(vector.size(), 5'001u) << "the receiver did not take the sender's whole vector";
+    uint64_t last = 0, btc = 0;
+    for (const auto& e : vector) {
+        if (e.key == "V4999.EX" && e.origin == 3) last = e.frontier;
+        if (e.key == "BTC.USDT") btc = e.frontier;
+    }
+    EXPECT_EQ(last, 5'000u);
+    EXPECT_EQ(btc, 12u);
 }
 
 TEST(MMSnapshotTransfer, StagingIsGoneAndNoDescriptorLeaks) {

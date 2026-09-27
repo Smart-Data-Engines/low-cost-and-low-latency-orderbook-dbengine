@@ -173,9 +173,11 @@ TEST(MeshRestartOrigins, APeersRecordsAfterTheLastVectorAreRememberedToo) {
 TEST(MeshRestartOrigins, RecordsASegmentAlreadyHoldsAreRememberedFromTheirOrigin) {
     // Since part 2a of #165 a checkpoint's replay starts at the oldest record a row still waiting in
     // a store needs, so a restart reads again the records of every store sealed after it, and skips
-    // them as stored. Their numbers were known only to the vector - and a vector of more than 4 096
-    // entries is never written (#177). Here one symbol carries records of 4 097 origins, which makes
-    // it that large and is the row still waiting; a store the tick seals comes after it.
+    // them as stored. Their numbers are known only to the vector - and this restart has none: it never
+    // reached the WAL (skip_vector_persistence_for_test(), as a crash between a seal's sync and the
+    // vector can leave; until #177 a vector of more than 4 096 entries was never written, and this
+    // test made one). One symbol carries records of 4 097 origins and is the row still waiting; a
+    // store the tick seals comes after it.
     TempDir live("mm_origins_skip_live_");
     TempDir crashed("mm_origins_skip_crash_");
 
@@ -188,6 +190,7 @@ TEST(MeshRestartOrigins, RecordsASegmentAlreadyHoldsAreRememberedFromTheirOrigin
     };
     {
         auto node = open_node(live.path, ob::FsyncPolicy::INTERVAL);
+        node->skip_vector_persistence_for_test();
         // A tick before anything arrives, so the cache is built while it is empty and goes past
         // 4 096 entries by updates: the first update after open is a whole rebuild, which would
         // otherwise be the only thing this test's vector ever went through.
@@ -203,11 +206,9 @@ TEST(MeshRestartOrigins, RecordsASegmentAlreadyHoldsAreRememberedFromTheirOrigin
         node->flush_tick_for_test();
         ASSERT_EQ(segments_on_disk(live.path), 1u)
             << "the tick was to seal SEALED and nothing else, leaving WIDE's rows waiting";
-        bool truncated = false;
-        (void)node->export_version_vector(1u << 20, truncated);
-        ASSERT_TRUE(truncated)
-            << "the vector fits, so it was written, and the restart would learn from it what this "
-               "test is about the replay learning";
+        ASSERT_FALSE(vector_in_wal(live.path))
+            << "a vector was written, and the restart would learn from it what this test is about "
+               "the replay learning";
         crash_image(live.path, crashed.path);
         node->close();
     }
@@ -328,5 +329,35 @@ TEST(MeshRestartOrigins, WhatAPeerIsToldIsWhatAWholeExportSays) {
         << "the copy kept from the frontiers that moved is not the vector a whole export gives";
     EXPECT_EQ(told_all(*node), told_before) << "the flush found something the ticks had not";
     EXPECT_GT(told_before.size(), 100u) << "the case is too small to say anything";
+    node->close();
+}
+
+TEST(MeshRestartOrigins, AVectorPastOneRecordIsWrittenInPartsAndRestoredWhole) {
+    // #177: past 1 560 entries a vector could not be written down - the single-record format has no
+    // room - so the WAL got the "send everything" marker, and a restart came back knowing nothing it
+    // had not replayed. It goes in parts now, and the restart puts them back together.
+    TempDir dir("mm_origins_parts_");
+    std::vector<ob::SequenceTracker::VectorEntry> wide;
+    for (uint64_t i = 0; i < 5'000; ++i) {
+        wide.push_back({"P" + std::to_string(i) + ".EX", kPeer, i + 1});
+    }
+    {
+        auto node = open_node(dir.path);
+        node->adopt_snapshot_sequence_state(wide, {});   // written down as it is adopted
+        node->close();
+    }
+    size_t parts = 0;
+    ob::WALReplayer replayer(dir.path);
+    replayer.replay_v2([&parts](const ob::WALReplayContext& ctx) {
+        if (ctx.header.record_type == ob::WAL_RECORD_VERSION_VECTOR_PART) ++parts;
+    });
+    EXPECT_GE(parts, 4u) << "the vector did not go into the WAL in parts";
+    EXPECT_EQ(written_down(dir.path).size(), 5'000u) << "the WAL does not hold the whole vector";
+
+    auto node = open_node(dir.path);
+    node->flush_tick_for_test();
+    const auto told = told_all(*node);
+    EXPECT_EQ(told.size(), 5'000u) << "the restart did not put the vector back together";
+    EXPECT_EQ(told.count({"P4999.EX", kPeer}) ? told.at({"P4999.EX", kPeer}) : 0u, 5'000u);
     node->close();
 }
