@@ -706,12 +706,16 @@ TEST(VectorChanges, ChangesPutOnAWholeVectorAreTheVectorTheyDescribe) {
     // B from origin 1 moved, and C appeared: the cache lists the moved entries by index.
     now[1].frontier = 27;
     now.push_back({"C.EX", 3, 1});
-    add_all(from_wal, ob::serialize_version_vector_changes(now, {1, 3}, 2));
+    const auto changes = ob::serialize_version_vector_changes(now, {1, 3}, 2);
+    add_all(from_wal, changes);
 
     ASSERT_TRUE(from_wal.vector().has_value());
     EXPECT_EQ(frontiers_of(*from_wal.vector()), frontiers_of(now));
     EXPECT_EQ(from_wal.changes_applied(), 1u);
     EXPECT_FALSE(from_wal.unusable());
+    // What a writer going on from this log weighs its next whole vector against.
+    EXPECT_EQ(from_wal.whole_bytes(), ob::VV_HEADER_SIZE + 3 * ob::VV_ENTRY_SIZE);
+    EXPECT_EQ(from_wal.changes_bytes(), changes.front().payload.size());
 }
 
 TEST(VectorChanges, ChangesInPartsGoOnAVectorInParts) {
