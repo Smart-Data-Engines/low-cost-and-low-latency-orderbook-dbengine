@@ -380,3 +380,21 @@ TEST(MeshRestartOrigins, AVectorIsRestoredFromTheWalItsDirectoryNames) {
         << "the restart did not take up the vector the WAL in --wal-dir holds";
     node->close();
 }
+
+TEST(MeshRestartOrigins, HeldNumbersAreRestoredFromTheWalItsDirectoryNames) {
+    // #186: the numbers held above a frontier are written into the WAL beside the vector, and a
+    // restart with --wal-dir takes them up from there.
+    TempDir dir("mm_origins_waldir_held_"), wal("mm_origins_waldir_held_wal_");
+    const std::vector<ob::SequenceTracker::VectorEntry> vector{{"H.EX", kPeer, 5}};
+    const std::vector<ob::SequenceTracker::HeldRanges> held{{"H.EX", kPeer, {{8, 10}}}};
+    {
+        auto node = open_node(dir.path, ob::FsyncPolicy::EVERY, wal.path);
+        node->adopt_snapshot_sequence_state(vector, held);
+        ASSERT_EQ(node->above_frontier_size("H.EX", kPeer), 3u) << "the premise: three held";
+        node->close();
+    }
+    auto node = open_node(dir.path, ob::FsyncPolicy::EVERY, wal.path);
+    EXPECT_EQ(node->above_frontier_size("H.EX", kPeer), 3u)
+        << "the restart did not take up the held numbers the WAL in --wal-dir holds";
+    node->close();
+}
