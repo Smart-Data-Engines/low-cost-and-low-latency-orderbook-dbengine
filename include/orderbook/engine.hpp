@@ -1022,6 +1022,19 @@ private:
     /// **Caller must hold mtx_** — it is called from inside the flush's merge block.
     void persist_version_vector_if_changed();
 
+    /// Close a mesh node's numbering from before per-origin numbers, once (#187): every origin of
+    /// every symbol the tracker holds is declared up to kClosedNumberingBase - 1 and this node's own
+    /// numbers go on from the base; the vector goes into the WAL and onto the device, then the data
+    /// directory notes it (`numbering_closed`), and a start that finds the note does nothing.
+    /// `legacy_segments` is how many segments from before #184 the store holds. Takes `mtx_`.
+    void close_legacy_numbering(size_t legacy_segments);
+
+    /// After a snapshot's vector is adopted: note that the numbering is closed when the sender's
+    /// was - its vector states frontiers at the base - and remove the note when it was not (#187).
+    /// Caller holds `mtx_`.
+    void note_numbering_of_installed_snapshot(
+        const std::vector<SequenceTracker::VectorEntry>& vector);
+
     /// Whether a record already seen for this (symbol, origin) is applied again or dropped.
     /// Named rather than a bool at the call site: `apply_delta_impl(delta, levels, true)` says
     /// nothing about which way true goes.

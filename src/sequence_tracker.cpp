@@ -90,6 +90,7 @@ SequenceTracker::Decision SequenceTracker::observe(const std::string& key, uint1
         // local write whenever a remote hole is holding the frontier down — a GAP record per
         // insert, which is noise, not signal.
         OriginState& ost = st.origins[origin];
+        close_if_past_base(stored_key, origin, ost, d.sequence_number);
         if (note_seen(ost, d.sequence_number)) mark_moved(stored_key, origin, ost);
         return d;
     }
@@ -98,6 +99,7 @@ SequenceTracker::Decision SequenceTracker::observe(const std::string& key, uint1
     if (it == st.origins.end()) {
         // First record from this origin. Not a gap: there is nothing to be one past.
         OriginState& fresh = st.origins[origin];
+        close_if_past_base(stored_key, origin, fresh, d.sequence_number);
         if (note_seen(fresh, d.sequence_number)) mark_moved(stored_key, origin, fresh);
         OB_LOG_DEBUG("sequence", "First record from origin: key=%s origin=%u seq=%llu",
                      key.c_str(), static_cast<unsigned>(origin),
@@ -113,6 +115,7 @@ SequenceTracker::Decision SequenceTracker::observe(const std::string& key, uint1
     //   seq == frontier + 1  in order, even when the maximum is higher: this is the record
     //                        that fills a known hole, which is the opposite of a gap.
     //   seq >  frontier + 1  something between the frontier and this record is missing.
+    close_if_past_base(stored_key, origin, it->second, d.sequence_number);
     const uint64_t expected = it->second.frontier + 1;
     if (d.sequence_number > expected) {
         d.gap      = true;
@@ -150,19 +153,15 @@ void SequenceTracker::seed(const std::string& key, uint16_t origin, uint64_t seq
     SymbolState& st = sym->second;
     if (origin == local_origin_) st.next_local = std::max(st.next_local, seq + 1);   // see observe()
     OriginState& ost = st.origins[origin];
+    close_if_past_base(sym->first, origin, ost, seq);
     if (note_seen(ost, seq)) mark_moved(sym->first, origin, ost);
 }
 
-void SequenceTracker::declare_frontier(const std::string& key, uint16_t origin, uint64_t seq) {
-    if (seq == 0) return;
-    const auto [sym, created] = symbols_.try_emplace(key);
-    (void)created;
-    OriginState& st = sym->second.origins[origin];
-    if (seq <= st.frontier) return;
-
-    mark_moved(sym->first, origin, st);
+bool SequenceTracker::raise_frontier(OriginState& st, uint64_t seq) {
+    if (seq <= st.frontier) return false;
     st.frontier   = seq;
     st.high_water = std::max(st.high_water, seq);
+    st.held_full  = false;
     // Anything held below the declared frontier is now covered.
     while (!st.above_frontier.empty() && *st.above_frontier.begin() <= st.frontier) {
         st.above_frontier.erase(st.above_frontier.begin());
@@ -173,9 +172,63 @@ void SequenceTracker::declare_frontier(const std::string& key, uint16_t origin, 
         st.frontier = *it;
         it = st.above_frontier.erase(it);
     }
+    return true;
+}
+
+void SequenceTracker::declare_frontier(const std::string& key, uint16_t origin, uint64_t seq) {
+    if (seq == 0) return;
+    const auto [sym, created] = symbols_.try_emplace(key);
+    (void)created;
+    OriginState& st = sym->second.origins[origin];
+    if (!raise_frontier(st, seq)) return;
+    mark_moved(sym->first, origin, st);
     OB_LOG_DEBUG("sequence", "Declared frontier: key=%s origin=%u frontier=%llu",
                  key.c_str(), static_cast<unsigned>(origin),
                  static_cast<unsigned long long>(st.frontier));
+}
+
+std::size_t SequenceTracker::close_numbering(const std::string& key) {
+    const auto [sym, created] = symbols_.try_emplace(key);
+    (void)created;
+    SymbolState& st = sym->second;
+    st.next_local = std::max(st.next_local, kClosedNumberingBase);
+    std::size_t moved = 0;
+    for (auto& [origin, ost] : st.origins) {
+        const uint64_t was = ost.frontier;
+        if (!raise_frontier(ost, kClosedNumberingBase - 1)) continue;
+        mark_moved(sym->first, origin, ost);
+        ++moved;
+        OB_LOG_DEBUG("sequence", "Numbering closed: key=%s origin=%u frontier %llu -> %llu",
+                     key.c_str(), static_cast<unsigned>(origin),
+                     static_cast<unsigned long long>(was),
+                     static_cast<unsigned long long>(ost.frontier));
+    }
+    return moved;
+}
+
+std::vector<std::string> SequenceTracker::keys() const {
+    std::vector<std::string> out;
+    out.reserve(symbols_.size());
+    for (const auto& [key, st] : symbols_) {
+        (void)st;
+        out.push_back(key);
+    }
+    return out;
+}
+
+void SequenceTracker::close_if_past_base(const std::string& key, uint16_t origin, OriginState& st,
+                                         uint64_t seq) {
+    if (seq < kClosedNumberingBase || st.frontier >= kClosedNumberingBase - 1) return;
+    const uint64_t was = st.frontier;
+    raise_frontier(st, kClosedNumberingBase - 1);
+    mark_moved(key, origin, st);
+    OB_LOG_WARN("sequence", "Numbering of %s origin %u closed here by its record %llu: its origin "
+                            "closed its numbering from before per-origin numbers (#184, #187), so "
+                            "every number of it below %llu is held here, where the frontier stood at "
+                            "%llu - one missing here below that is not asked for again",
+                key.c_str(), static_cast<unsigned>(origin), static_cast<unsigned long long>(seq),
+                static_cast<unsigned long long>(kClosedNumberingBase),
+                static_cast<unsigned long long>(was));
 }
 
 void SequenceTracker::raise_local(const std::string& key, uint64_t seq) {

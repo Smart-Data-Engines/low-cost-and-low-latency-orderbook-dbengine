@@ -25,6 +25,16 @@
 
 namespace ob {
 
+/// Where a symbol's numbers go on from once its numbering from before per-origin numbers is closed
+/// (#187): every number below it is that numbering's, declared held for every origin of the symbol at
+/// the close, and each origin numbers its records from here.
+///
+/// A constant, the same on every node, and not the highest old number each node holds: an origin
+/// numbers on from its own highest, so a node that held more of the old numbers than the origin did
+/// would take the origin's next records for ones it had, and one that held fewer would wait for
+/// numbers nothing sends. Nodes that were not in step at the close agree on this without asking.
+inline constexpr uint64_t kClosedNumberingBase = 1ULL << 48;
+
 /// Per-symbol sequence state: the local counter, plus the last number seen from each origin.
 class SequenceTracker {
 public:
@@ -116,8 +126,23 @@ public:
     /// Sound for the **local** origin only, and only from the restored counter: a node mints
     /// its own numbers and applies them in the same critical section, so it cannot be missing
     /// one of its own records. Using this for a remote origin would claim records that were
-    /// never received, which is the failure #61 is about.
+    /// never received, which is the failure #61 is about - and the one exception is
+    /// `close_numbering()`, below, which names its cost.
     void declare_frontier(const std::string& key, uint16_t origin, uint64_t seq);
+
+    /// Close `key`'s numbering from before per-origin numbers (#187): every origin this tracker knows
+    /// for it holds every number below kClosedNumberingBase, and this node's own numbers of it go on
+    /// from there. Returns how many origins' frontiers moved.
+    ///
+    /// The holes that numbering left in each origin's stream are other origins' numbers, not records
+    /// that never arrived, and nothing else can say so: a frontier stopped at the first one stays
+    /// there, the numbers above it fill the held set, and a redelivery past the set is stored twice
+    /// (measured: 11 904 rows where 11 000 were written). The cost is a record this node really lacks
+    /// below the base, which is not asked for again.
+    std::size_t close_numbering(const std::string& key);
+
+    /// Every symbol this tracker holds anything for.
+    std::vector<std::string> keys() const;
 
     /// Restore frontiers from this node's own persisted vector.
     ///
@@ -218,6 +243,17 @@ private:
     /// Record `seq` as seen from `origin` and advance the frontier as far as it now reaches.
     /// Returns whether the frontier moved - a redelivery, and a number held above it, do not.
     static bool note_seen(OriginState& st, uint64_t seq);
+
+    /// Raise `st`'s frontier to `seq`: what is held below it is covered, and what is held just above
+    /// joins it. Returns whether it moved. What declare_frontier() and the closes share.
+    static bool raise_frontier(OriginState& st, uint64_t seq);
+
+    /// A number at or past kClosedNumberingBase from an origin whose frontier is below it: that
+    /// origin closed its numbering from before per-origin numbers where it is written (#187), so it is
+    /// closed here too - for an origin this node did not know when it closed its own, or a node that
+    /// holds no segment from before. Before anything is judged a gap. `key` is the map's own key.
+    void close_if_past_base(const std::string& key, uint16_t origin, OriginState& st,
+                            uint64_t seq);
 
     /// List `st` for the next `take_moved_frontiers()`, once. `key` is the map's own key: the
     /// maps are node-based, so it and `st` stay where they are until `reset()`, which drops the
