@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -132,6 +133,12 @@ std::vector<uint8_t> serialize_held_ranges(
 bool deserialize_held_ranges(const uint8_t* data, size_t len,
                             std::vector<SequenceTracker::HeldRanges>& out);
 
+/// The hash of one (key, origin) pair, of a key held as a string or looked up through a view of one
+/// (std::hash gives both the same value).
+inline size_t hash_vector_key(std::string_view key, uint16_t origin) {
+    return std::hash<std::string_view>{}(key) ^ (static_cast<size_t>(origin) << 1);
+}
+
 /// A peer's vector, ready to be asked "does it have this record?".
 class PeerVector {
 public:
@@ -143,9 +150,18 @@ public:
 
     /// Everything the peer holds from `origin` for `key`; 0 means nothing.
     uint64_t frontier_for(const std::string& key, uint16_t origin) const;
+    /// The frontier the peer listed for (`key`, `origin`), or nullptr when it did not list the
+    /// pair - which frontier_for() reads as 0, and a comparison needs told apart (#177).
+    const uint64_t* find(std::string_view key, uint16_t origin) const;
 
     /// The entries as read, for a node restoring its own persisted vector.
     std::vector<SequenceTracker::VectorEntry> entries() const;
+    /// Every (key, origin, frontier), without copying them out: what a comparison walks (#177 - at
+    /// 50 000 entries the copy entries() makes was a malloc per key on the mesh's io loop).
+    template <typename F>
+    void for_each(F&& f) const {
+        for (const auto& [k, frontier] : entries_) f(k.key, k.origin, frontier);
+    }
 
     bool   truncated() const { return truncated_; }
     size_t entry_count() const { return entries_.size(); }
@@ -159,15 +175,27 @@ private:
     struct Key {
         std::string key;
         uint16_t    origin;
-        bool operator==(const Key& o) const { return origin == o.origin && key == o.key; }
+    };
+    /// A key looked up without building a string for it (#177): frontier_for() made a copy of the
+    /// key, and a malloc, for every entry of ours at every comparison.
+    struct KeyView {
+        std::string_view key;
+        uint16_t         origin;
     };
     struct KeyHash {
-        size_t operator()(const Key& k) const {
-            return std::hash<std::string>{}(k.key) ^ (static_cast<size_t>(k.origin) << 1);
+        using is_transparent = void;
+        size_t operator()(const Key& k) const { return hash_vector_key(k.key, k.origin); }
+        size_t operator()(const KeyView& k) const { return hash_vector_key(k.key, k.origin); }
+    };
+    struct KeyEq {
+        using is_transparent = void;
+        template <typename A, typename B>
+        bool operator()(const A& a, const B& b) const {
+            return a.origin == b.origin && std::string_view(a.key) == std::string_view(b.key);
         }
     };
 
-    std::unordered_map<Key, uint64_t, KeyHash> entries_;
+    std::unordered_map<Key, uint64_t, KeyHash, KeyEq> entries_;
     bool truncated_{false};
     bool received_{false};
     VectorAssembler assembler_;
@@ -194,6 +222,9 @@ struct VectorDiff {
 /// "holds everything" — the same asymmetry the catch-up filter relies on. Getting that backwards
 /// is how a reconciliation pass would conclude there is nothing to repair while a peer sits on
 /// data nobody else has.
+///
+/// `ours` lists each (key, origin) at most once, as SequenceTracker::export_vector() and the
+/// engine's copy of it do: a peer whose every pair was found among ours has no pair left to walk.
 VectorDiff compare_vectors(const std::vector<SequenceTracker::VectorEntry>& ours,
                            const PeerVector& theirs, uint16_t peer_node_id);
 

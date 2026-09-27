@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string_view>
+#include <unordered_set>
 
 namespace ob {
 
@@ -383,10 +385,10 @@ bool PeerVector::deserialize_part(const uint8_t* data, size_t len) {
         case VectorAssembler::Step::Complete:
             break;
     }
-    const auto entries = assembler_.take();
+    auto entries = assembler_.take();
     entries_.clear();
     entries_.reserve(entries.size());
-    for (const auto& e : entries) entries_[Key{e.key, e.origin}] = e.frontier;
+    for (auto& e : entries) entries_[Key{std::move(e.key), e.origin}] = e.frontier;
     received_  = true;
     truncated_ = false;
     OB_LOG_INFO("mm", "Version vector received in parts: entries=%zu", entries.size());
@@ -403,8 +405,13 @@ std::vector<SequenceTracker::VectorEntry> PeerVector::entries() const {
 }
 
 uint64_t PeerVector::frontier_for(const std::string& key, uint16_t origin) const {
-    auto it = entries_.find(Key{key, origin});
+    auto it = entries_.find(KeyView{key, origin});
     return it == entries_.end() ? 0 : it->second;
+}
+
+const uint64_t* PeerVector::find(std::string_view key, uint16_t origin) const {
+    auto it = entries_.find(KeyView{key, origin});
+    return it == entries_.end() ? nullptr : &it->second;
 }
 
 VectorDiff compare_vectors(const std::vector<SequenceTracker::VectorEntry>& ours,
@@ -416,11 +423,20 @@ VectorDiff compare_vectors(const std::vector<SequenceTracker::VectorEntry>& ours
     // bandwidth; under-stating it loses data.
     const bool peer_unknown = theirs.wants_everything();
 
+    // One walk over ours answers both directions for every pair both sides list.
+    size_t listed_by_both = 0;
     for (const auto& e : ours) {
-        const uint64_t theirs_frontier = peer_unknown ? 0 : theirs.frontier_for(e.key, e.origin);
+        const uint64_t* listed = peer_unknown ? nullptr : theirs.find(e.key, e.origin);
+        const uint64_t theirs_frontier = listed == nullptr ? 0 : *listed;
         if (theirs_frontier < e.frontier) {
             diff.peer_lacks.push_back(VectorGap{peer_node_id, e.key, e.origin,
                                                 theirs_frontier + 1, e.frontier});
+        }
+        if (listed == nullptr) continue;
+        ++listed_by_both;
+        if (e.frontier < theirs_frontier) {
+            diff.we_lack.push_back(VectorGap{peer_node_id, e.key, e.origin,
+                                             e.frontier + 1, theirs_frontier});
         }
     }
 
@@ -429,23 +445,31 @@ VectorDiff compare_vectors(const std::vector<SequenceTracker::VectorEntry>& ours
         // zero would be a claim; leaving them out is the truth.
         return diff;
     }
-
-    // The other direction needs the peer's entries, including keys we have never heard of: a
-    // symbol only it holds is exactly the gap worth finding. Through an index of ours - a loop over
-    // ours for every one of theirs was 25 million comparisons at 5 000 entries (#177).
-    std::unordered_map<std::string, std::unordered_map<uint16_t, uint64_t>> ours_index;
-    ours_index.reserve(ours.size());
-    for (const auto& o : ours) ours_index[o.key][o.origin] = o.frontier;
-    for (const auto& e : theirs.entries()) {
-        uint64_t ours_frontier = 0;
-        if (const auto k = ours_index.find(e.key); k != ours_index.end()) {
-            if (const auto o = k->second.find(e.origin); o != k->second.end()) ours_frontier = o->second;
-        }
-        if (ours_frontier < e.frontier) {
-            diff.we_lack.push_back(VectorGap{peer_node_id, e.key, e.origin,
-                                             ours_frontier + 1, e.frontier});
-        }
+    if (listed_by_both == theirs.entry_count()) {
+        // Every pair the peer listed is one of ours, and was compared above: the steady state of a
+        // mesh, where a second walk, over theirs, was a third of what a comparison cost (#177).
+        return diff;
     }
+
+    // The pairs only the peer lists: a symbol only it holds is exactly the gap worth finding, and a
+    // walk over ours never meets it. Through a set of ours whose keys point into `ours` rather than
+    // copy them - a loop over ours for every one of theirs was 25 million comparisons at 5 000
+    // entries (#177).
+    struct View {
+        std::string_view key;
+        uint16_t         origin;
+        bool operator==(const View& o) const { return origin == o.origin && key == o.key; }
+    };
+    struct ViewHash {
+        size_t operator()(const View& v) const { return hash_vector_key(v.key, v.origin); }
+    };
+    std::unordered_set<View, ViewHash> ours_pairs;
+    ours_pairs.reserve(ours.size());
+    for (const auto& o : ours) ours_pairs.insert(View{o.key, o.origin});
+    theirs.for_each([&](const std::string& key, uint16_t origin, uint64_t frontier) {
+        if (frontier == 0 || ours_pairs.count(View{key, origin}) != 0) return;
+        diff.we_lack.push_back(VectorGap{peer_node_id, key, origin, 1, frontier});
+    });
 
     return diff;
 }

@@ -11,7 +11,9 @@
 
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -530,7 +532,8 @@ TEST(VectorParts, TheSnapshotsBlockCarriesAVectorOfAnySize) {
 }
 
 TEST(CompareVectors, FiveThousandEntriesEachWayAreComparedEntryForEntry) {
-    // The direction "what this node lacks" goes through an index now; what it finds is the same.
+    // "What this node lacks" is found by the walk over ours now, and a pair only the peer lists
+    // through a set of ours; what it finds is the same.
     auto ours = entries_of(5'000);
     auto theirs_entries = entries_of(5'000);
     theirs_entries[17].frontier += 5;        // they hold more of one
@@ -541,4 +544,56 @@ TEST(CompareVectors, FiveThousandEntriesEachWayAreComparedEntryForEntry) {
     const auto diff = ob::compare_vectors(ours, theirs, 2);
     ASSERT_EQ(diff.we_lack.size(), 2u);
     EXPECT_TRUE(diff.peer_lacks.empty());
+}
+
+RC_GTEST_PROP(CompareVectorsProperty, BothDirectionsAreWhatComparingEveryPairFinds, ()) {
+    // Two vectors over one pool of (key, origin) pairs, each side listing any part of it - the peer
+    // with frontiers of 0 too, which its wire can carry: the walk over ours, the count that says the
+    // peer listed nothing else, and the walk over theirs when it did must find what comparing every
+    // pair of one side with every pair of the other finds (#177).
+    const auto symbols = *rc::gen::inRange<size_t>(0, 30);
+    std::vector<ob::SequenceTracker::VectorEntry> ours;
+    std::vector<ob::SequenceTracker::VectorEntry> theirs_entries;
+    for (size_t s = 0; s < symbols; ++s) {
+        const std::string key = "K" + std::to_string(s) + ".EX";
+        for (uint16_t origin = 1; origin <= 3; ++origin) {
+            if (*rc::gen::arbitrary<bool>()) {
+                ours.push_back({key, origin, *rc::gen::inRange<uint64_t>(1, 20)});
+            }
+            if (*rc::gen::arbitrary<bool>()) {
+                theirs_entries.push_back({key, origin, *rc::gen::inRange<uint64_t>(0, 20)});
+            }
+        }
+    }
+    const auto theirs = make_peer_vector(theirs_entries);
+    const auto diff = ob::compare_vectors(ours, theirs, 7);
+
+    using Gap = std::tuple<std::string, uint16_t, uint64_t, uint64_t>;
+    std::multiset<Gap> peer_lacks;
+    std::multiset<Gap> we_lack;
+    for (const auto& o : ours) {
+        uint64_t t = 0;
+        for (const auto& e : theirs_entries) {
+            if (e.key == o.key && e.origin == o.origin) t = e.frontier;
+        }
+        if (t < o.frontier) peer_lacks.insert(Gap{o.key, o.origin, t + 1, o.frontier});
+    }
+    for (const auto& e : theirs_entries) {
+        uint64_t mine = 0;
+        for (const auto& o : ours) {
+            if (o.key == e.key && o.origin == e.origin) mine = o.frontier;
+        }
+        if (mine < e.frontier) we_lack.insert(Gap{e.key, e.origin, mine + 1, e.frontier});
+    }
+
+    const auto as_set = [](const std::vector<ob::VectorGap>& gaps) {
+        std::multiset<Gap> out;
+        for (const auto& g : gaps) {
+            RC_ASSERT(g.peer_node_id == 7u);
+            out.insert(Gap{g.key, g.origin, g.from_seq, g.to_seq});
+        }
+        return out;
+    };
+    RC_ASSERT(as_set(diff.peer_lacks) == peer_lacks);
+    RC_ASSERT(as_set(diff.we_lack) == we_lack);
 }

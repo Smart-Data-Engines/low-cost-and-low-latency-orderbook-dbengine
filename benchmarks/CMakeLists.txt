@@ -75,3 +75,9 @@ target_link_libraries(segment_index_cost PRIVATE orderbook_columnar)
 # a store on the disk it is given.
 add_executable(segment_size_cost segment_size_cost.cpp)
 target_link_libraries(segment_size_cost PRIVATE orderbook_columnar)
+
+# ── What a version vector costs to send, receive and compare as it grows (#177) ──
+#
+# Compiled, deliberately not run: it prints a table, and the numbers in the roadmap came from it.
+add_executable(vector_cost vector_cost.cpp)
+target_link_libraries(vector_cost PRIVATE orderbook_sequence)
