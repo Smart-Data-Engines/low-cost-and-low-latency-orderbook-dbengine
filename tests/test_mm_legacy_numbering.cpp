@@ -223,3 +223,31 @@ TEST(MeshLegacyNumbering, AnInstalledSnapshotCarriesWhetherItsNumberingIsClosed)
     EXPECT_FALSE(closed_note(dir.path)) << "an open snapshot's numbering was noted closed";
     engine->close();
 }
+
+TEST(MeshLegacyNumbering, AStoreOutsideAMeshIsNotClosed) {
+    // Outside a mesh every row is origin 0 and a segment's highest number is its frontier, as it
+    // always was: there are no other origins' numbers to have left holes.
+    mm_engine::TempDir dir("legacy_numbering_standalone_");
+    uint64_t ts = kTs;
+    const auto standalone = [&dir] {
+        auto e = std::make_unique<ob::Engine>(dir.path, mm_engine::kNoAutoFlush, ob::FsyncPolicy::NONE);
+        e->open();
+        return e;
+    };
+    {
+        auto engine = standalone();
+        for (int k = 0; k < 7; ++k) {
+            auto r = record("LG03", 0, ts++);
+            ASSERT_EQ(engine->apply_delta(r.delta, r.levels.data()), ob::OB_OK);
+        }
+        engine->flush_incremental();
+        engine->close();
+    }
+    ASSERT_GT(strip_own_fields(dir.path), 0u);
+    auto engine = standalone();
+    EXPECT_FALSE(closed_note(dir.path)) << "a store outside a mesh was closed";
+    engine->flush_incremental();
+    EXPECT_EQ(told(*engine, "LG03.EX", 0), 7u)
+        << "origin 0's frontier is not the segment's highest number";
+    engine->close();
+}
