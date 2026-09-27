@@ -365,6 +365,12 @@ ob_add_engine_test(test_mm_restart_origins
     test_mm_restart_origins.cpp
 )
 
+# Each origin numbers its own records of a symbol, and a restart continues from its own highest
+# (#184) and declares only what it wrote (#185).
+ob_add_engine_test(test_mm_per_origin_numbering
+    test_mm_per_origin_numbering.cpp
+)
+
 ob_add_engine_test(test_mm_snapshot
     test_mm_snapshot.cpp
 )

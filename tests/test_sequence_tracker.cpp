@@ -183,6 +183,7 @@ TEST(SequenceTracker, RaiseLocalOnAnUnseenSymbolIsTheSameAsStartingThere) {
 
 TEST(SequenceTracker, SeedLeavesAConservativeFrontierAcrossAHoleInTheTail) {
     ob::SequenceTracker t;
+    t.set_local_origin(1);   // the replay of this node's own records, which raise its counter (#184)
 
     // Replay of a WAL tail with a hole. The hole may be real, or records 2-3 may be sitting
     // in a segment where replay cannot see them — the tail only reaches back to the last
@@ -592,4 +593,61 @@ RC_GTEST_PROP(SequenceTrackerProperty, ACopyWhoseListingIsCurrentIsTheExport, ()
             RC_ASSERT(copy == as_map(t.export_vector(1u << 20, truncated)));
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Whose numbers raise the local counter (#184)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(SequenceTracker, ANumberAnotherOriginMintedDoesNotRaiseTheLocalCounter) {
+    // One counter per symbol, raised by every origin's numbers, gave each origin's stream holes
+    // when two mesh nodes wrote one symbol - node 0 1-500, node 1 501-1 000, node 0 1 001-1 500 -
+    // and a frontier is "everything up to here", so every receiver's stopped at the first hole.
+    ob::SequenceTracker t;
+    t.set_local_origin(1);
+    for (uint64_t seq = 1; seq <= 500; ++seq) (void)t.observe("S.EX", 2, seq);
+    t.seed("S.EX", 2, 501);
+    EXPECT_EQ(t.peek_next_local("S.EX"), 1u) << "another origin's numbers raised this node's counter";
+    EXPECT_EQ(t.observe("S.EX", 1, 0).sequence_number, 1u);
+    EXPECT_EQ(t.observe("S.EX", 1, 0).sequence_number, 2u);
+    EXPECT_EQ(t.frontier("S.EX", 1), 2u) << "this node's own stream has a hole";
+
+    // Its own numbers, received or replayed, still do: they are its counter's.
+    t.seed("S.EX", 1, 10);
+    EXPECT_EQ(t.peek_next_local("S.EX"), 11u);
+    (void)t.observe("S.EX", 1, 20);
+    EXPECT_EQ(t.peek_next_local("S.EX"), 21u);
+}
+
+TEST(SequenceTracker, WithoutAMeshEveryNumberIsTheLocalOrigins) {
+    // The control: origin 0 is everything a node without a mesh holds, a replica's included, so a
+    // promoted replica numbers on from its primary's numbers as it always did.
+    ob::SequenceTracker t;
+    (void)t.observe("R.EX", 0, 41);
+    t.seed("R.EX", 0, 42);
+    EXPECT_EQ(t.peek_next_local("R.EX"), 43u);
+}
+
+TEST(SequenceTracker, AHeldSetAtItsCapIsSaidOnceUntilTheFrontierMoves) {
+    // The diagnostic for a hole nothing fills (#184): a held set at its cap. Once, not per record -
+    // every record above the hole reaches it - and again only after the frontier has moved.
+    ob::SequenceTracker t;
+    t.set_local_origin(1);
+    (void)t.observe("H.EX", 2, 1);
+    testing::internal::CaptureStderr();
+    for (uint64_t seq = 3; seq < 3 + ob::SequenceTracker::kMaxAboveFrontier + 10; ++seq) {
+        (void)t.observe("H.EX", 2, seq);
+    }
+    const std::string said = testing::internal::GetCapturedStderr();
+    size_t warnings = 0;
+    for (size_t at = said.find("Held set full"); at != std::string::npos;
+         at = said.find("Held set full", at + 1)) {
+        ++warnings;
+    }
+    EXPECT_EQ(warnings, 1u) << "a held set at its cap is said once, not per record past it";
+    EXPECT_EQ(t.above_frontier_size("H.EX", 2), ob::SequenceTracker::kMaxAboveFrontier);
+    EXPECT_EQ(t.frontier("H.EX", 2), 1u);
+    (void)t.observe("H.EX", 2, 2);   // the hole filled: the held numbers drain
+    EXPECT_GT(t.frontier("H.EX", 2), 1u);
+    EXPECT_LT(t.above_frontier_size("H.EX", 2), ob::SequenceTracker::kMaxAboveFrontier);
 }
