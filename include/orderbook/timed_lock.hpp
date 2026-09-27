@@ -18,6 +18,8 @@ namespace ob {
 
 /// A hold or a wait of this long is one a writer notices: the median write takes 0.05 ms.
 inline constexpr double kSlowLockMs = 20.0;
+/// A flush tick this long has let the pending queue fill at the write ceiling (#186).
+inline constexpr double kSlowTickMs = 1000.0;
 
 class TimedLock {
 public:

@@ -1023,6 +1023,7 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
         Clock::time_point asked{Clock::now()};
         Clock::time_point held{}, room_from{}, room_to{}, wal_from{}, wal_to{}, released{};
         size_t writes{0};
+        bool wal_beside_data{false};
         ~WriteTiming() {
             const auto end = released == Clock::time_point{} ? Clock::now() : released;
             const auto ms = [](Clock::time_point a, Clock::time_point b) {
@@ -1033,13 +1034,20 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
             if (waited < kSlowLockMs && total < kSlowLockMs) return;
             const double room = room_to == Clock::time_point{} ? 0.0 : ms(room_from, room_to);
             const double wal  = wal_to == Clock::time_point{} ? 0.0 : ms(wal_from, wal_to);
+            // A WAL append that long is the filesystem's (#186): on ext4 write() waits for the
+            // journal, which a data directory's segments keep busy - unless the WAL has one of its own.
+            const bool hint = wal_beside_data && wal >= kSlowLockMs;
             OB_LOG_WARN("engine", "A batch of %zu write(s) waited %.1f ms for the engine lock and "
                                   "held it %.1f ms - %.1f ms of it waiting for room in the pending "
-                                  "queue, %.1f ms in the WAL append",
-                        writes, waited, total, room, wal);
+                                  "queue, %.1f ms in the WAL append%s",
+                        writes, waited, total, room, wal,
+                        hint ? "; a WAL on a filesystem of its own (--wal-dir) does not wait for "
+                               "the data directory's journal"
+                             : "");
         }
     } timing;
     timing.writes = n;
+    timing.wal_beside_data = wal_dir_ == base_dir_;
     std::unique_lock<std::mutex> lock(mtx_);
     timing.held = WriteTiming::Clock::now();
 
@@ -2833,6 +2841,17 @@ void Engine::flush_tick() {
                          taken, ms_since(tick_started, synced), ms_since(synced, drained),
                          ms_since(drained, sealed), ms_since(sealed, retained),
                          ms_since(retained, finished));
+        }
+        // And said at WARN when a tick takes a second (#186): writers at the ceiling wait for the room
+        // a tick frees in the pending queue - up to 3.4 s, measured, with every section this tick
+        // holds the lock in short - and which phase it was is what an operator needs to know.
+        if (const double total = ms_since(tick_started, TickClock::now()); total >= kSlowTickMs) {
+            OB_LOG_WARN("engine", "A flush tick took %.0f ms for %zu row(s): WAL sync %.1f ms, drain "
+                                  "%.1f ms, seals %.1f ms, retention %.1f ms, merges %.1f ms - writers "
+                                  "at the ceiling wait for the room it frees",
+                        total, taken, ms_since(tick_started, synced), ms_since(synced, drained),
+                        ms_since(drained, sealed), ms_since(sealed, retained),
+                        ms_since(retained, TickClock::now()));
         }
 }
 
