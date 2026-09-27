@@ -326,7 +326,7 @@ TEST(HeldRanges, ExportTruncatesAndSaysSoRatherThanDroppingSilently) {
 //
 // `payload_len` is a uint16_t in both the WAL record header and the multi-master frame header,
 // and the writers cast a size_t into it. A version vector of 4096 entries — the documented
-// maximum — is 172 kB, so the cast wrapped and produced a header claiming 40962 bytes for a
+// maximum until #177 — is 172 kB, so the cast wrapped and produced a header claiming 40962 bytes for a
 // 172034-byte payload. In the WAL that makes every later record unreadable, because replay takes
 // the header at its word and lands in the middle of this payload. On the wire the peer compares
 // `payload_len` against the frame it received, disagrees, and disconnects — again on every

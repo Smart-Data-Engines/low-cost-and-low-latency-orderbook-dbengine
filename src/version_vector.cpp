@@ -17,8 +17,9 @@ std::vector<uint8_t> serialize_version_vector(
     // header and the multi-master frame header carry the length in a uint16_t, so a payload above
     // 65535 bytes produces a header that understates it. In the WAL that makes every later record
     // unreadable; on the wire the peer sees payload_len disagree with the frame and disconnects,
-    // on every reconnect, for ever. 4096 entries is 172 kB, so MM_MAX_VV_ENTRIES alone never
-    // brought this anywhere near safe (#78).
+    // on every reconnect, for ever. 4096 entries - the bound MM_MAX_VV_ENTRIES was until #177 - is
+    // 172 kB, so that bound alone never brought this anywhere near safe (#78). A vector past one
+    // record goes in parts now (serialize_version_vector_records()); this stays the backstop.
     const size_t would_be = VV_HEADER_SIZE + entries.size() * VV_ENTRY_SIZE;
     const bool too_large_for_a_header = would_be > WAL_MAX_PAYLOAD_LEN;
     if (too_large_for_a_header) {

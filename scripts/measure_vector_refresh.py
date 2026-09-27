@@ -4,18 +4,18 @@
 Until #180 the vector a peer is told was exported only at a checkpoint, and since part 2a of #165 a
 tick that seals nothing writes none - so a peer could be told, for up to ten seconds, that this node
 lacked what it held. Since the fix every tick exports it again whenever the sequence tracker moved:
-under the engine's lock, one pass over every (symbol, origin) the node holds, at most 4 096 entries.
-This measures that at the largest vector a node states. Three nodes; `--symbols` symbols written
+under the engine's lock, one pass over every (symbol, origin) the node holds - at most 4 096 entries
+until #177. This measured that at the largest vector a node stated then. Three nodes; `--symbols` symbols written
 once on the first, so every node holds that many entries; then `benchmarks/pipelined_ingest`
 against the first node, whose writes move the tracker between any two ticks. Each run prints the
 ingest's rate in levels per second and its batch round trip at p50, p99, p99.9 and max - a lock
 held once a tick is a tail, not a median.
 
-**Keep `--symbols` under 1 561** for the rounds of a mesh: past that a vector does not fit the
-record that carries it and is sent as "send everything" (#177), so every reconciliation resends the
-whole WAL and that, not the refresh, is what the ingest pays. The refresh itself still exports up to
-4 096 entries, and `--nodes 1` measures that: a mesh node with no peer broadcasts and resends
-nothing, so what differs between builds is the tick.
+**On a build before #177, keep `--symbols` under 1 561** for the rounds of a mesh: past that a
+vector did not fit the record that carries it and was sent as "send everything", so every
+reconciliation resent the whole WAL and that, not the refresh, was what the ingest paid. Since #177
+a vector of any size goes in parts. `--nodes 1` measures the refresh alone: a mesh node with no peer
+broadcasts and resends nothing, so what differs between builds is the tick.
 
     scripts/measure_vector_refresh.py --server before=<ob_tcp_server> --server after=<ob_tcp_server> \\
         --probe build-release/benchmarks/pipelined_ingest [--symbols 1500] [--rounds 4]
