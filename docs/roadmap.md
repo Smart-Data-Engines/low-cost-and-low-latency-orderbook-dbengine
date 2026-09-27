@@ -2268,7 +2268,7 @@ taken only from the connection asked (`not_requested`) and only while the joiner
 (`holds_data`), and a sender its target refused stops sending (`peer_refused`). And the bootstrap
 starts with the request: the first version started it at the `BEGIN`, as before, and its own
 integration test showed the joiner holding its peers' catch-ups - they start at its empty vector -
-8 ms after asking, when the `BEGIN` came, and so refusing the snapshot it had asked for (pitfall 493).
+8 ms after asking, when the `BEGIN` came, and so refusing the snapshot it had asked for (pitfall 494).
 With no peer left to ask, the joiner takes writes again rather than refuse them for ever.
 
 Measured, the same probe (Debug, i3-7100U, 1 600 symbols): **1 / 1 / 1** snapshots asked for, sent and

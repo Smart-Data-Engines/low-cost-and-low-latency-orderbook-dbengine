@@ -3862,7 +3862,7 @@ two vectors are compared in one walk, 4.9 ms at 50 000 entries (pitfalls 490-491
 closed**: a joiner asked every peer for a snapshot and installed each one it was sent, in turn -
 three from three peers, writes refused 21.6 s where one bootstrap took 6.8 - and asks one peer now,
 refusing writes from its request, so the other peers' catch-ups do not make it a node with data by
-the BEGIN (pitfall 493). **#169, #175, #176, #186 and #187 are open P1s**: #187 is the holes the old numbering left in every node's
+the BEGIN (pitfall 494). **#169, #175, #176, #186 and #187 are open P1s**: #187 is the holes the old numbering left in every node's
 tracker, which a snapshot carries and nothing clears but a new mesh; an exchange name with a dot
 makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live book, sequence numbers
 and stored rows, measured on the wire; sharding by symbol has no control plane: no shard writes
