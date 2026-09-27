@@ -651,3 +651,78 @@ TEST(SequenceTracker, AHeldSetAtItsCapIsSaidOnceUntilTheFrontierMoves) {
     EXPECT_GT(t.frontier("H.EX", 2), 1u);
     EXPECT_LT(t.above_frontier_size("H.EX", 2), ob::SequenceTracker::kMaxAboveFrontier);
 }
+
+// ── The numbering from before per-origin numbers, closed (#187) ───────────────────────────────
+
+namespace {
+
+/// One symbol as a mesh node numbered it before #184: origins 2 and 3 in turns, one counter.
+void old_numbering(ob::SequenceTracker& t, const std::string& key) {
+    for (uint64_t s = 1; s <= 5; ++s) t.observe(key, 2, s);
+    for (uint64_t s = 6; s <= 10; ++s) t.observe(key, 3, s);
+    for (uint64_t s = 11; s <= 15; ++s) t.observe(key, 2, s);
+}
+
+}  // namespace
+
+TEST(ClosedNumbering, EveryKnownOriginIsClosedAndTheCounterGoesOnFromTheBase) {
+    ob::SequenceTracker t;
+    t.set_local_origin(1);
+    old_numbering(t, "K.EX");
+    ASSERT_EQ(t.frontier("K.EX", 2), 5u);
+    ASSERT_EQ(t.frontier("K.EX", 3), 0u);
+    ASSERT_EQ(t.above_frontier_size("K.EX", 2), 5u);
+
+    EXPECT_EQ(t.close_numbering("K.EX"), 2u);
+    EXPECT_EQ(t.frontier("K.EX", 2), ob::kClosedNumberingBase - 1);
+    EXPECT_EQ(t.frontier("K.EX", 3), ob::kClosedNumberingBase - 1);
+    EXPECT_EQ(t.above_frontier_size("K.EX", 2), 0u);
+    EXPECT_EQ(t.above_frontier_size("K.EX", 3), 0u);
+    EXPECT_EQ(t.peek_next_local("K.EX"), ob::kClosedNumberingBase);
+    EXPECT_EQ(t.frontier("K.EX", 1), 0u) << "an origin the symbol never had was closed";
+    EXPECT_EQ(t.close_numbering("K.EX"), 0u) << "a second close moved something";
+}
+
+TEST(ClosedNumbering, ARecordFromTheBaseClosesItsOwnOriginAndIsNoGap) {
+    ob::SequenceTracker t;
+    t.set_local_origin(1);
+    old_numbering(t, "K.EX");
+    t.observe("K.EX", 4, 1);
+    const auto d = t.observe("K.EX", 3, ob::kClosedNumberingBase);
+    EXPECT_FALSE(d.gap) << "the first number of a closed origin was judged a gap";
+    EXPECT_EQ(t.frontier("K.EX", 3), ob::kClosedNumberingBase);
+    EXPECT_EQ(t.frontier("K.EX", 2), 5u) << "another origin was closed by it";
+    EXPECT_EQ(t.frontier("K.EX", 4), 1u);
+}
+
+TEST(ClosedNumbering, ARecordBelowTheBaseClosesNothing) {
+    ob::SequenceTracker t;
+    old_numbering(t, "K.EX");
+    const auto d = t.observe("K.EX", 3, ob::kClosedNumberingBase - 1);
+    EXPECT_TRUE(d.gap);
+    EXPECT_EQ(t.frontier("K.EX", 3), 0u);
+}
+
+TEST(ClosedNumbering, AReplayedOrOwnRecordFromTheBaseClosesItsOriginToo) {
+    ob::SequenceTracker t;
+    t.set_local_origin(1);
+    old_numbering(t, "K.EX");
+    t.seed("K.EX", 2, ob::kClosedNumberingBase);
+    EXPECT_EQ(t.frontier("K.EX", 2), ob::kClosedNumberingBase) << "a replayed record did not close";
+
+    // This node never wrote K; its first own number after the close is the base, and in order.
+    t.close_numbering("K.EX");
+    const auto own = t.observe("K.EX", 1, 0);
+    EXPECT_EQ(own.sequence_number, ob::kClosedNumberingBase);
+    EXPECT_EQ(t.frontier("K.EX", 1), ob::kClosedNumberingBase);
+}
+
+TEST(ClosedNumbering, ASymbolFirstSeenAfterTheCloseNumbersFromOne) {
+    ob::SequenceTracker t;
+    t.set_local_origin(1);
+    old_numbering(t, "K.EX");
+    for (const auto& key : t.keys()) t.close_numbering(key);
+    EXPECT_EQ(t.observe("NEW.EX", 1, 0).sequence_number, 1u);
+    EXPECT_EQ(t.observe("NEW.EX", 2, 1).gap, false);
+    EXPECT_EQ(t.frontier("NEW.EX", 2), 1u);
+}

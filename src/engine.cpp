@@ -46,6 +46,13 @@ namespace {
 /// and neither .col nor meta.json, so no snapshot carries it.
 constexpr const char* kWalLocationFile = "wal_location";
 
+/// The data directory's note that its numbering from before per-origin numbers is closed (#187).
+/// What keeps a later start from closing it again: a node that joined after the close numbers a symbol
+/// from 1, and closing again would take its records below kClosedNumberingBase for ones this node
+/// has. A file for the reason `wal_location` is one, and set from the snapshot's vector when one is
+/// installed, since a snapshot carries neither.
+constexpr const char* kNumberingClosedFile = "numbering_closed";
+
 /// A WAL is in `dir`: a wal_*.bin file or the identity beside them.
 bool holds_wal(const std::filesystem::path& dir) {
     std::error_code ec;
@@ -257,6 +264,10 @@ void Engine::open() {
     // a peer needs it (#184, below). Both only ever raise, so the order changes nothing else.
     const bool vector_restored = restore_version_vector();
 
+    // Segments written before per-origin numbers (#184), counted by the pass below: what decides
+    // whether this start closes their numbering (#187).
+    size_t legacy_segments = 0;
+
     // Restore the sequence counters from what is already durable in segments, before the
     // replay below adds what is durable only in the WAL. Both only ever raise, so the order
     // between them does not matter; skipping either hands out a number twice.
@@ -268,15 +279,23 @@ void Engine::open() {
     // numbers its peers wrote, and every reconciliation scanned the WAL for records nobody wrote.
     {
         const uint16_t self = mm_config_.enabled ? mm_config_.node_id : 0;
-        size_t own = 0, legacy = 0, received = 0;
+        size_t own = 0, received = 0;
         for (const auto& meta : combined_store_.index()) {
             if (meta.max_sequence_number == 0) continue;   // written before numbers existed
             const std::string key = meta.symbol + "." + meta.exchange;
             if (!meta.has_own_max) {
-                // Written before a segment said whose its rows were: as it always was.
+                // Written before a segment said whose its rows were (#184). The counter goes on
+                // above every origin's numbers in it, as it always did. Outside a mesh every row is
+                // origin 0, and the frontier is the segment's highest, as it always was; in one, the
+                // frontier is not declared - that claimed, for this node's own origin, every number
+                // its peers wrote (#185), and every reconciliation then started a catch-up whose
+                // redeliveries of the old numbering's gapped streams were stored twice (#187). That
+                // numbering is closed once instead, after the tail replay below.
                 seq_tracker_.raise_local(key, meta.max_sequence_number);
-                seq_tracker_.declare_frontier(key, self, meta.max_sequence_number);
-                ++legacy;
+                if (!mm_config_.enabled) {
+                    seq_tracker_.declare_frontier(key, self, meta.max_sequence_number);
+                }
+                ++legacy_segments;
                 continue;
             }
             if (meta.own_origin == self) {
@@ -313,7 +332,7 @@ void Engine::open() {
         }
         OB_LOG_INFO("engine", "Sequence counters restored from segments: own=%zu legacy=%zu "
                               "received=%zu symbols=%zu%s",
-                    own, legacy, received, seq_tracker_.symbol_count(),
+                    own, legacy_segments, received, seq_tracker_.symbol_count(),
                     received > 0 && !vector_restored
                         ? " (the received ones raised the counter by every origin's numbers: no "
                           "vector said how far this node's own went)"
@@ -334,6 +353,10 @@ void Engine::open() {
     // existed, the replay callback was empty and every write acknowledged but not yet
     // flushed was lost on a crash, despite being in a fsynced WAL.
     const uint64_t replayed = replay_wal_tail(tail_replayer, last_checkpoint);
+
+    // A mesh node's numbering from before per-origin numbers is closed once (#187): after the tail
+    // replay, which holds the last of its numbers, and before anything new is written.
+    if (mm_config_.enabled && legacy_segments > 0) close_legacy_numbering(legacy_segments);
 
     // Persist what was recovered before serving anything. Two reasons, and the first
     // is not optional: SELECT reads the columnar store and never the live SoA buffer,
@@ -1967,6 +1990,7 @@ void Engine::adopt_snapshot_sequence_state(
     // flush would come back with the frontiers of the contents that were just discarded.
     persist_version_vector_if_changed();
     refresh_version_vector_cache();
+    if (mm_config_.enabled) note_numbering_of_installed_snapshot(vector);
 
     OB_LOG_INFO("engine",
                 "Adopted snapshot sequence state: entries=%zu held_entries=%zu symbols=%zu",
@@ -2081,6 +2105,81 @@ void Engine::publish_segment_count() {
     const size_t segments = combined_store_.segment_count();
     registry_.set_gauge("ob_segment_count", static_cast<int64_t>(segments));
     OB_LOG_DEBUG("engine", "ob_segment_count = %zu", segments);
+}
+
+void Engine::close_legacy_numbering(size_t legacy_segments) {
+    const std::string marker = base_dir_ + "/" + kNumberingClosedFile;
+    std::error_code ec;
+    if (fs::exists(marker, ec)) {
+        OB_LOG_INFO("engine", "%zu segment(s) are from before per-origin numbers (#184); their "
+                              "numbering was closed at an earlier start (%s)",
+                    legacy_segments, marker.c_str());
+        return;
+    }
+
+    // Every symbol the tracker holds: this node's whole history is from before the close - its
+    // segments' and its WAL tail's, which the replay has just put back.
+    size_t symbols = 0, moved = 0;
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+        for (const auto& key : seq_tracker_.keys()) {
+            moved += seq_tracker_.close_numbering(key);
+            ++symbols;
+        }
+        // Written down and on the device before the note that says so: a start that finds the
+        // note restores the vector, and one that finds no note closes again, which changes nothing.
+        persist_version_vector_if_changed();
+        if (!wal_.sync()) {
+            OB_LOG_ERROR("engine", "The WAL could not be synced after closing the numbering of %zu "
+                                   "symbol(s) (#187); the next start closes it again", symbols);
+            return;
+        }
+    }
+    const std::string note = "numbering from before per-origin numbers closed below " +
+                             std::to_string(kClosedNumberingBase) + " for " +
+                             std::to_string(symbols) + " symbol(s)\n";
+    if (const int err = write_file_atomically(marker, note); err != 0) {
+        OB_LOG_WARN("engine", "Could not write %s (%s): the next start closes the numbering again, "
+                              "which changes nothing unless a node that joined since has written",
+                    marker.c_str(), std::strerror(err));
+    }
+    OB_LOG_WARN("engine",
+                "Closed the numbering of %zu symbol(s) written before per-origin numbers (#184, "
+                "#187): %zu frontier(s) of their origins declared up to %llu, and this node's own "
+                "numbers of them go on from %llu - a record missing here below that now is not "
+                "caught up",
+                symbols, moved, static_cast<unsigned long long>(kClosedNumberingBase - 1),
+                static_cast<unsigned long long>(kClosedNumberingBase));
+}
+
+void Engine::note_numbering_of_installed_snapshot(
+        const std::vector<SequenceTracker::VectorEntry>& vector) {
+    // The note does not travel with a snapshot, and the state it describes does (#187): a sender
+    // that closed its numbering states frontiers at the base, and this node's store now holds its
+    // segments - so without the note the next start would close again, and take the records of a
+    // node that joined since, numbered from 1, for ones this node has.
+    const bool closed = std::any_of(vector.begin(), vector.end(), [](const auto& e) {
+        return e.frontier >= kClosedNumberingBase - 1;
+    });
+    const std::string marker = base_dir_ + "/" + kNumberingClosedFile;
+    std::error_code ec;
+    if (!closed) {
+        if (fs::remove(marker, ec)) {
+            OB_LOG_INFO("engine", "The installed snapshot's numbering is not closed (#187): %s "
+                                  "removed", marker.c_str());
+        }
+        return;
+    }
+    if (const int err = write_file_atomically(
+            marker, "numbering closed by the node whose snapshot was installed\n");
+        err != 0) {
+        OB_LOG_WARN("engine", "Could not write %s (%s) after installing a snapshot whose numbering "
+                              "is closed: the next start closes it again (#187)",
+                    marker.c_str(), std::strerror(err));
+        return;
+    }
+    OB_LOG_INFO("engine", "The installed snapshot's numbering is closed (#187): noted in %s",
+                marker.c_str());
 }
 
 bool Engine::holds_no_data() {

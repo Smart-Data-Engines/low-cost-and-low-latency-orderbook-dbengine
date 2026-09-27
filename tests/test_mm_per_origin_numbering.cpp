@@ -13,6 +13,7 @@
 #include "orderbook/columnar_store.hpp"
 #include "orderbook/compaction.hpp"
 #include "orderbook/engine.hpp"
+#include "orderbook/sequence_tracker.hpp"
 #include "mm_engine_node.hpp"
 #include "test_ports.hpp"
 
@@ -171,7 +172,9 @@ TEST(MeshPerOriginNumbering, ASymbolOnlyPeersWriteIsNotClaimedAfterARestart) {
 
 TEST(MeshPerOriginNumbering, ASegmentFromBeforeThisIsReadAsItAlwaysWas) {
     // The control: a segment that does not say whose its rows are - one an older build wrote - is
-    // read the way it was, the counter continued from every origin's highest.
+    // read the way it was, the counter continued from every origin's highest, so no number is handed
+    // out twice. Since #187 the first start of a mesh node with such a segment closes that numbering,
+    // and the counter goes on from the base - above every origin's highest all the more.
     TempDir dir("mm_numbering_legacy_");
     {
         auto node = open_node(dir.path);
@@ -187,8 +190,8 @@ TEST(MeshPerOriginNumbering, ASegmentFromBeforeThisIsReadAsItAlwaysWas) {
     auto node = open_node(dir.path);
     write_own(*node, record("L", 0, 3'000'000'000ULL));
     node->close();
-    EXPECT_EQ(own_numbers(dir.path, "L").back(), 51u)
-        << "a segment from before #184 is not read the way it always was";
+    EXPECT_EQ(own_numbers(dir.path, "L").back(), ob::kClosedNumberingBase)
+        << "a segment from before #184 is not read the way it always was, closed by #187";
 }
 
 TEST(MeshPerOriginNumbering, AMergeRecordsItsInputsOwnHighestAndWhetherItTookInAPeers) {

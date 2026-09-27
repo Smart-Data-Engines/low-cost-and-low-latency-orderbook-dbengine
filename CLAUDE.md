@@ -3829,6 +3829,18 @@ Learned the hard way. Check here before debugging.
      the test's last assertions found two defects nothing else had: the snapshot counted as received
      1.2 s before the joiner took writes, and `ob_segment_count` at 0 after an install - and after
      every restart - being set only by a flush. Expect them to find something.
+503. **"Not measured" on an integrity item is a guess about its size.** #187 was filed as a node that
+     misses rows; measured, every node stored rows again - 11 904, 11 404 and 16 232 of 11 000 - a P0
+     filed as a P1. The mechanism in the filing was right, and its consequence was not.
+504. **A boundary every node works out for itself is a boundary they disagree on.** Closing the old
+     numbering at each node's highest old number is right only where every node holds the same rows:
+     an origin numbers on from its own highest, so a node that held more takes the origin's next
+     records for ones it has, and one that held fewer waits for numbers nothing sends. A constant -
+     2^48 - needs no agreement (#187).
+505. **A one-shot change of state needs a note that outlives the process, and travels with the state.**
+     The close must not run twice - a node that joined since numbers from 1, and would lose its
+     records below the base - so the data directory notes it; and a snapshot carries the closed
+     frontiers but not the note, so installing one sets the note from what its frontiers say (#187).
 
 ## Current state and open problems
 
@@ -3914,8 +3926,11 @@ so a node of 8 192 segments could bootstrap no peer, and 8 MiB of metadata stopp
 build answers it so whatever the store's size, and an older joiner is sent what it was sent before
 (pitfalls 500-502). Its test found two more on its last lines, fixed with it: the snapshot counted as
 received before the joiner took writes, and `ob_segment_count` at 0 after an install or a restart.
-**#169, #175 and #187 are open P1s**: #187 is the holes the old numbering left in every node's
-tracker, which a snapshot carries and nothing clears but a new mesh; an exchange name with a dot
+**#187 is closed, and was a P0**: on a mesh upgraded across #184 the holes the old one-counter
+numbering left stopped every frontier of a symbol two nodes wrote, and after an outage every node
+stored its rows again - 11 904, 11 404 and 16 232 where 11 000 were written; a mesh node closes that
+numbering once at its first start now, at the fixed base 2^48, and the same probe holds 11 000 on
+every node (pitfalls 503-505). **#169 and #175 are open P1s**: an exchange name with a dot
 makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live book, sequence numbers
 and stored rows, measured on the wire; sharding by symbol has no control plane: no shard writes
 itself or the map to etcd, each owns every symbol, and a second on the same etcd becomes the first

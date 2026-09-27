@@ -44,12 +44,14 @@ inline constexpr uint16_t kPortsMmWireClock         = 20700;  ///< test_mm_wire_
 inline constexpr uint16_t kPortsWriteBatch          = 20800;  ///< test_write_batch.cpp
 inline constexpr uint16_t kPortsMmRestartOrigins    = 20900;  ///< test_mm_restart_origins.cpp
 inline constexpr uint16_t kPortsMmPerOriginNumbering = 21000;  ///< test_mm_per_origin_numbering.cpp
+inline constexpr uint16_t kPortsMmLegacyNumbering   = 21100;  ///< test_mm_legacy_numbering.cpp
 
 /// Every block above, so a test can check them all rather than the ones somebody remembered.
 inline constexpr uint16_t kAllPortBlocks[] = {
     kPortsReplication, kPortsReplicationCompress, kPortsFailoverRoles, kPortsMultiMaster,
     kPortsMmDedup,     kPortsMmStats,             kPortsMmPendingPeers, kPortsMmWireClock,
     kPortsWriteBatch,  kPortsMmRestartOrigins,    kPortsMmPerOriginNumbering,
+    kPortsMmLegacyNumbering,
 };
 
 /// How many ports one block owns.
