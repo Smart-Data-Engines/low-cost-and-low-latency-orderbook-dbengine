@@ -646,12 +646,14 @@ void Engine::update_version_vector_cache() {
                 }
             }
             if (vector_cache_.size() > kMaxPersistedVectorEntries) {
-                // What the whole export says past the limit: nothing, rather than part of it.
+                // What the whole export says past the limit: nothing, rather than part of it - and
+                // the next write down says so, once.
                 vector_cache_.clear();
                 vector_cache_index_.clear();
                 vector_cache_truncated_ = true;
                 vector_unwritten_.clear();
                 vector_unwritten_flag_.clear();
+                vector_whole_due_ = true;
             }
         }
         vector_cache_covers_ = moved.listings;
@@ -684,24 +686,21 @@ void Engine::persist_version_vector_if_changed() {
     update_version_vector_cache();
     const uint64_t held_version = seq_tracker_.held_version();
     const bool held_moved = held_version != held_version_written_;
-    if (vector_unwritten_.empty() && !vector_whole_due_ && !held_moved) return;   // nothing moved
-
-    if (vector_cache_truncated_) {
-        // Too many entries to write down. A node with that many symbols will relearn by
-        // over-asking after a restart, which costs traffic and drops duplicates.
-        OB_LOG_WARN("engine",
-                    "Version vector too large to persist (limit=%zu) — a restart will ask "
-                    "peers for more than it needs", kMaxPersistedVectorEntries);
-        vector_unwritten_.clear();
-        vector_whole_due_ = false;
-        held_version_written_ = held_version;
-        return;
-    }
 
     // An empty vector nothing has written down yet states nothing a missing one does not.
     if (vector_cache_.empty() && vector_base_file_ == kNoVectorBase) vector_whole_due_ = false;
 
-    if (!vector_unwritten_.empty() || vector_whole_due_) {
+    if (vector_cache_truncated_) {
+        // Too many entries to write down - said when it became so, which asked for a whole vector.
+        // A node with that many symbols will relearn by over-asking after a restart, which costs
+        // traffic and drops duplicates.
+        if (vector_whole_due_) {
+            OB_LOG_WARN("engine",
+                        "Version vector too large to persist (limit=%zu) — a restart will ask "
+                        "peers for more than it needs", kMaxPersistedVectorEntries);
+        }
+        vector_whole_due_ = false;
+    } else if (!vector_unwritten_.empty() || vector_whole_due_) {
         // Whole when a restart needs it: the changes after a whole vector stand on it, so it is the
         // first written in every WAL file - retention deletes whole files, older than the one that
         // holds the last checkpoint - and it is written again once the changes since outgrow it, or
