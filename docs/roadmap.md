@@ -2253,9 +2253,11 @@ with the bootstrap, however it ends, and the next vector a peer sends while the 
 nothing begins the next. The same probe: **3 requests, 3 refusals, and a write taken 7.1 s after the
 joiner started**.
 
-Tests in `tests/test_mm_snapshot.cpp` (`MMSnapshotEachPeerOnce`, eight, #192's with them): four fail on
+Tests in `tests/test_mm_snapshot.cpp` (`MMSnapshotEachPeerOnce`, eight, #192's with them): five fail on
 the tree before the fix - a peer that refused, failed a transfer or did not answer asked again in the
-same round, and a source not told - and two controls pass on both. **Mutation table, written down
+same round, a round that never ended, and a source not told - and three pass on both: a round's end
+lets the next ask, and a source that went away, aborted, or came back on a new connection is told
+nothing. **Mutation table, written down
 before the run: 10 mutations, every one as predicted** - the control survived; skipping no peer of
 the round, or not recording one, was killed by the three tests of a round and the next round's;
 leaving the round standing after the wait, or after the bootstrap, by the next round's, each by its
