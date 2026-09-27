@@ -74,6 +74,10 @@ def metric(node, name: str) -> float:
         return -1.0
 
 
+# Above the battery's 120 s: filling the nodes takes about half of that, and a joiner that never gets
+# its snapshot has to reach the test's own deadlines - which say what the nodes said - before pytest's
+# ends it with nothing but "Timeout".
+@pytest.mark.timeout(480)
 def test_a_node_of_more_than_8192_segments_bootstraps_a_joiner(mm_cluster):
     writer = mm_cluster.nodes[0]
     client = client_for(writer)
@@ -112,9 +116,10 @@ def test_a_node_of_more_than_8192_segments_bootstraps_a_joiner(mm_cluster):
     joiner = mm_cluster.add_multi_master_node(timeout=60)
     mm_cluster.wait_for_mm_mesh(timeout=90)
 
-    # Three ways out, and each says which: the snapshot arrives; a peer refuses it (#176); or the
-    # joiner never asks (#177) - which it would have done within the handshake's two-second grace,
-    # so twenty seconds of silence is an answer rather than a slow machine.
+    # Four ways out, and each says which: the snapshot arrives; a peer refuses it (#176); the joiner
+    # abandons one part-way; or it never asks (#177) - which it would have done within the
+    # handshake's two-second grace, so twenty seconds of silence is an answer rather than a slow
+    # machine.
     peers = mm_cluster.nodes[:-1]
     failed_before = sum(metric(n, "ob_mm_snapshot_failed_total") for n in peers)
     formed = time.monotonic()
@@ -125,6 +130,9 @@ def test_a_node_of_more_than_8192_segments_bootstraps_a_joiner(mm_cluster):
             break
         if sum(metric(n, "ob_mm_snapshot_failed_total") for n in peers) > failed_before:
             outcome = "a peer refused the snapshot (#176)"
+            break
+        if metric(joiner, "ob_mm_snapshot_failed_total") > 0.0:
+            outcome = "the joiner abandoned a snapshot part-way"
             break
         if (metric(joiner, "ob_mm_snapshot_requested_total") < 1.0
                 and time.monotonic() - formed > 20.0):
