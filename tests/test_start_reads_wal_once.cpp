@@ -65,6 +65,17 @@ uint64_t wal_bytes(const std::string& dir) {
 /// last mark before its checkpoint - a block apart - to the end.
 constexpr uint64_t kSlack = 2 * ob::WALReplayer::kDefaultReadBlockBytes;
 
+/// Batches of a thousand 40-level records until the WAL is five times the slack - whatever a
+/// block is - and how many batches that took.
+int write_past_the_slack(ob::Engine& engine, const std::string& dir, const char* symbol) {
+    int batches = 0;
+    while (wal_bytes(dir) <= 5 * kSlack) {
+        write_rows(engine, symbol, 1'000'000'000ULL + static_cast<uint64_t>(batches) * 1000, 1000, 40);
+        ++batches;
+    }
+    return batches;
+}
+
 /// What open() read from the WAL.
 uint64_t bytes_to_open(ob::Engine& engine) {
     const uint64_t before = ob::WALReplayer::bytes_read_for_test();
@@ -75,24 +86,24 @@ uint64_t bytes_to_open(ob::Engine& engine) {
 }  // namespace
 
 TEST(StartReadsWalOnce, ACleanStopsStartReadsItsWalOnce) {
-    // Eight megabytes of WAL, every record of it covered by the last checkpoint: a start read it
+    // A WAL five times the slack, every record of it covered by the last checkpoint: a start read it
     // five times whole, then twice in blocks, and reads it once now.
     TempDir dir("start_once_clean_");
+    int batches = 0;
     {
         auto engine = single_node(dir.path);
         engine->open();
-        write_rows(*engine, "ONCE", 1'000'000'000ULL, 8000, 40);
+        batches = write_past_the_slack(*engine, dir.path, "ONCE");
         engine->close();
     }
     const uint64_t wal = wal_bytes(dir.path);
-    ASSERT_GT(wal, 4 * kSlack) << "the premise: a WAL much longer than the slack";
 
     auto engine = single_node(dir.path);
     const uint64_t read = bytes_to_open(*engine);
     EXPECT_GE(read, wal) << "a start that did not read its whole WAL cannot have found its last "
                             "checkpoint";
     EXPECT_LE(read, wal + kSlack) << "a start read " << read << " bytes of a WAL of " << wal;
-    EXPECT_EQ(rows(*engine, "ONCE"), 8000 * 40);
+    EXPECT_EQ(rows(*engine, "ONCE"), batches * 1000 * 40);
     engine->close();
 }
 
@@ -103,10 +114,11 @@ TEST(StartReadsWalOnce, ACrashedNodesStartReadsItsWalOnceAndThenTheTail) {
     TempDir live("start_once_live_");
     TempDir crashed("start_once_crash_");
     uint64_t tail_from = 0;
+    int batches = 0;
     {
         auto engine = single_node(live.path);
         engine->open();
-        write_rows(*engine, "ONCE", 1'000'000'000ULL, 8000, 40);
+        batches = write_past_the_slack(*engine, live.path, "ONCE");
         engine->flush_incremental();
         engine->promote_to_primary(ob::EpochValue{5});
         tail_from = wal_bytes(live.path);
@@ -116,14 +128,13 @@ TEST(StartReadsWalOnce, ACrashedNodesStartReadsItsWalOnceAndThenTheTail) {
     }
     const uint64_t wal  = wal_bytes(crashed.path);
     const uint64_t tail = wal - tail_from;
-    ASSERT_GT(wal, 4 * kSlack) << "the premise: a WAL much longer than the slack";
 
     auto engine = single_node(crashed.path);
     const uint64_t read = bytes_to_open(*engine);
     EXPECT_GE(read, wal + tail);
     EXPECT_LE(read, wal + tail + kSlack) << "a start read " << read << " bytes of a WAL of " << wal
                                          << " with a tail of " << tail;
-    EXPECT_EQ(rows(*engine, "ONCE"), 8700 * 40) << "the tail was not replayed";
+    EXPECT_EQ(rows(*engine, "ONCE"), (batches * 1000 + 700) * 40) << "the tail was not replayed";
     EXPECT_EQ(engine->current_epoch(), 5u) << "the epoch was not read from the one pass";
     engine->close();
 }
