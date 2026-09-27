@@ -3684,10 +3684,10 @@ Learned the hard way. Check here before debugging.
      blank line waits out its socket's timeout on an error: `has_row_at()` polling a symbol not yet
      delivered took 60 s and raised, which read as a node that stopped answering. Return on the
      first line when it starts with `ERR`.
-477. **Past 1 561 (symbol, origin) entries a mesh measurement measures #177.** A vector that size
-     does not fit the record that carries it and is sent as "send everything", so every
-     reconciliation resends the whole WAL; whatever else a run with 4 000 symbols was meant to
-     measure, the resends are what it pays. Keep measurement symbol counts under it until #177.
+477. **Until #177, past 1 560 (symbol, origin) entries a mesh measurement measured #177.** A vector
+     that size did not fit the record that carries it and was sent as "send everything", so every
+     reconciliation resent the whole WAL; whatever else a run with 4 000 symbols was meant to
+     measure, the resends were what it paid. A measurement from before #177 at that size says so.
 478. **A count taken straight after a write reads only what a flush has drained.** A record's rows
      wait in the pending queue until the flush tick takes them, and a query reads stores, segments
      and the book - not that queue. Four of #179's restart tests counted right after a redelivery,
@@ -3761,6 +3761,17 @@ Learned the hard way. Check here before debugging.
      counter beside it said the same. Before logging or counting a condition, ask what fraction of
      events it will be; and a test that pins the numbers it produced (`RingBufferEviction` counted one
      origin writing after itself as conflicts) pins the defect with them.
+490. **Time a profile shows in a hash table's chains is misses until the chains are counted.** A
+     profile of #177's benchmark - receiving and comparing vectors of 50 000 entries - spent 17% in
+     `_M_find_before_node`, which read as a weak hash: the origin XORed in, shifted by one. Counted:
+     1.47 probes a lookup, and the same with a mixed hash (`evidence/2026-09-27-mesh-vector-parts/`).
+     The cost was a node per entry and a key copied per lookup; the hash stayed.
+491. **A step that answers "not yet" and "refused" with the same `false` needs a test that feeds what
+     would complete it.** `PeerVector::deserialize_part()` returns false for a part that continues an
+     assembly, one out of sequence and one that does not parse, so tests that fed a bad part and
+     checked the answer passed with the checks for all three removed (#177's mutations V4-V6). The
+     test that tells them apart feeds the bad part and then the parts a wrong assembly would complete
+     with, and looks at what was taken.
 
 ## Current state and open problems
 
@@ -3825,18 +3836,22 @@ segment records how far this node's own numbers go, so a restart continues from 
 declares only what it wrote (pitfalls 486-488). **#182 is closed**: every replicated update of a
 level a node held was logged at INFO as a conflict - 290 000 lines, 60.6 MB, on each receiver of
 300 000 writes from one node - and only two origins writing one level are one now, said by the window
-(pitfall 489). **#169, #175, #176, #177, #186 and #187 are open P1s**: #187 is the holes the old numbering left in every node's tracker, which a snapshot
-carries and nothing clears but a new mesh; an exchange name with a dot makes two instruments one key - `A.B` on
-`C` and `A` on `B.C` share a live book, sequence numbers and stored rows, measured on the wire;
-sharding by symbol has no control plane: no shard writes itself or the map to etcd, each owns every
-symbol, and a second on the same etcd becomes the first one's replica, measured against a native
-etcd; a mesh snapshot names each file by a 16-bit index, so a node of 8 192 segments cannot
-bootstrap a peer that joins it; a version vector past 1 561 entries asks for everything, so every
-reconciliation resends the whole retained WAL and a joiner never asks for a snapshot; every
-replicated update of a level a node holds is logged at INFO as a conflict, same origin or not; a
-restarted node claims from its segments the numbers its peers wrote, and every reconciliation scans
-its whole WAL for them; and a mesh node of 4 000 symbols stalls a write for up to 0.6 s at a
-trickle and refuses writes at the pipelined ceiling, on master as much as on this branch.
+(pitfall 489). **#177 is closed**: a version vector of any size goes in parts - on the wire, in the
+WAL and in a snapshot's metadata - where past 1 560 entries it was "send everything", so every
+reconciliation resent the whole retained WAL (9 600 to 20 800 duplicates a node in 16 s, none now)
+and a node that joined never asked for a snapshot; the copy peers are told has no 4 096 bound, and
+two vectors are compared in one walk, 4.9 ms at 50 000 entries (pitfalls 490-491). **#169, #175,
+#176, #186, #187 and #188 are open P1s**: #187 is the holes the old numbering left in every node's
+tracker, which a snapshot carries and nothing clears but a new mesh; an exchange name with a dot
+makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live book, sequence numbers
+and stored rows, measured on the wire; sharding by symbol has no control plane: no shard writes
+itself or the map to etcd, each owns every symbol, and a second on the same etcd becomes the first
+one's replica, measured against a native etcd; a mesh snapshot names each file by a 16-bit index, so
+a node of 8 192 segments cannot bootstrap a peer that joins it; a node that joins a mesh asks every
+peer for a snapshot and installs each one it is sent, in turn - three installs from three peers,
+writes refused 21.6 s where one took 6.8 (#188); and a mesh node of 4 000 symbols stalls a write for
+up to 0.6 s at a trickle and refuses writes at the pipelined ceiling, on master as much as on this
+branch.
 **#172 is closed**: the Python client's sharded pool swaps its routing whole and replaces a shard
 connection a timeout closed, under a test that builds a sharded pool against a map in etcd. **#174
 is an open P2**: a start reads the whole WAL twice even when its last checkpoint covers every

@@ -252,14 +252,36 @@ the same data yields different offsets — the two numbers had no common scale. 
 reporting offset 846 against a local 870 was judged "behind by 24 bytes" and sent one empty checkpoint
 record, while the rows it had missed sat earlier in the log (roadmap #61).
 
-One limit worth knowing, and it is about size. The vector travels in a record header whose
-`payload_len` is a `uint16_t`, so a vector above 65535 bytes — 1561 entries at 42 bytes each — cannot
-be described by the header that carries it. It is not sent and not written down; the node falls back
-to asking for everything. This said that costs bandwidth and never data, and it costs more than
-bandwidth (#177): every reconciliation then makes each peer send the node its whole retained WAL
-again — 9 600 to 20 800 duplicates dropped in a 16 s window at 1 600 entries, none at 1 500 — and a
-node that joins such a mesh never asks for a snapshot, because a peer that wants everything says
-nothing about what it holds.
+**A vector of any size goes in parts** (#177). The record header that carries a vector describes its
+length in a `uint16_t`, so one record holds 1 560 entries at 42 bytes each. A vector that fits goes as
+it always did, one record of type 7: a mesh below that size sees nothing new, and a node of an older
+build reads it. Past it, the vector goes as parts, `WAL_RECORD_VERSION_VECTOR_PART` (type 9) - each
+with a generation, its number, the number of parts and up to 1 560 entries, all of one generation
+sent, and written down, one after another. A receiver takes the vector when the last part of one
+generation arrives in sequence; until then, and when an assembly breaks off, what the peer said
+before stands. A restart takes the last complete set in the WAL, so a set a crash cut short leaves
+the one before it. A node of an older build skips the unknown type, hears no vector from such a peer
+and sends it everything, as it did before. A snapshot's metadata carries the vector the same way, as
+a block of parts behind a marker (`0xFFFE`) that an older receiver refuses - as it refused the "send
+everything" a vector that size used to be.
+
+Until #177 a vector past one record was that marker, and this said it costs bandwidth and never data.
+It cost more: every reconciliation made each peer send the node its whole retained WAL again - 9 600
+to 20 800 duplicates dropped in a 16 s window at 1 600 entries, none at 1 500, and none at 1 600 now -
+and a node that joined such a mesh never asked for a snapshot, because a peer that wants everything
+says nothing about what it holds. The copy peers are told stopped at 4 096 entries too, and exported
+nothing past them, which the decision on a peer's vector read as "the peer lacks nothing". The bound
+is memory's now, `VV_MAX_ENTRIES` (a million), and a node past it catches a peer up - the rounds send
+only what the peer's own vector does not hold - rather than judging it from nothing.
+
+**Two vectors are compared in one walk over this node's.** Each pair the peer lists too is compared
+both ways there, and when that was every pair the peer listed - a mesh at rest - nothing is left to
+walk; only pairs the peer alone lists are walked again, through a set of views into this node's
+entries. At 50 000 entries (Release, i3-7100U, `benchmarks/vector_cost`) a vector costs 1.8 ms to
+serialise, 15 ms to receive and 4.9 ms to compare with an equal one - 23 ms with a tenth more pairs on
+the peer's side - on the io loop, at every reconciliation. Before #177 the direction "what this node
+lacks" was a loop over this node's pairs for each of the peer's: 2.8 ms at 1 500 entries, where it is
+0.08 ms now.
 
 **A catch-up is rounds, from a position in the sender's own WAL** (#178). It is state of the
 connection it serves: where the next record to read starts. A round reads up to
@@ -351,8 +373,9 @@ closes what remains exactly: the numbers above the frontier that the sender does
 a redelivery of any of them is recognised.
 
 **The metadata is streamed, not carried in one frame.** A manifest for a few thousand segments passes
-65535 bytes on its own, and so does a version vector of 1561 entries. Metadata in a single frame
-would have put a store-size limit on the one case bootstrap exists for.
+65535 bytes on its own, and so does a version vector past 1 560 entries, which the block carries in
+parts. Metadata in a single frame would have put a store-size limit on the one case bootstrap exists
+for.
 
 **Chunks are pushed only while the peer's send buffer has room**, and resume from the `EPOLLOUT`
 branch of the io loop as the socket drains. So live deltas enqueued between chunks go out promptly,
