@@ -1950,7 +1950,8 @@ TcpServer::TcpServer(ServerConfig config)
                                            },
                                            .cluster_secret = secrets_.cluster,
                                            .tls_server = tls_.mesh_server,
-                                           .tls_client = tls_.mesh_client
+                                           .tls_client = tls_.mesh_client,
+                                           .advertise_host = config_.advertise_host
                                        },
                                        config_.wal_rotate_bytes,
                                        config_.wal_dir);

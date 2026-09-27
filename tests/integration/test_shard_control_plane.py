@@ -373,3 +373,24 @@ def test_the_pool_reads_a_bare_symbol_migrated():
     assert ob._parse_shard_error("ERR SYMBOL_MIGRATED\n") == ("SYMBOL_MIGRATED", "")
     assert ob._parse_shard_error("ERR SYMBOL_MIGRATED s1") == ("SYMBOL_MIGRATED", "s1")
     assert ob._parse_shard_error(f"ERR NOT_OWNER A.{EXCHANGE}") == ("NOT_OWNER", f"A.{EXCHANGE}")
+
+
+def test_a_mesh_node_registers_the_host_it_is_reached_by(cluster):
+    # #195 in the mesh: a node registered 127.0.0.1 for its peers, so a mesh across hosts dialled
+    # itself and never formed.
+    port, mm_port = free_port(), free_port()
+    cluster.ports["mm1"] = port
+    log = open(f"{cluster.dir}/mm1.log", "ab")
+    cluster.procs["mm1"] = subprocess.Popen(
+        [SERVER, "--port", str(port), "--metrics-port", "0", "--data-dir", f"{cluster.dir}/mm1",
+         "--multi-master", "--mm-node-id", "1", "--mm-replication-port", str(mm_port),
+         "--node-id", "mm-1", "--coordinator-endpoints", cluster.etcd, "--advertise-host", "127.0.0.2"],
+        stdout=log, stderr=subprocess.STDOUT)
+    cluster._wait_port(port)
+    deadline = time.time() + patience(20)
+    registered = None
+    while time.time() < deadline and not registered:
+        registered = cluster.get(f"{PREFIX}mm_peers/1")
+        time.sleep(0.2)
+    assert registered, "the mesh node registered nothing"
+    assert json.loads(registered)["address"] == f"127.0.0.2:{mm_port}", registered
