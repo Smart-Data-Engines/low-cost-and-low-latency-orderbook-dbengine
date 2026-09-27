@@ -611,11 +611,23 @@ size_t MultiMasterManager::connected_peer_count() const {
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 
 void MultiMasterManager::start_bootstrap() {
-    bootstrapping_.store(true, std::memory_order_release);
+    // Since #188 a bootstrap starts when the snapshot is asked for, and the BEGIN that answers it
+    // finds it started: said once.
+    if (bootstrapping_.exchange(true, std::memory_order_acq_rel)) return;
     OB_LOG_INFO("mm",
                 "Bootstrap started for node %u — writes are refused with ERR BOOTSTRAPPING until "
                 "finish_bootstrap() is called",
                 config_.node_id);
+}
+
+void MultiMasterManager::end_snapshot_wait(const char* why) {
+    // Not a failed bootstrap - nothing was received, and nothing here was touched: no peer is left
+    // to give this node the snapshot it asked for. Refusing writes until one appears would be #73's
+    // node that refuses them for ever; the next peer's vector asks again while it still holds nothing.
+    if (!bootstrapping_.exchange(false, std::memory_order_acq_rel)) return;
+    OB_LOG_WARN("mm", "No peer gave node %u the snapshot it asked for (%s); accepting writes until "
+                      "one can - the next peer whose vector says what it holds is asked",
+                config_.node_id, why);
 }
 
 void MultiMasterManager::finish_bootstrap(bool succeeded) {
@@ -1825,7 +1837,7 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
                 OB_LOG_INFO("mm", "Peer %u refused the snapshot this node asked it for: %s",
                             peer.node_id, reason.c_str());
                 snapshot_ask_ = MMSnapshotAsk{};
-                ask_another_peer_for_snapshot(peer.node_id);
+                if (!ask_another_peer_for_snapshot(peer.node_id)) end_snapshot_wait("refused");
             }
             // And a receiver that refused this node's snapshot does not want the rest of it: a
             // refused sender used to stream every file, and the receiver drop each chunk (#188).

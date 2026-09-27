@@ -820,6 +820,21 @@ TEST(MMSnapshotOnePeer, ANodeThatHoldsNothingAsksOnePeerAtATime) {
     EXPECT_EQ(ask.node_id, 2u);
 }
 
+TEST(MMSnapshotOnePeer, ANodeRefusesWritesFromItsRequestUntilTheLastPeerRefuses) {
+    // Between the request and the BEGIN the other peers' catch-ups arrive, and a client may write: a
+    // node that took either held data by the BEGIN - and was refused the snapshot, or lost what it
+    // held to the install. Measured: a joiner held its peers' catch-ups 8 ms after asking, when the
+    // BEGIN came. And a node no peer can serve takes writes again rather than refuse them for ever.
+    Node node(1);
+    WiredPeer a(2);
+    ob::PeerConnection& pa = a.mgr(*node.mm);
+    ASSERT_FALSE(node.mm->is_bootstrapping());
+    ASSERT_TRUE(node.mm->request_snapshot_from(pa));
+    EXPECT_TRUE(node.mm->is_bootstrapping()) << "a node waiting for its snapshot takes writes";
+    arrive_snapshot_frame(*node.mm, pa, ob::MM_MSG_SNAPSHOT_ABORT, ob::encode_snapshot_abort("busy"));
+    EXPECT_FALSE(node.mm->is_bootstrapping()) << "a node no peer can serve refuses writes for good";
+}
+
 TEST(MMSnapshotOnePeer, APeerThatRefusesOrGoesAwayLetsTheNextBeAsked) {
     Node node(1);
     WiredPeer a(2), b(3), c(4);

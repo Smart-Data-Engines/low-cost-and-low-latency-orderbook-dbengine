@@ -632,6 +632,7 @@ void MultiMasterManager::handle_snapshot_begin(PeerConnection& peer,
                           "now; refusing it rather than installing over it", peer.node_id);
         engine_.registry().increment_counter("ob_mm_snapshot_refused_total");
         send_snapshot_abort(peer, "holds_data");
+        end_snapshot_wait("it holds data now");
         return;
     }
 
@@ -988,13 +989,13 @@ void MultiMasterManager::abort_bootstrap(const char* reason) {
     const uint16_t source = st.source_node_id;
     st = MMSnapshotRecv{};
 
+    // Another peer is asked at once (#188): before, every peer had been asked, and a BEGIN from one
+    // of the others was the retry. Not on the way out.
+    if (!stopping_.load(std::memory_order_acquire) && ask_another_peer_for_snapshot(source)) return;
+
     // A node that cannot bootstrap says so loudly and becomes usable. Sitting in a state that
     // refuses every write is the failure mode #73 and #76 were both about.
     finish_bootstrap(/*succeeded=*/false);
-
-    // And asks another peer at once (#188): before, every peer had been asked, and a BEGIN from one
-    // of the others was the retry. Not on the way out.
-    if (!stopping_.load(std::memory_order_acquire)) ask_another_peer_for_snapshot(source);
 }
 
 void MultiMasterManager::on_peer_disconnected(PeerConnection& peer) {
@@ -1037,24 +1038,26 @@ void MultiMasterManager::on_peer_disconnected(PeerConnection& peer) {
         OB_LOG_INFO("mm", "Peer %u, asked for a snapshot, dropped connection %llu before answering",
                     peer.node_id, static_cast<unsigned long long>(peer.conn_id));
         snapshot_ask_ = MMSnapshotAsk{};
-        ask_another_peer_for_snapshot(peer.node_id);
+        if (!ask_another_peer_for_snapshot(peer.node_id)) end_snapshot_wait("the peer asked left");
     }
 }
 
-void MultiMasterManager::ask_another_peer_for_snapshot(uint16_t gone_node) {
+bool MultiMasterManager::ask_another_peer_for_snapshot(uint16_t gone_node) {
     for (auto& [node_id, other] : peers_) {
         if (node_id == gone_node || !other.connected || !other.handshake_done) continue;
         if (other.peer_vector.wants_everything() || other.peer_vector.entry_count() == 0) continue;
-        // Whatever request_snapshot_from() refuses for now - a bootstrap under way, data of this
-        // node's own - it refuses for every peer, so the first one it is asked about decides.
-        if (!request_snapshot_from(other)) {
+        // Whatever request_snapshot_from() refuses for now - data of this node's own - it refuses
+        // for every peer, so the first one it is asked about decides.
+        const bool asked = request_snapshot_from(other);
+        if (!asked) {
             OB_LOG_DEBUG("mm", "Not asking peer %u for a snapshot in place of peer %u", node_id,
                          gone_node);
         }
-        return;
+        return asked;
     }
-    OB_LOG_INFO("mm", "No other peer states what it holds; the next one whose vector does is asked for "
-                      "the snapshot peer %u did not send", gone_node);
+    OB_LOG_INFO("mm", "No other peer states what it holds to ask for the snapshot peer %u did not "
+                      "send", gone_node);
+    return false;
 }
 
 void MultiMasterManager::expire_snapshot_ask(std::chrono::steady_clock::time_point now) {
@@ -1067,7 +1070,7 @@ void MultiMasterManager::expire_snapshot_ask(std::chrono::steady_clock::time_poi
     OB_LOG_WARN("mm", "Peer %u did not answer this node's snapshot request in %lld ms; asking another",
                 silent, static_cast<long long>(waited));
     snapshot_ask_ = MMSnapshotAsk{};
-    ask_another_peer_for_snapshot(silent);
+    if (!ask_another_peer_for_snapshot(silent)) end_snapshot_wait("unanswered");
 }
 
 void MultiMasterManager::note_snapshot_asked_for_test(const PeerConnection& peer) {
@@ -1114,6 +1117,10 @@ bool MultiMasterManager::request_snapshot_from(PeerConnection& peer) {
     const auto frame = wrap_snapshot_frame(MM_MSG_SNAPSHOT_REQUEST, config_.node_id, {});
     enqueue_frame(peer, frame.data(), frame.size());
     snapshot_ask_ = MMSnapshotAsk{true, peer.node_id, peer.conn_id, std::chrono::steady_clock::now()};
+    // The bootstrap starts here, not at the BEGIN that answers (#188): the other peers' catch-ups
+    // arrive in between, and a node that applied them - or a client's write - held data by then, to
+    // be refused the snapshot or to lose what it held to the install.
+    start_bootstrap();
     engine_.registry().increment_counter("ob_mm_snapshot_requested_total");
     OB_LOG_INFO("mm",
                 "Asked peer %u for a snapshot: this node holds nothing, and the peer reports "

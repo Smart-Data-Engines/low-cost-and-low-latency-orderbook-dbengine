@@ -672,8 +672,10 @@ public:
     MMSnapshotAsk snapshot_ask_for_test() const;
 
     /// Enter the bootstrap state: this node holds no data yet and must not serve as though it did.
+    /// Entered when the snapshot is asked for (#188), and said once however often it is called.
     ///
-    /// Always paired with `finish_bootstrap()`. A flag that gates writes and has no way out is a
+    /// Always paired with `finish_bootstrap()` - or, when no transfer began and no peer is left to
+    /// ask, with `end_snapshot_wait()`. A flag that gates writes and has no way out is a
     /// self-inflicted outage waiting for its first caller — `INSERT`, `MINSERT` and `DELETE` all
     /// answer `ERR BOOTSTRAPPING` while this is set, and before #76 nothing anywhere cleared it
     /// (roadmap #73 is the same shape, found in the failover state machine).
@@ -820,8 +822,12 @@ private:
     void expire_snapshot_ask(std::chrono::steady_clock::time_point now);
     /// The request to `gone_node` ended without a snapshot - refused, dropped or expired: ask the
     /// first other connected peer whose vector says it holds something, at once, rather than at its
-    /// next vector - a reconciliation interval later (#188). Caller holds `mtx_`.
-    void ask_another_peer_for_snapshot(uint16_t gone_node);
+    /// next vector - a reconciliation interval later (#188). True when one was asked. Caller holds
+    /// `mtx_`.
+    bool ask_another_peer_for_snapshot(uint16_t gone_node);
+    /// The wait for a snapshot this node asked for ends with no peer left to ask: it accepts writes
+    /// again, and says why (#188). Caller holds `mtx_`.
+    void end_snapshot_wait(const char* why);
 
     /// Source of PeerConnection::conn_id. Read and bumped under mtx_, like peers_ itself.
     uint64_t next_conn_id_{1};
