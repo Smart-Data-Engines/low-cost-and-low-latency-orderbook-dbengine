@@ -226,8 +226,11 @@ TEST(SealEpochs, ACheckpointWrittenWhileABlockWaitsNamesTheEpochItsSyncCovered) 
     TempDir dir;
     ob::Engine engine(dir.path, 20'000'000ULL, ob::FsyncPolicy::INTERVAL);
     engine.open();
-    for (uint64_t seq = 1; seq <= ob::Engine::kSealRows / 1000 + 1; ++seq) insert(engine, "A", seq, 1000);
+    // B first: A comes due with its last record, so the tick that drains that record seals A, and B
+    // has to be waiting by then. Written after A, B was drained a tick after A's seal one run in
+    // twenty, and that seal's checkpoint - nothing waiting yet - was the eight-byte one (#174).
     insert(engine, "B", 1, 7);
+    for (uint64_t seq = 1; seq <= ob::Engine::kSealRows / 1000 + 1; ++seq) insert(engine, "A", seq, 1000);
     ASSERT_TRUE(eventually([&] { return !epochs_on_disk(dir.path, "A").empty(); }))
         << "the store over the rows threshold was never sealed";
     ASSERT_TRUE(eventually([&] {

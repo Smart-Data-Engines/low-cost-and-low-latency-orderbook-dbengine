@@ -64,7 +64,10 @@ The engine is composed of six subsystems, each responsible for a specific concer
    before #166, whose recorded time range was not its rows', is given its rows' range here — read
    once from its `ts.col`, corrected in the index always and on disk where it can be done safely —
    and the same happens to segments a snapshot install brings in.
-2. Remove the segments no surviving `CHECKPOINT` vouches for, and leave their rows to the replay
+2. Read the WAL once, a block at a time (#174): the pass that finds the last `CHECKPOINT` also keeps
+   the last version vector, the last held numbers and the highest epoch, and marks a record start
+   every block of each file. Nothing below reads the whole log again.
+3. Remove the segments no surviving `CHECKPOINT` vouches for, and leave their rows to the replay
    below (#160). A checkpoint is appended only after the segments it claims were synced, so a newer
    segment belongs to a flush whose checkpoint never made it - cut short by a crash, a sync that
    failed, or a power cut before the WAL sync that would have kept the checkpoint - and it may be
@@ -74,16 +77,18 @@ The engine is composed of six subsystems, each responsible for a specific concer
    retention deletes nothing a synced checkpoint does not vouch for. A log with no checkpoint at all
    vouches for no segment, when it starts at its first file; a checkpoint from an older build says
    nothing of what it covered, and then every segment is taken as written, as it always was.
-3. Replay the WAL records the last `CHECKPOINT` does not cover — every record after it, and the
+4. Replay the WAL records the last `CHECKPOINT` does not cover — every record after it, and the
    records before it that start at or after the position it names (#159) — and apply them to the
-   SoA buffer and the pending-row queue. A record its symbol's segments already hold is skipped:
+   SoA buffer and the pending-row queue. The replay begins at the first pass's last mark before the
+   first of them, so what it reads is that tail and at most a block more; the position a checkpoint
+   names is compared with, never read from. A record its symbol's segments already hold is skipped:
    every segment records the WAL position its rows came from, so "already durable" is a position
    comparison per symbol (#63). Segments written before positions were recorded fall back to
    comparing the record's timestamp with the segment's `end_ts_ns`.
-4. If anything was replayed, flush it into a segment immediately. `QueryEngine` reads segments, not
+5. If anything was replayed, flush it into a segment immediately. `QueryEngine` reads segments, not
    the live SoA buffer, so a recovered row that stays in memory is invisible to every `SELECT`.
-5. Read the epoch record, if any, and restore the fencing epoch.
-6. Start the background flush thread.
+6. Restore the fencing epoch, the highest the first pass read.
+7. Start the background flush thread.
 
 ### Shutdown (close)
 

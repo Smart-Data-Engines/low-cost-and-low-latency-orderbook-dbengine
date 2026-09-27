@@ -199,6 +199,11 @@ ob_add_wal_test(test_wal_cursor
     test_wal_cursor.cpp
 )
 
+# ── The WAL replay read in blocks (#174) ──────────────────────────────────────
+ob_add_wal_test(test_wal_replay_blocks
+    test_wal_replay_blocks.cpp
+)
+
 # ── Tasks 5.3–5.6: Codec property and unit tests ──────────────────────────────
 ob_add_codec_test(test_codec
     test_codec.cpp
@@ -379,6 +384,11 @@ ob_add_engine_test(test_mm_per_origin_numbering
 # A mesh node's numbering from before per-origin numbers, closed once at the upgrade (#187).
 ob_add_engine_test(test_mm_legacy_numbering
     test_mm_legacy_numbering.cpp
+)
+
+# ── A start reads its WAL once (#174) ─────────────────────────────────────────
+ob_add_engine_test(test_start_reads_wal_once
+    test_start_reads_wal_once.cpp
 )
 
 ob_add_engine_test(test_mm_snapshot

@@ -782,11 +782,18 @@ private:
 // Returns the last successfully replayed sequence_number (0 if none).
 class WALReplayer {
 public:
-    explicit WALReplayer(std::string_view dir);
+    static constexpr size_t kDefaultReadBlockBytes = 1u << 20;
+
+    /// Each file is read `read_block_bytes` at a time (#174) - at least the largest record, however
+    /// small the number asked for; tests ask for the least, so that records cross blocks everywhere.
+    explicit WALReplayer(std::string_view dir, size_t read_block_bytes = kDefaultReadBlockBytes);
 
     /// Replay all valid records.  cb receives the header and a pointer to the
     /// payload bytes (valid only for the duration of the call).
     /// Returns the last good sequence_number.
+    ///
+    /// `replay_v2()` without the origin and the position: a record with a 38-byte header comes
+    /// back as its first 24 bytes and its payload.
     uint64_t replay(
         std::function<void(const WALRecord&, const uint8_t* payload)> cb);
 
@@ -796,6 +803,13 @@ public:
     /// For extended records (version=1): reads full 38B header.
     /// Returns the last good sequence_number.
     uint64_t replay_v2(WALReplayCallbackV2 cb);
+
+    /// `replay_v2()` from `from`: the files before its file are not read, and its file is read from
+    /// its offset (#174). `from` is the start of the log, or a record start a whole replay of this
+    /// directory read - a mark of `find_last_checkpoint()`'s - and from one of those the records are
+    /// the ones that replay read from there on. The epoch, the torn files and the sequence number
+    /// returned are of what this replay read.
+    uint64_t replay_v2_from(WalPosition from, WALReplayCallbackV2 cb);
 
     /// Replay the records the last CHECKPOINT does not cover: every record after it, and - when it
     /// says what it covered (#159) - the records before it that start at or after that position.
@@ -808,8 +822,9 @@ public:
     ///
     /// Two passes rather than buffering the tail in memory: the first finds the last
     /// checkpoint, the second invokes cb for the records it does not cover. The tail can be
-    /// arbitrarily large if flushing fell behind, and open() is not on a latency
-    /// path, so bounded memory is worth more than one pass.
+    /// arbitrarily large if flushing fell behind, so bounded memory is worth reading the tail
+    /// twice - and only the tail: the second pass begins at the first pass's last mark before it
+    /// (#174), so the log is read once whole.
     ///
     /// With no checkpoint in the log, every record is replayed — which is correct for
     /// a log written before checkpoints existed, and for one whose first flush has
@@ -830,8 +845,22 @@ public:
         uint64_t records{0};                 ///< every record the log holds
         bool     any_record{false};
         uint32_t first_file_index{0};        ///< the oldest WAL file a record came from
+        WalPosition at{};                    ///< where the last checkpoint record starts, if ordinal
+        /// A record start every block or so of the log, and its ordinal (#174). The second pass
+        /// begins at the last one before the first record it can forward, so it does not read the
+        /// records before that, of which it forwards none. Empty in a LastCheckpoint made any other
+        /// way, which the second pass reads from the start of the log.
+        struct Mark {
+            WalPosition at{};
+            uint64_t    ordinal{0};
+        };
+        std::vector<Mark> marks;
+        size_t tears_skipped{0};             ///< files the pass stepped over a torn record in (#126)
     };
-    LastCheckpoint find_last_checkpoint();
+    ///
+    /// Every record the pass reads is handed to `also` as well, so that a start takes everything it
+    /// needs from the whole log in this one pass (#174); `last_epoch()` is the pass's afterwards.
+    LastCheckpoint find_last_checkpoint(const WALReplayCallbackV2& also = {});
 
     /// The second pass: forward what `last` does not cover, as `replay_after_checkpoint()` does.
     uint64_t replay_after(const LastCheckpoint& last, WALReplayCallbackV2 cb);
@@ -851,8 +880,16 @@ public:
     /// Reset at the start of every replay, so a caller that replays twice reads the second pass.
     size_t tears_skipped() const { return tears_skipped_; }
 
+    /// Bytes every replay in this process has read from WAL files (#174). A start reads its WAL once
+    /// and then what its last checkpoint does not cover - it read it five times - and a test holds
+    /// it to that.
+    static uint64_t bytes_read_for_test() { return bytes_read_.load(std::memory_order_relaxed); }
+
 private:
+    static inline std::atomic<uint64_t> bytes_read_{0};
+
     std::string dir_;
+    size_t      read_block_bytes_;
     uint64_t    last_epoch_{0};
     size_t      tears_skipped_{0};
 };

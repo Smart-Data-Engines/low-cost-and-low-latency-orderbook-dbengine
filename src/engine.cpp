@@ -239,8 +239,13 @@ void Engine::open() {
     // removed here and rebuilt by the replay, so nothing below - the sequence counters, the replay
     // filter - learns anything from a segment a power cut may have left short.
     load_or_create_wal_identity();
+    // The one pass over the whole WAL (#174): the last checkpoint, and with it the rest of what the
+    // start below takes from the whole log - the last vector, the last held numbers, the epoch.
     WALReplayer tail_replayer(wal_dir_);
-    const WALReplayer::LastCheckpoint last_checkpoint = tail_replayer.find_last_checkpoint();
+    WalStartRecords from_wal;
+    const WALReplayer::LastCheckpoint last_checkpoint = tail_replayer.find_last_checkpoint(
+        [&from_wal](const WALReplayContext& ctx) { from_wal.note(ctx); });
+    const uint64_t wal_epoch = tail_replayer.last_epoch();
     remove_unvouched_segments(last_checkpoint);
 
     // The seal epoch continues from the highest anything names (#165 part 2a). Starting again at
@@ -262,7 +267,7 @@ void Engine::open() {
 
     // The vector first, so the segments below know whether one was there: a segment received from
     // a peer needs it (#184, below). Both only ever raise, so the order changes nothing else.
-    const bool vector_restored = restore_version_vector();
+    const bool vector_restored = restore_version_vector(from_wal);
 
     // Segments written before per-origin numbers (#184), counted by the pass below: what decides
     // whether this start closes their numbering (#187).
@@ -347,7 +352,7 @@ void Engine::open() {
 
     // What this node holds, from the last vector it wrote down. Before the tail replay, so
     // the tail can only raise it.
-    restore_held_sequences();
+    restore_held_sequences(from_wal);
 
     // Replay the WAL tail — the records written after the last flush. Until this
     // existed, the replay callback was empty and every write acknowledged but not yet
@@ -376,12 +381,9 @@ void Engine::open() {
     }
     publish_segment_count();
 
-    // Restore epoch from WAL replay.
-    {
-        WALReplayer epoch_replayer(wal_dir_);
-        epoch_replayer.replay([](const WALRecord&, const uint8_t*) {});
-        current_epoch_.store(epoch_replayer.last_epoch(), std::memory_order_relaxed);
-    }
+    // The epoch, the highest the first pass read: a promotion is the only writer of one, and the
+    // failover manager that promotes starts below.
+    current_epoch_.store(wal_epoch, std::memory_order_relaxed);
 
     // Mutual exclusivity gate: MM mode and Replication mode are mutually exclusive.
     // In MM mode, ONLY MultiMasterManager is created.
@@ -700,14 +702,32 @@ void Engine::persist_version_vector_if_changed() {
                  entries.size(), bytes, records.size());
 }
 
-void Engine::restore_held_sequences() {
-    std::vector<uint8_t> last;
-    WALReplayer replayer(wal_dir_);
-    replayer.replay_v2([&last](const WALReplayContext& ctx) {
-        if (ctx.header.record_type != WAL_RECORD_HELD_SEQUENCES) return;
-        last.assign(ctx.payload, ctx.payload + ctx.payload_len);
-    });
+void Engine::WalStartRecords::note(const WALReplayContext& ctx) {
+    if (ctx.header.record_type == WAL_RECORD_VERSION_VECTOR) {
+        PeerVector one;
+        if (one.deserialize(ctx.payload, ctx.payload_len) && !one.truncated()) {
+            vector = one.entries();
+            vector_unusable = false;
+        } else {
+            vector.reset();
+            vector_unusable = true;
+        }
+        return;
+    }
+    if (ctx.header.record_type == WAL_RECORD_VERSION_VECTOR_PART) {
+        if (parts.add(ctx.payload, ctx.payload_len) == VectorAssembler::Step::Complete) {
+            vector = parts.take();
+            vector_unusable = false;
+        }
+        return;
+    }
+    if (ctx.header.record_type == WAL_RECORD_HELD_SEQUENCES) {
+        held.assign(ctx.payload, ctx.payload + ctx.payload_len);
+    }
+}
 
+void Engine::restore_held_sequences(const WalStartRecords& from_wal) {
+    const std::vector<uint8_t>& last = from_wal.held;
     if (last.empty()) return;   // nothing was held when this node last wrote its state down
 
     std::vector<SequenceTracker::HeldRanges> held;
@@ -836,38 +856,13 @@ void Engine::load_or_create_wal_identity() {
                 static_cast<unsigned long long>(wal_identity_));
 }
 
-bool Engine::restore_version_vector() {
+bool Engine::restore_version_vector(WalStartRecords& from_wal) {
     // Caller holds nothing: this runs from open() before the flush thread exists.
-    // A full pass, like the epoch restore: the vector is written next to a checkpoint, so
-    // replay_after_checkpoint() would usually skip it. Keep the last one seen - one record, or parts of
-    // one generation put back together in their order (#177); a set of parts a crash cut short is not
-    // a vector, and the one before it stands.
-    std::optional<std::vector<SequenceTracker::VectorEntry>> last;
-    bool last_unusable = false;
-    VectorAssembler parts;
-    WALReplayer replayer(wal_dir_);
-    replayer.replay_v2([&](const WALReplayContext& ctx) {
-        if (ctx.header.record_type == WAL_RECORD_VERSION_VECTOR) {
-            PeerVector one;
-            if (one.deserialize(ctx.payload, ctx.payload_len) && !one.truncated()) {
-                last = one.entries();
-                last_unusable = false;
-            } else {
-                last.reset();
-                last_unusable = true;
-            }
-            return;
-        }
-        if (ctx.header.record_type == WAL_RECORD_VERSION_VECTOR_PART) {
-            if (parts.add(ctx.payload, ctx.payload_len) == VectorAssembler::Step::Complete) {
-                last = parts.take();
-                last_unusable = false;
-            }
-        }
-    });
-
+    // From the whole log, not the tail: the vector is written next to a checkpoint, so
+    // replay_after_checkpoint() would usually skip it.
+    std::optional<std::vector<SequenceTracker::VectorEntry>>& last = from_wal.vector;
     if (!last) {
-        if (last_unusable) {
+        if (from_wal.vector_unusable) {
             OB_LOG_WARN("engine", "Persisted version vector unusable — asking peers for everything");
         } else {
             OB_LOG_INFO("engine", "No version vector in the WAL — this node will ask peers for "
@@ -3764,7 +3759,9 @@ uint64_t Engine::replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastC
                 static_cast<unsigned long long>(skipped),
                 static_cast<unsigned long long>(skipped_by_timestamp),
                 static_cast<unsigned long long>(seeded_other_origins));
-    if (replayer.tears_skipped() > 0) {
+    // The first pass's count: this one begins where the checkpoint does not cover, and reads only
+    // the files from there (#174).
+    if (last.tears_skipped > 0) {
         // Only reachable for a WAL an **older build** left behind: since #126 a writer that tears a
         // record abandons the file, and such a file ends mid-record, which every reader here has
         // always tolerated without a checksum ever being compared. So this line means "this
@@ -3776,7 +3773,7 @@ uint64_t Engine::replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastC
                     "successors were replayed. A file in this state was written by a build from "
                     "before the writer abandoned a file it tore, and on that build the records "
                     "behind the tear did not survive a restart",
-                    replayer.tears_skipped());
+                    last.tears_skipped);
     }
     if (skipped_by_timestamp > 0) {
         OB_LOG_WARN("engine",
