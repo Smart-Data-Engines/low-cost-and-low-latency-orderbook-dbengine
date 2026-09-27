@@ -1094,16 +1094,32 @@ private:
     void load_or_create_wal_identity();
     uint64_t wal_identity_{0};
 
+    /// What a start takes from the whole WAL besides its last checkpoint, gathered in the pass that
+    /// finds it (#174). The vector, the held numbers and the epoch were a pass each, and a pass over
+    /// a WAL of 422 MB took 4.9 s before it was read in blocks; each is still the last of its kind.
+    struct WalStartRecords {
+        /// The last version vector: one record, or the parts of one generation put back together
+        /// in their order (#177). A set of parts a crash cut short is not a vector, and the one
+        /// before it stands.
+        std::optional<std::vector<SequenceTracker::VectorEntry>> vector;
+        bool            vector_unusable{false};   ///< the last vector record did not read
+        VectorAssembler parts;
+        /// The payload of the last HELD_SEQUENCES record: empty when there is none.
+        std::vector<uint8_t> held;
+
+        void note(const WALReplayContext& ctx);
+    };
+
     /// True when a usable vector was restored - which a segment received from a peer relies on
     /// to leave this node's counter where the vector puts it (#184).
-    bool restore_version_vector();
+    bool restore_version_vector(WalStartRecords& from_wal);
 
     /// Restore the numbers held above the frontiers from the last HELD_SEQUENCES record.
     ///
     /// Separate from the vector restore, and called even when there is no usable vector: held
     /// numbers are independently useful, and importing them can only raise what this node claims
     /// to have seen.
-    void restore_held_sequences();
+    void restore_held_sequences(const WalStartRecords& from_wal);
     /// The store for `symbol.exchange`, created if it is new. Caller holds `flush_mtx_`, which every
     /// mutator of `stores_` holds, so a lookup needs nothing more; a creation - the one insertion
     /// into `stores_` - also takes mtx_ unless `mtx_held`, because `holds_no_data()` reads the map

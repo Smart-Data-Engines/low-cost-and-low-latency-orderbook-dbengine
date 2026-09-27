@@ -782,11 +782,18 @@ private:
 // Returns the last successfully replayed sequence_number (0 if none).
 class WALReplayer {
 public:
-    explicit WALReplayer(std::string_view dir);
+    static constexpr size_t kDefaultReadBlockBytes = 1u << 20;
+
+    /// Each file is read `read_block_bytes` at a time (#174) - at least the largest record, however
+    /// small the number asked for; tests ask for the least, so that records cross blocks everywhere.
+    explicit WALReplayer(std::string_view dir, size_t read_block_bytes = kDefaultReadBlockBytes);
 
     /// Replay all valid records.  cb receives the header and a pointer to the
     /// payload bytes (valid only for the duration of the call).
     /// Returns the last good sequence_number.
+    ///
+    /// `replay_v2()` without the origin and the position: a record with a 38-byte header comes
+    /// back as its first 24 bytes and its payload.
     uint64_t replay(
         std::function<void(const WALRecord&, const uint8_t* payload)> cb);
 
@@ -831,7 +838,10 @@ public:
         bool     any_record{false};
         uint32_t first_file_index{0};        ///< the oldest WAL file a record came from
     };
-    LastCheckpoint find_last_checkpoint();
+    ///
+    /// Every record the pass reads is handed to `also` as well, so that a start takes everything it
+    /// needs from the whole log in this one pass (#174); `last_epoch()` is the pass's afterwards.
+    LastCheckpoint find_last_checkpoint(const WALReplayCallbackV2& also = {});
 
     /// The second pass: forward what `last` does not cover, as `replay_after_checkpoint()` does.
     uint64_t replay_after(const LastCheckpoint& last, WALReplayCallbackV2 cb);
@@ -851,8 +861,16 @@ public:
     /// Reset at the start of every replay, so a caller that replays twice reads the second pass.
     size_t tears_skipped() const { return tears_skipped_; }
 
+    /// Replays - passes over a whole directory - this process has made (#174). A start makes two:
+    /// the last checkpoint's, which gathers everything else it takes from the whole log, and the
+    /// tail's. It made five, and a test holds it to the number.
+    static uint64_t passes_for_test() { return passes_.load(std::memory_order_relaxed); }
+
 private:
+    static inline std::atomic<uint64_t> passes_{0};
+
     std::string dir_;
+    size_t      read_block_bytes_;
     uint64_t    last_epoch_{0};
     size_t      tears_skipped_{0};
 };
