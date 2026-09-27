@@ -634,6 +634,11 @@ public:
     /// What the EPOLLIN branch does with what it read: handle every whole frame in the peer's
     /// receive buffer and keep the rest (#181). Takes the lock, as the io loop holds it there.
     void process_recv_buf_for_test(PeerConnection& peer);
+    /// The most entries of its vector this node states (VV_MAX_ENTRIES), lowered by a test that needs
+    /// a vector past it without a million of them (#177). Test seam.
+    void set_vector_limit_for_test(size_t limit) {
+        vector_limit_.store(limit, std::memory_order_relaxed);
+    }
 
     /// Enter the bootstrap state: this node holds no data yet and must not serve as though it did.
     ///
@@ -783,6 +788,10 @@ private:
     /// The generation of the vector in parts this node last sent (#177): what ties a vector's parts
     /// together on the receiving side. Guarded by `mtx_`.
     uint32_t vector_generation_sent_{0};
+    /// The most entries of its vector this node states: VV_MAX_ENTRIES, but for a test
+    /// (set_vector_limit_for_test()). Read with `mtx_` and without it, so atomic.
+    std::atomic<size_t> vector_limit_{VV_MAX_ENTRIES};
+    size_t vector_limit() const { return vector_limit_.load(std::memory_order_relaxed); }
 
     /// One condition, one pair of log lines, however long it holds: an event whose handling threw.
     ///

@@ -496,6 +496,30 @@ TEST(MMCatchupRounds, APeerThatHoldsEverythingIsNotScannedWhateverTheCopy) {
     EXPECT_FALSE(other.catchup.active) << "a peer lacking nothing was sent a scan after the tick";
 }
 
+TEST(MMCatchupRounds, ANodePastTheVectorItStatesCatchesAPeerUpRatherThanJudgingIt) {
+    // A copy past the bound exports nothing, and nothing compared with a peer's vector read as "it
+    // lacks nothing": a node past it never caught up a peer whose vector fit - a joiner above all
+    // (#177). Such a node cannot say what the peer lacks, so it catches the peer up, and the rounds
+    // send only what the peer's own vector does not hold. The bound is a million entries; the test
+    // lowers it below this node's three.
+    CatchupNode node(1 << 20, 64 << 20, 64 << 10, kNoAutoFlush);
+    write_rows(*node.engine, "ALL", 300, 1'000'000'000ULL);
+    write_rows(*node.engine, "TWO", 10, 2'000'000'000ULL);
+    write_rows(*node.engine, "SIX", 10, 3'000'000'000ULL);
+    node.engine->flush_tick_for_test();
+    node.write("ALL", 0, 1, 300);
+    node.mm->set_vector_limit_for_test(2);
+    WiredPeer from(kPeer);
+    ob::PeerConnection& peer = from.mgr(*node.mm);
+    peer.catchup_started = false;
+
+    arrive(node, from, {{"ALL.EX", 0, 300}, {"TWO.EX", 0, 10}, {"SIX.EX", 0, 10}});
+    EXPECT_TRUE(peer.catchup_started);
+    ASSERT_TRUE(peer.catchup.active)
+        << "a node that cannot state what it holds judged the peer to lack nothing";
+    EXPECT_TRUE(run_to_end(node, from).empty()) << "the peer was sent what its vector says it holds";
+}
+
 TEST(MMCatchupRounds, ACopyThatDoesNotCatchUpIsWaitedForOnlyTheGrace) {
     // The tick it asks for does not come - a flush stuck on a device, say. The wait is bounded, and
     // what ends it is the catch-up: the safe direction, since the rounds filter by the peer's vector

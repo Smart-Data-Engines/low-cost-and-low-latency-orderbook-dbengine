@@ -457,6 +457,31 @@ TEST(VectorParts, OneEntryPastItGoesInPartsThatPutItBackTogether) {
     EXPECT_EQ(as_map(pv.entries()), as_map(entries));
 }
 
+TEST(VectorParts, AKeyAtTheWireLimitSurvivesParts) {
+    auto entries = entries_of(ob::VV_MAX_SINGLE_ENTRIES + 1);
+    const std::string key = "123456789012345.123456789012345";
+    ASSERT_EQ(key.size(), 31u);
+    entries.back().key = key;
+    const auto records = ob::serialize_version_vector_records(entries, false, 7);
+    ASSERT_EQ(records.size(), 2u);
+    ob::PeerVector pv;
+    ASSERT_TRUE(receive(pv, records));
+    EXPECT_EQ(pv.frontier_for(key, entries.back().origin), entries.back().frontier)
+        << "the longest possible key was clipped";
+}
+
+TEST(VectorParts, AVectorInPartsAfterTheSendEverythingMarkerReplacesIt) {
+    // A peer whose vector could not be stated - a build before this one, past 1 560 entries - and
+    // then could: what it says now is what it holds.
+    ob::PeerVector pv;
+    const auto marker = ob::serialize_version_vector({}, /*truncated=*/true);
+    ASSERT_TRUE(pv.deserialize(marker.data(), marker.size()));
+    ASSERT_TRUE(pv.wants_everything());
+    ASSERT_TRUE(receive(pv, ob::serialize_version_vector_records(entries_of(5'000), false, 1)));
+    EXPECT_FALSE(pv.wants_everything()) << "the peer was still read as unable to state its vector";
+    EXPECT_EQ(pv.entry_count(), 5'000u);
+}
+
 RC_GTEST_PROP(VectorPartsProperty, AnyVectorSentAndReceivedIsItself, ()) {
     const auto n = *rc::gen::inRange<size_t>(0, 12'000);
     const auto entries = entries_of(n);
@@ -529,6 +554,17 @@ TEST(VectorParts, TheSnapshotsBlockCarriesAVectorOfAnySize) {
     torn.resize(torn.size() - 1);
     EXPECT_FALSE(ob::deserialize_version_vector_blob(torn.data(), torn.size(), out, says))
         << "a block cut short was taken for a vector";
+    auto longer = large;
+    longer.push_back(0);
+    EXPECT_FALSE(ob::deserialize_version_vector_blob(longer.data(), longer.size(), out, says))
+        << "a block with bytes after its vector was taken for one";
+    auto more_parts = large;
+    uint32_t parts = 0;
+    std::memcpy(&parts, more_parts.data() + sizeof(uint16_t), sizeof(parts));
+    ++parts;
+    std::memcpy(more_parts.data() + sizeof(uint16_t), &parts, sizeof(parts));
+    EXPECT_FALSE(ob::deserialize_version_vector_blob(more_parts.data(), more_parts.size(), out, says))
+        << "a block that says it holds a part more than its vector was taken for one";
 }
 
 TEST(CompareVectors, FiveThousandEntriesEachWayAreComparedEntryForEntry) {

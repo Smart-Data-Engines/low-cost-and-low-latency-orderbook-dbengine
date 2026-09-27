@@ -2127,7 +2127,7 @@ void MultiMasterManager::process_handshake(PeerConnection& peer,
 
 void MultiMasterManager::send_version_vector(PeerConnection& peer) {
     bool truncated = false;
-    const auto entries = engine_.export_version_vector(VV_MAX_ENTRIES, truncated);
+    const auto entries = engine_.export_version_vector(vector_limit(), truncated);
     // One frame when it fits, parts of one generation when it does not (#177), enqueued together and
     // in order - which is what the receiver's assembly relies on. Past one frame this used to be the
     // "send everything" marker, and every reconciliation resent the whole retained WAL.
@@ -2163,7 +2163,7 @@ ReconcileReport MultiMasterManager::reconcile_with_peers() {
     // The vector snapshot comes from the engine's cache, so this does not touch the engine mutex
     // while holding MM's — the cycle that deadlocked the flush thread once already.
     bool truncated = false;
-    const auto ours = engine_.export_version_vector(VV_MAX_ENTRIES, truncated);
+    const auto ours = engine_.export_version_vector(vector_limit(), truncated);
 
     std::lock_guard<std::mutex> lock(mtx_);
     for (auto& [node_id, peer] : peers_) {
@@ -2243,7 +2243,7 @@ void MultiMasterManager::on_peer_vector(PeerConnection& peer) {
 void MultiMasterManager::decide_catchup_from_vector(PeerConnection& peer, bool may_defer) {
     bool truncated = false;
     uint64_t covers = 0;
-    const auto ours = engine_.export_version_vector(VV_MAX_ENTRIES, truncated, &covers);
+    const auto ours = engine_.export_version_vector(vector_limit(), truncated, &covers);
     if (truncated) {
         // A copy past the bound exports nothing, and nothing compared with the peer's vector reads
         // as "it lacks nothing" - so a peer whose vector fits was never caught up from here (#177).
@@ -2505,7 +2505,7 @@ void MultiMasterManager::start_catchup_to_peer(PeerConnection& peer) {
     // Nothing to say about a peer that said nothing about itself.
     if (!st.wants_everything) {
         bool truncated = false;
-        const auto ours = engine_.export_version_vector(VV_MAX_ENTRIES, truncated);
+        const auto ours = engine_.export_version_vector(vector_limit(), truncated);
         const VectorDiff diff = compare_vectors(ours, peer.peer_vector, peer.node_id);
         st.lacks.reserve(diff.peer_lacks.size());
         for (const auto& gap : diff.peer_lacks) {
