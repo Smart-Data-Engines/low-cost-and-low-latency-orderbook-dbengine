@@ -251,3 +251,23 @@ TEST(MeshLegacyNumbering, AStoreOutsideAMeshIsNotClosed) {
         << "origin 0's frontier is not the segment's highest number";
     engine->close();
 }
+
+TEST(MeshLegacyNumbering, ACrashRightAfterTheCloseKeepsIt) {
+    // The note goes down only once the closed vector is on the device: a start that finds the note
+    // restores that vector and does not close again, so the note must never outlive the vector. A
+    // crash is a copy of the data directory taken while nothing writes, as in test_mm_restart_origins:
+    // here right after the start that closed, before anything flushed or checkpointed.
+    LegacyStore store(4, 5);
+    mm_engine::TempDir image("legacy_numbering_crash_");
+    {
+        auto engine = open_node(store.dir.path);
+        ASSERT_TRUE(closed_note(store.dir.path));
+        mm_engine::crash_image(store.dir.path, image.path);
+        engine->close();
+    }
+    auto engine = open_node(image.path);
+    EXPECT_EQ(told_now(*engine, kKey, kPeerA), kBase - 1)
+        << "the note survived a crash after the close, and the closed vector did not";
+    EXPECT_EQ(told_now(*engine, kKey, kPeerB), kBase - 1);
+    engine->close();
+}
