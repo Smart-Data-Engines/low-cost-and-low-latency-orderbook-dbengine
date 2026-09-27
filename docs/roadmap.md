@@ -2834,6 +2834,11 @@ The first version walked ours, then built an index of ours - copying every key -
 through it; a lookup in the peer's vector copied the key it looked for, and a vector received copied
 its keys into the table rather than move them.
 
+Found in this PR's CI, and older than it: `MultiMasterManager::stop()` stopped anti-entropy after
+closing `epoll_fd_`, so a reconciliation in flight at a shutdown could call `epoll_ctl()` on the
+descriptor being closed - ThreadSanitizer reported it once a vector in parts made a pass long enough.
+It is stopped before anything closes now (pitfall 493).
+
 Writing the vector down now costs what it did not: at every checkpoint after a frontier moved, under
 the engine's lock, 0.10 ms and 61.5 kB of WAL at 1 500 entries, 0.48 - 0.62 ms and 205 kB at 5 000,
 and 8.95 - 12.7 ms and 2 051 kB at 50 000 (the same program, three runs); before #177 a vector past

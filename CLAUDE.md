@@ -3778,6 +3778,12 @@ Learned the hard way. Check here before debugging.
      one anywhere between records. Creating the test's 14.6 MB snapshot on the worker takes 1.7 s on
      an idle i3-7100U and took 7.2 s once beside another session's tests, so a heartbeat went first
      and the test failed - in a full `ctest` on #177's branch, on code #177 does not touch.
+493. **Every thread that uses a descriptor stops before the descriptor closes - the one that
+     starts last included.** `MultiMasterManager::stop()` joined the io, reconnect and snapshot
+     threads before closing `epoll_fd_` (pitfall 41, #80) and stopped anti-entropy last, after it:
+     a reconciliation in flight sends each peer its vector, and a send that drains a buffer calls
+     `epoll_ctl()` - on a descriptor number the kernel may have handed on. ThreadSanitizer caught it
+     in #177's CI, once a vector in parts made a pass long enough to be in flight at a shutdown.
 
 ## Current state and open problems
 

@@ -399,6 +399,15 @@ void MultiMasterManager::stop() {
         peer_registry_->deregister_self();
     }
 
+    // Anti-entropy next, before anything below closes what it uses. A pass sends each peer its
+    // vector under mtx_, and a send that drains a peer's buffer disarms EPOLLOUT on epoll_fd_ - and
+    // it was stopped last, after epoll_fd_ was closed: ThreadSanitizer caught a pass calling
+    // epoll_ctl() on the descriptor this function was closing (#177's CI, where a vector in parts
+    // made the pass longer). Its thread takes mtx_, so this must not hold it; stop() joins it.
+    if (anti_entropy_) {
+        anti_entropy_->stop();
+    }
+
     // Wake the io thread, then join it, and only then close anything it might be holding.
     //
     // The order matters and the previous one was wrong: closing listen_fd_ and epoll_fd_ here was
@@ -464,11 +473,6 @@ void MultiMasterManager::stop() {
         }
         peers_.clear();
         pending_.clear();
-    }
-
-    // Stop anti-entropy if running.
-    if (anti_entropy_) {
-        anti_entropy_->stop();
     }
 
     OB_LOG_INFO("mm", "MultiMasterManager stopped: node_id=%u", config_.node_id);
