@@ -730,23 +730,21 @@ void Engine::persist_version_vector_if_changed() {
             }
             bytes += r.payload.size();
         }
-        const uint32_t ended_in = wal_.current_position().file_index;
         if (whole) {
+            // In one file with the checkpoint after it: only data rotates the WAL, and a vector's
+            // records are not data.
             vector_base_file_     = file;
             vector_whole_bytes_   = bytes;
             vector_changes_bytes_ = 0;
-            // A rotation inside the whole vector left its first parts in the file before: the next
-            // write is whole again, in this one, and retention keeps `file` until then.
-            vector_whole_due_ = ended_in != file;
+            vector_whole_due_     = false;
         } else {
             vector_changes_bytes_ += bytes;
         }
         for (const std::size_t i : vector_unwritten_) vector_unwritten_flag_[i] = 0;
         OB_LOG_DEBUG("engine", "Persisted version vector %s: entries=%zu of %zu bytes=%zu records=%zu "
-                               "file=%u%s",
+                               "file=%u",
                      whole ? "whole" : "changes", whole ? vector_cache_.size() : vector_unwritten_.size(),
-                     vector_cache_.size(), bytes, records.size(), file,
-                     ended_in != file ? " (a rotation inside it)" : "");
+                     vector_cache_.size(), bytes, records.size(), file);
         vector_unwritten_.clear();
     }
 
@@ -2947,9 +2945,10 @@ void Engine::flush_tick() {
                     safe_truncate = std::min(safe_truncate, r.confirmed_file);
                 }
             }
-            // And never the file the last whole vector begins in: the changes written after it stand
-            // on it (#189). It is in the last file, or - after a rotation inside it, until the next
-            // vector - the one before.
+            // And never the file the last whole vector is in (#189): the changes after it stand on it,
+            // and it is the vector a restart reads. Every file's first vector is whole, but a file
+            // whose rows moved no frontier - a peer's numbers held above a hole - gets none, and the
+            // checkpoint after them is past the vector's file.
             safe_truncate = std::min(safe_truncate, vector_base_file_);
         }
         if (safe_truncate > 0) {

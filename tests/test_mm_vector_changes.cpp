@@ -19,6 +19,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <filesystem>
@@ -99,6 +100,38 @@ size_t held_records(const std::string& dir) {
     return n;
 }
 
+
+constexpr uint16_t kThird = 3;
+
+/// The file of the last CHECKPOINT record.
+uint32_t last_checkpoint_file(const std::string& dir) {
+    uint32_t file = 0;
+    ob::WALReplayer replayer(dir);
+    replayer.replay_v2([&](const ob::WALReplayContext& ctx) {
+        if (ctx.header.record_type == ob::WAL_RECORD_CHECKPOINT) file = ctx.wal_file_index;
+    });
+    return file;
+}
+
+/// A peer's rows and this node's own, and the whole vector their checkpoint writes; then `held` of a
+/// third origin's numbers above a hole - rows that move no frontier - through several WAL files, and
+/// a checkpoint after them, which writes the held set and no vector. Returns the whole vector's file.
+uint32_t whole_vector_then_held_only(ob::Engine& node, const std::string& dir, uint64_t held) {
+    for (uint64_t seq = 1; seq <= 5; ++seq) {
+        EXPECT_EQ(deliver(node, record("PEERS", seq, 7'000'000'000ULL + seq), kPeer), ob::OB_OK);
+    }
+    write_symbols(node, 0, 20, 1'000'000'000ULL);
+    node.flush_incremental();
+    const auto whole = vector_writes(dir);
+    EXPECT_FALSE(whole.empty());
+    const uint32_t base = whole.empty() ? 0 : whole.back().file;
+    for (uint64_t seq = 100; seq < 100 + held; ++seq) {
+        EXPECT_EQ(deliver(node, record("HELDQ", seq, 8'000'000'000ULL + seq), kThird), ob::OB_OK);
+    }
+    node.flush_incremental();
+    EXPECT_EQ(vector_writes(dir).size(), whole.size()) << "the premise: no vector after the held rows";
+    return base;
+}
 }  // namespace
 
 TEST(MeshVectorChanges, ACheckpointAfterAFewMovedWritesThoseAndARestartPutsThemOn) {
@@ -208,29 +241,57 @@ TEST(MeshVectorChanges, ChangesInAWalFileStandOnAWholeVectorThatBeginsInIt) {
 }
 
 TEST(MeshVectorChanges, RetentionKeepsTheFileTheLastWholeVectorBeginsIn) {
-    // WAL files of 32 kB and a whole vector of 1 500 entries, one record of 63 kB: every whole vector
-    // ends its file, the checkpoint after it is in the next one, and retention - which deletes the
-    // files the last checkpoint is past - would take the vector a restart reads with it.
+    // A vector's records do not rotate the WAL - only data does - so a whole vector is in the file of
+    // the checkpoint after it. What leaves it behind is data that moves no frontier: a peer's numbers
+    // held above a hole. A checkpoint after them writes the held set and no vector, in a later file,
+    // and retention retires the files that checkpoint is past - the vector's too.
     TempDir live("mm_vchanges_ret_live_");
     TempDir crashed("mm_vchanges_ret_crash_");
     std::map<std::pair<std::string, uint16_t>, uint64_t> before;
     {
-        auto node = mesh_node(live.path, 32u << 10);
-        write_symbols(*node, 0, 1500, 1'000'000'000ULL);
-        for (int round = 0; round < 4; ++round) {
-            write_symbols(*node, static_cast<size_t>(round) * 11, 5, 9'000'000'000ULL + round * 100ULL);
-            node->flush_tick_for_test();
-            node->flush_incremental();
-            node->flush_tick_for_test();
-        }
-        ASSERT_FALSE(fs::exists(fs::path(live.path) / "wal_000000.bin"))
-            << "the premise: retention removed files";
+        auto node = mesh_node(live.path, 8u << 10);
+        const uint32_t base = whole_vector_then_held_only(*node, live.path, 100);
+        node->flush_tick_for_test();
+        node->flush_tick_for_test();
+        ASSERT_GT(last_checkpoint_file(live.path), base) << "the premise: the checkpoint is past the vector";
         before = told_all(*node);
         crash_image(live.path, crashed.path);
         node->close();
     }
-    auto node = mesh_node(crashed.path);
+    auto node = mesh_node(crashed.path, 8u << 10);
     EXPECT_EQ(told_all(*node), before) << "the restart found no whole vector to start from";
+    node->close();
+}
+
+TEST(MeshVectorChanges, ARestartKeepsTheFileItsWholeVectorBeginsInUntilItWritesOne) {
+    // The same after a restart, before it writes a vector of its own: the one it read is in a file
+    // that the first checkpoint it writes - after held numbers alone - is past.
+    TempDir live("mm_vchanges_rs_live_");
+    TempDir first("mm_vchanges_rs_first_");
+    TempDir second("mm_vchanges_rs_second_");
+    std::map<std::pair<std::string, uint16_t>, uint64_t> before;
+    uint32_t base = 0;
+    {
+        auto node = mesh_node(live.path, 8u << 10);
+        base = whole_vector_then_held_only(*node, live.path, 100);
+        crash_image(live.path, first.path);
+        node->close();
+    }
+    {
+        auto node = mesh_node(first.path, 8u << 10);
+        for (uint64_t seq = 600; seq < 900; ++seq) {
+            ASSERT_EQ(deliver(*node, record("HELDQ", seq, 8'000'000'000ULL + seq), kThird), ob::OB_OK);
+        }
+        node->flush_incremental();
+        node->flush_tick_for_test();
+        node->flush_tick_for_test();
+        ASSERT_GT(last_checkpoint_file(first.path), base) << "the premise: the checkpoint is past the vector";
+        before = told_all(*node);
+        crash_image(first.path, second.path);
+        node->close();
+    }
+    auto node = mesh_node(second.path, 8u << 10);
+    EXPECT_EQ(told_all(*node), before) << "the second restart found no whole vector to start from";
     node->close();
 }
 
@@ -254,5 +315,68 @@ TEST(MeshVectorChanges, HeldNumbersAreWrittenDownWhenTheyChange) {
     auto node = mesh_node(crashed.path);
     EXPECT_EQ(deliver(*node, record("HELD", 3, 5'000'000'003ULL), kPeer), ob::OB_OK);
     EXPECT_EQ(rows(*node, "HELD"), 2) << "the held number was not restored, and its redelivery stored";
+    node->close();
+}
+
+TEST(MeshVectorChanges, AWholeVectorIsWrittenAgainOnceTheChangesSinceOutgrowIt) {
+    // So that neither a restart nor the WAL pays for changes without end: 20 entries whole, and five
+    // moved at every checkpoint - the fourth set takes the changes past the whole vector's size.
+    TempDir dir("mm_vchanges_grow_");
+    auto node = mesh_node(dir.path);
+    write_symbols(*node, 0, 20, 1'000'000'000ULL);
+    node->flush_incremental();
+    std::vector<uint8_t> kinds;   // one per vector written after the first: whole or changes
+    size_t seen = vector_writes(dir.path).size();
+    for (int round = 1; round <= 6; ++round) {
+        write_symbols(*node, 0, 5, 1'000'000'000ULL * (round + 1));
+        node->flush_incremental();
+        const auto all = vector_writes(dir.path);
+        ASSERT_GT(all.size(), seen);
+        kinds.push_back(all.back().type);
+        seen = all.size();
+    }
+    const auto first_whole = std::find_if(kinds.begin(), kinds.end(), [](uint8_t t) {
+        return t != ob::WAL_RECORD_VERSION_VECTOR_CHANGES;
+    });
+    ASSERT_NE(first_whole, kinds.begin()) << "the first moves after a whole vector were not changes";
+    EXPECT_NE(first_whole, kinds.end()) << "six sets of changes and never a whole vector again";
+    EXPECT_EQ(written_down(dir.path), told_all(*node));
+    node->close();
+}
+
+TEST(MeshVectorChanges, WhenMostOfTheVectorMovedItIsWrittenWhole) {
+    TempDir dir("mm_vchanges_most_");
+    auto node = mesh_node(dir.path);
+    write_symbols(*node, 0, 20, 1'000'000'000ULL);
+    node->flush_incremental();
+    write_symbols(*node, 0, 15, 2'000'000'000ULL);   // 15 of 20
+    node->flush_incremental();
+    EXPECT_NE(vector_writes(dir.path).back().type, ob::WAL_RECORD_VERSION_VECTOR_CHANGES);
+    node->close();
+}
+
+TEST(MeshVectorChanges, ARestartGoesOnWithChangesOnTheWholeVectorItRead) {
+    // The writer goes on in the last WAL file, where the whole vector a restart read begins: what
+    // moves after it is written as changes on it, not as another whole vector.
+    TempDir live("mm_vchanges_on_live_");
+    TempDir crashed("mm_vchanges_on_crash_");
+    {
+        auto node = mesh_node(live.path);
+        write_symbols(*node, 0, 100, 1'000'000'000ULL);
+        node->flush_incremental();
+        write_symbols(*node, 0, 2, 2'000'000'000ULL);
+        node->flush_incremental();
+        crash_image(live.path, crashed.path);
+        node->close();
+    }
+    auto node = mesh_node(crashed.path);
+    const size_t before = vector_writes(crashed.path).size();
+    write_symbols(*node, 10, 2, 3'000'000'000ULL);
+    node->flush_incremental();
+    const auto all = vector_writes(crashed.path);
+    ASSERT_GT(all.size(), before);
+    EXPECT_EQ(all.back().type, ob::WAL_RECORD_VERSION_VECTOR_CHANGES)
+        << "a restart wrote its vector whole again";
+    EXPECT_EQ(written_down(crashed.path), told_all(*node));
     node->close();
 }
