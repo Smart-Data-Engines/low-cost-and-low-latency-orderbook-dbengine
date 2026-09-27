@@ -48,6 +48,12 @@ inline constexpr uint64_t MM_VV_GRACE_MS        = 2000; // wait for a peer's vec
 /// How often the io loop looks again while a decision waits for the copy of this node's vector to
 /// catch up with the tracker (#180 part D): a tick away at most, so a short wait, and only then.
 inline constexpr int      MM_VV_RECHECK_POLL_MS = 10;
+/// How long a snapshot request may go unanswered before the next peer is asked (#188). A peer that
+/// refuses says so, and one that goes away is seen going; this is for one that says nothing. A
+/// snapshot is a flush and a checksum of every stored file first - 4.1 ms for 2.37 MB, and 3.8 s for
+/// 12 800 small files in a Debug build - so the wait is long enough for a store of hundreds of
+/// gigabytes.
+inline constexpr int64_t  MM_SNAPSHOT_ASK_DEADLINE_MS = 600'000;
 /// How long a dial to a peer may take before it is treated as failed (#97).
 ///
 /// A constant rather than a flag, and the reason is that the kernel's own answer is unusable: a SYN
@@ -396,6 +402,8 @@ struct SnapshotBegin {
 struct MMSnapshotSend {
     bool             active{false};
     uint16_t         target_node_id{0};
+    /// Which connection it goes to: an abort from that connection ends it (#188).
+    uint64_t         target_conn_id{0};
     SnapshotManifest manifest;
     std::vector<uint8_t> meta;         // manifest ++ vector ++ held, sent before the files
     size_t           meta_offset{0};
@@ -420,6 +428,19 @@ struct MMSnapshotPrepare {
     uint64_t target_conn_id{0};
     uint64_t token{0};
     std::chrono::steady_clock::time_point started_at{};
+};
+
+/// Receiving side, before a bootstrap: the one snapshot request this node has outstanding (#188).
+///
+/// A node that held nothing asked every peer whose vector arrived before the first SNAPSHOT_BEGIN -
+/// on a join, all of them - each prepared and sent a whole snapshot, and the node installed each one
+/// that arrived after a bootstrap had finished, over the data that bootstrap installed. One request
+/// at a time, and a BEGIN only from the connection it went to.
+struct MMSnapshotAsk {
+    bool     active{false};
+    uint16_t node_id{0};
+    uint64_t conn_id{0};
+    std::chrono::steady_clock::time_point asked_at{};
 };
 
 /// Receiving side: staged to a scratch directory, installed only once every byte has checked out.
@@ -639,6 +660,16 @@ public:
     void set_vector_limit_for_test(size_t limit) {
         vector_limit_.store(limit, std::memory_order_relaxed);
     }
+    /// What request_snapshot_from() records of the request it sends, for a test that drives a
+    /// transfer without the vectors that lead to one (#188): the receiver takes a BEGIN only from
+    /// the connection it asked. Takes the lock. Test seam.
+    void note_snapshot_asked_for_test(const PeerConnection& peer);
+    /// What the io loop does every pass with a request nobody answered, at `now` (#188). Test seam.
+    void expire_snapshot_ask_for_test(std::chrono::steady_clock::time_point now) {
+        expire_snapshot_ask(now);
+    }
+    /// Whether a snapshot request is outstanding, and to whom (#188). Takes the lock. Test seam.
+    MMSnapshotAsk snapshot_ask_for_test() const;
 
     /// Enter the bootstrap state: this node holds no data yet and must not serve as though it did.
     ///
@@ -782,6 +813,15 @@ private:
     AsyncSnapshotBuilder snapshot_builder_;
     MMSnapshotPrepare    snapshot_prepare_;
     uint64_t             next_snapshot_token_{1};
+    /// The snapshot this node asked a peer for and has not had an answer to (#188). Guarded by mtx_.
+    MMSnapshotAsk        snapshot_ask_;
+    /// Forget a request unanswered for MM_SNAPSHOT_ASK_DEADLINE_MS and ask another peer. Takes the
+    /// lock; the io loop calls it every pass.
+    void expire_snapshot_ask(std::chrono::steady_clock::time_point now);
+    /// The request to `gone_node` ended without a snapshot - refused, dropped or expired: ask the
+    /// first other connected peer whose vector says it holds something, at once, rather than at its
+    /// next vector - a reconciliation interval later (#188). Caller holds `mtx_`.
+    void ask_another_peer_for_snapshot(uint16_t gone_node);
 
     /// Source of PeerConnection::conn_id. Read and bumped under mtx_, like peers_ itself.
     uint64_t next_conn_id_{1};
@@ -806,6 +846,9 @@ private:
     std::thread io_thread_;
     std::thread reconnect_thread_;
     std::atomic<bool> running_{false};
+    /// Set by stop(): what it ends asks no peer for anything (#188). Not `!running_`, which a manager
+    /// that was never started - a test's - also is.
+    std::atomic<bool> stopping_{false};
     std::atomic<bool> bootstrapping_{false};
 
     // ── Snapshot transfer (#76) ───────────────────────────────────────────────

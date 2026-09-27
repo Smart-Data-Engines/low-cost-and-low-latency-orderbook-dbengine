@@ -390,6 +390,7 @@ void MultiMasterManager::start() {
 
 void MultiMasterManager::stop() {
     if (!running_.exchange(false, std::memory_order_acq_rel)) return;
+    stopping_.store(true, std::memory_order_release);   // a bootstrap ended now asks no one (#188)
 
     OB_LOG_INFO("mm", "Stopping MultiMasterManager: node_id=%u", config_.node_id);
 
@@ -730,6 +731,8 @@ void MultiMasterManager::io_loop() {
         // notification is what makes it prompt; this is what makes a lost notification cost half a
         // second instead of a stuck bootstrap.
         poll_snapshot_preparation();
+        // And has a snapshot request gone unanswered too long? Then the next peer is asked (#188).
+        expire_snapshot_ask(std::chrono::steady_clock::now());
 
         // Whether any event in this pass threw. Without it the recovery line below fires in the
         // **same** pass as the ERROR it is supposed to close - measured, the log alternated
@@ -1815,6 +1818,20 @@ void MultiMasterManager::handle_frame(PeerConnection& peer,
             OB_LOG_WARN("mm", "Peer %u aborted the snapshot: %s", peer.node_id, reason.c_str());
             if (snapshot_recv_.active && snapshot_recv_.source_node_id == peer.node_id) {
                 abort_bootstrap("peer_aborted");
+            }
+            // The peer this node asked refused: the next one that states its vector is asked (#188).
+            if (snapshot_ask_.active && snapshot_ask_.node_id == peer.node_id &&
+                snapshot_ask_.conn_id == peer.conn_id) {
+                OB_LOG_INFO("mm", "Peer %u refused the snapshot this node asked it for: %s",
+                            peer.node_id, reason.c_str());
+                snapshot_ask_ = MMSnapshotAsk{};
+                ask_another_peer_for_snapshot(peer.node_id);
+            }
+            // And a receiver that refused this node's snapshot does not want the rest of it: a
+            // refused sender used to stream every file, and the receiver drop each chunk (#188).
+            if (snapshot_send_.active && snapshot_send_.target_node_id == peer.node_id &&
+                snapshot_send_.target_conn_id == peer.conn_id) {
+                finish_snapshot_send(false, "peer_refused");
             }
             return;
         }

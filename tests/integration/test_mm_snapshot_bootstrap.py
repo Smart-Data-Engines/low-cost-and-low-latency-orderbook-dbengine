@@ -117,6 +117,29 @@ def test_a_node_added_to_a_running_cluster_receives_a_snapshot(mm_cluster):
         joiner_client.close()
 
 
+def test_the_joiner_took_one_snapshot_from_one_peer(mm_cluster):
+    """#188: a joiner asked every peer whose vector arrived before the first SNAPSHOT_BEGIN - on a
+    join, all of them - each prepared and sent a whole snapshot, and the joiner installed each one
+    that arrived after a bootstrap had finished: three from three peers, writes refused 21.6 s
+    where one bootstrap took 6.8. Runs on the cluster the test above extended, and watches for a
+    few seconds more, since the later snapshots arrived after the first had been installed."""
+    if len(mm_cluster.nodes) < 4:
+        pytest.skip("runs on the cluster the bootstrap test extends; select the whole module")
+    joiner, peers = mm_cluster.nodes[-1], mm_cluster.nodes[:-1]
+    deadline = time.monotonic() + 8.0
+    while True:
+        body = scrape(joiner.metrics_port)
+        requested = metric_value(body, "ob_mm_snapshot_requested_total")
+        received = metric_value(body, "ob_mm_snapshot_received_total")
+        sent = sum(metric_value(scrape(n.metrics_port), "ob_mm_snapshot_sent_total") for n in peers)
+        assert (requested, received, sent) == (1.0, 1.0, 1.0), (
+            f"the joiner asked for {requested:.0f} snapshot(s) and installed {received:.0f}, "
+            f"and its peers sent {sent:.0f}")
+        if time.monotonic() > deadline:
+            break
+        time.sleep(0.5)
+
+
 def test_the_joiner_can_state_what_it_holds(mm_cluster):
     """The #67 half: after a snapshot the node exports a frontier for a foreign origin.
 
