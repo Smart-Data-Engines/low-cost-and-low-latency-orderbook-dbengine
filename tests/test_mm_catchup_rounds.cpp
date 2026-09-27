@@ -22,10 +22,12 @@
 
 #include "mm_test_peer.hpp"
 
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <ostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -37,6 +39,7 @@ using mm_test::WiredPeer;
 
 constexpr uint16_t kSelf = 1;
 constexpr uint16_t kPeer = 2;
+constexpr uint64_t kNoAutoFlush = 3'600'000'000'000ULL;   // every tick is the test's own
 
 /// A node whose mesh WAL is written by the test: the records a catch-up reads.
 struct CatchupNode {
@@ -47,7 +50,8 @@ struct CatchupNode {
     ob::MultiMasterConfig config;
     std::unique_ptr<ob::MultiMasterManager> mm;
 
-    CatchupNode(size_t round_bytes, size_t watermark, size_t rotate_bytes = 64 << 10) {
+    CatchupNode(size_t round_bytes, size_t watermark, size_t rotate_bytes = 64 << 10,
+                uint64_t flush_interval_ns = 100'000'000ULL) {
         config.node_id                   = kSelf;
         config.replication_port          = 0;
         config.enabled                   = true;
@@ -55,7 +59,7 @@ struct CatchupNode {
         config.max_catchup_bytes         = round_bytes;
         config.snapshot_low_watermark_bytes = watermark;
         config.anti_entropy_interval_sec = 30;
-        engine = std::make_unique<ob::Engine>(tmp.path);
+        engine = std::make_unique<ob::Engine>(tmp.path, flush_interval_ns);
         engine->open();
         wal = std::make_unique<ob::WALWriter>(tmp.path + "/mm_wal", rotate_bytes);
         hlc = std::make_unique<ob::HybridLogicalClock>(kSelf);
@@ -79,6 +83,42 @@ struct CatchupNode {
         }
     }
 };
+
+/// `n` rows of `symbol` a client writes to the node's engine: its tracker's frontier moves with each,
+/// and the copy of its vector a peer is compared with only at the next tick.
+void write_rows(ob::Engine& engine, const char* symbol, uint64_t n, uint64_t first_ts) {
+    for (uint64_t i = 0; i < n; ++i) {
+        ob::DeltaUpdate d{};
+        std::strncpy(d.symbol, symbol, sizeof(d.symbol) - 1);
+        std::strncpy(d.exchange, "EX", sizeof(d.exchange) - 1);
+        d.timestamp_ns = first_ts + i;
+        d.side         = ob::SIDE_BID;
+        d.n_levels     = 1;
+        ob::Level level{};
+        level.price = 100'000 + static_cast<int64_t>(i);
+        level.qty   = 7;
+        ASSERT_EQ(engine.apply_delta(d, &level), ob::OB_OK);
+    }
+}
+
+/// The peer's vector arriving on its connection, as a frame the io loop reads off the socket.
+void arrive(CatchupNode& node, WiredPeer& from,
+            const std::vector<ob::SequenceTracker::VectorEntry>& entries) {
+    const auto payload = ob::serialize_version_vector(entries, /*truncated=*/false);
+    ob::WALRecordV2 hdr{};
+    hdr.record_type    = ob::WAL_RECORD_VERSION_VECTOR;
+    hdr.version        = 1;
+    hdr.payload_len    = static_cast<uint16_t>(payload.size());
+    hdr.origin_node_id = kPeer;
+    std::vector<uint8_t> frame;
+    ob::encode_frame_header(ob::MM_WALRECORD_V2_SIZE + payload.size(), frame);
+    const auto* hb = reinterpret_cast<const uint8_t*>(&hdr);
+    frame.insert(frame.end(), hb, hb + ob::MM_WALRECORD_V2_SIZE);
+    frame.insert(frame.end(), payload.begin(), payload.end());
+    ob::PeerConnection& peer = from.mgr(*node.mm);
+    peer.recv_buf.insert(peer.recv_buf.end(), frame.begin(), frame.end());
+    node.mm->process_recv_buf_for_test(peer);
+}
 
 /// A peer vector that says the peer holds `frontier` of each (key, origin) given - and, received,
 /// says what it holds rather than asking for everything.
@@ -141,6 +181,17 @@ std::vector<Delivered> run_to_end(CatchupNode& node, WiredPeer& to, int* rounds 
     if (rounds) *rounds = n;
     drain(node, to, got);
     return got;
+}
+
+/// Whether `done` became true within `within`, polled as the io loop's short wait would.
+template <typename F>
+bool until(F&& done, std::chrono::milliseconds within = std::chrono::milliseconds(1000)) {
+    const auto deadline = std::chrono::steady_clock::now() + within;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (done()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return done();
 }
 
 }  // namespace
@@ -318,4 +369,186 @@ TEST(MMCatchupRounds, ARangeWhoseFirstNumberIsInTheWalIsNotCalledUnfillable) {
     EXPECT_EQ(run_to_end(node, to), expected("NEW", 3, 101, 1000));
     EXPECT_EQ(node.engine->registry().counter_value("ob_mm_catchup_unfillable_total"), 0u);
     EXPECT_EQ(to.mgr(*node.mm).unfillable_ranges.ticks(), 0u);
+}
+
+TEST(MMCatchupRounds, AReconciliationDoesNotTakeAPeersOwnTimerForSilence) {
+    // #183. A reconciliation sends this node's vector; the peer's own reconciliation sends its, on
+    // its own timer, and a peer does not answer a vector with one of its own. A deadline armed by
+    // the reconciliation expired whenever the two timers were more than the grace apart, and the
+    // peer was treated as holding nothing - a catch-up from its last vector, which here is an
+    // interval old and says 500 where live traffic has since given it everything. Measured on three
+    // nodes reconciling every 5 s: 6-7 such catch-ups a run, each sending everything written since
+    // the peer's last vector, and the whole of a 300 000-record catch-up again in two runs of three.
+    CatchupNode node(1 << 20, 64 << 20);
+    node.write("QUIET", kSelf, 1, 1000);
+    WiredPeer to(kPeer);
+    ob::PeerConnection& peer = to.mgr(*node.mm);
+    peer.peer_vector     = vector_of({{"QUIET.EX", kSelf, 500}});   // its last vector
+    peer.catchup_started = true;                                     // acted on when it came
+
+    (void)node.mm->reconcile_with_peers();
+    to.collect();
+    const auto sent = take_frames(to.inbox);
+    ASSERT_EQ(sent.size(), 1u) << "the premise: the reconciliation sends this node's vector";
+    EXPECT_EQ(sent.front().hdr.record_type, ob::WAL_RECORD_VERSION_VECTOR);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(ob::MM_VV_GRACE_MS + 200));
+    node.mm->start_overdue_catchups_for_test();
+    EXPECT_FALSE(peer.catchup.active)
+        << "the peer's silence since the reconciliation was taken for holding nothing";
+    std::vector<Delivered> got;
+    node.mm->run_catchup_rounds_for_test();
+    drain(node, to, got);
+    EXPECT_TRUE(got.empty()) << got.size() << " records sent again from a vector an interval old";
+}
+
+TEST(MMCatchupRounds, APeerSilentSinceItsHandshakeIsSentEverything) {
+    // The control of the one above, and the deadline's own case, which stays: after a handshake a
+    // peer that has stated nothing is unknown, and everything retained is the safe direction.
+    CatchupNode node(1 << 20, 64 << 20);
+    node.write("MUTE", kSelf, 1, 300);
+    WiredPeer to(kPeer);
+    ob::PeerConnection& peer = to.mgr(*node.mm);
+    peer.catchup_started    = false;   // as a handshake leaves it
+    peer.vector_deadline_ms = 1;       // and its grace long past
+    node.mm->start_overdue_catchups_for_test();
+    ASSERT_TRUE(peer.catchup.active) << "a peer silent since its handshake was not caught up";
+    EXPECT_EQ(run_to_end(node, to), expected("MUTE", kSelf, 1, 300));
+}
+
+// Part D of #180, found in PR #188's CI. A peer's vector is compared with a copy of this node's that
+// a tick brings up to date, and "the peer lacks nothing" was concluded from whatever copy there
+// was: a node back within a tick of the writes it missed was compared with one that did not have
+// them yet, judged to hold them, and sent them only at the next reconciliation - 100 of 2 100 rows
+// 3 s after it reconnected, and with a tick of 1 s in every run. The engine here ticks only when
+// the test says so; the peer's rows are client writes to it (origin 0, as without a mesh), and the
+// rounds read the same numbers from the WAL the test writes.
+
+TEST(MMCatchupRounds, AVectorComparedWithACopyBehindTheTrackerAsksForTheTickAndIsDecidedByIt) {
+    CatchupNode node(1 << 20, 64 << 20, 64 << 10, kNoAutoFlush);
+    write_rows(*node.engine, "LAG", 100, 1'000'000'000ULL);
+    node.engine->flush_tick_for_test();                        // the copy: 100
+    write_rows(*node.engine, "LAG", 200, 2'000'000'000ULL);   // the tracker: 300; the copy still 100
+    node.write("LAG", 0, 1, 300);
+    WiredPeer from(kPeer);
+    ob::PeerConnection& peer = from.mgr(*node.mm);
+    peer.catchup_started    = false;   // as a handshake leaves it
+    peer.vector_deadline_ms = 1;       // and its grace for a silent peer long past
+    const uint64_t ticks = node.engine->registry().counter_value("ob_flush_ticks_total");
+    {
+        auto stuck = node.engine->hold_flush_for_test();      // no tick until this goes
+        arrive(node, from, {{"LAG.EX", 0, 100}});   // what the copy says this node holds
+        EXPECT_FALSE(peer.catchup_started) << "the peer was judged to lack nothing from a copy the "
+                                              "tracker is 200 numbers ahead of";
+        node.mm->start_overdue_catchups_for_test();
+        EXPECT_FALSE(peer.catchup.active) << "a peer that has sent its vector was taken for silent";
+        EXPECT_TRUE(node.mm->recheck_deferred_vectors_for_test())
+            << "decided before a tick brought the copy up to date";
+        EXPECT_FALSE(peer.catchup.active);
+    }
+    // The flush loop's interval is an hour, so a tick now is the one the wait asked for.
+    ASSERT_TRUE(until([&] {
+        node.mm->recheck_deferred_vectors_for_test();
+        return peer.catchup.active;
+    })) << "the wait did not ask for its tick, or the tick did not end it";
+    EXPECT_GT(node.engine->registry().counter_value("ob_flush_ticks_total"), ticks);
+    EXPECT_EQ(run_to_end(node, from), expected("LAG", 0, 101, 300));
+}
+
+TEST(MMCatchupRounds, AVectorComparedWithACopyUpToDateIsDecidedAtOnce) {
+    // The control of the one above: the tick came before the vector, and nothing waits for another.
+    CatchupNode node(1 << 20, 64 << 20, 64 << 10, kNoAutoFlush);
+    write_rows(*node.engine, "NOW", 300, 1'000'000'000ULL);
+    node.engine->flush_tick_for_test();
+    node.write("NOW", 0, 1, 300);
+    WiredPeer from(kPeer);
+    ob::PeerConnection& peer = from.mgr(*node.mm);
+    peer.catchup_started = false;
+
+    arrive(node, from, {{"NOW.EX", 0, 100}});
+    ASSERT_TRUE(peer.catchup.active) << "a copy up to date was waited for all the same";
+    EXPECT_EQ(run_to_end(node, from), expected("NOW", 0, 101, 300));
+}
+
+TEST(MMCatchupRounds, APeerThatHoldsEverythingIsNotScannedWhateverTheCopy) {
+    // And the other half of the shortcut, which stays: a peer holding what the tracker does is not
+    // sent a scan of the WAL - from a copy up to date at once, and from one behind it after the tick.
+    CatchupNode node(1 << 20, 64 << 20, 64 << 10, kNoAutoFlush);
+    write_rows(*node.engine, "ALL", 300, 1'000'000'000ULL);
+    node.engine->flush_tick_for_test();
+    WiredPeer from(kPeer);
+    ob::PeerConnection& peer = from.mgr(*node.mm);
+    peer.catchup_started = false;
+    arrive(node, from, {{"ALL.EX", 0, 300}});
+    EXPECT_TRUE(peer.catchup_started) << "a peer lacking nothing waited, with the copy up to date";
+    EXPECT_FALSE(peer.catchup.active) << "a peer lacking nothing was sent a scan";
+
+    WiredPeer late(3);
+    ob::PeerConnection& other = late.mgr(*node.mm);
+    other.catchup_started = false;
+    write_rows(*node.engine, "ALL", 1, 2'000'000'000ULL);     // the tracker: 301, the copy 300
+    arrive(node, late, {{"ALL.EX", 0, 301}});
+    EXPECT_FALSE(other.catchup_started) << "the premise: behind the tracker, it waits";
+    EXPECT_TRUE(until([&] {
+        node.mm->recheck_deferred_vectors_for_test();
+        return other.catchup_started;
+    })) << "no tick came to decide it";
+    EXPECT_FALSE(other.catchup.active) << "a peer lacking nothing was sent a scan after the tick";
+}
+
+TEST(MMCatchupRounds, ACopyThatDoesNotCatchUpIsWaitedForOnlyTheGrace) {
+    // The tick it asks for does not come - a flush stuck on a device, say. The wait is bounded, and
+    // what ends it is the catch-up: the safe direction, since the rounds filter by the peer's vector
+    // anyway.
+    CatchupNode node(1 << 20, 64 << 20, 64 << 10, kNoAutoFlush);
+    write_rows(*node.engine, "STUCK", 100, 1'000'000'000ULL);
+    node.engine->flush_tick_for_test();
+    write_rows(*node.engine, "STUCK", 200, 2'000'000'000ULL);
+    node.write("STUCK", 0, 1, 300);
+    WiredPeer from(kPeer);
+    ob::PeerConnection& peer = from.mgr(*node.mm);
+    peer.catchup_started = false;
+    auto stuck = node.engine->hold_flush_for_test();   // released before the node closes
+    arrive(node, from, {{"STUCK.EX", 0, 100}});
+    ASSERT_TRUE(node.mm->recheck_deferred_vectors_for_test()) << "the premise: it waits";
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(ob::MM_VV_GRACE_MS + 200));
+    EXPECT_FALSE(node.mm->recheck_deferred_vectors_for_test()) << "waited past the grace";
+    ASSERT_TRUE(peer.catchup.active) << "nothing ended a wait for a tick that did not come";
+    EXPECT_EQ(run_to_end(node, from), expected("STUCK", 0, 101, 300));
+}
+
+TEST(MMCatchupRounds, ACopyRebuiltWholeIsUpToDate) {
+    // A copy rebuilt from the whole vector - at a start, or when a snapshot replaces what the node
+    // holds - reaches every listing so far, so what is compared with it is decided at once.
+    CatchupNode node(1 << 20, 64 << 20, 64 << 10, kNoAutoFlush);
+    write_rows(*node.engine, "OLD", 10, 1'000'000'000ULL);
+    node.engine->adopt_snapshot_sequence_state({{"SNAP.EX", 3, 500}}, {});
+    WiredPeer from(kPeer);
+    ob::PeerConnection& peer = from.mgr(*node.mm);
+    peer.catchup_started = false;
+    arrive(node, from, {{"SNAP.EX", 3, 500}});
+    EXPECT_TRUE(peer.catchup_started) << "a copy rebuilt whole was taken for one behind";
+    EXPECT_FALSE(peer.catchup.active);
+}
+
+TEST(MMCatchupRounds, AWriteAfterTheVectorDoesNotPutTheDecisionOffAgain) {
+    // What the wait is for is the tracker as the vector found it: a write after that goes to the
+    // connected peer live, so the tick that brings the copy past it decides, whatever came since -
+    // with writes that never stop, waiting for a copy with nothing newer would wait for good.
+    CatchupNode node(1 << 20, 64 << 20, 64 << 10, kNoAutoFlush);
+    write_rows(*node.engine, "LIVE", 300, 1'000'000'000ULL);
+    node.engine->flush_tick_for_test();
+    write_rows(*node.engine, "LIVE", 1, 2'000'000'000ULL);    // the tracker 301, the copy 300
+    WiredPeer from(kPeer);
+    ob::PeerConnection& peer = from.mgr(*node.mm);
+    peer.catchup_started = false;
+    arrive(node, from, {{"LIVE.EX", 0, 301}});
+    ASSERT_FALSE(peer.catchup_started) << "the premise: behind the tracker, it waits";
+    node.engine->flush_tick_for_test();                       // a tick past what the vector found
+    auto stuck = node.engine->hold_flush_for_test();          // and none after it here
+    write_rows(*node.engine, "LIVE", 1, 3'000'000'000ULL);    // after the tick: 302, the copy 301
+    EXPECT_FALSE(node.mm->recheck_deferred_vectors_for_test());
+    EXPECT_TRUE(peer.catchup_started) << "a write after the vector put the decision off again";
+    EXPECT_FALSE(peer.catchup.active);
 }

@@ -1018,14 +1018,19 @@ uint64_t WALReplayer::replay_after(const LastCheckpoint& last, WALReplayCallback
     // wrongly covered are not in the log's own account of itself, so they cannot be told apart here.
     uint64_t seen = 0;
     uint64_t forwarded = 0;
-    uint64_t given_back = 0;   // records before the last checkpoint, forwarded because of its position
+    // Rows given back: DELTA records before the last checkpoint, forwarded because of its position.
+    // Only those, because that is what the count tells an operator - how many acknowledged writes
+    // the checkpoint's position handed to the replay - and since #179 the checkpoint's own version
+    // vector (and held set) are appended in front of it, inside the same range: counted, they made
+    // "the three records it gave back" read four.
+    uint64_t given_back = 0;
     uint64_t last_seq = replay_v2([&](const WALReplayContext& ctx) {
         ++seen;
         if (seen <= last.ordinal) {
             if (!last.covered || seen == last.ordinal) return;
             const WalPosition at{ctx.wal_file_index, static_cast<uint32_t>(ctx.wal_byte_offset)};
             if (wal_position_before(at, *last.covered)) return;
-            ++given_back;
+            if (ctx.header.record_type == WAL_RECORD_DELTA) ++given_back;
         }
         ++forwarded;
         cb(ctx);

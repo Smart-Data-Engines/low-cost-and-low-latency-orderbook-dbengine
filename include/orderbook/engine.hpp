@@ -118,6 +118,20 @@ public:
     /// then write segments to disk and merge index (Phase B, no mutex).
     void flush_incremental();
 
+    /// One flush tick on the calling thread: what the flush loop runs every interval - drain, seal
+    /// the stores that are due and only those, refresh what the mesh is told. A test seam: a test
+    /// that needs a tick's decisions rather than `flush_incremental()`'s seal-everything runs one
+    /// with the loop's interval out of the way, and knows when it has finished. Serialised with the
+    /// loop and with `flush_incremental()` by `flush_mtx_`, which the tick takes.
+    void flush_tick_for_test() { flush_tick(); }
+
+    /// Hold `flush_mtx_` until the returned lock goes: no tick and no `FLUSH` runs meanwhile, which is
+    /// how a test stands for a flush that is stuck - on a device, say - without the flush loop being
+    /// told anything. Release it before `close()`, which needs it. A test seam.
+    [[nodiscard]] std::unique_lock<std::mutex> hold_flush_for_test() {
+        return std::unique_lock<std::mutex>(flush_mtx_);
+    }
+
     /// Apply a delta update: WAL → SoA buffer (gap detection) → enqueue for columnar flush.
     /// Returns OB_OK on success, error code on failure.
     ob_status_t apply_delta(const DeltaUpdate& delta, const Level* levels);
@@ -538,15 +552,38 @@ public:
     /// close that cycle — measured as a node that stopped answering writes entirely.
     ///
     /// A stale cache understates what we hold, so a peer sends more than it needs to and the
-    /// duplicates are dropped on arrival. The staleness window is one flush interval.
+    /// duplicates are dropped on arrival. The staleness window is one flush interval. And it
+    /// understates what a peer **lacks** - the direction that costs: compared with a copy
+    /// without the writes a returning peer missed, the peer holds everything, so the mesh manager
+    /// does not conclude that from a copy behind the tracker (`covers`, #180 part D).
     /// How many sequence numbers from `origin` are held above the frontier for this symbol key.
     ///
     /// A test seam, and a diagnostic: a non-zero count means this node has seen records it cannot
     /// yet claim contiguity for, which is exactly the state a restart used to lose (#75).
     std::size_t above_frontier_size(const std::string& key, uint16_t origin);
 
+    ///
+    /// `covers`, when given, is the tracker's `listings()` the copy reaches: a copy is exact when
+    /// `frontier_listings()` is not past it, and a peer's vector compared with one that is behind
+    /// can be judged to hold writes it missed (#180 part D).
     std::vector<SequenceTracker::VectorEntry> export_version_vector(std::size_t limit,
-                                                                    bool& truncated) const;
+                                                                    bool& truncated,
+                                                                    uint64_t* covers = nullptr) const;
+
+    /// The tracker's `SequenceTracker::listings()` now: readable without `mtx_`, and so from under
+    /// the mesh manager's lock, which `export_version_vector()` is for (#180 part D).
+    uint64_t frontier_listings() const { return seq_tracker_.listings(); }
+
+    /// The `covers` of `export_version_vector()` without the copy: what the mesh manager waits
+    /// for when a decision was put off until the copy caught up. Under `vector_cache_mtx_` only.
+    uint64_t version_vector_covers() const;
+
+    /// Ask for the tick that brings the copy of the vector up to date, now rather than at the end
+    /// of the interval: what a mesh decision put off until the copy catches up asks for (#180 part
+    /// D), so that the wait is a tick's work and not up to `--flush-interval-ms` of nothing - and not
+    /// the grace after which it gives up waiting. Callable from under the mesh manager's lock: all it
+    /// takes is `flush_stop_mtx_`, a leaf.
+    void request_vector_refresh() { request_flush(); }
 
     /// Get the HLC clock (nullptr if multi-master is not enabled).
     HybridLogicalClock* hlc() const { return hlc_.get(); }
@@ -741,9 +778,22 @@ private:
     mutable std::mutex                   vector_cache_mtx_;
     std::vector<SequenceTracker::VectorEntry> vector_cache_;
     bool                                 vector_cache_truncated_{false};
+    /// The tracker's `listings()` at the take the copy was last brought up to date from (#180
+    /// part D). Under `vector_cache_mtx_`, with the copy.
+    uint64_t                             vector_cache_covers_{0};
 
-    /// Refresh the snapshot above from the tracker. Caller must hold mtx_.
+    /// Rebuild the snapshot above from the tracker, whole. Caller must hold mtx_.
     void refresh_version_vector_cache();
+    /// Bring it up to date with the frontiers that moved since the last update or rebuild (#180):
+    /// the flush tick calls it whether or not it seals, so what peers are told is at most one tick
+    /// old - at the cost of what moved, not of the vector, which is the difference between a few
+    /// microseconds a tick and 286 us at 4 000 entries. Caller holds mtx_, on the flush thread -
+    /// never from under the mesh manager's lock, which is what the cache is for.
+    void update_version_vector_cache();
+    /// Where each (symbol, origin) sits in `vector_cache_`, so an update finds it. Guarded by mtx_
+    /// (only the flush thread and the rebuilds, all under it, touch it); `vector_cache_` itself is
+    /// also written under `vector_cache_mtx_`, which the mesh manager reads it under.
+    std::unordered_map<std::string, std::unordered_map<uint16_t, std::size_t>> vector_cache_index_;
     std::unique_ptr<HybridLogicalClock>  hlc_;
     std::unique_ptr<MultiMasterManager>  mm_mgr_;
 
@@ -778,9 +828,11 @@ private:
     /// thirteenfold wait for the same work (#137).
     ///
     /// **Lock order.** `request_flush()` takes `flush_stop_mtx_` while the caller holds `mtx_`,
-    /// which adds `mtx_ → flush_stop_mtx_` to the order documented above. It is safe because
-    /// `flush_stop_mtx_` is a leaf: it is taken in exactly two places — the wait in
-    /// `flush_loop()` and the wake in `close()` — and neither holds `mtx_` while doing so.
+    /// which adds `mtx_ → flush_stop_mtx_` to the order documented above - and the mesh manager's
+    /// `request_vector_refresh()` from under its own lock, which adds that one's too (#180 part D).
+    /// It is safe because `flush_stop_mtx_` is a leaf: besides these wakes it is taken in exactly
+    /// two places — the wait in `flush_loop()` and the wake in `close()` — and nothing is taken while
+    /// it is held.
     /// Taking it is not optional: setting the flag without it loses the wake-up when the flush
     /// loop has evaluated its predicate and not yet slept.
     std::atomic<bool> flush_now_{false};

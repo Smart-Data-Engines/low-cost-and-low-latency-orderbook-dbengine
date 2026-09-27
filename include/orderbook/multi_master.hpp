@@ -46,6 +46,9 @@ inline constexpr size_t   MM_MAX_VV_ENTRIES     = 4096; // ~172 kB on the wire
 inline constexpr size_t   MM_MAX_PEER_SEND_BUF  = 64ULL << 20;
 inline constexpr uint64_t MM_VV_GRACE_MS        = 2000; // wait for a peer's vector before
                                                         // assuming it holds nothing
+/// How often the io loop looks again while a decision waits for the copy of this node's vector to
+/// catch up with the tracker (#180 part D): a tick away at most, so a short wait, and only then.
+inline constexpr int      MM_VV_RECHECK_POLL_MS = 10;
 /// How long a dial to a peer may take before it is treated as failed (#97).
 ///
 /// A constant rather than a flag, and the reason is that the kernel's own answer is unusable: a SYN
@@ -335,11 +338,18 @@ struct PeerConnection {
 
     /// What the peer says it holds. Until it arrives, the peer is assumed to hold nothing.
     PeerVector   peer_vector;
-    /// Monotonic milliseconds after which a silent peer is treated as holding nothing.
+    /// Monotonic milliseconds after which a silent peer is treated as holding nothing. Armed by the
+    /// handshake only: a reconciliation that armed it too took a peer's own timer for silence (#183).
     uint64_t     vector_deadline_ms{0};
     /// Set once catch-up has been started for this connection, so a late vector does not
     /// start a second stream.
     bool         catchup_started{false};
+    /// A "lacks nothing" this connection's vector could not be given yet (#180 part D): the copy
+    /// of this node's vector it was compared with was behind the tracker, so the writes the peer
+    /// missed may be exactly the ones the copy does not have. The tracker's listing the copy has
+    /// to reach first, and when the decision was put off; 0 = none. Reset with the connection.
+    uint64_t     vector_recheck_listings{0};
+    uint64_t     vector_recheck_since_ms{0};
     HLCTimestamp last_hlc;           // last HLC received from this peer
 
     /// Open while this peer is being refused for an implausible clock (#121). Per peer, because
@@ -615,6 +625,11 @@ public:
     /// snapshot ones: they take the lock themselves, and the rounds read the WAL without it.
     void start_catchup_for_test(PeerConnection& peer);
     bool run_catchup_rounds_for_test() { return run_catchup_rounds(); }
+    /// What the io loop does when a peer's vector is overdue after its handshake (#183). Test seam.
+    void start_overdue_catchups_for_test() { start_overdue_catchups(); }
+    /// What the io loop does between its passes with the decisions put off for a copy of this
+    /// node's vector that was behind the tracker (#180 part D). Takes the lock. Test seam.
+    bool recheck_deferred_vectors_for_test();
     /// What the EPOLLOUT branch does first: write what the socket takes of the peer's buffer.
     bool try_drain_send_buf_for_test(PeerConnection& peer);
     /// What the EPOLLIN branch does with what it read: handle every whole frame in the peer's
@@ -923,6 +938,19 @@ private:
     void send_version_vector(PeerConnection& peer);
     /// Start catch-up for peers whose vector never arrived within MM_VV_GRACE_MS.
     void start_overdue_catchups();
+
+    /// What a peer's vector means for a catch-up to it: one when it lacks anything the copy of this
+    /// node's vector holds, or asks for everything; none when it lacks nothing - but only from a
+    /// copy that has every frontier the tracker moved before the vector arrived, and with
+    /// `may_defer`, a copy behind the tracker asks the engine for a tick and puts the decision off
+    /// until the tick has brought it up to date (#180 part D). A copy is up to a tick behind, and
+    /// one without the writes a returning peer missed judged it to hold them until the next
+    /// reconciliation. Caller holds `mtx_`.
+    void decide_catchup_from_vector(PeerConnection& peer, bool may_defer);
+    /// Take up the decisions put off above: decided with the copy once it reaches the listing it
+    /// had to, and a catch-up after MM_VV_GRACE_MS without it - the safe direction, since the rounds
+    /// filter by the peer's vector anyway. True while one still waits. Caller holds `mtx_`.
+    bool recheck_deferred_vectors();
 
     // Reconnect logic (task 10.1)
     /// Mark peer as disconnected, close fd, log INFO. Schedules reconnect.

@@ -359,6 +359,12 @@ ob_add_engine_test(test_mm_dedup
     test_mm_dedup.cpp
 )
 
+# What a mesh node knows after a restart, and from whom (#179), and what it tells peers between
+# seals (#180).
+ob_add_engine_test(test_mm_restart_origins
+    test_mm_restart_origins.cpp
+)
+
 ob_add_engine_test(test_mm_snapshot
     test_mm_snapshot.cpp
 )

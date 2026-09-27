@@ -12,17 +12,31 @@ Found measuring #178. Two defects, both older than it - the same numbers on the 
   compared against a vector without the writes it missed, judged to hold everything, and caught up
   only at the next reconciliation. Measured: the rows it missed arrived 20 s after its restart.
 
+Both fixed together: replay seeds each record under the origin its header names, the vector is
+written before the checkpoint rather than after it, and every flush tick refreshes the vector peers
+are told whenever the tracker moved, sealing or not. The single-engine account of each part is
+`tests/test_mm_restart_origins.cpp`.
+
+And a third, found in the fix's own CI run (#180 part D): "a tick late" was still too late for the
+one decision that reads the copy the tick refreshes. A node back within a tick of the writes it
+missed was compared with a copy of its peers' vectors that did not have them yet, judged to hold
+everything, and sent them at the next reconciliation - 100 of 2 100 rows 3 s after it reconnected,
+there once, and with a tick of 1 s in every run. The decision now waits for the tick
+(`tests/test_mm_catchup_rounds.cpp`).
+
 A mesh of its own for each test, reconciling every 5 s: both kill and restart a node, and what
 the first leaves behind - rows stored twice, a vector claiming them for the wrong origin - would
 start the catch-up the second one is about.
 """
 from __future__ import annotations
 
+import re
 import time
+import urllib.request
 
 import pytest
 
-from conftest import ClusterManager, node_log_since, node_log_size
+from conftest import ClusterManager, node_log_since, node_log_size, patience
 from orderbook_engine import BookUpdate, OrderbookEngine
 
 pytestmark = pytest.mark.multi_master
@@ -31,6 +45,12 @@ EXCHANGE = "RST"
 SYMBOLS = [f"R{i:02d}" for i in range(10)]
 BASE_TS = 1_700_000_000_000_000_000
 INTERVAL_S = 5
+# For the node back within a tick: wide enough that the writes and the restart after one of the
+# writer's ticks land before the next - together they take about half a second here - and a
+# reconciliation interval far wider, so that the only thing to send the rows within the wait after
+# the tick is the tick. Three times both under a sanitizer, which slows a restart as much (patience()).
+SLOW_TICK_S = patience(5.0)
+SLOW_TICK_INTERVAL_S = int(patience(30.0))
 
 
 class Duplicated(AssertionError):
@@ -67,6 +87,14 @@ def rows(node) -> int:
         client.close()
 
 
+def metric(node, name: str) -> float:
+    with urllib.request.urlopen(f"http://127.0.0.1:{node.metrics_port}/metrics",
+                                timeout=6.0) as resp:
+        body = resp.read().decode(errors="replace")
+    match = re.search(rf"^{re.escape(name)}(?:\{{[^}}]*\}})?\s+([0-9.eE+-]+)$", body, re.M)
+    return float(match.group(1)) if match else 0.0
+
+
 def wait_for(node, at_least: int, timeout: float) -> int:
     deadline = time.monotonic() + timeout
     got = rows(node)
@@ -76,19 +104,29 @@ def wait_for(node, at_least: int, timeout: float) -> int:
     return got
 
 
+def start_mesh(*extra: str, nodes: int = 3, interval_s: int = INTERVAL_S) -> ClusterManager:
+    cm = ClusterManager()
+    cm.extra_node_args = ["--anti-entropy-interval-seconds", str(interval_s), *extra]
+    cm.start_multi_master(node_count=nodes)
+    cm.wait_for_mm_mesh(timeout=45)
+    return cm
+
+
 @pytest.fixture
 def mesh():
-    cm = ClusterManager()
-    cm.extra_node_args = ["--anti-entropy-interval-seconds", str(INTERVAL_S)]
-    cm.start_multi_master(node_count=3)
-    cm.wait_for_mm_mesh(timeout=45)
+    cm = start_mesh()
     yield cm
     cm.shutdown()
 
 
-@pytest.mark.xfail(strict=True, raises=Duplicated,
-                   reason="#179: a replayed record is seeded with this node's origin, so a node "
-                          "restarted before its vector reached the WAL is sent its rows again")
+@pytest.fixture
+def slow_tick_pair():
+    cm = start_mesh("--flush-interval-ms", str(int(SLOW_TICK_S * 1000)), nodes=2,
+                    interval_s=SLOW_TICK_INTERVAL_S)
+    yield cm
+    cm.shutdown()
+
+
 def test_a_node_restarted_before_its_vector_was_written_holds_each_row_once(mesh):
     writer, restarted = mesh.nodes[0], mesh.nodes[2]
     write(writer, BASE_TS, 10)
@@ -118,17 +156,15 @@ def test_a_node_restarted_before_its_vector_was_written_holds_each_row_once(mesh
         raise Duplicated(f"the restarted node holds {got} rows where the writer holds {expected}")
 
 
-# Not strict, unlike #179's: what this reproduces is a window - the writer sealing nothing between
-# the kill and the reconnect - and a slow enough runner closes it by the node's slowness alone. The
-# TSan job did, on PR #187's tree: the writer sealed inside the window, its vector was fresh, and
-# the test passed with the defect in place. A strict marker there reads a timing as a fix.
-@pytest.mark.xfail(strict=False, raises=Late,
-                   reason="#180: a node's vector is refreshed at a checkpoint, so a peer that comes "
-                          "back within the seal interval is judged to hold what it missed")
-def test_a_node_restarted_after_missing_writes_gets_them_when_it_reconnects(mesh):
+def held_after_missing_writes(mesh, returning: int, just_after_a_tick: bool = False,
+                              wait_s: float = 3.0) -> tuple[int, int]:
+    """What node `returning` holds `wait_s` after it reconnected, and what the writer does: it was
+    killed with every node's rows written down, 200 rows a symbol were written to node 0
+    meanwhile, and it was restarted."""
     writer = mesh.nodes[0]
     write(writer, BASE_TS, 10)
-    assert wait_for(mesh.nodes[2], 100, 30) == 100, "the premise: the mesh holds the first rows"
+    assert wait_for(mesh.nodes[returning], 100, 30) == 100, (
+        "the premise: the mesh holds the first rows")
     # What every node holds is written down, so the restart is not the one #179 is about.
     for node in mesh.nodes:
         client = client_for(node)
@@ -138,17 +174,54 @@ def test_a_node_restarted_after_missing_writes_gets_them_when_it_reconnects(mesh
             client.close()
     before = rows(writer)
 
-    mesh.kill_node(2)
+    if just_after_a_tick:
+        # Straight after one of the writer's ticks, so that what follows lands before its next one.
+        # The counter rises as a tick starts; the pause is for that tick to end.
+        ticks = metric(writer, "ob_flush_ticks_total")
+        deadline = time.monotonic() + 3 * SLOW_TICK_S
+        while metric(writer, "ob_flush_ticks_total") == ticks and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert metric(writer, "ob_flush_ticks_total") > ticks, "the premise: the writer ticks"
+        time.sleep(0.1)
+    started = time.monotonic()
+
+    mesh.kill_node(returning)
     write(writer, BASE_TS + 1_000_000, 200)
     # Not counted on the writer until the end: a count flushes it, and a flush writes the
     # checkpoint that refreshes its vector - which is the refresh this test is about.
     expected = before + 200 * len(SYMBOLS)
 
-    mesh.restart_node(2)
+    mesh.restart_node(returning)
+    if just_after_a_tick:
+        took = time.monotonic() - started
+        assert took < SLOW_TICK_S - patience(1.0), (
+            f"the premise: the writes and the restart fit in a tick, with a second to spare "
+            f"({took:.2f} s of a {SLOW_TICK_S:.0f} s tick)")
     mesh.wait_for_mm_mesh(timeout=90)
     # A catch-up at the reconnect sends what the peer lacks in well under a second here; the
     # three seconds are room, and far less than a seal interval and a reconciliation.
-    got = wait_for(mesh.nodes[2], expected, 3.0)
+    got = wait_for(mesh.nodes[returning], expected, wait_s)
     assert rows(writer) == expected, "the premise: the writer holds every row it wrote"
+    return got, expected
+
+
+def test_a_node_restarted_after_missing_writes_gets_them_when_it_reconnects(mesh):
+    got, expected = held_after_missing_writes(mesh, returning=2)
     if got < expected:
         raise Late(f"3 s after it reconnected the node holds {got} of {expected} rows")
+
+
+def test_a_node_back_within_a_tick_of_the_writes_it_missed_gets_them_when_it_reconnects(
+        slow_tick_pair):
+    # The same, with the writes and the restart inside one of the writer's ticks: the copy of its
+    # vector the returning node is compared with has none of the writes. The decision asks for a
+    # tick and the rows come with it, milliseconds after the reconnect; the wait is a tick and two
+    # seconds anyway, and ends long before the returning node's first reconciliation, the only other
+    # thing that would send them. Two nodes: a third would hold the writes too, in a copy its own
+    # tick refreshes on a clock this test does not follow.
+    wait_s = SLOW_TICK_S + patience(2.0)
+    got, expected = held_after_missing_writes(slow_tick_pair, returning=1, just_after_a_tick=True,
+                                              wait_s=wait_s)
+    if got < expected:
+        raise Late(f"{wait_s:.0f} s after it reconnected within a tick the node holds {got} of "
+                   f"{expected} rows")

@@ -15,6 +15,7 @@
 // off by a zero rather than merely forgotten — nothing filled the field in, so
 // `prev_seq != 0` never held and the check never ran.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <set>
@@ -120,6 +121,35 @@ public:
     /// the vector down" without serialising it each time.
     uint64_t fingerprint() const;
 
+    /// Every (symbol, origin) whose frontier moved since the last call, with the frontier it has now
+    /// - each once, however often it moved - or `all` when a copy kept from these must be rebuilt
+    /// from `export_vector()` instead: before the first call, and after `reset()`.
+    ///
+    /// For the copy of the vector peers are told (#180), which the flush tick keeps up to date at
+    /// every tick under the engine's lock. Exporting the whole vector there cost 286 us at 4 000
+    /// entries (p50, Release, i3-7100U) - a stall of every write, every tick anything moved; this
+    /// costs what moved. A held number is not in the vector, so only a frontier counts.
+    struct MovedFrontiers {
+        bool                     all{false};
+        std::vector<VectorEntry> moved;
+        /// `listings()` as this take left it: a copy built from it holds every frontier that moved
+        /// up to that listing, and whether one moved since is `listings()` being past it.
+        uint64_t                 listings{0};
+    };
+    MovedFrontiers take_moved_frontiers();
+
+    /// How many times a (symbol, origin) has gone onto the list `take_moved_frontiers()` hands out,
+    /// and `reset()`s: monotonic, and readable **without** the engine's lock - the one thing here
+    /// that is (#180 part D).
+    ///
+    /// After a take, the first frontier of any pair to move lists that pair, so "nothing listed
+    /// since the take" is "no frontier moved since the take": a copy of the vector kept from the
+    /// takes knows it is exact when this still equals the `listings` of its last one. The mesh
+    /// manager asks that before it tells a peer it lacks nothing, from under its own lock, which
+    /// the write path takes after the engine's - so it cannot ask the tracker itself. It rises at
+    /// most once a pair a take, not once a record.
+    uint64_t listings() const { return listings_.load(std::memory_order_acquire); }
+
     /// Records above the frontier held per (key, origin) before the set stops growing.
     ///
     /// Holding them is an optimisation — it lets a filled hole drain in one step. Dropping
@@ -166,6 +196,7 @@ private:
         uint64_t           high_water{0};      ///< largest number seen; drives gap detection
         uint64_t           frontier{0};        ///< everything up to here has been seen
         std::set<uint64_t> above_frontier;     ///< seen but not contiguous yet
+        bool               listed{false};      ///< in `moved_` since the last take
     };
 
     struct SymbolState {
@@ -174,9 +205,30 @@ private:
     };
 
     /// Record `seq` as seen from `origin` and advance the frontier as far as it now reaches.
-    static void note_seen(OriginState& st, uint64_t seq);
+    /// Returns whether the frontier moved - a redelivery, and a number held above it, do not.
+    static bool note_seen(OriginState& st, uint64_t seq);
+
+    /// List `st` for the next `take_moved_frontiers()`, once. `key` is the map's own key: the
+    /// maps are node-based, so it and `st` stay where they are until `reset()`, which drops the
+    /// list with them.
+    void mark_moved(const std::string& key, uint16_t origin, OriginState& st);
+
+    struct Moved {
+        const std::string* key;
+        uint16_t           origin;
+        OriginState*       state;
+    };
+
+    /// One more listing; see listings(). Its only writer holds the engine's lock, so a load and a
+    /// store, not a read-modify-write.
+    void count_listing() {
+        listings_.store(listings_.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+    }
 
     std::unordered_map<std::string, SymbolState> symbols_;
+    std::vector<Moved> moved_;         ///< see take_moved_frontiers()
+    bool               moved_all_{true};
+    std::atomic<uint64_t> listings_{0};   ///< see listings()
 };
 
 }  // namespace ob

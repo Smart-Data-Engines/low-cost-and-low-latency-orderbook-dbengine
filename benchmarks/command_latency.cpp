@@ -158,10 +158,13 @@ int main(int argc, char** argv) {
 
     std::sort(ns.begin(), ns.end());
     const size_t n = ns.size();
+    // p99.9 as well, for the reason pipelined_ingest reports it: a stall that comes once a flush
+    // tick touches one round trip in hundreds, and p99 does not see it (#180).
     std::printf("{\"command\": \"%s\", \"iterations\": %d, \"p50_ns\": %lld, \"p99_ns\": %lld, "
-                "\"min_ns\": %lld, \"max_ns\": %lld, \"wall_s\": %.3f, \"server_cpu_s\": %.3f, "
-                "\"answer_bytes\": %zu, \"answer_lines\": %zu}\n",
-                label.c_str(), iterations, ns[n / 2], ns[(n * 99) / 100], ns.front(), ns.back(),
+                "\"p999_ns\": %lld, \"min_ns\": %lld, \"max_ns\": %lld, \"wall_s\": %.3f, "
+                "\"server_cpu_s\": %.3f, \"answer_bytes\": %zu, \"answer_lines\": %zu}\n",
+                label.c_str(), iterations, ns[n / 2], ns[(n * 99) / 100], ns[(n * 999) / 1000],
+                ns.front(), ns.back(),
                 std::chrono::duration<double>(wall1 - wall0).count(),
                 (cpu_before < 0 || cpu_after < 0) ? -1.0 : cpu_after - cpu_before, answer_bytes,
                 answer_lines);

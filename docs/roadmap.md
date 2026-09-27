@@ -2213,6 +2213,119 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 186. A mesh node holding 4 000 symbols stalls a write for up to 0.6 s at a trickle, and refuses writes at the pipelined ceiling **P1**
+
+**Found measuring what #180's per-tick update costs, and on master as much as on the branch.** One
+mesh node, 4 000 symbols prefilled with a row each, 500 of them written once each every 100 ms, and
+`benchmarks/command_latency` timing one `INSERT` at a time, 300 000 of them (i3-7100U, Release):
+p50 45 - 50 us and p99 91 - 100 us on every build, and the largest round trip of a run 7 - 12 ms -
+or **169 - 623 ms, in six runs of twelve**, three of master's four among them, a run with one taking
+2 s longer than one without. The writer's log says nothing at INFO. And the same node under
+`benchmarks/pipelined_ingest` at two connections refused writes on master - `The pending queue did
+not free room in 5 s, so this write is refused` twice, after three waits for room that each ended in
+0.2 - 2.6 s - which is the outcome `kBackpressureDeadline` is justified in `engine.hpp` as one "a
+healthy flush never reaches even on a machine an order of magnitude slower". Both are measured and
+unexplained. Candidates, in the order to rule them out: a tick sealing many stores at once (the
+trickle makes ~40 due a tick), a merge of part 2b of #165, `syncfs()` against ext4's journal while a
+write of the WAL waits under the engine's lock, the vector's serialisation warning of #177 logged
+at every seal of a 4 008-entry vector. What decides it is the tick's locked sections timed on the
+writer (WARN above 20 ms), and the same run against a standalone node and a mesh node of 40 symbols.
+The evidence of #179 holds the runs and the writer's log of each.
+
+- Effort: M | Impact: a write that waits for over half a second, now and then, on a node an
+  exchange-sized symbol list makes large - and writes refused at a ceiling the deadline was sized
+  never to meet
+
+### 185. A restarted mesh node claims, from its segments, to have written the numbers its peers wrote, and every reconciliation scans its whole WAL for them **P1**
+
+**Found reading the start for #179, and measured with a probe (the evidence of #179).**
+`Engine::open()` declares this node's own frontier for every symbol it holds a segment of, up to the
+highest sequence number in it - sound on one node, where every row is its own, and wrong in a mesh,
+where a segment holds every origin's rows. A node that only ever received a symbol comes back from
+a restart - a clean one - claiming records of its own origin that nobody wrote. Its peers do not have
+them, so every vector it is sent says they lack them; a catch-up starts, reads this node's whole
+retained WAL looking for them, sends nothing, and counts the ranges as unfillable. Measured on three
+nodes reconciling every 5 s, ten symbols written only by node 0 and sealed on node 2, node 2 stopped
+and started: **14 catch-ups from node 2 in 30 s**, one per peer per reconciliation, each reading
+all 2 002 records of its WAL and sending none, and `ob_mm_catchup_unfillable_total` at **140** - ten
+ranges nobody wrote, fourteen times. The code this skips a scan with says what that costs at size:
+"a 1 GB WAL at the 94 MB/s this scan runs at would spend most of every interval reading itself".
+
+The declaration stays in #179's fix on purpose: without it this node's own frontier for a symbol
+several nodes write would stop at the first number another node took (#184). What would let it
+declare exactly what it wrote is the highest number of **its own** origin in each segment - the same
+fact #184's fix needs to restore its counter.
+
+- Effort: M (with #184) | Impact: a full WAL scan per peer at every reconciliation on any mesh node
+  restarted with segments of symbols it does not write, and an unfillable-range warning and counter
+  that report ranges nobody wrote
+
+### 184. A symbol two mesh nodes write gets numbers with holes in each origin's stream, so every node's frontier stops at the first, and a node that missed rows is judged to hold them **P0**
+
+**Found reading the tracker for #179, and measured with `tests/integration/test_mm_multi_writer.py`
+and the probe it was built from.** A sequence number belongs to the origin that minted it, and the
+receive path drops a record when `has_seen(key, origin, seq)` - but the counter that mints them is
+one per symbol, raised by every origin's numbers (`observe()`: "a node that both accepts client
+writes and receives a stream would hand out a number already in use"). So when two nodes write one
+symbol, neither origin's numbers for it are contiguous: node 0 writes 1-500, node 1 then 501-1 000,
+node 0 1 001-1 500. A frontier is "everything up to here", so every node's frontier for node 0 stops
+at 500 and for node 1 at 0, and everything above lives in the held set, capped at 4 096 per
+(symbol, origin). Every node then states the same frontiers, and a node that missed writes during an
+outage is compared against a vector that says it lacks nothing.
+
+Measured on three nodes reconciling every 5 s: twenty rounds of 500 rows of one symbol, taking turns
+on node 0 and node 1, then node 2 killed, two more rounds, node 2 restarted. On the branch that
+fixed #179, node 2 holds **10 000 of 11 000 rows**, forty seconds and eight reconciliations later -
+nothing is sent it, because nothing looks missing. On the build before it, **12 308**: the replay
+remembered every record as node 2's own, so node 2 looked empty, was sent everything above the
+stuck frontiers, and the numbers past the held set's cap - 404 of node 0's, 904 of node 1's - were
+stored twice. The same outage with one writer: 11 000 of 11 000 within 5.4 s, on both. And a node
+that is disconnected without a restart states the tracker it kept, which is the branch's case on
+either build. The module's second test is a strict xfail; its first, one writer, is the control.
+
+A fix numbers each origin's records for a symbol from its own counter - in a mesh, a number another
+origin minted does not raise this node's, which is what the dedup key already assumes; the replica's
+case the raise is for is origin 0 on both sides and keeps it. It also needs a restart to find that
+counter without the segments' highest number, which is every origin's: a segment that records the
+highest number of this node's own origin, which #185 needs as well. Data a mesh wrote before the fix
+keeps its holes, and a frontier cannot pass them; the repair for a node holding such a symbol is the
+one there is, a wipe and a snapshot.
+
+- Effort: M-L | Impact: a mesh node that misses writes of a symbol another node also writes never
+  gets them - silently, for as long as it runs
+
+### 183. A reconciliation took a peer's own timer for silence, and treated the peer as holding nothing ✅ **P1**
+
+**Found measuring #180, by lining up the two nodes' logs.** `reconcile_with_peers()` sends this node's
+vector to every peer and armed a deadline, `MM_VV_GRACE_MS` (2 s), for the peer's answer - but a peer
+does not answer a vector with one of its own: it sends its vector when its own reconciliation runs.
+Whenever the two nodes' timers were more than two seconds apart, the deadline expired first, and the
+peer was "treated as holding nothing and sending everything retained": a catch-up from its last
+vector, which is up to an interval old. Every such reconciliation resent what had been written since
+that vector, and after a large catch-up - whose records the last vector predates - the whole of it.
+Measured with `scripts/measure_mesh_catchup.py`, three nodes reconciling every 5 s, 300 000
+records, the build with #180's fix: 6-7 deadline catch-ups a run, and in two runs of three the whole
+catch-up sent again, 307 307 and 306 557 records, every one a duplicate the receiver dropped. It is
+also what #178's measurement recorded as "312 985 records sent a second time", which #180's first
+account attributed to a stale vector: the writer's log says `Peer 3 sent no version vector within
+2000 ms` right before it. Whether a run is hit depends only on the phase of the two timers, so it
+was in master all along - and at the default 30 s interval a peer whose timer runs more than 2 s
+after this node's is resent, at every reconciliation, what was written in the up to 30 s since its
+last vector.
+
+**Fixed:** the deadline is the handshake's only - where a peer that has stated nothing really is
+unknown and everything retained is the safe direction; a reconciliation sends the vector and waits
+for nothing. Every connected peer does send vectors: the handshake refuses any protocol but 2, which
+also makes the warning about protocol 1 after it dead code. Tests in `tests/test_mm_catchup_rounds.cpp`:
+`AReconciliationDoesNotTakeAPeersOwnTimerForSilence`, and the deadline's own case, which must stay,
+`APeerSilentSinceItsHandshakeIsSentEverything`. Measured on the tree with all three fixes, the same
+run of four rounds ABAB: the writer sent the returning node **305 895 - 306 794 records**, the batch
+once, and not one catch-up came from the deadline; master sent **317 342 - 1 916 787**, and 0 - 7 of
+a run's catch-ups came from it.
+
+- Effort: S | Impact: duplicate traffic on every reconciliation between nodes whose timers are more
+  than two seconds apart, and a second full catch-up after a large one
+
 ### 182. A mesh node logs every replicated update of a level it already holds as a conflict, at INFO **P1**
 
 **Found measuring #178.** `ConflictResolver::resolve()` compares a remote update with the state it
@@ -2252,51 +2365,169 @@ from the front moves about 210 GB.
 - Effort: S | Impact: a mesh node caught up after an outage, or bootstrapped, applied what it was sent
   at a few thousand records a second
 
-### 180. A mesh node's version vector is refreshed only when a store seals, so a peer that comes back within the seal interval is judged to hold what it missed **P1**
+### 180. A mesh node's version vector was refreshed only when a store sealed, so a peer that came back within the seal interval was judged to hold what it missed ✅ **P1**
 
 **Found measuring #178, and measured with `tests/integration/test_mm_restart.py`.** The vector a node
 compares a returning peer's against is a cache, refreshed when a checkpoint is written - and
-`flush_write_and_merge()` returns before the checkpoint when the tick sealed nothing, which since
+`flush_write_and_merge()` returned before the checkpoint when the tick sealed nothing, which since
 part 2a of #165 is most ticks: a store at a trickle seals every ten seconds. So a peer that was down
-while this node wrote, and comes back within that window, is compared against a vector without those
+while this node wrote, and came back within that window, was compared against a vector without those
 writes, judged to hold everything, and caught up only by a later reconciliation. Measured on a fresh
 three-node mesh reconciling every 5 s: a node killed after the mesh flushed, while its peer wrote
 2 000 rows, held **238 of 2 100** three seconds after it reconnected; with the default interval and
-nothing flushed, the rows it missed arrived 20 s after its restart. Nothing is lost - the next
-reconciliation sends it - but the catch-up at a reconnect, which is what a reconnect is for, does
-not. And it works the other way round too: the node that was caught up says, until it seals, that it
-lacks what it was sent. In #178's measurement the writer sent 312 985 records a second time, twelve
-rounds after the first catch-up, every one of them a duplicate the receiver dropped.
+nothing flushed, the rows it missed arrived 20 s after its restart. And the other way round: the node
+that was caught up said, until it sealed, that it lacked what it was sent, so every reconciliation in
+that window sent it all again.
 
-A fix refreshes the cache when the tracker changes rather than when a store seals, without taking
-the engine's lock from under the manager's - which is why there is a cache at all. Its test is the
-module's second strict xfail.
+**Fixed:** every flush tick, sealing or not, brings the vector peers are told up to date - at
+most one tick old, under the engine's lock the tick holds anyway and never from under the manager's,
+which is what the cache is for. **Not** by exporting it again: the first version of the fix did,
+and measured before it was kept, `export_vector()` costs **286 us at 4 000 entries** (p50, Release,
+i3-7100U; 67 us at 1 500) - a stall of every write, ten times a second, whenever anything moved. The
+tracker lists each (symbol, origin) whose frontier moved since the last take, once
+(`take_moved_frontiers()`), and the tick applies them to the cache through an index
+(`update_version_vector_cache()`): **0.6 us for 8 moved pairs at 4 000 entries**, 4.6 us for 64,
+48 us for 512, 530 us when every one moved - a tick that drains rows of all 4 000 symbols pays more
+than that for the drain. It rebuilds only after a reset, and the persist path uses the same update
+instead of the second whole export it made before. A RapidCheck property holds a copy kept from the
+moves equal to the export, whatever the tracker is asked in between, and an engine test holds what a
+peer is told equal to the whole export a flush writes into the WAL.
 
-- Effort: S-M | Impact: a returning mesh peer serves stale reads for up to a seal interval and a
-  reconciliation longer than it has to
+Measured: the module's second test passes without its marker - the returning node holds all 2 100
+rows within the three seconds. `scripts/measure_mesh_catchup.py` with reconciliation every 5 s and
+30 s of watching after the returning node caught up, Release, 300 000 records, i3-7100U, four rounds
+ABAB: master sent the returning node **317 342 - 1 916 787 records**, the batch again whenever a
+vector it sent inside the seal window reached the writer - `Peer 3 is missing 11 (symbol, origin)
+ranges` 5 s after the first catch-up began and 2.2 s after it ended - and whenever #183's deadline
+fired; the branch, with #183 fixed too, **305 895 - 306 794**, the batch once. #180's first account
+put the 312 985 records #178's measurement sent twice down to a stale vector; the writer's log says
+they were #183's.
 
-### 179. A mesh node restarted before its version vector reached the WAL stores the rows a peer sent it twice **P0**
+What the per-tick update costs a write, measured on one mesh node holding 4 000 entries, 500 of its
+frontiers moved every 100 ms by a trickle, and `benchmarks/command_latency` timing 300 000 `INSERT`s
+one at a time (it reports p99.9 since this): four runs each of master, the branch, and the branch
+without the update, **p50 45.3 - 49.7 us, p99 90.8 - 99.6 us and p99.9 0.91 - 1.33 ms across all
+twelve**, the three builds' ranges overlapping. The largest round trip of a run was 7 - 12 ms, or
+169 - 623 ms in six runs of the twelve, on every build, master included - a stall this did not bring,
+filed as #186. The same measurement with a probe in Python read the branch's p99.9 as 2.65 - 5.89 ms
+against master's 2.39 - 2.57: its clock runs in the interpreter it shares with the trickle, and it is
+why the probe is `command_latency` now. Its tests are
+`APeerIsToldWhatArrivedAfterOneTickThatSealsNothing` and `WhatAPeerIsToldIsWhatAWholeExportSays` in
+`tests/test_mm_restart_origins.cpp`, and the moved-frontier contract and a RapidCheck property that
+a copy kept from the moves is the export in `tests/test_sequence_tracker.cpp`; the mutation table is
+#179's.
+
+**And "a tick old" was still too old for the decision that reads the copy - found in this fix's own
+CI run (part D).** A tick late is what a peer reading the copy gets; a decision this node draws from
+it lasts longer. Given a peer's vector, the manager compares it with the copy and starts no scan when
+the peer lacks nothing by it - and nothing looks again before the next reconciliation, 30 s by
+default. A peer back within a tick of the writes it missed was compared with a copy that did not
+have them yet: PR #188's integration job failed the module's second test with **100 of 2 100** rows
+3 s after the reconnect. Locally it passed ten runs of ten, and the logs of the ten say how narrowly:
+the writer's last update of the copy came 2 - 96 ms before the handshake, and in three runs the copy
+still lacked 2 of the 10 symbols - the catch-up started because others were missing, and its rounds
+read the WAL, not the copy. With a tick of 1 s it failed three runs of three, both peers logging
+`Peer 3 holds everything we do (10 entries compared) — no scan` 0.7 s and 0.2 s before their copies
+caught up, and the rows coming with the reconciliation 5 s later.
+
+**Fixed:** the tracker counts listings on its moved list - a pair's first move after a take lists
+it, so "nothing listed since the take" is "no frontier moved since" - in an atomic the manager reads
+without the engine's lock (`SequenceTracker::listings()`). The copy records the listing it reaches,
+and a "lacks nothing" from a copy behind the tracker asks the engine for a tick now
+(`request_vector_refresh()`, the wake a writer at the pending ceiling uses) and waits for the one
+that brings the copy past the listing the vector found (`decide_catchup_from_vector()`, and
+`recheck_deferred_vectors()` between the io loop's passes, which wait 10 ms while a decision does) -
+at most `MM_VV_GRACE_MS`, after which the catch-up starts, its rounds filtering by the peer's vector
+anyway. The first version waited for the interval's tick instead, and at a flush interval past the
+grace nearly every wait would have ended in that scan. A scan whenever the copy is behind would not
+do at all: under writes that do not stop nearly every vector finds it behind, and that is the
+whole-WAL read every reconciliation that #57 removed. A vector's arrival also disarms the
+handshake's deadline for a silent peer, which a waiting decision would otherwise meet. Measured with
+the module's third test - two nodes ticking every 5 s and reconciling every 30 s, the writes and the
+restart straight after one of the writer's ticks (`ob_flush_ticks_total`): on the build before this,
+**six runs of six** held 100 of 2 100 rows 7 s after the reconnect; with it, **six of six** held all
+of them, the writer logging the wait at the handshake, the decision 10 - 91 ms after it and the
+catch-up of 2 000 records done 20 - 102 ms after it - with a flush interval of 5 s.
+The C++ tests are six in `tests/test_mm_catchup_rounds.cpp`, and in `tests/test_sequence_tracker.cpp`
+what `listings()` counts and a RapidCheck property that a copy whose listing is current is the export.
+Part D's mutation table, its verdicts written down before each pass: **21 mutations on the final
+tree, every one as written** - 16 killed, and the 5 that were to survive did: the second look not
+dropping a disconnected peer's wait (the rounds drop a catch-up for a connection that is gone), the
+io loop waiting 500 ms whatever waits (latency; the C++ tests take the second look themselves, and
+the writer's log has the decision 10 - 91 ms after the handshake), the two resets with the
+connection (equivalent: the second look and the next vector do the same), and a control. The row
+the requested tick adds - a wait that asks for nothing - is killed by two tests whose flush interval
+is an hour. The first two passes ran on the version that waited for the interval's tick: 20
+mutations in 22 runs, as written, two of them run again after they did not build (pitfall 484).
+
+- Effort: S-M | Impact: a returning mesh peer served stale reads for up to a seal interval and a
+  reconciliation longer than it had to
+
+### 179. A mesh node restarted before its version vector reached the WAL stored the rows a peer sent it twice ✅ **P0**
 
 **Found measuring #178, and measured with `tests/integration/test_mm_restart.py`, on both the build
-before #178 and after it.** `apply_delta_replayed()` seeds the sequence tracker with this node's own
-origin for every record the start replays - `seq_tracker_.seed(key, mm_config_.node_id, seq)` -
-whatever origin the record's header names. A record a peer sent is therefore remembered as one this
-node wrote. The version vector that would say otherwise reaches the WAL with a checkpoint, and a
-store at a trickle seals every ten seconds, so a node killed within that window comes back saying it
-holds nothing from the record's real origin; its peers send the records again, the receive path finds
-their numbers unseen for that origin, and applies them into append-only storage a second time.
+before #178 and after it.** `apply_delta_replayed()` seeded the sequence tracker with this node's own
+origin for every record the start replayed - `seq_tracker_.seed(key, mm_config_.node_id, seq)` -
+whatever origin the record's header named. A record a peer sent was therefore remembered as one this
+node wrote. The version vector that would have said otherwise reaches the WAL with a checkpoint, and
+a store at a trickle seals every ten seconds, so a node killed within that window came back saying it
+held nothing from the record's real origin; its peers sent the records again, the receive path found
+their numbers unseen for that origin, and applied them into append-only storage a second time.
 Measured on a fresh three-node mesh: 100 rows written, delivered, the node killed 1.5 s later and
-restarted - it replayed the 100 (`WAL replay: records=100 applied=100`, `No version vector in the
-WAL`) and then held **200 rows where the writer held 100**; in #178's measurement, 20 200 of 20 100.
-The same seed raises this node's local counter and claims a frontier of its own origin for records it
-never wrote, which its peers then look for and cannot find - one way #178's new warning about ranges
-older than the WAL fires without a real gap.
+restarted - it replayed the 100 and then held **200 rows where the writer held 100**; in #178's
+measurement, 300 200 of 300 100 in every round of both builds.
 
-A fix seeds a replayed record with the origin in its header and raises the local counter only for
-this node's own, and holds the segment-restored counters to the same rule; its test is the module's
-first strict xfail.
+Reading the replay for the fix found two more ways to the same duplicates. The records a restart
+reads again and **skips as stored** were not seeded at all - and since part 2a of #165 that is every
+record of every store sealed after the oldest row still waiting, whose numbers only a vector knew,
+while a vector of more than 4 096 entries is never written (#177). And the vector was written
+**after** the checkpoint: a crash between the two appends left the checkpoint, which cuts the replay,
+and not the vector that covered the records before it.
 
-- Effort: S-M | Impact: duplicate rows on any mesh node that restarts within a seal interval of
+**Fixed:** `replay_wal_tail()` seeds every DELTA of the tail - applied, or skipped as stored - under
+the origin its header names, a legacy record without one being this node's own, and
+`apply_delta_replayed()` seeds nothing; the replay line says how many were another origin's
+(`other_origins=N`). The vector is written before the checkpoint, in the same critical section. Two
+things stay as they were, on purpose: `seed()` still raises the symbol's one local counter with any
+origin's number, as a live `observe()` does, and a start still declares this node's own frontier from
+the highest number in its segments - without that declaration a node's own frontier for a symbol
+several nodes write would stop at the first number another node took. What both cost is #183 and
+#184.
+
+Measured: the module's first test passes without its marker. `scripts/measure_mesh_catchup.py`,
+Release, 300 000 records, i3-7100U, ABAB, two rounds: master **300 200 of 300 100** in both, the
+branch **300 100 of 300 100** in both - and the writer's catch-up skipped the 3 760 - 3 824 records
+the returning node had replayed, where master skipped none and sent them again. Seven tests in the
+new `tests/test_mm_restart_origins.cpp` take the restart apart on one engine: a crash is a copy of
+the data directory taken while nothing writes, a tick runs on the test's thread
+(`flush_tick_for_test()`), and each case - the WAL alone, a vector and a tail, records skipped as
+stored behind a vector too large to write, a crash straight after the checkpoint, a record from
+before the mesh - has a peer redeliver what the node held and counts the rows after a flush.
+
+**For a symbol more than one node writes, this changes what a restart gets wrong rather than fixing
+it**, and #184 is why: every origin's numbers for such a symbol have holes, so every node's frontier
+stops at the first, and a node that states them truthfully - as it does now - is judged to hold what
+it missed. Measured: 10 000 of 11 000 rows after an outage and a restart on the branch, 12 308 on
+master, where the replay's own-origin seeding made the node look empty and it was sent everything
+above the stuck frontiers. A disconnect without a restart was the branch's case on master too.
+
+**Mutation table - #179's, #180's and #183's: 30 runs in two passes, 27 as written down before
+them.** The first pass had 20 rows, and three written as killed survived; each was a finding about
+the tests rather than a verdict to move. Four restart tests counted rows straight after a
+redelivery, and a redelivered record's rows wait in the pending queue, which a query does not read -
+so a mutation that stored duplicates was invisible to the counts (rows 2 and 4; row 1 was killed by
+the tests' other assertions only), where `test_mm_dedup.cpp` had always flushed first. And the
+too-large vector only ever went through the first update after open, a whole rebuild, so the
+update's own overflow was never reached (row 14). The tests flush before they count and tick before
+the vector grows now, and the second pass reran the ten rows on that file: ten as written. Killed
+in the integration test as well: seeding this node's origin again stores 200 rows where the writer
+holds 100, and no update in a tick that seals nothing leaves the returning node 100 of 2 100 rows
+three seconds after it reconnected. Surviving as written: the update the persist path makes, which
+the sealing tick makes again straight after it; a redelivery listed as a move, which only the
+moved-frontier contract catches, the property holding because the value listed is the value held;
+and the control. Verdicts, harness and both passes' logs are in the evidence.
+
+- Effort: S-M | Impact: duplicate rows on any mesh node that restarted within a seal interval of
   receiving them - silently, and in append-only storage
 
 ### 178. A mesh node that missed more than `--mm-max-catchup-bytes` of its peers' WAL never got the rest: every catch-up stopped where the first one did ✅ **P0**
@@ -2343,7 +2574,7 @@ The same test, on the fix: **20 100 of 20 100 rows**, the writer's catch-up `fin
 
 **Measured in Release builds on the i3-7100U**, master `1eb78aa` against this branch, with
 `scripts/measure_mesh_catchup.py`: three nodes; one killed while its peer wrote 300 000
-single-level rows to ten symbols; the writer flushed, so its vector names them (#180 otherwise);
+single-level rows to ten symbols; the writer flushed, so its vector names them (#180 otherwise, since fixed);
 the node restarted - and all along, a probe on the writer sending one `INSERT` at a time. ABAB, two
 rounds of each:
 
@@ -2359,7 +2590,7 @@ On master the returning node was dropped for not draining, came back, and was se
 scan, 6.5 s at the longest. The one probe of 131 ms on the branch came 4.3 s after the restart,
 when the catch-up had finished; the longest the catch-up held the lock in that run was 4.2 ms. The
 returning node holds 100 rows more than the writer in every run of both builds: the rows it had
-before the kill, stored twice after it, which is #179.
+before the kill, stored twice after it, which was #179 - fixed since, and 300 100 of 300 100 in the same measurement now.
 
 **Mutation table: 28 runs, 24 as written down before them** - 19 killed and 5 surviving where the
 verdict said, in two passes. The first pass had 25 rows; four written as killed survived, and each
@@ -2430,6 +2661,13 @@ The control flushes before it measures, because it found something smaller on th
 vector is refreshed when a checkpoint is written, and since part 2a of #165 that can be ten seconds
 after a write, so a reconciliation in between sends the batch back to where it came from - 1 500
 duplicates on two nodes of three, below the limit, in the first run without the flush.
+
+**The other side of the limit, found reading the decision for #180's part D and not measured, is
+worse.** `export_version_vector()` hands out nothing once the copy holds more than 4 096 entries, and
+the decision on a peer's vector reads nothing as "the peer lacks nothing" unless that vector asks
+for everything - so a peer whose own vector fits, a joiner above all, is never caught up from such a
+node: past 1 561 entries it asks for no snapshot, and past 4 096 on the sender it is sent no
+catch-up either. The fix has to make that decision say "unknown" there rather than "nothing".
 
 A fix carries a vector of any size - in parts, on the wire and in the WAL - and compares two
 vectors without a loop inside a loop, which `compare_vectors()` has for the direction this node
@@ -11509,22 +11747,32 @@ measures the harness.
 
 ## Recommended order
 
-**#179 is the open P0**, and **#169, #175, #176, #177, #180 and #182 are open P1s** — the mechanical
-list is the `Open:` line below; read it there rather than trusting this paragraph, which is prose and
-has been wrong about this before. All five mesh items were found measuring the first of them, and so
-were two that are closed: **#178 was a P0** - a mesh node that missed more than
-`--mm-max-catchup-bytes` of its peers' WAL never got the rest, 6 990 of 20 100 rows for good,
-because every catch-up started at the first record and stopped where the first had; a catch-up is
-rounds from a cursor now, read without the lock every local write takes - and **#181**: a node
-applied a burst of frames in quadratic time, erasing each from the front of its receive buffer, 123 s
-for a catch-up its peer sent in 0.1 s; 1.8 s now. **#179**: a mesh node
-restarted before its version vector reached the WAL remembers the rows it replayed as its own, is
-sent them again and stores them twice - 200 rows where the writer holds 100. **#177**: a version
-vector past 1 561 entries asks for everything, so every reconciliation resends the whole retained WAL
-and a joining node never asks for a snapshot. **#180**: a node's vector is refreshed only when a
-store seals, so a peer that comes back within the seal interval is judged to hold what it missed.
-**#182**: every replicated update of a level a node holds is logged at INFO as a conflict - 61 MB of
-log for 300 000 writes.
+**#184 is the open P0**, and **#169, #175, #176, #177, #182, #185 and #186 are open P1s** — the
+mechanical list is the `Open:` line below; read it there rather than trusting this paragraph, which
+is prose and has been wrong about this before. **#184**: when two mesh nodes write one symbol, the
+one counter per symbol gives each origin's numbers holes, so every node's frontier for it stops at
+the first and a node that missed rows is judged to hold them - 10 000 of 11 000 after an outage, for
+good; it is the next piece of work, with **#185** beside it, which the same fix closes: a restarted
+node claims from its segments the numbers its peers wrote, and every reconciliation scans its whole
+WAL for them. The mesh items were found measuring #178, and so were five that are closed: **#178
+was a P0** - a mesh node that missed more than `--mm-max-catchup-bytes` of its peers' WAL never got
+the rest, 6 990 of 20 100 rows for good, because every catch-up started at the first record and
+stopped where the first had; a catch-up is rounds from a cursor now, read without the lock every
+local write takes - **#181**: a node applied a burst of frames in quadratic time, erasing each from
+the front of its receive buffer, 123 s for a catch-up its peer sent in 0.1 s; 1.8 s now - **#179 was
+a P0**: a mesh node restarted before its version vector reached the WAL remembered the rows it
+replayed as its own, was sent them again and stored them twice, 200 rows where the writer held 100;
+replay seeds each record under the origin its header names now, the records it skips as stored
+included, and the vector goes into the WAL before the checkpoint - **#180**: a node's vector was
+refreshed only when a store sealed, so a peer back within the seal interval was judged to hold what
+it missed; every tick brings it up to date now, at the cost of the frontiers that moved - and
+**#183**, found measuring #180: a reconciliation took a peer's own timer for silence and treated the
+peer as holding nothing, resending everything since its last vector. **#186** was found measuring
+#180's cost, on master too: a mesh node of 4 000 symbols stalls a write for up to 0.6 s at a
+trickle, and refuses writes at the pipelined ceiling. **#177**: a version vector past 1 561 entries
+asks for everything, so every reconciliation resends the whole retained WAL and a joining node never
+asks for a snapshot. **#182**: every replicated update of a level a node holds is logged at INFO as
+a conflict - 61 MB of log for 300 000 writes.
 **#176** was found writing part 2b of #165: a mesh snapshot names each file by a 16-bit index, so a
 node of 8 192 segments — 8 192 instruments, whatever merging does — cannot bootstrap a peer that
 joins it; measuring it found #177 first. **#175**: sharding by symbol has no control plane — no shard writes itself or
@@ -11595,7 +11843,7 @@ fifth off a three-column question. Every P0 raised before it —
 (#73 while proving #70, #82's true cause while proving #82's smaller half, #97 from the flicker of
 #96's own test).
 
-**Open: #169, #174, #175, #176, #177, #179, #180, #182.** Every other item above #58 is marked closed, and
+**Open: #169, #174, #175, #176, #177, #182, #184, #185, #186.** Every other item above #58 is marked closed, and
 `scripts/check_roadmap.py` holds that in both directions — an item whose heading loses its tick has
 to appear on this line in the same commit, and one that gains a tick has to leave it. Items #1 to
 #58 are planned work nobody has built, not defects, which is what the floor in this line is for.
@@ -11733,12 +11981,13 @@ The capability items are in the table below.
 
 | Priority | Item | Effort | Why now |
 |----------|------|--------|---------|
-| **P0** | A mesh node restarted within a seal interval of receiving rows stores each of them once (#179) | S–M | The replay seeds every record with this node's origin, so a node restarted before its version vector reached the WAL is sent the rows it replayed again and applies them into append-only storage: 200 rows where the writer holds 100 |
+| **P0** | A mesh node that missed writes of a symbol another node also writes gets them back (#184) | M–L | One counter per symbol gives each origin's numbers holes when two nodes write it, so every node's frontier stops at the first and a node that missed rows is judged to hold them: 10 000 of 11 000 after an outage, for good |
 | **P1** | An exchange name with a dot is refused, so no two instruments share a key (#169) | S–M | `A.B` on `C` and `A` on `B.C` share one live book, one sequence counter and one store, silently |
 | **P1** | Sharding by symbol gains its control plane: the shards write the map, and both clients read it (#175) | M–L | A shard writes neither itself nor the map to etcd, owns every symbol, and a second one on the same etcd becomes the first one's replica; neither client can find a shard |
 | **P1** | A version vector of any size, so a mesh of thousands of instruments neither resends its WAL every reconciliation nor refuses a joiner its snapshot (#177) | M | Past 1 561 (symbol, origin) entries a vector is sent as "send everything": 9 600 - 20 800 duplicates a node in a 16 s window where 1 500 entries cost none, and a joiner that never asks for a snapshot |
 | **P1** | A mesh logs a conflict only where two origins wrote one level, and as a count rather than a line each (#182) | S | Every replicated update of a level the node holds is logged at INFO as a conflict, same origin or not: 301 985 lines, 61 MB, for 300 000 writes |
-| **P1** | A returning mesh peer is caught up at its reconnect, whatever this node wrote since its last seal (#180) | S–M | A node's vector is refreshed only when a store seals, so a peer back within ten seconds is judged to hold what it missed: 238 of 2 100 rows three seconds after it reconnected |
+| **P1** | A restarted mesh node declares from its segments only the numbers it wrote (#185) | M (with #184) | It claims the numbers its peers wrote, so every reconciliation scans its whole WAL for ranges nobody wrote: 14 catch-ups in 30 s that sent nothing, 140 ranges counted unfillable |
+| **P1** | A mesh node of 4 000 symbols neither stalls a write for half a second nor refuses writes at the pipelined ceiling (#186) | M | Measured on master and the branch alike and not yet explained: the largest round trip of a run 169–623 ms in six runs of twelve, and writes refused when the pending queue did not free room in 5 s |
 | **P1** | A mesh snapshot carries any number of files, so a peer can join a node of 8 192 segments or more (#176) | M | A mesh snapshot names a file by a 16-bit index, so a node of 8 192 segments - 8 192 instruments, whatever part 2b merges - cannot bootstrap a peer that joins it; found reading the sender, not yet measured |
 | **P2** | A start finds its last checkpoint without reading the whole WAL twice (#174) | S–M | Since part 2b of #165 the index is 1.9 - 2.9 s of a cold start after a twenty-minute soak, 5.9 - 6.8 s, and the WAL most of the rest - and a start reads it twice even when the checkpoint covers every record |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
@@ -11881,11 +12130,20 @@ absolute thresholds for a designated benchmark host.
 
 ### Test suite
 
-Verified by [the full CI run for PR #186](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/36262489880),
-on the tree whose flush tick merges a symbol's small segments (#165, part 2b).
+Verified by [the full CI run for PR #187](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/36280397819),
+on the tree whose mesh catch-up is rounds from a cursor (#178) and whose receive buffer is consumed
+in one pass (#181).
 
-**Against PR #184's run (1348 and 400) C++ is +42 and integration +5, and both reconcile to
-files.** All of them are part 2b of #165's: twenty in the new `tests/test_compaction_store.cpp`,
+**Against PR #186's run (1390 and 405) C++ is +17 and integration +2, and both reconcile to
+files.** Eight in the new `tests/test_wal_cursor.cpp`, eight in the new
+`tests/test_mm_catchup_rounds.cpp` and two in the new `tests/test_mm_receive.cpp`, less Property 8
+of `tests/test_mm_networking.cpp`, which asserted the snapshot fall-back #178 removed. The two
+integration tests are `test_mm_catchup_ceiling.py` and the control of
+`test_mm_version_vector_scale.py`; five more ran as xfails of #176, #177, #179 and #180, which a
+passing count does not include.
+
+**Before that, against PR #184's run (1348 and 400) C++ was +42 and integration +5, and both
+reconciled to files.** All of them are part 2b of #165's: twenty in the new `tests/test_compaction_store.cpp`,
 eleven in the new `tests/test_compaction_policy.cpp` and eleven in the new
 `tests/test_compaction.cpp`, and the five integration tests are the new `test_compaction.py`.
 
@@ -11987,9 +12245,9 @@ ran 265 tests, because `re.search` returns the *first* match and pytest's verdic
 
 | Suite | Count | Status |
 |-------|-------|--------|
-| C++ (GTest + RapidCheck) | 1390 | **1390 on PR #186's tree**, measured by CI — forty-two more than the row before, all of them part 2b of #165's: twenty in the new `tests/test_compaction_store.cpp`, eleven in the new `tests/test_compaction_policy.cpp` and eleven in the new `tests/test_compaction.cpp` — and locally `ctest -j1` gave **1390/1390 in 252.07 s** on the i3-7100U on that branch. **Before that**, 1348 on PR #184's tree, measured by CI — unchanged, because #172 added none — and locally `ctest -j1` passed on that branch. **Before that**, 1348 on PR #183's tree, measured by CI — forty-seven more than the row before, all of them part 2a of #165's: sixteen in the new `tests/test_row_blocks.cpp`, seventeen in the new `tests/test_lazy_flush.cpp` and fourteen in the new `tests/test_seal_epochs.cpp` — and locally `ctest -j1` gave **1348/1348 in 268.80 s** on the i3-7100U on that branch. **Before that**, 1301 on PR #180's tree, measured by CI — five more than the row before, all five in the new `tests/test_snapshot_query.cpp` (#167 and #168) — and locally `ctest -j1` gave **1301/1301 in 235.78 s** on the i3-7100U on that branch. **Before that**, 1296 on PR #179's tree, measured by CI — fourteen more than the row before, all fourteen in the new `tests/test_segment_index.cpp` (part 1 of #165) — and locally `ctest -j1` gave **1296/1296 in 226.59 s** on the i3-7100U on that branch. **Before that**, 1282 on PR #178's tree, measured by CI — eleven more than the row before, all eleven in the new `tests/test_segment_time_range.cpp` (#166) — and locally `ctest -j1` gave **1282/1282 in 231.86 s** on the i3-7100U on #166's branch. **Before that**, 1271 on PR #177's tree, and locally 1271/1271 in 256.94 s on #164's branch. **Before that**, 1249 on PR #176's tree, and locally 1249/1249 in 226.63 s on #163's branch. **Before that**, 1239 on PR #175's tree, and locally 1239/1239 in 223.84 s on #162's branch; and 1236 on PR #174's tree, and locally 1236/1236 in 223.5 s on #160's branch. **Before that**, 1236 on PR #173's tree, and locally 1236/1236 in 216.0 s on #159's branch. **Before that**, 1228 on PR #172's tree, and locally 1228/1228 in 226.7 s on #158's branch rebased onto PR #171's merge. **Before that**, 1182 on PR #169's tree. **Before that**, 1181, measured by CI on #151's tree; locally `ctest -j1` gave **1181/1181 in 262 s** on the i3-7100U on #151's branch, with the build clean and warning-free. **Before that**, 1151, and locally 1151 passed in a single `ctest -j1` run on the i3-7100U with the build clean and warning-free. **Before that**, all passing with `ctest -j1` on the i3-7100U, **205 s in a single run** — **thirty-one more than master, and the breakdown is one file per question** (#139). Nine are the new `tests/test_query_columns.cpp`: what a select list resolves to, that `columns_to_read()` is wider than the output list because a filter reads what the answer does not carry, and that the canonical order is the table's order. Eight in `tests/test_response_formatter.cpp` cover the narrowed path against the unrolled one **by formatting each column alone and cutting that field out of the `SELECT *` output** — a content-based dispatch means no call can be made to take the general path over the canonical shape, so the two are held together by construction rather than by a literal. Eight in `tests/test_query_engine.cpp`, three in `tests/test_columnar_store.cpp` — including the one that found a guarantee stated three times, where a hardcoded `true` made two widenings unobservable and the mutation for them survived — and three in `tests/test_client.cpp` for the two clients' refusals, because both read a row by position and neither can read a narrowed answer. **Before them**, **four more than the previous commit, and all four are about the machine this tree had never run on**: two in `tests/test_mm_snapshot.cpp` pin the ten header bytes of a snapshot chunk literally rather than through our own decoder, and a full-size chunk, because the frame is sized once now (PR #146); two in `tests/test_crc32c.cpp` are the pair that makes the rest of that file mean anything on this architecture — one skips with an explanation where there is only the table to compare against itself, which is what every agreement test had been doing off x86, and one requires the implementation the engine *reports* to be the one that runs (PR #147) across the four runs this tree and its two predecessors recorded, against 236-390 s three commits back when another session's containers were resident — the spread, not either end, is what the next number is read against. **Four more than the previous commit, and the arithmetic is worth writing down: six new and two removed** (#121). The six are three in `tests/test_hlc_skew.cpp` — the bound accepts up to itself and refuses one nanosecond past it, a peer behind us is plausible however far behind, and `UINT64_MAX` is refused so the logical carry can never saturate — and three in `tests/test_mm_wire_clock.cpp`, which is the only instrument that can reach this at all: a fake peer framing one DELTA whose HLC says what no real clock would. The two removed are the ones that **pinned the behaviour this decision reverses**, `AnHourInTheFutureOnTheWireBecomesThisNodesClockAndStays` and `ARecordFromAPeerWhoseClockIsWrongIsStillApplied`, both written by #54's stage D to state that nothing bounded the absorption. They were not deleted into a gap: the same file now asserts the opposite about the same wire shape, which is what makes a falling count readable rather than alarming. **And the local number that preceded this row was wrong by exactly those four.** A full local run on this branch printed `1094/1094` against a build directory that had not registered the four; the reconciliation is three measurements agreeing — CI's 1098, `ctest -N` listing 1100, and a local rerun after the merge giving **1098 passed in 218.95 s**. A stale build answers in the same voice it would use if it were right, which this repository has now paid for in five different shapes. **Before it**, unchanged by three commits: #134 deleted two methods no test referenced, and #135's tests are integration ones — three runs of the same suite on the same machine, the slowest with another session's containers resident and ~1 GB actually free. That spread, not any one of its ends, is what the next number is read against: it is wider than anything a commit in this repository has changed. **Seven more than the previous commit, and all seven are #131's.** Five are `LoopGuard`'s own, in the new `tests/test_loop_guard.cpp`: the counter counts every failing iteration rather than every episode, the episode counts consecutive failures and reopens after a recovery, two successes running report nothing (the observable half of "loud once" for a loop that polls ten times a second), a **null** registry still gets loud-once because two of the seven loops run in somebody else's process, and the name it writes is in the registry's own output. The other two are the descriptor `MetricsServer::handle_request` used to leak on the paths that throw — one behavioural, fifty requests against a live server with no growth in `/proc/self/fd`, and one static, because **the throwing path cannot be driven**: nothing in the process can make `serialize()` fail on demand and a knob to make it would be a knob nothing turns in production. **Before them**, four were #112's last two loops. Three are in the new `tests/test_replication_io_boundary.cpp`: that the pacing function returns zero only while a catch-up can progress, that nothing in `run_loop()` assigns `wait_ms` any other way (counted at **three** sites, because losing the one in the `catch` is the regression), and that both `try`s are where they have to be — anchored on the dispatch loop's own line rather than on a log phrase, which is the mistake #128's version of this test made. The fourth is in `tests/test_thread_boundaries.cpp` and is the one worth reading: the set of loops that guard an iteration is **derived from the tree** rather than listed, because a mutation deleting a row from the hand-written list **survived**. Fourteen `void Class::…loop()` definitions in `src/`, one a notifier with no loop in it and named, six of the remaining thirteen guarded and **seven not** — those seven are #131. Checked in both directions, so a loop in neither list fails and a row naming a function the tree no longer has fails too. **Before them**, the most recent addition was #129's: a registry given a 1200-second lease interval has to stop inside two seconds, which is a property stated three orders of magnitude clear of load rather than a duration. **Before it**, four were #128's, and they divide the way that defect does: three in `tests/test_mm_epoll_identity.cpp` are about the shape — that the two reserved event keys cannot collide with a connection, that closing a descriptor takes its registration with it (measured against `dup2`, which forces the reuse the defect needs instead of hoping for it), and that no registration in `src/multi_master.cpp` carries a bare descriptor number. The fourth is behavioural: a connection landing on the descriptor its predecessor gave back is its own connection, with both numbers read back so a run where the kernel did not recycle the number says so rather than passing quietly. Three of the six mutations in that item's table are killed by the static test **and by nothing else**, which is what says it carries weight. **Before them**, two were #126's, and they pin the replayer's rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. **Earlier**: two were #54's D3, three #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists **1085**: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The count that passes and the count CTest lists differ by exactly those two harnesses, always; a row two commits back gave one number for both. The runtimes are what this machine gave on the commit measured, not a budget |
-| Python integration | 405 | **`405 passed, 2 skipped in 29:23`** on the GitHub runner for PR #186's tree — five more than the row before, all in the new `test_compaction.py` (part 2b of #165) — and locally `405 passed, 2 skipped in 29:58` on the i3-7100U on that branch, one commit before its head, whose one C++ change was a destructor `ctest` covers. **Before that**, `400 passed, 2 skipped in 29:08` on the GitHub runner for PR #184's tree — seven more than the row before, all in the new `test_sharded_pool.py` (#172) — and locally `400 passed, 2 skipped in 30:15` on the i3-7100U on that branch. **Before that**, `393 passed, 2 skipped in 28:56` on the GitHub runner for PR #183's tree — twelve more than the row before: nine in the new `test_reply_attribution.py` (#170 and #171, PR #181) and three in the new `test_lazy_flush.py` (part 2a of #165) — and locally `393 passed, 2 skipped in 29:36` on the i3-7100U on that branch. **Before that**, `381 passed, 2 skipped in 25:15` on the GitHub runner for PR #180's tree — three more, all in the new `test_snapshot_query.py` (#167 and #168) — and locally `380 passed, 1 failed, 2 skipped in 26:24` on the i3-7100U on that branch, the failure the one #170 is about. **Before that**, `378 passed, 2 skipped in 25:45` on PR #179's tree — unchanged, because part 1 of #165 added none; its wire measurement is the soak — and locally `378 passed, 2 skipped in 25:51` on the i3-7100U on that branch. **Before that**, `378 passed, 2 skipped in 25:05` on PR #178's tree — six more, all in the new `test_segment_time_range.py` (#166) — and locally `378 passed, 2 skipped in 26:01` on the i3-7100U on #166's branch, with `OB_POWER_CUT_TESTS=1`. **Before that**, `372 passed, 2 skipped in 25:25` on PR #177's tree, and locally 372 in 26:06 on #164's branch. **Before that**, `364 passed, 2 skipped in 25:05` on PR #176's tree, and locally 364 in 24:48 on #163's branch. **Before that**, `363 passed, 2 skipped in 24:34` on PR #175's tree, and locally 363 in 24:52 on #162's branch; and `360 passed, 2 skipped in 24:15` on PR #174's tree, the six power-cut tests among them, and locally 360 in 24:35 on #160's branch. **Before that**, `345 passed, 2 skipped in 23:55` on PR #173's tree, and locally 345 in 23:51 on #159's branch. **Before that**, `340 passed, 2 skipped in 23:25` on PR #172's tree, and locally 340 in 22:55 on #158's code before its rebase. **Before that**, `330 passed, 2 skipped in 22:38` on PR #169's tree, and before that `327 passed, 2 skipped in 22:56`, and before that `299 passed, 2 skipped in 22:44`, and before that all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 280; count pytest's final result rather than the report plugin's progress characters. `280 passed, 2 skipped in 22:42` on the GitHub runner for this commit — **seven more than master, and all seven are the new `test_column_projection.py`**, which asks the question over the raw protocol on purpose: both of our clients read a row by position, so neither can read a narrowed answer and the refusals are at the bottom of that file. **Two of its tests had never run to completion before this run** — the branch's previous CI was cancelled — and both failed on the first one that did. One pinned the seven-column header as a literal in `src/response_formatter.cpp`, which this branch replaced with a generator and then deleted; it reads the column table now, which is stronger, because a dead literal can agree with a header nothing prints. The other wrote one row per test into one symbol on a session-scoped cluster, so with storage append-only the seventh test read seven rows where it had written one — and **29:20 for the same 273 under TSan**, which is the job that has to be read as well, because a battery that skips under instrumentation reads as green. Against `20:37` on the development machine (i3-7100U, native etcd) **for the 263-test tree seven commits back** — the figure is kept as the spread to expect between the two machines, and labelled with the tree it came from rather than silently paired with a count it never measured. **Unchanged by #121, and the reason is the instrument rather than the effort**: producing a real node whose physical clock is five minutes off needs the host clock moved or a time namespace, which is not something this battery can do to the machine it runs on — so the assertion lives at the wire instead, where #54's stage D already built the fake peer for it. **Before it, one more than the commit before, in the existing `test_failover_storage_faults.py` beside the control that was already there** (#130): what a node *says* while it holds a leader key it won and cannot act on. The assertion with teeth is sampled rather than read once — `ROLE` must never name this node's own replication port as the primary it follows, across a twenty-second window in which the pre-fix code answered exactly that on **every** sample. The second assertion is that the condition is reported **once**, with what an operator can do about it, because the loop runs every second and the storage that refused the record usually goes on refusing it. Measured against the two source files from the commit before that fix: **1 failed, 2 passed in 66.8 s**, the failure arriving on the **first** sample with `REPLICA 127.0.0.1:43273 2` and #112's two tests untouched. **Before it, two more, both in the new `test_coordinator_endpoint_order.py`, and the second is a control rather than a second case** (#135): the same unreachable coordinator endpoint in the harmless position, which passed before that fix and has to keep passing — without it, a harness that quietly stopped prepending anything would leave the first test green and meaningless. Both assert their premise from `Popen.args`, the command line the node actually got, rather than from the attribute that put it there, because an attribute is what the harness *meant* to say. The first also requires the mesh to form on top of both registrations, because that is the only assertion reaching the third of the three call sites: two registered nodes that never see each other is a topology watch still reading the wrong endpoint. Measured against the four source files from the commit before that fix, harness and tests unchanged: **1 failed, 1 passed in 50.1 s**, the failure naming both nodes. **Before them, one more than the commit before that, and all three in `test_peer_lease_lost.py` were rewritten**, because #132 turned the first one's premise inside out: it was written to assert that the registration **does not** come back, with a note saying that the day that loop learns to re-register is the day it fails. That day was this commit. It now polls **both** halves — the key and the log line — because the key lands in etcd before the line lands in the log, and reading the log once at the moment the key appears is a race the first rewrite lost. The #133 test needed a **new premise** as well (`stop_etcd()` rather than a revoke, which also exercises the branch that keeps this fix quiet), because after #132 a revoked lease is no longer a permanent condition, and counting log lines over a condition that repairs itself counts a condition that happened once. **The third is the one that says the gate is real**: a refusal over a key that **exists**, which nothing else in this battery produces — `redirect_peer()` writes without a lease, so the test captures the lease id before redirecting and revokes it by id afterwards. Its control is the *premise* rather than the outcome, because without asserting that a refusal reached the log it passes against a node whose refresh is succeeding. The other two gained a rate bound that is independent of wording: the count of registry lines above `DEBUG` across the window, measured at one and two. This tree's battery ran locally only as **the one module** (3 tests in **40 s**, and stage C's twelve in **3:37** as the regression check on the fixture this fix had to leave alone); the whole battery on this commit is CI's, and the 224-235 s `ctest` above is local. **Before them**, two were #112's `monitor_loop` half and both in the new `test_failover_storage_faults.py`: a replica whose data directory refuses the `EPOCH` record a role transition writes loses that monitor tick and not the thread, and its control at a size nothing writes, which must inject nothing. The assertion that carries the guarantee in the first of the two is the **recovery** line rather than the error line — only a later tick can write it, so a run in which the thread died would report the error and then say nothing, which is what a boundary is for. The pair costs **45.7 s** locally, and the module asserts its own premise: `OB_FAULT_PATH=ob_node1_` names the replica's data directory only because `ClusterManager.start()` waits for node-0 to hold PRIMARY before it starts node-1, and a change to that ordering would aim the injector at the **primary's** startup promotion, which exits the process. **Before them**, two were #112's `io_loop` half and both in the new `test_mesh_storage_faults.py`: a mesh receiver whose WAL refuses one record still receives the ones after it (**38.6 s**, because it waits for a mesh to form and for four records to cross it), and its control at a size nothing writes, which must inject nothing (**28.2 s**); that pair costs **67 s** locally. **Before those**: three were #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
-| Python integration under TSan | 405 | **`405 passed in 36:04`** on the GitHub runner for PR #186's tree, against **29:23** uninstrumented on the same runner. **Before that**, `400 passed in 36:10` on PR #184's tree, against 29:08 uninstrumented. **Before that**, `393 passed in 35:50` on PR #183's tree, against 28:56 uninstrumented. **Before that**, `381 passed in 32:09` on PR #180's tree, against 25:15 uninstrumented. **Before that**, `378 passed in 32:41` on PR #179's tree, against 25:45 uninstrumented. **Before that**, `378 passed in 32:09` on PR #178's tree, against 25:05 uninstrumented. **Before that**, `372 passed in 32:04` on PR #177's tree, against 25:25 uninstrumented — instrumentation's cost is the difference between two runs on one machine. **Before that**, `364 passed in 31:35` on PR #176's tree, and `363 passed in 31:15` on PR #175's tree, and `360 passed in 30:48` on PR #174's tree, and `345 passed in 30:13` on PR #173's tree, and `340 passed in 29:39` on PR #172's tree, and `330 passed in 29:56` on PR #169's tree, and before that `327 passed in 29:28`, and before that `299 passed in 29:18`, and before that all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `280 passed in 29:06` on the GitHub runner for this commit. **This row was four behind, and the tool that exists to prevent that had already printed the right number**: the citation above it named [PR #139's run](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/34947630036), which reported `273 in 29:06`, while the cell said `269 in 28:17` — a run on an older tree. `scripts/test_table.py` prints all three counts in one block precisely so that one edit carries them together, and the previous table commit carried two of the three. Reading it is the part a script cannot do — and this job is what closed #122: it turned **red** on the pull request for #117 with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **22:02** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
+| C++ (GTest + RapidCheck) | 1407 | **1407 on PR #187's tree**, measured by CI — seventeen more than the row before: eight in the new `tests/test_wal_cursor.cpp`, eight in the new `tests/test_mm_catchup_rounds.cpp` and two in the new `tests/test_mm_receive.cpp`, less Property 8 of `tests/test_mm_networking.cpp` (#178) — and locally `ctest -j1` gave **1407/1407 in 250.73 s** on the i3-7100U on that branch, before its last four commits, which changed no C++. **Before that**, 1390 on PR #186's tree, measured by CI — forty-two more than the row before, all of them part 2b of #165's: twenty in the new `tests/test_compaction_store.cpp`, eleven in the new `tests/test_compaction_policy.cpp` and eleven in the new `tests/test_compaction.cpp` — and locally `ctest -j1` gave **1390/1390 in 252.07 s** on the i3-7100U on that branch. **Before that**, 1348 on PR #184's tree, measured by CI — unchanged, because #172 added none — and locally `ctest -j1` passed on that branch. **Before that**, 1348 on PR #183's tree, measured by CI — forty-seven more than the row before, all of them part 2a of #165's: sixteen in the new `tests/test_row_blocks.cpp`, seventeen in the new `tests/test_lazy_flush.cpp` and fourteen in the new `tests/test_seal_epochs.cpp` — and locally `ctest -j1` gave **1348/1348 in 268.80 s** on the i3-7100U on that branch. **Before that**, 1301 on PR #180's tree, measured by CI — five more than the row before, all five in the new `tests/test_snapshot_query.cpp` (#167 and #168) — and locally `ctest -j1` gave **1301/1301 in 235.78 s** on the i3-7100U on that branch. **Before that**, 1296 on PR #179's tree, measured by CI — fourteen more than the row before, all fourteen in the new `tests/test_segment_index.cpp` (part 1 of #165) — and locally `ctest -j1` gave **1296/1296 in 226.59 s** on the i3-7100U on that branch. **Before that**, 1282 on PR #178's tree, measured by CI — eleven more than the row before, all eleven in the new `tests/test_segment_time_range.cpp` (#166) — and locally `ctest -j1` gave **1282/1282 in 231.86 s** on the i3-7100U on #166's branch. **Before that**, 1271 on PR #177's tree, and locally 1271/1271 in 256.94 s on #164's branch. **Before that**, 1249 on PR #176's tree, and locally 1249/1249 in 226.63 s on #163's branch. **Before that**, 1239 on PR #175's tree, and locally 1239/1239 in 223.84 s on #162's branch; and 1236 on PR #174's tree, and locally 1236/1236 in 223.5 s on #160's branch. **Before that**, 1236 on PR #173's tree, and locally 1236/1236 in 216.0 s on #159's branch. **Before that**, 1228 on PR #172's tree, and locally 1228/1228 in 226.7 s on #158's branch rebased onto PR #171's merge. **Before that**, 1182 on PR #169's tree. **Before that**, 1181, measured by CI on #151's tree; locally `ctest -j1` gave **1181/1181 in 262 s** on the i3-7100U on #151's branch, with the build clean and warning-free. **Before that**, 1151, and locally 1151 passed in a single `ctest -j1` run on the i3-7100U with the build clean and warning-free. **Before that**, all passing with `ctest -j1` on the i3-7100U, **205 s in a single run** — **thirty-one more than master, and the breakdown is one file per question** (#139). Nine are the new `tests/test_query_columns.cpp`: what a select list resolves to, that `columns_to_read()` is wider than the output list because a filter reads what the answer does not carry, and that the canonical order is the table's order. Eight in `tests/test_response_formatter.cpp` cover the narrowed path against the unrolled one **by formatting each column alone and cutting that field out of the `SELECT *` output** — a content-based dispatch means no call can be made to take the general path over the canonical shape, so the two are held together by construction rather than by a literal. Eight in `tests/test_query_engine.cpp`, three in `tests/test_columnar_store.cpp` — including the one that found a guarantee stated three times, where a hardcoded `true` made two widenings unobservable and the mutation for them survived — and three in `tests/test_client.cpp` for the two clients' refusals, because both read a row by position and neither can read a narrowed answer. **Before them**, **four more than the previous commit, and all four are about the machine this tree had never run on**: two in `tests/test_mm_snapshot.cpp` pin the ten header bytes of a snapshot chunk literally rather than through our own decoder, and a full-size chunk, because the frame is sized once now (PR #146); two in `tests/test_crc32c.cpp` are the pair that makes the rest of that file mean anything on this architecture — one skips with an explanation where there is only the table to compare against itself, which is what every agreement test had been doing off x86, and one requires the implementation the engine *reports* to be the one that runs (PR #147) across the four runs this tree and its two predecessors recorded, against 236-390 s three commits back when another session's containers were resident — the spread, not either end, is what the next number is read against. **Four more than the previous commit, and the arithmetic is worth writing down: six new and two removed** (#121). The six are three in `tests/test_hlc_skew.cpp` — the bound accepts up to itself and refuses one nanosecond past it, a peer behind us is plausible however far behind, and `UINT64_MAX` is refused so the logical carry can never saturate — and three in `tests/test_mm_wire_clock.cpp`, which is the only instrument that can reach this at all: a fake peer framing one DELTA whose HLC says what no real clock would. The two removed are the ones that **pinned the behaviour this decision reverses**, `AnHourInTheFutureOnTheWireBecomesThisNodesClockAndStays` and `ARecordFromAPeerWhoseClockIsWrongIsStillApplied`, both written by #54's stage D to state that nothing bounded the absorption. They were not deleted into a gap: the same file now asserts the opposite about the same wire shape, which is what makes a falling count readable rather than alarming. **And the local number that preceded this row was wrong by exactly those four.** A full local run on this branch printed `1094/1094` against a build directory that had not registered the four; the reconciliation is three measurements agreeing — CI's 1098, `ctest -N` listing 1100, and a local rerun after the merge giving **1098 passed in 218.95 s**. A stale build answers in the same voice it would use if it were right, which this repository has now paid for in five different shapes. **Before it**, unchanged by three commits: #134 deleted two methods no test referenced, and #135's tests are integration ones — three runs of the same suite on the same machine, the slowest with another session's containers resident and ~1 GB actually free. That spread, not any one of its ends, is what the next number is read against: it is wider than anything a commit in this repository has changed. **Seven more than the previous commit, and all seven are #131's.** Five are `LoopGuard`'s own, in the new `tests/test_loop_guard.cpp`: the counter counts every failing iteration rather than every episode, the episode counts consecutive failures and reopens after a recovery, two successes running report nothing (the observable half of "loud once" for a loop that polls ten times a second), a **null** registry still gets loud-once because two of the seven loops run in somebody else's process, and the name it writes is in the registry's own output. The other two are the descriptor `MetricsServer::handle_request` used to leak on the paths that throw — one behavioural, fifty requests against a live server with no growth in `/proc/self/fd`, and one static, because **the throwing path cannot be driven**: nothing in the process can make `serialize()` fail on demand and a knob to make it would be a knob nothing turns in production. **Before them**, four were #112's last two loops. Three are in the new `tests/test_replication_io_boundary.cpp`: that the pacing function returns zero only while a catch-up can progress, that nothing in `run_loop()` assigns `wait_ms` any other way (counted at **three** sites, because losing the one in the `catch` is the regression), and that both `try`s are where they have to be — anchored on the dispatch loop's own line rather than on a log phrase, which is the mistake #128's version of this test made. The fourth is in `tests/test_thread_boundaries.cpp` and is the one worth reading: the set of loops that guard an iteration is **derived from the tree** rather than listed, because a mutation deleting a row from the hand-written list **survived**. Fourteen `void Class::…loop()` definitions in `src/`, one a notifier with no loop in it and named, six of the remaining thirteen guarded and **seven not** — those seven are #131. Checked in both directions, so a loop in neither list fails and a row naming a function the tree no longer has fails too. **Before them**, the most recent addition was #129's: a registry given a 1200-second lease interval has to stop inside two seconds, which is a property stated three orders of magnitude clear of load rather than a duration. **Before it**, four were #128's, and they divide the way that defect does: three in `tests/test_mm_epoll_identity.cpp` are about the shape — that the two reserved event keys cannot collide with a connection, that closing a descriptor takes its registration with it (measured against `dup2`, which forces the reuse the defect needs instead of hoping for it), and that no registration in `src/multi_master.cpp` carries a bare descriptor number. The fourth is behavioural: a connection landing on the descriptor its predecessor gave back is its own connection, with both numbers read back so a run where the kernel did not recycle the number says so rather than passing quietly. Three of the six mutations in that item's table are killed by the static test **and by nothing else**, which is what says it carries weight. **Before them**, two were #126's, and they pin the replayer's rule from both sides: a checksum mismatch in an earlier WAL file yields the records from the file behind it, and one in the **last** file still stops replay — that one is a crash tail, and reading past it would hand the engine a record the process never finished writing. **Earlier**: two were #54's D3, three #125's, six #124's, seven #123's, six #118's, seven #117's. `tests/test_iouring_instrumentation.cpp` adds four that read a source file this build does not compile, which is the only check available for the rest of that transport. CTest lists **1085**: two are `DISABLED_` measurement harnesses (`MMSnapshotMeasurement.SnapshotCreationCost`, `ReplicationProtocolTest.TheWritePathWaitOfALargeCatchup`) that print measurements rather than assert them. The count that passes and the count CTest lists differ by exactly those two harnesses, always; a row two commits back gave one number for both. The runtimes are what this machine gave on the commit measured, not a budget |
+| Python integration | 407 | **`407 passed, 2 skipped, 5 xfailed in 33:28`** on the GitHub runner for PR #187's tree — two more than the row before: `test_mm_catchup_ceiling.py` and the control of `test_mm_version_vector_scale.py`, with five strict xfails beside them (#176, #177, #179, #180), the first this battery has run since its skip gate was written, which is why that gate reads the report now (pitfall 471) — and locally `407 passed, 2 skipped, 5 xfailed in 33:00` on the i3-7100U on that branch. **Before that**, `405 passed, 2 skipped in 29:23` on the GitHub runner for PR #186's tree — five more than the row before, all in the new `test_compaction.py` (part 2b of #165) — and locally `405 passed, 2 skipped in 29:58` on the i3-7100U on that branch, one commit before its head, whose one C++ change was a destructor `ctest` covers. **Before that**, `400 passed, 2 skipped in 29:08` on the GitHub runner for PR #184's tree — seven more than the row before, all in the new `test_sharded_pool.py` (#172) — and locally `400 passed, 2 skipped in 30:15` on the i3-7100U on that branch. **Before that**, `393 passed, 2 skipped in 28:56` on the GitHub runner for PR #183's tree — twelve more than the row before: nine in the new `test_reply_attribution.py` (#170 and #171, PR #181) and three in the new `test_lazy_flush.py` (part 2a of #165) — and locally `393 passed, 2 skipped in 29:36` on the i3-7100U on that branch. **Before that**, `381 passed, 2 skipped in 25:15` on the GitHub runner for PR #180's tree — three more, all in the new `test_snapshot_query.py` (#167 and #168) — and locally `380 passed, 1 failed, 2 skipped in 26:24` on the i3-7100U on that branch, the failure the one #170 is about. **Before that**, `378 passed, 2 skipped in 25:45` on PR #179's tree — unchanged, because part 1 of #165 added none; its wire measurement is the soak — and locally `378 passed, 2 skipped in 25:51` on the i3-7100U on that branch. **Before that**, `378 passed, 2 skipped in 25:05` on PR #178's tree — six more, all in the new `test_segment_time_range.py` (#166) — and locally `378 passed, 2 skipped in 26:01` on the i3-7100U on #166's branch, with `OB_POWER_CUT_TESTS=1`. **Before that**, `372 passed, 2 skipped in 25:25` on PR #177's tree, and locally 372 in 26:06 on #164's branch. **Before that**, `364 passed, 2 skipped in 25:05` on PR #176's tree, and locally 364 in 24:48 on #163's branch. **Before that**, `363 passed, 2 skipped in 24:34` on PR #175's tree, and locally 363 in 24:52 on #162's branch; and `360 passed, 2 skipped in 24:15` on PR #174's tree, the six power-cut tests among them, and locally 360 in 24:35 on #160's branch. **Before that**, `345 passed, 2 skipped in 23:55` on PR #173's tree, and locally 345 in 23:51 on #159's branch. **Before that**, `340 passed, 2 skipped in 23:25` on PR #172's tree, and locally 340 in 22:55 on #158's code before its rebase. **Before that**, `330 passed, 2 skipped in 22:38` on PR #169's tree, and before that `327 passed, 2 skipped in 22:56`, and before that `299 passed, 2 skipped in 22:44`, and before that all passing, plus the two collection-time Binance opt-in skips (`OB_BINANCE_TESTS=1`). Those skips are not part of the 280; count pytest's final result rather than the report plugin's progress characters. `280 passed, 2 skipped in 22:42` on the GitHub runner for this commit — **seven more than master, and all seven are the new `test_column_projection.py`**, which asks the question over the raw protocol on purpose: both of our clients read a row by position, so neither can read a narrowed answer and the refusals are at the bottom of that file. **Two of its tests had never run to completion before this run** — the branch's previous CI was cancelled — and both failed on the first one that did. One pinned the seven-column header as a literal in `src/response_formatter.cpp`, which this branch replaced with a generator and then deleted; it reads the column table now, which is stronger, because a dead literal can agree with a header nothing prints. The other wrote one row per test into one symbol on a session-scoped cluster, so with storage append-only the seventh test read seven rows where it had written one — and **29:20 for the same 273 under TSan**, which is the job that has to be read as well, because a battery that skips under instrumentation reads as green. Against `20:37` on the development machine (i3-7100U, native etcd) **for the 263-test tree seven commits back** — the figure is kept as the spread to expect between the two machines, and labelled with the tree it came from rather than silently paired with a count it never measured. **Unchanged by #121, and the reason is the instrument rather than the effort**: producing a real node whose physical clock is five minutes off needs the host clock moved or a time namespace, which is not something this battery can do to the machine it runs on — so the assertion lives at the wire instead, where #54's stage D already built the fake peer for it. **Before it, one more than the commit before, in the existing `test_failover_storage_faults.py` beside the control that was already there** (#130): what a node *says* while it holds a leader key it won and cannot act on. The assertion with teeth is sampled rather than read once — `ROLE` must never name this node's own replication port as the primary it follows, across a twenty-second window in which the pre-fix code answered exactly that on **every** sample. The second assertion is that the condition is reported **once**, with what an operator can do about it, because the loop runs every second and the storage that refused the record usually goes on refusing it. Measured against the two source files from the commit before that fix: **1 failed, 2 passed in 66.8 s**, the failure arriving on the **first** sample with `REPLICA 127.0.0.1:43273 2` and #112's two tests untouched. **Before it, two more, both in the new `test_coordinator_endpoint_order.py`, and the second is a control rather than a second case** (#135): the same unreachable coordinator endpoint in the harmless position, which passed before that fix and has to keep passing — without it, a harness that quietly stopped prepending anything would leave the first test green and meaningless. Both assert their premise from `Popen.args`, the command line the node actually got, rather than from the attribute that put it there, because an attribute is what the harness *meant* to say. The first also requires the mesh to form on top of both registrations, because that is the only assertion reaching the third of the three call sites: two registered nodes that never see each other is a topology watch still reading the wrong endpoint. Measured against the four source files from the commit before that fix, harness and tests unchanged: **1 failed, 1 passed in 50.1 s**, the failure naming both nodes. **Before them, one more than the commit before that, and all three in `test_peer_lease_lost.py` were rewritten**, because #132 turned the first one's premise inside out: it was written to assert that the registration **does not** come back, with a note saying that the day that loop learns to re-register is the day it fails. That day was this commit. It now polls **both** halves — the key and the log line — because the key lands in etcd before the line lands in the log, and reading the log once at the moment the key appears is a race the first rewrite lost. The #133 test needed a **new premise** as well (`stop_etcd()` rather than a revoke, which also exercises the branch that keeps this fix quiet), because after #132 a revoked lease is no longer a permanent condition, and counting log lines over a condition that repairs itself counts a condition that happened once. **The third is the one that says the gate is real**: a refusal over a key that **exists**, which nothing else in this battery produces — `redirect_peer()` writes without a lease, so the test captures the lease id before redirecting and revokes it by id afterwards. Its control is the *premise* rather than the outcome, because without asserting that a refusal reached the log it passes against a node whose refresh is succeeding. The other two gained a rate bound that is independent of wording: the count of registry lines above `DEBUG` across the window, measured at one and two. This tree's battery ran locally only as **the one module** (3 tests in **40 s**, and stage C's twelve in **3:37** as the regression check on the fixture this fix had to leave alone); the whole battery on this commit is CI's, and the 224-235 s `ctest` above is local. **Before them**, two were #112's `monitor_loop` half and both in the new `test_failover_storage_faults.py`: a replica whose data directory refuses the `EPOCH` record a role transition writes loses that monitor tick and not the thread, and its control at a size nothing writes, which must inject nothing. The assertion that carries the guarantee in the first of the two is the **recovery** line rather than the error line — only a later tick can write it, so a run in which the thread died would report the error and then say nothing, which is what a boundary is for. The pair costs **45.7 s** locally, and the module asserts its own premise: `OB_FAULT_PATH=ob_node1_` names the replica's data directory only because `ClusterManager.start()` waits for node-0 to hold PRIMARY before it starts node-1, and a change to that ordering would aim the injector at the **primary's** startup promotion, which exits the process. **Before them**, two were #112's `io_loop` half and both in the new `test_mesh_storage_faults.py`: a mesh receiver whose WAL refuses one record still receives the ones after it (**38.6 s**, because it waits for a mesh to form and for four records to cross it), and its control at a size nothing writes, which must inject nothing (**28.2 s**); that pair costs **67 s** locally. **Before those**: three were #54's A2.2 — the torn-record measurement behind #126, which costs 1.9 s — #125's — a killed replica whose confirmed WAL file retention has removed comes back with every row — and #54's C4, a mesh peer that stopped reading, which costs **9.0 s** and ~2.9 MB of writes because that is where the kernel stops absorbing them. The three before it were #124's — the first tests in this battery to cross a WAL file boundary — and the four together cost **23 s** locally, because the threshold they rotate at is 65573 bytes rather than 512 MB. The ten before them were #54 stage C, and they are most of the **16:24 → 19:18** change: each proxied-mesh test starts three nodes behind a proxy and converges on row content |
+| Python integration under TSan | 407 | **`407 passed, 5 xfailed in 39:44`** on the GitHub runner for PR #187's tree, against **33:28** uninstrumented on the same runner. **Before that**, `405 passed in 36:04` on PR #186's tree, against 29:23 uninstrumented. **Before that**, `400 passed in 36:10` on PR #184's tree, against 29:08 uninstrumented. **Before that**, `393 passed in 35:50` on PR #183's tree, against 28:56 uninstrumented. **Before that**, `381 passed in 32:09` on PR #180's tree, against 25:15 uninstrumented. **Before that**, `378 passed in 32:41` on PR #179's tree, against 25:45 uninstrumented. **Before that**, `378 passed in 32:09` on PR #178's tree, against 25:05 uninstrumented. **Before that**, `372 passed in 32:04` on PR #177's tree, against 25:25 uninstrumented — instrumentation's cost is the difference between two runs on one machine. **Before that**, `364 passed in 31:35` on PR #176's tree, and `363 passed in 31:15` on PR #175's tree, and `360 passed in 30:48` on PR #174's tree, and `345 passed in 30:13` on PR #173's tree, and `340 passed in 29:39` on PR #172's tree, and `330 passed in 29:56` on PR #169's tree, and before that `327 passed in 29:28`, and before that `299 passed in 29:18`, and before that all passing, zero skips and zero sanitizer reports; the live Binance modules are excluded from this job. `280 passed in 29:06` on the GitHub runner for this commit. **This row was four behind, and the tool that exists to prevent that had already printed the right number**: the citation above it named [PR #139's run](https://github.com/Smart-Data-Engines/low-cost-and-low-latency-orderbook-dbengine/actions/runs/34947630036), which reported `273 in 29:06`, while the cell said `269 in 28:17` — a run on an older tree. `scripts/test_table.py` prints all three counts in one block precisely so that one edit carries them together, and the previous table commit carried two of the three. Reading it is the part a script cannot do — and this job is what closed #122: it turned **red** on the pull request for #117 with a race on `unique_ptr::reset`, which is the only reason that defect is closed rather than filed. Read it against the **22:02** the same runner gave the uninstrumented battery rather than against this machine's number: instrumentation's cost is the difference between two runs on one machine, and every wait in the stage B and stage C windows scales with `patience()` on top of it |
 
 #54's nine — six for the fault injector and three for what the engine does with a refused WAL
 write — run in both integration jobs, and both counts above are from the same CI run rather than

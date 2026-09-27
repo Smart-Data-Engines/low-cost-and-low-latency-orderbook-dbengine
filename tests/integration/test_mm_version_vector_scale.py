@@ -25,8 +25,8 @@ import urllib.request
 
 import pytest
 
-from conftest import ClusterManager
-from orderbook_engine import BookUpdate, OrderbookEngine
+from conftest import ClusterManager, patience
+from orderbook_engine import BookUpdate, OrderbookEngine, OrderbookError
 
 pytestmark = pytest.mark.multi_master
 
@@ -73,13 +73,25 @@ def write_symbols(node, first: int, last: int) -> None:
         client.close()
 
 
+def holds(client, name: str) -> bool:
+    """Whether the node answers for `name` with a row. A symbol it has never seen is `NOT_FOUND`,
+    which here means not delivered yet: the first query of this module's wait raised it under
+    ThreadSanitizer, where delivery is slower than the writes that precede it (PR #188's CI)."""
+    try:
+        return len(client.query_all(name, EXCHANGE)) >= 1
+    except OrderbookError as exc:
+        if "NOT_FOUND" in str(exc):
+            return False
+        raise
+
+
 def wait_until_every_node_has(nodes, last: int, timeout: float = 60.0) -> None:
     """Every node answers for the last symbol written - the mesh delivered the batch."""
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + patience(timeout)
     for node in nodes:
         client = client_for(node)
         try:
-            while len(client.query_all(symbol(last - 1), EXCHANGE)) < 1:
+            while not holds(client, symbol(last - 1)):
                 assert time.monotonic() < deadline, f"node {node.index} never got {symbol(last - 1)}"
                 time.sleep(0.5)
         finally:
