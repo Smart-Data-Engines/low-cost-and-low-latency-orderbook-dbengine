@@ -3712,6 +3712,23 @@ Learned the hard way. Check here before debugging.
      master's; `command_latency`, in a process of its own, read the three builds alike. The first
      reading was never explained and did not need to be: a tail is read by a probe that shares
      nothing with what it is measuring, and the one that did is kept only as why.
+482. **"At most a tick old" describes a read, not a decision drawn from it.** The copy of the vector
+     a peer is told is a tick old at worst (#180); the node's own "this peer lacks nothing, so no
+     scan", drawn from the same copy, lasted until the next reconciliation - 30 s by default - and a
+     peer back within a tick of what it missed was held at 100 of 2 100 rows for as long. A decision
+     nothing revisits is drawn from state as fresh as the event that asked for it; where it cannot
+     be, the copy says how far it reaches (`covers`, against `SequenceTracker::listings()`) and the
+     decision waits for it, bounded (#180 part D).
+483. **Ten local passes of a race are not evidence; the logs of the ten are.** The test CI failed
+     once had passed ten runs of ten here, and their logs said the handshake came 2-96 ms after the
+     tick that saved it. A test whose failure depends on landing in a window has to place itself
+     there: with a 1 s tick the same steps failed three runs of three but its regression form, left to
+     chance, failed one in three - it waits for `ob_flush_ticks_total` to move now and writes and
+     restarts straight after, on two nodes, because a third node's tick keeps a clock the test cannot
+     follow. Six of six fail before the fix, six of six pass after it.
+484. **A mutation that takes away a parameter's last use measures the compiler.** Under `-Werror`
+     an unused parameter is an error, so "never defer" written as `if (false)` did not build and the
+     row read INVALID; write the mutation with a `(void)` of what it leaves unused.
 
 ## Current state and open problems
 
@@ -3764,9 +3781,11 @@ receive buffer (pitfalls 462-471). **#179, #180 and #183 are closed**: a restart
 each replayed record - the ones a segment holds included - under the origin its header names, and
 writes its vector before the checkpoint, so it stops storing a peer's rows twice (200 where the
 writer held 100); every flush tick brings the vector peers are told up to date from the frontiers
-that moved, microseconds where a whole export cost 286 us at 4 000 entries; and a reconciliation no
-longer arms a deadline for an answer no peer sends, which treated a peer as empty whenever the two
-timers were more than 2 s apart (pitfalls 472-481). **#184 is the open P0**: when two nodes write
+that moved, microseconds where a whole export cost 286 us at 4 000 entries, and no "this peer lacks
+nothing" is drawn from a copy older than the tracker - found in the fix's own CI run, a node back
+within a tick of the writes it missed held 100 of 2 100 rows until the next reconciliation; and a
+reconciliation no longer arms a deadline for an answer no peer sends, which treated a peer as empty
+whenever the two timers were more than 2 s apart (pitfalls 472-484). **#184 is the open P0**: when two nodes write
 one symbol the one counter per symbol gives each origin's numbers holes, every node's frontier stops
 at the first, and a node that missed rows is judged to hold them - 10 000 of 11 000 for good, which
 #179's fix made the restart's outcome as well as the disconnect's. **#169, #175, #176, #177, #182,

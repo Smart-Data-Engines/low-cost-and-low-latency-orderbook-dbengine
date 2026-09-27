@@ -281,6 +281,16 @@ lists the (symbol, origin) pairs whose frontier moved since the last tick, and t
 them through an index - microseconds for the few a tick moves, where exporting the vector again
 cost 286 us at 4 000 entries.
 
+**And no decision is drawn from a cache older than the tracker** (#180 part D). A tick old is how
+fresh a peer's view is; the node's own "this peer lacks nothing, so no scan" lasts until the next
+reconciliation, and drawn from a cache without the writes a returning peer missed, it held that peer
+at 100 of 2 100 rows for as long. So the tracker counts listings on its moved list, readably without
+the engine's lock (a pair's first move after a take lists it, so an unchanged count means nothing
+moved), the cache records the count it reaches, and a "lacks nothing" from a cache behind the count
+waits for the tick that brings it past - at most `MM_VV_GRACE_MS`, after which the catch-up starts,
+its rounds filtering by the peer's vector anyway. A decision that says the peer lacks something needs
+no wait: the rounds read the WAL, not the cache.
+
 A node that joined an origin's stream in the middle used to be the other limit: it saw sequence 5000
 before it ever saw 1, so it could not claim "everything up to here" for that origin and kept
 receiving redeliveries for ever. That is what snapshot bootstrap is for, and it now exists — see

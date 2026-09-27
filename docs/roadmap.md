@@ -2417,6 +2417,43 @@ why the probe is `command_latency` now. Its tests are
 a copy kept from the moves is the export in `tests/test_sequence_tracker.cpp`; the mutation table is
 #179's.
 
+**And "a tick old" was still too old for the decision that reads the copy - found in this fix's own
+CI run (part D).** A tick late is what a peer reading the copy gets; a decision this node draws from
+it lasts longer. Given a peer's vector, the manager compares it with the copy and starts no scan when
+the peer lacks nothing by it - and nothing looks again before the next reconciliation, 30 s by
+default. A peer back within a tick of the writes it missed was compared with a copy that did not
+have them yet: PR #188's integration job failed the module's second test with **100 of 2 100** rows
+3 s after the reconnect. Locally it passed ten runs of ten, and the logs of the ten say how narrowly:
+the writer's last update of the copy came 2 - 96 ms before the handshake, and in three runs the copy
+still lacked 2 of the 10 symbols - the catch-up started because others were missing, and its rounds
+read the WAL, not the copy. With a tick of 1 s it failed three runs of three, both peers logging
+`Peer 3 holds everything we do (10 entries compared) — no scan` 0.7 s and 0.2 s before their copies
+caught up, and the rows coming with the reconciliation 5 s later.
+
+**Fixed:** the tracker counts listings on its moved list - a pair's first move after a take lists
+it, so "nothing listed since the take" is "no frontier moved since" - in an atomic the manager reads
+without the engine's lock (`SequenceTracker::listings()`). The copy records the listing it reaches,
+and a "lacks nothing" from a copy behind the tracker waits for the tick that brings it past the
+listing the vector found (`decide_catchup_from_vector()`, and `recheck_deferred_vectors()` between
+the io loop's passes, which wait 10 ms while a decision does) - at most `MM_VV_GRACE_MS`, after which
+the catch-up starts, its rounds filtering by the peer's vector anyway. A scan whenever the copy is
+behind would not do: under writes that do not stop nearly every vector finds it behind, and that is
+the whole-WAL read every reconciliation that #57 removed. A vector's arrival also disarms the
+handshake's deadline for a silent peer, which a waiting decision would otherwise meet. Measured with
+the module's third test - two nodes ticking every 5 s and reconciling every 30 s, the writes and the
+restart straight after one of the writer's ticks (`ob_flush_ticks_total`): on the build before this,
+**six runs of six** held 100 of 2 100 rows 7 s after the reconnect; with it, **six of six** held all
+of them, the writer logging the wait at the handshake and the decision 0.7 s later, with its tick.
+The C++ tests are six in `tests/test_mm_catchup_rounds.cpp`, and in `tests/test_sequence_tracker.cpp`
+what `listings()` counts and a RapidCheck property that a copy whose listing is current is the export.
+Part D's mutation table, written down before it ran: **20 mutations in 22 runs, every one as
+written** - 15 killed, and the 5 that were to survive did: the second look not dropping a
+disconnected peer's wait (the rounds drop a catch-up for a connection that is gone), the io loop
+waiting 500 ms whatever waits (latency: the writer's log has the decision 3 - 9 ms after the tick's
+update), the two resets with the connection (equivalent: the second look and the next vector do the
+same), and a control. Two rows did not build at first - "never wait" written as `if (false)` took a
+parameter's last use away under `-Werror` - and ran again with a `(void)` (pitfall 484).
+
 - Effort: S-M | Impact: a returning mesh peer served stale reads for up to a seal interval and a
   reconciliation longer than it had to
 
@@ -2618,6 +2655,13 @@ The control flushes before it measures, because it found something smaller on th
 vector is refreshed when a checkpoint is written, and since part 2a of #165 that can be ten seconds
 after a write, so a reconciliation in between sends the batch back to where it came from - 1 500
 duplicates on two nodes of three, below the limit, in the first run without the flush.
+
+**The other side of the limit, found reading the decision for #180's part D and not measured, is
+worse.** `export_version_vector()` hands out nothing once the copy holds more than 4 096 entries, and
+the decision on a peer's vector reads nothing as "the peer lacks nothing" unless that vector asks
+for everything - so a peer whose own vector fits, a joiner above all, is never caught up from such a
+node: past 1 561 entries it asks for no snapshot, and past 4 096 on the sender it is sent no
+catch-up either. The fix has to make that decision say "unknown" there rather than "nothing".
 
 A fix carries a vector of any size - in parts, on the wire and in the WAL - and compares two
 vectors without a loop inside a loop, which `compare_vectors()` has for the direction this node
