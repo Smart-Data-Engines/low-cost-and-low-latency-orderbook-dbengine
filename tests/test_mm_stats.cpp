@@ -137,6 +137,9 @@ TEST(MultiMasterStats, ConflictsCountTwoOriginsWritingALevelNotOneWritingItAgain
     for (uint64_t i = 1; i <= 50; ++i) ASSERT_EQ(deliver(i, 2, now + i), ob::OB_OK);
     EXPECT_EQ(engine.registry().counter_value("ob_mm_conflicts_total"), 0u)
         << "one origin updating the level it holds was counted as conflicts";
+    ASSERT_EQ(deliver(51, 2, now + 10), ob::OB_OK);   // a late copy: older than what it holds
+    EXPECT_EQ(engine.registry().counter_value("ob_mm_conflicts_total"), 0u)
+        << "a late copy from the origin that wrote the level was counted as a conflict";
     ASSERT_EQ(deliver(1, 3, now + 100), ob::OB_OK);
     EXPECT_EQ(engine.registry().counter_value("ob_mm_conflicts_total"), 1u)
         << "another origin writing the level was not counted";
