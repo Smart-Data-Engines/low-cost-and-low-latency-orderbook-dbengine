@@ -1888,7 +1888,12 @@ TEST_F(ReplicationProtocolTest, ALiveRecordDoesNotEnterASnapshotStream) {
         return true;
     };
 
-    const std::string begin = next_line();
+    // A HEARTBEAT may come first, and the replica skips it: the timer fires every 5 s, and creating
+    // this snapshot on the worker took 7.2 s once, on a loaded machine, so one was queued before the
+    // transfer began. Inside the transfer the heartbeat is held back (#99), so between a header line
+    // and its bytes it would still be the defect this test is about.
+    std::string begin = next_line();
+    while (begin.rfind("HEARTBEAT", 0) == 0) begin = next_line();
     ASSERT_EQ(begin.rfind("SNAPSHOT_BEGIN", 0), 0u) << "got: " << begin;
     size_t total_bytes = 0, file_count = 0;
     unsigned snap_file = 0;

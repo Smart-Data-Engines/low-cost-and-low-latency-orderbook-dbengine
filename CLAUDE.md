@@ -3772,6 +3772,12 @@ Learned the hard way. Check here before debugging.
      checked the answer passed with the checks for all three removed (#177's mutations V4-V6). The
      test that tells them apart feeds the bad part and then the parts a wrong assembly would complete
      with, and looks at what was taken.
+492. **A test that reads a protocol stream reads it as the protocol's reader does.**
+     `ALiveRecordDoesNotEnterASnapshotStream` took the first line of a replica's stream for the
+     `SNAPSHOT_BEGIN` it asked for; the primary sends `HEARTBEAT` every 5 s, and the replica skips
+     one anywhere between records. Creating the test's 14.6 MB snapshot on the worker takes 1.7 s on
+     an idle i3-7100U and took 7.2 s once beside another session's tests, so a heartbeat went first
+     and the test failed - in a full `ctest` on #177's branch, on code #177 does not touch.
 
 ## Current state and open problems
 
