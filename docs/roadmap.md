@@ -2253,6 +2253,16 @@ with the bootstrap, however it ends, and the next vector a peer sends while the 
 nothing begins the next. The same probe: **3 requests, 3 refusals, and a write taken 7.1 s after the
 joiner started**.
 
+Tests in `tests/test_mm_snapshot.cpp` (`MMSnapshotEachPeerOnce`, eight, #192's with them): four fail on
+the tree before the fix - a peer that refused, failed a transfer or did not answer asked again in the
+same round, and a source not told - and two controls pass on both. **Mutation table, written down
+before the run: 10 mutations, every one as predicted** - the control survived; skipping no peer of
+the round, or not recording one, was killed by the three tests of a round and the next round's;
+leaving the round standing after the wait, or after the bootstrap, by the next round's, each by its
+half; never telling the source, and not recording the BEGIN's connection, by the source told;
+telling it always, or telling the one that aborted, by the source not told; and finding it by its
+node alone, by the node back on a new connection.
+
 - Effort: S | Impact: a node joining a mesh that cannot serve it refuses writes for as long as it
   runs, and keeps every peer preparing snapshots
 
