@@ -1228,6 +1228,15 @@ ob_status_t Engine::apply_remote_delta(const DeltaUpdate& delta_in, const Level*
         ConflictKey ck{delta.symbol, delta.exchange, delta.side, levels[i].price};
         ConflictResolution result = resolver.resolve(ck, remote_hlc, origin_node_id);
 
+        if (result == ConflictResolution::REJECT_STALE) {
+            // The origin that wrote the level last, with an update not newer than that: a late copy,
+            // not a conflict (#182).
+            OB_LOG_DEBUG("engine", "Stale update skipped for %s/%s/%d/%ld from origin %u",
+                         delta.symbol, delta.exchange, delta.side,
+                         static_cast<long>(levels[i].price), static_cast<unsigned>(origin_node_id));
+            continue;
+        }
+
         if (result == ConflictResolution::REJECT_REMOTE) {
             OB_LOG_DEBUG("engine", "Conflict resolved: local_wins for %s/%s/%d/%ld",
                          delta.symbol, delta.exchange, delta.side,

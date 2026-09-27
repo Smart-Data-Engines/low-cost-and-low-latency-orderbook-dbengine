@@ -64,7 +64,8 @@ struct ConflictEntry {
 enum class ConflictResolution {
     APPLY_REMOTE,   // remote HLC is newer → apply remote write
     REJECT_REMOTE,  // local HLC is newer → reject remote write
-    NO_CONFLICT,    // no existing local state for this key
+    NO_CONFLICT,    // no existing local state for this key, or the origin that wrote it last writes it again
+    REJECT_STALE,   // the origin that wrote it last, with an update not newer than that: a late copy (#182)
 };
 
 // ── ConflictResolver ──────────────────────────────────────────────────────────
@@ -78,9 +79,24 @@ public:
     /// Compares remote_hlc with the last known HLC for the given key.
     /// Returns APPLY_REMOTE if remote is newer, REJECT_REMOTE if local is newer,
     /// NO_CONFLICT if no local state exists for this key.
+    ///
+    /// A conflict is two origins writing one level (#182). The origin that wrote the level last
+    /// writing it again is a book's ordinary life - NO_CONFLICT when newer, REJECT_STALE when not -
+    /// and neither enters the log, the counts or a line. Counting those, a mesh logged a conflict for
+    /// nearly every replicated update: 301 985 lines, 61 MB, for 300 000 writes.
     ConflictResolution resolve(const ConflictKey& key,
                                const HLCTimestamp& remote_hlc,
                                uint16_t remote_origin);
+    /// The same, at `now_ns` on the wall clock: what the log's window is measured against. A seam
+    /// for the window's test; `resolve()` above passes `wall_clock_ns()`.
+    ConflictResolution resolve(const ConflictKey& key,
+                               const HLCTimestamp& remote_hlc,
+                               uint16_t remote_origin,
+                               uint64_t now_ns);
+
+    /// A conflict opens a window of this length: it is logged at INFO with its details, and the ones
+    /// inside the window are counted, and said as one line with the next conflict after it (#182).
+    static constexpr uint64_t kLogWindowNs = 10'000'000'000ULL;
 
     /// Update the last known HLC for a key (called after successful apply).
     void update_hlc(const ConflictKey& key, const HLCTimestamp& hlc,
@@ -118,6 +134,13 @@ private:
 
     /// Append an entry to the ring buffer, trimming if necessary.
     void log_conflict(const ConflictEntry& entry);
+
+    /// Say a conflict: at INFO when no window is open or the open one has passed - with the count of
+    /// the ones inside it, if any - and at DEBUG inside the window. Caller holds `mtx_`.
+    void say(const ConflictEntry& entry, uint64_t now_ns);
+    bool     window_open_{false};
+    uint64_t window_started_ns_{0};   ///< when the last INFO line was said
+    uint64_t unsaid_{0};              ///< conflicts inside the window since that line
 };
 
 } // namespace ob
