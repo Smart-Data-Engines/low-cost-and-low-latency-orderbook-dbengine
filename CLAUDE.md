@@ -3663,7 +3663,9 @@ Learned the hard way. Check here before debugging.
      vector appended after the checkpoint leaves a crash window in which the checkpoint is on the
      disk and the vector covering the records it cut off is not (#179). Same critical section, the
      vector first; a restart takes the last vector anywhere in the WAL, so the order changes
-     nothing it finds.
+     nothing it finds - except a count that covered the range it moved into: the replay's "of which
+     N written before the checkpoint" counted every record there, read 4 for three rows, and counts
+     rows now (`test_storage_faults.py` caught it).
 474. **A cache refreshed where the data is written down is as stale as the writing is lazy.** The
      vector peers are told was exported at every checkpoint, which was every tick until part 2a of
      #165 made seals lazy - and from then on up to ten seconds old: a peer back inside that window
