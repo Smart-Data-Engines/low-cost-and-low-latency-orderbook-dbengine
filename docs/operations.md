@@ -1315,8 +1315,8 @@ the last one.
 
 ## How long a start takes, and what makes it longer
 
-A start reads the `meta.json` of every segment in the data directory, and reads the WAL twice,
-before it answers anything. Since part 2a of #165 a symbol gains a segment when it is **due** —
+A start reads the `meta.json` of every segment in the data directory, and reads the WAL once - and
+then again what its last checkpoint does not cover - before it answers anything. Since part 2a of #165 a symbol gains a segment when it is **due** —
 65 536 rows, or ten seconds after its oldest waiting row — rather than on every flush tick, so at a
 steady write rate a node gains about one segment per active symbol every ten seconds. Since part 2b
 the flush tick merges them ([merging segments](#merging-segments)), so the count follows the data
@@ -1347,6 +1347,13 @@ After twenty minutes of the same soak, merging is what the count follows:
 
 Of the cold start, opening the index took 22.5 – 23.0 s before part 2b and 1.9 – 2.9 s since; the
 rest, 3.8 – 3.9 s in both, is mostly the two passes over the WAL.
+
+**The WAL's part since #174.** Every figure above is from a build that read the WAL at least twice,
+a record at a time, and a start of the build just before #174 read it five times: on the i3-7100U,
+with one WAL file of 422 MB (1.2 million records of 10 levels) and a clean stop, it took **21.9 –
+25.3 s** to listen. The same directory, warm, on the build with #174: **0.14 – 0.17 s**, of which the
+one pass over the WAL is 0.13 – 0.15 s - about 3 GB/s. So the WAL costs a warm start about a third of
+a second a gigabyte now, and a cold one what the disk takes to read it once.
 
 ### After a crash
 

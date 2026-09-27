@@ -3856,6 +3856,21 @@ Learned the hard way. Check here before debugging.
      and in the mesh registration is correct on the one machine every test runs on, and wrong on every
      other (#195). What a node advertises is configuration, and a test says it is published as
      configured.
+509. **A pass over a log costs what it does per record, times the readers that each make one.** The
+     replay read a record with a `lseek()` and three `read()`s and a vector for its payload - 4 us a
+     record - and a start had five readers that each wanted something from the whole WAL, each with
+     its own replay: 23 s to listen with 422 MB of it (#174). Read in blocks a pass is 0.13 s, and one
+     pass hands every record to every reader that needs the whole log.
+510. **A second parser of one format is wrong about the variant it was not written for.** `replay()`
+     read every record as a 24-byte header, and a mesh node's are 38 bytes: the first failed its
+     checksum, and the epoch restore logged at every restart of a mesh node that a record had been cut
+     short by the process stopping (#174). The warning names a real failure, so nobody read it as a
+     parser's. One parser, and views of it.
+511. **A test whose premise is that two writes are drained by one tick has a race in it.** The
+     seal-epoch test wrote A, due with its last record, and then B, which had to be waiting when A was
+     sealed; one run in twenty B was drained a tick later and the seal's checkpoint was the other
+     form - 5 runs in 100 on master, and the first suite run on #174's branch was one of them. Order
+     the writes so that the premise holds whichever tick drains them.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -3947,15 +3962,18 @@ numbering once at its first start now, at the fixed base 2^48, and the same prob
 every node (pitfalls 503-505). **#175 is closed**: shards write themselves into the map in etcd by
 compare-and-swap and read it every 2 s, each group elects under its own keys, and both clients route
 by the map; with it **#195**, a node publishing 127.0.0.1 as its address in the leader key and the mesh
-registration (`--advertise-host`, pitfalls 506-508). **#169 is an open P1**: an exchange name with a dot
+registration (`--advertise-host`, pitfalls 506-508). **#174 is closed**: a start read the whole WAL
+five times, a record at a time - 23.2 - 25.3 s to listen with a WAL of 422 MB on the i3-7100U - and
+reads it once, in blocks, and then what its last checkpoint does not cover: 0.14 - 0.17 s; and a mesh
+node's restart no longer reports a record cut short that nobody cut (pitfalls 509-511). **#169 is an
+open P1**: an exchange name with a dot
 makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live book, sequence numbers
 and stored rows, measured on the wire.
 **#172 is closed**: the Python client's sharded pool swaps its routing whole and replaces a shard
-connection a timeout closed, under a test that builds a sharded pool against a map in etcd. **#174,
-#189, #190, #193 and #196 are open P2s** - #196 a symbol moved between shards without its rows, and
-`MIGRATE` refused until it is not: a start reads the whole WAL twice even when its last checkpoint
-covers every record; since #177 a node of 50 000 (symbol, origin) pairs holds writes for 9 - 13 ms at
-every checkpoint, writing its whole vector down; at the write ceiling a flush tick's WAL sync takes
+connection a timeout closed, under a test that builds a sharded pool against a map in etcd. **#189,
+#190, #193 and #196 are open P2s** - #196 a symbol moved between shards without its rows, and
+`MIGRATE` refused until it is not; since #177 a node of 50 000 (symbol, origin) pairs holds writes for
+9 - 13 ms at every checkpoint, writing its whole vector down; at the write ceiling a flush tick's WAL sync takes
 1 - 3 s on a device the segments keep busy, and writers wait that long for room in the pending queue;
 and a joiner checks every path of a snapshot's manifest against the filesystem on its mesh io thread,
 5 s for 70 000 files. **#194 (P3)**: a snapshot holding a file of zero bytes cannot be installed,
