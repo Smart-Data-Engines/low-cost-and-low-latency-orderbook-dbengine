@@ -197,3 +197,19 @@ TEST(WalDir, AStartWithoutTheOptionDoesNotBeginAnEmptyWalBesideTheRealOne) {
     std::getline(location, noted);
     EXPECT_EQ(fs::path(noted), fs::weakly_canonical(other.path)) << "the note still names the old place";
 }
+
+TEST(WalDir, TheEpochComesBackFromThatWal) {
+    // The epoch a promotion writes is a WAL record too, and a restart reads it back from the WAL's
+    // directory.
+    TempDir data("waldir_epoch_data_"), wal("waldir_epoch_wal_");
+    {
+        auto engine = engine_at(data.path, wal.path);
+        engine->open();
+        engine->promote_to_primary(ob::EpochValue{42});
+        engine->close();
+    }
+    auto engine = engine_at(data.path, wal.path);
+    engine->open();
+    EXPECT_EQ(engine->current_epoch(), 42u) << "the epoch was read from the data directory";
+    engine->close();
+}

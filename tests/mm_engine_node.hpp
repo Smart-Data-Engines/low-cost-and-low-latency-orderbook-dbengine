@@ -63,11 +63,12 @@ inline ob::MultiMasterConfig mm_config(std::atomic<uint16_t>& port) {
 }
 
 inline std::unique_ptr<ob::Engine> open_node(std::atomic<uint16_t>& port, const std::string& dir,
-                                             ob::FsyncPolicy policy = ob::FsyncPolicy::EVERY) {
+                                             ob::FsyncPolicy policy = ob::FsyncPolicy::EVERY,
+                                             const std::string& wal_dir = "") {
     auto engine = std::make_unique<ob::Engine>(dir, kNoAutoFlush, policy, ob::ReplicationConfig{},
                                                ob::ReplicationClientConfig{},
                                                ob::FailoverConfig{}, ob::TTLConfig{},
-                                               mm_config(port));
+                                               mm_config(port), 512ULL << 20, wal_dir);
     engine->open();
     return engine;
 }

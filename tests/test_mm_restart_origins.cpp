@@ -48,8 +48,9 @@ using namespace mm_engine;
 std::atomic<uint16_t> g_port{ob::test::kPortsMmRestartOrigins};
 
 std::unique_ptr<ob::Engine> open_node(const std::string& dir,
-                                      ob::FsyncPolicy policy = ob::FsyncPolicy::EVERY) {
-    return mm_engine::open_node(g_port, dir, policy);
+                                      ob::FsyncPolicy policy = ob::FsyncPolicy::EVERY,
+                                      const std::string& wal_dir = "") {
+    return mm_engine::open_node(g_port, dir, policy, wal_dir);
 }
 
 }  // namespace
@@ -359,5 +360,23 @@ TEST(MeshRestartOrigins, AVectorPastOneRecordIsWrittenInPartsAndRestoredWhole) {
     const auto told = told_all(*node);
     EXPECT_EQ(told.size(), 5'000u) << "the restart did not put the vector back together";
     EXPECT_EQ(told.count({"P4999.EX", kPeer}) ? told.at({"P4999.EX", kPeer}) : 0u, 5'000u);
+    node->close();
+}
+
+TEST(MeshRestartOrigins, AVectorIsRestoredFromTheWalItsDirectoryNames) {
+    // #186: with --wal-dir the vector a restart takes up is in that directory's WAL, not the data
+    // directory's - which holds none.
+    TempDir dir("mm_origins_waldir_"), wal("mm_origins_waldir_wal_");
+    const std::vector<ob::SequenceTracker::VectorEntry> held{{"W1.EX", kPeer, 7}, {"W2.EX", kPeer, 9}};
+    {
+        auto node = open_node(dir.path, ob::FsyncPolicy::EVERY, wal.path);
+        node->adopt_snapshot_sequence_state(held, {});
+        node->close();
+    }
+    auto node = open_node(dir.path, ob::FsyncPolicy::EVERY, wal.path);
+    node->flush_tick_for_test();
+    const auto told = told_all(*node);
+    EXPECT_EQ(told.count({"W2.EX", kPeer}) ? told.at({"W2.EX", kPeer}) : 0u, 9u)
+        << "the restart did not take up the vector the WAL in --wal-dir holds";
     node->close();
 }

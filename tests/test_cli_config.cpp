@@ -244,6 +244,20 @@ ob::ResolvedConfig resolve(std::vector<std::string> args) {
 
 }  // namespace
 
+TEST(WalDirInConfig, TheFlagAndTheFileNameTheWalsDirectory) {
+    // #186: the WAL on a filesystem of its own. Unset, it is the data directory, and --print-config
+    // says which it is either way.
+    EXPECT_EQ(resolve({"--data-dir", "/srv/ob", "--wal-dir", "/srv/ob-wal"}).config.wal_dir,
+              "/srv/ob-wal");
+    EXPECT_EQ(resolve({"--data-dir", "/srv/ob"}).config.wal_dir, "");
+    const auto path = write_config("data-dir = /srv/ob\nwal-dir = /srv/ob-wal\n", "waldir");
+    const std::string file = path.string();
+    EXPECT_EQ(resolve({"--config", file}).config.wal_dir, "/srv/ob-wal");
+    const std::string printed = ob::format_config(resolve({"--data-dir", "/srv/ob"}));
+    EXPECT_NE(printed.find("wal-dir"), std::string::npos) << printed;
+    EXPECT_NE(printed.find("/srv/ob"), std::string::npos) << printed;
+}
+
 TEST(MachineInConfig, ResolvingTheConfigurationReadsTheMachine) {
     // Stage 3: the CPUs this process can use are read where the rest of the configuration is
     // resolved, so the log line and --print-config describe what the node was sized against. The
