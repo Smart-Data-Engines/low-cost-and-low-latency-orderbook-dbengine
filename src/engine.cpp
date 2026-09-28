@@ -846,6 +846,11 @@ void Engine::discard_local_data_for_resync() {
 
     combined_store_.open_existing();
     publish_segment_count();
+
+    // The same as an install (#197): the store is empty and the WAL holds the discarded one's
+    // records, which a restart would replay into it and a replica of this node would be streamed.
+    // Thrown on: a replica that cannot begin a new lineage must not go on to replay into the old one.
+    begin_wal_lineage_locked("the local data was discarded to replay from zero");
 }
 
 std::string Engine::replication_state_path() const {
@@ -900,6 +905,56 @@ void Engine::load_or_create_wal_identity() {
     }
     OB_LOG_INFO("engine", "WAL identity %llu generated",
                 static_cast<unsigned long long>(wal_identity_));
+}
+
+void Engine::begin_wal_lineage_locked(const char* why) {
+    const uint64_t old_identity = wal_identity_.load(std::memory_order_relaxed);
+    std::random_device rd;
+    uint64_t fresh = 0;
+    while (fresh == 0 || fresh == old_identity) {
+        fresh = (static_cast<uint64_t>(rd()) << 32) ^ rd();
+    }
+    // Durably first, as at the first open (#160): a start that finds the old identity beside the new
+    // lineage's files would trust positions its segments carry from a store that is gone.
+    const std::string path = wal_dir_ + "/wal_identity";
+    if (const int err = write_file_atomically(path, std::to_string(fresh)); err != 0) {
+        throw std::runtime_error("Engine: cannot write " + path + " for a new WAL lineage: " +
+                                 std::strerror(err));
+    }
+    wal_identity_.store(fresh, std::memory_order_relaxed);
+    repl_config_.wal_identity = fresh;   // what a ReplicationManager made at a promotion announces
+    if (repl_mgr_) {
+        OB_LOG_WARN("engine", "A new WAL lineage on a node that serves replicas (%s): they are told "
+                              "the old identity until this node restarts", why);
+    }
+
+    // Past a ROTATE record, into a file of its own, and nothing before it: what retention leaves
+    // once it has taken the start of a log - so a request for the start is WAL_TRUNCATED.
+    wal_.rotate();
+    const WalPosition first = wal_.current_position();
+    const size_t removed = wal_.truncate_before(first.file_index);
+    if (const int err = sync_directory(wal_dir_); err != 0) {
+        OB_LOG_WARN("engine", "The WAL directory %s could not be synced after the old lineage's files "
+                              "were removed (%s): a power cut may bring some back",
+                    wal_dir_.c_str(), std::strerror(err));
+    }
+
+    // Nothing below `first` exists any more, and nothing the store holds is owed to a record below
+    // it. The vector is written whole next, into the new file: its base was in a removed one.
+    drained_up_to_ = first;
+    if (!checkpoints_frozen()) {
+        durable_up_to_   = first;
+        retention_floor_ = first;
+    }
+    vector_base_file_ = kNoVectorBase;
+    vector_whole_due_ = true;
+
+    OB_LOG_INFO("engine",
+                "A new WAL lineage (%s): identity %016llx after %016llx, begun at file %u; %zu file(s) "
+                "of the old one removed, so a replica asking for the log from the start is sent a "
+                "snapshot (#197)",
+                why, static_cast<unsigned long long>(fresh),
+                static_cast<unsigned long long>(old_identity), first.file_index, removed);
 }
 
 bool Engine::restore_version_vector(WalStartRecords& from_wal) {
@@ -2187,6 +2242,19 @@ bool Engine::install_snapshot(const std::string& staging_dir,
         return false;
     }
     OB_LOG_DEBUG("engine", "The installed snapshot is on the device");
+    // The store holds rows no record of this WAL holds (#197): a new lineage, before anything
+    // appends a record to the old one.
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+        try {
+            begin_wal_lineage_locked("a snapshot was installed");
+        } catch (const std::exception& e) {
+            OB_LOG_ERROR("engine", "The installed snapshot's WAL lineage could not begin (%s); the "
+                                   "install is reported failed, so this node bootstraps again",
+                         e.what());
+            return false;
+        }
+    }
     // Its segments merge like any others, once it is on the device (#165 part 2b).
     note_store_for_compaction();
     return true;
