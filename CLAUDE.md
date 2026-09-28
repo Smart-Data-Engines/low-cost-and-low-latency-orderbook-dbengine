@@ -3945,6 +3945,12 @@ Learned the hard way. Check here before debugging.
      that contains the target string elsewhere - and a probe that started the server and then looked
      for it in the same command found its own shell, and `kill` ended it (exit 144, twice). Take the
      PID at launch, or look it up in a separate command.
+527. **A store that holds rows no record of its WAL holds has to begin a new WAL lineage - or a
+     replica of it asking for the start is streamed nothing of them.** Pitfall 523's shape again, on
+     the path nobody thought of as a restore: a replica that bootstrapped from a snapshot and was later
+     made a primary gave a new replica of its own 0 of 18 000 rows, and after a failover every other
+     replica would have done the same (#197). `install_snapshot()` and
+     `discard_local_data_for_resync()` begin one now: a new identity, and a first file after them.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers

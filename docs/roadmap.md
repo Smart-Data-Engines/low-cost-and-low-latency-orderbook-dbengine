@@ -2252,6 +2252,35 @@ ignore checks.
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
 
+### 197. A replica that bootstrapped from a snapshot and then became a primary gives a replica of its own none of the snapshot's rows ✅ **P1**
+
+**Found building #34.** A snapshot's rows are in the installed segments and in no record of the
+replica's own WAL, and that WAL began at file 0, before the install. A primary decides "stream or
+snapshot" by one fact - whether the WAL file a replica asks from exists - so a new replica of such a
+node, asking for the log from the start, was streamed a log without those rows and held none of them,
+answering queries with less and no error. Measured on a pair and a probe (`baa9529`): a replica
+bootstrapped from a snapshot of 18 000 rows, restarted as a primary, gave a new replica of its own
+**0 of 18 000**. After a failover to such a replica every other replica sees a new WAL identity,
+starts over and asks from the start: the same loss on a real cluster, and the next failover makes it
+permanent. The shape is pitfall 523's, which #34 met first on a restored primary.
+
+**Fixed.** `install_snapshot()` and `discard_local_data_for_resync()` begin a new WAL lineage under
+the engine's locks (`Engine::begin_wal_lineage_locked()`): a new identity, written to `wal_identity`
+durably and put where a promotion's `ReplicationManager` announces it from; the WAL rotated into a
+file of its own and the files before it removed; the positions and the vector's base that pointed
+into them reset. A replica asking such a node for the start is told `WAL_TRUNCATED` and sent a
+snapshot, and a restart replays none of the replaced store's records. The node's log says so: `A new
+WAL lineage (a snapshot was installed): identity … after …, begun at file N`.
+
+Tests: `tests/test_snapshot_lineage.cpp` - an install, a discard, and a node that installs nothing
+keeping its identity; `tests/integration/test_replica_lineage.py` - the probe as a test, and a
+failover on a cluster with etcd to a replica that bootstrapped from a snapshot, after which the other
+replica holds every row. Without the fix all four of the first kind fail but the control, and both
+integration tests fail.
+
+- Effort: S | Impact: silent data loss on the replicas of a primary that had once bootstrapped from a
+  snapshot - a replica that joined after retention took the start of the log
+
 ### 196. Moving a symbol between shards moves none of its rows ✅ **P2**
 
 **Found fixing #175.** `MIGRATE <symbol> <shard>` marked the symbol migrated on its shard - every
