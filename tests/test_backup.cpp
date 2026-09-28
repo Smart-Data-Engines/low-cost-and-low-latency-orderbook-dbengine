@@ -270,6 +270,43 @@ TEST(BackupCut, TheSealsAreWrittenWithoutTheEnginesLockAndHoldOnlyWhatTheCutDrai
     engine->close();
 }
 
+TEST(BackupCut, FlushAndTheCutSyncTheWalWithoutTheEnginesLock) {
+    // #190 step 4: FLUSH and a snapshot's cut took the rows and synced the WAL under the engine's
+    // lock, and a backup's cut held every writer 759 ms of its fsync. Between the two holds now,
+    // another thread writes - which it could not, with the lock held until the fsync ended.
+    TempDir dir;
+    auto engine = engine_at(dir.path);
+    for (const bool snapshot : {false, true}) {
+        for (uint64_t n = 0; n < 10; ++n) write(*engine, "A", (snapshot ? 100 : 0) + n);
+        std::thread writer;
+        std::atomic<bool> wrote{false};
+        bool wrote_while_syncing = false;
+        engine->while_syncing_wal_for_test([&] {
+            if (writer.joinable()) return;   // the first hold of this call only
+            writer = std::thread([&] {
+                write(*engine, "B", snapshot ? 2 : 1);
+                wrote = true;
+            });
+            wrote_while_syncing = eventually([&] { return wrote.load(); }, 2000ms);
+        });
+        if (snapshot) {
+            auto cut = engine->create_snapshot_with_sequence_state(ob::SnapshotChecksums::Skip);
+            (void)cut;
+        } else {
+            engine->flush_incremental();
+        }
+        engine->while_syncing_wal_for_test(nullptr);
+        if (writer.joinable()) writer.join();
+        EXPECT_TRUE(wrote_while_syncing)
+            << (snapshot ? "a snapshot's cut" : "FLUSH") << " held the engine's lock through the WAL's fsync";
+    }
+    // Everything was taken - the writes during the syncs by the next flush.
+    engine->flush_incremental();
+    EXPECT_EQ(rows_of(*engine, "A").size(), 20u * 3u);
+    EXPECT_EQ(rows_of(*engine, "B").size(), 2u * 3u);
+    engine->close();
+}
+
 // ── Names, paths, the directory ──────────────────────────────────────────────
 
 TEST(BackupName, ReadsBackAsItsTimeAndSortsInTime) {

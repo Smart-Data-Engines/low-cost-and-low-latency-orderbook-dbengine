@@ -77,9 +77,10 @@ struct SnapshotWithSequenceState {
     /// How long the capture took. Measured rather than assumed: this used to run on the caller's
     /// thread, and for multi-master that thread was `io_loop()` (#79).
     double create_ms{0.0};
-    /// How much of it held the engine's lock - the WAL sync, the drain, the WAL position and the
-    /// sequence state, and the merge of the seals into the index: the part every writer waits for
-    /// (#34). The seals themselves, the walk and the checksums take no lock.
+    /// How long its two holds of the engine's lock took - the rows and the WAL position with the
+    /// sequence state, and the merge of the seals into the index: what every writer waits for (#34).
+    /// The WAL's fsync (#190), the seals, the walk and the checksums take no lock, and the drain
+    /// takes it for moments between, as the tick's does.
     double locked_ms{0.0};
     /// Keeps the files the manifest names where they are (#165 part 2b, `Engine::pin_segment_files()`)
     /// for as long as whoever sends the snapshot holds it.

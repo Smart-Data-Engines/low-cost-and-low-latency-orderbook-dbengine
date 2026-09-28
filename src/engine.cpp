@@ -1857,42 +1857,37 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
         // flush_mtx_ before mtx_: this path writes segments, so it must not run
         // alongside flush_loop() or a client FLUSH.
         std::lock_guard<std::mutex> flush_lock(flush_mtx_);
-        {
-            std::unique_lock<std::mutex> lock(mtx_);
-            // From here to the end of the block no writer takes the engine's lock.
-            const auto t_locked = std::chrono::steady_clock::now();
-
-            // Flush all pending rows to columnar stores.
-            //
-            // Thrown rather than logged: a snapshot means "everything up to here is on the disk",
-            // and this is the call that establishes it. The async worker turns the exception into a
-            // failed snapshot, which is a peer that retries - where a snapshot taken anyway would be
-            // a peer bootstrapping from a premise nobody checked.
-            if (!wal_.sync()) {
-                throw std::runtime_error("Engine: WAL sync failed while taking a snapshot");
-            }
-            sync_ms = std::chrono::duration<double, std::milli>(
-                          std::chrono::steady_clock::now() - t_locked).count();
-            flush_drain_pending();
-
-            // Capture WAL position atomically with the flush.
-            // One load: a manifest is what a joining peer catches up from, so a pair assembled from
-            // two moments points it at a position that never existed.
-            const WalPosition manifest_pos = wal_.current_position();
-            manifest.wal_file_index  = manifest_pos.file_index;
-            manifest.wal_byte_offset = manifest_pos.offset;
-
-            for (const std::string& dir : replaced_input_dirs()) {
-                replaced.insert(fs::path(dir).lexically_normal().string());
-            }
-
-            // And the sequence state, in the same critical section. See the header for why the
-            // boundary has to be exactly here and not a line later.
-            out.vector = seq_tracker_.export_vector(kMaxPersistedVectorEntries, out.vector_truncated);
-            out.held   = seq_tracker_.export_held(kMaxPersistedHeldRanges, out.held_truncated);
-            out.locked_ms = std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - t_locked).count();
-        }
+        // The rows waiting and the WAL's sync, as FLUSH and the tick take theirs (#190): under the lock
+        // the ticket, the rows, the position and the sequence state - one hold, so the manifest's
+        // position, the vector and the rows are of one moment; the fsync without it. Thrown on a
+        // failed sync, as it was: a snapshot means "everything up to here is on the disk", and this
+        // is the call that establishes it. The async worker turns the exception into a failed
+        // snapshot, which is a peer that retries - where a snapshot taken anyway would be a peer
+        // bootstrapping from a premise nobody checked.
+        const auto t_taking = std::chrono::steady_clock::now();
+        WalPosition covered{};
+        PendingQueue::Batch batch = take_pending_synced(
+            "a snapshot's cut", "Engine: WAL sync failed while taking a snapshot", covered, [&] {
+                const auto t_locked = std::chrono::steady_clock::now();
+                // One position, the ticket's: every row taken has its record before it, and a
+                // manifest is what a joining peer catches up from, so a pair assembled from two
+                // moments points it at a position that never existed.
+                const WalPosition manifest_pos = wal_.current_position();
+                manifest.wal_file_index  = manifest_pos.file_index;
+                manifest.wal_byte_offset = manifest_pos.offset;
+                for (const std::string& dir : replaced_input_dirs()) {
+                    replaced.insert(fs::path(dir).lexically_normal().string());
+                }
+                // And the sequence state, in the same critical section. See the header for why the
+                // boundary has to be exactly here and not a line later.
+                out.vector = seq_tracker_.export_vector(kMaxPersistedVectorEntries, out.vector_truncated);
+                out.held   = seq_tracker_.export_held(kMaxPersistedHeldRanges, out.held_truncated);
+                out.locked_ms = std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - t_locked).count();
+            });
+        sync_ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - t_taking).count();
+        drain_batch(batch, covered, /*mtx_held=*/false);
 
         // Every store's blocks, since #165 part 2a: a snapshot is what is on the disk, and a row in
         // a block is not yet. Written without the engine's lock, as the tick and FLUSH write theirs;
@@ -2101,8 +2096,8 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
                         std::chrono::steady_clock::now() - t_start).count();
     OB_LOG_INFO("engine",
                 "Snapshot created: files=%zu bytes=%zu rows=%zu wal=%u:%zu vector=%zu%s "
-                "held=%zu%s checksums=%s in %.1f ms: the engine's lock held %.1f ms (%.1f of it the WAL "
-                "sync), seals written without it in %.1f ms",
+                "held=%zu%s checksums=%s in %.1f ms: the engine's lock held %.1f ms, the WAL synced "
+                "without it in %.1f ms and the seals written in %.1f ms",
                 manifest.files.size(), manifest.total_bytes, manifest.total_rows,
                 manifest.wal_file_index, manifest.wal_byte_offset,
                 out.vector.size(), out.vector_truncated ? " (truncated)" : "",
@@ -3184,44 +3179,12 @@ void Engine::flush_tick() {
         // draining them would move them out of the only place that still knows they were never
         // synced, and #112's boundary catches the throw, counts it and runs the next tick. The
         // drain runs without mtx_ too, giving each chunk back as soon as it is in its stores.
-        WALWriter::SyncTicket ticket;
-        PendingQueue::Batch batch;
-        {
-            TimedLock timed(mtx_, "flush tick: the WAL sync ticket and the rows it covers");
-            auto prepared = wal_.prepare_sync();
-            ticket = std::move(prepared.first);
-            if (prepared.second != 0) {
-                // The duplicate could not be made and the sync ran under the lock, and failed.
-                throw std::runtime_error("Engine: WAL sync failed during the flush tick");
-            }
-            batch = pending_rows_.take_all();
-            taken = batch.rows();
-            detached_rows_.store(batch.rows(), std::memory_order_relaxed);
-            if (!ticket.owed()) {
-                // Nothing to sync - `every` has synced each run, `none` never does, or nothing was
-                // written - and the floor moves here too (#160): nothing owed means the log is
-                // synced to its end, under `every` by the last write's own sync, which is this
-                // path's ordinary case once writes are flowing, since each one resets the count a
-                // checkpoint left. Without this, retention under `every` never moved at all.
-                note_wal_synced();
-            }
-        }
-        if (ticket.owed()) {
-            const int sync_err = wal_.perform_sync(ticket);
-            TimedLock timed(mtx_, "flush tick: completing the WAL sync");
-            wal_.complete_sync(ticket, sync_err);
-            if (sync_err != 0) {
-                detached_rows_.store(0, std::memory_order_relaxed);
-                pending_rows_.put_back_front(std::move(batch));
-                throw std::runtime_error("Engine: WAL sync failed during the flush tick");
-            }
-            // The floor follows the checkpoint this sync covered (#160): it was appended by the last
-            // tick, before this ticket's position, and no checkpoint is appended while this tick
-            // holds `flush_mtx_`.
-            note_wal_synced();
-        }
+        WalPosition covered{};
+        PendingQueue::Batch batch = take_pending_synced(
+            "flush tick", "Engine: WAL sync failed during the flush tick", covered);
+        taken = batch.rows();
         const auto synced = TickClock::now();
-        drain_batch(batch, ticket.position(), /*mtx_held=*/false);
+        drain_batch(batch, covered, /*mtx_held=*/false);
         const auto drained = TickClock::now();
 
         // Phase B: segment I/O + merge, outside mtx_ so writers are not blocked. A failed segment
@@ -3342,6 +3305,55 @@ void Engine::flush_tick() {
         }
 }
 
+
+Engine::PendingQueue::Batch Engine::take_pending_synced(const char* what, const char* failure,
+                                                       WalPosition& covered,
+                                                       const std::function<void()>& under_the_lock) {
+    // Moved here from the flush tick (#190), where it had been since #151, so that FLUSH and a
+    // snapshot's cut - which synced under the engine's lock, 759 ms of a backup cut's 779 measured -
+    // take the rows and settle the sync the one way. The rows go back to the queue on a failed sync:
+    // draining them would move them out of the only place that still knows they were never synced.
+    const std::string taking   = std::string(what) + ": the WAL sync ticket and the rows it covers";
+    const std::string settling = std::string(what) + ": completing the WAL sync";
+    WALWriter::SyncTicket ticket;
+    PendingQueue::Batch batch;
+    {
+        TimedLock timed(mtx_, taking.c_str());
+        auto prepared = wal_.prepare_sync();
+        ticket = std::move(prepared.first);
+        if (prepared.second != 0) {
+            // The duplicate could not be made and the sync ran under the lock, and failed.
+            throw std::runtime_error(failure);
+        }
+        batch = pending_rows_.take_all();
+        detached_rows_.store(batch.rows(), std::memory_order_relaxed);
+        if (under_the_lock) under_the_lock();
+        if (!ticket.owed()) {
+            // Nothing to sync - `every` has synced each run, `none` never does, or nothing was
+            // written - and the floor moves here too (#160): nothing owed means the log is
+            // synced to its end, under `every` by the last write's own sync, which is this
+            // path's ordinary case once writes are flowing, since each one resets the count a
+            // checkpoint left. Without this, retention under `every` never moved at all.
+            note_wal_synced();
+        }
+    }
+    if (while_syncing_wal_for_test_) while_syncing_wal_for_test_();
+    if (ticket.owed()) {
+        const int sync_err = wal_.perform_sync(ticket);
+        TimedLock timed(mtx_, settling.c_str());
+        wal_.complete_sync(ticket, sync_err);
+        if (sync_err != 0) {
+            detached_rows_.store(0, std::memory_order_relaxed);
+            pending_rows_.put_back_front(std::move(batch));
+            throw std::runtime_error(failure);
+        }
+        // The floor follows the checkpoint this sync covered (#160): it was appended before this
+        // ticket's position, and no checkpoint is appended while the caller holds `flush_mtx_`.
+        note_wal_synced();
+    }
+    covered = ticket.position();
+    return batch;
+}
 
 void Engine::flush_drain_pending() {
     // Phase A: drain pending_rows_ into per-symbol columnar stores.
@@ -4181,16 +4193,15 @@ void Engine::flush_everything(bool claim_regardless) {
     // active segment, and the segment ended up in the query index twice.
     std::lock_guard<std::mutex> flush_lock(flush_mtx_);
 
-    // Phase A: lock → WAL sync → drain pending rows → unlock
+    // Phase A: the rows waiting and the WAL's sync, with the engine's lock only to take them, as the
+    // tick takes its own (#190). It synced under the lock until then, and every writer waited for the
+    // fsync. A client asked for this one, so a client is told: `FLUSH` answering `OK` over a failed
+    // sync is the same lie as `INSERT` doing it.
     {
-        std::unique_lock<std::mutex> lock(mtx_);
-        // A client asked for this one, so a client is told. `FLUSH` answering `OK` over a failed
-        // sync is the same lie as `INSERT` doing it.
-        if (!wal_.sync()) {
-            throw std::runtime_error("Engine: WAL sync failed during FLUSH");
-        }
-        note_wal_synced();
-        flush_drain_pending();
+        WalPosition covered{};
+        PendingQueue::Batch batch =
+            take_pending_synced("FLUSH", "Engine: WAL sync failed during FLUSH", covered);
+        drain_batch(batch, covered, /*mtx_held=*/false);
     }
     // Phase B: segment I/O + merge, outside mtx_ so writers are not blocked. A client asked for
     // this flush, so a client is told when its segments could not be made durable (#160) - the

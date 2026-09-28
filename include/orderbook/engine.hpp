@@ -154,6 +154,13 @@ public:
     /// by the engine: what a test uses to write while a snapshot's seals are being written (#34).
     void while_sealing_for_test(std::function<void()> hook) { while_sealing_for_test_ = std::move(hook); }
 
+    /// Called between the two holds of `take_pending_synced()` - the rows taken, the WAL's `fsync` not
+    /// yet begun - with no engine lock held: what a test uses to write while a FLUSH or a snapshot's
+    /// cut syncs the WAL (#190).
+    void while_syncing_wal_for_test(std::function<void()> hook) {
+        while_syncing_wal_for_test_ = std::move(hook);
+    }
+
     void skip_vector_persistence_for_test() {
         skip_vector_persistence_.store(true, std::memory_order_relaxed);
     }
@@ -1105,6 +1112,7 @@ private:
     uint32_t vector_generation_written_{0};
     std::atomic<bool> skip_vector_persistence_{false};   ///< see skip_vector_persistence_for_test()
     std::function<void()> while_sealing_for_test_;       ///< see while_sealing_for_test()
+    std::function<void()> while_syncing_wal_for_test_;   ///< see while_syncing_wal_for_test()
     /// Held ranges written down per persist. The WAL payload length is 16-bit, so this is a hard
     /// ceiling rather than a preference: 3000 ranges is ~48 KB of payload plus entry headers.
     static constexpr std::size_t kMaxPersistedHeldRanges = 3000;
@@ -1293,7 +1301,18 @@ private:
     /// checkpoint vouches for to have been removed (#160): a record a remaining segment already
     /// holds is skipped by the WAL position that segment recorded (#63), which needs the index.
     uint64_t replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastCheckpoint& last);
-    void flush_drain_pending();    // Phase A: drain pending_rows_ → per-symbol append (must hold mtx_)
+    void flush_drain_pending();
+
+    /// The rows waiting, and a sync of the WAL records they came from, with the engine's lock held
+    /// only to take them (#151's ticket, #190): under `mtx_` the WAL's sync ticket, the rows, and
+    /// `under_the_lock` in the same hold; the `fsync` without the lock; the ticket settled under it
+    /// again. A failed sync puts the rows back at the front of the queue and throws `failure`. The
+    /// ticket's position goes to `covered`: every row taken has its record before it, the sync
+    /// covered it, and it is what the drain stamps into the blocks. `what` names the two holds in
+    /// the slow-lock log (`TimedLock`). Caller holds `flush_mtx_`, so no other drain comes between.
+    PendingQueue::Batch take_pending_synced(const char* what, const char* failure,
+                                            WalPosition& covered,
+                                            const std::function<void()>& under_the_lock = nullptr);    // Phase A: drain pending_rows_ → per-symbol append (must hold mtx_)
     /// The drain itself: `batch` into its per-symbol stores, each store stamped with `covered` -
     /// the WAL position every one of these rows' records is at or before, and which a sync has
     /// reached - and `drained_up_to_` set to it once every row is in. Each chunk is given back to
