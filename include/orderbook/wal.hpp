@@ -40,12 +40,17 @@ inline constexpr uint8_t WAL_RECORD_HELD_SEQUENCES = 8;
 /// One part of a version vector too large for one record (#177): see `VectorAssembler`. A build that
 /// does not know the type skips it, in a WAL and on a mesh link, as it skips any it does not know.
 inline constexpr uint8_t WAL_RECORD_VERSION_VECTOR_PART = 9;
+/// One part of the entries of this node's version vector that moved since the last vector it wrote
+/// (#189): the part format of `WAL_RECORD_VERSION_VECTOR_PART`, put on the last whole vector by a
+/// restart (`VectorFromWal`). Read only by the node that wrote it - catch-up forwards DELTA records and
+/// nothing else - and skipped by a build that does not know the type.
+inline constexpr uint8_t WAL_RECORD_VERSION_VECTOR_CHANGES = 10;
 
 /// Reserved: 200 and above are wire-only message types, never written to a WAL file.
 ///
 /// The multi-master snapshot protocol (MM_MSG_SNAPSHOT_* in multi_master.hpp) borrows this
 /// field to tag its frames, because frames after the handshake carry a WALRecordV2 header and
-/// nothing else identifies them. A new WAL record type takes the next free number from 9 up and
+/// nothing else identifies them. A new WAL record type takes the next free number from 11 up and
 /// must stay below 200, or a node would read a snapshot chunk as a record to replay.
 inline constexpr uint8_t WAL_RECORD_WIRE_ONLY_BASE = 200;
 
@@ -412,6 +417,9 @@ public:
     /// one vector go in one critical section, one after another, which is what lets a restart put them
     /// back together by their order.
     void append_version_vector_part(const uint8_t* payload, size_t payload_len);
+    /// The same for one part of the entries that moved since the last vector (#189,
+    /// WAL_RECORD_VERSION_VECTOR_CHANGES): written in one critical section like a vector's parts.
+    void append_version_vector_changes(const uint8_t* payload, size_t payload_len);
 
     /// Write a HELD_SEQUENCES record (type 8). Not fsynced, for the same reason as the vector:
     /// losing it costs redeliveries and duplicate drops, never data.

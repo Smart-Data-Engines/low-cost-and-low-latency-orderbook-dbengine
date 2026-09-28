@@ -952,6 +952,16 @@ for ones it holds.
 **How far behind a replica is** is a different question with a different answer, in the section
 below.
 
+### Downgrading a mesh node across #189
+
+Since #189 a checkpoint writes down the entries of the version vector that moved since the last one,
+and a whole vector only where a restart needs one - a build before #189 skips the changes, as it skips
+any record type it does not know, and restores the last whole vector alone. So a node goes back to an
+older build **from a clean stop**: a stop that wrote changes since its last whole vector writes a whole
+one before it ends, and that is the vector the older build reads. Started on the older build after a
+crash instead, the node restores its frontiers as of its last whole vector - behind what it holds -
+and its peers' catch-up sends it again what moved since.
+
 ## When a replica falls behind
 
 Two gauges again, and the same rule: read the pair.

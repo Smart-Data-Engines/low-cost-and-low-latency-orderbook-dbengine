@@ -577,6 +577,25 @@ void WALWriter::append_version_vector_part(const uint8_t* payload, size_t payloa
     OB_LOG_DEBUG("wal", "Version vector part appended (not fsynced): bytes=%zu", payload_len);
 }
 
+void WALWriter::append_version_vector_changes(const uint8_t* payload, size_t payload_len) {
+    if (payload_len > WAL_MAX_PAYLOAD_LEN) {
+        OB_LOG_ERROR("wal",
+                     "Refusing to append a part of a version vector's changes: %zu bytes exceeds "
+                     "the %zu a record header can describe",
+                     payload_len, WAL_MAX_PAYLOAD_LEN);
+        return;
+    }
+    WALRecord hdr{};
+    hdr.sequence_number = 0;
+    hdr.timestamp_ns    = 0;
+    hdr.checksum        = crc32c(payload, payload_len);
+    hdr.payload_len     = static_cast<uint16_t>(payload_len);
+    hdr.record_type     = WAL_RECORD_VERSION_VECTOR_CHANGES;
+    hdr._pad            = 0;
+    write_record(hdr, payload, payload_len, /*allow_fsync=*/false);
+    OB_LOG_DEBUG("wal", "Version vector changes part appended (not fsynced): bytes=%zu", payload_len);
+}
+
 void WALWriter::append_version_vector(const uint8_t* payload, size_t payload_len) {
     // Backstop for #78. The header describes the length in a uint16_t, and write_record()
     // writes whatever it is handed, so a payload above the limit would produce a record

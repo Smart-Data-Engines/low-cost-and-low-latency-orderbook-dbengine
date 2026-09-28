@@ -11,6 +11,7 @@
 #include <rapidcheck/gtest.h>
 
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -725,4 +726,84 @@ TEST(ClosedNumbering, ASymbolFirstSeenAfterTheCloseNumbersFromOne) {
     EXPECT_EQ(t.observe("NEW.EX", 1, 0).sequence_number, 1u);
     EXPECT_EQ(t.observe("NEW.EX", 2, 1).gap, false);
     EXPECT_EQ(t.frontier("NEW.EX", 2), 1u);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// What a writer asks before writing the held set down (#189)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(HeldVersion, CountsChangesToTheHeldNumbersAndNothingElse) {
+    ob::SequenceTracker t;
+    const uint16_t peer = 2;
+    const uint64_t before = t.held_version();
+    (void)t.observe("A.EX", peer, 1);
+    (void)t.observe("A.EX", peer, 2);
+    EXPECT_EQ(t.held_version(), before) << "records in order hold nothing, and changed nothing held";
+    EXPECT_EQ(t.holding_count(), 0u);
+
+    (void)t.observe("A.EX", peer, 5);   // held above the hole at 3
+    EXPECT_EQ(t.held_version(), before + 1);
+    EXPECT_EQ(t.holding_count(), 1u);
+    (void)t.observe("A.EX", peer, 5);   // a redelivery of what is held
+    EXPECT_EQ(t.held_version(), before + 1) << "a redelivery changed the held set";
+
+    (void)t.observe("A.EX", peer, 3);
+    (void)t.observe("A.EX", peer, 4);   // fills the hole: 5 drains into the frontier
+    EXPECT_EQ(t.frontier("A.EX", peer), 5u);
+    EXPECT_EQ(t.held_version(), before + 2);
+    EXPECT_EQ(t.holding_count(), 0u) << "a state that holds nothing is still in the index";
+
+    t.declare_frontier("B.EX", peer, 10);
+    (void)t.observe("B.EX", peer, 13);
+    t.declare_frontier("B.EX", peer, 20);   // covers what B held
+    EXPECT_EQ(t.holding_count(), 0u);
+    EXPECT_EQ(t.held_version(), before + 4);
+
+    (void)t.observe("C.EX", peer, 9);
+    ASSERT_EQ(t.holding_count(), 1u);
+    t.reset();
+    EXPECT_EQ(t.holding_count(), 0u);
+    EXPECT_EQ(t.held_version(), before + 6) << "a reset that dropped held numbers changed nothing";
+}
+
+RC_GTEST_PROP(HeldVersionProperty, TheHeldExportIsWhatWasHeldInKeyAndOriginOrder, ()) {
+    // Any records from a few origins in any order, and the numbers each holds above its frontier -
+    // computed here from what arrived - are what export_held() hands out, sorted, from its index.
+    ob::SequenceTracker t;
+    std::map<std::pair<std::string, uint16_t>, std::set<uint64_t>> seen;
+    const auto n = *rc::gen::inRange<size_t>(0, 400);
+    for (size_t i = 0; i < n; ++i) {
+        const auto key = "K" + std::to_string(*rc::gen::inRange(0, 6)) + ".EX";
+        const auto origin = static_cast<uint16_t>(*rc::gen::inRange(1, 4));
+        const auto seq = static_cast<uint64_t>(*rc::gen::inRange(1, 40));
+        (void)t.observe(key, origin, seq);
+        seen[{key, origin}].insert(seq);
+    }
+    std::vector<ob::SequenceTracker::HeldRanges> expected;
+    for (const auto& [k, seqs] : seen) {
+        uint64_t frontier = 0;
+        while (seqs.count(frontier + 1) != 0) ++frontier;
+        ob::SequenceTracker::HeldRanges h;
+        h.key = k.first;
+        h.origin = k.second;
+        for (uint64_t s : seqs) {
+            if (s <= frontier) continue;
+            if (!h.ranges.empty() && h.ranges.back().second + 1 == s) {
+                h.ranges.back().second = s;
+            } else {
+                h.ranges.emplace_back(s, s);
+            }
+        }
+        if (!h.ranges.empty()) expected.push_back(std::move(h));
+    }
+    bool truncated = false;
+    const auto held = t.export_held(1u << 20, truncated);
+    RC_ASSERT(!truncated);
+    RC_ASSERT(held.size() == expected.size());
+    RC_ASSERT(t.holding_count() == expected.size());
+    for (size_t i = 0; i < held.size(); ++i) {
+        RC_ASSERT(held[i].key == expected[i].key);
+        RC_ASSERT(held[i].origin == expected[i].origin);
+        RC_ASSERT(held[i].ranges == expected[i].ranges);
+    }
 }

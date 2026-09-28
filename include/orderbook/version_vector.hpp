@@ -19,6 +19,7 @@
 #include "orderbook/wal.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -107,6 +108,62 @@ private:
     uint16_t next_{0};
     std::vector<SequenceTracker::VectorEntry> building_;
     std::vector<SequenceTracker::VectorEntry> complete_;
+};
+
+// ── What moved since the last vector written, and the vector a WAL states (#189) ─
+//
+// Since #177 a vector of any size went into the WAL before every checkpoint that followed a frontier
+// moving, whole and under the engine's lock: at 50 000 (symbol, origin) entries 8.7 - 9 ms and 2 MB of
+// WAL at every checkpoint. A checkpoint writes the entries that moved since the last vector instead -
+// parts of one generation, of a record type of their own - and a whole vector where a restart needs one
+// to start from (Engine::persist_version_vector_if_changed()).
+
+/// The records that carry the entries of `entries` that `which` names (indices into it): parts 0..N-1
+/// of `generation` - the part format, whatever their number - of type WAL_RECORD_VERSION_VECTOR_CHANGES.
+std::vector<VectorRecord> serialize_version_vector_changes(
+    const std::vector<SequenceTracker::VectorEntry>& entries, const std::vector<size_t>& which,
+    uint32_t generation);
+
+/// The version vector a WAL states, as a restart reads it (#189): the last whole vector - one record,
+/// or the parts of one generation (#177) - with every complete set of changes written after it put on
+/// top, in order. A set of parts a crash cut short is neither, and what stood before it stands; changes
+/// with no whole vector before them in the log state nothing, and the vector is unusable.
+class VectorFromWal {
+public:
+    /// One record of the log, in the log's order. Other record types are passed over.
+    void add(const WALReplayContext& ctx);
+
+    /// The vector, when the log states one.
+    std::optional<std::vector<SequenceTracker::VectorEntry>>& vector() { return vector_; }
+    const std::optional<std::vector<SequenceTracker::VectorEntry>>& vector() const { return vector_; }
+    /// The last whole vector did not read, or changes came with none before them.
+    bool unusable() const { return unusable_; }
+    /// The WAL file the last whole vector begins in: while changes stand on it, retention keeps it.
+    std::optional<uint32_t> base_file() const { return base_file_; }
+    /// Sets of changes put on the last whole vector.
+    size_t changes_applied() const { return changes_applied_; }
+    /// The bytes the last whole vector took, and the changes put on it: what the writer that goes on
+    /// from this log weighs the next whole one against.
+    size_t whole_bytes() const { return whole_bytes_; }
+    size_t changes_bytes() const { return changes_bytes_; }
+
+private:
+    void take_whole(std::vector<SequenceTracker::VectorEntry> entries, uint32_t file, size_t bytes);
+    void apply(std::vector<SequenceTracker::VectorEntry> changes);
+
+    std::optional<std::vector<SequenceTracker::VectorEntry>> vector_;
+    bool                    unusable_{false};
+    std::optional<uint32_t> base_file_;
+    size_t                  changes_applied_{0};
+    size_t                  whole_bytes_{0};
+    size_t                  changes_bytes_{0};
+    VectorAssembler         whole_parts_;
+    uint32_t                whole_first_file_{0};   ///< the file of the part 0 being assembled
+    size_t                  whole_assembling_bytes_{0};
+    VectorAssembler         change_parts_;
+    size_t                  change_assembling_bytes_{0};
+    /// (key, origin) -> its index in vector_: built at the first changes after a whole vector.
+    std::unordered_map<std::string, std::unordered_map<uint16_t, size_t>> index_;
 };
 
 // ── Held sequence numbers ────────────────────────────────────────────────────

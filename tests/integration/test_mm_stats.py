@@ -132,8 +132,13 @@ def mm_node():
         pytest.skip(f"etcd not available: {ETCD}")
     data_dir = tempfile.mkdtemp(prefix="ob_mm_stats_")
     node = MmNode(data_dir)
-    yield node
-    node.stop()
+    try:
+        yield node
+    finally:
+        node.stop()
+        # 62 MB a test - the node's WAL and its etcd - and the battery left 84 of them in /tmp in
+        # three days before this.
+        shutil.rmtree(data_dir, ignore_errors=True)
 
 
 def status_field(reply: str, name: str) -> str | None:

@@ -391,6 +391,11 @@ ob_add_engine_test(test_start_reads_wal_once
     test_start_reads_wal_once.cpp
 )
 
+# ── A mesh node writes down what moved in its vector (#189) ───────────────────
+ob_add_engine_test(test_mm_vector_changes
+    test_mm_vector_changes.cpp
+)
+
 ob_add_engine_test(test_mm_snapshot
     test_mm_snapshot.cpp
 )

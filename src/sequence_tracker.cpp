@@ -45,6 +45,18 @@ void SequenceTracker::mark_moved(const std::string& key, uint16_t origin, Origin
     count_listing();
 }
 
+void SequenceTracker::note_held(const std::string& key, uint16_t origin, OriginState& st,
+                                std::size_t held_before) {
+    const std::size_t now = st.above_frontier.size();
+    if (now == held_before) return;   // one call changes the set in one direction only
+    ++held_version_;
+    if (now == 0) {
+        holding_.erase(&st);
+    } else if (held_before == 0) {
+        holding_.emplace(&st, Holding{&key, origin});
+    }
+}
+
 SequenceTracker::MovedFrontiers SequenceTracker::take_moved_frontiers() {
     MovedFrontiers out;
     out.all      = moved_all_;
@@ -91,7 +103,9 @@ SequenceTracker::Decision SequenceTracker::observe(const std::string& key, uint1
         // insert, which is noise, not signal.
         OriginState& ost = st.origins[origin];
         close_if_past_base(stored_key, origin, ost, d.sequence_number);
+        const std::size_t held = ost.above_frontier.size();
         if (note_seen(ost, d.sequence_number)) mark_moved(stored_key, origin, ost);
+        note_held(stored_key, origin, ost, held);
         return d;
     }
 
@@ -100,7 +114,9 @@ SequenceTracker::Decision SequenceTracker::observe(const std::string& key, uint1
         // First record from this origin. Not a gap: there is nothing to be one past.
         OriginState& fresh = st.origins[origin];
         close_if_past_base(stored_key, origin, fresh, d.sequence_number);
+        const std::size_t held = fresh.above_frontier.size();
         if (note_seen(fresh, d.sequence_number)) mark_moved(stored_key, origin, fresh);
+        note_held(stored_key, origin, fresh, held);
         OB_LOG_DEBUG("sequence", "First record from origin: key=%s origin=%u seq=%llu",
                      key.c_str(), static_cast<unsigned>(origin),
                      static_cast<unsigned long long>(d.sequence_number));
@@ -127,7 +143,9 @@ SequenceTracker::Decision SequenceTracker::observe(const std::string& key, uint1
                     static_cast<unsigned long long>(it->second.high_water));
     }
 
+    const std::size_t held = it->second.above_frontier.size();
     if (note_seen(it->second, d.sequence_number)) mark_moved(stored_key, origin, it->second);
+    note_held(stored_key, origin, it->second, held);
     if (!it->second.held_full && it->second.above_frontier.size() >= kMaxAboveFrontier) {
         // Said once per episode - until the frontier moves again. A held set at its cap is a hole
         // nothing is filling: numbers above it are no longer held, so a redelivery of one is stored
@@ -155,7 +173,9 @@ void SequenceTracker::seed(const std::string& key, uint16_t origin, uint64_t seq
     if (origin == local_origin_) st.next_local = std::max(st.next_local, seq + 1);   // see observe()
     OriginState& ost = st.origins[origin];
     close_if_past_base(sym->first, origin, ost, seq);
+    const std::size_t held = ost.above_frontier.size();
     if (note_seen(ost, seq)) mark_moved(sym->first, origin, ost);
+    note_held(sym->first, origin, ost, held);
 }
 
 bool SequenceTracker::raise_frontier(OriginState& st, uint64_t seq) {
@@ -181,8 +201,10 @@ void SequenceTracker::declare_frontier(const std::string& key, uint16_t origin, 
     const auto [sym, created] = symbols_.try_emplace(key);
     (void)created;
     OriginState& st = sym->second.origins[origin];
+    const std::size_t held = st.above_frontier.size();
     if (!raise_frontier(st, seq)) return;
     mark_moved(sym->first, origin, st);
+    note_held(sym->first, origin, st, held);
     OB_LOG_DEBUG("sequence", "Declared frontier: key=%s origin=%u frontier=%llu",
                  key.c_str(), static_cast<unsigned>(origin),
                  static_cast<unsigned long long>(st.frontier));
@@ -196,8 +218,10 @@ std::size_t SequenceTracker::close_numbering(const std::string& key) {
     std::size_t moved = 0;
     for (auto& [origin, ost] : st.origins) {
         const uint64_t was = ost.frontier;
+        const std::size_t held = ost.above_frontier.size();
         if (!raise_frontier(ost, kClosedNumberingBase - 1)) continue;
         mark_moved(sym->first, origin, ost);
+        note_held(sym->first, origin, ost, held);
         ++moved;
         OB_LOG_DEBUG("sequence", "Numbering closed: key=%s origin=%u frontier %llu -> %llu",
                      key.c_str(), static_cast<unsigned>(origin),
@@ -221,8 +245,10 @@ void SequenceTracker::close_if_past_base(const std::string& key, uint16_t origin
                                          uint64_t seq) {
     if (seq < kClosedNumberingBase || st.frontier >= kClosedNumberingBase - 1) return;
     const uint64_t was = st.frontier;
+    const std::size_t held = st.above_frontier.size();
     raise_frontier(st, kClosedNumberingBase - 1);
     mark_moved(key, origin, st);
+    note_held(key, origin, st, held);
     OB_LOG_WARN("sequence", "Numbering of %s origin %u closed here by its record %llu: its origin "
                             "closed its numbering from before per-origin numbers (#184, #187), so "
                             "every number of it below %llu is held here, where the frontier stood at "
@@ -295,6 +321,8 @@ void SequenceTracker::import_own_vector(const std::vector<VectorEntry>& entries)
 void SequenceTracker::reset() {
     const std::size_t had = symbols_.size();
     moved_.clear();                // the states it points at go next
+    if (!holding_.empty()) ++held_version_;
+    holding_.clear();              // and these
     symbols_.clear();
     moved_all_ = true;
     count_listing();               // a copy kept from before this is behind it
@@ -327,42 +355,54 @@ std::vector<SequenceTracker::HeldRanges> SequenceTracker::export_held(std::size_
     std::vector<HeldRanges> out;
     std::size_t budget = max_ranges;
 
-    for (const auto& [key, st] : symbols_) {
-        for (const auto& [origin, ost] : st.origins) {
-            if (ost.above_frontier.empty()) continue;
+    // From the states that hold something (#189), not from every frontier: at 50 000 (symbol,
+    // origin) pairs the walk that found the few holding anything was paid at every checkpoint. In
+    // (key, origin) order, so that one held set is written as the same bytes.
+    using Entry = std::pair<const OriginState* const, Holding>;
+    std::vector<const Entry*> order;
+    order.reserve(holding_.size());
+    for (const Entry& e : holding_) order.push_back(&e);
+    std::sort(order.begin(), order.end(), [](const Entry* a, const Entry* b) {
+        return *a->second.key != *b->second.key ? *a->second.key < *b->second.key
+                                                : a->second.origin < b->second.origin;
+    });
 
-            HeldRanges entry;
-            entry.key    = key;
-            entry.origin = origin;
+    std::size_t visited = 0;
+    for (const Entry* e : order) {
+        const OriginState& ost = *e->first;
+        ++visited;
 
-            // Collapse consecutive numbers into one range as we go: the set is ordered, so this
-            // is a single pass and no intermediate list of numbers is built.
-            uint64_t first = 0, last = 0;
-            bool open_range = false;
-            for (uint64_t seq : ost.above_frontier) {
-                if (open_range && seq == last + 1) {
-                    last = seq;
-                    continue;
-                }
-                if (open_range) entry.ranges.emplace_back(first, last);
-                first = last = seq;
-                open_range = true;
+        HeldRanges entry;
+        entry.key    = *e->second.key;
+        entry.origin = e->second.origin;
+
+        // Collapse consecutive numbers into one range as we go: the set is ordered, so this
+        // is a single pass and no intermediate list of numbers is built.
+        uint64_t first = 0, last = 0;
+        bool open_range = false;
+        for (uint64_t seq : ost.above_frontier) {
+            if (open_range && seq == last + 1) {
+                last = seq;
+                continue;
             }
             if (open_range) entry.ranges.emplace_back(first, last);
+            first = last = seq;
+            open_range = true;
+        }
+        if (open_range) entry.ranges.emplace_back(first, last);
 
-            if (entry.ranges.size() > budget) {
-                // Keep what fits rather than dropping the entry: a partial held set is still
-                // fewer duplicates than none.
-                entry.ranges.resize(budget);
-                truncated = true;
-            }
-            budget -= entry.ranges.size();
-            if (!entry.ranges.empty()) out.push_back(std::move(entry));
-            if (budget == 0) {
-                // Anything not visited yet is dropped, and the caller must be told.
-                truncated = truncated || out.size() < symbols_.size();
-                return out;
-            }
+        if (entry.ranges.size() > budget) {
+            // Keep what fits rather than dropping the entry: a partial held set is still
+            // fewer duplicates than none.
+            entry.ranges.resize(budget);
+            truncated = true;
+        }
+        budget -= entry.ranges.size();
+        if (!entry.ranges.empty()) out.push_back(std::move(entry));
+        if (budget == 0) {
+            // Anything not visited yet is dropped, and the caller must be told.
+            truncated = truncated || visited < order.size();
+            return out;
         }
     }
     return out;
@@ -378,7 +418,9 @@ void SequenceTracker::import_held(const std::vector<HeldRanges>& held) {
                 // note_seen() also advances the frontier when a range turns out to close a hole,
                 // which is correct: if the gap below was filled in a previous run and recorded in
                 // the frontier, these numbers now sit right above it.
+                const std::size_t held = ost.above_frontier.size();
                 if (note_seen(ost, seq)) mark_moved(sym->first, entry.origin, ost);
+                note_held(sym->first, entry.origin, ost, held);
             }
         }
     }

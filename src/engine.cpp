@@ -268,6 +268,16 @@ void Engine::open() {
     // The vector first, so the segments below know whether one was there: a segment received from
     // a peer needs it (#184, below). Both only ever raise, so the order changes nothing else.
     const bool vector_restored = restore_version_vector(from_wal);
+    {
+        // What this start writes down goes on from the log's own: the changes stand on the whole
+        // vector they were read against, retention keeps its file, and the next whole one is weighed
+        // against it (#189). Only a log without a usable vector needs a whole one first.
+        std::lock_guard<std::mutex> lock(mtx_);
+        vector_base_file_     = from_wal.vector.base_file().value_or(kNoVectorBase);
+        vector_whole_bytes_   = from_wal.vector.whole_bytes();
+        vector_changes_bytes_ = from_wal.vector.changes_bytes();
+        vector_whole_due_     = !vector_restored;
+    }
 
     // Segments written before per-origin numbers (#184), counted by the pass below: what decides
     // whether this start closes their numbering (#187).
@@ -328,12 +338,6 @@ void Engine::open() {
             // highest is the only safe number, holes and all - the lesser harm until #177.
             if (!vector_restored) seq_tracker_.raise_local(key, meta.max_sequence_number);
             ++received;
-        }
-        if (vector_restored) {
-            std::unique_lock<std::mutex> lock(mtx_);
-            // What the WAL holds is what the vector said, and the declarations above are derived
-            // from segments at every start: not a change the next checkpoint has to write down.
-            vector_fingerprint_written_ = seq_tracker_.fingerprint();
         }
         OB_LOG_INFO("engine", "Sequence counters restored from segments: own=%zu legacy=%zu "
                               "received=%zu symbols=%zu%s",
@@ -508,6 +512,14 @@ void Engine::close() {
         // Final flush of all pending rows under the lock (Phase A).
         {
             std::unique_lock<std::mutex> lock(mtx_);
+            // The last vector a clean stop leaves is whole when changes were written since the last
+            // whole one (#189): a build before #189 reads whole vectors only, and a downgrade starts
+            // from a clean stop. Written here, before the final sync, whether or not the final flush
+            // seals anything - a flush that seals nothing writes no checkpoint, and no vector.
+            if (vector_changes_bytes_ > 0) {
+                vector_whole_due_ = true;
+                persist_version_vector_if_changed();
+            }
             // Group commit: sync any remaining WAL records.
             //
             // Logged rather than thrown, and that is the difference between this call site and the
@@ -590,6 +602,11 @@ void Engine::refresh_version_vector_cache() {
         vector_cache_truncated_ = truncated;
         vector_cache_covers_    = covers;
     }
+    // The entries have new places, and what moved is folded into them: what goes into the WAL next
+    // is the whole copy (#189).
+    vector_unwritten_.clear();
+    vector_unwritten_flag_.assign(vector_cache_.size(), 0);
+    vector_whole_due_ = true;
 }
 
 void Engine::update_version_vector_cache() {
@@ -612,18 +629,31 @@ void Engine::update_version_vector_cache() {
             for (auto& e : moved.moved) {
                 auto& origins = vector_cache_index_[e.key];
                 const auto at = origins.find(e.origin);
+                std::size_t i = 0;
                 if (at != origins.end()) {
-                    vector_cache_[at->second].frontier = e.frontier;
+                    i = at->second;
+                    vector_cache_[i].frontier = e.frontier;
                 } else {
-                    origins.emplace(e.origin, vector_cache_.size());
+                    i = vector_cache_.size();
+                    origins.emplace(e.origin, i);
                     vector_cache_.push_back(std::move(e));
+                    vector_unwritten_flag_.push_back(0);
+                }
+                // And onto what the WAL's vector lacks (#189), once.
+                if (vector_unwritten_flag_[i] == 0) {
+                    vector_unwritten_flag_[i] = 1;
+                    vector_unwritten_.push_back(i);
                 }
             }
             if (vector_cache_.size() > kMaxPersistedVectorEntries) {
-                // What the whole export says past the limit: nothing, rather than part of it.
+                // What the whole export says past the limit: nothing, rather than part of it - and
+                // the next write down says so, once.
                 vector_cache_.clear();
                 vector_cache_index_.clear();
                 vector_cache_truncated_ = true;
+                vector_unwritten_.clear();
+                vector_unwritten_flag_.clear();
+                vector_whole_due_ = true;
             }
         }
         vector_cache_covers_ = moved.listings;
@@ -643,87 +673,110 @@ void Engine::persist_version_vector_if_changed() {
     // segments and appends the checkpoint. Taking mtx_ here instead deadlocked the flush
     // thread against itself: std::mutex is not recursive, and the stack showed the flush
     // thread waiting on a mutex it already held while every client write queued behind it.
-    const uint64_t fp = seq_tracker_.fingerprint();
-    if (fp == vector_fingerprint_written_) return;      // nothing moved
+    //
+    // What moved, not the whole vector (#189). Every writer here waits for this lock, and at 50 000
+    // (symbol, origin) entries the whole vector - copied from the tracker, serialised, written - held
+    // it 8.7 - 9 ms and wrote 2 MB at every checkpoint that followed a frontier moving. The cache
+    // knows what moved since the last vector written down, from the same list it is updated from; the
+    // whole vector is written where a restart needs one to put the changes on.
     if (skip_vector_persistence_.load(std::memory_order_relaxed)) {
         update_version_vector_cache();                  // what peers are told still moves
         return;
     }
-
-    bool truncated = false;
-    auto entries = seq_tracker_.export_vector(kMaxPersistedVectorEntries, truncated);
     update_version_vector_cache();
+    const uint64_t held_version = seq_tracker_.held_version();
+    const bool held_moved = held_version != held_version_written_;
 
-    if (truncated) {
-        // Too many entries to write down. A node with that many symbols will relearn by
-        // over-asking after a restart, which costs traffic and drops duplicates.
-        OB_LOG_WARN("engine",
-                    "Version vector too large to persist (limit=%zu) — a restart will ask "
-                    "peers for more than it needs", kMaxPersistedVectorEntries);
-        vector_fingerprint_written_ = fp;
-        return;
-    }
+    // An empty vector nothing has written down yet states nothing a missing one does not.
+    if (vector_cache_.empty() && vector_base_file_ == kNoVectorBase) vector_whole_due_ = false;
 
-    // One record when it fits, parts of one generation when it does not (#177) - one after another,
-    // in this critical section, which is what lets a restart put them back together by their order.
-    const auto records = serialize_version_vector_records(entries, /*truncated=*/false,
-                                                          ++vector_generation_written_);
-    size_t bytes = 0;
-    for (const auto& r : records) {
-        if (r.record_type == WAL_RECORD_VERSION_VECTOR_PART) {
-            wal_.append_version_vector_part(r.payload.data(), r.payload.size());
-        } else {
-            wal_.append_version_vector(r.payload.data(), r.payload.size());
+    if (vector_cache_truncated_) {
+        // Too many entries to write down - said when it became so, which asked for a whole vector.
+        // A node with that many symbols will relearn by over-asking after a restart, which costs
+        // traffic and drops duplicates.
+        if (vector_whole_due_) {
+            OB_LOG_WARN("engine",
+                        "Version vector too large to persist (limit=%zu) — a restart will ask "
+                        "peers for more than it needs", kMaxPersistedVectorEntries);
         }
-        bytes += r.payload.size();
+        vector_whole_due_ = false;
+    } else if (!vector_unwritten_.empty() || vector_whole_due_) {
+        // Whole when a restart needs it: the changes after a whole vector stand on it, so it is the
+        // first written in every WAL file - retention deletes whole files, older than the one that
+        // holds the last checkpoint - and it is written again once the changes since outgrow it, or
+        // when most of it moved anyway.
+        const uint32_t file = wal_.current_position().file_index;
+        const bool whole = vector_whole_due_ || file != vector_base_file_ ||
+                           vector_changes_bytes_ >= vector_whole_bytes_ ||
+                           vector_unwritten_.size() * 2 >= vector_cache_.size();
+        // One record when a whole one fits, parts of one generation when it does not (#177); the
+        // changes always in parts. One after another, in this critical section, which is what lets a
+        // restart put them back together by their order - and from the cache, which is the vector
+        // the tracker would export, not from a copy of it.
+        const auto records =
+            whole ? serialize_version_vector_records(vector_cache_, /*truncated=*/false,
+                                                     ++vector_generation_written_)
+                  : serialize_version_vector_changes(vector_cache_, vector_unwritten_,
+                                                     ++vector_generation_written_);
+        size_t bytes = 0;
+        for (const auto& r : records) {
+            if (r.record_type == WAL_RECORD_VERSION_VECTOR_CHANGES) {
+                wal_.append_version_vector_changes(r.payload.data(), r.payload.size());
+            } else if (r.record_type == WAL_RECORD_VERSION_VECTOR_PART) {
+                wal_.append_version_vector_part(r.payload.data(), r.payload.size());
+            } else {
+                wal_.append_version_vector(r.payload.data(), r.payload.size());
+            }
+            bytes += r.payload.size();
+        }
+        if (whole) {
+            // In one file with the checkpoint after it: only data rotates the WAL, and a vector's
+            // records are not data.
+            vector_base_file_     = file;
+            vector_whole_bytes_   = bytes;
+            vector_changes_bytes_ = 0;
+            vector_whole_due_     = false;
+        } else {
+            vector_changes_bytes_ += bytes;
+        }
+        for (const std::size_t i : vector_unwritten_) vector_unwritten_flag_[i] = 0;
+        OB_LOG_DEBUG("engine", "Persisted version vector %s: entries=%zu of %zu bytes=%zu records=%zu "
+                               "file=%u",
+                     whole ? "whole" : "changes", whole ? vector_cache_.size() : vector_unwritten_.size(),
+                     vector_cache_.size(), bytes, records.size(), file);
+        vector_unwritten_.clear();
     }
 
     // The held set goes with it. The frontier alone describes a node that followed every origin's
     // stream from its first record; anything that arrived out of order lives above the frontier,
     // and forgetting it across a restart turns catch-up's deliberate over-delivery back into
-    // duplicate rows (#75).
-    bool held_truncated = false;
-    const auto held = seq_tracker_.export_held(kMaxPersistedHeldRanges, held_truncated);
-    if (held_truncated) {
-        OB_LOG_WARN("engine",
-                    "Held sequence set too large to persist in full (limit=%zu ranges) — a "
-                    "restart may store duplicates for the numbers left out",
-                    kMaxPersistedHeldRanges);
+    // duplicate rows (#75). Written when it changed - the tracker counts that, and exports it from
+    // the few (symbol, origin) that hold something (#189).
+    if (held_moved) {
+        bool held_truncated = false;
+        const auto held = seq_tracker_.export_held(kMaxPersistedHeldRanges, held_truncated);
+        if (held_truncated) {
+            OB_LOG_WARN("engine",
+                        "Held sequence set too large to persist in full (limit=%zu ranges) — a "
+                        "restart may store duplicates for the numbers left out",
+                        kMaxPersistedHeldRanges);
+        }
+        if (!held.empty()) {
+            const auto held_payload = serialize_held_ranges(held);
+            wal_.append_held_sequences(held_payload.data(), held_payload.size());
+            OB_LOG_DEBUG("engine", "Persisted held sequences: entries=%zu bytes=%zu",
+                         held.size(), held_payload.size());
+        }
+        held_version_written_ = held_version;
     }
-    if (!held.empty()) {
-        const auto held_payload = serialize_held_ranges(held);
-        wal_.append_held_sequences(held_payload.data(), held_payload.size());
-        OB_LOG_DEBUG("engine", "Persisted held sequences: entries=%zu bytes=%zu",
-                     held.size(), held_payload.size());
-    }
-    vector_fingerprint_written_ = fp;
-
-    OB_LOG_DEBUG("engine", "Persisted version vector: entries=%zu bytes=%zu records=%zu",
-                 entries.size(), bytes, records.size());
 }
 
 void Engine::WalStartRecords::note(const WALReplayContext& ctx) {
-    if (ctx.header.record_type == WAL_RECORD_VERSION_VECTOR) {
-        PeerVector one;
-        if (one.deserialize(ctx.payload, ctx.payload_len) && !one.truncated()) {
-            vector = one.entries();
-            vector_unusable = false;
-        } else {
-            vector.reset();
-            vector_unusable = true;
-        }
-        return;
-    }
-    if (ctx.header.record_type == WAL_RECORD_VERSION_VECTOR_PART) {
-        if (parts.add(ctx.payload, ctx.payload_len) == VectorAssembler::Step::Complete) {
-            vector = parts.take();
-            vector_unusable = false;
-        }
-        return;
-    }
     if (ctx.header.record_type == WAL_RECORD_HELD_SEQUENCES) {
         held.assign(ctx.payload, ctx.payload + ctx.payload_len);
+        return;
     }
+    vector.add(ctx);
 }
 
 void Engine::restore_held_sequences(const WalStartRecords& from_wal) {
@@ -746,7 +799,7 @@ void Engine::restore_held_sequences(const WalStartRecords& from_wal) {
     {
         std::unique_lock<std::mutex> lock(mtx_);
         seq_tracker_.import_held(held);
-        vector_fingerprint_written_ = seq_tracker_.fingerprint();
+        held_version_written_ = seq_tracker_.held_version();   // what the WAL holds: not a change
     }
     OB_LOG_INFO("engine",
                 "Restored held sequences from WAL: entries=%zu numbers=%zu — these are the "
@@ -860,9 +913,9 @@ bool Engine::restore_version_vector(WalStartRecords& from_wal) {
     // Caller holds nothing: this runs from open() before the flush thread exists.
     // From the whole log, not the tail: the vector is written next to a checkpoint, so
     // replay_after_checkpoint() would usually skip it.
-    std::optional<std::vector<SequenceTracker::VectorEntry>>& last = from_wal.vector;
+    std::optional<std::vector<SequenceTracker::VectorEntry>>& last = from_wal.vector.vector();
     if (!last) {
-        if (from_wal.vector_unusable) {
+        if (from_wal.vector.unusable()) {
             OB_LOG_WARN("engine", "Persisted version vector unusable — asking peers for everything");
         } else {
             OB_LOG_INFO("engine", "No version vector in the WAL — this node will ask peers for "
@@ -886,11 +939,11 @@ bool Engine::restore_version_vector(WalStartRecords& from_wal) {
             seq_tracker_.raise_local(e.key, e.frontier);
             ++own_raised;
         }
-        vector_fingerprint_written_ = seq_tracker_.fingerprint();
         refresh_version_vector_cache();   // safe: refresh does not touch mtx_
     }
-    OB_LOG_INFO("engine", "Restored version vector from WAL: entries=%zu, %zu of them this node's own",
-                entries.size(), own_raised);
+    OB_LOG_INFO("engine", "Restored version vector from WAL: entries=%zu, %zu of them this node's own, "
+                          "%zu set(s) of changes on the last whole one",
+                entries.size(), own_raised, from_wal.vector.changes_applied());
     return true;
 }
 
@@ -2891,6 +2944,11 @@ void Engine::flush_tick() {
                     safe_truncate = std::min(safe_truncate, r.confirmed_file);
                 }
             }
+            // And never the file the last whole vector is in (#189): the changes after it stand on it,
+            // and it is the vector a restart reads. Every file's first vector is whole, but a file
+            // whose rows moved no frontier - a peer's numbers held above a hole - gets none, and the
+            // checkpoint after them is past the vector's file.
+            safe_truncate = std::min(safe_truncate, vector_base_file_);
         }
         if (safe_truncate > 0) {
             wal_.truncate_before(safe_truncate);
