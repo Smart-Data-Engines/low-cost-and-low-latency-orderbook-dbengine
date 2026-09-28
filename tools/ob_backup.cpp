@@ -23,6 +23,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -54,10 +55,13 @@ std::string first_line(const std::string& s) { return s.substr(0, s.find('\n'));
 
 static int run(int argc, char** argv) {
     ob::ClientConfig config;
-    std::string identity, secret_file, port;
+    std::string identity, secret_file, port, timeout_text;
     long timeout_s = 3600;
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view flag = argv[i];
+    // A cursor over the arguments rather than a for loop's counter moved in its body (#36).
+    const std::vector<std::string> args(argv + 1, argv + argc);
+    size_t at = 0;
+    while (at < args.size()) {
+        const std::string& flag = args[at++];
         if (flag == "--help" || flag == "-h") {
             usage(stdout);
             return 0;
@@ -66,33 +70,31 @@ static int run(int argc, char** argv) {
             config.tls = true;
             continue;
         }
-        if (i + 1 >= argc || argv[i + 1][0] == '\0') {
-            std::fprintf(stderr, "ob_backup: %s needs a value\n", argv[i]);
+        std::string* into = flag == "--host"             ? &config.host
+                          : flag == "--port"             ? &port
+                          : flag == "--auth-identity"    ? &identity
+                          : flag == "--auth-secret-file" ? &secret_file
+                          : flag == "--tls-ca-file"      ? &config.tls_ca_file
+                          : flag == "--timeout-s"        ? &timeout_text
+                                                         : nullptr;
+        if (!into) {
+            std::fprintf(stderr, "ob_backup: unknown argument '%s'\n", flag.c_str());
             usage(stderr);
             return 2;
         }
-        const std::string value = argv[++i];
-        if (flag == "--host") {
-            config.host = value;
-        } else if (flag == "--port") {
-            port = value;
-        } else if (flag == "--auth-identity") {
-            identity = value;
-        } else if (flag == "--auth-secret-file") {
-            secret_file = value;
-        } else if (flag == "--tls-ca-file") {
-            config.tls_ca_file = value;
-        } else if (flag == "--timeout-s") {
-            char* end = nullptr;
-            timeout_s = std::strtol(value.c_str(), &end, 10);
-            if (end == value.c_str() || *end != '\0' || timeout_s <= 0) {
-                std::fprintf(stderr, "ob_backup: --timeout-s '%s' is not a positive number\n",
-                             value.c_str());
-                return 2;
-            }
-        } else {
-            std::fprintf(stderr, "ob_backup: unknown argument '%s'\n", argv[i - 1]);
+        if (at >= args.size() || args[at].empty()) {
+            std::fprintf(stderr, "ob_backup: %s needs a value\n", flag.c_str());
             usage(stderr);
+            return 2;
+        }
+        *into = args[at++];
+    }
+    if (!timeout_text.empty()) {
+        char* end = nullptr;
+        timeout_s = std::strtol(timeout_text.c_str(), &end, 10);
+        if (end == timeout_text.c_str() || *end != '\0' || timeout_s <= 0) {
+            std::fprintf(stderr, "ob_backup: --timeout-s '%s' is not a positive number\n",
+                         timeout_text.c_str());
             return 2;
         }
     }

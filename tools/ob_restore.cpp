@@ -18,6 +18,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -37,8 +38,11 @@ void usage(std::FILE* to) {
 
 static int run(int argc, char** argv) {
     std::string verify, backup, data_dir, wal_dir, level = "error";
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view flag = argv[i];
+    // A cursor over the arguments rather than a for loop's counter moved in its body (#36).
+    const std::vector<std::string> args(argv + 1, argv + argc);
+    size_t at = 0;
+    while (at < args.size()) {
+        const std::string& flag = args[at++];
         if (flag == "--help" || flag == "-h") {
             usage(stdout);
             return 0;
@@ -50,16 +54,15 @@ static int run(int argc, char** argv) {
                           : flag == "--log-level" ? &level
                                                   : nullptr;
         if (!into) {
-            std::fprintf(stderr, "ob_restore: unknown argument '%s'\n", argv[i]);
+            std::fprintf(stderr, "ob_restore: unknown argument '%s'\n", flag.c_str());
             usage(stderr);
             return 2;
         }
-        if (i + 1 >= argc || argv[i + 1][0] == '\0') {
-            std::fprintf(stderr, "ob_restore: %s needs a value\n", argv[i]);
+        if (at >= args.size() || args[at].empty()) {
+            std::fprintf(stderr, "ob_restore: %s needs a value\n", flag.c_str());
             return 2;
         }
-        *into = argv[i + 1];
-        ++i;
+        *into = args[at++];
     }
     const auto parsed = ob::StructuredLogger::parse_level(level);
     if (!parsed) {
