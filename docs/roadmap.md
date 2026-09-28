@@ -1359,9 +1359,21 @@ runners, the fix is a measured timeout, not deletion.
 
 - Effort: M | Impact: Prevents regressions that unit tests structurally cannot catch
 
-### 56. Rolling upgrade support
+### 56. Rolling upgrade support ✅
 - Protocol version negotiation matrix, mixed-version cluster tests, documented upgrade path
 - Effort: M | Impact: Required before anyone runs this longer than one release
+- **Shipped** (28 September 2026; spec `kiro-workspace/specs/rolling-upgrades/`): the matrix is
+  measured rather than negotiated. `tests/integration/test_mixed_versions.py` runs the server of the
+  revision `scripts/previous_version.txt` names beside this tree's - a data directory written by
+  one and opened by the other, each way; a primary of one with a replica of the other, each way; a
+  failover from one to the other under etcd; a mesh of both; this tree's clients against the
+  previous server - and `docs/upgrading.md` holds what it measured, with the procedure: replicas
+  one at a time, then a failover onto an upgraded one, a mesh node by node. The module fails when
+  a scenario has no row in the matrix or a row names no scenario, so a change that breaks one
+  cannot merge without saying what now happens. Both CI integration jobs build the previous server
+  in a worktree; the module skips without it on a developer's machine and fails in CI. Against
+  `c610b72` every row keeps every row. `ob_tcp_server --version` says which build a binary is.
+  No protocol grew a version negotiation it did not need: none of the scenarios asked for one.
 
 ### 57. Anti-entropy reconciles for real, and here is what that covers ✅
 
@@ -12819,7 +12831,6 @@ The capability items are in the table below.
 | **P3** | Arrow output (#46) | M | Near-zero integration cost for analytics teams |
 | **P3** | Point-in-time recovery (#34, what is left of it) | M | A restore to a moment between two backups; backup and restore themselves shipped |
 | **P3** | Access control (#31) | M | Multi-tenant deployments and the compliance conversation; authentication landed with #30, authorisation did not |
-| **P4** | Rolling upgrade support (#56) | M | Required before anyone runs this longer than one release |
 | **P4** | Performance frontier (#49-53) | varies | Proves the bespoke-engine claim; pick one and write it up |
 
 ## Known gaps and honest caveats
