@@ -447,6 +447,18 @@ void Engine::open() {
         node_role_.store(failover_mgr_->role(), std::memory_order_relaxed);
     }
 
+    // The seal's sync in the background (#190), beside the flush thread; not under `none`, which
+    // syncs nothing and so has nothing for it to do.
+    if (fsync_policy_ != FsyncPolicy::NONE && !seal_sync_thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(seal_sync_mtx_);
+            seal_sync_stop_ = false;
+        }
+        seal_sync_thread_ = std::thread([this]() {
+            run_thread_body("engine", "seal_sync_loop", [this] { seal_sync_loop(); });
+        });
+    }
+
     // Start background flush thread.
     stop_flush_.store(false, std::memory_order_relaxed);
     flush_thread_ = std::thread([this]() {
@@ -531,8 +543,10 @@ void Engine::close() {
         // second flush_segment() loop that used to follow was dead code. Reported rather than
         // thrown, like the sync above: this runs from the destructor, and an exception out of it
         // ends the process. The rows a failed write kept are in the WAL, which the next start
-        // replays.
+        // replays. The last tick's background sync first, so that its checkpoint comes before this
+        // one's (#190).
         try {
+            receive_seal_sync(/*wait=*/true);
             flush_write_and_merge(/*seal_all=*/true, kNoRowLimit);
         } catch (const std::exception& e) {
             OB_LOG_ERROR("engine", "close: the final flush could not write its segments (%s); the "
@@ -546,6 +560,8 @@ void Engine::close() {
     if (!wal_.flush()) {
         OB_LOG_ERROR("engine", "close: the closing WAL flush failed");
     }
+
+    stop_seal_sync();
 
     // Last, because the final flush above syncs through it (#160). -1 afterwards, since the
     // destructor calls close() again.
@@ -3260,6 +3276,11 @@ void Engine::flush_tick() {
                                   published_repl_replayed_);
         }
 
+        // The checkpoint the last tick's background sync was for, if that sync is done (#190) -
+        // here, before this tick's WAL sync ticket, so that the sync below covers it and retention
+        // may follow it as it always has (#160).
+        receive_seal_sync(/*wait=*/false);
+
         // Where the tick's time goes, on DEBUG (#165 part 2a): at the write ceiling the cycle is
         // what bounds a writer, and throughput alone does not say which of its phases grew.
         using TickClock = std::chrono::steady_clock;
@@ -3294,7 +3315,8 @@ void Engine::flush_tick() {
         // sync is counted and logged inside, and the tick goes on: the rows are merged and
         // readable, and retention below stays where it was until a restart (#160). What it seals
         // is its share: about what it drained (#165 part 2a, kSealRows).
-        flush_write_and_merge(/*seal_all=*/false, taken);
+        flush_write_and_merge(/*seal_all=*/false, taken, /*claim_regardless=*/false,
+                              /*sync_in_background=*/true);
         const auto sealed = TickClock::now();
 
         // Update gauge: WAL file index.
@@ -3868,7 +3890,8 @@ void Engine::drop_unsealed_locked() {
     registry_.set_gauge("ob_unsealed_rows", 0);
 }
 
-int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim_regardless) {
+int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim_regardless,
+                                  bool sync_in_background) {
     // Phase B: flush segments to disk and merge into combined_store_.
     // Caller holds flush_mtx_. Runs WITHOUT mtx_ (except the brief merge at the end)
     // so that disk I/O does not block writers.
@@ -3904,10 +3927,16 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim
     // parent - took a tick of 100 ms to 250 at sixteen symbols, while one syncfs() cost 16-60 ms
     // however many symbols the tick wrote. Not when a write failed: no checkpoint can claim a
     // flush that did not write all it drained, so there is nothing for the sync to vouch for.
-    const int sync_err = write_failure ? 0 : sync_segments();
+    // In the background from a tick (#190): the segments are merged now and readable, and the sync
+    // and the checkpoint are seal_sync_loop()'s and the next tick's. Not under `none`, whose sync is
+    // nothing, and not after a failed write, which has nothing for a sync to vouch for.
+    const bool background =
+        sync_in_background && !write_failure && fsync_policy_ != FsyncPolicy::NONE;
+    const int sync_err = write_failure || background ? 0 : sync_segments();
     const auto synced = SealClock::now();
     size_t sealed_rows = 0;
     for (const Seal& s : seals) sealed_rows += s.rows;
+    std::optional<SealSyncClaim> ask;
 
     {
         TimedLock timed(mtx_, "flush tick: merging the seals, the checkpoint and the vector");
@@ -3954,9 +3983,19 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim
         // checkpoint (#179): a crash between the two left a checkpoint on the disk and no vector for
         // the records before it, which the replay skips and nothing else tells the tracker about.
         // A restart takes the last vector anywhere in the WAL, so the order changes nothing it finds.
-        persist_version_vector_if_changed();
-        update_version_vector_cache();   // nothing to do when the persist just did it
-        if (!write_failure && !checkpoints_frozen()) {
+        if (background) {
+            // The claim now, before the sync starts: what is sealed after that is not what it
+            // covers - a later epoch, or rows drained after this position. The vector is written
+            // with the checkpoint, when the sync is done.
+            update_version_vector_cache();
+            if (!checkpoints_frozen()) {
+                ask = SealSyncClaim{claim_locked(), seal_epoch_, !unsealed_.empty()};
+            }
+        } else {
+            persist_version_vector_if_changed();
+            update_version_vector_cache();   // nothing to do when the persist just did it
+        }
+        if (!background && !write_failure && !checkpoints_frozen()) {
             // Replay starts at the oldest record a row still waiting in a block needs, and with
             // rows waiting a position cannot say which segments are durable, so the checkpoint names
             // the seal epoch the sync above covered (#165 part 2a) - every epoch before it being
@@ -3980,14 +4019,16 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim
             if (fsync_policy_ == FsyncPolicy::NONE) retention_floor_ = durable_up_to_;
         }
     }
+    if (ask) ask_seal_sync(*ask);
     const auto merged = SealClock::now();
     const auto ms = [](SealClock::time_point from, SealClock::time_point to) {
         return std::chrono::duration<double, std::milli>(to - from).count();
     };
     OB_LOG_DEBUG("engine", "sealed %zu store(s), %zu row(s): chosen and written in %.2f ms, "
-                           "synced in %.2f ms, merged and checkpointed in %.2f ms",
-                 seals.size(), sealed_rows, ms(started, written), ms(written, synced),
-                 ms(synced, merged));
+                           "%s %.2f ms, merged and %s in %.2f ms",
+                 seals.size(), sealed_rows, ms(started, written),
+                 background ? "sync asked in the background," : "synced in", ms(written, synced),
+                 background ? "claimed" : "checkpointed", ms(synced, merged));
 
     if (sync_err != 0) {
         // Counted every time, said loudly once - by the freeze, which is the consequence an
@@ -4112,14 +4153,145 @@ int Engine::sync_segments() {
     if (fsync_policy_ == FsyncPolicy::NONE) return 0;   // that policy promises nothing after a cut
     if (data_dir_fd_ < 0) return EBADF;                 // open() has not run: nothing to vouch for
     const auto started = std::chrono::steady_clock::now();
+    const uint64_t stamp = syncs_started_.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (::syncfs(data_dir_fd_) != 0) {
         return errno;
     }
-    ++segment_syncs_;
+    segment_syncs_ = std::max(segment_syncs_, stamp);
     OB_LOG_DEBUG("engine", "Segments synced in %.2f ms",
                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                            started).count());
     return 0;
+}
+
+void Engine::ask_seal_sync(const SealSyncClaim& claim) {
+    // Caller holds flush_mtx_. The claim of one not started yet is replaced: this one's is at or past
+    // it, epoch and position both, and the sync that starts next covers what either was for.
+    bool replaced = false;
+    {
+        std::lock_guard<std::mutex> lock(seal_sync_mtx_);
+        replaced = seal_sync_asked_.has_value();
+        seal_sync_asked_ = claim;
+    }
+    seal_sync_cv_.notify_all();
+    OB_LOG_DEBUG("engine", "Seal sync asked in the background: claim file %u offset %u, epoch %llu%s",
+                 claim.position.file_index, claim.position.offset,
+                 static_cast<unsigned long long>(claim.seal_epoch),
+                 replaced ? " (in place of one not started)" : "");
+}
+
+void Engine::seal_sync_loop() {
+    std::unique_lock<std::mutex> lock(seal_sync_mtx_);
+    seal_sync_alive_ = true;
+    for (;;) {
+        seal_sync_cv_.wait(lock, [this] { return seal_sync_stop_ || seal_sync_asked_.has_value(); });
+        if (!seal_sync_asked_) break;   // stopping, with nothing asked for
+        const SealSyncClaim claim = *seal_sync_asked_;
+        seal_sync_asked_.reset();
+        seal_sync_running_ = true;
+        // Numbered before it starts: what a merge wrote after this was not written before it.
+        const uint64_t stamp = syncs_started_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        // A test's hold (hold_seal_syncs_from_for_test()); UINT64_MAX, and passed at once, otherwise.
+        seal_sync_cv_.wait(lock, [&] { return stamp < seal_sync_hold_from_ || seal_sync_stop_; });
+        lock.unlock();
+
+        // One sync an iteration, guarded: a sync that throws is a sync that failed, and the loop goes
+        // on - ended, no checkpoint would be appended again, retention would stop, and a FLUSH would
+        // wait for it for good.
+        int err = 0;
+        double took = 0;
+        try {
+            const auto started = std::chrono::steady_clock::now();
+            if (data_dir_fd_ < 0) {
+                err = EBADF;
+            } else if (::syncfs(data_dir_fd_) != 0) {
+                err = errno;
+            }
+            took = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                             started).count();
+            OB_LOG_DEBUG("engine", "Seal sync %llu in the background: %s in %.2f ms",
+                         static_cast<unsigned long long>(stamp), err ? std::strerror(err) : "done",
+                         took);
+        } catch (const std::exception& e) {
+            if (err == 0) err = EIO;
+            OB_LOG_ERROR("engine", "Seal sync in the background threw, taken for a failed sync: %s",
+                         e.what());
+        }
+
+        lock.lock();
+        seal_sync_running_ = false;
+        seal_sync_ms_ = took;
+        ++seal_syncs_finished_;
+        if (err != 0) {
+            // Kept until taken in, whatever succeeds after it: a failed sync marks the pages it
+            // could not write clean, so no later one vouches for them (#160).
+            if (seal_sync_errno_ == 0) seal_sync_errno_ = err;
+        } else {
+            seal_sync_done_ = claim;
+            seal_sync_done_stamp_ = stamp;
+        }
+        seal_sync_cv_.notify_all();   // a receive waiting for it
+    }
+    seal_sync_alive_ = false;
+    seal_sync_cv_.notify_all();
+}
+
+void Engine::receive_seal_sync(bool wait) {
+    // Caller holds flush_mtx_ and not mtx_.
+    std::optional<SealSyncClaim> done;
+    int err = 0;
+    uint64_t stamp = 0;
+    double took = 0;
+    {
+        std::unique_lock<std::mutex> lock(seal_sync_mtx_);
+        if (wait) {
+            // Or the thread is gone - stopped, or never started under `none` - and nothing runs.
+            seal_sync_cv_.wait(lock, [this] {
+                return (!seal_sync_running_ && !seal_sync_asked_) || !seal_sync_alive_;
+            });
+        }
+        done = std::move(seal_sync_done_);
+        seal_sync_done_.reset();
+        err = seal_sync_errno_;
+        seal_sync_errno_ = 0;
+        stamp = seal_sync_done_stamp_;
+        took = seal_sync_ms_;
+    }
+    if (!done && err == 0) return;
+    segment_syncs_ = std::max(segment_syncs_, stamp);
+
+    TimedLock timed(mtx_, "flush tick: the checkpoint a background sync was for");
+    if (err != 0) {
+        registry_.increment_counter("ob_segment_sync_errors_total");
+        freeze_checkpoints(std::string("A background seal sync failed (") + std::strerror(err) + ")");
+        return;
+    }
+    // What this node holds before the checkpoint, as the synchronous path writes it (#179).
+    persist_version_vector_if_changed();
+    update_version_vector_cache();
+    if (checkpoints_frozen()) return;
+    durable_up_to_ = done->position;
+    const auto now_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::system_clock::now().time_since_epoch())
+                                                  .count());
+    if (done->blocks_waiting) {
+        wal_.append_checkpoint(now_ns, durable_up_to_, done->seal_epoch);
+    } else {
+        wal_.append_checkpoint(now_ns, durable_up_to_);
+    }
+    checkpoint_seal_epoch_ = done->seal_epoch;
+    OB_LOG_DEBUG("engine", "Checkpoint of a background seal sync (%.2f ms): file %u offset %u, "
+                           "epoch %llu", took, durable_up_to_.file_index, durable_up_to_.offset,
+                 static_cast<unsigned long long>(done->seal_epoch));
+}
+
+void Engine::stop_seal_sync() {
+    {
+        std::lock_guard<std::mutex> lock(seal_sync_mtx_);
+        seal_sync_stop_ = true;
+    }
+    seal_sync_cv_.notify_all();
+    if (seal_sync_thread_.joinable()) seal_sync_thread_.join();
 }
 
 void Engine::apply_delta_replayed(const DeltaUpdate& delta, const Level* levels, bool own) {
@@ -4319,6 +4491,9 @@ void Engine::flush_everything(bool claim_regardless) {
     // flush_loop() was mid-tick used to produce two Phase B passes over the same
     // active segment, and the segment ended up in the query index twice.
     std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+    // A tick's background sync first, and its checkpoint (#190): this flush's own comes after it, so
+    // the last one in the log is this one - which a FLUSH is asked for, and a drop depends on.
+    receive_seal_sync(/*wait=*/true);
 
     // Phase A: the rows waiting and the WAL's sync, with the engine's lock only to take them, as the
     // tick takes its own (#190). It synced under the lock until then, and every writer waited for the

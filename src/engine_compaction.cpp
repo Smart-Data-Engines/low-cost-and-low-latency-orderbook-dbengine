@@ -142,7 +142,7 @@ void Engine::finish_compaction_on_close() {
         // stay for the next start, which removes the ones a merged segment beside them holds.
         const bool wants_sync =
             std::any_of(retired_inputs_.begin(), retired_inputs_.end(),
-                        [&](const RetiredInputs& r) { return r.synced_before == segment_syncs_; });
+                        [&](const RetiredInputs& r) { return segment_syncs_ <= r.synced_before; });
         if (!frozen && !merges_stopped_ && (!wants_sync || sync_for_merge() == 0)) {
             remove_retired_inputs();
         }
@@ -195,9 +195,9 @@ void Engine::compaction_step(size_t drained_rows) {
     // has had one; an idle tick has not, and a merge must not wait for a seal that may never come.
     const bool wants_sync =
         std::any_of(staged_merges_.begin(), staged_merges_.end(),
-                    [&](const StagedMerge& s) { return s.synced_before == segment_syncs_; }) ||
+                    [&](const StagedMerge& s) { return segment_syncs_ <= s.synced_before; }) ||
         std::any_of(retired_inputs_.begin(), retired_inputs_.end(),
-                    [&](const RetiredInputs& r) { return r.synced_before == segment_syncs_; });
+                    [&](const RetiredInputs& r) { return segment_syncs_ <= r.synced_before; });
     if (wants_sync) {
         if (const int err = sync_for_merge(); err != 0) {
             merge_sync_failed(err);
@@ -382,8 +382,9 @@ int Engine::sync_for_merge() {
         appended_epoch = checkpoint_seal_epoch_;
     }
     const auto started = SteadyClock::now();
+    const uint64_t stamp = syncs_started_.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (::syncfs(data_dir_fd_) != 0) return errno;
-    ++segment_syncs_;
+    segment_syncs_ = std::max(segment_syncs_, stamp);
     last_merge_sync_ = SteadyClock::now();
     if (fsync_policy_ == FsyncPolicy::NONE) {
         // Nothing else syncs under `none`, so this is what puts a checkpoint on the device - and
@@ -528,7 +529,9 @@ bool Engine::stage_merge(const std::vector<SegmentMeta>& inputs) {
                  inputs.size(), first.symbol.c_str(), first.exchange.c_str(),
                  static_cast<unsigned long long>(rows), level + 1,
                  ms_between(started, SteadyClock::now()));
-    staged_merges_.push_back(StagedMerge{inputs, std::move(*out), segment_syncs_});
+    // Read after the write: a sync started before it finished is not taken for one that covers it.
+    staged_merges_.push_back(
+        StagedMerge{inputs, std::move(*out), syncs_started_.load(std::memory_order_acquire)});
     return true;
 }
 
@@ -570,7 +573,7 @@ void Engine::publish_staged_merges() {
     const auto now = SteadyClock::now();
     size_t published = 0;
     for (auto it = staged_merges_.begin(); it != staged_merges_.end();) {
-        if (it->synced_before == segment_syncs_) {
+        if (segment_syncs_ <= it->synced_before) {
             ++it;   // not on the device yet
             continue;
         }
@@ -581,7 +584,7 @@ void Engine::publish_staged_merges() {
             retired.dirs.reserve(it->inputs.size());
             for (const SegmentMeta& in : it->inputs) retired.dirs.push_back(in.dir_path);
             retired.readers = result.readers_before;
-            retired.synced_before = segment_syncs_;
+            retired.synced_before = syncs_started_.load(std::memory_order_acquire);
             retired_inputs_.push_back(std::move(retired));
             registry_.increment_counter("ob_compactions_total");
             registry_.increment_counter("ob_compaction_inputs_total", it->inputs.size());
@@ -623,7 +626,7 @@ void Engine::remove_retired_inputs() {
     for (auto it = retired_inputs_.begin(); it != retired_inputs_.end();) {
         // The rename has to be on the device first - were it lost and the removal kept, a power cut
         // would take both - and every scan that copied an input before the swap reads it still.
-        if (it->synced_before == segment_syncs_ || !it->readers.expired()) {
+        if (segment_syncs_ <= it->synced_before || !it->readers.expired()) {
             waiting += it->dirs.size();
             ++it;
             continue;

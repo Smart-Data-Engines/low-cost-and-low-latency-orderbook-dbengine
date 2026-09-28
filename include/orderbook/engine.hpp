@@ -138,7 +138,36 @@ public:
     /// that needs a tick's decisions rather than `flush_incremental()`'s seal-everything runs one
     /// with the loop's interval out of the way, and knows when it has finished. Serialised with the
     /// loop and with `flush_incremental()` by `flush_mtx_`, which the tick takes.
-    void flush_tick_for_test() { flush_tick(); }
+    void flush_tick_for_test() {
+        flush_tick();
+        // And the checkpoint its seal's sync was for (#190): a tick leaves that sync in the
+        // background, and a test of what a tick leaves wants what the next one takes in.
+        std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+        receive_seal_sync(/*wait=*/true);
+    }
+    /// One tick, leaving its seal's sync in the background as the loop's does (#190).
+    void flush_tick_leaving_the_sync_for_test() { flush_tick(); }
+
+    /// Hold every background seal sync numbered `from` or later after it is numbered and before its
+    /// syncfs(), until a later call moves `from` past it: a sync the device takes seconds over, on a
+    /// test's schedule (#190). The first sync is number 1; UINT64_MAX holds none.
+    void hold_seal_syncs_from_for_test(uint64_t from) {
+        {
+            std::lock_guard<std::mutex> lock(seal_sync_mtx_);
+            seal_sync_hold_from_ = from;
+        }
+        seal_sync_cv_.notify_all();
+    }
+    /// How many background seal syncs have finished, failed ones included (#190).
+    uint64_t seal_syncs_finished_for_test() {
+        std::lock_guard<std::mutex> lock(seal_sync_mtx_);
+        return seal_syncs_finished_;
+    }
+    /// Whether a background seal sync runs, or waits to (#190).
+    bool seal_sync_busy_for_test() {
+        std::lock_guard<std::mutex> lock(seal_sync_mtx_);
+        return seal_sync_running_ || seal_sync_asked_.has_value();
+    }
 
     /// Hold `flush_mtx_` until the returned lock goes: no tick and no `FLUSH` runs meanwhile, which is
     /// how a test stands for a flush that is stuck - on a device, say - without the flush loop being
@@ -796,7 +825,7 @@ private:
     struct StagedMerge {
         std::vector<SegmentMeta> inputs;
         SegmentMeta output;
-        uint64_t    synced_before{0};   ///< `segment_syncs_` when written
+        uint64_t    synced_before{0};   ///< `syncs_started_` after the write: covered past it
     };
     std::vector<StagedMerge> staged_merges_;
     /// Published, their inputs waiting for a sync - which takes the rename to the device - and for
@@ -804,7 +833,7 @@ private:
     struct RetiredInputs {
         std::vector<std::string>  dirs;
         std::weak_ptr<const void> readers;
-        uint64_t                  synced_before{0};   ///< `segment_syncs_` when published
+        uint64_t                  synced_before{0};   ///< `syncs_started_` after the rename
     };
     std::vector<RetiredInputs> retired_inputs_;
     /// Segments a merge could not read whole, left as they are for the life of the process.
@@ -823,9 +852,14 @@ private:
     uint64_t merge_seq_{0};
     std::chrono::steady_clock::time_point merge_backoff_until_{};
     LogEpisode merge_failures_{};
-    /// Syncs of the data directory that ran - a seal's under a policy that syncs, and every one of the
-    /// merges' own: what a step compares with the count it recorded to know that a sync has come
-    /// since. Not `none`'s, which sync nothing.
+    /// Syncs of the data directory, numbered when they **start** - a seal's under a policy that
+    /// syncs, the merges' own, and a seal's in the background (#190) - and the highest number of one
+    /// that has finished and been taken in. What a step recorded when it wrote (`syncs_started_`,
+    /// read after the write) is covered once `segment_syncs_` is past it: a sync that started after
+    /// the write finished. Counted by start rather than by end since the background sync (#190): one
+    /// that began before a merge wrote, and ended after, was taken for one that covered it. Not
+    /// `none`'s, which sync nothing. `segment_syncs_` under flush_mtx_.
+    std::atomic<uint64_t> syncs_started_{0};
     uint64_t segment_syncs_{0};
     /// The seal epoch the last checkpoint appended vouches for, and the one the last checkpoint known
     /// to be on the device does: a merge takes a segment of this WAL only at or below the second.
@@ -965,6 +999,29 @@ private:
     // does not have to wait out a full flush interval before join() returns.
     std::mutex              flush_stop_mtx_;
     std::condition_variable flush_stop_cv_;
+
+    /// What the checkpoint of a background seal sync claims (#190), frozen when the sync is asked for.
+    struct SealSyncClaim {
+        WalPosition position{};          ///< claim_locked() when the sync was asked for
+        uint64_t    seal_epoch{0};       ///< seal_epoch_ then
+        bool        blocks_waiting{false};   ///< the checkpoint's form: with the epoch, or eight bytes
+    };
+    /// The background seal sync (#190, seal_sync_loop()): what was asked for and not started, whether
+    /// one runs, the claim of the last that finished and was not taken in yet, the first failure not
+    /// taken in, and that sync's start number. Under seal_sync_mtx_.
+    std::thread                  seal_sync_thread_;
+    std::mutex                   seal_sync_mtx_;
+    std::condition_variable      seal_sync_cv_;
+    std::optional<SealSyncClaim> seal_sync_asked_;
+    bool                         seal_sync_running_{false};
+    std::optional<SealSyncClaim> seal_sync_done_;
+    int                          seal_sync_errno_{0};
+    uint64_t                     seal_sync_done_stamp_{0};
+    double                       seal_sync_ms_{0};
+    bool                         seal_sync_stop_{false};
+    bool                         seal_sync_alive_{false};   ///< the loop runs
+    uint64_t                     seal_sync_hold_from_{UINT64_MAX};   ///< see hold_seal_syncs_from_for_test()
+    uint64_t                     seal_syncs_finished_{0};
 
     /// Set by a writer that has run out of room, cleared by the flush loop when it wakes.
     ///
@@ -1364,7 +1421,25 @@ private:
     /// `claim_regardless` appends the checkpoint even when nothing was left to seal, after a sync of
     /// its own: what drop_symbol() needs, because the last checkpoint can be older than a seal that
     /// claims nothing (seal_symbol()), and a restart replays from it.
-    int flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim_regardless = false);
+    int flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim_regardless = false,
+                              bool sync_in_background = false);
+
+    // ── The seal's sync in the background (#190) ──────────────────────────────
+    //
+    // A tick used to wait for the syncfs() of what it sealed before it could drain the queue again -
+    // 1.2 - 2.7 s at the median at the write ceiling, 9.6 s at worst, on a device slower than the
+    // ingest, while the queue lasts 0.55 s there. The tick hands the sync to seal_sync_loop() now,
+    // with the claim frozen when it asks, and the next tick appends the checkpoint once the sync is
+    // done - under flush_mtx_ and before its own WAL sync, where the checkpoint always was.
+    /// Hand the sync of what the tick just sealed to the background, with its claim; one asked for
+    /// while another runs replaces any not started, whose claim it covers. Holds flush_mtx_.
+    void ask_seal_sync(const SealSyncClaim& claim);
+    /// Take in what a background sync came to - once it finished, or, with `wait`, once none runs or
+    /// is asked for: a failure freezes the checkpoints; a success appends the checkpoint it was asked
+    /// for, the vector before it. Holds flush_mtx_, not mtx_.
+    void receive_seal_sync(bool wait);
+    void seal_sync_loop();
+    void stop_seal_sync();
 
     /// flush_incremental(), and with `claim_regardless` a checkpoint whatever it sealed.
     void flush_everything(bool claim_regardless);

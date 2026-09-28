@@ -239,6 +239,9 @@ TEST(ThreadBoundaries, EveryLoopInTheTreeIsEitherGuardedPerIterationOrRecorded) 
     const std::vector<std::pair<std::string, std::string>> guarded = {
         {"Engine::flush_loop",
          "rows stay in memory and the WAL grows without bound while clients are answered OK"},
+        {"Engine::seal_sync_loop",
+         "no seal's sync completes again, so no checkpoint is appended, WAL retention stops and a "
+         "FLUSH waits for it for good (#190)"},
         {"FailoverManager::monitor_loop",
          "the node never learns about a role change (#82's shape), and a half-finished promotion "
          "leaves it a replica of itself (#130)"},
