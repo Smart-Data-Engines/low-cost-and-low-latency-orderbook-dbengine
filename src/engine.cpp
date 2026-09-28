@@ -1791,57 +1791,73 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
     // below; with the pin held no step changes them after that.
     std::unordered_set<std::string> replaced;
 
-    // Phase 1: flush + capture under lock (< 100ms).
+    // Phase 1: flush + capture. Two short holds of the engine's lock with the seals written between
+    // them, without it, as FLUSH writes its own (#34). Measured before: a backup's cut held every
+    // writer 2.43 s on the development machine, the seals of everything waiting written under the
+    // lock after a WAL sync. Nothing drains while flush_mtx_ is held, so the blocks sealed below hold
+    // exactly the rows the first hold drained - every row up to the position it captured, and no
+    // other - and the vector it exported describes them.
+    double sync_ms = 0.0, seals_ms = 0.0;
     {
         // flush_mtx_ before mtx_: this path writes segments, so it must not run
         // alongside flush_loop() or a client FLUSH.
         std::lock_guard<std::mutex> flush_lock(flush_mtx_);
-        std::unique_lock<std::mutex> lock(mtx_);
-        // From here to the end of the block no writer takes the engine's lock (#34).
-        const auto t_locked = std::chrono::steady_clock::now();
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            // From here to the end of the block no writer takes the engine's lock.
+            const auto t_locked = std::chrono::steady_clock::now();
 
-        // Flush all pending rows to columnar stores.
-        //
-        // Thrown rather than logged: a snapshot means "everything up to here is on the disk", and
-        // this is the call that establishes it. The async worker turns the exception into a failed
-        // snapshot, which is a peer that retries - where a snapshot taken anyway would be a peer
-        // bootstrapping from a premise nobody checked.
-        if (!wal_.sync()) {
-            throw std::runtime_error("Engine: WAL sync failed while taking a snapshot");
+            // Flush all pending rows to columnar stores.
+            //
+            // Thrown rather than logged: a snapshot means "everything up to here is on the disk",
+            // and this is the call that establishes it. The async worker turns the exception into a
+            // failed snapshot, which is a peer that retries - where a snapshot taken anyway would be
+            // a peer bootstrapping from a premise nobody checked.
+            if (!wal_.sync()) {
+                throw std::runtime_error("Engine: WAL sync failed while taking a snapshot");
+            }
+            sync_ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t_locked).count();
+            flush_drain_pending();
+
+            // Capture WAL position atomically with the flush.
+            // One load: a manifest is what a joining peer catches up from, so a pair assembled from
+            // two moments points it at a position that never existed.
+            const WalPosition manifest_pos = wal_.current_position();
+            manifest.wal_file_index  = manifest_pos.file_index;
+            manifest.wal_byte_offset = manifest_pos.offset;
+
+            for (const std::string& dir : replaced_input_dirs()) {
+                replaced.insert(fs::path(dir).lexically_normal().string());
+            }
+
+            // And the sequence state, in the same critical section. See the header for why the
+            // boundary has to be exactly here and not a line later.
+            out.vector = seq_tracker_.export_vector(kMaxPersistedVectorEntries, out.vector_truncated);
+            out.held   = seq_tracker_.export_held(kMaxPersistedHeldRanges, out.held_truncated);
+            out.locked_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t_locked).count();
         }
-        flush_drain_pending();
 
-        // Flush all per-symbol columnar store active segments. The returned metas
-        // must be merged, not dropped: SELECT reads combined_store_ only, so a
-        // snapshot that flushed rows without merging them made the rows it had just
-        // persisted disappear from every query until the next open_existing().
-        //
         // Every store's blocks, since #165 part 2a: a snapshot is what is on the disk, and a row in
-        // a block is not yet. Thrown like the sync above, for the same reason.
+        // a block is not yet. Written without the engine's lock, as the tick and FLUSH write theirs;
+        // thrown like the sync above, for the same reason. The returned metas must be merged, not
+        // dropped: SELECT reads combined_store_ only, so a snapshot that flushed rows without merging
+        // them made the rows it had just persisted disappear from every query until the next
+        // open_existing().
+        const auto t_seals = std::chrono::steady_clock::now();
         std::vector<Seal> seals = choose_seals(/*seal_all=*/true, nullptr, kNoRowLimit);
-        if (const std::exception_ptr failure = write_seals(seals)) {
+        const std::exception_ptr failure = write_seals(seals);
+        seals_ms = std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - t_seals).count();
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            const auto t_merge = std::chrono::steady_clock::now();
             segment_merge_refused_.fetch_add(merge_seals_locked(seals), std::memory_order_relaxed);
-            std::rethrow_exception(failure);
+            out.locked_ms += std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - t_merge).count();
         }
-        segment_merge_refused_.fetch_add(merge_seals_locked(seals), std::memory_order_relaxed);
-
-        // Capture WAL position atomically with the flush.
-        // One load: a manifest is what a joining peer catches up from, so a pair assembled from two
-        // moments points it at a position that never existed.
-        const WalPosition manifest_pos = wal_.current_position();
-        manifest.wal_file_index  = manifest_pos.file_index;
-        manifest.wal_byte_offset = manifest_pos.offset;
-
-        for (const std::string& dir : replaced_input_dirs()) {
-            replaced.insert(fs::path(dir).lexically_normal().string());
-        }
-
-        // And the sequence state, in the same critical section. See the header for why the
-        // boundary has to be exactly here and not a line later.
-        out.vector = seq_tracker_.export_vector(kMaxPersistedVectorEntries, out.vector_truncated);
-        out.held   = seq_tracker_.export_held(kMaxPersistedHeldRanges, out.held_truncated);
-        out.locked_ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - t_locked).count();
+        if (failure) std::rethrow_exception(failure);
     }
 
     // Phase 2: enumerate files and compute CRC32C (lock-free, read-only).
@@ -2030,12 +2046,13 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
                         std::chrono::steady_clock::now() - t_start).count();
     OB_LOG_INFO("engine",
                 "Snapshot created: files=%zu bytes=%zu rows=%zu wal=%u:%zu vector=%zu%s "
-                "held=%zu%s checksums=%s in %.1f ms, %.1f ms of it holding the engine's lock",
+                "held=%zu%s checksums=%s in %.1f ms: the engine's lock held %.1f ms (%.1f of it the WAL "
+                "sync), seals written without it in %.1f ms",
                 manifest.files.size(), manifest.total_bytes, manifest.total_rows,
                 manifest.wal_file_index, manifest.wal_byte_offset,
                 out.vector.size(), out.vector_truncated ? " (truncated)" : "",
                 out.held.size(), out.held_truncated ? " (truncated)" : "",
-                checksum ? "computed" : "skipped", out.create_ms, out.locked_ms);
+                checksum ? "computed" : "skipped", out.create_ms, out.locked_ms, sync_ms, seals_ms);
 
     return out;
 }
@@ -3553,6 +3570,7 @@ std::vector<Engine::Seal> Engine::choose_seals(bool seal_all, ColumnarStore* onl
 }
 
 std::exception_ptr Engine::write_seals(std::vector<Seal>& seals) {
+    if (while_sealing_for_test_ && !seals.empty()) while_sealing_for_test_();
     std::exception_ptr failure;
     std::vector<Seal> written;
     written.reserve(seals.size());

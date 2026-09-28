@@ -237,6 +237,39 @@ TEST(BackupCut, WithoutChecksumsItListsTheSameFilesAndReadsNone) {
     engine->close();
 }
 
+TEST(BackupCut, TheSealsAreWrittenWithoutTheEnginesLockAndHoldOnlyWhatTheCutDrained) {
+    TempDir dir;
+    auto engine = engine_at(dir.path);
+    fill(*engine, {"A"}, 10);
+    for (uint64_t n = 10; n < 20; ++n) write(*engine, "A", n);   // waiting: the cut seals them
+
+    // Inside the snapshot's seal writes, another thread writes. With the engine's lock held there it
+    // could not until the seals were done - and they would be waiting for it.
+    std::thread writer;
+    std::atomic<bool> wrote{false};
+    bool wrote_while_sealing = false;
+    engine->while_sealing_for_test([&] {
+        writer = std::thread([&] {
+            write(*engine, "B", 1);
+            wrote = true;
+        });
+        wrote_while_sealing = eventually([&] { return wrote.load(); }, 2000ms);
+    });
+    auto snap = engine->create_snapshot_with_sequence_state(ob::SnapshotChecksums::Skip);
+    engine->while_sealing_for_test(nullptr);
+    if (writer.joinable()) writer.join();
+    EXPECT_TRUE(wrote_while_sealing) << "a writer waited for a snapshot's seals";
+    // The cut is the moment before the seals: B, written during them, is in none of its files.
+    for (const auto& f : snap.manifest.files) {
+        EXPECT_NE(f.path.rfind("B/", 0), 0u) << f.path << " is a write taken after the cut";
+    }
+    EXPECT_EQ(snap.manifest.total_rows, 20u * 3u);
+    snap.pin.reset();
+    engine->flush_incremental();
+    EXPECT_EQ(rows_of(*engine, "B").size(), 3u) << "the write taken during the seals was lost";
+    engine->close();
+}
+
 // ── Names, paths, the directory ──────────────────────────────────────────────
 
 TEST(BackupName, ReadsBackAsItsTimeAndSortsInTime) {

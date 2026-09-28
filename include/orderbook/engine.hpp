@@ -150,6 +150,10 @@ public:
     /// segments and the replay alone, as after a crash between a seal's sync and the vector that goes
     /// with it. Tests used a vector too large to write for this until #177 made every vector
     /// writable. A test seam.
+    /// Called on the sealing thread as a call of `write_seals()` begins, with no engine lock held
+    /// by the engine: what a test uses to write while a snapshot's seals are being written (#34).
+    void while_sealing_for_test(std::function<void()> hook) { while_sealing_for_test_ = std::move(hook); }
+
     void skip_vector_persistence_for_test() {
         skip_vector_persistence_.store(true, std::memory_order_relaxed);
     }
@@ -1100,6 +1104,7 @@ private:
     /// together by their order, and this says which parts belong together. Guarded by `mtx_`.
     uint32_t vector_generation_written_{0};
     std::atomic<bool> skip_vector_persistence_{false};   ///< see skip_vector_persistence_for_test()
+    std::function<void()> while_sealing_for_test_;       ///< see while_sealing_for_test()
     /// Held ranges written down per persist. The WAL payload length is 16-bit, so this is a hard
     /// ceiling rather than a preference: 3000 ranges is ~48 KB of payload plus entry headers.
     static constexpr std::size_t kMaxPersistedHeldRanges = 3000;
