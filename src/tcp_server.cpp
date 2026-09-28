@@ -2066,6 +2066,11 @@ TcpServer::TcpServer(ServerConfig config)
 }
 
 TcpServer::~TcpServer() {
+    // The engine first, while `read_only_` - declared after it, so destroyed before it - still lives:
+    // the engine holds a pointer to it (`set_read_only_flag()`) and a failover manager stopping in
+    // the engine's close() may still write it. `run()` closes the engine on every way out it
+    // returns by; this is the way out it throws from, a port that would not bind.
+    engine_.reset();
     if (listen_fd_ >= 0) ::close(listen_fd_);
 }
 
