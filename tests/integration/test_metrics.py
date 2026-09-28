@@ -182,3 +182,23 @@ def test_refused_commands_are_counted_even_though_they_are_logged_once(cluster):
         f"three refusals and one good command moved the counter from {before} to {after}; "
         f"a counter that logs once per connection has to count every time, or the volume is "
         f"invisible")
+
+
+def test_every_metric_the_shipped_dashboard_and_alerts_watch_is_exported(cluster):
+    # #35: scripts/check_dashboards.py holds the names against the registry in the source; this holds
+    # them against what a running node serves - a metric registered and never serialised, or served
+    # under another name, would pass the one and fail here.
+    import json
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    watched = set()
+    for path in [*(repo / "packaging" / "grafana").glob("*.json"),
+                 *(repo / "packaging" / "prometheus").glob("*.yml")]:
+        watched |= set(re.findall(r"\bob_[a-z0-9_]+\b", path.read_text()))
+    assert watched, "no dashboard or alert rules found under packaging/"
+    json.loads((repo / "packaging" / "grafana" / "orderbook-engine.json").read_text())
+
+    served = set(re.findall(r"^(ob_[a-z0-9_]+)(?:\{| )", scrape(cluster.primary().metrics_port), re.M))
+    missing = sorted(watched - served)
+    assert not missing, f"watched by the dashboard or an alert, not served by a node: {missing}"
