@@ -629,7 +629,10 @@ void ShardCoordinator::execute_migration(const std::string& symbol_key,
         uint64_t moved = copy_segments(target, engine_.seal_symbol(symbol_key), copied);
         double round_ms = ms_since(round_started);
         uint32_t rounds = 1;
-        while (moved >= kFinalRoundUpdates && rounds < kMaxCopyRounds) {
+        // Converged: the last round copied a small remainder, which the freeze copies about as much
+        // of again. The rounds also stop after kMaxCopyRounds, converged or not.
+        bool converged = moved < kFinalRoundUpdates;
+        while (!converged && rounds < kMaxCopyRounds) {
             if (!running_.load(std::memory_order_acquire)) {
                 throw std::runtime_error("shard " + config_.shard_id + " is stopping");
             }
@@ -637,11 +640,12 @@ void ShardCoordinator::execute_migration(const std::string& symbol_key,
             moved = copy_segments(target, engine_.seal_symbol(symbol_key), copied);
             round_ms = ms_since(round_started);
             ++rounds;
+            converged = moved < kFinalRoundUpdates;
         }
         // Rounds that never came down to a small remainder: the symbol's writes arrive about as fast
         // as they are copied, and the freeze would refuse them for about as long as the last round
         // took - past what a client tries again for. Refused, and the symbol stays where it is.
-        if (moved >= kFinalRoundUpdates && round_ms > kFreezeBudgetMs) {
+        if (!converged && round_ms > kFreezeBudgetMs) {
             char detail[160];
             std::snprintf(detail, sizeof(detail),
                           "the last of %u rounds copied %llu update(s) in %.0f ms, and the switch "
