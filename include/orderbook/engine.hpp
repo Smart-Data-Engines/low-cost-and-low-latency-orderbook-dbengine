@@ -579,7 +579,7 @@ public:
     /// compares the one its primary announces against the one it saved, and a data directory
     /// restored from scratch has a different one even at the same address - which is the case
     /// requirement 4.3 exists for.
-    uint64_t wal_identity() const { return wal_identity_; }
+    uint64_t wal_identity() const { return wal_identity_.load(std::memory_order_relaxed); }
 
     EpochValue get_current_epoch() const override;
     void truncate_and_rebootstrap(const EpochValue& new_epoch,
@@ -1188,7 +1188,17 @@ private:
     /// on first open. Deliberately outside every segment directory: a snapshot ships segment
     /// directories, and an identity that travelled with them would defeat its own purpose.
     void load_or_create_wal_identity();
-    uint64_t wal_identity_{0};
+
+    /// Begin a new WAL lineage (#197): a new identity, durably, and a first file after this moment,
+    /// the files before it removed. For a store that now holds rows no record of this WAL holds - a
+    /// snapshot installed, the store discarded to replay from zero - so a replica asking this node,
+    /// a primary later, for the log from the start is told WAL_TRUNCATED and sent a snapshot, and a
+    /// restart replays none of the records of the store that was replaced. Caller holds `flush_mtx_`
+    /// and `mtx_`. Throws, having changed nothing, when the identity cannot be written.
+    void begin_wal_lineage_locked(const char* why);
+    /// Atomic since #197: a snapshot install begins a new lineage, and the accessor reads it without
+    /// a lock. Written only under `flush_mtx_` and `mtx_` after `open()`.
+    std::atomic<uint64_t> wal_identity_{0};
 
     /// What a start takes from the whole WAL besides its last checkpoint, gathered in the pass that
     /// finds it (#174). The vector, the held numbers and the epoch were a pass each, and a pass over

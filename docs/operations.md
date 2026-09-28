@@ -944,6 +944,21 @@ does not have. Expect every surviving replica to discard and re-stream after a p
 before. What changed is the restart of a replica whose primary did not move, which is the common
 case and was paying the same price.
 
+**A replica that installs a snapshot, or discards its data to replay from zero, begins a new WAL of
+its own** (#197), and says so:
+
+```
+A new WAL lineage (a snapshot was installed): identity 3f1c... after 91ab..., begun at file 7; 7
+file(s) of the old one removed, so a replica asking for the log from the start is sent a snapshot
+```
+
+The rows a snapshot brings are in its segments and in no record of the replica's WAL. Before #197
+that WAL went on from file 0, so once such a replica became a primary, a replica of it that asked for
+the log from the start was streamed a log without them - measured, 0 of 18 000 rows, with no error -
+and after a failover to it every other replica did exactly that. The new lineage begins at a file
+after the install, so the request is `WAL_TRUNCATED` and the replica is sent a snapshot, as it is
+after retention took the start of a log.
+
 ### Which epoch a replica thinks it is in, and the one line that has two readings
 
 A replica reports the epoch of the primary it follows — `REPLICA 10.0.0.2:9090 9` — and keeps that
