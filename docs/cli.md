@@ -589,6 +589,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--max-subscriptions-per-session` | `<N>` | Subscription limit per session (default: 16) |
 | `--metrics-bind` | `<ADDR>` | Address the metrics listener binds to (default: every interface) |
 | `--metrics-port` | `<PORT>` | Prometheus metrics port; 0 disables the endpoint |
+| `--migration-identity` | `<IDENTITY>` | The identity from `--auth-secret-file` a shard authenticates as on another shard's client port when it moves a symbol there (`MIGRATE`, #196); every shard's file must have it, and one its own file lacks refuses to start |
 | `--mm-max-catchup-bytes` | `<N>` | WAL bytes one catch-up round reads for a peer before the io loop turns to its other work (default: 8 MiB); a longer catch-up is more rounds |
 | `--mm-max-peer-send-buffer` | `<N>` | Per-peer send buffer ceiling; past it the peer is dropped |
 | `--mm-node-id` | `<N>` | Multi-master node id, unique in the mesh |

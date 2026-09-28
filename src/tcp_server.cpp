@@ -157,6 +157,19 @@ LoadedSecrets load_secrets_or_exit(const ServerConfig& config) {
         std::exit(1);
     }
 
+    if (!config.migration_identity.empty() &&
+        (!out.client_auth_enabled() || out.clients.find(config.migration_identity) == nullptr)) {
+        // Refused at the start rather than at the first MIGRATE, which would fail without moving a
+        // row and say why only in a status line.
+        std::fprintf(stderr,
+                     "Error: --migration-identity '%s' is not an identity in --auth-secret-file%s: a "
+                     "shard moving a symbol authenticates to the other shard with its own copy of the "
+                     "secret.\n",
+                     config.migration_identity.c_str(),
+                     out.client_auth_enabled() ? "" : ", which is not given");
+        std::exit(1);
+    }
+
     if (out.client_auth_enabled()) {
         OB_LOG_INFO("auth", "client authentication enabled (%zu identities from %s)",
                     out.clients.size(), config.auth_secret_file.c_str());
@@ -1045,6 +1058,7 @@ const std::vector<std::string>& known_flags() {
         "max-subscriptions-per-session",
         "metrics-bind",
         "metrics-port",
+        "migration-identity",
         "mm-max-catchup-bytes",
         "mm-max-peer-send-buffer",
         "mm-node-id",
@@ -1105,6 +1119,7 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"election-lease-wait-ms", {"<N>", "Wait after the leader key vanishes before standing"}},
         {"failover-enabled", {"<BOOL>", "Participate in automatic failover: true/1/yes or false/0/no (default: true)"}},
         {"auth-secret-file", {"<PATH>", "Client credentials, '<identity> <secret>' per line; mode 600. Empty disables client authentication"}},
+        {"migration-identity", {"<IDENTITY>", "The identity from --auth-secret-file a shard authenticates as on another shard's client port, moving a symbol there"}},
         {"cluster-secret-file", {"<PATH>", "Shared secret for replication and multi-master links, one line; mode 600"}},
         {"compaction", {"on|off", "Whether the flush tick merges small segments into bigger ones "
                                   "(default: on)"}},
@@ -1529,6 +1544,8 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
                 }
             }
             if (!one.empty()) config.tls_peer_names.push_back(one);
+        } else if (arg == "--migration-identity") {
+            config.migration_identity = std::string{cursor.value()};
         } else if (arg == "--auth-secret-file") {
             config.auth_secret_file = std::string{cursor.value()};
         } else if (arg == "--cluster-secret-file") {
@@ -1859,6 +1876,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     // The *path*, and there is no value to print because the secret is never a field of
     // ServerConfig. `--print-config` exists to be pasted into a ticket.
     line("auth-secret-file", c.auth_secret_file.empty() ? "(none)" : c.auth_secret_file);
+    line("migration-identity", c.migration_identity.empty() ? "(none)" : c.migration_identity);
     line("cluster-secret-file", c.cluster_secret_file.empty() ? "(none)" : c.cluster_secret_file);
     line("compaction", c.compaction ? "on" : "off");
     line("fsync-policy",
@@ -2934,6 +2952,16 @@ void TcpServer::run() {
         sc_config.coordinator.node_id = config_.node_id;
         sc_config.coordinator.cluster_prefix = "/ob/";
         sc_config.advertise_address = config_.advertise_host + ":" + std::to_string(config_.port);
+        // How this shard reaches another's client port to move a symbol there (#196): TLS when its
+        // own client port has it - one cluster, one configuration - and the identity it was given.
+        sc_config.migration_access.tls         = config_.tls_client;
+        sc_config.migration_access.tls_ca_file = config_.tls_ca_file;
+        if (!config_.migration_identity.empty()) {
+            if (const Credential* own = secrets_.clients.find(config_.migration_identity)) {
+                sc_config.migration_access.identity = own->identity;
+                sc_config.migration_access.secret   = own->secret;
+            }
+        }
 
         shard_coord = std::make_unique<ShardCoordinator>(sc_config, *engine_);
         shard_coord->start();

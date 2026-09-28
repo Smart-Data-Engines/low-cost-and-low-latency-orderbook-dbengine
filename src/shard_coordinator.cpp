@@ -5,9 +5,11 @@
 #include "orderbook/thread_boundary.hpp"
 #include "orderbook/engine.hpp"
 #include "orderbook/logger.hpp"
+#include "orderbook/update_assembler.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 
 namespace ob {
 
@@ -300,12 +302,7 @@ bool ShardCoordinator::owns_symbol(const std::string& symbol_key) const {
 
 bool ShardCoordinator::is_migrating(const std::string& symbol_key) const {
     std::lock_guard<std::mutex> lock(mtx_);
-    for (const auto& m : shard_map_.active_migrations) {
-        if (m.symbol_key == symbol_key) {
-            return true;
-        }
-    }
-    return false;
+    return migrating_ && migration_.symbol == symbol_key;
 }
 
 void ShardCoordinator::on_shard_map_change(ShardMapChangeCallback cb) {
@@ -324,16 +321,26 @@ void ShardCoordinator::increment_routing_errors() {
 ShardCoordinator::MigrationMetrics ShardCoordinator::migration_metrics() const {
     std::lock_guard<std::mutex> lock(mtx_);
     MigrationMetrics metrics;
-    for (const auto& m : shard_map_.active_migrations) {
-        if (m.source_shard_id == config_.shard_id) {
-            metrics.in_progress = true;
-            metrics.symbol = m.symbol_key;
-            metrics.target_shard = m.target_shard_id;
-            metrics.progress_pct = m.progress_pct;
-            break;
-        }
-    }
+    metrics.in_progress  = migrating_;
+    metrics.symbol       = migration_.symbol;
+    metrics.target_shard = migration_.target;
+    metrics.progress_pct = migration_.phase == "done" ? 100 : 0;
     return metrics;
+}
+
+ShardCoordinator::MigrationStatus ShardCoordinator::migration_status() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return migration_;
+}
+
+void ShardCoordinator::set_migration_status(const std::function<void(MigrationStatus&)>& change) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    change(migration_);
+}
+
+std::string ShardCoordinator::owner_in(const ShardMap& map, const std::string& symbol_key) {
+    const auto named = map.assignments.find(symbol_key);
+    return named != map.assignments.end() ? named->second : ring_of(map).lookup(symbol_key);
 }
 
 // ── register_shard() ──────────────────────────────────────────────────────────
@@ -515,167 +522,392 @@ void ShardCoordinator::rebalance() {
 
 bool ShardCoordinator::initiate_migration(const std::string& symbol_key,
                                           const std::string& target_shard_id) {
-    OB_LOG_INFO("shard_coord", "Initiating migration: symbol=%s -> target=%s",
-                symbol_key.c_str(), target_shard_id.c_str());
-
-    std::lock_guard<std::mutex> lock(mtx_);
-
-    // Validate: we must own the symbol
-    auto it = shard_map_.assignments.find(symbol_key);
-    if (it == shard_map_.assignments.end() || it->second != config_.shard_id) {
-        OB_LOG_WARN("shard_coord", "Cannot migrate symbol=%s: not owned by shard=%s",
-                    symbol_key.c_str(), config_.shard_id.c_str());
-        return false;
-    }
-
-    // Validate: target shard must exist
-    if (shard_map_.shards.find(target_shard_id) == shard_map_.shards.end()) {
-        OB_LOG_WARN("shard_coord", "Cannot migrate symbol=%s: unknown target shard=%s",
-                    symbol_key.c_str(), target_shard_id.c_str());
-        return false;
-    }
-
-    // Validate: not already migrating
-    for (const auto& m : shard_map_.active_migrations) {
-        if (m.symbol_key == symbol_key) {
-            OB_LOG_WARN("shard_coord", "Cannot migrate symbol=%s: migration already in progress",
-                        symbol_key.c_str());
+    {
+        // One at a time: the driver's state is one migration's.
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (migrating_) {
+            OB_LOG_WARN("shard_coord", "Not moving %s: moving %s to shard %s is under way",
+                        symbol_key.c_str(), migration_.symbol.c_str(), migration_.target.c_str());
             return false;
         }
+        migrating_        = true;
+        migration_        = MigrationStatus{};
+        migration_.symbol = symbol_key;
+        migration_.target = target_shard_id;
+        migration_.phase  = "adopting";
     }
-
-    // Set migration state
-    MigrationState ms;
-    ms.symbol_key = symbol_key;
-    ms.source_shard_id = config_.shard_id;
-    ms.target_shard_id = target_shard_id;
-    ms.progress_pct = 0;
-    shard_map_.active_migrations.push_back(std::move(ms));
-    shard_map_.version++;
-
-    // Launch migration in background thread
-    if (migration_thread_.joinable()) {
-        migration_thread_.join();
-    }
+    if (migration_thread_.joinable()) migration_thread_.join();   // the last one's, finished
     migration_thread_ = std::thread([this, symbol_key, target_shard_id]() {
         run_thread_body("shard_coord", "execute_migration", [&] {
             execute_migration(symbol_key, target_shard_id);
         });
+        // A move whose switch has an unknown outcome leaves its symbol frozen, and one begun now
+        // could thaw it: none begins until a restart reads the map.
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (migration_.phase != "unknown") migrating_ = false;
     });
-
     return true;
 }
 
 // ── execute_migration() ───────────────────────────────────────────────────────
 
+namespace {
+
+/// Rounds of copying while the symbol's writes are taken, each copying what came during the one
+/// before, until one copies fewer updates than this - what the second freeze then copies with the
+/// symbol's writes refused - or there have been kMaxCopyRounds.
+constexpr uint64_t kFinalRoundUpdates = 2000;
+constexpr uint32_t kMaxCopyRounds     = 8;
+/// The longest the last round may have taken when it copied more than kFinalRoundUpdates: the freeze
+/// copies about as much again with the symbol's writes refused.
+constexpr double kFreezeBudgetMs = 1000.0;
+
+/// An answer as a log line and an error can carry it: without its newlines.
+std::string one_line(std::string answer) {
+    while (!answer.empty() && (answer.back() == '\n' || answer.back() == '\r')) answer.pop_back();
+    return answer;
+}
+
+double ms_since(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+}
+
+}  // namespace
+
 void ShardCoordinator::execute_migration(const std::string& symbol_key,
                                          const std::string& target_shard_id) {
-    OB_LOG_INFO("shard_coord", "Executing migration: symbol=%s -> shard=%s",
-                symbol_key.c_str(), target_shard_id.c_str());
+    const auto started = std::chrono::steady_clock::now();
+    OB_LOG_INFO("shard_coord", "Moving %s to shard %s with its rows (#196)", symbol_key.c_str(),
+                target_shard_id.c_str());
+    const auto fail = [&](const std::string& why) {
+        OB_LOG_ERROR("shard_coord", "Moving %s to shard %s failed: %s - it stays on shard %s, which "
+                                    "takes its writes", symbol_key.c_str(), target_shard_id.c_str(),
+                     why.c_str(), config_.shard_id.c_str());
+        set_migration_status([&](MigrationStatus& m) {
+            m.phase = "failed";
+            m.error = why;
+        });
+    };
 
+    std::string address;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        const auto t = shard_map_.shards.find(target_shard_id);
+        if (t != shard_map_.shards.end()) address = t->second.address;
+    }
+    if (address.empty()) return fail("the map names no address for shard " + target_shard_id);
+    TargetConnection target(address, config_.migration_access);
+    if (const std::string why = target.connect(); !why.empty()) {
+        return fail("shard " + target_shard_id + " at " + address + " cannot be reached: " + why);
+    }
+    std::string answer;
+    if (const std::string why =
+            target.command("ADOPT " + symbol_key + " BEGIN " + config_.shard_id, answer);
+        !why.empty()) {
+        return fail("shard " + target_shard_id + " did not answer ADOPT BEGIN: " + why);
+    }
+    if (answer != "OK\n\n") {
+        return fail("shard " + target_shard_id + " did not adopt it: " + one_line(answer));
+    }
+
+    // Adopted: from here a failure before the map names the target abandons the adoption, and one
+    // after it does not - what the target holds is then the symbol's only copy that takes writes.
+    bool frozen = false;
+    bool switched_map = false;
+    std::shared_ptr<const void> pin;
     try {
-        // Step 1: Create symbol snapshot
-        OB_LOG_INFO("shard_coord", "Creating snapshot for symbol=%s", symbol_key.c_str());
-        auto manifest = engine_.create_symbol_snapshot(symbol_key);
-
-        // Update progress
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            for (auto& m : shard_map_.active_migrations) {
-                if (m.symbol_key == symbol_key) {
-                    m.progress_pct = 25;
-                    break;
-                }
+        std::unordered_set<std::string> copied;
+        set_migration_status([](MigrationStatus& m) { m.phase = "copying"; });
+        // The files pinned first, so that no merge or retention sweep changes what the rounds copy
+        // from: a merge between the first seal and the pin would replace segments the list names -
+        // gone when read, or their rows sent again as the merged segment's. A merge under way when
+        // the pin is taken finishes before the seal, which waits for the flush lock it holds.
+        pin = engine_.pin_segment_files();
+        // No round but the last needs the symbol's writes refused: a row taken after a round's seal
+        // drained the queue is in a segment a later seal lists, and the last seal is made frozen.
+        auto round_started = std::chrono::steady_clock::now();
+        uint64_t moved = copy_segments(target, engine_.seal_symbol(symbol_key), copied);
+        double round_ms = ms_since(round_started);
+        uint32_t rounds = 1;
+        // Converged: the last round copied a small remainder, which the freeze copies about as much
+        // of again. The rounds also stop after kMaxCopyRounds, converged or not.
+        bool converged = moved < kFinalRoundUpdates;
+        while (!converged && rounds < kMaxCopyRounds) {
+            if (!running_.load(std::memory_order_acquire)) {
+                throw std::runtime_error("shard " + config_.shard_id + " is stopping");
             }
+            round_started = std::chrono::steady_clock::now();
+            moved = copy_segments(target, engine_.seal_symbol(symbol_key), copied);
+            round_ms = ms_since(round_started);
+            ++rounds;
+            converged = moved < kFinalRoundUpdates;
+        }
+        // Rounds that never came down to a small remainder: the symbol's writes arrive about as fast
+        // as they are copied, and the freeze would refuse them for about as long as the last round
+        // took - past what a client tries again for. Refused, and the symbol stays where it is.
+        if (!converged && round_ms > kFreezeBudgetMs) {
+            char detail[160];
+            std::snprintf(detail, sizeof(detail),
+                          "the last of %u rounds copied %llu update(s) in %.0f ms, and the switch "
+                          "would refuse the symbol's writes for about as long",
+                          rounds, static_cast<unsigned long long>(moved), round_ms);
+            throw std::runtime_error(std::string("its writes arrive about as fast as they are copied: ") +
+                                     detail);
+        }
+        set_migration_status([&](MigrationStatus& m) {
+            m.phase  = "switching";
+            m.rounds = rounds;
+        });
+
+        // The switch. The symbol's writes are refused SYMBOL_MOVING from here to the thaw: what
+        // came during the last round is copied, and then the map names the target.
+        engine_.freeze_symbol(symbol_key);
+        frozen = true;
+        const auto freeze_started = std::chrono::steady_clock::now();
+        copy_segments(target, engine_.seal_symbol(symbol_key), copied);
+        std::string why;
+        const MapSwitch switched = switch_owner_in_map(symbol_key, target_shard_id, why);
+        if (switched == MapSwitch::Refused) throw std::runtime_error("the map was not switched: " + why);
+        if (switched == MapSwitch::Unknown) {
+            // Neither thawed nor abandoned, and no other MIGRATE until a restart (migrating_ stays).
+            // The map may name the target, and then a write taken here would be stored where no
+            // client reads it, and what the target adopted would be the symbol's only copy.
+            OB_LOG_ERROR("shard_coord", "Moving %s to shard %s: whether the map names shard %s for it "
+                                        "is unknown (%s) - its writes stay refused here until a "
+                                        "restart of shard %s reads the map from etcd",
+                         symbol_key.c_str(), target_shard_id.c_str(), target_shard_id.c_str(),
+                         why.c_str(), config_.shard_id.c_str());
+            set_migration_status([&](MigrationStatus& m) {
+                m.phase = "unknown";
+                m.error = why;
+            });
+            return;
         }
 
-        // Step 2: Transfer snapshot to target shard
-        // In production, this would send the snapshot over the network.
-        // The target shard would call engine_.load_symbol_snapshot().
-        OB_LOG_INFO("shard_coord", "Snapshot created for symbol=%s, transferring to %s",
-                    symbol_key.c_str(), target_shard_id.c_str());
-
-        // Update progress
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            for (auto& m : shard_map_.active_migrations) {
-                if (m.symbol_key == symbol_key) {
-                    m.progress_pct = 50;
-                    break;
-                }
-            }
+        // The map names the target. END lets it take the symbol's writes from every client before
+        // its own read of the map says so; were END lost, that read ends the adoption all the same.
+        switched_map = true;
+        if (const std::string e = target.command("ADOPT " + symbol_key + " END", answer);
+            !e.empty() || answer != "OK\n\n") {
+            OB_LOG_WARN("shard_coord", "Moving %s: shard %s did not take END (%s) - it takes the "
+                                       "symbol's writes once it reads the map",
+                        symbol_key.c_str(), target_shard_id.c_str(),
+                        e.empty() ? one_line(answer).c_str() : e.c_str());
         }
-
-        // Step 3: Get WAL delta (changes since snapshot)
-        OB_LOG_DEBUG("shard_coord", "Getting WAL delta for symbol=%s", symbol_key.c_str());
-        auto wal_delta = engine_.get_symbol_wal_delta(symbol_key, 0, 0);
-
-        // Update progress
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            for (auto& m : shard_map_.active_migrations) {
-                if (m.symbol_key == symbol_key) {
-                    m.progress_pct = 75;
-                    break;
-                }
-            }
-        }
-
-        // Step 4: Atomic ShardMap update — reassign symbol to target
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            shard_map_.assignments[symbol_key] = target_shard_id;
-            shard_map_.version++;
-
-            // Remove migration state
-            auto& migrations = shard_map_.active_migrations;
-            migrations.erase(
-                std::remove_if(migrations.begin(), migrations.end(),
-                    [&](const MigrationState& m) {
-                        return m.symbol_key == symbol_key;
-                    }),
-                migrations.end());
-        }
-
-        // Step 5: Mark symbol as migrated on source (reject future writes)
         engine_.mark_symbol_migrated(symbol_key);
-
-        OB_LOG_INFO("shard_coord", "Migration complete: symbol=%s -> shard=%s",
-                    symbol_key.c_str(), target_shard_id.c_str());
-
+        engine_.thaw_symbol(symbol_key);
+        frozen = false;
+        const double freeze_ms = ms_since(freeze_started);
+        MigrationStatus done;
+        set_migration_status([&](MigrationStatus& m) {
+            m.phase     = "done";
+            m.freeze_ms = freeze_ms;
+            done        = m;
+        });
+        OB_LOG_INFO("shard_coord", "Moved %s to shard %s: %u round(s), %llu update(s) of %llu row(s), "
+                                   "its writes refused for %.1f ms, %.1f s in all",
+                    symbol_key.c_str(), target_shard_id.c_str(), done.rounds,
+                    static_cast<unsigned long long>(done.updates),
+                    static_cast<unsigned long long>(done.rows), freeze_ms, ms_since(started) / 1000.0);
     } catch (const std::exception& e) {
-        OB_LOG_ERROR("shard_coord", "Migration failed, rolling back: symbol=%s error=%s",
-                     symbol_key.c_str(), e.what());
-        rollback_migration(symbol_key);
-    } catch (...) {
-        OB_LOG_ERROR("shard_coord", "Migration failed, rolling back: symbol=%s error=unknown",
-                     symbol_key.c_str());
-        rollback_migration(symbol_key);
+        if (switched_map) {
+            // The map names the target: the move is done whatever failed after it, and the symbol
+            // is refused here as migrated.
+            engine_.mark_symbol_migrated(symbol_key);
+            if (frozen) engine_.thaw_symbol(symbol_key);
+            OB_LOG_ERROR("shard_coord", "Moved %s to shard %s, the map names it, and then: %s",
+                         symbol_key.c_str(), target_shard_id.c_str(), e.what());
+            set_migration_status([&](MigrationStatus& m) {
+                m.phase = "done";
+                m.error = e.what();
+            });
+            return;
+        }
+        abandon_on_target(target, symbol_key);
+        if (frozen) engine_.thaw_symbol(symbol_key);
+        fail(e.what());
+    }
+}
+
+uint64_t ShardCoordinator::copy_segments(TargetConnection& target,
+                                         const std::vector<SegmentMeta>& sealed,
+                                         std::unordered_set<std::string>& copied) {
+    // Sent in batches, each one write answered in order: one round trip a write bounded the copy
+    // below the rate one writer writes at, and a copy slower than its symbol's writers never ends.
+    constexpr size_t kBatchUpdates = 512;
+    constexpr size_t kBatchLevels  = 8192;
+    const auto started = std::chrono::steady_clock::now();
+    uint64_t updates = 0;
+    uint64_t rows = 0;
+    uint64_t counted_updates = 0;   // what the status says already
+    uint64_t counted_rows = 0;
+    size_t segments = 0;
+    std::vector<MovedUpdate> batch;
+    std::vector<MovedWrite> writes;
+    size_t batch_levels = 0;
+    for (const SegmentMeta& meta : sealed) {
+        if (!copied.insert(meta.dir_path).second) continue;
+        ++segments;
+        std::string refused;
+        const auto send = [&]() {
+            if (batch.empty() || !refused.empty()) return;
+            if (!running_.load(std::memory_order_acquire)) {
+                refused = "shard " + config_.shard_id + " is stopping";
+                return;
+            }
+            writes.resize(batch.size());
+            for (size_t i = 0; i < batch.size(); ++i) {
+                writes[i] = MovedWrite{batch[i].side, batch[i].timestamp_ns, batch[i].levels.data(),
+                                       batch[i].levels.size()};
+            }
+            refused = target.send_updates(meta.symbol, meta.exchange, writes);
+            if (refused.empty()) {
+                updates += batch.size();
+                rows += batch_levels;
+            }
+            batch.clear();
+            batch_levels = 0;
+        };
+        UpdateAssembler assembler;
+        MovedUpdate done;
+        const auto take = [&](MovedUpdate&& u) {
+            batch_levels += u.levels.size();
+            batch.push_back(std::move(u));
+            if (batch.size() >= kBatchUpdates || batch_levels >= kBatchLevels) send();
+        };
+        const bool whole = engine_.read_symbol_segment(meta, [&](const SnapshotRow& row) {
+            if (!refused.empty()) return;   // the read goes on to its end; nothing more is sent
+            if (assembler.add(row, done)) take(std::move(done));
+        });
+        if (refused.empty() && assembler.finish(done)) take(std::move(done));
+        send();
+        // Progress by the segment, so that SHARD_INFO moves during a round.
+        set_migration_status([&](MigrationStatus& m) {
+            m.updates += updates - counted_updates;
+            m.rows += rows - counted_rows;
+        });
+        counted_updates = updates;
+        counted_rows    = rows;
+        if (!refused.empty()) {
+            throw std::runtime_error("shard at " + target.address() + " did not store a write of " +
+                                     meta.dir_path + ": " + refused);
+        }
+        if (!whole) throw std::runtime_error("segment " + meta.dir_path + " could not be read whole");
+    }
+    OB_LOG_INFO("shard_coord", "Copied %zu segment(s) to %s: %llu update(s) of %llu row(s) in %.1f ms",
+                segments, target.address().c_str(), static_cast<unsigned long long>(updates),
+                static_cast<unsigned long long>(rows), ms_since(started));
+    return updates;
+}
+
+void ShardCoordinator::abandon_on_target(TargetConnection& target, const std::string& symbol_key) {
+    const std::string line = "ADOPT " + symbol_key + " ABANDON";
+    std::string answer;
+    std::string why = target.connected() ? target.command(line, answer) : std::string("not connected");
+    if (!why.empty()) {
+        // The copy's connection broke: a new one says it.
+        TargetConnection again(target.address(), config_.migration_access);
+        why = again.connect();
+        if (why.empty()) why = again.command(line, answer);
+    }
+    if (why.empty() && answer.rfind("OK", 0) == 0) {
+        OB_LOG_WARN("shard_coord", "Moving %s abandoned: the target at %s dropped what it adopted (%s)",
+                    symbol_key.c_str(), target.address().c_str(), one_line(answer).c_str());
+        return;
+    }
+    OB_LOG_ERROR("shard_coord", "Moving %s abandoned, and the target at %s keeps what it adopted: %s - "
+                                "ADOPT %s ABANDON on it drops that, and the next MIGRATE of the "
+                                "symbol is refused until it does",
+                 symbol_key.c_str(), target.address().c_str(),
+                 why.empty() ? one_line(answer).c_str() : why.c_str(), symbol_key.c_str());
+}
+
+ShardCoordinator::MapSwitch ShardCoordinator::switch_owner_in_map(const std::string& symbol_key,
+                                                                  const std::string& target_shard_id,
+                                                                  std::string& why) {
+    // A compare-and-swap that gets no answer may have landed, and then the map names the target:
+    // from then on this gives up only once a read says which, or after kUnknownFor. Before one,
+    // nothing was written, and an unreachable etcd is a refusal.
+    constexpr int kAttempts = 16;
+    constexpr auto kUnknownFor = std::chrono::seconds(60);
+    const std::string key = shard_map_key(config_.coordinator.cluster_prefix);
+    bool maybe_landed = false;
+    std::chrono::steady_clock::time_point give_up{};
+    int attempts = 0;
+    auto pause = std::chrono::milliseconds(10);
+    for (;;) {
+        if (!running_.load(std::memory_order_acquire)) {
+            why = "shard " + config_.shard_id + " is stopping";
+            return maybe_landed ? MapSwitch::Unknown : MapSwitch::Refused;
+        }
+        if (maybe_landed && std::chrono::steady_clock::now() >= give_up) {
+            why = "a compare-and-swap of the map got no answer, and no read since has said whether it "
+                  "was written";
+            return MapSwitch::Unknown;
+        }
+        if (!maybe_landed && ++attempts > kAttempts) {
+            why = "etcd did not take the map in " + std::to_string(kAttempts) + " attempts";
+            return MapSwitch::Refused;
+        }
+        if (attempts > 1 || maybe_landed) {
+            std::this_thread::sleep_for(pause);
+            pause = std::min(pause * 2, std::chrono::milliseconds(2000));
+        }
+        CoordinatorClient::KeyValue kv;
+        const auto read = coordinator_ ? coordinator_->get(key, kv) : CoordinatorClient::KeyRead::Unavailable;
+        if (read == CoordinatorClient::KeyRead::Unavailable) continue;
+        if (read == CoordinatorClient::KeyRead::Absent) {
+            why = "etcd holds no shard map";
+            return MapSwitch::Refused;
+        }
+        ShardMap map;
+        std::string error;
+        if (!ShardMap::from_json(kv.value, map, error)) {
+            why = "the map in etcd does not parse: " + error;
+            return MapSwitch::Refused;
+        }
+        const std::string owner = owner_in(map, symbol_key);
+        if (owner == target_shard_id) {
+            // This switch, or an earlier attempt's that landed.
+            OB_LOG_INFO("shard_coord", "The map names shard %s for %s (revision %lld)",
+                        target_shard_id.c_str(), symbol_key.c_str(),
+                        static_cast<long long>(kv.mod_revision));
+            adopt_map(std::move(map), kv.mod_revision);
+            return MapSwitch::Switched;
+        }
+        if (owner != config_.shard_id) {
+            why = "the map names shard " + owner + " for it";
+            return MapSwitch::Refused;
+        }
+        map.assignments[symbol_key] = target_shard_id;
+        ++map.version;
+        const auto cas = coordinator_->compare_and_put(key, kv.mod_revision, map.to_json());
+        if (cas == CoordinatorClient::CasOutcome::Swapped) {
+            OB_LOG_INFO("shard_coord", "The map names shard %s for %s now (version %lu)",
+                        target_shard_id.c_str(), symbol_key.c_str(),
+                        static_cast<unsigned long>(map.version));
+            // The revision of this write is the next poll's to learn, as join_map() leaves it.
+            adopt_map(std::move(map), 0);
+            return MapSwitch::Switched;
+        }
+        if (cas == CoordinatorClient::CasOutcome::Unavailable && !maybe_landed) {
+            maybe_landed = true;
+            give_up = std::chrono::steady_clock::now() + kUnknownFor;
+            OB_LOG_WARN("shard_coord", "A compare-and-swap of the map for %s got no answer: reading it "
+                                       "until it says whether it was written", symbol_key.c_str());
+        } else if (cas == CoordinatorClient::CasOutcome::Conflict) {
+            OB_LOG_DEBUG("shard_coord", "The map changed since revision %lld: reading it again",
+                         static_cast<long long>(kv.mod_revision));
+        }
     }
 }
 
 // ── rollback_migration() ──────────────────────────────────────────────────────
 
 void ShardCoordinator::rollback_migration(const std::string& symbol_key) {
-    OB_LOG_WARN("shard_coord", "Rolling back migration for symbol=%s", symbol_key.c_str());
-
-    std::lock_guard<std::mutex> lock(mtx_);
-
-    // Remove migration state
-    auto& migrations = shard_map_.active_migrations;
-    migrations.erase(
-        std::remove_if(migrations.begin(), migrations.end(),
-            [&](const MigrationState& m) {
-                return m.symbol_key == symbol_key;
-            }),
-        migrations.end());
-
-    // Ensure symbol stays assigned to this shard
-    shard_map_.assignments[symbol_key] = config_.shard_id;
-    shard_map_.version++;
-
-    OB_LOG_INFO("shard_coord", "Migration rolled back: symbol=%s remains on shard=%s",
-                symbol_key.c_str(), config_.shard_id.c_str());
+    // What the stub's failure did to this shard's copy of the map; a migration now changes nothing
+    // here that a failure has to take back, and the map in etcd is written once, by its switch.
+    OB_LOG_DEBUG("shard_coord", "Nothing to roll back for %s", symbol_key.c_str());
 }
 
 // ── handle_shard_map_command() ────────────────────────────────────────────────
@@ -724,6 +956,20 @@ std::string ShardCoordinator::handle_shard_info_command() const {
     result += "\n";
     result += "symbols_count\t" + std::to_string(symbols_count) + "\n";
     result += "data_size\t" + std::to_string(data_size) + "\n";
+    // The migration this shard runs, or ran last (#196): what MIGRATE, which answers once it has
+    // begun, leaves an operator to read.
+    if (!migration_.phase.empty()) {
+        char freeze[32];
+        std::snprintf(freeze, sizeof(freeze), "%.1f", migration_.freeze_ms);
+        result += "migration_symbol\t" + migration_.symbol + "\n";
+        result += "migration_target\t" + migration_.target + "\n";
+        result += "migration_phase\t" + migration_.phase + "\n";
+        result += "migration_rounds\t" + std::to_string(migration_.rounds) + "\n";
+        result += "migration_updates\t" + std::to_string(migration_.updates) + "\n";
+        result += "migration_rows\t" + std::to_string(migration_.rows) + "\n";
+        result += "migration_freeze_ms\t" + std::string(freeze) + "\n";
+        if (!migration_.error.empty()) result += "migration_error\t" + migration_.error + "\n";
+    }
     result += "\n";
 
     return result;
@@ -735,41 +981,40 @@ std::string ShardCoordinator::handle_migrate_command(const std::string& symbol_k
                                                       const std::string& target_shard_id) {
     OB_LOG_INFO("shard_coord", "Handling MIGRATE: symbol=%s target=%s",
                 symbol_key.c_str(), target_shard_id.c_str());
-
-    // Validate ownership (without holding lock during initiate_migration)
     {
         std::lock_guard<std::mutex> lock(mtx_);
-        auto it = shard_map_.assignments.find(symbol_key);
-        if (it == shard_map_.assignments.end() || it->second != config_.shard_id) {
+        // Owned as a write is: by the map's assignment, or by the ring (#196, requirement 5).
+        if (owner_in(shard_map_, symbol_key) != config_.shard_id) {
             OB_LOG_WARN("shard_coord", "MIGRATE rejected: not owner of symbol=%s",
                         symbol_key.c_str());
             return "ERR NOT_OWNER " + symbol_key + "\n";
         }
-
-        // Check target shard exists
-        if (shard_map_.shards.find(target_shard_id) == shard_map_.shards.end()) {
+        const auto target = shard_map_.shards.find(target_shard_id);
+        if (target == shard_map_.shards.end()) {
             OB_LOG_WARN("shard_coord", "MIGRATE rejected: unknown shard=%s",
                         target_shard_id.c_str());
             return "ERR unknown shard: " + target_shard_id + "\n";
         }
-
-        // Check not already migrating
-        for (const auto& m : shard_map_.active_migrations) {
-            if (m.symbol_key == symbol_key) {
-                return "ERR migration already in progress: " + symbol_key + "\n";
-            }
+        if (target_shard_id == config_.shard_id) {
+            return "ERR shard " + config_.shard_id + " owns " + symbol_key + " already\n";
+        }
+        if (target->second.status != ShardStatus::ACTIVE) {
+            return "ERR shard " + target_shard_id + " is not active\n";
+        }
+        if (migrating_ && migration_.phase == "unknown") {
+            return "ERR whether moving " + migration_.symbol + " to shard " + migration_.target +
+                   " switched the map is unknown: restart shard " + config_.shard_id +
+                   ", which reads the map, before another MIGRATE\n";
+        }
+        if (migrating_) {
+            return "ERR migration already in progress: " + migration_.symbol + "\n";
         }
     }
-
-    // Refused rather than run (#196): initiate_migration() marks the symbol migrated here - every
-    // write of it refused with SYMBOL_MIGRATED from then on - and moves none of its rows, since the
-    // symbol snapshot names no files and the WAL delta is empty; and the map in etcd, which every
-    // client routes by since #175, still names this shard. A symbol MIGRATE ran on could be written
-    // nowhere.
-    OB_LOG_WARN("shard_coord", "MIGRATE refused for symbol=%s to shard=%s: moving a symbol's rows "
-                               "between shards is not implemented (#196)",
-                symbol_key.c_str(), target_shard_id.c_str());
-    return "ERR MIGRATE is not implemented: it would move none of " + symbol_key + "'s rows (#196)\n";
+    if (!initiate_migration(symbol_key, target_shard_id)) {
+        return "ERR migration already in progress\n";
+    }
+    // Under way: SHARD_INFO says how it goes.
+    return "OK\n\n";
 }
 
 // ── handle_adopt_command() ────────────────────────────────────────────────────

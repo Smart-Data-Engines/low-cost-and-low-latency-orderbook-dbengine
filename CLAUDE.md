@@ -3903,6 +3903,25 @@ Learned the hard way. Check here before debugging.
      holds the server's admin lock; were the `ADOPT` it sends held by the same lock on the other
      side, two shards migrating to each other would each wait for the other's. `ADOPT` is serialised
      by the coordinator's own lock, and `AdminSerialisation` fails when the set changes.
+519. **`orderbook/client.hpp` and the engine's headers each define an `ob::Level` and an
+     `ob::QueryResult`, and they are not the same types.** No translation unit can include both. The
+     coordinator reaches another shard's client port through `src/symbol_mover.cpp`, which includes
+     the client and nothing of the engine, behind a header that names neither type.
+520. **A cycle of static libraries links only when it is declared.** `orderbook_multi_master` calls
+     into the engine and the WAL, which name it, and did not name them back: it linked while some
+     library earlier on the line happened to pull the engine's objects in first. A dependency added
+     to the coordinator moved that library, and `test_shard_router_mm` lost `Engine::install_snapshot`.
+     Declared, CMake repeats the cycle on the line.
+521. **A copy that is slower than the writers it copies never ends.** The migration's rounds each
+     copy what arrived during the one before; at one round trip a write, the copy of one symbol ran
+     below the rate two writers wrote it at, the rounds never came down to a small remainder, and the
+     freeze that ended them refused the symbol's writes for over 30 s - past the 10 s a client tries
+     again for. The copy is pipelined now (`minsert_many()`), and rounds that do not converge refuse
+     the move instead of freezing for as long.
+522. **A list of segments is a snapshot only while nothing merges them: pin first, then list.** A
+     merge between a migration's first seal and its pin would replace segments the list names - read
+     after they are gone, or their rows sent again as the merged segment's. A merge under way when the
+     pin is taken finishes before the seal, which waits for the flush lock it holds.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -4006,11 +4025,15 @@ connection a timeout closed, under a test that builds a sharded pool against a m
 is closed**: since #177 a node of 50 000 (symbol, origin) pairs held writes for 9 - 13 ms at every
 checkpoint, writing its whole vector down; a checkpoint writes what moved now - 20.5 kB in 0.03 ms
 after 1% of them moved - and a whole vector where a restart needs one to start from (pitfalls
-512-513). **#190, #193 and #196 are open P2s** - #196 a symbol moved between shards without its rows,
-and `MIGRATE` refused until it is not; at the write ceiling a flush tick's WAL sync takes
-1 - 3 s on a device the segments keep busy, and writers wait that long for room in the pending queue;
-and a joiner checks every path of a snapshot's manifest against the filesystem on its mesh io thread,
-5 s for 70 000 files. **#194 (P3)**: a snapshot holding a file of zero bytes cannot be installed,
+512-513). **#196 is closed**: `MIGRATE` marked a symbol migrated and moved none of its rows; it moves
+them now while the symbol is written - rounds of pipelined copies, then a freeze of the remainder and
+a compare-and-swap of the map in etcd - and the target adopts it only where none of its rows is, from
+the copying connection alone, under a numbered adoption the engine checks again under its lock:
+4.8 - 142.7 ms of refused writes (median 7.4) across ten moves of 250 000 rows with two writers, and
+not one write lost (pitfalls 514-522). **#190 and #193 are open P2s** - at the write ceiling a flush
+tick's WAL sync takes 1 - 3 s on a device the segments keep busy, and writers wait that long for room
+in the pending queue; and a joiner checks every path of a snapshot's manifest against the filesystem
+on its mesh io thread, 5 s for 70 000 files. **#194 (P3)**: a snapshot holding a file of zero bytes cannot be installed,
 though the engine writes no such file.
 
 **#170 and #171**: a Python client connection carries one exchange at a time and is closed when one

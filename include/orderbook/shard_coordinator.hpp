@@ -8,6 +8,7 @@
 
 #include "orderbook/coordinator.hpp"
 #include "orderbook/shard_map.hpp"
+#include "orderbook/symbol_mover.hpp"
 
 #include <atomic>
 #include <functional>
@@ -15,10 +16,13 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
+#include <vector>
 
 namespace ob {
 
 class Engine;  // forward
+struct SegmentMeta;
 
 // ── Shard coordinator configuration ───────────────────────────────────────────
 
@@ -29,6 +33,8 @@ struct ShardCoordinatorConfig {
     /// "host:port" the shard's clients connect to - what the map says of it (#175): --advertise-host
     /// and --port.
     std::string advertise_address;
+    /// How this shard reaches another's client port to move a symbol there (#196).
+    MigrationAccess migration_access;
 };
 
 // ── Callback for shard map changes ────────────────────────────────────────────
@@ -66,8 +72,8 @@ public:
     /// Get the number of symbols assigned to this shard.
     size_t local_symbol_count() const;
 
-    /// Initiate migration of a symbol to the target shard.
-    /// Returns true if migration was initiated.
+    /// Start moving a symbol to the target shard with its rows (#196), on a thread of its own: false
+    /// when a migration is under way. What MIGRATE runs once it has checked ownership and the target.
     bool initiate_migration(const std::string& symbol_key,
                             const std::string& target_shard_id);
 
@@ -95,7 +101,8 @@ public:
     /// Handle SHARD_INFO command — return shard info as TSV.
     std::string handle_shard_info_command() const;
 
-    /// Handle MIGRATE command — initiate migration.
+    /// MIGRATE: a symbol this shard owns, by the map's assignment or by the ring, to an active shard
+    /// of the map (#196). Answers once the migration has begun; SHARD_INFO says how it goes.
     std::string handle_migrate_command(const std::string& symbol_key,
                                        const std::string& target_shard_id);
 
@@ -132,6 +139,20 @@ public:
     };
     MigrationMetrics migration_metrics() const;
 
+    /// The migration this shard runs, or ran last (#196): what SHARD_INFO says of it.
+    struct MigrationStatus {
+        std::string symbol;
+        std::string target;
+        /// adopting, copying, switching, done, failed, unknown; empty before the first
+        std::string phase;
+        uint32_t    rounds{0};       ///< copy rounds, the first one's included
+        uint64_t    updates{0};      ///< updates the target stored
+        uint64_t    rows{0};         ///< rows they carried
+        double      freeze_ms{0};    ///< the second freeze, while the symbol's writes were refused
+        std::string error;           ///< why it failed, or why its end is unknown
+    };
+    MigrationStatus migration_status() const;
+
     /// Routing error counter (for STATUS).
     uint64_t routing_errors() const;
 
@@ -161,6 +182,9 @@ private:
     int64_t test_map_revision_{0};   ///< see adopt_map_for_test()
     std::atomic<ShardStatus> status_{ShardStatus::JOINING};
     std::atomic<uint64_t> routing_errors_{0};
+    /// See migration_status(). Under mtx_, and `migrating_` says whether the driver runs.
+    MigrationStatus migration_;
+    bool            migrating_{false};
 
     ShardMapChangeCallback change_cb_;
 
@@ -211,11 +235,35 @@ private:
     // Rebalancing after topology change
     void rebalance();
 
-    // Execute symbol migration
+    /// The migration's driver (#196): ADOPT BEGIN on the target; the segment files pinned; rounds
+    /// of sealing and copying while the symbol's writes are taken; the freeze, the last copy and the
+    /// map's switch; END, the migrated mark and the thaw. A failure before the switch abandons the
+    /// adoption and thaws; a switch whose outcome is unknown leaves the symbol frozen, because the
+    /// map may name the target.
     void execute_migration(const std::string& symbol_key,
                            const std::string& target_shard_id);
 
-    // Rollback migration
+    // ── The source's half of a migration (#196) ──────────────────────────────
+    /// What a switch of the symbol's owner in the map came to: written (by this attempt or an
+    /// earlier one that landed), refused (the map names a third shard, or nothing could be written),
+    /// or unknown - a compare-and-swap that got no answer, which may have landed, and no read since
+    /// that says.
+    enum class MapSwitch { Switched, Refused, Unknown };
+    MapSwitch switch_owner_in_map(const std::string& symbol_key, const std::string& target_shard_id,
+                                  std::string& why);
+    /// The segments of `sealed` not in `copied`, sent to the target as the updates that wrote them;
+    /// `copied` gains them. Throws on a refusal, a broken connection or a segment that cannot be read.
+    uint64_t copy_segments(TargetConnection& target, const std::vector<SegmentMeta>& sealed,
+                           std::unordered_set<std::string>& copied);
+    /// Tell the target the migration is over and not to keep what it adopted: on the connection
+    /// the copy used when it still works, else on a new one. Logged either way.
+    void abandon_on_target(TargetConnection& target, const std::string& symbol_key);
+    /// Update the status under mtx_.
+    void set_migration_status(const std::function<void(MigrationStatus&)>& change);
+    /// Who the map names for the symbol: its assignment, or the ring's answer.
+    static std::string owner_in(const ShardMap& map, const std::string& symbol_key);
+
+    /// Nothing, since #196: a migration changes nothing here that a failure has to take back.
     void rollback_migration(const std::string& symbol_key);
 
     // Propagate multi-master topology from etcd to ShardMap

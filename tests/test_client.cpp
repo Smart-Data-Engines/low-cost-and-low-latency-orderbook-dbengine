@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 #include <rapidcheck/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -823,4 +824,162 @@ TEST(ClientUnit, RowParserStillAcceptsTheSevenColumnsAndTheOlderSix) {
     ASSERT_TRUE(with_six.has_value()) << with_six.error_message();
     ASSERT_EQ(with_six.value().rows.size(), 1u);
     EXPECT_EQ(with_six.value().rows[0].sequence_number, 0u) << "unknown, not invented";
+}
+
+// ── minsert_many (#196): several writes in one send, answered in order ─────────────────────────
+
+namespace {
+
+/// A server that reads MINSERTs as the protocol frames them - a header naming its level count, then
+/// that many level lines - and answers only once it has every one it was told to expect, in
+/// `chunk`-byte pieces: a client that waited for each answer before sending the next write would
+/// wait here for good, and one that assumed an answer arrives whole would misread the pieces.
+class MinsertStub {
+public:
+    MinsertStub(std::vector<std::string> answers, size_t chunk)
+        : answers_(std::move(answers)), chunk_(chunk) {
+        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        int opt = 1;
+        ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
+        addr.sin_port        = 0;
+        if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) return;
+        socklen_t len = sizeof(addr);
+        ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
+        port_ = ntohs(addr.sin_port);
+        ::listen(listen_fd_, 1);
+        thread_ = std::thread([this] { serve(); });
+    }
+    ~MinsertStub() {
+        if (listen_fd_ >= 0) ::shutdown(listen_fd_, SHUT_RDWR);
+        if (thread_.joinable()) thread_.join();
+        if (listen_fd_ >= 0) ::close(listen_fd_);
+    }
+    uint16_t port() const { return port_; }
+    /// The level count of every MINSERT read, in order.
+    std::vector<size_t> minserts() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return minserts_;
+    }
+
+private:
+    void serve() {
+        const int fd = ::accept(listen_fd_, nullptr, nullptr);
+        if (fd < 0) return;
+        static constexpr std::string_view kWelcome = "OK ob_tcp_server v0.1.0\n\n";
+        (void)::send(fd, kWelcome.data(), kWelcome.size(), MSG_NOSIGNAL);
+        std::string pending;
+        char buf[4096];
+        size_t levels_left = 0;
+        size_t seen = 0;
+        while (seen < answers_.size()) {
+            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            pending.append(buf, static_cast<size_t>(n));
+            size_t nl;
+            while ((nl = pending.find('\n')) != std::string::npos) {
+                const std::string line = pending.substr(0, nl);
+                pending.erase(0, nl + 1);
+                if (levels_left > 0) {
+                    --levels_left;
+                    if (levels_left == 0) ++seen;
+                    continue;
+                }
+                if (line.rfind("STATUS", 0) == 0) {
+                    const std::string reply =
+                        "OK\ncapabilities: insert_event_time,strict_args\nreplicas: 0\n\n";
+                    (void)::send(fd, reply.data(), reply.size(), MSG_NOSIGNAL);
+                } else if (line.rfind("MINSERT ", 0) == 0) {
+                    // MINSERT <symbol> <exchange> <side> <n> [time]
+                    std::vector<std::string> tokens;
+                    size_t from = 0;
+                    for (size_t sp; (sp = line.find(' ', from)) != std::string::npos; from = sp + 1) {
+                        tokens.push_back(line.substr(from, sp - from));
+                    }
+                    tokens.push_back(line.substr(from));
+                    levels_left = tokens.size() > 4 ? std::stoul(tokens[4]) : 0;
+                    std::lock_guard<std::mutex> lock(mtx_);
+                    minserts_.push_back(levels_left);
+                }
+            }
+        }
+        std::string all;
+        for (const auto& a : answers_) all += a;
+        for (size_t at = 0; at < all.size(); at += chunk_) {
+            const std::string piece = all.substr(at, chunk_);
+            (void)::send(fd, piece.data(), piece.size(), MSG_NOSIGNAL);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        // Held open until the client is done reading, then closed with the listener.
+        (void)::recv(fd, buf, sizeof(buf), 0);
+        ::close(fd);
+    }
+
+    std::vector<std::string> answers_;
+    size_t      chunk_;
+    int         listen_fd_ = -1;
+    uint16_t    port_      = 0;
+    std::thread thread_;
+    std::mutex  mtx_;
+    std::vector<size_t> minserts_;
+};
+
+std::vector<ob::OrderbookClient::MinsertWrite> five_writes(std::vector<ob::Level>& levels) {
+    levels.clear();
+    for (int i = 0; i < 15; ++i) levels.push_back(ob::Level{100 + i, 1, 1});
+    std::vector<ob::OrderbookClient::MinsertWrite> writes;
+    const size_t sizes[] = {1, 2, 3, 4, 5};
+    size_t at = 0;
+    for (size_t i = 0; i < 5; ++i) {
+        ob::OrderbookClient::MinsertWrite w;
+        w.symbol        = "BTC-USD";
+        w.exchange      = "BINANCE";
+        w.side          = i % 2 == 0 ? ob::Side::BID : ob::Side::ASK;
+        w.levels        = levels.data() + at;
+        w.n_levels      = sizes[i];
+        w.event_time_ns = 1'700'000'000'000'000'000ULL + i;
+        writes.push_back(w);
+        at += sizes[i];
+    }
+    return writes;
+}
+
+} // namespace
+
+TEST(ClientMinsertMany, ManyWritesInOneSendAreAnsweredInOrderWhateverPiecesTheAnswersComeIn) {
+    MinsertStub server({"OK\n\n", "OK\n\n", "ERR SYMBOL_MOVING\n", "OK\n\n", "OK\n\n"}, 3);
+    ASSERT_NE(server.port(), 0u) << "the stub could not bind";
+    ob::ClientConfig cfg;
+    cfg.port             = server.port();
+    cfg.read_timeout_sec = 3.0;   // a client waiting for each answer fails here, not in ten seconds
+    ob::OrderbookClient client(cfg);
+    ASSERT_TRUE(client.connect());
+
+    std::vector<ob::Level> levels;
+    std::string refusal;
+    const auto stored = client.minsert_many(five_writes(levels), refusal);
+    ASSERT_TRUE(stored) << stored.error_message();
+    EXPECT_EQ(stored.value(), 4u) << "an answer was lost, counted twice, or an ERR counted as stored";
+    EXPECT_EQ(refusal, "SYMBOL_MOVING");
+    EXPECT_EQ(server.minserts(), (std::vector<size_t>{1, 2, 3, 4, 5}))
+        << "the writes the server read are not the five sent, level for level";
+}
+
+TEST(ClientMinsertMany, AnAnswerThatIsNeitherOkNorErrIsAnError) {
+    MinsertStub server({"OK\n\n", "PONG\n", "OK\n\n", "OK\n\n", "OK\n\n"}, 64);
+    ASSERT_NE(server.port(), 0u);
+    ob::ClientConfig cfg;
+    cfg.port             = server.port();
+    cfg.read_timeout_sec = 3.0;
+    ob::OrderbookClient client(cfg);
+    ASSERT_TRUE(client.connect());
+
+    std::vector<ob::Level> levels;
+    std::string refusal;
+    const auto stored = client.minsert_many(five_writes(levels), refusal);
+    ASSERT_FALSE(stored) << "an answer no MINSERT gives was taken for one";
+    // Refused as what it is, rather than waited on until the read timed out.
+    EXPECT_EQ(stored.error_code(), ob::OB_ERR_PARSE) << stored.error_message();
 }
