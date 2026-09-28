@@ -270,6 +270,66 @@ TEST(BackupCut, TheSealsAreWrittenWithoutTheEnginesLockAndHoldOnlyWhatTheCutDrai
     engine->close();
 }
 
+TEST(BackupCut, FlushAndTheCutSyncTheWalWithoutTheEnginesLock) {
+    // #190 step 4: FLUSH and a snapshot's cut took the rows and synced the WAL under the engine's
+    // lock, and a backup's cut held every writer 759 ms of its fsync. Between the two holds now,
+    // another thread writes - which it could not, with the lock held until the fsync ended.
+    TempDir dir;
+    auto engine = engine_at(dir.path);
+    for (const bool snapshot : {false, true}) {
+        for (uint64_t n = 0; n < 10; ++n) write(*engine, "A", (snapshot ? 100 : 0) + n);
+        std::thread writer;
+        std::atomic<bool> wrote{false};
+        bool wrote_while_syncing = false;
+        std::pair<uint32_t, size_t> before_the_write{};
+        engine->while_syncing_wal_for_test([&] {
+            if (writer.joinable()) return;   // the first hold of this call only
+            before_the_write = engine->get_wal_position();
+            writer = std::thread([&] {
+                write(*engine, "B", snapshot ? 2 : 1);
+                wrote = true;
+            });
+            wrote_while_syncing = eventually([&] { return wrote.load(); }, 2000ms);
+        });
+        if (snapshot) {
+            auto cut = engine->create_snapshot_with_sequence_state(ob::SnapshotChecksums::Skip);
+            // The cut is the moment the rows were taken: a peer catching up from its position must
+            // be sent the write made during the sync, which none of its files holds.
+            EXPECT_EQ(std::make_pair(cut.manifest.wal_file_index, cut.manifest.wal_byte_offset),
+                      before_the_write)
+                << "the manifest's position is past a record whose row is in none of its files";
+            // B's write during this sync is n = 2; the one made during FLUSH's, n = 1, was waiting
+            // when this cut took its rows, and is in it.
+            const std::string during = "B/EX/" + std::to_string(kBase + 2 * 1000) + "_";
+            const std::string before = "B/EX/" + std::to_string(kBase + 1 * 1000) + "_";
+            bool has_before = false;
+            for (const auto& f : cut.manifest.files) {
+                EXPECT_NE(f.path.rfind(during, 0), 0u) << f.path << " is a write taken after the cut";
+                has_before |= f.path.rfind(before, 0) == 0;
+            }
+            EXPECT_TRUE(has_before) << "the write waiting when the cut took its rows is not in it";
+            // And the sequence state is of the same moment: B's frontier is its first write's number,
+            // not the second's, whose row is in no file.
+            uint64_t b_frontier = 0;
+            for (const auto& e : cut.vector) {
+                if (e.key == "B.EX") b_frontier = std::max(b_frontier, e.frontier);
+            }
+            EXPECT_EQ(b_frontier, 1u) << "the vector claims a write whose row is in none of the cut's files";
+        } else {
+            engine->flush_incremental();
+        }
+        engine->while_syncing_wal_for_test(nullptr);
+        if (writer.joinable()) writer.join();
+        EXPECT_TRUE(wrote_while_syncing)
+            << (snapshot ? "a snapshot's cut" : "FLUSH") << " held the engine's lock through the WAL's fsync";
+    }
+    // Everything was taken - the writes during the syncs by the next flush.
+    engine->flush_incremental();
+    EXPECT_EQ(rows_of(*engine, "A").size(), 20u * 3u);
+    EXPECT_EQ(rows_of(*engine, "B").size(), 2u * 3u);
+    engine->close();
+}
+
 // ── Names, paths, the directory ──────────────────────────────────────────────
 
 TEST(BackupName, ReadsBackAsItsTimeAndSortsInTime) {

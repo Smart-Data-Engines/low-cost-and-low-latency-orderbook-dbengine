@@ -559,12 +559,38 @@ TEST(FlushTickStatic, TheTicksSyncDrainAndDeletingRunWithoutTheEnginesLock) {
     const auto locked = [&](const std::string& body_text, std::size_t at) {
         return inside_a_lock_of(body_text, at, lock) || inside_a_lock_of(body_text, at, timed);
     };
-    const std::size_t perform = tick.find("wal_.perform_sync(");
-    ASSERT_NE(perform, std::string::npos) << "the tick does not perform a sync ticket";
-    EXPECT_FALSE(locked(tick, perform))
-        << "the flush tick syncs the WAL with the engine's lock held, so every writer waits for "
-           "the fsync (7.9 ms at p50 and 25.8 at worst, measured)";
-    const std::size_t drain = tick.find("drain_batch(batch, ticket.position(), /*mtx_held=*/false)");
+    // The ticket's steps live in `take_pending_synced()` since #190, shared with FLUSH and a
+    // snapshot's cut, which synced under the lock until then: the one body is checked, and each of
+    // the three is checked to call it without the lock and to sync no other way.
+    const std::string synced = definition_body(src, "Engine::PendingQueue::Batch Engine::take_pending_synced(");
+    ASSERT_FALSE(synced.empty()) << "Engine::take_pending_synced moved; this test would check nothing";
+    const std::size_t perform = synced.find("wal_.perform_sync(");
+    ASSERT_NE(perform, std::string::npos) << "the rows are not taken with a sync ticket";
+    EXPECT_FALSE(locked(synced, perform))
+        << "the WAL is synced with the engine's lock held, so every writer waits for the fsync "
+           "(7.9 ms at p50 and 25.8 at worst in the tick, 759 ms of a backup's cut, measured)";
+    for (const char* step : {"wal_.prepare_sync(", "wal_.complete_sync(", "pending_rows_.take_all()"}) {
+        const std::size_t at = synced.find(step);
+        ASSERT_NE(at, std::string::npos) << step;
+        EXPECT_TRUE(locked(synced, at))
+            << step << " runs without the engine's lock, and a writer appends to the WAL and the "
+                       "queue under it";
+    }
+    EXPECT_EQ(occurrences(synced, "wal_.sync()"), 0u);
+    for (const char* caller : {"void Engine::flush_tick(", "void Engine::flush_everything(",
+                               "Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state("}) {
+        const std::string body = definition_body(src, caller);
+        ASSERT_FALSE(body.empty()) << caller << " moved; this test would check nothing";
+        const std::size_t at = body.find("take_pending_synced(");
+        ASSERT_NE(at, std::string::npos) << caller << " takes its rows some other way";
+        EXPECT_FALSE(locked(body, at)) << caller << " takes its rows with the engine's lock already held";
+        EXPECT_EQ(occurrences(body, "wal_.sync()"), 0u)
+            << caller << " also syncs the WAL the old way, under the lock";
+        const std::size_t drains = body.find("drain_batch(batch, covered, /*mtx_held=*/false)");
+        ASSERT_NE(drains, std::string::npos) << caller << " does not drain its rows without the lock";
+        EXPECT_FALSE(locked(body, drains)) << caller << " drains with the engine's lock held";
+    }
+    const std::size_t drain = tick.find("drain_batch(batch, covered, /*mtx_held=*/false)");
     ASSERT_NE(drain, std::string::npos) << "the tick does not drain its batch without the lock";
     EXPECT_FALSE(locked(tick, drain))
         << "the flush tick drains with the engine's lock held, so every writer waits for ~640k rows "
@@ -584,15 +610,6 @@ TEST(FlushTickStatic, TheTicksSyncDrainAndDeletingRunWithoutTheEnginesLock) {
     EXPECT_TRUE(locked(tick, floor))
         << "the retention floor is read without the engine's lock";
 
-    for (const char* step : {"wal_.prepare_sync(", "wal_.complete_sync(", "pending_rows_.take_all()"}) {
-        const std::size_t at = tick.find(step);
-        ASSERT_NE(at, std::string::npos) << step;
-        EXPECT_TRUE(locked(tick, at))
-            << step << " runs without the engine's lock, and a writer appends to the WAL and the "
-                       "queue under it";
-    }
-    EXPECT_EQ(occurrences(tick, "wal_.sync()"), 0u)
-        << "the tick also syncs the WAL the old way, under the lock";
     // The detection is only worth something if it can tell the two apart in a body it did not
     // write: a lock in an inner block is out of scope once the block closes.
     const std::string held = "{ std::unique_lock<std::mutex> lock(mtx_); x(); }";

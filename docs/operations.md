@@ -555,8 +555,8 @@ failed, 2 when it could not ask, 3 when `--timeout-s` ran out first.
 
 - **A cut at one moment.** Every write acknowledged before `BACKUP` was accepted is in it, a `MINSERT`
   whole or not at all; a write acknowledged after the cut is not. The cut takes the engine's lock
-  twice, briefly - for the WAL's sync and the drain of the rows waiting, and, once their seals are
-  written without it, for the merge - so writers wait for it as they wait for a `FLUSH`.
+  twice, briefly - for the rows waiting, the position and the sequence state, and, once the WAL is
+  synced and the seals are written without it, for the merge - as a `FLUSH` takes it.
 - **Its segment files and a description**, `backup.json`: every file with its size and CRC32C, the
   WAL position and identity the cut was taken at, the node and its role, the engine's version, and
   the sequence state - for a mesh node, the frontiers it holds of every origin.
@@ -636,12 +636,14 @@ A server started on a restored directory of 148 MB was listening 7-10 ms after i
 
 What a backup costs a writer, measured with one connection writing about 320 000 levels a second
 (below this device's ceiling) and `ob_backup` every 5 s, against the same load without it, six rounds
-each: the batch round trip's p50, p99 and p99.9 do not move (about 58 / 107 / 250 us either way). Of
-13 cuts, 10 held the engine's lock 1-9 ms and three 49, 89 and 779 ms - that one 759 ms of it the WAL's
-`fsync`, which the cut, like `FLUSH`, still does under the lock. On this device the worst batch without
-any backup ranged from 3.8 ms to 2.87 s across the same six rounds: near a device's write ceiling its
-own stalls are larger than a backup's, and a WAL on a device of its own takes the `fsync` off the data
-directory's journal (#190). Evidence: `evidence/2026-09-28-backup/`.
+each: the batch round trip's p50, p99 and p99.9 do not move (about 57 / 108 / 240 us either way), and
+every one of 13 cuts held the engine's lock 0.0 ms - the WAL's `fsync`, up to 2.33 s on this device,
+and the seals run without it (#190 step 4; before it the longest cut held writers 779 ms). The worst
+batch is the device's: 4 ms to 3.9 s with backups and 4 ms to 2.1 s without, across the same rounds.
+Near a device's write ceiling its own stalls are larger than a backup's, which adds to them through
+the filesystem's journal (its `syncfs()`); a WAL on a device of its own takes the WAL's `fsync` off
+the data directory's journal. Evidence: `evidence/2026-09-28-backup/` and
+`evidence/2026-09-28-sync-outside-the-lock/`.
 
 **RPO** is the interval between backups: the WAL written since the last one is not in any backup, and
 this release has no restore to a point between two (below). **RTO** is `ob_restore` - the check, the
