@@ -3951,6 +3951,11 @@ Learned the hard way. Check here before debugging.
      made a primary gave a new replica of its own 0 of 18 000 rows, and after a failover every other
      replica would have done the same (#197). `install_snapshot()` and
      `discard_local_data_for_resync()` begin one now: a new identity, and a first file after them.
+528. **A shape test that recognises a lock by the name of its variable passes a lock of another name.**
+     `FlushTickStatic` looks for `lock(mtx_)` and `timed(mtx_`; the mutation table of #190's step 4
+     moved the fsync under `std::unique_lock<std::mutex> held_through_the_sync(mtx_)`, and only the
+     behavioural test - a write made from between the two holds - caught it. The static half guards the
+     spelling the code has; the seam is what guards the property.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -3982,6 +3987,10 @@ below are the recent closures worth knowing because each changes what the engine
 carries no count, because the previous version of this sentence said "four" above a list of six and
 omitted the newest one entirely - which is the rot pitfall 312 is about, in the paragraph that
 warns about it.
+
+**#197 is closed**: a snapshot install and a discard begin a new WAL lineage, so a replica that had
+bootstrapped from a snapshot, once a primary, gives its replicas every row (pitfall 527). **#190's step
+4**: FLUSH and a snapshot's cut sync the WAL without the engine's lock, as the tick does.
 
 **Backup and restore (#34) shipped; point-in-time recovery, the rest of #34, has not**: `BACKUP` on a
 server with `--backup-dir` is a cut from the snapshot path, hard-linked or copied, published by a
