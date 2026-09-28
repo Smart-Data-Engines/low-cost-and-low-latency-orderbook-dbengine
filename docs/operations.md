@@ -156,10 +156,11 @@ What happens, in order:
 
 1. **The target adopts the symbol** (`ADOPT <symbol.exchange> BEGIN <source>`, which the source sends):
    it takes the symbol's writes from that connection alone, and only where none of its rows is.
-2. **The copy.** The source seals the symbol, pins its segment files - no merge and no retention
-   sweep runs until the move ends - and sends every row to the target as the writes that stored
-   them, with their event times. Then it copies again whatever arrived meanwhile, in rounds, until a
-   round copies fewer than 2 000 updates (or after eight). The symbol takes writes throughout.
+2. **The copy.** The source pins its segment files - no merge and no retention sweep runs until the
+   move ends - seals the symbol and sends every row to the target as the writes that stored them,
+   with their event times, pipelined in batches of up to 512. Then it copies again whatever arrived
+   meanwhile, in rounds, until a round copies fewer than 2 000 updates (or after eight). The symbol
+   takes writes throughout.
 3. **The switch.** The symbol's writes are refused `SYMBOL_MOVING` - the clients try again - while
    the last round's arrivals are copied and the map in etcd is compare-and-swapped to name the
    target. Then the target is told (`ADOPT … END`), and the source refuses the symbol from then on
@@ -178,7 +179,9 @@ connects with TLS and verifies the target against `--tls-ca-file`.
 When it fails:
 
 - **Before the switch** - the target is unreachable, refuses to adopt, dies during the copy; etcd
-  refuses the map - the source abandons the adoption (`ADOPT … ABANDON`, which drops what the target
+  refuses the map; or the rounds never came down to a small remainder, the last taking more than a
+  second (`its writes arrive about as fast as they are copied`), which would freeze the symbol for
+  about as long - the source abandons the adoption (`ADOPT … ABANDON`, which drops what the target
   had stored), thaws the symbol and goes on taking its writes: `migration_phase failed` and why. If the
   target could not be told - it was down - it keeps what it had stored, and the next `MIGRATE` is
   refused with `ERR shard <target> holds rows of <symbol> already`: run `ADOPT <symbol.exchange>
@@ -199,6 +202,9 @@ Limits of this first version:
   where the rows are the same.
 - Nothing rebalances by itself: a shard added to a running cluster still takes its share of the ring
   without the rows (above), and moving them is a `MIGRATE` per symbol.
+- **Moving a symbol back** to a shard it left: that shard kept its rows, so it refuses to adopt the
+  symbol until `ADOPT <symbol.exchange> ABANDON` on it drops them - the move back copies every row
+  again, those included.
 
 ## Tuning that is real for this engine
 

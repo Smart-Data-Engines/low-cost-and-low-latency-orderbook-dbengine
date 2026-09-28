@@ -3903,6 +3903,25 @@ Learned the hard way. Check here before debugging.
      holds the server's admin lock; were the `ADOPT` it sends held by the same lock on the other
      side, two shards migrating to each other would each wait for the other's. `ADOPT` is serialised
      by the coordinator's own lock, and `AdminSerialisation` fails when the set changes.
+519. **`orderbook/client.hpp` and the engine's headers each define an `ob::Level` and an
+     `ob::QueryResult`, and they are not the same types.** No translation unit can include both. The
+     coordinator reaches another shard's client port through `src/symbol_mover.cpp`, which includes
+     the client and nothing of the engine, behind a header that names neither type.
+520. **A cycle of static libraries links only when it is declared.** `orderbook_multi_master` calls
+     into the engine and the WAL, which name it, and did not name them back: it linked while some
+     library earlier on the line happened to pull the engine's objects in first. A dependency added
+     to the coordinator moved that library, and `test_shard_router_mm` lost `Engine::install_snapshot`.
+     Declared, CMake repeats the cycle on the line.
+521. **A copy that is slower than the writers it copies never ends.** The migration's rounds each
+     copy what arrived during the one before; at one round trip a write, the copy of one symbol ran
+     below the rate two writers wrote it at, the rounds never came down to a small remainder, and the
+     freeze that ended them refused the symbol's writes for over 30 s - past the 10 s a client tries
+     again for. The copy is pipelined now (`minsert_many()`), and rounds that do not converge refuse
+     the move instead of freezing for as long.
+522. **A list of segments is a snapshot only while nothing merges them: pin first, then list.** A
+     merge between a migration's first seal and its pin would replace segments the list names - read
+     after they are gone, or their rows sent again as the merged segment's. A merge under way when the
+     pin is taken finishes before the seal, which waits for the flush lock it holds.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
