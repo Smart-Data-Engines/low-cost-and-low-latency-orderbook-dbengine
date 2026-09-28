@@ -876,6 +876,84 @@ Result<void> OrderbookClient::minsert(std::string_view symbol,
     return parse_ok_response(rr.value());
 }
 
+Result<std::string> OrderbookClient::command(std::string_view line) {
+    size_t len = format_simple(line);
+    auto sr = send_all(len);
+    if (!sr) return Result<std::string>::err(sr.error_code(), sr.error_message());
+
+    auto rr = recv_response();
+    if (!rr) return Result<std::string>::err(rr.error_code(), rr.error_message());
+    OB_LOG_DEBUG("client", "%.*s -> %.*s", static_cast<int>(line.size()), line.data(),
+                 static_cast<int>(rr.value().size()), rr.value().data());
+    return Result<std::string>::ok(std::string(rr.value()));
+}
+
+Result<size_t> OrderbookClient::minsert_many(const std::vector<MinsertWrite>& writes,
+                                             std::string& refusal) {
+    refusal.clear();
+    if (writes.empty()) return Result<size_t>::ok(0);
+    if (compressed_) {
+        return Result<size_t>::err(OB_ERR_INVALID_ARG, "minsert_many on a compressed connection");
+    }
+    for (const MinsertWrite& w : writes) {
+        if (w.n_levels == 0) return Result<size_t>::err(OB_ERR_INVALID_ARG, "empty levels");
+        if (w.n_levels > 1000) return Result<size_t>::err(OB_ERR_INVALID_ARG, "too many levels");
+        if (auto refused = refuse_unsupported_event_time(w.event_time_ns); !refused) {
+            return Result<size_t>::err(refused.error_code(), refused.error_message());
+        }
+    }
+    // Every line into one buffer, each formatted as minsert() formats it, and one write of it all.
+    std::string batch;
+    for (const MinsertWrite& w : writes) {
+        const size_t len = format_minsert(w.symbol, w.exchange, w.side, w.levels, w.n_levels,
+                                          w.event_time_ns);
+        batch.append(send_buf_.data(), len);
+    }
+    const size_t len = batch.size();
+    send_buf_.swap(batch);   // send_all() writes from send_buf_; what it held is not needed
+    auto sent = send_all(len);
+    if (!sent) return Result<size_t>::err(sent.error_code(), sent.error_message());
+
+    // The answers, in order: `OK` and its blank line, or `ERR` and its line.
+    size_t answered = 0;
+    size_t stored = 0;
+    std::string pending;
+    size_t at = 0;   // where the unread answers in `pending` begin
+    char tmp[16384];
+    while (answered < writes.size()) {
+        const std::string_view rest(pending.data() + at, pending.size() - at);
+        if (rest.starts_with("OK\n\n")) {
+            at += 4;
+            ++answered;
+            ++stored;
+            continue;
+        }
+        if (rest.starts_with("ERR ")) {
+            const size_t nl = rest.find('\n');
+            if (nl != std::string_view::npos) {
+                if (refusal.empty()) refusal = std::string(rest.substr(4, nl - 4));
+                at += nl + 1;
+                ++answered;
+                continue;
+            }
+        } else if (!rest.empty() && !std::string_view("OK\n\n").starts_with(rest.substr(0, 4)) &&
+                   !std::string_view("ERR ").starts_with(rest.substr(0, 4))) {
+            return Result<size_t>::err(OB_ERR_PARSE,
+                                       "unexpected answer to a MINSERT: " +
+                                           std::string(rest.substr(0, std::min<size_t>(rest.size(), 64))));
+        }
+        std::string why;
+        const ssize_t n = read_some(tmp, sizeof(tmp), &why);
+        if (n <= 0) return Result<size_t>::err(OB_ERR_IO, n == 0 ? "connection closed" : why);
+        if (at > 0 && at == pending.size()) {
+            pending.clear();
+            at = 0;
+        }
+        pending.append(tmp, static_cast<size_t>(n));
+    }
+    return Result<size_t>::ok(stored);
+}
+
 Result<void> OrderbookClient::flush() {
     size_t len = format_simple("FLUSH");
     auto sr = send_all(len);

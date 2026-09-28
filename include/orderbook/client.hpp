@@ -189,6 +189,24 @@ public:
                                 Side side, const Level* levels, size_t n_levels,
                                 std::optional<uint64_t> event_time_ns = std::nullopt);
 
+    /// One write of `minsert_many()`.
+    struct MinsertWrite {
+        std::string_view        symbol;
+        std::string_view        exchange;
+        Side                    side{Side::BID};
+        const Level*            levels{nullptr};
+        size_t                  n_levels{0};
+        std::optional<uint64_t> event_time_ns;
+    };
+
+    /// Several `minsert()`s sent in one write and answered in order (#196): what a shard moving a
+    /// symbol sends its rows as, because one round trip a write was what bounded the copy, and the
+    /// server applies the writes of one read together. Returns how many were stored; `refusal` is
+    /// the first `ERR` answer, empty when there was none - the writes after a refused one were sent
+    /// and are answered, and may be stored. An error is a connection that failed or an answer that
+    /// is neither `OK` nor `ERR`. Not on a compressed connection.
+    Result<size_t> minsert_many(const std::vector<MinsertWrite>& writes, std::string& refusal);
+
     /// What the server says it can do, by name, read once per connection (#105).
     ///
     /// Empty means a server that predates the list, and that is an answer rather than an error.
@@ -210,6 +228,12 @@ public:
     // ── Diagnostics ──────────────────────────────────────────────────
     Result<bool>     ping();
     Result<RoleInfo> role();
+
+    /// Send one command line and return the server's whole answer, as it came: `OK` and its blank
+    /// line, or `ERR ...` and its newline. For a command this client has no method of its own for -
+    /// `ADOPT`, which a shard moving a symbol sends the shard it moves to (#196). An error is a
+    /// connection that failed, not an `ERR` answer, which is the caller's to read.
+    Result<std::string> command(std::string_view line);
 
     // ── Command formatting (public for property-based testing) ───────
     size_t format_insert(std::string_view symbol, std::string_view exchange,
