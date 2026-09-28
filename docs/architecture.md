@@ -317,6 +317,19 @@ Until #179 the replay seeded this node's origin for every record, so a node rest
 vector reached the WAL was sent what it had replayed again and stored it twice - 200 rows where the
 writer held 100.
 
+**What a checkpoint writes down of the vector is what moved** (#189). The cache below lists the
+entries whose frontier moved since the last vector written down, and a checkpoint writes those as
+parts of their own record type, `WAL_RECORD_VERSION_VECTOR_CHANGES` (10), serialised from the cache -
+where it wrote the whole vector, copied from the tracker, at every checkpoint after a frontier moved:
+8.7 - 9 ms under the engine's lock and 2 MB of WAL at 50 000 entries. A restart takes the last whole
+vector and puts every complete set of changes after it on top (`VectorFromWal`), so a whole vector is
+written where one is needed to start from: the first in every WAL file, the first after a start whose
+log had none, after the cache is rebuilt, when the changes since outgrow it or most of it moved, and at
+a clean stop that wrote changes - which is what a build before #189, reading whole vectors only, starts
+from. Only data rotates the WAL, so a whole vector is in the file of the checkpoint after it; rows that
+move no frontier - a peer's numbers held above a hole - leave it behind, and retention keeps its file.
+The held set is written when it changed, which the tracker counts.
+
 **What a peer is told is at most one tick old** (#180). The manager reads the vector from a cache
 rather than from the tracker, because it reads it under its own lock, and the write path takes the
 engine's before the manager's. The cache used to be refreshed where the vector is written down, at

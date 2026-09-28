@@ -3871,6 +3871,16 @@ Learned the hard way. Check here before debugging.
      sealed; one run in twenty B was drained a tick later and the seal's checkpoint was the other
      form - 5 runs in 100 on master, and the first suite run on #174's branch was one of them. Order
      the writes so that the premise holds whichever tick drains them.
+512. **Only data rotates the WAL, so what else is written lands in the file of what follows it - and
+     rows that move nothing are what leave it behind.** #189's retention test was first written for a
+     whole vector that a rotation cut across; no append but a data one rotates, so that cannot happen,
+     and its premise, asserted, failed. What does leave the last whole vector in a file the last
+     checkpoint is past is rows that move no frontier - a peer's numbers held above a hole - after
+     which a checkpoint writes the held set and no vector. Retention keeps the vector's file now.
+513. **A clean stop is not a checkpoint.** `close()` seals what waits, and with nothing waiting its
+     final flush writes no checkpoint - so it wrote no vector either, and a stop meant to leave a whole
+     vector for an older build left changes (#189). What a stop has to leave in the WAL it writes
+     itself.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -3970,10 +3980,12 @@ open P1**: an exchange name with a dot
 makes two instruments one key - `A.B` on `C` and `A` on `B.C` share a live book, sequence numbers
 and stored rows, measured on the wire.
 **#172 is closed**: the Python client's sharded pool swaps its routing whole and replaces a shard
-connection a timeout closed, under a test that builds a sharded pool against a map in etcd. **#189,
-#190, #193 and #196 are open P2s** - #196 a symbol moved between shards without its rows, and
-`MIGRATE` refused until it is not; since #177 a node of 50 000 (symbol, origin) pairs holds writes for
-9 - 13 ms at every checkpoint, writing its whole vector down; at the write ceiling a flush tick's WAL sync takes
+connection a timeout closed, under a test that builds a sharded pool against a map in etcd. **#189
+is closed**: since #177 a node of 50 000 (symbol, origin) pairs held writes for 9 - 13 ms at every
+checkpoint, writing its whole vector down; a checkpoint writes what moved now - 20.5 kB in 0.03 ms
+after 1% of them moved - and a whole vector where a restart needs one to start from (pitfalls
+512-513). **#190, #193 and #196 are open P2s** - #196 a symbol moved between shards without its rows,
+and `MIGRATE` refused until it is not; at the write ceiling a flush tick's WAL sync takes
 1 - 3 s on a device the segments keep busy, and writers wait that long for room in the pending queue;
 and a joiner checks every path of a snapshot's manifest against the filesystem on its mesh io thread,
 5 s for 70 000 files. **#194 (P3)**: a snapshot holding a file of zero bytes cannot be installed,
