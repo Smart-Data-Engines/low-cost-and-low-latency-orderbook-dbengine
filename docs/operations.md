@@ -567,7 +567,7 @@ failed, 2 when it could not ask, 3 when `--timeout-s` ran out first.
   log and the description say which it was.
 - **One at a time.** A second `BACKUP` is refused with the name of the one running; `BACKUP STATUS`
   says where it is: its phase (`cut`, `link` or `copy`, `checksum`, `publish`), files and bytes done,
-  and how long it held the segment files.
+  how long its cut held writers (`cut_ms`) and how long it held the segment files (`pinned_ms`).
 - **Complete, or not a backup.** It is written as `.partial-<name>` and renamed to `<name>` once every
   file and the description are on the device (one `syncfs()` of the backup directory's filesystem).
   A failure removes what it wrote; a directory named `.partial-...` is one a node stopped while taking,

@@ -122,6 +122,7 @@ struct BackupProgress {
     uint64_t    files_done{0};
     uint64_t    bytes_total{0};
     uint64_t    bytes_done{0};
+    uint64_t    cut_ms{0};           // the cut: writers wait for it as for a FLUSH
     uint64_t    pinned_ms{0};
     uint64_t    elapsed_ms{0};
 };
@@ -129,8 +130,8 @@ struct BackupProgress {
 const char* backup_state_name(BackupProgress::State s);
 
 /// The answer to `BACKUP STATUS`: `OK`, then one `key: value` line each for state, name, phase,
-/// method, files (done/total), bytes (done/total), pinned_ms, elapsed_ms and error, `-` for a value
-/// that is empty, and the blank line.
+/// method, files (done/total), bytes (done/total), cut_ms, pinned_ms, elapsed_ms and error, `-` for
+/// a value that is empty, and the blank line.
 std::string format_backup_status(const BackupProgress& p);
 
 /// Takes backups of one engine into one directory, one at a time, each on a thread of its own.

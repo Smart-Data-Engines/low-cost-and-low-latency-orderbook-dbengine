@@ -172,9 +172,9 @@ static int run(int argc, char** argv) {
             return 1;
         }
         if (f["state"] == "done") {
-            std::printf("backup %s done: %s, %s file(s), %s byte(s), pinned %s ms, %s ms\n",
+            std::printf("backup %s done: %s, %s file(s), %s byte(s), cut %s ms, pinned %s ms, %s ms\n",
                         name.c_str(), f["method"].c_str(), f["files"].c_str(), f["bytes"].c_str(),
-                        f["pinned_ms"].c_str(), f["elapsed_ms"].c_str());
+                        f["cut_ms"].c_str(), f["pinned_ms"].c_str(), f["elapsed_ms"].c_str());
             return 0;
         }
         if (f["state"] == "failed") {

@@ -510,8 +510,8 @@ TEST(BackupRunner, AtStartTheNewestCompleteBackupIsTheLastSuccess) {
 TEST(BackupStatus, EveryFieldOnALineOfItsOwnAndNoLineBreakInsideOne) {
     const std::string idle = ob::format_backup_status(ob::BackupProgress{});
     EXPECT_EQ(idle,
-              "OK\nstate: idle\nname: -\nphase: -\nmethod: -\nfiles: 0/0\nbytes: 0/0\npinned_ms: 0\n"
-              "elapsed_ms: 0\nerror: -\n\n");
+              "OK\nstate: idle\nname: -\nphase: -\nmethod: -\nfiles: 0/0\nbytes: 0/0\ncut_ms: 0\n"
+              "pinned_ms: 0\nelapsed_ms: 0\nerror: -\n\n");
     ob::BackupProgress failed;
     failed.state = ob::BackupProgress::State::Failed;
     failed.name  = "20260928T100000.000Z";

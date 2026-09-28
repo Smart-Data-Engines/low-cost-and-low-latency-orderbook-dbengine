@@ -781,6 +781,7 @@ std::string format_backup_status(const BackupProgress& p) {
     out += "method: " + value(p.method) + "\n";
     out += "files: " + std::to_string(p.files_done) + "/" + std::to_string(p.files_total) + "\n";
     out += "bytes: " + std::to_string(p.bytes_done) + "/" + std::to_string(p.bytes_total) + "\n";
+    out += "cut_ms: " + std::to_string(p.cut_ms) + "\n";
     out += "pinned_ms: " + std::to_string(p.pinned_ms) + "\n";
     out += "elapsed_ms: " + std::to_string(p.elapsed_ms) + "\n";
     out += "error: " + value(p.error) + "\n\n";
@@ -967,6 +968,7 @@ void BackupRunner::run(std::string name) {
             std::lock_guard<std::mutex> lock(mtx_);
             progress_.files_total = d.files.size();
             progress_.bytes_total = d.total_bytes;
+            progress_.cut_ms      = static_cast<uint64_t>(cut_ms);
         }
         OB_LOG_INFO("backup", "Backup %s: cut at WAL %u:%llu, %zu file(s), %llu byte(s), %llu row(s), "
                               "in %.1f ms",

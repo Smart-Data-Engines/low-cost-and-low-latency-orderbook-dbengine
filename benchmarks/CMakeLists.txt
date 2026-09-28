@@ -62,6 +62,13 @@ add_executable(command_latency command_latency.cpp)
 add_executable(pipelined_ingest pipelined_ingest.cpp)
 target_link_libraries(pipelined_ingest PRIVATE Threads::Threads)
 
+# ── What a backup and a restore cost on this disk (#34) ──────────────────────
+#
+# Compiled, deliberately not run: it fills a store of the size it is given, backs it up linked and
+# copied and restores it, and prints what each took - for the record in evidence/, not a threshold.
+add_executable(backup_cost backup_cost.cpp)
+target_link_libraries(backup_cost PRIVATE orderbook_backup)
+
 # ── What the segment index costs a tick and a query as it grows (#165) ───────
 #
 # Compiled, deliberately not run: it prints a table rather than asserting one, and the numbers in
