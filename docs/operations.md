@@ -661,10 +661,10 @@ copy, the start - plus the server's own start on the restored directory, measure
 
 ## Which build is running
 
-Three ways to ask, all reporting the same number:
+Three ways to ask, all reporting the same number (`--help` carries none):
 
 ```bash
-ob_tcp_server --help | head -1                      # not this: --help does not carry a version
+ob_tcp_server --version                              # the binary, without starting it (#56)
 echo "STATUS" | nc localhost 9090 | grep '^version:' # a running node, over the wire
 curl -s localhost:9091/metrics | grep ob_build_info  # a running node, for a monitoring system
 ```

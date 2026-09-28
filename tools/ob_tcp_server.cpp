@@ -119,10 +119,16 @@ static int run_server(int argc, char* argv[]) {
 }
 
 int main(int argc, char* argv[]) {
-    // Check for --help before full CLI parsing.
+    // Check for --help and --version before full CLI parsing.
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             std::printf("%s", ob::format_usage(argv[0]).c_str());
+            return 0;
+        }
+        // Which build this is, and nothing else (#56): what an operator checks on each node of a
+        // rolling upgrade before and after it, without starting anything.
+        if (std::strcmp(argv[i], "--version") == 0) {
+            std::printf("ob_tcp_server %s\n", std::string(ob::version()).c_str());
             return 0;
         }
     }

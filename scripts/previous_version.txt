@@ -1,0 +1,7 @@
+# The previous version, for tests/integration/test_mixed_versions.py (#56): the revision whose server
+# the CI integration jobs build beside this tree's. Moved to the previous release's revision at each
+# release; docs/upgrading.md's matrix is what the module measured against it.
+#
+# c610b72: master on 28 September 2026, before #34 (backups), #197 (a new WAL lineage after a
+# snapshot install) and #190's step 4 (FLUSH and a snapshot's cut sync the WAL without the lock).
+c610b72dddeab6e6bcc72295be4b78a2b73df39f

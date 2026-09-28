@@ -217,6 +217,20 @@ jobs:
           fi
           sudo dmsetup targets | grep -q '^flakey'
 
+      # The previous version's server, for test_mixed_versions.py (#56): built from the revision
+      # scripts/previous_version.txt names, in a worktree of its own and plain - it is the other side
+      # of an upgrade, not the build under test. Without it the module fails here rather than skip.
+      - name: Build the previous version's server
+        run: |
+          PREV=$(grep -v '^#' scripts/previous_version.txt | head -1)
+          git fetch --no-tags --depth=1 origin "$PREV"
+          git worktree add --detach "$RUNNER_TEMP/engine-prev" "$PREV"
+          cmake -S "$RUNNER_TEMP/engine-prev" -B "$RUNNER_TEMP/engine-prev/build" \
+            -DCMAKE_BUILD_TYPE=Debug -DOB_BUILD_TESTS=OFF
+          cmake --build "$RUNNER_TEMP/engine-prev/build" -j$(nproc) --target ob_tcp_server
+          "$RUNNER_TEMP/engine-prev/build/ob_tcp_server" --help > /dev/null
+          echo "OB_PREVIOUS_SERVER_BINARY=$RUNNER_TEMP/engine-prev/build/ob_tcp_server" >> "$GITHUB_ENV"
+
       # The harness starts its own etcd per cluster, so nothing is started here. Binance tests are
       # opt-in and stay skipped without OB_BINANCE_TESTS. The power-cut tests are opt-in locally
       # and switched on here, and the skip gate below is what keeps them on (#160).
@@ -699,6 +713,20 @@ jobs:
       #
       # Binance modules are excluded because they need the live feed and skip without it, which in a
       # summary line is indistinguishable from passing.
+      # The previous version's server, for test_mixed_versions.py (#56): built from the revision
+      # scripts/previous_version.txt names, in a worktree of its own and plain - it is the other side
+      # of an upgrade, not the build under test. Without it the module fails here rather than skip.
+      - name: Build the previous version's server
+        run: |
+          PREV=$(grep -v '^#' scripts/previous_version.txt | head -1)
+          git fetch --no-tags --depth=1 origin "$PREV"
+          git worktree add --detach "$RUNNER_TEMP/engine-prev" "$PREV"
+          cmake -S "$RUNNER_TEMP/engine-prev" -B "$RUNNER_TEMP/engine-prev/build" \
+            -DCMAKE_BUILD_TYPE=Debug -DOB_BUILD_TESTS=OFF
+          cmake --build "$RUNNER_TEMP/engine-prev/build" -j$(nproc) --target ob_tcp_server
+          "$RUNNER_TEMP/engine-prev/build/ob_tcp_server" --help > /dev/null
+          echo "OB_PREVIOUS_SERVER_BINARY=$RUNNER_TEMP/engine-prev/build/ob_tcp_server" >> "$GITHUB_ENV"
+
       - name: Run the integration battery against the TSan server
         env:
           OB_INTEGRATION_TESTS: "1"
