@@ -1280,8 +1280,8 @@ Of the 2.5 ms, reading the seven files is 0.4, decoding price, quantity and sequ
 before), and handing the rows to one `std::function` 0.8. `BM_TimeRangeQuery`'s process does not
 trim between its scans - the same tunables take its minor faults from 85 500 to 7 200 and its time
 not at all - which is why the benchmark never showed it. Whether a server pays it depends on what
-its heap did before, and a read that allocates nothing does not: step 2 reuses a scan's buffers
-from one segment to the next.
+its heap did before, and a read that allocates nothing does not: step 2 keeps a thread's buffers
+from one read to the next.
 
 The rewrite is held to the decoder before it, kept in `tests/test_codec.cpp`, on arbitrary words and
 counts. That property's first version drew its words with `arbitrary<uint64_t>()`, which RapidCheck
