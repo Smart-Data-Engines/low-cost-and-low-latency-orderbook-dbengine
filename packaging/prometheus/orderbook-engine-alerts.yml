@@ -1,0 +1,167 @@
+# Prometheus alert rules for orderbook-dbengine (#35).
+#
+# Load with `rule_files:` in prometheus.yml. Every metric named here is checked against the engine's
+# registry by scripts/check_dashboards.py, so a rule cannot watch a metric the engine does not export
+# - which is the failure this file would otherwise have in common with the five dead gauges #35 found
+# first. What each alert means, and what to do, is in docs/operations.md: the section each one names.
+groups:
+  - name: orderbook-engine-durability
+    rules:
+      - alert: OrderbookCheckpointsFrozen
+        expr: max by (instance) (ob_checkpoints_frozen) == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }}: a sync failed and no checkpoint claims anything since"
+          description: >-
+            After a failed WAL or segment sync Linux marks the pages it could not write clean, so no
+            later sync can vouch for them: checkpoints stop, WAL retention stops (the disk fills with
+            WAL), and a restart replays from the last checkpoint synced before the failure. Find the
+            device error in the node's log, fix the device, restart the node. docs/operations.md,
+            "When an fsync fails".
+      - alert: OrderbookSyncErrors
+        expr: sum by (instance) (increase(ob_wal_fsync_errors_total[5m])) + sum by (instance) (increase(ob_segment_sync_errors_total[5m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }}: WAL or segment syncs are failing"
+          description: >-
+            The device refused a sync. Writes are refused or checkpoints frozen, depending on the
+            fsync policy. docs/operations.md, "When an fsync fails".
+      - alert: OrderbookWritesRefused
+        expr: sum by (instance) (increase(ob_writer_backpressure_refusals_total[5m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }}: writes refused - the pending queue freed no room in 5 s"
+          description: >-
+            The flush did not drain the pending queue for five seconds: a device slower than the
+            ingest, a full disk, or a failing sync. Clients were answered with an error, not OK.
+            Look at the flush tick lines in the log for the phase that grew. docs/operations.md,
+            "What the metrics say when something is wrong".
+      - alert: OrderbookWritersWaiting
+        expr: sum by (instance) (rate(ob_writer_backpressure_waits_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: writers keep waiting for room in the pending queue"
+          description: >-
+            For ten minutes some writes waited for the flush: sustained ingest near the device's
+            write ceiling. A WAL on a device of its own (--wal-dir) takes the WAL's syncs off the
+            data directory's journal. docs/operations.md, "The WAL on a filesystem of its own".
+      - alert: OrderbookFlushErrors
+        expr: sum by (instance) (increase(ob_flush_errors_total[5m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: flush ticks are failing"
+          description: >-
+            A tick threw and the next one runs; rows stay in memory and in the WAL. The first
+            failure is logged at ERROR with its reason.
+      - alert: OrderbookLoopErrors
+        expr: sum by (instance) (increase(ob_loop_errors_total[5m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: a background loop abandoned an iteration"
+          description: >-
+            One of the engine's loops caught an exception and went on. The node's log names the loop
+            and the error. docs/operations.md, "When a subsystem's loop keeps failing".
+
+  - name: orderbook-engine-replication
+    rules:
+      - alert: OrderbookReplicaDisconnected
+        expr: max by (instance) (ob_replicas_connected) < max by (instance) (max_over_time(ob_replicas_connected[1h]))
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: fewer replicas connected than an hour ago"
+          description: >-
+            A replica this primary had is gone for five minutes. Its log says why; a replica that
+            comes back catches up from the WAL, or from a snapshot if retention moved on.
+            docs/operations.md, "When a replica falls behind".
+      - alert: OrderbookReplicationLagHigh
+        expr: max by (instance) (ob_replication_lag_bytes) > 64 * 1024 * 1024
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: a replica is more than 64 MiB of WAL behind"
+          description: >-
+            The slowest replica has been over 64 MiB behind for five minutes; a failover now would
+            lose what it lacks under the failover policy's rules. docs/operations.md, "When a replica
+            falls behind".
+      - alert: OrderbookReplicaLagUnknown
+        expr: max by (instance) (ob_replicas_lag_unknown) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: a replica's position is unknown"
+          description: >-
+            A connected replica has not said where it is for five minutes, so its lag is not a
+            number. docs/operations.md, "A replica that is slow, rather than one that is behind".
+      - alert: OrderbookFailover
+        expr: changes(max by (instance) (ob_current_epoch)[10m:30s]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.instance }}: the epoch changed - a failover"
+          description: >-
+            A new primary was elected and fences the old one by epoch. Check that the old primary is
+            a replica now, and why it lost the lease.
+
+  - name: orderbook-engine-mesh
+    rules:
+      - alert: OrderbookMeshPeerDown
+        expr: max by (instance) (ob_mm_peers_connected) < max by (instance) (max_over_time(ob_mm_peers_connected[1h]))
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: fewer mesh peers connected than an hour ago"
+          description: >-
+            A multi-master peer is gone for five minutes. docs/operations.md, "A mesh peer that is
+            unreachable rather than down".
+      - alert: OrderbookMeshLagHigh
+        expr: max by (instance) (ob_mm_replication_lag_records) > 100000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: a mesh peer is more than 100 000 records behind"
+          description: >-
+            docs/operations.md, "When a mesh peer falls behind".
+      - alert: OrderbookMeshPeersDropped
+        expr: sum by (instance) (increase(ob_mm_peer_dropped_slow_total[10m])) + sum by (instance) (increase(ob_mm_peer_dropped_clock_total[10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: mesh peers dropped for being slow, or for their clock"
+          description: >-
+            docs/operations.md, "When a peer's clock is wrong", and "A mesh link that is up and
+            carrying nothing".
+
+  - name: orderbook-engine-clients
+    rules:
+      - alert: OrderbookAuthFailures
+        expr: sum by (instance) (rate(ob_auth_failures_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: more than one failed authentication a second"
+          description: >-
+            A client with the wrong secret, or somebody guessing. The server closes the session after
+            each failure. docs/operations.md, "Turning on client authentication".
+      - alert: OrderbookSubscribersDisconnected
+        expr: sum by (instance) (increase(ob_subscription_overflow_disconnects_total[10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: subscribers disconnected for reading too slowly"
+          description: >-
+            A subscriber's queue passed --max-subscriber-queue-bytes and the session was closed.

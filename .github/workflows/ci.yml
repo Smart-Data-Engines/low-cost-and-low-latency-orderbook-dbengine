@@ -49,6 +49,24 @@ jobs:
           python3 -m pip install -q pyyaml
           python3 .github/rulesets/check_contexts.py
 
+      - name: The shipped dashboard and alert rules watch metrics the engine exports
+        # Every panel and alert is over a registered metric, no gauge is taken a rate of, every alert
+        # has a severity and says what to do - and with promtool every query parses, and every alert
+        # fires on the fault it is for and on nothing a healthy node exports (#35). promtool is
+        # pinned by version and by the checksum the release publishes.
+        env:
+          PROM_VER: 2.54.1
+          PROM_SHA256: 31715ef65e8a898d0f97c8c08c03b6b9afe485ac84e1698bcfec90fc6e62924f
+        run: |
+          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL -o prometheus.tar.gz \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROM_VER}/prometheus-${PROM_VER}.linux-amd64.tar.gz"
+          echo "${PROM_SHA256}  prometheus.tar.gz" | sha256sum -c -
+          tar xzf prometheus.tar.gz "prometheus-${PROM_VER}.linux-amd64/promtool"
+          export PROMTOOL="$PWD/prometheus-${PROM_VER}.linux-amd64/promtool"
+          "$PROMTOOL" check rules packaging/prometheus/orderbook-engine-alerts.yml
+          python3 scripts/check_dashboards.py
+          python3 scripts/check_alert_rules.py
+
   build-and-test:
     name: build-and-test
     runs-on: ubuntu-24.04

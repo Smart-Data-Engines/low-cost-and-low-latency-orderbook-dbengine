@@ -554,6 +554,38 @@ it — and because it went to `stdout` unflushed, redirecting the server's outpu
 journal delayed it until the process exited. Grep the log's `listening on port` line, from the
 logger, to confirm a start.
 
+## The dashboard and the alert rules
+
+Two files ship with the engine (#35):
+
+- `packaging/grafana/orderbook-engine.json` — a Grafana dashboard: writes and queries, flush and
+  durability, storage, replication and failover, the multi-master mesh. Import it and pick the
+  Prometheus data source; the `job` and `instance` variables come from `ob_build_info`, which every
+  node exports with its version and its role.
+- `packaging/prometheus/orderbook-engine-alerts.yml` — alert rules, to load with `rule_files:`.
+
+| Alert | Severity | What it means | Where to look |
+|---|---|---|---|
+| `OrderbookCheckpointsFrozen` | critical | a sync failed; no checkpoint claims anything since, and WAL retention has stopped | "When an fsync fails" |
+| `OrderbookSyncErrors` | critical | the device refused a WAL or segment sync | "When an fsync fails" |
+| `OrderbookWritesRefused` | critical | writes answered with an error: the pending queue freed no room in 5 s | below, `ob_pending_rows` |
+| `OrderbookWritersWaiting` | warning | for ten minutes some writes waited for the flush: ingest near the device's ceiling | "The WAL on a filesystem of its own" |
+| `OrderbookFlushErrors`, `OrderbookLoopErrors` | warning | a flush tick, or an iteration of a background loop, threw and the next one runs | "When a subsystem's loop keeps failing" |
+| `OrderbookReplicaDisconnected` | warning | fewer replicas connected than an hour ago | "When a replica falls behind" |
+| `OrderbookReplicationLagHigh` | warning | the slowest replica more than 64 MiB of WAL behind for five minutes | "When a replica falls behind" |
+| `OrderbookReplicaLagUnknown` | warning | a replica that has not said where it is for five minutes | "A replica that is slow, rather than one that is behind" |
+| `OrderbookFailover` | info | the epoch changed: a new primary | "High Availability" in `docs/cli.md` |
+| `OrderbookMeshPeerDown`, `OrderbookMeshLagHigh`, `OrderbookMeshPeersDropped` | warning | a mesh peer gone, far behind, or dropped as slow or for its clock | "When a mesh peer falls behind", "When a peer's clock is wrong" |
+| `OrderbookAuthFailures` | warning | more than one failed authentication a second | "Turning on client authentication" |
+| `OrderbookSubscribersDisconnected` | warning | subscribers closed for reading too slowly | below, `ob_subscription_queued_bytes` |
+
+The thresholds are starting points for a deployment to tune: 64 MiB of replication lag is seconds of
+writes at the ceiling and hours of a quiet market. What is not left to taste is checked in CI:
+`scripts/check_dashboards.py` holds every metric the two files name against the engine's registry and
+refuses a rate of a gauge; `scripts/check_alert_rules.py` runs every alert through `promtool test
+rules` on the series of the fault it is for - and a healthy node's, on which none fires; and an
+integration test holds the names against what a running node serves.
+
 ## What the metrics say when something is wrong
 
 `--metrics-port` exposes a Prometheus endpoint. Three gauges answer most questions before a log does:

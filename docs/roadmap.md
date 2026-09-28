@@ -653,10 +653,20 @@ node that is merely listening can accept a write and have nobody to send it to.
 - Documented recovery procedure with RPO/RTO numbers
 - Effort: M | Impact: Nobody runs a database they cannot restore
 
-### 35. Grafana dashboard and alert rules
+### 35. Grafana dashboard and alert rules ✅
 - Shipped dashboard JSON and Prometheus alert rules (replica lag, failover events, backpressure,
   conflict rate, flush latency)
 - Effort: S | Impact: High value relative to cost; makes the metrics already being exported usable
+- **Shipped** (28 September 2026): `packaging/grafana/orderbook-engine.json` - 31 panels over 48
+  queries: writes and queries, flush and durability, storage, replication and failover, the mesh,
+  with `job` and `instance` from `ob_build_info` - and `packaging/prometheus/orderbook-engine-alerts.yml`,
+  15 alerts from frozen checkpoints and refused writes to a failover and a dropped mesh peer, each
+  saying what it means and which section of `docs/operations.md` to read. Neither can watch a metric
+  the engine does not serve: `scripts/check_dashboards.py` holds every name against the registry,
+  refuses a rate of a gauge and, with promtool, parses every query; `scripts/check_alert_rules.py`
+  runs each alert through `promtool test rules` on the series of its fault, and all of them on a
+  healthy node's, where none fires; both run in `docs-integrity`, with promtool pinned by version and
+  checksum. An integration test holds the names against a running node's `/metrics`.
 - **Prerequisite cleared.** Five of the gauges a dashboard would plot were dead: registered as
   `ob_segment_count`, `ob_pending_rows`, `ob_symbol_count`, `ob_wal_file_index` and `ob_current_epoch`,
   but written by the engine without the `ob_` prefix. `MetricsRegistry::set_gauge()` looks the name up
@@ -2437,6 +2447,22 @@ from how long the last syncs took - so that a sustained overload is slower write
 and refusals; and, as a second step, keeps the drain from waiting behind a seal's sync, so that a seal
 that is slow now and then is absorbed by the unsealed budget (4 M rows) instead of the pending queue
 (1 M). Its measure is this run's waits and refusals, on a device slower than the ingest.
+
+**Three prototypes measured, 28 September, none merged** (spec
+`kiro-workspace/specs/drain-beside-the-seal/`, `evidence/2026-09-28-write-ceiling-2/`, the same run
+ABAB against `bed1212`). The seal's sync handed to a thread of its own, the checkpoint appended by the
+next tick with the claim frozen when it asked (branch `perf/drain-beside-the-seal`): writers waited in
+7 rounds of 8 with it and without, because the slow ticks became the WAL's sync instead - 7.6 s, 3.5
+s, 1.3 s - which in ext4's ordered mode waits behind the same journal commit the background syncfs()
+forces. Admission, a batch written with the pending queue past half waiting after its write in
+proportion to its rows (branch `perf/write-admission`): no round of 16 waited for room, where 13 of 16
+did, and the median round's worst batch fell from 2.1 s to 1.1 s - for 23% of the throughput at the
+median (1.22 to 0.94 M levels/s) and p99 from 4.4 to 27 ms; past three quarters, 3 rounds of 16
+waited, at 0.80 M levels/s and a worst batch of 5.8 s. And the worst batch is the device's in every
+build: the WAL's `write()` held in the kernel under the engine's lock, 688 ms in one round, which the
+node's own log attributes and answers with `--wal-dir`. What is left: fewer bytes a level on the
+device - a record writes about 36 bytes a level, of which the level is 24, and its header carries two
+names at a fixed 32 bytes each - and the WAL on a device of its own.
 
 - Effort: M | Impact: writes at the ceiling wait seconds, now and then, on storage the segments share
   with the WAL, and a slower device than this one would refuse them
@@ -12711,7 +12737,6 @@ The capability items are in the table below.
 | **P2** | A flush tick's WAL sync at the ceiling does not keep writers waiting seconds for room (#190) | M | On a device the segments keep busy the tick's WAL sync took 1.2 - 3.0 s at the pipelined ceiling, and writers waited up to 3.4 s for room in the pending queue - 1.6 s from the refusal |
 | **P2** | A joiner checks a snapshot's paths off its mesh io thread, once a directory (#193) | S | At 70 000 files the check took 5.1 s of the joiner's io thread (Debug), 83% of it resolving every path against the filesystem twice; a week of 4 000 instruments would make it a minute |
 | **P2** | Worked example on live market data (#43) | S | `scripts/binance_live_bootstrap.py` already runs the two-node case end to end on a live feed; what is missing is the write-up and a dashboard |
-| **P2** | Grafana dashboard and alert rules (#35) | S | The metrics are already exported and the five dead gauges behind this are fixed; this is the cheapest step that makes them usable |
 | **P2** | Documentation site (#40) | M | Lowers evaluation friction |
 | **P2** | Release engineering + PyPI wheels (#42) | S | `pip install` is the shortest path to a first user |
 | **P3** | A mesh snapshot with a file of zero bytes in it installs (#194) | S | Its sender sends no chunk for an empty file and its receiver waits for one; the engine writes no such file |
