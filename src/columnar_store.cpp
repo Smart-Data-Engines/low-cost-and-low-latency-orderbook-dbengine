@@ -971,6 +971,42 @@ std::vector<SegmentMeta> ColumnarStore::index() const {
     return all;
 }
 
+bool ColumnarStore::is_dotted_key(const std::string& key, std::string_view dotted) {
+    // symbol NUL exchange here, symbol '.' exchange there: the same length, and equal but for that.
+    if (key.size() != dotted.size()) return false;
+    const size_t nul = key.find('\0');
+    if (nul == std::string::npos || dotted[nul] != '.') return false;
+    const std::string_view k(key);
+    return k.substr(0, nul) == dotted.substr(0, nul) && k.substr(nul + 1) == dotted.substr(nul + 1);
+}
+
+std::vector<SegmentMeta> ColumnarStore::segments_of(std::string_view dotted) const {
+    std::vector<SegmentMeta> out;
+    {
+        std::shared_lock<std::shared_mutex> lock(index_mtx_);
+        for (const auto& [key, si] : by_symbol_) {
+            if (!is_dotted_key(key, dotted)) continue;
+            for (const auto& tier : si.tiers) {
+                out.insert(out.end(), tier.segments.begin(), tier.segments.end());
+            }
+        }
+    }
+    std::sort(out.begin(), out.end(), segment_order_less);
+    return out;
+}
+
+bool ColumnarStore::holds_dotted(std::string_view dotted) const {
+    std::shared_lock<std::shared_mutex> lock(index_mtx_);
+    for (const auto& [key, si] : by_symbol_) {
+        if (!is_dotted_key(key, dotted)) continue;
+        if (!si.blocks.empty() || std::any_of(si.tiers.begin(), si.tiers.end(),
+                                              [](const WidthTier& t) { return !t.segments.empty(); })) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // ── flush_segment ─────────────────────────────────────────────────────────────
 
 std::optional<SegmentMeta> ColumnarStore::flush_segment() {

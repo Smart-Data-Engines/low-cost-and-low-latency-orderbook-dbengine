@@ -21,6 +21,11 @@ inline constexpr ob_status_t OB_ERR_OVERFLOW    = -6;
 inline constexpr ob_status_t OB_ERR_CHECKSUM    = -7;
 inline constexpr ob_status_t OB_ERR_FULL        = -8;
 inline constexpr ob_status_t OB_ERR_MIGRATED    = -9;
+/// The symbol is being moved to another shard (#196): refused for now, and a client tries again.
+inline constexpr ob_status_t OB_ERR_MOVING      = -10;
+/// A write taken on an adoption of its symbol (#196) that no longer stands - abandoned, or begun
+/// again since: this shard does not own the symbol, and a client asks the map which one does.
+inline constexpr ob_status_t OB_ERR_NOT_OWNER   = -11;
 inline constexpr ob_status_t OB_ERR_INTERNAL    = -99;
 
 // ── Exception ─────────────────────────────────────────────────────────────────

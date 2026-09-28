@@ -25,6 +25,7 @@ enum class CommandType {
     SHARD_MAP,
     SHARD_INFO,
     MIGRATE,
+    ADOPT,
     MM_PEERS,
     MM_CONFLICTS,
     SUBSCRIBE,
@@ -99,8 +100,10 @@ struct Command {
     MinsertArgs minsert_args;   // for MINSERT
     BookArgs    book_args;      // for BOOK
     std::string target_node_id; // for FAILOVER
-    std::string migrate_symbol;       // "symbol.exchange" for MIGRATE
+    std::string migrate_symbol;       // "symbol.exchange" for MIGRATE and ADOPT
     std::string migrate_target_shard; // target shard_id for MIGRATE
+    std::string adopt_action;         // BEGIN, END or ABANDON for ADOPT (#196)
+    std::string adopt_source_shard;   // the moving symbol's shard, for ADOPT BEGIN
     size_t      mm_conflicts_limit{100}; // for MM_CONFLICTS
 
     /// The whole SUBSCRIBE line, handed to the query engine unparsed.

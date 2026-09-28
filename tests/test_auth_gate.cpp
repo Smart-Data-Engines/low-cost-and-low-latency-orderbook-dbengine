@@ -130,7 +130,7 @@ TEST(AuthGateStatic, EverySensitiveCommandRequiresAuthentication) {
                    ob::CommandType::FLUSH, ob::CommandType::STATUS, ob::CommandType::ROLE,
                    ob::CommandType::FAILOVER, ob::CommandType::COMPRESS,
                    ob::CommandType::SHARD_MAP, ob::CommandType::SHARD_INFO,
-                   ob::CommandType::MIGRATE, ob::CommandType::MM_PEERS,
+                   ob::CommandType::MIGRATE, ob::CommandType::ADOPT, ob::CommandType::MM_PEERS,
                    ob::CommandType::MM_CONFLICTS, ob::CommandType::SUBSCRIBE,
                    ob::CommandType::UNSUBSCRIBE}) {
         EXPECT_FALSE(ob::allowed_before_authentication(t))

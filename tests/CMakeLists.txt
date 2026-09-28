@@ -857,6 +857,17 @@ target_link_libraries(test_shard_coordinator
 )
 gtest_discover_tests(test_shard_coordinator PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
 
+# ── A symbol moved to another shard with its rows (#196) ──────────────────────
+add_executable(test_symbol_migration test_symbol_migration.cpp)
+target_link_libraries(test_symbol_migration
+    PRIVATE
+        orderbook_shard_coordinator
+        orderbook_shard_map
+        orderbook_tcp_server_lib
+        GTest::gtest_main
+)
+gtest_discover_tests(test_symbol_migration PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
+
 # ── HLC property-based and unit tests (multi-master-replication, Tasks 1.4–1.10) ─
 add_executable(test_hlc test_hlc.cpp)
 target_link_libraries(test_hlc

@@ -1142,11 +1142,34 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
             key += '.';
             key += delta.exchange;
 
+            // A write taken on an adoption (#196) is stored only while that adoption stands. The
+            // server let it through without this lock, and one abandoned since has had its rows
+            // dropped: a row stored now would stay on a shard that neither owns nor adopts it.
+            if (writes[i].adoption != 0) {
+                const auto a = adoptions_.find(key);
+                if (a == adoptions_.end() || a->second != writes[i].adoption) {
+                    OB_LOG_WARN("engine", "Refusing a write of %s taken on adoption %llu, which no "
+                                          "longer stands",
+                                key.c_str(), static_cast<unsigned long long>(writes[i].adoption));
+                    outcomes[i].status = OB_ERR_NOT_OWNER;
+                    s.state[i] = WriteState::Final;
+                    continue;
+                }
+            }
             // Reject writes to migrated symbols (Requirement 6.6).
             if (!migrated_symbols_.empty() && migrated_symbols_.count(key)) {
                 OB_LOG_WARN("engine", "Rejecting write to migrated symbol: symbol_key=%s",
                             key.c_str());
                 outcomes[i].status = OB_ERR_MIGRATED;
+                s.state[i] = WriteState::Final;
+                continue;
+            }
+            // And, for now, to one that is moving (#196): here, under the lock the WAL append
+            // takes, so none is taken after the migration's last copy.
+            if (!frozen_symbols_.empty() && frozen_symbols_.count(key)) {
+                OB_LOG_DEBUG("engine", "Refusing a write of %s: it is moving to another shard",
+                             key.c_str());
+                outcomes[i].status = OB_ERR_MOVING;
                 s.state[i] = WriteState::Final;
                 continue;
             }
@@ -2337,10 +2360,224 @@ std::vector<uint8_t> Engine::get_symbol_wal_delta(const std::string& symbol_key,
     return {};
 }
 
-bool Engine::is_symbol_migrated(const std::string& symbol_key) const {
-    // Note: caller should hold mtx_ or this should be called from a context
-    // where migrated_symbols_ is not being concurrently modified.
+bool Engine::is_symbol_migrated(const std::string& symbol_key) {
+    std::lock_guard<std::mutex> lock(mtx_);
     return migrated_symbols_.count(symbol_key) > 0;
+}
+
+void Engine::freeze_symbol(const std::string& symbol_key) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    frozen_symbols_.insert(symbol_key);
+    OB_LOG_INFO("engine", "Writes of %s refused while it moves to another shard (#196)",
+                symbol_key.c_str());
+}
+
+void Engine::thaw_symbol(const std::string& symbol_key) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (frozen_symbols_.erase(symbol_key) > 0) {
+        OB_LOG_INFO("engine", "Writes of %s taken again", symbol_key.c_str());
+    }
+}
+
+bool Engine::is_symbol_frozen(const std::string& symbol_key) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return frozen_symbols_.count(symbol_key) > 0;
+}
+
+std::vector<SegmentMeta> Engine::seal_symbol(const std::string& symbol_key) {
+    const auto started = std::chrono::steady_clock::now();
+    // One seal at a time, and the store stays: every mutator of stores_ holds flush_mtx_.
+    std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+    ColumnarStore* store = nullptr;
+    {
+        std::unique_lock<std::mutex> lock(mtx_);
+        if (!wal_.sync()) {
+            throw std::runtime_error("Engine: WAL sync failed while sealing " + symbol_key +
+                                     " to move it");
+        }
+        note_wal_synced();
+        flush_drain_pending();
+        auto it = stores_.find(symbol_key);
+        if (it != stores_.end()) store = it->second.get();
+    }
+    if (store != nullptr) {
+        // Written without the engine's lock, as a tick writes its seals, so the other symbols'
+        // writers do not wait for this one's segments; none of its own is taken meanwhile, because
+        // a migration seals it frozen. Claimed by nothing until a tick's sync covers them.
+        std::vector<Seal> seals = choose_seals(/*seal_all=*/false, store, kNoRowLimit);
+        const std::exception_ptr failure = write_seals(seals);
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            segment_merge_refused_.fetch_add(merge_seals_locked(seals), std::memory_order_relaxed);
+            publish_segment_count();
+        }
+        if (failure) std::rethrow_exception(failure);
+    }
+    std::vector<SegmentMeta> out = combined_store_.segments_of(symbol_key);
+    uint64_t rows = 0;
+    for (const auto& meta : out) rows += meta.row_count;
+    OB_LOG_INFO("engine", "Sealed %s to move it: %zu segment(s), %llu row(s), %.1f ms",
+                symbol_key.c_str(), out.size(), static_cast<unsigned long long>(rows),
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
+                    .count());
+    return out;
+}
+
+bool Engine::read_symbol_segment(const SegmentMeta& meta,
+                                 const std::function<void(const SnapshotRow&)>& cb) const {
+    return combined_store_.read_segment(meta, cb);
+}
+
+bool Engine::holds_symbol(const std::string& symbol_key) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return holds_symbol_locked(symbol_key);
+}
+
+bool Engine::holds_symbol_locked(const std::string& symbol_key) const {
+    // Caller holds mtx_. A row queued or in a block has a store and a live book; one on the disk,
+    // after a restart, may have neither yet.
+    return stores_.count(symbol_key) > 0 || buffers_.count(symbol_key) > 0 ||
+           combined_store_.holds_dotted(symbol_key);
+}
+
+size_t Engine::drop_symbol(const std::string& symbol_key) {
+    // Everything sealed and synced, and a checkpoint past the symbol's last record appended - even
+    // when this flush seals nothing, because the last checkpoint can be older than a seal that
+    // claimed nothing (seal_symbol()), and a restart replays from it: its records would come back
+    // with no segment to say they are stored.
+    flush_everything(/*claim_regardless=*/true);
+    std::lock_guard<std::mutex> flush_lock(flush_mtx_);
+    // Before anything is removed, so that a refusal leaves everything as it was. A snapshot taking a
+    // pin after this waits for flush_mtx_ to flush, and its manifest then names none of these files.
+    if (const int pins = segment_file_pins_->load(std::memory_order_acquire); pins > 0) {
+        OB_LOG_WARN("engine", "Not dropping %s: %d snapshot pin(s) hold the segment files for a "
+                              "transfer", symbol_key.c_str(), pins);
+        throw std::runtime_error("a snapshot being sent holds the segment files; drop " + symbol_key +
+                                 " once it is sent");
+    }
+    std::unique_lock<std::mutex> lock(mtx_);
+    if (checkpoints_frozen()) {
+        OB_LOG_ERROR("engine", "Not dropping %s: the checkpoints froze at a failed sync, so a restart "
+                               "replays from before them and would bring its records back",
+                     symbol_key.c_str());
+        throw std::runtime_error("the checkpoints froze at a failed sync, and a restart would replay " +
+                                 symbol_key + " back; restart this node and drop it then");
+    }
+    const std::vector<SegmentMeta> segments = combined_store_.segments_of(symbol_key);
+    std::vector<std::string> dirs;
+    std::unordered_set<std::string> parents;   // where its segments are, and its merges' inputs
+    dirs.reserve(segments.size());
+    for (const auto& meta : segments) {
+        dirs.push_back(meta.dir_path);
+        parents.insert(std::filesystem::path(meta.dir_path).parent_path().string());
+    }
+    const size_t removed = combined_store_.remove_segments(dirs);
+    // The inputs of its merges that wait to be removed go now: a start keeps an input it finds
+    // without the merged segment that names it, and that segment is gone. An input is its merged
+    // segment's neighbour, in the symbol's directory.
+    size_t inputs = 0;
+    size_t waiting = 0;
+    for (RetiredInputs& r : retired_inputs_) {
+        std::vector<std::string> kept;
+        for (const std::string& dir : r.dirs) {
+            if (parents.count(std::filesystem::path(dir).parent_path().string()) == 0) {
+                kept.push_back(dir);
+                continue;
+            }
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+            if (ec) {
+                OB_LOG_ERROR("engine", "Dropping %s: cannot remove %s, which a merge replaced (%s)",
+                             symbol_key.c_str(), dir.c_str(), ec.message().c_str());
+            } else {
+                ++inputs;
+            }
+        }
+        r.dirs = std::move(kept);
+        waiting += r.dirs.size();
+    }
+    retired_inputs_.erase(std::remove_if(retired_inputs_.begin(), retired_inputs_.end(),
+                                         [](const RetiredInputs& r) { return r.dirs.empty(); }),
+                          retired_inputs_.end());
+    registry_.set_gauge("ob_segments_awaiting_removal", static_cast<int64_t>(waiting));
+    // A merge of its segments written and not yet published goes too, with its output.
+    for (auto it = staged_merges_.begin(); it != staged_merges_.end();) {
+        if (it->output.symbol + "." + it->output.exchange != symbol_key) {
+            ++it;
+            continue;
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(it->output.dir_path, ec);
+        it = staged_merges_.erase(it);
+    }
+    for (auto it = compaction_partitions_.begin(); it != compaction_partitions_.end();) {
+        if (it->first.symbol + "." + it->first.exchange == symbol_key) {
+            it = compaction_partitions_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    auto st = stores_.find(symbol_key);
+    if (st != stores_.end()) {
+        ColumnarStore* store = st->second.get();
+        const auto u = unsealed_.find(store);
+        if (u != unsealed_.end() && !u->second.blocks.empty()) {
+            // The flush above sealed every block, and nothing writes the symbol since.
+            OB_LOG_ERROR("engine", "Dropping %s: a block of it was written after the seal - its rows "
+                                   "stay", symbol_key.c_str());
+        } else {
+            if (u != unsealed_.end()) unsealed_.erase(u);   // keyed by the store destroyed below
+            block_rows_hint_.erase(store);
+            stores_.erase(st);
+        }
+    }
+    buffers_.erase(symbol_key);
+    publish_segment_count();
+    registry_.set_gauge("ob_symbol_count", static_cast<int64_t>(buffers_.size()));
+    OB_LOG_INFO("engine", "Dropped %s: %zu segment(s) of %zu removed and %zu replaced input(s) of its "
+                          "merges, its store and live book with them (#196)",
+                symbol_key.c_str(), removed, dirs.size(), inputs);
+    return removed;
+}
+
+uint64_t Engine::begin_adoption(const std::string& symbol_key) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (holds_symbol_locked(symbol_key)) {
+        OB_LOG_WARN("engine", "Not adopting %s: this node holds rows of it already", symbol_key.c_str());
+        return 0;
+    }
+    const uint64_t adoption = ++last_adoption_;
+    adoptions_[symbol_key] = adoption;
+    if (migrated_symbols_.erase(symbol_key) > 0) {
+        OB_LOG_INFO("engine", "%s was migrated away from this node and is coming back: its writes are "
+                              "no longer refused as migrated", symbol_key.c_str());
+    }
+    OB_LOG_INFO("engine", "Adoption %llu of %s begun: the writes taken on it are stored (#196)",
+                static_cast<unsigned long long>(adoption), symbol_key.c_str());
+    return adoption;
+}
+
+void Engine::end_adoption(const std::string& symbol_key) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    const auto a = adoptions_.find(symbol_key);
+    if (a == adoptions_.end()) return;
+    OB_LOG_INFO("engine", "Adoption %llu of %s ended: the map names this shard for it",
+                static_cast<unsigned long long>(a->second), symbol_key.c_str());
+    adoptions_.erase(a);
+}
+
+size_t Engine::abandon_adoption(const std::string& symbol_key) {
+    {
+        // First, so that no write taken on it is stored after the drop below.
+        std::lock_guard<std::mutex> lock(mtx_);
+        const auto a = adoptions_.find(symbol_key);
+        if (a != adoptions_.end()) {
+            OB_LOG_INFO("engine", "Adoption %llu of %s abandoned: a write taken on it is refused from "
+                                  "here", static_cast<unsigned long long>(a->second), symbol_key.c_str());
+            adoptions_.erase(a);
+        }
+    }
+    return drop_symbol(symbol_key);
 }
 
 void Engine::mark_symbol_migrated(const std::string& symbol_key) {
@@ -3403,7 +3640,7 @@ void Engine::drop_unsealed_locked() {
     registry_.set_gauge("ob_unsealed_rows", 0);
 }
 
-int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows) {
+int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim_regardless) {
     // Phase B: flush segments to disk and merge into combined_store_.
     // Caller holds flush_mtx_. Runs WITHOUT mtx_ (except the brief merge at the end)
     // so that disk I/O does not block writers.
@@ -3420,7 +3657,7 @@ int Engine::flush_write_and_merge(bool seal_all, size_t drained_rows) {
     const std::exception_ptr write_failure = write_seals(seals);
     const auto written = SealClock::now();
 
-    if (seals.empty()) {
+    if (seals.empty() && !claim_regardless) {
         TimedLock timed(mtx_, "flush tick: no seal - gauges and the vector copy");
         registry_.set_gauge("ob_unsealed_rows",
                             static_cast<int64_t>(unsealed_rows_.load(std::memory_order_relaxed)));
@@ -3846,6 +4083,10 @@ uint64_t Engine::replay_wal_tail(WALReplayer& replayer, const WALReplayer::LastC
 }
 
 void Engine::flush_incremental() {
+    flush_everything(/*claim_regardless=*/false);
+}
+
+void Engine::flush_everything(bool claim_regardless) {
     // One flush at a time, whichever thread asks. A client FLUSH arriving while
     // flush_loop() was mid-tick used to produce two Phase B passes over the same
     // active segment, and the segment ended up in the query index twice.
@@ -3865,7 +4106,8 @@ void Engine::flush_incremental() {
     // Phase B: segment I/O + merge, outside mtx_ so writers are not blocked. A client asked for
     // this flush, so a client is told when its segments could not be made durable (#160) - the
     // same rule as a failed WAL sync above.
-    if (const int err = flush_write_and_merge(/*seal_all=*/true, kNoRowLimit); err != 0) {
+    if (const int err = flush_write_and_merge(/*seal_all=*/true, kNoRowLimit, claim_regardless);
+        err != 0) {
         throw std::runtime_error(std::string("Engine: segment sync failed during FLUSH: ") +
                                  std::strerror(err));
     }

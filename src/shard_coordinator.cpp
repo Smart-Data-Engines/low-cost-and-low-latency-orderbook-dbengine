@@ -168,6 +168,19 @@ void ShardCoordinator::adopt_map(ShardMap map, int64_t revision) {
         hash_ring_    = ring_of(shard_map_);
         member        = shard_map_.shards.count(config_.shard_id) != 0;
         shards        = shard_map_.shards.size();
+        // An adoption whose END came ends once the map names this shard for the symbol (#196).
+        for (auto it = adopting_.begin(); it != adopting_.end();) {
+            const auto named = shard_map_.assignments.find(it->first);
+            if (it->second.ended && named != shard_map_.assignments.end() &&
+                named->second == config_.shard_id) {
+                OB_LOG_INFO("shard_coord", "Adopted %s from shard %s: the map names shard %s now",
+                            it->first.c_str(), it->second.source.c_str(), config_.shard_id.c_str());
+                engine_.end_adoption(it->first);
+                it = adopting_.erase(it);
+            } else {
+                ++it;
+            }
+        }
         version       = shard_map_.version;
         cb            = change_cb_;
         copy          = shard_map_;
@@ -272,6 +285,9 @@ size_t ShardCoordinator::local_symbol_count() const {
 
 bool ShardCoordinator::owns_symbol(const std::string& symbol_key) const {
     std::lock_guard<std::mutex> lock(mtx_);
+    // Adopted, and ended: the map in etcd names this shard, and the one here does not yet (#196).
+    // An adoption END has not ended is its connection's alone (adoption_number()).
+    if (const auto a = adopting_.find(symbol_key); a != adopting_.end() && a->second.ended) return true;
     auto it = shard_map_.assignments.find(symbol_key);
     if (it != shard_map_.assignments.end()) {
         return it->second == config_.shard_id;
@@ -753,6 +769,117 @@ std::string ShardCoordinator::handle_migrate_command(const std::string& symbol_k
                                "between shards is not implemented (#196)",
                 symbol_key.c_str(), target_shard_id.c_str());
     return "ERR MIGRATE is not implemented: it would move none of " + symbol_key + "'s rows (#196)\n";
+}
+
+// ── handle_adopt_command() ────────────────────────────────────────────────────
+
+bool ShardCoordinator::is_adopting(const std::string& symbol_key) const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return adopting_.count(symbol_key) > 0;
+}
+
+uint64_t ShardCoordinator::adoption_number(const std::string& symbol_key) const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    const auto a = adopting_.find(symbol_key);
+    return a == adopting_.end() ? 0 : a->second.number;
+}
+
+std::string ShardCoordinator::handle_adopt_command(const std::string& symbol_key,
+                                                    const std::string& action,
+                                                    const std::string& source_shard_id,
+                                                    uint64_t* adoption) {
+    std::lock_guard<std::mutex> one_at_a_time(adopt_command_mtx_);
+    const auto owned_locked = [&] {
+        const auto named = shard_map_.assignments.find(symbol_key);
+        return named != shard_map_.assignments.end() ? named->second == config_.shard_id
+                                                     : hash_ring_.lookup(symbol_key) == config_.shard_id;
+    };
+    if (action == "BEGIN") {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (status_.load(std::memory_order_acquire) != ShardStatus::ACTIVE) {
+                return "ERR shard " + config_.shard_id + " is not active\n";
+            }
+            const auto a = adopting_.find(symbol_key);
+            if (a != adopting_.end()) {
+                return "ERR already adopting " + symbol_key + " from shard " + a->second.source + "\n";
+            }
+            if (owned_locked()) {
+                return "ERR shard " + config_.shard_id + " owns " + symbol_key + " already\n";
+            }
+        }
+        // Checked under the engine's lock with the adoption's start: nothing writes the symbol here
+        // - this shard does not own it and does not adopt it yet - so what it holds stays held.
+        const uint64_t number = engine_.begin_adoption(symbol_key);
+        if (number == 0) {
+            OB_LOG_WARN("shard_coord", "ADOPT %s refused: shard %s holds rows of it already - a "
+                                       "migration that failed left them, and ADOPT %s ABANDON drops them",
+                        symbol_key.c_str(), config_.shard_id.c_str(), symbol_key.c_str());
+            return "ERR shard " + config_.shard_id + " holds rows of " + symbol_key +
+                   " already: ADOPT " + symbol_key + " ABANDON drops them\n";
+        }
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            adopting_[symbol_key] = Adoption{source_shard_id, number, false};
+        }
+        if (adoption != nullptr) *adoption = number;
+        OB_LOG_INFO("shard_coord", "Adopting %s from shard %s (adoption %llu): the writes of the "
+                                   "connection that began it are taken here until the map names this "
+                                   "shard",
+                    symbol_key.c_str(), source_shard_id.c_str(),
+                    static_cast<unsigned long long>(number));
+        return "OK\n\n";
+    }
+    if (action == "END") {
+        std::lock_guard<std::mutex> lock(mtx_);
+        const auto a = adopting_.find(symbol_key);
+        if (a == adopting_.end()) return "ERR not adopting " + symbol_key + "\n";
+        a->second.ended = true;
+        const auto named = shard_map_.assignments.find(symbol_key);
+        if (named != shard_map_.assignments.end() && named->second == config_.shard_id) {
+            OB_LOG_INFO("shard_coord", "Adopted %s from shard %s", symbol_key.c_str(),
+                        a->second.source.c_str());
+            engine_.end_adoption(symbol_key);
+            adopting_.erase(a);
+        } else {
+            OB_LOG_INFO("shard_coord", "Adoption of %s ended: its writes are taken from any connection, "
+                                       "and it is this shard's once the map it reads says so",
+                        symbol_key.c_str());
+        }
+        return "OK\n\n";
+    }
+    // ABANDON: out of the adopted first, so that nothing writes it while it is dropped.
+    bool adopted = false;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        const auto a = adopting_.find(symbol_key);
+        if (a == adopting_.end()) {
+            // A shard drops only what it does not own: the rows of a symbol it serves are not a
+            // migration's to throw away.
+            if (owned_locked()) return "ERR shard " + config_.shard_id + " owns " + symbol_key + "\n";
+        } else if (a->second.ended) {
+            // END came after the map in etcd was changed to name this shard: what it adopted is the
+            // symbol's only copy that takes writes.
+            return "ERR the adoption of " + symbol_key + " has ended: the map names shard " +
+                   config_.shard_id + "\n";
+        } else {
+            adopting_.erase(a);
+            adopted = true;
+        }
+    }
+    try {
+        const size_t dropped =
+            adopted ? engine_.abandon_adoption(symbol_key) : engine_.drop_symbol(symbol_key);
+        OB_LOG_WARN("shard_coord", "%s %s: %zu segment(s) of it dropped",
+                    adopted ? "Adoption abandoned of" : "Rows dropped of", symbol_key.c_str(), dropped);
+        return "OK " + std::to_string(dropped) + "\n\n";
+    } catch (const std::exception& e) {
+        // The adoption is over either way; what stays is rows no connection writes, which a later
+        // BEGIN refuses to adopt over and ABANDON drops.
+        OB_LOG_ERROR("shard_coord", "ADOPT %s ABANDON: the rows of it stay: %s", symbol_key.c_str(),
+                     e.what());
+        return "ERR the rows of " + symbol_key + " stay: " + e.what() + "\n";
+    }
 }
 
 // ── pin_symbol() / unpin_symbol() ─────────────────────────────────────────────

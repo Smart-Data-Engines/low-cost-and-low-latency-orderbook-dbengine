@@ -135,6 +135,17 @@ from the others, and nothing moves those symbols' rows to it: `MIGRATE` is refus
 writes. Symbols that must stay where their history is can be assigned in the map before the shard is
 added.
 
+**Moving a symbol is being built** (#196). What a shard has so far is the half the shard a symbol moves
+to runs - `ADOPT <symbol.exchange> BEGIN <source shard>`, `END` and `ABANDON`, which the source's
+`MIGRATE` is to send - and `MIGRATE` is still refused. One of them is an operator's already:
+`ADOPT <symbol.exchange> ABANDON` on a shard that neither owns nor adopts the symbol drops every row of
+it there, for good - its segments, the inputs of their merges, its live book - and answers
+`OK <segments removed>`. A shard refuses it for a symbol it owns; and, removing nothing, while a
+snapshot is being sent from it and after a failed sync has frozen its checkpoints
+(`ERR the rows of <symbol> stay: …`, which says which). A shard that holds a row of a symbol does not
+adopt it (`ERR shard <id> holds rows of <symbol> already`), so a migration tried again cannot store a
+row twice.
+
 ## Tuning that is real for this engine
 
 Three of the knobs people expect are **not** tuning for this engine, and saying so is more useful

@@ -24,6 +24,18 @@ int Session::fd() const { return fd_; }
 
 uint64_t Session::conn_id() const { return conn_id_; }
 
+uint64_t Session::adoption_of(const std::string& symbol_key) const {
+    const auto it = adoptions_.find(symbol_key);
+    return it == adoptions_.end() ? 0 : it->second;
+}
+
+void Session::set_adoption(const std::string& symbol_key, uint64_t adoption) {
+    adoptions_[symbol_key] = adoption;
+    OB_LOG_DEBUG("session", "conn_id=%llu adopts %s (adoption %llu): its writes of it are taken",
+                 static_cast<unsigned long long>(conn_id_), symbol_key.c_str(),
+                 static_cast<unsigned long long>(adoption));
+}
+
 std::vector<std::string> Session::feed(const char* data, size_t len) {
     read_buffer_.append(data, len);
 

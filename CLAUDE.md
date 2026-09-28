@@ -3881,6 +3881,28 @@ Learned the hard way. Check here before debugging.
      final flush writes no checkpoint - so it wrote no vector either, and a stop meant to leave a whole
      vector for an older build left changes (#189). What a stop has to leave in the WAL it writes
      itself.
+514. **A check made without the lock that the state it reads is written under is a race, whatever
+     it checks.** The server refused writes of a migrated symbol by reading the engine's set without
+     the engine's lock, and a migration marks the symbol under it - a write could pass the check and
+     be stored after the last copy. The refusal belongs where the WAL append is, under `mtx_`; and
+     an ownership the server grants from a set it holds itself - an adoption (#196) - is granted
+     with a number the engine checks again there.
+515. **A seal that writes no checkpoint leaves the log's last one older than the rows it sealed.**
+     `seal_symbol()` and the symbol snapshot seal under the lock and claim nothing, so something
+     that then removes rows and trusts that "a restart replays none of their records" - a dropped
+     symbol - is trusting a checkpoint that may predate them all; with none in the log, a restart
+     replays everything. It has to append one itself (`flush_everything(claim_regardless)`).
+516. **Removing a merged segment while its inputs wait to be removed brings the inputs back.** A
+     start keeps an input it finds without the merged segment that names it - which is right after
+     a crash mid-merge, and wrong after a drop took the merged segment on purpose. Whatever removes a
+     symbol's segments removes the inputs waiting in `retired_inputs_` too.
+517. **`OK` on this wire is followed by a blank line; `ERR` is not.** `format_ok()` is `OK\n\n`, and a
+     client reads an answer to the blank line - so an `OK\n` written by hand, as `ADOPT` first was, is
+     an answer that never ends. Build answers with the formatter, or with its terminator.
+518. **A command a migration sends to another shard must not run alone across reactors.** `MIGRATE`
+     holds the server's admin lock; were the `ADOPT` it sends held by the same lock on the other
+     side, two shards migrating to each other would each wait for the other's. `ADOPT` is serialised
+     by the coordinator's own lock, and `AdminSerialisation` fails when the set changes.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
