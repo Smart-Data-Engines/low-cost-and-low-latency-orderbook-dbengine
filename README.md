@@ -377,6 +377,8 @@ See the [docs/](docs/) directory:
 - [Python Bindings](docs/python.md)
 - [C API Reference](docs/c-api.md)
 - [Storage Format](docs/storage.md)
+- [Operations](docs/operations.md) - backups, failover, the dashboard and alert rules
+- [Upgrading without stopping](docs/upgrading.md)
 - [Benchmarks](benchmarks/README.md)
 - [Roadmap](docs/roadmap.md)
 - [Repository security](docs/github-security.md)

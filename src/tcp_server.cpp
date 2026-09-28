@@ -1225,7 +1225,7 @@ std::string format_usage(const std::string& program) {
         const size_t length = flag.size() + (placeholder.empty() ? 0 : placeholder.size() + 1);
         width = std::max(width, length);
     }
-    width = std::max(width, std::string("help").size());
+    width = std::max(width, std::string("version").size());
 
     for (const auto& flag : known_flags()) {
         const auto it = flag_help().find(flag);
@@ -1238,6 +1238,7 @@ std::string format_usage(const std::string& program) {
         out += "  " + left + std::string(width + 2 - (left.size() - 2), ' ') + description + "\n";
     }
     out += "  --help" + std::string(width - 2, ' ') + "Show this help message and exit\n";
+    out += "  --version" + std::string(width - 5, ' ') + "Print the version and exit\n";
     return out;
 }
 
@@ -2065,6 +2066,11 @@ TcpServer::TcpServer(ServerConfig config)
 }
 
 TcpServer::~TcpServer() {
+    // The engine first, while `read_only_` - declared after it, so destroyed before it - still lives:
+    // the engine holds a pointer to it (`set_read_only_flag()`) and a failover manager stopping in
+    // the engine's close() may still write it. `run()` closes the engine on every way out it
+    // returns by; this is the way out it throws from, a port that would not bind.
+    engine_.reset();
     if (listen_fd_ >= 0) ::close(listen_fd_);
 }
 
