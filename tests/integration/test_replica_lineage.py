@@ -94,6 +94,62 @@ def test_a_replica_made_a_primary_after_a_snapshot_gives_a_new_replica_every_row
                     n.stop()
 
 
+def test_a_replica_that_fell_behind_retention_and_took_a_snapshot_gives_a_new_replica_every_row():
+    """The install with no discard before it: a replica that kept its position.
+
+    A replica that stopped with a position in its primary's stream, and came back after retention
+    took that position, resumes, is told `WAL_TRUNCATED` and installs a snapshot with nothing
+    discarded first - the path the two tests around this one do not take. Made a primary, it gives a
+    new replica every row. What this does not show on its own: the file 0 a new replica asks for was
+    already removed by the lineage the replica's first connection began, when it discarded, so the
+    install's own lineage is held by `test_snapshot_lineage.cpp` and by the log line above.
+    """
+    with tempfile.TemporaryDirectory(prefix="ob_lineage_a_") as adir, \
+            tempfile.TemporaryDirectory(prefix="ob_lineage_r_") as rdir, \
+            tempfile.TemporaryDirectory(prefix="ob_lineage_q_") as qdir:
+        p1 = free_port()
+        a = Node(adir, ["--replication-port", str(p1), "--wal-rotate-bytes", ROTATE])
+        r = Node(rdir, ["--primary-host", "127.0.0.1", "--primary-port", str(p1)])
+        r2 = q = None
+        try:
+            a.start()
+            r.start()
+            fill(a.port, "LRT", 10)
+            first = sorted(a.prices("LRT"))
+            assert eventually(lambda: serving(r, "LRT") == first, within=60), "the replica did not follow"
+            r.stop()
+
+            # Retention takes what the stopped replica would resume from.
+            lowest = lowest_wal_file(adir)
+            fill(a.port, "LRT", 60, first=10)
+            assert eventually(lambda: lowest_wal_file(adir) > lowest + 2, within=60), (
+                "the primary kept the files the replica would resume from")
+            want = sorted(a.prices("LRT"))
+            log_at = len(r.log())
+            r.start()
+            assert eventually(lambda: serving(r, "LRT") == want, within=60), "no bootstrap"
+            since = r.log()[log_at:]
+            assert "resuming from" in since, "the replica did not resume, so this is not the path"
+            assert "discarding and replaying from zero" not in since, (
+                "the replica discarded first, so this test is the one above it")
+            assert "Snapshot installed" in since
+            r.stop()
+            a.stop()
+
+            p2 = free_port()
+            r2 = Node(rdir, ["--replication-port", str(p2)])
+            r2.start()
+            q = Node(qdir, ["--primary-host", "127.0.0.1", "--primary-port", str(p2)])
+            q.start()
+            assert eventually(lambda: serving(q, "LRT") == want, within=60), (
+                f"a new replica of the promoted node holds {len(serving(q, 'LRT') or [])} of "
+                f"{len(want)} rows")
+        finally:
+            for n in (q, r2, r, a):
+                if n is not None:
+                    n.stop()
+
+
 def test_after_a_failover_to_a_replica_from_a_snapshot_the_other_replica_holds_every_row():
     cluster = ClusterManager()
     cluster.extra_node_args = ["--wal-rotate-bytes", ROTATE]
