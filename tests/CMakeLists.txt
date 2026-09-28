@@ -868,6 +868,15 @@ target_link_libraries(test_symbol_migration
 )
 gtest_discover_tests(test_symbol_migration PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
 
+# ── A node's backup, taken and restored (#34) ─────────────────────────────────
+add_executable(test_backup test_backup.cpp)
+target_link_libraries(test_backup
+    PRIVATE
+        orderbook_backup
+        GTest::gtest_main
+)
+gtest_discover_tests(test_backup PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
+
 # ── HLC property-based and unit tests (multi-master-replication, Tasks 1.4–1.10) ─
 add_executable(test_hlc test_hlc.cpp)
 target_link_libraries(test_hlc

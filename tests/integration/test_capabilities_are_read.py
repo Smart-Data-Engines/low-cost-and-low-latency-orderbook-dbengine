@@ -28,6 +28,8 @@ READERS = {
     # silently accept a field it does not understand. Pinned by the tests of that refusal.
     "strict_args": ("tests/test_command_arity.cpp",
                     "EveryBoundedCommandRefusesOneTokenTooMany"),
+    # The backup tool asks before it sends BACKUP, which an older server answers as unknown (#34).
+    "backup": ("tools/ob_backup.cpp", 'caps.value().count("backup") == 0'),
 }
 
 

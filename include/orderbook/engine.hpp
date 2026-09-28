@@ -38,6 +38,13 @@
 
 namespace ob {
 
+/// The data directory's note that its numbering from before per-origin numbers is closed (#187).
+/// What keeps a later start from closing it again: a node that joined after the close numbers a symbol
+/// from 1, and closing again would take its records below kClosedNumberingBase for ones this node
+/// has. A file, neither .col nor meta.json, so no snapshot carries it: set from the snapshot's vector
+/// when one is installed, and by `restore_backup()` from the backup's description (#34).
+inline constexpr const char* kNumberingClosedFile = "numbering_closed";
+
 /// TTL / data retention configuration.
 struct TTLConfig {
     uint64_t ttl_hours{0};                  // 0 = disabled
@@ -409,13 +416,18 @@ public:
     /// of the difference appends the rows a second time. The held set closes the remaining gap
     /// exactly: the numbers above the frontier that we do hold are listed, so a redelivery of any
     /// of them meets `has_seen()`.
-    SnapshotWithSequenceState create_snapshot_with_sequence_state();
+    ///
+    /// `Skip` lists the files with their sizes, under the same pin, and reads none of them (#34).
+    SnapshotWithSequenceState create_snapshot_with_sequence_state(
+        SnapshotChecksums checksums = SnapshotChecksums::Compute);
 
     /// Replace this node's sequence state with a snapshot sender's.
     ///
     /// Only legitimate straight after `install_snapshot()` or `adopt_store_on_disk()`, because it
     /// resets: our contents are now the sender's contents, so our frontiers must be the sender's
-    /// frontiers and nothing else.
+    /// frontiers and nothing else. The third such moment is `restore_backup()` (#34): straight after
+    /// `open()` on a fresh WAL, over segments copied from a backup, whose sender is the node that
+    /// took it.
     void adopt_snapshot_sequence_state(const std::vector<SequenceTracker::VectorEntry>& vector,
                                        const std::vector<SequenceTracker::HeldRanges>& held);
 
@@ -527,6 +539,11 @@ public:
     /// Where the WAL files and `wal_identity` live: the data directory unless `--wal-dir` names one
     /// of its own (#186).
     const std::string& wal_dir() const { return wal_dir_; }
+
+    /// This node's number in a mesh, 0 outside one; and its name for the coordinator, empty without
+    /// one. What a backup's description says about the node that took it (#34).
+    uint16_t mm_node_id() const { return mm_config_.enabled ? mm_config_.node_id : 0; }
+    const std::string& coordinator_node_id() const { return failover_config_.coordinator.node_id; }
 
     // ── Failover / role management ────────────────────────────────────────────
 

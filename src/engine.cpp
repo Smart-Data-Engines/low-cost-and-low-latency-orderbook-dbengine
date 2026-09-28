@@ -46,13 +46,6 @@ namespace {
 /// and neither .col nor meta.json, so no snapshot carries it.
 constexpr const char* kWalLocationFile = "wal_location";
 
-/// The data directory's note that its numbering from before per-origin numbers is closed (#187).
-/// What keeps a later start from closing it again: a node that joined after the close numbers a symbol
-/// from 1, and closing again would take its records below kClosedNumberingBase for ones this node
-/// has. A file for the reason `wal_location` is one, and set from the snapshot's vector when one is
-/// installed, since a snapshot carries neither.
-constexpr const char* kNumberingClosedFile = "numbering_closed";
-
 /// A WAL is in `dir`: a wal_*.bin file or the identity beside them.
 bool holds_wal(const std::filesystem::path& dir) {
     std::error_code ec;
@@ -1783,8 +1776,10 @@ SnapshotManifest Engine::create_snapshot() {
     return create_snapshot_with_sequence_state().manifest;
 }
 
-Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() {
+Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
+        SnapshotChecksums checksums) {
     const auto t_start = std::chrono::steady_clock::now();
+    const bool checksum = checksums == SnapshotChecksums::Compute;
 
     SnapshotWithSequenceState out;
     SnapshotManifest& manifest = out.manifest;
@@ -1925,9 +1920,10 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
             }
             auto file_size = static_cast<size_t>(entry.file_size());
 
-            // Compute CRC32C by folding chunks, so nothing the size of the file is allocated.
+            // Compute CRC32C by folding chunks, so nothing the size of the file is allocated. Not at
+            // all for a caller that reads the files itself (#34): it gets the list and the sizes.
             uint32_t crc = 0;
-            {
+            if (checksum) {
                 const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
                 if (fd < 0) {
                     // Previously this left crc at 0 and said nothing, so a manifest could describe
@@ -2011,7 +2007,10 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
     // before the rename, the directory after - with one writer at a time, because that function's
     // temporary has one name: concurrent writers race only over which of them is last, which
     // "overwrite previous" already permits.
-    {
+    //
+    // Not for a snapshot without checksums (#34): a manifest whose every CRC is zero would stand in
+    // the data directory as a description of files it never checked.
+    if (checksum) {
         static std::mutex manifest_writer;
         std::lock_guard<std::mutex> one_at_a_time(manifest_writer);
         const std::string final_path = base_dir_ + "/snapshot_manifest.json";
@@ -2027,12 +2026,12 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state() 
                         std::chrono::steady_clock::now() - t_start).count();
     OB_LOG_INFO("engine",
                 "Snapshot created: files=%zu bytes=%zu rows=%zu wal=%u:%zu vector=%zu%s "
-                "held=%zu%s in %.1f ms",
+                "held=%zu%s checksums=%s in %.1f ms",
                 manifest.files.size(), manifest.total_bytes, manifest.total_rows,
                 manifest.wal_file_index, manifest.wal_byte_offset,
                 out.vector.size(), out.vector_truncated ? " (truncated)" : "",
                 out.held.size(), out.held_truncated ? " (truncated)" : "",
-                out.create_ms);
+                checksum ? "computed" : "skipped", out.create_ms);
 
     return out;
 }

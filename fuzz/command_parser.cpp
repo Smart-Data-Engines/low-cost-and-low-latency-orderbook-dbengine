@@ -62,6 +62,9 @@ bool same_meaning(const ob::Command& a, const ob::Command& b) {
             && a.adopt_source_shard == b.adopt_source_shard;
     case ob::CommandType::MM_CONFLICTS:
         return a.mm_conflicts_limit == b.mm_conflicts_limit;
+    case ob::CommandType::BACKUP:
+        // STATUS included: a formatter that dropped it would turn a question into a backup.
+        return a.backup_status == b.backup_status;
     case ob::CommandType::SUBSCRIBE:
         return a.subscribe_sql == b.subscribe_sql;
     case ob::CommandType::UNSUBSCRIBE:

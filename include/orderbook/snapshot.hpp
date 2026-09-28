@@ -58,6 +58,15 @@ struct SnapshotManifest {
     // Both are implemented in src/replication.cpp, where they were written.
 };
 
+/// Whether a snapshot reads every file it lists to checksum it (#34).
+///
+/// `Compute` is what a snapshot sent to a replica or a mesh peer needs: the receiver checks each file
+/// against its CRC. `Skip` is for a caller that reads the files itself - a backup, which checksums
+/// the bytes it copies as it copies them, or its own hard links once the pin is released - so the
+/// files are not read twice and a linked backup holds the pin only while it links. Its manifest has
+/// every CRC zero, so it is not written to the data directory as `snapshot_manifest.json`.
+enum class SnapshotChecksums { Compute, Skip };
+
 /// A snapshot plus what the sender holds, captured together.
 struct SnapshotWithSequenceState {
     SnapshotManifest                          manifest;

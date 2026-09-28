@@ -108,6 +108,11 @@ MetricsRegistry::MetricsRegistry() {
     // checkpoints were frozen - that restart is what the freeze waits for.
     counters_.push_back(make_counter("ob_segments_rebuilt_from_wal_total",
                                      "Segments removed at startup and rebuilt from the WAL"));
+    // Backups into --backup-dir (#34), registered in the change that writes them. The pair is what
+    // an alert reads: failures that are not zero, and successes that stopped.
+    counters_.push_back(make_counter("ob_backups_total", "Backups completed into --backup-dir"));
+    counters_.push_back(make_counter("ob_backup_failures_total",
+                                     "Backups that failed, and left nothing that looks like one"));
     // A writer that ran out of room in the pending queue, and one whose wait for room ran out
     // (#137). The pair matters: waits without refusals is backpressure working, and refusals
     // mean the flush itself is not making progress.
@@ -186,6 +191,16 @@ MetricsRegistry::MetricsRegistry() {
     // instruction: it means "fix the disk, then restart this node", and the WAL grows until then.
     gauges_.push_back(make_gauge("ob_checkpoints_frozen",
                                  "1 once a failed sync froze the checkpoints until a restart"));
+    // The last backup (#34). The time is the cut's, on the wall clock, and set at startup from the
+    // newest complete backup in the directory, so an alert on its age survives a restart.
+    gauges_.push_back(make_gauge("ob_backup_running", "1 while a backup is being taken"));
+    gauges_.push_back(make_gauge("ob_backup_last_success_timestamp_seconds",
+                                 "The cut of the last complete backup, seconds since the epoch; 0 for none"));
+    gauges_.push_back(make_gauge("ob_backup_last_duration_ms",
+                                 "Milliseconds the last complete backup took"));
+    gauges_.push_back(make_gauge("ob_backup_last_bytes", "Bytes the last complete backup holds"));
+    gauges_.push_back(make_gauge("ob_backup_last_pinned_ms",
+                                 "Milliseconds the last backup held merges and retention back"));
     gauges_.push_back(make_gauge("ob_active_sessions", "Number of active TCP sessions"));
     gauges_.push_back(make_gauge("ob_session_pending_bytes",
                                  "Response bytes queued across sessions (a slow client shows up here)"));
