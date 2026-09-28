@@ -2250,7 +2250,9 @@ its last record appended even when nothing was left to seal (a seal that claims 
 than the log's last checkpoint, and a restart replays from that one), and the inputs of its merges
 that wait to be removed taken with the merged segments (a start keeps an input it finds without the
 merged segment that names it). A drop is refused, removing nothing, while a snapshot's pin holds the
-files and after a failed sync has frozen the checkpoints. Tests: `tests/test_symbol_migration.cpp`.
+files and after a failed sync has frozen the checkpoints. Tests: `tests/test_symbol_migration.cpp`,
+and over the wire, on a native etcd, the adoption test in `tests/integration/test_shard_control_plane.py`;
+the mutation table (35 mutations and two controls) is in the pull request.
 
 - Effort: L | Impact: a sharded cluster cannot be rebalanced, and a shard added while writes flow
   splits the symbols it takes over across two shards
