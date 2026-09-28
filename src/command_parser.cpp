@@ -123,6 +123,7 @@ static constexpr CommandGrammar kGrammar[] = {
      "AUTH to ask for a challenge, or AUTH <identity> <response> to answer one", false},
     {CommandType::BOOK,         "BOOK",         4,
      "BOOK <symbol> <exchange> [depth]", true},
+    {CommandType::BACKUP,       "BACKUP",       2, "BACKUP, or BACKUP STATUS", true},
 };
 
 static_assert(std::size(kGrammar) == static_cast<size_t>(CommandType::UNKNOWN),
@@ -384,6 +385,15 @@ Command parse_command(std::string_view line) {
         OB_LOG_DEBUG("cmd_parser", "Parsed command: ADOPT symbol=%s action=%s source=%s",
                      cmd.migrate_symbol.c_str(), cmd.adopt_action.c_str(),
                      cmd.adopt_source_shard.c_str());
+        return cmd;
+    }
+
+    if (iequals(first, "BACKUP")) {
+        // BACKUP | BACKUP STATUS (#34). No path: the server writes where its --backup-dir says.
+        if (tokens.size() >= 2 && !iequals(tokens[1], "STATUS")) return cmd; // UNKNOWN
+        cmd.type = CommandType::BACKUP;
+        cmd.backup_status = tokens.size() >= 2;
+        OB_LOG_DEBUG("cmd_parser", "Parsed command: BACKUP%s", cmd.backup_status ? " STATUS" : "");
         return cmd;
     }
 
@@ -709,6 +719,7 @@ std::string format_command(const Command& cmd) {
         return "ADOPT " + cmd.migrate_symbol + " " + cmd.adopt_action +
                (cmd.adopt_source_shard.empty() ? std::string() : " " + cmd.adopt_source_shard) + "\n";
     case CommandType::MM_PEERS:  return "MM_PEERS\n";
+    case CommandType::BACKUP: return cmd.backup_status ? "BACKUP STATUS\n" : "BACKUP\n";
     case CommandType::SUBSCRIBE:
         return cmd.subscribe_sql + "\n";
 

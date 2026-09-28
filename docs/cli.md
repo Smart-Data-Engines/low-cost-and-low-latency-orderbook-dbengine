@@ -566,6 +566,7 @@ package is installed on. `CliConfigStatic.EveryKnownFlagIsInTheCliReference` hol
 | `--advertise-host` | `<HOST>` | The host clients and peers reach this node by, in what it publishes to the coordinator (default: 127.0.0.1) |
 | `--anti-entropy-interval-seconds` | `<N>` | Multi-master reconciliation interval (default: 60) |
 | `--auth-secret-file` | `<PATH>` | Client credentials, `<identity> <secret>` per line; mode 600. Empty disables client authentication |
+| `--backup-dir` | `<DIR>` | Where `BACKUP` writes this node's backups, one directory each: hard links on the data directory's filesystem, a checked copy on another. Not the data or the WAL directory, inside either or holding either - the start is refused. Without it `BACKUP` is refused (#34; `docs/operations.md`, "Backing up and restoring a node") |
 | `--cluster-secret-file` | `<PATH>` | Shared secret for replication and multi-master links, one line; mode 600 |
 | `--compaction` | `on\|off` | Whether the flush tick merges a symbol's small segments into bigger ones (default: on). A valve, not a tuning knob: `off` leaves every segment as its seal wrote it, so their number grows with uptime again (#165 part 2b) |
 | `--config` | `<FILE>` | Read `key = value` settings from FILE; command line wins |
@@ -704,7 +705,7 @@ arrival time is the time of the import rather than the time of the market.
 ```
 C: STATUS
 S: ...
-S: capabilities: insert_event_time,strict_args
+S: capabilities: insert_event_time,strict_args,backup
 ```
 
 **Ask before you send.** A server that predates this field answers `OK` and stores the row with

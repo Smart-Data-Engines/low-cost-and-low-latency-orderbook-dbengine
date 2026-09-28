@@ -32,6 +32,7 @@ enum class CommandType {
     UNSUBSCRIBE,
     AUTH,
     BOOK,
+    BACKUP,
     UNKNOWN
 };
 
@@ -104,6 +105,7 @@ struct Command {
     std::string migrate_target_shard; // target shard_id for MIGRATE
     std::string adopt_action;         // BEGIN, END or ABANDON for ADOPT (#196)
     std::string adopt_source_shard;   // the moving symbol's shard, for ADOPT BEGIN
+    bool        backup_status{false}; // BACKUP STATUS rather than BACKUP (#34)
     size_t      mm_conflicts_limit{100}; // for MM_CONFLICTS
 
     /// The whole SUBSCRIBE line, handed to the query engine unparsed.

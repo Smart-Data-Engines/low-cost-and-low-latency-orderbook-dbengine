@@ -396,6 +396,12 @@ target_link_libraries(orderbook_compaction PUBLIC orderbook_core)
 add_library(orderbook_engine STATIC src/engine.cpp src/engine_compaction.cpp src/replication.cpp)
 target_link_libraries(orderbook_engine PUBLIC orderbook_query orderbook_wal orderbook_failover orderbook_compression orderbook_metrics orderbook_logger orderbook_multi_master orderbook_sequence orderbook_auth orderbook_tls orderbook_compaction)
 
+# ── Backup and restore (#34) ──────────────────────────────────────────────────
+# The server's BACKUP and the offline ob_restore: engine-side, and nothing of the client, whose
+# headers define an `ob::Level` and an `ob::NodeRole` of their own.
+add_library(orderbook_backup STATIC src/backup.cpp)
+target_link_libraries(orderbook_backup PUBLIC orderbook_engine nlohmann_json::nlohmann_json)
+
 # ── C API compiled library ────────────────────────────────────────────────────
 add_library(orderbook_capi STATIC src/c_api.cpp)
 target_link_libraries(orderbook_capi PUBLIC orderbook_query orderbook_wal)
@@ -480,7 +486,7 @@ add_library(orderbook_tcp_server_lib STATIC
     src/session.cpp
     src/subscription_hub.cpp
 )
-target_link_libraries(orderbook_tcp_server_lib PUBLIC orderbook_engine orderbook_logger orderbook_metrics_server orderbook_shard_coordinator orderbook_auth orderbook_tls orderbook_machine)
+target_link_libraries(orderbook_tcp_server_lib PUBLIC orderbook_engine orderbook_backup orderbook_logger orderbook_metrics_server orderbook_shard_coordinator orderbook_auth orderbook_tls orderbook_machine)
 
 # ── Native C++ client library ──────────────────────────────────────────────────
 add_library(orderbook_client STATIC src/client.cpp)
@@ -498,6 +504,13 @@ endif()
 # ── TCP Server executable ─────────────────────────────────────────────────────
 add_executable(ob_tcp_server tools/ob_tcp_server.cpp)
 target_link_libraries(ob_tcp_server PRIVATE orderbook_tcp_server_lib)
+
+# ── Backup tools (#34) ────────────────────────────────────────────────────────
+# ob_restore checks a backup and restores it offline; ob_backup asks a running server for one.
+add_executable(ob_restore tools/ob_restore.cpp)
+target_link_libraries(ob_restore PRIVATE orderbook_backup)
+add_executable(ob_backup tools/ob_backup.cpp)
+target_link_libraries(ob_backup PRIVATE orderbook_client orderbook_auth)
 
 # ── The io_uring transport was removed (#147) ────────────────────────────────
 #
@@ -551,7 +564,7 @@ set_target_properties(orderbook_shared PROPERTIES
 # on **both** sides, not one.
 if(NOT SKBUILD)
 
-install(TARGETS ob_tcp_server
+install(TARGETS ob_tcp_server ob_restore ob_backup
     RUNTIME DESTINATION usr/bin
     COMPONENT runtime
 )

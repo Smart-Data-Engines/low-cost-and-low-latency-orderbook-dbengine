@@ -26,6 +26,11 @@ inline constexpr std::string_view kCapabilities[] = {
     /// A command line carrying a token the grammar has no place for is refused rather than read
     /// past. A client can rely on an unknown field being reported instead of dropped (#107).
     "strict_args",
+
+    /// `BACKUP` takes a backup into the server's --backup-dir, and `BACKUP STATUS` reports it (#34).
+    /// A server without it answers `BACKUP` as an unknown command, which a tool cannot tell from a
+    /// typo, so `ob_backup` asks for this name first.
+    "backup",
 };
 
 } // namespace ob

@@ -172,6 +172,11 @@ installs anything, and a containerised competitor would measure the container.
   allowed to grow the server's memory. Also available embedded (`Engine::subscribe()`,
   `ob_subscribe()`) and from the Python client (`subscribe()` / `poll()`)
 - **TCP server** — connect remotely via telnet/nc, like PostgreSQL or ClickHouse
+- **Backup and restore** — `BACKUP` takes a cut at one moment into the server's `--backup-dir`
+  (hard links on the data directory's filesystem, a checksummed copy on another), `ob_backup` asks
+  for one from cron, and `ob_restore` checks a backup whole before it writes anything and restores
+  it into an empty directory. No restore to a moment between two backups yet: see
+  [docs/operations.md](docs/operations.md), "Backing up and restoring a node"
 - **Multi-master replication** — write to any node, automatic conflict resolution via HLC + LWW
 - **Fuzzed parsers** — libFuzzer harnesses over wire command parsing, multi-master framing and WAL
   deserialization, with an in-repo corpus and a bounded run on every pull request. Each asserts a

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "orderbook/auth.hpp"
+#include "orderbook/backup.hpp"
 #include "orderbook/command_parser.hpp"
 #include "orderbook/engine.hpp"
 #include "orderbook/machine.hpp"
@@ -128,6 +129,7 @@ struct ServerConfig {
     /// exceed this by one record.
     size_t      wal_rotate_bytes{512ULL << 20};   // 512 MB
     std::string wal_dir;                          // empty: the data directory (#186)
+    std::string backup_dir;                       // empty: BACKUP is refused (#34)
 
     /// Background flush interval. Shorter means less unflushed data at any moment and
     /// more segment writes; longer means the opposite. Configurable because it decides
@@ -466,6 +468,9 @@ private:
 /// is off, and then the wire behaves exactly as it did before #30 - not one byte differs - except
 /// that AUTH is refused, so a client configured to authenticate against a server that does not
 /// finds out rather than believing it did.
+///
+/// When backups is non-null, BACKUP starts one and BACKUP STATUS reports it (#34); when it is null,
+/// BACKUP is refused and BACKUP STATUS answers `state: idle`.
 std::string execute_command(const Command& cmd,
                             Engine& engine,
                             Session& session,
@@ -474,7 +479,8 @@ std::string execute_command(const Command& cmd,
                             MetricsRegistry* registry = nullptr,
                             ShardCoordinator* shard_coord = nullptr,
                             SubscriptionHub* hub = nullptr,
-                            const SecretStore* client_secrets = nullptr);
+                            const SecretStore* client_secrets = nullptr,
+                            BackupRunner* backups = nullptr);
 
 /// Execute `INSERT` and `MINSERT` commands as one batch - the writes a client sent in one read.
 ///

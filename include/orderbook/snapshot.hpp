@@ -58,6 +58,15 @@ struct SnapshotManifest {
     // Both are implemented in src/replication.cpp, where they were written.
 };
 
+/// Whether a snapshot reads every file it lists to checksum it (#34).
+///
+/// `Compute` is what a snapshot sent to a replica or a mesh peer needs: the receiver checks each file
+/// against its CRC. `Skip` is for a caller that reads the files itself - a backup, which checksums
+/// the bytes it copies as it copies them, or its own hard links once the pin is released - so the
+/// files are not read twice and a linked backup holds the pin only while it links. Its manifest has
+/// every CRC zero, so it is not written to the data directory as `snapshot_manifest.json`.
+enum class SnapshotChecksums { Compute, Skip };
+
 /// A snapshot plus what the sender holds, captured together.
 struct SnapshotWithSequenceState {
     SnapshotManifest                          manifest;
@@ -68,6 +77,10 @@ struct SnapshotWithSequenceState {
     /// How long the capture took. Measured rather than assumed: this used to run on the caller's
     /// thread, and for multi-master that thread was `io_loop()` (#79).
     double create_ms{0.0};
+    /// How much of it held the engine's lock - the WAL sync, the drain, the WAL position and the
+    /// sequence state, and the merge of the seals into the index: the part every writer waits for
+    /// (#34). The seals themselves, the walk and the checksums take no lock.
+    double locked_ms{0.0};
     /// Keeps the files the manifest names where they are (#165 part 2b, `Engine::pin_segment_files()`)
     /// for as long as whoever sends the snapshot holds it.
     std::shared_ptr<const void> pin;

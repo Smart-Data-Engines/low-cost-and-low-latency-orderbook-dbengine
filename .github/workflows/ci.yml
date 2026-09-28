@@ -177,10 +177,12 @@ jobs:
       # reporting green on the rest. A test that skips itself because the harness did not build it
       # is the same failure mode as a check that runs and gates nothing.
       # ob_cli is exercised by test_cli_tool.py; leaving it out skips that entire module (#110).
-      - name: Build the server, CLI, C++ client harness and fault injector
+      - name: Build the server, CLI, backup tools, C++ client harness and fault injector
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-          cmake --build build -j$(nproc) --target ob_tcp_server ob_cli ob_integration_test obfault
+          cmake --build build -j$(nproc) --target ob_tcp_server ob_cli ob_integration_test obfault \
+            ob_restore ob_backup
+          # ob_restore and ob_backup are exercised by test_backup.py (#34), which fails without them.
           # obfault is libobfault.so, the storage fault injector (#54). Named here because this job
           # builds targets rather than everything, and the nine tests that LD_PRELOAD it **fail**
           # rather than skip when it is missing - which is how its absence was found, loudly, with
@@ -587,7 +589,7 @@ jobs:
       - name: Configure and build
         run: |
           cmake -S . -B build-pkg -DCMAKE_BUILD_TYPE=Release -DOB_BUILD_TESTS=OFF
-          cmake --build build-pkg -j$(nproc) --target ob_tcp_server
+          cmake --build build-pkg -j$(nproc) --target ob_tcp_server ob_restore ob_backup
 
       - name: Build the packages
         run: cd build-pkg && cpack
@@ -653,7 +655,8 @@ jobs:
       - name: Configure and build the server, CLI and client harness under TSan
         run: |
           cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DOB_ENABLE_TSAN=ON -DOB_BUILD_TESTS=ON
-          cmake --build build-tsan -j$(nproc) --target ob_tcp_server ob_cli ob_integration_test obfault
+          cmake --build build-tsan -j$(nproc) --target ob_tcp_server ob_cli ob_integration_test obfault \
+            ob_restore ob_backup
           test -f build-tsan/tests/libobfault.so
           # obfault is the storage fault injector (#54), and it has to be built from *this* tree:
           # `fault_injector_path()` derives it from OB_SERVER_BINARY, so a shim taken from the

@@ -530,6 +530,133 @@ Three things about it an operator should know:
   PostgreSQL met this in 2018 and answers it by crashing into WAL recovery; this engine keeps
   serving, and keeps every record until a restart can rebuild from them.
 
+## Backing up and restoring a node
+
+A node takes its own backup, into the directory its configuration names, and `ob_restore` restores
+one offline into an empty data directory (#34). Replication is not a backup: a replica repeats an
+operator's mistake - a retention set too short, a symbol dropped - in the same second as its
+primary.
+
+```bash
+ob_tcp_server --data-dir /var/lib/orderbook --backup-dir /var/lib/orderbook-backups ...
+ob_backup --host 127.0.0.1 --port 9090          # from cron: exit 0 once the backup is complete
+ob_restore --verify /var/lib/orderbook-backups/20260928T093000.123Z
+ob_restore --backup /var/lib/orderbook-backups/20260928T093000.123Z --data-dir /var/lib/orderbook-2
+```
+
+`--backup-dir` may not be the data or the WAL directory, inside either, or hold either: the engine
+reads every `meta.json` under its data directory as its own, and a replica's bootstrap removes every
+directory there but its own, so the server refuses to start with that layout. `ob_backup` takes the
+client's `--auth-identity` with `--auth-secret-file` (the server's client-secret format; the secret
+is never an argument) and `--tls`/`--tls-ca-file`; it exits 0 when the backup is complete, 1 when it
+failed, 2 when it could not ask, 3 when `--timeout-s` ran out first.
+
+### What a backup is
+
+- **A cut at one moment.** Every write acknowledged before `BACKUP` was accepted is in it, a `MINSERT`
+  whole or not at all; a write acknowledged after the cut is not. The cut takes the engine's lock
+  twice, briefly - for the WAL's sync and the drain of the rows waiting, and, once their seals are
+  written without it, for the merge - so writers wait for it as they wait for a `FLUSH`.
+- **Its segment files and a description**, `backup.json`: every file with its size and CRC32C, the
+  WAL position and identity the cut was taken at, the node and its role, the engine's version, and
+  the sequence state - for a mesh node, the frontiers it holds of every origin.
+- **Linked or copied.** When `--backup-dir` is on the data directory's filesystem the files are hard
+  links: a backup in milliseconds, which a deletion, a merge, the retention sweep and a mistake in the
+  data directory do not touch - and which is on the same device. Copy the backup directory off the
+  host (it is a plain directory), or give `--backup-dir` a filesystem of its own, and the node copies
+  the bytes, checksumming them as they pass and checking the free space first. `BACKUP STATUS`, the
+  log and the description say which it was.
+- **One at a time.** A second `BACKUP` is refused with the name of the one running; `BACKUP STATUS`
+  says where it is: its phase (`cut`, `link` or `copy`, `checksum`, `publish`), files and bytes done,
+  how long its cut held writers (`cut_ms`) and how long it held the segment files (`pinned_ms`).
+- **Complete, or not a backup.** It is written as `.partial-<name>` and renamed to `<name>` once every
+  file and the description are on the device (one `syncfs()` of the backup directory's filesystem).
+  A failure removes what it wrote; a directory named `.partial-...` is one a node stopped while taking,
+  which the node lists in its log at start - remove those. The node removes nothing else there:
+  deleting old backups is the operator's, and with hard links removing one frees only what no other
+  backup, and not the data directory, still links.
+
+While one is taken, merges and the retention sweep wait for as long as its files are linked or copied
+(`pinned_ms`); for a copied backup of a large store that is the length of the copy. A replica's
+snapshot bootstrap holds them the same way.
+
+### Restoring
+
+1. `ob_restore --verify <backup>` - optional, and worth running on a schedule: a backup that was
+   never read back is a hope.
+2. `ob_restore --backup <backup> --data-dir <empty> [--wal-dir <empty>]`. The whole backup is checked
+   against its description first, and one file that does not match writes nothing. The target must
+   be empty. Then the files are copied into it, checked again as they pass, and the store is opened
+   through the engine's own start, which takes the backup's sequence state.
+3. Start the server on the new directory as before - with `--wal-dir` when the restore had one.
+
+What comes up is the backup's rows, each once, and writes after it numbered on from the backup's. The
+WAL is new, with a new identity, and begins at its second file; so a replica that followed the node
+before the loss finds a WAL at the same address that is not the one it was reading (`a different WAL at
+the same address` in its log), discards what it holds, asks for the log from the start - and is sent a
+snapshot, because the rows are in the restored segments and in no record of the new WAL. For a primary
+with replicas, restore the primary; the replicas bootstrap from it on their own.
+
+**A multi-master node** restored with its own `--mm-node-id` goes on numbering its writes from what the
+backup held. That is right when the whole mesh is restored, and wrong while any peer holds records the
+node wrote after its backup: the new records would take numbers the peers have seen, and they would
+drop them as duplicates. With the mesh alive, give the restored node a new `--mm-node-id` - it then
+holds the old node's records as another origin's, and its peers catch it up on what it lacks - or do
+not restore it at all, and let it bootstrap from a peer the ordinary way (a node that holds nothing
+asks for a snapshot). A backup whose vector was past the entries a node can state is refused as a
+mesh node's: without frontiers a restored mesh node would take every row again.
+
+**A shard** backs up its own symbols. The shard map is in etcd, not in any backup: save it beside the
+shards' backups (`etcdctl get /ob/shard_map --print-value-only`), and restore the shards before any
+client writes. A symbol a shard held after it had moved away (#196 keeps the source's rows until an
+`ADOPT ABANDON`) comes back with the shard as rows nobody routes to.
+
+### What it costs, and what a restore takes
+
+Measured in Release on the development machine - an i3-7100U, ext4 on LVM over LUKS on an NVMe - on
+28 September 2026 (min / median / max; five runs of the smaller store, three of the larger):
+
+| store | method | cut: writers wait | files pinned | total |
+|---|---|---|---|---|
+| 10 M rows, 241 MB, 15 072 files | linked | 0 / 0 / 11 ms | 0.56 / 0.57 / 0.59 s | 0.99 / 1.01 / 1.04 s |
+| | copied | 0 / 0 / 14 ms | 1.08 / 1.09 / 1.15 s | 1.86 / 1.93 / 6.74 s |
+| 50 M rows, 1.2 GB, 54 016 files | linked | 14 / 61 / 71 ms | 1.8 / 2.3 / 10.5 s | 5.9 / 6.9 / 11.8 s |
+| | copied | 1 / 4 / 7 ms | 4.4 / 7.3 / 7.9 s | 7.1 / 21.0 / 24.6 s |
+
+A copied backup here is a copy on the same device, which is the cost of moving the bytes; to another
+device it is the slower of the two. After the pin, a linked backup reads its own links for their
+checksums, and a copied one waits for its `syncfs()`.
+
+| restore, the backup's pages not in the cache | check | copy | open | total |
+|---|---|---|---|---|
+| 10 M rows | 3.2 / 3.6 / 3.7 s | 1.62 / 1.63 / 1.68 s | 0.18 / 0.20 / 0.20 s | 5.1 / 5.5 / 5.6 s |
+| 50 M rows | 15.7 / 15.9 / 16.2 s | 16.6 / 35.4 / 36.0 s | 0.58 / 1.0 / 1.16 s | 33.8 / 52.4 / 53.1 s |
+
+A server started on a restored directory of 148 MB was listening 7-10 ms after its first log line.
+
+What a backup costs a writer, measured with one connection writing about 320 000 levels a second
+(below this device's ceiling) and `ob_backup` every 5 s, against the same load without it, six rounds
+each: the batch round trip's p50, p99 and p99.9 do not move (about 58 / 107 / 250 us either way). Of
+13 cuts, 10 held the engine's lock 1-9 ms and three 49, 89 and 779 ms - that one 759 ms of it the WAL's
+`fsync`, which the cut, like `FLUSH`, still does under the lock. On this device the worst batch without
+any backup ranged from 3.8 ms to 2.87 s across the same six rounds: near a device's write ceiling its
+own stalls are larger than a backup's, and a WAL on a device of its own takes the `fsync` off the data
+directory's journal (#190). Evidence: `evidence/2026-09-28-backup/`.
+
+**RPO** is the interval between backups: the WAL written since the last one is not in any backup, and
+this release has no restore to a point between two (below). **RTO** is `ob_restore` - the check, the
+copy, the start - plus the server's own start on the restored directory, measured above.
+
+### Not in this release
+
+- **Restoring to a moment between two backups** from the WAL. It needs the WAL replayed from a
+  backup's position to a chosen record, past checkpoints that claim segments the backup does not hold
+  - a change to the start's replay, with a specification of its own.
+- **Incremental backups.** A segment has no identity that lasts: its directory's name comes back once a
+  merge has removed it, so "the same path, size and CRC" is not proof of the same contents.
+- **Scheduling, retention of old backups, shipping off the host.** Cron with `ob_backup`, and any tool
+  that copies a directory.
+
 ## Which build is running
 
 Three ways to ask, all reporting the same number:
@@ -578,6 +705,8 @@ Two files ship with the engine (#35):
 | `OrderbookMeshPeerDown`, `OrderbookMeshLagHigh`, `OrderbookMeshPeersDropped` | warning | a mesh peer gone, far behind, or dropped as slow or for its clock | "When a mesh peer falls behind", "When a peer's clock is wrong" |
 | `OrderbookAuthFailures` | warning | more than one failed authentication a second | "Turning on client authentication" |
 | `OrderbookSubscribersDisconnected` | warning | subscribers closed for reading too slowly | below, `ob_subscription_queued_bytes` |
+| `OrderbookBackupFailed` | warning | a backup failed; it left nothing that looks like one | "Backing up and restoring a node" |
+| `OrderbookBackupStale` | warning | a node that has taken backups has no complete one from the last 26 hours; one that never took any is not paged | "Backing up and restoring a node" |
 
 The thresholds are starting points for a deployment to tune: 64 MiB of replication lag is seconds of
 writes at the ceiling and hours of a quiet market. What is not left to taste is checked in CI:

@@ -1,4 +1,6 @@
 #include "orderbook/tcp_server.hpp"
+
+#include "orderbook/backup.hpp"
 #include "orderbook/socket_options.hpp"
 #include "orderbook/version.hpp"
 #include "orderbook/subscription_hub.hpp"
@@ -197,6 +199,8 @@ bool serialised_across_reactors(CommandType t) {
     // sends ADOPT to the shard it moves a symbol to, so two shards each migrating to the other would
     // each wait for the other's ADOPT holding what that ADOPT waits for.
     case CommandType::ADOPT:
+    // One at a time by the runner's own lock (#34), and the backup itself runs on its own thread.
+    case CommandType::BACKUP:
     case CommandType::SELECT:
     case CommandType::BOOK:
     case CommandType::INSERT:
@@ -242,6 +246,7 @@ bool allowed_before_authentication(CommandType t) {
     case CommandType::SHARD_INFO:
     case CommandType::MIGRATE:
     case CommandType::ADOPT:
+    case CommandType::BACKUP:
     case CommandType::MM_PEERS:
     case CommandType::MM_CONFLICTS:
     case CommandType::SUBSCRIBE:
@@ -586,7 +591,8 @@ std::string execute_command(const Command& cmd,
                             MetricsRegistry* registry,
                             ShardCoordinator* shard_coord,
                             SubscriptionHub* hub,
-                            const SecretStore* client_secrets) {
+                            const SecretStore* client_secrets,
+                            BackupRunner* backups) {
     // ── Authentication gate ───────────────────────────────────────────────────
     //
     // Before the switch, not as a branch inside each case. A per-case check means the next command
@@ -800,6 +806,33 @@ std::string execute_command(const Command& cmd,
         }
 
         return format_status(snap, session.identity());
+    }
+
+    case CommandType::BACKUP: {
+        session.increment_commands();
+        if (cmd.backup_status) {
+            return format_backup_status(backups ? backups->progress() : BackupProgress{});
+        }
+        if (!backups) {
+            return format_error("backup is not configured: start the server with --backup-dir");
+        }
+        std::string name;
+        const BackupRunner::Start started = backups->start(name);
+        const std::string who = session.identity().empty() ? std::string("an unauthenticated server's client")
+                                                           : std::string(session.identity());
+        switch (started) {
+        case BackupRunner::Start::Started:
+            OB_LOG_INFO("tcp_server", "BACKUP from %s: backup %s started", who.c_str(), name.c_str());
+            return "OK BACKUP " + name + "\n\n";
+        case BackupRunner::Start::Running:
+            OB_LOG_INFO("tcp_server", "BACKUP from %s refused: backup %s is running", who.c_str(),
+                        name.c_str());
+            return format_error("backup " + name + " is running");
+        case BackupRunner::Start::Bootstrapping:
+            OB_LOG_INFO("tcp_server", "BACKUP from %s refused: this node is bootstrapping", who.c_str());
+            return format_error("this node is bootstrapping from a snapshot");
+        }
+        return format_error("backup did not start");
     }
 
     case CommandType::ROLE:
@@ -1038,6 +1071,7 @@ const std::vector<std::string>& known_flags() {
         "coordinator-endpoints",
         "coordinator-lease-ttl",
         "auth-secret-file",
+        "backup-dir",
         "cluster-secret-file",
         "compaction",
         "data-dir",
@@ -1118,6 +1152,7 @@ const std::map<std::string, std::pair<std::string, std::string>>& flag_help() {
         {"election-deference-ms", {"<N>", "Wait for a replica further ahead in the log; 0 disables"}},
         {"election-lease-wait-ms", {"<N>", "Wait after the leader key vanishes before standing"}},
         {"failover-enabled", {"<BOOL>", "Participate in automatic failover: true/1/yes or false/0/no (default: true)"}},
+        {"backup-dir", {"<DIR>", "Where BACKUP writes this node's backups, one directory each; not the data or the WAL directory, nor inside either. Without it BACKUP is refused (#34)"}},
         {"auth-secret-file", {"<PATH>", "Client credentials, '<identity> <secret>' per line; mode 600. Empty disables client authentication"}},
         {"migration-identity", {"<IDENTITY>", "The identity from --auth-secret-file a shard authenticates as on another shard's client port, moving a symbol there"}},
         {"cluster-secret-file", {"<PATH>", "Shared secret for replication and multi-master links, one line; mode 600"}},
@@ -1602,6 +1637,8 @@ ResolvedConfig resolve_cli_args(int argc, char* argv[]) {
             config.wal_rotate_bytes = cursor.value_as<size_t>();
         } else if (arg == "--wal-dir") {
             config.wal_dir = std::string{cursor.value()};
+        } else if (arg == "--backup-dir") {
+            config.backup_dir = std::string{cursor.value()};
         } else {
             // Previously ignored in silence, which meant a typo started a server on the default
             // port: `--prot 5599` was accepted, and so was `--port` with no value at all.
@@ -1876,6 +1913,7 @@ std::string format_config(const ResolvedConfig& resolved) {
     // The *path*, and there is no value to print because the secret is never a field of
     // ServerConfig. `--print-config` exists to be pasted into a ticket.
     line("auth-secret-file", c.auth_secret_file.empty() ? "(none)" : c.auth_secret_file);
+    line("backup-dir", c.backup_dir.empty() ? "(none)" : c.backup_dir);
     line("migration-identity", c.migration_identity.empty() ? "(none)" : c.migration_identity);
     line("cluster-secret-file", c.cluster_secret_file.empty() ? "(none)" : c.cluster_secret_file);
     line("compaction", c.compaction ? "on" : "off");
@@ -1939,6 +1977,18 @@ TcpServer::TcpServer(ServerConfig config)
     , tls_(load_tls_or_exit(config_))
     , read_only_(config_.read_only)
 {
+    // Where backups go (#34), checked before the engine opens the data directory: a backup directory
+    // inside it would be read as the engine's own segments, and removed by a replica's bootstrap.
+    if (!config_.backup_dir.empty()) {
+        if (const std::string problem =
+                backup_dir_problem(config_.backup_dir, config_.data_dir, config_.wal_dir);
+            !problem.empty()) {
+            OB_LOG_ERROR("tcp_server", "Refusing to start: %s", problem.c_str());
+            std::fprintf(stderr, "Error: %s\n", problem.c_str());
+            std::exit(1);
+        }
+    }
+
     ReplicationConfig repl_config{};
     if (!config_.multi_master) {
         repl_config.port = config_.replication_port;
@@ -2054,6 +2104,9 @@ struct ReactorShared {
     /// Held for a command `serialised_across_reactors()` names, so it runs alone as it did when
     /// one loop ran every command.
     std::mutex&              admin_mtx;
+
+    /// BACKUP's runner, null without --backup-dir (#34).
+    BackupRunner*            backups;
 };
 
 class Reactor {
@@ -2113,6 +2166,7 @@ private:
     std::atomic<bool>&       read_only_;
     ServerStats&             stats_;
     ShardCoordinator*        shard_coord_;
+    BackupRunner*            backups_;
     MetricsServer*           metrics_server_;
     int&                     listen_fd_;
     int                      epoll_fd_{-1};
@@ -2186,6 +2240,7 @@ Reactor::Reactor(int index, const ReactorShared& shared, int& listen_fd)
     , read_only_(shared.read_only)
     , stats_(shared.stats)
     , shard_coord_(shared.shard_coord)
+    , backups_(shared.backups)
     , metrics_server_(shared.metrics_server)
     , listen_fd_(listen_fd)
     , sessions_(shared.config.max_sessions)
@@ -2760,7 +2815,7 @@ void Reactor::run_loop() {
                                 // caller at a time, and released before the answer is queued.
                                 std::unique_lock<std::mutex> alone(admin_mtx_, std::defer_lock);
                                 if (serialised_across_reactors(cmd.type)) alone.lock();
-                                std::string response = execute_command(cmd, *engine_, *session, stats_, read_only_.load(std::memory_order_acquire), &engine_->registry(), shard_coord_, &hub_, secrets_.client_store());
+                                std::string response = execute_command(cmd, *engine_, *session, stats_, read_only_.load(std::memory_order_acquire), &engine_->registry(), shard_coord_, &hub_, secrets_.client_store(), backups_);
                                 if (alone.owns_lock()) alone.unlock();
 
                                 if (response.empty()) {
@@ -2967,6 +3022,13 @@ void TcpServer::run() {
         shard_coord->start();
     }
 
+    // Backups into --backup-dir (#34): after the engine is open, before any client can ask, and
+    // stopped before the engine closes - a running backup holds its pin on the segment files.
+    std::unique_ptr<BackupRunner> backups;
+    if (!config_.backup_dir.empty()) {
+        backups = std::make_unique<BackupRunner>(*engine_, config_.backup_dir, engine_->registry());
+    }
+
     // 1. Create non-blocking TCP socket.
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (listen_fd_ < 0) {
@@ -3007,7 +3069,7 @@ void TcpServer::run() {
     std::mutex            admin_mtx;
     ReactorShared shared{config_,    *engine_, tls_,  secrets_,          running_,
                          draining_,  read_only_, stats, shard_coord.get(), metrics_server_.get(),
-                         &dealt_to, admin_mtx};
+                         &dealt_to, admin_mtx, backups.get()};
 
     // 7-8. Reactor 0 holds the listening socket and runs on this thread; the others have a thread
     // each. Every one is built before any of them runs, so the list reactor 0 deals from is complete
@@ -3089,6 +3151,13 @@ void TcpServer::run() {
     // would still be serving after run() returned. stop() is idempotent.
     if (metrics_server_) {
         metrics_server_->stop();
+    }
+
+    // A backup still running is stopped - it fails, and what it wrote is removed - before the
+    // engine closes under it.
+    if (backups) {
+        backups->stop();
+        backups.reset();
     }
 
     // Stop ShardCoordinator before closing engine.

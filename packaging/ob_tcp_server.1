@@ -75,6 +75,17 @@ chasing a hung node.
 .BI \-\-metrics\-port " n"
 Prometheus endpoint. 0 disables it.
 .TP
+.BI \-\-backup\-dir " path"
+Where
+.B BACKUP
+writes this node's backups, one directory each. Not the data directory and not inside it; without
+it
+.B BACKUP
+is refused. Restore one with
+.BR ob_restore ,
+ask a running node for one with
+.BR ob_backup .
+.TP
 .BI \-\-coordinator\-endpoints " urls"
 Comma-separated etcd endpoints. Required for automatic failover and for multi-master.
 .TP
@@ -124,4 +135,5 @@ A command line or configuration file the server does not fully understand, a por
 or a data directory it cannot open. The server refuses to start rather than starting with a
 configuration nobody intended.
 .SH SEE ALSO
+.BR ob_restore " \-\-help, " ob_backup " \-\-help, "
 .BR etcd (1)
