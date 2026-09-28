@@ -1,9 +1,11 @@
 #include "orderbook/codec.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace ob {
 
@@ -84,7 +86,6 @@ static constexpr S8bSelector kSelectors[16] = {
 };
 
 static constexpr uint64_t kFallbackMarker = (1ULL << 60) - 1; // all 60 bits set
-static constexpr uint64_t kMaxSimple8b    = (1ULL << 60) - 1;
 
 // Find the best selector that fits all values in [begin, begin+count).
 // Returns selector index, or -1 if no selector fits (shouldn't happen for sel>=2).
@@ -128,8 +129,12 @@ Simple8bResult encode_simple8b(std::span<const uint64_t> values) {
 
     size_t i = 0;
     while (i < values.size()) {
-        // Check for fallback: value > max Simple8b
-        if (values[i] > kMaxSimple8b) {
+        // Check for fallback: a value past the 60 bits a word holds, **or equal to the marker**
+        // (#198). A selector-15 word whose payload is all ones is read as the fallback marker, so
+        // 2^60 - 1 stored as an ordinary value made the decoder take the next word for a raw value:
+        // measured, [2^60 - 1, 5, 7] came back as one value, 4611686018427387965. It is the one
+        // value both encodings would spell the same, and the fallback is the unambiguous one.
+        if (values[i] >= kFallbackMarker) {
             // Emit fallback: two words
             // Word 0: selector=15 in top 4 bits, value = kFallbackMarker
             uint64_t word0 = (static_cast<uint64_t>(15) << 60) | kFallbackMarker;
@@ -173,48 +178,80 @@ Simple8bResult encode_simple8b(std::span<const uint64_t> values) {
     return result;
 }
 
+namespace {
+
+/// One whole word of `Count` values of `Bits` bits: every shift a constant and every value its own
+/// expression, so there is no loop left to keep (#49). The table-driven loop this replaces read
+/// both numbers from `kSelectors` per word and bounded every value by the count; GCC left the
+/// widest words' loops rolled even with the numbers constant, which is why this is a fold and not
+/// a `for`.
+template <unsigned Bits, unsigned... K>
+inline void unpack_values(uint64_t word, uint64_t* out, std::integer_sequence<unsigned, K...>) noexcept {
+    constexpr uint64_t mask = (1ULL << Bits) - 1;
+    ((out[K] = (word >> (K * Bits)) & mask), ...);
+}
+
+template <unsigned Bits, unsigned Count>
+inline void unpack(uint64_t word, uint64_t* out) noexcept {
+    unpack_values<Bits>(word, out, std::make_integer_sequence<unsigned, Count>{});
+}
+
+}  // namespace
+
 std::vector<uint64_t> decode_simple8b(std::span<const uint64_t> words, size_t count) {
-    std::vector<uint64_t> out;
-    out.reserve(count);
-
+    // Zeroed once, so the two all-zero selectors only move the cursor, and trimmed at the end to
+    // what the words held. Never larger than they can hold, 240 values each: the push_back version
+    // only reserved `count`, and zeroing touches the pages.
+    const size_t want = std::min(count, words.size() * 240);
+    std::vector<uint64_t> out(want);
+    uint64_t* o = out.data();
+    size_t n = 0;
     size_t wi = 0;
-    while (wi < words.size() && out.size() < count) {
-        uint64_t word = words[wi++];
-        uint32_t sel  = static_cast<uint32_t>(word >> 60);
-
-        // Check for fallback marker
-        if (sel == 15) {
-            uint64_t payload = word & kFallbackMarker;
-            if (payload == kFallbackMarker && wi < words.size()) {
-                // Raw uint64 fallback
-                out.push_back(words[wi++]);
-                continue;
+    while (wi < words.size() && n < want) {
+        const uint64_t word = words[wi++];
+        const uint32_t sel  = static_cast<uint32_t>(word >> 60);
+        const size_t   room = want - n;
+        if (kSelectors[sel].count > room) {
+            // More slots than values remain - the encoder's last word, partly filled. Never
+            // selector 15, whose one slot always fits.
+            const uint32_t bits = kSelectors[sel].bits;
+            if (bits != 0) {
+                const uint64_t mask = (1ULL << bits) - 1;
+                for (size_t k = 0; k < room; ++k) o[n + k] = (word >> (k * bits)) & mask;
             }
-            // Normal selector 15: 1 × 60-bit value
-            out.push_back(payload);
-            continue;
+            n = want;
+            break;
         }
-
-        uint32_t cnt  = kSelectors[sel].count;
-        uint32_t bits = kSelectors[sel].bits;
-
-        if (bits == 0) {
-            // All zeros
-            uint32_t emit = static_cast<uint32_t>(
-                cnt < static_cast<uint32_t>(count - out.size()) ? cnt : (count - out.size()));
-            for (uint32_t k = 0; k < emit; ++k) {
-                out.push_back(0ULL);
+        switch (sel) {
+        case 0:  n += 240; break;
+        case 1:  n += 120; break;
+        case 2:  unpack<1, 60>(word, o + n);  n += 60; break;
+        case 3:  unpack<2, 30>(word, o + n);  n += 30; break;
+        case 4:  unpack<3, 20>(word, o + n);  n += 20; break;
+        case 5:  unpack<4, 15>(word, o + n);  n += 15; break;
+        case 6:  unpack<5, 12>(word, o + n);  n += 12; break;
+        case 7:  unpack<6, 10>(word, o + n);  n += 10; break;
+        case 8:  unpack<7, 8>(word, o + n);   n += 8;  break;
+        case 9:  unpack<8, 7>(word, o + n);   n += 7;  break;
+        case 10: unpack<10, 6>(word, o + n);  n += 6;  break;
+        case 11: unpack<12, 5>(word, o + n);  n += 5;  break;
+        case 12: unpack<15, 4>(word, o + n);  n += 4;  break;
+        case 13: unpack<20, 3>(word, o + n);  n += 3;  break;
+        case 14: unpack<30, 2>(word, o + n);  n += 2;  break;
+        default: {
+            // One 60-bit value - or, with the marker for a payload and a word after it, the
+            // fallback, whose value is that word.
+            const uint64_t payload = word & kFallbackMarker;
+            if (payload == kFallbackMarker && wi < words.size()) {
+                o[n++] = words[wi++];
+            } else {
+                o[n++] = payload;
             }
-        } else {
-            uint64_t mask = (bits == 64) ? UINT64_MAX : ((1ULL << bits) - 1);
-            uint32_t emit = static_cast<uint32_t>(
-                cnt < static_cast<uint32_t>(count - out.size()) ? cnt : (count - out.size()));
-            for (uint32_t k = 0; k < emit; ++k) {
-                out.push_back((word >> (k * bits)) & mask);
-            }
+            break;
+        }
         }
     }
-
+    out.resize(n);
     return out;
 }
 

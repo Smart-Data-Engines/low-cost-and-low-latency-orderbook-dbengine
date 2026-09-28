@@ -44,9 +44,10 @@ std::vector<int64_t> decode_prices(std::span<const uint64_t> encoded);
 //  14:    2 × 30 bits
 //  15:    1 × 60 bits  (or raw uint64 fallback)
 //
-// Fallback: values > (1ULL<<60)-1 are stored as two words:
+// Fallback: values >= (1ULL<<60)-1 are stored as two words:
 //   word 0: selector=15, value=0xFFFFFFFFFFFFFFF (all 60 bits set = marker)
 //   word 1: raw uint64 value
+// (1ULL<<60)-1 itself fits selector 15, but that word would be the marker (#198).
 
 struct Simple8bResult {
     std::vector<uint64_t> words;  ///< encoded 64-bit words

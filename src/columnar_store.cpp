@@ -657,9 +657,10 @@ void ColumnarStore::append_row(const SnapshotRow& row, uint64_t own_seq) {
     seq_buf_.push_back(static_cast<int64_t>(row.sequence_number));
     ++active_row_count_;
 
-    // Check if qty needs fallback (> 2^60 - 1)
-    static constexpr uint64_t kMaxSimple8b = (1ULL << 60) - 1;
-    if (row.quantity > kMaxSimple8b) {
+    // Whether qty takes the codec's raw fallback: at or past 2^60 - 1, the value the marker spells
+    // (#198).
+    static constexpr uint64_t kFallbackMarker = (1ULL << 60) - 1;
+    if (row.quantity >= kFallbackMarker) {
         active_has_raw_qty_ = true;
     }
     // After any rollover above, so the number is the segment's the row is in.
