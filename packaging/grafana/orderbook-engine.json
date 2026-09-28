@@ -1189,6 +1189,178 @@
           }
         }
       ]
+    },
+    {
+      "type": "row",
+      "title": "Backups",
+      "id": 32,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 77
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Age of the last complete backup",
+      "id": 33,
+      "description": "Seconds since the cut of the last complete backup in --backup-dir; read from the directory at start, so a restart does not reset it. No line: this node has never completed one.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 78
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - max by (instance) (ob_backup_last_success_timestamp_seconds{job=~\"$job\", instance=~\"$instance\"} > 0)",
+          "legendFormat": "{{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Backups and failures",
+      "id": 34,
+      "description": "Backups completed and failed in the last hour. A failure leaves nothing that looks like a backup; its reason is in BACKUP STATUS and the node's log.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 78
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance) (increase(ob_backups_total{job=~\"$job\", instance=~\"$instance\"}[1h]))",
+          "legendFormat": "done {{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (instance) (increase(ob_backup_failures_total{job=~\"$job\", instance=~\"$instance\"}[1h]))",
+          "legendFormat": "failed {{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Last backup: duration and pin",
+      "id": 35,
+      "description": "How long the last backup took, and for how long it held merges and retention back: the link or the copy of its files. running is 1 while one is being taken.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 78
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (instance) (ob_backup_last_duration_ms{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "total {{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "max by (instance) (ob_backup_last_pinned_ms{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "pinned {{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "max by (instance) (ob_backup_running{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "running {{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Last backup: bytes",
+      "id": 36,
+      "description": "What the last complete backup holds, and so what a restore copies back.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 78
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (instance) (ob_backup_last_bytes{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "{{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
     }
   ]
 }

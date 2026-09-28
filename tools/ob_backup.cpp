@@ -17,6 +17,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <exception>
 #include <cstdlib>
 #include <map>
 #include <string>
@@ -51,7 +52,7 @@ std::string first_line(const std::string& s) { return s.substr(0, s.find('\n'));
 
 }  // namespace
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
     ob::ClientConfig config;
     std::string identity, secret_file, port;
     long timeout_s = 3600;
@@ -188,5 +189,16 @@ int main(int argc, char** argv) {
             return 3;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+}
+
+// Nothing leaves by the terminate handler (#102): an exception from the filesystem or an allocation
+// is a message and an exit status, as a refusal is.
+int main(int argc, char** argv) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "ob_backup: %s\n", e.what());
+        return 2;
     }
 }

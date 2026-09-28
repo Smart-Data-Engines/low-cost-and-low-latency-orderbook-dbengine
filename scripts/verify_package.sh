@@ -22,13 +22,15 @@ echo "package: $DEB"
 # ── Layout ────────────────────────────────────────────────────────────────────
 CONTENTS=$(dpkg-deb -c "$DEB" | awk '{print $6}')
 for path in ./usr/bin/ob_tcp_server \
+            ./usr/bin/ob_restore \
+            ./usr/bin/ob_backup \
             ./etc/orderbook/ob.conf \
             ./usr/lib/systemd/system/ob_tcp_server.service \
             ./usr/share/man/man1/ob_tcp_server.1 \
             ./usr/include/orderbook/engine.hpp; do
     echo "$CONTENTS" | grep -qx -- "$path" || fail "missing from the package: $path"
 done
-ok "binary, config, unit, man page and headers are all in the package"
+ok "server, backup tools, config, unit, man page and headers are all in the package"
 
 # The config must be at /etc, not /usr/etc. `packaging/debian/conffiles` names /etc/orderbook/ob.conf,
 # and a conffile declaration pointing at a path the package does not contain marks nothing — the
@@ -79,6 +81,12 @@ dpkg-deb -x "$DEB" "$WORK"
 grep -q "data-dir .*/var/lib/orderbook .*(file)" "$WORK/resolved.txt" \
     || fail "the shipped configuration did not take effect: data-dir is not from the file"
 ok "the packaged binary accepts the packaged configuration, and the file's values reach it"
+
+# The backup tools (#34) run from the package: a binary missing a shared library it links would be
+# found by the operator restoring a node, which is the worst moment to find it.
+"$WORK/usr/bin/ob_restore" --help > /dev/null || fail "the packaged ob_restore does not run"
+"$WORK/usr/bin/ob_backup" --help > /dev/null || fail "the packaged ob_backup does not run"
+ok "the packaged ob_restore and ob_backup run"
 
 # ── The unit ──────────────────────────────────────────────────────────────────
 # systemd-analyze reports the ExecStart binary as missing unless the package is installed, which it

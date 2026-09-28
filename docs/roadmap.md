@@ -652,6 +652,32 @@ node that is merely listening can accept a write and have nobody to send it to.
 - `ob_backup` / `ob_restore` tooling on top of existing snapshots plus WAL
 - Documented recovery procedure with RPO/RTO numbers
 - Effort: M | Impact: Nobody runs a database they cannot restore
+- **Backup and restore shipped** (28 September 2026; spec `kiro-workspace/specs/backup-restore/`,
+  procedure in `docs/operations.md`, "Backing up and restoring a node"). `BACKUP` on a server
+  started with `--backup-dir` takes a cut from the snapshot path - the pin, everything waiting
+  sealed, the WAL position and the sequence state in one critical section - without its checksums,
+  and hard-links the files into `.partial-<name>` when the backup directory is on the data
+  directory's filesystem, or copies them, checksumming the bytes as they pass; the pin is released
+  once they are linked or copied, and a linked backup checksums its own links after. One `syncfs()`,
+  the description (`backup.json`: every file's size and CRC32C, the cut's WAL position and identity,
+  the node, the sequence state), the rename to `<name>`: nothing that looks like a backup exists
+  before all of it is on the device, and a failure removes what it wrote. `BACKUP STATUS` says where
+  one is; `ob_backup` asks for one from cron, with the client's authentication and TLS.
+  `ob_restore --verify` checks one; `ob_restore` checks the whole backup before it creates anything,
+  copies it into an empty data directory, and opens it through the engine's own start, taking the
+  backup's sequence state. Metrics, two alerts (a failed backup, none for 26 hours on a node that has
+  taken one) and a dashboard row.
+- **Found on the way.** A restored primary served its rows and its replica held none: the replica saw
+  the new WAL's identity, discarded what it had, and streamed the restored node's log from the start
+  - a log in which none of the restored rows is a record. The restored WAL begins at its second file
+  now, so a replica asking for it from the start is told `WAL_TRUNCATED` and bootstraps from a
+  snapshot, as it would after retention.
+- **Not yet: point-in-time recovery.** The point a restore returns to is a backup's cut; RPO is the
+  interval between backups. A restore to a moment between two needs the WAL replayed from a backup's
+  position to a chosen record, past checkpoints that claim segments the backup does not hold - a
+  change to the start's replay, and the rest of this item. Incremental backups are not planned: a
+  segment's directory name comes back once a merge removed it, so path, size and CRC do not prove the
+  same contents.
 
 ### 35. Grafana dashboard and alert rules ✅
 - Shipped dashboard JSON and Prometheus alert rules (replica lag, failover events, backpressure,
@@ -12742,7 +12768,7 @@ The capability items are in the table below.
 | **P3** | A mesh snapshot with a file of zero bytes in it installs (#194) | S | Its sender sends no chunk for an empty file and its receiver waits for one; the engine writes no such file |
 | **P3** | Time-bucketed aggregation (#44) | L | The most-requested analytical capability for this data |
 | **P3** | Arrow output (#46) | M | Near-zero integration cost for analytics teams |
-| **P3** | Backup and restore (#34) | M | Table stakes for a database |
+| **P3** | Point-in-time recovery (#34, what is left of it) | M | A restore to a moment between two backups; backup and restore themselves shipped |
 | **P3** | Access control (#31) | M | Multi-tenant deployments and the compliance conversation; authentication landed with #30, authorisation did not |
 | **P4** | Rolling upgrade support (#56) | M | Required before anyone runs this longer than one release |
 | **P4** | Performance frontier (#49-53) | varies | Proves the bespoke-engine claim; pick one and write it up |

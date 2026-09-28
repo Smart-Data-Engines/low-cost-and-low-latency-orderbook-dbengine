@@ -46,6 +46,16 @@ FAULTS = {
                                    ("ob_mm_peer_dropped_clock_total", "0 0 0 0 0 0")], 4),
     "OrderbookAuthFailures": ([("ob_auth_failures_total", "0+120x20")], 15),
     "OrderbookSubscribersDisconnected": ([("ob_subscription_overflow_disconnects_total", "0 0 0 3 3 3")], 4),
+    "OrderbookBackupFailed": ([("ob_backup_failures_total", "0 0 0 1 1 1")], 4),
+    # A backup at t=60 s and none since: 27 hours on, time() is past the cut by more than 26.
+    "OrderbookBackupStale": ([("ob_backup_last_success_timestamp_seconds", "60x1700")], 27 * 60),
+}
+
+# alert -> (input series, minute) at which it must **not** fire: the cases a fault's shape could be
+# mistaken for, beyond the healthy node below.
+QUIET = {
+    # A node that never took a backup exports 0, and is not paged for a schedule it does not have.
+    "OrderbookBackupStale": ([("ob_backup_last_success_timestamp_seconds", "0x1700")], 27 * 60),
 }
 
 # What a healthy primary with two replicas and two mesh peers exports for twenty minutes.
@@ -59,6 +69,7 @@ HEALTHY = [
     ("ob_mm_replication_lag_records", "10x20"), ("ob_mm_peer_dropped_slow_total", "0x20"),
     ("ob_mm_peer_dropped_clock_total", "0x20"), ("ob_auth_failures_total", "0x20"),
     ("ob_subscription_overflow_disconnects_total", "0x20"),
+    ("ob_backup_failures_total", "0x20"), ("ob_backup_last_success_timestamp_seconds", "600x20"),
 ]
 
 
@@ -96,6 +107,13 @@ def main() -> int:
                 }],
             }],
         })
+    for name, (series, at) in QUIET.items():
+        assert name in alerts, f"a quiet scenario for {name}, which is not an alert"
+        tests.append({
+            "interval": "1m",
+            "input_series": [{"series": f"{m}{{{LABELS}}}", "values": v} for m, v in series],
+            "alert_rule_test": [{"eval_time": f"{at}m", "alertname": name, "exp_alerts": []}],
+        })
     tests.append({
         "interval": "1m",
         "input_series": [{"series": f"{m}{{{LABELS}}}", "values": v} for m, v in HEALTHY],
@@ -113,7 +131,8 @@ def main() -> int:
     if out.returncode != 0:
         print(out.stderr.strip())
         return 1
-    print(f"{len(FAULTS)} alerts each fire on their fault, and none on a healthy node")
+    print(f"{len(FAULTS)} alerts each fire on their fault, {len(QUIET)} stay quiet where they must, "
+          f"and none fires on a healthy node")
     return 0
 
 

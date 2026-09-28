@@ -564,7 +564,7 @@ set_target_properties(orderbook_shared PROPERTIES
 # on **both** sides, not one.
 if(NOT SKBUILD)
 
-install(TARGETS ob_tcp_server
+install(TARGETS ob_tcp_server ob_restore ob_backup
     RUNTIME DESTINATION usr/bin
     COMPONENT runtime
 )

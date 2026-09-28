@@ -3922,6 +3922,29 @@ Learned the hard way. Check here before debugging.
      merge between a migration's first seal and its pin would replace segments the list names - read
      after they are gone, or their rows sent again as the merged segment's. A merge under way when the
      pin is taken finishes before the seal, which waits for the flush lock it holds.
+523. **A store whose rows are in no record of its WAL gives a replica that streams the WAL from the
+     start nothing.** Measured on the first restore of #34: the replica of a primary restored from a
+     backup saw the new WAL's identity, discarded what it held, asked for the log from 0:0 - which
+     existed, and held a vector and no rows - and served nothing for as long as it was watched. The
+     primary decides "stream or snapshot" by whether the requested WAL file exists, so the restored
+     WAL begins at its second file, and the request is `WAL_TRUNCATED`, a snapshot, as after
+     retention. Any path that puts rows into a store other than through its own WAL has the question.
+524. **`ColumnarStore::open_existing()` indexes every `meta.json` anywhere under the data directory,
+     at any depth**, with the symbol the file names. A backup directory, or a staging one, inside it is
+     read at the next start as the node's own segments - every backed-up row twice - and a replica's
+     bootstrap removes every directory there but its staging one. So `--backup-dir` inside the data
+     or the WAL directory (or holding one) refuses the start, and `ob_restore` copies into place and
+     then opens the engine, rather than staging inside a directory an engine will open.
+525. **A backup's publish costs the filesystem's dirty data, not the backup's size.** `syncfs()` syncs
+     everything dirty on that filesystem: the first backup on the development machine took 4.6 s,
+     4.5 s of it in `syncfs()` behind a build's pages, and the next one, of the same 22 KB, 188 ms.
+     On a node the flush keeps the dirty data bounded; a number from a machine doing something else
+     measures the something else.
+526. **`pgrep -f "[o]b_tcp_server --port N"` still matches the shell that launched the server with that
+     text.** The bracket keeps the pattern from matching its *own* command line, not a command line
+     that contains the target string elsewhere - and a probe that started the server and then looked
+     for it in the same command found its own shell, and `kill` ended it (exit 144, twice). Take the
+     PID at launch, or look it up in a separate command.
 ## Current state and open problems
 
 Roadmap phases 1-6 are complete; 7-11 are planned in [docs/roadmap.md](docs/roadmap.md). Item numbers
@@ -3953,6 +3976,14 @@ below are the recent closures worth knowing because each changes what the engine
 carries no count, because the previous version of this sentence said "four" above a list of six and
 omitted the newest one entirely - which is the rot pitfall 312 is about, in the paragraph that
 warns about it.
+
+**Backup and restore (#34) shipped; point-in-time recovery, the rest of #34, has not**: `BACKUP` on a
+server with `--backup-dir` is a cut from the snapshot path, hard-linked or copied, published by a
+rename only when it is all on the device; `ob_restore` checks the whole backup before it writes, and
+opens it through the engine's own start with the WAL begun at its second file, so a replica asking
+from the start is sent a snapshot (pitfalls 523-526; `docs/operations.md`, "Backing up and restoring
+a node"). **#35 is closed**: a dashboard and alert rules in `packaging/`, held against the registry
+and `promtool test rules` in CI.
 
 **#165 is closed, in three parts**: the segment index is per symbol and in width tiers, so a flush
 tick's merge is a lookup and an insertion and a query searches only its symbol's windows - a

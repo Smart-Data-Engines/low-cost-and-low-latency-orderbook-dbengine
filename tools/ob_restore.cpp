@@ -14,6 +14,7 @@
 #include "orderbook/logger.hpp"
 
 #include <cstdio>
+#include <exception>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -34,7 +35,7 @@ void usage(std::FILE* to) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
     std::string verify, backup, data_dir, wal_dir, level = "error";
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
@@ -115,4 +116,15 @@ int main(int argc, char** argv) {
                 report.sequence_adopted ? "restored" : "from the segments (the backup's was truncated)",
                 report.verify_ms, report.copy_ms, report.open_ms);
     return 0;
+}
+
+// Nothing leaves by the terminate handler (#102): an exception from the filesystem or an allocation
+// is a message and an exit status, as a refusal is.
+int main(int argc, char** argv) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "ob_restore: %s\n", e.what());
+        return 1;
+    }
 }

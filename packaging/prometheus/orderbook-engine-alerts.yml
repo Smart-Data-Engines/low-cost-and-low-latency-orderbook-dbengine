@@ -145,6 +145,30 @@ groups:
             docs/operations.md, "When a peer's clock is wrong", and "A mesh link that is up and
             carrying nothing".
 
+  - name: orderbook-engine-backup
+    rules:
+      - alert: OrderbookBackupFailed
+        expr: sum by (instance) (increase(ob_backup_failures_total[1h])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: a backup failed"
+          description: >-
+            BACKUP STATUS and the node's log say why: a directory it cannot write, a full disk, a
+            stop during it. A failed backup leaves nothing that looks like one. docs/operations.md,
+            "Backing up and restoring a node".
+      - alert: OrderbookBackupStale
+        expr: max by (instance) (ob_backup_last_success_timestamp_seconds) > 0 and time() - max by (instance) (ob_backup_last_success_timestamp_seconds) > 26 * 3600
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: no complete backup for more than 26 hours"
+          description: >-
+            This node has taken backups, and the last complete one is more than 26 hours old: the
+            schedule that asks for them stopped, or every one since failed. 26 hours is a daily
+            backup with room - change it to the schedule. A node that never took one is not paged.
+            docs/operations.md, "Backing up and restoring a node".
+
   - name: orderbook-engine-clients
     rules:
       - alert: OrderbookAuthFailures
