@@ -237,9 +237,13 @@ TEST(SealEpochs, ACheckpointWrittenWhileABlockWaitsNamesTheEpochItsSyncCovered) 
         return engine.registry().gauge_value("ob_unsealed_rows") == 7;
     })) << "B's rows were not left waiting, so this proves nothing about the epoch form";
 
-    ob::WALReplayer replayer(dir.path);
-    const auto last = replayer.find_last_checkpoint();
-    ASSERT_TRUE(last.seal_epoch.has_value()) << "a checkpoint written while B waited named no epoch";
+    // The checkpoint comes a tick after A's seal, once the sync the tick left in the background is
+    // done (#190).
+    ob::WALReplayer::LastCheckpoint last;
+    ASSERT_TRUE(eventually([&] {
+        last = ob::WALReplayer(dir.path).find_last_checkpoint();
+        return last.seal_epoch.has_value();
+    })) << "a checkpoint written while B waited named no epoch";
     const auto a_epochs = epochs_on_disk(dir.path, "A");
     for (uint64_t e : a_epochs) {
         EXPECT_LE(e, *last.seal_epoch) << "a sealed segment is past the epoch the checkpoint vouches for";
