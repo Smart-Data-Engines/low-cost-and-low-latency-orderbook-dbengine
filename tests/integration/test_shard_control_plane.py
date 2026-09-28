@@ -69,8 +69,9 @@ class Cluster:
         raise RuntimeError(f"nothing listens on port {port}")
 
     def start(self, sid: str, wait: bool = True, host: str = "127.0.0.1",
-              shard: str | None = None) -> None:
-        """Node `sid`, of shard `shard` - its own name unless a second node of a shard's group."""
+              shard: str | None = None, extra: tuple[str, ...] = ()) -> None:
+        """Node `sid`, of shard `shard` - its own name unless a second node of a shard's group -
+        with `extra` flags after the rest."""
         port = free_port()
         self.ports[sid] = port
         self.repl_ports[sid] = free_port()
@@ -79,7 +80,7 @@ class Cluster:
             [SERVER, "--port", str(port), "--metrics-port", "0", "--data-dir", f"{self.dir}/{sid}",
              "--shard-id", shard or sid, "--node-id", f"node-{sid}",
              "--coordinator-endpoints", self.etcd,
-             "--replication-port", str(self.repl_ports[sid]), "--advertise-host", host],
+             "--replication-port", str(self.repl_ports[sid]), "--advertise-host", host, *extra],
             stdout=log, stderr=subprocess.STDOUT)
         if wait:
             self._wait_port(port)
@@ -347,24 +348,20 @@ def test_a_replica_of_a_shards_group_leaves_the_map_naming_its_primary(cluster):
     assert insert(cluster, "s0b", "ANY") == "ERR read-only replica"
 
 
-def test_migrate_is_refused_and_the_symbol_stays_writable(cluster):
-    # #196: MIGRATE marked the symbol migrated and moved none of its rows, and the map still named
-    # the source - so the symbol could be written nowhere. Refused, until it moves data.
+def test_migrate_moves_only_what_the_shard_owns_to_an_active_shard(cluster):
+    # #196 moves a symbol with its rows (test_shard_migration.py); what it refuses to begin, it
+    # refuses before it touches anything: a symbol another shard owns, a shard the map does not
+    # name, the shard itself.
     for sid in ("s0", "s1"):
         cluster.start(sid)
-    doc = cluster.wait_for_map(("s0", "s1"))
-    doc["assignments"] = {f"PIN.{EXCHANGE}": "s0"}
-    doc["version"] += 1
-    cluster.put(f"{PREFIX}shard_map", json.dumps(doc))
-    answer = ""
-    deadline = time.time() + patience(20)
-    while time.time() < deadline:          # until s0 has read the assignment
-        answer = command(cluster, "s0", f"MIGRATE PIN.{EXCHANGE} s1")
-        if "not implemented" in answer:
-            break
-        time.sleep(0.3)
-    assert answer.startswith("ERR MIGRATE is not implemented"), answer
-    assert wait_until_writable(cluster, "s0", "PIN") == "OK", "the symbol MIGRATE was refused for is not writable"
+    cluster.wait_for_map(("s0", "s1"))
+    mine = symbols_of("s0", ("s0", "s1"), 1)[0]
+    theirs = symbols_of("s1", ("s0", "s1"), 1)[0]
+    assert refused_as_not_owned(cluster, "s0", theirs) == f"ERR NOT_OWNER {theirs}.{EXCHANGE}"
+    assert command(cluster, "s0", f"MIGRATE {theirs}.{EXCHANGE} s1") == f"ERR NOT_OWNER {theirs}.{EXCHANGE}"
+    assert command(cluster, "s0", f"MIGRATE {mine}.{EXCHANGE} s9") == "ERR unknown shard: s9"
+    assert command(cluster, "s0", f"MIGRATE {mine}.{EXCHANGE} s0").startswith("ERR shard s0 owns")
+    assert wait_until_writable(cluster, "s0", mine) == "OK"
 
 
 class Connection:
@@ -419,6 +416,7 @@ def test_the_pool_reads_a_bare_symbol_migrated():
     # The server says it bare; the pool matched only the form with a detail, so the refresh and
     # the retry it exists for never happened against a real server.
     assert ob._parse_shard_error("ERR SYMBOL_MIGRATED\n") == ("SYMBOL_MIGRATED", "")
+    assert ob._parse_shard_error("ERR SYMBOL_MOVING\n") == ("SYMBOL_MOVING", "")
     assert ob._parse_shard_error("ERR SYMBOL_MIGRATED s1") == ("SYMBOL_MIGRATED", "s1")
     assert ob._parse_shard_error(f"ERR NOT_OWNER A.{EXCHANGE}") == ("NOT_OWNER", f"A.{EXCHANGE}")
 

@@ -1106,7 +1106,7 @@ def _parse_shard_error(raw: str):
     """Parse sharding error responses.
 
     Returns (error_type, detail) or (None, None) if not a shard error.
-    error_type: "NOT_OWNER", "SYMBOL_MIGRATED", or None
+    error_type: "NOT_OWNER", "SYMBOL_MIGRATED", "SYMBOL_MOVING", or None
     detail: symbol key or new address
     """
     if not raw.startswith("ERR "):
@@ -1119,7 +1119,18 @@ def _parse_shard_error(raw: str):
     # against every real server.
     if msg == "SYMBOL_MIGRATED" or msg.startswith("SYMBOL_MIGRATED "):
         return "SYMBOL_MIGRATED", msg[len("SYMBOL_MIGRATED "):]
+    # The symbol is being moved to another shard (#196): refused for now, by the shard that owns it.
+    if msg == "SYMBOL_MOVING" or msg.startswith("SYMBOL_MOVING "):
+        return "SYMBOL_MOVING", msg[len("SYMBOL_MOVING "):]
     return None, None
+
+
+# How long a write refused SYMBOL_MOVING is tried again on the same shard, and the pauses between:
+# a migration refuses a symbol's writes while it copies the last of its rows and switches the map,
+# which is milliseconds (#196), and a pause that grows keeps a stalled one from being hammered.
+_MOVING_RETRY_SECONDS = 10.0
+_MOVING_FIRST_PAUSE = 0.02
+_MOVING_LONGEST_PAUSE = 0.2
 
 
 class _ShardRouting:
@@ -1153,7 +1164,8 @@ class _ClientPool:
       - Routes INSERT/MINSERT per symbol to the correct shard
       - Routes SELECT per symbol (single-shard) or fan-out (multi-symbol)
       - Periodic ShardMap refresh in health-check thread
-      - Handles ERR SYMBOL_MIGRATED (refresh + retry 1x)
+      - Handles ERR SYMBOL_MIGRATED and ERR NOT_OWNER (refresh + retry 1x), and
+        ERR SYMBOL_MOVING (the same shard again, for up to 10 s)
 
     When coordinator_endpoints is not provided:
       - Behavior unchanged (backward compatible primary/replica routing)
@@ -1556,35 +1568,57 @@ class _ClientPool:
 
     def execute_write_sharded(self, symbol: str, exchange: str,
                                command: str) -> str:
-        """Route write to the correct shard based on symbol."""
+        """Route write to the correct shard based on symbol.
+
+        Three answers are the routing's rather than the caller's, and are tried again for up to
+        `_MOVING_RETRY_SECONDS` (#196). `SYMBOL_MOVING`: the symbol's owner refuses its writes while
+        it moves them, which is milliseconds - the same shard again, after a pause that grows.
+        `SYMBOL_MIGRATED` and `NOT_OWNER`: this routing is older than the map - the shard a symbol
+        left says one or the other, depending on whether it has read the new map yet - so the map is
+        read again and the write sent where it now says; at once the first time, and after a pause
+        from then on, because the shard the map names may not have read it yet either.
+        """
         routing = self._routing
-        shard_id = self._resolve_shard(symbol, exchange, routing)
-        backend = routing.connections.get(shard_id)
-        if backend is None:
-            raise OrderbookError(-1, f"Shard {shard_id} not connected")
-        try:
-            raw = backend.execute(command)
-            err_type, detail = _parse_shard_error(raw)
-            if err_type == "SYMBOL_MIGRATED":
-                # Refresh shard map and retry 1x. An empty fetch - etcd unreachable - keeps the
-                # routing there is rather than replacing it with none.
-                logger.warning("Symbol migrated: %s.%s, refreshing shard map",
-                               symbol, exchange)
+        refreshes = 0
+        deadline = None
+        pause = _MOVING_FIRST_PAUSE
+        while True:
+            shard_id = self._resolve_shard(symbol, exchange, routing)
+            backend = routing.connections.get(shard_id)
+            if backend is None:
+                raise OrderbookError(
+                    -1, f"Shard {shard_id} not connected" + (" after refresh" if refreshes else ""))
+            try:
+                raw = backend.execute(command)
+            except (OSError, socket.error) as e:
+                logger.error("Shard %s unreachable for symbol %s.%s",
+                             shard_id, symbol, exchange)
+                raise OrderbookError(-1, f"Shard {shard_id} unreachable") from e
+            err_type, _ = _parse_shard_error(raw)
+            if err_type not in ("SYMBOL_MOVING", "SYMBOL_MIGRATED", "NOT_OWNER"):
+                return raw
+            now = time.monotonic()
+            if deadline is None:
+                deadline = now + _MOVING_RETRY_SECONDS
+            if now >= deadline:
+                logger.warning("%s for %s.%s from shard %s for %.0f s: giving up", err_type, symbol,
+                               exchange, shard_id, _MOVING_RETRY_SECONDS)
+                return raw
+            if err_type == "SYMBOL_MOVING" or refreshes > 0:
+                logger.debug("%s for %s.%s from shard %s: again in %.0f ms", err_type, symbol,
+                             exchange, shard_id, pause * 1000)
+                time.sleep(pause)
+                pause = min(pause * 2, _MOVING_LONGEST_PAUSE)
+            if err_type != "SYMBOL_MOVING":
+                # An empty fetch - etcd unreachable - keeps the routing there is rather than
+                # replacing it with none.
+                logger.warning("%s for %s.%s from shard %s, refreshing shard map",
+                               err_type, symbol, exchange, shard_id)
+                refreshes += 1
                 new_map = self._fetch_shard_map()
                 if new_map:
                     self._refresh_routing(new_map)
                 routing = self._routing
-                shard_id = self._resolve_shard(symbol, exchange, routing)
-                backend = routing.connections.get(shard_id)
-                if backend is None:
-                    raise OrderbookError(
-                        -1, f"Shard {shard_id} not connected after refresh")
-                raw = backend.execute(command)
-            return raw
-        except (OSError, socket.error) as e:
-            logger.error("Shard %s unreachable for symbol %s.%s",
-                         shard_id, symbol, exchange)
-            raise OrderbookError(-1, f"Shard {shard_id} unreachable") from e
 
     @property
     def is_sharded(self) -> bool:

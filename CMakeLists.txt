@@ -347,7 +347,11 @@ target_link_libraries(orderbook_mm_framing PUBLIC orderbook_core)
 
 # ── Multi-master manager compiled library (peer networking, WAL broadcast) ─────
 add_library(orderbook_multi_master STATIC src/multi_master.cpp src/mm_snapshot.cpp)
-target_link_libraries(orderbook_multi_master PUBLIC orderbook_mm_framing orderbook_async_snapshot orderbook_peer_registry orderbook_conflict_resolver orderbook_anti_entropy orderbook_hlc orderbook_compression orderbook_logger)
+# The engine and the WAL too, which it calls into and which name it: a cycle of static libraries,
+# which CMake repeats on the link line. Undeclared, it linked only while some earlier library on the
+# line happened to pull the engine's objects in first - and #196's coordinator, linking the client,
+# moved that earlier library, and every test linking the coordinator lost `Engine::install_snapshot`.
+target_link_libraries(orderbook_multi_master PUBLIC orderbook_mm_framing orderbook_async_snapshot orderbook_peer_registry orderbook_conflict_resolver orderbook_anti_entropy orderbook_hlc orderbook_compression orderbook_logger orderbook_engine orderbook_wal)
 
 # ── Shard map compiled library ─────────────────────────────────────────────────
 add_library(orderbook_shard_map STATIC src/shard_map.cpp)
@@ -366,8 +370,10 @@ add_library(orderbook_shard_router STATIC src/shard_router.cpp)
 target_link_libraries(orderbook_shard_router PUBLIC orderbook_shard_map orderbook_coordinator orderbook_logger orderbook_metrics)
 
 # ── Shard coordinator compiled library ──────────────────────────────────────────
-add_library(orderbook_shard_coordinator STATIC src/shard_coordinator.cpp)
-target_link_libraries(orderbook_shard_coordinator PUBLIC orderbook_shard_map orderbook_coordinator orderbook_engine orderbook_logger)
+# The migration's connection to the shard a symbol moves to (#196) is a client's, in a translation
+# unit of its own: `orderbook/client.hpp` and the engine's headers define different `ob::Level`s.
+add_library(orderbook_shard_coordinator STATIC src/shard_coordinator.cpp src/symbol_mover.cpp)
+target_link_libraries(orderbook_shard_coordinator PUBLIC orderbook_shard_map orderbook_coordinator orderbook_engine orderbook_logger orderbook_client)
 
 # ── Metrics HTTP server compiled library ───────────────────────────────────────
 add_library(orderbook_metrics_server STATIC src/metrics_server.cpp)

@@ -459,17 +459,44 @@ auto ShardRouter::execute_with_migration_retry(const std::string& symbol_key,
     auto result = fn(*client);
     if (result) return result;
 
-    // Check for SYMBOL_MIGRATED error
-    const auto& msg = result.error_message();
-    if (msg.find("SYMBOL_MIGRATED") != std::string::npos) {
-        OB_LOG_WARN("shard_router", "Symbol migrated: symbol=%s, refreshing map",
-                    symbol_key.c_str());
-
-        // Refresh shard map
-        refresh_shard_map();
-
-        // Retry once with new routing
-        {
+    // Three answers are the routing's rather than the caller's, and are tried again for up to 10 s
+    // (#196). SYMBOL_MOVING: the symbol's owner refuses its writes while it moves them, which is
+    // milliseconds - the same shard again, after a pause that grows. SYMBOL_MIGRATED and NOT_OWNER:
+    // this routing is older than the map - the shard a symbol left says one or the other, depending
+    // on whether it has read the new map yet - so the map is read again and the write sent where it
+    // now says; at once the first time, and after a pause from then on, because the shard the map
+    // names may not have read it yet either.
+    const auto routing_answer = [](const std::string& msg) {
+        if (msg.find("SYMBOL_MOVING") != std::string::npos) return 1;
+        if (msg.find("SYMBOL_MIGRATED") != std::string::npos ||
+            msg.find("NOT_OWNER") != std::string::npos) {
+            return 2;
+        }
+        return 0;
+    };
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    auto pause = std::chrono::milliseconds(20);
+    int refreshes = 0;
+    for (;;) {
+        const int kind = routing_answer(result.error_message());
+        if (kind == 0) return result;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            OB_LOG_WARN("shard_router", "%s for symbol=%s from shard %s for 10 s: giving up",
+                        result.error_message().c_str(), symbol_key.c_str(), shard_id.c_str());
+            return result;
+        }
+        if (kind == 1 || refreshes > 0) {
+            OB_LOG_DEBUG("shard_router", "%s for symbol=%s from shard %s: again in %lld ms",
+                         result.error_message().c_str(), symbol_key.c_str(), shard_id.c_str(),
+                         static_cast<long long>(pause.count()));
+            std::this_thread::sleep_for(pause);
+            pause = std::min(pause * 2, std::chrono::milliseconds(200));
+        }
+        if (kind == 2) {
+            OB_LOG_WARN("shard_router", "%s for symbol=%s from shard %s, refreshing map",
+                        result.error_message().c_str(), symbol_key.c_str(), shard_id.c_str());
+            ++refreshes;
+            refresh_shard_map();
             std::lock_guard<std::mutex> lock(mtx_);
             auto it = shard_map_.assignments.find(symbol_key);
             if (it != shard_map_.assignments.end()) {
@@ -479,17 +506,14 @@ auto ShardRouter::execute_with_migration_retry(const std::string& symbol_key,
             }
             client = get_client(shard_id);
         }
-
         if (!client) {
             OB_LOG_ERROR("shard_router", "Shard unreachable after refresh: shard=%s symbol=%s",
                          shard_id.c_str(), symbol_key.c_str());
             return R::err(OB_ERR_IO, "shard " + shard_id + " unreachable after refresh");
         }
-
-        return fn(*client);
+        result = fn(*client);
+        if (result) return result;
     }
-
-    return result;
 }
 
 // ── 11.6  assign_unknown_symbol() ────────────────────────────────────────────

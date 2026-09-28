@@ -133,7 +133,8 @@ private:
     /// Parse symbol(s) from a SQL query's FROM clause.
     std::vector<std::string> extract_symbols_from_sql(std::string_view sql) const;
 
-    /// Send operation, handle ERR SYMBOL_MIGRATED with one retry.
+    /// Send operation. SYMBOL_MOVING, SYMBOL_MIGRATED and NOT_OWNER are tried again for up to 10 s
+    /// (#196): the first on the same shard, the other two where the map, read again, says.
     template<typename F>
     auto execute_with_migration_retry(const std::string& symbol_key, F&& fn)
         -> decltype(fn(std::declval<OrderbookClient&>()));

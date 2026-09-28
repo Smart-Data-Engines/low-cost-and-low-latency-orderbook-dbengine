@@ -130,21 +130,75 @@ Clients find the shards through the map: the Python pool with `coordinator_endpo
 `OrderbookPool` with `PoolConfig::coordinator_endpoints`, each reading it at every health check.
 
 **Add shards before the writes flow.** A shard added to a running cluster takes its share of the ring
-from the others, and nothing moves those symbols' rows to it: `MIGRATE` is refused until it does
-(#196), and for up to 2 s, until each shard has read the new map, the others still take its symbols'
-writes. Symbols that must stay where their history is can be assigned in the map before the shard is
-added.
+from the others, and nothing moves those symbols' rows to it by itself - `MIGRATE` moves one symbol at
+a time (below) - and for up to 2 s, until each shard has read the new map, the others still take its
+symbols' writes. Symbols that must stay where their history is can be assigned in the map before the
+shard is added.
 
-**Moving a symbol is being built** (#196). What a shard has so far is the half the shard a symbol moves
-to runs - `ADOPT <symbol.exchange> BEGIN <source shard>`, `END` and `ABANDON`, which the source's
-`MIGRATE` is to send - and `MIGRATE` is still refused. One of them is an operator's already:
-`ADOPT <symbol.exchange> ABANDON` on a shard that neither owns nor adopts the symbol drops every row of
-it there, for good - its segments, the inputs of their merges, its live book - and answers
-`OK <segments removed>`. A shard refuses it for a symbol it owns; and, removing nothing, while a
-snapshot is being sent from it and after a failed sync has frozen its checkpoints
-(`ERR the rows of <symbol> stay: …`, which says which). A shard that holds a row of a symbol does not
-adopt it (`ERR shard <id> holds rows of <symbol> already`), so a migration tried again cannot store a
-row twice.
+### Moving a symbol to another shard
+
+`MIGRATE <symbol.exchange> <shard>` on the shard that owns the symbol - by the map's assignment or by
+the ring, as a write is owned - moves it there **with its rows** (#196), while it is written. It answers
+`OK` as soon as the move has begun; `SHARD_INFO` says how it goes:
+
+```
+migration_symbol     BTC-USD.BINANCE
+migration_target     s1
+migration_phase      done          (adopting, copying, switching, done, failed, unknown)
+migration_rounds     2
+migration_updates    20401
+migration_rows       102001
+migration_freeze_ms  41.7
+migration_error      ...           (when it failed, or its end is unknown)
+```
+
+What happens, in order:
+
+1. **The target adopts the symbol** (`ADOPT <symbol.exchange> BEGIN <source>`, which the source sends):
+   it takes the symbol's writes from that connection alone, and only where none of its rows is.
+2. **The copy.** The source seals the symbol, pins its segment files - no merge and no retention
+   sweep runs until the move ends - and sends every row to the target as the writes that stored
+   them, with their event times. Then it copies again whatever arrived meanwhile, in rounds, until a
+   round copies fewer than 2 000 updates (or after eight). The symbol takes writes throughout.
+3. **The switch.** The symbol's writes are refused `SYMBOL_MOVING` - the clients try again - while
+   the last round's arrivals are copied and the map in etcd is compare-and-swapped to name the
+   target. Then the target is told (`ADOPT … END`), and the source refuses the symbol from then on
+   (`SYMBOL_MIGRATED`, or `NOT_OWNER` once it reads the map). `migration_freeze_ms` is this window.
+
+Writers see nothing but latency. The Python pool and the C++ router try `SYMBOL_MOVING` again on the
+same shard, and `SYMBOL_MIGRATED` and `NOT_OWNER` where the map, read again, sends them - for up to
+10 s, with pauses from 20 ms to 200 ms. The source keeps its rows of the symbol (storage is
+append-only); readers routed by the map read the target.
+
+**With client authentication**, the source authenticates to the target as `--migration-identity
+<identity>`, an identity in its own `--auth-secret-file`, so every shard's file must have it. A node
+started with an identity its file does not have refuses to start. **With `--tls-client`**, the source
+connects with TLS and verifies the target against `--tls-ca-file`.
+
+When it fails:
+
+- **Before the switch** - the target is unreachable, refuses to adopt, dies during the copy; etcd
+  refuses the map - the source abandons the adoption (`ADOPT … ABANDON`, which drops what the target
+  had stored), thaws the symbol and goes on taking its writes: `migration_phase failed` and why. If the
+  target could not be told - it was down - it keeps what it had stored, and the next `MIGRATE` is
+  refused with `ERR shard <target> holds rows of <symbol> already`: run `ADOPT <symbol.exchange>
+  ABANDON` on the target, which drops them, and move it again. A move tried again stores nothing
+  twice.
+- **When the switch's outcome is unknown** - etcd did not answer the compare-and-swap and has not
+  said since, for 60 s, whether it took it - the symbol **stays refused** on the source: the map may
+  name the target, and a write taken on the source would then be stored where nobody reads it.
+  `migration_phase unknown`. Restart the source once etcd answers: it reads the map and follows it.
+
+Limits of this first version:
+
+- One move at a time per shard, and a shard group of one primary: a replica of the target does not
+  drop what an abandoned move had stored, and a mesh (multi-master) shard is not moved.
+- The rows are sent in the order a scan of the source delivers them, which is what a `SELECT`
+  compares. A symbol whose writes came out of time order across seals - a backfill, a late
+  correction - may end with another of the updates that share a level on top of the target's book,
+  where the rows are the same.
+- Nothing rebalances by itself: a shard added to a running cluster still takes its share of the ring
+  without the rows (above), and moving them is a `MIGRATE` per symbol.
 
 ## Tuning that is real for this engine
 

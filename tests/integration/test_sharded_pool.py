@@ -350,9 +350,12 @@ class MigratedShard:
         pass
 
 
-def test_a_migrated_symbol_with_etcd_unreachable_keeps_the_routing_there_is(shards):
-    # SYMBOL_MIGRATED makes the pool fetch the map and retry once. With etcd gone the fetch is
-    # empty, and routing by an empty map would leave every shard unreachable until the next fetch.
+def test_a_migrated_symbol_with_etcd_unreachable_keeps_the_routing_there_is(shards, monkeypatch):
+    # SYMBOL_MIGRATED makes the pool fetch the map and retry. With etcd gone the fetch is empty, and
+    # routing by an empty map would leave every shard unreachable until the next fetch. The shard
+    # here answers it for ever, and the pool tries for `_MOVING_RETRY_SECONDS` (#196): shortened, so
+    # that the test's time is not that wait's.
+    monkeypatch.setattr(ob, "_MOVING_RETRY_SECONDS", 0.5)
     shards.put_map(assignments={"AAA.EX": "s0"})
     eng = engine(shards, 3600)
     pool = eng._pool

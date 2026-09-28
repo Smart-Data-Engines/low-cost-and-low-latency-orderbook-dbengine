@@ -202,6 +202,11 @@ struct ServerConfig {
     /// --auth-secret-file: `<identity> <secret>` lines. Empty = client authentication disabled.
     std::string auth_secret_file;
 
+    /// --migration-identity: the identity from the file above this shard authenticates as on
+    /// another shard's client port when it moves a symbol there (#196). Empty: none, which a target
+    /// with client authentication refuses. An identity the file does not have refuses to start.
+    std::string migration_identity;
+
     // ── TLS (#30 part three) ──────────────────────────────────────────────────
     //
     // Paths, never contents, for the same reason as the secret files: `format_config()` prints

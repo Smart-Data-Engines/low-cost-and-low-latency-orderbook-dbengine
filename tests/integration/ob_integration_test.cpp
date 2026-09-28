@@ -9,6 +9,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -296,13 +297,52 @@ static int run_shard_pool(const std::string& coordinator, const std::string& sym
     return 0;
 }
 
+// ── shard_writer (#196): a pool writing one symbol while it moves ────────────
+
+/// Writes of one symbol through a pool that finds its shards in etcd, one `bid` level each at its
+/// own event time, until `until` exists; the event time of every write acknowledged goes to `out`,
+/// one a line. A write the pool could not place is a failure: the migration a test runs beside it is
+/// to cost writers nothing but latency.
+static int run_shard_writer(const std::string& coordinator, const std::string& symbol,
+                            const std::string& until, const std::string& out_path) {
+    ob::PoolConfig pc;
+    pc.coordinator_endpoints = {coordinator};
+    pc.health_check_interval_sec = 0.5;
+    ob::OrderbookPool pool(pc);
+    std::ofstream out(out_path);
+    constexpr uint64_t kFirst = 1'760'000'200'000'000'000ULL;
+    uint64_t written = 0;
+    uint64_t failed = 0;
+    std::string first_failure;
+    for (uint64_t i = 0; !std::ifstream(until).good(); ++i) {
+        const uint64_t ts = kFirst + i * 1000;
+        auto res = pool.insert(symbol, "EX", ob::Side::BID, static_cast<int64_t>(30'000 + i), 1, 1, ts);
+        if (res) {
+            out << ts << "\n";
+            ++written;
+        } else {
+            if (failed++ == 0) first_failure = std::to_string(ts) + ": " + res.error_message();
+        }
+    }
+    out.flush();
+    pool.close();
+    if (failed > 0) {
+        print_result("shard_writer", "fail", std::to_string(failed) + " failed, the first " + first_failure);
+        return 1;
+    }
+    print_result("shard_writer", "pass", std::to_string(written) + " written");
+    return 0;
+}
+
 // ── CLI argument parsing ─────────────────────────────────────────────────────
 
 static void usage(const char* prog) {
     std::cerr << "Usage: " << prog
               << " --host <host> --port <port>"
               << " --test <ping|insert_query|minsert|query_agg>\n"
-              << "       " << prog << " --test shard_pool --coordinator <URL> --symbols <A,B,...>\n";
+              << "       " << prog << " --test shard_pool --coordinator <URL> --symbols <A,B,...>\n"
+              << "       " << prog << " --test shard_writer --coordinator <URL> --symbols <A>"
+              << " --until <FILE> --out <FILE>\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -311,6 +351,8 @@ int main(int argc, char* argv[]) {
     std::string test_name;
     std::string coordinator;
     std::string symbols;
+    std::string until;
+    std::string out;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
@@ -323,6 +365,10 @@ int main(int argc, char* argv[]) {
             coordinator = argv[++i];
         } else if (std::strcmp(argv[i], "--symbols") == 0 && i + 1 < argc) {
             symbols = argv[++i];
+        } else if (std::strcmp(argv[i], "--until") == 0 && i + 1 < argc) {
+            until = argv[++i];
+        } else if (std::strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
+            out = argv[++i];
         } else {
             usage(argv[0]);
             return 1;
@@ -339,6 +385,7 @@ int main(int argc, char* argv[]) {
     if (test_name == "minsert")      return run_minsert(host, port);
     if (test_name == "query_agg")    return run_query_agg(host, port);
     if (test_name == "shard_pool")   return run_shard_pool(coordinator, symbols);
+    if (test_name == "shard_writer") return run_shard_writer(coordinator, symbols, until, out);
 
     std::cerr << "Unknown test: " << test_name << "\n";
     usage(argv[0]);

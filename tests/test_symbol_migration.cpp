@@ -18,6 +18,7 @@
 #include "orderbook/shard_map.hpp"
 #include "orderbook/tcp_server.hpp"
 #include "orderbook/types.hpp"
+#include "orderbook/update_assembler.hpp"
 
 #include <gtest/gtest.h>
 
@@ -188,6 +189,59 @@ TEST(SymbolMigration, SealingASymbolListsEveryRowOfIt) {
     auto reopened = engine_at(dir.path);
     EXPECT_EQ(rows(*reopened, "SEAL"), 70 * 3) << "a restart after the seal lost or doubled rows";
     reopened->close();
+}
+
+TEST(SymbolMigration, ASegmentsRowsAreReadBackAsTheWritesThatStoredThem) {
+    // A write of n levels stored n rows, levels 0 to n-1, with its time, number and side: the copy
+    // sends them as that write, so that the target stores the same rows and builds the same book.
+    std::vector<ob::SnapshotRow> rows;
+    const auto wrote = [&](uint64_t ts, uint64_t seq, uint8_t side, uint16_t n) {
+        for (uint16_t i = 0; i < n; ++i) {
+            ob::SnapshotRow r{};
+            r.timestamp_ns    = ts;
+            r.sequence_number = seq;
+            r.side            = side;
+            r.level_index     = i;
+            r.price           = static_cast<int64_t>(ts * 10 + i);
+            r.quantity        = i + 1u;
+            r.order_count     = 2;
+            rows.push_back(r);
+        }
+    };
+    wrote(100, 1, ob::SIDE_BID, 3);
+    wrote(100, 2, ob::SIDE_BID, 2);   // the same time: the next number
+    wrote(100, 2, ob::SIDE_ASK, 1);   // the same number: the other side
+    wrote(150, 0, ob::SIDE_ASK, 2);   // before numbers existed
+    wrote(150, 0, ob::SIDE_ASK, 2);   // and another like it, told apart by its level 0
+    wrote(200, 3, ob::SIDE_BID, 1);
+
+    ob::UpdateAssembler assembler;
+    ob::MovedUpdate done;
+    std::vector<ob::MovedUpdate> sent;
+    for (const auto& r : rows) {
+        if (assembler.add(r, done)) sent.push_back(done);
+    }
+    if (assembler.finish(done)) sent.push_back(done);
+    EXPECT_FALSE(assembler.finish(done)) << "the last write was given twice";
+
+    ASSERT_EQ(sent.size(), 6u);
+    const std::vector<size_t> levels{3, 2, 1, 2, 2, 1};
+    const std::vector<uint64_t> times{100, 100, 100, 150, 150, 200};
+    const std::vector<uint8_t> sides{ob::SIDE_BID, ob::SIDE_BID, ob::SIDE_ASK, ob::SIDE_ASK,
+                                     ob::SIDE_ASK, ob::SIDE_BID};
+    size_t row = 0;
+    for (size_t i = 0; i < sent.size(); ++i) {
+        EXPECT_EQ(sent[i].levels.size(), levels[i]) << "update " << i;
+        EXPECT_EQ(sent[i].timestamp_ns, times[i]) << "update " << i;
+        EXPECT_EQ(sent[i].side, sides[i]) << "update " << i;
+        for (const auto& l : sent[i].levels) {
+            EXPECT_EQ(l.price, rows[row].price);
+            EXPECT_EQ(l.qty, rows[row].quantity);
+            EXPECT_EQ(l.count, rows[row].order_count);
+            ++row;
+        }
+    }
+    EXPECT_EQ(row, rows.size());
 }
 
 // ── The shard a symbol moves to: the engine ───────────────────────────────────
