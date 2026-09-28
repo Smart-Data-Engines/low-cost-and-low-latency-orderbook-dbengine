@@ -136,6 +136,13 @@ MetricsRegistry::MetricsRegistry() {
                                      "writes that waited for room in the pending queue"));
     counters_.push_back(make_counter("ob_writer_backpressure_refusals_total",
                                      "writes refused because the pending queue never freed room"));
+    // Admission (#190): batches that waited after they were written because the pending queue was
+    // past half, and how long they waited in all - the slow-down that keeps writers from the stop
+    // the two above count.
+    counters_.push_back(make_counter("ob_writer_admission_delays_total",
+                                     "write batches delayed because the pending queue was past half"));
+    counters_.push_back(make_counter("ob_writer_admission_delay_us_total",
+                                     "microseconds write batches were delayed in all, for admission"));
     // Mesh events whose handling threw and which the io loop abandoned (#112). Registered in the
     // same change that writes it: measured, an ENOSPC on a peer's delta used to end that thread
     // outright, and every outside signal - PING, MM_PEERS, the peer's `connected` row - stayed

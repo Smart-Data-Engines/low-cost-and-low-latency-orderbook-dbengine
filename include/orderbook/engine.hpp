@@ -221,6 +221,23 @@ public:
     /// Access the metrics registry.
     MetricsRegistry& registry() { return registry_; }
 
+    // ── Admission (#190) ─────────────────────────────────────────────────────
+    //
+    // A device slower than the ingest makes the flush tick seconds long, and the pending queue lasts
+    // about half a second at the write ceiling: every writer stopped once it was full, for up to the
+    // five seconds after which a write is refused. A batch written with the queue past half waits
+    // now, after its write and outside the engine's lock, in proportion to its rows and to how far
+    // past half the queue is - 100 us a row with the queue full, 200 ms a batch at most - so writers
+    // slow down with the device instead of stopping.
+    // Backpressure: maximum number of pending rows before apply_delta blocks.
+    // Default 1M rows ≈ ~100 MB memory. Prevents OOM under sustained ingestion. Public for what
+    // admission is measured against (#190).
+    static constexpr size_t MAX_PENDING_ROWS = 1'000'000;
+    static constexpr uint64_t kAdmissionFullDelayPerRowNs = 100'000;
+    static constexpr uint64_t kAdmissionMaxDelayNs        = 200'000'000;
+    /// The delay for a batch that queued `rows` with the queue holding `queued`. Pure.
+    static uint64_t admission_delay_ns(size_t queued, size_t rows);
+
     /// Whether the flush tick merges small segments (#165 part 2b): on unless `--compaction off`.
     /// Not a tuning knob - a valve on a process that rewrites what is stored. Before open().
     void set_compaction_enabled(bool enabled) { compaction_enabled_ = enabled; }
@@ -929,6 +946,9 @@ private:
     /// Loud once when writers start waiting, loud once when they stop (#116's mechanism).
     /// Guarded by `mtx_`, which every waiter already holds.
     LogEpisode backpressure_;
+    /// The same for admission (#190): delayed batches, and how long they waited in all. Under mtx_.
+    LogEpisode admission_;
+    uint64_t   admission_delayed_ns_{0};
 
     /// How long a writer waits for room before the write is refused.
     ///
@@ -1041,9 +1061,9 @@ private:
         return pending_rows_.size() + detached_rows_.load(std::memory_order_relaxed);
     }
 
-    // Backpressure: maximum number of pending rows before apply_delta blocks.
-    // Default 1M rows ≈ ~100 MB memory. Prevents OOM under sustained ingestion.
-    static constexpr size_t MAX_PENDING_ROWS = 1'000'000;
+
+    /// Admission (#190), with admit_locked(): the delay a write batch waits after it is written.
+    uint64_t admit_locked(size_t rows);
     std::condition_variable pending_cv_;  // signalled when pending_rows_ is drained
 
     // Helpers

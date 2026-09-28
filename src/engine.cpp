@@ -1304,7 +1304,23 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
     // sampling it inside the batch could only ever have seen it under this lock anyway.
     registry_.set_gauge("ob_pending_rows", static_cast<int64_t>(queued_rows()));
 
-    if (!multi_master) return;
+    // Admission (#190): how long this batch waits, counted here under the lock the queue is counted
+    // under, and waited out below without it - after the writes are in the log and queued, so what
+    // waits is the writer's next batch, not these rows.
+    size_t rows_queued = 0;
+    for (size_t k = 0; k < s.records.size(); ++k) {
+        if (s.wal[k].error.empty()) rows_queued += s.deltas[s.write_of[k]].n_levels;
+    }
+    const uint64_t admission_ns = admit_locked(rows_queued);
+
+    if (!multi_master) {
+        if (admission_ns > 0) {
+            timing.released = WriteTiming::Clock::now();
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::nanoseconds(admission_ns));
+        }
+        return;
+    }
 
     // 6. Broadcast to peers - with mtx_ released, in the order of the writes.
     //
@@ -1333,6 +1349,46 @@ void Engine::apply_local_writes(std::span<const ClientWrite> writes,
             outcomes[i].error = e.what();
         }
     }
+    if (admission_ns > 0) std::this_thread::sleep_for(std::chrono::nanoseconds(admission_ns));
+}
+
+uint64_t Engine::admission_delay_ns(size_t queued, size_t rows) {
+    const size_t half = MAX_PENDING_ROWS / 2;
+    if (queued <= half || rows == 0) return 0;
+    const double past = std::min(1.0, static_cast<double>(queued - half) /
+                                          static_cast<double>(MAX_PENDING_ROWS - half));
+    const double ns = past * static_cast<double>(kAdmissionFullDelayPerRowNs) *
+                      static_cast<double>(rows);
+    return std::min(static_cast<uint64_t>(ns), kAdmissionMaxDelayNs);
+}
+
+uint64_t Engine::admit_locked(size_t rows) {
+    // Caller holds mtx_.
+    const size_t queued = queued_rows();
+    const uint64_t ns = admission_delay_ns(queued, rows);
+    if (ns == 0) {
+        if (rows > 0) {
+            if (const uint64_t batches = admission_.end()) {
+                OB_LOG_INFO("engine", "Writes are taken at full speed again: %llu batch(es) waited "
+                                      "for admission, %.1f ms in all",
+                            static_cast<unsigned long long>(batches),
+                            static_cast<double>(admission_delayed_ns_) / 1e6);
+                admission_delayed_ns_ = 0;
+            }
+        }
+        return 0;
+    }
+    if (admission_.begin()) {
+        OB_LOG_WARN("engine", "Writes arrive faster than the flush drains them - the pending queue "
+                              "holds %zu of %zu rows - so each batch waits after it is written, "
+                              "longer as the queue fills, up to %.0f ms, rather than every writer "
+                              "stopping once it is full",
+                    queued, MAX_PENDING_ROWS, static_cast<double>(kAdmissionMaxDelayNs) / 1e6);
+    }
+    admission_delayed_ns_ += ns;
+    registry_.increment_counter("ob_writer_admission_delays_total");
+    registry_.increment_counter("ob_writer_admission_delay_us_total", ns / 1000);
+    return ns;
 }
 
 void Engine::broadcast_to_replicas(const DeltaUpdate& delta, const Level* levels,

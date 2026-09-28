@@ -857,6 +857,11 @@ target_link_libraries(test_shard_coordinator
 )
 gtest_discover_tests(test_shard_coordinator PROPERTIES ENVIRONMENT "RC_PARAMS=max_success=100")
 
+# ── Admission at the rate the flush drains (#190) ─────────────────────────────
+add_executable(test_write_admission test_write_admission.cpp)
+target_link_libraries(test_write_admission PRIVATE orderbook_engine GTest::gtest_main)
+gtest_discover_tests(test_write_admission PROPERTIES TIMEOUT ${OB_TEST_TIMEOUT})
+
 # ── A symbol moved to another shard with its rows (#196) ──────────────────────
 add_executable(test_symbol_migration test_symbol_migration.cpp)
 target_link_libraries(test_symbol_migration
