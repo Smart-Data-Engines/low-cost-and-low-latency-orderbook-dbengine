@@ -391,6 +391,11 @@ ob_add_engine_test(test_start_reads_wal_once
     test_start_reads_wal_once.cpp
 )
 
+# ── The WAL written back ahead of its sync (#190) ─────────────────────────────
+ob_add_engine_test(test_wal_writeback_ahead
+    test_wal_writeback_ahead.cpp
+)
+
 # ── A mesh node writes down what moved in its vector (#189) ───────────────────
 ob_add_engine_test(test_mm_vector_changes
     test_mm_vector_changes.cpp

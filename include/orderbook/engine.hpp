@@ -126,6 +126,13 @@ public:
     /// loop and with `flush_incremental()` by `flush_mtx_`, which the tick takes.
     void flush_tick_for_test() { flush_tick(); }
 
+    /// How many ranges of the WAL the writeback-ahead thread has handed to the kernel (#190).
+    uint64_t wal_writeback_requests_for_test() const {
+        return wal_writeback_requests_.load(std::memory_order_relaxed);
+    }
+    /// What the writeback-ahead thread hands the kernel at a time (#190).
+    static constexpr uint64_t kWalWritebackChunkBytes = 1u << 20;
+
     /// Hold `flush_mtx_` until the returned lock goes: no tick and no `FLUSH` runs meanwhile, which is
     /// how a test stands for a flush that is stuck - on a device, say - without the flush loop being
     /// told anything. Release it before `close()`, which needs it. A test seam.
@@ -821,11 +828,13 @@ private:
     void update_version_vector_cache();
 
     /// Hands what writers appended to the WAL to the kernel's writeback a megabyte at a time, off
-    /// every writer's path (#190): at the write ceiling a flush tick's sync, and the syncfs() of its
-    /// seals, found a hundred megabytes of WAL to write and waited seconds for it.
+    /// every writer's path (#190): at the write ceiling a flush tick's sync found everything written
+    /// since the last one to write, and took 0.9 - 2.4 s while writers waited for room. Runs under
+    /// `--fsync-policy interval` only: `every` syncs each write, and `none` promises nothing.
     void wal_writeback_loop();
-    std::thread       wal_writeback_thread_;
-    std::atomic<bool> stop_wal_writeback_{false};
+    std::thread           wal_writeback_thread_;
+    std::atomic<bool>     stop_wal_writeback_{false};
+    std::atomic<uint64_t> wal_writeback_requests_{0};   ///< ranges handed to writeback so far
     /// Where each (symbol, origin) sits in `vector_cache_`, so an update finds it. Guarded by mtx_
     /// (only the flush thread and the rebuilds, all under it, touch it); `vector_cache_` itself is
     /// also written under `vector_cache_mtx_`, which the mesh manager reads it under.

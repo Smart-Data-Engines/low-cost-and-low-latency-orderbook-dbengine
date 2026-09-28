@@ -469,17 +469,25 @@ void Engine::open() {
 }
 
 void Engine::wal_writeback_loop() {
-    constexpr uint64_t kChunk = 1u << 20;
+    // What writers append goes to the page cache, and until #190 only the flush tick's sync handed
+    // it to the device: at the write ceiling, ~63 MB/s of WAL, that sync found everything since the
+    // last one to write and took 0.9 - 2.4 s while writers waited for the room its drain frees. A
+    // request for writeback of each megabyte behind the writer keeps what a sync finds small. Off
+    // every writer's path: `sync_file_range()` blocks when the device's queue is full, which is when
+    // it matters, and a writer holds the engine's lock.
+    constexpr uint64_t kChunk = kWalWritebackChunkBytes;
     int fd = -1;
     uint32_t file = std::numeric_limits<uint32_t>::max();
     uint64_t asked = 0;
-    uint64_t requests = 0;
-    OB_LOG_INFO("engine", "WAL writeback ahead of the sync: every %llu bytes appended (#190)",
+    bool failing = false;
+    OB_LOG_INFO("engine", "WAL written back ahead of its sync: each %llu bytes appended (#190)",
                 static_cast<unsigned long long>(kChunk));
     while (!stop_wal_writeback_.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         const WalPosition now = wal_.current_position();
         if (now.file_index != file) {
+            // A rotation, or the first pass: a descriptor of the file being written, taken under the
+            // lock a rotation holds, so it is the file `now` names or a later one.
             std::pair<int, WalPosition> got{-1, {}};
             {
                 std::lock_guard<std::mutex> lock(mtx_);
@@ -489,17 +497,35 @@ void Engine::wal_writeback_loop() {
             fd    = got.first;
             file  = got.second.file_index;
             asked = 0;
+            if (fd < 0 && !failing) {
+                OB_LOG_WARN("engine", "WAL writeback ahead has no descriptor of file %u (%s); the "
+                                      "flush tick's sync writes it all, as before #190",
+                            file, std::strerror(errno));
+                failing = true;
+            } else if (fd >= 0) {
+                OB_LOG_DEBUG("engine", "WAL writeback ahead follows file %u (descriptor %d)", file, fd);
+            }
             continue;
         }
         if (fd < 0 || now.offset < asked + kChunk) continue;
-        (void)::sync_file_range(fd, static_cast<off_t>(asked), static_cast<off_t>(now.offset - asked),
-                                SYNC_FILE_RANGE_WRITE);
+        if (::sync_file_range(fd, static_cast<off_t>(asked), static_cast<off_t>(now.offset - asked),
+                              SYNC_FILE_RANGE_WRITE) != 0) {
+            if (!failing) {
+                OB_LOG_WARN("engine", "WAL writeback ahead failed on file %u: %s; the flush tick's "
+                                      "sync writes it all, as before #190",
+                            file, std::strerror(errno));
+            }
+            failing = true;
+        } else {
+            if (failing) OB_LOG_INFO("engine", "WAL writeback ahead works again, file %u", file);
+            failing = false;
+            wal_writeback_requests_.fetch_add(1, std::memory_order_relaxed);
+        }
         asked = now.offset;
-        ++requests;
     }
     if (fd >= 0) ::close(fd);
     OB_LOG_INFO("engine", "WAL writeback ahead stopped after %llu request(s)",
-                static_cast<unsigned long long>(requests));
+                static_cast<unsigned long long>(wal_writeback_requests_.load(std::memory_order_relaxed)));
 }
 
 void Engine::close() {
