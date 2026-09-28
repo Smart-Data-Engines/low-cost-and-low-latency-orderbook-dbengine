@@ -209,9 +209,9 @@ RC_GTEST_PROP(CodecProperty, prop_volume_roundtrip_in_runs_of_widths, ()) {
 // past what the words hold.
 //
 // Selector and payload uniform whatever the case's size. The first version drew
-// `arbitrary<uint64_t>()`, which RapidCheck makes 64 * size / 100 bits wide: below size 94 no
-// selector bit was ever set, so nearly every word was 240 zeros, and dropping the last value of a
-// partly filled word survived it (the mutation table of #49's step 1).
+// `arbitrary<uint64_t>()`, which RapidCheck makes 64 * size / 100 bits wide: up to size 94 no
+// selector bit is set, and two of 25 cases are larger, so nearly every word was 240 zeros and
+// dropping the last value of a partly filled word survived it (the mutation table of #49's step 1).
 RC_GTEST_PROP(CodecProperty, prop_simple8b_decode_matches_the_previous_decoder, ()) {
     static constexpr uint64_t kMarkerWord = (15ULL << 60) | ((1ULL << 60) - 1);
     const auto word = rc::gen::resize(100, rc::gen::weightedOneOf<uint64_t>({

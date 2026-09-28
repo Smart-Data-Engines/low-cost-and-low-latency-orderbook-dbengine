@@ -1240,6 +1240,57 @@ codebase. Each item is also a story we can sell as bespoke work.
 - AVX2/AVX-512 for delta, zigzag and Simple8b encode/decode. SIMD is currently only in aggregation
 - Effort: M | Impact: Flush and scan throughput
 
+**Step 1, portable: the Simple8b decoder unrolled per selector.** The decoder read each word's width
+and count from the selector table and bounded every value by the count, one `push_back` at a time.
+It is now a switch on the selector, and each word's values are unpacked with constant shifts by a
+fold over an index sequence, not a loop: GCC 13 completely unrolls a loop of at most 16 iterations
+(`max-completely-peel-times`), so the selectors of 20, 30 and 60 values stayed rolled even with
+constant bounds, and the fold took the 2-bit case from 1.27 to 0.77 ns a value. Only a word the
+count ends inside goes through the table. Measured on the i3-7100U, the library's Release flags,
+one core, the fastest of 301 passes over 100 000 values, in ns a value:
+
+| Column | Before | After |
+|---|---|---|
+| quantities 1-5000, selectors 11 and 12 mixed | 3.34 | 2.13 |
+| sequence numbers rising by 1, 2 bits | 1.52 | 0.77 |
+| 0 and 1 | 1.44 | 0.77 |
+| all zero | 1.18 | 0.26 |
+| quantities 0-199 | 2.19 | 0.98 |
+| 59-bit values | 4.18 | 3.17 |
+
+The mixed column gains least: its selector changes word by word, which a switch cannot predict. That
+is an explanation, not a measurement - this machine gives us no branch counters. The delta-zigzag
+decoder was tried the same way, sized once and written through a pointer, and was slower (1.39 →
+1.52 ns: zeroing the vector cost more than the `push_back` it saved), so it stays as it was.
+
+**The scan gained 4%, and the larger cost is not in the code.** `BM_TimeRangeQuery/100000`'s
+median went from 3.27-3.33 ms to 3.16-3.19 ms over three alternating runs of each binary. A segment
+read allocates its column buffers and decoded columns afresh - about 5.7 MB for 100 000 rows - and
+frees them at the end, and a process whose heap glibc trims after that free faults every page back
+in on the next read. A store alone in a process, scanning one such segment
+(`scan_split.cpp`, median of 201 scans):
+
+| | Default malloc | Heap not trimmed |
+|---|---|---|
+| before | 6.44-6.61 ms | 2.63-2.65 ms |
+| after | 6.32-6.34 ms | 2.51-2.56 ms |
+
+"Not trimmed" is `GLIBC_TUNABLES=glibc.malloc.trim_threshold=268435456:glibc.malloc.mmap_threshold=268435456`.
+Of the 2.5 ms, reading the seven files is 0.4, decoding price, quantity and sequence 0.65 (0.82
+before), and handing the rows to one `std::function` 0.8. `BM_TimeRangeQuery`'s process does not
+trim between its scans - the same tunables take its minor faults from 85 500 to 7 200 and its time
+not at all - which is why the benchmark never showed it. Whether a server pays it depends on what
+its heap did before, and a read that allocates nothing does not: step 2 reuses a scan's buffers
+from one segment to the next.
+
+The rewrite is held to the decoder before it, kept in `tests/test_codec.cpp`, on arbitrary words and
+counts. That property's first version drew its words with `arbitrary<uint64_t>()`, which RapidCheck
+makes 64 × size / 100 bits wide, so up to size 94 it set no selector bit and saw nearly nothing but
+240-zero words. The mutation table's first pass showed it: a mutation dropping the last value of a
+partly filled word survived the property. It draws at full size now, and the second pass killed
+every decoder mutation but the control - capping the output at what the words hold, which changes no
+value.
+
 ### 50. NUMA awareness and thread pinning
 - Per-socket allocation, pinned io threads, `--cpu-affinity` configuration
 - Effort: M | Impact: Tail latency on multi-socket servers, which is where clients run
@@ -2263,6 +2314,43 @@ ignore checks.
 
 - Effort: M | Impact: A multi-master node under bidirectional load could deadlock, taking client
   writes and peer replication down together. P0 by consequence, never observed in the wild
+
+### 198. A quantity of exactly 2^60 − 1 reads back wrong, and so does every quantity after it in its segment ✅ **P2**
+
+**Found reading the codec for #49.** Simple8b stores a value wider than a word's 60 bits as a
+fallback of two words: a selector-15 word whose payload is all ones - the marker - and then the raw
+value. The encoder sent only values *above* 2^60 − 1 there, so 2^60 − 1 itself was written as an
+ordinary selector-15 word, which is the marker, and the decoder took the word after it for the raw
+value. Measured with the store on master (`75f6858`):
+
+- a segment of five rows whose first quantity is 2^60 − 1 reads it back as 5 764 607 523 034 282 357
+  and **each of the four quantities after it as 0**: the word holding them was taken for the value,
+  and a query pads a short quantity column with zeros;
+- the sequence-number column is Simple8b over zigzag deltas, and a sequence number falling by exactly
+  2^59 from one row to the next writes the same word. That segment's sequence column comes back
+  short, so every query reading it - `SELECT *` does - skips the whole segment with `Skipping segment
+  …: short column(s)`: **0 of 5 rows**.
+
+Nothing tested the value. The round-trip property drew uniformly over 2^60 values; the fallback
+property put its fallback values last, under a comment saying they were shuffled; and the boundary
+test used 2^60 − 2, "to avoid the marker".
+
+**Fixed.** The encoder spells 2^60 − 1 as the fallback, and `ColumnarStore::append_row()` flags it
+as a raw quantity by the same test. Nothing changes for the decoder: the fallback's two words are
+what every earlier build reads as that value, so a segment written after the fix reads right on a
+build from before it. A segment written before the fix with such a value stays misread - its bytes
+do not say which of the two readings was meant.
+
+Tests: `tests/test_codec.cpp` has the two measured cases and three more, each read by the previous
+decoder as well; the round-trip property draws the top of its range by name, a new property draws
+runs of values of one width each, and the fallback property shuffles. `tests/test_columnar_store.cpp`
+has `TheCodecsMarkerValueIsPreserved`, both columns through a segment. Undoing the encoder's half
+fails five tests - the new unit test, the store test and three properties. Undoing the store's half
+fails none, and is the table's control: a segment's `has_raw_qty` is the store's flag *or* the
+encoder's, and the encoder's already covers the value.
+
+- Effort: S | Impact: silent corruption of the quantities after the value in its segment, or a
+  segment missing from every query that reads sequence numbers; either needs that exact value
 
 ### 197. A replica that bootstrapped from a snapshot and then became a primary gives a replica of its own none of the snapshot's rows ✅ **P1**
 
