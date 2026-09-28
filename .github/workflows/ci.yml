@@ -601,7 +601,10 @@ jobs:
   sanitizers-integration:
     name: sanitizers-integration (tsan)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # The battery under ThreadSanitizer took 41:25 on PR #199's run, and with the build that was the
+    # whole of 45 minutes: PR #200's run was canceled at 83%, every test so far passing, on a runner
+    # 3% slower. The margin, not a slower suite.
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
