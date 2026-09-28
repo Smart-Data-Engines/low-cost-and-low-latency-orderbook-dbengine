@@ -387,43 +387,40 @@ std::string BackupDescription::to_json() const {
     return j.dump(1) + "\n";
 }
 
-bool BackupDescription::from_json(std::string_view text, BackupDescription& out,
-                                  std::string& error) {
-    json j;
-    try {
-        j = json::parse(text.begin(), text.end());
-    } catch (const std::exception& e) {
-        error = std::string("not JSON: ") + e.what();
-        return false;
-    }
-    if (!j.is_object()) {
-        error = "not a JSON object";
-        return false;
-    }
-    BackupDescription d;
+namespace {
+
+// The description is read in the four parts it is written in, each refusing what it cannot trust
+// with the reason in `error`, so that a backup nobody can restore says why before anything is copied.
+
+/// What the document is: its format and version, the backup's name, the engine that wrote it and
+/// when. A version this build does not know is refused rather than read as the one it does.
+bool read_header(const json& j, BackupDescription& d, std::string& error) {
     std::string format;
     uint64_t version = 0;
     if (!get_string(j, "format", format, error)) return false;
-    if (format != kFormat) {
-        error = "\"format\" is \"" + format + "\", not \"" + kFormat + "\"";
+    if (format != BackupDescription::kFormat) {
+        error = "\"format\" is \"" + format + "\", not \"" + BackupDescription::kFormat + "\"";
         return false;
     }
     if (!get_unsigned(j, "format_version", UINT32_MAX, version, error)) return false;
-    if (version != static_cast<uint64_t>(kFormatVersion)) {
+    if (version != static_cast<uint64_t>(BackupDescription::kFormatVersion)) {
         error = "format version " + std::to_string(version) + " is not one this build reads (" +
-                std::to_string(kFormatVersion) + ")";
+                std::to_string(BackupDescription::kFormatVersion) + ")";
         return false;
     }
-    uint64_t v = 0;
     if (!get_string(j, "name", d.name, error)) return false;
     if (!parse_backup_name(d.name, nullptr)) {
         error = "\"name\" \"" + d.name + "\" is not a backup's name";
         return false;
     }
-    if (!get_string(j, "engine_version", d.engine_version, error)) return false;
-    if (!get_unsigned(j, "cut_at_ns", UINT64_MAX, d.cut_at_ns, error)) return false;
-    if (!get_unsigned(j, "finished_at_ns", UINT64_MAX, d.finished_at_ns, error)) return false;
+    return get_string(j, "engine_version", d.engine_version, error) &&
+           get_unsigned(j, "cut_at_ns", UINT64_MAX, d.cut_at_ns, error) &&
+           get_unsigned(j, "finished_at_ns", UINT64_MAX, d.finished_at_ns, error);
+}
 
+/// Which node took it, in which role, and where in which WAL the cut was; and how it was taken.
+bool read_node_and_wal(const json& j, BackupDescription& d, std::string& error) {
+    uint64_t v = 0;
     const json* node = nullptr;
     if (!get_object(j, "node", node, error)) return false;
     if (!get_string(*node, "role", d.role, error)) return false;
@@ -448,17 +445,23 @@ bool BackupDescription::from_json(std::string_view text, BackupDescription& out,
         error = "\"method\" \"" + d.method + "\" is neither linked nor copied";
         return false;
     }
-    if (!get_unsigned(j, "total_bytes", UINT64_MAX, d.total_bytes, error)) return false;
-    if (!get_unsigned(j, "total_rows", UINT64_MAX, d.total_rows, error)) return false;
+    return get_unsigned(j, "total_bytes", UINT64_MAX, d.total_bytes, error) &&
+           get_unsigned(j, "total_rows", UINT64_MAX, d.total_rows, error);
+}
 
+/// Every file with its size and CRC32C. A path that leaves the directory it is restored to, one
+/// listed twice, and sizes that do not add up to `total_bytes` are each refused: each is a
+/// description written by something other than this engine, or damaged since.
+bool read_files(const json& j, BackupDescription& d, std::string& error) {
     const json* files = nullptr;
     if (!get_array(j, "files", files, error)) return false;
     std::unordered_set<std::string> seen;
     uint64_t sum = 0;
     for (size_t i = 0; i < files->size(); ++i) {
         const json& f = (*files)[i];
+        const std::string at = "files[" + std::to_string(i) + "]";
         if (!f.is_object()) {
-            error = "files[" + std::to_string(i) + "] is not an object";
+            error = at + " is not an object";
             return false;
         }
         SnapshotFileEntry e;
@@ -466,16 +469,15 @@ bool BackupDescription::from_json(std::string_view text, BackupDescription& out,
         if (!get_string(f, "path", e.path, error) ||
             !get_unsigned(f, "size", UINT64_MAX, size, error) ||
             !get_unsigned(f, "crc32c", UINT32_MAX, crc, error)) {
-            error = "files[" + std::to_string(i) + "]: " + error;
+            error = at + ": " + error;
             return false;
         }
         if (!backup_path_is_contained(e.path)) {
-            error = "files[" + std::to_string(i) + "]: the path \"" + e.path +
-                    "\" leaves the directory it is restored to";
+            error = at + ": the path \"" + e.path + "\" leaves the directory it is restored to";
             return false;
         }
         if (!seen.insert(e.path).second) {
-            error = "files[" + std::to_string(i) + "]: \"" + e.path + "\" is listed twice";
+            error = at + ": \"" + e.path + "\" is listed twice";
             return false;
         }
         e.size   = static_cast<size_t>(size);
@@ -488,11 +490,15 @@ bool BackupDescription::from_json(std::string_view text, BackupDescription& out,
                 std::to_string(d.total_bytes);
         return false;
     }
+    return true;
+}
 
+/// The sequence state: the vector's frontiers and the numbers held above them, each with whether it
+/// was cut short, and #187's closed numbering.
+bool read_sequence(const json& j, BackupDescription& d, std::string& error) {
     const json* seq = nullptr;
-    if (!get_object(j, "sequence", seq, error)) return false;
     const json* vec = nullptr;
-    if (!get_array(*seq, "vector", vec, error)) return false;
+    if (!get_object(j, "sequence", seq, error) || !get_array(*seq, "vector", vec, error)) return false;
     for (size_t i = 0; i < vec->size(); ++i) {
         const json& e = (*vec)[i];
         SequenceTracker::VectorEntry ve;
@@ -533,9 +539,31 @@ bool BackupDescription::from_json(std::string_view text, BackupDescription& out,
         }
         d.held.push_back(std::move(hr));
     }
-    if (!get_bool(*seq, "held_truncated", d.held_truncated, error)) return false;
-    if (!get_bool(j, "numbering_closed", d.numbering_closed, error)) return false;
+    return get_bool(*seq, "held_truncated", d.held_truncated, error) &&
+           get_bool(j, "numbering_closed", d.numbering_closed, error);
+}
 
+}  // namespace
+
+bool BackupDescription::from_json(std::string_view text, BackupDescription& out,
+                                  std::string& error) {
+    json j;
+    try {
+        j = json::parse(text.begin(), text.end());
+    } catch (const std::exception& e) {
+        error = std::string("not JSON: ") + e.what();
+        return false;
+    }
+    if (!j.is_object()) {
+        error = "not a JSON object";
+        return false;
+    }
+    // Into a copy, so that a refusal part-way leaves `out` as it was.
+    BackupDescription d;
+    if (!read_header(j, d, error) || !read_node_and_wal(j, d, error) || !read_files(j, d, error) ||
+        !read_sequence(j, d, error)) {
+        return false;
+    }
     out = std::move(d);
     return true;
 }

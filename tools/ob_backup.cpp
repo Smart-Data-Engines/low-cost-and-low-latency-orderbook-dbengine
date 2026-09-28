@@ -51,13 +51,19 @@ std::map<std::string, std::string> fields_of(const std::string& answer) {
 
 std::string first_line(const std::string& s) { return s.substr(0, s.find('\n')); }
 
-}  // namespace
-
-static int run(int argc, char** argv) {
+/// What the command line asked for.
+struct Options {
     ob::ClientConfig config;
-    std::string identity, secret_file, port, timeout_text;
-    long timeout_s = 3600;
-    // A cursor over the arguments rather than a for loop's counter moved in its body (#36).
+    std::string      identity;
+    std::string      secret_file;
+    long             timeout_s = 3600;
+};
+
+/// Read the command line into `o`. Returns -1 to go on, or the exit status: 0 for --help, 2 for
+/// anything it does not understand. A cursor over the arguments rather than a for loop's counter
+/// moved in its body (#36).
+int parse_options(int argc, char** argv, Options& o) {
+    std::string port, timeout_text;
     const std::vector<std::string> args(argv + 1, argv + argc);
     size_t at = 0;
     while (at < args.size()) {
@@ -67,14 +73,14 @@ static int run(int argc, char** argv) {
             return 0;
         }
         if (flag == "--tls") {
-            config.tls = true;
+            o.config.tls = true;
             continue;
         }
-        std::string* into = flag == "--host"             ? &config.host
+        std::string* into = flag == "--host"             ? &o.config.host
                           : flag == "--port"             ? &port
-                          : flag == "--auth-identity"    ? &identity
-                          : flag == "--auth-secret-file" ? &secret_file
-                          : flag == "--tls-ca-file"      ? &config.tls_ca_file
+                          : flag == "--auth-identity"    ? &o.identity
+                          : flag == "--auth-secret-file" ? &o.secret_file
+                          : flag == "--tls-ca-file"      ? &o.config.tls_ca_file
                           : flag == "--timeout-s"        ? &timeout_text
                                                          : nullptr;
         if (!into) {
@@ -91,8 +97,8 @@ static int run(int argc, char** argv) {
     }
     if (!timeout_text.empty()) {
         char* end = nullptr;
-        timeout_s = std::strtol(timeout_text.c_str(), &end, 10);
-        if (end == timeout_text.c_str() || *end != '\0' || timeout_s <= 0) {
+        o.timeout_s = std::strtol(timeout_text.c_str(), &end, 10);
+        if (end == timeout_text.c_str() || *end != '\0' || o.timeout_s <= 0) {
             std::fprintf(stderr, "ob_backup: --timeout-s '%s' is not a positive number\n",
                          timeout_text.c_str());
             return 2;
@@ -105,60 +111,68 @@ static int run(int argc, char** argv) {
         usage(stderr);
         return 2;
     }
-    config.port = static_cast<uint16_t>(port_number);
-    if (identity.empty() != secret_file.empty()) {
+    o.config.port = static_cast<uint16_t>(port_number);
+    if (o.identity.empty() != o.secret_file.empty()) {
         std::fprintf(stderr, "ob_backup: --auth-identity and --auth-secret-file go together\n");
         return 2;
     }
-    if (!identity.empty()) {
-        try {
-            const ob::SecretStore store = ob::SecretStore::load_client_file(secret_file);
-            const ob::Credential* c = store.find(identity);
-            if (!c) {
-                std::fprintf(stderr, "ob_backup: %s has no secret for '%s'\n", secret_file.c_str(),
-                             identity.c_str());
-                return 2;
-            }
-            config.auth_identity = c->identity;
-            config.auth_secret   = c->secret;
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "ob_backup: %s\n", e.what());
+    return -1;
+}
+
+/// The identity's secret, from a file in the server's client-secret format. 0, or 2 with a message:
+/// no such identity in it, or a file the loader refuses (its mode, a short secret, a repeat).
+int load_credentials(Options& o) {
+    if (o.identity.empty()) return 0;
+    try {
+        const ob::SecretStore store = ob::SecretStore::load_client_file(o.secret_file);
+        const ob::Credential* c = store.find(o.identity);
+        if (!c) {
+            std::fprintf(stderr, "ob_backup: %s has no secret for '%s'\n", o.secret_file.c_str(),
+                         o.identity.c_str());
             return 2;
         }
-    }
-    ob::StructuredLogger::instance().set_level(ob::LogLevel::WARN);
-
-    ob::OrderbookClient client(config);
-    if (auto c = client.connect(); !c) {
-        std::fprintf(stderr, "ob_backup: cannot connect to %s:%u: %s\n", config.host.c_str(),
-                     config.port, c.error_message().c_str());
+        o.config.auth_identity = c->identity;
+        o.config.auth_secret   = c->secret;
+        return 0;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "ob_backup: %s\n", e.what());
         return 2;
     }
+}
+
+/// Ask for a backup on a connected client: the capability first, since a server without it answers
+/// BACKUP as an unknown command. Its name, or empty with the exit status in `status`.
+std::string begin_backup(ob::OrderbookClient& client, const Options& o, int& status) {
+    status = 2;
     const auto caps = client.capabilities();
     if (!caps) {
         std::fprintf(stderr, "ob_backup: STATUS failed: %s\n", caps.error_message().c_str());
-        return 2;
+        return {};
     }
     if (caps.value().count("backup") == 0) {
         std::fprintf(stderr, "ob_backup: %s:%u does not take backups (no 'backup' in its "
                              "capabilities): a build from before #34\n",
-                     config.host.c_str(), config.port);
-        return 2;
+                     o.config.host.c_str(), o.config.port);
+        return {};
     }
-
     const auto begun = client.command("BACKUP");
     if (!begun) {
         std::fprintf(stderr, "ob_backup: BACKUP failed: %s\n", begun.error_message().c_str());
-        return 2;
+        return {};
     }
     const std::string answer = begun.value();
     const std::string_view prefix = "OK BACKUP ";
     if (answer.rfind(prefix, 0) != 0) {
         std::fprintf(stderr, "ob_backup: %s\n", first_line(answer).c_str());
-        return 2;
+        return {};
     }
-    const std::string name = first_line(answer).substr(prefix.size());
+    status = 0;
+    return first_line(answer).substr(prefix.size());
+}
 
+/// Poll `BACKUP STATUS` every half second until backup `name` is done or failed, or the wait runs
+/// out: 0 done (one line on stdout), 1 failed, 2 a connection that broke, 3 the time up.
+int wait_for_backup(ob::OrderbookClient& client, const std::string& name, long timeout_s) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
     for (;;) {
         const auto status = client.command("BACKUP STATUS");
@@ -192,6 +206,26 @@ static int run(int argc, char** argv) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
+}
+
+}  // namespace
+
+static int run(int argc, char** argv) {
+    Options o;
+    if (const int status = parse_options(argc, argv, o); status >= 0) return status;
+    if (const int status = load_credentials(o); status != 0) return status;
+    ob::StructuredLogger::instance().set_level(ob::LogLevel::WARN);
+
+    ob::OrderbookClient client(o.config);
+    if (auto c = client.connect(); !c) {
+        std::fprintf(stderr, "ob_backup: cannot connect to %s:%u: %s\n", o.config.host.c_str(),
+                     o.config.port, c.error_message().c_str());
+        return 2;
+    }
+    int status = 0;
+    const std::string name = begin_backup(client, o, status);
+    if (name.empty()) return status;
+    return wait_for_backup(client, name, o.timeout_s);
 }
 
 // Nothing leaves by the terminate handler (#102): an exception from the filesystem or an allocation
