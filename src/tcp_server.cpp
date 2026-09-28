@@ -180,6 +180,10 @@ bool serialised_across_reactors(CommandType t) {
     case CommandType::FAILOVER:
     case CommandType::MIGRATE:
         return true;
+    // One at a time by the coordinator's own lock (#196), and not alone across reactors: a migration
+    // sends ADOPT to the shard it moves a symbol to, so two shards each migrating to the other would
+    // each wait for the other's ADOPT holding what that ADOPT waits for.
+    case CommandType::ADOPT:
     case CommandType::SELECT:
     case CommandType::BOOK:
     case CommandType::INSERT:
@@ -224,6 +228,7 @@ bool allowed_before_authentication(CommandType t) {
     case CommandType::SHARD_MAP:
     case CommandType::SHARD_INFO:
     case CommandType::MIGRATE:
+    case CommandType::ADOPT:
     case CommandType::MM_PEERS:
     case CommandType::MM_CONFLICTS:
     case CommandType::SUBSCRIBE:
@@ -345,21 +350,26 @@ StampedTime stamp_for(const std::optional<uint64_t>& given) {
 /// when it does. The checks `INSERT` and `MINSERT` each had a copy of, in the order they ran.
 std::string refuse_write(const char* command, const std::string& symbol,
                          const std::string& exchange, Engine& engine, bool read_only,
-                         ShardCoordinator* shard_coord) {
+                         ShardCoordinator* shard_coord, const Session& session, uint64_t& adoption) {
+    adoption = 0;
     if (read_only || engine.node_role() == NodeRole::REPLICA) return format_error("read-only replica");
     // Covers the multi-master bootstrap too, which used to need its own block here and
     // answered with a second spelling of the same error.
     if (engine.is_bootstrapping()) return format_error("bootstrapping");
-    // Shard ownership check: reject writes for symbols not owned by this shard
+    // Shard ownership check: reject writes for symbols not owned by this shard. A migrated symbol,
+    // and one moving, the engine refuses itself, under its lock (#196): checked here, without it,
+    // the set was read while a migration wrote it, and a write could get past the last freeze.
     if (shard_coord) {
         const std::string symbol_key = symbol + "." + exchange;
-        if (engine.is_symbol_migrated(symbol_key)) {
-            shard_coord->increment_routing_errors();
-            OB_LOG_WARN("tcp_server", "Rejecting %s for migrated symbol=%s", command,
-                        symbol_key.c_str());
-            return format_error("SYMBOL_MIGRATED");
-        }
         if (!shard_coord->owns_symbol(symbol_key)) {
+            // Or adopted, by this connection (#196): the migration writing the rows it moves here.
+            // The engine takes the write only while the adoption stands, under its lock, which
+            // this check is made without.
+            const uint64_t mine = session.adoption_of(symbol_key);
+            if (mine != 0 && shard_coord->adoption_number(symbol_key) == mine) {
+                adoption = mine;
+                return {};
+            }
             shard_coord->increment_routing_errors();
             OB_LOG_WARN("tcp_server", "Rejecting %s for non-owned symbol=%s", command,
                         symbol_key.c_str());
@@ -436,8 +446,9 @@ void execute_writes(std::span<const Command> cmds,
         const std::string& symbol   = single ? cmd.insert_args.symbol   : cmd.minsert_args.symbol;
         const std::string& exchange = single ? cmd.insert_args.exchange : cmd.minsert_args.exchange;
 
+        uint64_t adoption = 0;
         std::string refusal = refuse_write(single ? "INSERT" : "MINSERT", symbol, exchange, engine,
-                                           read_only, shard_coord);
+                                           read_only, shard_coord, session, adoption);
         if (!refusal.empty()) {
             answers[i] = std::move(refusal);
             continue;
@@ -486,7 +497,9 @@ void execute_writes(std::span<const Command> cmds,
             }
         }
         s.deltas.push_back(delta);
-        s.writes.push_back(ClientWrite{});
+        ClientWrite write{};
+        write.adoption = adoption;
+        s.writes.push_back(write);
         s.answer_of.push_back(i);
     }
     if (s.writes.empty()) return;
@@ -521,6 +534,17 @@ void execute_writes(std::span<const Command> cmds,
         std::string& answer = answers[s.answer_of[k]];
         if (!o.error.empty()) {
             answer = format_error(o.error);
+        } else if (o.status == OB_ERR_MIGRATED || o.status == OB_ERR_MOVING) {
+            // What a client acts on: SYMBOL_MIGRATED sends it to read the map again, SYMBOL_MOVING to
+            // try the same shard again shortly (#196).
+            if (shard_coord) shard_coord->increment_routing_errors();
+            answer = format_error(o.status == OB_ERR_MIGRATED ? "SYMBOL_MIGRATED" : "SYMBOL_MOVING");
+        } else if (o.status == OB_ERR_NOT_OWNER) {
+            // Taken on an adoption that was abandoned before it reached the log (#196): the answer
+            // the check before the engine gives once it is.
+            if (shard_coord) shard_coord->increment_routing_errors();
+            answer = format_error(std::string("NOT_OWNER ") + s.deltas[k].symbol + "." +
+                                  s.deltas[k].exchange);
         } else if (o.status != OB_OK) {
             answer = format_error("apply_delta failed with code " + std::to_string(o.status));
         } else {
@@ -795,6 +819,21 @@ std::string execute_command(const Command& cmd,
         if (read_only) return format_error("read-only mode");
         return shard_coord->handle_migrate_command(
             cmd.migrate_symbol, cmd.migrate_target_shard);
+    }
+
+    case CommandType::ADOPT: {
+        session.increment_commands();
+        OB_LOG_INFO("tcp_server", "Handling ADOPT command: symbol=%s action=%s source=%s",
+                    cmd.migrate_symbol.c_str(), cmd.adopt_action.c_str(),
+                    cmd.adopt_source_shard.c_str());
+        if (!shard_coord) return format_error("sharding not enabled");
+        if (read_only) return format_error("read-only mode");
+        uint64_t adoption = 0;
+        std::string answer = shard_coord->handle_adopt_command(cmd.migrate_symbol, cmd.adopt_action,
+                                                               cmd.adopt_source_shard, &adoption);
+        // Its writes of the symbol are taken from this connection alone until END.
+        if (adoption != 0) session.set_adoption(cmd.migrate_symbol, adoption);
+        return answer;
     }
 
     case CommandType::MM_PEERS: {

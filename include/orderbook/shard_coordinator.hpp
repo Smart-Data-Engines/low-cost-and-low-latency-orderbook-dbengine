@@ -99,6 +99,30 @@ public:
     std::string handle_migrate_command(const std::string& symbol_key,
                                        const std::string& target_shard_id);
 
+    /// The target's half of a migration (#196), sent by the shard the symbol moves from. BEGIN
+    /// adopts it - this shard takes its writes from the connection that sent BEGIN, although the
+    /// map still names the source - when this node holds none of its rows, so a migration tried
+    /// again stores nothing twice; `*adoption` is then the adoption's number, which that connection
+    /// keeps (`Session::set_adoption()`). END says the map names this shard now: from it the
+    /// symbol's writes are taken from any connection. An adoption ends once the map this shard
+    /// reads names it, END or not. ABANDON ends an adoption END has not, and drops what was adopted
+    /// - or, with none, what a migration that failed left of a symbol this shard does not own; never
+    /// the rows of one its map names it for.
+    std::string handle_adopt_command(const std::string& symbol_key, const std::string& action,
+                                     const std::string& source_shard_id,
+                                     uint64_t* adoption = nullptr);
+
+    /// Whether the symbol is being adopted here (#196).
+    bool is_adopting(const std::string& symbol_key) const;
+
+    /// The number of the symbol's adoption, which the connection that began it writes on until END
+    /// makes the symbol this shard's (owns_symbol()); 0 without one (#196).
+    uint64_t adoption_number(const std::string& symbol_key) const;
+
+    /// Install `map` as a read of etcd would, without etcd: what a test of the map's consequences
+    /// needs - this shard's status, its ring, the adoptions a map ends.
+    void adopt_map_for_test(ShardMap map) { adopt_map(std::move(map), ++test_map_revision_); }
+
     /// Migration metrics (for STATUS).
     struct MigrationMetrics {
         bool        in_progress{false};
@@ -122,6 +146,19 @@ private:
     mutable std::mutex mtx_;
     ShardMap shard_map_;
     ConsistentHashRing hash_ring_;
+    /// Symbols adopted from another shard (#196): symbol key -> the shard it moves from, the
+    /// adoption's number (Engine::begin_adoption()), and whether END came. The entry goes once a map
+    /// this shard reads names it for the symbol. Under mtx_.
+    struct Adoption {
+        std::string source;
+        uint64_t    number{0};
+        bool        ended{false};
+    };
+    std::map<std::string, Adoption> adopting_;
+    /// One ADOPT at a time (#196): each is a check and then an act. Its own lock rather than the
+    /// server's for commands that run alone (see serialised_across_reactors()), and taken before mtx_.
+    std::mutex adopt_command_mtx_;
+    int64_t test_map_revision_{0};   ///< see adopt_map_for_test()
     std::atomic<ShardStatus> status_{ShardStatus::JOINING};
     std::atomic<uint64_t> routing_errors_{0};
 

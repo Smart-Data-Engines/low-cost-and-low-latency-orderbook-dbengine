@@ -55,6 +55,11 @@ bool same_meaning(const ob::Command& a, const ob::Command& b) {
     case ob::CommandType::MIGRATE:
         return a.migrate_symbol == b.migrate_symbol
             && a.migrate_target_shard == b.migrate_target_shard;
+    case ob::CommandType::ADOPT:
+        // The source included: BEGIN names the shard the symbol moves from, END and ABANDON name
+        // none, and a formatter that dropped it would turn a BEGIN into a line the parser refuses.
+        return a.migrate_symbol == b.migrate_symbol && a.adopt_action == b.adopt_action
+            && a.adopt_source_shard == b.adopt_source_shard;
     case ob::CommandType::MM_CONFLICTS:
         return a.mm_conflicts_limit == b.mm_conflicts_limit;
     case ob::CommandType::SUBSCRIBE:

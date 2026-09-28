@@ -367,6 +367,54 @@ def test_migrate_is_refused_and_the_symbol_stays_writable(cluster):
     assert wait_until_writable(cluster, "s0", "PIN") == "OK", "the symbol MIGRATE was refused for is not writable"
 
 
+class Connection:
+    """One connection to a node, kept open: an adoption is the connection's that began it (#196)."""
+
+    def __init__(self, cluster: Cluster, sid: str) -> None:
+        self.sock = socket.create_connection(("127.0.0.1", cluster.ports[sid]), timeout=10)
+        self.file = self.sock.makefile("rb")
+        while self.file.readline().strip():   # the greeting
+            pass
+
+    def send(self, line: str) -> str:
+        """The first line of the answer; an OK ends with a blank line, which is read too."""
+        self.sock.sendall(f"{line}\n".encode())
+        first = self.file.readline().decode(errors="replace").strip()
+        if first.startswith("OK"):
+            assert self.file.readline().strip() == b"", f"{line!r}: an OK not ended by a blank line"
+        return first
+
+    def close(self) -> None:
+        self.sock.close()
+
+
+def test_an_adopted_symbol_is_written_by_the_connection_that_adopted_it_alone(cluster):
+    # #196, the half of a migration the shard a symbol moves to runs, over the wire: the adoption's
+    # writes come from the connection that began it - a client the map sends elsewhere is refused
+    # while it lasts - and ABANDON drops what it wrote.
+    for sid in ("s0", "s1"):
+        cluster.start(sid)
+    cluster.wait_for_map(("s0", "s1"))
+    sym = symbols_of("s0", ("s0", "s1"), 1)[0]
+    key = f"{sym}.{EXCHANGE}"
+    assert refused_as_not_owned(cluster, "s1", sym) == f"ERR NOT_OWNER {key}"
+    migration, other = Connection(cluster, "s1"), Connection(cluster, "s1")
+    try:
+        assert migration.send(f"ADOPT {key} BEGIN s0") == "OK"
+        assert migration.send(f"INSERT {sym} {EXCHANGE} bid 100 1 1") == "OK"
+        assert other.send(f"INSERT {sym} {EXCHANGE} bid 101 1 1") == f"ERR NOT_OWNER {key}"
+        assert count_rows(cluster, "s1", sym) == 1
+        assert other.send(f"ADOPT {key} BEGIN s0").startswith(f"ERR already adopting {key}")
+        answer = other.send(f"ADOPT {key} ABANDON")
+        assert answer.startswith("OK "), answer
+        assert migration.send(f"INSERT {sym} {EXCHANGE} bid 102 1 1") == f"ERR NOT_OWNER {key}"
+        assert count_rows(cluster, "s1", sym) == 0, "ABANDON left the adopted row"
+    finally:
+        migration.close()
+        other.close()
+    assert insert(cluster, "s0", sym) == "OK", "the shard the map names stopped taking the symbol"
+
+
 def test_the_pool_reads_a_bare_symbol_migrated():
     # The server says it bare; the pool matched only the form with a detail, so the refresh and
     # the retry it exists for never happened against a real server.

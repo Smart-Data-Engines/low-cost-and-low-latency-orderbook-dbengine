@@ -112,6 +112,8 @@ static constexpr CommandGrammar kGrammar[] = {
     {CommandType::SHARD_INFO,   "SHARD_INFO",   1, "SHARD_INFO", true},
     {CommandType::MIGRATE,      "MIGRATE",      3, "MIGRATE <symbol.exchange> <target_shard_id>",
      true},
+    {CommandType::ADOPT,        "ADOPT",        4,
+     "ADOPT <symbol.exchange> BEGIN <source_shard_id>, or ADOPT <symbol.exchange> END|ABANDON", true},
     {CommandType::MM_PEERS,     "MM_PEERS",     1, "MM_PEERS", true},
     {CommandType::MM_CONFLICTS, "MM_CONFLICTS", 2, "MM_CONFLICTS [limit]", true},
     {CommandType::SUBSCRIBE,    "SUBSCRIBE",    std::nullopt, "SUBSCRIBE <query>", true},
@@ -364,6 +366,24 @@ Command parse_command(std::string_view line) {
         cmd.migrate_target_shard = std::string(tokens[2]);
         OB_LOG_DEBUG("cmd_parser", "Parsed command: MIGRATE symbol=%s target=%s",
                      cmd.migrate_symbol.c_str(), cmd.migrate_target_shard.c_str());
+        return cmd;
+    }
+
+    if (iequals(first, "ADOPT")) {
+        // ADOPT <symbol_key> BEGIN <source_shard_id> | END | ABANDON - the target's half of a
+        // migration (#196), sent by the shard the symbol moves from.
+        if (tokens.size() < 3) return cmd; // UNKNOWN — missing arguments
+        std::string action(tokens[2]);
+        for (char& c : action) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (action != "BEGIN" && action != "END" && action != "ABANDON") return cmd;
+        if (action == "BEGIN" && tokens.size() < 4) return cmd;   // BEGIN names the source
+        cmd.type = CommandType::ADOPT;
+        cmd.migrate_symbol = std::string(tokens[1]);
+        cmd.adopt_action = action;
+        if (action == "BEGIN") cmd.adopt_source_shard = std::string(tokens[3]);
+        OB_LOG_DEBUG("cmd_parser", "Parsed command: ADOPT symbol=%s action=%s source=%s",
+                     cmd.migrate_symbol.c_str(), cmd.adopt_action.c_str(),
+                     cmd.adopt_source_shard.c_str());
         return cmd;
     }
 
@@ -685,6 +705,9 @@ std::string format_command(const Command& cmd) {
     case CommandType::SHARD_INFO: return "SHARD_INFO\n";
     case CommandType::MIGRATE:
         return "MIGRATE " + cmd.migrate_symbol + " " + cmd.migrate_target_shard + "\n";
+    case CommandType::ADOPT:
+        return "ADOPT " + cmd.migrate_symbol + " " + cmd.adopt_action +
+               (cmd.adopt_source_shard.empty() ? std::string() : " " + cmd.adopt_source_shard) + "\n";
     case CommandType::MM_PEERS:  return "MM_PEERS\n";
     case CommandType::SUBSCRIBE:
         return cmd.subscribe_sql + "\n";

@@ -527,6 +527,14 @@ public:
     /// it answers "not found" - which used to copy the whole index to find out (#165).
     bool holds(std::string_view symbol, std::string_view exchange) const;
 
+    /// The segments of the symbol the engine's maps key `dotted` - symbol, a dot, exchange - in
+    /// `segment_order_less` order, and whether it has any segment or block: what moving a symbol
+    /// between shards reads and drops (#196). By the dotted key, so that the rows moved are the ones
+    /// the engine and the shard map mean by it - both, where a dot in a name makes it two of this
+    /// index's symbols - and without the whole-index copy index() makes.
+    std::vector<SegmentMeta> segments_of(std::string_view dotted) const;
+    bool holds_dotted(std::string_view dotted) const;
+
     /// Publish drained rows, so a query reads them before they are sealed (#165 part 2a). A symbol's
     /// blocks are read after its segments, in the order they were published - the order they were
     /// written, which is what a tie between two rows of one level resolves by (#168).
@@ -664,6 +672,8 @@ private:
         std::deque<std::shared_ptr<const RowBlock>> blocks;
     };
     static std::string index_key(std::string_view symbol, std::string_view exchange);
+    /// Whether this index's `key` is the engine's `dotted` one (segments_of()).
+    static bool is_dotted_key(const std::string& key, std::string_view dotted);
 
     // The index (rebuilt from meta.json on open_existing). By symbol, keyed with a NUL between
     // symbol and exchange rather than the dot the engine's other maps use, because a symbol can

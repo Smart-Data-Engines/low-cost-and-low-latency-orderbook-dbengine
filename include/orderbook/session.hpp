@@ -30,6 +30,13 @@ public:
     /// name, as `PeerConnection::conn_id` in the multi-master path.
     uint64_t conn_id() const;
 
+    /// The adoption of a symbol this connection began (#196, `ADOPT <key> BEGIN`), whose writes the
+    /// shard takes from this connection alone - the migration's, which copies the rows - and 0 for
+    /// any other. The connection's, so that a client routing to the wrong shard is told so while a
+    /// symbol is adopted there, rather than having a write stored that an abandoned migration drops.
+    uint64_t adoption_of(const std::string& symbol_key) const;
+    void     set_adoption(const std::string& symbol_key, uint64_t adoption);
+
     /// Append incoming bytes to read buffer. Returns complete lines (if any).
     std::vector<std::string> feed(const char* data, size_t len);
 
@@ -243,6 +250,7 @@ private:
     bool        refusal_logged_{false};
     uint64_t    conn_id_;
     std::string read_buffer_;
+    std::unordered_map<std::string, uint64_t> adoptions_;   ///< see adoption_of()
 
 
     /// Bytes accepted from execute_command() but not yet taken by the socket.

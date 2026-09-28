@@ -72,6 +72,12 @@ constexpr uint64_t ttl_cutoff_ns(uint64_t wall_now_ns, uint64_t ttl_hours) {
 struct ClientWrite {
     const DeltaUpdate* update{nullptr};
     const Level*       levels{nullptr};
+    /// 0, or the adoption of the write's symbol (`Engine::begin_adoption()`) this shard took it on
+    /// (#196): stored only while that adoption stands, which is checked under the lock the WAL
+    /// append takes. The server's ownership check is made without it, and a write it let through
+    /// that reached the log after the adoption was abandoned would leave a row on a shard that
+    /// neither owns nor adopts its symbol - which nothing drops again.
+    uint64_t           adoption{0};
 };
 
 /// What happened to one write of a batch: the status `apply_delta()` returns for it, or - where
@@ -463,11 +469,58 @@ public:
                                                uint32_t from_file,
                                                size_t from_offset);
 
-    /// Check if a symbol has been migrated (reject writes after switchover).
-    bool is_symbol_migrated(const std::string& symbol_key) const;
+    /// Check if a symbol has been migrated (reject writes after switchover). Under the engine's
+    /// lock, which a migration marks it under: the check that read it without was a race (#196).
+    bool is_symbol_migrated(const std::string& symbol_key);
 
     /// Mark a symbol as migrated (after atomic ShardMap update).
     void mark_symbol_migrated(const std::string& symbol_key);
+
+    // ── A symbol moved to another shard with its rows (#196) ──────────────────────────────────
+
+    /// Refuse the symbol's writes with OB_ERR_MOVING, which a client tries again, while a migration
+    /// copies it. Checked under the engine's lock with the WAL append, where the migrated check is,
+    /// so no write gets past it - one checked outside the lock could be taken after the migration's
+    /// last copy, answered OK here and never reach the other shard.
+    void freeze_symbol(const std::string& symbol_key);
+    void thaw_symbol(const std::string& symbol_key);
+    bool is_symbol_frozen(const std::string& symbol_key);
+
+    /// Seal what this node holds of the symbol and list its segments: after it nothing of the symbol
+    /// waits in the queue or in a block - what a migration copies. The segments are written without
+    /// the engine's lock, as a tick writes its seals, so the other symbols' writers do not wait for
+    /// them; nothing claims them before a tick's sync does.
+    std::vector<SegmentMeta> seal_symbol(const std::string& symbol_key);
+
+    /// Every row of one segment, in the order it holds them. False when it cannot be read whole.
+    bool read_symbol_segment(const SegmentMeta& meta,
+                             const std::function<void(const SnapshotRow&)>& cb) const;
+
+    /// Whether this node holds any row of the symbol - in a segment, a block or its live book. A
+    /// shard adopts only a symbol it holds nothing of, so a migration tried again after one that
+    /// failed stores nothing twice.
+    bool holds_symbol(const std::string& symbol_key);
+
+    /// Remove every row of the symbol - its segments, the merges of them, its store, its live book -
+    /// when an adoption is abandoned, and for good: everything is sealed and synced first, and a
+    /// checkpoint past the symbol's last record appended, so a restart replays none of its records.
+    /// The caller sees to it that nothing writes the symbol: this shard neither owns nor adopts it.
+    /// Throws, having removed nothing, while a snapshot's pin holds the files (it names them to a
+    /// replica) and after a failed sync froze the checkpoints (a restart replays from before them).
+    /// Returns the segments removed.
+    size_t drop_symbol(const std::string& symbol_key);
+
+    /// The target's half of a migration (#196). begin_adoption() lets this node store writes of a
+    /// symbol its shard does not own - the ones taken on the adoption it returns
+    /// (`ClientWrite::adoption`) - and returns 0, beginning nothing, when this node holds a row of
+    /// the symbol already: a migration tried again would store it twice. It forgets that the symbol
+    /// was migrated away from here, if it was: it is coming back. end_adoption(): the map names this
+    /// shard now, and its writes are taken as any owner's. abandon_adoption(): the adoption ends, a
+    /// write taken on it is refused from then on (`OB_ERR_NOT_OWNER`), and every row of the symbol
+    /// is dropped (drop_symbol(), which may throw).
+    uint64_t begin_adoption(const std::string& symbol_key);
+    void     end_adoption(const std::string& symbol_key);
+    size_t   abandon_adoption(const std::string& symbol_key);
 
     /// Access the base data directory path.
     const std::string& base_dir() const { return base_dir_; }
@@ -778,6 +831,13 @@ private:
 
     // Sharding: symbols that have been migrated away from this shard
     std::unordered_set<std::string> migrated_symbols_;
+    /// Symbols whose writes are refused while they move (#196, freeze_symbol()). Under mtx_.
+    std::unordered_set<std::string> frozen_symbols_;
+    /// Adoptions this node stores writes on (#196, begin_adoption()): symbol key -> the adoption's
+    /// number, which a write taken on it carries. Numbered, so that a write taken on one abandoned
+    /// is refused under an adoption of the same symbol begun since. Under mtx_.
+    std::unordered_map<std::string, uint64_t> adoptions_;
+    uint64_t last_adoption_{0};
 
     // Multi-master replication (optional, disabled when mm_config_.enabled == false)
     MultiMasterConfig                    mm_config_;
@@ -1219,7 +1279,17 @@ private:
     /// asked is told.
     ///
     /// `drained_rows` is what the tick drained (`pick_seals()`), and `kNoRowLimit` for the rest.
-    int flush_write_and_merge(bool seal_all, size_t drained_rows);
+    ///
+    /// `claim_regardless` appends the checkpoint even when nothing was left to seal, after a sync of
+    /// its own: what drop_symbol() needs, because the last checkpoint can be older than a seal that
+    /// claims nothing (seal_symbol()), and a restart replays from it.
+    int flush_write_and_merge(bool seal_all, size_t drained_rows, bool claim_regardless = false);
+
+    /// flush_incremental(), and with `claim_regardless` a checkpoint whatever it sealed.
+    void flush_everything(bool claim_regardless);
+
+    /// holds_symbol() for a caller that holds mtx_.
+    bool holds_symbol_locked(const std::string& symbol_key) const;
 
     /// One store's seal: its first `count` blocks written into `metas` (#165 part 2a).
     struct Seal {
