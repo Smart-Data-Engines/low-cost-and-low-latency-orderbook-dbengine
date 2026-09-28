@@ -554,8 +554,9 @@ failed, 2 when it could not ask, 3 when `--timeout-s` ran out first.
 ### What a backup is
 
 - **A cut at one moment.** Every write acknowledged before `BACKUP` was accepted is in it, a `MINSERT`
-  whole or not at all; a write acknowledged after the cut is not. The cut seals everything waiting,
-  as `FLUSH` does, under the engine's lock, so writers wait for it as they wait for a `FLUSH`.
+  whole or not at all; a write acknowledged after the cut is not. The cut takes the engine's lock
+  twice, briefly - for the WAL's sync and the drain of the rows waiting, and, once their seals are
+  written without it, for the merge - so writers wait for it as they wait for a `FLUSH`.
 - **Its segment files and a description**, `backup.json`: every file with its size and CRC32C, the
   WAL position and identity the cut was taken at, the node and its role, the engine's version, and
   the sequence state - for a mesh node, the frontiers it holds of every origin.
@@ -612,9 +613,35 @@ client writes. A symbol a shard held after it had moved away (#196 keeps the sou
 
 ### What it costs, and what a restore takes
 
-Measured in Release on the development machine (i3-7100U, one ext4 on NVMe):
+Measured in Release on the development machine - an i3-7100U, ext4 on LVM over LUKS on an NVMe - on
+28 September 2026 (min / median / max; five runs of the smaller store, three of the larger):
 
-<!-- numbers from evidence/2026-09-28-backup/, filled in by the measurement -->
+| store | method | cut: writers wait | files pinned | total |
+|---|---|---|---|---|
+| 10 M rows, 241 MB, 15 072 files | linked | 0 / 0 / 11 ms | 0.56 / 0.57 / 0.59 s | 0.99 / 1.01 / 1.04 s |
+| | copied | 0 / 0 / 14 ms | 1.08 / 1.09 / 1.15 s | 1.86 / 1.93 / 6.74 s |
+| 50 M rows, 1.2 GB, 54 016 files | linked | 14 / 61 / 71 ms | 1.8 / 2.3 / 10.5 s | 5.9 / 6.9 / 11.8 s |
+| | copied | 1 / 4 / 7 ms | 4.4 / 7.3 / 7.9 s | 7.1 / 21.0 / 24.6 s |
+
+A copied backup here is a copy on the same device, which is the cost of moving the bytes; to another
+device it is the slower of the two. After the pin, a linked backup reads its own links for their
+checksums, and a copied one waits for its `syncfs()`.
+
+| restore, the backup's pages not in the cache | check | copy | open | total |
+|---|---|---|---|---|
+| 10 M rows | 3.2 / 3.6 / 3.7 s | 1.62 / 1.63 / 1.68 s | 0.18 / 0.20 / 0.20 s | 5.1 / 5.5 / 5.6 s |
+| 50 M rows | 15.7 / 15.9 / 16.2 s | 16.6 / 35.4 / 36.0 s | 0.58 / 1.0 / 1.16 s | 33.8 / 52.4 / 53.1 s |
+
+A server started on a restored directory of 148 MB was listening 7-10 ms after its first log line.
+
+What a backup costs a writer, measured with one connection writing about 320 000 levels a second
+(below this device's ceiling) and `ob_backup` every 5 s, against the same load without it, six rounds
+each: the batch round trip's p50, p99 and p99.9 do not move (about 58 / 107 / 250 us either way). Of
+13 cuts, 10 held the engine's lock 1-9 ms and three 49, 89 and 779 ms - that one 759 ms of it the WAL's
+`fsync`, which the cut, like `FLUSH`, still does under the lock. On this device the worst batch without
+any backup ranged from 3.8 ms to 2.87 s across the same six rounds: near a device's write ceiling its
+own stalls are larger than a backup's, and a WAL on a device of its own takes the `fsync` off the data
+directory's journal (#190). Evidence: `evidence/2026-09-28-backup/`.
 
 **RPO** is the interval between backups: the WAL written since the last one is not in any backup, and
 this release has no restore to a point between two (below). **RTO** is `ob_restore` - the check, the
