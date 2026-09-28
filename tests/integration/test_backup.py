@@ -92,14 +92,18 @@ class Node:
     def log_text(self) -> str:
         return self.log_path.read_text(errors="replace") if self.log_path.exists() else ""
 
-    def prices(self, symbol: str) -> list[int]:
-        """Every row's price; none for a symbol the node does not hold (yet)."""
-        engine = OrderbookEngine(host="127.0.0.1", port=self.port, timeout=30)
+    def prices(self, symbol: str) -> list[int] | None:
+        """Every row's price; none for a symbol the node does not hold (yet); None while it installs a
+        snapshot and says so rather than answering from a store it is replacing - which a replica
+        bootstrapping from a restored primary does for as long as the install takes."""
+        engine = OrderbookEngine(host="127.0.0.1", port=self.port, timeout=patience(60))
         try:
             return [r.price for r in engine.query(f"SELECT * FROM '{symbol}'.'{EXCH}'")]
         except OrderbookError as e:
             if "NOT_FOUND" in str(e):
                 return []
+            if "bootstrapping" in str(e).lower():
+                return None
             raise
         finally:
             engine.close()
@@ -108,7 +112,9 @@ class Node:
 class Wire:
     """A bare connection, reading whole answers: `OK ...` to its blank line, `ERR ...` to its end."""
 
-    def __init__(self, port: int, timeout: float = 30.0):
+    def __init__(self, port: int, timeout: float = 60.0):
+        # Scaled like every wait here: a FLUSH behind a busy device, under a sanitizer, is slow.
+        timeout = patience(timeout)
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
         self.sock.settimeout(timeout)
         self.buf = b""
@@ -288,23 +294,30 @@ def test_a_primary_restored_from_a_backup_makes_its_replica_start_over():
             everything = sorted(primary.prices(SYMBOLS[0]))
             assert len(everything) == 300 * LEVELS, len(everything)
             deadline = time.time() + patience(60)
-            while time.time() < deadline and sorted(replica.prices(SYMBOLS[0])) != everything:
+            while time.time() < deadline and sorted(replica.prices(SYMBOLS[0]) or []) != everything:
                 time.sleep(0.5)
-            assert sorted(replica.prices(SYMBOLS[0])) == everything, "the replica never caught up"
+            assert sorted(replica.prices(SYMBOLS[0]) or []) == everything, "the replica never caught up"
 
             # The primary's disk is lost; it comes back from the backup, at the same address.
             primary.kill()
             restore(f"{tmp}/backups/{name}", f"{tmp}/restored")
             restored.start()
             deadline = time.time() + patience(90)
-            while time.time() < deadline and sorted(replica.prices(SYMBOLS[0])) != at_backup:
+            while time.time() < deadline and sorted(replica.prices(SYMBOLS[0]) or []) != at_backup:
                 time.sleep(0.5)
             assert sorted(restored.prices(SYMBOLS[0])) == at_backup
-            assert sorted(replica.prices(SYMBOLS[0])) == at_backup, (
+            assert sorted(replica.prices(SYMBOLS[0]) or []) == at_backup, (
                 "the replica still serves rows the restored primary does not have: it resumed "
                 "inside the WAL of the primary that was lost")
-            assert "a different WAL at the same address" in replica.log_text(), (
-                "the replica caught up for a reason other than the new WAL's identity")
+            # Started over - by the new WAL's identity, or, when the replica had not yet saved a
+            # position naming the old stream, by having none; the act is the same - and caught up
+            # from a snapshot, the only thing that holds the restored rows.
+            log = replica.log_text()
+            assert "discarding and replaying from zero" in log, (
+                "the replica caught up without starting over:\n" + log[-3000:])
+            assert "Snapshot installed" in log, (
+                "the replica caught up without a snapshot, so from a WAL that holds none of the "
+                "restored rows:\n" + log[-3000:])
         finally:
             replica.stop()
             restored.stop()
