@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cerrno>
 #include <chrono>
@@ -1220,10 +1221,97 @@ bool read_column_file(const std::string& dir, const char* name, std::vector<T>& 
     f.seekg(0, std::ios::beg);
     out.resize(sz / sizeof(T));
     f.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(sz));
+    // What was read, not what was asked for: `out` may be a buffer an earlier read filled, and the
+    // part a short read left would hold that read's values where a new vector held zeros.
+    out.resize(static_cast<size_t>(f.gcount()) / sizeof(T));
     return true;
 }
 
+/// The buffers one segment read fills - the column files as read and the columns decoded - kept by
+/// the thread from one read to the next (#49 step 2). A read allocated all eleven afresh and freed
+/// them at the end, and in a process whose heap glibc trims after that free every page came back as
+/// a fault on the next read: a store alone in a process scanned a segment of 100 000 rows in
+/// 6.3 ms, and in 2.5 ms with the heap left untrimmed.
+struct SegmentReadBuffers {
+    std::vector<uint64_t> timestamps, enc_prices, enc_qtys, enc_seq, qtys, zigzag_seq;
+    std::vector<int64_t>  prices, seqs;
+    std::vector<uint32_t> counts;
+    std::vector<uint8_t>  sides;
+    std::vector<uint16_t> levels;
+
+    size_t held_bytes() const {
+        return (timestamps.capacity() + enc_prices.capacity() + enc_qtys.capacity() +
+                enc_seq.capacity() + qtys.capacity() + zigzag_seq.capacity()) * sizeof(uint64_t) +
+               (prices.capacity() + seqs.capacity()) * sizeof(int64_t) +
+               counts.capacity() * sizeof(uint32_t) + sides.capacity() * sizeof(uint8_t) +
+               levels.capacity() * sizeof(uint16_t);
+    }
+};
+
+/// What a thread keeps between reads. A segment has at most `compaction::kMaxRows` rows, 262 144,
+/// and every column of that many is 23 MB, so this holds any segment the engine writes; a read that
+/// left more - a segment from somewhere else - gives it back.
+constexpr size_t kHeldReadBytes = size_t{32} << 20;
+std::atomic<size_t> g_held_read_limit{kHeldReadBytes};
+
+struct HeldReadBuffers {
+    SegmentReadBuffers buffers;
+    bool in_use = false;
+};
+
+HeldReadBuffers& held_read_buffers() {
+    thread_local HeldReadBuffers held;
+    return held;
+}
+
+/// This thread's buffers for the length of one read - or a set of the read's own, when a read on
+/// this thread already has them: a callback that reads a segment again must not refill the columns
+/// the outer read is handing rows out of.
+class ReadBuffersLease {
+public:
+    ReadBuffersLease() : held_(held_read_buffers()) {
+        if (!held_.in_use) {
+            held_.in_use = true;
+            buffers_ = &held_.buffers;
+        } else {
+            OB_LOG_DEBUG("columnar", "a segment read inside another on this thread: it uses buffers "
+                                     "of its own");
+            own_.emplace();
+            buffers_ = &*own_;
+        }
+    }
+    ~ReadBuffersLease() {
+        if (buffers_ != &held_.buffers) return;
+        const size_t bytes = held_.buffers.held_bytes();
+        const size_t limit = g_held_read_limit.load(std::memory_order_relaxed);
+        if (bytes > limit) {
+            OB_LOG_DEBUG("columnar", "giving back %zu bytes of segment-read buffers: this thread "
+                                     "keeps at most %zu between reads", bytes, limit);
+            held_.buffers = SegmentReadBuffers{};
+        }
+        held_.in_use = false;
+    }
+    ReadBuffersLease(const ReadBuffersLease&) = delete;
+    ReadBuffersLease& operator=(const ReadBuffersLease&) = delete;
+
+    SegmentReadBuffers& buffers() { return *buffers_; }
+
+private:
+    HeldReadBuffers&                  held_;
+    std::optional<SegmentReadBuffers> own_;
+    SegmentReadBuffers*               buffers_ = nullptr;
+};
+
 }  // namespace
+
+size_t ColumnarStore::read_buffers_held() {
+    return held_read_buffers().buffers.held_bytes();
+}
+
+void ColumnarStore::set_read_buffers_limit_for_test(size_t bytes) {
+    OB_LOG_INFO("columnar", "segment-read buffers: a thread keeps at most %zu bytes (was %zu)", bytes,
+                g_held_read_limit.exchange(bytes, std::memory_order_relaxed));
+}
 
 ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
         const SegmentMeta& meta, ColumnSet columns, uint64_t start_ns, uint64_t end_ns,
@@ -1249,10 +1337,25 @@ ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
         return SegmentRead::kUnreadable;
     }
 
-    std::vector<uint64_t> timestamps, enc_prices, enc_qtys, enc_seq;
-    std::vector<uint32_t> counts;
-    std::vector<uint8_t>  sides;
-    std::vector<uint16_t> levels;
+    // The thread's buffers, which hold an earlier read's columns. Every column this read uses is
+    // read or decoded into its buffer below; one it does not use is emptied here, capacity kept, so
+    // that it is empty by construction as a new vector was.
+    ReadBuffersLease lease;
+    SegmentReadBuffers& b = lease.buffers();
+    std::vector<uint64_t>& timestamps = b.timestamps;
+    std::vector<uint64_t>& enc_prices = b.enc_prices;
+    std::vector<uint64_t>& enc_qtys   = b.enc_qtys;
+    std::vector<uint64_t>& enc_seq    = b.enc_seq;
+    std::vector<uint32_t>& counts     = b.counts;
+    std::vector<uint8_t>&  sides      = b.sides;
+    std::vector<uint16_t>& levels     = b.levels;
+    if (!columns.has(QueryColumn::TimestampNs)) timestamps.clear();
+    if (!want_price) { enc_prices.clear(); b.prices.clear(); }
+    if (!want_qty)   { enc_qtys.clear();   b.qtys.clear(); }
+    if (!want_cnt)   counts.clear();
+    if (!want_side)  sides.clear();
+    if (!want_level) levels.clear();
+    if (!want_seq)   { enc_seq.clear(); b.zigzag_seq.clear(); b.seqs.clear(); }
 
     // A missing file is fatal for the segment only when the query needs that column. Before
     // the read set existed every column was needed, so a segment missing any one of the seven
@@ -1293,14 +1396,14 @@ ColumnarStore::SegmentRead ColumnarStore::read_segment_rows(
     // Decoding follows the set too, and the sequence number is the expensive one: it is
     // Simple8b **and** zigzag-delta, so a query that does not ask for it skips two of the
     // four decode passes a segment would otherwise cost.
-    std::vector<int64_t>  prices;
-    std::vector<uint64_t> qtys;
-    std::vector<int64_t>  seqs;
-    if (want_price) prices = decode_prices(enc_prices);
-    if (want_qty)   qtys   = decode_simple8b(enc_qtys, meta.row_count);
+    std::vector<int64_t>&  prices = b.prices;
+    std::vector<uint64_t>& qtys   = b.qtys;
+    std::vector<int64_t>&  seqs   = b.seqs;
+    if (want_price) decode_prices_into(enc_prices, prices);
+    if (want_qty)   decode_simple8b_into(enc_qtys, meta.row_count, qtys);
     if (want_seq) {
-        auto zigzag_seq = decode_simple8b(enc_seq, meta.row_count);
-        seqs = decode_prices(zigzag_seq);
+        decode_simple8b_into(enc_seq, meta.row_count, b.zigzag_seq);
+        decode_prices_into(b.zigzag_seq, seqs);
     }
 
     // A short column means a truncated or corrupt segment. Emitting the rows

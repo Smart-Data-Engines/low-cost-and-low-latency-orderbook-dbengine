@@ -512,6 +512,14 @@ public:
         return last_rebuild_ranges_read_;
     }
 
+    /// Bytes of segment-read buffers the calling thread keeps between reads (#49 step 2): the columns
+    /// of the last segment it read, while they are within the limit below.
+    static size_t read_buffers_held();
+
+    /// What a thread keeps at most: 32 MiB, every column of the largest segment compaction writes
+    /// and room besides. A test lowers it to watch a read give its buffers back.
+    static void set_read_buffers_limit_for_test(size_t bytes);
+
     /// Number of segments in the index (including active if flushed).
     size_t segment_count() const {
         std::shared_lock<std::shared_mutex> lock(index_mtx_);

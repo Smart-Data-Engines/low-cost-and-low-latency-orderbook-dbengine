@@ -1197,3 +1197,107 @@ TEST(SegmentIdentity, TwoStoresRacingForOneSpanGetDifferentDirectories) {
     EXPECT_EQ(unique.size(), static_cast<size_t>(kThreads))
         << "two flushers were handed the same directory, so one overwrote the other";
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// #49 step 2: a thread keeps its segment-read buffers from one read to the next
+//
+// The buffers hold the last read's columns. What must not follow from that: a read handing back a
+// value an earlier read left - in a shorter segment, in a run of zeros, or while an outer read on
+// the same thread is still handing rows out of them.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Every field a function of the store's tag and the row's index, so that a value from the other
+// store's segment, or from another row, cannot pass for the right one. The quantities hold runs of
+// zeros - Simple8b's all-zero words - where the other tag's hold values.
+uint64_t tagged_qty(uint64_t tag, uint64_t i) {
+    const bool zero = (tag % 2 == 1) ? (i % 500 >= 300) : (i % 500 < 300);
+    return zero ? 0 : tag * 1000 + i;
+}
+
+void fill_tagged(ob::ColumnarStore& store, uint64_t tag, uint64_t rows) {
+    for (uint64_t i = 0; i < rows; ++i) {
+        auto row = make_row(1000 + i, static_cast<int64_t>(tag * 1'000'000 + i), tagged_qty(tag, i),
+                            static_cast<uint32_t>(tag + i % 7),
+                            tag % 2 == 1 ? ob::SIDE_ASK : ob::SIDE_BID,
+                            static_cast<uint16_t>(tag + i % 3));
+        row.sequence_number = tag * 1'000'000 + i;
+        store.append(row);
+    }
+    ASSERT_TRUE(store.flush_segment().has_value());
+}
+
+void expect_tagged(std::vector<ob::SnapshotRow> rows, uint64_t tag, uint64_t count) {
+    ASSERT_EQ(rows.size(), count) << "store " << tag;
+    std::sort(rows.begin(), rows.end(), [](const ob::SnapshotRow& a, const ob::SnapshotRow& b) {
+        return a.timestamp_ns < b.timestamp_ns;
+    });
+    for (uint64_t i = 0; i < count; ++i) {
+        const auto& r = rows[i];
+        ASSERT_EQ(r.timestamp_ns, 1000 + i) << "store " << tag << " row " << i;
+        ASSERT_EQ(r.price, static_cast<int64_t>(tag * 1'000'000 + i)) << "store " << tag << " row " << i;
+        ASSERT_EQ(r.quantity, tagged_qty(tag, i)) << "store " << tag << " row " << i;
+        ASSERT_EQ(r.order_count, tag + i % 7) << "store " << tag << " row " << i;
+        ASSERT_EQ(r.side, tag % 2 == 1 ? ob::SIDE_ASK : ob::SIDE_BID) << "store " << tag << " row " << i;
+        ASSERT_EQ(r.level_index, tag + i % 3) << "store " << tag << " row " << i;
+        ASSERT_EQ(r.sequence_number, tag * 1'000'000 + i) << "store " << tag << " row " << i;
+    }
+}
+
+}  // namespace
+
+TEST(ColumnarStoreReadBuffers, ASegmentReadAfterALongerOneHandsBackOnlyItsOwnValues) {
+    TempDir tmp("read_buffers_lengths");
+    ob::ColumnarStore longer((tmp.path / "a").string(), 1'000'000'000ULL);
+    ob::ColumnarStore shorter((tmp.path / "b").string(), 1'000'000'000ULL);
+    fill_tagged(longer, 1, 3000);
+    fill_tagged(shorter, 2, 700);
+
+    expect_tagged(scan_all(longer), 1, 3000);
+    expect_tagged(scan_all(shorter), 2, 700);
+    expect_tagged(scan_all(longer), 1, 3000);
+    EXPECT_GT(ob::ColumnarStore::read_buffers_held(), 0u) << "the thread keeps what the reads filled";
+}
+
+TEST(ColumnarStoreReadBuffers, AReadInsideAnotherOnTheSameThreadGetsBuffersOfItsOwn) {
+    TempDir tmp("read_buffers_nested");
+    ob::ColumnarStore outer_store((tmp.path / "a").string(), 1'000'000'000ULL);
+    ob::ColumnarStore inner_store((tmp.path / "b").string(), 1'000'000'000ULL);
+    fill_tagged(outer_store, 3, 1200);
+    fill_tagged(inner_store, 4, 800);
+
+    std::vector<ob::SnapshotRow> outer, inner;
+    outer_store.scan(0, UINT64_MAX, "", "", ob::ColumnSet::all(), [&](const ob::SnapshotRow& r) {
+        if (outer.empty()) inner = scan_all(inner_store);
+        outer.push_back(r);
+    });
+    expect_tagged(inner, 4, 800);
+    expect_tagged(outer, 3, 1200);
+}
+
+TEST(ColumnarStoreReadBuffers, AThreadGivesBackBuffersPastItsLimit) {
+    TempDir tmp("read_buffers_limit");
+    ob::ColumnarStore store(tmp.str(), 1'000'000'000ULL);
+    fill_tagged(store, 5, 2000);
+
+    struct RestoreLimit {
+        ~RestoreLimit() { ob::ColumnarStore::set_read_buffers_limit_for_test(size_t{32} << 20); }
+    } restore;
+
+    // From nothing, whatever the tests before this one left on the thread.
+    ob::ColumnarStore::set_read_buffers_limit_for_test(0);
+    expect_tagged(scan_all(store), 5, 2000);
+    ASSERT_EQ(ob::ColumnarStore::read_buffers_held(), 0u) << "a read past the limit gives it back";
+
+    ob::ColumnarStore::set_read_buffers_limit_for_test(size_t{32} << 20);
+    expect_tagged(scan_all(store), 5, 2000);
+    const size_t held = ob::ColumnarStore::read_buffers_held();
+    EXPECT_GE(held, size_t{2000} * (8 + 8 + 4 + 1 + 2 + 8 + 8)) << "every column of 2000 rows";
+    expect_tagged(scan_all(store), 5, 2000);
+    EXPECT_EQ(ob::ColumnarStore::read_buffers_held(), held) << "the next read of it needs no more";
+
+    ob::ColumnarStore::set_read_buffers_limit_for_test(held - 1);
+    expect_tagged(scan_all(store), 5, 2000);
+    EXPECT_EQ(ob::ColumnarStore::read_buffers_held(), 0u) << "a byte under what they take, and they go";
+}

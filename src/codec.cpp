@@ -47,6 +47,14 @@ std::vector<uint64_t> encode_prices(std::span<const int64_t> prices) {
 
 std::vector<int64_t> decode_prices(std::span<const uint64_t> encoded) {
     std::vector<int64_t> out;
+    decode_prices_into(encoded, out);
+    return out;
+}
+
+void decode_prices_into(std::span<const uint64_t> encoded, std::vector<int64_t>& out) {
+    // Appended rather than sized and written through a pointer: for a new vector, zeroing it first
+    // cost more than the push_back saves (#49's step 1 measured 1.39 against 1.52 ns a value).
+    out.clear();
     out.reserve(encoded.size());
     uint64_t prev = 0;
     for (size_t i = 0; i < encoded.size(); ++i) {
@@ -55,7 +63,6 @@ std::vector<int64_t> decode_prices(std::span<const uint64_t> encoded) {
         out.push_back(static_cast<int64_t>(price));
         prev = price;
     }
-    return out;
 }
 
 // ── Simple8b codec ────────────────────────────────────────────────────────────
@@ -199,11 +206,17 @@ inline void unpack(uint64_t word, uint64_t* out) noexcept {
 }  // namespace
 
 std::vector<uint64_t> decode_simple8b(std::span<const uint64_t> words, size_t count) {
-    // Zeroed once, so the two all-zero selectors only move the cursor, and trimmed at the end to
-    // what the words held. Never larger than they can hold, 240 values each: the push_back version
-    // only reserved `count`, and zeroing touches the pages.
+    std::vector<uint64_t> out;
+    decode_simple8b_into(words, count, out);
+    return out;
+}
+
+void decode_simple8b_into(std::span<const uint64_t> words, size_t count, std::vector<uint64_t>& out) {
+    // Sized once and trimmed at the end to what the words held. Never larger than they can hold,
+    // 240 values each: the push_back version only reserved `count`, and sizing touches the pages.
+    // A vector used before still holds its last values, so the all-zero selectors write theirs.
     const size_t want = std::min(count, words.size() * 240);
-    std::vector<uint64_t> out(want);
+    out.resize(want);
     uint64_t* o = out.data();
     size_t n = 0;
     size_t wi = 0;
@@ -218,13 +231,15 @@ std::vector<uint64_t> decode_simple8b(std::span<const uint64_t> words, size_t co
             if (bits != 0) {
                 const uint64_t mask = (1ULL << bits) - 1;
                 for (size_t k = 0; k < room; ++k) o[n + k] = (word >> (k * bits)) & mask;
+            } else {
+                std::fill_n(o + n, room, uint64_t{0});
             }
             n = want;
             break;
         }
         switch (sel) {
-        case 0:  n += 240; break;
-        case 1:  n += 120; break;
+        case 0:  std::fill_n(o + n, 240, uint64_t{0}); n += 240; break;
+        case 1:  std::fill_n(o + n, 120, uint64_t{0}); n += 120; break;
         case 2:  unpack<1, 60>(word, o + n);  n += 60; break;
         case 3:  unpack<2, 30>(word, o + n);  n += 30; break;
         case 4:  unpack<3, 20>(word, o + n);  n += 20; break;
@@ -252,7 +267,6 @@ std::vector<uint64_t> decode_simple8b(std::span<const uint64_t> words, size_t co
         }
     }
     out.resize(n);
-    return out;
 }
 
 } // namespace ob
