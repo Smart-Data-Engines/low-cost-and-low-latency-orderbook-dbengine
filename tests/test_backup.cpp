@@ -308,6 +308,13 @@ TEST(BackupCut, FlushAndTheCutSyncTheWalWithoutTheEnginesLock) {
                 has_before |= f.path.rfind(before, 0) == 0;
             }
             EXPECT_TRUE(has_before) << "the write waiting when the cut took its rows is not in it";
+            // And the sequence state is of the same moment: B's frontier is its first write's number,
+            // not the second's, whose row is in no file.
+            uint64_t b_frontier = 0;
+            for (const auto& e : cut.vector) {
+                if (e.key == "B.EX") b_frontier = std::max(b_frontier, e.frontier);
+            }
+            EXPECT_EQ(b_frontier, 1u) << "the vector claims a write whose row is in none of the cut's files";
         } else {
             engine->flush_incremental();
         }
