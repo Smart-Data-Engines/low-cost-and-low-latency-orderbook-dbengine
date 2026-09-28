@@ -402,6 +402,42 @@ TEST(BackupRunner, MergesAfterALinkedBackupDoNotChangeIt) {
     engine->close();
 }
 
+TEST(BackupRunner, AMergeWaitsForTheBackupsPinAndGoesOnAfterIt) {
+    TempDir dir, backups;
+    auto engine = std::make_unique<ob::Engine>(dir.path, 20'000'000ULL, ob::FsyncPolicy::NONE);
+    engine->open();
+    for (uint64_t n = 0; n + 1 < ob::compaction::kFanIn; ++n) {
+        write(*engine, "A", n);
+        engine->flush_incremental();
+    }
+    ob::BackupRunner runner(*engine, backups.path, engine->registry());
+    bool merged_under_the_pin = false;
+    runner.hold_after_cut_for_test([&] {
+        // The eighth seal, after the cut: a merge of all eight is due, and would remove the seven
+        // segments the backup is about to link. A second of ticks to take it in.
+        write(*engine, "A", 100);
+        engine->flush_incremental();
+        merged_under_the_pin = eventually(
+            [&] { return engine->registry().counter_value("ob_compactions_total") >= 1; }, 1000ms);
+    });
+    std::string name;
+    ASSERT_EQ(runner.start(name), ob::BackupRunner::Start::Started);
+    const ob::BackupProgress p = wait_for(runner);
+    EXPECT_FALSE(merged_under_the_pin) << "a tick merged the segments the backup had listed";
+    EXPECT_EQ(p.state, ob::BackupProgress::State::Done) << p.error;
+    ob::BackupDescription d;
+    std::string error;
+    ASSERT_TRUE(ob::read_backup_description(backups.path + "/" + name, d, error)) << error;
+    EXPECT_EQ(std::count_if(d.files.begin(), d.files.end(),
+                            [](const auto& f) { return fs::path(f.path).filename() == "meta.json"; }),
+              static_cast<long>(ob::compaction::kFanIn - 1));
+    // Released: the merge goes on.
+    EXPECT_TRUE(eventually([&] {
+        return engine->registry().counter_value("ob_compactions_total") >= 1;
+    })) << "the backup's pin was never released";
+    engine->close();
+}
+
 TEST(BackupRunner, OneAtATimeAndTheSecondIsToldWhichIsRunning) {
     TempDir dir, backups;
     auto engine = engine_at(dir.path);

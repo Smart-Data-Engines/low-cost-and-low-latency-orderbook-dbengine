@@ -945,7 +945,8 @@ void BackupRunner::run(std::string name) {
         const auto t_pin = std::chrono::steady_clock::now();
         SnapshotWithSequenceState cut =
             engine_.create_snapshot_with_sequence_state(SnapshotChecksums::Skip);
-        const double cut_ms = cut.create_ms;
+        // What writers waited for: the cut's critical section, not the walk of the directory after it.
+        const double cut_ms = cut.locked_ms;
         BackupDescription d;
         d.name             = name;
         d.engine_version   = std::string(version());
@@ -971,10 +972,10 @@ void BackupRunner::run(std::string name) {
             progress_.cut_ms      = static_cast<uint64_t>(cut_ms);
         }
         OB_LOG_INFO("backup", "Backup %s: cut at WAL %u:%llu, %zu file(s), %llu byte(s), %llu row(s), "
-                              "in %.1f ms",
+                              "in %.1f ms, %.1f ms of it holding writers",
                     name.c_str(), d.wal_file_index, static_cast<unsigned long long>(d.wal_byte_offset),
                     d.files.size(), static_cast<unsigned long long>(d.total_bytes),
-                    static_cast<unsigned long long>(d.total_rows), cut_ms);
+                    static_cast<unsigned long long>(d.total_rows), cut.create_ms, cut_ms);
         std::function<void()> hook;
         {
             std::lock_guard<std::mutex> lock(mtx_);

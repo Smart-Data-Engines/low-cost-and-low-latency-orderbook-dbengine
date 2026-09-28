@@ -122,7 +122,7 @@ struct BackupProgress {
     uint64_t    files_done{0};
     uint64_t    bytes_total{0};
     uint64_t    bytes_done{0};
-    uint64_t    cut_ms{0};           // the cut: writers wait for it as for a FLUSH
+    uint64_t    cut_ms{0};           // the cut's hold of the engine's lock: what writers wait for
     uint64_t    pinned_ms{0};
     uint64_t    elapsed_ms{0};
 };

@@ -1797,6 +1797,8 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
         // alongside flush_loop() or a client FLUSH.
         std::lock_guard<std::mutex> flush_lock(flush_mtx_);
         std::unique_lock<std::mutex> lock(mtx_);
+        // From here to the end of the block no writer takes the engine's lock (#34).
+        const auto t_locked = std::chrono::steady_clock::now();
 
         // Flush all pending rows to columnar stores.
         //
@@ -1838,6 +1840,8 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
         // boundary has to be exactly here and not a line later.
         out.vector = seq_tracker_.export_vector(kMaxPersistedVectorEntries, out.vector_truncated);
         out.held   = seq_tracker_.export_held(kMaxPersistedHeldRanges, out.held_truncated);
+        out.locked_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t_locked).count();
     }
 
     // Phase 2: enumerate files and compute CRC32C (lock-free, read-only).
@@ -2026,12 +2030,12 @@ Engine::SnapshotWithSequenceState Engine::create_snapshot_with_sequence_state(
                         std::chrono::steady_clock::now() - t_start).count();
     OB_LOG_INFO("engine",
                 "Snapshot created: files=%zu bytes=%zu rows=%zu wal=%u:%zu vector=%zu%s "
-                "held=%zu%s checksums=%s in %.1f ms",
+                "held=%zu%s checksums=%s in %.1f ms, %.1f ms of it holding the engine's lock",
                 manifest.files.size(), manifest.total_bytes, manifest.total_rows,
                 manifest.wal_file_index, manifest.wal_byte_offset,
                 out.vector.size(), out.vector_truncated ? " (truncated)" : "",
                 out.held.size(), out.held_truncated ? " (truncated)" : "",
-                checksum ? "computed" : "skipped", out.create_ms);
+                checksum ? "computed" : "skipped", out.create_ms, out.locked_ms);
 
     return out;
 }

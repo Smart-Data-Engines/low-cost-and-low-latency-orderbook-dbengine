@@ -77,6 +77,10 @@ struct SnapshotWithSequenceState {
     /// How long the capture took. Measured rather than assumed: this used to run on the caller's
     /// thread, and for multi-master that thread was `io_loop()` (#79).
     double create_ms{0.0};
+    /// How much of it held the engine's lock - the seal of everything waiting, the WAL position and
+    /// the sequence state: the part every writer waits for (#34). The walk and the checksums after it
+    /// take no lock.
+    double locked_ms{0.0};
     /// Keeps the files the manifest names where they are (#165 part 2b, `Engine::pin_segment_files()`)
     /// for as long as whoever sends the snapshot holds it.
     std::shared_ptr<const void> pin;
