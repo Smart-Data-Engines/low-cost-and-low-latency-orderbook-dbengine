@@ -15,15 +15,16 @@
 
 namespace {
 
+struct Selector { uint32_t count; uint32_t bits; };
+constexpr Selector kSelectors[16] = {
+    {240, 0}, {120, 0}, {60, 1}, {30, 2}, {20, 3}, {15, 4}, {12, 5}, {10, 6},
+    {8, 7},   {7, 8},   {6, 10}, {5, 12}, {4, 15}, {3, 20}, {2, 30}, {1, 60},
+};
+
 // The Simple8b decoder as it was before #49 unrolled it, kept as it was: the rewrite changes speed
 // and nothing else, so it has to answer as this did for every input, words the encoder wrote or
 // not. It is also the previous version's decoder, which is what reads a segment on a downgrade.
 std::vector<uint64_t> reference_decode_simple8b(std::span<const uint64_t> words, size_t count) {
-    struct Selector { uint32_t count; uint32_t bits; };
-    static constexpr Selector kSelectors[16] = {
-        {240, 0}, {120, 0}, {60, 1}, {30, 2}, {20, 3}, {15, 4}, {12, 5}, {10, 6},
-        {8, 7},   {7, 8},   {6, 10}, {5, 12}, {4, 15}, {3, 20}, {2, 30}, {1, 60},
-    };
     static constexpr uint64_t kFallbackMarker = (1ULL << 60) - 1;
 
     std::vector<uint64_t> out;
@@ -180,16 +181,22 @@ RC_GTEST_PROP(CodecProperty, prop_volume_fallback, ()) {
 // Runs of one width each, so that the encoder chooses every selector and the fallback's values sit
 // anywhere in the sequence: a draw uniform over 2^60 values, as Property 11 makes, puts nearly every
 // value in a selector-15 word of its own.
+//
+// Widths and values at full size whatever the case's size: RapidCheck scales an integer's range by
+// it, and at the small sizes a run begins with every "60-bit" value would be a few bits wide.
 RC_GTEST_PROP(CodecProperty, prop_volume_roundtrip_in_runs_of_widths, ()) {
     static constexpr uint64_t kMarker = (1ULL << 60) - 1;
     std::vector<uint64_t> values;
     const auto runs = *rc::gen::inRange<size_t>(1, 9);
     for (size_t r = 0; r < runs; ++r) {
-        const auto bits = *rc::gen::inRange<unsigned>(0, 62);   // 61: the marker's value and past it
+        const auto bits = *rc::gen::weightedOneOf<unsigned>({
+            {8, rc::gen::resize(100, rc::gen::inRange<unsigned>(0, 61))},
+            {1, rc::gen::just(61u)},                   // the marker's value and past it
+        });
         const auto len  = *rc::gen::inRange<size_t>(1, 300);
-        const auto value = bits <= 60
+        const auto value = rc::gen::resize(100, bits <= 60
             ? rc::gen::inRange<uint64_t>(0, 1ULL << bits)
-            : rc::gen::element(kMarker, kMarker + 1, uint64_t{UINT64_MAX});
+            : rc::gen::element(kMarker, kMarker + 1, uint64_t{UINT64_MAX}));
         for (size_t k = 0; k < len; ++k) values.push_back(*value);
     }
 
@@ -198,15 +205,27 @@ RC_GTEST_PROP(CodecProperty, prop_volume_roundtrip_in_runs_of_widths, ()) {
 }
 
 // The unrolled decoder answers as the one before it for any words and any count - including words
-// no encoder writes, a fallback marker with nothing after it, and a count past what the words hold.
+// no encoder writes, a fallback marker with nothing after it, and a count that ends inside a word or
+// past what the words hold.
+//
+// Selector and payload uniform whatever the case's size. The first version drew
+// `arbitrary<uint64_t>()`, which RapidCheck makes 64 * size / 100 bits wide: below size 94 no
+// selector bit was ever set, so nearly every word was 240 zeros, and dropping the last value of a
+// partly filled word survived it (the mutation table of #49's step 1).
 RC_GTEST_PROP(CodecProperty, prop_simple8b_decode_matches_the_previous_decoder, ()) {
     static constexpr uint64_t kMarkerWord = (15ULL << 60) | ((1ULL << 60) - 1);
-    const auto words = *rc::gen::container<std::vector<uint64_t>>(
-        rc::gen::weightedOneOf<uint64_t>({
-            {6, rc::gen::arbitrary<uint64_t>()},   // any selector, any payload
-            {1, rc::gen::just(kMarkerWord)},       // a fallback's first word
-        }));
-    const auto count = *rc::gen::inRange<size_t>(0, words.size() * 240 + 2);
+    const auto word = rc::gen::resize(100, rc::gen::weightedOneOf<uint64_t>({
+        {6, rc::gen::apply([](uint64_t sel, uint64_t payload) { return (sel << 60) | payload; },
+                           rc::gen::inRange<uint64_t>(0, 16),
+                           rc::gen::inRange<uint64_t>(0, 1ULL << 60))},
+        {1, rc::gen::just(kMarkerWord)},           // a fallback's first word
+    }));
+    const auto words = *rc::gen::container<std::vector<uint64_t>>(word);
+
+    // Up to just past the slots the words have, so that the count ends inside a word as often as not.
+    size_t slots = 0;
+    for (const uint64_t w : words) slots += kSelectors[w >> 60].count;
+    const auto count = *rc::gen::resize(100, rc::gen::inRange<size_t>(0, slots + 2));
     RC_ASSERT(ob::decode_simple8b(words, count) == reference_decode_simple8b(words, count));
 }
 
