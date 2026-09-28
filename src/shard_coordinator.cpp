@@ -168,11 +168,12 @@ void ShardCoordinator::adopt_map(ShardMap map, int64_t revision) {
         hash_ring_    = ring_of(shard_map_);
         member        = shard_map_.shards.count(config_.shard_id) != 0;
         shards        = shard_map_.shards.size();
-        // An adoption whose END came ends once the map names this shard for the symbol (#196).
+        // An adoption ends once the map names this shard for the symbol (#196) - after END or
+        // without it: the source writes the map only once the rows are here, and a migration whose
+        // END was lost has written it too.
         for (auto it = adopting_.begin(); it != adopting_.end();) {
             const auto named = shard_map_.assignments.find(it->first);
-            if (it->second.ended && named != shard_map_.assignments.end() &&
-                named->second == config_.shard_id) {
+            if (named != shard_map_.assignments.end() && named->second == config_.shard_id) {
                 OB_LOG_INFO("shard_coord", "Adopted %s from shard %s: the map names shard %s now",
                             it->first.c_str(), it->second.source.c_str(), config_.shard_id.c_str());
                 engine_.end_adoption(it->first);
@@ -852,11 +853,13 @@ std::string ShardCoordinator::handle_adopt_command(const std::string& symbol_key
     bool adopted = false;
     {
         std::lock_guard<std::mutex> lock(mtx_);
+        // A shard drops only what it does not own - by its map, whether it adopts the symbol or not:
+        // the rows of a symbol it serves are not a migration's to throw away, and a migration whose
+        // END never came has written the map to name this shard all the same.
+        if (owned_locked()) return "ERR shard " + config_.shard_id + " owns " + symbol_key + "\n";
         const auto a = adopting_.find(symbol_key);
         if (a == adopting_.end()) {
-            // A shard drops only what it does not own: the rows of a symbol it serves are not a
-            // migration's to throw away.
-            if (owned_locked()) return "ERR shard " + config_.shard_id + " owns " + symbol_key + "\n";
+            // What a migration that failed left of a symbol this shard does not own.
         } else if (a->second.ended) {
             // END came after the map in etcd was changed to name this shard: what it adopted is the
             // symbol's only copy that takes writes.

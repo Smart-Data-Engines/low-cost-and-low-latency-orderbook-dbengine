@@ -104,9 +104,10 @@ public:
     /// map still names the source - when this node holds none of its rows, so a migration tried
     /// again stores nothing twice; `*adoption` is then the adoption's number, which that connection
     /// keeps (`Session::set_adoption()`). END says the map names this shard now: from it the
-    /// symbol's writes are taken from any connection, and the adoption ends once the map this shard
-    /// reads says so. ABANDON ends an adoption END has not, and drops what was adopted - or, with
-    /// none, what a migration that failed left of a symbol this shard does not own.
+    /// symbol's writes are taken from any connection. An adoption ends once the map this shard
+    /// reads names it, END or not. ABANDON ends an adoption END has not, and drops what was adopted
+    /// - or, with none, what a migration that failed left of a symbol this shard does not own; never
+    /// the rows of one its map names it for.
     std::string handle_adopt_command(const std::string& symbol_key, const std::string& action,
                                      const std::string& source_shard_id,
                                      uint64_t* adoption = nullptr);
@@ -146,8 +147,8 @@ private:
     ShardMap shard_map_;
     ConsistentHashRing hash_ring_;
     /// Symbols adopted from another shard (#196): symbol key -> the shard it moves from, the
-    /// adoption's number (Engine::begin_adoption()), and whether END came - after it, the entry goes
-    /// once a map this shard reads names it. Under mtx_.
+    /// adoption's number (Engine::begin_adoption()), and whether END came. The entry goes once a map
+    /// this shard reads names it for the symbol. Under mtx_.
     struct Adoption {
         std::string source;
         uint64_t    number{0};

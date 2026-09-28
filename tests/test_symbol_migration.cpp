@@ -515,6 +515,36 @@ TEST_F(SymbolMigrationServer, ADropRefusedIsAnsweredWithWhatStays) {
     EXPECT_FALSE(engine_->holds_symbol("HELD.EX"));
 }
 
+TEST_F(SymbolMigrationServer, AMapThatNamesThisShardEndsAnAdoptionWhoseEndWasLost) {
+    // The source writes the map once the rows are here and then sends END. An END lost on the way
+    // left the adoption standing, and ABANDON then dropped what it adopted - the symbol's only copy
+    // that takes writes, since the map names this shard for it.
+    coord_->adopt_map_for_test(two_shards("LOST.EX", "shard-0"));
+    ASSERT_EQ(run(*source_, "ADOPT LOST.EX BEGIN shard-0"), "OK\n\n");
+    ASSERT_EQ(run(*source_, "INSERT LOST EX bid 100 1 1"), "OK\n\n");
+    coord_->adopt_map_for_test(two_shards("LOST.EX", "shard-1"));
+    EXPECT_FALSE(coord_->is_adopting("LOST.EX")) << "the map named this shard and the adoption stood";
+    EXPECT_EQ(run(*other_, "INSERT LOST EX bid 101 1 1"), "OK\n\n");
+    EXPECT_EQ(run(*other_, "ADOPT LOST.EX ABANDON").rfind("ERR shard shard-1 owns", 0), 0u);
+    engine_->flush_incremental();
+    EXPECT_EQ(rows(*engine_, "LOST"), 2) << "ABANDON dropped the symbol the map names this shard for";
+}
+
+TEST_F(SymbolMigrationServer, ASymbolTheRingGivesThisShardIsNotDroppedWhileAdopted) {
+    // Owned by the ring rather than an assignment, which ends no adoption: ABANDON asks who owns the
+    // symbol before it asks whether it is adopted.
+    coord_->adopt_map_for_test(two_shards("RING.EX", "shard-0"));
+    ASSERT_EQ(run(*source_, "ADOPT RING.EX BEGIN shard-0"), "OK\n\n");
+    ASSERT_EQ(run(*source_, "INSERT RING EX bid 100 1 1"), "OK\n\n");
+    ob::ShardMap alone = two_shards("OTHER.EX", "shard-1");   // RING.EX assigned to nobody
+    alone.shards.erase("shard-0");                             // and the ring is shard-1's alone
+    coord_->adopt_map_for_test(alone);
+    ASSERT_TRUE(coord_->is_adopting("RING.EX"));
+    ASSERT_TRUE(coord_->owns_symbol("RING.EX"));
+    EXPECT_EQ(run(*other_, "ADOPT RING.EX ABANDON").rfind("ERR shard shard-1 owns", 0), 0u);
+    EXPECT_TRUE(engine_->holds_symbol("RING.EX")) << "ABANDON dropped a symbol the ring gives this shard";
+}
+
 TEST_F(SymbolMigrationServer, AnAdoptionNeedsAnActiveShard) {
     // A shard the map does not name is joining, and owns and adopts nothing.
     ob::ShardMap map = two_shards("JOIN.EX", "shard-0");
