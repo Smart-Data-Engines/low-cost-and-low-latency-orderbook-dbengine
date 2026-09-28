@@ -819,6 +819,13 @@ private:
     /// microseconds a tick and 286 us at 4 000 entries. Caller holds mtx_, on the flush thread -
     /// never from under the mesh manager's lock, which is what the cache is for.
     void update_version_vector_cache();
+
+    /// Hands what writers appended to the WAL to the kernel's writeback a megabyte at a time, off
+    /// every writer's path (#190): at the write ceiling a flush tick's sync, and the syncfs() of its
+    /// seals, found a hundred megabytes of WAL to write and waited seconds for it.
+    void wal_writeback_loop();
+    std::thread       wal_writeback_thread_;
+    std::atomic<bool> stop_wal_writeback_{false};
     /// Where each (symbol, origin) sits in `vector_cache_`, so an update finds it. Guarded by mtx_
     /// (only the flush thread and the rebuilds, all under it, touch it); `vector_cache_` itself is
     /// also written under `vector_cache_mtx_`, which the mesh manager reads it under.

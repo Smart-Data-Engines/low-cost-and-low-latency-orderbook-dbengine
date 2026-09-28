@@ -31,6 +31,7 @@
 #include <thread>
 
 #include <fcntl.h>
+#include <limits>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -459,6 +460,46 @@ void Engine::open() {
     flush_thread_ = std::thread([this]() {
         run_thread_body("engine", "flush_loop", [this] { flush_loop(); });
     });
+    if (fsync_policy_ == FsyncPolicy::INTERVAL) {
+        stop_wal_writeback_.store(false, std::memory_order_relaxed);
+        wal_writeback_thread_ = std::thread([this]() {
+            run_thread_body("engine", "wal_writeback_loop", [this] { wal_writeback_loop(); });
+        });
+    }
+}
+
+void Engine::wal_writeback_loop() {
+    constexpr uint64_t kChunk = 1u << 20;
+    int fd = -1;
+    uint32_t file = std::numeric_limits<uint32_t>::max();
+    uint64_t asked = 0;
+    uint64_t requests = 0;
+    OB_LOG_INFO("engine", "WAL writeback ahead of the sync: every %llu bytes appended (#190)",
+                static_cast<unsigned long long>(kChunk));
+    while (!stop_wal_writeback_.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        const WalPosition now = wal_.current_position();
+        if (now.file_index != file) {
+            std::pair<int, WalPosition> got{-1, {}};
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                got = wal_.writeback_descriptor();
+            }
+            if (fd >= 0) ::close(fd);
+            fd    = got.first;
+            file  = got.second.file_index;
+            asked = 0;
+            continue;
+        }
+        if (fd < 0 || now.offset < asked + kChunk) continue;
+        (void)::sync_file_range(fd, static_cast<off_t>(asked), static_cast<off_t>(now.offset - asked),
+                                SYNC_FILE_RANGE_WRITE);
+        asked = now.offset;
+        ++requests;
+    }
+    if (fd >= 0) ::close(fd);
+    OB_LOG_INFO("engine", "WAL writeback ahead stopped after %llu request(s)",
+                static_cast<unsigned long long>(requests));
 }
 
 void Engine::close() {
@@ -466,6 +507,8 @@ void Engine::close() {
     if (mm_mgr_) {
         mm_mgr_->stop();
     }
+    stop_wal_writeback_.store(true, std::memory_order_relaxed);
+    if (wal_writeback_thread_.joinable()) wal_writeback_thread_.join();
 
     // Stop failover manager first (it may trigger role transitions).
     if (failover_mgr_) {

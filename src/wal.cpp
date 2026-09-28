@@ -933,6 +933,11 @@ std::pair<WALWriter::SyncTicket, int> WALWriter::prepare_sync() {
     return {std::move(ticket), 0};
 }
 
+std::pair<int, WalPosition> WALWriter::writeback_descriptor() const {
+    if (fd_ < 0) return {-1, current_position()};
+    return {::fcntl(fd_, F_DUPFD_CLOEXEC, 0), current_position()};
+}
+
 int WALWriter::perform_sync(SyncTicket& ticket) {
     int first_err = 0;
     for (const int fd : ticket.leaving_) {

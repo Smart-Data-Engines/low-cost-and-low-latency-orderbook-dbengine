@@ -574,6 +574,12 @@ public:
     /// this mechanism nothing.
     WalPosition current_position() const { return position_.load(std::memory_order_relaxed); }
 
+    /// A descriptor of the file being written, and the position it was at, for writing the WAL back
+    /// ahead of its sync (#190): the caller closes it. Caller holds the engine's lock, as for
+    /// `prepare_sync()`, which is what keeps a rotation from swapping the file meanwhile. -1 when no
+    /// file is open.
+    std::pair<int, WalPosition> writeback_descriptor() const;
+
     /// Index of the WAL file currently being written to.
     uint32_t current_file_index() const { return current_position().file_index; }
 
