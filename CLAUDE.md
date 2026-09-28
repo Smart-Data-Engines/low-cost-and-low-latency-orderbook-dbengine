@@ -4025,11 +4025,15 @@ connection a timeout closed, under a test that builds a sharded pool against a m
 is closed**: since #177 a node of 50 000 (symbol, origin) pairs held writes for 9 - 13 ms at every
 checkpoint, writing its whole vector down; a checkpoint writes what moved now - 20.5 kB in 0.03 ms
 after 1% of them moved - and a whole vector where a restart needs one to start from (pitfalls
-512-513). **#190, #193 and #196 are open P2s** - #196 a symbol moved between shards without its rows,
-and `MIGRATE` refused until it is not; at the write ceiling a flush tick's WAL sync takes
-1 - 3 s on a device the segments keep busy, and writers wait that long for room in the pending queue;
-and a joiner checks every path of a snapshot's manifest against the filesystem on its mesh io thread,
-5 s for 70 000 files. **#194 (P3)**: a snapshot holding a file of zero bytes cannot be installed,
+512-513). **#196 is closed**: `MIGRATE` marked a symbol migrated and moved none of its rows; it moves
+them now while the symbol is written - rounds of pipelined copies, then a freeze of the remainder and
+a compare-and-swap of the map in etcd - and the target adopts it only where none of its rows is, from
+the copying connection alone, under a numbered adoption the engine checks again under its lock:
+4.8 - 142.7 ms of refused writes (median 7.4) across ten moves of 250 000 rows with two writers, and
+not one write lost (pitfalls 514-522). **#190 and #193 are open P2s** - at the write ceiling a flush
+tick's WAL sync takes 1 - 3 s on a device the segments keep busy, and writers wait that long for room
+in the pending queue; and a joiner checks every path of a snapshot's manifest against the filesystem
+on its mesh io thread, 5 s for 70 000 files. **#194 (P3)**: a snapshot holding a file of zero bytes cannot be installed,
 though the engine writes no such file.
 
 **#170 and #171**: a Python client connection carries one exchange at a time and is closed when one
