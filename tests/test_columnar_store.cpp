@@ -1312,7 +1312,13 @@ TEST(ColumnarStoreReadBuffers, BuffersPastTheBudgetAreFreedRatherThanKept) {
     ob::ColumnarStore::set_read_buffers_limit_for_test(kBudget);
     expect_tagged(scan_all(store), 5, 2000);
     const size_t held = ob::ColumnarStore::read_buffers_held();
-    EXPECT_GE(held, size_t{2000} * (8 + 8 + 4 + 1 + 2 + 8 + 8)) << "every column of 2000 rows";
+    // At least every column of 2000 rows as read and as decoded: the timestamps, the prices both
+    // ways, the quantities and sequence numbers decoded (and the sequence numbers' zigzag deltas),
+    // the counts, sides and levels - all but the Simple8b words, whose number the codec decides. A
+    // floor of the decoded columns alone let a count that left one buffer out pass (the mutation
+    // table of #49's step 2).
+    const size_t every_column = size_t{2000} * (8 + 8 + 8 + 8 + 8 + 8 + 4 + 1 + 2);
+    EXPECT_GE(held, every_column);
     expect_tagged(scan_all(store), 5, 2000);
     EXPECT_EQ(ob::ColumnarStore::read_buffers_held(), held)
         << "the next read takes the same set back and needs no more";
